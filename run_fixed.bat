@@ -4,10 +4,10 @@ echo 运行视频字幕生成程序...
 echo ==========================================================
 
 :: 激活conda环境
-call conda activate whisper_srt
+call conda activate whisperx
 
 :: 运行Python脚本
-python video_to_srt.py
+python video_to_srt_optimized.py
 
 :: 完成后暂停
 echo.

@@ -12,15 +12,6 @@ import glob
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import gc
 
-# 添加尝试导入必要库，如果导入失败，通过install_dependencies()安装
-try:
-    from pydub import AudioSegment, silence
-    from tqdm import tqdm
-    import whisperx
-except ImportError:
-    # 导入失败会在check_environment和install_dependencies中处理
-    pass
-
 # ========================
 # 配置区域
 # ========================
@@ -44,268 +35,85 @@ BATCH_SIZE = 16
 COMPUTE_TYPE = "float16"  # 或 "int8", "float32"
 WHISPER_MODEL = "medium"  # 指定 Whisper 模型大小
 
-
-
 # ========================
-# 环境检测
+# 依赖检查与安装
 # ========================
 
 def install_dependencies():
-    """检查并安装必要的依赖库"""
-    print("[INFO] 检查并安装必要的依赖...")
+    """安装必要的依赖库"""
+    print("[INFO] 正在检查并安装必要的依赖...")
     
-    # 定义依赖项及其版本要求
-    required_packages = {
-        "pydub": "pydub",
-        "tqdm": "tqdm",
-        # 指定与CUDA 11.8兼容的PyTorch 1.13.1版本
-        "torch": None,  # 特殊处理，见下方
-        "transformers": "transformers",
-        "ffmpeg-python": "ffmpeg-python"
-    }
+    # 定义关键依赖项
+    dependencies = [
+        "pydub",
+        "tqdm",
+        "transformers",
+        "ffmpeg-python",
+        "faster-whisper"
+    ]
     
-    # 检查并安装pip
-    try:
-        import pip
-    except ImportError:
-        print("[ERROR] pip未安装，请先安装pip")
-        return False
-    
-    # 使用清华源
-    pip_command = [sys.executable, "-m", "pip", "install", "-i", "https://pypi.tuna.tsinghua.edu.cn/simple"]
-    
-    # 检查tkinter (系统级依赖)
-    try:
-        import tkinter
-        print("[INFO] tkinter已安装")
-    except ImportError:
-        print("[WARNING] tkinter未安装，这是系统级依赖，需要单独安装")
-        if platform.system() == "Windows":
-            print("  在Windows上，tkinter通常随Python一起安装")
-        elif platform.system() == "Linux":
-            print("  在Linux上，请使用系统包管理器安装python-tk包")
-            print("  例如: sudo apt-get install python3-tk")
-        elif platform.system() == "Darwin":
-            print("  在macOS上，请使用系统包管理器安装python-tk包")
-            print("  例如: brew install python-tk")
-    
-    # 特别处理PyTorch - 安装CUDA 11.7版本(与CUDA 11.8兼容)
+    # 检查PyTorch安装
     try:
         import torch
-        print(f"[INFO] PyTorch已安装，版本:{torch.__version__}")
-        # 检查是否有完整兼容性问题
-        try:
-            import torchaudio
-            print(f"[INFO] torchaudio已安装，版本:{torchaudio.__version__}")
-            torch_installed = True
-        except (ImportError, OSError) as e:
-            print(f"[WARNING] torchaudio导入失败: {e}")
-            torch_installed = False
+        import torchaudio
+        print(f"[INFO] PyTorch已安装，版本: {torch.__version__}")
+        print(f"[INFO] torchaudio已安装，版本: {torchaudio.__version__}")
+        print(f"[INFO] CUDA是否可用: {torch.cuda.is_available()}")
     except ImportError:
-        torch_installed = False
-    
-    if not torch_installed:
-        print("[INFO] 卸载现有PyTorch相关包...")
-        subprocess.check_call([sys.executable, "-m", "pip", "uninstall", "-y", "torch", "torchvision", "torchaudio"])
-        
-        print("[INFO] 安装与CUDA 11.8兼容的PyTorch 1.13.1...")
+        print("[INFO] 安装PyTorch (CUDA 11.8兼容版本)...")
+        torch_cmd = [
+            sys.executable, "-m", "pip", "install", 
+            "torch==2.0.1", "torchaudio==2.0.2", "torchvision==0.15.2",
+            "--index-url", "https://download.pytorch.org/whl/cu118"
+        ]
         try:
-            # 确保安装完全匹配的版本集
-            torch_cmd = pip_command + [
-                "torch==1.13.1+cu117", 
-                "torchvision==0.14.1+cu117", 
-                "torchaudio==0.13.1+cu117", 
-                "--extra-index-url", 
-                "https://download.pytorch.org/whl/cu117"
-            ]
             subprocess.check_call(torch_cmd)
-            
-            # 验证安装
-            import torch
-            import torchaudio
-            print(f"[INFO] PyTorch安装成功，版本: {torch.__version__}")
-            print(f"[INFO] torchaudio安装成功，版本: {torchaudio.__version__}")
-            print(f"[INFO] CUDA是否可用: {torch.cuda.is_available()}")
+            print("[INFO] PyTorch安装成功")
         except subprocess.CalledProcessError:
             print("[ERROR] PyTorch安装失败")
             return False
     
-    # 安装一般依赖
-    for package, install_name in required_packages.items():
-        if package == "torch":  # 已单独处理
-            continue
+    # 安装其他依赖
+    pip_cmd = [sys.executable, "-m", "pip", "install"]
+    for dep in dependencies:
         try:
-            __import__(package)
-            print(f"[INFO] {package}已安装")
+            __import__(dep.replace("-", "_").split("==")[0])
+            print(f"[INFO] {dep}已安装")
         except ImportError:
-            print(f"[INFO] 安装{package}...")
-            if install_name:
-                try:
-                    subprocess.check_call(pip_command + [install_name])
-                    print(f"[INFO] {package}安装成功")
-                except subprocess.CalledProcessError:
-                    print(f"[ERROR] {package}安装失败")
-                    return False
-    
-    # 特殊处理pyannote.audio，安装0.x版本
-    try:
-        import pyannote.audio
-        version = getattr(pyannote.audio, "__version__", "unknown")
-        print(f"[INFO] pyannote.audio已安装，版本:{version}")
-        if not version.startswith("0."):
-            print("[WARNING] pyannote.audio版本不兼容，需要0.x版本")
-            pyannote_installed = False
-        else:
-            pyannote_installed = True
-    except ImportError:
-        pyannote_installed = False
-    
-    if not pyannote_installed:
-        print("[INFO] 安装pyannote.audio 0.x版本...")
-        try:
-            # 尝试安装特定版本，如果失败则尝试0.x系列
+            print(f"[INFO] 安装{dep}...")
             try:
-                subprocess.check_call(pip_command + ["pyannote.audio==0.0.1"])
+                subprocess.check_call(pip_cmd + [dep])
+                print(f"[INFO] {dep}安装成功")
             except subprocess.CalledProcessError:
-                print("[INFO] 尝试安装pyannote.audio 0.x系列版本...")
-                subprocess.check_call(pip_command + ["'pyannote.audio>=0.0.1,<1.0.0'"])
-            print("[INFO] pyannote.audio安装成功")
-        except subprocess.CalledProcessError:
-            print("[ERROR] pyannote.audio安装失败")
-            return False
+                print(f"[ERROR] {dep}安装失败")
+                # 继续安装其他依赖，而不是立即中断
     
-# 安装whisperx
+    # 安装whisperx (从GitHub安装最新版)
     try:
         import whisperx
         print("[INFO] whisperx已安装")
-        # 额外验证whisperx是否可用
-        try:
-            # 尝试访问一个关键函数或属性
-            getattr(whisperx, "load_model")
-            print("[INFO] whisperx功能测试通过")
-            whisperx_installed = True
-        except (AttributeError, ImportError) as e:
-            print(f"[WARNING] whisperx虽然已导入但功能测试失败: {e}")
-            whisperx_installed = False
     except ImportError:
-        print("[INFO] 无法导入whisperx，将尝试安装")
-        whisperx_installed = False
-    
-    if not whisperx_installed:
         print("[INFO] 安装whisperx...")
         try:
-            # 确保相关依赖包已经安装且可用
-            subprocess.check_call(pip_command + ["faster-whisper"])
-            
-            # 卸载可能存在的有问题的whisperx版本
-            subprocess.check_call([sys.executable, "-m", "pip", "uninstall", "-y", "whisperx"])
-            
-            # 重新安装whisperx
-            subprocess.check_call(pip_command + ["git+https://github.com/m-bain/whisperx.git"])
-            
-            # 清除sys.modules缓存中的whisperx，强制下次导入时重新加载
-            if "whisperx" in sys.modules:
-                del sys.modules["whisperx"]
-                
-            # 验证安装
-            import whisperx
-            print("[INFO] whisperx安装成功并可导入")
+            subprocess.check_call(pip_cmd + ["git+https://github.com/m-bain/whisperx.git"])
+            print("[INFO] whisperx安装成功")
         except subprocess.CalledProcessError:
             print("[ERROR] whisperx安装失败")
             return False
-        except ImportError as e:
-            print(f"[ERROR] whisperx安装后仍然无法导入: {e}")
-            return False
     
-    print("[INFO] 所有依赖检查和安装完成")
-    return True
-
-def check_environment():
-    """检查运行环境和必要组件"""
-    print("[INFO] 检查运行环境...")
-
-    # 检查 Python 版本
-    python_version = sys.version.split()[0]
-    print(f"[INFO] Python 版本: {python_version}")
-    if int(python_version.split('.')[0]) < 3 or (
-            int(python_version.split('.')[0]) == 3 and int(python_version.split('.')[1]) < 8):
-        print("[ERROR] 需要 Python 3.8 或更高版本")
-        return False
-
-    # 检查必要的库
-    required_packages = {
-        "tkinter": "用于文件选择对话框",
-        "pydub": "用于音频处理",
-        "tqdm": "用于显示进度条",
-        "whisperx": "用于语音识别和强制对齐"
-    }
-
-    missing_packages = []
-    for package, desc in required_packages.items():
-        try:
-            if package == "tkinter":
-                import tkinter
-            elif package == "pydub":
-                import pydub
-            elif package == "tqdm":
-                import tqdm
-            elif package == "whisperx":
-                # 清理缓存以确保重新导入
-                if "whisperx" in sys.modules:
-                    del sys.modules["whisperx"]
-                import whisperx
-                # 尝试访问一个关键功能以验证完整性
-                getattr(whisperx, "load_model")
-            print(f"[INFO] 已安装 {package}")
-        except (ImportError, AttributeError) as e:
-            missing_packages.append(f"{package} ({desc}) - 错误: {e}")
-
-    if missing_packages:
-        print("[ERROR] 缺少以下必要库:")
-        for pkg in missing_packages:
-            print(f"  - {pkg}")
-        print("\n请使用以下命令安装缺失的库:")
-        print("pip install " + " ".join([pkg.split()[0] for pkg in missing_packages]))
-        return False
-
-    # 检查 ffmpeg
+    # 检查ffmpeg
     try:
-        result = subprocess.run(["ffmpeg", "-version"],
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                text=True,
-                                check=False)
+        result = subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
         if result.returncode == 0:
-            print("[INFO] ffmpeg 已安装")
+            print("[INFO] ffmpeg已安装")
         else:
-            print("[ERROR] ffmpeg 测试失败")
-            return False
+            print("[WARNING] ffmpeg检测失败，可能需要手动安装")
     except FileNotFoundError:
-        print("[ERROR] ffmpeg 未找到，请安装 ffmpeg 并确保其在系统路径中")
+        print("[WARNING] ffmpeg未找到，请安装ffmpeg并确保其在系统路径中")
         print("下载地址: https://ffmpeg.org/download.html")
-        return False
-
-    # 如果设置为使用 CUDA，检查 CUDA 环境
-    if "DEVICE" in globals() and DEVICE == "cuda":
-        try:
-            import torch
-            if torch.cuda.is_available():
-                cuda_version = torch.version.cuda
-                device_count = torch.cuda.device_count()
-                device_name = torch.cuda.get_device_name(0) if device_count > 0 else "未知"
-                print(f"[INFO] CUDA 可用: 版本 {cuda_version}, 设备 {device_count}, 名称: {device_name}")
-            else:
-                print("[WARNING] CUDA 不可用")
-                
-        except ImportError:
-            print("[WARNING] 无法导入 torch 以检查 CUDA 状态")
-            
-
-    print("[INFO] 环境检查完成")
+    
+    print("[INFO] 依赖检查和安装完成")
     return True
-
-
-
 
 # ========================
 # 工具函数
@@ -323,7 +131,7 @@ def load_status():
             with open(STATUS_FILE, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except json.JSONDecodeError:
-            print("[WARNING] 状态文件格式错误，将重新开始.")
+            print("[WARNING] 状态文件格式错误，将重新开始。")
             return {}
     return {}
 
@@ -351,8 +159,8 @@ def cleanup_temp():
 
 def extract_audio(video_path, audio_output_path, force_extract=False):
     """
-    调用 ffmpeg 提取音频为 WAV 格式 (单声道, 16kHz).
-    如果文件已存在且 force_extract 为 False，则跳过.
+    调用 ffmpeg 提取音频为 WAV 格式 (单声道, 16kHz)。
+    如果文件已存在且 force_extract 为 False，则跳过。
     """
     if not force_extract and os.path.exists(audio_output_path):
         print(f"[INFO] 音频文件已存在，跳过提取：{audio_output_path}")
@@ -370,15 +178,14 @@ def extract_audio(video_path, audio_output_path, force_extract=False):
     ]
     print("[INFO] 正在提取音频...")
     try:
-        result = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                universal_newlines=True)
+        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         print(f"[INFO] 音频已成功提取到：{audio_output_path}")
         return True
     except FileNotFoundError:
-        print("[ERROR] ffmpeg 未找到.请确保 ffmpeg 已安装并添加到系统 PATH.")
+        print("[ERROR] ffmpeg 未找到。请确保 ffmpeg 已安装并添加到系统 PATH。")
         return False
     except subprocess.CalledProcessError as e:
-        print("[ERROR] ffmpeg 提取音频时出错.")
+        print("[ERROR] ffmpeg 提取音频时出错。")
         print(f"命令: {' '.join(e.cmd)}")
         print(f"返回码: {e.returncode}")
         print(f"错误输出:\n{e.stderr}")
@@ -397,11 +204,14 @@ def get_existing_segments(temp_dir):
 
 def split_audio(audio_path, force_split=False):
     """
-    将长音频切分为较短的片段.
-    如果分段文件已存在且 force_split 为 False，则尝试加载信息.
+    将长音频切分为较短的片段。
+    如果分段文件已存在且 force_split 为 False，则尝试加载信息。
     返回：
         segments_info: 列表，每个元素为字典 {"file": path, "start_ms": start_time}
     """
+    from pydub import AudioSegment, silence
+    from tqdm import tqdm
+    
     existing_segment_files = get_existing_segments(TEMP_DIR)
 
     # 检查：如果段文件存在且不强制分割，尝试从状态文件中获取分段信息
@@ -409,12 +219,12 @@ def split_audio(audio_path, force_split=False):
     if not force_split and status.get("segments_info") and existing_segment_files:
         # 检查现有文件是否与状态中的数量匹配
         if len(existing_segment_files) == len(status["segments_info"]):
-            print("[INFO] 使用之前保存的分段信息.")
+            print("[INFO] 使用之前保存的分段信息。")
             return status["segments_info"]
         else:
-            print("[INFO] 现有分段文件与状态记录不匹配，将重新分段.")
+            print("[INFO] 现有分段文件与状态记录不匹配，将重新分段。")
     elif not force_split and existing_segment_files:
-        print("[INFO] 检测到现有分段文件，但无状态信息，将重新分段以确保时间戳正确.")
+        print("[INFO] 检测到现有分段文件，但无状态信息，将重新分段以确保时间戳正确。")
 
     print("[INFO] 开始音频分段...")
     try:
@@ -483,7 +293,7 @@ def split_audio(audio_path, force_split=False):
             break  # 没有更多音频或零长度段
 
     pbar.close()
-    print(f"[INFO] 音频分段完成，共 {len(segments_info)} 个分段.")
+    print(f"[INFO] 音频分段完成，共 {len(segments_info)} 个分段。")
 
     # 保存分段信息到状态用于潜在的恢复
     status = load_status()
@@ -505,26 +315,30 @@ whisper_model = None
 
 def load_whisper_model():
     """全局加载WhisperX模型"""
+    import whisperx
+    
     global whisper_model
     if whisper_model is None:
         print(f"[INFO] 加载 WhisperX 模型 ({WHISPER_MODEL}, {COMPUTE_TYPE})...")
         try:
             whisper_model = whisperx.load_model(WHISPER_MODEL, DEVICE, compute_type=COMPUTE_TYPE)
-            print("[INFO] WhisperX 模型加载成功.")
+            print("[INFO] WhisperX 模型加载成功。")
         except Exception as e:
             print(f"[ERROR] 加载 WhisperX 模型失败: {e}")
-            print("请检查模型名称、计算类型、设备设置以及 WhisperX 和相关依赖（如 PyTorch）是否正确安装.")
+            print("请检查模型名称、计算类型、设备设置以及 WhisperX 和相关依赖（如 PyTorch）是否正确安装。")
             if DEVICE == "cuda":
-                print("确保 CUDA 环境已正确配置.")
+                print("确保 CUDA 环境已正确配置。")
             sys.exit(1)  # 如果模型加载失败，退出
     return whisper_model
 
 
 def transcribe_and_align(segment_info, model, align_model_cache, device=DEVICE):
     """
-    对单个音频分段进行转录和强制对齐.
-    使用缓存的对齐模型（如果可用）.
+    对单个音频分段进行转录和强制对齐。
+    使用缓存的对齐模型（如果可用）。
     """
+    import whisperx
+    
     segment_file = segment_info["file"]
     segment_start_ms = segment_info["start_ms"]
     segment_basename = os.path.basename(segment_file)
@@ -540,7 +354,7 @@ def transcribe_and_align(segment_info, model, align_model_cache, device=DEVICE):
 
         # 检查转录是否产生了段落
         if not result or not result.get("segments"):
-            print(f"[WARNING] 分段 {segment_basename} 未生成有效转录结果.")
+            print(f"[WARNING] 分段 {segment_basename} 未生成有效转录结果。")
             return None  # 表示此段落失败
 
         # 2. 对齐
@@ -593,12 +407,14 @@ def transcribe_and_align(segment_info, model, align_model_cache, device=DEVICE):
 
 def process_all_segments(segments_info, status):
     """
-    使用多线程处理所有音频分段的转录和对齐.
-    利用 status 文件进行断点续传.
+    使用多线程处理所有音频分段的转录和对齐。
+    利用 status 文件进行断点续传。
     """
+    from tqdm import tqdm
+    
     model = load_whisper_model()  # 确保在开始线程前加载模型
     if model is None:
-        print("[ERROR] Whisper 模型未能加载，无法继续处理.")
+        print("[ERROR] Whisper 模型未能加载，无法继续处理。")
         return None  # 返回None表示失败
 
     processed_results_map = status.get("processed_results", {})  # 加载映射 {idx_str: result}
@@ -617,20 +433,20 @@ def process_all_segments(segments_info, status):
             if os.path.exists(seg_info["file"]):
                 tasks_to_submit.append((idx, seg_info))
             else:
-                print(f"[WARNING] 分段文件 {seg_info['file']} 未找到，跳过处理索引 {idx}.")
+                print(f"[WARNING] 分段文件 {seg_info['file']} 未找到，跳过处理索引 {idx}。")
 
     if not tasks_to_submit:
-        print("[INFO] 所有分段均已处理完成（根据状态文件）.")
+        print("[INFO] 所有分段均已处理完成（根据状态文件）。")
         # 验证all_results是否有每个段的条目
         if processed_count == len(segments_info):
             return all_results
         else:
-            print("[WARNING] 状态文件显示完成，但结果数量与分段数不匹配.建议检查临时文件或重新运行.")
+            print("[WARNING] 状态文件显示完成，但结果数量与分段数不匹配。建议检查临时文件或重新运行。")
             return all_results  # 返回我们拥有的内容
 
     num_workers = min(4, os.cpu_count() or 1)  # 限制工作线程数，尤其是使用GPU锁时
     print(
-        f"[INFO] 开始转录 {len(tasks_to_submit)} 个未处理的分段（共 {len(segments_info)} 个），使用 {num_workers} 个工作线程.")
+        f"[INFO] 开始转录 {len(tasks_to_submit)} 个未处理的分段（共 {len(segments_info)} 个），使用 {num_workers} 个工作线程。")
 
     # 对齐模型缓存（每种语言一个）
     align_model_cache = {}
@@ -655,7 +471,7 @@ def process_all_segments(segments_info, status):
                     status["processed_results"] = processed_results_map
                     save_status(status)
                 else:
-                    print(f"\n[WARNING] 分段 {idx} 未能成功处理.")
+                    print(f"\n[WARNING] 分段 {idx} 未能成功处理。")
 
             except Exception as exc:
                 # 处理future本身引发的异常（如果在任务内处理，则很少发生）
@@ -669,9 +485,9 @@ def process_all_segments(segments_info, status):
     # 处理后的最终检查
     completed_count = sum(1 for r in all_results if r is not None)
     if completed_count != len(segments_info):
-        print(f"[WARNING] 转录完成，但有 {len(segments_info) - completed_count} 个分段未能成功处理.")
+        print(f"[WARNING] 转录完成，但有 {len(segments_info) - completed_count} 个分段未能成功处理。")
     else:
-        print("[INFO] 所有分段转录处理完成.")
+        print("[INFO] 所有分段转录处理完成。")
 
     # 清理对齐模型缓存
     del align_model_cache
@@ -706,15 +522,15 @@ def format_timestamp(seconds):
 
 def generate_srt(all_results, srt_output_path, use_word_timestamps=False):
     """
-    将所有转录结果组合成 SRT 文件.
-    优先使用 'segments'，如果 use_word_timestamps=True 且 'word_segments' 存在，则使用词级别时间戳.
+    将所有转录结果组合成 SRT 文件。
+    优先使用 'segments'，如果 use_word_timestamps=True 且 'word_segments' 存在，则使用词级别时间戳。
     """
     print("[INFO] 正在生成 SRT 字幕文件...")
     srt_lines = []
     counter = 1
 
     if all_results is None:
-        print("[ERROR] 转录结果为空，无法生成 SRT 文件.")
+        print("[ERROR] 转录结果为空，无法生成 SRT 文件。")
         return False
 
     for result in all_results:
@@ -751,7 +567,7 @@ def generate_srt(all_results, srt_output_path, use_word_timestamps=False):
 
                 # 检查无效时间戳（结束时间早于开始时间）
                 if end_time < start_time:
-                    print(f"[WARNING] 检测到无效时间戳 (end < start) 在段落: {text[:30]}...，跳过此行.")
+                    print(f"[WARNING] 检测到无效时间戳 (end < start) 在段落: {text[:30]}...，跳过此行。")
                     continue
 
                 start_ts = format_timestamp(start_time)
@@ -766,7 +582,7 @@ def generate_srt(all_results, srt_output_path, use_word_timestamps=False):
             pass  # 此结果段中没有可用数据
 
     if not srt_lines:
-        print("[WARNING] 未生成任何有效的字幕行.")
+        print("[WARNING] 未生成任何有效的字幕行。")
         return False
 
     try:
@@ -787,26 +603,21 @@ def main():
 
     # 安装依赖
     if not install_dependencies():
-        print("[ERROR] 依赖安装失败，程序无法继续.")
+        print("[ERROR] 依赖安装失败，程序无法继续。")
         sys.exit(1)
         
-    # 检查环境
-    if not check_environment():
-        print("[ERROR] 环境检查失败，程序无法继续.")
-        sys.exit(1)
     ensure_temp_dir()
 
-    # 确保导入必要的库（在环境检查后）
+    # 确保导入必要的库
     try:
         import tkinter as tk
         from tkinter import filedialog
-        from pydub import AudioSegment, silence
-        from tqdm import tqdm
-        import whisperx
-        import gc
     except ImportError as e:
-        print(f"[ERROR] 导入必要库失败: {e}")
-        print("请尝试重新运行程序或手动安装缺失的依赖.")
+        print(f"[ERROR] 导入tkinter库失败: {e}")
+        print("请安装tkinter库后重试。")
+        if platform.system() == "Linux":
+            print("在Linux上，请使用系统包管理器安装python3-tk包")
+            print("例如: sudo apt-get install python3-tk")
         sys.exit(1)
 
     # 添加文件选择对话框
@@ -828,7 +639,7 @@ def main():
             sys.exit(1)
 
     if not video_path:  # 如果用户取消选择
-        print("[INFO] 未选择文件，程序退出.")
+        print("[INFO] 未选择文件，程序退出。")
         sys.exit(0)
 
     print(f"[INFO] 已选择文件: {video_path}")
@@ -851,11 +662,11 @@ def main():
 
     # 检查状态文件是否用于相同的视频
     if status.get("video_file") == video_filename:
-        print(f"[INFO] 检测到与 '{video_filename}' 相关的先前状态.")
+        print(f"[INFO] 检测到与 '{video_filename}' 相关的先前状态。")
         # 询问用户是否要恢复或重新开始
         resume_choice = input("是否尝试从上次中断处继续？(y/n，默认为 y): ").strip().lower()
         if resume_choice == 'n':
-            print("[INFO] 用户选择重新开始处理.将清理旧状态和临时文件.")
+            print("[INFO] 用户选择重新开始处理。将清理旧状态和临时文件。")
             status = {}  # 清除状态
             cleanup_temp()  # 清理所有临时文件
             ensure_temp_dir()  # 重新创建临时目录
@@ -869,19 +680,19 @@ def main():
 
     # 2. 提取音频
     if not extract_audio(video_path, audio_path, force_extract):
-        print("[ERROR] 音频提取失败，程序终止.")
+        print("[ERROR] 音频提取失败，程序终止。")
         sys.exit(1)
 
     # 3. 分割音频
     segments_info = split_audio(audio_path, force_split)
     if not segments_info:
-        print("[ERROR] 音频分段失败，程序终止.")
+        print("[ERROR] 音频分段失败，程序终止。")
         sys.exit(1)
 
     # 4. 转录和强制对齐
     all_results = process_all_segments(segments_info, status)
     if not all_results:
-        print("[ERROR] 转录过程失败，程序终止.")
+        print("[ERROR] 转录过程失败，程序终止。")
         sys.exit(1)
 
     # 5. 生成字幕文件
@@ -892,9 +703,9 @@ def main():
     cleanup_choice = input("是否清理临时文件？(y/n，默认为 n): ").strip().lower()
     if cleanup_choice == 'y':
         cleanup_temp()
-        print("[INFO] 临时文件已清理.")
+        print("[INFO] 临时文件已清理。")
     else:
-        print("[INFO] 保留临时文件以供后续使用.")
+        print("[INFO] 保留临时文件以供后续使用。")
 
 
 if __name__ == "__main__":
