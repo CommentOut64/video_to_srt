@@ -2,5 +2,5 @@
 1. 修改为默认清理缓存
 2. 清除libpng warning: iCCP: known incorrect sRGB profile警告
 3. 接受mp3等音频格式
-4. 优化操作界面，提供多次转录循环
+4. 使用Rich美化操作界面，重写操作逻辑链，支持进行多次转录
 5. 
