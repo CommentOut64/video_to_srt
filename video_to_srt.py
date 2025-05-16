@@ -2,7 +2,6 @@ import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import subprocess
-import sys
 import platform
 import json
 import threading
@@ -13,10 +12,67 @@ import gc
 import warnings
 # 已有的警告过滤
 warnings.filterwarnings("ignore", message="TensorFloat-32 \\(TF32\\) has been disabled")
-# 添加对 libpng 警告的过滤
-warnings.filterwarnings("ignore", message=".*libpng warning.*")
 # 忽略 PyAnnote Audio 的 TF32 相关警告
 warnings.filterwarnings("ignore", message="TensorFloat-32 \\(TF32\\) has been disabled")
+
+# 插入更强力的 StderrFilter 类和应用代码:
+import sys
+import io
+import re
+
+class StderrFilter:
+    def __init__(self):
+        self.old_stderr = sys.stderr
+        # 尝试获取 fileno，如果失败则为 None
+        try:
+            self._fileno = self.old_stderr.fileno()
+        except (AttributeError, io.UnsupportedOperation):
+            self._fileno = None 
+        
+    def __enter__(self):
+        sys.stderr = self
+        return self
+        
+    def __exit__(self, *args):
+        sys.stderr = self.old_stderr
+        
+    def write(self, text):
+        # 完全过滤所有libpng警告
+        if 'libpng warning' not in text:
+            self.old_stderr.write(text)
+    
+    def flush(self):
+        self.old_stderr.flush()
+        
+    # 添加与文件对象兼容的方法
+    def fileno(self):
+        # 这个方法主要由 main 函数中的 os.dup/os.dup2 使用
+        if self._fileno is not None:
+            return self._fileno
+        if hasattr(self.old_stderr, 'fileno'):
+             current_fileno = self.old_stderr.fileno()
+             if isinstance(current_fileno, int):
+                 return current_fileno
+        # 如果原始 stderr 没有有效的 fileno，调用者（如 main 中的 os.dup）需要有回退机制
+        # main 函数中已有回退到 fd 2 的逻辑
+        raise io.UnsupportedOperation("underlying stream does not support fileno or returned non-integer")
+
+    def isatty(self):
+        # tqdm 等库可能会调用此方法
+        if hasattr(self.old_stderr, 'isatty'):
+            return self.old_stderr.isatty()
+        return False # 保守的默认值，如果原始stderr没有isatty
+    
+# 立即应用stderr过滤器
+# 确保在任何可能产生警告的库导入之前应用
+if not isinstance(sys.stderr, StderrFilter): # 防止重复应用
+    sys.stderr = StderrFilter()
+
+# 添加更多环境变量抑制警告
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+os.environ['PILLOW_SILENCE_LIBPNG'] = '1'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
 # 提前导入和设置 PyTorch
 try:
     import torch
@@ -168,35 +224,44 @@ def cleanup_temp():
 # 第一步：视频导入与音频提取
 # ========================
 
-def extract_audio(video_path, audio_output_path, force_extract=False):
-    """调用 ffmpeg 提取音频为 WAV 格式 (单声道, 16kHz)"""
+def extract_audio(input_file_path, audio_output_path, force_extract=False): # 参数名修改
+    """
+    调用 ffmpeg 从输入文件 (视频或音频) 提取/转换为
+    WAV 格式 (单声道, 16kHz, pcm_s16le) 到 audio_output_path.
+    """
     if not force_extract and os.path.exists(audio_output_path):
-        print(f"[INFO] 音频文件已存在,跳过提取：{audio_output_path}")
+        # 如果目标文件已存在且不强制处理，则跳过
+        print(f"[INFO] 标准化音频文件已存在,跳过处理：{audio_output_path}")
         return True
 
     command = [
         "ffmpeg",
         "-y",
-        "-i", video_path,
-        "-vn",
-        "-ac", "1",
-        "-ar", "16000",
-        "-acodec", "pcm_s16le",
+        "-i", input_file_path, # 使用新的参数名
+        "-vn",                 # 对视频文件，忽略视频；对音频文件，此选项无害
+        "-ac", "1",            # 单声道
+        "-ar", "16000",        # 采样率 16kHz
+        "-acodec", "pcm_s16le",# 输出为 WAV 格式
         audio_output_path
     ]
-    print("[INFO] 正在提取音频...")
+    print(f"[INFO] 正在处理输入文件 '{os.path.basename(input_file_path)}' 以生成标准化音频...")
     try:
-        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        print(f"[INFO] 音频已成功提取到：{audio_output_path}")
+        # 在 subprocess.run 中添加 text=True 和 encoding='utf-8' 以便更好地处理 ffmpeg 输出
+        result = subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8', errors='replace')
+        print(f"[INFO] 标准化音频已成功生成到：{audio_output_path}")
         return True
     except FileNotFoundError:
         print("[ERROR] ffmpeg 未找到.请确保 ffmpeg 已安装并添加到系统 PATH.")
         return False
     except subprocess.CalledProcessError as e:
-        print("[ERROR] ffmpeg 提取音频时出错.")
+        print(f"[ERROR] ffmpeg 处理文件 '{os.path.basename(input_file_path)}' 时出错.")
         print(f"命令: {' '.join(e.cmd)}")
         print(f"返回码: {e.returncode}")
-        print(f"错误输出:\n{e.stderr}")
+        # 打印 ffmpeg 的 stderr 输出以帮助诊断
+        if e.stderr:
+            print(f"FFmpeg 错误输出:\n{e.stderr}")
+        else:
+            print("FFmpeg 未产生 stderr 输出.")
         return False
 
 
@@ -250,7 +315,7 @@ def split_audio(audio_path, force_split=False):
             except OSError:
                 pass
 
-    pbar = tqdm(total=audio_length, unit='ms', desc="音频分段进度")
+    pbar = tqdm(total=audio_length, unit='ms', desc="音频分段进度", file=sys.stdout, dynamic_ncols=True)
     while start < audio_length:
         end = start + SEGMENT_LENGTH_MS
         actual_end = min(end, audio_length)
@@ -507,7 +572,7 @@ def process_all_segments(segments_info, status):
         future_to_index = {executor.submit(transcribe_and_align, seg_info, model, align_model_cache, DEVICE): idx for
                            idx, seg_info in tasks_to_submit}
 
-        pbar = tqdm(total=len(segments_info), initial=processed_count, desc="转录进度", unit="段")
+        pbar = tqdm(total=len(segments_info), initial=processed_count, desc="转录进度", unit="段", file=sys.stdout, dynamic_ncols=True)
 
         for future in as_completed(future_to_index):
             idx = future_to_index[future]
@@ -649,49 +714,94 @@ def main():
     ensure_temp_dir()
 
     # 确保导入必要的库
-    # 更完善的 stderr 重定向
+    video_path = ""
+    # 文件描述符重定向 Tkinter 对话框以抑制C库警告
+    # 初始化文件描述符变量
+    original_stderr_fileno = -1
+    saved_stderr_fileno_copy = -1
+    devnull_fileno = -1
+    
     try:
+        # 步骤 1: 获取当前 stderr 的文件描述符。
+        # sys.stderr 应该是 StderrFilter 实例。其 fileno() 方法应返回原始 stderr 的 fd。
+        try:
+            current_fd = sys.stderr.fileno()
+            if isinstance(current_fd, int): # 确保是有效的整数文件描述符
+                 original_stderr_fileno = current_fd
+            else: # 如果 fileno() 返回 None 或其他非整数
+                original_stderr_fileno = 2 # 回退到标准 stderr 文件描述符
+        except (AttributeError, io.UnsupportedOperation):
+            # 如果 sys.stderr 没有 fileno() 方法或不支持该操作
+            original_stderr_fileno = 2 # 回退到标准 stderr 文件描述符
+
+        # 步骤 2: 复制原始 stderr 文件描述符，以便后续恢复。
+        saved_stderr_fileno_copy = os.dup(original_stderr_fileno)
+
+        # 步骤 3: 打开 os.devnull 并获取其文件描述符。
+        devnull_fileno = os.open(os.devnull, os.O_RDWR)
+
+        # 步骤 4: 将 stderr (由 original_stderr_fileno 代表) 重定向到 os.devnull。
+        # 这会影响所有直接写入该文件描述符的输出。
+        os.dup2(devnull_fileno, original_stderr_fileno)
+
+        # 现在可以安全地导入和使用 tkinter。
+        # 任何来自 tkinter 底层库的 stderr 输出都将进入 os.devnull。
         import tkinter as tk
         from tkinter import filedialog
         
-        # 使用环境变量来抑制 libpng 警告（适用于某些系统）
-        os.environ['TK_SILENCE_DEPRECATION'] = '1'
+        os.environ['TK_SILENCE_DEPRECATION'] = '1' # 保留，尽管与libpng无关
         
-        # 重定向标准错误输出
-        with open(os.devnull, 'w') as devnull:
-            old_stderr = sys.stderr
-            sys.stderr = devnull
-            
-            # 创建并隐藏 root 窗口
-            root = tk.Tk()
-            root.withdraw()
-            
-            print("[INFO] 请选择要处理的视频文件...")
-            video_path = filedialog.askopenfilename(
-                title="选择要处理的视频文件",
-                filetypes=[("视频文件", "*.mp4 *.avi *.mov *.mkv *.flv *.wmv"), ("所有文件", "*.*")]
-            )
-            root.destroy()
-            
-            # 恢复标准错误输出
-            sys.stderr = old_stderr
+        root = tk.Tk()
+        root.withdraw() 
+        
+        # 这个 print 输出到 stdout，不受 stderr 重定向的影响。
+        print("[INFO] 请选择要处理的视频或音频文件...") # 更新提示信息
+        selected_file_path_dialog = filedialog.askopenfilename(
+            title="选择要处理的视频或音频文件", # 更新标题
+            filetypes=[
+                ("媒体文件", "*.mp4 *.avi *.mov *.mkv *.flv *.wmv *.mp3 *.wav *.flac *.m4a *.aac *.ogg"), # 添加音频格式
+                ("视频文件", "*.mp4 *.avi *.mov *.mkv *.flv *.wmv"),
+                ("音频文件", "*.mp3 *.wav *.flac *.m4a *.aac *.ogg"),
+                ("所有文件", "*.*")
+            ]
+        )
+        root.destroy()
+        selected_file_path = selected_file_path_dialog # 将对话框结果赋给新变量名
+        video_path = selected_file_path
 
     except Exception as e:
-        # 确保恢复标准错误输出
-        if 'old_stderr' in locals():
-            sys.stderr = old_stderr
-            
+        # 在处理异常之前，首先尝试恢复 stderr，以便错误信息可以被打印。
+        if saved_stderr_fileno_copy != -1 and original_stderr_fileno != -1:
+            try:
+                os.dup2(saved_stderr_fileno_copy, original_stderr_fileno)
+            except OSError as oe_restore:
+                # 如果恢复失败，这是一个严重的问题。尝试通过原始 sys.__stderr__ 输出。
+                sys.__stderr__.write(f"CRITICAL: Failed to restore stderr in except block: {oe_restore}\n")
+        
         print(f"[ERROR] 打开文件选择对话框时出错: {e}")
         print("[INFO] 请手动输入视频文件路径:")
         video_path_input = input("请输入视频文件的完整路径: ").strip('"')
         if not os.path.isfile(video_path_input):
             print(f"[ERROR] 无法找到文件: {video_path_input}")
             sys.exit(1)
-        video_path = video_path_input # 赋值给 video_path
+        video_path = video_path_input
     finally:
-        # 确保恢复 stderr
-        sys.stderr = old_stderr
-        # captured_stderr.close()
+        # 步骤 5: 无论如何都要恢复 stderr 文件描述符到原始状态。
+        if saved_stderr_fileno_copy != -1 and original_stderr_fileno != -1:
+            try:
+                os.dup2(saved_stderr_fileno_copy, original_stderr_fileno)
+            except OSError as oe_final_restore:
+                sys.__stderr__.write(f"CRITICAL: Failed to restore stderr in finally block: {oe_final_restore}\n")
+
+        # 步骤 6: 关闭打开的文件描述符。
+        if devnull_fileno != -1:
+            try:
+                os.close(devnull_fileno)
+            except OSError: pass # 忽略关闭 devnull_fileno 的错误
+        if saved_stderr_fileno_copy != -1:
+            try:
+                os.close(saved_stderr_fileno_copy)
+            except OSError: pass # 忽略关闭 saved_stderr_fileno_copy 的错误
 
     if not video_path:
         print("[INFO] 未选择文件,程序退出.")
@@ -700,65 +810,53 @@ def main():
     print(f"[INFO] 已选择文件: {video_path}")
 
     # 检查选择的路径是否为有效文件
-    if not os.path.isfile(video_path):
-        print(f"[ERROR] 选择的路径不是有效文件：{video_path}")
+    if not selected_file_path:
+        print("[INFO] 未选择文件,程序退出.")
+        sys.exit(0)
+
+    print(f"[INFO] 已选择文件: {selected_file_path}")
+
+    # 检查选择的路径是否为有效文件
+    if not os.path.isfile(selected_file_path):
+        print(f"[ERROR] 选择的路径不是有效文件：{selected_file_path}")
         sys.exit(1)
 
-    video_filename = os.path.basename(video_path)
-    srt_output_path = os.path.splitext(video_path)[0] + ".srt"
-    audio_path = os.path.join(TEMP_DIR, "audio.wav")
+    # 使用更通用的 input_filename 作为状态记录的键
+    input_filename = os.path.basename(selected_file_path)
+    srt_output_path = os.path.splitext(selected_file_path)[0] + ".srt"
+    # audio_processing_path 始终是处理流程中期望的标准化WAV文件
+    audio_processing_path = os.path.join(TEMP_DIR, "audio.wav")
 
-    # 断点续传逻辑
     status = load_status()
-    force_extract = False
-    force_split = False
-    force_process = False
+    force_extract, force_split, force_process = False, False, False
 
-    if status.get("video_file") == video_filename:
-        print(f"[INFO] 检测到与 '{video_filename}' 相关的先前状态.")
-        resume_choice = input("是否尝试从上次中断处继续？(y/n,默认为 y): ").strip().lower()
-        if resume_choice == 'n':
-            print("[INFO] 用户选择重新开始处理.将清理旧状态和临时文件.")
-            status = {}
+    # 修改状态文件中的键名，使其更通用
+    if status.get("input_file") == input_filename: # 从 "video_file" 改为 "input_file"
+        print(f"[INFO] 检测到与 '{input_filename}' 相关的先前状态.")
+        if input("是否尝试从上次中断处继续？(y/n,默认为 y): ").strip().lower() == 'n':
+            status, force_extract, force_split, force_process = {}, True, True, True
             cleanup_temp()
             ensure_temp_dir()
-            force_extract = True
-            force_split = True
-            force_process = True
-
-    # 1. 更新状态文件
-    status["video_file"] = video_filename
+    
+    status["input_file"] = input_filename # 从 "video_file" 改为 "input_file"
     save_status(status)
 
-    # 2. 提取音频
-    if not extract_audio(video_path, audio_path, force_extract):
-        print("[ERROR] 音频提取失败,程序终止.")
-        sys.exit(1)
-
-    # 3. 分割音频
-    segments_info = split_audio(audio_path, force_split)
-    if not segments_info:
-        print("[ERROR] 音频分段失败,程序终止.")
-        sys.exit(1)
-
-    # 4. 转录和强制对齐
+    # extract_audio 的第一个参数现在是用户选择的原始文件 (selected_file_path)
+    # 第二个参数是目标输出的标准化WAV文件 (audio_processing_path)
+    # extract_audio 函数本身通过ffmpeg处理视频提取或音频转码
+    if not extract_audio(selected_file_path, audio_processing_path, force_extract): sys.exit(1)
+    # 后续步骤使用这个标准化的 audio_processing_path
+    segments_info = split_audio(audio_processing_path, force_split)
+    if not segments_info: sys.exit(1)
     all_results = process_all_segments(segments_info, status)
-    if not all_results:
-        print("[ERROR] 转录过程失败,程序终止.")
-        sys.exit(1)
-
-    # 5. 生成字幕文件
+    if not all_results: sys.exit(1)
     if generate_srt(all_results, srt_output_path):
         print(f"[SUCCESS] 字幕生成成功：{srt_output_path}")
 
-    # 6. 询问是否清理临时文件
-    cleanup_choice = input("是否清理临时文件？(y/n,默认为 n): ").strip().lower()
-    if cleanup_choice == 'y':
+    if input("是否清理临时文件？(y/n,默认为 y): ").strip().lower() != 'n':
         cleanup_temp()
-        print("[INFO] 临时文件已清理.")
     else:
-        print("[INFO] 保留临时文件以供后续使用.")
-
+        print("[INFO] 保留临时文件.")
 
 if __name__ == "__main__":
     main()
