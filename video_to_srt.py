@@ -5,6 +5,7 @@ import subprocess
 import platform
 import json
 import threading
+import time
 import shutil
 import glob
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -118,6 +119,13 @@ whisper_model_global = None
 # GPU 操作的线程锁, 防止竞争条件
 gpu_lock = threading.Lock()
 
+# --- 新增: 用于异步模型加载的全局变量 ---
+model_load_event = threading.Event() # 用于指示模型加载是否完成
+model_load_lock = threading.Lock()   # 用于确保只有一个线程尝试启动加载过程
+model_load_initiated = False         # 标记是否已启动加载过程
+background_load_thread = None        # 存储后台加载线程的引用
+# --- 结束新增 ---
+
 # ========================
 # 依赖检查 (Dependency Check)
 # ========================
@@ -230,17 +238,61 @@ def extract_audio(input_file_path, audio_output_path, force_extract=False):
         console.print(f"[bold blue][INFO][/bold blue] 标准化音频文件已存在. 跳过提取: {audio_output_path}")
         return True
 
-    # ffmpeg 命令: 覆盖输出文件, 指定输入文件, 无视频, 单声道, 16kHz 采样率, pcm_s16le 编码
+    # 首先获取文件时长
+    try:
+        probe_cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", input_file_path]
+        duration_result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+        total_duration = float(duration_result.stdout.strip())
+    except (subprocess.SubprocessError, ValueError):
+        total_duration = None
+
+    # ffmpeg 命令，添加进度输出
     command = [
         "ffmpeg", "-y", "-i", input_file_path, "-vn", "-ac", "1", 
-        "-ar", "16000", "-acodec", "pcm_s16le", audio_output_path
+        "-ar", "16000", "-acodec", "pcm_s16le", 
+        "-progress", "pipe:1", audio_output_path
     ]
+    
     console.print(f"[bold blue][INFO][/bold blue] 正在处理输入文件 '{os.path.basename(input_file_path)}' 以生成标准化音频...")
+    
     try:
-        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console, transient=True) as progress:
-            progress.add_task("FFmpeg 处理中...", total=None)
-            # 对 ffmpeg 输出使用 utf-8 编码并替换错误字符, 以增强鲁棒性
-            result = subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8', errors='replace')
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeRemainingColumn(),
+            console=console, 
+            transient=False
+        ) as progress:
+            task_id = progress.add_task("音频提取", total=100 if total_duration else None)
+            
+            # 使用Popen实时读取进度输出
+            process = subprocess.Popen(
+                command, 
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                errors='replace'
+            )
+            
+            # 读取并解析进度输出
+            for line in process.stdout:
+                if "out_time_ms" in line:
+                    time_ms = int(line.strip().split("=")[1]) / 1000000  # 转换为秒
+                    if total_duration:
+                        progress_percent = min(100, (time_ms / total_duration) * 100)
+                        progress.update(task_id, completed=progress_percent)
+            
+            # 等待进程完成
+            process.communicate()
+            if process.returncode != 0:
+                raise subprocess.CalledProcessError(process.returncode, command)
+            
+            # 确保进度条显示100%完成
+            if total_duration:
+                progress.update(task_id, completed=100)
+            
         console.print(f"[bold green][INFO][/bold green] 标准化音频已成功生成: {audio_output_path}")
         return True
     except FileNotFoundError:
@@ -248,12 +300,10 @@ def extract_audio(input_file_path, audio_output_path, force_extract=False):
         return False
     except subprocess.CalledProcessError as e:
         console.print(f"[bold red][ERROR][/bold red] 使用 ffmpeg 处理文件 '{os.path.basename(input_file_path)}' 时出错.")
-        console.print(f"命令: {' '.join(e.cmd)}")
+        console.print(f"命令: {' '.join(e.cmd if hasattr(e, 'cmd') else command)}")
         console.print(f"返回码: {e.returncode}")
-        if e.stderr:
+        if hasattr(e, 'stderr') and e.stderr:
             console.print(f"FFmpeg 错误输出:\n[dim]{e.stderr}[/dim]")
-        else:
-            console.print("FFmpeg 未产生 stderr 输出.")
         return False
 
 # ========================
@@ -341,7 +391,12 @@ def split_audio(audio_path, force_split=False):
                 segment_filename = os.path.join(TEMP_DIR, f"segment_{segment_idx}.wav")
                 try:
                     segment_audio_chunk.export(segment_filename, format="wav")
-                    segments_info.append({"file": segment_filename, "start_ms": current_pos_ms})
+                    segment_duration_ms = actual_end_pos_ms - current_pos_ms
+                    segments_info.append({
+                        "file": segment_filename, 
+                        "start_ms": current_pos_ms,
+                        "duration_ms": segment_duration_ms 
+                    })
                 except Exception as e:
                     progress_bar.console.print(f"\n[bold red][ERROR][/bold red] 导出分段 {segment_filename} 失败: {e}")
 
@@ -360,26 +415,147 @@ def split_audio(audio_path, force_split=False):
 # ========================
 # 步骤 3: 转录与对齐 (Step 3: Transcription & Alignment)
 # ========================
-def load_whisper_model_rich():
-    """使用 Rich 进度显示加载 WhisperX 模型, 并使用全局设置."""
-    import whisperx # 此特定功能的局部导入
+
+# --- 新增: 实际在后台线程中加载模型的函数 ---
+def _perform_actual_model_load():
+    """
+    此函数在后台线程中执行实际的模型加载操作。
+    """
     global whisper_model_global, WHISPER_MODEL, COMPUTE_TYPE, DEVICE
-    
+    import whisperx # 局部导入以避免在主线程早期导入
+
+    if whisper_model_global is not None: # 应该在调用此函数前被 unload_whisper_model 清理
+        console.print("[bold yellow][WARNING][/bold yellow] _perform_actual_model_load 被调用，但模型已存在。可能存在逻辑错误。")
+        model_load_event.set() # 确保事件被设置
+        return
+
+    # console.print(f"[bold blue][INFO][/bold blue] 正在后台加载 WhisperX 模型 ([cyan]{WHISPER_MODEL}[/cyan], compute: [cyan]{COMPUTE_TYPE}[/cyan], device: [cyan]{DEVICE}[/cyan])...")
+    try:
+        # 注意: Rich Progress 在后台线程中直接使用可能行为不确定, 考虑简化或移除这里的 Progress
+        # with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console, transient=True) as progress:
+        #     progress.add_task("后台加载 Whisper 模型中...", total=None)
+        with gpu_lock: # 确保线程安全的模型加载
+            loaded_model = whisperx.load_model(WHISPER_MODEL, DEVICE, compute_type=COMPUTE_TYPE)
+        whisper_model_global = loaded_model # 赋值给全局变量
+        # console.print("[bold green][INFO][/bold green] WhisperX 模型后台加载成功.")
+    except Exception as e:
+        # console.print(f"[bold red][ERROR][/bold red] 后台加载 WhisperX 模型失败: {e}")
+        # console.print("请检查模型名称, 计算类型, 设备设置以及 WhisperX 和相关依赖 (如 PyTorch) 是否正确安装.")
+        # if DEVICE == "cuda":
+        #     console.print("如果使用 CUDA, 请确保 CUDA 环境已正确配置.")
+        whisper_model_global = None # 确保失败时为 None
+    # finally:
+        # model_load_event.set() # 无论成功与否, 都通知等待者加载已尝试/完成
+# --- 结束新增 ---
+
+# --- 新增: 启动异步模型加载的函数 ---
+def start_async_model_load(force_reload=False):
+    """
+    启动一个后台线程来加载 Whisper 模型 (如果尚未加载或需要强制重新加载)。
+    """
+    global model_load_initiated, background_load_thread, model_load_event, whisper_model_global
+
+    with model_load_lock: # 保护对 model_load_initiated 和线程创建的访问
+        if force_reload and whisper_model_global is not None:
+            console.print("[bold blue][INFO][/bold blue] 请求强制重新加载模型。正在卸载现有模型...")
+            unload_whisper_model(silent=True) # 卸载现有模型, 重置事件和状态
+
+        # 只有在尚未启动加载, 或者强制重新加载清除了状态后才启动
+        if not model_load_initiated or force_reload:
+            model_load_initiated = True
+            model_load_event.clear() # 清除事件, 以便新的加载可以被等待
+            
+            # console.print("[bold blue][INFO][/bold blue] 正在启动后台模型加载线程...")
+            background_load_thread = threading.Thread(target=_perform_actual_model_load, daemon=True)
+            background_load_thread.start()
+        elif whisper_model_global is None and model_load_event.is_set():
+            # 先前加载失败, 尝试重新启动加载
+            model_load_initiated = True
+            model_load_event.clear()
+            # console.print("[bold yellow][WARNING][/bold yellow] 先前的模型加载尝试似乎已失败。正在尝试重新启动后台加载...")
+            background_load_thread = threading.Thread(target=_perform_actual_model_load, daemon=True)
+            background_load_thread.start()
+
+# --- 结束新增 ---
+
+# --- 修改: load_whisper_model_rich 函数 ---
+def load_whisper_model_rich():
+    """
+    获取已加载的 WhisperX 模型实例。
+    如果模型尚未加载, 则会等待后台加载完成。
+    """
+    global whisper_model_global
+
+    if whisper_model_global is not None:
+        # console.print("[DEBUG] 模型已加载, 直接返回实例。")
+        return whisper_model_global
+
+    # 确保加载过程已启动 (如果尚未启动)
+    # 这也处理了首次调用或模型被卸载后的情况
+    start_async_model_load() # 它内部有锁和检查, 不会重复启动
+
+    # console.print("[bold blue][INFO][/bold blue] 等待 WhisperX 模型加载完成...")
+    model_load_event.wait() # 等待后台线程完成加载
+
     if whisper_model_global is None:
-        console.print(f"[bold blue][INFO][/bold blue] 正在加载 WhisperX 模型 ([cyan]{WHISPER_MODEL}[/cyan], compute: [cyan]{COMPUTE_TYPE}[/cyan], device: [cyan]{DEVICE}[/cyan])...")
-        try:
-            with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console, transient=True) as progress:
-                progress.add_task("加载 Whisper 模型中...", total=None)
-                with gpu_lock: # 确保线程安全的模型加载
-                    whisper_model_global = whisperx.load_model(WHISPER_MODEL, DEVICE, compute_type=COMPUTE_TYPE)
-            console.print("[bold green][INFO][/bold green] WhisperX 模型加载成功.")
-        except Exception as e:
-            console.print(f"[bold red][ERROR][/bold red] 加载 WhisperX 模型失败: {e}")
-            console.print("请检查模型名称, 计算类型, 设备设置以及 WhisperX 和相关依赖 (如 PyTorch) 是否正确安装.")
-            if DEVICE == "cuda":
-                console.print("如果使用 CUDA, 请确保 CUDA 环境已正确配置.")
-            return None # 加载失败时返回 None
-    return whisper_model_global
+        # console.print("[bold red][ERROR][/bold red] 模型加载完成, 但实例仍为 None. 加载可能已失败.")
+        # 此处可以考虑是否再次尝试, 但目前设计是 _perform_actual_model_load 会打印错误
+    # else:
+        # console.print("[DEBUG] 模型加载完成, 返回实例。")
+    
+        return whisper_model_global
+# --- 结束修改 ---
+
+# --- 新增: 卸载模型的函数 ---
+def unload_whisper_model(silent=False):
+    """
+    卸载全局 Whisper 模型并清理相关资源。
+    """
+    global whisper_model_global, model_load_initiated, model_load_event, background_load_thread
+
+    with model_load_lock: # 确保在卸载时没有新的加载被启动
+        if whisper_model_global is not None:
+            if not silent:
+                console.print("[bold blue][INFO][/bold blue] 正在卸载 WhisperX 模型...")
+            
+            # 等待任何可能正在进行的加载完成, 以避免竞争条件
+            # 但如果 background_load_thread 存在且正在运行, 我们可能需要一种方式来通知它停止
+            # 为了简单起见, 假设如果 whisper_model_global 非 None, 则加载已完成或我们正在强制卸载
+            
+            temp_model_ref = whisper_model_global # 临时引用以进行清理
+            whisper_model_global = None # 首先将其设置为 None
+
+            try:
+                del temp_model_ref # 尝试删除引用
+                gc.collect()
+                if DEVICE == "cuda" and 'torch' in sys.modules:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        if not silent:
+                            console.print("[bold blue][INFO][/bold blue] CUDA 缓存已清理.")
+            except Exception as e:
+                if not silent:
+                    console.print(f"[bold yellow][WARNING][/bold yellow] 卸载模型或清理CUDA缓存时出错: {e}")
+            
+            if not silent:
+                console.print("[bold green][INFO][/bold green] WhisperX 模型已卸载.")
+        else:
+            if not silent:
+                console.print("[bold blue][INFO][/bold blue] 没有已加载的 WhisperX 模型可卸载.")
+
+        # 重置加载状态, 以便下次可以重新加载
+        model_load_event.clear() # 清除事件, 因为模型已卸载
+        model_load_initiated = False
+        if background_load_thread and background_load_thread.is_alive():
+             # 如果有一个仍在运行的加载线程, 我们不能安全地终止它。
+             # 理想情况下, _perform_actual_model_load 应该检查一个取消标志。
+             # 目前, 我们只是记录它。下次加载将创建一个新线程。
+             if not silent:
+                console.print("[bold yellow][WARNING][/bold yellow] 一个后台加载线程可能仍在运行。它加载的模型将被忽略。")
+        background_load_thread = None
+# --- 结束新增 ---
+
 
 def transcribe_and_align_segment(segment_info, model_instance, align_model_cache, device_to_use=DEVICE):
     """转录并对齐单个音频分段."""
@@ -464,7 +640,9 @@ def process_all_segments(segments_info_list, current_status):
     import whisperx # 局部导入
     from contextlib import redirect_stdout, redirect_stderr # 用于捕获输出
 
-    model_instance = load_whisper_model_rich()
+    # --- 修改: 调用新的模型加载函数 ---
+    model_instance = load_whisper_model_rich() # 这将等待异步加载完成 (如果需要)
+    # --- 结束修改 ---
     if model_instance is None:
         console.print("[bold red][ERROR][/bold red] Whisper 模型未能加载. 中止处理.")
         return None
@@ -549,18 +727,255 @@ def process_all_segments(segments_info_list, current_status):
     num_workers = min(4, os.cpu_count() or 1) # 工作线程的合理默认值
     console.print(f"[bold blue][INFO][/bold blue] 正在转录 [cyan]{len(tasks_to_submit_for_processing)}[/cyan] 个新的/失败的分段 (共 {len(segments_info_list)} 个), 使用 [cyan]{num_workers}[/cyan] 个工作线程.")
 
+    # --- 新增: 细粒度进度跟踪系统 ---
+    progress_tracker = {
+        "lock": threading.Lock(),                                    # 进度更新的线程锁
+        "segments": {idx: 0.0 for idx, _ in tasks_to_submit_for_processing},  # 每个分段的进度(0.0-1.0)
+        "total_segments": len(segments_info_list),                  # 总分段数
+        "completed_segments": already_processed_count,               # 已完成的分段数
+        "last_update_time": time.time(),                            # 新增：跟踪上次更新时间
+        "min_update_interval": 0.1                                  # 新增：最小更新间隔(秒)，防止过于频繁更新
+    }
+
+    # 定义用于更新单个分段进度的函数
+    def update_segment_progress(idx, stage, progress_value):
+        """
+        更新特定分段的进度，并计算总体进度
+        
+        参数:
+            idx: 分段索引
+            stage: 处理阶段 ('load', 'transcribe', 'align')
+            progress_value: 当前阶段的进度值(0.0-1.0)
+            
+        返回:
+            float: 更新后的总进度值
+        """
+        with progress_tracker["lock"]:
+            # 时间节流：防止过于频繁的更新减少UI响应性
+            current_time = time.time()
+            if (current_time - progress_tracker["last_update_time"] < 
+                    progress_tracker["min_update_interval"]):
+                # 如果更新太频繁，跳过一些更新但仍然记录进度
+                is_significant_update = (stage == "load" and progress_value == 1.0 or
+                                       stage == "transcribe" and progress_value == 1.0 or
+                                       stage == "align" and progress_value == 1.0)
+                if not is_significant_update:
+                    return None
+            
+            # 更新时间
+            progress_tracker["last_update_time"] = current_time
+            
+            # 根据处理阶段分配权重: 加载(10%)、转录(60%)、对齐(30%)
+            if stage == "load":
+                weight = 0.1
+                base = 0.0
+            elif stage == "transcribe":
+                weight = 0.6
+                base = 0.1
+            elif stage == "align":
+                weight = 0.3
+                base = 0.7
+            else:
+                return None
+            
+            # 计算新的段进度值(考虑权重和基准)
+            new_progress = base + (progress_value * weight)
+            if new_progress > progress_tracker["segments"].get(idx, 0):
+                progress_tracker["segments"][idx] = new_progress
+                
+                # 计算总体进度：已完成段 + 部分完成段的进度总和
+                total_progress = progress_tracker["completed_segments"]
+                for seg_progress in progress_tracker["segments"].values():
+                    total_progress += seg_progress
+                    
+                return total_progress
+            return None
+    
+    # 增强转录函数以支持细粒度进度报告
+    def transcribe_and_align_segment_with_progress(segment_info, segment_idx, model_instance, align_model_cache, device_to_use=DEVICE):
+        """转录并对齐单个音频分段，同时报告进度."""
+        import whisperx
+        from contextlib import redirect_stdout
+        import io
+        import time  # 新增：用于时间测量
+
+        segment_file = segment_info["file"]
+        segment_start_ms = segment_info["start_ms"]
+        segment_basename = os.path.basename(segment_file)
+        # 此分段的语言，可能是预先检测的或每个分段检测一次
+        detected_language_for_segment = segment_info.get("detected_language")
+
+        try:
+            # 加载音频数据 (10%的进度)
+            update_segment_progress(segment_idx, "load", 0.5)  # 加载开始
+            audio_data = whisperx.load_audio(segment_file)
+            update_segment_progress(segment_idx, "load", 1.0)  # 加载完成
+            
+            # 转录阶段 (60%的进度)
+            update_segment_progress(segment_idx, "transcribe", 0.1)  # 转录开始
+            
+            # 新增：创建转录进度更新线程
+            transcribe_completed = threading.Event()
+            
+            def update_transcribe_progress():
+                """后台线程：定期更新转录进度"""
+                progress_values = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]  # 中间进度点
+                interval = 1.0  # 更新间隔(秒)
+                
+                for progress_value in progress_values:
+                    # 等待指定时间或者直到转录完成
+                    if transcribe_completed.wait(timeout=interval):
+                        break  # 如果转录已完成，退出循环
+                    update_segment_progress(segment_idx, "transcribe", progress_value)
+            
+            # 启动进度更新线程
+            progress_thread = threading.Thread(target=update_transcribe_progress, daemon=True)
+            progress_thread.start()
+            
+            # 执行转录
+            try:
+                # 抑制 whisperx 内部 print 输出的详细信息
+                temp_stdout_buffer = io.StringIO()
+                with redirect_stdout(temp_stdout_buffer):
+                    with gpu_lock:  # 线程安全的转录
+                        transcription_result = model_instance.transcribe(
+                            audio_data, 
+                            batch_size=BATCH_SIZE, 
+                            verbose=False,
+                            language=detected_language_for_segment
+                        )
+            finally:
+                # 无论转录是否成功，都标记转录完成
+                transcribe_completed.set()
+                
+            # 确保更新到100%
+            update_segment_progress(segment_idx, "transcribe", 1.0)  # 转录完成
+
+            if not transcription_result or not transcription_result.get("segments"):
+                return None  # 没有有效的转录结果
+
+            # 确定对齐模型的语言代码
+            lang_code = detected_language_for_segment if detected_language_for_segment else transcription_result["language"]
+            
+            align_model, align_metadata = align_model_cache.get(lang_code, (None, None))
+            
+            # 对齐阶段开始 (30%的进度)
+            update_segment_progress(segment_idx, "align", 0.1)  # 对齐模型准备
+
+            # 新增：创建对齐进度更新线程
+            align_completed = threading.Event()
+            
+            def update_align_progress():
+                """后台线程：定期更新对齐进度"""
+                progress_values = [0.2, 0.3, 0.5, 0.7, 0.8]  # 中间进度点
+                interval = 0.8  # 更新间隔(秒)
+                
+                for progress_value in progress_values:
+                    if align_completed.wait(timeout=interval):
+                        break  # 如果对齐已完成，退出循环
+                    update_segment_progress(segment_idx, "align", progress_value)
+            
+            # 如果需要加载对齐模型
+            if align_model is None:
+                try:
+                    update_segment_progress(segment_idx, "align", 0.15)  # 开始加载对齐模型
+                    with gpu_lock:
+                        align_model, align_metadata = whisperx.load_align_model(
+                            language_code=lang_code, device=device_to_use
+                        )
+                    align_model_cache[lang_code] = (align_model, align_metadata)
+                    update_segment_progress(segment_idx, "align", 0.4)  # 对齐模型加载完成
+                except Exception as e:
+                    raise Exception(f"加载语言 '{lang_code}' 的对齐模型失败: {e}")
+            else:
+                update_segment_progress(segment_idx, "align", 0.4)  # 对齐模型已经加载
+
+            # 启动对齐进度更新线程
+            align_progress_thread = threading.Thread(target=update_align_progress, daemon=True)
+            align_progress_thread.start()
+            
+            # 执行对齐
+            try:
+                with gpu_lock:  # 线程安全的对齐
+                    aligned_result = whisperx.align(
+                        transcription_result["segments"], 
+                        align_model, 
+                        align_metadata, 
+                        audio_data, 
+                        device_to_use
+                    )
+            finally:
+                # 无论对齐是否成功，都标记对齐完成
+                align_completed.set()
+            
+            update_segment_progress(segment_idx, "align", 0.9)  # 对齐处理完成
+
+            # ... 其余的时间戳处理代码保持不变 ...
+            # 将时间戳调整为绝对时间 (相对于原始完整音频)
+            segment_start_sec = segment_start_ms / 1000.0
+            final_adjusted_alignment = {"segments": []}
+
+            if "word_segments" in aligned_result:
+                final_adjusted_alignment["word_segments"] = []
+                for word_info in aligned_result["word_segments"]:
+                    if "start" in word_info: word_info["start"] += segment_start_sec
+                    if "end" in word_info: word_info["end"] += segment_start_sec
+                    final_adjusted_alignment["word_segments"].append(word_info)
+
+            for seg in aligned_result["segments"]:
+                if "start" in seg: seg["start"] += segment_start_sec
+                if "end" in seg: seg["end"] += segment_start_sec
+                final_adjusted_alignment["segments"].append(seg)
+            
+            update_segment_progress(segment_idx, "align", 1.0)  # 对齐全部完成
+            
+            del audio_data  # 释放内存
+            gc.collect()
+            return final_adjusted_alignment
+
+        except Exception as e:
+            # 返回错误信息, 由主处理循环处理
+            return {"error": str(e), "segment_basename": segment_basename}
+
     with Progress(
-        TextColumn("[progress.description]{task.description}"), BarColumn(),
-        TextColumn("[cyan]{task.completed}/{task.total}[/cyan] 段"),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=40, complete_style="green", finished_style="bold green"),
+        TextColumn("[cyan]{task.completed:.2f}/{task.total}[/cyan] 段"),
         TextColumn("[progress.percentage]{task.percentage:>3.1f}%"),
-        TimeRemainingColumn(), console=console, transient=False
+        TimeRemainingColumn(),
+        TextColumn("({task.fields['done']}/{task.fields['total']})"), # <--- 修正这里
+        console=console,
+        transient=False,
+        refresh_per_second=5
     ) as progress_bar:
-        transcribe_task = progress_bar.add_task("转录进度", total=len(segments_info_list), completed=already_processed_count)
+        transcribe_task = progress_bar.add_task(
+            "转录进度",
+            total=float(len(segments_info_list)),
+            completed=float(already_processed_count),
+            fields={"done": already_processed_count, "total": len(segments_info_list)} # <--- 修正这里，使用 fields
+        )
+        
+        # --- 新增: 封装进度更新函数 ---
+        # 创建一个包装函数，用于在更新段进度后同时更新进度条显示
+        original_update = update_segment_progress
+        def progress_update_wrapper(idx, stage, progress_value):
+            new_total = original_update(idx, stage, progress_value)
+            if new_total is not None:
+                progress_bar.update(transcribe_task, completed=new_total)
+            return new_total
+        
+        # 替换原始更新函数
+        update_segment_progress = progress_update_wrapper
+        # --- 结束新增 ---
         
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            # 将 future 映射到其原始索引, 以便正确放置结果
+            # 使用新的支持进度报告的转录函数
             future_to_idx_map = {
-                executor.submit(transcribe_and_align_segment, seg_info_item, model_instance, alignment_model_cache, DEVICE): original_idx 
+                executor.submit(
+                    transcribe_and_align_segment_with_progress, 
+                    seg_info_item, original_idx, model_instance, 
+                    alignment_model_cache, DEVICE
+                ): original_idx 
                 for original_idx, seg_info_item in tasks_to_submit_for_processing
             }
 
@@ -593,7 +1008,13 @@ def process_all_segments(segments_info_list, current_status):
                     current_status["processed_results"] = processed_results_map
                     save_status(current_status)
                 finally:
-                    progress_bar.update(transcribe_task, advance=1)
+                    # 可以移除此行，因为我们现在用细粒度进度更新
+                    # progress_bar.update(transcribe_task, advance=1)
+                    # 将分段标记为完全完成
+                    with progress_tracker["lock"]:
+                        progress_tracker["segments"][idx] = 1.0
+                        total = progress_tracker["completed_segments"] + sum(progress_tracker["segments"].values())
+                        progress_bar.update(transcribe_task, completed=total)
     
     successful_count = sum(1 for r in all_segment_results if r is not None and "error" not in r)
     failed_count = len(segments_info_list) - successful_count
@@ -925,9 +1346,10 @@ def handle_dependencies_check_ui():
             
     console.print("\n[bold blue][INFO][/bold blue] 返回主菜单.")
 
+# --- 修改: handle_model_selection_ui 函数 ---
 def handle_model_selection_ui():
     """用于配置 Whisper 模型和处理参数的 UI 处理程序."""
-    global WHISPER_MODEL, COMPUTE_TYPE, DEVICE, BATCH_SIZE, whisper_model_global # 允许修改全局变量
+    global WHISPER_MODEL, COMPUTE_TYPE, DEVICE, BATCH_SIZE # whisper_model_global 由 unload/load 函数管理
     
     console.print(Panel(Text("Whisper 模型与参数配置", justify="center", style="bold cyan"), box=ROUNDED, expand=False))
     
@@ -1002,21 +1424,19 @@ def handle_model_selection_ui():
 
             WHISPER_MODEL, COMPUTE_TYPE, DEVICE, BATCH_SIZE = temp_model, temp_compute, temp_device, temp_batch
             
-            if model_config_changed and whisper_model_global is not None:
-                console.print("[INFO] 模型配置已更改. 清除已缓存的模型. 下次使用时将重新加载.")
-                del whisper_model_global
-                whisper_model_global = None 
-                gc.collect()
-                if DEVICE == "cuda" and 'torch' in sys.modules: # 检查是否已导入 torch
-                    try:
-                        torch.cuda.empty_cache() # 如果使用 CUDA, 清空 GPU 缓存
-                    except Exception: pass # 如果 torch 或 cuda 未完全可用, 忽略错误
+            if model_config_changed:
+                console.print("[INFO] 模型配置已更改。将卸载当前模型并开始后台加载新模型。")
+                # unload_whisper_model() # 卸载旧模型, 它会重置加载状态
+                # start_async_model_load() # 启动新模型的异步加载
+                start_async_model_load(force_reload=True) # 强制重新加载会处理卸载和启动新加载
+
 
             console.print("[bold green][SUCCESS][/bold green] 模型配置已更新!")
         else:
             console.print("[bold blue][INFO][/bold blue] 更改已取消.")
 
     console.print("\n[bold blue][INFO][/bold blue] 返回主菜单.")
+# --- 结束修改 ---
 
 # ========================
 # 主界面循环 (Main UI Loop)
@@ -1041,12 +1461,13 @@ def display_main_menu_ui():
     user_choice = Prompt.ask("输入选项 [1-4]", choices=["1", "2", "3", "4"], default="1")
     return user_choice
 
+# --- 修改: main_cli_loop 函数 ---
 def main_cli_loop():
     """主命令行界面循环."""
-    # 初始静默依赖检查 (可选, 可能有些打扰)
-    # if not check_dependencies(verbose=False):
-    #     console.print("[bold yellow][WARNING][/bold yellow] 检测到潜在的依赖项问题. "
-    #                   "请使用选项 [2] 检查详细信息.")
+    # --- 新增: 程序启动时开始异步加载模型 ---
+    console.print("[bold blue][INFO][/bold blue] 程序启动, 正在初始化并尝试后台加载 Whisper 模型...")
+    start_async_model_load()
+    # --- 结束新增 ---
 
     while True:
         user_action = display_main_menu_ui()
@@ -1058,21 +1479,33 @@ def main_cli_loop():
             handle_model_selection_ui()
         elif user_action == "4":
             if Confirm.ask("您确定要退出程序吗?", default=True):
+                console.print("[bold blue][INFO][/bold blue] 正在准备退出, 卸载模型...")
+                unload_whisper_model() # 确保模型卸载
+                if background_load_thread and background_load_thread.is_alive():
+                    console.print("[bold yellow][WARNING][/bold yellow] 等待后台模型加载线程结束...")
+                    background_load_thread.join(timeout=5)
+                    if background_load_thread.is_alive():
+                        console.print("[bold red][ERROR][/bold red] 后台模型加载线程未能及时结束。")
                 console.print("[bold blue]感谢使用, 程序已退出.[/bold blue]")
                 break
-        console.line(2) # 在再次显示菜单前添加一些间隔
 
 if __name__ == "__main__":
     try:
         main_cli_loop()
     except KeyboardInterrupt:
         console.print("\n[bold yellow]用户中断了进程. 正在退出.[/bold yellow]")
+        # --- 新增: KeyboardInterrupt 时也尝试卸载模型 ---
+        unload_whisper_model()
+        # --- 结束新增 ---
     except Exception as e:
         # 为未处理的异常打印 rich 格式的回溯信息
         console.print_exception(show_locals=True, width=None) # 自动宽度
         console.log(f"[bold red]发生未捕获的严重错误: {e}[/bold red]")
         console.log("请查看上面的错误详细信息. 您可能需要重新启动程序.")
     finally:
-        # 任何最终的清理工作都可以放在这里
-        # 使用 'with' 语句的 ThreadPoolExecutor 会自行处理关闭.
-        console.print("程序已终止.", style="dim")
+        # --- 新增: 确保在程序最终结束前再次尝试卸载模型 ---
+        # 这主要用于捕获 main_cli_loop 内部未被 try-except 包裹的 KeyboardInterrupt
+        # 或者其他导致 finally 执行的退出路径
+        if whisper_model_global is not None or model_load_initiated: # 只有在模型可能已加载或正在加载时才尝试
+             console.print("[bold blue][INFO][/bold blue] 程序终止前进行最终模型清理...")
+             unload_whisper_model(silent=True) # 静默模式, 避免重复打印
