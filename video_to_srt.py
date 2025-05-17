@@ -550,10 +550,14 @@ def process_all_segments(segments_info_list, current_status):
     console.print(f"[bold blue][INFO][/bold blue] 正在转录 [cyan]{len(tasks_to_submit_for_processing)}[/cyan] 个新的/失败的分段 (共 {len(segments_info_list)} 个), 使用 [cyan]{num_workers}[/cyan] 个工作线程.")
 
     with Progress(
-        TextColumn("[progress.description]{task.description}"), BarColumn(),
+        SpinnerColumn(), # 添加或确保 SpinnerColumn 存在
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
         TextColumn("[cyan]{task.completed}/{task.total}[/cyan] 段"),
-        TextColumn("[progress.percentage]{task.percentage:>3.1f}%"),
-        TimeRemainingColumn(), console=console, transient=False
+        TimeElapsedColumn(), # 显示已用时间
+        TimeRemainingColumn(), # 显示预计剩余时间
+        console=console,
+        transient=False
     ) as progress_bar:
         transcribe_task = progress_bar.add_task("转录进度", total=len(segments_info_list), completed=already_processed_count)
         
