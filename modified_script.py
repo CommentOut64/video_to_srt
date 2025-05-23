@@ -540,7 +540,8 @@ def transcribe_and_align_segment(segment_info, model_instance, align_model_cache
             try:
                 align_model, align_metadata = whisperx.load_align_model(
                     language_code=lang_code,
-                    device=DEVICE
+                    device=DEVICE,
+                    model_dir=MODEL_CACHE_DIR
                 )
                 align_model_cache[lang_code] = (align_model, align_metadata)
                 logger.info(f"分段 {segment_basename}: 语言 '{lang_code}' 的对齐模型加载并缓存成功.")
@@ -555,7 +556,7 @@ def transcribe_and_align_segment(segment_info, model_instance, align_model_cache
             align_model, 
             align_metadata, 
             audio_data, 
-            device=DEVICE,
+            device=DEVICE
         )
         logger.debug(f"分段 {segment_basename}: 对齐完成.")
 
@@ -656,7 +657,8 @@ def process_all_segments(segments_info_list, current_status):
                 with model_lock:
                     align_model, align_metadata = whisperx.load_align_model(
                         language_code=overall_detected_language, 
-                        device=DEVICE
+                        device=DEVICE,
+                        model_dir=MODEL_CACHE_DIR
                     )
                 alignment_model_cache[overall_detected_language] = (align_model, align_metadata)
             logger.info(f"语言 '{overall_detected_language}' 的对齐模型已预加载.")
