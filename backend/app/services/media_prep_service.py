@@ -507,7 +507,8 @@ class MediaPrepService:
                         logger.info(f"[MediaPrep] 360p 转码被中断: {job_id}")
                         break
                     
-                    line_str = line.decode().strip()
+                    # V3.1.0+dev.20260104.01: 修复 Windows 编码问题
+                    line_str = line.decode('utf-8', errors='replace').strip()
                     if line_str.startswith('out_time_ms='):
                         try:
                             out_time_ms = int(line_str.split('=')[1])
@@ -685,7 +686,8 @@ class MediaPrepService:
                         logger.info(f"[MediaPrep] 720p 转码被中断: {job_id}")
                         break
                     
-                    line_str = line.decode().strip()
+                    # V3.1.0+dev.20260104.01: 修复 Windows 编码问题
+                    line_str = line.decode('utf-8', errors='replace').strip()
                     if line_str.startswith('out_time_ms='):
                         try:
                             out_time_ms = int(line_str.split('=')[1])
@@ -983,8 +985,9 @@ class MediaPrepService:
             ]
 
             creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            # V3.1.0+dev.20260104.01: 添加 encoding='utf-8' 避免 Windows GBK 编码问题
             result = subprocess.run(
-                cmd, capture_output=True, text=True,
+                cmd, capture_output=True, text=True, encoding='utf-8', errors='replace',
                 creationflags=creationflags
             )
 
@@ -1143,7 +1146,8 @@ class MediaPrepService:
                         logger.info(f"[MediaPrep] 重封装被中断: {job_id}")
                         break
                     
-                    line_str = line.decode().strip()
+                    # V3.1.0+dev.20260104.01: 修复 Windows 编码问题
+                    line_str = line.decode('utf-8', errors='replace').strip()
                     if line_str.startswith('out_time_ms='):
                         try:
                             out_time_ms = int(line_str.split('=')[1])

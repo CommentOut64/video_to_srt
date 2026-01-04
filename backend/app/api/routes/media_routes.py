@@ -1089,14 +1089,16 @@ async def get_thumbnails(job_id: str, count: int = 10, sprite: bool = True):
 
     if sprite and sprite_cache.exists():
         try:
-            with open(sprite_cache, 'r') as f:
+            # V3.1.0+dev.20260104.01: 添加 encoding='utf-8'
+            with open(sprite_cache, 'r', encoding='utf-8') as f:
                 return JSONResponse(json.load(f))
         except:
             pass
 
     if not sprite and thumbnails_cache.exists():
         try:
-            with open(thumbnails_cache, 'r') as f:
+            # V3.1.0+dev.20260104.01: 添加 encoding='utf-8'
+            with open(thumbnails_cache, 'r', encoding='utf-8') as f:
                 return JSONResponse(json.load(f))
         except:
             pass
@@ -1119,7 +1121,8 @@ async def get_thumbnails(job_id: str, count: int = 10, sprite: bool = True):
             if sprite_result:
                 # 缓存结果
                 try:
-                    with open(sprite_cache, 'w') as f:
+                    # V3.1.0+dev.20260104.01: 添加 encoding='utf-8'
+                    with open(sprite_cache, 'w', encoding='utf-8') as f:
                         json.dump(sprite_result, f)
                 except:
                     pass
@@ -1175,7 +1178,8 @@ async def get_thumbnails(job_id: str, count: int = 10, sprite: bool = True):
 
         # 缓存结果
         try:
-            with open(thumbnails_cache, 'w') as f:
+            # V3.1.0+dev.20260104.01: 添加 encoding='utf-8'
+            with open(thumbnails_cache, 'w', encoding='utf-8') as f:
                 json.dump(result, f)
         except:
             pass
@@ -1837,7 +1841,8 @@ async def _auto_generate_peaks(job_id: str, audio_file: Path, peaks_cache: Path)
                 "method": "auto_ffmpeg" if use_ffmpeg else "auto_wave",
                 "samples": len(peaks) // 2
             }
-            with open(peaks_cache, 'w') as f:
+            # V3.1.0+dev.20260104.01: 添加 encoding='utf-8'
+            with open(peaks_cache, 'w', encoding='utf-8') as f:
                 json.dump(result, f)
             print(f"[media] 波形数据自动生成成功: {job_id}")
     except Exception as e:

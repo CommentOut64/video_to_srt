@@ -438,7 +438,8 @@ async def _terminate_processes():
                         timeout=5
                     )
                     if result.returncode == 0 and result.stdout:
-                        for line in result.stdout.decode().strip().split('\n'):
+                        # V3.1.0+dev.20260104.01: 修复 Windows 编码问题
+                        for line in result.stdout.decode('utf-8', errors='replace').strip().split('\n'):
                             parts = line.split()
                             if len(parts) >= 5:
                                 pid = parts[-1]

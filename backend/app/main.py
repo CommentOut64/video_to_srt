@@ -161,7 +161,8 @@ def cleanup_old_processes():
                 timeout=5
             )
             if result.returncode == 0 and result.stdout:
-                lines = result.stdout.decode().strip().split('\n')
+                # V3.1.0+dev.20260104.01: 修复 Windows 编码问题
+                lines = result.stdout.decode('utf-8', errors='replace').strip().split('\n')
                 for line in lines:
                     parts = line.split()
                     if len(parts) >= 5:

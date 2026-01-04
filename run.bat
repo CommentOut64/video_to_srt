@@ -104,63 +104,38 @@ echo.
 echo [Step 6/6] Starting services...
 echo.
 
-REM 先清理可能残留的旧进程
+REM Clean old processes before starting
 echo [Cleanup] Checking for old processes...
 
-REM 清理 FFmpeg 进程
+REM Clean FFmpeg processes
 taskkill /F /IM ffmpeg.exe >nul 2>&1
-if %ERRORLEVEL%==0 echo [Cleanup] FFmpeg processes terminated
 
-REM 清理 ffprobe 进程
+REM Clean ffprobe processes
 taskkill /F /IM ffprobe.exe >nul 2>&1
 
-REM 检查并释放端口 8000（旧后端进程）
+REM Check and release port 8000 (old backend process)
 echo [Cleanup] Checking port 8000...
-set "CLEANED_8000=0"
-for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":8000" ^| findstr "LISTENING"') do (
-    if not "%%a"=="" (
-        echo [Cleanup] Found process on port 8000 - PID: %%a
-        taskkill /F /PID %%a >nul 2>&1
-        if not ERRORLEVEL 1 (
-            echo [Cleanup] Killed process PID %%a
-            set "CLEANED_8000=1"
-        )
-    )
+for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| find ":8000" ^| find "LISTENING"') do (
+    echo [Cleanup] Found process on port 8000 - PID: %%a
+    taskkill /F /PID %%a >nul 2>&1
 )
 
-REM 检查并释放端口 5173（旧前端进程）
+REM Check and release port 5173 (old frontend process)
 echo [Cleanup] Checking port 5173...
-set "CLEANED_5173=0"
-for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":5173" ^| findstr "LISTENING"') do (
-    if not "%%a"=="" (
-        echo [Cleanup] Found process on port 5173 - PID: %%a
-        taskkill /F /PID %%a >nul 2>&1
-        if not ERRORLEVEL 1 (
-            echo [Cleanup] Killed process PID %%a
-            set "CLEANED_5173=1"
-        )
-    )
+for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| find ":5173" ^| find "LISTENING"') do (
+    echo [Cleanup] Found process on port 5173 - PID: %%a
+    taskkill /F /PID %%a >nul 2>&1
 )
 
-REM 使用 PowerShell 查找并终止残留的 Python 进程（运行 uvicorn）
+REM Use PowerShell to find and kill old uvicorn processes
 echo [Cleanup] Checking for old uvicorn processes...
-for /f "tokens=*" %%p in ('powershell -NoProfile -Command "Get-Process -Name python -ErrorAction SilentlyContinue | Where-Object {$_.CommandLine -like '*uvicorn*app.main*'} | Select-Object -ExpandProperty Id" 2^>nul') do (
-    if not "%%p"=="" (
-        echo [Cleanup] Found old uvicorn process - PID: %%p
-        taskkill /F /PID %%p >nul 2>&1
-    )
-)
+powershell -NoProfile -Command "Get-Process -Name python -ErrorAction SilentlyContinue | Where-Object {$_.CommandLine -like '*uvicorn*app.main*'} | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }" 2>nul
 
-REM 使用 PowerShell 查找并终止残留的 Node 进程（运行 vite）
+REM Use PowerShell to find and kill old vite processes
 echo [Cleanup] Checking for old vite processes...
-for /f "tokens=*" %%p in ('powershell -NoProfile -Command "Get-Process -Name node -ErrorAction SilentlyContinue | Where-Object {$_.CommandLine -like '*vite*'} | Select-Object -ExpandProperty Id" 2^>nul') do (
-    if not "%%p"=="" (
-        echo [Cleanup] Found old vite process - PID: %%p
-        taskkill /F /PID %%p >nul 2>&1
-    )
-)
+powershell -NoProfile -Command "Get-Process -Name node -ErrorAction SilentlyContinue | Where-Object {$_.CommandLine -like '*vite*'} | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }" 2>nul
 
-REM 等待进程完全退出
+REM Wait for processes to exit
 timeout /t 2 /nobreak >nul
 echo [OK] Old processes cleanup completed
 echo.
@@ -180,7 +155,7 @@ cd /d "%PROJECT_ROOT%"
 
 timeout /t 3 /nobreak >nul
 
-REM 不在这里打开浏览器，由后端统一控制
+REM Browser opening is controlled by backend
 REM start "" "http://localhost:5173"
 
 echo.
@@ -199,17 +174,17 @@ echo   [!] Do NOT close this window manually!
 echo.
 echo ========================================
 
-REM 循环检测后端进程是否还在运行
-REM 如果后端进程退出（用户点击"退出系统"），则自动关闭主窗口
+REM Loop to detect if backend is still running
+REM Auto close main window when backend exits (user clicks "Exit System")
 :wait_loop
 timeout /t 3 /nobreak >nul
 
-REM 检查端口 8000 是否还有进程监听（改进版本兼容性）
+REM Check if port 8000 is still listening
 netstat -ano 2>nul | find ":8000" | find "LISTENING" >nul 2>&1
 if errorlevel 1 (
     echo.
     echo [INFO] Backend service has stopped. Closing...
-    REM 终止前端进程
+    REM Kill frontend process
     taskkill /F /IM node.exe /FI "WINDOWTITLE eq Video2SRT*" >nul 2>&1
     timeout /t 1 /nobreak >nul
     exit /b 0

@@ -547,7 +547,7 @@ class CheckpointManager:
         version = data.get("version", "")
         if not version.startswith("3.7"):
             # 尝试从旧格式迁移
-            self.logger.info(f"检测到旧版本检查点 ({version})，尝试迁移到 V3.7")
+            self.logger.debug(f"检测到旧版本检查点 ({version})，尝试迁移到 V3.7")
             data = self._migrate_to_v37(data)
 
         return CheckpointV37.from_dict(data)
@@ -633,7 +633,7 @@ class CheckpointManager:
             "original_settings": old_data.get("original_settings")
         }
 
-        self.logger.info(f"检查点迁移完成: {job_id}")
+        self.logger.debug(f"检查点迁移完成: {job_id}")
         return new_data
 
     def create_checkpoint_v37(self, job_id: str) -> CheckpointV37:

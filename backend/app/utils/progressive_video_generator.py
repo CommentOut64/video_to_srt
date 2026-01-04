@@ -99,7 +99,8 @@ class ProgressiveVideoGenerator:
             if not line:
                 break
 
-            line_str = line.decode().strip()
+            # V3.1.0+dev.20260104.01: 修复 Windows 编码问题，显式指定 UTF-8
+            line_str = line.decode('utf-8', errors='replace').strip()
             if line_str.startswith('out_time_ms='):
                 try:
                     out_time_ms = int(line_str.split('=')[1])
@@ -115,7 +116,8 @@ class ProgressiveVideoGenerator:
 
         if process.returncode != 0:
             stderr = await process.stderr.read()
-            raise Exception(f"FFmpeg 失败: {stderr.decode()}")
+            # V3.1.0+dev.20260104.01: 修复 Windows 编码问题
+            raise Exception(f"FFmpeg 失败: {stderr.decode('utf-8', errors='replace')}")
 
     def _push_progress(self, job_id: str, stage: str, progress: float):
         """推送进度到 SSE"""
@@ -168,8 +170,9 @@ class ProgressiveVideoGenerator:
             str(video_path)
         ]
 
+        # V3.1.0+dev.20260104.01: 添加 encoding='utf-8' 避免 Windows GBK 编码问题
         result = subprocess.run(
-            cmd, capture_output=True, text=True,
+            cmd, capture_output=True, text=True, encoding='utf-8', errors='replace',
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
         )
 

@@ -247,7 +247,8 @@ class AudioProcessingPipeline:
             )
             return str(audio_path)
         except subprocess.CalledProcessError as e:
-            self.logger.error(f"音频提取失败: {e.stderr.decode()}")
+            # V3.1.0+dev.20260104.01: 修复 Windows 编码问题
+            self.logger.error(f"音频提取失败: {e.stderr.decode('utf-8', errors='replace')}")
             raise RuntimeError(f"音频提取失败: {e}")
 
     def _determine_separation_strategy(

@@ -750,11 +750,8 @@ class JobQueueService:
         from app.pipelines import (
             AudioProcessingPipeline,
             AudioProcessingConfig,
-            DualAlignmentPipeline,
-            DualAlignmentConfig,
             AsyncDualPipeline,
             get_audio_processing_pipeline,
-            get_dual_alignment_pipeline,
             get_async_dual_pipeline
         )
         from app.services.streaming_subtitle import get_streaming_subtitle_manager, remove_streaming_subtitle_manager
@@ -793,15 +790,12 @@ class JobQueueService:
         job_dir = Path(job.dir)
         checkpoint_manager = CheckpointManagerV37(job_dir, logger)
 
-        # 流水线模式选择（V3.1.0 新增）
-        # 从配置中读取，支持环境变量 USE_ASYNC_PIPELINE 控制
+        # 流水线配置
         from app.core.config import config as project_config
-        use_async_pipeline = project_config.USE_ASYNC_PIPELINE
         queue_maxsize = project_config.PIPELINE_QUEUE_MAXSIZE
 
         try:
-            pipeline_mode = "异步流水线 (V3.1.0)" if use_async_pipeline else "串行流水线 (V3.0)"
-            logger.info(f"[双流对齐] 开始处理任务: {job.job_id}, preset={preset_id}, 模式={pipeline_mode}")
+            logger.info(f"[双流对齐] 开始处理任务: {job.job_id}, preset={preset_id}")
 
             # V3.7: 检查是否有检查点需要恢复
             checkpoint = checkpoint_manager.load_checkpoint()
@@ -1009,77 +1003,59 @@ class JobQueueService:
 
             pipeline_sentences = []  # 用于收集本轮流水线产出的句子，作为无字幕快照时的兜底
 
-            if use_async_pipeline:
-                # V3.1.0: 异步流水线（三级流水线，错位并行）
-                logger.info(f"[双流对齐] 使用异步流水线处理 {total_chunks} 个 Chunk (queue_maxsize={queue_maxsize})")
-                async_pipeline = AsyncDualPipeline(
-                    job_id=job.job_id,
-                    queue_maxsize=queue_maxsize,
-                    sensevoice_language=getattr(job.settings, 'sensevoice_language', 'auto'),
-                    whisper_language=getattr(job.settings, 'whisper_language', 'auto'),
-                    user_glossary=getattr(job.settings, 'user_glossary', None),
-                    transcription_profile=ConfigAdapter.get_transcription_profile(job.settings),
-                    logger=logger,
-                    cancellation_token=cancellation_token,  # V3.7
-                    progress_emitter=progress_emitter  # V3.1.0: 传递进度发射器
+            # V3.1.0: 异步流水线（三级流水线，错位并行）
+            logger.info(f"[双流对齐] 使用异步流水线处理 {total_chunks} 个 Chunk (queue_maxsize={queue_maxsize})")
+            async_pipeline = AsyncDualPipeline(
+                job_id=job.job_id,
+                queue_maxsize=queue_maxsize,
+                sensevoice_language=getattr(job.settings, 'sensevoice_language', 'auto'),
+                whisper_language=getattr(job.settings, 'whisper_language', 'auto'),
+                user_glossary=getattr(job.settings, 'user_glossary', None),
+                transcription_profile=ConfigAdapter.get_transcription_profile(job.settings),
+                logger=logger,
+                cancellation_token=cancellation_token,  # V3.7
+                progress_emitter=progress_emitter  # V3.1.0: 传递进度发射器
+            )
+
+            # V3.7: 如果有历史上下文，恢复 SlowWorker 状态
+            if previous_whisper_text and async_pipeline.slow_worker:
+                async_pipeline.slow_worker.restore_prompt_cache(previous_whisper_text)
+                logger.info(f"[V3.7] 已恢复 SlowWorker 上下文: {len(previous_whisper_text)} 字符")
+
+            # V3.1.0: 分别计算各 Worker 的基准偏移量
+            # FastWorker 使用 safe_indices（用于跳过已处理的 chunk）
+            # SlowWorker 和 AlignmentWorker 使用各自实际处理的数量（用于进度计算）
+            base_slow_count = 0
+            base_align_count = 0
+            if is_resuming and checkpoint.transcription:
+                # SlowWorker 的基准 = checkpoint 中保存的 slow_indices 数量
+                base_slow_count = len(slow_indices) if slow_indices else len(safe_indices)
+                # AlignmentWorker 的基准 = checkpoint 中保存的 finalized_indices 数量
+                base_align_count = len(finalized) if finalized else len(safe_indices)
+                logger.info(
+                    f"[V3.1.0] Worker 基准偏移量: "
+                    f"FastWorker={len(fast_processed_indices)}, "
+                    f"SlowWorker={base_slow_count}, "
+                    f"AlignmentWorker={base_align_count}"
                 )
 
-                # V3.7: 如果有历史上下文，恢复 SlowWorker 状态
-                if previous_whisper_text and async_pipeline.slow_worker:
-                    async_pipeline.slow_worker.restore_prompt_cache(previous_whisper_text)
-                    logger.info(f"[V3.7] 已恢复 SlowWorker 上下文: {len(previous_whisper_text)} 字符")
+            # 处理所有 Chunks（流水线并行，传递完整音频数组用于 Audio Overlap）
+            # V3.1.0: 传递初始索引集合，修复恢复后进度不准确问题
+            contexts = await async_pipeline.run(
+                audio_chunks=audio_chunks,
+                full_audio_array=full_audio,
+                full_audio_sr=sr,
+                job_dir=job_dir,  # V3.7
+                processed_indices=fast_processed_indices,  # V3.1.0: FastWorker 跳过的索引
+                base_slow_count=base_slow_count,  # V3.1.0: SlowWorker 的基准偏移量（已废弃）
+                base_align_count=base_align_count,  # V3.1.0: AlignmentWorker 的基准偏移量（已废弃）
+                initial_slow_processed_indices=slow_indices if is_resuming else None,  # V3.1.0: SlowWorker 初始索引
+                initial_finalized_indices=finalized if is_resuming else None  # V3.1.0: AlignmentWorker 初始索引
+            )
 
-                # V3.1.0: 分别计算各 Worker 的基准偏移量
-                # FastWorker 使用 safe_indices（用于跳过已处理的 chunk）
-                # SlowWorker 和 AlignmentWorker 使用各自实际处理的数量（用于进度计算）
-                base_slow_count = 0
-                base_align_count = 0
-                if is_resuming and checkpoint.transcription:
-                    # SlowWorker 的基准 = checkpoint 中保存的 slow_indices 数量
-                    base_slow_count = len(slow_indices) if slow_indices else len(safe_indices)
-                    # AlignmentWorker 的基准 = checkpoint 中保存的 finalized_indices 数量
-                    base_align_count = len(finalized) if finalized else len(safe_indices)
-                    logger.info(
-                        f"[V3.1.0] Worker 基准偏移量: "
-                        f"FastWorker={len(fast_processed_indices)}, "
-                        f"SlowWorker={base_slow_count}, "
-                        f"AlignmentWorker={base_align_count}"
-                    )
-
-                # 处理所有 Chunks（流水线并行，传递完整音频数组用于 Audio Overlap）
-                # V3.1.0: 传递初始索引集合，修复恢复后进度不准确问题
-                contexts = await async_pipeline.run(
-                    audio_chunks=audio_chunks,
-                    full_audio_array=full_audio,
-                    full_audio_sr=sr,
-                    job_dir=job_dir,  # V3.7
-                    processed_indices=fast_processed_indices,  # V3.1.0: FastWorker 跳过的索引
-                    base_slow_count=base_slow_count,  # V3.1.0: SlowWorker 的基准偏移量（已废弃）
-                    base_align_count=base_align_count,  # V3.1.0: AlignmentWorker 的基准偏移量（已废弃）
-                    initial_slow_processed_indices=slow_indices if is_resuming else None,  # V3.1.0: SlowWorker 初始索引
-                    initial_finalized_indices=finalized if is_resuming else None  # V3.1.0: AlignmentWorker 初始索引
-                )
-
-                # 提取结果
-                for ctx in contexts:
-                    pipeline_sentences.extend(ctx.final_sentences)
-
-            else:
-                # V3.0: 串行流水线（兼容模式）
-                logger.info(f"[双流对齐] 使用串行流水线处理 {total_chunks} 个 Chunk")
-                dual_config = DualAlignmentConfig()
-                dual_pipeline = get_dual_alignment_pipeline(
-                    job_id=job.job_id,
-                    config=dual_config,
-                    logger=logger
-                )
-
-                # 处理所有 Chunks（串行）
-                results = await dual_pipeline.run(audio_chunks)
-
-                # 提取结果
-                for result in results:
-                    pipeline_sentences.extend(result.sentences)
+            # 提取结果
+            for ctx in contexts:
+                pipeline_sentences.extend(ctx.final_sentences)
 
             progress_tracker.complete_phase(ProcessPhase.SENSEVOICE)
             # V3.1.0: 双流对齐完成
