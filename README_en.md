@@ -13,6 +13,9 @@
 
 AnchorFlux employs an innovative dual-anchor architecture: **SenseVoice anchors time boundaries, Whisper anchors semantic content**, coordinated through an asynchronous dual-stream pipeline to achieve a balance between transcription speed and quality.
 
+[![演示视频](https://img.shields.io/static/v1?label=%20&message=%E6%BC%94%E7%A4%BA%E8%A7%86%E9%A2%91&color=F37697&style=flat&logo=bilibili&logoColor=white&logoWidth=20)](https://www.bilibili.com/video/BV1xAqzB5EFN)
+[![教程视频](https://img.shields.io/static/v1?label=%20&message=%E6%95%99%E7%A8%8B%E8%A7%86%E9%A2%91&color=F37697&style=flat&logo=bilibili&logoColor=white&logoWidth=20)](https://www.bilibili.com/video/BV1ejvCBPEz9)
+
 ## Features
 
 ### Core Features

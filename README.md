@@ -13,6 +13,9 @@
 
 AnchorFlux 采用创新的双锚架构：**SenseVoice 锚定时间边界，Whisper 锚定语义内容**，利用异步双流流水线协调两者，实现了转录速度与质量的平衡。
 
+[![演示视频](https://img.shields.io/static/v1?label=%20&message=%E6%BC%94%E7%A4%BA%E8%A7%86%E9%A2%91&color=F37697&style=flat&logo=bilibili&logoColor=white&logoWidth=20)](https://www.bilibili.com/video/BV1xAqzB5EFN)
+[![教程视频](https://img.shields.io/static/v1?label=%20&message=%E6%95%99%E7%A8%8B%E8%A7%86%E9%A2%91&color=F37697&style=flat&logo=bilibili&logoColor=white&logoWidth=20)](https://www.bilibili.com/video/BV1ejvCBPEz9)
+
 ## 功能特点
 
 ### 核心功能
