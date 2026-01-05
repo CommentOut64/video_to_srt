@@ -11,9 +11,9 @@
       <!-- 图标占位 -->
       <div class="app-icon">
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-  <path 
-    fill="#58A6FF" 
-    d="M21 3H3c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H3V5h18v14zM5 10h9v2H5zm0-3h9v2H5zm0 6h6v2H5z" 
+  <path
+    fill="#58A6FF"
+    d="M21 3H3c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H3V5h18v14zM5 10h9v2H5zm0-3h9v2H5zm0 6h6v2H5z"
   />
 </svg>
       </div>
@@ -23,6 +23,17 @@
 
       <!-- 版本号 -->
       <div class="version">版本 {{ version }}</div>
+
+      <!-- 检查更新按钮 V3.1.1+dev.20260105.01 -->
+      <el-button
+        class="check-update-btn"
+        :loading="isCheckingUpdate"
+        @click="handleCheckUpdate"
+        size="small"
+        plain
+      >
+        {{ isCheckingUpdate ? '检查中...' : '检查更新' }}
+      </el-button>
 
       <!-- 链接 -->
       <div class="links">
@@ -68,44 +79,136 @@
       </div>
       -->
     </div>
+
+    <!-- 更新窗口 V3.1.1+dev.20260105.01 -->
+    <UpdateDialog
+      v-model="showUpdateDialog"
+      :update-info="pendingUpdateInfo"
+      @ignore="handleUpdateIgnored"
+    />
   </el-dialog>
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { ref, watch, onMounted } from 'vue'
+import { ElMessage } from 'element-plus'
+import { useUpdateChecker } from '@/composables'
+import systemApi from '@/services/api/systemApi'
+import UpdateDialog from './UpdateDialog.vue'
 
 const visible = defineModel({ type: Boolean, default: false })
 
 // 版本号
-const version = ref('3.1.0-beta')
+const version = ref('...')
 
-// 日志级别设置已禁用（控制台固定INFO，文件固定DEBUG）
-// const logLevel = ref('INFO')
-// const fetchLogLevel = async () => { ... }
-// const handleLogLevelChange = async (newLevel) => { ... }
-// watch(visible, (newVal) => { if (newVal) fetchLogLevel() })
+// V3.1.1+dev.20260105.01: 更新相关状态
+const isCheckingUpdate = ref(false)
+const showUpdateDialog = ref(false)
+const pendingUpdateInfo = ref(null)
+
+const { checkForUpdate } = useUpdateChecker()
+
+// 获取版本号
+async function fetchVersion() {
+  try {
+    const response = await systemApi.getVersion()
+    if (response?.version) {
+      version.value = response.version
+    }
+  } catch (e) {
+    console.warn('[About] Failed to fetch version:', e)
+    version.value = '未知'
+  }
+}
+
+// V3.1.1+dev.20260105.01: 检查更新
+async function handleCheckUpdate() {
+  isCheckingUpdate.value = true
+
+  try {
+    // 手动检查时忽略已忽略的版本
+    const result = await checkForUpdate(true)
+
+    if (result.hasUpdate && result.updateInfo) {
+      pendingUpdateInfo.value = result.updateInfo
+      showUpdateDialog.value = true
+    } else if (result.error) {
+      ElMessage.error('检查更新失败: ' + result.error)
+    } else {
+      ElMessage.success('当前已是最新版本')
+    }
+  } catch (e) {
+    ElMessage.error('检查更新失败: ' + (e.message || '网络错误'))
+  } finally {
+    isCheckingUpdate.value = false
+  }
+}
+
+// 更新被忽略
+function handleUpdateIgnored() {
+  pendingUpdateInfo.value = null
+}
+
+// 对话框打开时获取版本号
+watch(visible, (newVal) => {
+  if (newVal) {
+    fetchVersion()
+  }
+})
+
+// 初始化时也获取版本号
+onMounted(() => {
+  fetchVersion()
+})
 </script>
 
-<style scoped lang="scss">
+<style lang="scss">
+/* V3.1.1+dev.20260105.03: 优化对话框样式 - 使用全局样式因为 el-dialog 会 teleport 到 body */
 .about-dialog {
-  :deep(.el-dialog) {
+  .el-dialog {
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
   }
 
-  :deep(.el-dialog__header) {
+  /* V3.1.1+dev.20260105.03: 减小 header 高度，优化标题和关闭按钮对齐 */
+  .el-dialog__header {
     border-bottom: 1px solid var(--border-color);
-    padding: 16px 20px;
+    padding: 12px 16px !important;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
   }
 
-  :deep(.el-dialog__title) {
+  .el-dialog__title {
     color: var(--text-bright);
-    font-size: 16px;
+    font-size: 14px !important;
     font-weight: 600;
+    line-height: 1;
   }
 
-  :deep(.el-dialog__body) {
-    padding: 32px 20px;
+  /* V3.1.1+dev.20260105.03: 调整关闭按钮位置 */
+  .el-dialog__headerbtn {
+    position: static !important;
+    width: 24px;
+    height: 24px;
+    top: auto !important;
+    right: auto !important;
+  }
+
+  .el-dialog__body {
+    padding: 24px 20px !important;
+  }
+
+  /* V3.1.1+dev.20260105.03: 统一按钮 hover/click 样式 */
+  .el-button {
+    &:hover:not(:disabled) {
+      background: var(--bg-hover) !important;
+      border-color: var(--border-color) !important;
+    }
+
+    &:active:not(:disabled) {
+      background: var(--bg-tertiary) !important;
+    }
   }
 }
 
@@ -142,6 +245,11 @@ const version = ref('3.1.0-beta')
 .version {
   font-size: 13px;
   color: var(--text-secondary);
+}
+
+/* V3.1.1+dev.20260105.01: 检查更新按钮样式 */
+.check-update-btn {
+  margin-top: 4px;
 }
 
 .links {

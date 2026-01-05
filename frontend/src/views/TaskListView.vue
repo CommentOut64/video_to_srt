@@ -13,6 +13,10 @@
         </h1>
       </div>
       <div class="header-right">
+        <!-- V3.1.1+dev.20260105.02: 临时测试按钮 -->
+        <el-button size="small" @click="showTestUpdateDialog">
+          测试更新窗口
+        </el-button>
         <el-button type="primary" @click="showUploadDialog = true">
           <el-icon><Upload /></el-icon>
           上传视频
@@ -330,6 +334,12 @@
 
     <!-- 关于对话框 -->
     <AboutDialog v-model="showAboutDialog" />
+
+    <!-- V3.1.1+dev.20260105.02: 测试用更新对话框 -->
+    <UpdateDialog
+      v-model="showUpdateDialogTest"
+      :update-info="testUpdateInfo"
+    />
   </div>
 </template>
 
@@ -353,6 +363,7 @@ import fileApi from "@/services/api/fileApi"; // 导入文件 API
 // V3.1.0: 移除 sseChannelManager 导入，SSE 订阅由 App.vue 统一管理
 import PresetSelector from "@/components/editor/PresetSelector.vue"; // v3.5 预设选择器
 import AboutDialog from "@/components/AboutDialog.vue"; // 关于对话框
+import UpdateDialog from "@/components/UpdateDialog.vue"; // V3.1.1+dev.20260105.02: 更新对话框
 
 const router = useRouter();
 const taskStore = useUnifiedTaskStore();
@@ -360,6 +371,8 @@ const taskStore = useUnifiedTaskStore();
 // 响应式数据 - 上传相关
 const showUploadDialog = ref(false);
 const showAboutDialog = ref(false);
+const showUpdateDialogTest = ref(false); // V3.1.1+dev.20260105.02: 测试用更新对话框
+const testUpdateInfo = ref(null); // V3.1.1+dev.20260105.02: 测试用更新信息
 const uploadMode = ref("upload"); // 上传模式：'upload' 或 'select'
 const uploading = ref(false);
 const uploadRef = ref(null);
@@ -974,6 +987,18 @@ async function getThumbnailUrl(jobId, forceReload = false) {
     thumbnailCache.value[jobId] = null;
     return null;
   }
+}
+
+// V3.1.1+dev.20260105.02: 显示测试更新对话框
+function showTestUpdateDialog() {
+  testUpdateInfo.value = {
+    currentVersion: '3.1.1',
+    latestVersion: '3.2.0',
+    changelog: '测试更新内容:\n- 新增在线更新功能\n- 优化启动性能\n- 修复若干问题',
+    downloadUrl: 'https://example.com/test-update.zip',
+    forceUpdate: false
+  }
+  showUpdateDialogTest.value = true
 }
 
 // 处理退出系统
