@@ -14,6 +14,7 @@ import numpy as np
 import logging
 import gc
 import os
+import re
 from pathlib import Path
 
 # 用于类型检查的条件导入（不会在运行时触发导入）
@@ -535,6 +536,24 @@ class WhisperService:
 
         # 转换生成器为列表
         segment_list = list(segments_generator)
+
+        # V3.1.0+dev.20260104.02: 过滤 Whisper 可能输出的 prompt 前缀
+        # Whisper 有时会将 initial_prompt 内容当作转录结果输出
+        def clean_prompt_leak(text: str) -> str:
+            """清理 Whisper 输出中泄漏的 prompt 内容"""
+            if not text:
+                return text
+            # 移除 "Glossary: xxx." 开头的内容
+            # 匹配 "Glossary:" 开头，到第一个句号或换行结束
+            cleaned = re.sub(r'^Glossary:\s*[^.]*\.\s*', '', text, flags=re.IGNORECASE)
+            # 如果整个文本就是 Glossary 格式，返回空
+            if cleaned == text and text.lower().startswith('glossary:'):
+                return ''
+            return cleaned.strip()
+
+        # 清理每个 segment 的文本
+        for seg in segment_list:
+            seg.text = clean_prompt_leak(seg.text)
 
         # 构建统一格式的返回结果
         result = {

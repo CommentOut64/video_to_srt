@@ -9,6 +9,8 @@ import subprocess
 import os
 import gc
 import signal
+import json
+from datetime import datetime
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
 from typing import Optional, List
@@ -558,3 +560,192 @@ async def set_log_level(req: LogLevelRequest):
             "success": False,
             "message": f"设置日志级别失败: {str(e)}"
         }
+
+
+# ========== 更新系统 API (V3.1.0+dev.20260104.01) ==========
+
+class CheckUpdateResponse(BaseModel):
+    """检查更新响应"""
+    has_update: bool
+    current_version: str
+    latest_version: Optional[str] = None
+    changelog: Optional[str] = None
+    download_url: Optional[str] = None
+    release_date: Optional[str] = None
+
+
+class TriggerUpdateRequest(BaseModel):
+    """触发更新请求"""
+    download_url: str
+    version: str
+    changelog: Optional[str] = None
+
+
+# 当前版本号（从 CLAUDE.md 或 version.py 读取）
+CURRENT_VERSION = "3.1.1"
+
+# Gitee Release API 配置
+GITEE_API_BASE = "https://gitee.com/api/v5"
+GITEE_OWNER = "AnchorFlux"  # TODO: 替换为实际的 Gitee 用户名
+GITEE_REPO = "video_to_srt_gpu"  # TODO: 替换为实际的仓库名
+
+
+@router.get("/api/system/version")
+async def get_current_version():
+    """获取当前系统版本"""
+    return {
+        "success": True,
+        "version": CURRENT_VERSION,
+        "build_date": "2026-01-04"  # TODO: 从构建信息读取
+    }
+
+
+@router.get("/api/system/check-update")
+async def check_update():
+    """
+    检查是否有新版本可用
+
+    从 Gitee Releases 获取最新版本信息
+    """
+    import urllib.request
+    import urllib.error
+
+    try:
+        # 构建 API URL
+        api_url = f"{GITEE_API_BASE}/repos/{GITEE_OWNER}/{GITEE_REPO}/releases/latest"
+
+        logger.info(f"Checking for updates: {api_url}")
+
+        # 发送请求
+        req = urllib.request.Request(
+            api_url,
+            headers={
+                'User-Agent': 'AnchorFlux-Updater/1.0',
+                'Accept': 'application/json'
+            }
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode('utf-8'))
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                logger.info("No releases found on Gitee")
+                return CheckUpdateResponse(
+                    has_update=False,
+                    current_version=CURRENT_VERSION
+                ).dict()
+            raise
+
+        # 解析版本信息
+        latest_version = data.get('tag_name', '').lstrip('v')
+        changelog = data.get('body', '')
+        release_date = data.get('created_at', '')[:10]  # 只取日期部分
+
+        # 查找下载链接（优先 .zip 文件）
+        download_url = None
+        assets = data.get('assets', [])
+        for asset in assets:
+            if asset.get('name', '').endswith('.zip'):
+                download_url = asset.get('browser_download_url')
+                break
+
+        # 如果没有 assets，使用 zipball
+        if not download_url:
+            download_url = data.get('zipball_url')
+
+        # 比较版本（简单字符串比较，生产环境应使用 semver）
+        has_update = latest_version > CURRENT_VERSION
+
+        logger.info(f"Current: {CURRENT_VERSION}, Latest: {latest_version}, Has update: {has_update}")
+
+        return CheckUpdateResponse(
+            has_update=has_update,
+            current_version=CURRENT_VERSION,
+            latest_version=latest_version,
+            changelog=changelog,
+            download_url=download_url,
+            release_date=release_date
+        ).dict()
+
+    except Exception as e:
+        logger.error(f"检查更新失败: {e}")
+        return {
+            "success": False,
+            "has_update": False,
+            "current_version": CURRENT_VERSION,
+            "message": f"检查更新失败: {str(e)}"
+        }
+
+
+@router.post("/api/system/trigger-update")
+async def trigger_update(req: TriggerUpdateRequest):
+    """
+    触发更新流程
+
+    此 API 会:
+    1. 在项目根目录写入 update_signal.json
+    2. 关闭后端服务
+    3. Bootloader 检测到信号文件后执行更新
+    """
+    from app.core.config import config
+
+    try:
+        # 获取项目根目录
+        project_root = config.PROJECT_ROOT
+        signal_file = project_root / "update_signal.json"
+
+        # 写入更新信号文件
+        signal_data = {
+            "version": req.version,
+            "download_url": req.download_url,
+            "changelog": req.changelog,
+            "triggered_at": datetime.now().isoformat(),
+            "current_version": CURRENT_VERSION
+        }
+
+        with open(signal_file, 'w', encoding='utf-8') as f:
+            json.dump(signal_data, f, ensure_ascii=False, indent=2)
+
+        logger.info(f"Update signal written: {signal_file}")
+        logger.info(f"Target version: {req.version}")
+
+        # 返回成功响应
+        response = {
+            "success": True,
+            "message": "更新信号已写入，系统即将重启进行更新",
+            "signal_file": str(signal_file)
+        }
+
+        # 异步关闭后端（等待响应发送后）
+        asyncio.create_task(_shutdown_for_update())
+
+        return response
+
+    except Exception as e:
+        logger.error(f"触发更新失败: {e}")
+        return {
+            "success": False,
+            "message": f"触发更新失败: {str(e)}"
+        }
+
+
+async def _shutdown_for_update():
+    """为更新关闭后端服务"""
+    await asyncio.sleep(1)  # 等待响应发送完成
+
+    logger.info("=" * 60)
+    logger.info("Shutting down for update...")
+    logger.info("=" * 60)
+
+    # 保存必要状态
+    try:
+        from app.services.job_queue_service import get_queue_service
+        queue_service = get_queue_service()
+        queue_service._save_state()
+    except Exception as e:
+        logger.warning(f"保存队列状态失败: {e}")
+
+    # 退出进程（Bootloader 会检测到并执行更新）
+    logger.info("Backend exiting for update...")
+    os._exit(0)

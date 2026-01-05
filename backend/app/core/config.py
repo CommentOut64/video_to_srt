@@ -53,6 +53,9 @@ class ProjectConfig:
         # backend/app/core/config.py -> backend/app/core -> backend/app -> backend -> project_root
         self.BASE_DIR = Path(__file__).parent.parent.parent.parent.resolve()
 
+        # V3.1.0+dev.20260104.01: 添加 PROJECT_ROOT 别名（供更新系统使用）
+        self.PROJECT_ROOT = self.BASE_DIR
+
         # 加载.env文件 (在设置其他配置之前)
         env_file = self.BASE_DIR / ".env"
         load_env_file(env_file)
