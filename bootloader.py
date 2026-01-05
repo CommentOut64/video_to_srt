@@ -35,7 +35,7 @@ from datetime import datetime
 # ========================================
 # Constants
 # ========================================
-VERSION = "3.1.0+dev.20260105.01"
+VERSION = "3.1.1+dev.20260105.05"
 APP_NAME = "AnchorFlux"
 DEFAULT_BACKEND_PORT = 8000
 DEFAULT_FRONTEND_PORT = 5173
@@ -205,6 +205,9 @@ class ProcessManager:
         env['PYTHONUTF8'] = '1'
         env['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
+        # V3.1.1+dev.20260105.05: 传递 DEV_MODE 给后端，控制是否托管静态文件
+        env['DEV_MODE'] = 'true' if config.dev_mode else 'false'
+
         # Set HuggingFace mirror
         if config.hf_mirror:
             env['HF_ENDPOINT'] = 'https://hf-mirror.com'
@@ -282,8 +285,8 @@ class ProcessManager:
         if not (frontend_dir / "node_modules").exists():
             self.logger.warning("node_modules not found, running npm install...")
             try:
-                subprocess.run(['npm', 'install'], cwd=str(frontend_dir),
-                             check=True, timeout=300)
+                subprocess.run('npm install', cwd=str(frontend_dir),
+                             check=True, timeout=300, shell=True)
             except Exception as e:
                 self.logger.error(f"npm install failed: {e}")
                 return False
@@ -295,13 +298,23 @@ class ProcessManager:
             if os.name == 'nt':
                 creationflags = subprocess.CREATE_NEW_CONSOLE
 
+            # V3.1.1+dev.20260105.05: 使用 shell=True 确保能找到 npm
             self.frontend_process = subprocess.Popen(
-                ['npm', 'run', 'dev'],
+                'npm run dev',
                 cwd=str(frontend_dir),
-                creationflags=creationflags
+                creationflags=creationflags,
+                shell=True
             )
 
             self.logger.info(f"Frontend started: PID={self.frontend_process.pid}")
+
+            # V3.1.1+dev.20260105.05: 等待几秒让前端启动
+            time.sleep(3)
+            if self.frontend_process.poll() is not None:
+                exit_code = self.frontend_process.returncode
+                self.logger.error(f"Frontend crashed immediately with exit code: {exit_code}")
+                return False
+
             return True
 
         except Exception as e:
@@ -346,10 +359,131 @@ class ProcessManager:
 class UpdateManager:
     """Update manager"""
 
+    # V3.1.1+dev.20260105.04: 默认排除列表（配置文件不存在时使用）
+    DEFAULT_EXCLUDE_DIRS = {'jobs', 'models', 'temp', 'output', 'input', 'logs',
+                           'tools', '.venv', 'node_modules', '.git',
+                           'backend/models', 'backend/app/assets'}
+    DEFAULT_EXCLUDE_FILES = {'.env', '.env_installed', '.req_hash'}
+
     def __init__(self, config: BootloaderConfig, logger: BootloaderLogger):
         self.config = config
         self.logger = logger
         self.signal_file = config.project_root / UPDATE_SIGNAL_FILE
+        self.update_config_file = config.project_root / "backend" / "update_config.json"
+
+    def _load_update_config(self) -> Tuple[set, set]:
+        """
+        V3.1.1+dev.20260105.03: 从配置文件加载更新排除列表
+        配置文件位于 backend/update_config.json，可通过更新进行更新
+        """
+        exclude_dirs = self.DEFAULT_EXCLUDE_DIRS.copy()
+        exclude_files = self.DEFAULT_EXCLUDE_FILES.copy()
+
+        if not self.update_config_file.exists():
+            self.logger.debug(f"Update config not found, using defaults: {self.update_config_file}")
+            return exclude_dirs, exclude_files
+
+        try:
+            with open(self.update_config_file, 'r', encoding='utf-8') as f:
+                config_data = json.load(f)
+
+            # 读取目录排除列表
+            if 'exclude_dirs' in config_data:
+                exclude_dirs = set(config_data['exclude_dirs'])
+                self.logger.info(f"Loaded {len(exclude_dirs)} exclude dirs from config")
+
+            # 读取文件排除列表
+            if 'exclude_files' in config_data:
+                exclude_files = set(config_data['exclude_files'])
+                self.logger.info(f"Loaded {len(exclude_files)} exclude files from config")
+
+            return exclude_dirs, exclude_files
+
+        except Exception as e:
+            self.logger.warning(f"Failed to load update config: {e}, using defaults")
+            return self.DEFAULT_EXCLUDE_DIRS.copy(), self.DEFAULT_EXCLUDE_FILES.copy()
+
+    def _copy_with_excludes(self, source_dir: Path, dest_dir: Path,
+                            exclude_dirs: set, exclude_files: set,
+                            prefix: str = "") -> Tuple[int, int]:
+        """
+        V3.1.1+dev.20260105.04: 递归复制，支持任意深度的排除路径
+
+        Args:
+            source_dir: 源目录
+            dest_dir: 目标目录
+            exclude_dirs: 排除的目录路径集合（支持相对路径如 "backend/models"）
+            exclude_files: 排除的文件路径集合（支持相对路径）
+            prefix: 当前路径前缀（用于构建相对路径）
+
+        Returns:
+            (copied_count, skipped_count) 复制和跳过的项目数
+        """
+        copied_count = 0
+        skipped_count = 0
+
+        for item in source_dir.iterdir():
+            # 构建相对路径（用于匹配排除规则）
+            if prefix:
+                rel_path = f"{prefix}/{item.name}"
+            else:
+                rel_path = item.name
+
+            # 统一使用正斜杠，便于跨平台匹配
+            rel_path_normalized = rel_path.replace('\\', '/')
+
+            if item.is_dir():
+                # 检查目录是否在排除列表中
+                # 支持精确匹配和前缀匹配（如 "backend/models" 匹配 "backend/models/xxx"）
+                is_excluded = False
+                for exclude_dir in exclude_dirs:
+                    exclude_normalized = exclude_dir.replace('\\', '/')
+                    if rel_path_normalized == exclude_normalized or \
+                       rel_path_normalized.startswith(exclude_normalized + '/'):
+                        is_excluded = True
+                        break
+
+                if is_excluded:
+                    self.logger.debug(f"{prefix}[Skip] Excluded dir: {rel_path}")
+                    skipped_count += 1
+                    continue
+
+                # 目录未排除，递归处理
+                dest_subdir = dest_dir / item.name
+
+                # 确保目标目录存在
+                dest_subdir.mkdir(parents=True, exist_ok=True)
+
+                # 递归复制子目录内容
+                sub_copied, sub_skipped = self._copy_with_excludes(
+                    item, dest_subdir, exclude_dirs, exclude_files, rel_path
+                )
+                copied_count += sub_copied
+                skipped_count += sub_skipped
+
+            else:
+                # 文件处理
+                # 检查文件是否在排除列表中（支持相对路径和文件名匹配）
+                is_excluded = False
+                for exclude_file in exclude_files:
+                    exclude_normalized = exclude_file.replace('\\', '/')
+                    # 支持精确路径匹配和纯文件名匹配
+                    if rel_path_normalized == exclude_normalized or \
+                       item.name == exclude_file:
+                        is_excluded = True
+                        break
+
+                if is_excluded:
+                    self.logger.debug(f"{prefix}[Skip] Excluded file: {rel_path}")
+                    skipped_count += 1
+                    continue
+
+                # 文件未排除，直接覆盖复制
+                dest_file = dest_dir / item.name
+                shutil.copy2(item, dest_file)
+                copied_count += 1
+
+        return copied_count, skipped_count
 
     def check_update_signal(self) -> Optional[Dict[str, Any]]:
         """Check for update signal file"""
@@ -436,30 +570,20 @@ class UpdateManager:
 
             self.logger.info(f"[Headless] Source directory: {source_dir}")
 
-            # 4. 复制文件（排除用户数据目录）
+            # 4. 递归复制文件（排除用户数据目录和文件）
+            # V3.1.1+dev.20260105.04: 改用递归复制，支持任意深度的排除路径
             self.logger.info("[Headless] Step 3/4: Installing...")
-            exclude_dirs = {'jobs', 'models', 'temp', 'output', '.venv',
-                          'tools/python', 'node_modules', '.git'}
+            exclude_dirs, exclude_files = self._load_update_config()
 
-            copied_count = 0
-            for item in source_dir.iterdir():
-                if item.name in exclude_dirs:
-                    self.logger.debug(f"[Headless] Skipping: {item.name}")
-                    continue
+            self.logger.info(f"[Headless] Exclude dirs: {exclude_dirs}")
+            self.logger.info(f"[Headless] Exclude files: {exclude_files}")
 
-                dest = self.config.project_root / item.name
+            copied_count, skipped_count = self._copy_with_excludes(
+                source_dir, self.config.project_root,
+                exclude_dirs, exclude_files
+            )
 
-                if item.is_dir():
-                    if dest.exists():
-                        shutil.rmtree(dest)
-                    shutil.copytree(item, dest)
-                else:
-                    shutil.copy2(item, dest)
-
-                copied_count += 1
-                self.logger.debug(f"[Headless] Copied: {item.name}")
-
-            self.logger.info(f"[Headless] Copied {copied_count} items")
+            self.logger.info(f"[Headless] Copied {copied_count} files, skipped {skipped_count} excluded items")
 
             # 5. 清理临时文件
             self.logger.info("[Headless] Step 4/4: Cleaning up...")
@@ -558,22 +682,15 @@ class UpdateManager:
                 else:
                     source_dir = extract_dir
 
-                # Copy files (exclude user data directories)
-                exclude_dirs = {'jobs', 'models', 'temp', 'output', '.venv',
-                              'tools/python', 'node_modules', '.git'}
+                # Copy files (exclude user data directories and files)
+                # V3.1.1+dev.20260105.04: 改用递归复制，支持任意深度的排除路径
+                exclude_dirs, exclude_files = self._load_update_config()
 
-                for item in source_dir.iterdir():
-                    if item.name in exclude_dirs:
-                        continue
-
-                    dest = self.config.project_root / item.name
-
-                    if item.is_dir():
-                        if dest.exists():
-                            shutil.rmtree(dest)
-                        shutil.copytree(item, dest)
-                    else:
-                        shutil.copy2(item, dest)
+                copied_count, skipped_count = self._copy_with_excludes(
+                    source_dir, self.config.project_root,
+                    exclude_dirs, exclude_files
+                )
+                self.logger.info(f"Copied {copied_count} files, skipped {skipped_count} excluded items")
 
                 # 5. Cleanup
                 update_progress(95, "Cleaning up...")
@@ -601,11 +718,27 @@ class UpdateManager:
         return update_success[0]
 
 
+def get_project_root() -> Path:
+    """
+    获取项目根目录
+
+    V3.1.1+dev.20260105.02: 支持打包后的 EXE 运行环境
+    - 打包后: sys.executable 指向 EXE 文件，使用其所在目录
+    - 源码运行: __file__ 指向 bootloader.py，使用其所在目录
+    """
+    if getattr(sys, 'frozen', False):
+        # PyInstaller 打包后，sys.executable 是 EXE 文件路径
+        return Path(sys.executable).parent.resolve()
+    else:
+        # 源码运行
+        return Path(__file__).parent.resolve()
+
+
 class Bootloader:
     """Main bootloader class"""
 
     def __init__(self):
-        self.project_root = Path(__file__).parent.resolve()
+        self.project_root = get_project_root()
         self.config: Optional[BootloaderConfig] = None
         self.logger: Optional[BootloaderLogger] = None
         self.process_manager: Optional[ProcessManager] = None

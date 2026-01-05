@@ -572,6 +572,7 @@ class CheckUpdateResponse(BaseModel):
     changelog: Optional[str] = None
     download_url: Optional[str] = None
     release_date: Optional[str] = None
+    force_update: bool = False  # V3.1.1+dev.20260105.01: 强制更新标志
 
 
 class TriggerUpdateRequest(BaseModel):
@@ -579,15 +580,14 @@ class TriggerUpdateRequest(BaseModel):
     download_url: str
     version: str
     changelog: Optional[str] = None
+    delay_mode: bool = False  # V3.1.1+dev.20260105.01: 延迟更新模式（重启时更新）
 
 
-# 当前版本号（从 CLAUDE.md 或 version.py 读取）
+# 当前版本号
 CURRENT_VERSION = "3.1.1"
 
-# Gitee Release API 配置
-GITEE_API_BASE = "https://gitee.com/api/v5"
-GITEE_OWNER = "AnchorFlux"  # TODO: 替换为实际的 Gitee 用户名
-GITEE_REPO = "video_to_srt_gpu"  # TODO: 替换为实际的仓库名
+# V3.1.1+dev.20260105.01: 版本检查配置（使用 Gitee 镜像的 version.json）
+VERSION_CHECK_URL = "https://gitee.com/comment_out/anchor-flux-update/raw/master/version.json"
 
 
 @router.get("/api/system/version")
@@ -605,59 +605,63 @@ async def check_update():
     """
     检查是否有新版本可用
 
-    从 Gitee Releases 获取最新版本信息
+    V3.1.1+dev.20260105.01: 从 Gitee 镜像的 version.json 获取版本信息
+    version.json 格式:
+    {
+        "latest_version": "3.1.3",
+        "force_update": false,
+        "changelog": "更新内容",
+        "download_url": "https://github.com/.../update_v3.1.3.zip"
+    }
     """
     import urllib.request
     import urllib.error
 
     try:
-        # 构建 API URL
-        api_url = f"{GITEE_API_BASE}/repos/{GITEE_OWNER}/{GITEE_REPO}/releases/latest"
+        logger.info(f"Checking for updates: {VERSION_CHECK_URL}")
 
-        logger.info(f"Checking for updates: {api_url}")
-
-        # 发送请求
+        # 发送请求获取 version.json
         req = urllib.request.Request(
-            api_url,
+            VERSION_CHECK_URL,
             headers={
                 'User-Agent': 'AnchorFlux-Updater/1.0',
-                'Accept': 'application/json'
+                'Accept': 'application/json',
+                'Cache-Control': 'no-cache'  # 避免缓存
             }
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=10) as response:
+            with urllib.request.urlopen(req, timeout=15) as response:
                 data = json.loads(response.read().decode('utf-8'))
         except urllib.error.HTTPError as e:
             if e.code == 404:
-                logger.info("No releases found on Gitee")
+                logger.info("version.json not found")
                 return CheckUpdateResponse(
                     has_update=False,
                     current_version=CURRENT_VERSION
                 ).dict()
             raise
 
-        # 解析版本信息
-        latest_version = data.get('tag_name', '').lstrip('v')
-        changelog = data.get('body', '')
-        release_date = data.get('created_at', '')[:10]  # 只取日期部分
+        # 解析 version.json 格式
+        latest_version = data.get('latest_version', '').lstrip('v')
+        changelog = data.get('changelog', '')
+        download_url = data.get('download_url', '')
+        force_update = data.get('force_update', False)
 
-        # 查找下载链接（优先 .zip 文件）
-        download_url = None
-        assets = data.get('assets', [])
-        for asset in assets:
-            if asset.get('name', '').endswith('.zip'):
-                download_url = asset.get('browser_download_url')
-                break
+        # 比较版本号（使用元组比较以支持语义化版本）
+        def parse_version(v):
+            """将版本字符串解析为可比较的元组"""
+            try:
+                parts = v.split('.')
+                return tuple(int(p) for p in parts[:3])
+            except (ValueError, AttributeError):
+                return (0, 0, 0)
 
-        # 如果没有 assets，使用 zipball
-        if not download_url:
-            download_url = data.get('zipball_url')
+        current_tuple = parse_version(CURRENT_VERSION)
+        latest_tuple = parse_version(latest_version)
+        has_update = latest_tuple > current_tuple
 
-        # 比较版本（简单字符串比较，生产环境应使用 semver）
-        has_update = latest_version > CURRENT_VERSION
-
-        logger.info(f"Current: {CURRENT_VERSION}, Latest: {latest_version}, Has update: {has_update}")
+        logger.info(f"Current: {CURRENT_VERSION} ({current_tuple}), Latest: {latest_version} ({latest_tuple}), Has update: {has_update}")
 
         return CheckUpdateResponse(
             has_update=has_update,
@@ -665,7 +669,7 @@ async def check_update():
             latest_version=latest_version,
             changelog=changelog,
             download_url=download_url,
-            release_date=release_date
+            force_update=force_update
         ).dict()
 
     except Exception as e:
@@ -683,9 +687,13 @@ async def trigger_update(req: TriggerUpdateRequest):
     """
     触发更新流程
 
+    V3.1.1+dev.20260105.01: 支持延迟更新模式
+    - delay_mode=False: 立即更新（写入信号文件后关闭后端）
+    - delay_mode=True: 重启时更新（仅写入信号文件，不关闭后端）
+
     此 API 会:
     1. 在项目根目录写入 update_signal.json
-    2. 关闭后端服务
+    2. 如果不是延迟模式，关闭后端服务
     3. Bootloader 检测到信号文件后执行更新
     """
     from app.core.config import config
@@ -701,24 +709,35 @@ async def trigger_update(req: TriggerUpdateRequest):
             "download_url": req.download_url,
             "changelog": req.changelog,
             "triggered_at": datetime.now().isoformat(),
-            "current_version": CURRENT_VERSION
+            "current_version": CURRENT_VERSION,
+            "delay_mode": req.delay_mode  # V3.1.1+dev.20260105.01: 记录延迟模式
         }
 
         with open(signal_file, 'w', encoding='utf-8') as f:
             json.dump(signal_data, f, ensure_ascii=False, indent=2)
 
         logger.info(f"Update signal written: {signal_file}")
-        logger.info(f"Target version: {req.version}")
+        logger.info(f"Target version: {req.version}, Delay mode: {req.delay_mode}")
 
-        # 返回成功响应
-        response = {
-            "success": True,
-            "message": "更新信号已写入，系统即将重启进行更新",
-            "signal_file": str(signal_file)
-        }
-
-        # 异步关闭后端（等待响应发送后）
-        asyncio.create_task(_shutdown_for_update())
+        # 根据模式返回不同响应
+        if req.delay_mode:
+            # 延迟模式：仅写入信号文件，不关闭后端
+            response = {
+                "success": True,
+                "message": "更新已安排，将在下次重启时执行",
+                "signal_file": str(signal_file),
+                "delay_mode": True
+            }
+        else:
+            # 立即模式：写入信号文件后关闭后端
+            response = {
+                "success": True,
+                "message": "更新信号已写入，系统即将重启进行更新",
+                "signal_file": str(signal_file),
+                "delay_mode": False
+            }
+            # 异步关闭后端（等待响应发送后）
+            asyncio.create_task(_shutdown_for_update())
 
         return response
 

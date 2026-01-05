@@ -907,9 +907,13 @@ async def open_browser_if_needed():
     3. 如果有活跃客户端，跳过打开新页面（旧页面会自动刷新）
     4. 如果没有活跃客户端，打开新的浏览器标签页
 
-    这种方式避免了每次启动都打开新页面导致多页面冲突的问题
+    V3.1.1+dev.20260105.05: 开发模式下打开 localhost:5173，生产模式打开 localhost:8000
     """
     from app.services.client_registry import get_client_registry
+
+    # V3.1.1+dev.20260105.05: 检测开发模式，决定打开哪个端口
+    dev_mode = os.environ.get('DEV_MODE', '').lower() in ('true', '1', 'yes')
+    target_url = "http://localhost:5173" if dev_mode else "http://localhost:8000"
 
     # 等待前端服务启动（run.bat 中前端在后端之后启动）
     logger.info("等待前端服务启动...")
@@ -929,28 +933,32 @@ async def open_browser_if_needed():
             await asyncio.sleep(2)
 
     # 没有活跃客户端，打开浏览器
-    logger.info("无活跃客户端，正在打开浏览器...")
+    logger.info(f"无活跃客户端，正在打开浏览器: {target_url}")
     try:
         if os.name == 'nt':
             # Windows: 使用 start 命令强制打开新窗口/标签页
             subprocess.Popen(
-                ['cmd', '/c', 'start', '', 'http://localhost:8000'],
+                ['cmd', '/c', 'start', '', target_url],
                 shell=False,
                 creationflags=subprocess.CREATE_NO_WINDOW
             )
         else:
             import webbrowser
-            webbrowser.open("http://localhost:8000", new=2)
-        logger.info("浏览器标签页已打开: http://localhost:8000")
+            webbrowser.open(target_url, new=2)
+        logger.info(f"浏览器标签页已打开: {target_url}")
     except Exception as e:
         logger.error(f"打开浏览器失败: {e}")
 
 
 # ========== 静态文件托管 (生产模式) ==========
-# 检测前端 dist 目录并托管静态文件，实现开箱即用
+# V3.1.1+dev.20260105.05: 检测 DEV_MODE 环境变量，开发模式下不托管静态文件
+# 开发模式应使用 npm run dev (localhost:5173)，生产模式使用后端托管
+DEV_MODE = os.environ.get('DEV_MODE', '').lower() in ('true', '1', 'yes')
 FRONTEND_DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "frontend", "dist")
 
-if os.path.exists(FRONTEND_DIST):
+if DEV_MODE:
+    logger.info("开发模式: 静态文件托管已禁用，请使用 http://localhost:5173 访问前端")
+elif os.path.exists(FRONTEND_DIST):
     # 托管静态资源 (js, css, images等)
     app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST, "assets")), name="static-assets")
 

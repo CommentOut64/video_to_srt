@@ -15,7 +15,6 @@ __pycache__/
 build/
 dist/
 *.spec
-*.exe
 
 # 前端依赖和构建
 frontend/node_modules/
