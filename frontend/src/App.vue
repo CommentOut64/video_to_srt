@@ -9,6 +9,7 @@
  * - 全局任务状态同步
  * - 启动心跳服务（标签页重用机制）
  * - V3.1.1+dev.20260105.01: 启动时自动检查更新
+ * - V3.1.1+dev.20260106.01: 使用 sessionStorage 防止会话内重复检查更新
  */
 import { ref, onMounted, onUnmounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
@@ -29,11 +30,31 @@ const { checkForUpdate } = useUpdateChecker()
 
 let unsubscribeGlobal = null
 
-// V3.1.1+dev.20260105.01: 启动时检查更新
+// V3.1.1+dev.20260106.01: sessionStorage key，用于防止会话内重复检查更新
+const UPDATE_CHECK_SESSION_KEY = 'anchorflux_update_checked_this_session'
+
+// V3.1.1+dev.20260106.01: 启动时检查更新（每个会话只检查一次）
 async function checkUpdateOnStartup() {
+  // 检查本次会话是否已经检查过更新
+  try {
+    if (sessionStorage.getItem(UPDATE_CHECK_SESSION_KEY)) {
+      console.log('[App] 本次会话已检查过更新，跳过')
+      return
+    }
+  } catch {
+    // sessionStorage 不可用时继续执行
+  }
+
   console.log('[App] 步骤 0.5: 检查更新...')
 
   try {
+    // 标记本次会话已检查（在请求前标记，避免并发问题）
+    try {
+      sessionStorage.setItem(UPDATE_CHECK_SESSION_KEY, '1')
+    } catch {
+      // 忽略
+    }
+
     // 自动检查时会遵守忽略版本规则
     const result = await checkForUpdate(false)
 
@@ -66,7 +87,7 @@ onMounted(async () => {
     console.error('[App] 心跳服务启动失败:', error)
   }
 
-  // V3.1.1+dev.20260105.01: 启动时检查更新（不阻塞其他初始化）
+  // V3.1.1+dev.20260106.01: 启动时检查更新（每个会话只检查一次，不阻塞其他初始化）
   checkUpdateOnStartup()
 
   // 第一步：从后端同步任务列表（第一阶段修复：数据同步）
