@@ -105,6 +105,7 @@ import { ref, computed, watch, onMounted, onUnmounted, nextTick, inject } from "
 import { useProjectStore } from "@/stores/projectStore";
 import { usePlaybackManager } from "@/services/PlaybackManager";
 import ContextMenu from "@/components/editor/ContextMenu.vue";
+import { detectOverlappingSubtitles, OVERLAP_COLORS } from "@/utils/subtitleUtils";
 
 // ============ 缩放配置常量 ============
 const ZOOM_MIN = 20; // 最小缩放 20%
@@ -467,6 +468,7 @@ function setupWavesurferEvents() {
 }
 
 // 设置 Region 事件
+// V3.1.1+dev.20260106.03: 集成重叠检测，region-updated 时检测并标记重叠区域
 function setupRegionEvents() {
   if (!regionsPlugin) return;
 
@@ -478,6 +480,9 @@ function setupRegionEvents() {
       end: region.end,
     });
     emit("region-update", region);
+
+    // V3.1.1+dev.20260106.03: 拖拽结束后检测并标记重叠区域
+    checkAndMarkOverlaps();
   });
 
   regionsPlugin.on("region-clicked", (region, e) => {
@@ -489,13 +494,64 @@ function setupRegionEvents() {
     emit("region-click", region);
   });
 
+  // V3.1.1+dev.20260106.03: region-in/out 需要考虑重叠状态
   regionsPlugin.on("region-in", (region) => {
-    region.setOptions({ color: "rgba(88, 166, 255, 0.4)" });
+    // 如果是重叠区域，保持警示色的 hover 状态
+    const overlappingIds = detectOverlappingSubtitles(projectStore.subtitles);
+    if (overlappingIds.has(region.id)) {
+      region.setOptions({ color: "rgba(248, 81, 73, 0.5)" });  // 重叠区域 hover：更深的红色
+    } else {
+      region.setOptions({ color: OVERLAP_COLORS.hover });
+    }
   });
 
   regionsPlugin.on("region-out", (region) => {
-    region.setOptions({ color: props.regionColor });
+    // 恢复时需要判断是否为重叠区域
+    const overlappingIds = detectOverlappingSubtitles(projectStore.subtitles);
+    const isSelected = region.id === projectStore.view.selectedSubtitleId;
+
+    if (overlappingIds.has(region.id)) {
+      region.setOptions({ color: OVERLAP_COLORS.error });
+    } else if (isSelected) {
+      region.setOptions({ color: OVERLAP_COLORS.selected });
+    } else {
+      region.setOptions({ color: props.regionColor });
+    }
   });
+}
+
+/**
+ * V3.1.1+dev.20260106.03: 检测并标记重叠区域
+ * 只修改重叠区域的颜色，不影响其他区域
+ */
+function checkAndMarkOverlaps() {
+  if (!regionsPlugin || !isReady.value) return;
+
+  const overlappingIds = detectOverlappingSubtitles(projectStore.subtitles);
+  const regions = regionsPlugin.getRegions();
+
+  if (!regions || regions.length === 0) return;
+
+  regions.forEach(region => {
+    const isOverlapping = overlappingIds.has(region.id);
+    const isSelected = region.id === projectStore.view.selectedSubtitleId;
+
+    if (isOverlapping) {
+      // 重叠区域使用警示色
+      region.setOptions({ color: OVERLAP_COLORS.error });
+    } else if (isSelected) {
+      // 选中区域使用选中色
+      region.setOptions({ color: OVERLAP_COLORS.selected });
+    } else {
+      // 正常区域恢复正常色
+      region.setOptions({ color: props.regionColor });
+    }
+  });
+
+  // 如果存在重叠，记录日志
+  if (overlappingIds.size > 0) {
+    console.warn(`[WaveformTimeline] 检测到 ${overlappingIds.size} 个重叠区域:`, Array.from(overlappingIds));
+  }
 }
 
 // 加载音频数据
@@ -561,6 +617,7 @@ function stopPeaksPolling() {
 
 // 渲染字幕区域
 // V3.1.0: 增强日志，便于调试 regions 消失问题
+// V3.1.1+dev.20260106.03: 渲染时检测重叠并标记颜色
 function renderSubtitleRegions() {
   // 前置检查
   if (!isReady.value) {
@@ -581,6 +638,12 @@ function renderSubtitleRegions() {
     return;
   }
 
+  // V3.1.1+dev.20260106.03: 预先检测重叠区域
+  const overlappingIds = detectOverlappingSubtitles(projectStore.subtitles);
+  if (overlappingIds.size > 0) {
+    console.warn(`[WaveformTimeline] 检测到 ${overlappingIds.size} 个重叠区域`);
+  }
+
   isUpdatingRegions.value = true;
   regionsPlugin.clearRegions();
 
@@ -591,11 +654,21 @@ function renderSubtitleRegions() {
       return;
     }
     const isSelected = subtitle.id === projectStore.view.selectedSubtitleId;
+    const isOverlapping = overlappingIds.has(subtitle.id);
+
+    // V3.1.1+dev.20260106.03: 根据重叠状态决定颜色
+    let regionColor = props.regionColor;
+    if (isOverlapping) {
+      regionColor = OVERLAP_COLORS.error;  // 重叠区域优先显示警示色
+    } else if (isSelected) {
+      regionColor = OVERLAP_COLORS.selected;
+    }
+
     regionsPlugin.addRegion({
       id: subtitle.id,
       start: subtitle.start,
       end: subtitle.end,
-      color: isSelected ? "rgba(163, 113, 247, 0.35)" : props.regionColor,
+      color: regionColor,
       drag: props.dragEnabled,
       resize: props.resizeEnabled,
     });

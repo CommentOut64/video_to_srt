@@ -560,17 +560,36 @@ class TranscriptionService:
     def _generate_srt_from_sentences(self, sentences: List, output_path: Path):
         """
         从句子列表生成 SRT 文件
+        V3.1.1+dev.20260106.03: 生成前自动修复时间戳重叠
 
         Args:
             sentences: 句子列表
             output_path: 输出路径
         """
-        srt_content = []
+        # V3.1.1+dev.20260106.03: 转换为字典列表以便修复重叠
+        from app.utils.text_utils import repair_timestamp_overlaps, detect_timestamp_overlaps
 
-        for i, sentence in enumerate(sentences, 1):
-            start = self._format_srt_timestamp(sentence.start)
-            end = self._format_srt_timestamp(sentence.end)
-            text = sentence.text
+        segments = []
+        for sentence in sentences:
+            segments.append({
+                'start': sentence.start,
+                'end': sentence.end,
+                'text': sentence.text
+            })
+
+        # 检测并修复重叠
+        overlaps = detect_timestamp_overlaps(segments)
+        if overlaps:
+            self.logger.warning(f"检测到 {len(overlaps)} 处时间戳重叠，自动修复中...")
+            segments = repair_timestamp_overlaps(segments, gap_ms=1.0)
+            self.logger.info(f"已修复 {len(overlaps)} 处时间戳重叠")
+
+        # 生成 SRT 内容
+        srt_content = []
+        for i, seg in enumerate(segments, 1):
+            start = self._format_srt_timestamp(seg['start'])
+            end = self._format_srt_timestamp(seg['end'])
+            text = seg['text']
 
             srt_content.append(f"{i}\n{start} --> {end}\n{text}\n")
 
@@ -3163,20 +3182,21 @@ class TranscriptionService:
     def _generate_srt(self, results: List[Dict], path: str, word_level: bool):
         """
         生成SRT字幕文件
+        V3.1.1+dev.20260106.03: 生成前自动修复时间戳重叠
 
         Args:
             results: 转录结果列表
             path: 输出文件路径
             word_level: 是否使用词级时间戳
         """
-        lines = []
-        n = 1  # 字幕序号
+        # V3.1.1+dev.20260106.03: 导入重叠修复函数
+        from app.utils.text_utils import repair_timestamp_overlaps, detect_timestamp_overlaps
+
+        all_entries = []
 
         for r in results:
             if not r:
                 continue
-
-            entries = []
 
             # 词级时间戳模式
             if word_level and r.get('word_segments'):
@@ -3184,7 +3204,7 @@ class TranscriptionService:
                     if w.get('start') is not None and w.get('end') is not None:
                         txt = (w.get('word') or '').strip()
                         if txt:
-                            entries.append({
+                            all_entries.append({
                                 'start': w['start'],
                                 'end': w['end'],
                                 'text': txt
@@ -3196,30 +3216,38 @@ class TranscriptionService:
                     if s.get('start') is not None and s.get('end') is not None:
                         txt = (s.get('text') or '').strip()
                         if txt:
-                            entries.append({
+                            all_entries.append({
                                 'start': s['start'],
                                 'end': s['end'],
                                 'text': txt
                             })
 
-            # 写入SRT格式
-            for e in entries:
-                if e['end'] <= e['start']:
-                    continue  # 跳过无效时间戳
+        # 过滤无效时间戳
+        all_entries = [e for e in all_entries if e['end'] > e['start']]
 
-                lines.append(str(n))  # 序号
-                lines.append(
-                    f"{self._format_ts(e['start'])} --> {self._format_ts(e['end'])}"
-                )  # 时间戳
-                lines.append(e['text'])  # 字幕文本
-                lines.append("")  # 空行
-                n += 1
+        # V3.1.1+dev.20260106.03: 检测并修复重叠
+        if all_entries:
+            overlaps = detect_timestamp_overlaps(all_entries)
+            if overlaps:
+                self.logger.warning(f"检测到 {len(overlaps)} 处时间戳重叠，自动修复中...")
+                all_entries = repair_timestamp_overlaps(all_entries, gap_ms=1.0)
+                self.logger.info(f"已修复 {len(overlaps)} 处时间戳重叠")
+
+        # 写入SRT格式
+        lines = []
+        for n, e in enumerate(all_entries, 1):
+            lines.append(str(n))  # 序号
+            lines.append(
+                f"{self._format_ts(e['start'])} --> {self._format_ts(e['end'])}"
+            )  # 时间戳
+            lines.append(e['text'])  # 字幕文本
+            lines.append("")  # 空行
 
         # 写入文件
         with open(path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(lines))
 
-        self.logger.info(f"SRT文件已生成: {path}, 共{n-1}条字幕")
+        self.logger.info(f"SRT文件已生成: {path}, 共{len(all_entries)}条字幕")
 
     def clear_model_cache(self):
         """

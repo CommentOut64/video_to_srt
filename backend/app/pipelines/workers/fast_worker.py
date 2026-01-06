@@ -122,6 +122,7 @@ class FastWorker:
         # 初始化快流分句器（默认配置，主要依赖 VAD 停顿）
         if draft_split_config is None:
             draft_split_config = SplitConfig(
+                language="en",                   # 默认使用英文策略（非中文时使用）
                 prefer_punctuation_break=False,  # 不依赖标点
                 use_dynamic_pause=True,          # 使用动态停顿
                 pause_threshold=0.5,
@@ -440,7 +441,7 @@ class FastWorker:
         """
         检查句子是否语义不完整（V3.1.0）
 
-        使用中文分句器的语义完整性检查逻辑。
+        根据文本内容自动检测语言，选择合适的语义完整性检查策略。
 
         Args:
             sentence: 句子对象
@@ -451,9 +452,18 @@ class FastWorker:
         if not sentence or not sentence.text:
             return False
 
-        # 使用中文分句器的 strategy 进行语义检查
-        strategy = self.chinese_splitter.config.get_strategy()
-        is_incomplete = strategy.is_incomplete_ending(sentence.text)
+        text = sentence.text.strip()
+        
+        # 检测文本是否包含中文字符
+        has_chinese = any('\u4e00' <= c <= '\u9fff' for c in text)
+        
+        # 根据语言选择分句器的策略
+        if has_chinese:
+            strategy = self.chinese_splitter.config.get_strategy()
+        else:
+            strategy = self.draft_splitter.config.get_strategy()
+        
+        is_incomplete = strategy.is_incomplete_ending(text)
 
         if is_incomplete:
             self.logger.debug(f"[跨chunk检查] 句子语义不完整: '{sentence.text[-20:]}'")

@@ -198,6 +198,7 @@ import sseChannelManager from '@/services/sseChannelManager'
 import { useShortcuts } from '@/hooks/useShortcuts'
 import { useProxyVideo } from '@/composables/useProxyVideo'
 import { usePlaybackManager } from '@/services/PlaybackManager'
+import { repairSubtitleOverlaps } from '@/utils/subtitleUtils'
 
 // 组件导入
 import EditorHeader from '@/components/editor/EditorHeader.vue'
@@ -1162,9 +1163,15 @@ async function handleASSExport() {
   }
 }
 
+/**
+ * V3.1.1+dev.20260106.04: 导出前自动修复时间戳重叠
+ */
 function generateVTT() {
+  // 修复时间戳重叠（使用1ms间隔）
+  const repairedSubtitles = repairSubtitleOverlaps(projectStore.subtitles, 1)
+
   let vtt = 'WEBVTT\n\n'
-  projectStore.subtitles.forEach((sub, i) => {
+  repairedSubtitles.forEach((sub, i) => {
     const start = formatVTTTime(sub.start)
     const end = formatVTTTime(sub.end)
     vtt += `${i + 1}\n${start} --> ${end}\n${sub.text}\n\n`

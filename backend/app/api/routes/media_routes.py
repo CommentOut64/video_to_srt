@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from app.core.config import config
 from app.utils.ass_converter import ASSConverter
+from app.utils.text_utils import repair_srt_overlaps, repair_timestamp_overlaps, detect_timestamp_overlaps
 
 logger = logging.getLogger(__name__)
 
@@ -1498,9 +1499,13 @@ async def get_srt_content(job_id: str):
 async def save_srt_content(job_id: str, request: Request):
     """
     保存编辑后的SRT字幕文件
+    V3.1.1+dev.20260106.03: 保存前自动修复时间戳重叠
 
     Body:
-        { content: "1\n00:00:01,000 --> 00:00:03,000\n..." }
+        {
+            content: "1\n00:00:01,000 --> 00:00:03,000\n...",
+            auto_repair: true  // 可选，默认 true，是否自动修复重叠
+        }
     """
     job_dir = config.JOBS_DIR / job_id
 
@@ -1510,9 +1515,17 @@ async def save_srt_content(job_id: str, request: Request):
     try:
         body = await request.json()
         content = body.get("content")
+        auto_repair = body.get("auto_repair", True)  # 默认启用自动修复
 
         if not content:
             raise HTTPException(status_code=400, detail="缺少content参数")
+
+        # V3.1.1+dev.20260106.03: 自动修复时间戳重叠
+        repaired_count = 0
+        if auto_repair:
+            content, repaired_count = repair_srt_overlaps(content, gap_ms=1.0)
+            if repaired_count > 0:
+                logger.info(f"[{job_id}] 自动修复了 {repaired_count} 处时间戳重叠")
 
         srt_file = None
         for file in job_dir.iterdir():
@@ -1536,11 +1549,18 @@ async def save_srt_content(job_id: str, request: Request):
         with open(srt_file, 'w', encoding='utf-8') as f:
             f.write(content)
 
-        return JSONResponse({
+        response_data = {
             "success": True,
             "message": "SRT文件保存成功",
             "filename": srt_file.name
-        })
+        }
+
+        # V3.1.1+dev.20260106.03: 返回修复信息
+        if repaired_count > 0:
+            response_data["repaired_overlaps"] = repaired_count
+            response_data["message"] = f"SRT文件保存成功，自动修复了 {repaired_count} 处重叠"
+
+        return JSONResponse(response_data)
 
     except HTTPException:
         raise
@@ -1588,17 +1608,19 @@ async def get_ass_content(job_id: str):
 async def generate_ass_from_srt(job_id: str, request: Request):
     """
     从 SRT 文件生成 ASS 字幕文件
+    V3.1.1+dev.20260106.03: 生成前自动修复时间戳重叠
 
     Request Body:
         {
             "style_preset": "default" | "movie" | "news" | "danmaku",
             "title": "字幕标题",
             "video_width": 1920,
-            "video_height": 1080
+            "video_height": 1080,
+            "auto_repair": true  // 可选，默认 true，是否自动修复重叠
         }
 
     Returns:
-        JSON: { job_id, filename, message }
+        JSON: { job_id, filename, message, repaired_overlaps? }
     """
     job_dir = config.JOBS_DIR / job_id
 
@@ -1622,6 +1644,7 @@ async def generate_ass_from_srt(job_id: str, request: Request):
         title = body.get("title", srt_file.stem)
         video_width = body.get("video_width", 1920)
         video_height = body.get("video_height", 1080)
+        auto_repair = body.get("auto_repair", True)  # V3.1.1+dev.20260106.03: 默认启用自动修复
 
         # 读取 SRT 文件并解析为字幕数据
         subtitles = []
@@ -1646,6 +1669,17 @@ async def generate_ass_from_srt(job_id: str, request: Request):
                         "text": text
                     })
 
+        # V3.1.1+dev.20260106.03: 自动修复时间戳重叠
+        repaired_count = 0
+        if auto_repair and subtitles:
+            # 检测重叠数量
+            overlaps = detect_timestamp_overlaps(subtitles)
+            repaired_count = len(overlaps)
+
+            if repaired_count > 0:
+                subtitles = repair_timestamp_overlaps(subtitles, gap_ms=1.0)
+                logger.info(f"[{job_id}] ASS生成前自动修复了 {repaired_count} 处时间戳重叠")
+
         # 生成 ASS 文件
         ass_file = job_dir / f"{srt_file.stem}.ass"
         ASSConverter.convert_from_subtitles(
@@ -1659,11 +1693,18 @@ async def generate_ass_from_srt(job_id: str, request: Request):
 
         logger.info(f"ASS 文件已生成: {ass_file}")
 
-        return JSONResponse({
+        response_data = {
             "job_id": job_id,
             "filename": ass_file.name,
             "message": "ASS文件生成成功"
-        })
+        }
+
+        # V3.1.1+dev.20260106.03: 返回修复信息
+        if repaired_count > 0:
+            response_data["repaired_overlaps"] = repaired_count
+            response_data["message"] = f"ASS文件生成成功，自动修复了 {repaired_count} 处重叠"
+
+        return JSONResponse(response_data)
 
     except Exception as e:
         logger.error(f"生成ASS文件失败: {str(e)}")

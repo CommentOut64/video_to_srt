@@ -9,6 +9,7 @@ import { ref, computed, watch, toRaw } from "vue";
 import { useRefHistory } from "@vueuse/core";
 import localforage from "localforage";
 import smartSaver from "@/services/SmartSaver";
+import { repairSubtitleOverlaps } from "@/utils/subtitleUtils";
 
 export const useProjectStore = defineStore("project", () => {
   // ========== 1. 项目元数据 ==========
@@ -872,10 +873,14 @@ export const useProjectStore = defineStore("project", () => {
 
   /**
    * 导出SRT字符串
+   * V3.1.1+dev.20260106.04: 导出前自动修复时间戳重叠
    */
   function generateSRT() {
+    // 修复时间戳重叠（使用1ms间隔）
+    const repairedSubtitles = repairSubtitleOverlaps(subtitles.value, 1);
+
     let srtContent = "";
-    subtitles.value.forEach((sub, index) => {
+    repairedSubtitles.forEach((sub, index) => {
       srtContent += `${index + 1}\n`;
       srtContent += `${formatTimestamp(sub.start)} --> ${formatTimestamp(
         sub.end
