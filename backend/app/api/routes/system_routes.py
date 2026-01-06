@@ -223,7 +223,12 @@ async def shutdown_system(req: ShutdownRequest):
             logger.warning(f"清理GPU缓存失败: {e}")
             cleanup_report["gpu_cache_cleared"] = False
 
-        # ========== Phase 5: 清理临时文件（可选） ==========
+        # ========== Phase 5: 清理临时文件（可选）和日志 ==========
+        # V3.1.1+dev.20260106.02: 每次关闭都清理超过7天的日志
+        logger.info("Phase 5: 清理过期日志...")
+        logs_cleaned = _cleanup_old_logs(days=7)
+        cleanup_report["logs_cleaned"] = logs_cleaned
+
         if req.cleanup_temp:
             logger.info("Phase 5: 清理临时文件...")
             cleaned = _cleanup_temp_files_safely()
@@ -363,10 +368,59 @@ def _cleanup_temp_files_safely() -> bool:
             logger.info("临时文件已清理（保留所有任务数据）")
         
         return cleaned
-        
+
     except Exception as e:
         logger.warning(f"清理临时文件失败: {e}")
         return False
+
+
+def _cleanup_old_logs(days: int = 7) -> int:
+    """
+    V3.1.1+dev.20260106.02: 清理超过指定天数的日志文件
+
+    Args:
+        days: 保留天数，默认7天
+
+    Returns:
+        int: 清理的日志文件数量
+    """
+    try:
+        from app.core.config import config
+        from datetime import datetime, timedelta
+
+        cleaned_count = 0
+        cutoff_time = datetime.now() - timedelta(days=days)
+
+        if not config.LOG_DIR.exists():
+            return 0
+
+        # 遍历日志目录
+        for log_file in config.LOG_DIR.iterdir():
+            try:
+                # 只处理 .log 文件
+                if not log_file.is_file() or log_file.suffix.lower() != '.log':
+                    continue
+
+                # 获取文件修改时间
+                mtime = datetime.fromtimestamp(log_file.stat().st_mtime)
+
+                # 如果文件超过指定天数，删除
+                if mtime < cutoff_time:
+                    log_file.unlink()
+                    cleaned_count += 1
+                    logger.debug(f"已删除过期日志: {log_file.name} (修改于 {mtime.strftime('%Y-%m-%d')})")
+
+            except Exception as e:
+                logger.debug(f"清理日志文件失败: {log_file} - {e}")
+
+        if cleaned_count > 0:
+            logger.info(f"已清理 {cleaned_count} 个超过 {days} 天的日志文件")
+
+        return cleaned_count
+
+    except Exception as e:
+        logger.warning(f"清理日志失败: {e}")
+        return 0
 
 
 async def _terminate_processes():
