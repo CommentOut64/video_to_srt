@@ -24,6 +24,7 @@ from app.services.audio.vad_service import VADConfig
 from app.pipelines.stages.spectral_triage_stage import SpectralTriageStage
 from app.pipelines.stages.separation_stage import SeparationStage
 from app.models.job_models import PreprocessingConfig, JobState
+from app.services.demucs_service import get_demucs_service
 
 # V3.7: 导入取消令牌
 if TYPE_CHECKING:
@@ -82,8 +83,16 @@ class PreprocessingPipeline:
         # 初始化人声分离阶段（如果启用）
         enable_demucs = config.demucs_strategy != "off"
         if enable_demucs:
+            demucs_service = get_demucs_service()
+            try:
+                demucs_service.set_model(config.demucs_model)
+            except Exception as e:
+                self.logger.warning(
+                    f"设置 Demucs 模型 {config.demucs_model} 失败，使用默认模型: {e}"
+                )
             self.separation_stage = SeparationStage(
                 mode=config.separation_mode,
+                demucs_service=demucs_service,
                 logger=self.logger,
                 cancellation_token=cancellation_token  # V3.7: 传递令牌
             )

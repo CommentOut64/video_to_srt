@@ -389,6 +389,7 @@ const taskConfig = ref({
     demucs_strategy: 'auto',
     demucs_model: 'htdemucs',
     demucs_shifts: 1,
+    separation_mode: 'on_demand',
     spectrum_threshold: 0.35,
     vad_filter: true,
     enable_spectral_triage: true
@@ -627,6 +628,9 @@ async function handleUpload() {
   const failCount = ref(0);
 
   try {
+    // V3.1.1+dev.20260106.01: 调试日志
+    console.log('[DEBUG] taskConfig.preprocessing:', JSON.stringify(taskConfig.value.preprocessing, null, 2));
+
     // v3.5: 构建转录设置，使用 task_config 格式
     const transcriptionSettings = {
       task_config: {
@@ -644,6 +648,9 @@ async function handleUpload() {
       batch_size: 16,
       word_timestamps: false
     };
+
+    // V3.1.1+dev.20260106.01: 调试日志
+    console.log('[DEBUG] transcriptionSettings.task_config.preprocessing:', JSON.stringify(transcriptionSettings.task_config.preprocessing, null, 2));
 
     // 逐个上传文件
     for (const file of uploadFiles.value) {

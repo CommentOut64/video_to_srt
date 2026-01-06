@@ -38,6 +38,8 @@ class PreprocessingSettingsAPI(BaseModel):
     demucs_model: str = Field(default="htdemucs", description="Demucs 模型")
     # 分离预测次数: 1-5
     demucs_shifts: int = Field(default=1, ge=1, le=5, description="分离预测次数")
+    # 分离模式: global/on_demand
+    separation_mode: str = Field(default="on_demand", description="人声分离模式")
     # 是否启用频谱分诊（直通模式应设为 false）
     enable_spectral_triage: bool = Field(default=True, description="是否启用频谱分诊")
     # 分诊灵敏度: 0.0-1.0

@@ -117,6 +117,9 @@ class PreprocessingSettings:
     # 分离预测次数: 1-5, 数值越高效果越好但速度越慢
     demucs_shifts: int = 1
 
+    # 分离模式: global/on_demand
+    separation_mode: str = "on_demand"
+
     # 是否启用频谱分诊（直通模式应设为 false）
     enable_spectral_triage: bool = True
 
@@ -132,6 +135,7 @@ class PreprocessingSettings:
             "demucs_strategy": self.demucs_strategy,
             "demucs_model": self.demucs_model,
             "demucs_shifts": self.demucs_shifts,
+            "separation_mode": self.separation_mode,
             "enable_spectral_triage": self.enable_spectral_triage,
             "spectrum_threshold": self.spectrum_threshold,
             "vad_filter": self.vad_filter,
@@ -279,6 +283,7 @@ PRESET_FAST = MacroPreset(
         demucs_strategy="off",          # 强制关闭人声分离
         demucs_model="htdemucs",
         demucs_shifts=1,
+        separation_mode="on_demand",
         enable_spectral_triage=False,   # 直通模式: 跳过频谱分诊
         spectrum_threshold=0.35,
         vad_filter=True,
@@ -318,6 +323,7 @@ PRESET_BALANCED = MacroPreset(
         demucs_strategy="auto",         # 智能分诊
         demucs_model="htdemucs",
         demucs_shifts=1,
+        separation_mode="on_demand",
         enable_spectral_triage=True,    # 智能模式: 启用频谱分诊
         spectrum_threshold=0.35,
         vad_filter=True,
@@ -357,6 +363,7 @@ PRESET_QUALITY = MacroPreset(
         demucs_strategy="force_on",     # 强制开启人声分离
         demucs_model="mdx_extra",       # 使用 mdx_extra 高质量模型
         demucs_shifts=1,                # 增加预测次数
+        separation_mode="global",
         enable_spectral_triage=False,   # 强制分离模式: 跳过频谱分诊
         spectrum_threshold=0.35,
         vad_filter=True,
@@ -434,6 +441,7 @@ class TaskConfig:
                 demucs_strategy=preprocessing_data.get("demucs_strategy", "auto"),
                 demucs_model=preprocessing_data.get("demucs_model", "htdemucs"),
                 demucs_shifts=preprocessing_data.get("demucs_shifts", 1),
+                separation_mode=preprocessing_data.get("separation_mode", "on_demand"),
                 spectrum_threshold=preprocessing_data.get("spectrum_threshold", 0.35),
                 vad_filter=preprocessing_data.get("vad_filter", True),
             ),
@@ -474,6 +482,7 @@ class TaskConfig:
                 demucs_strategy=preset.preprocessing.demucs_strategy,
                 demucs_model=preset.preprocessing.demucs_model,
                 demucs_shifts=preset.preprocessing.demucs_shifts,
+                separation_mode=preset.preprocessing.separation_mode,
                 spectrum_threshold=preset.preprocessing.spectrum_threshold,
                 vad_filter=preset.preprocessing.vad_filter,
             ),
