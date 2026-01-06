@@ -814,6 +814,12 @@ function handleFullscreenChange() {
 // 处理视频容器点击（切换播放暂停）
 let clickTimer = null
 function handleContainerClick(e) {
+  // V3.1.1+dev.20260106.02: 修饰键点击时不触发暂停切换
+  // 防止 Shift/Ctrl/Alt 等修饰键与字幕移动操作冲突
+  if (e.shiftKey || e.ctrlKey || e.altKey || e.metaKey) {
+    return
+  }
+
   if (clickTimer) {
     clearTimeout(clickTimer)
     clickTimer = null
