@@ -798,13 +798,22 @@ class TranscriptionService:
 
         dest_path = job_dir / filename
 
-        # 复制文件到任务目录
+        # V3.1.1+dev.20260106.01: 使用硬链接替代复制，节省磁盘空间
+        # 硬链接让 input/video.mp4 和 jobs/{job_id}/video.mp4 指向同一数据块
+        # 支持多个任务指向同一个视频文件，删除任务时不影响原始文件
         if os.path.abspath(src_path) != os.path.abspath(dest_path):
             try:
-                shutil.copyfile(src_path, dest_path)
-                self.logger.debug(f"文件已复制: {src_path} -> {dest_path}")
-            except Exception as e:
-                self.logger.warning(f"文件复制失败: {e}")
+                # 优先使用硬链接
+                os.link(src_path, dest_path)
+                self.logger.debug(f"硬链接创建成功: {src_path} -> {dest_path}")
+            except (OSError, NotImplementedError) as e:
+                # 硬链接失败时降级到复制（跨文件系统、网络挂载等场景）
+                self.logger.warning(f"硬链接创建失败，回退到复制: {e}")
+                try:
+                    shutil.copyfile(src_path, dest_path)
+                    self.logger.debug(f"文件已复制: {src_path} -> {dest_path}")
+                except Exception as copy_err:
+                    self.logger.warning(f"文件复制失败: {copy_err}")
 
         # 创建任务状态对象
         job = JobState(
