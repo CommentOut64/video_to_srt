@@ -53,9 +53,10 @@
       <!-- 上半部分交互层：只处理光标拖拽，阻止Region操作 -->
       <div
         class="waveform-upper-zone"
-        @mousedown="handleUpperZoneMouseDown"
-        @mousemove="handleUpperZoneMouseMove"
-        @mouseleave="handleWaveformMouseLeave"
+        :class="{ 'is-region-dragging': isRegionPointerDragging }"
+        @pointerdown="handleUpperZonePointerDown"
+        @pointermove="handleUpperZonePointerMove"
+        @pointerleave="handleWaveformPointerLeave"
       ></div>
 
       <!-- 下半部分：WaveSurfer 波形和 Regions -->
@@ -165,8 +166,18 @@ const maxRetries = 3; // 最大重试次数
 // 自定义交互状态
 const cursorDragMode = ref("hover-only"); // 'hover-only' | 'anywhere'
 const isDraggingCursor = ref(false); // 是否正在拖拽光标
+const isRegionPointerDragging = ref(false); // Region 是否正在被拖拽
 const currentMouseCursor = ref("default"); // 当前鼠标样式
 let cursorDragStartTime = 0;
+let cursorPointerId = null;
+let cursorPointerTarget = null;
+let cursorDragGuardsAttached = false;
+let regionPointerId = null;
+let regionPointerTarget = null;
+let regionDragGuardsAttached = false;
+let regionPointerGuardEl = null;
+let previousBodyUserSelect = "";
+let previousBodyWebkitSelect = "";
 
 // 自定义滚动条状态
 const scrollbarThumbLeft = ref(0);
@@ -874,6 +885,167 @@ function stopSmartFollow() {
 
 // ============ 自定义交互逻辑（上下半区域分离）============
 
+// 【指针守护】全局监听指针事件，确保拖拽过程中不会因为冒泡或焦点变化而提前结束
+function attachCursorDragGuards() {
+  if (cursorDragGuardsAttached) return;
+  cursorDragGuardsAttached = true;
+  document.addEventListener("pointermove", handleCursorDragMove, true);
+  document.addEventListener("pointerup", handleCursorPointerEnd, true);
+  document.addEventListener("pointercancel", handleCursorPointerCancel, true);
+  window.addEventListener("blur", handleCursorPointerCancel, true);
+}
+
+function detachCursorDragGuards() {
+  if (!cursorDragGuardsAttached) return;
+  cursorDragGuardsAttached = false;
+  document.removeEventListener("pointermove", handleCursorDragMove, true);
+  document.removeEventListener("pointerup", handleCursorPointerEnd, true);
+  document.removeEventListener("pointercancel", handleCursorPointerCancel, true);
+  window.removeEventListener("blur", handleCursorPointerCancel, true);
+}
+
+function handleCursorPointerEnd(e) {
+  if (!isDraggingCursor.value) return;
+  if (
+    typeof e?.pointerId === "number" &&
+    cursorPointerId !== null &&
+    e.pointerId !== cursorPointerId
+  ) {
+    return;
+  }
+  handleCursorDragEnd();
+}
+
+function handleCursorPointerCancel(e) {
+  if (!isDraggingCursor.value) return;
+  if (
+    typeof e?.pointerId === "number" &&
+    cursorPointerId !== null &&
+    e.pointerId !== cursorPointerId
+  ) {
+    return;
+  }
+  handleCursorDragEnd();
+}
+
+// 【正文拖拽保护】Region 拖拽时关闭上层遮罩，避免事件被截断
+function disableBodySelection() {
+  if (typeof document === "undefined" || !document.body) return;
+  previousBodyUserSelect = document.body.style.userSelect;
+  previousBodyWebkitSelect = document.body.style.webkitUserSelect;
+  document.body.style.userSelect = "none";
+  document.body.style.webkitUserSelect = "none";
+}
+
+function restoreBodySelection() {
+  if (typeof document === "undefined" || !document.body) return;
+  document.body.style.userSelect = previousBodyUserSelect;
+  document.body.style.webkitUserSelect = previousBodyWebkitSelect;
+}
+
+function attachRegionDragGuards() {
+  if (regionDragGuardsAttached) return;
+  regionDragGuardsAttached = true;
+  document.addEventListener("pointerup", handleRegionPointerUp, true);
+  document.addEventListener("pointercancel", handleRegionPointerCancel, true);
+  window.addEventListener("blur", handleRegionPointerCancel, true);
+  disableBodySelection();
+}
+
+function detachRegionDragGuards() {
+  if (!regionDragGuardsAttached) return;
+  regionDragGuardsAttached = false;
+  document.removeEventListener("pointerup", handleRegionPointerUp, true);
+  document.removeEventListener("pointercancel", handleRegionPointerCancel, true);
+  window.removeEventListener("blur", handleRegionPointerCancel, true);
+  isRegionPointerDragging.value = false;
+  regionPointerId = null;
+  regionPointerTarget = null;
+  restoreBodySelection();
+}
+
+function handleRegionPointerUp(e) {
+  if (
+    typeof e?.pointerId === "number" &&
+    regionPointerId !== null &&
+    e.pointerId !== regionPointerId
+  ) {
+    return;
+  }
+  finalizeRegionPointerDrag();
+}
+
+function handleRegionPointerCancel(e) {
+  if (
+    typeof e?.pointerId === "number" &&
+    regionPointerId !== null &&
+    e.pointerId !== regionPointerId
+  ) {
+    return;
+  }
+  finalizeRegionPointerDrag();
+}
+
+function finalizeRegionPointerDrag() {
+  if (!isRegionPointerDragging.value) return;
+
+  if (
+    regionPointerTarget &&
+    typeof regionPointerId === "number" &&
+    typeof regionPointerTarget.releasePointerCapture === "function"
+  ) {
+    try {
+      if (regionPointerTarget.hasPointerCapture?.(regionPointerId)) {
+        regionPointerTarget.releasePointerCapture(regionPointerId);
+      }
+    } catch (error) {
+      console.debug("[WaveformTimeline] 释放 Region 指针捕获失败:", error);
+    }
+  }
+
+  regionPointerId = null;
+  regionPointerTarget = null;
+  isRegionPointerDragging.value = false;
+  detachRegionDragGuards();
+}
+
+function handleRegionPointerDown(e) {
+  if (!wavesurfer || !isReady.value) return;
+  if (e.pointerType === "mouse" && e.button !== 0) return;
+
+  const target = e.target;
+  if (!(target instanceof HTMLElement)) return;
+
+  const regionEl = target.closest('[part*="region"]');
+  if (!(regionEl instanceof HTMLElement)) return;
+
+  regionPointerId = e.pointerId;
+  regionPointerTarget = regionEl;
+  isRegionPointerDragging.value = true;
+
+  if (typeof regionEl.setPointerCapture === "function") {
+    try {
+      regionEl.setPointerCapture(e.pointerId);
+    } catch (error) {
+      console.debug("[WaveformTimeline] Region 指针捕获失败:", error);
+    }
+  }
+
+  attachRegionDragGuards();
+}
+
+function setupRegionPointerGuards() {
+  if (regionPointerGuardEl || !waveformRef.value) return;
+  regionPointerGuardEl = waveformRef.value;
+  regionPointerGuardEl.addEventListener("pointerdown", handleRegionPointerDown, true);
+}
+
+function teardownRegionPointerGuards() {
+  if (!regionPointerGuardEl) return;
+  regionPointerGuardEl.removeEventListener("pointerdown", handleRegionPointerDown, true);
+  regionPointerGuardEl = null;
+}
+
 /**
  * 获取鼠标点击的时间位置
  * @param {number} clientX - 鼠标的 clientX 坐标
@@ -944,9 +1116,9 @@ function isMouseNearCursor(clientX, threshold = 10) {
 /**
  * 上半部分区域鼠标按下事件（只处理光标拖拽，完全阻止Region操作）
  */
-function handleUpperZoneMouseDown(e) {
+function handleUpperZonePointerDown(e) {
   if (!wavesurfer || !isReady.value) return;
-  if (e.button !== 0) return; // 只处理左键
+  if (e.pointerType === "mouse" && e.button !== 0) return; // 只处理鼠标左键
 
   // 【关键】视频未就绪时拦截所有波形操作
   if (!isVideoReady.value) {
@@ -958,12 +1130,8 @@ function handleUpperZoneMouseDown(e) {
   e.preventDefault();
   e.stopPropagation();
 
-  // 【关键修复】点击后强制将焦点移到一个可聚焦的容器元素上
-  // 而不是 body，因为 body.focus() 在某些浏览器中不可靠
-  // 我们使用 containerRef（波形容器），并确保它可聚焦
-  if (containerRef.value) {
-    containerRef.value.focus();
-  }
+  // V3.1.1+dev.20260106.02: 移除强制焦点转移，避免破坏事件链
+  // 焦点转移可能导致拖拽过程中事件监听器失效
 
   // 检查是否允许拖拽
   let canDrag = false;
@@ -980,14 +1148,28 @@ function handleUpperZoneMouseDown(e) {
     // 开始拖拽光标
     isDraggingCursor.value = true;
     cursorDragStartTime = projectStore.player.currentTime;
+    cursorPointerId = typeof e.pointerId === "number" ? e.pointerId : null;
+    cursorPointerTarget =
+      e.currentTarget instanceof HTMLElement ? e.currentTarget : null;
 
     // 使用 PlaybackManager 进行拖拽
     playbackManager.startDragging('waveformCursor');
     playbackManager.updateDragging(clickTime);
     emit("seek", clickTime);
 
-    document.addEventListener("mousemove", handleCursorDragMove);
-    document.addEventListener("mouseup", handleCursorDragEnd);
+    if (
+      cursorPointerTarget &&
+      typeof cursorPointerTarget.setPointerCapture === "function" &&
+      typeof e.pointerId === "number"
+    ) {
+      try {
+        cursorPointerTarget.setPointerCapture(e.pointerId);
+      } catch (error) {
+        console.debug("[WaveformTimeline] 光标指针捕获失败:", error);
+      }
+    }
+
+    attachCursorDragGuards();
   } else {
     // 单击跳转（非拖拽）
     playbackManager.seekTo(clickTime);
@@ -998,9 +1180,9 @@ function handleUpperZoneMouseDown(e) {
 /**
  * 上半部分区域鼠标移动事件（动态改变鼠标样式）
  */
-function handleUpperZoneMouseMove(e) {
+function handleUpperZonePointerMove(e) {
   if (!wavesurfer || !isReady.value) return;
-  if (isDraggingCursor.value) return; // 拖拽时不改变样式
+  if (isDraggingCursor.value || isRegionPointerDragging.value) return; // 拖拽时不改变样式
 
   // 检查是否在光标附近
   const nearCursor = isMouseNearCursor(e.clientX, 10);
@@ -1019,32 +1201,67 @@ function handleUpperZoneMouseMove(e) {
 
 /**
  * 光标拖拽移动
+ * V3.1.1+dev.20260106.02: 添加异常处理，防止拖拽过程中出错导致状态污染
  */
 function handleCursorDragMove(e) {
-  if (!isDraggingCursor.value) return;
+  try {
+    if (!isDraggingCursor.value) return;
+    if (
+      typeof e.pointerId === "number" &&
+      cursorPointerId !== null &&
+      e.pointerId !== cursorPointerId
+    ) {
+      return;
+    }
 
-  const newTime = getTimeFromClientX(e.clientX);
-  playbackManager.updateDragging(newTime);
-  emit("seek", newTime);
+    const newTime = getTimeFromClientX(e.clientX);
+    playbackManager.updateDragging(newTime);
+    emit("seek", newTime);
+  } catch (error) {
+    console.error('[WaveformTimeline] 拖拽移动出错:', error);
+    // 异常时强制终止拖拽，避免状态污染
+    handleCursorDragEnd();
+  }
 }
 
 /**
  * 光标拖拽结束
+ * V3.1.1+dev.20260106.02: 使用捕获阶段，添加异常处理
  */
 function handleCursorDragEnd() {
-  isDraggingCursor.value = false;
+  try {
+    if (!isDraggingCursor.value) return;
+    isDraggingCursor.value = false;
 
-  document.removeEventListener("mousemove", handleCursorDragMove);
-  document.removeEventListener("mouseup", handleCursorDragEnd);
+    if (
+      cursorPointerTarget &&
+      typeof cursorPointerId === "number" &&
+      typeof cursorPointerTarget.releasePointerCapture === "function"
+    ) {
+      try {
+        if (cursorPointerTarget.hasPointerCapture?.(cursorPointerId)) {
+          cursorPointerTarget.releasePointerCapture(cursorPointerId);
+        }
+      } catch (error) {
+        console.debug("[WaveformTimeline] 光标释放指针捕获失败:", error);
+      }
+    }
 
-  // 使用 PlaybackManager 结束拖拽
-  playbackManager.stopDragging();
+    cursorPointerTarget = null;
+    cursorPointerId = null;
+    detachCursorDragGuards();
+
+    // 使用 PlaybackManager 结束拖拽
+    playbackManager.stopDragging();
+  } catch (error) {
+    console.error('[WaveformTimeline] 拖拽结束出错:', error);
+  }
 }
 
 /**
  * 波形区域鼠标离开事件（重置鼠标样式）
  */
-function handleWaveformMouseLeave() {
+function handleWaveformPointerLeave() {
   currentMouseCursor.value = "default";
 }
 
@@ -1193,8 +1410,9 @@ function handleScrollbarMouseDown(e) {
     scrollbarDragStartX = clickX;
     scrollbarDragStartScroll = scrollContainer.scrollLeft;
 
-    document.addEventListener("mousemove", handleScrollbarDragMove);
-    document.addEventListener("mouseup", handleScrollbarDragEnd);
+    // V3.1.1+dev.20260106.02: 使用捕获阶段处理事件
+    document.addEventListener("mousemove", handleScrollbarDragMove, true);
+    document.addEventListener("mouseup", handleScrollbarDragEnd, true);
   }
 }
 
@@ -1258,6 +1476,7 @@ function processScrollbarDrag() {
 
 /**
  * 滚动条拖拽结束
+ * V3.1.1+dev.20260106.02: 使用捕获阶段
  */
 function handleScrollbarDragEnd() {
   isDraggingScrollbar.value = false;
@@ -1268,8 +1487,9 @@ function handleScrollbarDragEnd() {
     scrollbarRafId = null;
   }
 
-  document.removeEventListener("mousemove", handleScrollbarDragMove);
-  document.removeEventListener("mouseup", handleScrollbarDragEnd);
+  // V3.1.1+dev.20260106.02: 移除事件监听器时参数必须一致
+  document.removeEventListener("mousemove", handleScrollbarDragMove, true);
+  document.removeEventListener("mouseup", handleScrollbarDragEnd, true);
 
   // 确保最终状态同步
   nextTick(() => {
@@ -1449,6 +1669,7 @@ function handleScrollbarWheel(e) {
 
 onMounted(async () => {
   await nextTick();
+  setupRegionPointerGuards();
   await initWavesurfer();
   containerRef.value?.addEventListener("wheel", handleWheel, {
     passive: false,
@@ -1473,13 +1694,29 @@ onUnmounted(() => {
   clearTimeout(regionUpdateTimer);
   stopSmartFollow(); // 清理智能跟随RAF循环
 
+  // V3.1.1+dev.20260106.02: 清理所有 document 事件监听器，防止拖拽期间组件卸载导致的事件泄漏
+  if (isDraggingCursor.value) {
+    handleCursorDragEnd();
+  } else {
+    detachCursorDragGuards();
+  }
+
+  if (isRegionPointerDragging.value) {
+    finalizeRegionPointerDrag();
+  } else {
+    detachRegionDragGuards();
+  }
+  teardownRegionPointerGuards();
+  document.removeEventListener("mousemove", handleScrollbarDragMove, true);
+  document.removeEventListener("mouseup", handleScrollbarDragEnd, true);
+
   // 清理 DOM 缓存
   cachedWrapper = null;
   cachedScrollContainer = null;
 
   // 【关键】注销 WaveSurfer
   playbackManager.unregisterWaveSurfer();
-  
+
   if (wavesurfer) {
     wavesurfer.destroy();
     wavesurfer = null;
@@ -1663,7 +1900,17 @@ onUnmounted(() => {
     right: 0;
     height: 50%; // 覆盖上半部分
     z-index: 10; // 在波形之上
+    // V3.1.1+dev.20260106.02: 防止拖拽时选中文本或触发其他触摸行为
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: none;
     // background: rgba(255, 0, 0, 0.1);  // 调试用，可删除
+
+    &.is-region-dragging {
+      // Region 拖拽时关闭遮罩交互，让拖拽事件不被阻断
+      pointer-events: none;
+      cursor: inherit;
+    }
   }
 
   #waveform {
@@ -1699,6 +1946,19 @@ onUnmounted(() => {
       background: var(--primary) !important;
       width: 4px !important;
       border-radius: 2px;
+      // V3.1.1+dev.20260106.02: 增大 handle 的点击区域，提高拖拽稳定性
+      // 使用 padding 或 border 扩大可点击范围，但保持视觉宽度不变
+      box-sizing: content-box;
+      // 确保 handle 在拖拽时保持鼠标捕获
+      touch-action: none;
+    }
+
+    // V3.1.1+dev.20260106.02: 确保 Region 容器在拖拽时不会丢失鼠标捕获
+    :deep(.wavesurfer-region) {
+      // 禁用文本选择，防止拖拽时选中文本导致事件中断
+      user-select: none;
+      -webkit-user-select: none;
+      touch-action: none;
     }
   }
 }
