@@ -1418,14 +1418,17 @@ function handleScrollbarMouseDown(e) {
 
 /**
  * 滚动条拖拽移动（优化版：使用RAF节流）
+ * V3.1.1+dev.20260106.03: 保存 shiftKey 状态用于精细模式
  */
 function handleScrollbarDragMove(e) {
   if (!isDraggingScrollbar.value || !wavesurfer) return;
 
   // 只保存最新的事件信息，不立即计算
+  // V3.1.1+dev.20260106.03: 添加 shiftKey 用于精细模式
   pendingScrollEvent = {
     clientX: e.clientX,
-    timestamp: Date.now()
+    timestamp: Date.now(),
+    shiftKey: e.shiftKey  // 精细模式标志
   };
 
   // 使用RAF在下一帧渲染前统一处理
@@ -1436,6 +1439,7 @@ function handleScrollbarDragMove(e) {
 
 /**
  * 处理滚动条拖拽（在RAF中执行）
+ * V3.1.1+dev.20260106.03: 添加 Shift 精细模式和动态阻尼
  */
 function processScrollbarDrag() {
   if (!pendingScrollEvent || !isDraggingScrollbar.value || !wavesurfer) {
@@ -1461,7 +1465,24 @@ function processScrollbarDrag() {
   const deltaX = pendingScrollEvent.clientX - rect.left - scrollbarDragStartX;
   const deltaPercent = deltaX / trackWidth;
 
-  const newScrollLeft = scrollbarDragStartScroll + deltaPercent * cachedMaxScrollLeft;
+  // V3.1.1+dev.20260106.03: 精细模式和动态阻尼
+  // Shift 精细模式：按住 Shift 时，拖拽灵敏度降低到 1/4
+  // 动态阻尼：缩放越大，基础拖拽也会变慢（使用较温和的阻尼曲线）
+  let effectiveDeltaPercent = deltaPercent;
+
+  // 动态阻尼：高缩放时适度降低灵敏度（使用 log 曲线，避免太"沉"）
+  // 100% 缩放 → 阻尼系数 1.0
+  // 400% 缩放 → 阻尼系数约 1.4
+  // 800% 缩放 → 阻尼系数约 1.6
+  const dampingFactor = 1 + Math.log10(Math.max(1, zoomLevel.value / 100)) * 0.5;
+  effectiveDeltaPercent = deltaPercent / dampingFactor;
+
+  // Shift 精细模式：进一步降低灵敏度
+  if (pendingScrollEvent.shiftKey) {
+    effectiveDeltaPercent *= 0.25;  // 精细模式：1/4 灵敏度
+  }
+
+  const newScrollLeft = scrollbarDragStartScroll + effectiveDeltaPercent * cachedMaxScrollLeft;
 
   // 更新滚动位置
   scrollContainer.scrollLeft = Math.max(0, Math.min(newScrollLeft, cachedMaxScrollLeft));
@@ -1649,6 +1670,7 @@ function handleWheel(e) {
 
 /**
  * 滚动条区域滚轮事件（允许水平滚动波形）
+ * V3.1.1+dev.20260106.03: 添加动态阻尼系数，缩放越大滚动越慢
  */
 function handleScrollbarWheel(e) {
   if (!wavesurfer || !isReady.value) return;
@@ -1661,8 +1683,17 @@ function handleScrollbarWheel(e) {
 
   e.preventDefault();
 
+  // 动态阻尼系数：缩放越大，滚动速度越慢，提供精细控制
+  // 基础速度
+  const BASE_SPEED = 2;
+  // 阻尼因子：缩放越大，因子越大。例如 100%时为1，800%时为8
+  const dampingFactor = Math.max(1, zoomLevel.value / 100);
+  // 核心公式：速度随着缩放增加而减小（使用平方根让衰减曲线更平滑）
+  // 效果：放大时，滚轮变得更"沉"，移动距离变短，提供精确控制
+  const dynamicSpeed = BASE_SPEED / Math.sqrt(dampingFactor);
+
   // 水平滚动波形
-  const scrollAmount = e.deltaY * 2; // 滚动速度
+  const scrollAmount = e.deltaY * dynamicSpeed;
   scrollContainer.scrollLeft += scrollAmount;
   updateScrollbarThumb();
 }
