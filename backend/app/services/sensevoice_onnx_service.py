@@ -677,6 +677,10 @@ class SenseVoiceONNXService:
         """
         音频预处理：提取 Fbank 特征并做 LFR 处理
 
+        V3.1.1+dev.20260107.01: 增强版预处理，针对平缓/机械人声优化
+        - 预加重：增强高频共振峰，让频谱更"锐利"
+        - 鲁棒性归一化：使用95%分位数替代峰值，避免爆破音压缩人声
+
         Args:
             audio_array: 音频数组
             sample_rate: 采样率
@@ -690,14 +694,49 @@ class SenseVoiceONNXService:
         if len(audio_array.shape) > 1:
             audio_array = np.mean(audio_array, axis=1)
 
-        # 归一化
+        # 转换类型
         if audio_array.dtype != np.float32:
             audio_array = audio_array.astype(np.float32)
 
-        # 确保范围在 [-1, 1]
-        max_val = np.abs(audio_array).max()
-        if max_val > 1.0:
-            audio_array = audio_array / max_val
+        # ==================== 信号增强处理 ====================
+        # V3.1.1+dev.20260107.01: 针对平缓/机械人声优化
+
+        # 1. 预加重 (Pre-emphasis)
+        # 系数 0.97 是标准值，能增强高频共振峰，让语音在频谱上更"锐利"
+        # 即使是平缓语调，辅音的特征也会被放大
+        audio_array = np.append(audio_array[0], audio_array[1:] - 0.97 * audio_array[:-1])
+
+        # 2. 鲁棒性归一化 (Robust Normalization)
+        # 不使用 max()，改用 95% 分位数
+        # 解决问题：如果音频里有一个很大的爆音，原来的 max 归一化会导致平缓人声变得极小
+        # 使用分位数可以忽略极值，把主体人声拉大
+        eps = 1e-8
+        quantile_95 = np.percentile(np.abs(audio_array), 95)
+
+        # V3.1.1+dev.20260107.06: 调整归一化目标值，避免削波失真
+        # 让95%分位归一化到0.5而不是1.0，避免超过5%的采样点被截断
+        scale = 0.5 / (quantile_95 + eps)
+
+        # 限制放大倍数，防止把极微小的底噪放大成噪音
+        # 上限设为 30.0，平衡增强效果和噪音风险
+        scale = min(scale, 30.0)
+
+        audio_array = audio_array * scale
+
+        # 硬截断，将范围限制在 [-1, 1]
+        audio_array = np.clip(audio_array, -1.0, 1.0)
+
+        # 统计削波情况
+        clipped_count = np.sum(np.abs(audio_array) >= 0.99)
+        clipped_ratio = clipped_count / len(audio_array) * 100
+
+        self.logger.debug(
+            f"音频预处理: quantile_95={quantile_95:.6f}, scale={scale:.2f}, "
+            f"target=0.5, 削波点数={clipped_count} ({clipped_ratio:.2f}%), "
+            f"样本数={len(audio_array)}"
+        )
+
+        # ==========================================================
 
         # 1. 提取 Mel 频谱特征 (Fbank)
         # 使用 librosa 提取 mel 频谱，与 kaldi fbank 类似

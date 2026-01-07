@@ -184,12 +184,14 @@ class ChunkEngine:
         if progress_callback:
             progress_callback(0.8, "生成 Chunk 列表...")
 
+        # V3.1.1+dev.20260107.04: 传递原始音频用于能量对比
         chunks = self._create_chunks(
             separated_audio,
             sr,
             segments,
             is_separated=enable_demucs,
-            separation_model=separation_model_used
+            separation_model=separation_model_used,
+            original_audio=audio_array if enable_demucs else None
         )
 
         if progress_callback:
@@ -267,17 +269,19 @@ class ChunkEngine:
         sr: int,
         segments: List[dict],
         is_separated: bool = False,
-        separation_model: Optional[str] = None
+        separation_model: Optional[str] = None,
+        original_audio: Optional[np.ndarray] = None
     ) -> List[AudioChunk]:
         """
         根据 VAD 分段结果创建 AudioChunk 列表
 
         Args:
-            audio_array: 完整音频数组
+            audio_array: 完整音频数组（可能是分离后的）
             sr: 采样率
             segments: VAD 分段元数据列表
             is_separated: 是否已进行人声分离
             separation_model: 使用的分离模型
+            original_audio: 原始音频数组（用于能量对比和回退）
 
         Returns:
             List[AudioChunk]: Chunk 列表
@@ -293,6 +297,24 @@ class ChunkEngine:
             end_sample = int(end_sec * sr)
             chunk_audio = audio_array[start_sample:end_sample]
 
+            # V3.1.1+dev.20260107.04: 提取原始音频片段（用于能量对比）
+            original_chunk = None
+            if original_audio is not None:
+                original_chunk = original_audio[start_sample:end_sample]
+
+                # 能量检测：如果分离后能量显著低于原始，自动回退
+                sep_rms = np.sqrt(np.mean(chunk_audio**2))
+                orig_rms = np.sqrt(np.mean(original_chunk**2))
+
+                # 阈值：分离后 RMS < 原始 RMS * 20% 且原始 RMS > 1e-3
+                if sep_rms < orig_rms * 0.2 and orig_rms > 1e-3:
+                    self.logger.warning(
+                        f"Chunk {seg['index']}: Demucs 分离失败，能量过低 "
+                        f"(sep_rms={sep_rms:.6f}, orig_rms={orig_rms:.6f}, "
+                        f"ratio={sep_rms/orig_rms*100:.1f}%)，回退到原始音频"
+                    )
+                    chunk_audio = original_chunk  # 回退到原始音频
+
             # 创建 AudioChunk
             chunk = AudioChunk(
                 index=seg["index"],
@@ -301,7 +323,8 @@ class ChunkEngine:
                 audio=chunk_audio,
                 sample_rate=sr,
                 is_separated=is_separated,
-                separation_model=separation_model
+                separation_model=separation_model,
+                original_audio=original_chunk
             )
 
             chunks.append(chunk)

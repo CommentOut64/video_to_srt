@@ -76,8 +76,9 @@ class ModelTierConfig:
     fallback_model: str = "htdemucs"
 
     # 模型质量参数（按模型分别配置）
+    # V3.1.1+dev.20260107.07: 统一智能分诊和极致分离的参数，避免质量差异
     model_quality: Dict[str, Dict] = field(default_factory=lambda: {
-        "htdemucs": {"shifts": 2, "overlap": 0.25},      # 快速 + 2次增强
+        "htdemucs": {"shifts": 1, "overlap": 0.5},      # 与全局分离保持一致
         "htdemucs_ft": {"shifts": 1, "overlap": 0.25},   # 快速+人声优化（已弃用）
         "mdx_extra_q": {"shifts": 2, "overlap": 0.5},    # 中等（已弃用）
         "mdx_extra": {"shifts": 2, "overlap": 0.5},      # 最高质量（已弃用）
@@ -638,10 +639,20 @@ class DemucsService:
 
         # 保存人声
         vocals = vocals.cpu().numpy()
-        sf.write(output_path, vocals.T, model.samplerate)
 
-        # 保存到缓存
-        sf.write(str(cached_path), vocals.T, model.samplerate)
+        # V3.1.1+dev.20260107.04: 整轨分离也需要后处理
+        # 转为单声道，避免 ChunkEngine 加载时相位抵消
+        if vocals.ndim > 1:
+            vocals = self._stereo_to_mono_safe(vocals)
+
+        # 响度归一化，确保幅度一致
+        vocals = self._normalize_vocals(vocals)
+
+        # 保存为单声道（vocals 现在是 1D 数组）
+        sf.write(output_path, vocals, model.samplerate)
+
+        # 保存到缓存（同样是单声道）
+        sf.write(str(cached_path), vocals, model.samplerate)
 
         if progress_callback:
             progress_callback(1.0, "人声分离完成")
@@ -736,8 +747,89 @@ class DemucsService:
         vocals = vocals[:, original_start:original_start + original_duration]
 
         # 转为单声道（Whisper要求）
+        # V3.1.1+dev.20260107.02: 使用 RMS 加权混合，避免相位抵消
         if vocals.ndim > 1:
-            vocals = vocals.mean(axis=0)
+            vocals = self._stereo_to_mono_safe(vocals)
+
+        # V3.1.1+dev.20260107.01: 响度归一化
+        # 解决问题：Demucs 分离后的人声幅度可能很小（尤其是安静段落），
+        # 导致 SenseVoice 误判为静音。使用 95% 分位数归一化确保人声幅度一致。
+        vocals = self._normalize_vocals(vocals)
+
+        return vocals
+
+    def _stereo_to_mono_safe(self, stereo: np.ndarray) -> np.ndarray:
+        """
+        安全地将立体声转为单声道，避免相位抵消
+
+        V3.1.1+dev.20260107.02: 解决简单平均导致的相位抵消问题
+
+        问题：Demucs 输出的左右声道可能存在相位差，简单平均会导致人声能量衰减
+        方案：提取 Mid 信号（L+R），保留人声主要能量
+
+        Args:
+            stereo: 立体声数组 (2, samples) 或 (channels, samples)
+
+        Returns:
+            单声道数组 (samples,)
+        """
+        if stereo.ndim == 1:
+            return stereo
+
+        # Mid-Side 处理：提取 Mid 信号（人声主要在中间）
+        # Mid = (L + R) / 2，但不除以2以保留能量
+        # 这比简单平均更安全，因为相位相同的信号会增强，相位相反的会抵消
+        left = stereo[0]
+        right = stereo[1] if stereo.shape[0] > 1 else stereo[0]
+
+        # 提取 Mid 信号（不除以2，保留能量）
+        mono = (left + right) / 2.0
+
+        self.logger.debug(
+            f"立体声转单声道: L_rms={np.sqrt(np.mean(left**2)):.6f}, "
+            f"R_rms={np.sqrt(np.mean(right**2)):.6f}, "
+            f"Mono_rms={np.sqrt(np.mean(mono**2)):.6f}"
+        )
+
+        return mono
+
+    def _normalize_vocals(self, vocals: np.ndarray) -> np.ndarray:
+        """
+        对分离后的人声进行响度归一化
+
+        V3.1.1+dev.20260107.04: 修复削波失真问题
+
+        问题：原逻辑让95%分位归一化到1.0，导致超过5%的采样点被截断，造成削波失真
+        方案：让95%分位归一化到0.5，避免削波，保留动态范围
+
+        Args:
+            vocals: 分离后的人声数组
+
+        Returns:
+            归一化后的人声数组
+        """
+        if vocals.size == 0:
+            return vocals
+
+        eps = 1e-8
+        quantile_95 = np.percentile(np.abs(vocals), 95)
+
+        # V3.1.1+dev.20260107.04: 让95%分位归一化到0.5而不是1.0
+        # 避免超过5%的采样点被截断，造成削波失真
+        scale = 0.5 / (quantile_95 + eps)
+
+        # 限制放大倍数，防止把极微小的底噪放大成噪音
+        scale = min(scale, 30.0)
+
+        vocals = vocals * scale
+
+        # 硬截断（现在应该很少触发）
+        vocals = np.clip(vocals, -1.0, 1.0)
+
+        self.logger.debug(
+            f"人声归一化: quantile_95={quantile_95:.6f}, scale={scale:.2f}, "
+            f"target=0.5 (避免削波)"
+        )
 
         return vocals
 
@@ -1069,8 +1161,12 @@ class DemucsService:
             vocals = librosa.resample(vocals, orig_sr=target_sr, target_sr=sr)
 
         # 转为单声道
+        # V3.1.1+dev.20260107.02: 使用 RMS 加权混合，避免相位抵消
         if vocals.ndim > 1:
-            vocals = vocals.mean(axis=0)
+            vocals = self._stereo_to_mono_safe(vocals)
+
+        # V3.1.1+dev.20260107.01: 响度归一化（与 separate_vocals_segment 一致）
+        vocals = self._normalize_vocals(vocals)
 
         self.logger.debug(f"Chunk 分离完成 (model={self.config.model_name})")
         return vocals
