@@ -13,6 +13,9 @@
 
 AnchorFlux employs an innovative dual-anchor architecture: **SenseVoice anchors time boundaries, Whisper anchors semantic content**, coordinated through an asynchronous dual-stream pipeline to achieve a balance between transcription speed and quality.
 
+<a href="https://www.bilibili.com/video/BV1xAqzB5EFN"><img src="https://img.shields.io/static/v1?label=%20&message=Demo%20Video&color=F37697&style=flat&logo=bilibili&logoColor=white&logoWidth=20" height="32"></a>
+<a href="https://www.bilibili.com/video/BV1ejvCBPEz9"><img src="https://img.shields.io/static/v1?label=%20&message=Tutorial%20Video&color=F37697&style=flat&logo=bilibili&logoColor=white&logoWidth=20" height="32"></a>
+
 ## Features
 
 ### Core Features
@@ -91,6 +94,58 @@ cd anchor-flux-main
 # Run
 run.bat
 ```
+
+### Switching Whisper Models
+
+**Method 1: Auto-download via Configuration (Recommended)**
+
+Edit the `.env` file in the project root, modify the `WHISPER_MODEL` parameter and restart the service. The system will automatically download the model from HuggingFace:
+```bash
+WHISPER_MODEL=large-v3  # Options: tiny, base, small, medium, large-v3, turbo
+```
+
+**Method 2: Manual Download**
+
+Download Faster-Whisper model files from HuggingFace and place them in the specified directory:
+
+1. Visit the model repository (e.g., large-v3): https://huggingface.co/Systran/faster-whisper-large-v3
+2. Download the following required files:
+   - `model.bin` - Model weights (required)
+   - `config.json` - Model configuration (required)
+   - `tokenizer.json` - Tokenizer (required)
+   - `vocabulary.txt` or `vocabulary.json` - Vocabulary (required)
+3. Create the following path in the project directory and place the files:
+   ```
+   backend/models/huggingface/models--Systran--faster-whisper-large-v3/snapshots/<any-hash-name>/
+   ├── model.bin
+   ├── config.json
+   ├── tokenizer.json
+   └── vocabulary.txt
+   ```
+   > Tip: `<any-hash-name>` can be any string, such as `main` or `v1`
+
+**Available Models:**
+
+| Model | HuggingFace Repository | VRAM Required |
+|-------|------------------------|---------------|
+| tiny | Systran/faster-whisper-tiny | ~1GB |
+| base | Systran/faster-whisper-base | ~1GB |
+| small | Systran/faster-whisper-small | ~2GB |
+| medium | Systran/faster-whisper-medium | ~5GB |
+| large-v3 | Systran/faster-whisper-large-v3 | ~10GB (float16) / ~6GB (int8) |
+| turbo | Systran/faster-whisper-large-v3-turbo | ~6GB |
+
+### Runtime Modes
+
+The system supports two runtime modes, switched via the `DEV_MODE` parameter in the `.env` file:
+
+| Mode | DEV_MODE | Frontend | Backend | Access URL |
+|------|----------|----------|---------|------------|
+| **Production** | `false` (default) | Pre-built static files hosted by backend | Port 8000 | http://localhost:8000 |
+| **Development** | `true` | `npm run dev` with hot reload (Port 5173) | Port 8000 | http://localhost:5173 |
+
+- **Production Mode**: Frontend uses pre-built files from `frontend/dist`, served by FastAPI static file hosting, suitable for daily use
+- **Development Mode**: Frontend uses Vite dev server with hot reload, suitable for development and debugging
 
 ## Technology Stack
 
@@ -268,6 +323,20 @@ Secondary verification mechanism prevents common hallucination issues in low-con
 backend_port = 8000      # Backend port
 frontend_port = 5173     # Frontend port
 ```
+
+### Environment Variables
+
+Customize system settings by editing the `.env` file in the project root. Restart the service after modifications.
+
+| Variable | Options | Default | Description |
+|----------|---------|---------|-------------|
+| `DEV_MODE` | `true` / `false` | `false` | Development mode, enables frontend dev server and DEBUG logs |
+| `WHISPER_MODEL` | `tiny` / `base` / `small` / `medium` / `large-v3` / `turbo` | `medium` | Whisper model size, affects accuracy and VRAM usage |
+| `WHISPER_COMPUTE_TYPE` | `auto` / `int8` / `int8_float16` / `float16` | `auto` | Inference precision, auto selects based on available VRAM |
+| `SENSEVOICE_DEVICE` | `cpu` / `cuda` / `auto` | `cpu` | SenseVoice inference device |
+| `SENSEVOICE_MODEL_TYPE` | `quantized` / `fp32` | `quantized` | SenseVoice model type, quantized only supports CPU |
+| `USE_HF_MIRROR` | `true` / `false` | `true` | Use HuggingFace China mirror |
+| `PYPI_MIRROR` | Mirror URL or empty | Tsinghua | Python package download mirror |
 
 ## Version History
 

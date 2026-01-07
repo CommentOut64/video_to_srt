@@ -13,6 +13,9 @@
 
 AnchorFlux 采用创新的双锚架构：**SenseVoice 锚定时间边界，Whisper 锚定语义内容**，利用异步双流流水线协调两者，实现了转录速度与质量的平衡。
 
+<a href="https://www.bilibili.com/video/BV1xAqzB5EFN"><img src="https://img.shields.io/static/v1?label=%20&message=%E6%BC%94%E7%A4%BA%E8%A7%86%E9%A2%91&color=F37697&style=flat&logo=bilibili&logoColor=white&logoWidth=20" height="32"></a>
+<a href="https://www.bilibili.com/video/BV1ejvCBPEz9"><img src="https://img.shields.io/static/v1?label=%20&message=%E6%95%99%E7%A8%8B%E8%A7%86%E9%A2%91&color=F37697&style=flat&logo=bilibili&logoColor=white&logoWidth=20" height="32"></a>
+
 ## 功能特点
 
 ### 核心功能
@@ -85,12 +88,64 @@ cd anchor-flux-main
    - 下载并安装 [CUDA 11.8+](https://developer.nvidia.com/cuda-11-8-0-download-archive)
    - 下载并安装 [cuDNN 8](https://developer.nvidia.com/rdp/cudnn-archive)
    - 验证安装: `nvidia-smi` 和 `nvcc --version`
-   
+
 3. **运行启动脚本**
 ```bash
 # 运行
 run.bat
 ```
+
+### 更换 Whisper 模型
+
+**方式一：修改配置自动下载（推荐）**
+
+编辑项目根目录的 `.env` 文件，修改 `WHISPER_MODEL` 参数后重启服务，系统会自动从 HuggingFace 下载对应模型：
+```bash
+WHISPER_MODEL=large-v3  # 可选: tiny, base, small, medium, large-v3, turbo
+```
+
+**方式二：手动下载模型**
+
+从 HuggingFace 下载 Faster-Whisper 模型文件，放置到指定目录：
+
+1. 访问模型仓库（以 large-v3 为例）：https://huggingface.co/Systran/faster-whisper-large-v3
+2. 下载以下必需文件：
+   - `model.bin` - 模型权重（必需）
+   - `config.json` - 模型配置（必需）
+   - `tokenizer.json` - 分词器（必需）
+   - `vocabulary.txt` 或 `vocabulary.json` - 词汇表（必需）
+3. 在项目目录创建以下路径并放入文件：
+   ```
+   backend/models/huggingface/models--Systran--faster-whisper-large-v3/snapshots/<任意hash名>/
+   ├── model.bin
+   ├── config.json
+   ├── tokenizer.json
+   └── vocabulary.txt
+   ```
+   > 提示：`<任意hash名>` 可以是任意字符串，如 `main` 或 `v1`
+
+**可用模型列表：**
+
+| 模型 | HuggingFace 仓库 | 显存需求 |
+|------|------------------|----------|
+| tiny | Systran/faster-whisper-tiny | ~1GB |
+| base | Systran/faster-whisper-base | ~1GB |
+| small | Systran/faster-whisper-small | ~2GB |
+| medium | Systran/faster-whisper-medium | ~5GB |
+| large-v3 | Systran/faster-whisper-large-v3 | ~10GB (float16) / ~6GB (int8) |
+| turbo | Systran/faster-whisper-large-v3-turbo | ~6GB |
+
+### 运行模式说明
+
+系统支持两种运行模式，通过 `.env` 文件中的 `DEV_MODE` 参数切换：
+
+| 模式 | DEV_MODE | 前端 | 后端 | 访问地址 |
+|------|----------|------|------|----------|
+| **生产模式** | `false`（默认） | 由后端托管已构建的静态文件 | 端口 8000 | http://localhost:8000 |
+| **开发模式** | `true` | `npm run dev` 热重载（端口 5173） | 端口 8000 | http://localhost:5173 |
+
+- **生产模式**：前端使用 `frontend/dist` 目录下的预构建文件，由 FastAPI 静态文件托管，适合日常使用
+- **开发模式**：前端使用 Vite 开发服务器，支持热重载，适合开发调试
 
 ## 技术栈
 
@@ -268,6 +323,20 @@ run.bat
 backend_port = 8000      # 后端端口
 frontend_port = 5173     # 前端端口
 ```
+
+### 环境变量配置
+
+通过编辑项目根目录下的 `.env` 文件可自定义系统配置，修改后需重启服务生效。
+
+| 变量名 | 可选值 | 默认值 | 说明 |
+|--------|--------|--------|------|
+| `DEV_MODE` | `true` / `false` | `false` | 开发模式，启用后使用前端开发服务器并显示 DEBUG 日志 |
+| `WHISPER_MODEL` | `tiny` / `base` / `small` / `medium` / `large-v3` / `turbo` | `medium` | Whisper 模型大小，影响准确率和显存占用 |
+| `WHISPER_COMPUTE_TYPE` | `auto` / `int8` / `int8_float16` / `float16` | `auto` | 推理精度，auto 会根据显存自动选择 |
+| `SENSEVOICE_DEVICE` | `cpu` / `cuda` / `auto` | `cpu` | SenseVoice 推理设备 |
+| `SENSEVOICE_MODEL_TYPE` | `quantized` / `fp32` | `quantized` | SenseVoice 模型类型，量化版仅支持 CPU |
+| `USE_HF_MIRROR` | `true` / `false` | `true` | 是否使用 HuggingFace 国内镜像源 |
+| `PYPI_MIRROR` | 镜像源 URL 或留空 | 清华源 | Python 包下载镜像源 |
 
 ## 版本历史
 
