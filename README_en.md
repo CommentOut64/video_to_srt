@@ -4,7 +4,7 @@
 
 [![Chinese README](https://img.shields.io/badge/README-中文-blue.svg)](README.md)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Version](https://img.shields.io/badge/version-v3.1.0--beta-brightgreen.svg)
+![Version](https://img.shields.io/badge/version-v3.1.1-brightgreen.svg)
 ![Vue](https://img.shields.io/badge/Vue-3.5+-4FC08D?logo=vue.js&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-009688?logo=fastapi&logoColor=white)
