@@ -2,9 +2,9 @@
 流水线模块
 
 包含:
-- base_pipeline: 流水线基类
-- dual_alignment_pipeline: 双流对齐流水线（核心）
 - audio_processing_pipeline: 音频前处理流水线
+- async_dual_pipeline: 异步双流流水线（V3.1.0+）
+- preprocessing_pipeline: 预处理流水线（新架构 - Stage模式）
 """
 
 from app.pipelines.audio_processing_pipeline import (
@@ -13,14 +13,6 @@ from app.pipelines.audio_processing_pipeline import (
     AudioProcessingResult,
     SeparationStrategy,
     get_audio_processing_pipeline
-)
-
-from app.pipelines.dual_alignment_pipeline import (
-    DualAlignmentPipeline,
-    DualAlignmentConfig,
-    ChunkProcessingResult,
-    AlignmentLevel,
-    get_dual_alignment_pipeline
 )
 
 from app.pipelines.async_dual_pipeline import (
@@ -41,14 +33,7 @@ __all__ = [
     'SeparationStrategy',
     'get_audio_processing_pipeline',
 
-    # 双流对齐流水线（V3.0 - 串行）
-    'DualAlignmentPipeline',
-    'DualAlignmentConfig',
-    'ChunkProcessingResult',
-    'AlignmentLevel',
-    'get_dual_alignment_pipeline',
-
-    # 异步双流流水线（V3.1.0 - 流水线）
+    # 异步双流流水线（V3.1.0+ - 生产使用）
     'AsyncDualPipeline',
     'get_async_dual_pipeline',
 

@@ -59,7 +59,7 @@ class FastWorker:
         demucs_service: Optional[DemucsService] = None,
         # V3.5: 极速模式参数
         is_final_output: bool = False,
-        # V3.9.1: 跨 chunk 合并参数
+        # V3.1.0: 跨 chunk 合并参数
         enable_cross_chunk_merge: bool = False,
         logger: Optional[logging.Logger] = None
     ):
@@ -88,7 +88,7 @@ class FastWorker:
         self.is_final_output = is_final_output
         self.logger = logger or logging.getLogger(__name__)
 
-        # V3.9.1: 跨 chunk 合并机制
+        # V3.1.0: 跨 chunk 合并机制
         self.enable_cross_chunk_merge = enable_cross_chunk_merge
         self.pending_sentence = None  # 缓存上一个 chunk 的最后一句（如果语义不完整）
 
@@ -122,6 +122,7 @@ class FastWorker:
         # 初始化快流分句器（默认配置，主要依赖 VAD 停顿）
         if draft_split_config is None:
             draft_split_config = SplitConfig(
+                language="en",                   # 默认使用英文策略（非中文时使用）
                 prefer_punctuation_break=False,  # 不依赖标点
                 use_dynamic_pause=True,          # 使用动态停顿
                 pause_threshold=0.5,
@@ -206,7 +207,7 @@ class FastWorker:
         is_draft = not self.is_final_output
         sentences = self._split_sentences(sv_result, chunk, is_draft=is_draft)
 
-        # V3.9.1: 跨 chunk 合并（仅在启用时）
+        # V3.1.0: 跨 chunk 合并（仅在启用时）
         if self.enable_cross_chunk_merge and sentences:
             # 如果有缓存的句子，与第一句合并
             if self.pending_sentence:
@@ -304,7 +305,7 @@ class FastWorker:
         # 阶段 3: 分句（Layer 1 + Layer 2）
         draft_sentences = self._split_sentences(sv_result, chunk, is_draft=True)
 
-        # V3.9.1: 跨 chunk 合并（仅在启用时）
+        # V3.1.0: 跨 chunk 合并（仅在启用时）
         if self.enable_cross_chunk_merge and draft_sentences:
             # 如果有缓存的句子，与第一句合并
             if self.pending_sentence:
@@ -438,9 +439,9 @@ class FastWorker:
 
     def _is_sentence_incomplete(self, sentence: SentenceSegment) -> bool:
         """
-        检查句子是否语义不完整（V3.9.1）
+        检查句子是否语义不完整（V3.1.0）
 
-        使用中文分句器的语义完整性检查逻辑。
+        根据文本内容自动检测语言，选择合适的语义完整性检查策略。
 
         Args:
             sentence: 句子对象
@@ -451,9 +452,18 @@ class FastWorker:
         if not sentence or not sentence.text:
             return False
 
-        # 使用中文分句器的 strategy 进行语义检查
-        strategy = self.chinese_splitter.config.get_strategy()
-        is_incomplete = strategy.is_incomplete_ending(sentence.text)
+        text = sentence.text.strip()
+        
+        # 检测文本是否包含中文字符
+        has_chinese = any('\u4e00' <= c <= '\u9fff' for c in text)
+        
+        # 根据语言选择分句器的策略
+        if has_chinese:
+            strategy = self.chinese_splitter.config.get_strategy()
+        else:
+            strategy = self.draft_splitter.config.get_strategy()
+        
+        is_incomplete = strategy.is_incomplete_ending(text)
 
         if is_incomplete:
             self.logger.debug(f"[跨chunk检查] 句子语义不完整: '{sentence.text[-20:]}'")
@@ -462,7 +472,7 @@ class FastWorker:
 
     def _merge_sentences(self, sent1: SentenceSegment, sent2: SentenceSegment) -> SentenceSegment:
         """
-        合并两个句子（V3.9.1）
+        合并两个句子（V3.1.0）
 
         用于跨 chunk 合并：将上一个 chunk 的最后一句与当前 chunk 的第一句合并。
 
@@ -486,7 +496,7 @@ class FastWorker:
         # 计算平均置信度
         avg_confidence = (sent1.confidence + sent2.confidence) / 2
 
-        # 创建合并后的句子对象（V3.8.1: 移除不存在的index参数）
+        # 创建合并后的句子对象（V3.1.0: 移除不存在的index参数）
         merged_sentence = SentenceSegment(
             text=merged_text,
             start=merged_start,

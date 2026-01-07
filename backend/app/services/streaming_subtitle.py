@@ -513,11 +513,11 @@ class StreamingSubtitleManager:
 
         return sentence_indices
 
-    # ========== V3.7.3: 字幕持久化方法 ==========
+    # ========== V3.1.0: 字幕持久化方法 ==========
 
     def to_checkpoint_data(self) -> dict:
         """
-        V3.7.3: 导出字幕快照用于 Checkpoint 保存
+        V3.1.0: 导出字幕快照用于 Checkpoint 保存
 
         返回完整的字幕状态，包括：
         - sentences_snapshot: 所有句子的序列化数据
@@ -551,7 +551,7 @@ class StreamingSubtitleManager:
 
     def restore_from_checkpoint(self, checkpoint_data: dict) -> bool:
         """
-        V3.7.3: 从 Checkpoint 恢复字幕状态
+        V3.1.0: 从 Checkpoint 恢复字幕状态
 
         恢复所有已保存的句子，并恢复索引计数器状态。
         恢复后，新添加的句子会从正确的索引继续编号，不会与已有句子冲突。
@@ -573,7 +573,7 @@ class StreamingSubtitleManager:
             chunk_sentences_map = checkpoint_data.get("chunk_sentences_map", {})
 
             if not sentences_snapshot:
-                logger.info(f"[V3.7.3] 无字幕快照需要恢复: job_id={self.job_id}")
+                logger.info(f"[V3.1.0] 无字幕快照需要恢复: job_id={self.job_id}")
                 return True
 
             # 恢复句子
@@ -643,7 +643,7 @@ class StreamingSubtitleManager:
                 }
 
             logger.info(
-                f"[V3.7.3] 字幕恢复成功: job_id={self.job_id}, "
+                f"[V3.1.0] 字幕恢复成功: job_id={self.job_id}, "
                 f"恢复了 {restored_count} 个句子, "
                 f"sentence_count={self.sentence_count}, "
                 f"chunk_count={len(self.chunk_sentences)}"
@@ -651,12 +651,12 @@ class StreamingSubtitleManager:
             return True
 
         except Exception as e:
-            logger.error(f"[V3.7.3] 字幕恢复失败: job_id={self.job_id}, error={e}", exc_info=True)
+            logger.error(f"[V3.1.0] 字幕恢复失败: job_id={self.job_id}, error={e}", exc_info=True)
             return False
 
     def push_restored_subtitles_to_frontend(self):
         """
-        V3.7.3: 恢复后推送所有字幕到前端
+        V3.1.0: 恢复后推送所有字幕到前端
 
         在恢复字幕后调用此方法，将已恢复的字幕通过 SSE 推送到前端，
         确保前端状态与后端同步。
@@ -692,7 +692,7 @@ class StreamingSubtitleManager:
                 )
 
         logger.info(
-            f"[V3.7.3] 已推送恢复的字幕到前端: job_id={self.job_id}, "
+            f"[V3.1.0] 已推送恢复的字幕到前端: job_id={self.job_id}, "
             f"chunks={len(self.chunk_sentences)}, "
             f"total_sentences={len(self.sentences)}"
         )

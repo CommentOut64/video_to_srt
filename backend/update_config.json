@@ -1,0 +1,23 @@
+{
+  "_comment": "V3.1.1+dev.20260105.03: 更新排除配置，此文件可通过更新进行更新",
+  "version": "1.0.0",
+  "exclude_dirs": [
+    "jobs",
+    "models",
+    "temp",
+    "output",
+    "input",
+    "logs",
+    "tools",
+    ".venv",
+    "node_modules",
+    ".git",
+    "backend/models",
+    "backend/app/assets"
+  ],
+  "exclude_files": [
+    ".env",
+    ".env_installed",
+    ".req_hash"
+  ]
+}

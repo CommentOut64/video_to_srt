@@ -1,0 +1,20 @@
+快速配置 - 切换 Whisper 模型
+
+第1步: 修改配置文件
+在项目根目录找到 .env 文件,用记事本打开,修改这一行:
+WHISPER_MODEL=large-v3
+可选的模型:
+tiny
+base
+small
+medium - 默认
+large-v3
+turbo
+
+第2步: 重启服务
+关闭当前窗口,重新双击运行 `一键启动.bat`
+
+完成!
+
+提示: 如果显存不足(显卡小于10GB),建议继续使用 medium 模型
+

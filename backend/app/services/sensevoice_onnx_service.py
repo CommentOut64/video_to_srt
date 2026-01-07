@@ -424,20 +424,44 @@ class SenseVoiceONNXService:
                 raise
 
     def _find_onnx_model(self) -> str:
-        """查找 ONNX 模型文件"""
+        """
+        查找 ONNX 模型文件
+
+        根据环境变量 SENSEVOICE_MODEL_TYPE 选择模型:
+        - quantized (默认): 使用 INT8 量化模型 (model_quant.onnx), CPU 下速度最快
+        - fp32: 使用 FP32 完整模型 (model.onnx), 支持 GPU 推理
+
+        注意: CUDA 对 INT8 量化算子支持不完整, 使用 GPU 时建议选择 fp32
+        """
+        import os
         model_path = Path(self.model_path)
 
-        # 常见的模型文件名
-        candidates = [
-            "model.onnx",
-            "model_quant.onnx",
-            "sensevoice_small.onnx",
-            "sensevoice_small_int8.onnx"
-        ]
+        # 从环境变量读取模型类型配置
+        model_type = os.getenv('SENSEVOICE_MODEL_TYPE', 'quantized').lower()
+
+        if model_type == 'fp32':
+            # FP32 模型优先 (支持 GPU)
+            candidates = [
+                "model.onnx",                 # FP32 优先
+                "sensevoice_small.onnx",      # FP32 备选
+                "model_quant.onnx",           # INT8 回退
+                "sensevoice_small_int8.onnx"
+            ]
+            self.logger.info("模型类型: FP32 (支持 GPU)")
+        else:
+            # 量化模型优先 (默认, CPU 速度最快)
+            candidates = [
+                "model_quant.onnx",           # INT8 优先
+                "sensevoice_small_int8.onnx", # INT8 备选
+                "model.onnx",                 # FP32 回退
+                "sensevoice_small.onnx"
+            ]
+            self.logger.info("模型类型: INT8 量化 (CPU 优化)")
 
         for candidate in candidates:
             model_file = model_path / candidate
             if model_file.exists():
+                self.logger.info(f"选择模型文件: {candidate}")
                 return str(model_file)
 
         # 搜索所有 .onnx 文件
@@ -485,38 +509,45 @@ class SenseVoiceONNXService:
         """
         获取执行提供者
 
-        V3.5 更新: 支持 auto 设备选择
-        - auto: GPU优先，无GPU时自动降级到CPU
-        - cuda: 强制使用GPU
-        - cpu: 强制使用CPU
+        从环境变量 SENSEVOICE_DEVICE 读取设备配置:
+        - cpu (默认): 强制使用 CPU, 配合 INT8 量化模型速度最优
+        - cuda: 强制使用 GPU, 需要 FP32 模型
+        - auto: 自动选择, 检测到 CUDA 则用 GPU, 否则用 CPU
+
+        注意: CUDA 对 INT8 量化算子支持不完整, 使用 GPU 时建议:
+              SENSEVOICE_DEVICE=cuda + SENSEVOICE_MODEL_TYPE=fp32
         """
+        import os
         import onnxruntime as ort
 
         available_providers = ort.get_available_providers()
         self.logger.info(f"可用的执行提供者: {available_providers}")
 
-        device = self.config.device.lower()
+        # 从环境变量读取设备配置 (默认 cpu)
+        device = os.getenv('SENSEVOICE_DEVICE', 'cpu').lower()
+        self.logger.info(f"SENSEVOICE_DEVICE 配置: {device}")
 
         if device == "auto":
-            # 自动选择：GPU优先，降级CPU
+            # 自动选择: GPU 优先, 降级 CPU
             if "CUDAExecutionProvider" in available_providers:
-                self.logger.info("设备选择: auto -> CUDA (GPU可用)")
+                self.logger.info("设备选择: auto -> CUDA (GPU 可用)")
                 return ["CUDAExecutionProvider", "CPUExecutionProvider"]
             else:
-                self.logger.info("设备选择: auto -> CPU (无可用GPU)")
+                self.logger.info("设备选择: auto -> CPU (无可用 GPU)")
                 return ["CPUExecutionProvider"]
 
         elif device == "cuda":
-            # 强制GPU
+            # 强制 GPU
             if "CUDAExecutionProvider" in available_providers:
+                self.logger.info("设备选择: CUDA (用户指定)")
                 return ["CUDAExecutionProvider", "CPUExecutionProvider"]
             else:
-                self.logger.warning("请求CUDA但不可用，降级到CPU")
+                self.logger.warning("请求 CUDA 但不可用, 降级到 CPU")
                 return ["CPUExecutionProvider"]
 
         else:
-            # CPU模式
-            self.logger.info("设备选择: CPU (用户指定)")
+            # CPU 模式 (默认)
+            self.logger.info("设备选择: CPU (默认, 配合 INT8 量化模型)")
             return ["CPUExecutionProvider"]
 
     def _print_model_info(self):

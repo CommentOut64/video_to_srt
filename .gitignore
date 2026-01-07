@@ -15,7 +15,6 @@ __pycache__/
 build/
 dist/
 *.spec
-*.exe
 
 # 前端依赖和构建
 frontend/node_modules/
@@ -55,7 +54,6 @@ Thumbs.db
 venv/
 env/
 ENV/
-.env
 
 # 临时文件
 *.tmp
@@ -91,3 +89,5 @@ tests_output/
 CLAUDE.md
 backend/models/pretrained/sensevoice/
 tools/python
+build_patch.bat
+patch_tools/apply_patch.py

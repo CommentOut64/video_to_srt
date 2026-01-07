@@ -14,6 +14,7 @@ import numpy as np
 import logging
 import gc
 import os
+import re
 from pathlib import Path
 
 # 用于类型检查的条件导入（不会在运行时触发导入）
@@ -25,8 +26,13 @@ from app.core import config
 logger = logging.getLogger(__name__)
 
 # ========== 模型配置常量 ==========
-# 默认模型名称
-DEFAULT_WHISPER_MODEL = "medium"
+# 默认模型名称 (可通过.env文件中的 WHISPER_MODEL 环境变量覆盖)
+DEFAULT_WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "medium")
+
+# 默认计算类型 (可通过.env文件中的 WHISPER_COMPUTE_TYPE 环境变量覆盖)
+# 支持: float16, int8, int8_float16, auto
+# auto: 根据显存自动选择 (>=8GB用int8_float16, <8GB用int8)
+DEFAULT_COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE_TYPE", "auto")
 
 # 支持的模型列表及其 HuggingFace 仓库 ID
 WHISPER_MODELS = {
@@ -53,6 +59,55 @@ REQUIRED_MODEL_FILES = ["model.bin", "config.json", "vocabulary.txt"]
 HF_MIRROR_ENDPOINT = "https://hf-mirror.com"
 
 
+def get_auto_compute_type(device: str = "cuda") -> str:
+    """
+    根据显存大小自动选择计算类型
+
+    Args:
+        device: 设备类型 (cuda/cpu)
+
+    Returns:
+        str: 自动选择的计算类型
+
+    规则:
+        - CPU模式: 返回 int8 (最快)
+        - GPU >= 8GB: 返回 int8_float16 (精度高，显存优化)
+        - GPU < 8GB: 返回 int8 (最省显存)
+        - 检测失败: 返回 int8_float16 (保守选择)
+    """
+    # CPU模式直接用int8
+    if device == "cpu":
+        logger.info("CPU模式，自动选择 compute_type=int8")
+        return "int8"
+
+    # GPU模式，检测显存
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            logger.warning("CUDA不可用，回退到 int8")
+            return "int8"
+
+        # 获取第一个GPU的显存 (MB)
+        device_props = torch.cuda.get_device_properties(0)
+        gpu_memory_mb = device_props.total_memory // (1024 * 1024)
+        gpu_memory_gb = gpu_memory_mb / 1024
+        gpu_name = device_props.name
+
+        # 根据显存选择计算类型
+        if gpu_memory_mb >= 8 * 1024:  # >= 8GB
+            compute_type = "int8_float16"
+            logger.info(f"检测到GPU: {gpu_name} ({gpu_memory_gb:.1f}GB), 自动选择 compute_type={compute_type}")
+        else:  # < 8GB
+            compute_type = "int8"
+            logger.info(f"检测到GPU: {gpu_name} ({gpu_memory_gb:.1f}GB), 显存较小，自动选择 compute_type={compute_type}")
+
+        return compute_type
+
+    except Exception as e:
+        logger.warning(f"显存检测失败: {e}, 使用保守策略 int8_float16")
+        return "int8_float16"
+
+
 class WhisperService:
     """Faster-Whisper 转录服务（自动下载模型，自动使用镜像源）"""
 
@@ -60,8 +115,8 @@ class WhisperService:
         self.model: Optional[WhisperModel] = None
         self._model_name: str = ""
         self._device: str = "cuda"
-        self._compute_type: str = "float16"
-        
+        self._compute_type: str = DEFAULT_COMPUTE_TYPE  # 使用环境变量配置的默认值
+
         # 强制设置镜像源环境变量
         self._setup_hf_mirror()
 
@@ -122,7 +177,7 @@ class WhisperService:
         self,
         model_name: str = DEFAULT_WHISPER_MODEL,
         device: str = "cuda",
-        compute_type: str = "float16",
+        compute_type: str = None,  # None表示使用DEFAULT_COMPUTE_TYPE
         download_root: str = None,
         local_files_only: bool = False,
         auto_download: bool = True
@@ -134,7 +189,9 @@ class WhisperService:
             model_name: 模型名称 (tiny, base, small, medium, large-v2, large-v3)
                        默认值: medium（平衡速度与精度）
             device: 设备 (cuda, cpu)
-            compute_type: 计算类型 (float16, int8, int8_float16)
+            compute_type: 计算类型 (float16, int8, int8_float16, auto)
+                         None 表示使用 DEFAULT_COMPUTE_TYPE（从环境变量读取）
+                         auto 表示根据显存自动选择
             download_root: 模型下载目录（默认使用 config.HF_CACHE_DIR）
             local_files_only: 是否仅使用本地文件
             auto_download: 是否自动下载缺失的模型（默认 True）
@@ -142,9 +199,18 @@ class WhisperService:
         Returns:
             self: 支持链式调用
         """
-        # 如果已加载相同模型，跳过
-        if self.model and self._model_name == model_name:
-            logger.debug(f"模型 {model_name} 已加载，跳过")
+        # 如果未指定compute_type，使用默认值（从环境变量读取）
+        if compute_type is None:
+            compute_type = DEFAULT_COMPUTE_TYPE
+
+        # 处理 auto 模式：根据显存自动选择
+        if compute_type == "auto":
+            compute_type = get_auto_compute_type(device)
+            logger.info(f"auto模式已解析为: {compute_type}")
+
+        # 如果已加载相同模型和计算类型，跳过
+        if self.model and self._model_name == model_name and self._compute_type == compute_type:
+            logger.debug(f"模型 {model_name} (compute_type={compute_type}) 已加载，跳过")
             return self
 
         # 卸载旧模型
@@ -470,6 +536,24 @@ class WhisperService:
 
         # 转换生成器为列表
         segment_list = list(segments_generator)
+
+        # V3.1.0+dev.20260104.02: 过滤 Whisper 可能输出的 prompt 前缀
+        # Whisper 有时会将 initial_prompt 内容当作转录结果输出
+        def clean_prompt_leak(text: str) -> str:
+            """清理 Whisper 输出中泄漏的 prompt 内容"""
+            if not text:
+                return text
+            # 移除 "Glossary: xxx." 开头的内容
+            # 匹配 "Glossary:" 开头，到第一个句号或换行结束
+            cleaned = re.sub(r'^Glossary:\s*[^.]*\.\s*', '', text, flags=re.IGNORECASE)
+            # 如果整个文本就是 Glossary 格式，返回空
+            if cleaned == text and text.lower().startswith('glossary:'):
+                return ''
+            return cleaned.strip()
+
+        # 清理每个 segment 的文本
+        for seg in segment_list:
+            seg.text = clean_prompt_leak(seg.text)
 
         # 构建统一格式的返回结果
         result = {

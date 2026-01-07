@@ -215,7 +215,7 @@ class JobSettings:
 
     # === 旧版设置 (兼容) ===
     model: str = "medium"
-    compute_type: str = "float16"
+    compute_type: str = "auto"  # auto: 根据显存自动选择 (>=8GB用int8_float16, <8GB用int8)
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     batch_size: int = 16
     word_timestamps: bool = False
@@ -242,7 +242,13 @@ class JobSettings:
                 "demucs_strategy": self.preprocessing.demucs_strategy,
                 "demucs_model": self.preprocessing.demucs_model,
                 "demucs_shifts": self.preprocessing.demucs_shifts,
+                "separation_mode": self.preprocessing.separation_mode,
+                "enable_spectral_triage": self.preprocessing.enable_spectral_triage,
                 "spectrum_threshold": self.preprocessing.spectrum_threshold,
+                "enable_fuse_breaker": self.preprocessing.enable_fuse_breaker,
+                "fuse_max_retry": self.preprocessing.fuse_max_retry,
+                "fuse_confidence_threshold": self.preprocessing.fuse_confidence_threshold,
+                "fuse_auto_upgrade": self.preprocessing.fuse_auto_upgrade,
                 "vad_filter": self.preprocessing.vad_filter,
             },
             "transcription": {
@@ -326,7 +332,7 @@ class JobSettings:
             # 旧版配置
             engine=data.get("engine", "sensevoice"),
             model=data.get("model", "medium"),
-            compute_type=data.get("compute_type", "float16"),
+            compute_type=data.get("compute_type", "auto"),
             device=data.get("device", "cuda"),
             batch_size=data.get("batch_size", 16),
             word_timestamps=data.get("word_timestamps", False),
@@ -377,8 +383,14 @@ class JobSettings:
                 demucs_strategy=preset.preprocessing.demucs_strategy,
                 demucs_model=preset.preprocessing.demucs_model,
                 demucs_shifts=preset.preprocessing.demucs_shifts,
+                separation_mode=preset.preprocessing.separation_mode,
+                enable_spectral_triage=preset.preprocessing.enable_spectral_triage,
                 spectrum_threshold=preset.preprocessing.spectrum_threshold,
                 vad_filter=preset.preprocessing.vad_filter,
+                enable_fuse_breaker=True,
+                fuse_max_retry=1,
+                fuse_confidence_threshold=0.5,
+                fuse_auto_upgrade=False,
             ),
             transcription=TranscriptionConfig(
                 transcription_profile=preset.transcription.transcription_profile,

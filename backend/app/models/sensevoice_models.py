@@ -17,7 +17,7 @@ class SenseVoiceConfig:
     model_dir: str = "iic/SenseVoiceSmall"  # ModelScope 模型ID
     batch_size: int = 1
     quantize: bool = True  # 使用量化模型（INT8）
-    device: str = "cpu"  # V3.5: auto/cuda/cpu，当前强制CPU（onnxruntime-gpu CUDA版本不兼容）
+    device: str = "auto"  # V3.5: auto/cuda/cpu，auto时GPU优先，无GPU降级CPU
     use_itn: bool = True  # 是否使用逆文本正则化
     language: str = "auto"  # auto, zh, en, yue, ja, ko, nospeech
     ban_emo_unk: bool = False  # 是否禁用未知情感标签

@@ -350,7 +350,7 @@ import {
 import { useUnifiedTaskStore } from "@/stores/unifiedTaskStore";
 import { transcriptionApi, systemApi } from "@/services/api";
 import fileApi from "@/services/api/fileApi"; // 导入文件 API
-// V3.7.5: 移除 sseChannelManager 导入，SSE 订阅由 App.vue 统一管理
+// V3.1.0: 移除 sseChannelManager 导入，SSE 订阅由 App.vue 统一管理
 import PresetSelector from "@/components/editor/PresetSelector.vue"; // v3.5 预设选择器
 import AboutDialog from "@/components/AboutDialog.vue"; // 关于对话框
 
@@ -389,6 +389,7 @@ const taskConfig = ref({
     demucs_strategy: 'auto',
     demucs_model: 'htdemucs',
     demucs_shifts: 1,
+    separation_mode: 'on_demand',
     spectrum_threshold: 0.35,
     vad_filter: true,
     enable_spectral_triage: true
@@ -423,7 +424,7 @@ function handlePresetChange(newConfig) {
 // 计算属性 - 使用 computed 包装确保响应式
 const tasks = computed(() => taskStore.tasks);
 
-// V3.7.5: 移除 unsubscribeGlobalSSE，SSE 订阅由 App.vue 统一管理
+// V3.1.0: 移除 unsubscribeGlobalSSE，SSE 订阅由 App.vue 统一管理
 
 // 监听任务列表变化，自动加载新增任务的缩略图
 watch(
@@ -627,6 +628,9 @@ async function handleUpload() {
   const failCount = ref(0);
 
   try {
+    // V3.1.1+dev.20260106.01: 调试日志
+    console.log('[DEBUG] taskConfig.preprocessing:', JSON.stringify(taskConfig.value.preprocessing, null, 2));
+
     // v3.5: 构建转录设置，使用 task_config 格式
     const transcriptionSettings = {
       task_config: {
@@ -644,6 +648,9 @@ async function handleUpload() {
       batch_size: 16,
       word_timestamps: false
     };
+
+    // V3.1.1+dev.20260106.01: 调试日志
+    console.log('[DEBUG] transcriptionSettings.task_config.preprocessing:', JSON.stringify(transcriptionSettings.task_config.preprocessing, null, 2));
 
     // 逐个上传文件
     for (const file of uploadFiles.value) {
@@ -756,11 +763,11 @@ async function deleteTask(jobId) {
       // 这有助于修复幽灵任务问题
     }
 
-    // [V3.6.3] 优化：立即从本地删除，不再立即调用 syncTasksFromBackend
+    // [V3.1.0] 优化：立即从本地删除，不再立即调用 syncTasksFromBackend
     // 依赖 SSE job_removed 事件确保一致性
     await taskStore.deleteTask(jobId);
 
-    // [V3.6.3] 延迟同步作为兜底机制
+    // [V3.1.0] 延迟同步作为兜底机制
     // 如果 SSE 事件丢失，1秒后的同步可以保证最终一致性
     setTimeout(() => {
       taskStore.syncTasksFromBackend();
@@ -798,8 +805,8 @@ function getStatusText(status) {
     processing: "转录中",
     pausing: "正在暂停...",
     paused: "已暂停",
-    canceling: "正在取消...",  // V3.8.2
-    force_canceled: "已强制取消",  // V3.8.2
+    canceling: "正在取消...",  // V3.1.0
+    force_canceled: "已强制取消",  // V3.1.0
     finished: "已完成",
     failed: "失败",
     canceled: "已取消",
@@ -907,11 +914,11 @@ onMounted(() => {
     });
   }
 
-  // V3.7.5: 移除重复的 SSE 订阅，由 App.vue 统一处理
+  // V3.1.0: 移除重复的 SSE 订阅，由 App.vue 统一处理
   // 避免重复订阅导致的任务重复添加问题
 });
 
-// V3.7.5: 监听任务状态变化，自动加载完成任务的缩略图
+// V3.1.0: 监听任务状态变化，自动加载完成任务的缩略图
 // 替代原来在 SSE 订阅中的缩略图加载逻辑
 watch(
   () => tasks.value,

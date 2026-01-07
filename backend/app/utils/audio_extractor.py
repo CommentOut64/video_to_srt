@@ -146,7 +146,8 @@ class AudioExtractor:
         stdout, stderr = await process.communicate()
 
         if process.returncode != 0:
-            raise Exception(f"FFmpeg 失败: {stderr.decode()}")
+            # V3.1.0+dev.20260104.01: 修复 Windows 编码问题
+            raise Exception(f"FFmpeg 失败: {stderr.decode('utf-8', errors='replace')}")
 
     def _run_sync(self, cmd: list):
         """同步运行 FFmpeg 命令"""
@@ -157,7 +158,8 @@ class AudioExtractor:
         )
 
         if result.returncode != 0:
-            raise Exception(f"FFmpeg 失败: {result.stderr.decode()}")
+            # V3.1.0+dev.20260104.01: 修复 Windows 编码问题
+            raise Exception(f"FFmpeg 失败: {result.stderr.decode('utf-8', errors='replace')}")
 
 
 # 全局实例

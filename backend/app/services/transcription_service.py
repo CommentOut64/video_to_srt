@@ -560,17 +560,36 @@ class TranscriptionService:
     def _generate_srt_from_sentences(self, sentences: List, output_path: Path):
         """
         从句子列表生成 SRT 文件
+        V3.1.1+dev.20260106.03: 生成前自动修复时间戳重叠
 
         Args:
             sentences: 句子列表
             output_path: 输出路径
         """
-        srt_content = []
+        # V3.1.1+dev.20260106.03: 转换为字典列表以便修复重叠
+        from app.utils.text_utils import repair_timestamp_overlaps, detect_timestamp_overlaps
 
-        for i, sentence in enumerate(sentences, 1):
-            start = self._format_srt_timestamp(sentence.start)
-            end = self._format_srt_timestamp(sentence.end)
-            text = sentence.text
+        segments = []
+        for sentence in sentences:
+            segments.append({
+                'start': sentence.start,
+                'end': sentence.end,
+                'text': sentence.text
+            })
+
+        # 检测并修复重叠
+        overlaps = detect_timestamp_overlaps(segments)
+        if overlaps:
+            self.logger.warning(f"检测到 {len(overlaps)} 处时间戳重叠，自动修复中...")
+            segments = repair_timestamp_overlaps(segments, gap_ms=1.0)
+            self.logger.info(f"已修复 {len(overlaps)} 处时间戳重叠")
+
+        # 生成 SRT 内容
+        srt_content = []
+        for i, seg in enumerate(segments, 1):
+            start = self._format_srt_timestamp(seg['start'])
+            end = self._format_srt_timestamp(seg['end'])
+            text = seg['text']
 
             srt_content.append(f"{i}\n{start} --> {end}\n{text}\n")
 
@@ -744,7 +763,7 @@ class TranscriptionService:
         if self._optimization_config:
             optimized = JobSettings(
                 model=base_settings.model if base_settings else "medium",
-                compute_type=base_settings.compute_type if base_settings else "float16",
+                compute_type=base_settings.compute_type if base_settings else "auto",
                 device=self._optimization_config.recommended_device,
                 batch_size=self._optimization_config.batch_size,
                 word_timestamps=base_settings.word_timestamps if base_settings else False
@@ -779,13 +798,22 @@ class TranscriptionService:
 
         dest_path = job_dir / filename
 
-        # 复制文件到任务目录
+        # V3.1.1+dev.20260106.01: 使用硬链接替代复制，节省磁盘空间
+        # 硬链接让 input/video.mp4 和 jobs/{job_id}/video.mp4 指向同一数据块
+        # 支持多个任务指向同一个视频文件，删除任务时不影响原始文件
         if os.path.abspath(src_path) != os.path.abspath(dest_path):
             try:
-                shutil.copyfile(src_path, dest_path)
-                self.logger.debug(f"文件已复制: {src_path} -> {dest_path}")
-            except Exception as e:
-                self.logger.warning(f"文件复制失败: {e}")
+                # 优先使用硬链接
+                os.link(src_path, dest_path)
+                self.logger.debug(f"硬链接创建成功: {src_path} -> {dest_path}")
+            except (OSError, NotImplementedError) as e:
+                # 硬链接失败时降级到复制（跨文件系统、网络挂载等场景）
+                self.logger.warning(f"硬链接创建失败，回退到复制: {e}")
+                try:
+                    shutil.copyfile(src_path, dest_path)
+                    self.logger.debug(f"文件已复制: {src_path} -> {dest_path}")
+                except Exception as copy_err:
+                    self.logger.warning(f"文件复制失败: {copy_err}")
 
         # 创建任务状态对象
         job = JobState(
@@ -1235,7 +1263,7 @@ class TranscriptionService:
 
     def _force_remove_directory(self, directory: Path, job_id: str, max_retries: int = 3):
         """
-        V3.7.5: 强制删除目录，处理 Windows 文件占用问题
+        V3.1.0: 强制删除目录，处理 Windows 文件占用问题
 
         策略：
         1. 先触发垃圾回收，释放可能的文件句柄
@@ -1342,7 +1370,7 @@ class TranscriptionService:
 
                 # 最后删除任务目录
                 if job_dir.exists():
-                    # V3.7.5: 使用强制删除逻辑，处理 Windows 文件占用问题
+                    # V3.1.0: 使用强制删除逻辑，处理 Windows 文件占用问题
                     self._force_remove_directory(job_dir, job_id)
                     self.logger.info(f"已删除任务数据: {job_id}")
             except Exception as e:
@@ -2625,6 +2653,13 @@ class TranscriptionService:
             if job:
                 job.message = f"加载模型 {settings.model}"
 
+            # 处理 auto 模式：解析为具体的计算类型
+            compute_type_resolved = settings.compute_type
+            if compute_type_resolved == "auto":
+                from app.services.whisper_service import get_auto_compute_type
+                compute_type_resolved = get_auto_compute_type(settings.device)
+                self.logger.info(f"auto模式已解析为: {compute_type_resolved}")
+
             # 首先尝试仅使用本地文件 (使用 Faster-Whisper)
             try:
                 from app.core.config import config
@@ -2632,7 +2667,7 @@ class TranscriptionService:
                 m = WhisperModel(
                     settings.model,
                     device=settings.device,
-                    compute_type=settings.compute_type,
+                    compute_type=compute_type_resolved,  # 使用解析后的计算类型
                     download_root=str(config.HF_CACHE_DIR),
                     local_files_only=True  # 禁止自动下载，只使用本地文件
                 )
@@ -2648,7 +2683,7 @@ class TranscriptionService:
                 m = WhisperModel(
                     settings.model,
                     device=settings.device,
-                    compute_type=settings.compute_type,
+                    compute_type=compute_type_resolved,  # 使用解析后的计算类型
                     download_root=str(config.HF_CACHE_DIR),
                     local_files_only=False  # 允许下载
                 )
@@ -3156,20 +3191,21 @@ class TranscriptionService:
     def _generate_srt(self, results: List[Dict], path: str, word_level: bool):
         """
         生成SRT字幕文件
+        V3.1.1+dev.20260106.03: 生成前自动修复时间戳重叠
 
         Args:
             results: 转录结果列表
             path: 输出文件路径
             word_level: 是否使用词级时间戳
         """
-        lines = []
-        n = 1  # 字幕序号
+        # V3.1.1+dev.20260106.03: 导入重叠修复函数
+        from app.utils.text_utils import repair_timestamp_overlaps, detect_timestamp_overlaps
+
+        all_entries = []
 
         for r in results:
             if not r:
                 continue
-
-            entries = []
 
             # 词级时间戳模式
             if word_level and r.get('word_segments'):
@@ -3177,7 +3213,7 @@ class TranscriptionService:
                     if w.get('start') is not None and w.get('end') is not None:
                         txt = (w.get('word') or '').strip()
                         if txt:
-                            entries.append({
+                            all_entries.append({
                                 'start': w['start'],
                                 'end': w['end'],
                                 'text': txt
@@ -3189,30 +3225,38 @@ class TranscriptionService:
                     if s.get('start') is not None and s.get('end') is not None:
                         txt = (s.get('text') or '').strip()
                         if txt:
-                            entries.append({
+                            all_entries.append({
                                 'start': s['start'],
                                 'end': s['end'],
                                 'text': txt
                             })
 
-            # 写入SRT格式
-            for e in entries:
-                if e['end'] <= e['start']:
-                    continue  # 跳过无效时间戳
+        # 过滤无效时间戳
+        all_entries = [e for e in all_entries if e['end'] > e['start']]
 
-                lines.append(str(n))  # 序号
-                lines.append(
-                    f"{self._format_ts(e['start'])} --> {self._format_ts(e['end'])}"
-                )  # 时间戳
-                lines.append(e['text'])  # 字幕文本
-                lines.append("")  # 空行
-                n += 1
+        # V3.1.1+dev.20260106.03: 检测并修复重叠
+        if all_entries:
+            overlaps = detect_timestamp_overlaps(all_entries)
+            if overlaps:
+                self.logger.warning(f"检测到 {len(overlaps)} 处时间戳重叠，自动修复中...")
+                all_entries = repair_timestamp_overlaps(all_entries, gap_ms=1.0)
+                self.logger.info(f"已修复 {len(overlaps)} 处时间戳重叠")
+
+        # 写入SRT格式
+        lines = []
+        for n, e in enumerate(all_entries, 1):
+            lines.append(str(n))  # 序号
+            lines.append(
+                f"{self._format_ts(e['start'])} --> {self._format_ts(e['end'])}"
+            )  # 时间戳
+            lines.append(e['text'])  # 字幕文本
+            lines.append("")  # 空行
 
         # 写入文件
         with open(path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(lines))
 
-        self.logger.info(f"SRT文件已生成: {path}, 共{n-1}条字幕")
+        self.logger.info(f"SRT文件已生成: {path}, 共{len(all_entries)}条字幕")
 
     def clear_model_cache(self):
         """
@@ -4358,7 +4402,7 @@ class TranscriptionService:
         # 调试日志：确认方法被调用
         self.logger.debug(f"开始后处理增强: {len(sentences)} 句, enhancement={solution_config.enhancement.value}")
 
-        # V3.5.2: 极速模式（sensevoice_only）完全跳过 Whisper 补刀
+        # V3.1.0: 极速模式（sensevoice_only）完全跳过 Whisper 补刀
         # 极速模式的设计目标是纯 SenseVoice 输出，不加载 Whisper 模型
         if solution_config.enhancement == EnhancementMode.OFF:
             self.logger.info("极速模式: 跳过所有 Whisper 补刀和仲裁")
@@ -4607,7 +4651,7 @@ class TranscriptionService:
 
             self.logger.info("使用新架构 PreprocessingPipeline（Stage模式）")
 
-            # V3.9.1: 根据语言选择 VAD 配置
+            # V3.1.0: 根据语言选择 VAD 配置
             # 英语使用 Whisper，需要合并 VAD（避免幻觉）
             # 其他语言使用 SenseVoice，需要保留停顿信息以获得更好的断句
             language = getattr(job.settings, 'language', 'auto')

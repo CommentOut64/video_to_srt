@@ -1,300 +1,1172 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+AnchorFlux Bootloader - Unified Launcher
+V3.1.0+dev.20260104.01
+
+Core Features:
+1. Lifecycle loop (Guardian mode): Detect signal file after backend exit
+2. Dev/Prod mode switch: Via DEV_MODE in .env
+3. Update support: Detect update_signal.json and execute update
+4. Cross-environment: Support venv and embedded Python
+
+Usage:
+- Double-click to run (production mode)
+- Command line: python bootloader.py [--dev]
+"""
+
 import os
 import sys
-import subprocess
 import time
+import json
+import signal
 import shutil
-import webbrowser
+import zipfile
+import tempfile
+import subprocess
+import threading
+import logging
 import hashlib
 from pathlib import Path
-
-# --- 配置区域 ---
-PROJECT_ROOT = Path(__file__).resolve().parent
-FFMPEG_DIR = PROJECT_ROOT / "tools"
-BACKEND_DIR = PROJECT_ROOT / "backend"
-FRONTEND_DIR = PROJECT_ROOT / "frontend"
-REQ_FILE = PROJECT_ROOT / "requirements.txt"
-MARKER_FILE = PROJECT_ROOT / ".env_installed"  # 用于标记依赖是否已安装
-REQ_HASH_FILE = PROJECT_ROOT / ".req_hash"  # 用于存储 requirements.txt 的哈希值
+from typing import Optional, Dict, Any, Tuple
+from dataclasses import dataclass
+from datetime import datetime
 
 # ========================================
-#  Python 路径配置 (双模式: 嵌入式优先, 回退venv)
+# Constants
 # ========================================
-EMBED_PYTHON_DIR = PROJECT_ROOT / "tools" / "python"
-EMBED_PYTHON = EMBED_PYTHON_DIR / "python.exe"
-EMBED_SITE_PACKAGES = EMBED_PYTHON_DIR / "Lib" / "site-packages"
+VERSION = "3.1.1+dev.20260105.05"
+APP_NAME = "AnchorFlux"
+DEFAULT_BACKEND_PORT = 8000
+DEFAULT_FRONTEND_PORT = 5173
 
-VENV_DIR = PROJECT_ROOT / ".venv"
-VENV_PYTHON = VENV_DIR / "Scripts" / "python.exe"
-VENV_SITE_PACKAGES = VENV_DIR / "Lib" / "site-packages"
+# Signal files
+UPDATE_SIGNAL_FILE = "update_signal.json"
+SHUTDOWN_SIGNAL_FILE = ".shutdown_signal"
 
-# 检测Python模式: 优先嵌入式, 回退venv
-if EMBED_PYTHON.exists():
-    PYTHON_EXEC = EMBED_PYTHON
-    SITE_PACKAGES = EMBED_SITE_PACKAGES
-    PYTHON_MODE = "embedded"
-elif VENV_PYTHON.exists():
-    PYTHON_EXEC = VENV_PYTHON
-    SITE_PACKAGES = VENV_SITE_PACKAGES
-    PYTHON_MODE = "venv"
-else:
-    PYTHON_EXEC = None
-    SITE_PACKAGES = None
-    PYTHON_MODE = "not_found"
+# Dependency marker files
+MARKER_FILE = ".env_installed"
+REQ_HASH_FILE = ".req_hash"
 
-# 国内镜像源 (清华源)
-PYPI_MIRROR = "https://pypi.tuna.tsinghua.edu.cn/simple"
+# Log formats
+LOG_FORMAT_DEV = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+LOG_FORMAT_PROD = "%(asctime)s [%(levelname)s] %(message)s"
 
 
-def log(msg):
-    print(f"[Bootloader] {msg}")
+@dataclass
+class BootloaderConfig:
+    """Bootloader configuration"""
+    project_root: Path
+    dev_mode: bool = False
+    backend_port: int = DEFAULT_BACKEND_PORT
+    frontend_port: int = DEFAULT_FRONTEND_PORT
+
+    # Python paths
+    python_exec: Optional[Path] = None
+    python_mode: str = "unknown"  # "embedded", "venv", "system"
+    site_packages: Optional[Path] = None
+
+    # Tool paths
+    tools_dir: Optional[Path] = None
+    ffmpeg_path: Optional[Path] = None
+
+    # Environment variables
+    pypi_mirror: str = "https://pypi.tuna.tsinghua.edu.cn/simple"
+    hf_mirror: bool = True
+
+    # Log level
+    log_level: str = "INFO"
 
 
-def get_file_hash(filepath: Path) -> str:
-    """计算文件的 MD5 哈希值"""
-    if not filepath.exists():
-        return ""
-    with open(filepath, "rb") as f:
-        return hashlib.md5(f.read()).hexdigest()
+class BootloaderLogger:
+    """Bootloader logger"""
+
+    def __init__(self, dev_mode: bool = False):
+        self.dev_mode = dev_mode
+        self.logger = logging.getLogger("bootloader")
+        self._setup_logging()
+
+    def _setup_logging(self):
+        """Configure logging"""
+        level = logging.DEBUG if self.dev_mode else logging.INFO
+        fmt = LOG_FORMAT_DEV if self.dev_mode else LOG_FORMAT_PROD
+
+        self.logger.setLevel(level)
+
+        # Clear existing handlers
+        self.logger.handlers.clear()
+
+        # Console handler
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(level)
+        console_handler.setFormatter(logging.Formatter(fmt))
+        self.logger.addHandler(console_handler)
+
+    def info(self, msg: str):
+        self.logger.info(msg)
+
+    def debug(self, msg: str):
+        self.logger.debug(msg)
+
+    def warning(self, msg: str):
+        self.logger.warning(msg)
+
+    def error(self, msg: str):
+        self.logger.error(msg)
 
 
-def get_saved_hash() -> str:
-    """获取保存的 requirements.txt 哈希值"""
-    if REQ_HASH_FILE.exists():
-        return REQ_HASH_FILE.read_text().strip()
-    return ""
+class ProcessManager:
+    """Process manager"""
 
+    def __init__(self, logger: BootloaderLogger):
+        self.logger = logger
+        self.backend_process: Optional[subprocess.Popen] = None
+        self.frontend_process: Optional[subprocess.Popen] = None
+        self._shutdown_requested = False
 
-def save_hash(hash_value: str):
-    """保存 requirements.txt 的哈希值"""
-    REQ_HASH_FILE.write_text(hash_value)
+    def cleanup_old_processes(self, backend_port: int, frontend_port: int):
+        """Clean up residual processes"""
+        self.logger.info("Checking for old processes...")
 
+        if os.name != 'nt':
+            return
 
-def parse_requirements(filepath: Path) -> set:
-    """解析 requirements.txt，返回包名集合（不含版本号）"""
-    packages = set()
-    if not filepath.exists():
-        return packages
+        try:
+            import psutil
 
-    with open(filepath, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            # 跳过空行、注释和特殊指令
-            if not line or line.startswith("#") or line.startswith("-"):
-                continue
-            # 提取包名（去除版本号和其他修饰符）
-            pkg_name = line.split("==")[0].split(">=")[0].split("<=")[0].split("[")[0].split("<")[0].split(">")[0].strip()
-            if pkg_name:
-                packages.add(pkg_name.lower())
-    return packages
+            # Clean up port occupancy
+            for port in [backend_port, frontend_port]:
+                for conn in psutil.net_connections(kind='inet'):
+                    if conn.laddr.port == port and conn.status == 'LISTEN':
+                        try:
+                            proc = psutil.Process(conn.pid)
+                            self.logger.info(f"Killing process on port {port}: PID={proc.pid}")
+                            proc.terminate()
+                            proc.wait(timeout=3)
+                        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
+                            pass
 
+            # Clean up FFmpeg processes
+            for proc in psutil.process_iter(['pid', 'name']):
+                try:
+                    name = proc.info['name']
+                    if name and name.lower() in ['ffmpeg.exe', 'ffprobe.exe']:
+                        proc.terminate()
+                        self.logger.debug(f"Terminated FFmpeg process: PID={proc.info['pid']}")
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
 
-def get_installed_packages() -> set:
-    """获取当前已安装的包名集合"""
-    if PYTHON_EXEC is None:
-        return set()
-    try:
-        result = subprocess.run(
-            [str(PYTHON_EXEC), "-m", "pip", "list", "--format=freeze"],
-            capture_output=True, text=True, check=True
-        )
-        packages = set()
-        for line in result.stdout.strip().split("\n"):
-            if line and "==" in line:
-                pkg_name = line.split("==")[0].strip().lower()
-                packages.add(pkg_name)
-        return packages
-    except subprocess.CalledProcessError:
-        return set()
+            self.logger.info("Old process cleanup completed")
 
+        except ImportError:
+            self.logger.warning("psutil not available, using fallback cleanup")
+            self._fallback_cleanup(backend_port, frontend_port)
 
-def fix_pytorch_dll():
-    """
-    修复 PyTorch 在 Windows 上的 DLL 依赖问题。
+        # Wait for cleanup to complete
+        time.sleep(2)
 
-    PyTorch 2.x+cu118 的 fbgemm.dll 依赖 libomp140.x86_64.dll (LLVM OpenMP)，
-    但 Windows 系统默认不包含此 DLL。解决方案是将 PyTorch 自带的
-    libiomp5md.dll (Intel OpenMP) 复制为 libomp140.x86_64.dll，
-    两者 API 兼容。
-    """
-    if SITE_PACKAGES is None:
-        return
+    def _fallback_cleanup(self, backend_port: int, frontend_port: int):
+        """Fallback cleanup (without psutil)"""
+        for port in [backend_port, frontend_port]:
+            try:
+                result = subprocess.run(
+                    f'netstat -ano | findstr ":{port}" | findstr "LISTENING"',
+                    shell=True, capture_output=True, timeout=5
+                )
+                if result.returncode == 0 and result.stdout:
+                    lines = result.stdout.decode('utf-8', errors='replace').strip().split('\n')
+                    for line in lines:
+                        parts = line.split()
+                        if len(parts) >= 5:
+                            pid = parts[-1]
+                            subprocess.run(['taskkill', '/F', '/PID', pid],
+                                         capture_output=True, timeout=3)
+            except Exception:
+                pass
 
-    torch_lib = SITE_PACKAGES / "torch" / "lib"
+        # Clean up FFmpeg
+        try:
+            subprocess.run(['taskkill', '/F', '/IM', 'ffmpeg.exe'],
+                         capture_output=True, timeout=3)
+            subprocess.run(['taskkill', '/F', '/IM', 'ffprobe.exe'],
+                         capture_output=True, timeout=3)
+        except Exception:
+            pass
 
-    source_dll = torch_lib / "libiomp5md.dll"
-    target_dll = torch_lib / "libomp140.x86_64.dll"
+    def start_backend(self, config: BootloaderConfig) -> bool:
+        """Start backend service"""
+        self.logger.info(f"Starting backend service on port {config.backend_port}...")
 
-    if not torch_lib.exists():
-        return  # PyTorch 未安装
+        backend_dir = config.project_root / "backend"
 
-    if target_dll.exists():
-        return  # 已修复
+        # Build environment variables
+        env = os.environ.copy()
+        env['PYTHONIOENCODING'] = 'utf-8'
+        env['PYTHONUTF8'] = '1'
+        env['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
-    if source_dll.exists():
-        log("Fixing PyTorch DLL (fbgemm.dll -> libomp140.x86_64.dll)...")
-        shutil.copy(source_dll, target_dll)
-        log("DLL fix completed!")
+        # V3.1.1+dev.20260105.05: 传递 DEV_MODE 给后端，控制是否托管静态文件
+        env['DEV_MODE'] = 'true' if config.dev_mode else 'false'
 
+        # Set HuggingFace mirror
+        if config.hf_mirror:
+            env['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
-def sync_dependencies():
-    """
-    智能依赖同步：
-    - 检测 requirements.txt 变化
-    - 自动安装新增包
-    """
-    if PYTHON_EXEC is None:
-        log("ERROR: Python not found!")
-        log(f"  - Embedded Python path: {EMBED_PYTHON}")
-        log(f"  - Venv Python path: {VENV_PYTHON}")
-        log("Please install Python 3.10+ or place embedded Python in tools/python/")
-        input("Press Enter to exit...")
-        sys.exit(1)
+        # Set PATH (including PyTorch DLLs and tools)
+        if config.site_packages:
+            torch_lib = config.site_packages / "torch" / "lib"
+            nvidia_cudnn = config.site_packages / "nvidia" / "cudnn" / "bin"
+            nvidia_cublas = config.site_packages / "nvidia" / "cublas" / "bin"
 
-    log(f"Python Mode: {PYTHON_MODE}")
-    log(f"Python Path: {PYTHON_EXEC}")
+            path_additions = []
+            for p in [torch_lib, nvidia_cudnn, nvidia_cublas]:
+                if p.exists():
+                    path_additions.append(str(p))
 
-    current_hash = get_file_hash(REQ_FILE)
-    saved_hash = get_saved_hash()
+            if config.tools_dir and config.tools_dir.exists():
+                path_additions.append(str(config.tools_dir))
 
-    # 如果哈希值相同且标记文件存在，说明无变化，极速启动
-    if current_hash == saved_hash and MARKER_FILE.exists():
-        log("Dependencies unchanged, skipping (fast startup)...")
-        return
+            if path_additions:
+                env['PATH'] = ';'.join(path_additions) + ';' + env.get('PATH', '')
 
-    log("Detected requirements.txt change or first run, syncing dependencies...")
-
-    # 解析当前 requirements.txt 中的包
-    required_packages = parse_requirements(REQ_FILE)
-    log(f"requirements.txt defines {len(required_packages)} packages")
-
-    # 获取当前已安装的包
-    installed_packages = get_installed_packages()
-
-    # 计算需要安装的包
-    to_install = required_packages - installed_packages
-
-    if to_install:
-        log(f"Need to install {len(to_install)} new packages: {', '.join(sorted(to_install))}")
-
-    # 使用 pip install -r 来安装所有依赖
-    log("Syncing dependencies...")
-    cmd = [
-        str(PYTHON_EXEC), "-m", "pip", "install",
-        "-r", str(REQ_FILE),
-        "-i", PYPI_MIRROR
-    ]
-
-    try:
-        subprocess.run(cmd, check=True)
-
-        # 安装成功后保存哈希值和标记文件
-        save_hash(current_hash)
-        MARKER_FILE.touch()
-        log("Dependency sync completed!")
-
-        # 修复 PyTorch DLL 依赖问题
-        fix_pytorch_dll()
-
-    except subprocess.CalledProcessError:
-        log("ERROR: Dependency sync failed!")
-        log("Hint: Check network or version constraints in requirements.txt")
-        input("Press Enter to exit...")
-        sys.exit(1)
-
-
-def check_ffmpeg():
-    """检查 FFmpeg 是否存在"""
-    ffmpeg_exe = FFMPEG_DIR / "ffmpeg.exe"
-    if not ffmpeg_exe.exists():
-        log(f"ERROR: FFmpeg not found: {ffmpeg_exe}")
-        log("Please download ffmpeg.exe and place it in the tools directory.")
-        input("Press Enter to exit...")
-        sys.exit(1)
-    log("FFmpeg check passed.")
-
-
-def setup_environment():
-    """配置运行时的环境变量 (关键步骤)"""
-    env = os.environ.copy()
-
-    # 1. 添加 FFmpeg 到 PATH
-    env["PATH"] = f"{FFMPEG_DIR};" + env["PATH"]
-
-    # 2. 使用动态检测到的 site-packages 路径
-    if SITE_PACKAGES is None:
-        log("ERROR: Site packages path not determined!")
-        sys.exit(1)
-
-    # 3. 注入 CUDA 库路径 (解决 cu11 和 cu12 共存)
-    # PyTorch (cu11) libs
-    torch_lib = SITE_PACKAGES / "torch" / "lib"
-    # Faster-Whisper (ctranslate2) 需要的 NVIDIA libs (cu12)
-    nvidia_cudnn = SITE_PACKAGES / "nvidia" / "cudnn" / "bin"
-    nvidia_cublas = SITE_PACKAGES / "nvidia" / "cublas" / "bin"
-
-    # 将这些路径前置到 PATH
-    extra_paths = [str(torch_lib), str(nvidia_cudnn), str(nvidia_cublas)]
-    env["PATH"] = ";".join(extra_paths) + ";" + env["PATH"]
-
-    # 4. 设置环境变量
-    env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-    env["HF_ENDPOINT"] = "https://hf-mirror.com"
-
-    return env
-
-
-def start_services(env):
-    """启动后端和前端"""
-    processes = []
-
-    try:
-        # --- 1. 启动后端 (Uvicorn) ---
-        log("Starting backend service...")
-        backend_cmd = [
-            str(PYTHON_EXEC), "-m", "uvicorn",
-            "app.main:app",
-            "--host", "127.0.0.1",
-            "--port", "8000",
+        # Start command
+        cmd = [
+            str(config.python_exec),
+            '-m', 'uvicorn',
+            'app.main:app',
+            '--host', '0.0.0.0',
+            '--port', str(config.backend_port)
         ]
-        backend_proc = subprocess.Popen(backend_cmd, cwd=str(BACKEND_DIR), env=env)
-        processes.append(backend_proc)
 
-        # --- 2. 等待后端启动后打开浏览器 ---
-        time.sleep(3)
-        webbrowser.open("http://127.0.0.1:8000/docs")
+        try:
+            # V3.1.0+dev.20260104.02: Run backend in same console to see output
+            # In production mode, run in same window; in dev mode, create new window
+            if config.dev_mode and os.name == 'nt':
+                # Dev mode: create new window for backend
+                creationflags = subprocess.CREATE_NEW_CONSOLE
+                self.backend_process = subprocess.Popen(
+                    cmd,
+                    cwd=str(backend_dir),
+                    env=env,
+                    creationflags=creationflags
+                )
+            else:
+                # Production mode: run in same console, inherit stdout/stderr
+                self.backend_process = subprocess.Popen(
+                    cmd,
+                    cwd=str(backend_dir),
+                    env=env
+                )
 
-        log("All services started. Press Ctrl+C to stop.")
+            self.logger.info(f"Backend started: PID={self.backend_process.pid}")
 
-        # 守护进程：等待任意子进程结束
-        while True:
-            time.sleep(1)
-            if backend_proc.poll() is not None:
-                log("Backend service stopped.")
-                break
+            # V3.1.0+dev.20260104.02: Wait a moment and check if backend crashed immediately
+            time.sleep(3)
+            if self.backend_process.poll() is not None:
+                exit_code = self.backend_process.returncode
+                self.logger.error(f"Backend crashed immediately with exit code: {exit_code}")
+                return False
 
-    except KeyboardInterrupt:
-        log("Stopping services...")
-    finally:
-        for p in processes:
-            p.terminate()
-        log("Exited.")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to start backend: {e}")
+            return False
+
+    def start_frontend(self, config: BootloaderConfig) -> bool:
+        """Start frontend service (dev mode only)"""
+        if not config.dev_mode:
+            self.logger.debug("Production mode, skipping frontend startup")
+            return True
+
+        frontend_dir = config.project_root / "frontend"
+
+        # Check node_modules
+        if not (frontend_dir / "node_modules").exists():
+            self.logger.warning("node_modules not found, running npm install...")
+            try:
+                subprocess.run('npm install', cwd=str(frontend_dir),
+                             check=True, timeout=300, shell=True)
+            except Exception as e:
+                self.logger.error(f"npm install failed: {e}")
+                return False
+
+        self.logger.info(f"Starting frontend service on port {config.frontend_port}...")
+
+        try:
+            creationflags = 0
+            if os.name == 'nt':
+                creationflags = subprocess.CREATE_NEW_CONSOLE
+
+            # V3.1.1+dev.20260105.05: 使用 shell=True 确保能找到 npm
+            self.frontend_process = subprocess.Popen(
+                'npm run dev',
+                cwd=str(frontend_dir),
+                creationflags=creationflags,
+                shell=True
+            )
+
+            self.logger.info(f"Frontend started: PID={self.frontend_process.pid}")
+
+            # V3.1.1+dev.20260105.05: 等待几秒让前端启动
+            time.sleep(3)
+            if self.frontend_process.poll() is not None:
+                exit_code = self.frontend_process.returncode
+                self.logger.error(f"Frontend crashed immediately with exit code: {exit_code}")
+                return False
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to start frontend: {e}")
+            return False
+
+    def wait_for_backend_exit(self) -> int:
+        """Wait for backend to exit, return exit code"""
+        if self.backend_process is None:
+            return -1
+
+        self.logger.info("Waiting for backend to exit...")
+        return self.backend_process.wait()
+
+    def is_backend_running(self) -> bool:
+        """Check if backend is still running"""
+        if self.backend_process is None:
+            return False
+        return self.backend_process.poll() is None
+
+    def terminate_all(self):
+        """Terminate all processes"""
+        self._shutdown_requested = True
+
+        if self.frontend_process and self.frontend_process.poll() is None:
+            self.logger.info("Terminating frontend process...")
+            self.frontend_process.terminate()
+            try:
+                self.frontend_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.frontend_process.kill()
+
+        if self.backend_process and self.backend_process.poll() is None:
+            self.logger.info("Terminating backend process...")
+            self.backend_process.terminate()
+            try:
+                self.backend_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.backend_process.kill()
+
+
+class UpdateManager:
+    """Update manager"""
+
+    # V3.1.1+dev.20260105.04: 默认排除列表（配置文件不存在时使用）
+    DEFAULT_EXCLUDE_DIRS = {'jobs', 'models', 'temp', 'output', 'input', 'logs',
+                           'tools', '.venv', 'node_modules', '.git',
+                           'backend/models', 'backend/app/assets'}
+    DEFAULT_EXCLUDE_FILES = {'.env', '.env_installed', '.req_hash'}
+
+    def __init__(self, config: BootloaderConfig, logger: BootloaderLogger):
+        self.config = config
+        self.logger = logger
+        self.signal_file = config.project_root / UPDATE_SIGNAL_FILE
+        self.update_config_file = config.project_root / "backend" / "update_config.json"
+
+    def _load_update_config(self) -> Tuple[set, set]:
+        """
+        V3.1.1+dev.20260105.03: 从配置文件加载更新排除列表
+        配置文件位于 backend/update_config.json，可通过更新进行更新
+        """
+        exclude_dirs = self.DEFAULT_EXCLUDE_DIRS.copy()
+        exclude_files = self.DEFAULT_EXCLUDE_FILES.copy()
+
+        if not self.update_config_file.exists():
+            self.logger.debug(f"Update config not found, using defaults: {self.update_config_file}")
+            return exclude_dirs, exclude_files
+
+        try:
+            with open(self.update_config_file, 'r', encoding='utf-8') as f:
+                config_data = json.load(f)
+
+            # 读取目录排除列表
+            if 'exclude_dirs' in config_data:
+                exclude_dirs = set(config_data['exclude_dirs'])
+                self.logger.info(f"Loaded {len(exclude_dirs)} exclude dirs from config")
+
+            # 读取文件排除列表
+            if 'exclude_files' in config_data:
+                exclude_files = set(config_data['exclude_files'])
+                self.logger.info(f"Loaded {len(exclude_files)} exclude files from config")
+
+            return exclude_dirs, exclude_files
+
+        except Exception as e:
+            self.logger.warning(f"Failed to load update config: {e}, using defaults")
+            return self.DEFAULT_EXCLUDE_DIRS.copy(), self.DEFAULT_EXCLUDE_FILES.copy()
+
+    def _copy_with_excludes(self, source_dir: Path, dest_dir: Path,
+                            exclude_dirs: set, exclude_files: set,
+                            prefix: str = "") -> Tuple[int, int]:
+        """
+        V3.1.1+dev.20260105.04: 递归复制，支持任意深度的排除路径
+
+        Args:
+            source_dir: 源目录
+            dest_dir: 目标目录
+            exclude_dirs: 排除的目录路径集合（支持相对路径如 "backend/models"）
+            exclude_files: 排除的文件路径集合（支持相对路径）
+            prefix: 当前路径前缀（用于构建相对路径）
+
+        Returns:
+            (copied_count, skipped_count) 复制和跳过的项目数
+        """
+        copied_count = 0
+        skipped_count = 0
+
+        for item in source_dir.iterdir():
+            # 构建相对路径（用于匹配排除规则）
+            if prefix:
+                rel_path = f"{prefix}/{item.name}"
+            else:
+                rel_path = item.name
+
+            # 统一使用正斜杠，便于跨平台匹配
+            rel_path_normalized = rel_path.replace('\\', '/')
+
+            if item.is_dir():
+                # 检查目录是否在排除列表中
+                # 支持精确匹配和前缀匹配（如 "backend/models" 匹配 "backend/models/xxx"）
+                is_excluded = False
+                for exclude_dir in exclude_dirs:
+                    exclude_normalized = exclude_dir.replace('\\', '/')
+                    if rel_path_normalized == exclude_normalized or \
+                       rel_path_normalized.startswith(exclude_normalized + '/'):
+                        is_excluded = True
+                        break
+
+                if is_excluded:
+                    self.logger.debug(f"{prefix}[Skip] Excluded dir: {rel_path}")
+                    skipped_count += 1
+                    continue
+
+                # 目录未排除，递归处理
+                dest_subdir = dest_dir / item.name
+
+                # 确保目标目录存在
+                dest_subdir.mkdir(parents=True, exist_ok=True)
+
+                # 递归复制子目录内容
+                sub_copied, sub_skipped = self._copy_with_excludes(
+                    item, dest_subdir, exclude_dirs, exclude_files, rel_path
+                )
+                copied_count += sub_copied
+                skipped_count += sub_skipped
+
+            else:
+                # 文件处理
+                # 检查文件是否在排除列表中（支持相对路径和文件名匹配）
+                is_excluded = False
+                for exclude_file in exclude_files:
+                    exclude_normalized = exclude_file.replace('\\', '/')
+                    # 支持精确路径匹配和纯文件名匹配
+                    if rel_path_normalized == exclude_normalized or \
+                       item.name == exclude_file:
+                        is_excluded = True
+                        break
+
+                if is_excluded:
+                    self.logger.debug(f"{prefix}[Skip] Excluded file: {rel_path}")
+                    skipped_count += 1
+                    continue
+
+                # 文件未排除，直接覆盖复制
+                dest_file = dest_dir / item.name
+                shutil.copy2(item, dest_file)
+                copied_count += 1
+
+        return copied_count, skipped_count
+
+    def check_update_signal(self) -> Optional[Dict[str, Any]]:
+        """Check for update signal file"""
+        if not self.signal_file.exists():
+            return None
+
+        try:
+            with open(self.signal_file, 'r', encoding='utf-8') as f:
+                signal_data = json.load(f)
+
+            self.logger.info(f"Update signal detected: {signal_data.get('version', 'unknown')}")
+            return signal_data
+
+        except Exception as e:
+            self.logger.error(f"Failed to read update signal: {e}")
+            return None
+
+    def clear_update_signal(self):
+        """Clear update signal file"""
+        if self.signal_file.exists():
+            try:
+                self.signal_file.unlink()
+                self.logger.info("Update signal cleared")
+            except Exception as e:
+                self.logger.error(f"Failed to clear update signal: {e}")
+
+    def execute_update(self, signal_data: Dict[str, Any], headless: bool = False) -> bool:
+        """
+        Execute update process
+
+        V3.1.1+dev.20260105.01: 添加 headless 模式支持，用于自动化测试
+        """
+        download_url = signal_data.get('download_url')
+        version = signal_data.get('version', 'unknown')
+
+        if not download_url:
+            self.logger.error("No download URL in update signal")
+            return False
+
+        self.logger.info(f"Starting update to version {version}...")
+
+        try:
+            if headless:
+                # V3.1.1+dev.20260105.01: 无头模式，不显示 GUI
+                return self._run_update_headless(download_url, version)
+            else:
+                # 正常模式，显示 Tkinter GUI
+                return self._run_update_gui(download_url, version)
+        except Exception as e:
+            self.logger.error(f"Update failed: {e}")
+            return False
+
+    def _run_update_headless(self, download_url: str, version: str) -> bool:
+        """
+        Run update without GUI (headless mode)
+
+        V3.1.1+dev.20260105.01: 用于自动化测试和无显示器环境
+        """
+        import urllib.request
+
+        self.logger.info(f"[Headless] Downloading update from: {download_url}")
+
+        try:
+            # 1. 下载更新包
+            temp_dir = Path(tempfile.mkdtemp())
+            zip_path = temp_dir / "update.zip"
+
+            self.logger.info("[Headless] Step 1/4: Downloading...")
+            urllib.request.urlretrieve(download_url, str(zip_path))
+            self.logger.info(f"[Headless] Downloaded: {zip_path.stat().st_size} bytes")
+
+            # 2. 解压更新包
+            self.logger.info("[Headless] Step 2/4: Extracting...")
+            extract_dir = temp_dir / "extracted"
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                zf.extractall(str(extract_dir))
+
+            # 3. 定位源目录
+            extracted_items = list(extract_dir.iterdir())
+            if len(extracted_items) == 1 and extracted_items[0].is_dir():
+                source_dir = extracted_items[0]
+            else:
+                source_dir = extract_dir
+
+            self.logger.info(f"[Headless] Source directory: {source_dir}")
+
+            # 4. 递归复制文件（排除用户数据目录和文件）
+            # V3.1.1+dev.20260105.04: 改用递归复制，支持任意深度的排除路径
+            self.logger.info("[Headless] Step 3/4: Installing...")
+            exclude_dirs, exclude_files = self._load_update_config()
+
+            self.logger.info(f"[Headless] Exclude dirs: {exclude_dirs}")
+            self.logger.info(f"[Headless] Exclude files: {exclude_files}")
+
+            copied_count, skipped_count = self._copy_with_excludes(
+                source_dir, self.config.project_root,
+                exclude_dirs, exclude_files
+            )
+
+            self.logger.info(f"[Headless] Copied {copied_count} files, skipped {skipped_count} excluded items")
+
+            # 5. 清理临时文件
+            self.logger.info("[Headless] Step 4/4: Cleaning up...")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+            self.logger.info("[Headless] Update completed successfully!")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"[Headless] Update error: {e}")
+            return False
+
+    def _run_update_gui(self, download_url: str, version: str) -> bool:
+        """Run update with GUI"""
+        try:
+            import tkinter as tk
+            from tkinter import ttk, messagebox
+        except ImportError:
+            self.logger.error("Tkinter not available, cannot show update GUI")
+            return False
+
+        # Create update window
+        root = tk.Tk()
+        root.title(f"{APP_NAME} - Updating to {version}")
+        root.geometry("400x200")
+        root.resizable(False, False)
+
+        # Center window
+        root.update_idletasks()
+        width = root.winfo_width()
+        height = root.winfo_height()
+        x = (root.winfo_screenwidth() // 2) - (width // 2)
+        y = (root.winfo_screenheight() // 2) - (height // 2)
+        root.geometry(f'{width}x{height}+{x}+{y}')
+
+        # UI elements
+        frame = ttk.Frame(root, padding="20")
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        status_label = ttk.Label(frame, text="Preparing update...")
+        status_label.pack(pady=10)
+
+        progress_bar = ttk.Progressbar(frame, length=300, mode='determinate')
+        progress_bar.pack(pady=10)
+
+        detail_label = ttk.Label(frame, text="")
+        detail_label.pack(pady=5)
+
+        update_success = [False]  # Use list to modify in closure
+
+        def update_progress(percent: int, status: str, detail: str = ""):
+            progress_bar['value'] = percent
+            status_label['text'] = status
+            detail_label['text'] = detail
+            root.update()
+
+        def do_update():
+            try:
+                import urllib.request
+
+                # 1. Download update package
+                update_progress(10, "Downloading update...")
+
+                temp_dir = Path(tempfile.mkdtemp())
+                zip_path = temp_dir / "update.zip"
+
+                def download_progress(block_num, block_size, total_size):
+                    if total_size > 0:
+                        percent = min(10 + int(block_num * block_size / total_size * 50), 60)
+                        downloaded = block_num * block_size / (1024 * 1024)
+                        total = total_size / (1024 * 1024)
+                        root.after(0, lambda: update_progress(
+                            percent, "Downloading...",
+                            f"{downloaded:.1f} MB / {total:.1f} MB"
+                        ))
+
+                urllib.request.urlretrieve(download_url, str(zip_path), download_progress)
+
+                # 2. Extract update package
+                update_progress(65, "Extracting files...")
+
+                extract_dir = temp_dir / "extracted"
+                with zipfile.ZipFile(zip_path, 'r') as zf:
+                    zf.extractall(str(extract_dir))
+
+                # 3. Backup current version (optional)
+                update_progress(75, "Backing up current version...")
+
+                # 4. Copy files
+                update_progress(80, "Installing update...")
+
+                # Find extracted root directory
+                extracted_items = list(extract_dir.iterdir())
+                if len(extracted_items) == 1 and extracted_items[0].is_dir():
+                    source_dir = extracted_items[0]
+                else:
+                    source_dir = extract_dir
+
+                # Copy files (exclude user data directories and files)
+                # V3.1.1+dev.20260105.04: 改用递归复制，支持任意深度的排除路径
+                exclude_dirs, exclude_files = self._load_update_config()
+
+                copied_count, skipped_count = self._copy_with_excludes(
+                    source_dir, self.config.project_root,
+                    exclude_dirs, exclude_files
+                )
+                self.logger.info(f"Copied {copied_count} files, skipped {skipped_count} excluded items")
+
+                # 5. Cleanup
+                update_progress(95, "Cleaning up...")
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+                update_progress(100, "Update completed!")
+                update_success[0] = True
+
+                root.after(1500, root.destroy)
+
+            except Exception as e:
+                self.logger.error(f"Update error: {e}")
+                root.after(0, lambda: messagebox.showerror(
+                    "Update Failed",
+                    f"Failed to update: {str(e)}\n\nThe application will restart with the current version."
+                ))
+                root.after(0, root.destroy)
+
+        # Run update in background thread
+        update_thread = threading.Thread(target=do_update, daemon=True)
+        update_thread.start()
+
+        root.mainloop()
+
+        return update_success[0]
+
+
+def get_project_root() -> Path:
+    """
+    获取项目根目录
+
+    V3.1.1+dev.20260105.02: 支持打包后的 EXE 运行环境
+    - 打包后: sys.executable 指向 EXE 文件，使用其所在目录
+    - 源码运行: __file__ 指向 bootloader.py，使用其所在目录
+    """
+    if getattr(sys, 'frozen', False):
+        # PyInstaller 打包后，sys.executable 是 EXE 文件路径
+        return Path(sys.executable).parent.resolve()
+    else:
+        # 源码运行
+        return Path(__file__).parent.resolve()
+
+
+class Bootloader:
+    """Main bootloader class"""
+
+    def __init__(self):
+        self.project_root = get_project_root()
+        self.config: Optional[BootloaderConfig] = None
+        self.logger: Optional[BootloaderLogger] = None
+        self.process_manager: Optional[ProcessManager] = None
+        self.update_manager: Optional[UpdateManager] = None
+        self._running = True
+
+    def _detect_dev_mode(self) -> bool:
+        """Detect development mode"""
+        # 1. Command line argument
+        if '--dev' in sys.argv:
+            return True
+
+        # 2. Environment variable
+        if os.environ.get('DEV_MODE', '').lower() in ('true', '1', 'yes'):
+            return True
+
+        # 3. .env file
+        env_file = self.project_root / '.env'
+        if env_file.exists():
+            try:
+                with open(env_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith('#') or '=' not in line:
+                            continue
+                        key, value = line.split('=', 1)
+                        if key.strip() == 'DEV_MODE':
+                            return value.strip().lower() in ('true', '1', 'yes')
+            except Exception:
+                pass
+
+        return False
+
+    def _detect_python(self, dev_mode: bool = False) -> Tuple[Optional[Path], str, Optional[Path]]:
+        """
+        Detect Python environment
+        V3.1.0+dev.20260105.01: 根据 DEV_MODE 调整检测优先级
+        - DEV_MODE=true: 优先使用 .venv（开发环境）
+        - DEV_MODE=false: 优先使用 embedded Python（生产环境）
+        """
+        tools_dir = self.project_root / "tools"
+        embed_python = tools_dir / "python" / "python.exe"
+        embed_site_packages = tools_dir / "python" / "Lib" / "site-packages"
+        venv_python = self.project_root / ".venv" / "Scripts" / "python.exe"
+        venv_site_packages = self.project_root / ".venv" / "Lib" / "site-packages"
+
+        if dev_mode:
+            # 开发模式: 优先使用 .venv
+            if venv_python.exists():
+                return venv_python, "venv", venv_site_packages
+            if embed_python.exists():
+                return embed_python, "embedded", embed_site_packages
+        else:
+            # 生产模式: 优先使用 embedded Python
+            if embed_python.exists():
+                return embed_python, "embedded", embed_site_packages
+            if venv_python.exists():
+                return venv_python, "venv", venv_site_packages
+
+        # 回退: System Python
+        try:
+            result = subprocess.run(['python', '--version'],
+                                  capture_output=True, timeout=5)
+            if result.returncode == 0:
+                return Path('python'), "system", None
+        except Exception:
+            pass
+
+        return None, "not_found", None
+
+    def _check_embedded_dependencies(self, python_exec: Path, site_packages: Path) -> bool:
+        """
+        检查 Python 环境是否已安装必要依赖
+        V3.1.0+dev.20260105.01: 智能检测，支持哈希值比对
+        """
+        marker_file = self.project_root / MARKER_FILE
+        req_hash_file = self.project_root / REQ_HASH_FILE
+        req_file = self.project_root / "requirements.txt"
+
+        # 计算当前 requirements.txt 的哈希值
+        current_hash = self._get_file_hash(req_file)
+        saved_hash = req_hash_file.read_text().strip() if req_hash_file.exists() else ""
+
+        # 如果哈希值相同且标记文件存在，说明无变化
+        if current_hash == saved_hash and marker_file.exists():
+            return True
+
+        # 额外检查核心包是否存在
+        core_packages = ['fastapi', 'uvicorn', 'pydub', 'torch']
+        for pkg in core_packages:
+            pkg_dir = site_packages / pkg
+            pkg_dist = site_packages / f"{pkg.replace('-', '_')}.dist-info"
+            if not pkg_dir.exists() and not pkg_dist.exists():
+                return False
+
+        return marker_file.exists()
+
+    def _get_file_hash(self, filepath: Path) -> str:
+        """计算文件的 MD5 哈希值"""
+        if not filepath.exists():
+            return ""
+        with open(filepath, "rb") as f:
+            return hashlib.md5(f.read()).hexdigest()
+
+    def _fix_pytorch_dll(self, site_packages: Path):
+        """
+        修复 PyTorch 在 Windows 上的 DLL 依赖问题
+
+        PyTorch 2.x+cu118 的 fbgemm.dll 依赖 libomp140.x86_64.dll (LLVM OpenMP)，
+        但 Windows 系统默认不包含此 DLL。解决方案是将 PyTorch 自带的
+        libiomp5md.dll (Intel OpenMP) 复制为 libomp140.x86_64.dll，
+        两者 API 兼容。
+        """
+        torch_lib = site_packages / "torch" / "lib"
+        source_dll = torch_lib / "libiomp5md.dll"
+        target_dll = torch_lib / "libomp140.x86_64.dll"
+
+        if not torch_lib.exists():
+            return  # PyTorch 未安装
+
+        if target_dll.exists():
+            return  # 已修复
+
+        if source_dll.exists():
+            self.logger.info("Fixing PyTorch DLL dependency (fbgemm.dll -> libomp140.x86_64.dll)...")
+            shutil.copy(source_dll, target_dll)
+            self.logger.info("DLL fix applied")
+
+    def _fix_onnxruntime_conflict(self, python_exec: Path, site_packages: Path, pypi_mirror: str):
+        """
+        修复 onnxruntime 版本冲突
+
+        funasr-onnx 会自动安装 onnxruntime (CPU版), 但我们只需要 onnxruntime-gpu
+        onnxruntime-gpu 完全兼容 CPU 推理, 可以满足所有依赖
+        """
+        # 卸载 CPU 版本
+        subprocess.run(
+            [str(python_exec), '-m', 'pip', 'uninstall', 'onnxruntime', '-y'],
+            capture_output=True
+        )
+
+        # 清理残留目录
+        onnx_dir = site_packages / "onnxruntime"
+        if onnx_dir.exists():
+            self.logger.info("Cleaning residual onnxruntime directory...")
+            shutil.rmtree(onnx_dir, ignore_errors=True)
+
+        # 重新安装 GPU 版本
+        self.logger.info("Reinstalling onnxruntime-gpu to ensure integrity...")
+        cmd = [
+            str(python_exec), '-m', 'pip', 'install',
+            '--force-reinstall', '--no-deps',
+            'onnxruntime-gpu==1.18.0'
+        ]
+        if pypi_mirror:
+            cmd.extend(['-i', pypi_mirror])
+        subprocess.run(cmd, capture_output=True)
+
+    def _install_embedded_dependencies(self, python_exec: Path, site_packages: Path, pypi_mirror: str) -> bool:
+        """
+        为 Python 环境安装依赖
+        V3.1.0+dev.20260105.01: 恢复原有的完整安装逻辑
+        """
+        req_file = self.project_root / "requirements.txt"
+        marker_file = self.project_root / MARKER_FILE
+        req_hash_file = self.project_root / REQ_HASH_FILE
+
+        if not req_file.exists():
+            self.logger.error(f"requirements.txt not found: {req_file}")
+            return False
+
+        self.logger.info("=" * 50)
+        self.logger.info("Installing dependencies...")
+        self.logger.info("This may take 10-30 minutes on first run...")
+        self.logger.info("=" * 50)
+
+        # Step 1: 升级 pip
+        self.logger.info("Step 1/4: Upgrading pip...")
+        cmd = [str(python_exec), '-m', 'pip', 'install', '--upgrade', 'pip']
+        if pypi_mirror:
+            cmd.extend(['-i', pypi_mirror])
+        result = subprocess.run(cmd, capture_output=True)
+        if result.returncode != 0:
+            self.logger.warning("Failed to upgrade pip, continuing anyway...")
+
+        # Step 2: 安装依赖
+        self.logger.info("Step 2/4: Installing dependencies from requirements.txt...")
+        cmd = [
+            str(python_exec), '-m', 'pip', 'install',
+            '-r', str(req_file)
+        ]
+        if pypi_mirror:
+            cmd.extend(['-i', pypi_mirror])
+
+        try:
+            # 实时显示安装进度
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                cwd=str(self.project_root)
+            )
+
+            while True:
+                line = process.stdout.readline()
+                if not line and process.poll() is not None:
+                    break
+                if line:
+                    line = line.strip()
+                    # 显示关键信息
+                    if any(kw in line.lower() for kw in ['installing', 'successfully', 'requirement', 'downloading', 'error', 'warning', 'collecting']):
+                        self.logger.info(f"  {line[:120]}")
+
+            if process.returncode != 0:
+                self.logger.error(f"pip install failed with exit code: {process.returncode}")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"Failed to install dependencies: {e}")
+            return False
+
+        # Step 3: 修复 onnxruntime 冲突
+        self.logger.info("Step 3/4: Fixing onnxruntime version conflict...")
+        self._fix_onnxruntime_conflict(python_exec, site_packages, pypi_mirror)
+        self.logger.info("onnxruntime-gpu installed (CPU version removed)")
+
+        # Step 4: 修复 PyTorch DLL
+        self.logger.info("Step 4/4: Fixing PyTorch DLL dependencies...")
+        self._fix_pytorch_dll(site_packages)
+
+        # 保存标记文件和哈希值
+        current_hash = self._get_file_hash(req_file)
+        req_hash_file.write_text(current_hash)
+        marker_file.touch()
+
+        self.logger.info("=" * 50)
+        self.logger.info("Dependencies installed successfully!")
+        self.logger.info("=" * 50)
+        return True
+
+    def _load_env_config(self) -> Dict[str, str]:
+        """Load .env configuration"""
+        config = {}
+        env_file = self.project_root / '.env'
+
+        if not env_file.exists():
+            return config
+
+        try:
+            with open(env_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith('#') or '=' not in line:
+                        continue
+                    key, value = line.split('=', 1)
+                    config[key.strip()] = value.strip()
+        except Exception:
+            pass
+
+        return config
+
+    def initialize(self) -> bool:
+        """Initialize bootloader"""
+        # Detect dev mode
+        dev_mode = self._detect_dev_mode()
+
+        # Initialize logger
+        self.logger = BootloaderLogger(dev_mode)
+
+        self.logger.info("=" * 50)
+        self.logger.info(f"{APP_NAME} Bootloader v{VERSION}")
+        self.logger.info(f"Mode: {'Development' if dev_mode else 'Production'}")
+        self.logger.info("=" * 50)
+
+        # Load .env config (需要在 Python 检测前加载，获取 PYPI_MIRROR)
+        env_config = self._load_env_config()
+        pypi_mirror = env_config.get('PYPI_MIRROR', 'https://pypi.tuna.tsinghua.edu.cn/simple')
+
+        # V3.1.0+dev.20260105.01: 根据 dev_mode 检测 Python
+        python_exec, python_mode, site_packages = self._detect_python(dev_mode)
+
+        if python_exec is None:
+            self.logger.error("Python not found! Please install Python 3.10+ or place embedded Python in tools/python/")
+            return False
+
+        self.logger.info(f"Python Mode: {python_mode}")
+        self.logger.info(f"Python Path: {python_exec}")
+
+        # V3.1.0+dev.20260105.01: 检查 Python 依赖，必要时自动安装
+        if site_packages:
+            if not self._check_embedded_dependencies(python_exec, site_packages):
+                self.logger.warning("Python environment missing dependencies, starting installation...")
+                if not self._install_embedded_dependencies(python_exec, site_packages, pypi_mirror):
+                    self.logger.error("Failed to install dependencies")
+                    self.logger.error("Press Enter to exit...")
+                    try:
+                        input()
+                    except:
+                        pass
+                    return False
+            else:
+                self.logger.info("Dependencies verified (fast boot mode)")
+
+        # Create config
+        self.config = BootloaderConfig(
+            project_root=self.project_root,
+            dev_mode=dev_mode,
+            python_exec=python_exec,
+            python_mode=python_mode,
+            site_packages=site_packages,
+            tools_dir=self.project_root / "tools",
+            pypi_mirror=pypi_mirror,
+            hf_mirror=env_config.get('USE_HF_MIRROR', 'true').lower() == 'true',
+            log_level='DEBUG' if dev_mode else 'INFO'
+        )
+
+        # Initialize managers
+        self.process_manager = ProcessManager(self.logger)
+        self.update_manager = UpdateManager(self.config, self.logger)
+
+        # Set signal handlers
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+        return True
+
+    def _signal_handler(self, signum, frame):
+        """Signal handler"""
+        self.logger.info(f"Received signal {signum}, shutting down...")
+        self._running = False
+        if self.process_manager:
+            self.process_manager.terminate_all()
+
+    def run(self) -> int:
+        """Run main loop"""
+        if not self.initialize():
+            return 1
+
+        while self._running:
+            # Clean up old processes
+            self.process_manager.cleanup_old_processes(
+                self.config.backend_port,
+                self.config.frontend_port
+            )
+
+            # Start backend
+            if not self.process_manager.start_backend(self.config):
+                self.logger.error("Failed to start backend")
+                self.logger.error("Press Enter to exit...")
+                try:
+                    input()
+                except:
+                    pass
+                return 1
+
+            # Start frontend (dev mode)
+            if self.config.dev_mode:
+                if not self.process_manager.start_frontend(self.config):
+                    self.logger.warning("Failed to start frontend, continuing anyway...")
+
+            # Show startup info
+            self.logger.info("")
+            self.logger.info("=" * 50)
+            self.logger.info("Services Started Successfully!")
+            self.logger.info("=" * 50)
+
+            if self.config.dev_mode:
+                self.logger.info(f"Frontend: http://localhost:{self.config.frontend_port}")
+            self.logger.info(f"Application: http://localhost:{self.config.backend_port}")
+            self.logger.info(f"API Docs: http://localhost:{self.config.backend_port}/docs")
+            self.logger.info("")
+            self.logger.info("Press Ctrl+C to stop, or use 'Exit System' button in the app")
+            self.logger.info("=" * 50)
+
+            # Wait for backend to exit
+            exit_code = self.process_manager.wait_for_backend_exit()
+            self.logger.info(f"Backend exited with code: {exit_code}")
+
+            # Check update signal
+            update_signal = self.update_manager.check_update_signal()
+
+            if update_signal:
+                # Execute update
+                self.logger.info("Update signal detected, starting update process...")
+
+                # Terminate frontend
+                self.process_manager.terminate_all()
+
+                # Execute update
+                if self.update_manager.execute_update(update_signal):
+                    self.logger.info("Update successful, restarting...")
+                    self.update_manager.clear_update_signal()
+                    # Continue loop, restart services
+                    time.sleep(2)
+                    continue
+                else:
+                    self.logger.error("Update failed, restarting with current version...")
+                    self.update_manager.clear_update_signal()
+                    time.sleep(2)
+                    continue
+            else:
+                # Normal exit
+                self.logger.info("No update signal, normal shutdown")
+                self._running = False
+
+        # Cleanup
+        if self.process_manager:
+            self.process_manager.terminate_all()
+
+        self.logger.info("Bootloader shutdown complete")
+        return 0
+
+
+def main():
+    """Main entry"""
+    # Set console encoding
+    if os.name == 'nt':
+        os.system('chcp 65001 >nul 2>&1')
+
+    os.environ['PYTHONIOENCODING'] = 'utf-8'
+    os.environ['PYTHONUTF8'] = '1'
+
+    bootloader = Bootloader()
+    sys.exit(bootloader.run())
 
 
 if __name__ == "__main__":
-    print("="*40)
-    print("   AnchorFlux - Smart Launcher")
-    print("="*40)
-    print(f"   Python Mode: {PYTHON_MODE}")
-    print("="*40)
-
-    # 1. 智能依赖同步
-    sync_dependencies()
-
-    # 2. FFmpeg 检查
-    check_ffmpeg()
-
-    # 3. 配置环境路径
-    run_env = setup_environment()
-
-    # 4. 启动服务
-    start_services(run_env)
+    main()

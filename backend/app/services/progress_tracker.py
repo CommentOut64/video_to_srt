@@ -165,7 +165,7 @@ class ProgressTracker:
 
     def resume_phase(self, phase: ProcessPhase, total_items: int, completed_items: int, message: str = ""):
         """
-        V3.7.4: 恢复某个阶段（用于断点续传）
+        V3.1.0: 恢复某个阶段（用于断点续传）
 
         与 start_phase 的区别：
         - start_phase: 从 0 开始，completed_items = 0

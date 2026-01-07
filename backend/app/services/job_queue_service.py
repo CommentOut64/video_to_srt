@@ -117,7 +117,7 @@ class JobQueueService:
         # [V3.7] 取消令牌注册表
         self.cancellation_tokens: Dict[str, CancellationToken] = {}
 
-        # [V3.8.2] 取消超时保障机制
+        # [V3.1.0] 取消超时保障机制
         # 用于确保取消操作最终生效，防止任务卡死导致队列阻塞
         self._pending_cancel_requests: Dict[str, float] = {}  # {job_id: cancel_request_time}
         self._pending_delete_after_cancel: set = set()  # 取消后需要删除数据的任务
@@ -152,14 +152,14 @@ class JobQueueService:
         self.worker_thread.start()
         logger.info("任务队列Worker线程已启动")
 
-        # [V3.8.2] 启动取消超时监控线程
+        # [V3.1.0] 启动取消超时监控线程
         self._cancel_timeout_thread = threading.Thread(
             target=self._cancel_timeout_monitor,
             daemon=True,
             name="CancelTimeoutMonitor"
         )
         self._cancel_timeout_thread.start()
-        logger.info("[V3.8.2] 取消超时监控线程已启动")
+        logger.info("[V3.1.0] 取消超时监控线程已启动")
 
     def add_job(self, job: JobState):
         """
@@ -193,7 +193,7 @@ class JobQueueService:
         暂停任务
 
         V3.7 更新: 集成 CancellationToken，触发协作式暂停
-        V3.7.2 更新: 区分"正在暂停"和"已暂停"状态
+        V3.1.0 更新: 区分"正在暂停"和"已暂停"状态
         - 正在运行的任务：推送 pause_pending，等待流水线响应
         - 队列中的任务：立即推送 job_paused
 
@@ -213,7 +213,7 @@ class JobQueueService:
                 # 正在执行的任务：设置暂停标志（pipeline会自己检测并保存checkpoint）
                 is_running = True
                 job.paused = True
-                # V3.7.2: 状态改为 pausing，表示正在等待流水线响应
+                # V3.1.0: 状态改为 pausing，表示正在等待流水线响应
                 job.status = "pausing"
                 job.message = "正在暂停，等待当前操作完成..."
 
@@ -239,7 +239,7 @@ class JobQueueService:
         self._notify_queue_change()
         self._notify_job_status(job_id, job.status)
 
-        # V3.7.2: 根据任务状态推送不同的信号
+        # V3.1.0: 根据任务状态推送不同的信号
         if is_running:
             # 正在运行的任务：推送 pause_pending，前端显示"正在暂停..."
             self._notify_job_signal(job_id, "pause_pending")
@@ -257,9 +257,9 @@ class JobQueueService:
         - 如果任务仍在运行中（暂停被延迟），只需清除暂停标志
         - 如果任务已完全停止，重新加入队列等待执行
 
-        V3.7.2 更新: 支持 pausing 状态（正在暂停但尚未完全暂停）
+        V3.1.0 更新: 支持 pausing 状态（正在暂停但尚未完全暂停）
 
-        V3.7.4 更新: 恢复时从 checkpoint 恢复进度，避免 SSE 推送 0%
+        V3.1.0 更新: 恢复时从 checkpoint 恢复进度，避免 SSE 推送 0%
 
         Args:
             job_id: 任务ID
@@ -271,12 +271,12 @@ class JobQueueService:
         if not job:
             return False
 
-        # V3.7.2: 支持 paused 和 pausing 两种状态
+        # V3.1.0: 支持 paused 和 pausing 两种状态
         if job.status not in ("paused", "pausing"):
             logger.warning(f"任务未暂停，无法恢复: {job_id}, status={job.status}")
             return False
 
-        # V3.7.4: 在推送 SSE 之前，先从 checkpoint 恢复进度
+        # V3.1.0: 在推送 SSE 之前，先从 checkpoint 恢复进度
         # 这样 _notify_job_status 推送的进度就是正确的，而非 0
         self._restore_progress_from_checkpoint(job)
 
@@ -327,14 +327,14 @@ class JobQueueService:
         """
         取消任务（支持删除已完成的任务）
 
-        V3.6.3 修复：
+        V3.1.0 修复：
         - 删除数据时同步清理内存中的 self.jobs[job_id]
         - 广播 job_removed 事件，解决幽灵任务问题
 
         V3.7 更新:
         - 集成 CancellationToken，触发协作式取消
 
-        V3.8.2 更新:
+        V3.1.0 更新:
         - 正在运行的任务进入"canceling"状态，不再立即清除 running_job_id
         - 增加超时保障机制，确保任务最终被清除
 
@@ -354,7 +354,7 @@ class JobQueueService:
                 try:
                     result = self.transcription_service.cancel_job(job_id, delete_data=True)
                     if result:
-                        # [V3.6.3] 推送任务删除事件（而非仅状态变更）
+                        # [V3.1.0] 推送任务删除事件（而非仅状态变更）
                         self._notify_job_removed(job_id)
                         # [V3.7] 清理取消令牌
                         self._remove_cancellation_token(job_id)
@@ -363,7 +363,7 @@ class JobQueueService:
                     logger.warning(f"删除任务 {job_id} 失败: {e}")
             return False
 
-        is_running = False  # [V3.8.2] 标记是否为正在运行的任务
+        is_running = False  # [V3.1.0] 标记是否为正在运行的任务
 
         with self.lock:
             # 设置取消标志
@@ -381,7 +381,7 @@ class JobQueueService:
                 job.status = "canceled"
                 job.message = "已取消（未开始）"
 
-            # [V3.8.2] 如果是正在运行的任务，进入"取消中"状态
+            # [V3.1.0] 如果是正在运行的任务，进入"取消中"状态
             # 不再立即清除 running_job_id，让 Worker 的 finally 块处理
             elif self.running_job_id == job_id:
                 is_running = True
@@ -391,9 +391,9 @@ class JobQueueService:
                 self._pending_cancel_requests[job_id] = time.time()
                 if delete_data:
                     self._pending_delete_after_cancel.add(job_id)
-                logger.info(f"[V3.8.2] 任务进入取消中状态: {job_id}")
+                logger.info(f"[V3.1.0] 任务进入取消中状态: {job_id}")
 
-        # [V3.8.2] 正在运行的任务：延迟处理删除，由 Worker 或超时监控完成
+        # [V3.1.0] 正在运行的任务：延迟处理删除，由 Worker 或超时监控完成
         if is_running:
             # 不在这里删除数据，等待任务真正结束
             # 保存队列状态
@@ -408,7 +408,7 @@ class JobQueueService:
         if delete_data:
             result = self.transcription_service.cancel_job(job_id, delete_data=True)
 
-            # [V3.6.3] 从内存中彻底移除任务，防止幽灵任务
+            # [V3.1.0] 从内存中彻底移除任务，防止幽灵任务
             with self.lock:
                 if job_id in self.jobs:
                     del self.jobs[job_id]
@@ -424,7 +424,7 @@ class JobQueueService:
         # 保存队列状态
         self._save_state()
 
-        # [V3.6.3] 根据是否删除数据，推送不同事件
+        # [V3.1.0] 根据是否删除数据，推送不同事件
         if delete_data:
             # 推送 job_removed 事件（任务被彻底删除）
             self._notify_job_removed(job_id)
@@ -475,11 +475,11 @@ class JobQueueService:
                         # 正式从队列移除
                         self.queue.popleft()
                         self.running_job_id = job_id
-                        self._current_executing_job_id = job_id  # [V3.8.2] 记录实际执行的任务ID
+                        self._current_executing_job_id = job_id  # [V3.1.0] 记录实际执行的任务ID
                         job.status = "processing"
                         job.message = "开始处理"
 
-                        # V3.7.4: 在推送 SSE 之前，先从 checkpoint 恢复进度
+                        # V3.1.0: 在推送 SSE 之前，先从 checkpoint 恢复进度
                         # 这样断点续传时前端收到的进度是正确的，而非 0
                         self._restore_progress_from_checkpoint(job)
 
@@ -524,11 +524,11 @@ class JobQueueService:
 
                     if use_dual_alignment:
                         # 双流对齐流水线 (V3.0+ 新架构)
-                        # V3.8.1: 所有 SenseVoice 模式都走新架构
+                        # V3.1.0: 所有 SenseVoice 模式都走新架构
                         logger.info(f"使用双流对齐流水线 (profile={transcription_profile}, preset={preset_id})")
                         _run_async_safely(self._run_dual_alignment_pipeline(job, preset_id))
                     elif engine == 'sensevoice':
-                        # V3.8.1: 旧架构已废弃，所有 SenseVoice 模式都应该走新架构
+                        # V3.1.0: 旧架构已废弃，所有 SenseVoice 模式都应该走新架构
                         logger.error(f"错误：SenseVoice 任务未走新架构！profile={transcription_profile}")
                         logger.error(f"这是一个配置错误，请检查 ConfigAdapter.needs_dual_alignment() 方法")
                         raise RuntimeError(f"SenseVoice 任务路由错误：{transcription_profile} 应该走新架构")
@@ -572,13 +572,13 @@ class JobQueueService:
 
                 finally:
                     # 4. 清理资源（关键！）
-                    # [V3.8.2] 使用 _current_executing_job_id 而非 running_job_id
+                    # [V3.1.0] 使用 _current_executing_job_id 而非 running_job_id
                     # 因为 running_job_id 可能被超时监控清除
                     finished_job_id = self._current_executing_job_id
                     with self.lock:
                         self.running_job_id = None
                         self._current_executing_job_id = None
-                        # [V3.8.2] 从待取消列表移除
+                        # [V3.1.0] 从待取消列表移除
                         self._pending_cancel_requests.pop(finished_job_id, None)
 
                     # [V3.7] 清理取消令牌
@@ -587,11 +587,11 @@ class JobQueueService:
                     # 资源大清洗
                     self._cleanup_resources()
 
-                    # [V3.8.2] 处理取消后的延迟删除
+                    # [V3.1.0] 处理取消后的延迟删除
                     need_delete_data = finished_job_id in self._pending_delete_after_cancel
                     if need_delete_data:
                         self._pending_delete_after_cancel.discard(finished_job_id)
-                        logger.info(f"[V3.8.2] 执行取消后的延迟删除: {finished_job_id}")
+                        logger.info(f"[V3.1.0] 执行取消后的延迟删除: {finished_job_id}")
                         try:
                             self.transcription_service.cancel_job(finished_job_id, delete_data=True)
                             with self.lock:
@@ -602,7 +602,7 @@ class JobQueueService:
                             self._save_state()
                             continue
                         except Exception as e:
-                            logger.error(f"[V3.8.2] 延迟删除失败: {finished_job_id}, {e}")
+                            logger.error(f"[V3.1.0] 延迟删除失败: {finished_job_id}, {e}")
 
                     # 保存任务最终状态到 job_meta.json
                     self.transcription_service.save_job_meta(job)
@@ -632,7 +632,7 @@ class JobQueueService:
                     # 保存队列状态
                     self._save_state()
 
-                    # 6. 任务完成后触发720p转码检查（V3.6.2新增）
+                    # 6. 任务完成后触发720p转码检查（V3.1.0新增）
                     # 解决: 360p完成时如果队列繁忙就不触发720p，导致队列空闲后也不再检查
                     if job.status == "finished":
                         self._trigger_720p_check_after_job_complete(job.job_id)
@@ -645,7 +645,7 @@ class JobQueueService:
 
     def _cancel_timeout_monitor(self):
         """
-        [V3.8.2] 取消超时监控线程
+        [V3.1.0] 取消超时监控线程
 
         职责：
         1. 定期检查待取消任务是否超时
@@ -657,7 +657,7 @@ class JobQueueService:
         - 超时保障：只在任务卡死时介入
         - 资源安全：等待流水线自然退出后再清理资源
         """
-        logger.info("[V3.8.2] 取消超时监控线程已启动")
+        logger.info("[V3.1.0] 取消超时监控线程已启动")
 
         while not self.stop_event.is_set():
             try:
@@ -677,13 +677,13 @@ class JobQueueService:
                     self._force_cancel_timeout_job(job_id, elapsed)
 
             except Exception as e:
-                logger.error(f"[V3.8.2] 超时监控异常: {e}", exc_info=True)
+                logger.error(f"[V3.1.0] 超时监控异常: {e}", exc_info=True)
 
-        logger.info("[V3.8.2] 取消超时监控线程已停止")
+        logger.info("[V3.1.0] 取消超时监控线程已停止")
 
     def _force_cancel_timeout_job(self, job_id: str, elapsed: float):
         """
-        [V3.8.2] 强制取消超时的任务
+        [V3.1.0] 强制取消超时的任务
 
         当任务取消请求超时（流水线未响应）时调用此方法。
         强制清除 running_job_id，允许队列继续处理其他任务。
@@ -698,7 +698,7 @@ class JobQueueService:
             elapsed: 已等待时间（秒）
         """
         logger.warning(
-            f"[V3.8.2] 任务取消超时，强制放行队列: {job_id} "
+            f"[V3.1.0] 任务取消超时，强制放行队列: {job_id} "
             f"(等待了 {elapsed:.1f}s，超时阈值 {self._force_cancel_timeout}s)"
         )
 
@@ -710,13 +710,13 @@ class JobQueueService:
             if job:
                 job.status = "force_canceled"
                 job.message = f"已强制取消（响应超时 {elapsed:.0f}s）"
-                logger.info(f"[V3.8.2] 任务状态更新为 force_canceled: {job_id}")
+                logger.info(f"[V3.1.0] 任务状态更新为 force_canceled: {job_id}")
 
             # 关键：强制清除 running_job_id，允许下一个任务开始
             # 注意：_current_executing_job_id 保持不变，让 Worker finally 块知道要清理谁
             if self.running_job_id == job_id:
                 self.running_job_id = None
-                logger.warning(f"[V3.8.2] 强制清除 running_job_id: {job_id}")
+                logger.warning(f"[V3.1.0] 强制清除 running_job_id: {job_id}")
 
         # 保存状态
         self._save_state()
@@ -729,7 +729,7 @@ class JobQueueService:
         # 如果需要删除数据，保留在 _pending_delete_after_cancel 中
         # 等 Worker 的 finally 块执行时处理
         if job_id in self._pending_delete_after_cancel:
-            logger.info(f"[V3.8.2] 任务 {job_id} 的数据将在流水线退出后删除")
+            logger.info(f"[V3.1.0] 任务 {job_id} 的数据将在流水线退出后删除")
 
     async def _run_dual_alignment_pipeline(self, job: 'JobState', preset_id: str):
         """
@@ -750,11 +750,8 @@ class JobQueueService:
         from app.pipelines import (
             AudioProcessingPipeline,
             AudioProcessingConfig,
-            DualAlignmentPipeline,
-            DualAlignmentConfig,
             AsyncDualPipeline,
             get_audio_processing_pipeline,
-            get_dual_alignment_pipeline,
             get_async_dual_pipeline
         )
         from app.services.streaming_subtitle import get_streaming_subtitle_manager, remove_streaming_subtitle_manager
@@ -779,7 +776,7 @@ class JobQueueService:
         progress_tracker = get_progress_tracker(job.job_id, preset_id)
         sse_manager = get_sse_manager()
 
-        # V3.7.1: 初始化进度发射器
+        # V3.1.0: 初始化进度发射器
         transcription_profile = ConfigAdapter.get_transcription_profile(job.settings)
         progress_emitter = get_progress_emitter(
             job, sse_manager,
@@ -793,25 +790,22 @@ class JobQueueService:
         job_dir = Path(job.dir)
         checkpoint_manager = CheckpointManagerV37(job_dir, logger)
 
-        # 流水线模式选择（V3.1.0 新增）
-        # 从配置中读取，支持环境变量 USE_ASYNC_PIPELINE 控制
+        # 流水线配置
         from app.core.config import config as project_config
-        use_async_pipeline = project_config.USE_ASYNC_PIPELINE
         queue_maxsize = project_config.PIPELINE_QUEUE_MAXSIZE
 
         try:
-            pipeline_mode = "异步流水线 (V3.1.0)" if use_async_pipeline else "串行流水线 (V3.0)"
-            logger.info(f"[双流对齐] 开始处理任务: {job.job_id}, preset={preset_id}, 模式={pipeline_mode}")
+            logger.info(f"[双流对齐] 开始处理任务: {job.job_id}, preset={preset_id}")
 
             # V3.7: 检查是否有检查点需要恢复
             checkpoint = checkpoint_manager.load_checkpoint()
             is_resuming = checkpoint is not None
             if is_resuming:
                 logger.info(f"[V3.7] 检测到检查点，准备断点续传: phase={checkpoint.phase}")
-                # V3.7.1: 从检查点恢复进度并立即推送 SSE
+                # V3.1.0: 从检查点恢复进度并立即推送 SSE
                 if hasattr(checkpoint, 'to_dict'):
                     progress_emitter.restore_from_checkpoint(checkpoint.to_dict())
-                    logger.info(f"[V3.7.1] 已恢复进度: {job.progress:.1f}%")
+                    logger.info(f"[V3.1.0] 已恢复进度: {job.progress:.1f}%")
 
             # === 预触发 Proxy 生成（不阻塞主流程）===
             await self._maybe_trigger_proxy_generation(job)
@@ -826,7 +820,7 @@ class JobQueueService:
 
             logger.info("使用新架构 PreprocessingPipeline（Stage模式）")
 
-            # V3.8.1: 根据语言选择VAD配置（迁移自旧架构）
+            # V3.1.0: 根据语言选择VAD配置（迁移自旧架构）
             from app.services.audio.vad_service import VADConfig
             language = getattr(job.settings, 'language', 'auto')
             is_english = language in {'en', 'english'}
@@ -848,10 +842,10 @@ class JobQueueService:
                 )
                 logger.info(f"VAD配置: SenseVoice模式（保留停顿），language={language}")
 
-            # 创建预处理流水线（V3.7: 传递取消令牌，V3.8.1: 传递VAD配置）
+            # 创建预处理流水线（V3.7: 传递取消令牌，V3.1.0: 传递VAD配置）
             preprocessing_pipeline = PreprocessingPipeline(
                 config=job.settings.preprocessing,
-                vad_config=vad_config,  # V3.8.1: 新增
+                vad_config=vad_config,  # V3.1.0: 新增
                 logger=logger,
                 cancellation_token=cancellation_token  # V3.7
             )
@@ -884,9 +878,9 @@ class JobQueueService:
                     f"分离比例={stats['separation_ratio']:.2%}"
                 )
             else:
-                # V3.7.2: 从检查点恢复 AudioChunk（传递 checkpoint 数据给预处理流水线）
+                # V3.1.0: 从检查点恢复 AudioChunk（传递 checkpoint 数据给预处理流水线）
                 # 预处理流水线会根据 checkpoint 中的 chunks_metadata 跳过 VAD
-                logger.info("[V3.7.2] 从检查点恢复预处理状态...")
+                logger.info("[V3.1.0] 从检查点恢复预处理状态...")
 
                 # 将 checkpoint 转换为字典格式供预处理流水线使用
                 checkpoint_dict = checkpoint.to_dict() if hasattr(checkpoint, 'to_dict') else None
@@ -895,7 +889,7 @@ class JobQueueService:
                     video_path=job.input_path,
                     job_state=job,
                     job_dir=job_dir,
-                    checkpoint=checkpoint_dict  # V3.7.2: 传递 checkpoint 用于跳过 VAD
+                    checkpoint=checkpoint_dict  # V3.1.0: 传递 checkpoint 用于跳过 VAD
                 )
 
             # 加载完整音频（用于双流对齐的 Audio Overlap 功能）
@@ -911,10 +905,10 @@ class JobQueueService:
                 raise RuntimeError("PreprocessingPipeline 未返回任何 AudioChunk")
 
             progress_tracker.complete_phase(ProcessPhase.EXTRACT)
-            # V3.7.1: 预处理完成
+            # V3.1.0: 预处理完成
             progress_emitter.update_preprocess(100, "completed", "预处理完成")
 
-            # V3.7.2: 预处理→转录过渡检查点
+            # V3.1.0: 预处理→转录过渡检查点
             # 在开始转录前检查是否有待处理的暂停/取消请求
             if cancellation_token and job_dir:
                 checkpoint_data = {
@@ -924,14 +918,14 @@ class JobQueueService:
                     }
                 }
                 cancellation_token.check_and_save(checkpoint_data, job_dir)
-                logger.debug("[V3.7.2] 预处理→转录过渡检查点已保存")
+                logger.debug("[V3.1.0] 预处理→转录过渡检查点已保存")
 
             # 阶段 2: 双流对齐处理
             total_chunks = len(audio_chunks)
             progress_tracker.start_phase(ProcessPhase.SENSEVOICE, total_chunks, "双流对齐...")
 
             # V3.7: 检查是否需要恢复转录状态
-            # V3.7.2: 使用 min(fast, slow) 作为安全恢复点
+            # V3.1.0: 使用 min(fast, slow) 作为安全恢复点
             # 原因：finalized_indices 在当前实现中未被保存到 checkpoint，始终为空
             # 使用 min 确保不会跳过任何需要处理的 chunk
             fast_processed_indices = set()
@@ -945,52 +939,52 @@ class JobQueueService:
                 slow_indices = set(transcription_state.slow_processed_indices) if transcription_state.slow_processed_indices else set()
                 finalized = set(transcription_state.finalized_indices) if transcription_state.finalized_indices else set()
 
-                # V3.7.2: 使用安全恢复策略
+                # V3.1.0: 使用安全恢复策略
                 # 优先使用 finalized_indices（如果有）
                 # 否则使用 fast 和 slow 的交集（两者都已处理的 chunk）
                 if finalized:
-                    # V3.7.4: 使用 finalized 的最大索引+1 作为安全恢复点
+                    # V3.1.0: 使用 finalized 的最大索引+1 作为安全恢复点
                     # finalized_indices 包含已完成对齐的 chunk 索引
                     # 例如：{0, 1, ..., 15}，我们应该跳过 0-15，从 16 开始
                     max_finalized = max(finalized)
                     safe_indices = set(range(max_finalized + 1))
                     logger.info(
-                        f"[V3.7.4] 使用 finalized_indices 的最大值作为恢复点: "
+                        f"[V3.1.0] 使用 finalized_indices 的最大值作为恢复点: "
                         f"max={max_finalized}, 跳过 0-{max_finalized} 共 {len(safe_indices)} 个 Chunk"
                     )
                 elif fast_indices and slow_indices:
                     # 使用交集：只有两个 Worker 都处理过的 chunk 才能跳过
                     safe_indices = fast_indices & slow_indices
-                    logger.info(f"[V3.7.2] 使用 fast & slow 交集作为恢复点: {len(safe_indices)} 个")
+                    logger.info(f"[V3.1.0] 使用 fast & slow 交集作为恢复点: {len(safe_indices)} 个")
                 elif slow_indices:
                     # 只有 slow 数据（不太可能，但以防万一）
                     safe_indices = slow_indices
-                    logger.info(f"[V3.7.2] 使用 slow_indices 作为恢复点: {len(slow_indices)} 个")
+                    logger.info(f"[V3.1.0] 使用 slow_indices 作为恢复点: {len(slow_indices)} 个")
                 else:
                     # 没有可靠的恢复点，从头开始
                     safe_indices = set()
-                    logger.info("[V3.7.2] 无可靠恢复点，从头开始")
+                    logger.info("[V3.1.0] 无可靠恢复点，从头开始")
 
                 fast_processed_indices = safe_indices
                 slow_processed_indices = safe_indices
 
                 previous_whisper_text = transcription_state.previous_whisper_text
                 logger.info(
-                    f"[V3.7.2] 恢复转录状态: safe={len(safe_indices)}, "
+                    f"[V3.1.0] 恢复转录状态: safe={len(safe_indices)}, "
                     f"checkpoint.fast={len(fast_indices)}, "
                     f"checkpoint.slow={len(slow_indices)}, "
                     f"finalized={len(finalized)}"
                 )
-                # V3.7.1: 更新进度发射器的已处理数（使用 safe_indices）
+                # V3.1.0: 更新进度发射器的已处理数（使用 safe_indices）
                 progress_emitter.update_fast(len(safe_indices), total_chunks, force_push=True)
 
-                # V3.7.4: 同步 progress_tracker 的已完成数量
+                # V3.1.0: 同步 progress_tracker 的已完成数量
                 # 修复进度归零问题：start_phase 会将 completed_items 重置为 0
                 # 这里需要恢复正确的已完成数量
                 progress_tracker.update_phase(ProcessPhase.SENSEVOICE, completed=len(safe_indices))
-                logger.info(f"[V3.7.4] progress_tracker 已同步: {len(safe_indices)}/{total_chunks} 个 Chunk")
+                logger.info(f"[V3.1.0] progress_tracker 已同步: {len(safe_indices)}/{total_chunks} 个 Chunk")
 
-                # V3.7.3: 恢复字幕状态（核心修复）
+                # V3.1.0: 恢复字幕状态（核心修复）
                 # 从 checkpoint 恢复已生成的字幕，确保新字幕索引不会与已有字幕冲突
                 if transcription_state.sentences_snapshot:
                     subtitle_checkpoint_data = {
@@ -999,90 +993,72 @@ class JobQueueService:
                         "chunk_sentences_map": transcription_state.chunk_sentences_map
                     }
                     if subtitle_manager.restore_from_checkpoint(subtitle_checkpoint_data):
-                        logger.info(f"[V3.7.3] 字幕状态已恢复: {len(transcription_state.sentences_snapshot)} 个句子")
+                        logger.info(f"[V3.1.0] 字幕状态已恢复: {len(transcription_state.sentences_snapshot)} 个句子")
                         # 推送已恢复的字幕到前端
                         subtitle_manager.push_restored_subtitles_to_frontend()
                     else:
-                        logger.warning("[V3.7.3] 字幕恢复失败，将从头生成字幕")
+                        logger.warning("[V3.1.0] 字幕恢复失败，将从头生成字幕")
                 else:
-                    logger.info("[V3.7.3] checkpoint 中无字幕快照，字幕将从头生成")
+                    logger.info("[V3.1.0] checkpoint 中无字幕快照，字幕将从头生成")
 
             pipeline_sentences = []  # 用于收集本轮流水线产出的句子，作为无字幕快照时的兜底
 
-            if use_async_pipeline:
-                # V3.1.0: 异步流水线（三级流水线，错位并行）
-                logger.info(f"[双流对齐] 使用异步流水线处理 {total_chunks} 个 Chunk (queue_maxsize={queue_maxsize})")
-                async_pipeline = AsyncDualPipeline(
-                    job_id=job.job_id,
-                    queue_maxsize=queue_maxsize,
-                    sensevoice_language=getattr(job.settings, 'sensevoice_language', 'auto'),
-                    whisper_language=getattr(job.settings, 'whisper_language', 'auto'),
-                    user_glossary=getattr(job.settings, 'user_glossary', None),
-                    transcription_profile=ConfigAdapter.get_transcription_profile(job.settings),
-                    logger=logger,
-                    cancellation_token=cancellation_token,  # V3.7
-                    progress_emitter=progress_emitter  # V3.7.1: 传递进度发射器
+            # V3.1.0: 异步流水线（三级流水线，错位并行）
+            logger.info(f"[双流对齐] 使用异步流水线处理 {total_chunks} 个 Chunk (queue_maxsize={queue_maxsize})")
+            async_pipeline = AsyncDualPipeline(
+                job_id=job.job_id,
+                queue_maxsize=queue_maxsize,
+                sensevoice_language=getattr(job.settings, 'sensevoice_language', 'auto'),
+                whisper_language=getattr(job.settings, 'whisper_language', 'auto'),
+                user_glossary=getattr(job.settings, 'user_glossary', None),
+                transcription_profile=ConfigAdapter.get_transcription_profile(job.settings),
+                logger=logger,
+                cancellation_token=cancellation_token,  # V3.7
+                progress_emitter=progress_emitter  # V3.1.0: 传递进度发射器
+            )
+
+            # V3.7: 如果有历史上下文，恢复 SlowWorker 状态
+            if previous_whisper_text and async_pipeline.slow_worker:
+                async_pipeline.slow_worker.restore_prompt_cache(previous_whisper_text)
+                logger.info(f"[V3.7] 已恢复 SlowWorker 上下文: {len(previous_whisper_text)} 字符")
+
+            # V3.1.0: 分别计算各 Worker 的基准偏移量
+            # FastWorker 使用 safe_indices（用于跳过已处理的 chunk）
+            # SlowWorker 和 AlignmentWorker 使用各自实际处理的数量（用于进度计算）
+            base_slow_count = 0
+            base_align_count = 0
+            if is_resuming and checkpoint.transcription:
+                # SlowWorker 的基准 = checkpoint 中保存的 slow_indices 数量
+                base_slow_count = len(slow_indices) if slow_indices else len(safe_indices)
+                # AlignmentWorker 的基准 = checkpoint 中保存的 finalized_indices 数量
+                base_align_count = len(finalized) if finalized else len(safe_indices)
+                logger.info(
+                    f"[V3.1.0] Worker 基准偏移量: "
+                    f"FastWorker={len(fast_processed_indices)}, "
+                    f"SlowWorker={base_slow_count}, "
+                    f"AlignmentWorker={base_align_count}"
                 )
 
-                # V3.7: 如果有历史上下文，恢复 SlowWorker 状态
-                if previous_whisper_text and async_pipeline.slow_worker:
-                    async_pipeline.slow_worker.restore_prompt_cache(previous_whisper_text)
-                    logger.info(f"[V3.7] 已恢复 SlowWorker 上下文: {len(previous_whisper_text)} 字符")
+            # 处理所有 Chunks（流水线并行，传递完整音频数组用于 Audio Overlap）
+            # V3.1.0: 传递初始索引集合，修复恢复后进度不准确问题
+            contexts = await async_pipeline.run(
+                audio_chunks=audio_chunks,
+                full_audio_array=full_audio,
+                full_audio_sr=sr,
+                job_dir=job_dir,  # V3.7
+                processed_indices=fast_processed_indices,  # V3.1.0: FastWorker 跳过的索引
+                base_slow_count=base_slow_count,  # V3.1.0: SlowWorker 的基准偏移量（已废弃）
+                base_align_count=base_align_count,  # V3.1.0: AlignmentWorker 的基准偏移量（已废弃）
+                initial_slow_processed_indices=slow_indices if is_resuming else None,  # V3.1.0: SlowWorker 初始索引
+                initial_finalized_indices=finalized if is_resuming else None  # V3.1.0: AlignmentWorker 初始索引
+            )
 
-                # V3.7.4: 分别计算各 Worker 的基准偏移量
-                # FastWorker 使用 safe_indices（用于跳过已处理的 chunk）
-                # SlowWorker 和 AlignmentWorker 使用各自实际处理的数量（用于进度计算）
-                base_slow_count = 0
-                base_align_count = 0
-                if is_resuming and checkpoint.transcription:
-                    # SlowWorker 的基准 = checkpoint 中保存的 slow_indices 数量
-                    base_slow_count = len(slow_indices) if slow_indices else len(safe_indices)
-                    # AlignmentWorker 的基准 = checkpoint 中保存的 finalized_indices 数量
-                    base_align_count = len(finalized) if finalized else len(safe_indices)
-                    logger.info(
-                        f"[V3.7.4] Worker 基准偏移量: "
-                        f"FastWorker={len(fast_processed_indices)}, "
-                        f"SlowWorker={base_slow_count}, "
-                        f"AlignmentWorker={base_align_count}"
-                    )
-
-                # 处理所有 Chunks（流水线并行，传递完整音频数组用于 Audio Overlap）
-                # V3.7.4: 传递初始索引集合，修复恢复后进度不准确问题
-                contexts = await async_pipeline.run(
-                    audio_chunks=audio_chunks,
-                    full_audio_array=full_audio,
-                    full_audio_sr=sr,
-                    job_dir=job_dir,  # V3.7
-                    processed_indices=fast_processed_indices,  # V3.7.2: FastWorker 跳过的索引
-                    base_slow_count=base_slow_count,  # V3.7.4: SlowWorker 的基准偏移量（已废弃）
-                    base_align_count=base_align_count,  # V3.7.4: AlignmentWorker 的基准偏移量（已废弃）
-                    initial_slow_processed_indices=slow_indices if is_resuming else None,  # V3.7.4: SlowWorker 初始索引
-                    initial_finalized_indices=finalized if is_resuming else None  # V3.7.4: AlignmentWorker 初始索引
-                )
-
-                # 提取结果
-                for ctx in contexts:
-                    pipeline_sentences.extend(ctx.final_sentences)
-
-            else:
-                # V3.0: 串行流水线（兼容模式）
-                logger.info(f"[双流对齐] 使用串行流水线处理 {total_chunks} 个 Chunk")
-                dual_config = DualAlignmentConfig()
-                dual_pipeline = get_dual_alignment_pipeline(
-                    job_id=job.job_id,
-                    config=dual_config,
-                    logger=logger
-                )
-
-                # 处理所有 Chunks（串行）
-                results = await dual_pipeline.run(audio_chunks)
-
-                # 提取结果
-                for result in results:
-                    pipeline_sentences.extend(result.sentences)
+            # 提取结果
+            for ctx in contexts:
+                pipeline_sentences.extend(ctx.final_sentences)
 
             progress_tracker.complete_phase(ProcessPhase.SENSEVOICE)
-            # V3.7.1: 双流对齐完成
+            # V3.1.0: 双流对齐完成
             progress_emitter.update_fast(total_chunks, total_chunks, force_push=True)
             progress_emitter.update_slow(total_chunks, total_chunks, force_push=True)
             progress_emitter.update_align(total_chunks, total_chunks, force_push=True)
@@ -1097,10 +1073,10 @@ class JobQueueService:
                 if subtitle_snapshot:
                     final_sentences = subtitle_snapshot
                     logger.info(
-                        f"[V3.7.4] 使用字幕管理器快照生成 SRT: sentences={len(final_sentences)}"
+                        f"[V3.1.0] 使用字幕管理器快照生成 SRT: sentences={len(final_sentences)}"
                     )
                 else:
-                    logger.info("[V3.7.4] 字幕管理器无有效句子，回退到流水线结果")
+                    logger.info("[V3.1.0] 字幕管理器无有效句子，回退到流水线结果")
 
             # 按时间排序
             final_sentences.sort(key=lambda s: s.start)
@@ -1119,7 +1095,7 @@ class JobQueueService:
             checkpoint_manager.delete_checkpoint()
             logger.info("[V3.7] 任务完成，检查点已清理")
 
-            # V3.7.1: 使用 progress_emitter 标记完成
+            # V3.1.0: 使用 progress_emitter 标记完成
             progress_emitter.complete("处理完成")
 
             # 完成
@@ -1139,7 +1115,7 @@ class JobQueueService:
             # 清理资源
             remove_streaming_subtitle_manager(job.job_id)
             remove_progress_tracker(job.job_id)
-            remove_progress_emitter(job.job_id)  # V3.7.1: 清理进度发射器
+            remove_progress_emitter(job.job_id)  # V3.1.0: 清理进度发射器
 
     async def _maybe_trigger_proxy_generation(self, job: 'JobState'):
         """
@@ -1189,7 +1165,7 @@ class JobQueueService:
 
     def _trigger_720p_check_after_job_complete(self, completed_job_id: str):
         """
-        任务完成后触发720p转码检查（V3.6.2新增）
+        任务完成后触发720p转码检查（V3.1.0新增）
 
         解决问题:
         - 360p完成时如果队列繁忙（有转录任务正在执行），就不会安排720p检查
@@ -1423,7 +1399,7 @@ class JobQueueService:
 
     def _notify_job_removed(self, job_id: str):
         """
-        通知前端任务已被彻底删除（V3.6.3 新增）
+        通知前端任务已被彻底删除（V3.1.0 新增）
 
         解决幽灵任务问题：当任务被删除时，广播此事件让前端移除任务卡片，
         避免 syncTasksFromBackend 时因缓存数据不一致导致任务"复活"。
@@ -1446,7 +1422,7 @@ class JobQueueService:
 
     def _restore_progress_from_checkpoint(self, job: "JobState"):
         """
-        V3.7.4: 从 checkpoint 恢复任务进度
+        V3.1.0: 从 checkpoint 恢复任务进度
 
         在 resume_job 和 worker 开始执行前调用，确保 SSE 推送的进度是正确的。
         这是修复"暂停恢复后进度归零"问题的关键。
@@ -1454,16 +1430,16 @@ class JobQueueService:
         Args:
             job: 任务状态对象
         """
-        logger.info(f"[V3.7.4] 尝试从 checkpoint 恢复进度: {job.job_id}, 当前进度={job.progress:.1f}%")
+        logger.info(f"[V3.1.0] 尝试从 checkpoint 恢复进度: {job.job_id}, 当前进度={job.progress:.1f}%")
 
         try:
             job_dir = Path(job.dir) if job.dir else None
             if not job_dir:
-                logger.info(f"[V3.7.4] 任务目录为空，跳过恢复: job.dir={job.dir}")
+                logger.info(f"[V3.1.0] 任务目录为空，跳过恢复: job.dir={job.dir}")
                 return
 
             if not job_dir.exists():
-                logger.info(f"[V3.7.4] 任务目录不存在，跳过恢复: path={job_dir}")
+                logger.info(f"[V3.1.0] 任务目录不存在，跳过恢复: path={job_dir}")
                 return
 
             from app.services.job.checkpoint_manager import CheckpointManagerV37
@@ -1472,7 +1448,7 @@ class JobQueueService:
             checkpoint = checkpoint_manager.load_checkpoint()
 
             if not checkpoint:
-                logger.info(f"[V3.7.4] 无 checkpoint 文件，跳过恢复")
+                logger.info(f"[V3.1.0] 无 checkpoint 文件，跳过恢复")
                 return
 
             # 从 checkpoint 恢复进度
@@ -1519,12 +1495,12 @@ class JobQueueService:
             if restored_progress > job.progress:
                 old_progress = job.progress
                 job.progress = round(restored_progress, 1)
-                logger.info(f"[V3.7.4] 从 checkpoint 恢复进度: {job.job_id}, {old_progress:.1f}% -> {job.progress:.1f}%")
+                logger.info(f"[V3.1.0] 从 checkpoint 恢复进度: {job.job_id}, {old_progress:.1f}% -> {job.progress:.1f}%")
             else:
-                logger.debug(f"[V3.7.4] checkpoint 进度 ({restored_progress:.1f}%) <= 当前进度 ({job.progress:.1f}%)，保持不变")
+                logger.debug(f"[V3.1.0] checkpoint 进度 ({restored_progress:.1f}%) <= 当前进度 ({job.progress:.1f}%)，保持不变")
 
         except Exception as e:
-            logger.warning(f"[V3.7.4] 恢复进度失败，保持当前进度: {job.job_id}, error={e}")
+            logger.warning(f"[V3.1.0] 恢复进度失败，保持当前进度: {job.job_id}, error={e}")
 
     # ==================== V3.7 取消令牌管理 ====================
 

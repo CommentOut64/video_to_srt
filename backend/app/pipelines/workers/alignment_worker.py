@@ -301,7 +301,7 @@ class AlignmentWorker:
                     )
 
             # 检测2: Whisper 过短（识别失败或漏识别）
-            # V3.8.1 修复：将阈值从 0.3 提升到 0.65
+            # V3.1.0 修复：将阈值从 0.3 提升到 0.65
             # 原因：双模态对齐以 Whisper 文本为准，如果 Whisper 明显短于 SenseVoice，
             #       会导致 SenseVoice 多识别的内容被丢弃（如 Chunk 58: 146 vs 262 字符）
             # 公式: len(whisper) < len(sensevoice) * 0.65

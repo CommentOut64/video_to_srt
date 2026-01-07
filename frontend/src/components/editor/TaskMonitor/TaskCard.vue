@@ -105,7 +105,7 @@
         </button>
       </el-tooltip>
 
-      <!-- V3.8.2: 正在取消状态显示加载动画 -->
+      <!-- V3.1.0: 正在取消状态显示加载动画 -->
       <el-tooltip content="正在取消..." placement="left" :show-after="500">
         <button
           v-if="task.status === 'canceling'"
@@ -137,7 +137,7 @@ const props = defineProps({
 
 const router = useRouter()
 
-// V3.7.4: 防抖控制 - 防止频繁切换暂停/恢复
+// V3.1.0: 防抖控制 - 防止频繁切换暂停/恢复
 const lastOperationTime = ref(0)
 const DEBOUNCE_DELAY = 2000 // 2秒防抖
 
@@ -171,7 +171,7 @@ function getPhaseLabel(task) {
 
 // 暂停任务
 async function pauseTask() {
-  // V3.7.4: 防抖检查
+  // V3.1.0: 防抖检查
   const now = Date.now()
   if (now - lastOperationTime.value < DEBOUNCE_DELAY) {
     ElMessage.warning('操作过于频繁，请稍后再试')
@@ -184,7 +184,7 @@ async function pauseTask() {
 
 // 恢复任务
 async function resumeTask() {
-  // V3.7.4: 防抖检查
+  // V3.1.0: 防抖检查
   const now = Date.now()
   if (now - lastOperationTime.value < DEBOUNCE_DELAY) {
     ElMessage.warning('操作过于频繁，请稍后再试')
@@ -431,14 +431,14 @@ function formatTime(timestamp) {
     color: var(--danger);
   }
 
-  // V3.8.2: 禁用状态
+  // V3.1.0: 禁用状态
   &:disabled {
     opacity: 0.6;
     cursor: not-allowed;
   }
 }
 
-// V3.8.2: 旋转动画
+// V3.1.0: 旋转动画
 .spin {
   animation: spin 1s linear infinite;
 }

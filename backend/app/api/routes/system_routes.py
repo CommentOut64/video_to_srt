@@ -9,6 +9,8 @@ import subprocess
 import os
 import gc
 import signal
+import json
+from datetime import datetime
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
 from typing import Optional, List
@@ -221,7 +223,12 @@ async def shutdown_system(req: ShutdownRequest):
             logger.warning(f"清理GPU缓存失败: {e}")
             cleanup_report["gpu_cache_cleared"] = False
 
-        # ========== Phase 5: 清理临时文件（可选） ==========
+        # ========== Phase 5: 清理临时文件（可选）和日志 ==========
+        # V3.1.1+dev.20260106.02: 每次关闭都清理超过7天的日志
+        logger.info("Phase 5: 清理过期日志...")
+        logs_cleaned = _cleanup_old_logs(days=7)
+        cleanup_report["logs_cleaned"] = logs_cleaned
+
         if req.cleanup_temp:
             logger.info("Phase 5: 清理临时文件...")
             cleaned = _cleanup_temp_files_safely()
@@ -361,10 +368,59 @@ def _cleanup_temp_files_safely() -> bool:
             logger.info("临时文件已清理（保留所有任务数据）")
         
         return cleaned
-        
+
     except Exception as e:
         logger.warning(f"清理临时文件失败: {e}")
         return False
+
+
+def _cleanup_old_logs(days: int = 7) -> int:
+    """
+    V3.1.1+dev.20260106.02: 清理超过指定天数的日志文件
+
+    Args:
+        days: 保留天数，默认7天
+
+    Returns:
+        int: 清理的日志文件数量
+    """
+    try:
+        from app.core.config import config
+        from datetime import datetime, timedelta
+
+        cleaned_count = 0
+        cutoff_time = datetime.now() - timedelta(days=days)
+
+        if not config.LOG_DIR.exists():
+            return 0
+
+        # 遍历日志目录
+        for log_file in config.LOG_DIR.iterdir():
+            try:
+                # 只处理 .log 文件
+                if not log_file.is_file() or log_file.suffix.lower() != '.log':
+                    continue
+
+                # 获取文件修改时间
+                mtime = datetime.fromtimestamp(log_file.stat().st_mtime)
+
+                # 如果文件超过指定天数，删除
+                if mtime < cutoff_time:
+                    log_file.unlink()
+                    cleaned_count += 1
+                    logger.debug(f"已删除过期日志: {log_file.name} (修改于 {mtime.strftime('%Y-%m-%d')})")
+
+            except Exception as e:
+                logger.debug(f"清理日志文件失败: {log_file} - {e}")
+
+        if cleaned_count > 0:
+            logger.info(f"已清理 {cleaned_count} 个超过 {days} 天的日志文件")
+
+        return cleaned_count
+
+    except Exception as e:
+        logger.warning(f"清理日志失败: {e}")
+        return 0
 
 
 async def _terminate_processes():
@@ -438,7 +494,8 @@ async def _terminate_processes():
                         timeout=5
                     )
                     if result.returncode == 0 and result.stdout:
-                        for line in result.stdout.decode().strip().split('\n'):
+                        # V3.1.0+dev.20260104.01: 修复 Windows 编码问题
+                        for line in result.stdout.decode('utf-8', errors='replace').strip().split('\n'):
                             parts = line.split()
                             if len(parts) >= 5:
                                 pid = parts[-1]
@@ -557,3 +614,211 @@ async def set_log_level(req: LogLevelRequest):
             "success": False,
             "message": f"设置日志级别失败: {str(e)}"
         }
+
+
+# ========== 更新系统 API (V3.1.0+dev.20260104.01) ==========
+
+class CheckUpdateResponse(BaseModel):
+    """检查更新响应"""
+    has_update: bool
+    current_version: str
+    latest_version: Optional[str] = None
+    changelog: Optional[str] = None
+    download_url: Optional[str] = None
+    release_date: Optional[str] = None
+    force_update: bool = False  # V3.1.1+dev.20260105.01: 强制更新标志
+
+
+class TriggerUpdateRequest(BaseModel):
+    """触发更新请求"""
+    download_url: str
+    version: str
+    changelog: Optional[str] = None
+    delay_mode: bool = False  # V3.1.1+dev.20260105.01: 延迟更新模式（重启时更新）
+
+
+# 当前版本号
+CURRENT_VERSION = "3.1.1"
+
+# V3.1.1+dev.20260105.01: 版本检查配置（使用 Gitee 镜像的 version.json）
+VERSION_CHECK_URL = "https://gitee.com/comment_out/anchor-flux-update/raw/master/version.json"
+
+
+@router.get("/api/system/version")
+async def get_current_version():
+    """获取当前系统版本"""
+    return {
+        "success": True,
+        "version": CURRENT_VERSION,
+        "build_date": "2026-01-04"  # TODO: 从构建信息读取
+    }
+
+
+@router.get("/api/system/check-update")
+async def check_update():
+    """
+    检查是否有新版本可用
+
+    V3.1.1+dev.20260105.01: 从 Gitee 镜像的 version.json 获取版本信息
+    version.json 格式:
+    {
+        "latest_version": "3.1.3",
+        "force_update": false,
+        "changelog": "更新内容",
+        "download_url": "https://github.com/.../update_v3.1.3.zip"
+    }
+    """
+    import urllib.request
+    import urllib.error
+
+    try:
+        logger.info(f"Checking for updates: {VERSION_CHECK_URL}")
+
+        # 发送请求获取 version.json
+        req = urllib.request.Request(
+            VERSION_CHECK_URL,
+            headers={
+                'User-Agent': 'AnchorFlux-Updater/1.0',
+                'Accept': 'application/json',
+                'Cache-Control': 'no-cache'  # 避免缓存
+            }
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=15) as response:
+                data = json.loads(response.read().decode('utf-8'))
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                logger.info("version.json not found")
+                return CheckUpdateResponse(
+                    has_update=False,
+                    current_version=CURRENT_VERSION
+                ).dict()
+            raise
+
+        # 解析 version.json 格式
+        latest_version = data.get('latest_version', '').lstrip('v')
+        changelog = data.get('changelog', '')
+        download_url = data.get('download_url', '')
+        force_update = data.get('force_update', False)
+
+        # 比较版本号（使用元组比较以支持语义化版本）
+        def parse_version(v):
+            """将版本字符串解析为可比较的元组"""
+            try:
+                parts = v.split('.')
+                return tuple(int(p) for p in parts[:3])
+            except (ValueError, AttributeError):
+                return (0, 0, 0)
+
+        current_tuple = parse_version(CURRENT_VERSION)
+        latest_tuple = parse_version(latest_version)
+        has_update = latest_tuple > current_tuple
+
+        logger.info(f"Current: {CURRENT_VERSION} ({current_tuple}), Latest: {latest_version} ({latest_tuple}), Has update: {has_update}")
+
+        return CheckUpdateResponse(
+            has_update=has_update,
+            current_version=CURRENT_VERSION,
+            latest_version=latest_version,
+            changelog=changelog,
+            download_url=download_url,
+            force_update=force_update
+        ).dict()
+
+    except Exception as e:
+        logger.error(f"检查更新失败: {e}")
+        return {
+            "success": False,
+            "has_update": False,
+            "current_version": CURRENT_VERSION,
+            "message": f"检查更新失败: {str(e)}"
+        }
+
+
+@router.post("/api/system/trigger-update")
+async def trigger_update(req: TriggerUpdateRequest):
+    """
+    触发更新流程
+
+    V3.1.1+dev.20260105.01: 支持延迟更新模式
+    - delay_mode=False: 立即更新（写入信号文件后关闭后端）
+    - delay_mode=True: 重启时更新（仅写入信号文件，不关闭后端）
+
+    此 API 会:
+    1. 在项目根目录写入 update_signal.json
+    2. 如果不是延迟模式，关闭后端服务
+    3. Bootloader 检测到信号文件后执行更新
+    """
+    from app.core.config import config
+
+    try:
+        # 获取项目根目录
+        project_root = config.PROJECT_ROOT
+        signal_file = project_root / "update_signal.json"
+
+        # 写入更新信号文件
+        signal_data = {
+            "version": req.version,
+            "download_url": req.download_url,
+            "changelog": req.changelog,
+            "triggered_at": datetime.now().isoformat(),
+            "current_version": CURRENT_VERSION,
+            "delay_mode": req.delay_mode  # V3.1.1+dev.20260105.01: 记录延迟模式
+        }
+
+        with open(signal_file, 'w', encoding='utf-8') as f:
+            json.dump(signal_data, f, ensure_ascii=False, indent=2)
+
+        logger.info(f"Update signal written: {signal_file}")
+        logger.info(f"Target version: {req.version}, Delay mode: {req.delay_mode}")
+
+        # 根据模式返回不同响应
+        if req.delay_mode:
+            # 延迟模式：仅写入信号文件，不关闭后端
+            response = {
+                "success": True,
+                "message": "更新已安排，将在下次重启时执行",
+                "signal_file": str(signal_file),
+                "delay_mode": True
+            }
+        else:
+            # 立即模式：写入信号文件后关闭后端
+            response = {
+                "success": True,
+                "message": "更新信号已写入，系统即将重启进行更新",
+                "signal_file": str(signal_file),
+                "delay_mode": False
+            }
+            # 异步关闭后端（等待响应发送后）
+            asyncio.create_task(_shutdown_for_update())
+
+        return response
+
+    except Exception as e:
+        logger.error(f"触发更新失败: {e}")
+        return {
+            "success": False,
+            "message": f"触发更新失败: {str(e)}"
+        }
+
+
+async def _shutdown_for_update():
+    """为更新关闭后端服务"""
+    await asyncio.sleep(1)  # 等待响应发送完成
+
+    logger.info("=" * 60)
+    logger.info("Shutting down for update...")
+    logger.info("=" * 60)
+
+    # 保存必要状态
+    try:
+        from app.services.job_queue_service import get_queue_service
+        queue_service = get_queue_service()
+        queue_service._save_state()
+    except Exception as e:
+        logger.warning(f"保存队列状态失败: {e}")
+
+    # 退出进程（Bootloader 会检测到并执行更新）
+    logger.info("Backend exiting for update...")
+    os._exit(0)

@@ -1,8 +1,8 @@
-# Whisper 幻觉抑制与双流稳定化实施方案 V3.2.0
+# Whisper 幻觉抑制与双流稳定化实施方案 V3.1.0
 
 > 本文档基于项目实际代码结构细化，可直接执行。
 > **实施状态: 已完成** (2024-12-13)
-> **更新日志**: V3.2.0 新增 Whisper Buffer Pool 方案，支持 DEEP_LISTEN 模式
+> **更新日志**: V3.1.0 新增 Whisper Buffer Pool 方案，支持 DEEP_LISTEN 模式
 
 ## 目录
 

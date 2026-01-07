@@ -129,7 +129,7 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
   }
 
   /**
-   * V3.7.4: 应用进度字段（单调递增保护）
+   * V3.1.0: 应用进度字段（单调递增保护）
    *
    * 核心规则：
    * 1. 只接受递增的进度值，绝不允许进度下降
@@ -213,7 +213,7 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
 
   /**
    * 更新任务状态（不更新进度）
-   * V3.7.4: 专门用于状态变更，避免进度被覆盖
+   * V3.1.0: 专门用于状态变更，避免进度被覆盖
    */
   function updateTaskStatus(jobId, status, message = null) {
     const task = tasksMap.value.get(jobId)
@@ -466,7 +466,7 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
       let addedCount = 0
       let skippedCount = 0
       for (const backendTask of backendTasks) {
-        // V3.7.5: 过滤掉 filename 为空的任务，避免显示"未知任务"
+        // V3.1.0: 过滤掉 filename 为空的任务，避免显示"未知任务"
         if (!backendTask.filename || backendTask.filename.trim() === '') {
           console.warn(`[UnifiedTaskStore] 跳过 filename 为空的任务: ${backendTask.id}`)
           skippedCount++

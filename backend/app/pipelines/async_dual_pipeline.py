@@ -16,12 +16,10 @@ AsyncDualPipeline - 三级异步流水线控制器
 - 异常传播：任何 Worker 的异常都会传播到 run() 方法
 - 结束信号：使用 ProcessingContext.is_end 通知下游停止
 
-V3.7 更新：
+V3.1.0 更新：
 - 集成 CancellationToken 支持暂停/取消
 - 支持断点续传检查点保存
 - SlowWorker 保存上文状态 (previous_whisper_text)
-
-V3.7.1 更新：
 - 集成 ProgressEventEmitter 统一进度发射器
 - 实时同步 job.progress 并推送 SSE 事件
 """
@@ -34,12 +32,12 @@ from app.schemas.pipeline_context import ProcessingContext
 from app.services.audio.chunk_engine import AudioChunk
 from app.services.sse_service import get_sse_manager
 from app.pipelines.workers import FastWorker, SlowWorker, AlignmentWorker
-from app.utils.cancellation_token import CancelledException, PausedException  # V3.7.4: 捕获取消/暂停异常
+from app.utils.cancellation_token import CancelledException, PausedException  # V3.1.0: 捕获取消/暂停异常
 
 # V3.7: 导入取消令牌和异常
 if TYPE_CHECKING:
     from app.utils.cancellation_token import CancellationToken
-    from app.services.progress_emitter import ProgressEventEmitter  # V3.7.1
+    from app.services.progress_emitter import ProgressEventEmitter  # V3.1.0
 
 
 class AsyncDualPipeline:
@@ -70,7 +68,7 @@ class AsyncDualPipeline:
         transcription_profile: str = "sv_whisper_patch",
         logger: Optional[logging.Logger] = None,
         cancellation_token: Optional["CancellationToken"] = None,  # V3.7: 新增
-        progress_emitter: Optional["ProgressEventEmitter"] = None  # V3.7.1: 新增
+        progress_emitter: Optional["ProgressEventEmitter"] = None  # V3.1.0: 新增
     ):
         """
         初始化流水线
@@ -87,13 +85,13 @@ class AsyncDualPipeline:
             transcription_profile: 转录模式 (sensevoice_only/sv_whisper_patch/sv_whisper_dual)
             logger: 日志记录器
             cancellation_token: 取消令牌（可选，V3.7）
-            progress_emitter: 进度发射器（可选，V3.7.1）
+            progress_emitter: 进度发射器（可选，V3.1.0）
         """
         self.job_id = job_id
         self.logger = logger or logging.getLogger(__name__)
         self.transcription_profile = transcription_profile
         self.cancellation_token = cancellation_token  # V3.7
-        self.progress_emitter = progress_emitter  # V3.7.1
+        self.progress_emitter = progress_emitter  # V3.1.0
 
         # 判断是否为纯 SenseVoice 模式
         self.is_sensevoice_only = (transcription_profile == "sensevoice_only")
@@ -117,7 +115,7 @@ class AsyncDualPipeline:
             sensevoice_language=sensevoice_language,
             enable_semantic_grouping=enable_semantic_grouping,
             is_final_output=self.is_sensevoice_only,  # 极速模式下 FastWorker 输出为定稿
-            enable_cross_chunk_merge=True,  # V3.9.1: 启用跨chunk合并（仅SenseVoice模式）
+            enable_cross_chunk_merge=True,  # V3.1.0: 启用跨chunk合并（仅SenseVoice模式）
             logger=self.logger
         )
 
@@ -147,7 +145,7 @@ class AsyncDualPipeline:
 
         # 错误收集
         self.errors: List[Exception] = []
-        # V3.7.4: 记录暂停异常，待数据排空后统一抛出
+        # V3.1.0: 记录暂停异常，待数据排空后统一抛出
         self.pause_exception: Optional[PausedException] = None
 
     async def run(
@@ -157,10 +155,10 @@ class AsyncDualPipeline:
         full_audio_sr: int = 16000,
         job_dir: Optional[Path] = None,  # V3.7: 用于保存检查点
         processed_indices: Optional[Set[int]] = None,  # V3.7: 已处理的索引（用于恢复）
-        base_slow_count: int = 0,  # V3.7.4: SlowWorker 的基准偏移量（已废弃）
-        base_align_count: int = 0,  # V3.7.4: AlignmentWorker 的基准偏移量（已废弃）
-        initial_slow_processed_indices: Optional[set] = None,  # V3.7.4: SlowWorker 初始索引
-        initial_finalized_indices: Optional[set] = None  # V3.7.4: AlignmentWorker 初始索引
+        base_slow_count: int = 0,  # V3.1.0: SlowWorker 的基准偏移量（已废弃）
+        base_align_count: int = 0,  # V3.1.0: AlignmentWorker 的基准偏移量（已废弃）
+        initial_slow_processed_indices: Optional[set] = None,  # V3.1.0: SlowWorker 初始索引
+        initial_finalized_indices: Optional[set] = None  # V3.1.0: AlignmentWorker 初始索引
     ) -> List[ProcessingContext]:
         """
         运行流水线
@@ -169,7 +167,7 @@ class AsyncDualPipeline:
         - 极速模式 (sensevoice_only): 仅运行 FastWorker，直接输出定稿
         - 补刀/双流模式: 运行完整三级流水线
 
-        V3.7.4: 支持分别设置各 Worker 的基准偏移量和初始索引，修复恢复后进度跳变问题
+        V3.1.0: 支持分别设置各 Worker 的基准偏移量和初始索引，修复恢复后进度跳变问题
 
         Args:
             audio_chunks: AudioChunk 列表
@@ -177,10 +175,10 @@ class AsyncDualPipeline:
             full_audio_sr: 完整音频采样率
             job_dir: 任务目录（可选，V3.7 用于保存检查点）
             processed_indices: 已处理的chunk索引集合（可选，V3.7 用于 FastWorker 跳过）
-            base_slow_count: SlowWorker 的基准偏移量（V3.7.4，已废弃）
-            base_align_count: AlignmentWorker 的基准偏移量（V3.7.4，已废弃）
-            initial_slow_processed_indices: SlowWorker 初始已处理索引集合（V3.7.4）
-            initial_finalized_indices: AlignmentWorker 初始已完成索引集合（V3.7.4）
+            base_slow_count: SlowWorker 的基准偏移量（V3.1.0，已废弃）
+            base_align_count: AlignmentWorker 的基准偏移量（V3.1.0，已废弃）
+            initial_slow_processed_indices: SlowWorker 初始已处理索引集合（V3.1.0）
+            initial_finalized_indices: AlignmentWorker 初始已完成索引集合（V3.1.0）
 
         Returns:
             List[ProcessingContext]: 处理结果列表
@@ -212,7 +210,7 @@ class AsyncDualPipeline:
         FastWorker 输出直接作为定稿推送，跳过 Whisper 和对齐。
 
         V3.7: 支持逐 Chunk 中断和检查点保存
-        V3.7.1: 集成进度发射器，实时推送 SSE 进度
+        V3.1.0: 集成进度发射器，实时推送 SSE 进度
         """
         self.logger.info(f"极速模式开始: {len(audio_chunks)} 个 Chunk")
 
@@ -244,7 +242,7 @@ class AsyncDualPipeline:
                 await self.fast_worker.process(ctx)
                 results.append(ctx)
 
-                # V3.7.1: 更新进度（极速模式只有 fast 阶段）
+                # V3.1.0: 更新进度（极速模式只有 fast 阶段）
                 if self.progress_emitter:
                     processed_count = len(results)
                     self.progress_emitter.update_fast(
@@ -265,7 +263,7 @@ class AsyncDualPipeline:
             if token and job_dir:
                 processed_indices.add(i)
 
-                # V3.7.3: 获取字幕快照用于实时持久化（极速模式）
+                # V3.1.0: 获取字幕快照用于实时持久化（极速模式）
                 subtitle_checkpoint_data = {}
                 if self.fast_worker and self.fast_worker.subtitle_manager:
                     subtitle_checkpoint_data = self.fast_worker.subtitle_manager.to_checkpoint_data()
@@ -276,20 +274,20 @@ class AsyncDualPipeline:
                         "processed_indices": list(processed_indices),
                         "processed_count": len(processed_indices),
                         "total_chunks": len(audio_chunks),
-                        # V3.7.3: 保存 finalized_indices（极速模式下所有 processed 都是 finalized）
+                        # V3.1.0: 保存 finalized_indices（极速模式下所有 processed 都是 finalized）
                         "finalized_indices": list(processed_indices),
-                        # V3.7.3: 字幕快照（实时持久化核心）
+                        # V3.1.0: 字幕快照（实时持久化核心）
                         **subtitle_checkpoint_data
                     }
                 }
                 try:
                     token.check_and_save(checkpoint_data, job_dir)
                 except PausedException as e:
-                    # V3.7.4: 捕获取消暂停，停止派发新 Chunk，等待上层处理
+                    # V3.1.0: 捕获取消暂停，停止派发新 Chunk，等待上层处理
                     if not self.pause_exception:
                         self.pause_exception = e
                     self.logger.info(
-                        f"[V3.7.4] 极速模式捕获暂停信号，已处理 {len(processed_indices)} / {total_chunks} 个 Chunk"
+                        f"[V3.1.0] 极速模式捕获暂停信号，已处理 {len(processed_indices)} / {total_chunks} 个 Chunk"
                     )
                     break
 
@@ -298,7 +296,7 @@ class AsyncDualPipeline:
             raise self.errors[0]
 
         if self.pause_exception:
-            # V3.7.4: 触发暂停时抛出异常，保持上层状态机一致
+            # V3.1.0: 触发暂停时抛出异常，保持上层状态机一致
             raise self.pause_exception
 
         self.logger.info(f"极速模式完成: {len(results)} 个 Chunk 已处理")
@@ -311,10 +309,10 @@ class AsyncDualPipeline:
         full_audio_sr: int = 16000,
         job_dir: Optional[Path] = None,  # V3.7
         processed_indices: Optional[Set[int]] = None,  # V3.7
-        base_slow_count: int = 0,  # V3.7.4: SlowWorker 的基准偏移量
-        base_align_count: int = 0,  # V3.7.4: AlignmentWorker 的基准偏移量
-        initial_slow_processed_indices: Optional[set] = None,  # V3.7.4: SlowWorker 初始索引
-        initial_finalized_indices: Optional[set] = None  # V3.7.4: AlignmentWorker 初始索引
+        base_slow_count: int = 0,  # V3.1.0: SlowWorker 的基准偏移量
+        base_align_count: int = 0,  # V3.1.0: AlignmentWorker 的基准偏移量
+        initial_slow_processed_indices: Optional[set] = None,  # V3.1.0: SlowWorker 初始索引
+        initial_finalized_indices: Optional[set] = None  # V3.1.0: AlignmentWorker 初始索引
     ) -> List[ProcessingContext]:
         """
         运行完整三级流水线（补刀/双流模式）
@@ -327,8 +325,8 @@ class AsyncDualPipeline:
         5. 检查异常
 
         V3.7: 支持检查点保存和恢复
-        V3.7.1: 集成进度发射器
-        V3.7.4: 支持分别设置各 Worker 的基准偏移量和初始索引，修复恢复后进度跳变问题
+        V3.1.0: 集成进度发射器
+        V3.1.0: 支持分别设置各 Worker 的基准偏移量和初始索引，修复恢复后进度跳变问题
 
         Args:
             audio_chunks: AudioChunk 列表
@@ -336,19 +334,19 @@ class AsyncDualPipeline:
             full_audio_sr: 完整音频采样率
             job_dir: 任务目录（可选，V3.7 用于保存检查点）
             processed_indices: 已处理的chunk索引集合（可选，V3.7 用于 FastWorker 跳过）
-            base_slow_count: SlowWorker 的基准偏移量（V3.7.4，已废弃，使用索引集合代替）
-            base_align_count: AlignmentWorker 的基准偏移量（V3.7.4，已废弃，使用索引集合代替）
-            initial_slow_processed_indices: SlowWorker 初始已处理索引集合（V3.7.4）
-            initial_finalized_indices: AlignmentWorker 初始已完成索引集合（V3.7.4）
+            base_slow_count: SlowWorker 的基准偏移量（V3.1.0，已废弃，使用索引集合代替）
+            base_align_count: AlignmentWorker 的基准偏移量（V3.1.0，已废弃，使用索引集合代替）
+            initial_slow_processed_indices: SlowWorker 初始已处理索引集合（V3.1.0）
+            initial_finalized_indices: AlignmentWorker 初始已完成索引集合（V3.1.0）
 
         Returns:
             List[ProcessingContext]: 处理结果列表
         """
-        # V3.7.4: 清理历史状态，避免重复抛出旧异常
+        # V3.1.0: 清理历史状态，避免重复抛出旧异常
         self.errors.clear()
         self.pause_exception = None
 
-        total_chunks = len(audio_chunks)  # V3.7.1: 保存总数用于进度计算
+        total_chunks = len(audio_chunks)  # V3.1.0: 保存总数用于进度计算
         self.logger.info(f"开始三级流水线: {total_chunks} 个 Chunk")
 
         # 存储结果
@@ -357,7 +355,7 @@ class AsyncDualPipeline:
         # V3.7: 初始化已处理索引集合
         processed_indices = processed_indices or set()
 
-        # 启动三个并行任务（V3.7.4: 传递初始索引集合）
+        # 启动三个并行任务（V3.1.0: 传递初始索引集合）
         task_fast = asyncio.create_task(
             self._fast_loop(audio_chunks, full_audio_array, full_audio_sr, job_dir, processed_indices, total_chunks)
         )
@@ -386,7 +384,7 @@ class AsyncDualPipeline:
             raise self.errors[0]
 
         if self.pause_exception:
-            # V3.7.4: 等待队列排空后再通知上层暂停，避免进度回退
+            # V3.1.0: 等待队列排空后再通知上层暂停，避免进度回退
             raise self.pause_exception
 
         self.logger.info(f"三级流水线完成: {len(results)} 个 Chunk 已处理")
@@ -400,7 +398,7 @@ class AsyncDualPipeline:
         full_audio_sr: int = 16000,
         job_dir: Optional[Path] = None,  # V3.7
         processed_indices: Optional[Set[int]] = None,  # V3.7
-        total_chunks: int = 0  # V3.7.1
+        total_chunks: int = 0  # V3.1.0
     ):
         """
         FastWorker 循环（生产者）
@@ -413,7 +411,7 @@ class AsyncDualPipeline:
         5. 发送结束信号
 
         V3.7: 支持原子区域和检查点保存
-        V3.7.1: 集成进度发射器
+        V3.1.0: 集成进度发射器
 
         Args:
             chunks: AudioChunk 列表
@@ -421,18 +419,18 @@ class AsyncDualPipeline:
             full_audio_sr: 完整音频采样率
             job_dir: 任务目录（可选，V3.7）
             processed_indices: 已处理的chunk索引集合（可选，V3.7）
-            total_chunks: 总 Chunk 数（V3.7.1）
+            total_chunks: 总 Chunk 数（V3.1.0）
         """
         token = self.cancellation_token  # V3.7
         processed_indices = processed_indices or set()
         total_chunks = total_chunks or len(chunks)
 
-        # V3.7.4: 计算基准偏移量（已完成的 chunk 数量）
+        # V3.1.0: 计算基准偏移量（已完成的 chunk 数量）
         # 修复进度归零问题：恢复后 fast_processed_count 应该从已完成数量开始累加
         base_fast_count = len(processed_indices)
-        fast_processed_count = 0  # V3.7.1: 追踪本次新处理的数量
-        pause_requested = False  # V3.7.4: 捕获暂停后进入排空模式
-        should_send_end_signal = True  # V3.7.4: 控制是否需要发送正常结束信号
+        fast_processed_count = 0  # V3.1.0: 追踪本次新处理的数量
+        pause_requested = False  # V3.1.0: 捕获暂停后进入排空模式
+        should_send_end_signal = True  # V3.1.0: 控制是否需要发送正常结束信号
 
         try:
             for i, chunk in enumerate(chunks):
@@ -460,9 +458,9 @@ class AsyncDualPipeline:
 
                     # 放入队列（如果队列满了，会自动阻塞，实现背压）
                     await self.queue_inter.put(ctx)
-                    fast_processed_count += 1  # V3.7.1
+                    fast_processed_count += 1  # V3.1.0
 
-                    # V3.7.4: 更新 FastWorker 进度（叠加基准偏移量）
+                    # V3.1.0: 更新 FastWorker 进度（叠加基准偏移量）
                     if self.progress_emitter:
                         total_processed = base_fast_count + fast_processed_count
                         self.progress_emitter.update_fast(
@@ -489,12 +487,12 @@ class AsyncDualPipeline:
                     try:
                         token.check_and_save(checkpoint_data, job_dir)
                     except PausedException as e:
-                        # V3.7.4: 捕获暂停信号，停止派发新 Chunk，但允许下游排空
+                        # V3.1.0: 捕获暂停信号，停止派发新 Chunk，但允许下游排空
                         pause_requested = True
                         if not self.pause_exception:
                             self.pause_exception = e
                         self.logger.info(
-                            f"[V3.7.4] FastWorker 捕获暂停信号，已完成 {len(processed_indices)} / {len(chunks)} 个 Chunk"
+                            f"[V3.1.0] FastWorker 捕获暂停信号，已完成 {len(processed_indices)} / {len(chunks)} 个 Chunk"
                         )
                         break
 
@@ -538,7 +536,7 @@ class AsyncDualPipeline:
                 )
                 await self.queue_inter.put(end_ctx)
                 if pause_requested:
-                    self.logger.info("[V3.7.4] FastWorker 已发送暂停结束信号，等待下游排空")
+                    self.logger.info("[V3.1.0] FastWorker 已发送暂停结束信号，等待下游排空")
                 else:
                     self.logger.info("FastWorker 循环完成")
 
@@ -546,8 +544,8 @@ class AsyncDualPipeline:
         self,
         job_dir: Optional[Path] = None,
         total_chunks: int = 0,
-        base_slow_count: int = 0,  # V3.7.4: 基准偏移量（已完成的 chunk 数量）
-        initial_slow_processed_indices: Optional[set] = None  # V3.7.4: 初始已处理索引集合
+        base_slow_count: int = 0,  # V3.1.0: 基准偏移量（已完成的 chunk 数量）
+        initial_slow_processed_indices: Optional[set] = None  # V3.1.0: 初始已处理索引集合
     ):
         """
         SlowWorker 循环（中间消费者-生产者）
@@ -559,15 +557,15 @@ class AsyncDualPipeline:
         4. 透传结束/错误信号
 
         V3.7: 支持原子区域和检查点保存（包括关键的 previous_whisper_text）
-        V3.7.1: 集成进度发射器
-        V3.7.2: 保存 slow_processed_indices 用于断点续传
-        V3.7.4: 使用累计索引集合，修复恢复后进度不准确问题
+        V3.1.0: 集成进度发射器
+        V3.1.0: 保存 slow_processed_indices 用于断点续传
+        V3.1.0: 使用累计索引集合，修复恢复后进度不准确问题
         """
         token = self.cancellation_token  # V3.7
         slow_processed_count = 0  # V3.7: 追踪本次新处理的数量
-        # V3.7.4: 使用累计索引集合（类似 FastWorker）
+        # V3.1.0: 使用累计索引集合（类似 FastWorker）
         slow_processed_indices = set(initial_slow_processed_indices) if initial_slow_processed_indices else set()
-        pause_requested = False  # V3.7.4: 捕获暂停后继续排空队列
+        pause_requested = False  # V3.1.0: 捕获暂停后继续排空队列
 
         try:
             while True:
@@ -597,9 +595,9 @@ class AsyncDualPipeline:
                     # 放入队列
                     await self.queue_final.put(ctx)
                     slow_processed_count += 1
-                    slow_processed_indices.add(chunk_index)  # V3.7.4: 累加到集合（类似 FastWorker）
+                    slow_processed_indices.add(chunk_index)  # V3.1.0: 累加到集合（类似 FastWorker）
 
-                    # V3.7.4: 更新 SlowWorker 进度（使用累计索引数量）
+                    # V3.1.0: 更新 SlowWorker 进度（使用累计索引数量）
                     if self.progress_emitter and total_chunks > 0:
                         total_processed = len(slow_processed_indices)
                         self.progress_emitter.update_slow(
@@ -619,8 +617,8 @@ class AsyncDualPipeline:
                     previous_whisper_text = getattr(self.slow_worker, 'prompt_cache', '')
                     checkpoint_data = {
                         "transcription": {
-                            "slow_processed_count": len(slow_processed_indices),  # V3.7.4: 使用累计数量
-                            "slow_processed_indices": list(slow_processed_indices),  # V3.7.4: 保存累计索引集合
+                            "slow_processed_count": len(slow_processed_indices),  # V3.1.0: 使用累计数量
+                            "slow_processed_indices": list(slow_processed_indices),  # V3.1.0: 保存累计索引集合
                             "previous_whisper_text": previous_whisper_text,  # 关键：保存上文状态
                             "last_slow_chunk_index": chunk_index
                         }
@@ -629,7 +627,7 @@ class AsyncDualPipeline:
                         token.check_and_save(checkpoint_data, job_dir)
                     except PausedException as e:
                         if not pause_requested:
-                            self.logger.info("[V3.7.4] SlowWorker 捕获暂停信号，继续排空 queue_inter")
+                            self.logger.info("[V3.1.0] SlowWorker 捕获暂停信号，继续排空 queue_inter")
                         pause_requested = True
                         if not self.pause_exception:
                             self.pause_exception = e
@@ -652,15 +650,15 @@ class AsyncDualPipeline:
             await self.queue_final.put(error_ctx)
         finally:
             if pause_requested:
-                self.logger.info("[V3.7.4] SlowWorker 已完成排空，等待 AlignmentWorker 同步完成")
+                self.logger.info("[V3.1.0] SlowWorker 已完成排空，等待 AlignmentWorker 同步完成")
 
     async def _align_loop(
         self,
         results: List[ProcessingContext],
         job_dir: Optional[Path] = None,
         total_chunks: int = 0,
-        base_align_count: int = 0,  # V3.7.4: 基准偏移量（已完成的 chunk 数量）
-        initial_finalized_indices: Optional[set] = None  # V3.7.4: 初始已完成索引集合
+        base_align_count: int = 0,  # V3.1.0: 基准偏移量（已完成的 chunk 数量）
+        initial_finalized_indices: Optional[set] = None  # V3.1.0: 初始已完成索引集合
     ):
         """
         AlignmentWorker 循环（最终消费者）
@@ -672,21 +670,21 @@ class AsyncDualPipeline:
         4. 检测结束信号
 
         V3.7: 支持原子区域和检查点保存
-        V3.7.1: 集成进度发射器
-        V3.7.4: 使用累计索引集合，修复恢复后进度不准确问题
+        V3.1.0: 集成进度发射器
+        V3.1.0: 使用累计索引集合，修复恢复后进度不准确问题
 
         Args:
             results: 结果列表（用于收集 context）
             job_dir: 任务目录（可选，V3.7）
-            total_chunks: 总 Chunk 数（V3.7.1）
-            base_align_count: 基准偏移量（V3.7.4）
-            initial_finalized_indices: 初始已完成索引集合（V3.7.4）
+            total_chunks: 总 Chunk 数（V3.1.0）
+            base_align_count: 基准偏移量（V3.1.0）
+            initial_finalized_indices: 初始已完成索引集合（V3.1.0）
         """
         token = self.cancellation_token  # V3.7
         align_processed_count = 0  # V3.7: 追踪本次新处理的数量
-        # V3.7.4: 使用累计索引集合（类似 FastWorker 和 SlowWorker）
+        # V3.1.0: 使用累计索引集合（类似 FastWorker 和 SlowWorker）
         finalized_indices = set(initial_finalized_indices) if initial_finalized_indices else set()
-        pause_requested = False  # V3.7.4: 捕获暂停后继续排空 queue_final
+        pause_requested = False  # V3.1.0: 捕获暂停后继续排空 queue_final
 
         try:
             while True:
@@ -713,9 +711,9 @@ class AsyncDualPipeline:
                     # 收集结果
                     results.append(ctx)
                     align_processed_count += 1
-                    finalized_indices.add(chunk_index)  # V3.7.4: 累加到集合
+                    finalized_indices.add(chunk_index)  # V3.1.0: 累加到集合
 
-                    # V3.7.4: 更新 AlignmentWorker 进度（使用累计索引数量）
+                    # V3.1.0: 更新 AlignmentWorker 进度（使用累计索引数量）
                     if self.progress_emitter and total_chunks > 0:
                         total_processed = len(finalized_indices)
                         self.progress_emitter.update_align(
@@ -731,19 +729,19 @@ class AsyncDualPipeline:
 
                 # V3.7: 每个 Chunk 处理完成后保存检查点
                 if token and job_dir:
-                    # V3.7.3: 获取字幕快照用于实时持久化
+                    # V3.1.0: 获取字幕快照用于实时持久化
                     subtitle_checkpoint_data = {}
                     if self.alignment_worker and self.alignment_worker.subtitle_manager:
                         subtitle_checkpoint_data = self.alignment_worker.subtitle_manager.to_checkpoint_data()
 
                     checkpoint_data = {
                         "transcription": {
-                            "align_processed_count": len(finalized_indices),  # V3.7.4: 使用累计数量
+                            "align_processed_count": len(finalized_indices),  # V3.1.0: 使用累计数量
                             "last_align_chunk_index": chunk_index,
                             "completed_chunks": len(results),
-                            # V3.7.4: 保存累计的 finalized_indices
+                            # V3.1.0: 保存累计的 finalized_indices
                             "finalized_indices": list(finalized_indices),
-                            # V3.7.3: 字幕快照（实时持久化核心）
+                            # V3.1.0: 字幕快照（实时持久化核心）
                             **subtitle_checkpoint_data
                         }
                     }
@@ -751,7 +749,7 @@ class AsyncDualPipeline:
                         token.check_and_save(checkpoint_data, job_dir)
                     except PausedException as e:
                         if not pause_requested:
-                            self.logger.info("[V3.7.4] AlignmentWorker 捕获暂停信号，继续排空 queue_final")
+                            self.logger.info("[V3.1.0] AlignmentWorker 捕获暂停信号，继续排空 queue_final")
                         pause_requested = True
                         if not self.pause_exception:
                             self.pause_exception = e
@@ -764,7 +762,7 @@ class AsyncDualPipeline:
             self.errors.append(e)
         finally:
             if pause_requested:
-                self.logger.info("[V3.7.4] AlignmentWorker 已排空所有上下文，等待上层暂停")
+                self.logger.info("[V3.1.0] AlignmentWorker 已排空所有上下文，等待上层暂停")
 
     def get_statistics(self) -> dict:
         """

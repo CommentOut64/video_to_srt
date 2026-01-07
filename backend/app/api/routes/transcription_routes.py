@@ -38,6 +38,8 @@ class PreprocessingSettingsAPI(BaseModel):
     demucs_model: str = Field(default="htdemucs", description="Demucs 模型")
     # 分离预测次数: 1-5
     demucs_shifts: int = Field(default=1, ge=1, le=5, description="分离预测次数")
+    # 分离模式: global/on_demand
+    separation_mode: str = Field(default="on_demand", description="人声分离模式")
     # 是否启用频谱分诊（直通模式应设为 false）
     enable_spectral_triage: bool = Field(default=True, description="是否启用频谱分诊")
     # 分诊灵敏度: 0.0-1.0
@@ -147,7 +149,7 @@ class TranscribeSettings(BaseModel):
     # === 旧版配置 (兼容) ===
     engine: str = "sensevoice"  # whisper 或 sensevoice
     model: str = "medium"
-    compute_type: str = "float16"
+    compute_type: str = "auto"  # auto: 根据显存自动选择
     device: str = "cuda"
     batch_size: int = 16
     word_timestamps: bool = False
@@ -433,7 +435,7 @@ def create_transcription_router(
                         # 保留旧版字段兼容
                         engine=settings_dict.get('engine', 'sensevoice'),
                         model=settings_dict.get('model', 'medium'),
-                        compute_type=settings_dict.get('compute_type', 'float16'),
+                        compute_type=settings_dict.get('compute_type', 'auto'),
                         device=settings_dict.get('device', 'cuda'),
                         batch_size=settings_dict.get('batch_size', 16),
                         word_timestamps=settings_dict.get('word_timestamps', False),
@@ -803,7 +805,7 @@ def create_transcription_router(
         all_tasks = {}  # 使用 dict 避免重复，key 为 job_id
 
         # 1. 队列中的任务（处理中或等待中）- 优先级最高
-        # [V3.6.3] 过滤幽灵任务：检测目录是否存在，不存在则从内存移除
+        # [V3.1.0] 过滤幽灵任务：检测目录是否存在，不存在则从内存移除
         ghost_job_ids = []
         with queue_service.lock:
             for job_id, job in list(queue_service.jobs.items()):
@@ -824,7 +826,7 @@ def create_transcription_router(
                     "phase": job.phase if hasattr(job, 'phase') else 'unknown'
                 }
 
-        # [V3.6.3] 清理检测到的幽灵任务
+        # [V3.1.0] 清理检测到的幽灵任务
         if ghost_job_ids:
             logger = logging.getLogger(__name__)
             with queue_service.lock:
@@ -993,50 +995,88 @@ def create_transcription_router(
         return result
 
     @router.get("/download/{job_id}")
-    async def download_result(job_id: str, copy_to_source: bool = False):
-        """下载转录结果"""
+    async def download_result(job_id: str, copy_to_source: bool = False, auto_repair: bool = True):
+        """
+        下载转录结果
+        V3.1.1+dev.20260106.03: 下载前自动修复时间戳重叠
+
+        Args:
+            job_id: 任务ID
+            copy_to_source: 是否复制到源文件目录
+            auto_repair: 是否自动修复重叠（默认 True）
+        """
         job = transcription_service.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="任务未找到")
-        
+
         if not job.srt_path or not os.path.exists(job.srt_path):
             raise HTTPException(status_code=404, detail="字幕文件未生成")
-        
+
         filename = os.path.basename(job.srt_path)
-        
+
+        # V3.1.1+dev.20260106.03: 读取并修复重叠
+        srt_content = None
+        if auto_repair:
+            try:
+                from app.utils.text_utils import repair_srt_overlaps
+                with open(job.srt_path, 'r', encoding='utf-8') as f:
+                    original_content = f.read()
+                srt_content, repaired_count = repair_srt_overlaps(original_content, gap_ms=1.0)
+                if repaired_count > 0:
+                    print(f"[{job_id}] 下载时自动修复了 {repaired_count} 处时间戳重叠")
+            except Exception as e:
+                print(f"[{job_id}] 修复重叠失败: {e}")
+                srt_content = None
+
         # 如果需要复制到源文件目录
         if copy_to_source and job.input_path:
             source_dir = os.path.dirname(job.input_path)
             source_srt_path = os.path.join(source_dir, filename)
-            
+
             try:
-                shutil.copy2(job.srt_path, source_srt_path)
+                # 如果有修复后的内容，写入修复后的版本
+                if srt_content:
+                    with open(source_srt_path, 'w', encoding='utf-8') as f:
+                        f.write(srt_content)
+                else:
+                    shutil.copy2(job.srt_path, source_srt_path)
                 print(f"SRT文件已复制到源目录: {source_srt_path}")
             except Exception as e:
                 print(f"复制到源目录失败: {e}")
-        
+
         # 同时复制到输出目录
         output_path = os.path.join(output_dir, filename)
         try:
-            if not os.path.exists(output_path):
+            # 如果有修复后的内容，写入修复后的版本
+            if srt_content:
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    f.write(srt_content)
+            elif not os.path.exists(output_path):
                 shutil.copy2(job.srt_path, output_path)
-            
+
             return FileResponse(
-                path=output_path, 
-                filename=filename, 
+                path=output_path,
+                filename=filename,
                 media_type='text/plain; charset=utf-8'
             )
         except Exception as e:
             # 如果复制失败，直接返回原文件
             return FileResponse(
-                path=job.srt_path, 
-                filename=filename, 
+                path=job.srt_path,
+                filename=filename,
                 media_type='text/plain; charset=utf-8'
             )
 
     @router.post("/copy-result/{job_id}")
-    async def copy_result_to_source(job_id: str):
-        """将转录结果复制到源文件目录"""
+    async def copy_result_to_source(job_id: str, auto_repair: bool = True):
+        """
+        将转录结果复制到源文件目录
+        V3.1.1+dev.20260106.03: 复制前自动修复时间戳重叠
+
+        Args:
+            job_id: 任务ID
+            auto_repair: 是否自动修复重叠（默认 True）
+        """
         job = transcription_service.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="任务未找到")
@@ -1056,13 +1096,38 @@ def create_transcription_router(
             srt_filename = os.path.basename(job.srt_path)
             target_path = os.path.join(source_dir, srt_filename)
 
-            # 复制文件
-            shutil.copy2(job.srt_path, target_path)
+            # V3.1.1+dev.20260106.03: 读取并修复重叠
+            repaired_count = 0
+            if auto_repair:
+                try:
+                    from app.utils.text_utils import repair_srt_overlaps
+                    with open(job.srt_path, 'r', encoding='utf-8') as f:
+                        original_content = f.read()
+                    repaired_content, repaired_count = repair_srt_overlaps(original_content, gap_ms=1.0)
+                    if repaired_count > 0:
+                        # 写入修复后的内容
+                        with open(target_path, 'w', encoding='utf-8') as f:
+                            f.write(repaired_content)
+                        print(f"[{job_id}] 复制时自动修复了 {repaired_count} 处时间戳重叠")
+                    else:
+                        # 无需修复，直接复制
+                        shutil.copy2(job.srt_path, target_path)
+                except Exception as e:
+                    print(f"[{job_id}] 修复重叠失败: {e}，直接复制原文件")
+                    shutil.copy2(job.srt_path, target_path)
+            else:
+                # 不修复，直接复制
+                shutil.copy2(job.srt_path, target_path)
+
+            message = f"字幕文件已复制到: {target_path}"
+            if repaired_count > 0:
+                message += f" (自动修复了 {repaired_count} 处重叠)"
 
             return {
                 "success": True,
-                "message": f"字幕文件已复制到: {target_path}",
-                "target_path": target_path
+                "message": message,
+                "target_path": target_path,
+                "repaired_overlaps": repaired_count
             }
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"复制文件失败: {str(e)}")
@@ -1186,7 +1251,7 @@ def create_transcription_router(
             with open(checkpoint_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
 
-            # V3.7.3+: 优先从 transcription.sentences_snapshot 读取（实时字幕快照）
+            # V3.1.0+: 优先从 transcription.sentences_snapshot 读取（实时字幕快照）
             transcription = data.get("transcription", {})
             sentences_snapshot = transcription.get("sentences_snapshot", [])
 
@@ -1194,7 +1259,7 @@ def create_transcription_router(
             detected_language = None
 
             if sentences_snapshot:
-                # 使用新格式（V3.7.3+ 实时字幕快照）
+                # 使用新格式（V3.1.0+ 实时字幕快照）
                 for sentence in sentences_snapshot:
                     all_segments.append({
                         "id": sentence.get("_index", 0),

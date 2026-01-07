@@ -165,6 +165,7 @@ const props = defineProps({
         demucs_strategy: 'auto',
         demucs_model: 'htdemucs',
         demucs_shifts: 1,
+        separation_mode: 'on_demand',
         spectrum_threshold: 0.35,
         vad_filter: true,
         enable_spectral_triage: true
@@ -225,7 +226,7 @@ const macroPresets = [
     requiresGpu: false,
     config: {
       // 直通模式: 完全跳过频谱分诊和人声分离
-      preprocessing: { demucs_strategy: 'off', enable_spectral_triage: false },
+      preprocessing: { demucs_strategy: 'off', separation_mode: 'on_demand', enable_spectral_triage: false },
       transcription: { transcription_profile: 'sensevoice_only' },
       refinement: { llm_task: 'off', llm_scope: 'sparse' }
     }
@@ -239,7 +240,7 @@ const macroPresets = [
     requiresGpu: true,
     config: {
       // 智能模式: 启用频谱分诊，按需分离
-      preprocessing: { demucs_strategy: 'auto', enable_spectral_triage: true },
+      preprocessing: { demucs_strategy: 'auto', separation_mode: 'on_demand', enable_spectral_triage: true },
       transcription: { transcription_profile: 'sv_whisper_patch' },
       refinement: { llm_task: 'proofread', llm_scope: 'sparse' }
     }
@@ -252,8 +253,8 @@ const macroPresets = [
     minVram: 8000,
     requiresGpu: true,
     config: {
-      // 极致模式: 强制全分离，频谱分诊可跳过（因为会强制分离）
-      preprocessing: { demucs_strategy: 'force_on', enable_spectral_triage: false },
+      // 极致模式: 强制全局分离，频谱分诊可跳过（因为会强制分离）
+      preprocessing: { demucs_strategy: 'force_on', separation_mode: 'global', enable_spectral_triage: false },
       transcription: { transcription_profile: 'sv_whisper_dual' },
       refinement: { llm_task: 'proofread', llm_scope: 'global' }
     }
@@ -470,15 +471,20 @@ function selectMacroPreset(presetId) {
 
 // 模块选项变更时检查是否匹配预设
 function onModuleChange() {
-  // 根据 demucs_strategy 自动推导 enable_spectral_triage
-  // - off: 直通模式，跳过频谱分诊
-  // - auto: 智能模式，启用频谱分诊
-  // - force_on: 强制分离，跳过频谱分诊（因为会强制分离所有chunk）
+  // 根据 demucs_strategy 自动推导 enable_spectral_triage 和 separation_mode
+  // - off: 直通模式，跳过频谱分诊，按需分离（实际不会执行）
+  // - auto: 智能模式，启用频谱分诊，按需分离
+  // - force_on: 强制分离，跳过频谱分诊，全局分离
   const strategy = localConfig.value.preprocessing.demucs_strategy
-  if (strategy === 'off' || strategy === 'force_on') {
+  if (strategy === 'off') {
     localConfig.value.preprocessing.enable_spectral_triage = false
-  } else {
+    localConfig.value.preprocessing.separation_mode = 'on_demand'
+  } else if (strategy === 'auto') {
     localConfig.value.preprocessing.enable_spectral_triage = true
+    localConfig.value.preprocessing.separation_mode = 'on_demand'
+  } else if (strategy === 'force_on') {
+    localConfig.value.preprocessing.enable_spectral_triage = false
+    localConfig.value.preprocessing.separation_mode = 'global'
   }
 
   // 检查当前配置是否匹配某个预设

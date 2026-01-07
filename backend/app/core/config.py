@@ -14,6 +14,36 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+def load_env_file(env_path: Path) -> None:
+    """加载.env文件到环境变量 (简化版,无需第三方库)"""
+    if not env_path.exists():
+        return
+
+    try:
+        with open(env_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                # 跳过空行和注释
+                if not line or line.startswith('#'):
+                    continue
+                # 解析KEY=VALUE格式
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    key = key.strip()
+                    value = value.strip()
+                    # 移除引号
+                    if value.startswith('"') and value.endswith('"'):
+                        value = value[1:-1]
+                    elif value.startswith("'") and value.endswith("'"):
+                        value = value[1:-1]
+                    # 只在环境变量不存在时设置
+                    if key and key not in os.environ:
+                        os.environ[key] = value
+        logger.info(f"[Config] Loaded environment variables from {env_path}")
+    except Exception as e:
+        logger.warning(f"[Config] Failed to load .env file: {e}")
+
+
 class ProjectConfig:
     """项目配置类"""
 
@@ -22,6 +52,13 @@ class ProjectConfig:
         # 获取项目根目录（从当前文件位置向上三级）
         # backend/app/core/config.py -> backend/app/core -> backend/app -> backend -> project_root
         self.BASE_DIR = Path(__file__).parent.parent.parent.parent.resolve()
+
+        # V3.1.0+dev.20260104.01: 添加 PROJECT_ROOT 别名（供更新系统使用）
+        self.PROJECT_ROOT = self.BASE_DIR
+
+        # 加载.env文件 (在设置其他配置之前)
+        env_file = self.BASE_DIR / ".env"
+        load_env_file(env_file)
 
         # 输入输出目录
         self.INPUT_DIR = self.BASE_DIR / "input"

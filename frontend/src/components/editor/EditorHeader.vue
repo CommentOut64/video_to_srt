@@ -304,11 +304,11 @@ function cancelEditTitle() {
 }
 
 // 是否暂停状态（包含正在暂停和已暂停两种状态）
-// V3.7.3: 'pausing' 状态表示正在等待当前原子操作完成，用户可以点击恢复取消暂停
+// V3.1.0: 'pausing' 状态表示正在等待当前原子操作完成，用户可以点击恢复取消暂停
 const isPaused = computed(() => ['pausing', 'paused'].includes(props.currentTaskStatus))
 
 // 是否显示当前任务进度（转录中、排队中、正在暂停、或已暂停）
-// V3.7.3: 新增 'pausing' 状态，表示任务正在暂停中（等待当前原子操作完成）
+// V3.1.0: 新增 'pausing' 状态，表示任务正在暂停中（等待当前原子操作完成）
 const showCurrentTaskProgress = computed(() =>
   ['processing', 'queued', 'pausing', 'paused'].includes(props.currentTaskStatus)
 )
@@ -332,7 +332,7 @@ const statusClass = computed(() => {
 
 // 元信息文字
 const metaText = computed(() => {
-  // V3.7.3: 区分"正在暂停"和"已暂停"状态
+  // V3.1.0: 区分"正在暂停"和"已暂停"状态
   if (props.currentTaskStatus === 'pausing') {
     return `正在暂停... ${props.currentTaskProgress}%`
   }
@@ -370,7 +370,7 @@ const phaseStyle = computed(() => {
 
 // 阶段标签
 const phaseLabel = computed(() => {
-  // V3.7.3: 区分"正在暂停"和"已暂停"状态
+  // V3.1.0: 区分"正在暂停"和"已暂停"状态
   if (props.currentTaskStatus === 'pausing') {
     return '正在暂停...'
   }

@@ -1,5 +1,5 @@
 """
-统一进度发射器 - V3.7.1
+统一进度发射器 - V3.1.0
 
 封装进度更新和 SSE 推送，解决双流流水线进度不同步的问题。
 
@@ -71,7 +71,7 @@ class ProgressEventEmitter:
     """
 
     # 阶段权重配置 (不同模式)
-    # V3.7.2 调整: 提高 fast (SenseVoice) 权重，让用户能看到明显的进度变化
+    # V3.1.0 调整: 提高 fast (SenseVoice) 权重，让用户能看到明显的进度变化
     WEIGHTS = {
         ProgressMode.SENSEVOICE_ONLY: {
             "preprocess": 0.15,
@@ -81,15 +81,15 @@ class ProgressEventEmitter:
         },
         ProgressMode.WHISPER_PATCH: {
             "preprocess": 0.10,
-            "fast": 0.50,  # V3.7.2: 45% → 50%，让 SenseVoice 完成时进度更明显
-            "slow": 0.30,  # V3.7.2: 35% → 30%
+            "fast": 0.50,  # V3.1.0: 45% → 50%，让 SenseVoice 完成时进度更明显
+            "slow": 0.30,  # V3.1.0: 35% → 30%
             "align": 0.10
         },
         ProgressMode.DUAL_STREAM: {
             "preprocess": 0.10,
-            "fast": 0.50,  # V3.7.2: 35% → 50%，让 SenseVoice 完成时进度达到 60%
-            "slow": 0.30,  # V3.7.2: 40% → 30%
-            "align": 0.10  # V3.7.2: 15% → 10%
+            "fast": 0.50,  # V3.1.0: 35% → 50%，让 SenseVoice 完成时进度达到 60%
+            "slow": 0.30,  # V3.1.0: 40% → 30%
+            "align": 0.10  # V3.1.0: 15% → 10%
         }
     }
 
@@ -297,7 +297,7 @@ class ProgressEventEmitter:
             self.detail.align * w["align"]
         )
 
-        # V3.7.2: 防止进度倒退（只允许进度增加或保持不变）
+        # V3.1.0: 防止进度倒退（只允许进度增加或保持不变）
         # 这解决了节流导致的阶段不同步问题
         if new_total < self.detail.total:
             # 进度倒退，不更新 total，只更新阶段进度
@@ -310,7 +310,7 @@ class ProgressEventEmitter:
         # 同步到 job.progress
         self.job.progress = round(self.detail.total, 1)
 
-        # V3.7.2: 关键节点强制推送（阶段完成时）
+        # V3.1.0: 关键节点强制推送（阶段完成时）
         is_milestone = False
         if phase == "fast" and self.detail.fast >= 100:
             is_milestone = True
@@ -366,7 +366,7 @@ class ProgressEventEmitter:
             "status": self.job.status,
             "processed": self.job.processed,
             "total": self.job.total,
-            # V3.7.1 新增: 阶段细节
+            # V3.1.0 新增: 阶段细节
             "mode": self.mode.value,
             "detail": {
                 "preprocess": self.detail.preprocess,

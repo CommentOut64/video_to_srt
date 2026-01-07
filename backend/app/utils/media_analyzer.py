@@ -49,7 +49,7 @@ class MediaAnalyzer:
         ]
 
         result = subprocess.run(
-            cmd, capture_output=True, text=True,
+            cmd, capture_output=True, text=True, encoding='utf-8',
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
         )
 
@@ -71,7 +71,7 @@ class MediaAnalyzer:
         ]
 
         result = subprocess.run(
-            cmd, capture_output=True, text=True,
+            cmd, capture_output=True, text=True, encoding='utf-8',
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
         )
 
@@ -158,7 +158,7 @@ class MediaAnalyzer:
 
         try:
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=10,
+                cmd, capture_output=True, text=True, timeout=10, encoding='utf-8',
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             )
             if result.returncode == 0:
@@ -179,7 +179,7 @@ class MediaAnalyzer:
 
         try:
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=30,
+                cmd, capture_output=True, text=True, timeout=30, encoding='utf-8',
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             )
             if result.returncode == 0:

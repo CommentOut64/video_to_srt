@@ -23,6 +23,13 @@ class SSEChannelManager extends EventEmitter {
     // 重连状态 { channelId: { timer, attempts } }
     this.reconnectState = new Map()
 
+    // [V3.1.0] 延迟关闭定时器 { channelId: timeoutId }
+    // 用于在取消订阅时提供短暂缓冲期，避免快速切换页面时频繁重建连接
+    this.pendingUnsubscribeTimers = new Map()
+
+    // [V3.1.0] 延迟关闭的缓冲时间（毫秒）
+    this.UNSUBSCRIBE_DELAY = 2000
+
     // 基础 URL
     this.baseURL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
 
@@ -54,7 +61,7 @@ class SSEChannelManager extends EventEmitter {
         handlers.onQueueUpdate?.(data.queue)
       },
       job_status: (data) => {
-        // V3.7.4: 状态事件不应该包含进度信息，避免归零
+        // V3.1.0: 状态事件不应该包含进度信息，避免归零
         // 只有当后端明确提供了 percent/progress 时才传递，否则不设置默认值
         const percent = data.percent ?? data.progress
         console.log('[SSE Global] 任务状态:', data)
@@ -70,7 +77,7 @@ class SSEChannelManager extends EventEmitter {
         // 使用 data.id 而非 data.job_id，兼容全局频道的字段名
         handlers.onJobProgress?.(data.id || data.job_id, percent, { ...data, percent })
       },
-      // [V3.6.3] 新增：任务删除事件，解决幽灵任务问题
+      // [V3.1.0] 新增：任务删除事件，解决幽灵任务问题
       job_removed: (data) => {
         console.log('[SSE Global] 任务删除:', data.job_id)
         handlers.onJobRemoved?.(data.job_id)
@@ -106,7 +113,7 @@ class SSEChannelManager extends EventEmitter {
     const channelId = `job:${jobId}`
     const url = `${this.baseURL}/api/stream/${jobId}`
 
-    // V3.7.2: 区分总体进度和阶段进度
+    // V3.1.0: 区分总体进度和阶段进度
     // 总体进度处理函数 - 用于更新主进度条
     const handleOverallProgress = (data) => {
       const percent = data.percent ?? data.progress ?? 0
@@ -169,7 +176,7 @@ class SSEChannelManager extends EventEmitter {
       },
 
       // === 进度事件（新格式带命名空间前缀） ===
-      // V3.7.2: 只有 progress.overall 更新主进度条，其他阶段进度单独处理
+      // V3.1.0: 只有 progress.overall 更新主进度条，其他阶段进度单独处理
       'progress.overall': handleOverallProgress,
       'progress.extract': handlePhaseProgress,
       'progress.bgm_detect': handlePhaseProgress,
@@ -181,9 +188,9 @@ class SSEChannelManager extends EventEmitter {
       'progress.llm_proof': handlePhaseProgress,
       'progress.llm_trans': handlePhaseProgress,
       'progress.srt': handlePhaseProgress,
-      'progress.fast': handlePhaseProgress,   // V3.7.2: 新增 fast/slow 阶段
-      'progress.slow': handlePhaseProgress,   // V3.7.2: 新增 fast/slow 阶段
-      'progress.preprocess': handlePhaseProgress,  // V3.7.2: 新增预处理阶段
+      'progress.fast': handlePhaseProgress,   // V3.1.0: 新增 fast/slow 阶段
+      'progress.slow': handlePhaseProgress,   // V3.1.0: 新增 fast/slow 阶段
+      'progress.preprocess': handlePhaseProgress,  // V3.1.0: 新增预处理阶段
       'progress.align': handleAlignProgress,
 
       // === 信号事件（新格式带命名空间前缀） ===
@@ -232,7 +239,7 @@ class SSEChannelManager extends EventEmitter {
         handlers.onSubtitleUpdate?.(data)
       },
 
-      // V3.7.3: 字幕恢复事件（断点续传后恢复字幕）
+      // V3.1.0: 字幕恢复事件（断点续传后恢复字幕）
       'subtitle.restored': (data) => {
         console.log(`[SSE Job ${jobId}] 恢复字幕:`, data)
         handlers.onRestored?.(data)
@@ -364,6 +371,9 @@ class SSEChannelManager extends EventEmitter {
    * @private
    */
   _subscribe(channelId, url, eventHandlers) {
+    // [V3.1.0] 如果有待执行的延迟关闭，先取消它（用户快速切换回来的场景）
+    this._cancelPendingUnsubscribe(channelId)
+
     // 检查是否已存在连接
     const existingConnection = this.channels.get(channelId)
 
@@ -394,12 +404,44 @@ class SSEChannelManager extends EventEmitter {
 
   /**
    * 请求取消订阅（延迟执行，避免页面切换时误关闭）
+   * [V3.1.0] 修复：实现真正的延迟关闭逻辑，解决 EventSource 连接泄漏问题
    * @private
    */
   _requestUnsubscribe(channelId) {
-    // 不立即关闭，给一个短暂的缓冲期
-    // 如果用户快速切换回来，可以复用连接
-    console.log(`[SSEChannelManager] 延迟取消订阅: ${channelId}`)
+    // 检查是否已有待执行的关闭定时器
+    const existingTimer = this.pendingUnsubscribeTimers.get(channelId)
+    if (existingTimer) {
+      // 已有待执行的关闭请求，无需重复设置
+      console.log(`[SSEChannelManager] 延迟取消订阅已排队: ${channelId}`)
+      return
+    }
+
+    console.log(`[SSEChannelManager] 延迟取消订阅: ${channelId}（${this.UNSUBSCRIBE_DELAY}ms 后执行）`)
+
+    // 设置延迟关闭定时器
+    const timer = setTimeout(() => {
+      console.log(`[SSEChannelManager] 执行延迟取消订阅: ${channelId}`)
+      // 清除定时器记录
+      this.pendingUnsubscribeTimers.delete(channelId)
+      // 真正执行关闭
+      this.unsubscribe(channelId)
+    }, this.UNSUBSCRIBE_DELAY)
+
+    this.pendingUnsubscribeTimers.set(channelId, timer)
+  }
+
+  /**
+   * 取消待执行的延迟关闭定时器
+   * [V3.1.0] 新增：在重新订阅时取消待执行的关闭操作
+   * @private
+   */
+  _cancelPendingUnsubscribe(channelId) {
+    const timer = this.pendingUnsubscribeTimers.get(channelId)
+    if (timer) {
+      console.log(`[SSEChannelManager] 取消延迟关闭: ${channelId}`)
+      clearTimeout(timer)
+      this.pendingUnsubscribeTimers.delete(channelId)
+    }
   }
 
   /**
@@ -544,14 +586,23 @@ class SSEChannelManager extends EventEmitter {
 
   /**
    * 取消订阅指定频道
+   * [V3.1.0] 增强：显式清理事件处理器引用，防止闭包泄漏
    * @param {string} channelId - 频道ID
    */
   unsubscribe(channelId) {
     console.log(`[SSEChannelManager] 取消订阅: ${channelId}`)
 
+    // [V3.1.0] 清除待执行的延迟关闭定时器
+    this._cancelPendingUnsubscribe(channelId)
+
     // 关闭 EventSource
     const eventSource = this.channels.get(channelId)
     if (eventSource) {
+      // [V3.1.0] 移除所有事件监听器（防止闭包引用泄漏）
+      // EventSource 的 onopen/onerror/onmessage 设为 null
+      eventSource.onopen = null
+      eventSource.onerror = null
+      eventSource.onmessage = null
       eventSource.close()
       this.channels.delete(channelId)
     }
@@ -563,8 +614,18 @@ class SSEChannelManager extends EventEmitter {
     }
     this.reconnectState.delete(channelId)
 
-    // 删除配置
-    this.channelConfigs.delete(channelId)
+    // [V3.1.0] 删除配置（包含事件处理器闭包引用）
+    // 这是关键：channelConfigs 中的 eventHandlers 持有对 store 的引用
+    const config = this.channelConfigs.get(channelId)
+    if (config) {
+      // 显式清空 eventHandlers 对象中的所有函数引用
+      if (config.eventHandlers) {
+        for (const key of Object.keys(config.eventHandlers)) {
+          config.eventHandlers[key] = null
+        }
+      }
+      this.channelConfigs.delete(channelId)
+    }
   }
 
   /**
@@ -573,6 +634,13 @@ class SSEChannelManager extends EventEmitter {
   unsubscribeAll() {
     console.log('[SSEChannelManager] 取消所有订阅')
 
+    // [V3.1.0] 先清除所有待执行的延迟关闭定时器
+    for (const timer of this.pendingUnsubscribeTimers.values()) {
+      clearTimeout(timer)
+    }
+    this.pendingUnsubscribeTimers.clear()
+
+    // 关闭所有频道
     for (const channelId of this.channels.keys()) {
       this.unsubscribe(channelId)
     }

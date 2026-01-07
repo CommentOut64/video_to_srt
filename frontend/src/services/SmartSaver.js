@@ -39,6 +39,11 @@ const CONFIG = {
   // 存储键前缀
   PROJECT_PREFIX: "project-",
   BACKUP_PREFIX: "project-backup-",
+
+  // [V3.1.0] localStorage 配额管理
+  MAX_BACKUP_COUNT: 5, // 最多保留5个备份
+  BACKUP_WARNING_THRESHOLD: 0.8, // 配额使用超过80%时警告
+  MAX_CONSECUTIVE_FAILURES: 3, // 最大连续失败次数后禁用备份
 };
 
 class SmartSaver {
@@ -48,6 +53,10 @@ class SmartSaver {
     this.pendingIdleCallback = null;
     this.debounceTimer = null;
     this.isSaving = false;
+
+    // [V3.1.0] 连续失败计数和禁用标记
+    this.consecutiveFailures = 0;
+    this.backupDisabled = false;
 
     // Worker 相关（预留）
     this.worker = null;
@@ -84,15 +93,131 @@ class SmartSaver {
 
   /**
    * 紧急同步保存到 localStorage（页面关闭时使用）
+   * [V3.1.0] 增强：配额检查、LRU淘汰、失败计数
    */
   _emergencySave(data) {
+    // 如果备份已被禁用（连续失败过多），跳过
+    if (this.backupDisabled) {
+      console.warn("[SmartSaver] 备份已禁用，跳过紧急备份");
+      return;
+    }
+
     try {
       const key = `${CONFIG.BACKUP_PREFIX}${data.jobId}`;
       const plain = this._toPlainObject(data.subtitles, data.meta);
-      localStorage.setItem(key, JSON.stringify(plain));
+      const jsonStr = JSON.stringify(plain);
+
+      // [V3.1.0] 检查 localStorage 可用空间
+      const storageInfo = this._getStorageInfo();
+      if (storageInfo.usageRatio > CONFIG.BACKUP_WARNING_THRESHOLD) {
+        console.warn(`[SmartSaver] localStorage 使用率 ${(storageInfo.usageRatio * 100).toFixed(1)}%，执行 LRU 清理`);
+        this._cleanupOldBackups();
+      }
+
+      // 尝试保存
+      localStorage.setItem(key, jsonStr);
       console.log("[SmartSaver] 紧急备份已保存到 localStorage");
+
+      // 重置失败计数
+      this.consecutiveFailures = 0;
     } catch (error) {
-      console.error("[SmartSaver] 紧急备份失败:", error);
+      this.consecutiveFailures++;
+      console.error(`[SmartSaver] 紧急备份失败 (${this.consecutiveFailures}/${CONFIG.MAX_CONSECUTIVE_FAILURES}):`, error);
+
+      // [V3.1.0] 如果是配额错误，尝试清理后重试一次
+      if (error.name === "QuotaExceededError") {
+        this._cleanupOldBackups();
+
+        // 重试一次
+        try {
+          const key = `${CONFIG.BACKUP_PREFIX}${data.jobId}`;
+          const plain = this._toPlainObject(data.subtitles, data.meta);
+          localStorage.setItem(key, JSON.stringify(plain));
+          console.log("[SmartSaver] 清理后紧急备份成功");
+          this.consecutiveFailures = 0;
+          return;
+        } catch (retryError) {
+          console.error("[SmartSaver] 清理后备份仍失败:", retryError);
+        }
+      }
+
+      // 连续失败过多，禁用备份功能避免无限循环
+      if (this.consecutiveFailures >= CONFIG.MAX_CONSECUTIVE_FAILURES) {
+        console.error("[SmartSaver] 连续失败次数过多，禁用 localStorage 备份");
+        this.backupDisabled = true;
+      }
+    }
+  }
+
+  /**
+   * [V3.1.0] 获取 localStorage 使用情况
+   */
+  _getStorageInfo() {
+    let totalSize = 0;
+    let backupCount = 0;
+
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      const value = localStorage.getItem(key);
+      totalSize += (key.length + value.length) * 2; // UTF-16 编码
+
+      if (key.startsWith(CONFIG.BACKUP_PREFIX)) {
+        backupCount++;
+      }
+    }
+
+    // 估算配额（大多数浏览器为 5-10MB）
+    const estimatedQuota = 5 * 1024 * 1024;
+
+    return {
+      totalSize,
+      backupCount,
+      usageRatio: totalSize / estimatedQuota,
+    };
+  }
+
+  /**
+   * [V3.1.0] 清理旧备份（LRU 策略）
+   */
+  _cleanupOldBackups() {
+    const backups = [];
+
+    // 收集所有备份信息
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith(CONFIG.BACKUP_PREFIX)) {
+        try {
+          const value = localStorage.getItem(key);
+          const data = JSON.parse(value);
+          backups.push({
+            key,
+            savedAt: data.savedAt || 0,
+            size: (key.length + value.length) * 2,
+          });
+        } catch (e) {
+          // 解析失败的备份直接删除
+          localStorage.removeItem(key);
+        }
+      }
+    }
+
+    // 按时间排序（最旧的在前）
+    backups.sort((a, b) => a.savedAt - b.savedAt);
+
+    // 删除超出限制的旧备份
+    while (backups.length > CONFIG.MAX_BACKUP_COUNT) {
+      const oldest = backups.shift();
+      console.log(`[SmartSaver] 清理旧备份: ${oldest.key}`);
+      localStorage.removeItem(oldest.key);
+    }
+
+    // 如果仍然空间不足，继续删除最旧的
+    let storageInfo = this._getStorageInfo();
+    while (storageInfo.usageRatio > CONFIG.BACKUP_WARNING_THRESHOLD && backups.length > 0) {
+      const oldest = backups.shift();
+      console.log(`[SmartSaver] 空间不足，继续清理: ${oldest.key}`);
+      localStorage.removeItem(oldest.key);
+      storageInfo = this._getStorageInfo();
     }
   }
 

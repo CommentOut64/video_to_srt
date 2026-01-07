@@ -8,18 +8,72 @@
  * - 自动跳转到编辑器（转录完成时）
  * - 全局任务状态同步
  * - 启动心跳服务（标签页重用机制）
+ * - V3.1.1+dev.20260105.01: 启动时自动检查更新
+ * - V3.1.1+dev.20260106.01: 使用 sessionStorage 防止会话内重复检查更新
  */
-import { onMounted, onUnmounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
+import { useUpdateChecker } from '@/composables'
 import sseChannelManager from '@/services/sseChannelManager'
 import { heartbeatService } from '@/services/heartbeat'
+import UpdateDialog from '@/components/UpdateDialog.vue'
 
 const router = useRouter()
 const route = useRoute()
 const taskStore = useUnifiedTaskStore()
 
+// V3.1.1+dev.20260105.01: 更新相关状态
+const showUpdateDialog = ref(false)
+const pendingUpdateInfo = ref(null)
+const { checkForUpdate } = useUpdateChecker()
+
 let unsubscribeGlobal = null
+
+// V3.1.1+dev.20260106.01: sessionStorage key，用于防止会话内重复检查更新
+const UPDATE_CHECK_SESSION_KEY = 'anchorflux_update_checked_this_session'
+
+// V3.1.1+dev.20260106.01: 启动时检查更新（每个会话只检查一次）
+async function checkUpdateOnStartup() {
+  // 检查本次会话是否已经检查过更新
+  try {
+    if (sessionStorage.getItem(UPDATE_CHECK_SESSION_KEY)) {
+      console.log('[App] 本次会话已检查过更新，跳过')
+      return
+    }
+  } catch {
+    // sessionStorage 不可用时继续执行
+  }
+
+  console.log('[App] 步骤 0.5: 检查更新...')
+
+  try {
+    // 标记本次会话已检查（在请求前标记，避免并发问题）
+    try {
+      sessionStorage.setItem(UPDATE_CHECK_SESSION_KEY, '1')
+    } catch {
+      // 忽略
+    }
+
+    // 自动检查时会遵守忽略版本规则
+    const result = await checkForUpdate(false)
+
+    if (result.hasUpdate && result.updateInfo) {
+      console.log('[App] 发现新版本:', result.updateInfo.latestVersion)
+      pendingUpdateInfo.value = result.updateInfo
+
+      // 等待 2 秒后自动弹出更新窗口
+      setTimeout(() => {
+        showUpdateDialog.value = true
+      }, 2000)
+    } else {
+      console.log('[App] 当前已是最新版本或该版本已被忽略')
+    }
+  } catch (e) {
+    console.warn('[App] 检查更新失败:', e)
+    // 静默失败，不影响用户使用
+  }
+}
 
 onMounted(async () => {
   console.log('[App] 应用已挂载，执行初始化')
@@ -32,6 +86,9 @@ onMounted(async () => {
   } catch (error) {
     console.error('[App] 心跳服务启动失败:', error)
   }
+
+  // V3.1.1+dev.20260106.01: 启动时检查更新（每个会话只检查一次，不阻塞其他初始化）
+  checkUpdateOnStartup()
 
   // 第一步：从后端同步任务列表（第一阶段修复：数据同步）
   console.log('[App] 步骤 1: 从后端同步任务列表...')
@@ -64,7 +121,7 @@ onMounted(async () => {
       // 同步任务列表到 store（第二阶段修复：实时更新）
       if (state.jobs && Array.isArray(state.jobs)) {
         state.jobs.forEach(job => {
-          // V3.7.5: 过滤掉 filename 为空的任务，避免显示"未知任务"
+          // V3.1.0: 过滤掉 filename 为空的任务，避免显示"未知任务"
           if (!job.filename || job.filename.trim() === '') {
             console.warn(`[App] 跳过 filename 为空的任务: ${job.id}`)
             return
@@ -119,7 +176,7 @@ onMounted(async () => {
       // 更新 store 中的任务状态
       const task = taskStore.getTask(jobId)
       if (task) {
-        // V3.7.4: onJobStatus 只更新 status 和 message，不更新 progress
+        // V3.1.0: onJobStatus 只更新 status 和 message，不更新 progress
         // 避免后端推送的低进度（如恢复时的 0）覆盖前端已有的高进度
         // progress 的更新由 onJobProgress 专门负责
         taskStore.updateTaskStatus(jobId, status, data.message || '')
@@ -159,7 +216,7 @@ onMounted(async () => {
       })
     },
 
-    // [V3.6.3] 新增：任务删除事件处理，解决幽灵任务问题
+    // [V3.1.0] 新增：任务删除事件处理，解决幽灵任务问题
     onJobRemoved(jobId) {
       console.log(`[App] 收到任务删除事件: ${jobId}`)
 
@@ -212,6 +269,12 @@ onUnmounted(() => {
 
 <template>
   <router-view />
+
+  <!-- V3.1.1+dev.20260105.01: 全局更新窗口 -->
+  <UpdateDialog
+    v-model="showUpdateDialog"
+    :update-info="pendingUpdateInfo"
+  />
 </template>
 
 <style scoped>

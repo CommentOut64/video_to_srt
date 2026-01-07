@@ -258,7 +258,7 @@ class VADConfig:
     - merge_max_duration：合并后的最大时长，12秒是甜蜜点，避免Whisper幻觉和对齐算法爆炸
     - merge_min_fragment：短于此时长的片段强制尝试合并（碎片保护）
 
-    Smart Accumulation 参数（V3.2.5 - 2025-12-19）：
+    Smart Accumulation 参数（V3.1.0 - 2025-12-19）：
     - smart_target_duration：软上限，达到后寻找断点截断（默认12.0s）
     - smart_max_duration：硬上限，绝对不能超（默认30.0s，Whisper物理限制）
     - smart_min_gap_to_split：达到软上限后，多大的间隔算"合适的断点"（默认0.3s）
@@ -268,7 +268,7 @@ class VADConfig:
       原因：避免语音起始被截断，提高时间戳准确性
     - 2025-12-17: 新增 Post-VAD 合并参数，迁移自旧架构
       max_duration 从 25.0 改为 12.0，max_gap 从 1.0 改为 1.5
-    - 2025-12-19: V3.2.5 引入 Smart Accumulation 智能累积算法
+    - 2025-12-19: V3.1.0 引入 Smart Accumulation 智能累积算法
       替换贪婪合并，在源头利用VAD断点精准控制Chunk时长
     """
     method: VADMethod = VADMethod.SILERO  # 默认使用Silero
@@ -283,7 +283,7 @@ class VADConfig:
     merge_max_gap: float = 1.0             # 允许合并的最大静音间隔（秒），恢复旧值1.0s
     merge_max_duration: float = 12.0       # 合并后的最大时长（秒），恢复旧值25.0s
     merge_min_fragment: float = 1.0        # 短于此时长的片段强制尝试合并（碎片保护）
-    # Smart Accumulation 参数（V3.2.5）
+    # Smart Accumulation 参数（V3.1.0）
     smart_target_duration: float = 12.0    # 软上限（甜蜜点）
     smart_max_duration: float = 30.0       # 硬上限（Whisper物理限制）
     smart_min_gap_to_split: float = 0.3    # 达到软上限后的最小断点间隔
@@ -418,7 +418,7 @@ class VADService:
 
         # VAD detection complete
 
-        # V3.2.5: 预处理 - 强制拆分超长原始片段
+        # V3.1.0: 预处理 - 强制拆分超长原始片段
         # 使用软上限（12秒）作为拆分阈值，确保Smart Accumulation有足够的断点可用
         # 如果VAD原始片段本身就有20秒，Smart Accumulation无法在12秒处截断
         speech_timestamps = self._break_long_segments(
@@ -428,7 +428,7 @@ class VADService:
             max_duration=vad_config.smart_target_duration  # 使用软上限12秒
         )
 
-        # V3.2.5: Smart Accumulation 智能累积合并
+        # V3.1.0: Smart Accumulation 智能累积合并
         # 软上限（甜蜜点）和硬上限（物理极限）双重标准
         TARGET = vad_config.smart_target_duration    # 默认 12.0s
         MAX = vad_config.smart_max_duration          # 默认 30.0s
@@ -516,7 +516,7 @@ class VADService:
             self.logger.warning("VAD未检测到语音，使用固定时长分段")
             return self._energy_based_split(audio_array, sr, vad_config.chunk_size)
 
-        # V3.2.5: 统计 Smart Accumulation 效果
+        # V3.1.0: 统计 Smart Accumulation 效果
         durations = [seg['end'] - seg['start'] for seg in segments_metadata]
         avg_duration = sum(durations) / len(durations) if durations else 0
         max_duration = max(durations) if durations else 0
@@ -583,7 +583,7 @@ class VADService:
             # 执行VAD
             vad_result = pipeline(temp_path)
 
-            # V3.2.5: 收集原始时间戳（秒 -> 采样点）
+            # V3.1.0: 收集原始时间戳（秒 -> 采样点）
             raw_timestamps = []
             for speech in vad_result.get_timeline().support():
                 raw_timestamps.append({
@@ -591,7 +591,7 @@ class VADService:
                     'end': int(speech.end * sr)
                 })
 
-            # V3.2.5: 预处理 - 强制拆分超长原始片段
+            # V3.1.0: 预处理 - 强制拆分超长原始片段
             # 使用软上限（12秒）作为拆分阈值，确保Smart Accumulation有足够的断点可用
             raw_timestamps = self._break_long_segments(
                 raw_timestamps,
@@ -600,7 +600,7 @@ class VADService:
                 max_duration=vad_config.smart_target_duration  # 使用软上限12秒
             )
 
-            # V3.2.5: Smart Accumulation 智能累积合并
+            # V3.1.0: Smart Accumulation 智能累积合并
             TARGET = vad_config.smart_target_duration
             MAX = vad_config.smart_max_duration
             MIN_GAP = vad_config.smart_min_gap_to_split
@@ -823,7 +823,7 @@ class VADService:
         max_duration: float
     ) -> List[Dict]:
         """
-        V3.2.5: 强制拆分超长片段
+        V3.1.0: 强制拆分超长片段
 
         在获取到VAD原始输出后，检查每个片段是否超过max_duration。
         如果超过，在片段中间（60%-95%区域）寻找能量最低点进行拆分。

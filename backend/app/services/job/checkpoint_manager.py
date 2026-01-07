@@ -2,14 +2,14 @@
 CheckpointManager - 断点续传管理器
 
 Phase 4 实现 - 2025-12-11
-V3.7 扩展 - 2025-12-21
+V3.1.0 扩展 - 2025-12-21
 
 核心职责：
 1. 保存和加载检查点（checkpoint.json）
 2. 原子性写入（临时文件 + 重命名）
 3. 检查点验证和恢复
 4. 检查点清理
-5. [V3.7] 支持新的统一检查点格式，包含预处理、转录、输出状态
+5. [V3.1.0] 支持新的统一检查点格式，包含预处理、转录、输出状态
 
 从 transcription_service.py 拆分出来，专注于断点续传功能。
 """
@@ -24,8 +24,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 
-# V3.7 检查点版本
-CHECKPOINT_VERSION = "3.7.0"
+# V3.1.0 检查点版本
+CHECKPOINT_VERSION = "3.1.0"
 
 
 @dataclass
@@ -85,7 +85,7 @@ class TranscriptionState:
     alignment_completed_count: int = 0
     alignment_levels: Dict[int, str] = field(default_factory=dict)
 
-    # V3.7.3: 字幕快照（断点续传核心）
+    # V3.1.0: 字幕快照（断点续传核心）
     # 保存已生成的所有字幕句子，确保恢复时不丢失
     sentences_snapshot: List[Dict[str, Any]] = field(default_factory=list)
     sentence_count: int = 0  # 全局句子计数器
@@ -183,7 +183,7 @@ class CheckpointV37:
                     "completed_count": self.transcription.alignment_completed_count,
                     "alignment_levels": self.transcription.alignment_levels
                 },
-                # V3.7.3: 字幕快照
+                # V3.1.0: 字幕快照
                 "sentences_snapshot": self.transcription.sentences_snapshot,
                 "sentence_count": self.transcription.sentence_count,
                 "chunk_sentences_map": self.transcription.chunk_sentences_map
@@ -253,7 +253,7 @@ class CheckpointV37:
         checkpoint.transcription.alignment_completed_count = align.get("completed_count", 0)
         checkpoint.transcription.alignment_levels = align.get("alignment_levels", {})
 
-        # V3.7.3: 字幕快照
+        # V3.1.0: 字幕快照
         checkpoint.transcription.sentences_snapshot = trans.get("sentences_snapshot", [])
         checkpoint.transcription.sentence_count = trans.get("sentence_count", 0)
         # chunk_sentences_map 的键是 int，JSON 反序列化后变成 str，需要转换
@@ -547,7 +547,7 @@ class CheckpointManager:
         version = data.get("version", "")
         if not version.startswith("3.7"):
             # 尝试从旧格式迁移
-            self.logger.info(f"检测到旧版本检查点 ({version})，尝试迁移到 V3.7")
+            self.logger.debug(f"检测到旧版本检查点 ({version})，尝试迁移到 V3.7")
             data = self._migrate_to_v37(data)
 
         return CheckpointV37.from_dict(data)
@@ -633,7 +633,7 @@ class CheckpointManager:
             "original_settings": old_data.get("original_settings")
         }
 
-        self.logger.info(f"检查点迁移完成: {job_id}")
+        self.logger.debug(f"检查点迁移完成: {job_id}")
         return new_data
 
     def create_checkpoint_v37(self, job_id: str) -> CheckpointV37:
@@ -1017,7 +1017,7 @@ class CheckpointManagerV37:
                 prep.vad_completed = prep_data["vad_completed"]
             if "total_chunks" in prep_data:
                 prep.total_chunks = prep_data["total_chunks"]
-            # V3.7.2: 保存 chunks_metadata（用于跳过 VAD 恢复）
+            # V3.1.0: 保存 chunks_metadata（用于跳过 VAD 恢复）
             if "chunks_metadata" in prep_data:
                 prep.chunks_metadata = prep_data["chunks_metadata"]
 
@@ -1091,7 +1091,7 @@ class CheckpointManagerV37:
             if "slow_processed_count" in trans_data:
                 trans.slow_completed_count = trans_data["slow_processed_count"]
             if "slow_processed_indices" in trans_data:
-                trans.slow_processed_indices = trans_data["slow_processed_indices"]  # V3.7.2
+                trans.slow_processed_indices = trans_data["slow_processed_indices"]  # V3.1.0
             if "previous_whisper_text" in trans_data:
                 trans.previous_whisper_text = trans_data["previous_whisper_text"]
             if "last_slow_chunk_index" in trans_data:
@@ -1105,7 +1105,7 @@ class CheckpointManagerV37:
             if "completed_chunks" in trans_data:
                 trans.alignment_completed_count = trans_data["completed_chunks"]
 
-            # V3.7.3: 字幕快照字段（实时持久化核心）
+            # V3.1.0: 字幕快照字段（实时持久化核心）
             if "sentences_snapshot" in trans_data:
                 trans.sentences_snapshot = trans_data["sentences_snapshot"]
             if "sentence_count" in trans_data:

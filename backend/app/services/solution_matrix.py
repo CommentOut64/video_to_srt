@@ -5,7 +5,7 @@
 前端预设对应后端具体配置。
 
 v3.5 更新: 支持从新版 transcription_profile 和 refinement 配置创建 SolutionConfig
-v3.5.1 更新: 使用 ConfigAdapter 统一新旧配置访问
+v3.1.0 更新: 使用 ConfigAdapter 统一新旧配置访问
 """
 from dataclasses import dataclass
 from enum import Enum
@@ -94,7 +94,7 @@ class SolutionConfig:
         """
         从 JobSettings 创建配置 (使用 ConfigAdapter 统一新旧配置)
 
-        v3.5.1 更新: 使用 ConfigAdapter 自动兼容新旧配置格式
+        v3.1.0 更新: 使用 ConfigAdapter 自动兼容新旧配置格式
 
         映射关系:
         - transcription_profile -> enhancement

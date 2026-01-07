@@ -10,6 +10,7 @@ V3.7 更新：
 - 按需模式：逐 Chunk 可中断
 """
 
+import asyncio
 import logging
 from typing import List, Optional, TYPE_CHECKING
 from pathlib import Path
@@ -126,10 +127,10 @@ class SeparationStage:
             token.enter_atomic_region("demucs_global_separation")
 
         try:
-            # 整轨分离
-            separated_path = await self.demucs_service.separate_vocals(
-                audio_path=audio_path,
-                model='htdemucs'  # 默认使用htdemucs
+            # 整轨分离（转移到线程，避免阻塞事件循环）
+            separated_path = await asyncio.to_thread(
+                self.demucs_service.separate_vocals,
+                audio_path
             )
 
             self.logger.info(f"全局分离完成，分离后文件: {separated_path}")

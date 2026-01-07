@@ -326,7 +326,15 @@ class ModelPreloadManager:
 
         try:
             start_time = time.time()
-            self.logger.info(f"正在从磁盘加载模型 {settings.model} (device={settings.device}, compute_type={settings.compute_type})")
+
+            # 处理 auto 模式：解析为具体的计算类型
+            compute_type_resolved = settings.compute_type
+            if compute_type_resolved == "auto":
+                from app.services.whisper_service import get_auto_compute_type
+                compute_type_resolved = get_auto_compute_type(settings.device)
+                self.logger.info(f"auto模式已解析为: {compute_type_resolved}")
+
+            self.logger.info(f"正在从磁盘加载模型 {settings.model} (device={settings.device}, compute_type={compute_type_resolved})")
 
             # 导入配置以获取缓存路径
             from app.core.config import config
@@ -338,7 +346,7 @@ class ModelPreloadManager:
             model = WhisperModel(
                 settings.model,
                 device=settings.device,
-                compute_type=settings.compute_type,
+                compute_type=compute_type_resolved,  # 使用解析后的计算类型
                 download_root=str(config.HF_CACHE_DIR),
                 local_files_only=True
             )
