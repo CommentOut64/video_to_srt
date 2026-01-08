@@ -1,94 +1,92 @@
-# Brouhaha SNR + C50 检测模型
+---
+tags:
+- pyannote
+- pyannote-audio
+- pyannote-audio-model
+- audio
+- voice
+- speech
+- voice-activity-detection
+- speech-to-noise ratio
+- snr
+- room acoustics
+- c50
+datasets:
+- LibriSpeech
+- AudioSet
+- EchoThief
+- MIT-Acoustical-Reverberation-Scene
+license: openrail
+extra_gated_prompt: "The collected information will help acquire a better knowledge of this model userbase and help its maintainers apply for grants to improve it further. "
+extra_gated_fields:
+  Company/university: text
+  Website: text
+  I plan to use this model for (task, type of audio data, etc): text
+---
 
-**版本**: V3.1.1+dev.20260107.03
+# 🎙️🥁🚨🔊 Brouhaha
 
-## 模型信息
+![Sample Brouhaha predictions](brouhaha.gif)
 
-| 属性 | 值 |
-|------|-----|
-| **模型来源** | [pyannote/brouhaha](https://huggingface.co/pyannote/brouhaha) |
-| **框架** | PyTorch (pyannote.audio) |
-| **输入** | 16kHz 单声道音频 |
-| **输出** | SNR (dB), C50 (dB), VAD (0-1) |
-| **推理速度** | ~5ms/chunk (CPU), ~2ms/chunk (GPU) |
-| **显存占用** | ~200MB (GPU) |
+**Joint voice activity detection, speech-to-noise ratio, and C50 room acoustics estimation**
 
-## 输出说明
+[TL;DR](https://twitter.com/LavechinMarvin/status/1585645131251605504) | [Paper](https://arxiv.org/abs/2210.13248) | [Code](https://github.com/marianne-m/brouhaha-vad) | [And Now for Something Completely Different](https://www.youtube.com/watch?v=8ZyOAS22Moo)
 
-| 输出 | 含义 | 典型范围 |
-|------|------|---------|
-| **SNR** | 信噪比 (Signal-to-Noise Ratio) | -10dB ~ 50dB |
-| **C50** | 清晰度指数 (Clarity Index) | -20dB ~ 30dB |
-| **VAD** | 语音活动检测 (Voice Activity Detection) | 0.0 ~ 1.0 |
 
-## 获取模型
 
-### 方式1：自动下载（推荐）
+## Installation
 
-首次运行时，BrouhahaService 会自动从 HuggingFace 下载模型。
-
-**前提条件**：
-1. 设置 HuggingFace Token 环境变量
-2. 访问 https://huggingface.co/pyannote/brouhaha 接受用户协议
-
-```bash
-# Windows PowerShell
-$env:HUGGING_FACE_HUB_TOKEN="your_token_here"
-
-# Windows CMD
-set HUGGING_FACE_HUB_TOKEN=your_token_here
-
-# Linux/Mac
-export HUGGING_FACE_HUB_TOKEN=your_token_here
-```
-
-### 方式2：手动下载
+This model relies on [pyannote.audio](https://github.com/pyannote/pyannote-audio) and [brouhaha-vad](https://github.com/marianne-m/brouhaha-vad).
 
 ```bash
-# 使用 huggingface-cli 下载
-pip install huggingface-hub
-
-huggingface-cli download pyannote/brouhaha \
-    --local-dir backend/models/pretrained/brouhaha \
-    --token your_hf_token_here
+pip install pyannote-audio
+pip install https://github.com/marianne-m/brouhaha-vad/archive/main.zip
 ```
 
-## 文件结构
-
-下载完成后，目录应包含：
-
-```
-backend/models/pretrained/brouhaha/
-├── pytorch_model.bin       # PyTorch 模型权重
-├── config.yaml             # pyannote 模型配置
-└── README.md               # 本说明文件
-```
-
-## 使用示例
+## Usage
 
 ```python
-from app.services.brouhaha_service import get_brouhaha_service
+# 1. visit hf.co/pyannote/brouhaha and accept user conditions
+# 2. visit hf.co/settings/tokens to create an access token
+# 3. instantiate pretrained model
+from pyannote.audio import Model
+model = Model.from_pretrained("pyannote/brouhaha", 
+                              use_auth_token="ACCESS_TOKEN_GOES_HERE")
 
-# 获取服务单例
-service = get_brouhaha_service()
+# apply model 
+from pyannote.audio import Inference
+inference = Inference(model)
+output = inference("audio.wav")
 
-# 检测音频
-result = service.detect(audio, sr=16000)
+# iterate over each frame
+for frame, (vad, snr, c50) in output:
+    t = frame.middle
+    print(f"{t:8.3f} vad={100*vad:.0f}% snr={snr:.0f} c50={c50:.0f}")
 
-print(f"SNR: {result.snr:.1f}dB")   # 信噪比
-print(f"C50: {result.c50:.1f}dB")   # 清晰度指数
-print(f"VAD: {result.vad:.2f}")     # 语音活动概率
+#  ...
+# 12.952 vad=100% snr=51 c50=17
+# 12.968 vad=100% snr=52 c50=17
+# 12.985 vad=100% snr=53 c50=17
+# ...
 ```
 
-## 回退机制
+## Citation
 
-如果模型不可用，服务会自动回退到 WADA-SNR 算法：
-- WADA-SNR 是一种无模型的 SNR 估计算法
-- 不依赖深度学习，仅使用信号处理
-- C50 将返回 0.0（无法估计）
+```bibtex
+@article{lavechin2022brouhaha,
+  Title   = {{Brouhaha: multi-task training for voice activity detection, speech-to-noise ratio, and C50 room acoustics estimation}},
+  Author  = {Marvin Lavechin and Marianne Métais and Hadrien Titeux and Alodie Boissonnet and Jade Copet and Morgane Rivière and Elika Bergelson and Alejandrina Cristia and Emmanuel Dupoux and Hervé Bredin},
+  Year    = {2022},
+  Journal = {arXiv preprint arXiv: Arxiv-2210.13248}
+}
 
-## 参考文献
-
-- [Brouhaha 论文](https://arxiv.org/abs/2210.13248)
-- [pyannote.audio 文档](https://github.com/pyannote/pyannote-audio)
-- [WADA-SNR 算法](https://www.cs.cmu.edu/~robust/Papers/KimSternIS08.pdf)
+```bibtex
+@inproceedings{Bredin2020,
+  Title = {{pyannote.audio: neural building blocks for speaker diarization}},
+  Author = {{Bredin}, Herv{\'e} and {Yin}, Ruiqing and {Coria}, Juan Manuel and {Gelly}, Gregory and {Korshunov}, Pavel and {Lavechin}, Marvin and {Fustes}, Diego and {Titeux}, Hadrien and {Bouaziz}, Wassim and {Gill}, Marie-Philippe},
+  Booktitle = {ICASSP 2020, IEEE International Conference on Acoustics, Speech, and Signal Processing},
+  Address = {Barcelona, Spain},
+  Month = {May},
+  Year = {2020},
+}
+```

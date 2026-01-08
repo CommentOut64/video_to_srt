@@ -916,7 +916,17 @@ class MediaPrepService:
             except Exception as e:
                 logger.debug(f"[MediaPrep] 卸载 Demucs 模型失败（可能未加载）: {e}")
 
-            # 4. 清理 CUDA 缓存
+            # 4. 卸载 Brouhaha 模型 (V3.1.1+dev.20260108.04)
+            try:
+                from app.services.brouhaha_service import get_brouhaha_service
+                brouhaha_service = get_brouhaha_service()
+                if brouhaha_service.is_available():
+                    brouhaha_service.unload()
+                    logger.info("[MediaPrep] 已卸载 Brouhaha 模型")
+            except Exception as e:
+                logger.debug(f"[MediaPrep] 卸载 Brouhaha 模型失败（可能未加载）: {e}")
+
+            # 5. 清理 CUDA 缓存
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -933,7 +943,7 @@ class MediaPrepService:
                 except:
                     pass
 
-            # 5. 等待资源释放
+            # 6. 等待资源释放
             import time
             time.sleep(1)
 

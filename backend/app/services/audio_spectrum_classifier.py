@@ -8,6 +8,12 @@ V2 更新 (2025-12-21):
 - 新增 YAMNet 探针模式语义级分类器，替代基于规则的频谱分析
 - 优先使用 YAMNet，回退到规则方法
 - 解决人声被误判为音乐的问题 (谐波比阈值过低)
+
+V3.1.1+dev.20260108.01:
+- 新增 Brouhaha SNR+C50 三层决策策略
+- Layer 1: SNR+C50 快速筛选（60-70% 直接决策）
+- Layer 2: 频谱特征补充判断（10-20%）
+- Layer 3: YAMNet 语义分类（10-20% 兜底）
 """
 import numpy as np
 import logging
@@ -19,6 +25,18 @@ from app.models.circuit_breaker_models import (
 from app.core.spectrum_thresholds import SpectrumThresholds, DEFAULT_SPECTRUM_THRESHOLDS
 
 logger = logging.getLogger(__name__)
+
+
+# ========== Brouhaha 集成 (V3.1.1+dev.20260108.01) ==========
+
+def _get_brouhaha_service():
+    """懒加载 Brouhaha 服务（避免循环导入）"""
+    try:
+        from app.services.brouhaha_service import get_brouhaha_service
+        return get_brouhaha_service()
+    except Exception as e:
+        logger.warning(f"Brouhaha 服务加载失败: {e}")
+        return None
 
 
 # ========== YAMNet 集成 ==========
@@ -37,15 +55,17 @@ class AudioSpectrumClassifier:
     """
     音频频谱分诊器
 
-    支持两种模式：
-    1. YAMNet 探针模式（默认）：使用预训练模型进行语义级分类，准确区分人声和音乐
-    2. 规则模式（回退）：基于频谱特征的规则判断
+    支持三种模式：
+    1. SNR+C50 策略（V3.1.1+）：使用 Brouhaha 模型的三层决策，最高效
+    2. YAMNet 探针模式（默认回退）：使用预训练模型进行语义级分类
+    3. 规则模式（最终回退）：基于频谱特征的规则判断
     """
 
     def __init__(
         self,
         thresholds: SpectrumThresholds = None,
-        use_yamnet: bool = True
+        use_yamnet: bool = True,
+        use_snr_strategy: bool = False  # V3.1.1+dev.20260108.01: 默认关闭，需显式启用
     ):
         """
         初始化分诊器
@@ -53,17 +73,26 @@ class AudioSpectrumClassifier:
         Args:
             thresholds: 频谱阈值配置
             use_yamnet: 是否使用 YAMNet 语义分类器（默认 True）
+            use_snr_strategy: 是否使用 SNR+C50 三层决策策略（默认 False）
         """
         self.thresholds = thresholds or DEFAULT_SPECTRUM_THRESHOLDS
         self._librosa = None  # 懒加载
         self._use_yamnet = use_yamnet
         self._yamnet = None  # 懒加载
+        self._use_snr_strategy = use_snr_strategy  # V3.1.1+dev.20260108.01
+        self._brouhaha = None  # 懒加载
 
     def _get_yamnet(self):
         """获取 YAMNet 分类器实例"""
         if self._yamnet is None and self._use_yamnet:
             self._yamnet = _get_yamnet_classifier()
         return self._yamnet
+
+    def _get_brouhaha(self):
+        """获取 Brouhaha 服务实例 (V3.1.1+dev.20260108.01)"""
+        if self._brouhaha is None and self._use_snr_strategy:
+            self._brouhaha = _get_brouhaha_service()
+        return self._brouhaha
 
     def _ensure_librosa(self):
         """确保 librosa 已加载"""
@@ -117,6 +146,11 @@ class AudioSpectrumClassifier:
             rolloff = librosa.feature.spectral_rolloff(S=stft, sr=sr)[0]
             features.spectral_rolloff = float(np.mean(rolloff))
 
+            # 频谱对比度 (V3.1.1+dev.20260108.01: 用于 Layer 2 决策)
+            # spectral_contrast 返回 [n_bands, frames]，取所有频段的平均值
+            contrast = librosa.feature.spectral_contrast(S=stft, sr=sr)
+            features.spectral_contrast = float(np.mean(contrast))
+
             # 3. 谐波比 (简化计算)
             harmonic, percussive = librosa.effects.hpss(audio)
             h_energy = np.sum(harmonic ** 2)
@@ -158,7 +192,9 @@ class AudioSpectrumClassifier:
         """
         对单个Chunk进行频谱分诊
 
-        优先使用 YAMNet 语义分类器，回退到规则方法。
+        V3.1.1+dev.20260108.01: 新增三层决策策略
+        - 若启用 use_snr_strategy 且 Brouhaha 可用，使用三层决策
+        - 否则回退到 YAMNet 或规则方法
 
         Args:
             audio: 音频数组
@@ -184,6 +220,14 @@ class AudioSpectrumClassifier:
                 features=SpectrumFeatures(),
                 reason=f"极短片段({duration_sec:.2f}s)，跳过分诊"
             )
+
+        # V3.1.1+dev.20260108.01: 尝试使用 SNR+C50 三层决策策略
+        if self._use_snr_strategy:
+            brouhaha = self._get_brouhaha()
+            if brouhaha is not None:
+                return self._diagnose_with_snr_c50_strategy(audio, chunk_index, sr, brouhaha)
+            else:
+                logger.debug(f"Chunk {chunk_index}: Brouhaha 不可用，回退到 YAMNet/规则方法")
 
         # 尝试使用 YAMNet 语义分类器
         yamnet = self._get_yamnet()
@@ -385,6 +429,273 @@ class AudioSpectrumClassifier:
 
         return min(score, 1.0)
 
+    # ========== V3.1.1+dev.20260108.01: SNR+C50 三层决策策略 ==========
+
+    def _diagnose_with_snr_c50_strategy(
+        self,
+        audio: np.ndarray,
+        chunk_index: int,
+        sr: int,
+        brouhaha
+    ) -> SpectrumDiagnosis:
+        """
+        使用 Brouhaha SNR+C50 三层决策策略进行分诊
+
+        三层决策流程：
+        - Layer 1: SNR+C50 快速筛选（60-70% 直接决策）
+        - Layer 2: 频谱特征补充判断（10-20%）
+        - Layer 3: YAMNet 语义分类（10-20% 兜底）
+
+        Args:
+            audio: 音频数组
+            chunk_index: Chunk索引
+            sr: 采样率
+            brouhaha: Brouhaha 服务实例
+
+        Returns:
+            SpectrumDiagnosis: 分诊结果
+        """
+        th = self.thresholds
+
+        # 获取 Brouhaha SNR/C50 检测结果
+        brouhaha_result = brouhaha.detect(audio, sr, chunk_id=chunk_index)
+        snr = brouhaha_result.snr
+        c50 = brouhaha_result.c50
+
+        # 确定 SNR/C50 级别
+        snr_level = self._classify_snr_level(snr)
+        c50_level = self._classify_c50_level(c50)
+
+        # Layer 1: SNR+C50 快速筛选
+        layer1_result = self._layer1_decision(snr, c50, snr_level, c50_level, chunk_index)
+        if layer1_result is not None:
+            need_separation, reason = layer1_result
+            return self._build_snr_diagnosis(
+                chunk_index=chunk_index,
+                snr=snr,
+                c50=c50,
+                snr_level=snr_level,
+                c50_level=c50_level,
+                triage_layer=1,
+                need_separation=need_separation,
+                reason=reason
+            )
+
+        # Layer 2: 频谱特征补充判断
+        features = self.extract_features(audio, sr)
+        features.snr = snr
+        features.c50 = c50
+
+        layer2_result = self._layer2_decision(features, snr_level, c50_level, chunk_index)
+        if layer2_result is not None:
+            need_separation, reason = layer2_result
+            return self._build_snr_diagnosis(
+                chunk_index=chunk_index,
+                snr=snr,
+                c50=c50,
+                snr_level=snr_level,
+                c50_level=c50_level,
+                triage_layer=2,
+                need_separation=need_separation,
+                reason=reason,
+                features=features
+            )
+
+        # Layer 3: YAMNet 语义分类兜底
+        yamnet = self._get_yamnet()
+        if yamnet is not None and yamnet.is_available():
+            yamnet_result = yamnet.classify_chunk(audio, chunk_id=chunk_index)
+            need_separation = yamnet_result.is_music
+            if need_separation:
+                reason = f"[L3] YAMNet 检测到音乐 (music={yamnet_result.music_score:.2f})"
+            else:
+                reason = f"[L3] YAMNet 判定为人声 (speech={yamnet_result.speech_score:.2f})"
+        else:
+            # 最终回退：使用规则方法判断
+            music_score = self._calculate_music_score(features)
+            noise_score = self._calculate_noise_score(features)
+            need_separation = music_score >= th.music_score_threshold or noise_score >= th.noise_score_threshold
+            reason = f"[L3] 规则判断 (music={music_score:.2f}, noise={noise_score:.2f})"
+
+        return self._build_snr_diagnosis(
+            chunk_index=chunk_index,
+            snr=snr,
+            c50=c50,
+            snr_level=snr_level,
+            c50_level=c50_level,
+            triage_layer=3,
+            need_separation=need_separation,
+            reason=reason,
+            features=features
+        )
+
+    def _classify_snr_level(self, snr: float) -> str:
+        """
+        分类 SNR 级别
+
+        Returns:
+            "high" / "warn" / "low"
+        """
+        th = self.thresholds
+        if snr >= th.snr_high_threshold:
+            return "high"
+        elif snr >= th.snr_low_threshold:
+            return "warn"
+        else:
+            return "low"
+
+    def _classify_c50_level(self, c50: float) -> str:
+        """
+        分类 C50 级别
+
+        Returns:
+            "good" / "warn" / "bad"
+        """
+        th = self.thresholds
+        if c50 >= th.c50_good_threshold:
+            return "good"
+        elif c50 >= th.c50_bad_threshold:
+            return "warn"
+        else:
+            return "bad"
+
+    def _layer1_decision(
+        self,
+        snr: float,
+        c50: float,
+        snr_level: str,
+        c50_level: str,
+        chunk_index: int
+    ) -> Optional[Tuple[bool, str]]:
+        """
+        Layer 1: SNR+C50 快速筛选
+
+        决策矩阵：
+        - SNR >= 25dB 且 C50 >= 5dB → 直接放行
+        - SNR < 12dB 或 C50 < -5dB → 强制分离
+        - 其他 → 进入 Layer 2
+
+        Returns:
+            None 表示需要进入下一层，否则返回 (need_separation, reason)
+        """
+        # 高质量：直接放行
+        if snr_level == "high" and c50_level == "good":
+            reason = f"[L1] 高SNR({snr:.1f}dB)+良好C50({c50:.1f}dB)，纯净人声"
+            logger.debug(f"Chunk {chunk_index}: {reason}")
+            return (False, reason)
+
+        # 低质量：强制分离
+        if snr_level == "low":
+            reason = f"[L1] 低SNR({snr:.1f}dB)，需要分离"
+            logger.debug(f"Chunk {chunk_index}: {reason}")
+            return (True, reason)
+
+        if c50_level == "bad":
+            reason = f"[L1] 严重混响C50({c50:.1f}dB)，需要分离"
+            logger.debug(f"Chunk {chunk_index}: {reason}")
+            return (True, reason)
+
+        # 警戒区，进入 Layer 2
+        return None
+
+    def _layer2_decision(
+        self,
+        features: SpectrumFeatures,
+        snr_level: str,
+        c50_level: str,
+        chunk_index: int
+    ) -> Optional[Tuple[bool, str]]:
+        """
+        Layer 2: 频谱特征补充判断
+
+        决策规则：
+        - 频谱对比度 < 12dB → 分离
+        - 对比度 < 15dB 且 平坦度 > 0.4 → 分离
+        - 其他 → 进入 Layer 3
+
+        Returns:
+            None 表示需要进入下一层，否则返回 (need_separation, reason)
+        """
+        th = self.thresholds
+        contrast = features.spectral_contrast
+        flatness = features.spectral_flatness
+
+        # 极低对比度：强制分离
+        if contrast < th.spectral_contrast_critical:
+            reason = f"[L2] 极低对比度({contrast:.1f}dB)，需要分离"
+            logger.debug(f"Chunk {chunk_index}: {reason}")
+            return (True, reason)
+
+        # 低对比度 + 高平坦度：分离
+        if contrast < th.spectral_contrast_low and flatness > th.spectral_flatness_high:
+            reason = f"[L2] 低对比度({contrast:.1f}dB)+高平坦度({flatness:.2f})，需要分离"
+            logger.debug(f"Chunk {chunk_index}: {reason}")
+            return (True, reason)
+
+        # 高 SNR 但 C50 警戒：检查是否能直接放行
+        if snr_level == "high" and c50_level == "warn":
+            # 高 SNR + 中等 C50 + 良好对比度 = 放行
+            if contrast >= th.spectral_contrast_low:
+                reason = f"[L2] 高SNR+中C50+良好对比度({contrast:.1f}dB)，放行"
+                logger.debug(f"Chunk {chunk_index}: {reason}")
+                return (False, reason)
+
+        # 进入 Layer 3
+        return None
+
+    def _build_snr_diagnosis(
+        self,
+        chunk_index: int,
+        snr: float,
+        c50: float,
+        snr_level: str,
+        c50_level: str,
+        triage_layer: int,
+        need_separation: bool,
+        reason: str,
+        features: SpectrumFeatures = None
+    ) -> SpectrumDiagnosis:
+        """
+        构建 SNR 策略的分诊结果
+
+        Args:
+            chunk_index: Chunk 索引
+            snr: 信噪比 (dB)
+            c50: 清晰度指数 (dB)
+            snr_level: SNR 级别
+            c50_level: C50 级别
+            triage_layer: 决策层级 (1/2/3)
+            need_separation: 是否需要分离
+            reason: 决策原因
+            features: 频谱特征（可选）
+
+        Returns:
+            SpectrumDiagnosis: 分诊结果
+        """
+        if need_separation:
+            diagnosis = DiagnosisResult.NOISE  # 默认标记为噪音
+            recommended_model = "htdemucs"
+        else:
+            diagnosis = DiagnosisResult.CLEAN
+            recommended_model = None
+
+        return SpectrumDiagnosis(
+            chunk_index=chunk_index,
+            diagnosis=diagnosis,
+            need_separation=need_separation,
+            music_score=0.0,
+            noise_score=0.0,
+            clean_score=1.0 if not need_separation else 0.0,
+            recommended_model=recommended_model,
+            features=features or SpectrumFeatures(snr=snr, c50=c50),
+            reason=reason,
+            snr=snr,
+            c50=c50,
+            snr_level=snr_level,
+            c50_level=c50_level,
+            triage_layer=triage_layer
+        )
+
     def diagnose_chunks(
         self,
         chunks: List[Tuple[np.ndarray, float, float]],
@@ -506,9 +817,19 @@ class AudioSpectrumClassifier:
 _classifier_instance = None
 
 
-def get_spectrum_classifier() -> AudioSpectrumClassifier:
-    """获取频谱分诊器单例"""
+def get_spectrum_classifier(use_snr_strategy: bool = True) -> AudioSpectrumClassifier:
+    """
+    获取频谱分诊器单例
+
+    V3.1.1+dev.20260108.02: 默认启用 SNR+C50 三层决策策略
+
+    Args:
+        use_snr_strategy: 是否使用 SNR+C50 策略（默认 True）
+
+    Returns:
+        AudioSpectrumClassifier: 分诊器单例实例
+    """
     global _classifier_instance
     if _classifier_instance is None:
-        _classifier_instance = AudioSpectrumClassifier()
+        _classifier_instance = AudioSpectrumClassifier(use_snr_strategy=use_snr_strategy)
     return _classifier_instance

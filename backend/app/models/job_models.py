@@ -40,6 +40,9 @@ class PreprocessingConfig:
     # 分诊灵敏度: 0.0-1.0 (默认从 spectrum_thresholds.py: 0.35)
     spectrum_threshold: float = 0.35
 
+    # V3.1.1+dev.20260108.02: 是否启用 SNR+C50 三层决策策略（默认启用）
+    use_snr_triage: bool = True
+
     # ========== 熔断回溯配置 (新增) ==========
     # 是否启用熔断回溯
     enable_fuse_breaker: bool = True
@@ -245,6 +248,7 @@ class JobSettings:
                 "separation_mode": self.preprocessing.separation_mode,
                 "enable_spectral_triage": self.preprocessing.enable_spectral_triage,
                 "spectrum_threshold": self.preprocessing.spectrum_threshold,
+                "use_snr_triage": self.preprocessing.use_snr_triage,
                 "enable_fuse_breaker": self.preprocessing.enable_fuse_breaker,
                 "fuse_max_retry": self.preprocessing.fuse_max_retry,
                 "fuse_confidence_threshold": self.preprocessing.fuse_confidence_threshold,
@@ -303,6 +307,7 @@ class JobSettings:
                 separation_mode=preprocessing_data.get("separation_mode", "on_demand"),
                 enable_spectral_triage=preprocessing_data.get("enable_spectral_triage", True),
                 spectrum_threshold=preprocessing_data.get("spectrum_threshold", 0.35),
+                use_snr_triage=preprocessing_data.get("use_snr_triage", True),
                 enable_fuse_breaker=preprocessing_data.get("enable_fuse_breaker", True),
                 fuse_max_retry=preprocessing_data.get("fuse_max_retry", 2),
                 fuse_confidence_threshold=preprocessing_data.get("fuse_confidence_threshold", 0.5),
@@ -386,6 +391,7 @@ class JobSettings:
                 separation_mode=preset.preprocessing.separation_mode,
                 enable_spectral_triage=preset.preprocessing.enable_spectral_triage,
                 spectrum_threshold=preset.preprocessing.spectrum_threshold,
+                use_snr_triage=True,  # V3.1.1+dev.20260108.02: 默认启用 SNR+C50 策略
                 vad_filter=preset.preprocessing.vad_filter,
                 enable_fuse_breaker=True,
                 fuse_max_retry=1,

@@ -1,7 +1,7 @@
 """
 Brouhaha SNR + C50 检测服务
 
-V3.1.1+dev.20260107.03: 新增 Brouhaha 模型集成
+V3.1.1+dev.20260108.03: 优化离线加载策略，支持整合包分发
 
 提供基于 Brouhaha 模型的信噪比(SNR)和清晰度指数(C50)检测功能。
 使用 PyTorch 原生推理，支持 CPU/GPU 自动选择。
@@ -10,6 +10,11 @@ V3.1.1+dev.20260107.03: 新增 Brouhaha 模型集成
 - SNR 检测: 信噪比，用于判断音频质量
 - C50 检测: 清晰度指数，用于判断混响程度
 - WADA-SNR 回退: 模型不可用时的无模型估计
+
+加载优先级:
+1. 直接从本地 checkpoint 文件加载（整合包分发推荐）
+2. 从 pyannote 本地缓存加载（开发环境）
+3. 回退到在线下载（需要 HF_TOKEN）
 
 参考:
 - Brouhaha 论文: https://arxiv.org/abs/2210.13248
@@ -23,6 +28,34 @@ from typing import Optional, Dict
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+# ========== V3.1.1+dev.20260108.02: huggingface_hub 兼容性修复 ==========
+# pyannote.audio 3.4.0 使用旧的 use_auth_token 参数，但新版 huggingface_hub 已移除
+# 这里通过 monkey-patch 修复兼容性问题，支持离线加载本地模型
+
+def _patch_hf_hub_for_pyannote():
+    """
+    修复 pyannote.audio 与新版 huggingface_hub 的兼容性问题
+    将 use_auth_token 参数转换为 token 参数
+    """
+    try:
+        import huggingface_hub.file_download as hf_download
+        original_hf_hub_download = hf_download.hf_hub_download
+
+        def patched_hf_hub_download(*args, **kwargs):
+            # 将 use_auth_token 转换为 token
+            if 'use_auth_token' in kwargs:
+                kwargs['token'] = kwargs.pop('use_auth_token')
+            return original_hf_hub_download(*args, **kwargs)
+
+        # 只 patch 一次
+        if not getattr(hf_download, '_pyannote_patched', False):
+            hf_download.hf_hub_download = patched_hf_hub_download
+            hf_download._pyannote_patched = True
+            logger.debug("已应用 huggingface_hub 兼容性补丁")
+    except Exception as e:
+        logger.warning(f"huggingface_hub 兼容性补丁失败: {e}")
 
 
 # ========== 数据类定义 ==========
@@ -136,9 +169,18 @@ class BrouhahaService:
         self._init_model()
 
     def _init_model(self):
-        """初始化 PyTorch 模型"""
+        """
+        初始化 PyTorch 模型
+
+        V3.1.1+dev.20260108.03: 简化加载逻辑
+        - 只检查 pytorch_model.bin 是否存在（checkpoint 包含完整模型信息）
+        - config.yaml 仅用于参考，不影响加载
+        """
         try:
             import torch
+
+            # V3.1.1+dev.20260108.02: 应用兼容性补丁
+            _patch_hf_hub_for_pyannote()
 
             # 设备选择
             if self._device_preference == "auto":
@@ -146,12 +188,11 @@ class BrouhahaService:
             else:
                 self._device = torch.device(self._device_preference)
 
-            # 检查本地模型是否存在
-            local_config = self.model_dir / "config.yaml"
+            # V3.1.1+dev.20260108.03: 只检查 checkpoint 文件
             local_weights = self.model_dir / "pytorch_model.bin"
 
-            if local_config.exists() and local_weights.exists():
-                # 从本地加载
+            if local_weights.exists():
+                # 从本地加载（优先）
                 self._load_from_local()
             else:
                 # 从 HuggingFace 下载
@@ -178,19 +219,70 @@ class BrouhahaService:
             self.model = None
 
     def _load_from_local(self):
-        """从本地目录加载模型"""
+        """
+        从本地目录加载模型（支持离线模式）
+
+        V3.1.1+dev.20260108.03: 优化离线加载策略
+        加载优先级:
+        1. 直接从本地 checkpoint 文件加载（整合包分发推荐）
+        2. 从 pyannote 本地缓存加载（开发环境）
+        3. 回退到在线下载
+        """
         try:
+            import warnings
             from pyannote.audio import Model
 
+            weights_path = self.model_dir / "pytorch_model.bin"
+
             logger.info(f"从本地加载 Brouhaha 模型: {self.model_dir}")
-            self.model = Model.from_pretrained(
-                str(self.model_dir),
-                strict=False
-            )
+
+            # 方式1（推荐）: 直接从本地 checkpoint 文件加载
+            # 适用于整合包分发场景，不依赖 HuggingFace 缓存
+            if weights_path.exists():
+                try:
+                    # V3.1.1+dev.20260108.04: 抑制版本不匹配警告
+                    # 这些警告来自 pyannote.audio 和 torch 版本差异，实际运行正常
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings("ignore", message="Model was trained with")
+                        warnings.filterwarnings("ignore", message="You are using `torch.load`")
+                        warnings.filterwarnings("ignore", message="Lightning automatically upgraded")
+
+                        # 使用绝对路径直接加载 checkpoint
+                        # pyannote Model.from_pretrained 会检测到这是本地文件并直接加载
+                        self.model = Model.from_pretrained(
+                            str(weights_path.absolute()),
+                            strict=False  # 允许版本差异
+                        )
+                    logger.info(f"从本地 checkpoint 文件加载成功: {weights_path}")
+                    return
+                except Exception as e1:
+                    logger.warning(f"本地 checkpoint 加载失败: {e1}")
+
+            # 方式2: 尝试从 pyannote 本地缓存加载
+            # 适用于开发环境，之前已经下载过模型的情况
+            try:
+                # 设置环境变量强制离线模式
+                os.environ['HF_HUB_OFFLINE'] = '1'
+
+                self.model = Model.from_pretrained(
+                    "pyannote/brouhaha",
+                    local_files_only=True
+                )
+                logger.info("通过 pyannote 本地缓存加载成功")
+                return
+            except Exception as e2:
+                logger.debug(f"pyannote 本地缓存加载失败: {e2}")
+
+            # 方式3: 如果上述都失败，尝试在线下载
+            logger.info("本地模型不可用，尝试从 HuggingFace 下载...")
+            self._download_from_huggingface()
+
+        except ImportError as e:
+            logger.warning(f"pyannote.audio 未安装: {e}")
+            self.model = None
         except Exception as e:
             logger.error(f"本地模型加载失败: {e}")
-            # 尝试从 HuggingFace 重新下载
-            self._download_from_huggingface()
+            self.model = None
 
     def _download_from_huggingface(self):
         """从 HuggingFace 下载模型"""
@@ -206,9 +298,10 @@ class BrouhahaService:
                 return
 
             logger.info("从 HuggingFace 下载 Brouhaha 模型...")
+            # V3.1.1+dev.20260108.02: 使用 token 参数替代已废弃的 use_auth_token
             self.model = Model.from_pretrained(
                 "pyannote/brouhaha",
-                use_auth_token=self.hf_token
+                token=self.hf_token
             )
 
             # 保存到本地目录

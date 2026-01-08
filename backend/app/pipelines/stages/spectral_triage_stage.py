@@ -6,6 +6,10 @@ SpectralTriageStage - 频谱分诊阶段
 V3.7 更新：
 - 集成 CancellationToken 支持暂停/取消
 - 支持逐 Chunk 中断和检查点保存
+
+V3.1.1+dev.20260108.02 更新：
+- 支持 use_snr_triage 配置参数
+- 默认启用 SNR+C50 三层决策策略
 """
 
 import logging
@@ -31,6 +35,8 @@ class SpectralTriageStage:
 
     V3.7: 支持 CancellationToken 实现暂停/取消/断点续传
     原子单位：单个 Chunk 分诊，可在每个 Chunk 之间中断
+
+    V3.1.1+dev.20260108.02: 支持 SNR+C50 三层决策策略配置
     """
 
     def __init__(
@@ -38,7 +44,8 @@ class SpectralTriageStage:
         classifier: Optional[AudioSpectrumClassifier] = None,
         threshold: float = 0.35,
         logger: Optional[logging.Logger] = None,
-        cancellation_token: Optional["CancellationToken"] = None  # V3.7: 新增
+        cancellation_token: Optional["CancellationToken"] = None,  # V3.7: 新增
+        use_snr_triage: bool = True  # V3.1.1+dev.20260108.02: 新增，默认启用
     ):
         """
         初始化频谱分诊阶段
@@ -48,11 +55,14 @@ class SpectralTriageStage:
             threshold: 分诊阈值，默认0.35
             logger: 日志记录器，如果为None则创建新的
             cancellation_token: 取消令牌（可选，V3.7）
+            use_snr_triage: 是否启用 SNR+C50 三层决策策略（默认 True，V3.1.1+dev.20260108.02）
         """
-        self.classifier = classifier or get_spectrum_classifier()
+        # V3.1.1+dev.20260108.02: 根据配置决定是否启用 SNR 策略
+        self.classifier = classifier or get_spectrum_classifier(use_snr_strategy=use_snr_triage)
         self.threshold = threshold
         self.logger = logger or logging.getLogger(__name__)
         self.cancellation_token = cancellation_token  # V3.7
+        self.use_snr_triage = use_snr_triage  # V3.1.1+dev.20260108.02
 
     async def process(
         self,

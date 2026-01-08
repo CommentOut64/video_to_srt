@@ -20,7 +20,11 @@ class DiagnosisResult(Enum):
 
 @dataclass
 class SpectrumFeatures:
-    """频谱特征"""
+    """
+    频谱特征
+
+    V3.1.1+dev.20260108.01: 新增 SNR/C50/spectral_contrast 字段，支持 Brouhaha 分诊
+    """
     # 基础特征
     zcr: float = 0.0                    # 过零率 (Zero Crossing Rate)
     zcr_variance: float = 0.0           # ZCR方差
@@ -30,6 +34,7 @@ class SpectrumFeatures:
     spectral_bandwidth: float = 0.0     # 谱带宽
     spectral_flatness: float = 0.0      # 频谱平坦度
     spectral_rolloff: float = 0.0       # 频谱滚降点
+    spectral_contrast: float = 0.0      # 频谱对比度 (dB)，人声 > 15dB，噪音 < 12dB
 
     # 谐波特征
     harmonic_ratio: float = 0.0         # 谐波比 (Harmonic-to-Noise Ratio)
@@ -43,10 +48,18 @@ class SpectrumFeatures:
     onset_strength: float = 0.0         # 节拍强度
     tempo: float = 0.0                  # 估计BPM
 
+    # Brouhaha 检测特征 (V3.1.1+dev.20260108.01)
+    snr: float = 0.0                    # 信噪比 (dB)，-10 ~ 50
+    c50: float = 0.0                    # 清晰度指数 (dB)，-20 ~ 30
+
 
 @dataclass
 class SpectrumDiagnosis:
-    """频谱分诊结果"""
+    """
+    频谱分诊结果
+
+    V3.1.1+dev.20260108.01: 新增 SNR/C50 级别和分诊层级字段，支持三层决策
+    """
     chunk_index: int                           # Chunk索引
     diagnosis: DiagnosisResult                 # 分诊结果
     need_separation: bool                      # 是否需要分离
@@ -64,6 +77,13 @@ class SpectrumDiagnosis:
 
     # 决策原因
     reason: str = ""
+
+    # Brouhaha 分诊扩展字段 (V3.1.1+dev.20260108.01)
+    snr: float = 0.0                           # 信噪比 (dB)
+    c50: float = 0.0                           # 清晰度指数 (dB)
+    snr_level: str = ""                        # SNR 级别: "high" / "warn" / "low"
+    c50_level: str = ""                        # C50 级别: "good" / "warn" / "bad"
+    triage_layer: int = 0                      # 决策层级: 1 / 2 / 3，0 表示未使用 SNR 策略
 
 
 class SeparationLevel(Enum):
