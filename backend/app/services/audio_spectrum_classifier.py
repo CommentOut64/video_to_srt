@@ -89,10 +89,27 @@ class AudioSpectrumClassifier:
         return self._yamnet
 
     def _get_brouhaha(self):
-        """获取 Brouhaha 服务实例 (V3.1.1+dev.20260108.01)"""
-        if self._brouhaha is None and self._use_snr_strategy:
+        """
+        获取 Brouhaha 服务实例 (V3.1.1+dev.20260108.01)
+
+        V3.1.1+dev.20260108.06: 修复卸载后未重新加载的问题
+        每次检查模型是否可用，如果不可用则尝试重新加载
+        """
+        if not self._use_snr_strategy:
+            return None
+
+        # 如果没有实例或实例不可用，尝试获取/重新加载
+        if self._brouhaha is None or not self._brouhaha.is_available():
             self._brouhaha = _get_brouhaha_service()
-        return self._brouhaha
+
+            # 如果获取后仍不可用，尝试重新初始化模型
+            if not self._brouhaha.is_available():
+                try:
+                    self._brouhaha._init_model()
+                except Exception as e:
+                    logger.warning(f"Brouhaha 重新加载失败: {e}")
+
+        return self._brouhaha if self._brouhaha.is_available() else None
 
     def _ensure_librosa(self):
         """确保 librosa 已加载"""
@@ -501,15 +518,28 @@ class AudioSpectrumClassifier:
                 features=features
             )
 
-        # Layer 3: YAMNet 语义分类兜底
+        # Layer 3: YAMNet 语义分类兜底 (V3.1.1+dev.20260108.07: 针对 CTC 模型强化)
         yamnet = self._get_yamnet()
         if yamnet is not None and yamnet.is_available():
             yamnet_result = yamnet.classify_chunk(audio, chunk_id=chunk_index)
-            need_separation = yamnet_result.is_music
-            if need_separation:
-                reason = f"[L3] YAMNet 检测到音乐 (music={yamnet_result.music_score:.2f})"
+
+            # V3.1.1+dev.20260108.07: SNR 二次检查（针对 CTC 模型的保守策略）
+            # 对于 25-30dB 的灰色地带，即使 YAMNet 判定为人声，也要求更高的置信度
+            if snr < 30.0 and not yamnet_result.is_music:
+                # SNR 偏低，需要更高的 YAMNet 置信度才能放行
+                if yamnet_result.speech_score < 0.95:
+                    need_separation = True
+                    reason = f"[L3] SNR 偏低({snr:.1f}dB) + YAMNet 置信度不足(speech={yamnet_result.speech_score:.2f})，保守分离"
+                else:
+                    need_separation = False
+                    reason = f"[L3] SNR 偏低({snr:.1f}dB) 但 YAMNet 高置信度(speech={yamnet_result.speech_score:.2f})，放行"
             else:
-                reason = f"[L3] YAMNet 判定为人声 (speech={yamnet_result.speech_score:.2f})"
+                # 正常判断
+                need_separation = yamnet_result.is_music
+                if need_separation:
+                    reason = f"[L3] YAMNet 检测到音乐 (music={yamnet_result.music_score:.2f})"
+                else:
+                    reason = f"[L3] YAMNet 判定为人声 (speech={yamnet_result.speech_score:.2f})"
         else:
             # 最终回退：使用规则方法判断
             music_score = self._calculate_music_score(features)

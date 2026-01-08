@@ -388,16 +388,19 @@ task:
 
             # 推理
             with torch.no_grad():
-                # Brouhaha 模型输出格式: (batch, frames, 3) -> [SNR, C50, VAD]
+                # Brouhaha 模型输出格式: (batch, frames, 3) -> [VAD, SNR, C50]
+                # 参考: https://huggingface.co/pyannote/brouhaha
                 outputs = self.model(waveform)
 
             # 聚合帧级输出为片段级（取均值）
             if outputs.dim() == 3:
                 outputs = outputs.mean(dim=1)  # [batch, 3]
 
-            snr = float(outputs[0, 0].cpu())
-            c50 = float(outputs[0, 1].cpu())
-            vad = float(outputs[0, 2].cpu()) if outputs.shape[1] > 2 else 1.0
+            # V3.1.1+dev.20260108.05: 修复输出顺序解析错误
+            # 正确顺序: [VAD, SNR, C50]，之前错误地解析为 [SNR, C50, VAD]
+            vad = float(outputs[0, 0].cpu())
+            snr = float(outputs[0, 1].cpu())
+            c50 = float(outputs[0, 2].cpu())
 
             result = BrouhahaResult(snr=snr, c50=c50, vad=vad, is_valid=True)
 
