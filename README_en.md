@@ -1,6 +1,8 @@
 # AnchorFlux
 
-> High-precision subtitle generation engine based on dual-modal spatiotemporal decoupled architecture.
+> **Modern Visual Subtitle Workstation Powered by Dual-Engine AI Architecture.**
+
+> Say goodbye to command lines and boring text proofreading. Let AI handle the heavy lifting, so you can focus on the art of creation.
 
 [![Chinese README](https://img.shields.io/badge/README-中文-blue.svg)](README.md)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
@@ -11,7 +13,7 @@
 
 <img src="https://cdn.jsdelivr.net/gh/CommentOut64/anchor-flux@main/assets/pic2.png" image-rendering: crisp-edges/>
 
-AnchorFlux employs an innovative dual-anchor architecture: **SenseVoice anchors time boundaries, Whisper anchors semantic content**, coordinated through an asynchronous dual-stream pipeline to achieve a balance between transcription speed and quality.
+AnchorFlux is not just another high-precision transcription script; it is a full-stack subtitle production solution tailored for video creators and developers.
 
 <a href="https://www.bilibili.com/video/BV1xAqzB5EFN"><img src="https://img.shields.io/static/v1?label=%20&message=Demo%20Video&color=F37697&style=flat&logo=bilibili&logoColor=white&logoWidth=20" height="32"></a>
 <a href="https://www.bilibili.com/video/BV1ejvCBPEz9"><img src="https://img.shields.io/static/v1?label=%20&message=Tutorial%20Video&color=F37697&style=flat&logo=bilibili&logoColor=white&logoWidth=20" height="32"></a>
@@ -35,7 +37,7 @@ AnchorFlux employs an innovative dual-anchor architecture: **SenseVoice anchors 
 - **Interactive Subtitle List**: Complete subtitle editing panel, support clicking subtitle items to jump to corresponding video progress with one click, support freely modifying text content and timestamps, support quickly inserting new subtitles or deleting existing ones
 - **Precise Subtitle Splitting**: Quick split functionality based on waveform timeline points or text cursor position
 - **One-Click Multi-Format Export**: Export subtitles to SRT, ASS, VTT standard subtitle formats and plain text files with one click
-- **History and Auto-Save**: Support unlimited undo and redo, all modifications automatically saved in real-time, no worry about data loss
+- **History and Auto-Save**: Support undo and redo, all modifications automatically saved in real-time, no worry about data loss
 
 ### User Interface
 
