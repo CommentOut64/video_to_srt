@@ -1,6 +1,8 @@
 # AnchorFlux
 
-> 基于双模态时空解耦架构的高精度字幕生成引擎。
+> **由双引擎 AI 架构驱动的可视化字幕生产工作站。**
+
+> 告别繁琐的命令行和枯燥的文本校对，让 AI 负责繁重的工作，让你专注于创作的艺术。
 
 [![English README](https://img.shields.io/badge/README-English-blue.svg)](README_en.md)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
@@ -11,7 +13,7 @@
 
 <img src="https://cdn.jsdelivr.net/gh/CommentOut64/anchor-flux@main/assets/pic2.png" image-rendering: crisp-edges/>
 
-AnchorFlux 采用创新的双锚架构：**SenseVoice 锚定时间边界，Whisper 锚定语义内容**，利用异步双流流水线协调两者，实现了转录速度与质量的平衡。
+**AnchorFlux** 不仅仅是一个高精度的语音转写工具，它是一套为视频创作者量身定制的**全流程字幕生产解决方案**。
 
 <a href="https://www.bilibili.com/video/BV1xAqzB5EFN"><img src="https://img.shields.io/static/v1?label=%20&message=%E6%BC%94%E7%A4%BA%E8%A7%86%E9%A2%91&color=F37697&style=flat&logo=bilibili&logoColor=white&logoWidth=20" height="32"></a>
 <a href="https://www.bilibili.com/video/BV1ejvCBPEz9"><img src="https://img.shields.io/static/v1?label=%20&message=%E6%95%99%E7%A8%8B%E8%A7%86%E9%A2%91&color=F37697&style=flat&logo=bilibili&logoColor=white&logoWidth=20" height="32"></a>
@@ -32,10 +34,10 @@ AnchorFlux 采用创新的双锚架构：**SenseVoice 锚定时间边界，Whisp
 - **实时字幕叠加预览**：内置视频播放器，支持字幕实时叠加渲染，所见即所得
 - **高精度波形可视化**：基于 WaveSurfer.js 渲染音频波形，直观展示语音活动与静音区间
 - **直观的字幕范围编辑**：在波形图上提供可视化的“字幕范围框”，支持通过鼠标直接拖拽边缘来快速调整字幕的起始与结束时间
-- **交互式字幕列表**：提供完整的字幕编辑面板，支持点击字幕项一键跳转至对应视频进度，支持随意修改文本内容与时间戳，支持快速插入新字幕或删除现有字幕
+- **交互式字幕列表**：提供完整的字幕编辑面板，支持点击跳转至对应视频进度、修改文本内容与时间戳、快速插入字幕或删除字幕
 - **精确的字幕拆分**：提供基于波形图时间点或文本光标位置的快速拆分功能
 - **多格式一键导出**：字幕一键导出为 SRT、ASS、VTT 标准字幕格式以及纯文本文件
-* **历史记录与自动保存**：支持无限步撤销与重做，所有修改实时自动保存，无需担心数据丢失
+- **历史记录与自动保存**：支持撤销与重做，所有修改实时自动保存，无需担心数据丢失
 
 ### 用户界面
 
