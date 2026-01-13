@@ -291,9 +291,22 @@ export const useProjectStore = defineStore("project", () => {
     const index = subtitles.value.findIndex((s) => s.id === id);
     if (index === -1) return;
 
+    const current = subtitles.value[index];
+
+    // 如果用户修改了文本，清空模型置信度，避免误导性徽章
+    const isTextEdited = payload.text !== undefined && payload.text !== current.text;
+    const sanitizedPayload = isTextEdited
+      ? {
+          ...payload,
+          confidence: null,
+          display_confidence: null,
+          confidence_source: 'manual',
+        }
+      : payload;
+
     subtitles.value[index] = {
-      ...subtitles.value[index],
-      ...payload,
+      ...current,
+      ...sanitizedPayload,
       isDirty: true,
     };
     meta.value.isDirty = true;
@@ -318,7 +331,7 @@ export const useProjectStore = defineStore("project", () => {
       words: payload.words || [],
       confidence: payload.confidence ?? null,  // V3.1.2: 默认 null 而非 1.0
       display_confidence: payload.display_confidence,  // V3.1.2: 映射后准确率
-      confidence_source: payload.confidence_source,    // V3.1.2: 置信度来源
+      confidence_source: payload.confidence_source ?? 'manual',    // V3.1.2: 置信度来源
       warning_type: payload.warning_type || "none",
       source: payload.source || "manual",
     };

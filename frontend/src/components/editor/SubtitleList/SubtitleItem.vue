@@ -44,7 +44,7 @@
         <!-- V3.1.2+dev.20260111.01: 使用 display_confidence（映射后准确率） -->
         <el-tooltip
           v-if="showConfidenceBadge"
-          :content="`置信度: ${displayConfidenceText}`"
+          :content="`准确率: ${displayConfidenceText}（来源: ${confidenceSourceText}）`"
           placement="top"
           :show-after="500"
         >
@@ -215,15 +215,12 @@ const itemClasses = computed(() => ({
 }))
 
 // 置信度徽章
-// V3.1.2+dev.20260113.01: 草稿字幕也显示准确率（只要有数据）
 const showConfidenceBadge = computed(() => {
-  const displayConf = props.subtitle.display_confidence ?? props.subtitle.confidence
-  return displayConf !== undefined && displayConf !== null
+  return props.subtitle.display_confidence !== undefined && props.subtitle.display_confidence !== null
 })
 
 const confidenceBadgeClass = computed(() => {
-  // V3.1.2: 使用 display_confidence，没有则 fallback 到 confidence
-  const conf = props.subtitle.display_confidence ?? props.subtitle.confidence
+  const conf = props.subtitle.display_confidence
   if (conf >= 0.85) return 'badge-good'
   if (conf >= 0.68) return 'badge-warning'
   return 'badge-danger'
@@ -231,9 +228,19 @@ const confidenceBadgeClass = computed(() => {
 
 // V3.1.2: 显示的置信度文本（百分比）
 const displayConfidenceText = computed(() => {
-  const conf = props.subtitle.display_confidence ?? props.subtitle.confidence
+  const conf = props.subtitle.display_confidence
   if (conf === undefined || conf === null) return ''
   return `${Math.round(conf * 100)}%`
+})
+
+// 置信度来源文本
+const confidenceSourceText = computed(() => {
+  const source = props.subtitle.confidence_source
+  if (source === 'whisper') return 'Whisper'
+  if (source === 'sensevoice') return 'SenseVoice'
+  if (source === 'manual') return '手动编辑'
+  if (source === 'srt_fallback') return '导入文件'
+  return source || '未知'
 })
 
 // 警告信息

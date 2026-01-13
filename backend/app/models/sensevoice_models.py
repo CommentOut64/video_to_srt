@@ -170,6 +170,11 @@ class SentenceSegment:
         """计算映射后的 display_confidence"""
         from app.core.confidence_mapper import ConfidenceMapper
 
+        # 无置信度时保持空值，前端不显示徽章
+        if self.confidence is None:
+            self.display_confidence = None
+            return
+
         # 确定置信度来源
         if self.confidence_source is None:
             self.confidence_source = self.source.value if self.source else "sensevoice"
@@ -188,6 +193,10 @@ class SentenceSegment:
         self.confidence = new_confidence
         if source:
             self.confidence_source = source
+        # 无置信度时清空显示值，避免误导
+        if new_confidence is None:
+            self.display_confidence = None
+            return
         self._compute_display_confidence()
 
     def mark_as_modified(self, new_text: str, source: TextSource):
@@ -222,7 +231,7 @@ class SentenceSegment:
         V3.1.2+dev.20260111.01: 新增 display_confidence 和 confidence_source 字段
         """
         # 确保 display_confidence 已计算
-        if self.display_confidence is None:
+        if self.display_confidence is None and self.confidence is not None:
             self._compute_display_confidence()
 
         return {

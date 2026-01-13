@@ -4187,7 +4187,8 @@ class TranscriptionService:
         """估算 Whisper 结果置信度"""
         segments = result.get('segments', [])
         if not segments:
-            return 0.7
+            # 无可靠片段时不返回置信度，让前端隐藏徽章
+            return None
 
         # 基于 avg_logprob 和 no_speech_prob 计算
         total_logprob = sum(s.get('avg_logprob', -0.5) for s in segments)

@@ -135,6 +135,11 @@ class StreamingSubtitleManager:
                     confidence_source = source.value
 
             sentence.update_confidence(confidence, confidence_source)
+        else:
+            # 无置信度（例如 Whisper 未返回可靠值）时，清空显示，避免沿用旧值
+            sentence.confidence = None
+            sentence.confidence_source = source.value
+            sentence.display_confidence = None
 
         if perplexity is not None:
             sentence.perplexity = perplexity
