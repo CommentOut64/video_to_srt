@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 
 from app.core.config import config
+from app.services.proxy_720_scheduler import get_proxy_scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +99,10 @@ class MediaPrepService:
         self.consumer_thread.start()
 
         logger.info(f"MediaPrepService 已启动 (workers={max_workers})")
+
+        # V3.1.2+dev.20260114.01: 绑定 720p 调度器，统一由调度器协调触发与状态
+        scheduler = get_proxy_scheduler()
+        scheduler.bind_media_prep(self)
 
     def enqueue_proxy(self, job_id: str, video_path: Path, output_path: Path,
                       priority: int = 10) -> bool:
@@ -209,6 +214,108 @@ class MediaPrepService:
         if status:
             return status.get("status") in ["queued", "processing"]
         return False
+
+    def trigger_720p_transcode(self, job_id: str, force: bool = False) -> dict:
+        """
+        V3.1.2+dev.20260113.01: 通用720p转码触发接口
+
+        支持手动触发和自动触发，统一检查条件和错误处理
+
+        Args:
+            job_id: 任务ID
+            force: 强制触发（跳过队列空闲检查）
+
+        Returns:
+            dict: {
+                "success": bool,
+                "message": str,
+                "reason": str (失败时)
+            }
+        """
+        try:
+            # 步骤1: 检查任务目录是否存在
+            job_dir = config.JOBS_DIR / job_id
+            if not job_dir.exists():
+                return {
+                    "success": False,
+                    "message": "任务目录不存在",
+                    "reason": "job_not_found"
+                }
+
+            # 步骤2: 检查360p是否完成
+            preview_status = self.get_preview_status(job_id)
+            if not preview_status or preview_status.get("status") != "completed":
+                return {
+                    "success": False,
+                    "message": "360p预览未完成",
+                    "reason": "preview_not_ready"
+                }
+
+            # 步骤3: 检查720p是否已存在或正在处理
+            proxy_720p_path = job_dir / "proxy_720p.mp4"
+            if proxy_720p_path.exists():
+                return {
+                    "success": False,
+                    "message": "720p已存在",
+                    "reason": "already_exists"
+                }
+
+            proxy_status = self.get_proxy_status(job_id)
+            if proxy_status and proxy_status.get("status") in ["queued", "processing"]:
+                return {
+                    "success": False,
+                    "message": "720p转码正在进行中",
+                    "reason": "already_processing"
+                }
+
+            # 步骤4: 检查队列是否空闲（除非force=True）
+            if not force:
+                queue_busy = self._is_transcription_queue_busy()
+                if queue_busy:
+                    return {
+                        "success": False,
+                        "message": "有任务正在运行，请稍后再试",
+                        "reason": "queue_busy"
+                    }
+
+            # 步骤5: 查找视频文件
+            video_file = None
+            video_exts = ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.webm', '.flv', '.m4v']
+            for file in job_dir.iterdir():
+                if file.is_file() and file.suffix.lower() in video_exts:
+                    video_file = file
+                    break
+
+            if not video_file:
+                return {
+                    "success": False,
+                    "message": "未找到视频文件",
+                    "reason": "video_not_found"
+                }
+
+            # 步骤6: 启动720p转码
+            logger.info(f"[MediaPrep] 触发720p转码: {job_id}, force={force}")
+            success = self.enqueue_proxy(job_id, video_file, proxy_720p_path, priority=10)
+
+            if success:
+                return {
+                    "success": True,
+                    "message": "720p转码已启动"
+                }
+            else:
+                return {
+                    "success": False,
+                    "message": "720p转码启动失败",
+                    "reason": "enqueue_failed"
+                }
+
+        except Exception as e:
+            logger.error(f"[MediaPrep] 触发720p转码异常: {job_id}, {e}", exc_info=True)
+            return {
+                "success": False,
+                "message": f"触发失败: {str(e)}",
+                "reason": "exception"
+            }
 
     def analyze_transcode_decision(self, video_info: dict) -> TranscodeDecision:
         """
@@ -549,9 +656,16 @@ class MediaPrepService:
                 logger.info(f"[MediaPrep] 360p预览转码完成: {output_path}")
                 self._push_preview_progress(job_id, 100, completed=True)
 
-                # 【优化】360p完成后，智能安排720p检查
-                # 策略：只有队列空闲时才安排延迟检查，避免频繁检测
-                self._schedule_720p_check_if_idle(job_id, video_path, output_path.parent / "proxy_720p.mp4")
+                # V3.1.2+dev.20260114.02: 交给 720p 调度器统一管理（自动/手动互斥、队列空闲再启动）
+                scheduler = get_proxy_scheduler()
+                scheduler.request(
+                    job_id,
+                    video_path,
+                    trigger_type="preview_complete",
+                    auto_enabled=config.PROXY_CONFIG.get('auto_trigger_720p', False),
+                    force=False,
+                    priority=100
+                )
             else:
                 # 失败
                 error_msg = f"FFmpeg 返回码: {process.returncode}"
@@ -584,6 +698,12 @@ class MediaPrepService:
         # 更新状态
         with self.lock:
             self.task_status[job_id]["proxy_720p"]["status"] = "processing"
+
+        # V3.1.2+dev.20260114.03: 通知调度器进入 processing，保证状态文件与队列一致
+        try:
+            get_proxy_scheduler().mark_processing(job_id)
+        except Exception as e:
+            logger.debug(f"[MediaPrep] 更新调度器处理状态失败: {e}")
 
         try:
             # 步骤1: 卸载所有模型，释放显存
@@ -727,6 +847,12 @@ class MediaPrepService:
                     self.task_status[job_id]["proxy_720p"]["progress"] = 100
 
                 logger.info(f"[MediaPrep] 720p 转码完成: {output_path}")
+
+                # V3.1.2+dev.20260114.03: 通知调度器已完成，便于前端无感切换
+                try:
+                    get_proxy_scheduler().mark_complete(job_id, output_path)
+                except Exception as e:
+                    logger.debug(f"[MediaPrep] 更新调度器完成状态失败: {e}")
                 self._push_proxy_progress(job_id, 100, completed=True)
             else:
                 # 失败
@@ -743,6 +869,12 @@ class MediaPrepService:
                 self.task_status[job_id]["proxy_720p"]["error"] = str(e)
 
             logger.error(f"[MediaPrep] 720p 转码异常: {e}", exc_info=True)
+
+            # V3.1.2+dev.20260114.03: 失败后通知调度器，避免前端等待
+            try:
+                get_proxy_scheduler().mark_failed(job_id, str(e))
+            except Exception as err:
+                logger.debug(f"[MediaPrep] 更新调度器失败状态失败: {err}")
 
     def _is_transcription_queue_busy(self) -> bool:
         """
@@ -923,12 +1055,14 @@ class MediaPrepService:
                 logger.debug(f"[MediaPrep] 卸载 Demucs 模型失败（可能未加载）: {e}")
 
             # 4. 卸载 Brouhaha 模型 (V3.1.1+dev.20260108.04)
+            # V3.1.2+dev.20260113.01: 避免触发不必要的模型加载
             try:
-                from app.services.brouhaha_service import get_brouhaha_service
-                brouhaha_service = get_brouhaha_service()
-                if brouhaha_service.is_available():
-                    brouhaha_service.unload()
-                    logger.info("[MediaPrep] 已卸载 Brouhaha 模型")
+                from app.services import brouhaha_service
+                # 只有当单例已存在时才卸载，避免触发初始化加载
+                if brouhaha_service._brouhaha_instance is not None:
+                    if brouhaha_service._brouhaha_instance.is_available():
+                        brouhaha_service._brouhaha_instance.unload()
+                        logger.info("[MediaPrep] 已卸载 Brouhaha 模型")
             except Exception as e:
                 logger.debug(f"[MediaPrep] 卸载 Brouhaha 模型失败（可能未加载）: {e}")
 

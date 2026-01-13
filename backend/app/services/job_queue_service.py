@@ -653,8 +653,7 @@ class JobQueueService:
                     # 保存队列状态
                     self._save_state()
 
-                    # 6. 任务完成后触发720p转码检查（V3.1.0新增）
-                    # 解决: 360p完成时如果队列繁忙就不触发720p，导致队列空闲后也不再检查
+                    # V3.1.2+dev.20260114.04: 队列变空/任务完成时通知720p调度器
                     if job.status == "finished":
                         self._trigger_720p_check_after_job_complete(job.job_id)
 
@@ -1210,67 +1209,14 @@ class JobQueueService:
         2. 找到有360p但没有720p的任务
         3. 触发720p转码
         """
+        # V3.1.2+dev.20260114.04: 队列空闲时直接通知调度器，由调度器选择待触发任务
         try:
-            from app.services.media_prep_service import get_media_prep_service
-            from app.core.config import config
-            from pathlib import Path
+            from app.services.proxy_720_scheduler import get_proxy_scheduler
 
-            media_prep = get_media_prep_service()
-            jobs_root = config.JOBS_DIR
-
-            if not jobs_root.exists():
-                return
-
-            triggered_count = 0
-
-            # 扫描所有任务目录
-            for job_dir in jobs_root.iterdir():
-                if not job_dir.is_dir():
-                    continue
-
-                job_id = job_dir.name
-                preview_360p = job_dir / "preview_360p.mp4"
-                proxy_720p = job_dir / "proxy_720p.mp4"
-
-                # 条件: 有360p但没有720p
-                if not preview_360p.exists():
-                    continue
-                if proxy_720p.exists():
-                    continue
-
-                # 检查720p是否已在队列中
-                proxy_status = media_prep.get_proxy_status(job_id)
-                if proxy_status and proxy_status.get("status") in ["queued", "processing"]:
-                    continue
-
-                # 找到视频文件
-                video_file = None
-                video_exts = ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.webm', '.flv', '.m4v']
-                for file in job_dir.iterdir():
-                    if file.is_file() and file.suffix.lower() in video_exts:
-                        # 跳过preview和proxy文件
-                        if file.name.startswith(('preview_', 'proxy_')):
-                            continue
-                        video_file = file
-                        break
-
-                if not video_file:
-                    continue
-
-                # 触发720p转码（低优先级，让新任务优先）
-                logger.info(f"[720p触发] 任务完成后发现待处理的720p: {job_id}")
-                media_prep.enqueue_proxy(job_id, video_file, proxy_720p, priority=15)
-                triggered_count += 1
-
-                # 一次只触发一个，避免阻塞
-                break
-
-            if triggered_count > 0:
-                logger.info(f"[720p触发] 已触发 {triggered_count} 个720p转码任务")
-
+            scheduler = get_proxy_scheduler()
+            scheduler.on_queue_idle()
         except Exception as e:
-            # 720p触发失败不影响主流程
-            logger.debug(f"[720p触发] 检查失败（非致命）: {e}")
+            logger.debug(f\"[720p触发] 调度器通知失败（非致命）: {e}\")
 
     def _cleanup_resources(self):
         """

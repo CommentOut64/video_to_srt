@@ -1654,20 +1654,18 @@ class TranscriptionService:
                 self.logger.info(f"[720p] 360p预览未完成，跳过720p转码: {job_id}")
                 return
 
-            # 检查转录队列是否空闲
-            queue_idle = self._is_transcription_queue_idle()
-            self.logger.info(f"[720p] 队列空闲状态: {queue_idle}")
+            # V3.1.2+dev.20260114.05: 交给 720p 调度器统一排队，避免重复入队
+            from app.services.proxy_720_scheduler import get_proxy_scheduler
 
-            if queue_idle:
-                # 队列空闲，立即启动（正常优先级）
-                self.logger.info(f"[720p] 队列空闲，立即启动转码: {job_id}")
-                success = media_prep.enqueue_proxy(job_id, video_file, proxy_720p, priority=10)
-                self.logger.info(f"[720p] 入队结果: {success}")
-            else:
-                # 队列繁忙，使用低优先级（独立进程模式）
-                self.logger.info(f"[720p] 队列繁忙，低优先级排队: {job_id}")
-                success = media_prep.enqueue_proxy(job_id, video_file, proxy_720p, priority=1)
-                self.logger.info(f"[720p] 入队结果: {success}")
+            scheduler = get_proxy_scheduler()
+            scheduler.request(
+                job_id,
+                video_file,
+                trigger_type="transcription_done",
+                auto_enabled=config.PROXY_CONFIG.get('auto_trigger_720p', False),
+                force=False,
+                priority=100
+            )
 
         except Exception as e:
             self.logger.warning(f"[720p] 触发转码失败（非致命）: {e}")

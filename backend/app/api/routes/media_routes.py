@@ -869,7 +869,8 @@ async def check_proxy_status(job_id: str):
         raise HTTPException(status_code=404, detail="任务不存在")
 
     # 从 MediaPrepService 获取任务状态
-    from app.services.media_prep_service import get_media_prep_service, TranscodeDecision
+from app.services.media_prep_service import get_media_prep_service, TranscodeDecision
+from app.services.proxy_720_scheduler import get_proxy_scheduler  # V3.1.2+dev.20260114.06: 统一720p调度
     media_prep = get_media_prep_service()
     task_status = media_prep.get_full_task_status(job_id)
 
@@ -885,49 +886,21 @@ async def check_proxy_status(job_id: str):
         "source": f"/api/media/{job_id}/video" if source_video else None
     }
 
-    # 如果没有任务状态，根据文件存在性推断状态
+    # 如果没有任务状态，根据文件存在性和调度器状态推断
     if not task_status:
+        scheduler_state = get_proxy_scheduler().get_state(job_id)
+        scheduler_state_name = scheduler_state.get("state")
+
         if proxy_720p.exists() or remux_video.exists():
             state = "ready_720p"
             progress = 100
         elif preview_360p.exists():
-            state = "ready_360p"
+            # 360p 完成但 720p 未就绪，保持 ready_360p
+            state = scheduler_state_name or "ready_360p"
             progress = 100
-
-            # 【新增】360p已完成但720p不存在，检查是否需要触发720p转码
-            if not proxy_720p.exists() and not remux_video.exists() and source_video:
-                print(f"[media] 360p已完成但720p不存在，检查是否触发720p转码: {job_id}")
-                try:
-                    # 检查720p是否已在队列中
-                    proxy_status = media_prep.get_proxy_status(job_id)
-                    if not proxy_status or proxy_status.get("status") not in ["queued", "processing"]:
-                        # 720p未在队列中，检查转录队列是否空闲
-                        from app.services.job_queue_service import get_queue_service
-
-                        queue_idle = True  # 默认认为空闲
-                        try:
-                            queue_service = get_queue_service()
-                            if queue_service:
-                                # 检查是否有正在处理或等待的任务
-                                active_jobs = [
-                                    j for j in queue_service.jobs.values()
-                                    if j.status in ['pending', 'processing', 'queued']
-                                ]
-                                queue_idle = len(active_jobs) == 0
-                                print(f"[media] 队列状态检查: 活跃任务数={len(active_jobs)}, 空闲={queue_idle}")
-                        except Exception as e:
-                            print(f"[media] 检查队列状态失败，默认认为空闲: {e}")
-
-                        if queue_idle:
-                            # 队列空闲，自动触发720p转码
-                            print(f"[media] 队列空闲，自动触发720p转码: {job_id}")
-                            media_prep.enqueue_proxy(job_id, source_video, proxy_720p, priority=10)
-                        else:
-                            # 队列繁忙，使用低优先级
-                            print(f"[media] 队列繁忙，低优先级触发720p转码: {job_id}")
-                            media_prep.enqueue_proxy(job_id, source_video, proxy_720p, priority=1)
-                except Exception as e:
-                    print(f"[media] 自动触发720p转码失败: {e}")
+            # V3.1.2+dev.20260114.06: 确保任务被调度器跟踪，但不在此处触发
+            if source_video:
+                get_proxy_scheduler().ensure_tracked(job_id, source_video, trigger_type="editor_check")
         elif source_video:
             # 分析是否需要转码
             from app.utils.media_analyzer import media_analyzer
@@ -959,8 +932,8 @@ async def check_proxy_status(job_id: str):
                 state = "idle"
                 progress = 0
         else:
-            state = "idle"
-            progress = 0
+            state = scheduler_state_name or "idle"
+            progress = scheduler_state.get("progress", 0) if scheduler_state else 0
 
         return JSONResponse({
             "state": state,
@@ -969,7 +942,8 @@ async def check_proxy_status(job_id: str):
             "urls": urls,
             "error": None,
             "started_at": None,
-            "estimated_remaining": None
+            "estimated_remaining": None,
+            "auto_trigger_720p": config.PROXY_CONFIG.get('auto_trigger_720p', True)
         })
 
     # 【新增】检查360p是否需要重试（处理意外关闭的情况）
@@ -1002,7 +976,8 @@ async def check_proxy_status(job_id: str):
         "urls": urls,
         "error": task_status.get("error"),
         "started_at": task_status.get("started_at"),
-        "estimated_remaining": task_status.get("estimated_remaining")
+        "estimated_remaining": task_status.get("estimated_remaining"),
+        "auto_trigger_720p": config.PROXY_CONFIG.get('auto_trigger_720p', True)
     })
 
 
@@ -1979,3 +1954,116 @@ async def _auto_generate_thumbnail(job_id: str, video_file: Path, thumbnail_file
         print(f"[media] 缩略图自动生成失败 [{job_id}]: {e}")
 
 
+@router.post("/{job_id}/upgrade-720p")
+async def upgrade_to_720p(job_id: str):
+    """
+    V3.1.2+dev.20260114.07: 手动触发720p转码（自动启用时禁止手动）
+
+    检查条件：
+    1. 任务存在且360p已完成
+    2. 720p未完成
+    3. 队列空闲
+    4. 无转码进行
+
+    Returns:
+        JSONResponse: {
+            "success": bool,
+            "message": str,
+            "reason": str (失败时)
+        }
+    """
+    try:
+        from app.services.media_prep_service import get_media_prep_service
+        from app.services.proxy_720_scheduler import get_proxy_scheduler
+
+        media_prep = get_media_prep_service()
+        scheduler = get_proxy_scheduler()
+
+        # 自动模式下禁止手动
+        auto_enabled = config.PROXY_CONFIG.get('auto_trigger_720p', False)
+        if auto_enabled:
+            return JSONResponse(
+                content={
+                    "success": False,
+                    "message": "已开启自动720p，不能手动触发",
+                    "reason": "auto_enabled"
+                },
+                status_code=400
+            )
+
+        job_dir = config.JOBS_DIR / job_id
+        if not job_dir.exists():
+            return JSONResponse(
+                content={
+                    "success": False,
+                    "message": "任务目录不存在",
+                    "reason": "job_not_found"
+                },
+                status_code=404
+            )
+
+        # 查找视频文件
+        video_file = None
+        video_exts = ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.webm', '.flv', '.m4v']
+        for f in job_dir.iterdir():
+            if f.is_file() and f.suffix.lower() in video_exts and not f.name.startswith(('preview_', 'proxy_')):
+                video_file = f
+                break
+
+        if not video_file:
+            return JSONResponse(
+                content={
+                    "success": False,
+                    "message": "未找到视频文件",
+                    "reason": "video_not_found"
+                },
+                status_code=400
+            )
+
+        # 调度器统一检查：360p、队列、进行中等
+        result = scheduler.request(
+            job_id,
+            video_file,
+            trigger_type="manual",
+            auto_enabled=auto_enabled,
+            force=False,
+            priority=50  # 手动优先级高于自动
+        )
+
+        if result.get("accepted"):
+            return JSONResponse(content={
+                "success": True,
+                "message": "后台已排队，队列空闲后自动生成720p"
+            }, status_code=200)
+
+        reason = result.get("reason", "unknown")
+        message = {
+            "auto_disabled": "未开启自动模式，但请求被拒绝",
+            "preview_not_ready": "360p未完成，无法升级720p",
+            "already_exists": "720p已存在",
+            "already_processing": "720p正在处理中",
+            "queue_busy": "有任务正在运行，请稍后再试",
+            "job_not_found": "任务不存在"
+        }.get(reason, "请求被拒绝")
+
+        status_code = 400
+        if reason in ["job_not_found"]:
+            status_code = 404
+        elif reason == "queue_busy":
+            status_code = 503
+
+        return JSONResponse(
+            content={"success": False, "message": message, "reason": reason},
+            status_code=status_code
+        )
+
+    except Exception as e:
+        logger.error(f"[media] 手动触发720p异常: {job_id}, {e}", exc_info=True)
+        return JSONResponse(
+            content={
+                "success": False,
+                "message": f"服务器错误: {str(e)}",
+                "reason": "server_error"
+            },
+            status_code=500
+        )
