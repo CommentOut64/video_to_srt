@@ -1358,6 +1358,20 @@ class TranscriptionService:
             try:
                 job_dir = Path(job.dir)
 
+                # V3.1.2+dev.20260112.01: 先取消 MediaPrep 的转码任务，释放文件句柄
+                # 避免 WinError 32 文件占用问题
+                try:
+                    from app.services.media_prep_service import get_media_prep_service
+                    media_prep = get_media_prep_service()
+                    killed = media_prep.cancel_tasks(job_id)
+                    if killed > 0:
+                        self.logger.info(f"[删除任务] 已终止 {killed} 个 MediaPrep 子进程: {job_id}")
+                        # 给系统一点时间释放文件句柄
+                        import time
+                        time.sleep(0.5)
+                except Exception as e:
+                    self.logger.warning(f"[删除任务] 取消 MediaPrep 任务失败: {e}")
+
                 # 先从内存中移除任务，避免删除失败时仍显示"未知文件"
                 with self.lock:
                     if job_id in self.jobs:
@@ -3413,7 +3427,8 @@ class TranscriptionService:
             sentence.start += chunk_start_time
             sentence.end += chunk_start_time
             sentence.source = TextSource.SENSEVOICE
-            sentence.confidence = sv_result.confidence
+            # V3.1.2+dev.20260111.01: 使用 update_confidence 确保 display_confidence 同步更新
+            sentence.update_confidence(sv_result.confidence, source="sensevoice")
 
             # 调整字级时间戳的偏移
             for word in sentence.words:

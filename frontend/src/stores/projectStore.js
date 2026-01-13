@@ -173,11 +173,15 @@ export const useProjectStore = defineStore("project", () => {
 
   /**
    * 导入SRT字幕（从转录结果加载）
+   *
+   * V3.1.2+dev.20260112.01: SRT 格式不包含置信度，将 confidence 和 display_confidence 设为 null
+   * 前端不显示置信度徽章，避免误导用户
    */
   function importSRT(srtContent, metadata) {
     const parsed = parseSRT(srtContent);
     subtitles.value = parsed.map((item, idx) => ({
       id: `subtitle-${Date.now()}-${idx}`,
+      sentenceIndex: idx,  // V3.1.2: 添加 sentenceIndex 以支持 SSE 匹配
       start: item.start,
       end: item.end,
       text: item.text,
@@ -186,7 +190,10 @@ export const useProjectStore = defineStore("project", () => {
       chunk_id: null, // 物理切片ID
       isDraft: false, // 已导入的SRT都是定稿
       words: [], // 字级置信度数据
-      confidence: 1.0, // 句子置信度
+      // V3.1.2+dev.20260112.01: SRT 无置信度数据，置空避免显示误导性的 100%
+      confidence: null,
+      display_confidence: null,
+      confidence_source: 'srt_fallback',  // 标记来源用于 UI 判断
       warning_type: "none", // 警告类型: none/low_confidence/high_perplexity/both
       source: "imported", // 来源: sensevoice/whisper/imported
     }));
@@ -211,6 +218,7 @@ export const useProjectStore = defineStore("project", () => {
    * - 直接导入 segments，不经过 SRT 转换
    * - 保留 sentenceIndex 字段，用于 SSE 推送时的字幕匹配
    * - 保留 confidence、source 等元数据
+   * - V3.1.2: 保留 display_confidence、confidence_source
    */
   function importSegments(segments, metadata) {
     subtitles.value = segments.map((seg) => ({
@@ -224,6 +232,8 @@ export const useProjectStore = defineStore("project", () => {
       isDraft: false,
       words: [],
       confidence: seg.confidence || 1.0,
+      display_confidence: seg.display_confidence,  // V3.1.2: 映射后准确率
+      confidence_source: seg.confidence_source,    // V3.1.2: 置信度来源
       warning_type: "none",
       source: seg.source || "imported",
     }));
@@ -291,10 +301,13 @@ export const useProjectStore = defineStore("project", () => {
 
   /**
    * 添加字幕
+   *
+   * V3.1.2+dev.20260112.01: 补齐 sentenceIndex、display_confidence、confidence_source 字段
    */
   function addSubtitle(insertIndex, payload) {
     const newSubtitle = {
       id: `subtitle-${Date.now()}`,
+      sentenceIndex: payload.sentenceIndex,  // V3.1.2: 全局句子索引
       start: payload.start || 0,
       end: payload.end || 0,
       text: payload.text || "",
@@ -303,7 +316,9 @@ export const useProjectStore = defineStore("project", () => {
       chunk_id: payload.chunk_id || null,
       isDraft: payload.isDraft ?? false,
       words: payload.words || [],
-      confidence: payload.confidence ?? 1.0,
+      confidence: payload.confidence ?? null,  // V3.1.2: 默认 null 而非 1.0
+      display_confidence: payload.display_confidence,  // V3.1.2: 映射后准确率
+      confidence_source: payload.confidence_source,    // V3.1.2: 置信度来源
       warning_type: payload.warning_type || "none",
       source: payload.source || "manual",
     };
@@ -573,12 +588,15 @@ export const useProjectStore = defineStore("project", () => {
     // 暂停历史记录，SSE 推送的内容不应被撤销
     pauseHistory();
 
+    // V3.1.2+dev.20260111.01: 添加 display_confidence 和 confidence_source
     const {
       index: sentenceIndex,
       text,
       start,
       end,
       confidence = 0.8,
+      display_confidence,  // V3.1.2: 映射后准确率
+      confidence_source,   // V3.1.2: 置信度来源
       words = [],
       warning_type = "none",
     } = sentenceData;
@@ -589,6 +607,7 @@ export const useProjectStore = defineStore("project", () => {
     // 查找是否已存在
     const existingIndex = subtitles.value.findIndex((s) => s.id === subtitleId);
 
+    // V3.1.2+dev.20260111.01: 包含 display_confidence 和 confidence_source
     const subtitleData = {
       id: subtitleId,
       start,
@@ -599,6 +618,8 @@ export const useProjectStore = defineStore("project", () => {
       isDraft: true, // 标记为草稿
       words,
       confidence,
+      display_confidence,  // V3.1.2: 映射后准确率
+      confidence_source,   // V3.1.2: 置信度来源
       warning_type,
       source: "sensevoice",
       sentenceIndex, // 保留原始句子索引
@@ -620,7 +641,8 @@ export const useProjectStore = defineStore("project", () => {
       chunkSubtitleMap.value.get(chunk_id).push(subtitleId);
 
       console.log(
-        `[ProjectStore] 添加草稿字幕: ${subtitleId}, 位置: ${insertIndex}`
+        `[ProjectStore] 添加草稿字幕: ${subtitleId}, 位置: ${insertIndex}, ` +
+        `display_confidence: ${display_confidence}, confidence: ${confidence}`
       );
     }
 
@@ -658,6 +680,7 @@ export const useProjectStore = defineStore("project", () => {
     const newSubtitleIds = [];
     sentences.forEach((sentence, idx) => {
       const subtitleId = `final-${chunk_id}-${idx}`;
+      // V3.1.2+dev.20260111.01: 包含 display_confidence 和 confidence_source
       const subtitleData = {
         id: subtitleId,
         start: sentence.start,
@@ -668,8 +691,10 @@ export const useProjectStore = defineStore("project", () => {
         isDraft: false, // 定稿
         words: sentence.words || [],
         confidence: sentence.confidence ?? 1.0,
+        display_confidence: sentence.display_confidence,  // V3.1.2: 映射后准确率
+        confidence_source: sentence.confidence_source,    // V3.1.2: 置信度来源
         warning_type: sentence.warning_type || "none",
-        source: "whisper",
+        source: sentence.source || "whisper",
       };
 
       // 按时间顺序插入
@@ -682,7 +707,8 @@ export const useProjectStore = defineStore("project", () => {
     chunkSubtitleMap.value.set(chunk_id, newSubtitleIds);
 
     console.log(
-      `[ProjectStore] 替换 Chunk ${chunk_id}: 添加 ${sentences.length} 个定稿字幕`
+      `[ProjectStore] 替换 Chunk ${chunk_id}: 添加 ${sentences.length} 个定稿字幕, ` +
+      `首条 display_confidence: ${sentences[0]?.display_confidence}`
     );
 
     // 更新双流进度
@@ -735,6 +761,7 @@ export const useProjectStore = defineStore("project", () => {
     sentences.forEach((sentence, idx) => {
       // 使用 restored 前缀标识恢复的字幕
       const subtitleId = `restored-${chunk_id}-${sentence.index ?? idx}`;
+      // V3.1.2+dev.20260111.01: 包含 display_confidence 和 confidence_source
       const subtitleData = {
         id: subtitleId,
         start: sentence.start,
@@ -746,6 +773,8 @@ export const useProjectStore = defineStore("project", () => {
         isRestored: true, // 标记为恢复的字幕
         words: sentence.words || [],
         confidence: sentence.confidence ?? 1.0,
+        display_confidence: sentence.display_confidence,  // V3.1.2: 映射后准确率
+        confidence_source: sentence.confidence_source,    // V3.1.2: 置信度来源
         warning_type: sentence.warning_type || "none",
         source: sentence.source || "restored",
         sentenceIndex: sentence.index,

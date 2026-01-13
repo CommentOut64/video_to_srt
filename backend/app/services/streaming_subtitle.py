@@ -66,12 +66,15 @@ class StreamingSubtitleManager:
         self.sentence_count += 1
 
         # 推送 SSE 事件（使用清洗后的文本）
+        # V3.1.2+dev.20260113.01: fallback 字典补充 display_confidence 和 confidence_source
         sentence_dict = sentence.to_dict() if hasattr(sentence, 'to_dict') else {
             "index": index,
             "text": sentence.text_clean or sentence.text,  # 优先使用清洗后的文本
             "start": sentence.start,
             "end": sentence.end,
             "confidence": sentence.confidence,
+            "display_confidence": getattr(sentence, 'display_confidence', None),  # V3.1.2: 映射后准确率
+            "confidence_source": getattr(sentence, 'confidence_source', None),    # V3.1.2: 置信度来源
             "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),
             "words": [w.to_dict() if hasattr(w, 'to_dict') else w for w in getattr(sentence, 'words', [])]  # 确保包含 words
         }
@@ -96,10 +99,13 @@ class StreamingSubtitleManager:
         new_text: str,
         source: TextSource,
         confidence: float = None,
-        perplexity: float = None
+        perplexity: float = None,
+        confidence_source: str = None  # V3.1.2: 新增，指定置信度来源
     ):
         """
         更新已有句子（Whisper 补刀或 LLM 校对）
+
+        V3.1.2+dev.20260111.01: 新增 confidence_source 参数，用于正确计算 display_confidence
 
         Args:
             index: 句子索引
@@ -107,6 +113,7 @@ class StreamingSubtitleManager:
             source: 文本来源
             confidence: 新置信度（可选）
             perplexity: LLM 困惑度（可选）
+            confidence_source: 置信度来源（可选，如 "whisper"）
         """
         if index not in self.sentences:
             logger.warning(f"句子 {index} 不存在，无法更新")
@@ -118,9 +125,17 @@ class StreamingSubtitleManager:
         from .pseudo_alignment import PseudoAlignment
         PseudoAlignment.apply_to_sentence(sentence, new_text, source)
 
-        # 更新置信度和困惑度
+        # V3.1.2: 更新置信度时，同时更新来源并重新计算 display_confidence
         if confidence is not None:
-            sentence.confidence = confidence
+            # 确定置信度来源：如果没有明确指定，根据 source 推断
+            if confidence_source is None:
+                if source == TextSource.WHISPER_PATCH:
+                    confidence_source = "whisper"
+                else:
+                    confidence_source = source.value
+
+            sentence.update_confidence(confidence, confidence_source)
+
         if perplexity is not None:
             sentence.perplexity = perplexity
             sentence.warning_type = sentence.compute_warning_type()
@@ -310,12 +325,15 @@ class StreamingSubtitleManager:
                 sentence_indices.append(index)
 
                 # V3.8: 收集待推送的句子数据（在锁内准备，锁外推送）
+                # V3.1.2+dev.20260113.01: fallback 字典补充 display_confidence 和 confidence_source
                 sentence_dict = sentence_copy.to_dict() if hasattr(sentence_copy, 'to_dict') else {
                     "index": index,
                     "text": sentence_copy.text_clean or sentence_copy.text,
                     "start": sentence_copy.start,
                     "end": sentence_copy.end,
                     "confidence": sentence_copy.confidence,
+                    "display_confidence": getattr(sentence_copy, 'display_confidence', None),  # V3.1.2: 映射后准确率
+                    "confidence_source": getattr(sentence_copy, 'confidence_source', None),    # V3.1.2: 置信度来源
                     "source": sentence_copy.source.value if hasattr(sentence_copy.source, 'value') else str(sentence_copy.source),
                     "is_draft": True,
                     "words": [w.to_dict() if hasattr(w, 'to_dict') else w for w in getattr(sentence_copy, 'words', [])]
@@ -401,6 +419,7 @@ class StreamingSubtitleManager:
             self.chunk_sentences[chunk_index] = new_indices
 
         # 推送 SSE 事件（批量替换）- 在锁外推送，避免死锁
+        # V3.1.2+dev.20260113.01: fallback 字典补充 display_confidence 和 confidence_source
         sentences_data = [
             sentence.to_dict() if hasattr(sentence, 'to_dict') else {
                 "index": new_indices[i],
@@ -408,6 +427,8 @@ class StreamingSubtitleManager:
                 "start": sentence.start,
                 "end": sentence.end,
                 "confidence": sentence.confidence,
+                "display_confidence": getattr(sentence, 'display_confidence', None),  # V3.1.2: 映射后准确率
+                "confidence_source": getattr(sentence, 'confidence_source', None),    # V3.1.2: 置信度来源
                 "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),
                 "is_draft": False,
                 "is_finalized": True,
@@ -476,12 +497,15 @@ class StreamingSubtitleManager:
                 sentence_indices.append(index)
 
                 # V3.8: 收集待推送的句子数据（在锁内准备，锁外推送）
+                # V3.1.2+dev.20260113.01: fallback 字典补充 display_confidence 和 confidence_source
                 sentence_dict = sentence_copy.to_dict() if hasattr(sentence_copy, 'to_dict') else {
                     "index": index,
                     "text": sentence_copy.text_clean or sentence_copy.text,
                     "start": sentence_copy.start,
                     "end": sentence_copy.end,
                     "confidence": sentence_copy.confidence,
+                    "display_confidence": getattr(sentence_copy, 'display_confidence', None),  # V3.1.2: 映射后准确率
+                    "confidence_source": getattr(sentence_copy, 'confidence_source', None),    # V3.1.2: 置信度来源
                     "source": sentence_copy.source.value if hasattr(sentence_copy.source, 'value') else str(sentence_copy.source),
                     "is_draft": False,
                     "is_finalized": True,
@@ -530,11 +554,14 @@ class StreamingSubtitleManager:
         sentences_snapshot = []
         for idx, sentence in self.sentences.items():
             # 使用 SentenceSegment.to_dict() 序列化
+            # V3.1.2+dev.20260113.01: fallback 字典补充 display_confidence 和 confidence_source
             sentence_dict = sentence.to_dict() if hasattr(sentence, 'to_dict') else {
                 "text": sentence.text_clean or sentence.text,
                 "start": sentence.start,
                 "end": sentence.end,
                 "confidence": sentence.confidence,
+                "display_confidence": getattr(sentence, 'display_confidence', None),  # V3.1.2: 映射后准确率
+                "confidence_source": getattr(sentence, 'confidence_source', None),    # V3.1.2: 置信度来源
                 "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),
             }
             # 添加索引信息
@@ -552,6 +579,8 @@ class StreamingSubtitleManager:
     def restore_from_checkpoint(self, checkpoint_data: dict) -> bool:
         """
         V3.1.0: 从 Checkpoint 恢复字幕状态
+
+        V3.1.2+dev.20260111.01: 恢复时计算 display_confidence（兼容旧数据）
 
         恢复所有已保存的句子，并恢复索引计数器状态。
         恢复后，新添加的句子会从正确的索引继续编号，不会与已有句子冲突。
@@ -583,13 +612,20 @@ class StreamingSubtitleManager:
                 if idx is None:
                     continue
 
+                # V3.1.2: 读取置信度相关字段（兼容旧数据）
+                raw_confidence = sentence_dict.get("confidence", 1.0)
+                display_confidence = sentence_dict.get("display_confidence")  # 可能为 None（旧数据）
+                confidence_source = sentence_dict.get("confidence_source")    # 可能为 None（旧数据）
+
                 # 从字典重建 SentenceSegment
                 sentence = SentenceSegment(
                     text=sentence_dict.get("original_text") or sentence_dict.get("text", ""),
                     text_clean=sentence_dict.get("text", ""),
                     start=sentence_dict.get("start", 0.0),
                     end=sentence_dict.get("end", 0.0),
-                    confidence=sentence_dict.get("confidence", 1.0),
+                    confidence=raw_confidence,
+                    display_confidence=display_confidence,  # V3.1.2: 新增
+                    confidence_source=confidence_source,    # V3.1.2: 新增
                 )
 
                 # 恢复来源
@@ -598,6 +634,13 @@ class StreamingSubtitleManager:
                     sentence.source = TextSource(source_str)
                 except ValueError:
                     sentence.source = TextSource.SENSEVOICE
+
+                # V3.1.2: 如果旧数据没有 display_confidence，立即计算
+                # __post_init__ 已经会自动计算，但这里确保 confidence_source 正确
+                if sentence.confidence_source is None:
+                    sentence.confidence_source = source_str
+                if sentence.display_confidence is None:
+                    sentence._compute_display_confidence()
 
                 # 恢复警告类型
                 warning_str = sentence_dict.get("warning_type", "none")
@@ -620,11 +663,13 @@ class StreamingSubtitleManager:
                 words_data = sentence_dict.get("words", [])
                 sentence.words = []
                 for word_dict in words_data:
+                    # V3.1.2: confidence 可能为 None（Whisper 补刀后的伪对齐）
+                    word_confidence = word_dict.get("confidence")  # 不设置默认值，保持 None
                     word = WordTimestamp(
                         word=word_dict.get("word", ""),
                         start=word_dict.get("start", 0.0),
                         end=word_dict.get("end", 0.0),
-                        confidence=word_dict.get("confidence", 1.0),
+                        confidence=word_confidence,
                         is_pseudo=word_dict.get("is_pseudo", False)
                     )
                     sentence.words.append(word)
@@ -667,11 +712,14 @@ class StreamingSubtitleManager:
             for idx in sentence_indices:
                 if idx in self.sentences:
                     sentence = self.sentences[idx]
+                    # V3.1.2+dev.20260113.01: fallback 字典补充 display_confidence 和 confidence_source
                     sentence_dict = sentence.to_dict() if hasattr(sentence, 'to_dict') else {
                         "text": sentence.text_clean or sentence.text,
                         "start": sentence.start,
                         "end": sentence.end,
                         "confidence": sentence.confidence,
+                        "display_confidence": getattr(sentence, 'display_confidence', None),  # V3.1.2: 映射后准确率
+                        "confidence_source": getattr(sentence, 'confidence_source', None),    # V3.1.2: 置信度来源
                     }
                     sentence_dict["index"] = idx
                     sentence_dict["is_draft"] = getattr(sentence, 'is_draft', False)

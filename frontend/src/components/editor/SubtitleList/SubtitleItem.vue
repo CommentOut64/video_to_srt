@@ -41,9 +41,10 @@
         </span>
 
         <!-- 置信度徽章 -->
+        <!-- V3.1.2+dev.20260111.01: 使用 display_confidence（映射后准确率） -->
         <el-tooltip
           v-if="showConfidenceBadge"
-          :content="`置信度: ${(subtitle.confidence * 100).toFixed(0)}%`"
+          :content="`置信度: ${displayConfidenceText}`"
           placement="top"
           :show-after="500"
         >
@@ -51,7 +52,7 @@
             class="confidence-badge"
             :class="confidenceBadgeClass"
           >
-            {{ (subtitle.confidence * 100).toFixed(0) }}%
+            {{ displayConfidenceText }}
           </span>
         </el-tooltip>
       </div>
@@ -214,15 +215,25 @@ const itemClasses = computed(() => ({
 }))
 
 // 置信度徽章
+// V3.1.2+dev.20260113.01: 草稿字幕也显示准确率（只要有数据）
 const showConfidenceBadge = computed(() => {
-  return props.subtitle.confidence !== undefined && props.subtitle.confidence < 0.9
+  const displayConf = props.subtitle.display_confidence ?? props.subtitle.confidence
+  return displayConf !== undefined && displayConf !== null
 })
 
 const confidenceBadgeClass = computed(() => {
-  const conf = props.subtitle.confidence
-  if (conf >= 0.8) return 'badge-good'
-  if (conf >= 0.6) return 'badge-warning'
+  // V3.1.2: 使用 display_confidence，没有则 fallback 到 confidence
+  const conf = props.subtitle.display_confidence ?? props.subtitle.confidence
+  if (conf >= 0.85) return 'badge-good'
+  if (conf >= 0.68) return 'badge-warning'
   return 'badge-danger'
+})
+
+// V3.1.2: 显示的置信度文本（百分比）
+const displayConfidenceText = computed(() => {
+  const conf = props.subtitle.display_confidence ?? props.subtitle.confidence
+  if (conf === undefined || conf === null) return ''
+  return `${Math.round(conf * 100)}%`
 })
 
 // 警告信息

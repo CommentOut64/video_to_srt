@@ -1091,6 +1091,18 @@ class JobQueueService:
 
             progress_tracker.complete_phase(ProcessPhase.SRT)
 
+            # V3.1.2+dev.20260114.01: 任务完成前持久化字幕快照，供后台转录后显示准确率
+            # 只保存精简版的 sentences_snapshot，避免删除 checkpoint 后丢失 display_confidence
+            if subtitle_manager and job_dir:
+                try:
+                    snapshot_data = subtitle_manager.to_checkpoint_data()
+                    snapshot_path = job_dir / "transcription_text.json"
+                    with open(snapshot_path, "w", encoding="utf-8") as f:
+                        json.dump(snapshot_data, f, ensure_ascii=False, indent=2)
+                    logger.info(f"[V3.1.2] 已保存字幕快照供编辑器复用: {snapshot_path}")
+                except Exception as e:
+                    logger.warning(f"[V3.1.2] 保存字幕快照失败: {e}")
+
             # V3.7: 任务完成，清理检查点
             checkpoint_manager.delete_checkpoint()
             logger.info("[V3.7] 任务完成，检查点已清理")

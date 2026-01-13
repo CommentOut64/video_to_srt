@@ -1134,7 +1134,8 @@ class SentenceSplitter:
                         prev.text_clean = merged_text_clean
                         prev.end = current.end
                         prev.words = merged_words
-                        prev.confidence = avg_confidence
+                        # V3.1.2+dev.20260111.01: 使用 update_confidence 确保 display_confidence 同步更新
+                        prev.update_confidence(avg_confidence)
 
                         logger.info(
                             f"向前合并短句: [{current_duration:.2f}s, {len(current.text)}字符] "

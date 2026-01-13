@@ -85,6 +85,10 @@ class MediaPrepService:
         self._active_processes: Dict[int, subprocess.Popen] = {}
         self._process_lock = threading.Lock()
 
+        # V3.1.2+dev.20260112.01: 进程到 job_id 的映射 { process_id: job_id }
+        # 用于按 job_id 取消特定任务的子进程
+        self._process_job_map: Dict[int, str] = {}
+
         # 启动消费线程
         self.consumer_thread = threading.Thread(
             target=self._consumer_loop,
@@ -493,9 +497,10 @@ class MediaPrepService:
                 stderr=subprocess.DEVNULL,  # 丢弃 stderr，避免缓冲区阻塞
                 creationflags=creationflags
             )
-            
+
             # 注册进程以便在关闭时能够终止
-            self._register_process(process)
+            # V3.1.2: 传入 job_id 用于按任务取消
+            self._register_process(process, job_id)
 
             # 解析进度
             last_logged_progress = 0  # 记录上次日志输出的进度
@@ -668,9 +673,10 @@ class MediaPrepService:
                 stderr=subprocess.DEVNULL,  # 丢弃 stderr，避免缓冲区阻塞
                 creationflags=creationflags
             )
-            
+
             # 注册进程以便在关闭时能够终止
-            self._register_process(process)
+            # V3.1.2: 传入 job_id 用于按任务取消
+            self._register_process(process, job_id)
 
             # 如果队列繁忙，降低 FFmpeg 进程优先级
             if queue_busy:
@@ -1143,9 +1149,10 @@ class MediaPrepService:
                 stderr=subprocess.DEVNULL,  # 丢弃 stderr，避免缓冲区阻塞
                 creationflags=creationflags
             )
-            
+
             # 注册进程以便在关闭时能够终止
-            self._register_process(process)
+            # V3.1.2: 传入 job_id 用于按任务取消
+            self._register_process(process, job_id)
 
             # 解析进度
             try:
@@ -1214,17 +1221,26 @@ class MediaPrepService:
                 "type": "remux"
             })
 
-    def _register_process(self, process: subprocess.Popen):
-        """注册活跃的子进程"""
+    def _register_process(self, process: subprocess.Popen, job_id: str = None):
+        """
+        注册活跃的子进程
+
+        V3.1.2+dev.20260112.01: 新增 job_id 参数，用于按任务取消进程
+        """
         with self._process_lock:
             self._active_processes[process.pid] = process
-            logger.debug(f"[MediaPrep] 注册进程: PID={process.pid}")
+            if job_id:
+                self._process_job_map[process.pid] = job_id
+            logger.debug(f"[MediaPrep] 注册进程: PID={process.pid}, job_id={job_id}")
 
     def _unregister_process(self, process: subprocess.Popen):
         """注销子进程"""
         with self._process_lock:
             if process.pid in self._active_processes:
                 del self._active_processes[process.pid]
+            # V3.1.2: 同时清理 job_id 映射
+            if process.pid in self._process_job_map:
+                del self._process_job_map[process.pid]
                 logger.debug(f"[MediaPrep] 注销进程: PID={process.pid}")
 
     def kill_all_subprocesses(self) -> int:
@@ -1249,6 +1265,62 @@ class MediaPrepService:
                 except Exception as e:
                     logger.warning(f"[MediaPrep] 终止进程失败 PID={pid}: {e}")
             self._active_processes.clear()
+            # V3.1.2: 同时清理 job_id 映射
+            self._process_job_map.clear()
+        return killed_count
+
+    def cancel_tasks(self, job_id: str) -> int:
+        """
+        V3.1.2+dev.20260112.01: 取消指定任务的所有 FFmpeg 子进程
+
+        用于删除任务前终止正在运行的转码进程，避免 WinError 32 文件占用问题。
+
+        Args:
+            job_id: 要取消的任务 ID
+
+        Returns:
+            int: 被终止的进程数
+        """
+        killed_count = 0
+        with self._process_lock:
+            # 找到该 job_id 对应的所有进程
+            pids_to_kill = [
+                pid for pid, jid in self._process_job_map.items()
+                if jid == job_id
+            ]
+
+            for pid in pids_to_kill:
+                process = self._active_processes.get(pid)
+                if process:
+                    try:
+                        if process.poll() is None:  # 进程仍在运行
+                            process.terminate()
+                            try:
+                                process.wait(timeout=3)
+                            except subprocess.TimeoutExpired:
+                                process.kill()  # 强制终止
+                            killed_count += 1
+                            logger.info(f"[MediaPrep] 已终止任务 {job_id} 的进程: PID={pid}")
+                    except Exception as e:
+                        logger.warning(f"[MediaPrep] 终止进程失败 PID={pid}: {e}")
+
+                # 清理映射
+                if pid in self._active_processes:
+                    del self._active_processes[pid]
+                if pid in self._process_job_map:
+                    del self._process_job_map[pid]
+
+        # 取消该任务的 720p 检查定时器
+        timer = self.pending_720p_checks.pop(job_id, None)
+        if timer:
+            timer.cancel()
+            logger.info(f"[MediaPrep] 已取消任务 {job_id} 的 720p 检查定时器")
+
+        # V3.1.2+dev.20260113.01: 移除状态修改逻辑
+        # 原因：MediaPrep 和 TranscriptionService 是独立系统，不应互相修改状态
+        # 只终止进程，不修改任务状态
+        logger.info(f"[MediaPrep] 已终止任务 {job_id} 的 {killed_count} 个进程，不修改任务状态")
+
         return killed_count
 
     def shutdown(self):

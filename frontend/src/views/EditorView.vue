@@ -451,16 +451,28 @@ async function loadProject() {
     projectStore.meta.duration = jobStatus.media_status?.video?.duration || 0
 
     // 2. 尝试从本地存储恢复
+    // V3.1.2+dev.20260112.01: 恢复策略优化
+    // 优先级: memoryCache → SmartSaver → segments API → SRT fallback
     const restored = await projectStore.restoreProject(props.jobId)
     if (restored && projectStore.subtitles.length > 0) {
       console.log('[EditorView] 从本地存储恢复成功')
 
-      // 检查缓存数据是否有 sentenceIndex 字段（新格式）
+      // V3.1.2: 检查缓存数据格式完整性
+      // 必须有 sentenceIndex 字段才能支持 SSE 匹配
       const hasValidFormat = projectStore.subtitles.every(s => s.sentenceIndex !== undefined)
 
-      if (!hasValidFormat && ['processing', 'queued', 'paused'].includes(jobStatus.status)) {
+      // V3.1.2: 检查缓存数据是否有置信度（用于已完成任务的数据完整性）
+      const hasConfidenceData = projectStore.subtitles.some(
+        s => s.display_confidence !== undefined && s.display_confidence !== null
+      )
+
+      if (!hasValidFormat) {
         // 缓存数据是旧格式，需要重新从 API 加载以获取 sentenceIndex
         console.log('[EditorView] 缓存数据格式过旧（缺少 sentenceIndex），重新从 API 加载')
+        await loadTranscribingSegments()
+      } else if (jobStatus.status === 'finished' && !hasConfidenceData) {
+        // V3.1.2: 已完成任务但缓存无置信度数据，尝试从 API 重新加载
+        console.log('[EditorView] 已完成任务缓存无置信度数据，尝试从 API 补充')
         await loadTranscribingSegments()
       }
 
@@ -483,8 +495,14 @@ async function loadProject() {
     }
 
     // 3. 根据任务状态从后端加载字幕数据
+    // V3.1.2+dev.20260111.02: 优先从 segments API 加载（含置信度），fallback 到 SRT
     if (jobStatus.status === 'finished') {
-      await loadCompletedSRT()
+      await loadTranscribingSegments()
+      // 如果 segments API 无数据，fallback 到 SRT
+      if (projectStore.subtitles.length === 0) {
+        console.log('[EditorView] segments API 无数据，尝试从 SRT 加载')
+        await loadFromSRT()
+      }
       // useProxyVideo会自动检查视频状态
     } else if (['processing', 'queued'].includes(jobStatus.status)) {
       await loadTranscribingSegments()
@@ -526,23 +544,6 @@ async function loadProject() {
   }
 }
 
-// 加载已完成的 SRT 文件
-async function loadCompletedSRT() {
-  try {
-    const srtData = await mediaApi.getSRTContent(props.jobId)
-    projectStore.importSRT(srtData.content, {
-      jobId: props.jobId,
-      filename: srtData.filename || projectStore.meta.filename,
-      duration: projectStore.meta.duration,
-      videoPath: projectStore.meta.videoPath,
-      audioPath: projectStore.meta.audioPath
-    })
-  } catch (error) {
-    console.warn('[EditorView] 加载 SRT 失败，尝试加载 segments:', error)
-    await loadTranscribingSegments()
-  }
-}
-
 // 加载转录中的 segments
 async function loadTranscribingSegments() {
   try {
@@ -569,6 +570,25 @@ async function loadTranscribingSegments() {
     }
   } catch (error) {
     console.warn('[EditorView] 加载转录文字失败:', error)
+  }
+}
+
+// V3.1.2: 从 SRT 文件加载（fallback，无置信度数据）
+async function loadFromSRT() {
+  try {
+    const srtData = await mediaApi.getSRTContent(props.jobId)
+    if (srtData.content) {
+      projectStore.importSRT(srtData.content, {
+        jobId: props.jobId,
+        filename: srtData.filename || projectStore.meta.filename,
+        duration: projectStore.meta.duration,
+        videoPath: projectStore.meta.videoPath,
+        audioPath: projectStore.meta.audioPath
+      })
+      console.log('[EditorView] 从 SRT 文件恢复成功（无置信度数据）')
+    }
+  } catch (error) {
+    console.warn('[EditorView] 从 SRT 加载失败:', error)
   }
 }
 
@@ -627,7 +647,29 @@ function subscribeSSE() {
       console.log('[EditorView] 任务完成:', data)
       progressStore.markStatus(props.jobId, 'finished', { percent: 100, phase: 'complete' })
       taskStore.updateTaskStatus(props.jobId, 'finished')
-      await loadCompletedSRT()
+
+      // V3.1.2+dev.20260111.02: 任务完成处理
+      // 优先保留 SSE 推送的字幕（含置信度），无数据时从 API 加载
+      if (projectStore.subtitles.length === 0) {
+        console.log('[EditorView] 无字幕数据（可能断线），尝试恢复...')
+        // 先尝试从 segments API 加载（含置信度）
+        await loadTranscribingSegments()
+
+        // 如果还是没有数据，从 SRT 文件加载（无置信度，但至少有字幕）
+        if (projectStore.subtitles.length === 0) {
+          console.log('[EditorView] segments API 无数据，尝试从 SRT 恢复')
+          await loadFromSRT()
+        }
+      } else {
+        console.log(`[EditorView] 保留 SSE 推送的 ${projectStore.subtitles.length} 条字幕（含置信度）`)
+        // 将所有草稿标记为定稿
+        projectStore.subtitles.forEach(sub => {
+          if (sub.isDraft) {
+            sub.isDraft = false
+          }
+        })
+      }
+
       stopProgressPolling()
       // 任务完成后关闭SSE连接
       cleanupSSE()
@@ -673,11 +715,16 @@ function subscribeSSE() {
       refreshTaskProgress()
     },
 
-    // 新增：SenseVoice 流式字幕事件
+    // V3.1.2+dev.20260113.01: 恢复 onSubtitleUpdate 回调
+    // 原因：专用处理器（onDraft等）处理新架构事件，onSubtitleUpdate 处理旧架构事件
+    // 两者互补，不会冲突
     onSubtitleUpdate(data) {
-      console.log('[EditorView] 收到字幕更新:', data)
-      // 处理流式字幕更新（SenseVoice/Whisper补刀/LLM校对翻译等）
-      handleStreamingSubtitle(data)
+      // 只处理旧架构的字幕事件（sv_sentence, whisper_patch, llm_proof 等）
+      // 新架构事件（draft, replace_chunk）由专用处理器处理
+      if (data.sentence || data.sentence_index !== undefined) {
+        console.log('[EditorView] 收到旧架构字幕更新:', data)
+        handleStreamingSubtitle(data)
+      }
     },
 
     // Phase 5: 草稿字幕事件（快流/SenseVoice）
@@ -769,7 +816,10 @@ function cleanupSSE() {
   }
 }
 
-// 处理流式字幕更新
+// 处理流式字幕更新（旧版兼容，已弃用）
+// V3.1.2+dev.20260112.01: 此函数已弃用，保留仅供旧版 SSE 事件兼容
+// 新架构使用专用处理器：handleDraftSubtitle、handleReplaceChunk 等
+// eslint-disable-next-line no-unused-vars
 function handleStreamingSubtitle(data) {
   if (!data) return
 
@@ -782,6 +832,10 @@ function handleStreamingSubtitle(data) {
   const end = sentence.end ?? data.end_time ?? data.end
   const warningType = sentence.warning_type ?? data.warning_type ?? 'none'
   const source = data.source ?? data.event_type ?? 'unknown'
+  // V3.1.2+dev.20260111.01: 提取 display_confidence 和 confidence_source
+  const confidence = sentence.confidence ?? data.confidence
+  const displayConfidence = sentence.display_confidence ?? data.display_confidence
+  const confidenceSource = sentence.confidence_source ?? data.confidence_source
 
   if (sentenceIndex === undefined || !text) {
     console.warn('[EditorView] 无效的字幕数据:', data)
@@ -796,23 +850,29 @@ function handleStreamingSubtitle(data) {
     s => s.sentenceIndex === sentenceIndex
   )
 
+  // V3.1.2+dev.20260112.01: 包含 display_confidence 和 confidence_source
   const subtitleData = {
-    id: `sv_${sentenceIndex}`,
     sentenceIndex,
     text,
     start: start ?? 0,
     end: end ?? 0,
+    confidence,
+    display_confidence: displayConfidence,
+    confidence_source: confidenceSource,
     warning_type: warningType,
     source
   }
 
   if (existingIndex >= 0) {
-    // 更新已有字幕
-    projectStore.updateSubtitle(existingIndex, subtitleData)
+    // V3.1.2+dev.20260112.01: 修复 - 传入正确的 id 而非索引
+    const existingId = projectStore.subtitles[existingIndex].id
+    projectStore.updateSubtitle(existingId, subtitleData)
   } else {
     // 添加新字幕 - 按时间顺序找到插入位置
     const insertIndex = projectStore.subtitles.findIndex(s => s.start > (start ?? 0))
     const finalIndex = insertIndex === -1 ? projectStore.subtitles.length : insertIndex
+    // V3.1.2: 添加 id 字段给新字幕
+    subtitleData.id = `sv_${sentenceIndex}`
     projectStore.addSubtitle(finalIndex, subtitleData)
   }
 
@@ -836,13 +896,15 @@ function handleDraftSubtitle(data) {
     return
   }
 
-  // 构建 sentenceData，匹配 projectStore.appendOrUpdateDraft 的参数格式
+  // V3.1.2+dev.20260111.01: 构建 sentenceData，包含 display_confidence
   const sentenceData = {
     index: sentenceIndex,
     text: sentence.text || '',
     start: sentence.start ?? 0,
     end: sentence.end ?? 0,
     confidence: sentence.confidence ?? 0.8,
+    display_confidence: sentence.display_confidence,  // V3.1.2: 映射后准确率
+    confidence_source: sentence.confidence_source,    // V3.1.2: 置信度来源
     words: sentence.words || [],
     warning_type: sentence.warning_type || 'none'
   }
@@ -861,13 +923,15 @@ function handleReplaceChunk(data) {
   const chunkIndex = data.chunk_index
   const sentences = Array.isArray(data.sentences) ? data.sentences : []
 
-  // 转换为 projectStore 需要的格式
+  // V3.1.2+dev.20260111.01: 转换为 projectStore 需要的格式，包含 display_confidence
   const formattedSentences = sentences.map((sentence, idx) => ({
     index: data.new_indices?.[idx] ?? idx,
     text: sentence.text || '',
     start: sentence.start ?? 0,
     end: sentence.end ?? 0,
     confidence: sentence.confidence ?? 1.0,
+    display_confidence: sentence.display_confidence,  // V3.1.2: 映射后准确率
+    confidence_source: sentence.confidence_source,    // V3.1.2: 置信度来源
     words: sentence.words || [],
     warning_type: sentence.warning_type || 'none',
     source: sentence.source || 'whisper'
@@ -894,13 +958,15 @@ function handleRestoredChunk(data) {
     return
   }
 
-  // 转换为 projectStore 需要的格式
+  // V3.1.2+dev.20260111.01: 转换为 projectStore 需要的格式，包含 display_confidence
   const formattedSentences = sentences.map((sentence, idx) => ({
     index: sentence.index ?? idx,
     text: sentence.text || '',
     start: sentence.start ?? 0,
     end: sentence.end ?? 0,
     confidence: sentence.confidence ?? 1.0,
+    display_confidence: sentence.display_confidence,  // V3.1.2: 映射后准确率
+    confidence_source: sentence.confidence_source,    // V3.1.2: 置信度来源
     words: sentence.words || [],
     warning_type: sentence.warning_type || 'none',
     source: sentence.source || 'restored',
@@ -925,25 +991,15 @@ function handleFinalizedSubtitle(data) {
   const sentence = data.sentence || {}
   const chunkIndex = data.chunk_index
 
-  // 格式化为单个句子的数组，复用 replaceChunk 逻辑
-  const formattedSentences = [{
-    index: data.index ?? 0,
-    text: sentence.text || '',
-    start: sentence.start ?? 0,
-    end: sentence.end ?? 0,
-    confidence: sentence.confidence ?? 1.0,
-    words: sentence.words || [],
-    warning_type: sentence.warning_type || 'none',
-    source: sentence.source || 'sensevoice'
-  }]
-
-  // 极速模式下使用 appendOrUpdateDraft，但标记为定稿
+  // V3.1.2+dev.20260111.01: 构建 sentenceData，包含 display_confidence
   const sentenceData = {
     index: data.index ?? 0,
     text: sentence.text || '',
     start: sentence.start ?? 0,
     end: sentence.end ?? 0,
     confidence: sentence.confidence ?? 1.0,
+    display_confidence: sentence.display_confidence,  // V3.1.2: 映射后准确率
+    confidence_source: sentence.confidence_source,    // V3.1.2: 置信度来源
     words: sentence.words || [],
     warning_type: sentence.warning_type || 'none'
   }
