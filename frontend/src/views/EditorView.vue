@@ -260,6 +260,7 @@ const dualStreamProgress = computed(() => {
 })
 let sseUnsubscribe = null
 let progressPollTimer = null
+let proxyPollTimer = null
 
 // Provide 编辑器上下文
 // ========== Provide 上下文 ==========
@@ -450,6 +451,13 @@ async function loadProject() {
     projectStore.meta.audioPath = mediaApi.getAudioUrl(props.jobId)
     projectStore.meta.duration = jobStatus.media_status?.video?.duration || 0
 
+    // 先尝试同步 Proxy 状态（便于决定是否需要订阅 SSE）
+    try {
+      await proxyVideo.refresh()
+    } catch (e) {
+      console.warn('[EditorView] 刷新 Proxy 状态失败（初始阶段，忽略）:', e)
+    }
+
     // 2. 尝试从本地存储恢复
     // V3.1.2+dev.20260112.01: 恢复策略优化
     // 优先级: memoryCache → SmartSaver → segments API → SRT fallback
@@ -481,15 +489,22 @@ async function loadProject() {
         console.log('[EditorView] 任务仍在处理中，需要订阅SSE')
         subscribeSSE()
         startProgressPolling()
+        startProxyPolling()
       } else if (jobStatus.status === 'paused') {
         // 暂停状态也需要订阅SSE，以便接收恢复信号
         console.log('[EditorView] 任务已暂停，订阅SSE以接收恢复信号')
         subscribeSSE()
         // V3.1.0: 暂停状态下立即刷新一次进度，不等待 SSE 连接
         refreshTaskProgress()
+        startProxyPolling()
       } else if (jobStatus.status === 'finished') {
         // 任务已完成，useProxyVideo会自动处理视频转码状态
         console.log('[EditorView] 本地恢复后任务已完成，useProxyVideo将自动检查视频转码状态')
+        // 若视频尚未就绪（如720p仍在生成），继续订阅 SSE 以接收 proxy/remux 事件
+        if (!proxyVideo.isReady.value) {
+          subscribeSSE()
+          startProxyPolling()
+        }
       }
       return
     }
@@ -503,12 +518,17 @@ async function loadProject() {
         console.log('[EditorView] segments API 无数据，尝试从 SRT 加载')
         await loadFromSRT()
       }
-      // useProxyVideo会自动检查视频状态
+      // 转录已完成，但可能仍在转码，若未就绪则订阅 SSE + 轮询
+      if (!proxyVideo.isReady.value) {
+        subscribeSSE()
+        startProxyPolling()
+      }
     } else if (['processing', 'queued'].includes(jobStatus.status)) {
       await loadTranscribingSegments()
       // 订阅SSE获取实时更新
       subscribeSSE()
       startProgressPolling()
+      startProxyPolling()
     } else if (jobStatus.status === 'paused') {
       // 暂停状态：加载已有的 segments，并订阅 SSE 以便接收恢复信号
       await loadTranscribingSegments()
@@ -516,9 +536,11 @@ async function loadProject() {
       subscribeSSE()
       // V3.1.0: 暂停状态下立即刷新一次进度，不等待 SSE 连接
       refreshTaskProgress()
+      startProxyPolling()
     } else if (jobStatus.status === 'created') {
       // 任务刚创建，订阅SSE等待开始
       subscribeSSE()
+      startProxyPolling()
     } else if (jobStatus.status === 'failed') {
       await loadTranscribingSegments()
     }
@@ -628,6 +650,21 @@ function subscribeSSE() {
     onInitialState(data) {
       console.log('[EditorView] SSE 初始状态:', data)
       progressStore.applySnapshot(props.jobId, data, 'sse_init')
+      // 如果附带 Proxy 状态，直接应用到 proxyVideo，避免断线后进度丢失
+      if (data.proxy) {
+        console.log('[EditorView] 同步初始 Proxy 状态:', data.proxy)
+        proxyVideo.applySnapshot(data.proxy)
+      }
+    },
+
+    // 新增：被服务器踢出时提示用户并停止当前窗口的 SSE
+    force_disconnect(data) {
+      const reason = data?.reason || '该任务已在其他窗口打开，当前窗口的 SSE 已断开'
+      console.warn('[EditorView] 收到强制断开:', reason)
+      taskStore.updateTaskSSEStatus(props.jobId, false, reason)
+      cleanupSSE()
+      // 简单弹窗提示用户（后续可替换为全局提示组件）
+      alert(reason)
     },
 
     onProgress(data) {
@@ -671,6 +708,7 @@ function subscribeSSE() {
       }
 
       stopProgressPolling()
+      startProxyPolling()
       // 任务完成后关闭SSE连接
       cleanupSSE()
     },
@@ -711,8 +749,17 @@ function subscribeSSE() {
     onConnected() {
       console.log('[EditorView] SSE 连接成功')
       taskStore.updateTaskSSEStatus(props.jobId, true)
+      taskStore.updateSSEHeartbeat()
       // 连接成功后，主动刷新一次进度状态
       refreshTaskProgress()
+      // 同步刷新 Proxy/预览状态，兜底断线期间的转码进度
+      proxyVideo.refresh()
+      startProxyPolling()
+    },
+
+    onPing() {
+      // 心跳同步到全局，避免误判超时
+      taskStore.updateSSEHeartbeat()
     },
 
     // V3.1.2+dev.20260113.01: 恢复 onSubtitleUpdate 回调
@@ -1062,6 +1109,11 @@ function startProgressPolling() {
         },
         'http_poll'
       )
+
+      // SSE 断连期间，若 Proxy 仍在处理或未就绪，顺便刷新视频转码状态
+      if (proxyVideo.isTranscoding.value || !proxyVideo.isReady.value) {
+        await proxyVideo.refresh()
+      }
     } catch (e) {
       console.warn('[EditorView] 轮询刷新失败:', e)
     }
@@ -1072,6 +1124,36 @@ function stopProgressPolling() {
   if (progressPollTimer) {
     clearInterval(progressPollTimer)
     progressPollTimer = null
+  }
+}
+
+// Proxy 状态兜底轮询（独立于转录进度）
+async function pollProxyOnce() {
+  try {
+    const status = await mediaApi.getProxyStatus(props.jobId)
+    proxyVideo.applySnapshot(status.data || status)
+    // 就绪或报错则停止轮询
+    if (proxyVideo.isReady.value || proxyVideo.hasError?.value) {
+      stopProxyPolling()
+    }
+  } catch (e) {
+    console.warn('[EditorView] Proxy 状态轮询失败:', e)
+  }
+}
+
+function startProxyPolling() {
+  stopProxyPolling()
+  // 已就绪则不轮询
+  if (proxyVideo.isReady.value) return
+  proxyPollTimer = setInterval(pollProxyOnce, 10000)
+  // 立即跑一次，加快恢复
+  pollProxyOnce()
+}
+
+function stopProxyPolling() {
+  if (proxyPollTimer) {
+    clearInterval(proxyPollTimer)
+    proxyPollTimer = null
   }
 }
 
@@ -1464,6 +1546,7 @@ onUnmounted(() => {
 
   // 停止轮询（轮询仅是备用方案）
   stopProgressPolling()
+  stopProxyPolling()
 })
 
 onBeforeRouteLeave(async (to, from) => {

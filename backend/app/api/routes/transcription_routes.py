@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 import json
 
+from app.core.config import config
 from app.models.job_models import (
     JobSettings, JobState, DemucsSettings, SenseVoiceSettings,
     PreprocessingConfig, TranscriptionConfig, RefinementConfig, ComputeConfig
@@ -24,6 +25,8 @@ from app.services.transcription_service import TranscriptionService
 from app.services.file_service import FileManagementService
 from app.services.sse_service import get_sse_manager
 from app.services.job_queue_service import get_queue_service
+from app.services.media_prep_service import get_media_prep_service
+from app.api.routes.media_routes import _find_video_file
 
 
 # ========== v3.5 新版 API 模型 ==========
@@ -202,6 +205,51 @@ def create_transcription_router(
         # 定义初始状态回调 - 连接时立即发送当前状态
         def get_initial_state():
             current_job = transcription_service.get_job(job_id)
+
+            def _build_proxy_state():
+                job_dir = config.JOBS_DIR / job_id
+                preview_360p = job_dir / "preview_360p.mp4"
+                proxy_720p = job_dir / "proxy_720p.mp4"
+                remux_video = job_dir / "remux.mp4"
+                source_video = _find_video_file(job_dir) if job_dir.exists() else None
+
+                urls = {
+                    "360p": f"/api/media/{job_id}/video/preview" if preview_360p.exists() else None,
+                    "720p": f"/api/media/{job_id}/video" if (proxy_720p.exists() or remux_video.exists()) else None,
+                    "source": f"/api/media/{job_id}/video" if source_video else None
+                }
+
+                media_prep = get_media_prep_service()
+                task_status = media_prep.get_full_task_status(job_id) if media_prep else None
+
+                state = "idle"
+                progress = 0
+                error = None
+                decision = task_status.get("decision") if task_status else None
+
+                if task_status:
+                    state = task_status.get("state", state)
+                    progress = task_status.get("progress", progress)
+                    error = task_status.get("error")
+                else:
+                    if proxy_720p.exists() or remux_video.exists():
+                        state = "ready_720p"
+                        progress = 100
+                    elif preview_360p.exists():
+                        state = "ready_360p"
+                        progress = 100
+                    elif source_video:
+                        state = "direct_play"
+                        progress = 100
+
+                return {
+                    "state": state,
+                    "progress": progress,
+                    "decision": decision,
+                    "urls": urls,
+                    "error": error
+                }
+
             if current_job:
                 return {
                     "job_id": current_job.job_id,
@@ -211,7 +259,9 @@ def create_transcription_router(
                     "status": current_job.status,
                     "processed": current_job.processed,
                     "total": current_job.total,
-                    "language": current_job.language or ""
+                    "language": current_job.language or "",
+                    # 追加当前 Proxy/预览状态，断线重连时立即同步
+                    "proxy": _build_proxy_state()
                 }
             return None
 

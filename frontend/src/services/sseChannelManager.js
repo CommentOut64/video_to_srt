@@ -393,10 +393,20 @@ class SSEChannelManager extends EventEmitter {
     }
 
     // 保存配置
-    this.channelConfigs.set(channelId, { url, eventHandlers })
+    // 追加默认的强制断开处理（后端踢掉旧连接时触发），避免悬挂连接
+    const mergedHandlers = { ...eventHandlers }
+    if (!mergedHandlers.force_disconnect) {
+      mergedHandlers.force_disconnect = (data) => {
+        console.warn(`[SSE ${channelId}] 收到服务器强制断开:`, data?.reason)
+        this.unsubscribe(channelId)
+      }
+    }
+
+    // 保存配置（使用合并后的处理器，确保重连也能接收强制断开事件）
+    this.channelConfigs.set(channelId, { url, eventHandlers: mergedHandlers })
 
     // 创建连接
-    this._createConnection(channelId, url, eventHandlers)
+    this._createConnection(channelId, url, mergedHandlers)
 
     // 返回取消订阅函数
     return () => this._requestUnsubscribe(channelId)
@@ -516,9 +526,9 @@ class SSEChannelManager extends EventEmitter {
               }
             })
         } else {
-          // 其他频道或readyState不是CLOSED，正常重连
-          if (readyState === EventSource.CLOSED) {
-            console.warn(`[SSE ${channelId}] 连接已关闭，尝试重连`)
+          // 其他频道或 readyState 不是 CLOSED：也尝试重连，防止悬挂
+          if (readyState === EventSource.CLOSED || readyState === EventSource.CONNECTING || readyState === EventSource.OPEN) {
+            console.warn(`[SSE ${channelId}] 连接异常（state=${readyState}），尝试重连`)
             this._scheduleReconnect(channelId)
           }
         }
@@ -544,7 +554,7 @@ class SSEChannelManager extends EventEmitter {
     // 获取重连状态
     let reconnectInfo = this.reconnectState.get(channelId)
     if (!reconnectInfo) {
-      reconnectInfo = { attempts: 0, timer: null }
+      reconnectInfo = { attempts: 0, timer: null, firstAttemptAt: Date.now() }
       this.reconnectState.set(channelId, reconnectInfo)
     }
 
@@ -555,11 +565,11 @@ class SSEChannelManager extends EventEmitter {
 
     reconnectInfo.attempts++
 
-    // 最大重连次数限制（防止任务不存在时无限重连）
-    const MAX_RECONNECT_ATTEMPTS = 5
-    if (reconnectInfo.attempts > MAX_RECONNECT_ATTEMPTS) {
-      console.warn(`[SSE ${channelId}] 已达到最大重连次数 (${MAX_RECONNECT_ATTEMPTS})，停止重连`)
-      // 清理资源
+    // 累计重连时长限制：超过 24h 停止自动重连，避免无意义占用
+    const MAX_RECONNECT_WINDOW = 24 * 60 * 60 * 1000
+    const elapsed = Date.now() - (reconnectInfo.firstAttemptAt || Date.now())
+    if (elapsed >= MAX_RECONNECT_WINDOW) {
+      console.warn(`[SSE ${channelId}] 累计重连超过 24h，停止自动重连`)
       this.channels.delete(channelId)
       this.channelConfigs.delete(channelId)
       this.reconnectState.delete(channelId)
@@ -569,7 +579,7 @@ class SSEChannelManager extends EventEmitter {
     // 计算重连延迟（指数退避，最大 30 秒）
     const delay = Math.min(1000 * Math.pow(2, reconnectInfo.attempts - 1), 30000)
 
-    console.log(`[SSE ${channelId}] ${delay}ms 后尝试第 ${reconnectInfo.attempts}/${MAX_RECONNECT_ATTEMPTS} 次重连`)
+    console.log(`[SSE ${channelId}] ${delay}ms 后尝试第 ${reconnectInfo.attempts} 次重连`)
 
     reconnectInfo.timer = setTimeout(() => {
       // 先关闭旧连接
