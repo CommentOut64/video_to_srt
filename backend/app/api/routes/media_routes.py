@@ -613,8 +613,19 @@ async def get_video(job_id: str, request: Request):
     remux_video = job_dir / "remux.mp4"
     preview_360p = job_dir / "preview_360p.mp4"
 
-    if proxy_720p.exists():
-        logger.debug(f"[media] 返回720p高清视频")
+    # V3.1.2+dev.20260114.08: 仅在调度器/状态标记 ready 时返回720p，避免未落盘即切换
+    from app.services.proxy_720_scheduler import get_proxy_scheduler
+    scheduler_state = get_proxy_scheduler().get_state(job_id)
+    proxy_status_ready = False
+    try:
+        from app.services.media_prep_service import get_media_prep_service
+        proxy_status = get_media_prep_service().get_proxy_status(job_id)
+        proxy_status_ready = proxy_status and proxy_status.get("status") == "completed"
+    except Exception:
+        proxy_status_ready = False
+
+    if proxy_720p.exists() and (scheduler_state.get("state") == "ready" or proxy_status_ready):
+        logger.debug(f"[media] 返回720p高清视频（已就绪）")
         return _serve_file_with_range(proxy_720p, request, 'video/mp4', job_id=job_id)
 
     if remux_video.exists():
@@ -868,9 +879,10 @@ async def check_proxy_status(job_id: str):
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
 
-    # 从 MediaPrepService 获取任务状态
-from app.services.media_prep_service import get_media_prep_service, TranscodeDecision
-from app.services.proxy_720_scheduler import get_proxy_scheduler  # V3.1.2+dev.20260114.06: 统一720p调度
+    # V3.1.2+dev.20260114.06: 获取任务状态（缩进修复）
+    from app.services.media_prep_service import get_media_prep_service, TranscodeDecision
+    from app.services.proxy_720_scheduler import get_proxy_scheduler  # 统一720p调度
+
     media_prep = get_media_prep_service()
     task_status = media_prep.get_full_task_status(job_id)
 
@@ -886,9 +898,11 @@ from app.services.proxy_720_scheduler import get_proxy_scheduler  # V3.1.2+dev.2
         "source": f"/api/media/{job_id}/video" if source_video else None
     }
 
+    # V3.1.2+dev.20260114.06: 读取调度器状态（用于版本/状态一致性）
+    scheduler_state = get_proxy_scheduler().get_state(job_id)
+
     # 如果没有任务状态，根据文件存在性和调度器状态推断
     if not task_status:
-        scheduler_state = get_proxy_scheduler().get_state(job_id)
         scheduler_state_name = scheduler_state.get("state")
 
         if proxy_720p.exists() or remux_video.exists():
@@ -943,7 +957,8 @@ from app.services.proxy_720_scheduler import get_proxy_scheduler  # V3.1.2+dev.2
             "error": None,
             "started_at": None,
             "estimated_remaining": None,
-            "auto_trigger_720p": config.PROXY_CONFIG.get('auto_trigger_720p', True)
+            "auto_trigger_720p": config.PROXY_CONFIG.get('auto_trigger_720p', True),
+            "version": scheduler_state.get("version")
         })
 
     # 【新增】检查360p是否需要重试（处理意外关闭的情况）
@@ -977,7 +992,8 @@ from app.services.proxy_720_scheduler import get_proxy_scheduler  # V3.1.2+dev.2
         "error": task_status.get("error"),
         "started_at": task_status.get("started_at"),
         "estimated_remaining": task_status.get("estimated_remaining"),
-        "auto_trigger_720p": config.PROXY_CONFIG.get('auto_trigger_720p', True)
+        "auto_trigger_720p": config.PROXY_CONFIG.get('auto_trigger_720p', True),
+        "version": scheduler_state.get("version")
     })
 
 

@@ -55,11 +55,14 @@
             :upgrade-progress="proxyVideo.progress.value"
             :proxy-state="proxyVideo.state.value"
             :proxy-error="proxyVideo.error.value"
+            :auto-trigger-720p="proxyVideo.autoTrigger720p.value"
             @loaded="handleVideoLoaded"
             @error="handleVideoError"
             @check-status="handleCheckVideoStatus"
             @resolution-change="handleResolutionChange"
             @retry="proxyVideo.retry"
+            @upgrade-started="handleUpgradeStarted"
+            @upgrade-failed="handleUpgradeFailed"
           />
         </div>
 
@@ -199,6 +202,7 @@ import { useShortcuts } from '@/hooks/useShortcuts'
 import { useProxyVideo } from '@/composables/useProxyVideo'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { repairSubtitleOverlaps } from '@/utils/subtitleUtils'
+import { ElMessage } from 'element-plus'
 
 // 组件导入
 import EditorHeader from '@/components/editor/EditorHeader.vue'
@@ -709,8 +713,9 @@ function subscribeSSE() {
 
       stopProgressPolling()
       startProxyPolling()
-      // 任务完成后关闭SSE连接
-      cleanupSSE()
+      // V3.1.2+dev.20260113.04: 不关闭SSE连接，保持接收Proxy转码事件
+      // 转录任务完成后，720p转码可能还在进行，需要继续接收 proxy_complete 事件
+      // cleanupSSE()
     },
 
     onFailed(data) {
@@ -1364,6 +1369,21 @@ function handleVideoLoaded(duration) {
 
 function handleVideoError(error) {
   console.error('视频加载错误:', error)
+}
+
+// V3.1.2+dev.20260113.01: 处理720p升级失败
+function handleUpgradeFailed(message) {
+  console.error('[EditorView] 720p升级失败:', message)
+  ElMessage.error(message || '有任务/转码正在运行，请稍后再试')
+}
+
+// V3.1.2+dev.20260113.02: 处理720p升级开始
+function handleUpgradeStarted() {
+  console.log('[EditorView] 720p后台转码已启动')
+  ElMessage.success({
+    message: '后台转码已开始，完成后将自动替换',
+    duration: 5000
+  })
 }
 
 async function handleCheckVideoStatus() {

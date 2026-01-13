@@ -117,6 +117,9 @@ class JobQueueService:
         # [V3.7] 取消令牌注册表
         self.cancellation_tokens: Dict[str, CancellationToken] = {}
 
+        # V3.1.2+dev.20260114.09: 720p 调度空闲通知延迟定时器
+        self._pending_proxy_idle_timer: Optional[threading.Timer] = None
+
         # [V3.1.0] 取消超时保障机制
         # 用于确保取消操作最终生效，防止任务卡死导致队列阻塞
         self._pending_cancel_requests: Dict[str, float] = {}  # {job_id: cancel_request_time}
@@ -1210,13 +1213,28 @@ class JobQueueService:
         3. 触发720p转码
         """
         # V3.1.2+dev.20260114.04: 队列空闲时直接通知调度器，由调度器选择待触发任务
+        # V3.1.2+dev.20260114.09: 队列空闲后延迟10秒再触发，给用户启动新任务的机会
         try:
-            from app.services.proxy_720_scheduler import get_proxy_scheduler
+            # 若已有未触发的定时器先取消，保证只保留最新的10秒窗口
+            if self._pending_proxy_idle_timer:
+                self._pending_proxy_idle_timer.cancel()
+                self._pending_proxy_idle_timer = None
 
-            scheduler = get_proxy_scheduler()
-            scheduler.on_queue_idle()
+            def _delayed_notify():
+                try:
+                    from app.services.proxy_720_scheduler import get_proxy_scheduler
+                    scheduler = get_proxy_scheduler()
+                    scheduler.on_queue_idle()
+                except Exception as e:
+                    logger.debug(f"[720p触发] 调度器通知失败（非致命）: {e}")
+                finally:
+                    self._pending_proxy_idle_timer = None
+
+            timer = threading.Timer(10, _delayed_notify)
+            self._pending_proxy_idle_timer = timer
+            timer.start()
         except Exception as e:
-            logger.debug(f\"[720p触发] 调度器通知失败（非致命）: {e}\")
+            logger.debug(f"[720p触发] 延迟触发安排失败（非致命）: {e}")
 
     def _cleanup_resources(self):
         """

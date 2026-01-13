@@ -51,6 +51,8 @@ export function useProxyVideo(jobIdInput) {
   const progress = ref(0)
   const error = ref(null)
   const decision = ref(null)  // 转码决策
+  const autoTrigger720p = ref(true)  // V3.1.2+dev.20260113.02: 是否启用自动触发720p
+  const version = ref(0) // V3.1.2+dev.20260114.08: 状态版本号，避免旧快照覆盖新状态
 
   const urls = ref({
     preview360p: null,
@@ -227,14 +229,19 @@ export function useProxyVideo(jobIdInput) {
       const new720pUrl = data.video_url || `/api/media/${jobId.value}/video`;
 
       console.log("[useProxyVideo] 立即更新720p URL，触发无缝切换");
+      console.log("[useProxyVideo] 更新前 - urls.value.proxy720p:", urls.value.proxy720p);
+
       urls.value.proxy720p = new720pUrl;
       state.value = ProxyState.READY_720P;
       progress.value = 0;
 
-      console.log("[useProxyVideo] 720p URL已更新:", {
+      console.log("[useProxyVideo] 更新后 - urls.value.proxy720p:", urls.value.proxy720p);
+      console.log("[useProxyVideo] 720p URL已更新，完整状态:", {
         proxy720p: urls.value.proxy720p,
         preview360p: urls.value.preview360p,
         state: state.value,
+        currentUrl: currentUrl.value,
+        currentResolution: currentResolution.value
       });
     },
 
@@ -261,13 +268,7 @@ export function useProxyVideo(jobIdInput) {
 
       console.log("[useProxyVideo] 初始化状态:", status);
 
-      // 恢复状态
-      state.value = status.state || ProxyState.IDLE;
-      progress.value = status.progress || 0;
-      decision.value = status.decision || null;
-      error.value = status.error || null;
-
-      // 恢复 URLs
+      // 恢复 URLs（先恢复URL，用于判断是否有可播放视频）
       if (status.urls) {
         urls.value = {
           preview360p: status.urls["360p"] || null,
@@ -275,6 +276,22 @@ export function useProxyVideo(jobIdInput) {
           source: status.urls.source || null,
         };
       }
+
+      // V3.1.2+dev.20260113.03: 静默转码逻辑
+      // 如果后端返回 transcoding_720 但已有360p可用，保持 ready_360p 状态
+      let effectiveState = status.state || ProxyState.IDLE;
+      if (effectiveState === ProxyState.TRANSCODING_720 && urls.value.preview360p) {
+        console.log("[useProxyVideo] 720p正在后台转码，保持360p就绪状态（静默转码）");
+        effectiveState = ProxyState.READY_360P;
+      }
+
+      // 恢复状态
+      state.value = effectiveState;
+      progress.value = status.progress || 0;
+      decision.value = status.decision || null;
+      error.value = status.error || null;
+      autoTrigger720p.value = status.auto_trigger_720p !== undefined ? status.auto_trigger_720p : true;
+      version.value = status.version !== undefined ? status.version : version.value;
 
       // 注意：不在这里订阅 SSE，由外部统一订阅并转发事件到 handlers
     } catch (e) {
@@ -419,6 +436,7 @@ export function useProxyVideo(jobIdInput) {
     error,
     decision,
     urls,
+    autoTrigger720p,  // V3.1.2+dev.20260113.02: 自动触发720p配置
 
     // 计算属性
     isReady,
@@ -438,7 +456,14 @@ export function useProxyVideo(jobIdInput) {
     // 从后端快照直接同步当前状态（SSE initial_state/HTTP 兜底）
     applySnapshot(proxyState) {
       if (!proxyState) return;
-      // 简单直接覆盖，保持与后端状态一致
+      // V3.1.2+dev.20260114.08: 防止旧快照覆盖新状态（版本递增）
+      if (proxyState.version !== undefined && version.value !== 0 && proxyState.version < version.value) {
+        console.log("[useProxyVideo] 忽略过期的状态快照", { incoming: proxyState.version, current: version.value });
+        return;
+      }
+      if (proxyState.version !== undefined) {
+        version.value = proxyState.version;
+      }
       state.value = proxyState.state || state.value;
       progress.value = proxyState.progress ?? progress.value;
       decision.value = proxyState.decision || decision.value;
