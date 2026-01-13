@@ -50,7 +50,18 @@ def _find_video_file(job_dir: Path) -> Optional[Path]:
     return None
 
 
-def _serve_file_with_range(file_path: Path, request: Request, media_type: str):
+from app.services.media_stream_tracker import (
+    register_stream,
+    unregister_stream,
+)
+
+
+def _serve_file_with_range(
+    file_path: Path,
+    request: Request,
+    media_type: str,
+    job_id: str = None
+):
     """
     支持HTTP Range请求的文件流式传输（允许拖拽进度条）
     """
@@ -60,12 +71,40 @@ def _serve_file_with_range(file_path: Path, request: Request, media_type: str):
     file_size = file_path.stat().st_size
     range_header = request.headers.get("range")
 
+    # 注册占用，确保删除逻辑可感知活跃流
+    registered = False
+    if job_id:
+        try:
+            register_stream(job_id)
+            registered = True
+        except Exception:
+            # 追踪失败不影响读取
+            registered = False
+
+    def finalize():
+        if registered and job_id:
+            unregister_stream(job_id)
+
+    def full_file_iterator():
+        try:
+            with open(file_path, "rb") as f:
+                while True:
+                    data = f.read(256 * 1024)
+                    if not data:
+                        break
+                    yield data
+        finally:
+            finalize()
+
     if not range_header:
-        # 无Range请求，返回完整文件
-        return FileResponse(
-            path=str(file_path),
+        # 无Range请求，改用流式响应以便在结束时释放占用
+        return StreamingResponse(
+            full_file_iterator(),
             media_type=media_type,
-            filename=file_path.name
+            headers={
+                "Content-Length": str(file_size),
+                "Accept-Ranges": "bytes",
+            }
         )
 
     # 解析Range头：bytes=start-end
@@ -76,33 +115,38 @@ def _serve_file_with_range(file_path: Path, request: Request, media_type: str):
 
         # 确保范围有效
         if start >= file_size:
+            finalize()
             raise HTTPException(status_code=416, detail="请求范围无效")
         end = min(end, file_size - 1)
 
     except ValueError:
+        finalize()
         raise HTTPException(status_code=400, detail="无效的Range头格式")
 
     # 返回部分内容（状态码206）
     def file_iterator():
-        with open(file_path, "rb") as f:
-            f.seek(start)
-            remaining = end - start + 1
+        try:
+            with open(file_path, "rb") as f:
+                f.seek(start)
+                remaining = end - start + 1
 
-            # 动态 chunk_size：根据请求大小调整 (优化大视频拖动性能)
-            if remaining < 1024 * 1024:  # < 1MB
-                chunk_size = 8192  # 8KB
-            elif remaining < 10 * 1024 * 1024:  # < 10MB
-                chunk_size = 64 * 1024  # 64KB
-            else:
-                chunk_size = 256 * 1024  # 256KB
+                # 动态 chunk_size：根据请求大小调整 (优化大视频拖动性能)
+                if remaining < 1024 * 1024:  # < 1MB
+                    chunk_size = 8192  # 8KB
+                elif remaining < 10 * 1024 * 1024:  # < 10MB
+                    chunk_size = 64 * 1024  # 64KB
+                else:
+                    chunk_size = 256 * 1024  # 256KB
 
-            while remaining > 0:
-                read_size = min(chunk_size, remaining)
-                data = f.read(read_size)
-                if not data:
-                    break
-                yield data
-                remaining -= len(data)
+                while remaining > 0:
+                    read_size = min(chunk_size, remaining)
+                    data = f.read(read_size)
+                    if not data:
+                        break
+                    yield data
+                    remaining -= len(data)
+        finally:
+            finalize()
 
     headers = {
         "Content-Range": f"bytes {start}-{end}/{file_size}",
@@ -571,15 +615,15 @@ async def get_video(job_id: str, request: Request):
 
     if proxy_720p.exists():
         logger.debug(f"[media] 返回720p高清视频")
-        return _serve_file_with_range(proxy_720p, request, 'video/mp4')
+        return _serve_file_with_range(proxy_720p, request, 'video/mp4', job_id=job_id)
 
     if remux_video.exists():
         print(f"[media] 返回重封装视频")
-        return _serve_file_with_range(remux_video, request, 'video/mp4')
+        return _serve_file_with_range(remux_video, request, 'video/mp4', job_id=job_id)
 
     if preview_360p.exists():
         print(f"[media] 返回360p预览视频")
-        return _serve_file_with_range(preview_360p, request, 'video/mp4')
+        return _serve_file_with_range(preview_360p, request, 'video/mp4', job_id=job_id)
 
     # 2. 查找源视频
     video_file = _find_video_file(job_dir)
@@ -636,12 +680,12 @@ async def get_video(job_id: str, request: Request):
         # 优先级1: 如果 720p 已完成，返回 720p 视频
         if proxy_completed and proxy_720p.exists():
             print(f"[media] 返回已完成的720p高清视频")
-            return _serve_file_with_range(proxy_720p, request, 'video/mp4')
+            return _serve_file_with_range(proxy_720p, request, 'video/mp4', job_id=job_id)
 
         # 优先级2: 如果 360p 已完成，返回 360p 视频（720p可能正在处理或未启动）
         if preview_completed and preview_360p.exists():
             print(f"[media] 返回已完成的360p预览视频")
-            return _serve_file_with_range(preview_360p, request, 'video/mp4')
+            return _serve_file_with_range(preview_360p, request, 'video/mp4', job_id=job_id)
 
         # 如果有任务正在处理，返回进度信息
         if preview_in_progress or proxy_in_progress:
@@ -677,7 +721,7 @@ async def get_video(job_id: str, request: Request):
 
     # 4. 返回兼容格式的源视频
     # 日志已在编码检测时输出，此处不再重复
-    return _serve_file_with_range(video_file, request, 'video/mp4')
+    return _serve_file_with_range(video_file, request, 'video/mp4', job_id=job_id)
 
 
 @router.get("/{job_id}/audio")
@@ -689,7 +733,7 @@ async def get_audio(job_id: str, request: Request):
     if not audio_file.exists():
         raise HTTPException(status_code=404, detail="音频文件不存在")
 
-    return _serve_file_with_range(audio_file, request, 'audio/wav')
+    return _serve_file_with_range(audio_file, request, 'audio/wav', job_id=job_id)
 
 
 @router.get("/{job_id}/peaks")
@@ -1218,12 +1262,12 @@ async def get_preview_video(job_id: str, request: Request):
     # 查找 360p 预览视频
     preview_360p = job_dir / "preview_360p.mp4"
     if preview_360p.exists():
-        return _serve_file_with_range(preview_360p, request, 'video/mp4')
+        return _serve_file_with_range(preview_360p, request, 'video/mp4', job_id=job_id)
 
     # 如果没有 360p，尝试返回 720p proxy
     proxy_video = job_dir / "proxy_720p.mp4"
     if proxy_video.exists():
-        return _serve_file_with_range(proxy_video, request, 'video/mp4')
+        return _serve_file_with_range(proxy_video, request, 'video/mp4', job_id=job_id)
 
     # 都没有，返回 202 表示正在生成
     raise HTTPException(

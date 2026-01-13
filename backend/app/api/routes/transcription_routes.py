@@ -502,10 +502,25 @@ def create_transcription_router(
     async def cancel_job(job_id: str, delete_data: bool = False):
         """取消转录任务（V2.2: 使用队列服务）"""
         queue_service = get_queue_service(transcription_service)
-        ok = queue_service.cancel_job(job_id, delete_data=delete_data)
+        ok, err, pending_delete = queue_service.cancel_job(job_id, delete_data=delete_data)
         if not ok:
-            raise HTTPException(status_code=404, detail="任务未找到")
-        return {"job_id": job_id, "canceled": ok, "data_deleted": delete_data}
+            # 占用场景用 423 方便前端弹全局提示；运行中删除用 409 告知稍后再试
+            if "占用" in (err or ""):
+                status = 423
+            elif "正在执行" in (err or "") or "取消中" in (err or ""):
+                status = 409
+            elif "未找到" in (err or ""):
+                status = 404
+            else:
+                status = 400
+            raise HTTPException(status_code=status, detail=err or "任务未找到")
+        return {
+            "job_id": job_id,
+            "canceled": ok,
+            "data_deleted": delete_data,
+            "message": err,
+            "pending_delete": pending_delete
+        }
 
     @router.post("/pause/{job_id}")
     async def pause_job(job_id: str):

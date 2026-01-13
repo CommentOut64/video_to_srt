@@ -756,24 +756,36 @@ async function deleteTask(jobId) {
 
     // 调用后端 API 删除任务数据
     try {
-      await transcriptionApi.cancelJob(jobId, true);
+      const res = await transcriptionApi.cancelJob(jobId, true);
+      // 后端现在区分“正在执行，等待取消后删除”与“已立即删除”
+      if (res.pending_delete) {
+        taskStore.updateTaskStatus(jobId, "canceling", res.message || "已请求取消并将在结束后删除");
+        ElMessage.info(res.message || "任务正在执行，已请求取消，结束后将删除");
+        return;
+      }
+
+      // 非运行中，已立即删除
+      taskStore.deleteTask(jobId);
+      setTimeout(() => {
+        taskStore.syncTasksFromBackend();
+      }, 500);
+      ElMessage.success("任务已删除");
     } catch (error) {
-      console.warn("调用后端删除失败，继续清理本地记录:", error);
-      // 即使后端删除失败，也继续清理本地记录
-      // 这有助于修复幽灵任务问题
+      // 处理占用/正在执行的快速失败
+      const status = error?.response?.status;
+      const detail = error?.response?.data?.detail || error?.message;
+      if (status === 409) {
+        ElMessage.info(detail || "任务正在取消中，稍后再试删除");
+        taskStore.updateTaskStatus(jobId, "canceling", detail);
+        return;
+      }
+      if (status === 423) {
+        ElMessage.warning(detail || "当前有进程占用，请稍后再试");
+        return;
+      }
+      console.error("删除任务失败:", error);
+      ElMessage.error(`删除失败: ${detail || "未知错误"}`);
     }
-
-    // [V3.1.0] 优化：立即从本地删除，不再立即调用 syncTasksFromBackend
-    // 依赖 SSE job_removed 事件确保一致性
-    await taskStore.deleteTask(jobId);
-
-    // [V3.1.0] 延迟同步作为兜底机制
-    // 如果 SSE 事件丢失，1秒后的同步可以保证最终一致性
-    setTimeout(() => {
-      taskStore.syncTasksFromBackend();
-    }, 1000);
-
-    ElMessage.success("任务已删除");
   } catch (error) {
     if (error !== "cancel") {
       console.error("删除任务失败:", error);

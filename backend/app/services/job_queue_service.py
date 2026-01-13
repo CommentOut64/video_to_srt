@@ -323,7 +323,7 @@ class JobQueueService:
 
         return True
 
-    def cancel_job(self, job_id: str, delete_data: bool = False) -> bool:
+    def cancel_job(self, job_id: str, delete_data: bool = False):
         """
         取消任务（支持删除已完成的任务）
 
@@ -343,7 +343,7 @@ class JobQueueService:
             delete_data: 是否删除任务数据
 
         Returns:
-            bool: 是否成功
+            Tuple[bool, Optional[str], bool]: (是否成功, 失败原因, 是否处于延迟删除状态)
         """
         job = self.jobs.get(job_id)
 
@@ -353,15 +353,18 @@ class JobQueueService:
                 # 尝试通过transcription_service删除已完成的任务
                 try:
                     result = self.transcription_service.cancel_job(job_id, delete_data=True)
-                    if result:
+                    success, err = result if isinstance(result, tuple) else (bool(result), None)
+                    if success:
                         # [V3.1.0] 推送任务删除事件（而非仅状态变更）
                         self._notify_job_removed(job_id)
                         # [V3.7] 清理取消令牌
                         self._remove_cancellation_token(job_id)
-                        return True
+                        return True, None, False
+                    return False, err or "删除失败", False
                 except Exception as e:
                     logger.warning(f"删除任务 {job_id} 失败: {e}")
-            return False
+                    return False, str(e), False
+            return False, "任务未找到", False
 
         is_running = False  # [V3.1.0] 标记是否为正在运行的任务
 
@@ -386,7 +389,8 @@ class JobQueueService:
             elif self.running_job_id == job_id:
                 is_running = True
                 job.status = "canceling"  # 新状态：取消中
-                job.message = "正在取消，等待当前操作完成..."
+                # 运行中删除：提示将延迟自动删除
+                job.message = "当前有进程占用，将延迟自动删除"
                 # 记录取消请求时间，用于超时保障
                 self._pending_cancel_requests[job_id] = time.time()
                 if delete_data:
@@ -402,11 +406,20 @@ class JobQueueService:
             self._notify_queue_change()
             self._notify_job_status(job_id, job.status)
             self._notify_job_signal(job_id, "job_canceling")  # 新信号
-            return True
+            # 如果需要删除数据，标记完成后再删
+            if delete_data:
+                with self.lock:
+                    self._pending_delete_after_cancel.add(job_id)
+                return True, "任务正在执行，已请求取消并将在结束后删除", True
+            return True, None, False
 
         # 非运行中的任务：立即处理
         if delete_data:
             result = self.transcription_service.cancel_job(job_id, delete_data=True)
+            success, err = result if isinstance(result, tuple) else (bool(result), None)
+            if not success:
+                # 删除失败时不广播删除事件，保留任务文件供用户重试
+                return False, err or "删除失败", False
 
             # [V3.1.0] 从内存中彻底移除任务，防止幽灵任务
             with self.lock:
@@ -417,7 +430,7 @@ class JobQueueService:
             # [V3.7] 清理取消令牌
             self._remove_cancellation_token(job_id)
         else:
-            result = True
+            success, err = True, None
             # 不删除数据时，保存任务元信息
             self.transcription_service.save_job_meta(job)
 
@@ -435,7 +448,7 @@ class JobQueueService:
             # 同时推送到单任务频道，确保 EditorView 能收到
             self._notify_job_signal(job_id, "job_canceled")
 
-        return result
+        return success, err, False
 
     def _worker_loop(self):
         """
@@ -593,14 +606,22 @@ class JobQueueService:
                         self._pending_delete_after_cancel.discard(finished_job_id)
                         logger.info(f"[V3.1.0] 执行取消后的延迟删除: {finished_job_id}")
                         try:
-                            self.transcription_service.cancel_job(finished_job_id, delete_data=True)
-                            with self.lock:
-                                if finished_job_id in self.jobs:
-                                    del self.jobs[finished_job_id]
-                            self._notify_job_removed(finished_job_id)
-                            # 跳过后续的状态保存和通知
-                            self._save_state()
-                            continue
+                            result = self.transcription_service.cancel_job(finished_job_id, delete_data=True)
+                            success, err = result if isinstance(result, tuple) else (bool(result), None)
+                            if success:
+                                with self.lock:
+                                    if finished_job_id in self.jobs:
+                                        del self.jobs[finished_job_id]
+                                self._notify_job_removed(finished_job_id)
+                                # 跳过后续的状态保存和通知
+                                self._save_state()
+                                continue
+                            # 删除失败（如外部占用），保留任务并提示稍后重试
+                            job.status = "paused"
+                            job.message = err or "当前有进程占用，请稍后再试"
+                            self.transcription_service.save_job_meta(job)
+                            self._notify_job_status(job.job_id, job.status)
+                            logger.error(f"[V3.1.0] 延迟删除失败: {finished_job_id}, {err}")
                         except Exception as e:
                             logger.error(f"[V3.1.0] 延迟删除失败: {finished_job_id}, {e}")
 

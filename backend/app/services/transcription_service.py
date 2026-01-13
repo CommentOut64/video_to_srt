@@ -1261,7 +1261,13 @@ class TranscriptionService:
         self.logger.info(f"⏸️ 任务暂停请求: {job_id}")
         return True
 
-    def _force_remove_directory(self, directory: Path, job_id: str, max_retries: int = 3):
+    def _force_remove_directory(
+        self,
+        directory: Path,
+        job_id: str,
+        max_retries: int = 3,
+        fast_fail: bool = False
+    ) -> bool:
         """
         V3.1.0: 强制删除目录，处理 Windows 文件占用问题
 
@@ -1275,6 +1281,7 @@ class TranscriptionService:
             directory: 要删除的目录路径
             job_id: 任务ID（用于日志）
             max_retries: 最大重试次数
+            fast_fail: True 时只尝试一次且不做延迟，快速返回给前端
         """
         import time
         import stat
@@ -1284,20 +1291,24 @@ class TranscriptionService:
         time.sleep(0.1)  # 给系统一点时间释放资源
 
         # 步骤2: 尝试直接删除（最快路径）
-        for attempt in range(max_retries):
+        attempts = 1 if fast_fail else max_retries
+        for attempt in range(attempts):
             try:
                 shutil.rmtree(directory)
                 self.logger.info(f"[强制删除] 成功删除目录: {job_id}, 尝试次数: {attempt + 1}")
-                return
+                return True
             except PermissionError as e:
-                if attempt < max_retries - 1:
+                if fast_fail or attempt >= attempts - 1:
+                    # 快速返回给上层，由用户稍后再试
                     self.logger.warning(
-                        f"[强制删除] 删除失败 (尝试 {attempt + 1}/{max_retries}): {e}, "
-                        f"等待 {0.5 * (attempt + 1)}s 后重试"
+                        f"[强制删除] 删除失败 (快速返回): {e}"
                     )
-                    time.sleep(0.5 * (attempt + 1))  # 指数退避
-                else:
-                    self.logger.warning(f"[强制删除] 直接删除失败，尝试逐个删除文件: {job_id}")
+                    return False
+                self.logger.warning(
+                    f"[强制删除] 删除失败 (尝试 {attempt + 1}/{max_retries}): {e}, "
+                    f"等待 {0.5 * (attempt + 1)}s 后重试"
+                )
+                time.sleep(0.5 * (attempt + 1))  # 指数退避
 
         # 步骤3: 逐个删除文件（降级策略）
         failed_files = []
@@ -1325,6 +1336,7 @@ class TranscriptionService:
         try:
             directory.rmdir()
             self.logger.info(f"[强制删除] 逐个删除完成: {job_id}")
+            return True
         except Exception as e:
             if failed_files:
                 self.logger.error(
@@ -1333,8 +1345,9 @@ class TranscriptionService:
                 )
             else:
                 self.logger.warning(f"[强制删除] 根目录删除失败: {job_id}, {e}")
+            return False
 
-    def cancel_job(self, job_id: str, delete_data: bool = False) -> bool:
+    def cancel_job(self, job_id: str, delete_data: bool = False):
         """
         取消转录任务
 
@@ -1343,11 +1356,11 @@ class TranscriptionService:
             delete_data: 是否删除任务数据
 
         Returns:
-            bool: 是否成功设置取消标志
+            Tuple[bool, Optional[str]]: (是否成功, 失败原因)
         """
         job = self.get_job(job_id)
         if not job:
-            return False
+            return False, "任务未找到"
 
         job.canceled = True
         job.message = "取消中..."
@@ -1357,6 +1370,18 @@ class TranscriptionService:
         if delete_data:
             try:
                 job_dir = Path(job.dir)
+
+                # 快速占用检测，避免用户等待
+                try:
+                    from app.services.media_stream_tracker import get_active_streams
+                    active_streams = get_active_streams(job_id)
+                except Exception:
+                    active_streams = 0
+
+                if active_streams > 0:
+                    msg = "当前有进程占用，请稍后再试"
+                    self.logger.warning(f"[删除任务] 文件被占用，放弃删除: {job_id}, active_streams={active_streams}")
+                    return False, msg
 
                 # V3.1.2+dev.20260112.01: 先取消 MediaPrep 的转码任务，释放文件句柄
                 # 避免 WinError 32 文件占用问题
@@ -1368,7 +1393,7 @@ class TranscriptionService:
                         self.logger.info(f"[删除任务] 已终止 {killed} 个 MediaPrep 子进程: {job_id}")
                         # 给系统一点时间释放文件句柄
                         import time
-                        time.sleep(0.5)
+                        time.sleep(0.2)
                 except Exception as e:
                     self.logger.warning(f"[删除任务] 取消 MediaPrep 任务失败: {e}")
 
@@ -1382,15 +1407,17 @@ class TranscriptionService:
                 if job.input_path:
                     self.job_index.remove_mapping(job.input_path)
 
-                # 最后删除任务目录
+                # 最后删除任务目录（快速失败，交给用户重试）
                 if job_dir.exists():
-                    # V3.1.0: 使用强制删除逻辑，处理 Windows 文件占用问题
-                    self._force_remove_directory(job_dir, job_id)
+                    success = self._force_remove_directory(job_dir, job_id, max_retries=1, fast_fail=True)
+                    if not success:
+                        return False, "当前有进程占用，请稍后再试"
                     self.logger.info(f"已删除任务数据: {job_id}")
             except Exception as e:
                 self.logger.error(f"删除任务数据失败: {e}")
+                return False, str(e)
 
-        return True
+        return True, None
 
     def _update_progress(
         self,
