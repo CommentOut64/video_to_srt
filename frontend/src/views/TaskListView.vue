@@ -443,9 +443,16 @@ watch(
   }
 );
 
-// 监听上传模式切换，自动加载文件列表
+// 监听上传模式切换，自动加载文件列表（每次切换到 select 都刷新）
 watch(uploadMode, async (newMode) => {
-  if (newMode === "select" && inputFiles.value.length === 0) {
+  if (newMode === "select") {
+    await loadInputFiles();
+  }
+});
+
+// 打开上传弹窗时，若当前在 select 标签页则刷新一次
+watch(showUploadDialog, async (visible) => {
+  if (visible && uploadMode.value === "select") {
     await loadInputFiles();
   }
 });
@@ -761,15 +768,17 @@ async function deleteTask(jobId) {
       if (res.pending_delete) {
         taskStore.updateTaskStatus(jobId, "canceling", res.message || "已请求取消并将在结束后删除");
         ElMessage.info(res.message || "任务正在执行，已请求取消，结束后将删除");
-        return;
+        // 任务会在原子段结束后自动删除，此处不删卡片
+      } else {
+        // 非运行中，已立即删除
+        taskStore.deleteTask(jobId);
+        ElMessage.success("任务已删除");
       }
-
-      // 非运行中，已立即删除
-      taskStore.deleteTask(jobId);
+      // 无论哪种情况，刷新 input 列表以反映文件变化
+      await loadInputFiles();
       setTimeout(() => {
         taskStore.syncTasksFromBackend();
       }, 500);
-      ElMessage.success("任务已删除");
     } catch (error) {
       // 处理占用/正在执行的快速失败
       const status = error?.response?.status;
