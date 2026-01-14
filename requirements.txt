@@ -67,4 +67,3 @@ sse-starlette
 # brouhaha-vad 提供 Brouhaha 模型架构定义 (CustomPyanNetModel)
 # 注意: 首次下载模型需要配置 HF_TOKEN 环境变量，之后可离线使用
 pyannote.audio>=3.1.0
-brouhaha @ https://github.com/marianne-m/brouhaha-vad/archive/main.zip

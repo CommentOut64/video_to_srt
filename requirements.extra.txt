@@ -1,0 +1,2 @@
+# 需要特殊安装参数的依赖（Bootloader 会通过 --no-deps 单独安装）
+brouhaha @ https://github.com/marianne-m/brouhaha-vad/archive/main.zip
