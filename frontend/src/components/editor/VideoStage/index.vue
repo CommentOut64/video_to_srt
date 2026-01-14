@@ -73,17 +73,38 @@
         <span class="subtitle-text">{{ currentSubtitleText }}</span>
       </div>
 
-      <!-- 渐进式加载状态指示器 -->
-      <transition name="fade">
-        <div v-if="showProgressiveHint" class="progressive-indicator">
-          <span class="resolution-badge" :class="resolutionClass">
-            {{ currentResolutionLabel }}
-          </span>
-          <span v-if="isUpgrading" class="upgrade-progress">
-            HD {{ Math.round(upgradeProgress) }}%
-          </span>
-        </div>
-      </transition>
+      <!-- V3.1.2+dev.20260113.01: 分辨率标志/按钮一体化 -->
+      <!-- 热区容器：始终存在以接收hover事件 -->
+      <div
+        class="resolution-hotspot"
+        @mouseenter="handleResolutionHover(true)"
+        @mouseleave="handleResolutionHover(false)"
+      >
+        <transition name="fade-smooth">
+          <div v-show="showResolutionBadge" class="resolution-indicator">
+            <div
+              class="resolution-badge"
+              :class="resolutionClass"
+            >
+              {{ currentResolutionLabel }}
+            </div>
+            <span v-if="isUpgrading" class="upgrade-progress">
+              HD {{ Math.round(upgradeProgress) }}%
+            </span>
+
+            <!-- 升级气泡 -->
+            <transition name="pop">
+              <div
+                v-if="showUpgradeBubble"
+                class="upgrade-bubble"
+                @click.stop="handleResolutionClick"
+              >
+                <span>升级为720P</span>
+              </div>
+            </transition>
+          </div>
+        </transition>
+      </div>
 
       <!-- 加载指示器 -->
       <transition name="fade">
@@ -145,10 +166,12 @@ const props = defineProps({
   upgradeProgress: { type: Number, default: 0 },    // 升级进度
   // Proxy 状态（来自 useProxyVideo）
   proxyState: { type: String, default: null },      // ProxyState 枚举值
-  proxyError: { type: String, default: null }       // Proxy 错误信息
+  proxyError: { type: String, default: null },      // Proxy 错误信息
+  autoTrigger720p: { type: Boolean, default: true } // V3.1.2+dev.20260113.02: 是否启用自动触发720p
 })
 
-const emit = defineEmits(['loaded', 'error', 'play', 'pause', 'timeupdate', 'ended', 'resolution-change', 'retry'])
+// V3.1.2+dev.20260113.02: 添加 upgrade-started 和 upgrade-failed 事件
+const emit = defineEmits(['loaded', 'error', 'play', 'pause', 'timeupdate', 'ended', 'resolution-change', 'retry', 'upgrade-started', 'upgrade-failed'])
 
 // Store
 const projectStore = useProjectStore()
@@ -170,6 +193,13 @@ const retryCount = ref(0)
 const maxRetries = 3
 const showProgressiveHint = ref(false)
 let progressiveHintTimer = null
+
+// V3.1.2+dev.20260113.01: 分辨率标志/按钮状态
+const showResolutionBadge = ref(false)
+const showUpgradeBubble = ref(false)
+const isHoveringResolution = ref(false)
+let resolutionBadgeTimer = null
+let resolutionHideTimer = null
 
 // 状态提示（短暂显示播放/暂停图标）
 const showStateHint = ref(false)
@@ -219,19 +249,32 @@ const preloadStrategy = computed(() => {
 const currentResolutionLabel = computed(() => {
   switch (props.currentResolution) {
     case '360p': return '360P'
-    case '720p': return 'HD'
-    case 'source': return 'SRC'
+    case '720p': return '720P'
+    case '1080p': return '1080P'
+    case 'source':
+      // 根据实际分辨率判断是否为1080P+
+      const height = projectStore.meta.videoHeight || 0
+      return height > 1080 ? '1080P+' : 'SRC'
     default: return ''
   }
 })
 
 // 分辨率样式类
 const resolutionClass = computed(() => {
+  const height = projectStore.meta.videoHeight || 0
   return {
     'preview': props.currentResolution === '360p',
     'hd': props.currentResolution === '720p',
-    'source': props.currentResolution === 'source'
+    'full-hd': props.currentResolution === '1080p',
+    'ultra-hd': props.currentResolution === 'source' && height > 1080,
+    'source': props.currentResolution === 'source' && height <= 1080
   }
+})
+
+// V3.1.2+dev.20260113.02: 是否可以升级到720P
+// 只有在360p状态、未转码中、且未启用自动触发时才允许手动升级
+const canUpgrade = computed(() => {
+  return props.currentResolution === '360p' && !props.isUpgrading && !props.autoTrigger720p
 })
 
 const currentSubtitleText = computed(() => projectStore.currentSubtitle?.text || '')
@@ -344,6 +387,73 @@ function showResolutionHint() {
   }, 3000)
 }
 
+// V3.1.2+dev.20260113.01: 显示分辨率标志（5秒后自动隐藏）
+function showResolutionBadgeTemporarily() {
+  showResolutionBadge.value = true
+  clearTimeout(resolutionBadgeTimer)
+  resolutionBadgeTimer = setTimeout(() => {
+    // 如果没有hover，则隐藏
+    if (!isHoveringResolution.value) {
+      showResolutionBadge.value = false
+    }
+  }, 5000)
+}
+
+// V3.1.2+dev.20260113.01: 处理分辨率标志hover
+function handleResolutionHover(isHovering) {
+  isHoveringResolution.value = isHovering
+
+  if (isHovering) {
+    // hover时立即显示
+    showResolutionBadge.value = true
+    clearTimeout(resolutionBadgeTimer)
+    clearTimeout(resolutionHideTimer)
+
+    // 如果可以升级，显示气泡
+    if (canUpgrade.value) {
+      showUpgradeBubble.value = true
+    }
+  } else {
+    // hover取消后延迟3秒隐藏
+    showUpgradeBubble.value = false
+    clearTimeout(resolutionHideTimer)
+    resolutionHideTimer = setTimeout(() => {
+      showResolutionBadge.value = false
+    }, 3000)
+  }
+}
+
+// V3.1.2+dev.20260113.01: 处理分辨率标志点击
+async function handleResolutionClick() {
+  if (!canUpgrade.value) return
+
+  // 隐藏气泡
+  showUpgradeBubble.value = false
+
+  try {
+    // 调用手动触发720p的API
+    const response = await fetch(`/api/media/${props.jobId}/upgrade-720p`, {
+      method: 'POST'
+    })
+
+    const result = await response.json()
+
+    if (result.success) {
+      // 成功：触发全局Toast提示（由父组件处理）
+      console.log('[VideoStage] 720p转码已启动')
+      emit('upgrade-started')
+    } else {
+      // 失败：显示错误提示
+      const message = result.message || '启动失败'
+      console.error('[VideoStage] 720p转码启动失败:', message)
+      emit('upgrade-failed', message)
+    }
+  } catch (error) {
+    console.error('[VideoStage] 720p转码请求异常:', error)
+    emit('upgrade-failed', '网络错误，请稍后再试')
+  }
+}
+
 // 追踪当前的 play() Promise，用于避免 AbortError 导致的状态不一致
 let currentPlayPromise = null
 
@@ -426,6 +536,13 @@ watch(() => props.isUpgrading, (isUpgrading) => {
     hasError.value = false
     errorMessage.value = ''
     retryCount.value = 0
+  }
+})
+
+// V3.1.2+dev.20260113.01: 监听分辨率变化，触发badge显示
+watch(() => props.currentResolution, (newRes, oldRes) => {
+  if (newRes && newRes !== oldRes) {
+    showResolutionBadgeTemporarily()
   }
 })
 
@@ -843,6 +960,11 @@ onMounted(() => {
   if (videoRef.value) {
     playbackManager.registerVideo(videoRef.value)
   }
+
+  // V3.1.2+dev.20260113.01: 初始化时显示分辨率标志
+  if (props.currentResolution) {
+    showResolutionBadgeTemporarily()
+  }
 })
 
 onUnmounted(() => {
@@ -851,6 +973,10 @@ onUnmounted(() => {
   clearTimeout(stateHintTimer)
   clearTimeout(progressiveHintTimer)
   if (clickTimer) clearTimeout(clickTimer)
+
+  // V3.1.2+dev.20260113.01: 清理分辨率标志相关定时器
+  clearTimeout(resolutionBadgeTimer)
+  clearTimeout(resolutionHideTimer)
 
   // 清理字幕拖动事件监听器
   document.removeEventListener('mousemove', handleSubtitleMouseMove)
@@ -1191,23 +1317,33 @@ onUnmounted(() => {
   }
 }
 
-// 渐进式加载指示器
-.progressive-indicator {
+// V3.1.2+dev.20260113.01: 分辨率标志/按钮一体化样式
+// 热区容器：始终存在以接收hover事件
+.resolution-hotspot {
   position: absolute;
   top: 16px;
   right: 16px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
+  min-width: 80px;
+  min-height: 40px;
   z-index: 25;
-  pointer-events: none;
+  pointer-events: auto;
+}
+
+.resolution-indicator {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  pointer-events: auto;
 
   .resolution-badge {
-    padding: 4px 10px;
+    padding: 4px 12px;
     font-size: 11px;
     font-weight: 600;
     border-radius: 4px;
     letter-spacing: 0.5px;
+    border: none;
+    user-select: none;
 
     &.preview {
       background: rgba(255, 193, 7, 0.9);
@@ -1216,6 +1352,16 @@ onUnmounted(() => {
 
     &.hd {
       background: rgba(76, 175, 80, 0.9);
+      color: #fff;
+    }
+
+    &.full-hd {
+      background: rgba(33, 150, 243, 0.9);
+      color: #fff;
+    }
+
+    &.ultra-hd {
+      background: rgba(186, 104, 200, 0.85);
       color: #fff;
     }
 
@@ -1232,6 +1378,24 @@ onUnmounted(() => {
     background: rgba(0, 0, 0, 0.7);
     color: rgba(76, 175, 80, 1);
     border-radius: 4px;
+  }
+
+  // V3.1.2+dev.20260113.01: 升级气泡样式
+  .upgrade-bubble {
+    padding: 8px 14px;
+    background: rgba(30, 30, 30, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 6px;
+    font-size: 12px;
+    color: #fff;
+    white-space: nowrap;
+    cursor: pointer;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+
+    &:hover {
+      background: rgba(40, 40, 40, 0.98);
+      // border-color: rgba(255, 193, 7, 0.5);
+    }
   }
 }
 
@@ -1257,11 +1421,31 @@ onUnmounted(() => {
   opacity: 0;
 }
 
+// V3.1.2+dev.20260113.01: 平滑渐变动画（用于分辨率标志）
+.fade-smooth-enter-active {
+  transition: opacity 0.3s ease;
+}
+.fade-smooth-leave-active {
+  transition: opacity 0.5s ease;
+}
+.fade-smooth-enter-from,
+.fade-smooth-leave-to {
+  opacity: 0;
+}
+
 .pop-enter-active {
   animation: pop-in 0.3s ease;
 }
 .pop-leave-active {
   animation: pop-out 0.2s ease;
+}
+
+// V3.1.2+dev.20260113.01: 气泡专用过渡（用于升级气泡）
+.resolution-indicator .pop-enter-active {
+  animation: bubble-pop-in 0.2s ease;
+}
+.resolution-indicator .pop-leave-active {
+  animation: bubble-pop-out 0.15s ease;
 }
 
 @keyframes pop-in {
@@ -1272,5 +1456,16 @@ onUnmounted(() => {
 @keyframes pop-out {
   0% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
   100% { transform: translate(-50%, -50%) scale(1.2); opacity: 0; }
+}
+
+// V3.1.2+dev.20260113.01: 气泡弹出动画
+@keyframes bubble-pop-in {
+  0% { transform: scale(0.8) translateY(-4px); opacity: 0; }
+  100% { transform: scale(1) translateY(0); opacity: 1; }
+}
+
+@keyframes bubble-pop-out {
+  0% { transform: scale(1) translateY(0); opacity: 1; }
+  100% { transform: scale(0.9) translateY(-4px); opacity: 0; }
 }
 </style>

@@ -1,0 +1,80 @@
+================================================================================
+                    AnchorFlux v3.1.2 更新日志
+================================================================================
+
+================================================================================
+格式一：简洁中文格式
+================================================================================
+
+新功能：\n- 新增 720p 高清转码系统，支持统一调度、中断恢复和智能状态同步\n- 新增 Brouhaha SNR+C50 三层分诊策略，支持本地离线加载\n- 新增智能探针分诊模式，显著提升分诊效率\n- 新增字幕准确率映射功能，置信度显示更直观\n- 优化编辑器保存提示与中文高亮处理\n\n改进：\n- 统一 Whisper 模型校验逻辑，提升兼容性\n- 优化分诊阈值配置，提高判断准确性\n- 优化分离后音频处理，提升能量检测准确性\n\n修复：\n- 修复任务删除时文件占用导致失败的问题，支持延迟删除\n- 修复置信度徽章在特定情况下显示误导的问题
+
+================================================================================
+格式二：GitHub Release Markdown 格式（中文）
+================================================================================
+
+## v3.1.2 更新日志
+
+### 新功能
+
+- **720p 转码系统**：新增统一调度器，支持转码中断智能恢复、分辨率标识增强、视频播放体验优化
+- **Brouhaha SNR+C50 分诊**：集成三层分诊策略（SNR信噪比 + C50清晰度），使用本地离线模型
+- **字幕准确率映射**：支持置信度到准确率的映射显示
+- **编辑器优化**：优化保存提示交互
+
+### 改进
+
+- 统一 Whisper 模型校验逻辑，提升不同模型格式的兼容性与一致性
+- 优化频谱分诊阈值配置，提高音频质量判断准确性
+- 优化人声分离后的音频处理流程，提升能量检测及归一化准确性
+
+### 修复
+
+- 修复任务删除时因文件占用导致删除失败的问题，新增占用检测与延迟删除机制
+- 修复置信度徽章在特定条件下显示误导信息的问题
+
+================================================================================
+格式三：简洁英文格式
+================================================================================
+
+New Features:
+- Added 720p HD transcoding system with unified scheduler, interrupt recovery, and smart status sync
+- Added Brouhaha SNR+C50 three-layer triage strategy with offline model loading support
+- Added smart probe triage mode for significantly improved triage efficiency
+- Added subtitle accuracy mapping with intuitive confidence display
+- Improved editor save prompts and Chinese text highlighting
+
+Improvements:
+- Unified Whisper model validation logic for better compatibility
+- Optimized triage threshold configuration for improved accuracy
+- Enhanced post-separation audio processing with better energy detection
+
+Bug Fixes:
+- Fixed task deletion failures caused by file locks, added delayed deletion support
+- Fixed misleading confidence badge display in certain conditions
+
+================================================================================
+格式四：GitHub Release Markdown 格式（英文）
+================================================================================
+
+## v3.1.2 Changelog
+
+### New Features
+
+- **720p HD Transcoding System**: Added unified scheduler with intelligent interrupt recovery, enhanced resolution indicators, and improved video playback fallback experience
+- **Brouhaha SNR+C50 Triage**: Integrated three-layer triage strategy (SNR + C50 clarity), supporting local offline model loading
+- **Smart Probe Triage**: Added probe mode and progress bar support for triage and separation stages, significantly improving processing efficiency
+- **Subtitle Accuracy Mapping**: Added confidence-to-accuracy mapping with full frontend-backend data integration
+- **Editor Enhancements**: Improved save prompt interaction and Chinese text highlighting
+
+### Improvements
+
+- Unified Whisper model validation logic for better compatibility across different model formats
+- Optimized spectral triage threshold configuration for improved audio quality assessment
+- Enhanced post-separation audio processing with improved energy detection and normalization accuracy
+
+### Bug Fixes
+
+- Fixed task deletion failures caused by file locks, added file occupation detection and delayed deletion mechanism
+- Fixed misleading confidence badge display under specific conditions
+
+================================================================================

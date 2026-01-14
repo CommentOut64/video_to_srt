@@ -17,6 +17,8 @@ sys.path.insert(0, str(BASE_DIR))
 from huggingface_hub import snapshot_download
 import logging
 
+from backend.app.services.model_validator import ModelValidator  # 直接使用服务端同款校验器
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s'
@@ -64,20 +66,17 @@ def download_faster_whisper_model(
         logger.info(f"模型下载完成！")
         logger.info(f"模型路径: {model_path}")
 
-        # 验证关键文件
+        # 使用统一的模型校验器，确保 vocabulary.json 这类新格式不会误判
         model_path = Path(model_path)
-        required_files = ["model.bin", "config.json", "vocabulary.txt"]
-        missing_files = []
+        is_complete, missing_files, detail = ModelValidator.validate_whisper_model(model_path)
 
-        for file in required_files:
-            if not (model_path / file).exists():
-                missing_files.append(file)
-
-        if missing_files:
+        if not is_complete:
             logger.warning(f"警告：缺少文件 {missing_files}")
+            logger.info(f"模型文件详情:\n{detail}")
             return False
         else:
             logger.info("模型文件完整性验证通过")
+            logger.info(f"模型文件详情:\n{detail}")
             return True
 
     except Exception as e:

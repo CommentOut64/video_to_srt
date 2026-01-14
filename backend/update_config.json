@@ -18,6 +18,7 @@
   "exclude_files": [
     ".env",
     ".env_installed",
-    ".req_hash"
+    ".req_hash",
+    "一键升级.exe"
   ]
 }

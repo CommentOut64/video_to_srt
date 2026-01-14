@@ -264,6 +264,7 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
     const task = tasksMap.value.get(jobId)
     if (task) {
       task.sseConnected = connected
+      // 如果是被踢下线的情况，记录错误提示，供 UI 展示弹窗/提示
       if (error) task.lastError = error
       else if (connected) task.lastError = null
       task.updatedAt = Date.now()

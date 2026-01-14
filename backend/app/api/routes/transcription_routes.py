@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 import json
 
+from app.core.config import config
 from app.models.job_models import (
     JobSettings, JobState, DemucsSettings, SenseVoiceSettings,
     PreprocessingConfig, TranscriptionConfig, RefinementConfig, ComputeConfig
@@ -24,6 +25,8 @@ from app.services.transcription_service import TranscriptionService
 from app.services.file_service import FileManagementService
 from app.services.sse_service import get_sse_manager
 from app.services.job_queue_service import get_queue_service
+from app.services.media_prep_service import get_media_prep_service
+from app.api.routes.media_routes import _find_video_file
 
 
 # ========== v3.5 新版 API 模型 ==========
@@ -202,6 +205,51 @@ def create_transcription_router(
         # 定义初始状态回调 - 连接时立即发送当前状态
         def get_initial_state():
             current_job = transcription_service.get_job(job_id)
+
+            def _build_proxy_state():
+                job_dir = config.JOBS_DIR / job_id
+                preview_360p = job_dir / "preview_360p.mp4"
+                proxy_720p = job_dir / "proxy_720p.mp4"
+                remux_video = job_dir / "remux.mp4"
+                source_video = _find_video_file(job_dir) if job_dir.exists() else None
+
+                urls = {
+                    "360p": f"/api/media/{job_id}/video/preview" if preview_360p.exists() else None,
+                    "720p": f"/api/media/{job_id}/video" if (proxy_720p.exists() or remux_video.exists()) else None,
+                    "source": f"/api/media/{job_id}/video" if source_video else None
+                }
+
+                media_prep = get_media_prep_service()
+                task_status = media_prep.get_full_task_status(job_id) if media_prep else None
+
+                state = "idle"
+                progress = 0
+                error = None
+                decision = task_status.get("decision") if task_status else None
+
+                if task_status:
+                    state = task_status.get("state", state)
+                    progress = task_status.get("progress", progress)
+                    error = task_status.get("error")
+                else:
+                    if proxy_720p.exists() or remux_video.exists():
+                        state = "ready_720p"
+                        progress = 100
+                    elif preview_360p.exists():
+                        state = "ready_360p"
+                        progress = 100
+                    elif source_video:
+                        state = "direct_play"
+                        progress = 100
+
+                return {
+                    "state": state,
+                    "progress": progress,
+                    "decision": decision,
+                    "urls": urls,
+                    "error": error
+                }
+
             if current_job:
                 return {
                     "job_id": current_job.job_id,
@@ -211,7 +259,9 @@ def create_transcription_router(
                     "status": current_job.status,
                     "processed": current_job.processed,
                     "total": current_job.total,
-                    "language": current_job.language or ""
+                    "language": current_job.language or "",
+                    # 追加当前 Proxy/预览状态，断线重连时立即同步
+                    "proxy": _build_proxy_state()
                 }
             return None
 
@@ -502,10 +552,25 @@ def create_transcription_router(
     async def cancel_job(job_id: str, delete_data: bool = False):
         """取消转录任务（V2.2: 使用队列服务）"""
         queue_service = get_queue_service(transcription_service)
-        ok = queue_service.cancel_job(job_id, delete_data=delete_data)
+        ok, err, pending_delete = queue_service.cancel_job(job_id, delete_data=delete_data)
         if not ok:
-            raise HTTPException(status_code=404, detail="任务未找到")
-        return {"job_id": job_id, "canceled": ok, "data_deleted": delete_data}
+            # 占用场景用 423 方便前端弹全局提示；运行中删除用 409 告知稍后再试
+            if "占用" in (err or ""):
+                status = 423
+            elif "正在执行" in (err or "") or "取消中" in (err or ""):
+                status = 409
+            elif "未找到" in (err or ""):
+                status = 404
+            else:
+                status = 400
+            raise HTTPException(status_code=status, detail=err or "任务未找到")
+        return {
+            "job_id": job_id,
+            "canceled": ok,
+            "data_deleted": delete_data,
+            "message": err,
+            "pending_delete": pending_delete
+        }
 
     @router.post("/pause/{job_id}")
     async def pause_job(job_id: str):
@@ -1239,8 +1304,32 @@ def create_transcription_router(
 
         job_dir = Path(job.dir)
         checkpoint_path = job_dir / "checkpoint.json"
+        snapshot_path = job_dir / "transcription_text.json"  # V3.1.2: 完成后保存的精简快照
 
-        if not checkpoint_path.exists():
+        # 优先读取 checkpoint，缺失时尝试使用快照文件（任务完成后删除 checkpoint 的兜底）
+        data = None
+        transcription_data = None
+        using_snapshot = False
+        logger = logging.getLogger(__name__)
+
+        if checkpoint_path.exists():
+            try:
+                with open(checkpoint_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    transcription_data = data.get("transcription", {})
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"读取 checkpoint 失败: {e}")
+        elif snapshot_path.exists():
+            try:
+                with open(snapshot_path, 'r', encoding='utf-8') as f:
+                    transcription_data = json.load(f)
+                # 兼容后续统一处理逻辑
+                data = {"transcription": transcription_data}
+                using_snapshot = True
+                logger.info(f"[{job_id}] 使用转录快照恢复字幕（checkpoint 已清理）")
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"读取转录快照失败: {e}")
+        else:
             return {
                 "job_id": job_id,
                 "has_checkpoint": False,
@@ -1248,26 +1337,48 @@ def create_transcription_router(
             }
 
         try:
-            with open(checkpoint_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-
             # V3.1.0+: 优先从 transcription.sentences_snapshot 读取（实时字幕快照）
-            transcription = data.get("transcription", {})
+            transcription = transcription_data or {}
             sentences_snapshot = transcription.get("sentences_snapshot", [])
 
             all_segments = []
             detected_language = None
+            need_update_checkpoint = False  # V3.1.2: 标记是否需要更新 checkpoint
 
             if sentences_snapshot:
                 # 使用新格式（V3.1.0+ 实时字幕快照）
+                # V3.1.2+dev.20260111.02: 增加 display_confidence 支持
+                from app.core.confidence_mapper import ConfidenceMapper
+
                 for sentence in sentences_snapshot:
+                    # V3.1.2: 处理置信度字段
+                    # 注意：旧数据可能完全没有 confidence 字段，此时不应显示虚假的准确率
+                    raw_conf = sentence.get("confidence")  # 可能为 None
+                    source = sentence.get("source", "sensevoice")
+
+                    # V3.1.2: 检查是否有 display_confidence，没有则计算并标记需要更新
+                    display_conf = sentence.get("display_confidence")
+                    confidence_source = sentence.get("confidence_source")
+
+                    if display_conf is None and raw_conf is not None:
+                        # 有原始置信度但无映射值：实时计算 display_confidence
+                        display_conf = ConfidenceMapper.map(raw_conf, source)
+                        confidence_source = source
+                        # 更新原始数据，稍后写回 checkpoint
+                        sentence["display_confidence"] = display_conf
+                        sentence["confidence_source"] = confidence_source
+                        need_update_checkpoint = True
+                    # 如果 raw_conf 为 None，display_conf 也保持 None，前端不显示准确率
+
                     all_segments.append({
                         "id": sentence.get("_index", 0),
                         "start": sentence.get("start", 0),
                         "end": sentence.get("end", 0),
                         "text": sentence.get("text", ""),
-                        "confidence": sentence.get("confidence", 0),
-                        "source": sentence.get("source", "unknown")
+                        "confidence": raw_conf,  # 可能为 None
+                        "display_confidence": display_conf,  # 可能为 None（旧数据无置信度）
+                        "confidence_source": confidence_source,  # 可能为 None
+                        "source": source
                     })
 
                 # 按 _index 排序（已经是正确顺序，但保险起见）
@@ -1279,6 +1390,18 @@ def create_transcription_router(
                 # 进度信息从 transcription 获取
                 processed_count = transcription.get("processed_count", 0)
                 total_chunks = transcription.get("total_chunks", 0)
+
+                # V3.1.2: 如果有旧数据需要迁移，写回 checkpoint
+                if need_update_checkpoint:
+                    try:
+                        # 使用原始文件路径写回：checkpoint 优先，其次快照文件
+                        target_path = checkpoint_path if checkpoint_path.exists() else snapshot_path
+                        dump_obj = data if not using_snapshot else transcription
+                        with open(target_path, 'w', encoding='utf-8') as f:
+                            json.dump(dump_obj, f, ensure_ascii=False, indent=2)
+                        logger.info(f"[{job_id}] 已迁移字幕数据: 添加 display_confidence 字段")
+                    except Exception as e:
+                        logger.warning(f"[{job_id}] 迁移 checkpoint 失败: {e}")
 
             else:
                 # 回退到旧格式（unaligned_results）
@@ -1300,9 +1423,17 @@ def create_transcription_router(
                 processed_count = len(data.get("processed_indices", []))
                 total_chunks = data.get("total_segments", 0)
 
+            # 快照模式下补充进度信息，避免 percentage 为 0
+            if using_snapshot:
+                if not processed_count:
+                    processed_count = len(sentences_snapshot)
+                if not total_chunks:
+                    total_chunks = job.total or len(sentences_snapshot)
+
             return {
                 "job_id": job_id,
-                "has_checkpoint": True,
+                "has_checkpoint": checkpoint_path.exists(),
+                "has_snapshot": using_snapshot,
                 "language": detected_language or "unknown",
                 "segments": all_segments,
                 "sentence_count": transcription.get("sentence_count", len(all_segments)),

@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 
 from app.core.config import config
+from app.services.proxy_720_scheduler import get_proxy_scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,10 @@ class MediaPrepService:
         self._active_processes: Dict[int, subprocess.Popen] = {}
         self._process_lock = threading.Lock()
 
+        # V3.1.2+dev.20260112.01: 进程到 job_id 的映射 { process_id: job_id }
+        # 用于按 job_id 取消特定任务的子进程
+        self._process_job_map: Dict[int, str] = {}
+
         # 启动消费线程
         self.consumer_thread = threading.Thread(
             target=self._consumer_loop,
@@ -94,6 +99,10 @@ class MediaPrepService:
         self.consumer_thread.start()
 
         logger.info(f"MediaPrepService 已启动 (workers={max_workers})")
+
+        # V3.1.2+dev.20260114.01: 绑定 720p 调度器，统一由调度器协调触发与状态
+        scheduler = get_proxy_scheduler()
+        scheduler.bind_media_prep(self)
 
     def enqueue_proxy(self, job_id: str, video_path: Path, output_path: Path,
                       priority: int = 10) -> bool:
@@ -205,6 +214,108 @@ class MediaPrepService:
         if status:
             return status.get("status") in ["queued", "processing"]
         return False
+
+    def trigger_720p_transcode(self, job_id: str, force: bool = False) -> dict:
+        """
+        V3.1.2+dev.20260113.01: 通用720p转码触发接口
+
+        支持手动触发和自动触发，统一检查条件和错误处理
+
+        Args:
+            job_id: 任务ID
+            force: 强制触发（跳过队列空闲检查）
+
+        Returns:
+            dict: {
+                "success": bool,
+                "message": str,
+                "reason": str (失败时)
+            }
+        """
+        try:
+            # 步骤1: 检查任务目录是否存在
+            job_dir = config.JOBS_DIR / job_id
+            if not job_dir.exists():
+                return {
+                    "success": False,
+                    "message": "任务目录不存在",
+                    "reason": "job_not_found"
+                }
+
+            # 步骤2: 检查360p是否完成
+            preview_status = self.get_preview_status(job_id)
+            if not preview_status or preview_status.get("status") != "completed":
+                return {
+                    "success": False,
+                    "message": "360p预览未完成",
+                    "reason": "preview_not_ready"
+                }
+
+            # 步骤3: 检查720p是否已存在或正在处理
+            proxy_720p_path = job_dir / "proxy_720p.mp4"
+            if proxy_720p_path.exists():
+                return {
+                    "success": False,
+                    "message": "720p已存在",
+                    "reason": "already_exists"
+                }
+
+            proxy_status = self.get_proxy_status(job_id)
+            if proxy_status and proxy_status.get("status") in ["queued", "processing"]:
+                return {
+                    "success": False,
+                    "message": "720p转码正在进行中",
+                    "reason": "already_processing"
+                }
+
+            # 步骤4: 检查队列是否空闲（除非force=True）
+            if not force:
+                queue_busy = self._is_transcription_queue_busy()
+                if queue_busy:
+                    return {
+                        "success": False,
+                        "message": "有任务正在运行，请稍后再试",
+                        "reason": "queue_busy"
+                    }
+
+            # 步骤5: 查找视频文件
+            video_file = None
+            video_exts = ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.webm', '.flv', '.m4v']
+            for file in job_dir.iterdir():
+                if file.is_file() and file.suffix.lower() in video_exts:
+                    video_file = file
+                    break
+
+            if not video_file:
+                return {
+                    "success": False,
+                    "message": "未找到视频文件",
+                    "reason": "video_not_found"
+                }
+
+            # 步骤6: 启动720p转码
+            logger.info(f"[MediaPrep] 触发720p转码: {job_id}, force={force}")
+            success = self.enqueue_proxy(job_id, video_file, proxy_720p_path, priority=10)
+
+            if success:
+                return {
+                    "success": True,
+                    "message": "720p转码已启动"
+                }
+            else:
+                return {
+                    "success": False,
+                    "message": "720p转码启动失败",
+                    "reason": "enqueue_failed"
+                }
+
+        except Exception as e:
+            logger.error(f"[MediaPrep] 触发720p转码异常: {job_id}, {e}", exc_info=True)
+            return {
+                "success": False,
+                "message": f"触发失败: {str(e)}",
+                "reason": "exception"
+            }
 
     def analyze_transcode_decision(self, video_info: dict) -> TranscodeDecision:
         """
@@ -493,9 +604,10 @@ class MediaPrepService:
                 stderr=subprocess.DEVNULL,  # 丢弃 stderr，避免缓冲区阻塞
                 creationflags=creationflags
             )
-            
+
             # 注册进程以便在关闭时能够终止
-            self._register_process(process)
+            # V3.1.2: 传入 job_id 用于按任务取消
+            self._register_process(process, job_id)
 
             # 解析进度
             last_logged_progress = 0  # 记录上次日志输出的进度
@@ -544,9 +656,16 @@ class MediaPrepService:
                 logger.info(f"[MediaPrep] 360p预览转码完成: {output_path}")
                 self._push_preview_progress(job_id, 100, completed=True)
 
-                # 【优化】360p完成后，智能安排720p检查
-                # 策略：只有队列空闲时才安排延迟检查，避免频繁检测
-                self._schedule_720p_check_if_idle(job_id, video_path, output_path.parent / "proxy_720p.mp4")
+                # V3.1.2+dev.20260114.02: 交给 720p 调度器统一管理（自动/手动互斥、队列空闲再启动）
+                scheduler = get_proxy_scheduler()
+                scheduler.request(
+                    job_id,
+                    video_path,
+                    trigger_type="preview_complete",
+                    auto_enabled=config.PROXY_CONFIG.get('auto_trigger_720p', False),
+                    force=False,
+                    priority=100
+                )
             else:
                 # 失败
                 error_msg = f"FFmpeg 返回码: {process.returncode}"
@@ -579,6 +698,12 @@ class MediaPrepService:
         # 更新状态
         with self.lock:
             self.task_status[job_id]["proxy_720p"]["status"] = "processing"
+
+        # V3.1.2+dev.20260114.03: 通知调度器进入 processing，保证状态文件与队列一致
+        try:
+            get_proxy_scheduler().mark_processing(job_id)
+        except Exception as e:
+            logger.debug(f"[MediaPrep] 更新调度器处理状态失败: {e}")
 
         try:
             # 步骤1: 卸载所有模型，释放显存
@@ -668,9 +793,10 @@ class MediaPrepService:
                 stderr=subprocess.DEVNULL,  # 丢弃 stderr，避免缓冲区阻塞
                 creationflags=creationflags
             )
-            
+
             # 注册进程以便在关闭时能够终止
-            self._register_process(process)
+            # V3.1.2: 传入 job_id 用于按任务取消
+            self._register_process(process, job_id)
 
             # 如果队列繁忙，降低 FFmpeg 进程优先级
             if queue_busy:
@@ -721,6 +847,14 @@ class MediaPrepService:
                     self.task_status[job_id]["proxy_720p"]["progress"] = 100
 
                 logger.info(f"[MediaPrep] 720p 转码完成: {output_path}")
+
+                # V3.1.2+dev.20260114.03: 通知调度器已完成，便于前端无感切换
+                try:
+                    get_proxy_scheduler().mark_complete(job_id, output_path)
+                    # V3.1.2+dev.20260114.14: 完成后立即尝试启动下一个待触发任务
+                    get_proxy_scheduler().on_queue_idle()
+                except Exception as e:
+                    logger.debug(f"[MediaPrep] 更新调度器完成状态失败: {e}")
                 self._push_proxy_progress(job_id, 100, completed=True)
             else:
                 # 失败
@@ -737,6 +871,14 @@ class MediaPrepService:
                 self.task_status[job_id]["proxy_720p"]["error"] = str(e)
 
             logger.error(f"[MediaPrep] 720p 转码异常: {e}", exc_info=True)
+
+            # V3.1.2+dev.20260114.03: 失败后通知调度器，避免前端等待
+            try:
+                get_proxy_scheduler().mark_failed(job_id, str(e))
+                # V3.1.2+dev.20260114.14: 失败后尝试启动下一个待触发任务
+                get_proxy_scheduler().on_queue_idle()
+            except Exception as err:
+                logger.debug(f"[MediaPrep] 更新调度器失败状态失败: {err}")
 
     def _is_transcription_queue_busy(self) -> bool:
         """
@@ -916,7 +1058,19 @@ class MediaPrepService:
             except Exception as e:
                 logger.debug(f"[MediaPrep] 卸载 Demucs 模型失败（可能未加载）: {e}")
 
-            # 4. 清理 CUDA 缓存
+            # 4. 卸载 Brouhaha 模型 (V3.1.1+dev.20260108.04)
+            # V3.1.2+dev.20260113.01: 避免触发不必要的模型加载
+            try:
+                from app.services import brouhaha_service
+                # 只有当单例已存在时才卸载，避免触发初始化加载
+                if brouhaha_service._brouhaha_instance is not None:
+                    if brouhaha_service._brouhaha_instance.is_available():
+                        brouhaha_service._brouhaha_instance.unload()
+                        logger.info("[MediaPrep] 已卸载 Brouhaha 模型")
+            except Exception as e:
+                logger.debug(f"[MediaPrep] 卸载 Brouhaha 模型失败（可能未加载）: {e}")
+
+            # 5. 清理 CUDA 缓存
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -933,7 +1087,7 @@ class MediaPrepService:
                 except:
                     pass
 
-            # 5. 等待资源释放
+            # 6. 等待资源释放
             import time
             time.sleep(1)
 
@@ -1133,9 +1287,10 @@ class MediaPrepService:
                 stderr=subprocess.DEVNULL,  # 丢弃 stderr，避免缓冲区阻塞
                 creationflags=creationflags
             )
-            
+
             # 注册进程以便在关闭时能够终止
-            self._register_process(process)
+            # V3.1.2: 传入 job_id 用于按任务取消
+            self._register_process(process, job_id)
 
             # 解析进度
             try:
@@ -1204,17 +1359,26 @@ class MediaPrepService:
                 "type": "remux"
             })
 
-    def _register_process(self, process: subprocess.Popen):
-        """注册活跃的子进程"""
+    def _register_process(self, process: subprocess.Popen, job_id: str = None):
+        """
+        注册活跃的子进程
+
+        V3.1.2+dev.20260112.01: 新增 job_id 参数，用于按任务取消进程
+        """
         with self._process_lock:
             self._active_processes[process.pid] = process
-            logger.debug(f"[MediaPrep] 注册进程: PID={process.pid}")
+            if job_id:
+                self._process_job_map[process.pid] = job_id
+            logger.debug(f"[MediaPrep] 注册进程: PID={process.pid}, job_id={job_id}")
 
     def _unregister_process(self, process: subprocess.Popen):
         """注销子进程"""
         with self._process_lock:
             if process.pid in self._active_processes:
                 del self._active_processes[process.pid]
+            # V3.1.2: 同时清理 job_id 映射
+            if process.pid in self._process_job_map:
+                del self._process_job_map[process.pid]
                 logger.debug(f"[MediaPrep] 注销进程: PID={process.pid}")
 
     def kill_all_subprocesses(self) -> int:
@@ -1239,6 +1403,134 @@ class MediaPrepService:
                 except Exception as e:
                     logger.warning(f"[MediaPrep] 终止进程失败 PID={pid}: {e}")
             self._active_processes.clear()
+            # V3.1.2: 同时清理 job_id 映射
+            self._process_job_map.clear()
+        return killed_count
+
+        # V3.1.2+dev.20260114.10: 按 job_id 终止/降优先级（队列新任务优先）
+    def cancel_proxy_job(self, job_id: str, reason: str = "paused_for_new_job") -> bool:
+        """终止指定 job 的 proxy 进程，并标记状态，便于后续重排队"""
+        target_pid = None
+        target_process = None
+        with self._process_lock:
+            for pid, jid in list(self._process_job_map.items()):
+                if jid == job_id:
+                    target_pid = pid
+                    target_process = self._active_processes.get(pid)
+                    break
+        if target_pid is None or target_process is None:
+            return False
+
+        try:
+            if target_process.poll() is None:
+                target_process.terminate()
+                try:
+                    target_process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    target_process.kill()
+            logger.info(f"[MediaPrep] 已终止720p进程: job_id={job_id}, pid={target_pid}, reason={reason}")
+        except Exception as e:
+            logger.warning(f"[MediaPrep] 终止720p进程失败: job_id={job_id}, pid={target_pid}, err={e}")
+
+        # 清理登记
+        self._unregister_process(target_process)
+
+        with self.lock:
+            if job_id in self.task_status and "proxy_720p" in self.task_status[job_id]:
+                # V3.1.2+dev.20260114.18: 被新任务打断不标记失败，回到待检查状态，清理错误
+                if reason == "paused_for_new_job":
+                    self.task_status[job_id]["proxy_720p"]["status"] = "waiting_check"
+                    self.task_status[job_id]["proxy_720p"]["error"] = None
+                    self.task_status[job_id]["proxy_720p"]["progress"] = 0
+                else:
+                    self.task_status[job_id]["proxy_720p"]["status"] = "failed"
+                    self.task_status[job_id]["proxy_720p"]["error"] = reason
+                    self.task_status[job_id]["proxy_720p"]["progress"] = 0
+        # V3.1.2+dev.20260114.13: 被新任务打断时不推送错误事件，静默等待重排队
+        if reason != "paused_for_new_job":
+            try:
+                self._push_proxy_error(job_id, reason)
+            except Exception as e:
+                logger.debug(f"[MediaPrep] 推送 proxy 错误事件失败: {job_id}, {e}")
+        return True
+
+    def set_low_priority_by_job(self, job_id: str) -> bool:
+        """将指定 job 的 proxy 进程设置为低优先级"""
+        target_pid = None
+        with self._process_lock:
+            for pid, jid in list(self._process_job_map.items()):
+                if jid == job_id:
+                    target_pid = pid
+                    break
+        if target_pid is None:
+            return False
+        self._set_low_priority(target_pid)
+        return True
+
+    def has_active_tasks(self) -> bool:
+        """V3.1.2+dev.20260114.12: 判断是否有活跃的媒体任务（360p/720p/其他转码）"""
+        with self.lock:
+            for task_map in self.task_status.values():
+                if not isinstance(task_map, dict):
+                    continue
+                for status in task_map.values():
+                    if isinstance(status, dict) and status.get("status") == "processing":
+                        return True
+        # 再检查队列是否有待处理任务
+        return not self.task_queue.empty()
+
+    def cancel_tasks(self, job_id: str) -> int:
+        """
+        V3.1.2+dev.20260112.01: 取消指定任务的所有 FFmpeg 子进程
+
+        用于删除任务前终止正在运行的转码进程，避免 WinError 32 文件占用问题。
+
+        Args:
+            job_id: 要取消的任务 ID
+
+        Returns:
+            int: 被终止的进程数
+        """
+        killed_count = 0
+        with self._process_lock:
+            # 找到该 job_id 对应的所有进程
+            pids_to_kill = [
+                pid for pid, jid in self._process_job_map.items()
+                if jid == job_id
+            ]
+
+            for pid in pids_to_kill:
+                process = self._active_processes.get(pid)
+                if process:
+                    try:
+                        if process.poll() is None:  # 进程仍在运行
+                            process.terminate()
+                            try:
+                                process.wait(timeout=3)
+                            except subprocess.TimeoutExpired:
+                                process.kill()  # 强制终止
+                            killed_count += 1
+                            logger.info(f"[MediaPrep] 已终止任务 {job_id} 的进程: PID={pid}")
+                    except Exception as e:
+                        logger.warning(f"[MediaPrep] 终止进程失败 PID={pid}: {e}")
+
+                # 清理映射
+                if pid in self._active_processes:
+                    del self._active_processes[pid]
+                if pid in self._process_job_map:
+                    del self._process_job_map[pid]
+
+        # 取消该任务的 720p 检查定时器
+        timer = self.pending_720p_checks.pop(job_id, None)
+        if timer:
+            timer.cancel()
+            logger.info(f"[MediaPrep] 已取消任务 {job_id} 的 720p 检查定时器")
+
+        # V3.1.2+dev.20260113.01: 移除状态修改逻辑
+        # 原因：MediaPrep 和 TranscriptionService 是独立系统，不应互相修改状态
+        # 只终止进程，不修改任务状态
+        logger.info(f"[MediaPrep] 已终止任务 {job_id} 的 {killed_count} 个进程，不修改任务状态")
+
         return killed_count
 
     def shutdown(self):

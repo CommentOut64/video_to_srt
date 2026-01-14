@@ -50,7 +50,80 @@ def _find_video_file(job_dir: Path) -> Optional[Path]:
     return None
 
 
-def _serve_file_with_range(file_path: Path, request: Request, media_type: str):
+def _find_best_h264(job_dir: Path):
+    """
+    V3.1.2+dev.20260114.21: 查找目录下最高分辨率且视频编码为 h264 的文件
+    返回 (path, height)
+    """
+    try:
+        ffprobe_cmd = config.get_ffprobe_command()
+    except Exception:
+        return None, 0
+
+    best_path = None
+    best_height = 0
+
+    for file in job_dir.iterdir():
+        if not file.is_file():
+            continue
+        if file.suffix.lower() not in ['.mp4', '.mov', '.mkv', '.avi', '.flv', '.webm', '.m4v']:
+            continue
+        if file.name.endswith('.tmp'):
+            continue
+        # 允许 proxy/remux/用户自带高清视频，但跳过 360p 预览
+        if file.name.startswith('preview_'):
+            continue
+        try:
+            cmd = [
+                ffprobe_cmd,
+                '-v', 'error',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=codec_name,height',
+                '-of', 'default=noprint_wrappers=1:nokey=1',
+                str(file)
+            ]
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=8
+            )
+            if result.returncode != 0 or not result.stdout:
+                continue
+            lines = result.stdout.strip().splitlines()
+            if len(lines) < 2:
+                continue
+            codec = lines[0].strip()
+            try:
+                height = int(float(lines[1].strip()))
+            except:
+                height = 0
+            if codec != 'h264':
+                continue
+            if height > best_height:
+                best_height = height
+                best_path = file
+        except Exception:
+            continue
+
+    return best_path, best_height
+
+
+from app.services.media_stream_tracker import (
+    register_stream,
+    unregister_stream,
+)
+
+
+def _serve_file_with_range(
+    file_path: Path,
+    request: Request,
+    media_type: str,
+    job_id: str = None
+):
     """
     支持HTTP Range请求的文件流式传输（允许拖拽进度条）
     """
@@ -60,12 +133,40 @@ def _serve_file_with_range(file_path: Path, request: Request, media_type: str):
     file_size = file_path.stat().st_size
     range_header = request.headers.get("range")
 
+    # 注册占用，确保删除逻辑可感知活跃流
+    registered = False
+    if job_id:
+        try:
+            register_stream(job_id)
+            registered = True
+        except Exception:
+            # 追踪失败不影响读取
+            registered = False
+
+    def finalize():
+        if registered and job_id:
+            unregister_stream(job_id)
+
+    def full_file_iterator():
+        try:
+            with open(file_path, "rb") as f:
+                while True:
+                    data = f.read(256 * 1024)
+                    if not data:
+                        break
+                    yield data
+        finally:
+            finalize()
+
     if not range_header:
-        # 无Range请求，返回完整文件
-        return FileResponse(
-            path=str(file_path),
+        # 无Range请求，改用流式响应以便在结束时释放占用
+        return StreamingResponse(
+            full_file_iterator(),
             media_type=media_type,
-            filename=file_path.name
+            headers={
+                "Content-Length": str(file_size),
+                "Accept-Ranges": "bytes",
+            }
         )
 
     # 解析Range头：bytes=start-end
@@ -76,33 +177,38 @@ def _serve_file_with_range(file_path: Path, request: Request, media_type: str):
 
         # 确保范围有效
         if start >= file_size:
+            finalize()
             raise HTTPException(status_code=416, detail="请求范围无效")
         end = min(end, file_size - 1)
 
     except ValueError:
+        finalize()
         raise HTTPException(status_code=400, detail="无效的Range头格式")
 
     # 返回部分内容（状态码206）
     def file_iterator():
-        with open(file_path, "rb") as f:
-            f.seek(start)
-            remaining = end - start + 1
+        try:
+            with open(file_path, "rb") as f:
+                f.seek(start)
+                remaining = end - start + 1
 
-            # 动态 chunk_size：根据请求大小调整 (优化大视频拖动性能)
-            if remaining < 1024 * 1024:  # < 1MB
-                chunk_size = 8192  # 8KB
-            elif remaining < 10 * 1024 * 1024:  # < 10MB
-                chunk_size = 64 * 1024  # 64KB
-            else:
-                chunk_size = 256 * 1024  # 256KB
+                # 动态 chunk_size：根据请求大小调整 (优化大视频拖动性能)
+                if remaining < 1024 * 1024:  # < 1MB
+                    chunk_size = 8192  # 8KB
+                elif remaining < 10 * 1024 * 1024:  # < 10MB
+                    chunk_size = 64 * 1024  # 64KB
+                else:
+                    chunk_size = 256 * 1024  # 256KB
 
-            while remaining > 0:
-                read_size = min(chunk_size, remaining)
-                data = f.read(read_size)
-                if not data:
-                    break
-                yield data
-                remaining -= len(data)
+                while remaining > 0:
+                    read_size = min(chunk_size, remaining)
+                    data = f.read(read_size)
+                    if not data:
+                        break
+                    yield data
+                    remaining -= len(data)
+        finally:
+            finalize()
 
     headers = {
         "Content-Range": f"bytes {start}-{end}/{file_size}",
@@ -569,17 +675,28 @@ async def get_video(job_id: str, request: Request):
     remux_video = job_dir / "remux.mp4"
     preview_360p = job_dir / "preview_360p.mp4"
 
-    if proxy_720p.exists():
-        logger.debug(f"[media] 返回720p高清视频")
-        return _serve_file_with_range(proxy_720p, request, 'video/mp4')
+    # V3.1.2+dev.20260114.08: 仅在调度器/状态标记 ready 时返回720p，避免未落盘即切换
+    from app.services.proxy_720_scheduler import get_proxy_scheduler
+    scheduler_state = get_proxy_scheduler().get_state(job_id)
+    proxy_status_ready = False
+    try:
+        from app.services.media_prep_service import get_media_prep_service
+        proxy_status = get_media_prep_service().get_proxy_status(job_id)
+        proxy_status_ready = proxy_status and proxy_status.get("status") == "completed"
+    except Exception:
+        proxy_status_ready = False
+
+    if proxy_720p.exists() and (scheduler_state.get("state") == "ready" or proxy_status_ready):
+        logger.debug(f"[media] 返回720p高清视频（已就绪）")
+        return _serve_file_with_range(proxy_720p, request, 'video/mp4', job_id=job_id)
 
     if remux_video.exists():
         print(f"[media] 返回重封装视频")
-        return _serve_file_with_range(remux_video, request, 'video/mp4')
+        return _serve_file_with_range(remux_video, request, 'video/mp4', job_id=job_id)
 
     if preview_360p.exists():
         print(f"[media] 返回360p预览视频")
-        return _serve_file_with_range(preview_360p, request, 'video/mp4')
+        return _serve_file_with_range(preview_360p, request, 'video/mp4', job_id=job_id)
 
     # 2. 查找源视频
     video_file = _find_video_file(job_dir)
@@ -636,12 +753,12 @@ async def get_video(job_id: str, request: Request):
         # 优先级1: 如果 720p 已完成，返回 720p 视频
         if proxy_completed and proxy_720p.exists():
             print(f"[media] 返回已完成的720p高清视频")
-            return _serve_file_with_range(proxy_720p, request, 'video/mp4')
+            return _serve_file_with_range(proxy_720p, request, 'video/mp4', job_id=job_id)
 
         # 优先级2: 如果 360p 已完成，返回 360p 视频（720p可能正在处理或未启动）
         if preview_completed and preview_360p.exists():
             print(f"[media] 返回已完成的360p预览视频")
-            return _serve_file_with_range(preview_360p, request, 'video/mp4')
+            return _serve_file_with_range(preview_360p, request, 'video/mp4', job_id=job_id)
 
         # 如果有任务正在处理，返回进度信息
         if preview_in_progress or proxy_in_progress:
@@ -677,7 +794,7 @@ async def get_video(job_id: str, request: Request):
 
     # 4. 返回兼容格式的源视频
     # 日志已在编码检测时输出，此处不再重复
-    return _serve_file_with_range(video_file, request, 'video/mp4')
+    return _serve_file_with_range(video_file, request, 'video/mp4', job_id=job_id)
 
 
 @router.get("/{job_id}/audio")
@@ -689,7 +806,7 @@ async def get_audio(job_id: str, request: Request):
     if not audio_file.exists():
         raise HTTPException(status_code=404, detail="音频文件不存在")
 
-    return _serve_file_with_range(audio_file, request, 'audio/wav')
+    return _serve_file_with_range(audio_file, request, 'audio/wav', job_id=job_id)
 
 
 @router.get("/{job_id}/peaks")
@@ -824,8 +941,10 @@ async def check_proxy_status(job_id: str):
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
 
-    # 从 MediaPrepService 获取任务状态
+    # V3.1.2+dev.20260114.06: 获取任务状态（缩进修复）
     from app.services.media_prep_service import get_media_prep_service, TranscodeDecision
+    from app.services.proxy_720_scheduler import get_proxy_scheduler  # 统一720p调度
+
     media_prep = get_media_prep_service()
     task_status = media_prep.get_full_task_status(job_id)
 
@@ -841,49 +960,23 @@ async def check_proxy_status(job_id: str):
         "source": f"/api/media/{job_id}/video" if source_video else None
     }
 
-    # 如果没有任务状态，根据文件存在性推断状态
+    # V3.1.2+dev.20260114.06: 读取调度器状态（用于版本/状态一致性）
+    scheduler_state = get_proxy_scheduler().get_state(job_id)
+
+    # 如果没有任务状态，根据文件存在性和调度器状态推断
     if not task_status:
+        scheduler_state_name = scheduler_state.get("state")
+
         if proxy_720p.exists() or remux_video.exists():
             state = "ready_720p"
             progress = 100
         elif preview_360p.exists():
-            state = "ready_360p"
+            # 360p 完成但 720p 未就绪，保持 ready_360p
+            state = scheduler_state_name or "ready_360p"
             progress = 100
-
-            # 【新增】360p已完成但720p不存在，检查是否需要触发720p转码
-            if not proxy_720p.exists() and not remux_video.exists() and source_video:
-                print(f"[media] 360p已完成但720p不存在，检查是否触发720p转码: {job_id}")
-                try:
-                    # 检查720p是否已在队列中
-                    proxy_status = media_prep.get_proxy_status(job_id)
-                    if not proxy_status or proxy_status.get("status") not in ["queued", "processing"]:
-                        # 720p未在队列中，检查转录队列是否空闲
-                        from app.services.job_queue_service import get_queue_service
-
-                        queue_idle = True  # 默认认为空闲
-                        try:
-                            queue_service = get_queue_service()
-                            if queue_service:
-                                # 检查是否有正在处理或等待的任务
-                                active_jobs = [
-                                    j for j in queue_service.jobs.values()
-                                    if j.status in ['pending', 'processing', 'queued']
-                                ]
-                                queue_idle = len(active_jobs) == 0
-                                print(f"[media] 队列状态检查: 活跃任务数={len(active_jobs)}, 空闲={queue_idle}")
-                        except Exception as e:
-                            print(f"[media] 检查队列状态失败，默认认为空闲: {e}")
-
-                        if queue_idle:
-                            # 队列空闲，自动触发720p转码
-                            print(f"[media] 队列空闲，自动触发720p转码: {job_id}")
-                            media_prep.enqueue_proxy(job_id, source_video, proxy_720p, priority=10)
-                        else:
-                            # 队列繁忙，使用低优先级
-                            print(f"[media] 队列繁忙，低优先级触发720p转码: {job_id}")
-                            media_prep.enqueue_proxy(job_id, source_video, proxy_720p, priority=1)
-                except Exception as e:
-                    print(f"[media] 自动触发720p转码失败: {e}")
+            # V3.1.2+dev.20260114.06: 确保任务被调度器跟踪，但不在此处触发
+            if source_video:
+                get_proxy_scheduler().ensure_tracked(job_id, source_video, trigger_type="editor_check")
         elif source_video:
             # 分析是否需要转码
             from app.utils.media_analyzer import media_analyzer
@@ -915,8 +1008,8 @@ async def check_proxy_status(job_id: str):
                 state = "idle"
                 progress = 0
         else:
-            state = "idle"
-            progress = 0
+            state = scheduler_state_name or "idle"
+            progress = scheduler_state.get("progress", 0) if scheduler_state else 0
 
         return JSONResponse({
             "state": state,
@@ -925,7 +1018,9 @@ async def check_proxy_status(job_id: str):
             "urls": urls,
             "error": None,
             "started_at": None,
-            "estimated_remaining": None
+            "estimated_remaining": None,
+            "auto_trigger_720p": config.PROXY_CONFIG.get('auto_trigger_720p', True),
+            "version": scheduler_state.get("version")
         })
 
     # 【新增】检查360p是否需要重试（处理意外关闭的情况）
@@ -951,6 +1046,34 @@ async def check_proxy_status(job_id: str):
                 print(f"[media] 自动启动360p转码失败: {e}")
 
     # 返回完整状态
+    # V3.1.2+dev.20260114.19: 如果 proxy 状态为 waiting_check/paused_for_new_job，静默清理错误
+    proxy_state = task_status.get("proxy_720p") if isinstance(task_status, dict) else None
+    if proxy_state and proxy_state.get("status") in ["waiting_check", "queued"] and proxy_state.get("error") == "paused_for_new_job":
+        proxy_state = dict(proxy_state)
+        proxy_state["error"] = None
+        task_status = dict(task_status)
+        task_status["proxy_720p"] = proxy_state
+
+    # V3.1.2+dev.20260114.21: 选择最高可播放的 h264 文件用于兜底加载
+    best_h264_path, best_h264_height = _find_best_h264(job_dir)
+    best_playable_url = None
+    best_playable_resolution = None
+    if best_h264_path:
+        best_playable_url = f"/api/media/{job_id}/video"
+        if best_h264_path.name == "proxy_720p.mp4":
+            best_playable_resolution = "720p"
+        elif best_h264_path.name.startswith("preview_"):
+            best_playable_resolution = "360p"
+        else:
+            if best_h264_height >= 1080:
+                best_playable_resolution = "1080p+"
+            elif best_h264_height >= 720:
+                best_playable_resolution = "720p"
+            elif best_h264_height >= 480:
+                best_playable_resolution = "480p"
+            else:
+                best_playable_resolution = "360p"
+
     return JSONResponse({
         "state": task_status.get("state", "idle"),
         "progress": task_status.get("progress", 0),
@@ -958,7 +1081,11 @@ async def check_proxy_status(job_id: str):
         "urls": urls,
         "error": task_status.get("error"),
         "started_at": task_status.get("started_at"),
-        "estimated_remaining": task_status.get("estimated_remaining")
+        "estimated_remaining": task_status.get("estimated_remaining"),
+        "auto_trigger_720p": config.PROXY_CONFIG.get('auto_trigger_720p', True),
+        "version": scheduler_state.get("version"),
+        "best_playable_url": best_playable_url,
+        "best_playable_resolution": best_playable_resolution
     })
 
 
@@ -1218,12 +1345,12 @@ async def get_preview_video(job_id: str, request: Request):
     # 查找 360p 预览视频
     preview_360p = job_dir / "preview_360p.mp4"
     if preview_360p.exists():
-        return _serve_file_with_range(preview_360p, request, 'video/mp4')
+        return _serve_file_with_range(preview_360p, request, 'video/mp4', job_id=job_id)
 
     # 如果没有 360p，尝试返回 720p proxy
     proxy_video = job_dir / "proxy_720p.mp4"
     if proxy_video.exists():
-        return _serve_file_with_range(proxy_video, request, 'video/mp4')
+        return _serve_file_with_range(proxy_video, request, 'video/mp4', job_id=job_id)
 
     # 都没有，返回 202 表示正在生成
     raise HTTPException(
@@ -1935,3 +2062,116 @@ async def _auto_generate_thumbnail(job_id: str, video_file: Path, thumbnail_file
         print(f"[media] 缩略图自动生成失败 [{job_id}]: {e}")
 
 
+@router.post("/{job_id}/upgrade-720p")
+async def upgrade_to_720p(job_id: str):
+    """
+    V3.1.2+dev.20260114.07: 手动触发720p转码（自动启用时禁止手动）
+
+    检查条件：
+    1. 任务存在且360p已完成
+    2. 720p未完成
+    3. 队列空闲
+    4. 无转码进行
+
+    Returns:
+        JSONResponse: {
+            "success": bool,
+            "message": str,
+            "reason": str (失败时)
+        }
+    """
+    try:
+        from app.services.media_prep_service import get_media_prep_service
+        from app.services.proxy_720_scheduler import get_proxy_scheduler
+
+        media_prep = get_media_prep_service()
+        scheduler = get_proxy_scheduler()
+
+        # 自动模式下禁止手动
+        auto_enabled = config.PROXY_CONFIG.get('auto_trigger_720p', False)
+        if auto_enabled:
+            return JSONResponse(
+                content={
+                    "success": False,
+                    "message": "已开启自动720p，不能手动触发",
+                    "reason": "auto_enabled"
+                },
+                status_code=400
+            )
+
+        job_dir = config.JOBS_DIR / job_id
+        if not job_dir.exists():
+            return JSONResponse(
+                content={
+                    "success": False,
+                    "message": "任务目录不存在",
+                    "reason": "job_not_found"
+                },
+                status_code=404
+            )
+
+        # 查找视频文件
+        video_file = None
+        video_exts = ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.webm', '.flv', '.m4v']
+        for f in job_dir.iterdir():
+            if f.is_file() and f.suffix.lower() in video_exts and not f.name.startswith(('preview_', 'proxy_')):
+                video_file = f
+                break
+
+        if not video_file:
+            return JSONResponse(
+                content={
+                    "success": False,
+                    "message": "未找到视频文件",
+                    "reason": "video_not_found"
+                },
+                status_code=400
+            )
+
+        # 调度器统一检查：360p、队列、进行中等
+        result = scheduler.request(
+            job_id,
+            video_file,
+            trigger_type="manual",
+            auto_enabled=auto_enabled,
+            force=False,
+            priority=50  # 手动优先级高于自动
+        )
+
+        if result.get("accepted"):
+            return JSONResponse(content={
+                "success": True,
+                "message": "后台已排队，队列空闲后自动生成720p"
+            }, status_code=200)
+
+        reason = result.get("reason", "unknown")
+        message = {
+            "auto_disabled": "未开启自动模式，但请求被拒绝",
+            "preview_not_ready": "360p未完成，无法升级720p",
+            "already_exists": "720p已存在",
+            "already_processing": "720p正在处理中",
+            "queue_busy": "有任务正在运行，请稍后再试",
+            "job_not_found": "任务不存在"
+        }.get(reason, "请求被拒绝")
+
+        status_code = 400
+        if reason in ["job_not_found"]:
+            status_code = 404
+        elif reason == "queue_busy":
+            status_code = 503
+
+        return JSONResponse(
+            content={"success": False, "message": message, "reason": reason},
+            status_code=status_code
+        )
+
+    except Exception as e:
+        logger.error(f"[media] 手动触发720p异常: {job_id}, {e}", exc_info=True)
+        return JSONResponse(
+            content={
+                "success": False,
+                "message": f"服务器错误: {str(e)}",
+                "reason": "server_error"
+            },
+            status_code=500
+        )

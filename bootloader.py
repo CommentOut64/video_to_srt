@@ -24,7 +24,6 @@ import shutil
 import zipfile
 import tempfile
 import subprocess
-import threading
 import logging
 import hashlib
 from pathlib import Path
@@ -39,6 +38,7 @@ VERSION = "3.1.1+dev.20260105.05"
 APP_NAME = "AnchorFlux"
 DEFAULT_BACKEND_PORT = 8000
 DEFAULT_FRONTEND_PORT = 5173
+UPDATE_HELPER_NAME = "update_helper.exe"
 
 # Signal files
 UPDATE_SIGNAL_FILE = "update_signal.json"
@@ -485,6 +485,71 @@ class UpdateManager:
 
         return copied_count, skipped_count
 
+    def _stage_update_package(self, download_url: str, version: str) -> Path:
+        import urllib.request
+
+        temp_dir = Path(tempfile.mkdtemp())
+        zip_path = temp_dir / "update.zip"
+
+        self.logger.info("Downloading update package...")
+        urllib.request.urlretrieve(download_url, str(zip_path))
+        self.logger.info(f"Downloaded update: {zip_path.stat().st_size} bytes")
+
+        extract_dir = temp_dir / "extracted"
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            zf.extractall(str(extract_dir))
+
+        extracted_items = list(extract_dir.iterdir())
+        if len(extracted_items) == 1 and extracted_items[0].is_dir():
+            source_dir = extracted_items[0]
+        else:
+            source_dir = extract_dir
+
+        staged_root = self.config.project_root / "temp" / "staged_updates"
+        staged_root.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        staged_dir = staged_root / f"{version.replace('/', '_')}_{timestamp}"
+        if staged_dir.exists():
+            shutil.rmtree(staged_dir, ignore_errors=True)
+
+        shutil.copytree(source_dir, staged_dir, dirs_exist_ok=True)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+        self.logger.info(f"Update staged at: {staged_dir}")
+        return staged_dir
+
+    def _launch_update_helper(self, staged_dir: Path):
+        if not getattr(sys, 'frozen', False):
+            self.logger.info("Running from source, applying update directly...")
+            exclude_dirs, exclude_files = self._load_update_config()
+            copied, skipped = self._copy_with_excludes(
+                staged_dir, self.config.project_root, exclude_dirs, exclude_files
+            )
+            self.logger.info(f"Copied {copied} files, skipped {skipped} items")
+            shutil.rmtree(staged_dir, ignore_errors=True)
+            return
+
+        helper_path = staged_dir / UPDATE_HELPER_NAME
+        if not helper_path.exists():
+            fallback = self.config.project_root / UPDATE_HELPER_NAME
+            if fallback.exists():
+                shutil.copy2(fallback, helper_path)
+            else:
+                raise FileNotFoundError(f"{UPDATE_HELPER_NAME} not found in update package")
+
+        exe_path = Path(sys.executable)
+        cmd = [
+            str(helper_path),
+            "--source", str(staged_dir),
+            "--target", str(self.config.project_root),
+            "--exe-path", str(exe_path),
+            "--cleanup"
+        ]
+
+        self.logger.info("Launching update helper and exiting current process...")
+        subprocess.Popen(cmd, cwd=str(staged_dir))
+        os._exit(0)
+
     def check_update_signal(self) -> Optional[Dict[str, Any]]:
         """Check for update signal file"""
         if not self.signal_file.exists():
@@ -512,9 +577,7 @@ class UpdateManager:
 
     def execute_update(self, signal_data: Dict[str, Any], headless: bool = False) -> bool:
         """
-        Execute update process
-
-        V3.1.1+dev.20260105.01: 添加 headless 模式支持，用于自动化测试
+        Execute update by staging files and launching helper executable.
         """
         download_url = signal_data.get('download_url')
         version = signal_data.get('version', 'unknown')
@@ -526,196 +589,22 @@ class UpdateManager:
         self.logger.info(f"Starting update to version {version}...")
 
         try:
-            if headless:
-                # V3.1.1+dev.20260105.01: 无头模式，不显示 GUI
-                return self._run_update_headless(download_url, version)
-            else:
-                # 正常模式，显示 Tkinter GUI
-                return self._run_update_gui(download_url, version)
+            staged_dir = self._stage_update_package(download_url, version)
         except Exception as e:
-            self.logger.error(f"Update failed: {e}")
+            self.logger.error(f"Failed to stage update: {e}")
             return False
 
-    def _run_update_headless(self, download_url: str, version: str) -> bool:
-        """
-        Run update without GUI (headless mode)
-
-        V3.1.1+dev.20260105.01: 用于自动化测试和无显示器环境
-        """
-        import urllib.request
-
-        self.logger.info(f"[Headless] Downloading update from: {download_url}")
+        # 清理信号，避免重复执行
+        self.clear_update_signal()
 
         try:
-            # 1. 下载更新包
-            temp_dir = Path(tempfile.mkdtemp())
-            zip_path = temp_dir / "update.zip"
-
-            self.logger.info("[Headless] Step 1/4: Downloading...")
-            urllib.request.urlretrieve(download_url, str(zip_path))
-            self.logger.info(f"[Headless] Downloaded: {zip_path.stat().st_size} bytes")
-
-            # 2. 解压更新包
-            self.logger.info("[Headless] Step 2/4: Extracting...")
-            extract_dir = temp_dir / "extracted"
-            with zipfile.ZipFile(zip_path, 'r') as zf:
-                zf.extractall(str(extract_dir))
-
-            # 3. 定位源目录
-            extracted_items = list(extract_dir.iterdir())
-            if len(extracted_items) == 1 and extracted_items[0].is_dir():
-                source_dir = extracted_items[0]
-            else:
-                source_dir = extract_dir
-
-            self.logger.info(f"[Headless] Source directory: {source_dir}")
-
-            # 4. 递归复制文件（排除用户数据目录和文件）
-            # V3.1.1+dev.20260105.04: 改用递归复制，支持任意深度的排除路径
-            self.logger.info("[Headless] Step 3/4: Installing...")
-            exclude_dirs, exclude_files = self._load_update_config()
-
-            self.logger.info(f"[Headless] Exclude dirs: {exclude_dirs}")
-            self.logger.info(f"[Headless] Exclude files: {exclude_files}")
-
-            copied_count, skipped_count = self._copy_with_excludes(
-                source_dir, self.config.project_root,
-                exclude_dirs, exclude_files
-            )
-
-            self.logger.info(f"[Headless] Copied {copied_count} files, skipped {skipped_count} excluded items")
-
-            # 5. 清理临时文件
-            self.logger.info("[Headless] Step 4/4: Cleaning up...")
-            shutil.rmtree(temp_dir, ignore_errors=True)
-
-            self.logger.info("[Headless] Update completed successfully!")
-            return True
-
+            self._launch_update_helper(staged_dir)
         except Exception as e:
-            self.logger.error(f"[Headless] Update error: {e}")
+            self.logger.error(f"Failed to launch update helper: {e}")
             return False
 
-    def _run_update_gui(self, download_url: str, version: str) -> bool:
-        """Run update with GUI"""
-        try:
-            import tkinter as tk
-            from tkinter import ttk, messagebox
-        except ImportError:
-            self.logger.error("Tkinter not available, cannot show update GUI")
-            return False
+        return True
 
-        # Create update window
-        root = tk.Tk()
-        root.title(f"{APP_NAME} - Updating to {version}")
-        root.geometry("400x200")
-        root.resizable(False, False)
-
-        # Center window
-        root.update_idletasks()
-        width = root.winfo_width()
-        height = root.winfo_height()
-        x = (root.winfo_screenwidth() // 2) - (width // 2)
-        y = (root.winfo_screenheight() // 2) - (height // 2)
-        root.geometry(f'{width}x{height}+{x}+{y}')
-
-        # UI elements
-        frame = ttk.Frame(root, padding="20")
-        frame.pack(fill=tk.BOTH, expand=True)
-
-        status_label = ttk.Label(frame, text="Preparing update...")
-        status_label.pack(pady=10)
-
-        progress_bar = ttk.Progressbar(frame, length=300, mode='determinate')
-        progress_bar.pack(pady=10)
-
-        detail_label = ttk.Label(frame, text="")
-        detail_label.pack(pady=5)
-
-        update_success = [False]  # Use list to modify in closure
-
-        def update_progress(percent: int, status: str, detail: str = ""):
-            progress_bar['value'] = percent
-            status_label['text'] = status
-            detail_label['text'] = detail
-            root.update()
-
-        def do_update():
-            try:
-                import urllib.request
-
-                # 1. Download update package
-                update_progress(10, "Downloading update...")
-
-                temp_dir = Path(tempfile.mkdtemp())
-                zip_path = temp_dir / "update.zip"
-
-                def download_progress(block_num, block_size, total_size):
-                    if total_size > 0:
-                        percent = min(10 + int(block_num * block_size / total_size * 50), 60)
-                        downloaded = block_num * block_size / (1024 * 1024)
-                        total = total_size / (1024 * 1024)
-                        root.after(0, lambda: update_progress(
-                            percent, "Downloading...",
-                            f"{downloaded:.1f} MB / {total:.1f} MB"
-                        ))
-
-                urllib.request.urlretrieve(download_url, str(zip_path), download_progress)
-
-                # 2. Extract update package
-                update_progress(65, "Extracting files...")
-
-                extract_dir = temp_dir / "extracted"
-                with zipfile.ZipFile(zip_path, 'r') as zf:
-                    zf.extractall(str(extract_dir))
-
-                # 3. Backup current version (optional)
-                update_progress(75, "Backing up current version...")
-
-                # 4. Copy files
-                update_progress(80, "Installing update...")
-
-                # Find extracted root directory
-                extracted_items = list(extract_dir.iterdir())
-                if len(extracted_items) == 1 and extracted_items[0].is_dir():
-                    source_dir = extracted_items[0]
-                else:
-                    source_dir = extract_dir
-
-                # Copy files (exclude user data directories and files)
-                # V3.1.1+dev.20260105.04: 改用递归复制，支持任意深度的排除路径
-                exclude_dirs, exclude_files = self._load_update_config()
-
-                copied_count, skipped_count = self._copy_with_excludes(
-                    source_dir, self.config.project_root,
-                    exclude_dirs, exclude_files
-                )
-                self.logger.info(f"Copied {copied_count} files, skipped {skipped_count} excluded items")
-
-                # 5. Cleanup
-                update_progress(95, "Cleaning up...")
-                shutil.rmtree(temp_dir, ignore_errors=True)
-
-                update_progress(100, "Update completed!")
-                update_success[0] = True
-
-                root.after(1500, root.destroy)
-
-            except Exception as e:
-                self.logger.error(f"Update error: {e}")
-                root.after(0, lambda: messagebox.showerror(
-                    "Update Failed",
-                    f"Failed to update: {str(e)}\n\nThe application will restart with the current version."
-                ))
-                root.after(0, root.destroy)
-
-        # Run update in background thread
-        update_thread = threading.Thread(target=do_update, daemon=True)
-        update_thread.start()
-
-        root.mainloop()
-
-        return update_success[0]
 
 
 def get_project_root() -> Path:

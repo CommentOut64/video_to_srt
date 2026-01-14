@@ -69,6 +69,17 @@ class SSEManager:
         Yields:
             SSE格式的消息字符串
         """
+        # 如果已存在同频道连接，主动踢掉旧连接，确保单活跃连接（避免多编辑器状态混乱）
+        if channel_id in self.connections and self.connections[channel_id]:
+            logger.info(f"SSE频道已有连接，踢掉旧连接后重建: {channel_id}")
+            old_connections = list(self.connections[channel_id])
+            self.connections[channel_id].clear()
+            for q in old_connections:
+                try:
+                    q.put_nowait({"event": "force_disconnect", "data": {"reason": "new_connection"}})
+                except Exception as e:
+                    logger.debug(f"推送强制断开事件失败: {e}")
+
         # 创建此连接的专用队列
         event_queue = asyncio.Queue(maxsize=self.max_queue_size)
         self.connections[channel_id].append(event_queue)
@@ -110,6 +121,12 @@ class SSEManager:
                         event_queue.get(),
                         timeout=self.heartbeat_interval
                     )
+
+                    # 特殊事件：强制断开，用于踢掉旧连接
+                    if message.get("event") == "force_disconnect":
+                        yield self._format_sse("force_disconnect", message.get("data", {}))
+                        logger.debug(f"收到强制断开指令，关闭连接: {connection_id}")
+                        break
 
                     # 发送事件
                     formatted = self._format_sse(message["event"], message["data"])

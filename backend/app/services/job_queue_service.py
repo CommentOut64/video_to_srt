@@ -22,6 +22,7 @@ import torch
 from app.models.job_models import JobState
 from app.services.sse_service import get_sse_manager
 from app.services.config_adapter import ConfigAdapter
+from app.core.config import config
 from app.utils.cancellation_token import (
     CancellationToken,
     CancelledException,
@@ -117,6 +118,9 @@ class JobQueueService:
         # [V3.7] 取消令牌注册表
         self.cancellation_tokens: Dict[str, CancellationToken] = {}
 
+        # V3.1.2+dev.20260114.09: 720p 调度空闲通知延迟定时器
+        self._pending_proxy_idle_timer: Optional[threading.Timer] = None
+
         # [V3.1.0] 取消超时保障机制
         # 用于确保取消操作最终生效，防止任务卡死导致队列阻塞
         self._pending_cancel_requests: Dict[str, float] = {}  # {job_id: cancel_request_time}
@@ -133,7 +137,6 @@ class JobQueueService:
         self.lock = threading.RLock()  # 使用可重入锁，避免嵌套调用死锁
 
         # 持久化文件路径
-        from app.core.config import config
         self.queue_file = Path(config.JOBS_DIR) / "queue_state.json"
         self.settings_file = Path(config.JOBS_DIR) / "queue_settings.json"
 
@@ -160,6 +163,19 @@ class JobQueueService:
         )
         self._cancel_timeout_thread.start()
         logger.info("[V3.1.0] 取消超时监控线程已启动")
+
+    def _find_video_file(self, job_id: str) -> Optional[Path]:
+        """V3.1.2+dev.20260114.11: 查找源视频（跳过 preview/proxy/remux）"""
+        job_dir = config.JOBS_DIR / job_id
+        if not job_dir.exists():
+            return None
+        video_exts = ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.webm', '.flv', '.m4v']
+        for file in job_dir.iterdir():
+            if file.is_file() and file.suffix.lower() in video_exts:
+                if file.name.startswith(('preview_', 'proxy_', 'remux')):
+                    continue
+                return file
+        return None
 
     def add_job(self, job: JobState):
         """
@@ -323,7 +339,7 @@ class JobQueueService:
 
         return True
 
-    def cancel_job(self, job_id: str, delete_data: bool = False) -> bool:
+    def cancel_job(self, job_id: str, delete_data: bool = False):
         """
         取消任务（支持删除已完成的任务）
 
@@ -343,7 +359,7 @@ class JobQueueService:
             delete_data: 是否删除任务数据
 
         Returns:
-            bool: 是否成功
+            Tuple[bool, Optional[str], bool]: (是否成功, 失败原因, 是否处于延迟删除状态)
         """
         job = self.jobs.get(job_id)
 
@@ -353,15 +369,18 @@ class JobQueueService:
                 # 尝试通过transcription_service删除已完成的任务
                 try:
                     result = self.transcription_service.cancel_job(job_id, delete_data=True)
-                    if result:
+                    success, err = result if isinstance(result, tuple) else (bool(result), None)
+                    if success:
                         # [V3.1.0] 推送任务删除事件（而非仅状态变更）
                         self._notify_job_removed(job_id)
                         # [V3.7] 清理取消令牌
                         self._remove_cancellation_token(job_id)
-                        return True
+                        return True, None, False
+                    return False, err or "删除失败", False
                 except Exception as e:
                     logger.warning(f"删除任务 {job_id} 失败: {e}")
-            return False
+                    return False, str(e), False
+            return False, "任务未找到", False
 
         is_running = False  # [V3.1.0] 标记是否为正在运行的任务
 
@@ -386,7 +405,8 @@ class JobQueueService:
             elif self.running_job_id == job_id:
                 is_running = True
                 job.status = "canceling"  # 新状态：取消中
-                job.message = "正在取消，等待当前操作完成..."
+                # 运行中删除：提示将延迟自动删除
+                job.message = "当前有进程占用，将延迟自动删除"
                 # 记录取消请求时间，用于超时保障
                 self._pending_cancel_requests[job_id] = time.time()
                 if delete_data:
@@ -402,11 +422,20 @@ class JobQueueService:
             self._notify_queue_change()
             self._notify_job_status(job_id, job.status)
             self._notify_job_signal(job_id, "job_canceling")  # 新信号
-            return True
+            # 如果需要删除数据，标记完成后再删
+            if delete_data:
+                with self.lock:
+                    self._pending_delete_after_cancel.add(job_id)
+                return True, "任务正在执行，已请求取消并将在结束后删除", True
+            return True, None, False
 
         # 非运行中的任务：立即处理
         if delete_data:
             result = self.transcription_service.cancel_job(job_id, delete_data=True)
+            success, err = result if isinstance(result, tuple) else (bool(result), None)
+            if not success:
+                # 删除失败时不广播删除事件，保留任务文件供用户重试
+                return False, err or "删除失败", False
 
             # [V3.1.0] 从内存中彻底移除任务，防止幽灵任务
             with self.lock:
@@ -417,7 +446,7 @@ class JobQueueService:
             # [V3.7] 清理取消令牌
             self._remove_cancellation_token(job_id)
         else:
-            result = True
+            success, err = True, None
             # 不删除数据时，保存任务元信息
             self.transcription_service.save_job_meta(job)
 
@@ -435,7 +464,7 @@ class JobQueueService:
             # 同时推送到单任务频道，确保 EditorView 能收到
             self._notify_job_signal(job_id, "job_canceled")
 
-        return result
+        return success, err, False
 
     def _worker_loop(self):
         """
@@ -489,17 +518,20 @@ class JobQueueService:
                         # 推送初始进度（让前端立即知道任务的初始状态）
                         self._notify_job_progress(job_id)
 
-                # 任务开始执行前保存状态（确保断电后能恢复 running 任务）
-                if self.running_job_id:
-                    self._save_state()
-                    # 同时保存任务元信息（记录 processing 状态）
-                    job = self.jobs.get(self.running_job_id)
-                    if job:
-                        self.transcription_service.save_job_meta(job)
+                    # 任务开始执行前保存状态（确保断电后能恢复 running 任务）
+                    if self.running_job_id:
+                        self._save_state()
+                        # 同时保存任务元信息（记录 processing 状态）
+                        job = self.jobs.get(self.running_job_id)
+                        if job:
+                            self.transcription_service.save_job_meta(job)
 
-                    # [V3.7] 创建取消令牌
-                    token = self._create_cancellation_token(self.running_job_id)
-                    logger.debug(f"[V3.7] 已创建取消令牌: {self.running_job_id}")
+                        # [V3.7] 创建取消令牌
+                        token = self._create_cancellation_token(self.running_job_id)
+                        logger.debug(f"[V3.7] 已创建取消令牌: {self.running_job_id}")
+
+                        # V3.1.2+dev.20260114.11: 新任务开始前，智能处理正在运行的 720p 转码
+                        self._maybe_throttle_or_pause_proxy()
 
                 # 2. 如果没有任务，休眠后继续
                 if self.running_job_id is None:
@@ -593,14 +625,22 @@ class JobQueueService:
                         self._pending_delete_after_cancel.discard(finished_job_id)
                         logger.info(f"[V3.1.0] 执行取消后的延迟删除: {finished_job_id}")
                         try:
-                            self.transcription_service.cancel_job(finished_job_id, delete_data=True)
-                            with self.lock:
-                                if finished_job_id in self.jobs:
-                                    del self.jobs[finished_job_id]
-                            self._notify_job_removed(finished_job_id)
-                            # 跳过后续的状态保存和通知
-                            self._save_state()
-                            continue
+                            result = self.transcription_service.cancel_job(finished_job_id, delete_data=True)
+                            success, err = result if isinstance(result, tuple) else (bool(result), None)
+                            if success:
+                                with self.lock:
+                                    if finished_job_id in self.jobs:
+                                        del self.jobs[finished_job_id]
+                                self._notify_job_removed(finished_job_id)
+                                # 跳过后续的状态保存和通知
+                                self._save_state()
+                                continue
+                            # 删除失败（如外部占用），保留任务并提示稍后重试
+                            job.status = "paused"
+                            job.message = err or "当前有进程占用，请稍后再试"
+                            self.transcription_service.save_job_meta(job)
+                            self._notify_job_status(job.job_id, job.status)
+                            logger.error(f"[V3.1.0] 延迟删除失败: {finished_job_id}, {err}")
                         except Exception as e:
                             logger.error(f"[V3.1.0] 延迟删除失败: {finished_job_id}, {e}")
 
@@ -632,8 +672,7 @@ class JobQueueService:
                     # 保存队列状态
                     self._save_state()
 
-                    # 6. 任务完成后触发720p转码检查（V3.1.0新增）
-                    # 解决: 360p完成时如果队列繁忙就不触发720p，导致队列空闲后也不再检查
+                    # V3.1.2+dev.20260114.04: 队列变空/任务完成时通知720p调度器
                     if job.status == "finished":
                         self._trigger_720p_check_after_job_complete(job.job_id)
 
@@ -1091,6 +1130,18 @@ class JobQueueService:
 
             progress_tracker.complete_phase(ProcessPhase.SRT)
 
+            # V3.1.2+dev.20260114.01: 任务完成前持久化字幕快照，供后台转录后显示准确率
+            # 只保存精简版的 sentences_snapshot，避免删除 checkpoint 后丢失 display_confidence
+            if subtitle_manager and job_dir:
+                try:
+                    snapshot_data = subtitle_manager.to_checkpoint_data()
+                    snapshot_path = job_dir / "transcription_text.json"
+                    with open(snapshot_path, "w", encoding="utf-8") as f:
+                        json.dump(snapshot_data, f, ensure_ascii=False, indent=2)
+                    logger.info(f"[V3.1.2] 已保存字幕快照供编辑器复用: {snapshot_path}")
+                except Exception as e:
+                    logger.warning(f"[V3.1.2] 保存字幕快照失败: {e}")
+
             # V3.7: 任务完成，清理检查点
             checkpoint_manager.delete_checkpoint()
             logger.info("[V3.7] 任务完成，检查点已清理")
@@ -1177,67 +1228,120 @@ class JobQueueService:
         2. 找到有360p但没有720p的任务
         3. 触发720p转码
         """
+        # V3.1.2+dev.20260114.04: 队列空闲时直接通知调度器，由调度器选择待触发任务
+        # V3.1.2+dev.20260114.09: 队列空闲后延迟10秒再触发，给用户启动新任务的机会
+        try:
+            # 若已有未触发的定时器先取消，保证只保留最新的10秒窗口
+            if self._pending_proxy_idle_timer:
+                self._pending_proxy_idle_timer.cancel()
+                self._pending_proxy_idle_timer = None
+
+            def _delayed_notify():
+                try:
+                    from app.services.proxy_720_scheduler import get_proxy_scheduler
+                    scheduler = get_proxy_scheduler()
+                    scheduler.on_queue_idle()
+                except Exception as e:
+                    logger.debug(f"[720p触发] 调度器通知失败（非致命）: {e}")
+                finally:
+                    self._pending_proxy_idle_timer = None
+
+            timer = threading.Timer(10, _delayed_notify)
+            self._pending_proxy_idle_timer = timer
+            timer.start()
+        except Exception as e:
+            logger.debug(f"[720p触发] 延迟触发安排失败（非致命）: {e}")
+
+    # V3.1.2+dev.20260114.11: 新任务开始时，智能决定保留/中断正在运行的 720p 转码
+    def _maybe_throttle_or_pause_proxy(self):
         try:
             from app.services.media_prep_service import get_media_prep_service
-            from app.core.config import config
-            from pathlib import Path
+            from app.services.proxy_720_scheduler import get_proxy_scheduler
 
             media_prep = get_media_prep_service()
-            jobs_root = config.JOBS_DIR
+            scheduler = get_proxy_scheduler()
 
-            if not jobs_root.exists():
+            # 获取正在处理的 proxy_720p 任务
+            active = []
+            with media_prep.lock:
+                for jid, status in media_prep.task_status.items():
+                    proxy = status.get("proxy_720p") if isinstance(status, dict) else None
+                    if proxy and proxy.get("status") == "processing":
+                        active.append((jid, proxy.get("progress", 0)))
+
+            if not active:
                 return
 
-            triggered_count = 0
+            policy = config.PROXY_CONFIG.get("proxy_pause_policy", {})
+            # 自适应阈值：基础 50%，长视频稍微提高，短视频稍微降低
+            default_base = policy.get("progress_cutoff_base", 0.5)
+            min_cutoff = policy.get("progress_cutoff_min", 0.4)
+            max_cutoff = policy.get("progress_cutoff_max", 0.6)
+            default_time_cutoff = policy.get("time_left_cutoff_seconds")  # 可为空
 
-            # 扫描所有任务目录
-            for job_dir in jobs_root.iterdir():
-                if not job_dir.is_dir():
-                    continue
+            for job_id, progress in active:
+                video_path = self._find_video_file(job_id)
+                duration = 0
+                if video_path:
+                    try:
+                        duration = media_prep._get_video_duration(video_path)
+                    except Exception:
+                        duration = 0
 
-                job_id = job_dir.name
-                preview_360p = job_dir / "preview_360p.mp4"
-                proxy_720p = job_dir / "proxy_720p.mp4"
+                # 计算自适应进度阈值
+                adapt_factor = min(duration / 7200, 1.0) if duration > 0 else 0
+                progress_cutoff = default_base + 0.1 * adapt_factor
+                progress_cutoff = max(min_cutoff, min(max_cutoff, progress_cutoff))
 
-                # 条件: 有360p但没有720p
-                if not preview_360p.exists():
-                    continue
-                if proxy_720p.exists():
-                    continue
+                # 剩余时间阈值
+                if default_time_cutoff is not None:
+                    time_left_cutoff = default_time_cutoff
+                else:
+                    time_left_cutoff = min(900, duration * 0.2) if duration > 0 else 900
 
-                # 检查720p是否已在队列中
-                proxy_status = media_prep.get_proxy_status(job_id)
-                if proxy_status and proxy_status.get("status") in ["queued", "processing"]:
-                    continue
+                remaining = duration * max(0, 1 - progress / 100) if duration > 0 else 999999
 
-                # 找到视频文件
-                video_file = None
-                video_exts = ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.webm', '.flv', '.m4v']
-                for file in job_dir.iterdir():
-                    if file.is_file() and file.suffix.lower() in video_exts:
-                        # 跳过preview和proxy文件
-                        if file.name.startswith(('preview_', 'proxy_')):
-                            continue
-                        video_file = file
-                        break
+                logger.info(
+                    f"[Proxy调度] 新任务即将开始，检测720p: job={job_id}, progress={progress:.1f}%, "
+                    f"duration={duration:.1f}s, remaining≈{remaining:.1f}s, "
+                    f"cutoff={progress_cutoff:.2f}, time_cutoff={time_left_cutoff:.1f}s"
+                )
 
-                if not video_file:
-                    continue
+                # 决策：进度高且剩余不长 -> 降优先级继续；否则中断并重排队（队首）
+                if progress >= progress_cutoff and remaining <= time_left_cutoff:
+                    media_prep.set_low_priority_by_job(job_id)
+                    logger.info(f"[Proxy调度] 进度高，改为低优先级继续: {job_id}")
+                else:
+                    paused = media_prep.cancel_proxy_job(job_id, "paused_for_new_job")
+                    if paused:
+                        # 清理可能的半成品，避免返回坏文件
+                        proxy_file = config.JOBS_DIR / job_id / "proxy_720p.mp4"
+                        if proxy_file.exists():
+                            try:
+                                proxy_file.unlink()
+                                logger.info(f"[Proxy调度] 已删除半成品720p: {proxy_file}")
+                            except Exception as e:
+                                logger.warning(f"[Proxy调度] 删除半成品720p失败: {proxy_file}, {e}")
 
-                # 触发720p转码（低优先级，让新任务优先）
-                logger.info(f"[720p触发] 任务完成后发现待处理的720p: {job_id}")
-                media_prep.enqueue_proxy(job_id, video_file, proxy_720p, priority=15)
-                triggered_count += 1
-
-                # 一次只触发一个，避免阻塞
-                break
-
-            if triggered_count > 0:
-                logger.info(f"[720p触发] 已触发 {triggered_count} 个720p转码任务")
-
+                        if video_path:
+                            # 标记暂停（待检查），避免前端误判失败
+                            scheduler.mark_paused(job_id, "paused_for_new_job")
+                            # 强制接受（即便 auto_trigger 关闭也恢复之前的任务），优先级最高
+                            scheduler.request(
+                                job_id,
+                                video_path,
+                                trigger_type="auto_resume",
+                                auto_enabled=True,
+                                force=True,
+                                priority=0  # 队首优先
+                            )
+                            logger.info(
+                                f"[Proxy调度] 进度低/剩余长，终止并重排队(优先级高): {job_id}, progress={progress:.1f}%"
+                            )
+                        else:
+                            logger.warning(f"[Proxy调度] 终止后未找到源视频，无法重排队: {job_id}")
         except Exception as e:
-            # 720p触发失败不影响主流程
-            logger.debug(f"[720p触发] 检查失败（非致命）: {e}")
+            logger.debug(f"[Proxy调度] 智能暂停/降级失败（非致命）: {e}")
 
     def _cleanup_resources(self):
         """

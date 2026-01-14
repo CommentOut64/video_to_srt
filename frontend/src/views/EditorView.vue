@@ -55,11 +55,14 @@
             :upgrade-progress="proxyVideo.progress.value"
             :proxy-state="proxyVideo.state.value"
             :proxy-error="proxyVideo.error.value"
+            :auto-trigger-720p="proxyVideo.autoTrigger720p.value"
             @loaded="handleVideoLoaded"
             @error="handleVideoError"
             @check-status="handleCheckVideoStatus"
             @resolution-change="handleResolutionChange"
             @retry="proxyVideo.retry"
+            @upgrade-started="handleUpgradeStarted"
+            @upgrade-failed="handleUpgradeFailed"
           />
         </div>
 
@@ -199,6 +202,7 @@ import { useShortcuts } from '@/hooks/useShortcuts'
 import { useProxyVideo } from '@/composables/useProxyVideo'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { repairSubtitleOverlaps } from '@/utils/subtitleUtils'
+import { ElMessage } from 'element-plus'
 
 // 组件导入
 import EditorHeader from '@/components/editor/EditorHeader.vue'
@@ -260,6 +264,7 @@ const dualStreamProgress = computed(() => {
 })
 let sseUnsubscribe = null
 let progressPollTimer = null
+let proxyPollTimer = null
 
 // Provide 编辑器上下文
 // ========== Provide 上下文 ==========
@@ -320,6 +325,19 @@ watch(jobIdRef, async (newJobId, oldJobId) => {
   // 重新加载项目
   await loadProject()
 })
+
+// 监听保存时间用于同步 task-meta 的显示
+watch(
+  () => projectStore.meta.lastSaved,
+  (value) => {
+    if (!projectStore.meta.jobId) {
+      lastSaved.value = null
+      return
+    }
+    lastSaved.value = value || null
+  },
+  { immediate: true }
+)
 
 // ========== 计算属性 ==========
 
@@ -450,17 +468,36 @@ async function loadProject() {
     projectStore.meta.audioPath = mediaApi.getAudioUrl(props.jobId)
     projectStore.meta.duration = jobStatus.media_status?.video?.duration || 0
 
+    // 先尝试同步 Proxy 状态（便于决定是否需要订阅 SSE）
+    try {
+      await proxyVideo.refresh()
+    } catch (e) {
+      console.warn('[EditorView] 刷新 Proxy 状态失败（初始阶段，忽略）:', e)
+    }
+
     // 2. 尝试从本地存储恢复
+    // V3.1.2+dev.20260112.01: 恢复策略优化
+    // 优先级: memoryCache → SmartSaver → segments API → SRT fallback
     const restored = await projectStore.restoreProject(props.jobId)
     if (restored && projectStore.subtitles.length > 0) {
       console.log('[EditorView] 从本地存储恢复成功')
 
-      // 检查缓存数据是否有 sentenceIndex 字段（新格式）
+      // V3.1.2: 检查缓存数据格式完整性
+      // 必须有 sentenceIndex 字段才能支持 SSE 匹配
       const hasValidFormat = projectStore.subtitles.every(s => s.sentenceIndex !== undefined)
 
-      if (!hasValidFormat && ['processing', 'queued', 'paused'].includes(jobStatus.status)) {
+      // V3.1.2: 检查缓存数据是否有置信度（用于已完成任务的数据完整性）
+      const hasConfidenceData = projectStore.subtitles.some(
+        s => s.display_confidence !== undefined && s.display_confidence !== null
+      )
+
+      if (!hasValidFormat) {
         // 缓存数据是旧格式，需要重新从 API 加载以获取 sentenceIndex
         console.log('[EditorView] 缓存数据格式过旧（缺少 sentenceIndex），重新从 API 加载')
+        await loadTranscribingSegments()
+      } else if (jobStatus.status === 'finished' && !hasConfidenceData) {
+        // V3.1.2: 已完成任务但缓存无置信度数据，尝试从 API 重新加载
+        console.log('[EditorView] 已完成任务缓存无置信度数据，尝试从 API 补充')
         await loadTranscribingSegments()
       }
 
@@ -469,28 +506,46 @@ async function loadProject() {
         console.log('[EditorView] 任务仍在处理中，需要订阅SSE')
         subscribeSSE()
         startProgressPolling()
+        startProxyPolling()
       } else if (jobStatus.status === 'paused') {
         // 暂停状态也需要订阅SSE，以便接收恢复信号
         console.log('[EditorView] 任务已暂停，订阅SSE以接收恢复信号')
         subscribeSSE()
         // V3.1.0: 暂停状态下立即刷新一次进度，不等待 SSE 连接
         refreshTaskProgress()
+        startProxyPolling()
       } else if (jobStatus.status === 'finished') {
         // 任务已完成，useProxyVideo会自动处理视频转码状态
         console.log('[EditorView] 本地恢复后任务已完成，useProxyVideo将自动检查视频转码状态')
+        // 若视频尚未就绪（如720p仍在生成），继续订阅 SSE 以接收 proxy/remux 事件
+        if (!proxyVideo.isReady.value) {
+          subscribeSSE()
+          startProxyPolling()
+        }
       }
       return
     }
 
     // 3. 根据任务状态从后端加载字幕数据
+    // V3.1.2+dev.20260111.02: 优先从 segments API 加载（含置信度），fallback 到 SRT
     if (jobStatus.status === 'finished') {
-      await loadCompletedSRT()
-      // useProxyVideo会自动检查视频状态
+      await loadTranscribingSegments()
+      // 如果 segments API 无数据，fallback 到 SRT
+      if (projectStore.subtitles.length === 0) {
+        console.log('[EditorView] segments API 无数据，尝试从 SRT 加载')
+        await loadFromSRT()
+      }
+      // 转录已完成，但可能仍在转码，若未就绪则订阅 SSE + 轮询
+      if (!proxyVideo.isReady.value) {
+        subscribeSSE()
+        startProxyPolling()
+      }
     } else if (['processing', 'queued'].includes(jobStatus.status)) {
       await loadTranscribingSegments()
       // 订阅SSE获取实时更新
       subscribeSSE()
       startProgressPolling()
+      startProxyPolling()
     } else if (jobStatus.status === 'paused') {
       // 暂停状态：加载已有的 segments，并订阅 SSE 以便接收恢复信号
       await loadTranscribingSegments()
@@ -498,9 +553,11 @@ async function loadProject() {
       subscribeSSE()
       // V3.1.0: 暂停状态下立即刷新一次进度，不等待 SSE 连接
       refreshTaskProgress()
+      startProxyPolling()
     } else if (jobStatus.status === 'created') {
       // 任务刚创建，订阅SSE等待开始
       subscribeSSE()
+      startProxyPolling()
     } else if (jobStatus.status === 'failed') {
       await loadTranscribingSegments()
     }
@@ -523,23 +580,6 @@ async function loadProject() {
     }
   } finally {
     isLoading.value = false
-  }
-}
-
-// 加载已完成的 SRT 文件
-async function loadCompletedSRT() {
-  try {
-    const srtData = await mediaApi.getSRTContent(props.jobId)
-    projectStore.importSRT(srtData.content, {
-      jobId: props.jobId,
-      filename: srtData.filename || projectStore.meta.filename,
-      duration: projectStore.meta.duration,
-      videoPath: projectStore.meta.videoPath,
-      audioPath: projectStore.meta.audioPath
-    })
-  } catch (error) {
-    console.warn('[EditorView] 加载 SRT 失败，尝试加载 segments:', error)
-    await loadTranscribingSegments()
   }
 }
 
@@ -569,6 +609,25 @@ async function loadTranscribingSegments() {
     }
   } catch (error) {
     console.warn('[EditorView] 加载转录文字失败:', error)
+  }
+}
+
+// V3.1.2: 从 SRT 文件加载（fallback，无置信度数据）
+async function loadFromSRT() {
+  try {
+    const srtData = await mediaApi.getSRTContent(props.jobId)
+    if (srtData.content) {
+      projectStore.importSRT(srtData.content, {
+        jobId: props.jobId,
+        filename: srtData.filename || projectStore.meta.filename,
+        duration: projectStore.meta.duration,
+        videoPath: projectStore.meta.videoPath,
+        audioPath: projectStore.meta.audioPath
+      })
+      console.log('[EditorView] 从 SRT 文件恢复成功（无置信度数据）')
+    }
+  } catch (error) {
+    console.warn('[EditorView] 从 SRT 加载失败:', error)
   }
 }
 
@@ -608,6 +667,21 @@ function subscribeSSE() {
     onInitialState(data) {
       console.log('[EditorView] SSE 初始状态:', data)
       progressStore.applySnapshot(props.jobId, data, 'sse_init')
+      // 如果附带 Proxy 状态，直接应用到 proxyVideo，避免断线后进度丢失
+      if (data.proxy) {
+        console.log('[EditorView] 同步初始 Proxy 状态:', data.proxy)
+        proxyVideo.applySnapshot(data.proxy)
+      }
+    },
+
+    // 新增：被服务器踢出时提示用户并停止当前窗口的 SSE
+    force_disconnect(data) {
+      const reason = data?.reason || '该任务已在其他窗口打开，当前窗口的 SSE 已断开'
+      console.warn('[EditorView] 收到强制断开:', reason)
+      taskStore.updateTaskSSEStatus(props.jobId, false, reason)
+      cleanupSSE()
+      // 简单弹窗提示用户（后续可替换为全局提示组件）
+      alert(reason)
     },
 
     onProgress(data) {
@@ -627,10 +701,34 @@ function subscribeSSE() {
       console.log('[EditorView] 任务完成:', data)
       progressStore.markStatus(props.jobId, 'finished', { percent: 100, phase: 'complete' })
       taskStore.updateTaskStatus(props.jobId, 'finished')
-      await loadCompletedSRT()
+
+      // V3.1.2+dev.20260111.02: 任务完成处理
+      // 优先保留 SSE 推送的字幕（含置信度），无数据时从 API 加载
+      if (projectStore.subtitles.length === 0) {
+        console.log('[EditorView] 无字幕数据（可能断线），尝试恢复...')
+        // 先尝试从 segments API 加载（含置信度）
+        await loadTranscribingSegments()
+
+        // 如果还是没有数据，从 SRT 文件加载（无置信度，但至少有字幕）
+        if (projectStore.subtitles.length === 0) {
+          console.log('[EditorView] segments API 无数据，尝试从 SRT 恢复')
+          await loadFromSRT()
+        }
+      } else {
+        console.log(`[EditorView] 保留 SSE 推送的 ${projectStore.subtitles.length} 条字幕（含置信度）`)
+        // 将所有草稿标记为定稿
+        projectStore.subtitles.forEach(sub => {
+          if (sub.isDraft) {
+            sub.isDraft = false
+          }
+        })
+      }
+
       stopProgressPolling()
-      // 任务完成后关闭SSE连接
-      cleanupSSE()
+      startProxyPolling()
+      // V3.1.2+dev.20260113.04: 不关闭SSE连接，保持接收Proxy转码事件
+      // 转录任务完成后，720p转码可能还在进行，需要继续接收 proxy_complete 事件
+      // cleanupSSE()
     },
 
     onFailed(data) {
@@ -669,15 +767,29 @@ function subscribeSSE() {
     onConnected() {
       console.log('[EditorView] SSE 连接成功')
       taskStore.updateTaskSSEStatus(props.jobId, true)
+      taskStore.updateSSEHeartbeat()
       // 连接成功后，主动刷新一次进度状态
       refreshTaskProgress()
+      // 同步刷新 Proxy/预览状态，兜底断线期间的转码进度
+      proxyVideo.refresh()
+      startProxyPolling()
     },
 
-    // 新增：SenseVoice 流式字幕事件
+    onPing() {
+      // 心跳同步到全局，避免误判超时
+      taskStore.updateSSEHeartbeat()
+    },
+
+    // V3.1.2+dev.20260113.01: 恢复 onSubtitleUpdate 回调
+    // 原因：专用处理器（onDraft等）处理新架构事件，onSubtitleUpdate 处理旧架构事件
+    // 两者互补，不会冲突
     onSubtitleUpdate(data) {
-      console.log('[EditorView] 收到字幕更新:', data)
-      // 处理流式字幕更新（SenseVoice/Whisper补刀/LLM校对翻译等）
-      handleStreamingSubtitle(data)
+      // 只处理旧架构的字幕事件（sv_sentence, whisper_patch, llm_proof 等）
+      // 新架构事件（draft, replace_chunk）由专用处理器处理
+      if (data.sentence || data.sentence_index !== undefined) {
+        console.log('[EditorView] 收到旧架构字幕更新:', data)
+        handleStreamingSubtitle(data)
+      }
     },
 
     // Phase 5: 草稿字幕事件（快流/SenseVoice）
@@ -769,7 +881,10 @@ function cleanupSSE() {
   }
 }
 
-// 处理流式字幕更新
+// 处理流式字幕更新（旧版兼容，已弃用）
+// V3.1.2+dev.20260112.01: 此函数已弃用，保留仅供旧版 SSE 事件兼容
+// 新架构使用专用处理器：handleDraftSubtitle、handleReplaceChunk 等
+// eslint-disable-next-line no-unused-vars
 function handleStreamingSubtitle(data) {
   if (!data) return
 
@@ -782,6 +897,10 @@ function handleStreamingSubtitle(data) {
   const end = sentence.end ?? data.end_time ?? data.end
   const warningType = sentence.warning_type ?? data.warning_type ?? 'none'
   const source = data.source ?? data.event_type ?? 'unknown'
+  // V3.1.2+dev.20260111.01: 提取 display_confidence 和 confidence_source
+  const confidence = sentence.confidence ?? data.confidence
+  const displayConfidence = sentence.display_confidence ?? data.display_confidence
+  const confidenceSource = sentence.confidence_source ?? data.confidence_source
 
   if (sentenceIndex === undefined || !text) {
     console.warn('[EditorView] 无效的字幕数据:', data)
@@ -796,23 +915,29 @@ function handleStreamingSubtitle(data) {
     s => s.sentenceIndex === sentenceIndex
   )
 
+  // V3.1.2+dev.20260112.01: 包含 display_confidence 和 confidence_source
   const subtitleData = {
-    id: `sv_${sentenceIndex}`,
     sentenceIndex,
     text,
     start: start ?? 0,
     end: end ?? 0,
+    confidence,
+    display_confidence: displayConfidence,
+    confidence_source: confidenceSource,
     warning_type: warningType,
     source
   }
 
   if (existingIndex >= 0) {
-    // 更新已有字幕
-    projectStore.updateSubtitle(existingIndex, subtitleData)
+    // V3.1.2+dev.20260112.01: 修复 - 传入正确的 id 而非索引
+    const existingId = projectStore.subtitles[existingIndex].id
+    projectStore.updateSubtitle(existingId, subtitleData)
   } else {
     // 添加新字幕 - 按时间顺序找到插入位置
     const insertIndex = projectStore.subtitles.findIndex(s => s.start > (start ?? 0))
     const finalIndex = insertIndex === -1 ? projectStore.subtitles.length : insertIndex
+    // V3.1.2: 添加 id 字段给新字幕
+    subtitleData.id = `sv_${sentenceIndex}`
     projectStore.addSubtitle(finalIndex, subtitleData)
   }
 
@@ -836,13 +961,15 @@ function handleDraftSubtitle(data) {
     return
   }
 
-  // 构建 sentenceData，匹配 projectStore.appendOrUpdateDraft 的参数格式
+  // V3.1.2+dev.20260111.01: 构建 sentenceData，包含 display_confidence
   const sentenceData = {
     index: sentenceIndex,
     text: sentence.text || '',
     start: sentence.start ?? 0,
     end: sentence.end ?? 0,
     confidence: sentence.confidence ?? 0.8,
+    display_confidence: sentence.display_confidence,  // V3.1.2: 映射后准确率
+    confidence_source: sentence.confidence_source,    // V3.1.2: 置信度来源
     words: sentence.words || [],
     warning_type: sentence.warning_type || 'none'
   }
@@ -861,13 +988,15 @@ function handleReplaceChunk(data) {
   const chunkIndex = data.chunk_index
   const sentences = Array.isArray(data.sentences) ? data.sentences : []
 
-  // 转换为 projectStore 需要的格式
+  // V3.1.2+dev.20260111.01: 转换为 projectStore 需要的格式，包含 display_confidence
   const formattedSentences = sentences.map((sentence, idx) => ({
     index: data.new_indices?.[idx] ?? idx,
     text: sentence.text || '',
     start: sentence.start ?? 0,
     end: sentence.end ?? 0,
     confidence: sentence.confidence ?? 1.0,
+    display_confidence: sentence.display_confidence,  // V3.1.2: 映射后准确率
+    confidence_source: sentence.confidence_source,    // V3.1.2: 置信度来源
     words: sentence.words || [],
     warning_type: sentence.warning_type || 'none',
     source: sentence.source || 'whisper'
@@ -894,13 +1023,15 @@ function handleRestoredChunk(data) {
     return
   }
 
-  // 转换为 projectStore 需要的格式
+  // V3.1.2+dev.20260111.01: 转换为 projectStore 需要的格式，包含 display_confidence
   const formattedSentences = sentences.map((sentence, idx) => ({
     index: sentence.index ?? idx,
     text: sentence.text || '',
     start: sentence.start ?? 0,
     end: sentence.end ?? 0,
     confidence: sentence.confidence ?? 1.0,
+    display_confidence: sentence.display_confidence,  // V3.1.2: 映射后准确率
+    confidence_source: sentence.confidence_source,    // V3.1.2: 置信度来源
     words: sentence.words || [],
     warning_type: sentence.warning_type || 'none',
     source: sentence.source || 'restored',
@@ -925,25 +1056,15 @@ function handleFinalizedSubtitle(data) {
   const sentence = data.sentence || {}
   const chunkIndex = data.chunk_index
 
-  // 格式化为单个句子的数组，复用 replaceChunk 逻辑
-  const formattedSentences = [{
-    index: data.index ?? 0,
-    text: sentence.text || '',
-    start: sentence.start ?? 0,
-    end: sentence.end ?? 0,
-    confidence: sentence.confidence ?? 1.0,
-    words: sentence.words || [],
-    warning_type: sentence.warning_type || 'none',
-    source: sentence.source || 'sensevoice'
-  }]
-
-  // 极速模式下使用 appendOrUpdateDraft，但标记为定稿
+  // V3.1.2+dev.20260111.01: 构建 sentenceData，包含 display_confidence
   const sentenceData = {
     index: data.index ?? 0,
     text: sentence.text || '',
     start: sentence.start ?? 0,
     end: sentence.end ?? 0,
     confidence: sentence.confidence ?? 1.0,
+    display_confidence: sentence.display_confidence,  // V3.1.2: 映射后准确率
+    confidence_source: sentence.confidence_source,    // V3.1.2: 置信度来源
     words: sentence.words || [],
     warning_type: sentence.warning_type || 'none'
   }
@@ -1006,6 +1127,11 @@ function startProgressPolling() {
         },
         'http_poll'
       )
+
+      // SSE 断连期间，若 Proxy 仍在处理或未就绪，顺便刷新视频转码状态
+      if (proxyVideo.isTranscoding.value || !proxyVideo.isReady.value) {
+        await proxyVideo.refresh()
+      }
     } catch (e) {
       console.warn('[EditorView] 轮询刷新失败:', e)
     }
@@ -1016,6 +1142,36 @@ function stopProgressPolling() {
   if (progressPollTimer) {
     clearInterval(progressPollTimer)
     progressPollTimer = null
+  }
+}
+
+// Proxy 状态兜底轮询（独立于转录进度）
+async function pollProxyOnce() {
+  try {
+    const status = await mediaApi.getProxyStatus(props.jobId)
+    proxyVideo.applySnapshot(status.data || status)
+    // 就绪或报错则停止轮询
+    if (proxyVideo.isReady.value || proxyVideo.hasError?.value) {
+      stopProxyPolling()
+    }
+  } catch (e) {
+    console.warn('[EditorView] Proxy 状态轮询失败:', e)
+  }
+}
+
+function startProxyPolling() {
+  stopProxyPolling()
+  // 已就绪则不轮询
+  if (proxyVideo.isReady.value) return
+  proxyPollTimer = setInterval(pollProxyOnce, 10000)
+  // 立即跑一次，加快恢复
+  pollProxyOnce()
+}
+
+function stopProxyPolling() {
+  if (proxyPollTimer) {
+    clearInterval(proxyPollTimer)
+    proxyPollTimer = null
   }
 }
 
@@ -1226,6 +1382,29 @@ function handleVideoLoaded(duration) {
 
 function handleVideoError(error) {
   console.error('视频加载错误:', error)
+  // V3.1.2+dev.20260114.22: 兜底降级，如果720p加载失败则回落到360p
+  const message = error?.message || ''
+  if (proxyVideo.currentResolution.value === '720p' && proxyVideo.urls.value.preview360p) {
+    proxyVideo.fallbackTo360p(message)
+    ElMessage.warning('720p 加载失败，已自动降级为 360p')
+  } else if (!proxyVideo.urls.value.preview360p) {
+    ElMessage.error('视频加载失败，且无可用的预览版本')
+  }
+}
+
+// V3.1.2+dev.20260113.01: 处理720p升级失败
+function handleUpgradeFailed(message) {
+  console.error('[EditorView] 720p升级失败:', message)
+  ElMessage.error(message || '有任务/转码正在运行，请稍后再试')
+}
+
+// V3.1.2+dev.20260113.02: 处理720p升级开始
+function handleUpgradeStarted() {
+  console.log('[EditorView] 720p后台转码已启动')
+  ElMessage.success({
+    message: '后台转码已开始，完成后将自动替换',
+    duration: 5000
+  })
 }
 
 async function handleCheckVideoStatus() {
@@ -1408,6 +1587,7 @@ onUnmounted(() => {
 
   // 停止轮询（轮询仅是备用方案）
   stopProgressPolling()
+  stopProxyPolling()
 })
 
 onBeforeRouteLeave(async (to, from) => {

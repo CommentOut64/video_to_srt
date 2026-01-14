@@ -2,13 +2,20 @@
 频谱分诊阈值配置
 
 基于 librosa 提取的频谱特征进行分类判断
+
+V3.1.1+dev.20260108.01: 新增 SNR/C50 分诊阈值，支持三层决策策略
+V3.1.1+dev.20260108.05: 应用 Optuna 自动调参结果，优化 SNR/C50 阈值
 """
 from dataclasses import dataclass
 
 
 @dataclass
 class SpectrumThresholds:
-    """频谱分诊阈值"""
+    """
+    频谱分诊阈值
+
+    V3.1.1+dev.20260108.01: 新增 Brouhaha SNR+C50 三层决策阈值
+    """
 
     # ========== 音乐检测阈值 ==========
     # 谐波比：音乐通常有明确的谐波结构
@@ -43,6 +50,24 @@ class SpectrumThresholds:
     # ========== 分离模型选择阈值 ==========
     heavy_bgm_threshold: float = 0.6         # 重度BGM，使用 mdx_extra
     light_bgm_threshold: float = 0.35        # 轻度BGM，使用 htdemucs
+
+    # ========== Brouhaha SNR+C50 分诊阈值 (V3.1.1+dev.20260108.07 针对 CTC 模型优化) ==========
+    # SNR 阈值（信噪比）
+    # Optuna 调参值回滚: snr_high_threshold=34.64, snr_low_threshold=17.98
+    # 经验值回滚: snr_high_threshold=25.0, snr_low_threshold=12.0
+    snr_high_threshold: float = 40.0         # SNR >= 此值直接放行（高质量语音）
+    snr_low_threshold: float = 25.0          # SNR < 此值强制分离（CTC 模型安全边界）
+
+    # C50 阈值（清晰度指数/混响）
+    # 经验值回滚: c50_good_threshold=5.0, c50_bad_threshold=-5.0
+    c50_good_threshold: float = 13.70        # C50 >= 此值视为良好（普通房间下限）
+    c50_bad_threshold: float = -12.33        # C50 < 此值视为严重混响
+
+    # 频谱对比度阈值（Layer 2 决策）
+    # 经验值回滚: spectral_contrast_low=15.0, spectral_contrast_critical=12.0, spectral_flatness_high=0.4
+    spectral_contrast_low: float = 19.84     # 频谱对比度低阈值 (dB)，低于此值警戒
+    spectral_contrast_critical: float = 13.59 # 频谱对比度临界阈值 (dB)，低于此值分离
+    spectral_flatness_high: float = 0.29     # 频谱平坦度高阈值（用于 Layer 2）
 
 
 # 默认配置实例

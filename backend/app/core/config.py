@@ -184,6 +184,8 @@ class ProjectConfig:
         # 注意: ffmpeg_cpu_threads 使用延迟计算，避免循环导入
         self._ffmpeg_cpu_threads_cache = None  # 延迟计算缓存
         self.PROXY_CONFIG = {
+            # V3.1.2+dev.20260113.02: 720p自动触发配置（默认启用）
+            "auto_trigger_720p": True,  # 默认自动触发720p转码
             # FFmpeg CPU 线程配置（避免使用全部核心导致降频）
             # 注意: 实际值通过 get_ffmpeg_cpu_threads() 方法获取（延迟计算）
             "ffmpeg_cpu_threads": None,  # 占位符，实际使用 get_ffmpeg_cpu_threads()

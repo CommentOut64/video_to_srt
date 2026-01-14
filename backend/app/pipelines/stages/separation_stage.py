@@ -8,6 +8,9 @@ V3.7 更新：
 - 集成 CancellationToken 支持暂停/取消
 - 全局模式：整轨分离为原子操作
 - 按需模式：逐 Chunk 可中断
+
+V3.1.2+dev.20260109.01 更新：
+- 添加命令行进度条支持（tqdm）
 """
 
 import asyncio
@@ -16,6 +19,7 @@ from typing import List, Optional, TYPE_CHECKING
 from pathlib import Path
 
 import numpy as np
+import librosa
 
 from app.services.audio.chunk_engine import AudioChunk
 from app.services.demucs_service import DemucsService, get_demucs_service
@@ -24,6 +28,13 @@ from app.models.circuit_breaker_models import SeparationLevel
 # V3.7: 导入取消令牌
 if TYPE_CHECKING:
     from app.utils.cancellation_token import CancellationToken
+
+# V3.1.2+dev.20260109.01: 导入 tqdm 进度条
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
 
 
 class SeparationStage:
@@ -47,7 +58,8 @@ class SeparationStage:
         mode: str = 'on_demand',
         demucs_service: Optional[DemucsService] = None,
         logger: Optional[logging.Logger] = None,
-        cancellation_token: Optional["CancellationToken"] = None  # V3.7: 新增
+        cancellation_token: Optional["CancellationToken"] = None,  # V3.7: 新增
+        show_progress: bool = True  # V3.1.2+dev.20260109.01: 新增，显示命令行进度条
     ):
         """
         初始化人声分离阶段
@@ -57,11 +69,13 @@ class SeparationStage:
             demucs_service: Demucs服务实例，如果为None则使用全局单例
             logger: 日志记录器，如果为None则创建新的
             cancellation_token: 取消令牌（可选，V3.7）
+            show_progress: 是否显示命令行进度条（默认 True，V3.1.2+dev.20260109.01）
         """
         self.mode = mode
         self.demucs_service = demucs_service or get_demucs_service()
         self.logger = logger or logging.getLogger(__name__)
         self.cancellation_token = cancellation_token  # V3.7
+        self.show_progress = show_progress  # V3.1.2+dev.20260109.01
 
         if mode not in ['global', 'on_demand']:
             raise ValueError(f"不支持的分离模式: {mode}，仅支持 'global' 或 'on_demand'")
@@ -135,16 +149,10 @@ class SeparationStage:
 
             self.logger.info(f"全局分离完成，分离后文件: {separated_path}")
 
-            # TODO: 重新加载分离后的音频并更新chunk
-            # 这里需要重新VAD切分，或者根据原始chunk的时间戳提取对应片段
-            # 暂时标记所有chunk为已分离
-            for chunk in chunks:
-                chunk.is_separated = True
-                chunk.separation_level = SeparationLevel.HTDEMUCS
-                chunk.separation_model = 'htdemucs'
-
-            self.logger.warning(
-                "全局分离模式暂未完全实现，需要重新加载分离后的音频并更新chunk"
+            # V3.1.1+dev.20260107.06: 加载分离后的音频并更新所有chunk
+            await self._load_separated_audio_to_chunks(
+                chunks=chunks,
+                separated_path=separated_path
             )
 
         finally:
@@ -179,6 +187,7 @@ class SeparationStage:
         仅对标记为needs_separation=True的chunk进行分离
 
         V3.7: 逐 Chunk 可中断，每个 Chunk 分离后保存检查点
+        V3.1.2+dev.20260109.01: 添加命令行进度条支持
 
         Args:
             chunks: AudioChunk列表
@@ -200,8 +209,19 @@ class SeparationStage:
         token = self.cancellation_token  # V3.7
         separated_indices = separated_indices or set()
 
+        # V3.1.2+dev.20260109.01: 创建进度条
+        iterator = need_sep_chunks
+        if self.show_progress and TQDM_AVAILABLE:
+            iterator = tqdm(
+                need_sep_chunks,
+                desc="人声分离",
+                unit="chunk",
+                ncols=80,
+                leave=False
+            )
+
         # 逐个分离需要分离的chunk
-        for chunk in need_sep_chunks:
+        for chunk in iterator:
             # V3.7: 跳过已分离的 chunk（用于恢复）
             if chunk.index in separated_indices:
                 self.logger.debug(f"跳过已分离的 chunk {chunk.index}")
@@ -324,3 +344,100 @@ class SeparationStage:
             "mdx_extra_count": mdx_extra,
             "separation_ratio": separated / total if total > 0 else 0.0
         }
+
+    async def _load_separated_audio_to_chunks(
+        self,
+        chunks: List[AudioChunk],
+        separated_path: str
+    ) -> None:
+        """
+        V3.1.1+dev.20260107.06: 加载分离后的音频并更新所有chunk
+
+        根据每个chunk的时间戳，从分离后的音频文件中提取对应片段，
+        并应用能量检测自动回退机制。
+
+        Args:
+            chunks: AudioChunk列表
+            separated_path: 分离后的音频文件路径
+        """
+        # 加载分离后的音频（在线程中执行，避免阻塞）
+        separated_audio, sep_sr = await asyncio.to_thread(
+            librosa.load,
+            separated_path,
+            sr=None,  # 保持原始采样率
+            mono=True
+        )
+
+        self.logger.info(
+            f"加载分离后音频: {separated_path}, "
+            f"采样率={sep_sr}, 时长={len(separated_audio)/sep_sr:.2f}s"
+        )
+
+        # 统计
+        fallback_count = 0
+        success_count = 0
+
+        for chunk in chunks:
+            # 保存原始音频（用于能量检测和熔断回溯）
+            if chunk.original_audio is None:
+                chunk.original_audio = chunk.audio.copy()
+
+            # 根据时间戳提取对应片段
+            # 注意：chunk的时间戳是基于原始音频的，需要转换到分离后音频的采样率
+            start_sample = int(chunk.start * sep_sr)
+            end_sample = int(chunk.end * sep_sr)
+
+            # 边界检查
+            start_sample = max(0, start_sample)
+            end_sample = min(len(separated_audio), end_sample)
+
+            if start_sample >= end_sample:
+                self.logger.warning(
+                    f"Chunk {chunk.index}: 时间戳越界，跳过 "
+                    f"(start={chunk.start:.2f}s, end={chunk.end:.2f}s)"
+                )
+                continue
+
+            # 提取分离后的音频片段
+            sep_chunk_audio = separated_audio[start_sample:end_sample]
+
+            # 重采样到chunk的采样率（如果不同）
+            if sep_sr != chunk.sample_rate:
+                sep_chunk_audio = librosa.resample(
+                    sep_chunk_audio,
+                    orig_sr=sep_sr,
+                    target_sr=chunk.sample_rate
+                )
+
+            # 能量检测：如果分离后能量显著低于原始，自动回退
+            sep_rms = np.sqrt(np.mean(sep_chunk_audio**2))
+            orig_rms = np.sqrt(np.mean(chunk.original_audio**2))
+
+            # 阈值：分离后 RMS < 原始 RMS * 20% 且原始 RMS > 1e-3
+            if sep_rms < orig_rms * 0.2 and orig_rms > 1e-3:
+                self.logger.warning(
+                    f"Chunk {chunk.index}: Demucs 分离失败，能量过低 "
+                    f"(sep_rms={sep_rms:.6f}, orig_rms={orig_rms:.6f}, "
+                    f"ratio={sep_rms/orig_rms*100:.1f}%)，回退到原始音频"
+                )
+                # 回退到原始音频，但仍标记为已处理
+                chunk.is_separated = False
+                fallback_count += 1
+            else:
+                # 更新chunk音频为分离后的音频
+                chunk.audio = sep_chunk_audio
+                chunk.is_separated = True
+                chunk.separation_level = SeparationLevel.HTDEMUCS
+                chunk.separation_model = 'htdemucs'
+                success_count += 1
+
+                self.logger.debug(
+                    f"Chunk {chunk.index}: 分离成功 "
+                    f"(sep_rms={sep_rms:.6f}, orig_rms={orig_rms:.6f})"
+                )
+
+        self.logger.info(
+            f"全局分离音频加载完成: 成功={success_count}, "
+            f"回退={fallback_count}, 总计={len(chunks)}"
+        )
+

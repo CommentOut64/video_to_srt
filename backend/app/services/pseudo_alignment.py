@@ -5,8 +5,12 @@
 - SenseVoice 确定的时间窗口（start/end）不可变
 - 当 Whisper/LLM 替换文本后，新字符均匀分布在原时间窗口内
 - 生成的字级时间戳标记为 is_pseudo=True
+
+V3.1.2+dev.20260111.01: 词级置信度改为 None（表示无词级置信度）
+- Whisper 补刀后，无法提供精确的词级置信度
+- confidence=None 表示"无词级置信度"，前端显示为灰色或无高亮
 """
-from typing import List, TYPE_CHECKING
+from typing import List, Optional, TYPE_CHECKING
 import logging
 
 if TYPE_CHECKING:
@@ -23,7 +27,7 @@ class PseudoAlignment:
         original_start: float,
         original_end: float,
         new_text: str,
-        default_confidence: float = 1.0
+        default_confidence: Optional[float] = None  # V3.1.2: 改为 None，表示无词级置信度
     ) -> List['WordTimestamp']:
         """
         将新文本均匀映射到原时间段内
@@ -32,7 +36,7 @@ class PseudoAlignment:
             original_start: 原始起始时间（由 SenseVoice 确定，不可变）
             original_end: 原始结束时间（由 SenseVoice 确定，不可变）
             new_text: 替换后的新文本
-            default_confidence: 默认置信度（修正后通常为 1.0）
+            default_confidence: 词级置信度（V3.1.2: 默认 None，表示无词级置信度）
 
         Returns:
             List[WordTimestamp]: 伪对齐的字级时间戳列表
@@ -77,13 +81,14 @@ class PseudoAlignment:
                 word=token,
                 start=round(w_start, 3),
                 end=round(w_end, 3),
-                confidence=default_confidence,
+                confidence=default_confidence,  # V3.1.2: 可能为 None
                 is_pseudo=True  # 标记为伪对齐生成
             ))
 
         logger.debug(
             f"伪对齐完成: {token_count} 个token, "
-            f"时间窗口 {original_start:.2f}-{original_end:.2f}s"
+            f"时间窗口 {original_start:.2f}-{original_end:.2f}s, "
+            f"confidence={'N/A' if default_confidence is None else default_confidence}"
         )
 
         return result

@@ -210,4 +210,59 @@ async def update_config(req: ConfigUpdateRequest):
         raise
     except Exception as e:
         logger.error(f"更新配置失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"更新配置失败: {str(e)}")
+
+
+# ========== V3.1.2+dev.20260113.01: Proxy配置管理 ==========
+
+class ProxyConfigRequest(BaseModel):
+    """Proxy配置更新请求"""
+    auto_trigger_720p: bool = Field(
+        ...,
+        description="是否自动触发720p转码"
+    )
+
+
+@router.get("/proxy")
+async def get_proxy_config():
+    """
+    获取Proxy配置
+
+    Returns:
+        auto_trigger_720p: 是否自动触发720p转码
+    """
+    from app.core.config import config
+
+    return {
+        "auto_trigger_720p": config.PROXY_CONFIG.get('auto_trigger_720p', False)
+    }
+
+
+@router.put("/proxy")
+async def update_proxy_config(req: ProxyConfigRequest):
+    """
+    更新Proxy配置
+
+    Args:
+        auto_trigger_720p: 是否自动触发720p转码
+
+    Returns:
+        success: 是否更新成功
+    """
+    from app.core.config import config
+
+    try:
+        config.PROXY_CONFIG['auto_trigger_720p'] = req.auto_trigger_720p
+
+        logger.info(f"[Config] Proxy配置已更新: auto_trigger_720p={req.auto_trigger_720p}")
+
+        return {
+            "success": True,
+            "message": "Proxy配置已更新",
+            "config": {
+                "auto_trigger_720p": req.auto_trigger_720p
+            }
+        }
+    except Exception as e:
+        logger.error(f"更新Proxy配置失败: {e}")
+        raise HTTPException(status_code=500, detail=f"更新配置失败: {str(e)}")

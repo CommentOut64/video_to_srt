@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from faster_whisper import WhisperModel
 
 from app.core import config
+from app.services.model_validator import ModelValidator  # 复用统一的模型校验逻辑
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +52,6 @@ WHISPER_MODELS = {
     "distil-large-v2": "Systran/faster-distil-whisper-large-v2",
     "distil-large-v3": "Systran/faster-distil-whisper-large-v3",
 }
-
-# CTranslate2 格式模型必需的文件
-REQUIRED_MODEL_FILES = ["model.bin", "config.json", "vocabulary.txt"]
 
 # HuggingFace 镜像源
 HF_MIRROR_ENDPOINT = "https://hf-mirror.com"
@@ -370,14 +368,11 @@ class WhisperService:
         # 按修改时间排序，取最新的
         latest_snapshot = max(snapshots, key=lambda x: x.stat().st_mtime)
 
-        # 检查必需文件是否存在
-        missing_files = []
-        for required_file in REQUIRED_MODEL_FILES:
-            if not (latest_snapshot / required_file).exists():
-                missing_files.append(required_file)
-
-        if missing_files:
+        # 通过统一校验器检查快照，自动兼容 vocabulary.txt/.json 等差异
+        is_complete, missing_files, detail = ModelValidator.validate_whisper_model(latest_snapshot)
+        if not is_complete:
             logger.warning(f"模型文件不完整，缺少: {missing_files}")
+            logger.info(detail)
             return None
 
         return str(latest_snapshot)
