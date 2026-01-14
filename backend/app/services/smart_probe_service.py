@@ -76,7 +76,7 @@ class SmartProbeService:
             return "PASS_ALL", {}
 
         center = n // 2
-        cache =   # 缓存结果
+        cache = {}  # 缓存结果
 
         # 1. 优先探测中心
         is_dirty, result = self._check_chunk(chunks[center])
