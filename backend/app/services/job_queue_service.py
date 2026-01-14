@@ -22,6 +22,7 @@ import torch
 from app.models.job_models import JobState
 from app.services.sse_service import get_sse_manager
 from app.services.config_adapter import ConfigAdapter
+from app.core.config import config
 from app.utils.cancellation_token import (
     CancellationToken,
     CancelledException,
@@ -136,7 +137,6 @@ class JobQueueService:
         self.lock = threading.RLock()  # 使用可重入锁，避免嵌套调用死锁
 
         # 持久化文件路径
-        from app.core.config import config
         self.queue_file = Path(config.JOBS_DIR) / "queue_state.json"
         self.settings_file = Path(config.JOBS_DIR) / "queue_settings.json"
 
@@ -163,6 +163,19 @@ class JobQueueService:
         )
         self._cancel_timeout_thread.start()
         logger.info("[V3.1.0] 取消超时监控线程已启动")
+
+    def _find_video_file(self, job_id: str) -> Optional[Path]:
+        """V3.1.2+dev.20260114.11: 查找源视频（跳过 preview/proxy/remux）"""
+        job_dir = config.JOBS_DIR / job_id
+        if not job_dir.exists():
+            return None
+        video_exts = ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.webm', '.flv', '.m4v']
+        for file in job_dir.iterdir():
+            if file.is_file() and file.suffix.lower() in video_exts:
+                if file.name.startswith(('preview_', 'proxy_', 'remux')):
+                    continue
+                return file
+        return None
 
     def add_job(self, job: JobState):
         """
@@ -505,17 +518,20 @@ class JobQueueService:
                         # 推送初始进度（让前端立即知道任务的初始状态）
                         self._notify_job_progress(job_id)
 
-                # 任务开始执行前保存状态（确保断电后能恢复 running 任务）
-                if self.running_job_id:
-                    self._save_state()
-                    # 同时保存任务元信息（记录 processing 状态）
-                    job = self.jobs.get(self.running_job_id)
-                    if job:
-                        self.transcription_service.save_job_meta(job)
+                    # 任务开始执行前保存状态（确保断电后能恢复 running 任务）
+                    if self.running_job_id:
+                        self._save_state()
+                        # 同时保存任务元信息（记录 processing 状态）
+                        job = self.jobs.get(self.running_job_id)
+                        if job:
+                            self.transcription_service.save_job_meta(job)
 
-                    # [V3.7] 创建取消令牌
-                    token = self._create_cancellation_token(self.running_job_id)
-                    logger.debug(f"[V3.7] 已创建取消令牌: {self.running_job_id}")
+                        # [V3.7] 创建取消令牌
+                        token = self._create_cancellation_token(self.running_job_id)
+                        logger.debug(f"[V3.7] 已创建取消令牌: {self.running_job_id}")
+
+                        # V3.1.2+dev.20260114.11: 新任务开始前，智能处理正在运行的 720p 转码
+                        self._maybe_throttle_or_pause_proxy()
 
                 # 2. 如果没有任务，休眠后继续
                 if self.running_job_id is None:
@@ -1235,6 +1251,97 @@ class JobQueueService:
             timer.start()
         except Exception as e:
             logger.debug(f"[720p触发] 延迟触发安排失败（非致命）: {e}")
+
+    # V3.1.2+dev.20260114.11: 新任务开始时，智能决定保留/中断正在运行的 720p 转码
+    def _maybe_throttle_or_pause_proxy(self):
+        try:
+            from app.services.media_prep_service import get_media_prep_service
+            from app.services.proxy_720_scheduler import get_proxy_scheduler
+
+            media_prep = get_media_prep_service()
+            scheduler = get_proxy_scheduler()
+
+            # 获取正在处理的 proxy_720p 任务
+            active = []
+            with media_prep.lock:
+                for jid, status in media_prep.task_status.items():
+                    proxy = status.get("proxy_720p") if isinstance(status, dict) else None
+                    if proxy and proxy.get("status") == "processing":
+                        active.append((jid, proxy.get("progress", 0)))
+
+            if not active:
+                return
+
+            policy = config.PROXY_CONFIG.get("proxy_pause_policy", {})
+            # 自适应阈值：基础 50%，长视频稍微提高，短视频稍微降低
+            default_base = policy.get("progress_cutoff_base", 0.5)
+            min_cutoff = policy.get("progress_cutoff_min", 0.4)
+            max_cutoff = policy.get("progress_cutoff_max", 0.6)
+            default_time_cutoff = policy.get("time_left_cutoff_seconds")  # 可为空
+
+            for job_id, progress in active:
+                video_path = self._find_video_file(job_id)
+                duration = 0
+                if video_path:
+                    try:
+                        duration = media_prep._get_video_duration(video_path)
+                    except Exception:
+                        duration = 0
+
+                # 计算自适应进度阈值
+                adapt_factor = min(duration / 7200, 1.0) if duration > 0 else 0
+                progress_cutoff = default_base + 0.1 * adapt_factor
+                progress_cutoff = max(min_cutoff, min(max_cutoff, progress_cutoff))
+
+                # 剩余时间阈值
+                if default_time_cutoff is not None:
+                    time_left_cutoff = default_time_cutoff
+                else:
+                    time_left_cutoff = min(900, duration * 0.2) if duration > 0 else 900
+
+                remaining = duration * max(0, 1 - progress / 100) if duration > 0 else 999999
+
+                logger.info(
+                    f"[Proxy调度] 新任务即将开始，检测720p: job={job_id}, progress={progress:.1f}%, "
+                    f"duration={duration:.1f}s, remaining≈{remaining:.1f}s, "
+                    f"cutoff={progress_cutoff:.2f}, time_cutoff={time_left_cutoff:.1f}s"
+                )
+
+                # 决策：进度高且剩余不长 -> 降优先级继续；否则中断并重排队（队首）
+                if progress >= progress_cutoff and remaining <= time_left_cutoff:
+                    media_prep.set_low_priority_by_job(job_id)
+                    logger.info(f"[Proxy调度] 进度高，改为低优先级继续: {job_id}")
+                else:
+                    paused = media_prep.cancel_proxy_job(job_id, "paused_for_new_job")
+                    if paused:
+                        # 清理可能的半成品，避免返回坏文件
+                        proxy_file = config.JOBS_DIR / job_id / "proxy_720p.mp4"
+                        if proxy_file.exists():
+                            try:
+                                proxy_file.unlink()
+                                logger.info(f"[Proxy调度] 已删除半成品720p: {proxy_file}")
+                            except Exception as e:
+                                logger.warning(f"[Proxy调度] 删除半成品720p失败: {proxy_file}, {e}")
+
+                        if video_path:
+                            # 标记暂停（待检查），避免前端误判失败
+                            scheduler.mark_paused(job_id, "paused_for_new_job")
+                            # 强制接受（即便 auto_trigger 关闭也恢复之前的任务），优先级最高
+                            scheduler.request(
+                                job_id,
+                                video_path,
+                                trigger_type="auto_resume",
+                                auto_enabled=True,
+                                force=True,
+                                priority=0  # 队首优先
+                            )
+                            logger.info(
+                                f"[Proxy调度] 进度低/剩余长，终止并重排队(优先级高): {job_id}, progress={progress:.1f}%"
+                            )
+                        else:
+                            logger.warning(f"[Proxy调度] 终止后未找到源视频，无法重排队: {job_id}")
+        except Exception as e:
+            logger.debug(f"[Proxy调度] 智能暂停/降级失败（非致命）: {e}")
 
     def _cleanup_resources(self):
         """

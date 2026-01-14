@@ -50,6 +50,68 @@ def _find_video_file(job_dir: Path) -> Optional[Path]:
     return None
 
 
+def _find_best_h264(job_dir: Path):
+    """
+    V3.1.2+dev.20260114.21: 查找目录下最高分辨率且视频编码为 h264 的文件
+    返回 (path, height)
+    """
+    try:
+        ffprobe_cmd = config.get_ffprobe_command()
+    except Exception:
+        return None, 0
+
+    best_path = None
+    best_height = 0
+
+    for file in job_dir.iterdir():
+        if not file.is_file():
+            continue
+        if file.suffix.lower() not in ['.mp4', '.mov', '.mkv', '.avi', '.flv', '.webm', '.m4v']:
+            continue
+        if file.name.endswith('.tmp'):
+            continue
+        # 允许 proxy/remux/用户自带高清视频，但跳过 360p 预览
+        if file.name.startswith('preview_'):
+            continue
+        try:
+            cmd = [
+                ffprobe_cmd,
+                '-v', 'error',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=codec_name,height',
+                '-of', 'default=noprint_wrappers=1:nokey=1',
+                str(file)
+            ]
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=8
+            )
+            if result.returncode != 0 or not result.stdout:
+                continue
+            lines = result.stdout.strip().splitlines()
+            if len(lines) < 2:
+                continue
+            codec = lines[0].strip()
+            try:
+                height = int(float(lines[1].strip()))
+            except:
+                height = 0
+            if codec != 'h264':
+                continue
+            if height > best_height:
+                best_height = height
+                best_path = file
+        except Exception:
+            continue
+
+    return best_path, best_height
+
+
 from app.services.media_stream_tracker import (
     register_stream,
     unregister_stream,
@@ -984,6 +1046,34 @@ async def check_proxy_status(job_id: str):
                 print(f"[media] 自动启动360p转码失败: {e}")
 
     # 返回完整状态
+    # V3.1.2+dev.20260114.19: 如果 proxy 状态为 waiting_check/paused_for_new_job，静默清理错误
+    proxy_state = task_status.get("proxy_720p") if isinstance(task_status, dict) else None
+    if proxy_state and proxy_state.get("status") in ["waiting_check", "queued"] and proxy_state.get("error") == "paused_for_new_job":
+        proxy_state = dict(proxy_state)
+        proxy_state["error"] = None
+        task_status = dict(task_status)
+        task_status["proxy_720p"] = proxy_state
+
+    # V3.1.2+dev.20260114.21: 选择最高可播放的 h264 文件用于兜底加载
+    best_h264_path, best_h264_height = _find_best_h264(job_dir)
+    best_playable_url = None
+    best_playable_resolution = None
+    if best_h264_path:
+        best_playable_url = f"/api/media/{job_id}/video"
+        if best_h264_path.name == "proxy_720p.mp4":
+            best_playable_resolution = "720p"
+        elif best_h264_path.name.startswith("preview_"):
+            best_playable_resolution = "360p"
+        else:
+            if best_h264_height >= 1080:
+                best_playable_resolution = "1080p+"
+            elif best_h264_height >= 720:
+                best_playable_resolution = "720p"
+            elif best_h264_height >= 480:
+                best_playable_resolution = "480p"
+            else:
+                best_playable_resolution = "360p"
+
     return JSONResponse({
         "state": task_status.get("state", "idle"),
         "progress": task_status.get("progress", 0),
@@ -993,7 +1083,9 @@ async def check_proxy_status(job_id: str):
         "started_at": task_status.get("started_at"),
         "estimated_remaining": task_status.get("estimated_remaining"),
         "auto_trigger_720p": config.PROXY_CONFIG.get('auto_trigger_720p', True),
-        "version": scheduler_state.get("version")
+        "version": scheduler_state.get("version"),
+        "best_playable_url": best_playable_url,
+        "best_playable_resolution": best_playable_resolution
     })
 
 

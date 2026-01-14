@@ -851,6 +851,8 @@ class MediaPrepService:
                 # V3.1.2+dev.20260114.03: 通知调度器已完成，便于前端无感切换
                 try:
                     get_proxy_scheduler().mark_complete(job_id, output_path)
+                    # V3.1.2+dev.20260114.14: 完成后立即尝试启动下一个待触发任务
+                    get_proxy_scheduler().on_queue_idle()
                 except Exception as e:
                     logger.debug(f"[MediaPrep] 更新调度器完成状态失败: {e}")
                 self._push_proxy_progress(job_id, 100, completed=True)
@@ -873,6 +875,8 @@ class MediaPrepService:
             # V3.1.2+dev.20260114.03: 失败后通知调度器，避免前端等待
             try:
                 get_proxy_scheduler().mark_failed(job_id, str(e))
+                # V3.1.2+dev.20260114.14: 失败后尝试启动下一个待触发任务
+                get_proxy_scheduler().on_queue_idle()
             except Exception as err:
                 logger.debug(f"[MediaPrep] 更新调度器失败状态失败: {err}")
 
@@ -1402,6 +1406,78 @@ class MediaPrepService:
             # V3.1.2: 同时清理 job_id 映射
             self._process_job_map.clear()
         return killed_count
+
+        # V3.1.2+dev.20260114.10: 按 job_id 终止/降优先级（队列新任务优先）
+    def cancel_proxy_job(self, job_id: str, reason: str = "paused_for_new_job") -> bool:
+        """终止指定 job 的 proxy 进程，并标记状态，便于后续重排队"""
+        target_pid = None
+        target_process = None
+        with self._process_lock:
+            for pid, jid in list(self._process_job_map.items()):
+                if jid == job_id:
+                    target_pid = pid
+                    target_process = self._active_processes.get(pid)
+                    break
+        if target_pid is None or target_process is None:
+            return False
+
+        try:
+            if target_process.poll() is None:
+                target_process.terminate()
+                try:
+                    target_process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    target_process.kill()
+            logger.info(f"[MediaPrep] 已终止720p进程: job_id={job_id}, pid={target_pid}, reason={reason}")
+        except Exception as e:
+            logger.warning(f"[MediaPrep] 终止720p进程失败: job_id={job_id}, pid={target_pid}, err={e}")
+
+        # 清理登记
+        self._unregister_process(target_process)
+
+        with self.lock:
+            if job_id in self.task_status and "proxy_720p" in self.task_status[job_id]:
+                # V3.1.2+dev.20260114.18: 被新任务打断不标记失败，回到待检查状态，清理错误
+                if reason == "paused_for_new_job":
+                    self.task_status[job_id]["proxy_720p"]["status"] = "waiting_check"
+                    self.task_status[job_id]["proxy_720p"]["error"] = None
+                    self.task_status[job_id]["proxy_720p"]["progress"] = 0
+                else:
+                    self.task_status[job_id]["proxy_720p"]["status"] = "failed"
+                    self.task_status[job_id]["proxy_720p"]["error"] = reason
+                    self.task_status[job_id]["proxy_720p"]["progress"] = 0
+        # V3.1.2+dev.20260114.13: 被新任务打断时不推送错误事件，静默等待重排队
+        if reason != "paused_for_new_job":
+            try:
+                self._push_proxy_error(job_id, reason)
+            except Exception as e:
+                logger.debug(f"[MediaPrep] 推送 proxy 错误事件失败: {job_id}, {e}")
+        return True
+
+    def set_low_priority_by_job(self, job_id: str) -> bool:
+        """将指定 job 的 proxy 进程设置为低优先级"""
+        target_pid = None
+        with self._process_lock:
+            for pid, jid in list(self._process_job_map.items()):
+                if jid == job_id:
+                    target_pid = pid
+                    break
+        if target_pid is None:
+            return False
+        self._set_low_priority(target_pid)
+        return True
+
+    def has_active_tasks(self) -> bool:
+        """V3.1.2+dev.20260114.12: 判断是否有活跃的媒体任务（360p/720p/其他转码）"""
+        with self.lock:
+            for task_map in self.task_status.values():
+                if not isinstance(task_map, dict):
+                    continue
+                for status in task_map.values():
+                    if isinstance(status, dict) and status.get("status") == "processing":
+                        return True
+        # 再检查队列是否有待处理任务
+        return not self.task_queue.empty()
 
     def cancel_tasks(self, job_id: str) -> int:
         """

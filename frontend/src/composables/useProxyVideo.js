@@ -248,8 +248,35 @@ export function useProxyVideo(jobIdInput) {
     // Proxy 错误
     onProxyError: (data) => {
       console.error("[useProxyVideo] Proxy 错误:", data);
-      state.value = ProxyState.ERROR;
-      error.value = data.message || "转码失败";
+      const reason = data?.reason || data?.message || "";
+
+      // V3.1.2+dev.20260114.16: 被新任务打断时静默回落到360p，不显示错误覆盖
+      const pausedForNewJob = reason.includes("paused_for_new_job");
+
+      if (pausedForNewJob) {
+        console.log("[useProxyVideo] 720p 被中断以让路新任务，保持 360p 播放并等待重试");
+        urls.value.proxy720p = null;
+        pending720pUrl.value = null;
+        progress.value = 0;
+        // 若有360p则保持 ready_360p，否则回到 idle 等待后续事件
+        state.value = urls.value.preview360p ? ProxyState.READY_360P : ProxyState.IDLE;
+        error.value = null;
+      } else {
+        // 其它错误：若有360p可用则静默回落，保留播放；否则进入错误状态
+        const has360 = !!urls.value.preview360p;
+        urls.value.proxy720p = null;
+        pending720pUrl.value = null;
+        progress.value = 0;
+
+        if (has360) {
+          state.value = ProxyState.READY_360P;
+          error.value = null; // 延迟到用户主动升级时再报错
+          console.warn("[useProxyVideo] 720p 失败，已回落至 360p 播放:", data.message);
+        } else {
+          state.value = ProxyState.ERROR;
+          error.value = data.message || "转码失败";
+        }
+      }
     },
   };
 
@@ -276,6 +303,12 @@ export function useProxyVideo(jobIdInput) {
           source: status.urls.source || null,
         };
       }
+      // V3.1.2+dev.20260114.21: 若后端提供最佳可播放URL，作为候选直接使用
+      if (!urls.value.proxy720p && status.best_playable_url) {
+        pending720pUrl.value = status.best_playable_url;
+        urls.value.proxy720p = status.best_playable_url;
+        console.log("[useProxyVideo] 使用后端最佳可播放URL作为初始候选:", status.best_playable_resolution);
+      }
 
       // V3.1.2+dev.20260113.03: 静默转码逻辑
       // 如果后端返回 transcoding_720 但已有360p可用，保持 ready_360p 状态
@@ -286,10 +319,17 @@ export function useProxyVideo(jobIdInput) {
       }
 
       // 恢复状态
+      // V3.1.2+dev.20260114.20: 清理 paused_for_new_job 错误，静默保持 360p
+      const incomingError = status.error || null;
+      const isPausedError = typeof incomingError === 'string' && incomingError.includes('paused_for_new_job');
+
       state.value = effectiveState;
       progress.value = status.progress || 0;
       decision.value = status.decision || null;
-      error.value = status.error || null;
+      error.value = isPausedError ? null : incomingError;
+      if (isPausedError && urls.value.preview360p) {
+        state.value = ProxyState.READY_360P;
+      }
       autoTrigger720p.value = status.auto_trigger_720p !== undefined ? status.auto_trigger_720p : true;
       version.value = status.version !== undefined ? status.version : version.value;
 
@@ -391,6 +431,22 @@ export function useProxyVideo(jobIdInput) {
     return true;
   }
 
+  /**
+   * 降级到360p（视频加载失败时调用）
+   */
+  function fallbackTo360p(reason = "") {
+    console.warn("[useProxyVideo] 视频加载失败，降级至360p:", reason);
+    pending720pUrl.value = null;
+    urls.value.proxy720p = null;
+    if (urls.value.preview360p) {
+      state.value = ProxyState.READY_360P;
+      error.value = null;
+    } else {
+      state.value = ProxyState.ERROR;
+      error.value = reason || "视频加载失败";
+    }
+  }
+
   // ========== 生命周期 ==========
 
   onMounted(() => {
@@ -453,6 +509,7 @@ export function useProxyVideo(jobIdInput) {
     subscribeSSE,
     unsubscribe,
     apply720pUpgrade, // 执行720p替换
+    fallbackTo360p,   // 视频加载失败降级
     // 从后端快照直接同步当前状态（SSE initial_state/HTTP 兜底）
     applySnapshot(proxyState) {
       if (!proxyState) return;
@@ -464,10 +521,18 @@ export function useProxyVideo(jobIdInput) {
       if (proxyState.version !== undefined) {
         version.value = proxyState.version;
       }
-      state.value = proxyState.state || state.value;
+      let nextState = proxyState.state || state.value;
+      let nextError = proxyState.error || null;
+      const pausedErr = typeof nextError === 'string' && nextError.includes('paused_for_new_job');
+      if (pausedErr && urls.value.preview360p) {
+        nextError = null;
+        nextState = ProxyState.READY_360P;
+      }
+
+      state.value = nextState;
       progress.value = proxyState.progress ?? progress.value;
       decision.value = proxyState.decision || decision.value;
-      error.value = proxyState.error || null;
+      error.value = nextError;
       if (proxyState.urls) {
         urls.value = {
           preview360p: proxyState.urls["360p"] || null,

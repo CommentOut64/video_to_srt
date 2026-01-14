@@ -172,6 +172,26 @@ class Proxy720Scheduler:
             if pending:
                 pending["last_error"] = message
 
+    def mark_paused(self, job_id: str, trigger_type: str = "paused_for_new_job") -> None:
+        """V3.1.2+dev.20260114.17: 被新任务打断时标记为待检查而非失败"""
+        with self.lock:
+            state = self._load_state(job_id)
+            version = state.get("version", 0) + 1
+            self._save_state(job_id, {
+                "state": "waiting_check",
+                "version": version,
+                "updated_at": _now(),
+                "trigger_type": trigger_type
+            })
+            pending = self.pending.get(job_id, {})
+            pending.update({
+                "job_id": job_id,
+                "priority": pending.get("priority", 100),
+                "requested_at": pending.get("requested_at", _now()),
+                "trigger_type": trigger_type
+            })
+            self.pending[job_id] = pending
+
     def ensure_tracked(self, job_id: str, video_path: Optional[Path], trigger_type: str = "restore") -> None:
         """编辑器加载或服务重启时调用，确保状态文件存在但不立即触发"""
         with self.lock:
@@ -206,10 +226,14 @@ class Proxy720Scheduler:
         video_path = Path(item["video_path"])
         output_path = config.JOBS_DIR / job_id / "proxy_720p.mp4"
 
-        # 队列繁忙则跳过，等待下次空闲事件
-        if self.media_prep and self.media_prep._is_transcription_queue_busy():
-            logger.info(f"[Proxy720Scheduler] 队列繁忙，暂不启动: {job_id}")
-            return False
+        # 队列或媒体转码繁忙则跳过，等待下次空闲事件
+        if self.media_prep:
+            if self.media_prep._is_transcription_queue_busy():
+                logger.info(f"[Proxy720Scheduler] 队列繁忙，暂不启动: {job_id}")
+                return False
+            if self.media_prep.has_active_tasks():
+                logger.info(f"[Proxy720Scheduler] 媒体转码繁忙，暂不启动720p: {job_id}")
+                return False
 
         # 360p/文件校验
         preview = config.JOBS_DIR / job_id / "preview_360p.mp4"

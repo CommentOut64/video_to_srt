@@ -1369,6 +1369,14 @@ function handleVideoLoaded(duration) {
 
 function handleVideoError(error) {
   console.error('视频加载错误:', error)
+  // V3.1.2+dev.20260114.22: 兜底降级，如果720p加载失败则回落到360p
+  const message = error?.message || ''
+  if (proxyVideo.currentResolution.value === '720p' && proxyVideo.urls.value.preview360p) {
+    proxyVideo.fallbackTo360p(message)
+    ElMessage.warning('720p 加载失败，已自动降级为 360p')
+  } else if (!proxyVideo.urls.value.preview360p) {
+    ElMessage.error('视频加载失败，且无可用的预览版本')
+  }
 }
 
 // V3.1.2+dev.20260113.01: 处理720p升级失败
