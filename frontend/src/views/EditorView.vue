@@ -326,6 +326,19 @@ watch(jobIdRef, async (newJobId, oldJobId) => {
   await loadProject()
 })
 
+// 监听保存时间用于同步 task-meta 的显示
+watch(
+  () => projectStore.meta.lastSaved,
+  (value) => {
+    if (!projectStore.meta.jobId) {
+      lastSaved.value = null
+      return
+    }
+    lastSaved.value = value || null
+  },
+  { immediate: true }
+)
+
 // ========== 计算属性 ==========
 
 // 项目名称 - 优先显示 title，否则显示 filename（去除扩展名）

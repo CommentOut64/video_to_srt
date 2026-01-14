@@ -428,12 +428,42 @@ function renderTextWithHighlight() {
     return escapeHtml(text)
   }
 
+  // SenseVoice 有时会返回整句作为一个词（常见于中文），此时直接去掉高亮，避免整句着色
+  if (words.length === 1) {
+    const raw = words[0].word || ''
+    const chars = [...raw]
+    const isCJKChar = (char) => /[\u4e00-\u9fff]/.test(char)
+    const isFullWidthPunc = (char) => /[，。！？、《》【】（）…]/.test(char)
+    const shouldBypassHighlight = raw.length > 4 && chars.every(ch => isCJKChar(ch) || isFullWidthPunc(ch))
+    if (shouldBypassHighlight) {
+      return escapeHtml(text)
+    }
+  }
+
   const WARN_THRESHOLD = 0.5
   const CRITICAL_THRESHOLD = 0.3
 
+  // 中文段落常被 SenseVoice 合并成整句，这里在前端拆分为逐字，防止整句高亮
+  const expandWords = (wordItem) => {
+    const raw = wordItem.word || ''
+    const chars = [...raw]
+    const isCJKChar = (char) => /[\u4e00-\u9fff]/.test(char)
+    const isFullWidthPunc = (char) => /[，。！？、《》【】（）…]/.test(char)
+    const shouldSplit = raw.length > 1 && chars.every(ch => isCJKChar(ch) || isFullWidthPunc(ch))
+    if (!shouldSplit) {
+      return [wordItem]
+    }
+    return chars.map(ch => ({
+      ...wordItem,
+      word: ch
+    }))
+  }
+
+  const processedWords = words.flatMap(word => expandWords(word))
+
   let html = ''
-  for (let i = 0; i < words.length; i++) {
-    const word = words[i]
+  for (let i = 0; i < processedWords.length; i++) {
+    const word = processedWords[i]
     const conf = word.confidence !== undefined ? word.confidence : 1.0
     const wordText = escapeHtml(word.word)
 
@@ -446,8 +476,8 @@ function renderTextWithHighlight() {
     }
 
     // 智能添加空格：英文单词之间加空格，中文字符之间不加
-    if (i < words.length - 1) {
-      const nextWord = words[i + 1].word
+    if (i < processedWords.length - 1) {
+      const nextWord = processedWords[i + 1].word
       // 如果当前词或下一词是中文字符，不加空格
       // 如果下一词是标点符号，不加空格
       const isChinese = (char) => char && /[\u4e00-\u9fff]/.test(char)

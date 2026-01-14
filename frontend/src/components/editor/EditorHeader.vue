@@ -39,6 +39,7 @@
         <div class="task-meta">
           <span class="status-dot" :class="statusClass"></span>
           <span class="meta-text">{{ metaText }}</span>
+          <span v-if="lastSavedText" class="save-text">{{ lastSavedText }}</span>
         </div>
       </div>
     </div>
@@ -330,24 +331,26 @@ const statusClass = computed(() => {
   return 'idle'
 })
 
-// 元信息文字
+// 元信息文字，只保留状态提示
 const metaText = computed(() => {
-  // V3.1.0: 区分"正在暂停"和"已暂停"状态
-  if (props.currentTaskStatus === 'pausing') {
-    return `正在暂停... ${props.currentTaskProgress}%`
-  }
-  if (props.currentTaskStatus === 'paused') {
-    return `已暂停 ${props.currentTaskProgress}%`
-  }
-  if (showCurrentTaskProgress.value) {
-    return `转录中 ${props.currentTaskProgress}%`
-  }
-  if (props.lastSaved) {
-    const date = new Date(props.lastSaved)
-    const time = date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
-    return `自动保存于 ${time}`
-  }
+  if (props.currentTaskStatus === 'pausing') return '正在暂停...'
+  if (props.currentTaskStatus === 'paused') return '已暂停'
+  if (props.currentTaskStatus === 'queued') return '排队中'
+  if (props.currentTaskStatus === 'processing') return '转录中'
+  if (props.currentTaskStatus === 'canceling') return '正在取消...'
+  if (props.currentTaskStatus === 'force_canceled') return '已强制取消'
+  if (props.currentTaskStatus === 'canceled') return '已取消'
+  if (props.currentTaskStatus === 'failed') return '任务失败'
+  if (props.currentTaskStatus === 'finished') return '已完成'
   return '准备就绪'
+})
+
+// 保存提示在每次自动保存后刷新
+const lastSavedText = computed(() => {
+  if (!props.lastSaved) return ''
+  const date = new Date(props.lastSaved)
+  const time = date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+  return `最后保存 ${time}`
 })
 
 // 获取阶段样式（与TaskMonitor保持一致）
@@ -486,7 +489,8 @@ $header-h: 56px;
     .task-meta {
       display: flex;
       align-items: center;
-      gap: 5px;
+      gap: 6px;
+      flex-wrap: wrap;
 
       .status-dot {
         width: 6px;
@@ -504,6 +508,19 @@ $header-h: 56px;
       .meta-text {
         font-size: 11px;
         color: var(--text-muted);
+      }
+
+      .save-text {
+        font-size: 11px;
+        color: var(--text-secondary);
+        display: flex;
+        align-items: center;
+        gap: 4px;
+
+        &::before {
+          content: '-';
+          color: var(--text-muted);
+        }
       }
     }
   }
