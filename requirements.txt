@@ -61,6 +61,7 @@ fastapi
 uvicorn[standard]
 python-multipart
 sse-starlette
+prometheus_client
 
 # --- Brouhaha SNR+C50 分诊 (V3.1.1+dev.20260108.03) ---
 # pyannote.audio 提供模型加载框架
