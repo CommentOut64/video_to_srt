@@ -53,10 +53,7 @@ class DemucsConfig:
 
     # 可用模型列表（供UI选择）
     available_models: List[str] = field(default_factory=lambda: [
-        "htdemucs",       # 【当前】快速模式，只需1个文件
-        "mdx_extra",      # 高质量
-        "htdemucs_ft",    # Fine-tuned（需4个文件）
-        "mdx_extra_q",    # 量化版（小显存）
+        "htdemucs",       # 统一使用 htdemucs（与注册表一致）
     ])
 
 
@@ -363,7 +360,7 @@ class DemucsService:
         - htdemucs: ~80MB
         - mdx_extra_q: ~25MB
         
-        【优化】：自动使用国内镜像加速下载
+        已切换到 ModelManagerV2 统一管理。
         """
         if device:
             self.config.device = device
@@ -373,38 +370,29 @@ class DemucsService:
             if self._model is not None and self._model_name_loaded == self.config.model_name:
                 return self._model
 
-            # 如果模型已加载但名称不同，先卸载
+            # 如果模型已加载但名称不同，先卸载本地引用（缓存由 ModelManagerV2 管理）
             if self._model is not None:
-                self.logger.info(f"卸载旧模型: {self._model_name_loaded}")
-                del self._model
+                self.logger.info(f"卸载旧模型引用: {self._model_name_loaded}")
                 self._model = None
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                self._model_name_loaded = None
 
-            self.logger.info(f"加载Demucs模型: {self.config.model_name}")
-
+            model_id = f"demucs-{self.config.model_name}"
             try:
-                # 【优化】使用国内镜像加速下载模型
-                self._load_model_with_mirror()
-                self._model_name_loaded = self.config.model_name
+                from app.services.model_manager_v2 import get_model_manager_v2
 
-                # 移动到指定设备
-                if self.config.device == "cuda" and torch.cuda.is_available():
-                    self._model.cuda()
-                    self.logger.info(f"Demucs模型 {self.config.model_name} 已加载到GPU")
-                else:
-                    self._model.cpu()
-                    self.config.device = "cpu"
-                    self.logger.info(f"Demucs模型 {self.config.model_name} 已加载到CPU")
-
-                self._model.eval()
-                return self._model
-
-            except ImportError:
-                raise RuntimeError(
-                    "Demucs未安装，请运行: pip install demucs"
+                manager = get_model_manager_v2()
+                self.logger.info(
+                    "Demucs 使用 ModelManagerV2 加载: id=%s device=%s",
+                    model_id,
+                    self.config.device,
                 )
+                manager.ensure_available(model_id)
+                handle = manager.acquire(model_id, device=self.config.device, compute_type="fp32")
+                self._model = handle
+                self._model_name_loaded = self.config.model_name
+                return self._model
+            except Exception as exc:
+                raise RuntimeError(f"Demucs 通过 ModelManagerV2 加载失败: {exc}") from exc
 
     def unload_model(self):
         """卸载模型释放显存"""

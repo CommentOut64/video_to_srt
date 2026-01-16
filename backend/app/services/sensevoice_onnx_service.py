@@ -264,9 +264,18 @@ class SenseVoiceONNXService:
         self.is_loaded = False
         self._lock = threading.Lock()
         self.logger = logging.getLogger(__name__)
+        self.model_id = "sensevoice-small"
 
-        # 模型路径
-        self.model_path = self._resolve_model_path()
+        # 模型路径（优先统一管理）
+        try:
+            from app.services.model_manager_v2 import get_model_manager_v2
+
+            manager = get_model_manager_v2()
+            self.model_path = manager.ensure_available(self.model_id)
+            self.logger.info("SenseVoice 使用 ModelManagerV2 路径: %s", self.model_path)
+        except Exception as exc:
+            self.logger.warning("ModelManagerV2 获取 SenseVoice 模型失败，回退旧路径: %s", exc)
+            self.model_path = self._resolve_model_path()
 
         # 计算帧参数
         self.n_fft = int(self.SAMPLE_RATE * self.FRAME_LENGTH_MS / 1000)  # 400
@@ -340,72 +349,16 @@ class SenseVoiceONNXService:
                 return
 
             try:
-                self.logger.info("开始加载 SenseVoice ONNX 模型...")
-                self.logger.info(f"模型路径: {self.model_path}")
+                from app.services.model_manager_v2 import get_model_manager_v2
 
-                # 导入 ONNX Runtime
-                try:
-                    import onnxruntime as ort
-                except ImportError as e:
-                    raise ImportError(
-                        "onnxruntime 未安装。请运行: pip install onnxruntime-gpu 或 pip install onnxruntime"
-                    ) from e
-
-                # 查找 ONNX 模型文件
-                model_file = self._find_onnx_model()
-                self.logger.info(f"ONNX 模型文件: {model_file}")
-
-                # 配置 ONNX Runtime
-                sess_options = ort.SessionOptions()
-                sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-
-                # V3.9: 智能 CPU 线程配置（根据 Intel/AMD 架构优化）
-                # 原理：
-                # - Intel 混合架构：仅使用 P-Core，避免 E-Core 拖慢推理
-                # - AMD 全大核：使用物理核心数的 50-60%，避免跨 CCX 开销
-                # - 使用物理核心而非逻辑核心，避免超线程带来的缓存竞争
-                from app.utils.cpu_optimizer import ONNXThreadOptimizer, CPUArchitectureDetector
-
-                vendor = CPUArchitectureDetector.detect_cpu_vendor()
-                physical_cores = CPUArchitectureDetector.get_physical_cores()
-                optimal_threads, thread_info = ONNXThreadOptimizer.calculate_optimal_threads(
-                    vendor=vendor,
-                    physical_cores=physical_cores,
-                    usage_ratio=0.6  # 使用 60% 的核心，避免功耗墙
-                )
-
-                sess_options.intra_op_num_threads = optimal_threads  # 算子内部并行度
-                sess_options.inter_op_num_threads = 1  # 算子间并行度
-
-                # 通用 CPU 优化（适用于 Intel/AMD）
-                try:
-                    # 1. 关闭线程自旋等待，降低空转功耗
-                    sess_options.add_session_config_entry('session.intra_op.allow_spinning', '0')
-                    sess_options.add_session_config_entry('session.inter_op.allow_spinning', '0')
-
-                    # 2. 将极小浮点数（denormal）视为 0，提升性能
-                    sess_options.add_session_config_entry('session.set_denormal_as_zero', '1')
-
-                    self.logger.debug("CPU 优化配置已启用: allow_spinning=0, denormal_as_zero=1")
-                except Exception as e:
-                    self.logger.debug(f"CPU 优化配置失败: {e}")
-
-                self.logger.info(
-                    f"CPU 线程配置: 厂商={vendor.upper()}, "
-                    f"物理核心={physical_cores}, "
-                    f"ONNX 使用={optimal_threads} 线程"
-                )
-                self.logger.info(f"配置策略: {thread_info['strategy']}")
-
-                # 选择执行提供者
-                providers = self._get_execution_providers()
-                self.logger.info(f"执行提供者: {providers}")
-
-                # 加载模型
-                self.session = ort.InferenceSession(
-                    model_file,
-                    sess_options=sess_options,
-                    providers=providers
+                self.logger.info("开始加载 SenseVoice ONNX 模型（ModelManagerV2）...")
+                manager = get_model_manager_v2()
+                # 更新模型路径（防止外部下载后路径变化）
+                self.model_path = manager.ensure_available(self.model_id)
+                self.session = manager.acquire(
+                    self.model_id,
+                    device=self.config.device or "auto",
+                    compute_type="int8",
                 )
 
                 # 加载词汇表

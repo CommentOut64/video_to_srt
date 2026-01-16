@@ -387,16 +387,27 @@ class VADService:
         # 使用 silero-vad 库的 get_speech_timestamps 函数
         from silero_vad import get_speech_timestamps
 
-        # 使用项目内置的 ONNX 模型
-        builtin_model_path = Path(__file__).parent.parent.parent / "assets" / "silero" / "silero_vad.onnx"
+        # 通过 ModelManagerV2 统一获取模型路径，回退到内置模型
+        try:
+            from app.services.model_manager_v2 import get_model_manager_v2
+
+            manager = get_model_manager_v2()
+            vad_dir = Path(manager.ensure_available("silero-vad"))
+            builtin_model_path = vad_dir / "silero_vad.onnx"
+            self.logger.info(f"Silero VAD 使用 ModelManagerV2 模型: {builtin_model_path}")
+        except Exception as exc:
+            builtin_model_path = Path(__file__).parent.parent.parent / "assets" / "silero" / "silero_vad.onnx"
+            self.logger.warning(
+                "ModelManagerV2 获取 Silero VAD 失败，回退内置路径: %s (reason=%s)",
+                builtin_model_path,
+                exc,
+            )
 
         if not builtin_model_path.exists():
             raise FileNotFoundError(
-                f"内置Silero VAD模型不存在: {builtin_model_path}\n"
+                f"Silero VAD 模型不存在: {builtin_model_path}\n"
                 "请确保项目完整，或重新从源码仓库获取"
             )
-
-        self.logger.info(f"使用内置模型: {builtin_model_path}")
 
         # 使用优化版 OnnxWrapper（多线程 + P-Core 亲和性）
         model = OptimizedOnnxWrapper(str(builtin_model_path), logger=self.logger)

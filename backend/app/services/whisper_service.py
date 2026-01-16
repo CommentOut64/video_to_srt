@@ -161,6 +161,31 @@ class WhisperService:
         """获取当前加载的模型名称"""
         return self._model_name
 
+    def _resolve_model_id(self, model_name: str) -> str:
+        """
+        将传入的模型名称解析为注册表中的模型ID。
+
+        统一入口：优先直接匹配，再尝试添加 whisper- 前缀，以及仓库名尾部。
+        """
+        from app.services.model_manager_v2 import get_model_manager_v2
+
+        manager = get_model_manager_v2()
+        candidates = [model_name]
+        # 兼容 medium → whisper-medium，medium.en → whisper-medium-en
+        candidates.append(f"whisper-{model_name.replace('.', '-')}")
+        # 兼容传入仓库ID Systran/faster-whisper-medium
+        if "/" in model_name:
+            tail = model_name.split("/")[-1]
+            candidates.extend([tail, f"whisper-{tail.replace('.', '-')}"])
+
+        for mid in candidates:
+            try:
+                manager.registry.get(mid)
+                return mid
+            except Exception:
+                continue
+        raise KeyError(f"未在模型注册表中找到匹配的 Whisper 模型: {model_name}")
+
     @property
     def device(self) -> str:
         """获取当前设备"""
@@ -211,66 +236,25 @@ class WhisperService:
             logger.debug(f"模型 {model_name} (compute_type={compute_type}) 已加载，跳过")
             return self
 
-        # 卸载旧模型
-        self.unload_model()
+        # 统一走 ModelManagerV2
+        model_id = self._resolve_model_id(model_name)
+        from app.services.model_manager_v2 import get_model_manager_v2
 
-        # 设置下载目录
-        if download_root is None:
-            download_root = str(config.HF_CACHE_DIR)
-        
-        # 确保下载目录存在
-        Path(download_root).mkdir(parents=True, exist_ok=True)
+        manager = get_model_manager_v2()
+        logger.info(
+            "WhisperService 使用 ModelManagerV2 加载: id=%s device=%s compute_type=%s",
+            model_id,
+            device,
+            compute_type,
+        )
+        manager.ensure_available(model_id)
+        handle = manager.acquire(model_id, device=device, compute_type=compute_type)
 
-        # 确保镜像源配置
-        self._setup_hf_mirror()
-
-        # 获取完整的仓库 ID
-        model_repo_id = self.get_model_repo_id(model_name)
-
-        logger.info(f"=" * 50)
-        logger.info(f"加载 Faster-Whisper 模型")
-        logger.info(f"  模型名称: {model_name}")
-        logger.info(f"  仓库 ID: {model_repo_id}")
-        logger.info(f"  设备: {device}, 计算类型: {compute_type}")
-        logger.info(f"  缓存目录: {download_root}")
-        logger.info(f"  镜像源: {os.environ.get('HF_ENDPOINT', '官方源')}")
-        logger.info(f"=" * 50)
-
-        try:
-            # 检查模型是否存在本地，不存在则下载
-            if auto_download:
-                model_path = self._ensure_model_downloaded(
-                    model_repo_id, 
-                    download_root,
-                    force_download=False
-                )
-                if model_path:
-                    # 使用本地路径加载
-                    logger.info(f"使用本地模型路径: {model_path}")
-                    model_repo_id = model_path
-
-            # 加载模型
-            # 延迟导入 faster_whisper，避免启动时加载 ctranslate2 导致首次启动卡死
-            from faster_whisper import WhisperModel
-
-            self.model = WhisperModel(
-                model_repo_id,
-                device=device,
-                compute_type=compute_type,
-                download_root=download_root,
-                local_files_only=local_files_only
-            )
-
-            self._model_name = model_name
-            self._device = device
-            self._compute_type = compute_type
-
-            logger.info(f"✓ Faster-Whisper 模型加载完成: {model_name}")
-
-        except Exception as e:
-            logger.error(f"✗ 加载 Faster-Whisper 模型失败: {e}")
-            raise
-
+        self.model = handle
+        self._model_name = model_name
+        self._device = device
+        self._compute_type = compute_type
+        logger.info("WhisperService 完成加载: model_id=%s", model_id)
         return self
 
     def _ensure_model_downloaded(
