@@ -197,10 +197,10 @@ async def shutdown_system(req: ShutdownRequest):
 
         # 4.1 卸载所有模型
         try:
-            from app.services.model_preload_manager import get_model_manager
-            model_manager = get_model_manager()
+            from app.services.model_manager_v2 import get_model_manager_v2
+            model_manager = get_model_manager_v2()
             if model_manager:
-                model_manager.clear_cache()
+                model_manager.unload_all()
                 cleanup_report["models_unloaded"] = True
                 logger.info("GPU模型已卸载")
         except Exception as e:

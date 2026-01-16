@@ -4,7 +4,7 @@
 """
 import os, subprocess, uuid, threading, json, math, gc, logging
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 from enum import Enum
 from dataclasses import dataclass, field
 from collections import OrderedDict  # 新增导入
@@ -318,13 +318,6 @@ from app.services.hardware_service import get_hardware_detector, get_hardware_op
 from app.services.cpu_affinity_service import CPUAffinityManager, CPUAffinityConfig
 from app.services.job_index_service import get_job_index_service
 from app.core.config import config  # 导入统一配置
-
-# 全局模型缓存 (按 (model, compute_type, device) 键)
-_model_cache: Dict[Tuple[str, str, str], object] = {}
-
-
-_model_lock = threading.Lock()
-
 
 class TranscriptionService:
     """
@@ -2589,147 +2582,39 @@ class TranscriptionService:
         Returns:
             模型对象
         """
-        # 尝试使用模型管理服务检查并下载模型
+        # 优先使用 ModelManager V2 统一获取模型
         try:
-            from app.services.model_manager_service import get_model_manager
-            model_mgr = get_model_manager()
-            whisper_model_info = model_mgr.whisper_models.get(settings.model)
+            from app.services.model_manager_v2 import get_model_manager_v2
 
-            if whisper_model_info:
-                # 检查模型状态
-                if whisper_model_info.status == "not_downloaded" or whisper_model_info.status == "incomplete":
-                    self.logger.warning(f"Whisper模型未下载或不完整: {settings.model}")
-
-                    # 获取模型大小信息
-                    model_size_mb = whisper_model_info.size_mb
-
-                    # 如果模型大小>=1GB,给出特殊提示
-                    download_msg = ""
-                    if model_size_mb >= 1024:
-                        size_gb = model_size_mb / 1024
-                        download_msg = f"当前下载模型大于1GB ({size_gb:.1f}GB),请耐心等待"
-                        self.logger.info(f"{download_msg}")
-                    else:
-                        download_msg = f"开始下载模型 {settings.model} ({model_size_mb}MB)"
-
-                    # 更新任务状态
-                    if job:
-                        job.message = download_msg
-
-                    self.logger.info(f"自动触发下载Whisper模型: {settings.model} ({model_size_mb}MB)")
-
-                    # 触发下载
-                    success = model_mgr.download_whisper_model(settings.model)
-                    if not success:
-                        self.logger.warning(f"模型管理器下载失败或已在下载中,使用备用方式")
-                        raise RuntimeError("模型管理器下载失败")
-
-                    # 等待下载完成（最多等待10分钟）
-                    import time
-                    max_wait_time = 600  # 10分钟
-                    wait_interval = 5  # 每5秒检查一次
-                    elapsed = 0
-
-                    while elapsed < max_wait_time:
-                        time.sleep(wait_interval)
-                        elapsed += wait_interval
-
-                        current_status = model_mgr.whisper_models[settings.model].status
-                        progress = model_mgr.whisper_models[settings.model].download_progress
-
-                        if current_status == "ready":
-                            self.logger.info(f"Whisper模型下载完成: {settings.model}")
-                            if job:
-                                job.message = f"模型下载完成,准备加载"
-                            break
-                        elif current_status == "error":
-                            self.logger.error(f"模型管理器下载失败,使用备用方式")
-                            raise RuntimeError(f"Whisper模型下载失败: {settings.model}")
-                        else:
-                            # 如果模型大小>=1GB,定期提醒用户耐心等待
-                            if model_size_mb >= 1024 and elapsed % 30 == 0:  # 每30秒提醒一次
-                                wait_msg = f"当前下载模型大于1GB,请耐心等待... {progress:.1f}% ({elapsed}s/{max_wait_time}s)"
-                                self.logger.info(f"{wait_msg}")
-                                if job:
-                                    job.message = wait_msg
-                            else:
-                                wait_msg = f"等待模型下载... {progress:.1f}%"
-                                self.logger.info(f"{wait_msg} ({elapsed}s/{max_wait_time}s)")
-                                # 更新任务状态(每次都更新,这样用户可以看到进度变化)
-                                if job:
-                                    job.message = wait_msg
-
-                    if elapsed >= max_wait_time:
-                        self.logger.error(f"模型下载超时,使用备用方式")
-                        raise TimeoutError(f"Whisper模型下载超时: {settings.model}")
-
-        except Exception as e:
-            self.logger.warning(f"模型管理服务检查失败,使用备用方式: {e}")
-
-        # 尝试使用模型预加载管理器
-        try:
-            from app.services.model_preload_manager import get_model_manager as get_preload_manager
-            model_manager = get_preload_manager()
-            if model_manager:
-                self.logger.debug("使用模型预加载管理器获取模型")
-                if job:
-                    job.message = "加载模型中"
-                return model_manager.get_model(settings)
-        except Exception as e:
-            self.logger.debug(f"无法使用模型预加载管理器，回退到本地缓存: {e}")
-            pass
-
-        # 回退到简单缓存机制
-        key = (settings.model, settings.compute_type, settings.device)
-        with _model_lock:
-            if key in _model_cache:
-                self.logger.debug(f"命中模型缓存: {key}")
-                if job:
-                    job.message = "使用缓存的模型"
-                return _model_cache[key]
-
-            self.logger.info(f"加载模型: {key}")
+            model_mgr = get_model_manager_v2()
+            self.logger.info(
+                "通过 ModelManagerV2 获取模型: %s device=%s compute_type=%s",
+                settings.model,
+                settings.device,
+                settings.compute_type,
+            )
             if job:
-                job.message = f"加载模型 {settings.model}"
-
-            # 处理 auto 模式：解析为具体的计算类型
-            compute_type_resolved = settings.compute_type
-            if compute_type_resolved == "auto":
-                from app.services.whisper_service import get_auto_compute_type
-                compute_type_resolved = get_auto_compute_type(settings.device)
-                self.logger.info(f"auto模式已解析为: {compute_type_resolved}")
-
-            # 首先尝试仅使用本地文件 (使用 Faster-Whisper)
-            try:
-                from app.core.config import config
-                from faster_whisper import WhisperModel
-                m = WhisperModel(
-                    settings.model,
-                    device=settings.device,
-                    compute_type=compute_type_resolved,  # 使用解析后的计算类型
-                    download_root=str(config.HF_CACHE_DIR),
-                    local_files_only=True  # 禁止自动下载，只使用本地文件
-                )
-                _model_cache[key] = m
-                if job:
-                    job.message = "模型加载完成"
-                return m
-            except Exception as e:
-                self.logger.warning(f"本地加载失败,允许下载: {e}")
-                if job:
-                    job.message = "本地模型不存在,正在下载"
-                # 如果本地加载失败,允许下载
-                m = WhisperModel(
-                    settings.model,
-                    device=settings.device,
-                    compute_type=compute_type_resolved,  # 使用解析后的计算类型
-                    download_root=str(config.HF_CACHE_DIR),
-                    local_files_only=False  # 允许下载
-                )
-                _model_cache[key] = m
-                if job:
-                    job.message = "模型下载并加载完成"
-                return m
+                job.message = "检查模型可用性"
+            model_mgr.ensure_available(settings.model)
+            if job:
+                job.message = "加载模型中"
+            handle = model_mgr.acquire(
+                settings.model,
+                device=settings.device,
+                compute_type=settings.compute_type,
+            )
+            self.logger.info(
+                "ModelManagerV2 返回模型句柄: %s device=%s compute_type=%s",
+                settings.model,
+                settings.device,
+                settings.compute_type,
+            )
+            if job:
+                job.message = "模型加载完成"
+            return handle
+        except Exception as e:
+            self.logger.error(f"ModelManagerV2 获取模型失败，终止: {e}", exc_info=True)
+            raise
 
   
     def _transcribe_segment_unaligned(
@@ -3303,16 +3188,11 @@ class TranscriptionService:
 
         注意: 新架构已移除对齐模型，仅清理 Whisper 模型
         """
-        global _model_cache
+        from app.services.model_manager_v2 import get_model_manager_v2
 
-        with _model_lock:
-            for key in list(_model_cache.keys()):
-                try:
-                    del _model_cache[key]
-                except:
-                    pass
-            _model_cache.clear()
-            self.logger.info("Whisper模型缓存已清空")
+        manager = get_model_manager_v2()
+        manager.unload_all()
+        self.logger.info("ModelManagerV2 缓存已清空")
 
     # ==========================================
     # SenseVoice 集成方法（Phase 3）
