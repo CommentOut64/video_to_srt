@@ -31,6 +31,7 @@ from app.config.model_config import ModelPreloadConfig
 
 # 导入API路由
 from app.api.routes import model_routes
+from app.api.routes import model_runtime_routes
 from app.api.routes import media_routes  # 新增：媒体资源路由
 from app.api.routes.transcription_routes import create_transcription_router
 from app.api.routes.demucs_routes import create_demucs_router  # 新增：Demucs配置路由
@@ -198,6 +199,7 @@ app.add_middleware(
 
 # 注册API路由
 app.include_router(model_routes.router)
+app.include_router(model_runtime_routes.router)
 app.include_router(media_routes.router)  # 新增：媒体资源路由
 app.include_router(system_routes.router)  # 新增：系统管理路由
 app.include_router(config_routes.router)  # 新增：用户配置路由
