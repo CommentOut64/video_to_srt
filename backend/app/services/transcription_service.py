@@ -4,7 +4,7 @@
 """
 import os, subprocess, uuid, threading, json, math, gc, logging
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from enum import Enum
 from dataclasses import dataclass, field
 from collections import OrderedDict  # 新增导入
@@ -419,8 +419,10 @@ class TranscriptionService:
             from app.pipelines.async_dual_pipeline import AsyncDualPipeline
 
             # 初始化音频处理流水线（旧架构，保持向后兼容）
+            from app.services.runtime_param_resolver import build_vad_config
+
             audio_config = AudioProcessingConfig(
-                vad_config=VADConfig(),  # 使用默认 VAD 配置
+                vad_config=build_vad_config(),
                 enable_demucs=True,
                 auto_strategy=True
             )
@@ -656,7 +658,7 @@ class TranscriptionService:
         """
         from app.pipelines.preprocessing_pipeline import PreprocessingPipeline
         from app.services.audio.chunk_engine import ChunkEngine
-        from app.services.audio.vad_service import VADConfig
+        from app.services.runtime_param_resolver import build_vad_config_for_profile
 
         # V3.9: 根据引擎类型选择 VAD 配置
         # 英语使用 Whisper，需要合并 VAD（避免幻觉）
@@ -664,33 +666,18 @@ class TranscriptionService:
         language = getattr(job.settings, 'language', 'auto')
         is_english = language in {'en', 'english'}
 
-        if is_english:
-            # Whisper 模式：合并 VAD，避免幻觉
-            vad_config = VADConfig(
-                merge_max_gap=1.0,
-                merge_max_duration=12.0,
-                smart_target_duration=12.0
-            )
-            self.logger.info("使用 Whisper VAD 配置（合并模式）")
-        else:
-            # SenseVoice 模式：保留停顿信息
-            vad_config = VADConfig(
-                merge_max_gap=0.3,           # 只合并极短停顿
-                merge_max_duration=8.0,      # 更短的 chunk
-                smart_target_duration=8.0    # 软上限降低
-            )
-            self.logger.info("使用 SenseVoice VAD 配置（保留停顿）")
+        profile = "whisper" if is_english else "sensevoice"
+        vad_config = build_vad_config_for_profile(profile)
+        self.logger.info("使用 %s VAD 配置", "Whisper" if is_english else "SenseVoice")
 
         # 创建自定义 ChunkEngine
-        chunk_engine = ChunkEngine(
-            vad_config=vad_config,
-            logger=self.logger
-        )
+        chunk_engine = ChunkEngine(logger=self.logger)
 
         # 创建 PreprocessingPipeline 实例
         preprocessing_pipeline = PreprocessingPipeline(
             config=job.settings.preprocessing,
             chunk_engine=chunk_engine,
+            vad_config=vad_config,
             logger=self.logger
         )
 
@@ -2052,9 +2039,13 @@ class TranscriptionService:
             audio_array, sr = librosa.load(audio_path, sr=16000)
             
             # 使用频谱分诊器进行快速全局预判
+            from app.services.runtime_param_resolver import get_demucs_runtime_params
+
             spectrum_classifier = get_spectrum_classifier()
+            runtime_demucs = get_demucs_runtime_params()
+            sample_duration = runtime_demucs.get("bgm_sample_duration", 10.0)
             level_str, avg_score = spectrum_classifier.quick_global_diagnosis(
-                audio_array, sr=sr, sample_duration=10.0
+                audio_array, sr=sr, sample_duration=sample_duration
             )
             
             # 转换为 BGMLevel 枚举
@@ -2444,6 +2435,98 @@ class TranscriptionService:
         # 新结果的logprob更高（更接近0）则更好
         return new_logprob > old_logprob
 
+    def _build_whisper_transcribe_params(
+        self,
+        job: JobState,
+        overrides: Optional[Dict[str, Any]] = None,
+        context: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """构建 Whisper 推理参数（运行参数 + 局部覆盖）。"""
+        from app.config.model_config import get_whisper_suppress_tokens
+        from app.services.config_adapter import ConfigAdapter
+        from app.services.model_manager_v2 import get_model_manager_v2
+        from app.services.model_runtime_config_service import get_model_runtime_config_service
+        from app.services.runtime_param_resolver import get_runtime_group
+        from app.services.whisper_service import get_whisper_service
+
+        model_name = ConfigAdapter.get_whisper_model(job.settings)
+        whisper_service = get_whisper_service()
+        override_keys = {key for key, value in (overrides or {}).items() if value is not None}
+        sources: Dict[str, str] = {}
+
+        try:
+            model_id = whisper_service.resolve_model_id(model_name)
+            manager = get_model_manager_v2()
+            spec = manager.registry.get(model_id)
+            runtime_data = get_model_runtime_config_service().get_effective_runtime_for_model(spec)
+            runtime = runtime_data.get("effective", {})
+            sources = runtime_data.get("sources", {})
+        except Exception as exc:
+            self.logger.debug("Whisper 运行参数回退分组: %s", exc)
+            runtime = get_runtime_group("whisper")
+
+        params: Dict[str, Any] = {
+            "language": runtime.get("language"),
+            "initial_prompt": runtime.get("initial_prompt"),
+            "word_timestamps": runtime.get("word_timestamps"),
+            "beam_size": runtime.get("beam_size"),
+            "vad_filter": runtime.get("vad_filter"),
+            "vad_parameters": runtime.get("vad_parameters"),
+            "temperature": runtime.get("temperature"),
+            "condition_on_previous_text": runtime.get("condition_on_previous_text"),
+            "suppress_tokens": runtime.get("suppress_tokens"),
+            "repetition_penalty": runtime.get("repetition_penalty"),
+            "no_repeat_ngram_size": runtime.get("no_repeat_ngram_size"),
+        }
+
+        if overrides:
+            for key, value in overrides.items():
+                if value is not None:
+                    params[key] = value
+
+        language = params.get("language")
+        if language is None or language == "auto" or language == "":
+            params["language"] = None
+
+        if params.get("word_timestamps") is None:
+            params["word_timestamps"] = False
+        if params.get("beam_size") is None:
+            params["beam_size"] = 5
+        if params.get("vad_filter") is None:
+            params["vad_filter"] = True
+        if params.get("temperature") is None:
+            params["temperature"] = 0.0
+        if params.get("condition_on_previous_text") is None:
+            params["condition_on_previous_text"] = True
+        if params.get("repetition_penalty") is None:
+            params["repetition_penalty"] = 1.0
+        if params.get("no_repeat_ngram_size") is None:
+            params["no_repeat_ngram_size"] = 0
+
+        if context == "patch":
+            if not sources:
+                if "word_timestamps" not in override_keys:
+                    params["word_timestamps"] = False
+                if "condition_on_previous_text" not in override_keys:
+                    params["condition_on_previous_text"] = False
+            else:
+                if (
+                    "word_timestamps" not in override_keys
+                    and sources.get("word_timestamps") == "default"
+                ):
+                    params["word_timestamps"] = False
+                if (
+                    "condition_on_previous_text" not in override_keys
+                    and sources.get("condition_on_previous_text") == "default"
+                ):
+                    params["condition_on_previous_text"] = False
+
+        if params.get("suppress_tokens") is None:
+            suppress_tokens = get_whisper_suppress_tokens(model_name)
+            params["suppress_tokens"] = suppress_tokens if suppress_tokens else None
+
+        return params
+
     def _transcribe_segment_with_retry(
         self,
         seg_meta: Dict,
@@ -2644,12 +2727,11 @@ class TranscriptionService:
 
         try:
             # 使用 Faster-Whisper 转录
-            segments_gen, info = model.transcribe(
-                audio,
-                language=job.language,
-                beam_size=5,
-                vad_filter=True
+            params = self._build_whisper_transcribe_params(
+                job,
+                overrides={"language": job.language, "vad_filter": True},
             )
+            segments_gen, info = model.transcribe(audio, **params)
 
             # 转换生成器为列表
             segments_list = list(segments_gen)
@@ -2716,12 +2798,11 @@ class TranscriptionService:
 
         try:
             # 使用 Faster-Whisper 转录
-            segments_gen, info = model.transcribe(
-                audio_slice,
-                language=job.language,
-                beam_size=5,
-                vad_filter=False  # 已经是切片，不需要再做 VAD
+            params = self._build_whisper_transcribe_params(
+                job,
+                overrides={"language": job.language, "vad_filter": False},
             )
+            segments_gen, info = model.transcribe(audio_slice, **params)
 
             # 转换生成器为列表
             segments_list = list(segments_gen)
@@ -2780,12 +2861,11 @@ class TranscriptionService:
 
         try:
             # 使用 Faster-Whisper 转录
-            segments_gen, info = model.transcribe(
-                audio,
-                language=job.language,
-                beam_size=5,
-                vad_filter=True
+            params = self._build_whisper_transcribe_params(
+                job,
+                overrides={"language": job.language, "vad_filter": True},
             )
+            segments_gen, info = model.transcribe(audio, **params)
 
             # 转换生成器为列表
             segments_list = list(segments_gen)
@@ -3236,11 +3316,9 @@ class TranscriptionService:
                 service.load_model()
 
             # 调用转录（返回字典）
-            # 注: SenseVoice 的 language 参数实际上是自动检测，这里传入 "auto" 即可
             result_dict = service.transcribe_audio_array(
                 audio_array=audio_array,
-                sample_rate=sample_rate,
-                language="auto"
+                sample_rate=sample_rate
             )
 
             # 转换为 SenseVoiceResult 对象
@@ -3758,13 +3836,15 @@ class TranscriptionService:
         context = subtitle_manager.get_context_window(sentence_index)
 
         # Whisper 转录
-        result = whisper_service.transcribe(
-            audio=audio_segment,
-            initial_prompt=context,
-            language=getattr(job.settings, 'language', 'auto'),
-            word_timestamps=False,
-            condition_on_previous_text=False  # 禁用前文条件化，避免与 initial_prompt 形成双重提示词增益
+        params = self._build_whisper_transcribe_params(
+            job,
+            overrides={
+                "language": getattr(job.settings, 'language', 'auto'),
+                "initial_prompt": context,
+            },
+            context="patch",
         )
+        result = whisper_service.transcribe(audio=audio_segment, **params)
 
         whisper_text = result.get('text', '').strip()
         whisper_conf = self._estimate_whisper_confidence(result)
@@ -3984,13 +4064,15 @@ class TranscriptionService:
         context = subtitle_manager.get_context_window(sentence_index)
 
         # Whisper 转录（仅取文本，弃用时间戳）
-        result = whisper_service.transcribe(
-            audio=audio_segment,
-            initial_prompt=context,
-            language=getattr(job.settings, 'language', 'auto'),
-            word_timestamps=False,  # 不需要字级时间戳，使用伪对齐
-            condition_on_previous_text=False  # 禁用前文条件化，避免与 initial_prompt 形成双重提示词增益
+        params = self._build_whisper_transcribe_params(
+            job,
+            overrides={
+                "language": getattr(job.settings, 'language', 'auto'),
+                "initial_prompt": context,
+            },
+            context="patch",
         )
+        result = whisper_service.transcribe(audio=audio_segment, **params)
 
         whisper_text = result.get('text', '').strip()
         segments = result.get('segments', [])
@@ -4567,7 +4649,7 @@ class TranscriptionService:
             # ========== 新架构：使用 PreprocessingPipeline ==========
             # 统一执行：音频提取 + VAD切分 + 频谱分诊 + 按需分离
             from app.pipelines.preprocessing_pipeline import PreprocessingPipeline
-            from app.services.audio.vad_service import VADConfig
+            from app.services.runtime_param_resolver import build_vad_config_for_profile
             import soundfile as sf
 
             self.logger.info("使用新架构 PreprocessingPipeline（Stage模式）")
@@ -4578,22 +4660,13 @@ class TranscriptionService:
             language = getattr(job.settings, 'language', 'auto')
             is_english = language in {'en', 'english'}
 
-            if is_english:
-                # Whisper 模式：合并 VAD，避免幻觉
-                vad_config = VADConfig(
-                    merge_max_gap=1.0,
-                    merge_max_duration=12.0,
-                    smart_target_duration=12.0
-                )
-                self.logger.info(f"VAD配置: Whisper模式（合并），language={language}")
-            else:
-                # SenseVoice 模式：保留停顿信息，获得更自然的断句
-                vad_config = VADConfig(
-                    merge_max_gap=0.3,           # 只合并极短停顿（保留自然停顿）
-                    merge_max_duration=8.0,      # 更短的 chunk（避免强制切分）
-                    smart_target_duration=8.0    # 软上限降低
-                )
-                self.logger.info(f"VAD配置: SenseVoice模式（保留停顿），language={language}")
+            profile = "whisper" if is_english else "sensevoice"
+            vad_config = build_vad_config_for_profile(profile)
+            self.logger.info(
+                "VAD配置: %s 模式，language=%s",
+                "Whisper" if is_english else "SenseVoice",
+                language,
+            )
 
             # 创建预处理流水线（传入 VAD 配置）
             preprocessing_pipeline = PreprocessingPipeline(

@@ -208,6 +208,14 @@ class SeparationStage:
 
         token = self.cancellation_token  # V3.7
         separated_indices = separated_indices or set()
+        runtime_model = None
+        try:
+            from app.services.runtime_param_resolver import get_demucs_runtime_params
+
+            runtime_demucs = get_demucs_runtime_params()
+            runtime_model = runtime_demucs.get("model_name")
+        except Exception:
+            runtime_model = None
 
         # V3.1.2+dev.20260109.01: 创建进度条
         iterator = need_sep_chunks
@@ -237,7 +245,7 @@ class SeparationStage:
                     chunk.original_audio = chunk.audio.copy()
 
                 # 选择分离模型
-                model = chunk.recommended_model or 'htdemucs'
+                model = chunk.recommended_model or runtime_model or 'htdemucs'
 
                 self.logger.debug(
                     f"分离 Chunk {chunk.index}: 使用模型 {model}"

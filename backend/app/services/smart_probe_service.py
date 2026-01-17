@@ -18,6 +18,8 @@ V3.1.2+dev.20260109.01: 新增智能探针分诊策略
 import logging
 from typing import List, Dict, Tuple, Optional
 
+from app.services.runtime_param_resolver import get_smart_probe_runtime_params
+
 logger = logging.getLogger(__name__)
 
 
@@ -194,8 +196,8 @@ _smart_probe_instance: Optional[SmartProbeService] = None
 
 
 def get_smart_probe_service(
-    snr_threshold: float = 15.0,
-    max_step_chunks: int = 30
+    snr_threshold: Optional[float] = None,
+    max_step_chunks: Optional[int] = None
 ) -> SmartProbeService:
     """
     获取智能探针服务单例
@@ -208,14 +210,21 @@ def get_smart_probe_service(
         SmartProbeService: 智能探针服务实例
     """
     global _smart_probe_instance
+    runtime = get_smart_probe_runtime_params()
+    effective_snr = snr_threshold if snr_threshold is not None else runtime.get("snr_threshold", 15.0)
+    effective_max_step = max_step_chunks if max_step_chunks is not None else 30
+
     if _smart_probe_instance is None:
         from app.services.brouhaha_service import get_brouhaha_service
         brouhaha = get_brouhaha_service()
         _smart_probe_instance = SmartProbeService(
             brouhaha_service=brouhaha,
-            snr_threshold=snr_threshold,
-            max_step_chunks=max_step_chunks
+            snr_threshold=effective_snr,
+            max_step_chunks=effective_max_step
         )
+    else:
+        _smart_probe_instance.threshold = effective_snr
+        _smart_probe_instance.max_step = effective_max_step
     return _smart_probe_instance
 
 

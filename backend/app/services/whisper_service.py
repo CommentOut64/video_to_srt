@@ -186,6 +186,11 @@ class WhisperService:
                 continue
         raise KeyError(f"未在模型注册表中找到匹配的 Whisper 模型: {model_name}")
 
+    def resolve_model_id(self, model_name: Optional[str] = None) -> str:
+        """对外暴露的模型ID解析方法。"""
+        target = model_name or self._model_name or DEFAULT_WHISPER_MODEL
+        return self._resolve_model_id(target)
+
     @property
     def device(self) -> str:
         """获取当前设备"""
@@ -446,17 +451,17 @@ class WhisperService:
     def transcribe(
         self,
         audio: Union[str, np.ndarray],
-        language: str = None,
-        initial_prompt: str = None,
-        word_timestamps: bool = False,
-        beam_size: int = 5,
-        vad_filter: bool = True,
-        vad_parameters: dict = None,
-        temperature: float = 0.0,
-        condition_on_previous_text: bool = True,
-        suppress_tokens: list = None,  # 幻觉抑制 Token ID 列表
-        repetition_penalty: float = 1.0,  # 重复惩罚系数（>1 抑制重复）
-        no_repeat_ngram_size: int = 0  # 禁止重复的 N-gram 大小（0=禁用）
+        language: Optional[str] = None,
+        initial_prompt: Optional[str] = None,
+        word_timestamps: Optional[bool] = None,
+        beam_size: Optional[int] = None,
+        vad_filter: Optional[bool] = None,
+        vad_parameters: Optional[dict] = None,
+        temperature: Optional[float] = None,
+        condition_on_previous_text: Optional[bool] = None,
+        suppress_tokens: Optional[list] = None,  # 幻觉抑制 Token ID 列表
+        repetition_penalty: Optional[float] = None,  # 重复惩罚系数（>1 抑制重复）
+        no_repeat_ngram_size: Optional[int] = None  # 禁止重复的 N-gram 大小（0=禁用）
     ) -> Dict[str, Any]:
         """
         转录音频
@@ -485,6 +490,49 @@ class WhisperService:
         """
         if not self.model:
             raise RuntimeError("模型未加载，请先调用 load_model()")
+
+        from app.services.runtime_param_resolver import get_runtime_group_for_model, get_runtime_group
+
+        try:
+            runtime = get_runtime_group_for_model(self.resolve_model_id())
+        except Exception as exc:
+            logger.debug("Whisper 运行参数获取失败，回退默认: %s", exc)
+            runtime = get_runtime_group("whisper")
+
+        def pick_value(key: str, value: Optional[Any]) -> Any:
+            if value is not None:
+                return value
+            return runtime.get(key)
+
+        language = pick_value("language", language)
+        initial_prompt = pick_value("initial_prompt", initial_prompt)
+        word_timestamps = pick_value("word_timestamps", word_timestamps)
+        beam_size = pick_value("beam_size", beam_size)
+        vad_filter = pick_value("vad_filter", vad_filter)
+        vad_parameters = pick_value("vad_parameters", vad_parameters)
+        temperature = pick_value("temperature", temperature)
+        condition_on_previous_text = pick_value(
+            "condition_on_previous_text",
+            condition_on_previous_text,
+        )
+        suppress_tokens = pick_value("suppress_tokens", suppress_tokens)
+        repetition_penalty = pick_value("repetition_penalty", repetition_penalty)
+        no_repeat_ngram_size = pick_value("no_repeat_ngram_size", no_repeat_ngram_size)
+
+        if word_timestamps is None:
+            word_timestamps = False
+        if beam_size is None:
+            beam_size = 5
+        if vad_filter is None:
+            vad_filter = True
+        if temperature is None:
+            temperature = 0.0
+        if condition_on_previous_text is None:
+            condition_on_previous_text = True
+        if repetition_penalty is None:
+            repetition_penalty = 1.0
+        if no_repeat_ngram_size is None:
+            no_repeat_ngram_size = 0
 
         # 处理语言代码：'auto' 或空字符串应转换为 None（自动检测）
         if language is None or language == 'auto' or language == '':
@@ -562,15 +610,45 @@ class WhisperService:
 
         return result
 
+    def _resolve_segment_param_overrides(self) -> Dict[str, Any]:
+        """
+        解析补刀分段场景的默认覆盖参数。
+
+        当运行参数未显式覆盖时，保持历史默认行为，
+        避免重复 VAD 或无必要的词级时间戳开销。
+        """
+        from app.services.model_runtime_config_service import get_model_runtime_config_service
+        from app.services.model_manager_v2 import get_model_manager_v2
+
+        try:
+            model_id = self.resolve_model_id(self._model_name or DEFAULT_WHISPER_MODEL)
+            manager = get_model_manager_v2()
+            spec = manager.registry.get(model_id)
+            runtime_data = get_model_runtime_config_service().get_effective_runtime_for_model(spec)
+            sources = runtime_data.get("sources", {})
+        except Exception as exc:
+            logger.debug("Whisper Segment 默认参数回退: %s", exc)
+            return {
+                "word_timestamps": False,
+                "vad_filter": False,
+            }
+
+        overrides: Dict[str, Any] = {}
+        if sources.get("word_timestamps") == "default":
+            overrides["word_timestamps"] = False
+        if sources.get("vad_filter") == "default":
+            overrides["vad_filter"] = False
+        return overrides
+
     def transcribe_segment(
         self,
         audio: Union[str, np.ndarray],
         start_time: float,
         end_time: float,
-        language: str = None,
-        initial_prompt: str = None,
-        repetition_penalty: float = 1.0,
-        no_repeat_ngram_size: int = 0
+        language: Optional[str] = None,
+        initial_prompt: Optional[str] = None,
+        repetition_penalty: Optional[float] = None,
+        no_repeat_ngram_size: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         转录指定时间段的音频（用于补刀场景）
@@ -602,15 +680,15 @@ class WhisperService:
             end_sample = int(end_time * sr)
             audio_segment = full_audio[start_sample:end_sample]
 
+        overrides = self._resolve_segment_param_overrides()
+
         return self.transcribe(
             audio=audio_segment,
             language=language,
             initial_prompt=initial_prompt,
-            word_timestamps=False,  # 补刀场景使用伪对齐，不需要词级时间戳
-            beam_size=5,
-            vad_filter=False,  # 已经是切片，不需要 VAD
             repetition_penalty=repetition_penalty,
-            no_repeat_ngram_size=no_repeat_ngram_size
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            **overrides
         )
 
     def warmup(self):

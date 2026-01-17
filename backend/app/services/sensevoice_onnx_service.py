@@ -16,12 +16,15 @@ SenseVoice ONNX 推理服务（纯 ONNX Runtime 实现）
 - librosa (用于音频预处理)
 """
 import os
+import re
 import logging
 import numpy as np
 from pathlib import Path
-from typing import List, Optional, Dict, Union, Tuple
+from typing import List, Optional, Dict, Union, Tuple, Any
 import threading
 import json
+
+from app.services.runtime_param_resolver import get_runtime_group_for_model
 
 logger = logging.getLogger(__name__)
 
@@ -265,6 +268,7 @@ class SenseVoiceONNXService:
         self._lock = threading.Lock()
         self.logger = logging.getLogger(__name__)
         self.model_id = "sensevoice-small"
+        self._apply_runtime_params()
 
         # 模型路径（优先统一管理）
         try:
@@ -283,6 +287,62 @@ class SenseVoiceONNXService:
 
         # 时间步长：LFR 后每帧代表 LFR_N * FRAME_SHIFT_MS = 60ms
         self.time_stride = self.LFR_N * self.FRAME_SHIFT_MS / 1000  # 0.06s
+
+    def _apply_runtime_params(self) -> Dict[str, Any]:
+        """
+        应用统一运行参数到配置（SenseVoice 分组）。
+
+        返回解析后的运行参数，便于调用方复用。
+        """
+        from app.services.model_manager_v2 import get_model_manager_v2
+        from app.services.model_runtime_config_service import get_model_runtime_config_service
+
+        sources: Dict[str, str] = {}
+        try:
+            manager = get_model_manager_v2()
+            spec = manager.registry.get(self.model_id)
+            runtime_data = get_model_runtime_config_service().get_effective_runtime_for_model(spec)
+            runtime = runtime_data.get("effective", {})
+            sources = runtime_data.get("sources", {})
+        except Exception:
+            runtime = get_runtime_group_for_model(self.model_id)
+
+        device = runtime.get("device")
+        if device:
+            self.config.device = device
+
+        model_type = runtime.get("model_type")
+        quantize = runtime.get("quantize")
+        model_type_source = sources.get("model_type")
+        quantize_source = sources.get("quantize")
+
+        if model_type:
+            self.config.model_type = model_type
+
+        if quantize is not None and quantize_source != "default":
+            self.config.quantize = bool(quantize)
+            if model_type_source == "default":
+                self.config.model_type = "quantized" if quantize else "fp32"
+        elif model_type and model_type_source != "default":
+            self.config.quantize = model_type == "quantized"
+
+        batch_size = runtime.get("batch_size")
+        if batch_size:
+            self.config.batch_size = int(batch_size)
+
+        language = runtime.get("language")
+        if language:
+            self.config.language = language
+
+        use_itn = runtime.get("use_itn")
+        if use_itn is not None:
+            self.config.use_itn = use_itn
+
+        ban_emo_unk = runtime.get("ban_emo_unk")
+        if ban_emo_unk is not None:
+            self.config.ban_emo_unk = ban_emo_unk
+
+        return runtime
 
     def _resolve_model_path(self) -> str:
         """
@@ -351,6 +411,9 @@ class SenseVoiceONNXService:
             try:
                 from app.services.model_manager_v2 import get_model_manager_v2
 
+                # V3.2.0+dev.20260117.03: 应用统一运行参数
+                self._apply_runtime_params()
+
                 self.logger.info("开始加载 SenseVoice ONNX 模型（ModelManagerV2）...")
                 manager = get_model_manager_v2()
                 # 更新模型路径（防止外部下载后路径变化）
@@ -380,17 +443,17 @@ class SenseVoiceONNXService:
         """
         查找 ONNX 模型文件
 
-        根据环境变量 SENSEVOICE_MODEL_TYPE 选择模型:
+        根据运行参数选择模型:
         - quantized (默认): 使用 INT8 量化模型 (model_quant.onnx), CPU 下速度最快
         - fp32: 使用 FP32 完整模型 (model.onnx), 支持 GPU 推理
 
         注意: CUDA 对 INT8 量化算子支持不完整, 使用 GPU 时建议选择 fp32
         """
-        import os
         model_path = Path(self.model_path)
 
-        # 从环境变量读取模型类型配置
-        model_type = os.getenv('SENSEVOICE_MODEL_TYPE', 'quantized').lower()
+        # 使用运行参数配置的模型类型
+        model_type = self.config.model_type or ("quantized" if self.config.quantize else "fp32")
+        model_type = model_type.lower()
 
         if model_type == 'fp32':
             # FP32 模型优先 (支持 GPU)
@@ -462,23 +525,25 @@ class SenseVoiceONNXService:
         """
         获取执行提供者
 
-        从环境变量 SENSEVOICE_DEVICE 读取设备配置:
+        从运行参数读取设备配置:
         - cpu (默认): 强制使用 CPU, 配合 INT8 量化模型速度最优
         - cuda: 强制使用 GPU, 需要 FP32 模型
         - auto: 自动选择, 检测到 CUDA 则用 GPU, 否则用 CPU
 
         注意: CUDA 对 INT8 量化算子支持不完整, 使用 GPU 时建议:
-              SENSEVOICE_DEVICE=cuda + SENSEVOICE_MODEL_TYPE=fp32
+              device=cuda + model_type=fp32
         """
-        import os
         import onnxruntime as ort
 
         available_providers = ort.get_available_providers()
         self.logger.info(f"可用的执行提供者: {available_providers}")
 
-        # 从环境变量读取设备配置 (默认 cpu)
-        device = os.getenv('SENSEVOICE_DEVICE', 'cpu').lower()
-        self.logger.info(f"SENSEVOICE_DEVICE 配置: {device}")
+        # 从运行参数读取设备配置 (默认 cpu)
+        device = (self.config.device or "cpu").lower()
+        self.logger.info(f"SenseVoice 设备配置: {device}")
+
+        if device == "cuda" and (self.config.model_type or "").lower() == "quantized":
+            self.logger.warning("检测到量化模型+GPU组合，可能存在算子兼容问题，建议切换 fp32")
 
         if device == "auto":
             # 自动选择: GPU 优先, 降级 CPU
@@ -527,7 +592,8 @@ class SenseVoiceONNXService:
         audio_array: np.ndarray,
         sample_rate: int = 16000,
         language: str = None,
-        use_itn: bool = None
+        use_itn: bool = None,
+        ban_emo_unk: bool = None
     ) -> Dict:
         """
         转录音频数组（内存中的音频数据）
@@ -537,6 +603,7 @@ class SenseVoiceONNXService:
             sample_rate: 采样率（必须是 16000）
             language: 语言代码
             use_itn: 是否使用逆文本正则化
+            ban_emo_unk: 是否禁用未知情感标签
 
         Returns:
             转录结果字典，包含：
@@ -555,11 +622,14 @@ class SenseVoiceONNXService:
             raise ValueError(f"SenseVoice 要求采样率为 16000 Hz，当前为 {sample_rate} Hz")
 
         try:
-            # 设置默认值
+            # 应用运行参数默认值
+            runtime = self._apply_runtime_params()
             if language is None:
-                language = "auto"
+                language = runtime.get("language", self.config.language or "auto")
             if use_itn is None:
-                use_itn = True
+                use_itn = runtime.get("use_itn", self.config.use_itn)
+            if ban_emo_unk is None:
+                ban_emo_unk = runtime.get("ban_emo_unk", self.config.ban_emo_unk)
 
             # 1. 音频预处理（提取 Fbank + LFR）
             audio_features = self._preprocess_audio(audio_array, sample_rate)
@@ -597,7 +667,11 @@ class SenseVoiceONNXService:
             # 修复 "laval" 被拆分为 " la" + "val" 的问题
             word_timestamps = self._merge_tokens_to_words(word_timestamps)
 
-            # 4. 提取标签信息并使用语言自适应标点归一化
+            # 4. 过滤未知情感标签（仅影响原始文本）
+            if ban_emo_unk:
+                text = self._strip_unknown_emotion_tags(text)
+
+            # 5. 提取标签信息并使用语言自适应标点归一化
             from ..services.text_normalizer import get_text_normalizer
             normalizer = get_text_normalizer()
 
@@ -608,7 +682,7 @@ class SenseVoiceONNXService:
             # 使用检测到的语言进行文本清洗和标点归一化
             process_result = normalizer.process(text, extract_info=True, language=detected_language)
 
-            # 5. 构建结果
+            # 6. 构建结果
             result = {
                 "text": text,
                 "text_clean": process_result["text_clean"],
@@ -835,15 +909,29 @@ class SenseVoiceONNXService:
         else:
             audio_paths = audio_path
 
-        results = []
-        for path in audio_paths:
-            # 加载音频
-            audio_array, sr = librosa.load(path, sr=16000, mono=True)
+        # 应用运行参数（确保 batch_size 生效）
+        self._apply_runtime_params()
+        batch_size = max(1, int(self.config.batch_size))
+        if batch_size > 1:
+            self.logger.info("SenseVoice 批量转录: batch_size=%d", batch_size)
 
-            # 转录
-            result = self.transcribe_audio_array(audio_array, sr, language, use_itn)
-            result["audio_path"] = path
-            results.append(result)
+        results = []
+        for batch_start in range(0, len(audio_paths), batch_size):
+            batch_paths = audio_paths[batch_start:batch_start + batch_size]
+            for path in batch_paths:
+                # 加载音频
+                audio_array, sr = librosa.load(path, sr=16000, mono=True)
+
+                # 转录
+                result = self.transcribe_audio_array(
+                    audio_array=audio_array,
+                    sample_rate=sr,
+                    language=language,
+                    use_itn=use_itn,
+                    ban_emo_unk=ban_emo_unk
+                )
+                result["audio_path"] = path
+                results.append(result)
 
         return results
 
@@ -922,6 +1010,17 @@ class SenseVoiceONNXService:
             merged_words.append(current_word)
 
         return merged_words
+
+    def _strip_unknown_emotion_tags(self, text: str) -> str:
+        """
+        过滤未知情感标签（保持其他标签不变）。
+
+        说明：仅处理 <|EMO_UNKNOWN|> 等未知情感标记，避免影响语言/事件标签。
+        """
+        if not text:
+            return text
+        cleaned = re.sub(r"<\|emo_?unk(?:nown)?\|>", "", text, flags=re.IGNORECASE)
+        return cleaned.strip()
 
     def get_model_info(self) -> Dict:
         """获取模型信息"""

@@ -860,26 +860,17 @@ class JobQueueService:
             logger.info("使用新架构 PreprocessingPipeline（Stage模式）")
 
             # V3.1.0: 根据语言选择VAD配置（迁移自旧架构）
-            from app.services.audio.vad_service import VADConfig
+            from app.services.runtime_param_resolver import build_vad_config_for_profile
             language = getattr(job.settings, 'language', 'auto')
             is_english = language in {'en', 'english'}
 
-            if is_english:
-                # Whisper模式：合并VAD，避免幻觉
-                vad_config = VADConfig(
-                    merge_max_gap=1.0,
-                    merge_max_duration=12.0,
-                    smart_target_duration=12.0
-                )
-                logger.info(f"VAD配置: Whisper模式（合并），language={language}")
-            else:
-                # SenseVoice模式：保留停顿信息，获得更自然的断句
-                vad_config = VADConfig(
-                    merge_max_gap=0.3,
-                    merge_max_duration=8.0,
-                    smart_target_duration=8.0
-                )
-                logger.info(f"VAD配置: SenseVoice模式（保留停顿），language={language}")
+            profile = "whisper" if is_english else "sensevoice"
+            vad_config = build_vad_config_for_profile(profile)
+            logger.info(
+                "VAD配置: %s 模式，language=%s",
+                "Whisper" if is_english else "SenseVoice",
+                language,
+            )
 
             # 创建预处理流水线（V3.7: 传递取消令牌，V3.1.0: 传递VAD配置）
             preprocessing_pipeline = PreprocessingPipeline(

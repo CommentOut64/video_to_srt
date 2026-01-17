@@ -299,11 +299,72 @@ class DemucsService:
     def __init__(self):
         self.logger = logging.getLogger(__name__)
         self.config = DemucsConfig()
+        self._model_overridden = False
         self._cache_dir = Path("models/demucs")
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 
         # 分级模型配置
         self.tier_config = ModelTierConfig()
+        self._apply_runtime_params(force_defaults=True)
+
+    def _resolve_device(self, device: Optional[str]) -> str:
+        """解析 Demucs 设备参数（auto -> cuda/cpu）。"""
+        if not device or device == "auto":
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        return device
+
+    def _apply_runtime_params(
+        self,
+        force_defaults: bool = False,
+        apply_model_name: Optional[bool] = None,
+    ) -> None:
+        """应用运行参数配置。"""
+        from app.services.model_runtime_config_service import get_model_runtime_config_service
+
+        runtime_data = get_model_runtime_config_service().get_effective_runtime_global()
+        effective = runtime_data.get("effective", {}).get("demucs", {})
+        sources = runtime_data.get("sources", {}).get("demucs", {})
+
+        if apply_model_name is None:
+            apply_model_name = not self._model_overridden
+
+        def should_apply(field: str) -> bool:
+            return force_defaults or sources.get(field) != "default"
+
+        if apply_model_name and should_apply("model_name"):
+            value = effective.get("model_name")
+            if value:
+                self.config.model_name = value
+
+        if should_apply("device"):
+            self.config.device = self._resolve_device(effective.get("device"))
+        if should_apply("shifts"):
+            self.config.shifts = effective.get("shifts", self.config.shifts)
+        if should_apply("overlap"):
+            self.config.overlap = effective.get("overlap", self.config.overlap)
+        if should_apply("segment_length"):
+            self.config.segment_length = effective.get("segment_length", self.config.segment_length)
+        if should_apply("segment_buffer_sec"):
+            self.config.segment_buffer_sec = effective.get("segment_buffer_sec", self.config.segment_buffer_sec)
+        if should_apply("bgm_sample_duration"):
+            self.config.bgm_sample_duration = effective.get(
+                "bgm_sample_duration",
+                self.config.bgm_sample_duration,
+            )
+        if should_apply("bgm_light_threshold"):
+            self.config.bgm_light_threshold = effective.get(
+                "bgm_light_threshold",
+                self.config.bgm_light_threshold,
+            )
+        if should_apply("bgm_heavy_threshold"):
+            self.config.bgm_heavy_threshold = effective.get(
+                "bgm_heavy_threshold",
+                self.config.bgm_heavy_threshold,
+            )
+
+    def refresh_runtime_params(self) -> None:
+        """刷新运行参数（仅应用显式覆盖）。"""
+        self._apply_runtime_params(force_defaults=False)
 
     def set_model(self, model_name: str):
         """
@@ -318,8 +379,10 @@ class DemucsService:
         if model_name != self.config.model_name:
             self.logger.info(f"切换Demucs模型: {self.config.model_name} → {model_name}")
             self.config.model_name = model_name
+            self._model_overridden = True
             # 卸载旧模型，下次使用时会加载新模型
             self.unload_model()
+            self._apply_runtime_params(force_defaults=False, apply_model_name=False)
 
     def preload_model(self, model_name: str = None) -> bool:
         """
@@ -363,7 +426,9 @@ class DemucsService:
         已切换到 ModelManagerV2 统一管理。
         """
         if device:
-            self.config.device = device
+            self.config.device = self._resolve_device(device)
+
+        self._apply_runtime_params(force_defaults=False, apply_model_name=not self._model_overridden)
 
         with self._model_lock:
             # 检查是否需要重新加载（模型切换）
@@ -566,6 +631,7 @@ class DemucsService:
         from demucs.audio import AudioFile, save_audio
 
         self.logger.info(f"开始全局人声分离: {audio_path}")
+        self._apply_runtime_params(force_defaults=False, apply_model_name=False)
 
         # 生成输出路径
         if output_path is None:
@@ -672,6 +738,8 @@ class DemucsService:
             np.ndarray: 分离后的人声片段（不含缓冲区）
         """
         from demucs.apply import apply_model
+
+        self._apply_runtime_params(force_defaults=False, apply_model_name=False)
 
         if buffer_sec is None:
             buffer_sec = self.config.segment_buffer_sec
@@ -1070,6 +1138,7 @@ class DemucsService:
                 f"应用质量参数: model={model_name}, "
                 f"shifts={self.config.shifts}, overlap={self.config.overlap}"
             )
+        self._apply_runtime_params(force_defaults=False, apply_model_name=False)
 
     def separate_chunk(
         self,
@@ -1091,6 +1160,8 @@ class DemucsService:
         Returns:
             np.ndarray: 分离后的人声数组 (samples,)
         """
+        self._apply_runtime_params(force_defaults=False, apply_model_name=False)
+
         # 切换模型（如果指定）
         if model and model != self.config.model_name:
             self.set_model(model)
@@ -1169,4 +1240,6 @@ def get_demucs_service() -> DemucsService:
     global _demucs_service
     if _demucs_service is None:
         _demucs_service = DemucsService()
+    else:
+        _demucs_service.refresh_runtime_params()
     return _demucs_service

@@ -175,7 +175,10 @@ class ChunkEngine:
         if progress_callback:
             progress_callback(0.6, "VAD 语音检测中...")
 
-        vad_config = vad_config or VADConfig()
+        if vad_config is None:
+            from app.services.runtime_param_resolver import build_vad_config
+
+            vad_config = build_vad_config()
         segments = self._detect_speech_segments(separated_audio, sr, vad_config)
 
         self.logger.info(f"VAD 检测完成: {len(segments)} 个语音段")
@@ -358,13 +361,17 @@ class ChunkEngine:
         self.logger.info(f"自适应分离策略: 可用显存 {vram_mb}MB")
 
         # 显存策略决策
+        from app.services.runtime_param_resolver import get_demucs_runtime_params
+        runtime_demucs = get_demucs_runtime_params()
+        runtime_model = runtime_demucs.get("model_name") or "htdemucs"
+
         if vram_mb >= 6000:
             # 高显存：整轨分离
             self.logger.info("显存充足，使用 Demucs 整轨分离")
             return self.process_audio(
                 audio_path,
                 enable_demucs=True,
-                demucs_model="htdemucs",
+                demucs_model=runtime_model,
                 vad_config=vad_config,
                 progress_callback=progress_callback
             )
@@ -374,7 +381,7 @@ class ChunkEngine:
             return self.process_audio(
                 audio_path,
                 enable_demucs=True,
-                demucs_model="htdemucs",  # 使用快速模型
+                demucs_model=runtime_model,
                 vad_config=vad_config,
                 progress_callback=progress_callback
             )

@@ -61,17 +61,27 @@ class PreprocessingPipeline:
         self.config = config
         self.logger = logger or logging.getLogger(__name__)
         self.cancellation_token = cancellation_token  # V3.7
-        self.vad_config = vad_config  # V3.1.0: 保存 VAD 配置
+        if vad_config is None:
+            from app.services.runtime_param_resolver import build_vad_config
+
+            self.vad_config = build_vad_config()
+        else:
+            self.vad_config = vad_config  # V3.1.0: 保存 VAD 配置
 
         # 初始化 ChunkEngine（用于音频提取和VAD切分）
         self.chunk_engine = chunk_engine or ChunkEngine(logger=self.logger)
 
         # 初始化频谱分诊阶段（如果启用）
         if config.enable_spectral_triage:
+            from app.services.runtime_param_resolver import get_spectrum_runtime_flags
+
+            runtime_flags = get_spectrum_runtime_flags()
+            use_snr_triage = config.use_snr_triage and runtime_flags.get("use_snr_strategy", True)
             self.spectral_triage_stage = SpectralTriageStage(
                 threshold=config.spectrum_threshold,
                 logger=self.logger,
-                cancellation_token=cancellation_token  # V3.7: 传递令牌
+                cancellation_token=cancellation_token,  # V3.7: 传递令牌
+                use_snr_triage=use_snr_triage
             )
             self.logger.info(
                 f"频谱分诊已启用: threshold={config.spectrum_threshold}"
@@ -278,7 +288,12 @@ class PreprocessingPipeline:
             List[AudioChunk]: VAD切分后的 Chunk 列表
         """
         # V3.1.0: 使用传入的 VAD 配置，如果没有则使用默认配置
-        vad_config = self.vad_config or VADConfig()
+        if self.vad_config is None:
+            from app.services.runtime_param_resolver import build_vad_config
+
+            vad_config = build_vad_config()
+        else:
+            vad_config = self.vad_config
         self.logger.info(f"VAD配置: merge_max_gap={vad_config.merge_max_gap}s, merge_max_duration={vad_config.merge_max_duration}s")
 
         # 定义进度回调

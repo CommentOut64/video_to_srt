@@ -59,7 +59,9 @@ class AudioProcessingConfig:
     def __post_init__(self):
         """初始化后处理"""
         if self.vad_config is None:
-            self.vad_config = VADConfig()
+            from app.services.runtime_param_resolver import build_vad_config
+
+            self.vad_config = build_vad_config()
 
 
 @dataclass
@@ -179,10 +181,14 @@ class AudioProcessingPipeline:
             )
         else:
             # 大块切分（暂时使用整轨分离的轻量模型）
+            from app.services.runtime_param_resolver import get_demucs_runtime_params
+
+            runtime_demucs = get_demucs_runtime_params()
+            runtime_model = runtime_demucs.get("model_name") or "htdemucs"
             chunks, full_audio, sr = self.chunk_engine.process_audio(
                 audio_path,
                 enable_demucs=True,
-                demucs_model="htdemucs",  # 使用快速模型
+                demucs_model=runtime_model,  # 使用运行参数默认模型
                 vad_config=config.vad_config,
                 progress_callback=progress_callback
             )
