@@ -20,6 +20,7 @@ from enum import Enum
 class SenseVoiceConfig:
     """SenseVoice 配置"""
     model_dir: str = "iic/SenseVoiceSmall"  # ModelScope 模型ID
+    model_type: str = "quantized"  # quantized/fp32，用于选择 ONNX 文件
     batch_size: int = 1
     quantize: bool = True  # 使用量化模型（INT8）
     device: str = "auto"  # V3.5: auto/cuda/cpu，auto时GPU优先，无GPU降级CPU
