@@ -25,7 +25,6 @@ from app.core.logging import setup_logging
 # 导入新的转录服务（替换processor）
 from app.services.transcription_service import get_transcription_service
 from app.models.job_models import JobSettings
-from app.services.cpu_affinity_service import CPUAffinityConfig
 from app.services.model_manager_v2 import get_model_manager_v2
 from app.config.model_config import ModelPreloadConfig
 
@@ -469,7 +468,9 @@ async def test_sse_stream(request: Request):
 async def get_cpu_info():
     """获取系统CPU信息和亲和性支持状态"""
     try:
-        cpu_info = transcription_service.cpu_manager.get_system_info()
+        from app.services.hardware_profile_service import get_hardware_profile_provider
+        provider = get_hardware_profile_provider()
+        cpu_info = provider.get_cpu_system_info()
         return {
             "success": True,
             "cpu_info": cpu_info,
@@ -486,10 +487,9 @@ async def get_cpu_info():
 async def get_hardware_basic():
     """获取核心硬件信息"""
     try:
-        # 创建临时的硬件检测服务以获取信息
-        from app.services.hardware_service import get_hardware_detector
-        detector = get_hardware_detector()
-        hardware_info = detector.detect()
+        from app.services.hardware_profile_service import get_hardware_profile_provider
+        provider = get_hardware_profile_provider()
+        hardware_info = provider.get_hardware_info()
         
         return {
             "success": True,
@@ -506,12 +506,10 @@ async def get_hardware_basic():
 async def get_hardware_optimization():
     """获取基于硬件的优化配置"""
     try:
-        from app.services.hardware_service import get_hardware_detector, get_hardware_optimizer
-        detector = get_hardware_detector()
-        optimizer = get_hardware_optimizer()
-        
-        hardware_info = detector.detect()
-        optimization_config = optimizer.get_optimization_config(hardware_info)
+        from app.services.hardware_profile_service import get_hardware_profile_provider
+        provider = get_hardware_profile_provider()
+        hardware_info = provider.get_hardware_info()
+        optimization_config = provider.get_optimization_config(hardware_info)
         
         return {
             "success": True,
@@ -528,12 +526,10 @@ async def get_hardware_optimization():
 async def get_hardware_status():
     """获取完整的硬件状态和优化信息"""
     try:
-        from app.services.hardware_service import get_hardware_detector, get_hardware_optimizer
-        detector = get_hardware_detector()
-        optimizer = get_hardware_optimizer()
-        
-        hardware_info = detector.detect()
-        optimization_config = optimizer.get_optimization_config(hardware_info)
+        from app.services.hardware_profile_service import get_hardware_profile_provider
+        provider = get_hardware_profile_provider()
+        hardware_info = provider.get_hardware_info()
+        optimization_config = provider.get_optimization_config(hardware_info)
         
         return {
             "success": True,

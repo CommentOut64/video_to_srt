@@ -313,9 +313,8 @@ class CircuitBreakHandler:
 
 
 from app.models.job_models import JobSettings, JobState
-from app.models.hardware_models import HardwareInfo, OptimizationConfig
-from app.services.hardware_service import get_hardware_detector, get_hardware_optimizer
-from app.services.cpu_affinity_service import CPUAffinityManager, CPUAffinityConfig
+from app.models.hardware_models import HardwareInfo, OptimizationConfig, CPUAffinityConfig
+from app.services.hardware_profile_service import get_hardware_profile_provider
 from app.services.job_index_service import get_job_index_service
 from app.core.config import config  # 导入统一配置
 
@@ -339,12 +338,8 @@ class TranscriptionService:
         self.lock = threading.Lock()
         self.logger = logging.getLogger(__name__)
 
-        # 集成CPU亲和性管理器
-        self.cpu_manager = CPUAffinityManager()
-
-        # 集成硬件检测
-        self.hardware_detector = get_hardware_detector()
-        self.hardware_optimizer = get_hardware_optimizer()
+        # 集成硬件能力提供者
+        self.hardware_profile_provider = get_hardware_profile_provider()
         self._hardware_info: Optional[HardwareInfo] = None
         self._optimization_config: Optional[OptimizationConfig] = None
 
@@ -367,7 +362,7 @@ class TranscriptionService:
         self.logger.info("Pipeline 架构已准备")
 
         # 记录CPU信息
-        sys_info = self.cpu_manager.get_system_info()
+        sys_info = self.hardware_profile_provider.get_cpu_system_info()
         if sys_info.get('supported', False):
             self.logger.info(
                 f" CPU信息: {sys_info['logical_cores']}个逻辑核心, "
@@ -387,16 +382,16 @@ class TranscriptionService:
         """执行硬件检测并生成优化配置"""
         try:
             self.logger.info("开始硬件检测...")
-            self._hardware_info = self.hardware_detector.detect()
-            self._optimization_config = self.hardware_optimizer.get_optimization_config(self._hardware_info)
+            self._hardware_info = self.hardware_profile_provider.get_hardware_info(is_force_refresh=True)
+            self._optimization_config = self.hardware_profile_provider.get_optimization_config(self._hardware_info)
 
             # 记录检测结果
             hw = self._hardware_info
             opt = self._optimization_config
             self.logger.info(f"硬件检测完成GPU: {'' if hw.cuda_available else ''}, "
-                           f"CPU: {hw.cpu_cores}核/{hw.cpu_threads}线程, "
-                           f"内存: {hw.memory_total_mb}MB, "
-                           f"优化配置: batch={opt.batch_size}, device={opt.recommended_device}")
+                             f"CPU: {hw.cpu_cores}核/{hw.cpu_threads}线程, "
+                             f"内存: {hw.memory_total_mb}MB, "
+                             f"优化配置: batch={opt.batch_size}, device={opt.recommended_device}")
 
             # 硬件检测完成后，初始化 Pipeline
             self._initialize_pipelines()
@@ -1099,7 +1094,7 @@ class TranscriptionService:
                 return None
 
             # 创建默认的CPU亲和性配置
-            from app.services.cpu_affinity_service import CPUAffinityConfig
+            from app.models.hardware_models import CPUAffinityConfig
             default_cpu_config = CPUAffinityConfig(
                 enabled=True,
                 strategy="auto",

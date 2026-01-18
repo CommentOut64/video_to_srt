@@ -6,8 +6,8 @@ V3.2.0+dev.20260114.01
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Any, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
 
 from app.core.asr.model_spec import ModelSpec
 
@@ -19,11 +19,17 @@ class LoadPlan:
     device: str
     compute_type: str
     local_path: str
+    runtime: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def key(self) -> str:
         """缓存键，确保同配置命中。"""
-        return f"{self.device}:{self.compute_type}:{self.local_path}"
+        if not self.runtime:
+            return f"{self.device}:{self.compute_type}:{self.local_path}"
+        runtime_items = ",".join(
+            f"{key}={self.runtime[key]}" for key in sorted(self.runtime)
+        )
+        return f"{self.device}:{self.compute_type}:{self.local_path}:{runtime_items}"
 
 
 class ModelLoader(ABC):

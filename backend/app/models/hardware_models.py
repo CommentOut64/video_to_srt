@@ -106,3 +106,21 @@ class OptimizationConfig:
                 "note": self.note
             }
         }
+
+
+@dataclass
+class CPUAffinityConfig:
+    """CPU亲和性配置（统一硬件能力提供者使用）"""
+    enabled: bool = True
+    strategy: str = "auto"  # auto/half/custom
+    custom_cores: Optional[List[int]] = None
+    exclude_cores: Optional[List[int]] = None
+
+    @property
+    def is_enabled(self) -> bool:
+        """兼容旧字段名，统一使用 is_enabled 判定。"""
+        return self.enabled
+
+    @is_enabled.setter
+    def is_enabled(self, value: bool) -> None:
+        self.enabled = value

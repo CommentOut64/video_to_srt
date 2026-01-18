@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -22,6 +22,8 @@ from app.core.asr.model_spec import ModelSpec
 from app.core.asr.registry import ModelRegistry
 from app.services.model_validator import ModelValidator
 from app.services.model_downloader import ModelDownloader
+from app.services.model_runtime_config_service import get_model_runtime_config_service
+from app.services.hardware_profile_service import get_hardware_profile_provider
 
 try:
     from app.core.asr.loaders.onnx_loader import OnnxLoader
@@ -105,8 +107,13 @@ class ModelManagerV2:
         loaders: Optional[Dict[str, ModelLoader]] = None,
         budget: Optional[ResourceBudget] = None,
         downloader: Optional[ModelDownloader] = None,
+        hardware_profile_provider=None,
     ):
         base = Path(config.BASE_DIR)
+        self.hardware_profile_provider = hardware_profile_provider or get_hardware_profile_provider()
+        self._runtime_service = get_model_runtime_config_service()
+        global_effective = self._runtime_service.get_effective_global()
+        effective = global_effective.get("effective", {})
         # V3.2.0+dev.20260116.02: 传递 base_dir 给 Registry 和 Downloader
         self.registry = registry or ModelRegistry(
             config_path=base / "backend" / "app" / "config" / "models.yaml",
@@ -114,12 +121,22 @@ class ModelManagerV2:
             base_dir=base,  # 传递项目根目录作为基准路径
         )
         self.loaders = loaders or self._default_loaders()
-        self.budget = budget or ResourceBudget()
+        if budget is None:
+            self.budget = ResourceBudget(
+                max_models=int(effective.get("max_models") or 3),
+                max_vram_mb=int(effective.get("max_vram_mb") or 8000),
+                reserved_vram_mb=int(effective.get("reserved_vram_mb") or 500),
+            )
+        else:
+            self.budget = budget
         self.cache = _LRUCache(self.budget.max_models)
         self._usage_vram: Dict[str, int] = {}
+        hardware_info = self.hardware_profile_provider.get_hardware_info()
+        self._hardware_info = hardware_info
         # 为防止意外下载，默认仅使用本地文件
+        allow_download = bool(effective.get("allow_download")) if downloader is None else downloader.allow_download
         self.downloader = downloader or ModelDownloader(
-            allow_download=False,
+            allow_download=allow_download,
             local_files_only=True,
             base_dir=base,  # V3.2.0+dev.20260116.02: 传递基准路径
         )
@@ -148,6 +165,13 @@ class ModelManagerV2:
             self.budget.max_models,
             self.budget.max_vram_mb,
             self.budget.reserved_vram_mb,
+        )
+        logger.info(
+            "ModelManagerV2 硬件概况: gpu=%s cpu_cores=%s cpu_threads=%s memory=%sMB",
+            hardware_info.gpu_count,
+            hardware_info.cpu_cores,
+            hardware_info.cpu_threads,
+            hardware_info.memory_total_mb,
         )
 
     def _default_loaders(self) -> Dict[str, ModelLoader]:
@@ -197,10 +221,30 @@ class ModelManagerV2:
 
     def acquire(self, model_id: str, device: str = "auto", compute_type: str = "auto") -> Any:
         spec = self.registry.get(model_id)
+        model_runtime = self._runtime_service.get_effective_model(spec).get("effective", {})
+        global_runtime = self._runtime_service.get_effective_global().get("effective", {})
+
+        resolved_device = device if device != "auto" else model_runtime.get("device", spec.default_device)
+        resolved_compute_type = compute_type if compute_type != "auto" else model_runtime.get(
+            "compute_type",
+            spec.compute_type,
+        )
+        cpu_threads = model_runtime.get("cpu_threads")
+
+        runtime_payload: Dict[str, Any] = {}
+        if spec.framework == "onnx":
+            if cpu_threads:
+                runtime_payload["cpu_threads"] = int(cpu_threads)
+            if global_runtime.get("onnx_intra_threads") is not None:
+                runtime_payload["onnx_intra_threads"] = int(global_runtime["onnx_intra_threads"])
+            if global_runtime.get("onnx_inter_threads") is not None:
+                runtime_payload["onnx_inter_threads"] = int(global_runtime["onnx_inter_threads"])
+
         plan = LoadPlan(
-            device=device if device != "auto" else spec.default_device,
-            compute_type=compute_type if compute_type != "auto" else spec.compute_type,
+            device=resolved_device,
+            compute_type=resolved_compute_type,
             local_path=self.downloader.ensure_local(spec),
+            runtime=runtime_payload,
         )
         logger.info(
             "ModelManagerV2 接到加载请求: %s framework=%s device=%s compute_type=%s path=%s",
@@ -224,9 +268,16 @@ class ModelManagerV2:
             )
             return cached
 
+        runtime_resources = dict(spec.resources)
+        if cpu_threads:
+            runtime_resources["cpu_threads"] = int(cpu_threads)
+        runtime_spec = spec
+        if runtime_resources != spec.resources:
+            runtime_spec = replace(spec, resources=runtime_resources)
+
         loader = self._select_loader(spec.framework)
         start = time.time()
-        handle = loader.load(spec, plan)
+        handle = loader.load(runtime_spec, plan)
         try:
             loader.warmup(handle, spec)
         except Exception as exc:  # pragma: no cover

@@ -262,7 +262,7 @@ class ProjectConfig:
         """
         计算 FFmpeg 转码使用的 CPU 线程数
 
-        使用 cpu_optimizer 模块的智能计算，避免全核心占用导致 CPU 降频
+        使用硬件能力提供者的智能计算，避免全核心占用导致 CPU 降频
 
         策略：
         - Intel 混合架构：仅使用 P-Core 的 60%
@@ -273,12 +273,11 @@ class ProjectConfig:
             int: 推荐的 FFmpeg 线程数
         """
         try:
-            from app.utils.cpu_optimizer import ONNXThreadOptimizer
+            from app.services.hardware_profile_service import get_hardware_profile_provider
 
-            # 使用 cpu_optimizer 计算最优线程数（与 ONNX 使用相同策略）
-            optimal_threads, info = ONNXThreadOptimizer.calculate_optimal_threads(
-                usage_ratio=0.6  # 使用 60% 的核心
-            )
+            provider = get_hardware_profile_provider()
+            optimal_threads = provider.get_onnx_thread_budget(usage_ratio=0.6)
+            info = provider.get_last_onnx_info()
 
             logger.info(
                 f"FFmpeg CPU 线程配置: {optimal_threads} 线程 "
@@ -293,7 +292,7 @@ class ProjectConfig:
                 physical_cores = psutil.cpu_count(logical=False) or 4
                 threads = max(1, int(physical_cores * 0.6))
                 logger.warning(
-                    f"cpu_optimizer 不可用，回退计算: {threads} 线程 "
+                    f"硬件能力提供者不可用，回退计算: {threads} 线程 "
                     f"(物理核心 {physical_cores} × 60%): {e}"
                 )
                 return threads

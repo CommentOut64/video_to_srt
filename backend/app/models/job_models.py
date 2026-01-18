@@ -9,7 +9,7 @@ import torch
 
 # 使用TYPE_CHECKING避免循环导入
 if TYPE_CHECKING:
-    from app.services.cpu_affinity_service import CPUAffinityConfig
+    from app.models.hardware_models import CPUAffinityConfig
 
 
 # ========== 分组一: 预处理与音频设置 ==========

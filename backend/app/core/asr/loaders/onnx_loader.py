@@ -42,11 +42,16 @@ class OnnxLoader(ModelLoader):
         providers = self._select_providers(plan.device)
 
         sess_options = ort.SessionOptions()
-        # 依据资源配置优化线程数
-        intra_threads = spec.resources.get("cpu_threads")
+        # 依据运行参数/资源配置优化线程数
+        intra_threads = plan.runtime.get("onnx_intra_threads")
+        if intra_threads is None:
+            intra_threads = plan.runtime.get("cpu_threads")
+        if intra_threads is None:
+            intra_threads = spec.resources.get("cpu_threads")
+        inter_threads = plan.runtime.get("onnx_inter_threads", 1)
         if intra_threads:
-            sess_options.intra_op_num_threads = intra_threads
-            sess_options.inter_op_num_threads = 1
+            sess_options.intra_op_num_threads = int(intra_threads)
+            sess_options.inter_op_num_threads = int(inter_threads)
 
         session = ort.InferenceSession(
             model_file.as_posix(),

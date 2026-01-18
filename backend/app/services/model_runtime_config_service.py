@@ -350,28 +350,10 @@ class ModelRuntimeConfigService:
     @staticmethod
     def _get_hardware_recommendation() -> Dict[str, Any]:
         try:
-            from app.services.hardware_service import get_hardware_detector, get_hardware_optimizer
-            from app.utils.cpu_optimizer import ONNXThreadOptimizer
+            from app.services.hardware_profile_service import get_hardware_profile_provider
 
-            detector = get_hardware_detector()
-            optimizer = get_hardware_optimizer()
-            hardware = detector.detect()
-            optim = optimizer.get_optimization_config(hardware)
-            onnx_threads, _ = ONNXThreadOptimizer.calculate_optimal_threads(hardware_info=hardware)
-
-            max_vram_mb = None
-            if hardware.cuda_available and hardware.gpu_memory_mb:
-                max_vram_mb = int(max(hardware.gpu_memory_mb) * 0.8)
-
-            return {
-                "device_preference": optim.recommended_device,
-                "cpu_threads": onnx_threads,
-                "onnx_intra_threads": onnx_threads,
-                "onnx_inter_threads": 1,
-                "max_vram_mb": max_vram_mb,
-                "reserved_vram_mb": 500,
-                "max_models": 3,
-            }
+            provider = get_hardware_profile_provider()
+            return provider.get_runtime_recommendation()
         except Exception as exc:
             logger.debug("硬件推荐参数获取失败（忽略）: %s", exc)
             return {}
