@@ -23,7 +23,7 @@ from app.models.circuit_breaker_models import (
     SpectrumFeatures, SpectrumDiagnosis, DiagnosisResult
 )
 from app.core.spectrum_thresholds import SpectrumThresholds
-from app.services.runtime_param_resolver import build_spectrum_thresholds, get_spectrum_runtime_flags
+from app.services.runtime_param_resolver import build_spectrum_thresholds
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +66,7 @@ class AudioSpectrumClassifier:
         self,
         thresholds: Optional[SpectrumThresholds] = None,
         use_yamnet: Optional[bool] = None,
-        use_snr_strategy: Optional[bool] = None  # V3.1.1+dev.20260108.01: 运行参数默认启用
+        use_snr_strategy: Optional[bool] = None  # V3.1.1+dev.20260108.01: 默认启用
     ):
         """
         初始化分诊器
@@ -74,16 +74,13 @@ class AudioSpectrumClassifier:
         Args:
             thresholds: 频谱阈值配置
             use_yamnet: 是否使用 YAMNet 语义分类器（默认 True）
-            use_snr_strategy: 是否使用 SNR+C50 三层决策策略（默认 False）
+            use_snr_strategy: 是否使用 SNR+C50 三层决策策略（默认 True）
         """
-        runtime_flags = get_spectrum_runtime_flags()
         self.thresholds = thresholds or build_spectrum_thresholds()
         self._librosa = None  # 懒加载
-        self._use_yamnet = runtime_flags.get("use_yamnet", True) if use_yamnet is None else use_yamnet
+        self._use_yamnet = True if use_yamnet is None else use_yamnet
         self._yamnet = None  # 懒加载
-        self._use_snr_strategy = (
-            runtime_flags.get("use_snr_strategy", True) if use_snr_strategy is None else use_snr_strategy
-        )
+        self._use_snr_strategy = True if use_snr_strategy is None else use_snr_strategy
         self._brouhaha = None  # 懒加载
 
     def apply_runtime_params(
@@ -885,9 +882,8 @@ def get_spectrum_classifier(use_snr_strategy: Optional[bool] = None) -> AudioSpe
     """
     global _classifier_instance
     thresholds = build_spectrum_thresholds()
-    flags = get_spectrum_runtime_flags()
-    effective_snr = flags.get("use_snr_strategy", True) if use_snr_strategy is None else use_snr_strategy
-    effective_yamnet = flags.get("use_yamnet", True)
+    effective_snr = True if use_snr_strategy is None else use_snr_strategy
+    effective_yamnet = True
     if _classifier_instance is None:
         _classifier_instance = AudioSpectrumClassifier(
             thresholds=thresholds,

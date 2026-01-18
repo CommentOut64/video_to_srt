@@ -131,42 +131,10 @@ def build_vad_config_for_profile(
 
 
 def build_spectrum_thresholds(overrides: Optional[Dict[str, Any]] = None) -> SpectrumThresholds:
-    """根据运行参数构建频谱阈值。"""
-    runtime = get_runtime_group("spectrum")
-    merged = _merge_params(runtime, overrides)
+    """根据配置构建频谱阈值。"""
     base = SpectrumThresholds()
-    return SpectrumThresholds(
-        harmonic_ratio_music=merged.get("harmonic_ratio_music", base.harmonic_ratio_music),
-        spectral_centroid_music_low=merged.get("spectral_centroid_music_low", base.spectral_centroid_music_low),
-        spectral_centroid_music_high=merged.get("spectral_centroid_music_high", base.spectral_centroid_music_high),
-        energy_variance_music=merged.get("energy_variance_music", base.energy_variance_music),
-        onset_strength_music=merged.get("onset_strength_music", base.onset_strength_music),
-        zcr_noise_high=merged.get("zcr_noise_high", base.zcr_noise_high),
-        zcr_variance_noise=merged.get("zcr_variance_noise", base.zcr_variance_noise),
-        high_freq_ratio_noise=merged.get("high_freq_ratio_noise", base.high_freq_ratio_noise),
-        spectral_flatness_noise=merged.get("spectral_flatness_noise", base.spectral_flatness_noise),
-        music_score_threshold=merged.get("music_score_threshold", base.music_score_threshold),
-        noise_score_threshold=merged.get("noise_score_threshold", base.noise_score_threshold),
-        clean_score_threshold=merged.get("clean_score_threshold", base.clean_score_threshold),
-        heavy_bgm_threshold=merged.get("heavy_bgm_threshold", base.heavy_bgm_threshold),
-        light_bgm_threshold=merged.get("light_bgm_threshold", base.light_bgm_threshold),
-        snr_high_threshold=merged.get("snr_high_threshold", base.snr_high_threshold),
-        snr_low_threshold=merged.get("snr_low_threshold", base.snr_low_threshold),
-        c50_good_threshold=merged.get("c50_good_threshold", base.c50_good_threshold),
-        c50_bad_threshold=merged.get("c50_bad_threshold", base.c50_bad_threshold),
-        spectral_contrast_low=merged.get("spectral_contrast_low", base.spectral_contrast_low),
-        spectral_contrast_critical=merged.get("spectral_contrast_critical", base.spectral_contrast_critical),
-        spectral_flatness_high=merged.get("spectral_flatness_high", base.spectral_flatness_high),
-    )
-
-
-def get_spectrum_runtime_flags() -> Dict[str, bool]:
-    """获取频谱分诊运行时开关参数。"""
-    runtime = get_runtime_group("spectrum")
-    return {
-        "use_yamnet": bool(runtime.get("use_yamnet", True)),
-        "use_snr_strategy": bool(runtime.get("use_snr_strategy", True)),
-    }
+    merged = _merge_params(dict(base.__dict__), overrides)
+    return SpectrumThresholds(**merged)
 
 
 def get_demucs_runtime_params() -> Dict[str, Any]:

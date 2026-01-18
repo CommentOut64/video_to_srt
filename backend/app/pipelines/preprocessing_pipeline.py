@@ -73,15 +73,11 @@ class PreprocessingPipeline:
 
         # 初始化频谱分诊阶段（如果启用）
         if config.enable_spectral_triage:
-            from app.services.runtime_param_resolver import get_spectrum_runtime_flags
-
-            runtime_flags = get_spectrum_runtime_flags()
-            use_snr_triage = config.use_snr_triage and runtime_flags.get("use_snr_strategy", True)
             self.spectral_triage_stage = SpectralTriageStage(
                 threshold=config.spectrum_threshold,
                 logger=self.logger,
                 cancellation_token=cancellation_token,  # V3.7: 传递令牌
-                use_snr_triage=use_snr_triage
+                use_snr_triage=config.use_snr_triage
             )
             self.logger.info(
                 f"频谱分诊已启用: threshold={config.spectrum_threshold}"

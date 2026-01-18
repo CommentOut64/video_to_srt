@@ -196,66 +196,6 @@ class VADRuntimeParams(_RuntimeBase):
         return self
 
 
-class SpectrumRuntimeParams(_RuntimeBase):
-    is_use_yamnet: Optional[bool] = Field(default=None, alias="use_yamnet")
-    is_use_snr_strategy: Optional[bool] = Field(default=None, alias="use_snr_strategy")
-    harmonic_ratio_music: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    spectral_centroid_music_low: Optional[float] = Field(default=None, ge=0.0)
-    spectral_centroid_music_high: Optional[float] = Field(default=None, ge=0.0)
-    energy_variance_music: Optional[float] = Field(default=None, ge=0.0)
-    onset_strength_music: Optional[float] = Field(default=None, ge=0.0)
-    zcr_noise_high: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    zcr_variance_noise: Optional[float] = Field(default=None, ge=0.0)
-    high_freq_ratio_noise: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    spectral_flatness_noise: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    music_score_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    noise_score_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    clean_score_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    heavy_bgm_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    light_bgm_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    snr_high_threshold: Optional[float] = Field(default=None, ge=0.0)
-    snr_low_threshold: Optional[float] = Field(default=None, ge=0.0)
-    c50_good_threshold: Optional[float] = Field(default=None)
-    c50_bad_threshold: Optional[float] = Field(default=None)
-    spectral_contrast_low: Optional[float] = Field(default=None, ge=0.0)
-    spectral_contrast_critical: Optional[float] = Field(default=None, ge=0.0)
-    spectral_flatness_high: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-
-    @model_validator(mode="after")
-    def _validate_threshold_pairs(self):
-        if (
-            self.spectral_centroid_music_low is not None
-            and self.spectral_centroid_music_high is not None
-            and self.spectral_centroid_music_high < self.spectral_centroid_music_low
-        ):
-            raise ValueError("spectral_centroid_music_high 必须 >= spectral_centroid_music_low")
-        if (
-            self.heavy_bgm_threshold is not None
-            and self.light_bgm_threshold is not None
-            and self.heavy_bgm_threshold < self.light_bgm_threshold
-        ):
-            raise ValueError("heavy_bgm_threshold 必须 >= light_bgm_threshold")
-        if (
-            self.snr_high_threshold is not None
-            and self.snr_low_threshold is not None
-            and self.snr_high_threshold < self.snr_low_threshold
-        ):
-            raise ValueError("snr_high_threshold 必须 >= snr_low_threshold")
-        if (
-            self.c50_good_threshold is not None
-            and self.c50_bad_threshold is not None
-            and self.c50_good_threshold < self.c50_bad_threshold
-        ):
-            raise ValueError("c50_good_threshold 必须 >= c50_bad_threshold")
-        if (
-            self.spectral_contrast_low is not None
-            and self.spectral_contrast_critical is not None
-            and self.spectral_contrast_low < self.spectral_contrast_critical
-        ):
-            raise ValueError("spectral_contrast_low 必须 >= spectral_contrast_critical")
-        return self
-
-
 class SmartProbeRuntimeParams(_RuntimeBase):
     snr_threshold: Optional[float] = Field(default=None, ge=0.0)
 
@@ -331,7 +271,6 @@ class RuntimeGroupUpdateRequest(_RuntimeBase):
     sensevoice: Optional[SenseVoiceRuntimeParams] = None
     demucs: Optional[DemucsRuntimeParams] = None
     vad: Optional[VADRuntimeParams] = None
-    spectrum: Optional[SpectrumRuntimeParams] = None
     smart_probe: Optional[SmartProbeRuntimeParams] = None
     yamnet: Optional[YAMNetRuntimeParams] = None
     punctuation: Optional[PunctuationRuntimeParams] = None
@@ -343,7 +282,6 @@ _RUNTIME_GROUP_MODELS = {
     "sensevoice": SenseVoiceRuntimeParams,
     "demucs": DemucsRuntimeParams,
     "vad": VADRuntimeParams,
-    "spectrum": SpectrumRuntimeParams,
     "smart_probe": SmartProbeRuntimeParams,
     "yamnet": YAMNetRuntimeParams,
     "punctuation": PunctuationRuntimeParams,
@@ -443,31 +381,6 @@ _PARAM_SCHEMA: Dict[str, Any] = {
             "sensevoice_merge_max_gap": {"type": "float", "min": 0.0, "default": 0.3},
             "sensevoice_merge_max_duration": {"type": "float", "min": 0.0, "default": 8.0},
             "sensevoice_smart_target_duration": {"type": "float", "min": 0.0, "default": 8.0},
-        },
-        "spectrum": {
-            "use_yamnet": {"type": "bool", "default": True},
-            "use_snr_strategy": {"type": "bool", "default": True},
-            "harmonic_ratio_music": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.6},
-            "spectral_centroid_music_low": {"type": "float", "min": 0.0, "default": 1500},
-            "spectral_centroid_music_high": {"type": "float", "min": 0.0, "default": 4000},
-            "energy_variance_music": {"type": "float", "min": 0.0, "default": 0.25},
-            "onset_strength_music": {"type": "float", "min": 0.0, "default": 0.3},
-            "zcr_noise_high": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.15},
-            "zcr_variance_noise": {"type": "float", "min": 0.0, "default": 0.02},
-            "high_freq_ratio_noise": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.4},
-            "spectral_flatness_noise": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.5},
-            "music_score_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.35},
-            "noise_score_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.45},
-            "clean_score_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.7},
-            "heavy_bgm_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.6},
-            "light_bgm_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.35},
-            "snr_high_threshold": {"type": "float", "min": 0.0, "default": 40.0},
-            "snr_low_threshold": {"type": "float", "min": 0.0, "default": 25.0},
-            "c50_good_threshold": {"type": "float", "default": 13.70},
-            "c50_bad_threshold": {"type": "float", "default": -12.33},
-            "spectral_contrast_low": {"type": "float", "min": 0.0, "default": 19.84},
-            "spectral_contrast_critical": {"type": "float", "min": 0.0, "default": 13.59},
-            "spectral_flatness_high": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.29},
         },
         "smart_probe": {
             "snr_threshold": {"type": "float", "min": 0.0, "default": 15.0},
