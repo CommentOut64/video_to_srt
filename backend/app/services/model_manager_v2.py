@@ -543,10 +543,6 @@ class ModelManagerV2:
         loader = self._select_loader(spec.framework)
         start = time.time()
         handle = loader.load(runtime_spec, plan)
-        try:
-            loader.warmup(handle, spec)
-        except Exception as exc:  # pragma: no cover
-            logger.warning("模型预热失败（忽略继续）: %s", exc)
 
         with self._cache_lock:
             cached = self.cache.get(plan.key)

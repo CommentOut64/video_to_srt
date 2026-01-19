@@ -138,8 +138,8 @@
             
             # 确保 Whisper 服务可用
             from app.services.whisper_service import get_whisper_service
-            # 预加载 Whisper (如果没加载)
-            get_whisper_service().warmup() 
+            # 初始化 Whisper 服务（无需预热）
+            get_whisper_service()
 
             for idx, (sent_idx, sentence) in enumerate(patch_queue):
                 await self._whisper_text_patch(

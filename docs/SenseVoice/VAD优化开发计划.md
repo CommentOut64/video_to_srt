@@ -389,7 +389,6 @@ async def _post_process_enhancement(
         # 确保 Whisper 服务可用
         from app.services.whisper_service import get_whisper_service
         whisper_service = get_whisper_service()
-        whisper_service.warmup()
 
         for idx, (sent_idx, sentence, is_critical) in enumerate(patch_queue):
             # 获取前文作为 Prompt（提升补刀准确性）

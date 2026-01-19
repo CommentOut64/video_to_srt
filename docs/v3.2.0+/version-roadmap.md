@@ -15,11 +15,11 @@
 - **统一注册表 + 类型适配**：以 `ModelSpec` 描述所有模型（ONNX、PyTorch、Faster-Whisper 乃至未来新引擎），抽象 `ModelLoader` 接口，按框架实现子类（OnnxLoader、TorchLoader、ExternalServiceLoader），可随时扩展。
 - **下载 / 校验流水线**：优先读取打包模型；若缺失则触发 Downloader（支持断点续传 + 哈希校验 + 多源镜像）。对“随发布打包”的模型仅执行校验，不重复下载。
 - **生命周期/资源治理**：
-  - 统一 `load_model / warmup / unload / reload` 流程，所有 Worker/Engine 只能通过 ModelManager 获取实例。
+  - 统一 `load_model / unload / reload` 流程，所有 Worker/Engine 只能通过 ModelManager 获取实例。
   - 集成显存预算池与 CPU 调度器：加载时评估 GPU/CPU 占用，不足则自动降级或驱逐低优先级模型；暴露线程/设备分配接口给 SenseVoice/Whisper。
   - 实时监控内存/显存/句柄，提供 Prometheus exporter；触发阈值时记录日志并降级。
 - **配置与参数暴露**：集中维护模型的输入/输出维度、可调参数、默认语言、支持特性等，供前端设置面板和 API 查询；所有参数变更通过 Manager 分发，避免散落各处。
-- **可观测性**：记录下载/加载/热身耗时，统计使用频率，提供指令查询当前模型状态/设备占用。
+- **可观测性**：记录下载/加载耗时，统计使用频率，提供指令查询当前模型状态/设备占用。
 
 ### 主要工作
 1. **ASR 接口与模型管理**

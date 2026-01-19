@@ -47,7 +47,6 @@ class ModelSpec:
     source: ModelSource = field(default_factory=ModelSource)
     resources: Dict[str, int] = field(default_factory=dict)  # 如 vram_mb、cpu_threads
     features: Dict[str, Any] = field(default_factory=dict)   # 语言、时间戳类型、标点等
-    warmup: Dict[str, Any] = field(default_factory=dict)     # 预热参数
     env: Dict[str, Any] = field(default_factory=dict)        # 依赖或环境变量
     fallback: List[str] = field(default_factory=list)        # 可选，标点等按语言兜底
 
@@ -63,7 +62,6 @@ class ModelSpec:
             source=ModelSource.from_dict(data.get("source", {})),
             resources=data.get("resources") or {},
             features=data.get("features") or {},
-            warmup=data.get("warmup") or {},
             env=data.get("env") or {},
             fallback=data.get("fallback") or [],
         )

@@ -691,24 +691,6 @@ class WhisperService:
             **overrides
         )
 
-    def warmup(self):
-        """预热模型（空跑一次确保完全加载到显存）"""
-        if not self.model:
-            logger.warning("模型未加载，无法预热")
-            return
-
-        logger.debug("开始 Faster-Whisper 模型预热")
-
-        # 创建 1 秒静音音频
-        dummy_audio = np.zeros(16000, dtype=np.float32)
-
-        try:
-            segments, _ = self.model.transcribe(dummy_audio)
-            _ = list(segments)  # 触发生成器执行
-            logger.debug("Faster-Whisper 模型预热完成")
-        except Exception as e:
-            logger.warning(f"模型预热失败: {e}")
-
     def estimate_confidence(self, result: Dict[str, Any]) -> float:
         """
         估算转录结果的置信度

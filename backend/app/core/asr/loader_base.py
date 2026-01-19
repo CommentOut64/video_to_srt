@@ -45,7 +45,3 @@ class ModelLoader(ABC):
         """卸载模型句柄并释放资源。"""
         raise NotImplementedError
 
-    def warmup(self, handle: Any, spec: ModelSpec) -> None:
-        """可选预热，默认空实现。"""
-        return
-

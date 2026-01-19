@@ -1,4 +1,4 @@
-# V3.2.0+dev.20260119.01 统一模型管理补充开发文档
+# V3.2.0+dev.20260119.03 统一模型管理补充开发文档
 
 > 目标：补齐统一模型管理在**运行参数 API**、**硬件检测接入**、**智能显存管理**、**去除预热**、**SSE 下载进度**方面的缺口。  
 > 本文档基于现有实现与代码调查结果，给出可落地的文件/代码级改造方案。
@@ -18,8 +18,7 @@
 1) **缺少运行参数 API**：前端无法读取/修改模型运行参数（device/compute_type/cpu_threads 等）。  
 2) **硬件检测未接入**：旧硬件检测/优化散落在 `hardware_service.py`、`cpu_affinity_service.py`、`cpu_optimizer.py`，未与 V2 整合。  
 3) **显存管理过于简单**：已补齐智能显存策略与动态预算（见第 3 节）。  
-4) **预热逻辑仍存在**：`ModelSpec.warmup` + `ModelLoader.warmup` 仍保留。  
-5) **SSE 下载进度未接入**：下载进度未向前端实时推送。
+4) **SSE 下载进度未接入**：下载进度未向前端实时推送。
 
 ---
 
@@ -222,10 +221,10 @@ score = priority_weight * keep_resident
 
 ---
 
-## 4. 移除预热逻辑（完全删除）
+## 4. 移除预热逻辑（已完成）
 
-### 4.1 需修改位置
-- `backend/app/core/asr/model_spec.py`：删除 `warmup` 字段  
+### 4.1 已删除位置
+- `backend/app/core/asr/model_spec.py`：移除 `warmup` 字段  
 - `backend/app/core/asr/loader_base.py`：删除 `warmup()` 抽象  
 - `backend/app/services/model_manager_v2.py`：移除 `loader.warmup` 调用  
 - `backend/app/config/models.yaml`：删除 `warmup:` 配置项  
@@ -286,9 +285,8 @@ GET /api/models/events    # SSE 订阅 models 频道
 2) 新增 `model_runtime_routes.py` 并挂载到 FastAPI  
 3) 新增 `hardware_profile_service.py` 并接入 ModelManagerV2  
 4) 新增 `model_residency_policy.py` 与 `model_residency.yaml`  
-5) 删除 warmup 字段与调用  
-6) 接入 SSE 下载进度  
-7) 归档旧硬件/资源管理模块
+5) 接入 SSE 下载进度  
+6) 归档旧硬件/资源管理模块
 
 ### 6.2 测试清单
 - 单元：
