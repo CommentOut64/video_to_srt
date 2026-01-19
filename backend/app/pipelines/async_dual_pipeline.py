@@ -28,9 +28,13 @@ import logging
 from typing import List, Optional, Any, TYPE_CHECKING, Set
 from pathlib import Path
 
+from app.core.asr.engine import ASREngine
+from app.core.thresholds import ThresholdConfig
 from app.schemas.pipeline_context import ProcessingContext
 from app.services.audio.chunk_engine import AudioChunk
+from app.services.alignment.default_aligner import DefaultAligner
 from app.services.sse_service import get_sse_manager
+from app.services.segmentation.default_segmenter import DefaultSegmenter
 from app.pipelines.workers import FastWorker, SlowWorker, AlignmentWorker
 from app.utils.cancellation_token import CancelledException, PausedException  # V3.1.0: 捕获取消/暂停异常
 
@@ -66,6 +70,12 @@ class AsyncDualPipeline:
         alignment_score_threshold: float = 0.3,
         enable_fallback: bool = True,
         transcription_profile: str = "sv_whisper_patch",
+        draft_engine: Optional[ASREngine] = None,
+        patch_engine: Optional[ASREngine] = None,
+        segmenter: Optional[DefaultSegmenter] = None,
+        aligner: Optional[DefaultAligner] = None,
+        patching_threshold: Optional[ThresholdConfig] = None,
+        enable_cross_chunk_merge: bool = True,
         logger: Optional[logging.Logger] = None,
         cancellation_token: Optional["CancellationToken"] = None,  # V3.7: 新增
         progress_emitter: Optional["ProgressEventEmitter"] = None  # V3.1.0: 新增
@@ -83,6 +93,12 @@ class AsyncDualPipeline:
             alignment_score_threshold: 对齐质量阈值
             enable_fallback: 是否启用降级策略
             transcription_profile: 转录模式 (sensevoice_only/sv_whisper_patch/sv_whisper_dual)
+            draft_engine: 草稿引擎实例（可选，使用新 ASR 接口时注入）
+            patch_engine: 补刀引擎实例（可选，使用新 ASR 接口时注入）
+            segmenter: 分句服务实例（可选）
+            aligner: 对齐服务实例（可选）
+            patching_threshold: 补刀阈值配置（可选）
+            enable_cross_chunk_merge: 是否启用跨 chunk 合并
             logger: 日志记录器
             cancellation_token: 取消令牌（可选，V3.7）
             progress_emitter: 进度发射器（可选，V3.1.0）
@@ -92,6 +108,10 @@ class AsyncDualPipeline:
         self.transcription_profile = transcription_profile
         self.cancellation_token = cancellation_token  # V3.7
         self.progress_emitter = progress_emitter  # V3.1.0
+        self.draft_engine = draft_engine
+        self.patch_engine = patch_engine
+        self.patching_threshold = patching_threshold
+        self.enable_cross_chunk_merge = enable_cross_chunk_merge
 
         # 判断是否为纯 SenseVoice 模式
         self.is_sensevoice_only = (transcription_profile == "sensevoice_only")
@@ -110,12 +130,21 @@ class AsyncDualPipeline:
         self.queue_final = asyncio.Queue(maxsize=queue_maxsize)  # SlowWorker -> AlignmentWorker
 
         # 实例化 FastWorker（总是需要）
+        if segmenter is None:
+            segmenter = DefaultSegmenter(
+                is_enable_semantic_grouping=enable_semantic_grouping,
+                is_enable_cross_chunk_merge=enable_cross_chunk_merge,
+                logger=self.logger,
+            )
+
         self.fast_worker = FastWorker(
             job_id=job_id,
             sensevoice_language=sensevoice_language,
+            draft_engine=self.draft_engine,
             enable_semantic_grouping=enable_semantic_grouping,
             is_final_output=self.is_sensevoice_only,  # 极速模式下 FastWorker 输出为定稿
-            enable_cross_chunk_merge=True,  # V3.1.0: 启用跨chunk合并（仅SenseVoice模式）
+            enable_cross_chunk_merge=enable_cross_chunk_merge,  # V3.1.0: 启用跨chunk合并（仅SenseVoice模式）
+            segmenter=segmenter,
             logger=self.logger
         )
 
@@ -128,15 +157,26 @@ class AsyncDualPipeline:
             self.slow_worker = SlowWorker(
                 whisper_language=whisper_language,
                 user_glossary=user_glossary,
+                patch_engine=self.patch_engine,
                 is_patching_mode=self.is_patching_mode,  # V3.10: 智能补刀模式
+                patching_threshold=self.patching_threshold,
                 logger=self.logger
             )
+
+            if aligner is None:
+                aligner = DefaultAligner(
+                    alignment_score_threshold=alignment_score_threshold,
+                    is_enable_fallback=enable_fallback,
+                    is_enable_semantic_grouping=enable_semantic_grouping,
+                    logger=self.logger,
+                )
 
             self.alignment_worker = AlignmentWorker(
                 job_id=job_id,
                 enable_semantic_grouping=enable_semantic_grouping,
                 alignment_score_threshold=alignment_score_threshold,
                 enable_fallback=enable_fallback,
+                aligner=aligner,
                 logger=self.logger
             )
 

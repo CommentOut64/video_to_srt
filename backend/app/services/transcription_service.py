@@ -4,7 +4,7 @@
 """
 import os, subprocess, uuid, threading, json, math, gc, logging
 from pathlib import Path
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 from enum import Enum
 from dataclasses import dataclass, field
 from collections import OrderedDict  # 新增导入
@@ -435,6 +435,59 @@ class TranscriptionService:
             self.audio_pipeline = None
             self.transcription_pipeline = None
 
+    def _is_new_asr_engine_enabled(self) -> bool:
+        """
+        判断是否启用新 ASR 引擎适配（支持回滚开关）。
+
+        环境变量:
+            USE_NEW_ASR_ENGINE=false 时关闭新引擎路径
+        """
+        flag = os.getenv("USE_NEW_ASR_ENGINE", "true").strip().lower()
+        return flag not in {"0", "false", "no"}
+
+    def _build_asr_engines(
+        self,
+        job: "JobState",
+        transcription_profile: str
+    ) -> Tuple[Optional["ASREngine"], Optional["ASREngine"]]:
+        """
+        根据任务配置构建 ASR 引擎实例（用于流水线注入）。
+
+        Args:
+            job: 任务状态对象
+            transcription_profile: 转录模式
+
+        Returns:
+            Tuple[Optional[ASREngine], Optional[ASREngine]]:
+                (draft_engine, patch_engine)
+        """
+        from app.core.asr.engine import ASREngine
+        from app.engines.factory import ASREngineFactory
+        from app.services.config_adapter import ConfigAdapter
+
+        settings = job.settings
+        engine_name = getattr(settings, "engine", "sensevoice")
+        if engine_name != "sensevoice":
+            self.logger.info("非 SenseVoice 引擎，保持旧路径: engine=%s", engine_name)
+            return None, None
+
+        draft_engine: Optional[ASREngine] = ASREngineFactory.create("sensevoice")
+
+        if transcription_profile == "sensevoice_only":
+            return draft_engine, None
+
+        model_name = ConfigAdapter.get_whisper_model(settings)
+        device = getattr(settings, "device", "cuda")
+        compute_type = getattr(settings, "compute_type", "auto")
+        patch_engine: Optional[ASREngine] = ASREngineFactory.create(
+            "whisper",
+            model_name=model_name,
+            device=device,
+            compute_type=compute_type,
+        )
+
+        return draft_engine, patch_engine
+
     async def _run_pipeline_v2(self, job: JobState):
         """
         新架构 Pipeline 入口方法（2025-12-17 架构改造）
@@ -499,10 +552,42 @@ class TranscriptionService:
             transcription_profile = ConfigAdapter.get_transcription_profile(job.settings)
             self.logger.info(f"转录模式: {transcription_profile}")
 
+            use_new_asr_engine = self._is_new_asr_engine_enabled()
+            draft_engine = None
+            patch_engine = None
+            if not use_new_asr_engine:
+                self.logger.info("USE_NEW_ASR_ENGINE=false，使用旧 ASR 执行器路径")
+            if use_new_asr_engine:
+                try:
+                    draft_engine, patch_engine = self._build_asr_engines(job, transcription_profile)
+                except Exception as e:
+                    self.logger.error("新 ASR 引擎初始化失败，回退旧路径: %s", e, exc_info=True)
+                    use_new_asr_engine = False
+            if use_new_asr_engine:
+                draft_name = draft_engine.get_engine_name() if draft_engine else "none"
+                patch_name = patch_engine.get_engine_name() if patch_engine else "none"
+                self.logger.info(
+                    "新 ASR 引擎已启用: draft=%s, patch=%s, profile=%s",
+                    draft_name,
+                    patch_name,
+                    transcription_profile,
+                )
+            else:
+                self.logger.info("新 ASR 引擎未启用，继续使用旧路径")
+
+            from app.core.thresholds import ThresholdConfig
+            patching_threshold_value = ConfigAdapter.get_patching_threshold(job.settings)
+            patching_threshold = ThresholdConfig(
+                whisper_patch_trigger_confidence=patching_threshold_value
+            )
+
             # 动态创建转录流水线
             self.transcription_pipeline = AsyncDualPipeline(
                 job_id=job.job_id,
                 transcription_profile=transcription_profile,
+                draft_engine=draft_engine if use_new_asr_engine else None,
+                patch_engine=patch_engine if use_new_asr_engine else None,
+                patching_threshold=patching_threshold,
                 logger=self.logger
             )
 

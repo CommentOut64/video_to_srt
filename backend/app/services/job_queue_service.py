@@ -1035,6 +1035,36 @@ class JobQueueService:
 
             # V3.1.0: 异步流水线（三级流水线，错位并行）
             logger.info(f"[双流对齐] 使用异步流水线处理 {total_chunks} 个 Chunk (queue_maxsize={queue_maxsize})")
+            use_new_asr_engine = self.transcription_service._is_new_asr_engine_enabled()
+            draft_engine = None
+            patch_engine = None
+            if not use_new_asr_engine:
+                logger.info("USE_NEW_ASR_ENGINE=false，双流流水线使用旧 ASR 执行器路径")
+            if use_new_asr_engine:
+                try:
+                    draft_engine, patch_engine = self.transcription_service._build_asr_engines(
+                        job, transcription_profile
+                    )
+                except Exception as exc:
+                    logger.error("新 ASR 引擎初始化失败，回退旧路径: %s", exc, exc_info=True)
+                    use_new_asr_engine = False
+            if use_new_asr_engine:
+                draft_name = draft_engine.get_engine_name() if draft_engine else "none"
+                patch_name = patch_engine.get_engine_name() if patch_engine else "none"
+                logger.info(
+                    "新 ASR 引擎已启用: draft=%s, patch=%s, profile=%s",
+                    draft_name,
+                    patch_name,
+                    transcription_profile,
+                )
+            else:
+                logger.info("新 ASR 引擎未启用，继续使用旧路径")
+
+            from app.core.thresholds import ThresholdConfig
+            patching_threshold_value = ConfigAdapter.get_patching_threshold(job.settings)
+            patching_threshold = ThresholdConfig(
+                whisper_patch_trigger_confidence=patching_threshold_value
+            )
             async_pipeline = AsyncDualPipeline(
                 job_id=job.job_id,
                 queue_maxsize=queue_maxsize,
@@ -1042,6 +1072,9 @@ class JobQueueService:
                 whisper_language=getattr(job.settings, 'whisper_language', 'auto'),
                 user_glossary=getattr(job.settings, 'user_glossary', None),
                 transcription_profile=ConfigAdapter.get_transcription_profile(job.settings),
+                draft_engine=draft_engine if use_new_asr_engine else None,
+                patch_engine=patch_engine if use_new_asr_engine else None,
+                patching_threshold=patching_threshold,
                 logger=logger,
                 cancellation_token=cancellation_token,  # V3.7
                 progress_emitter=progress_emitter  # V3.1.0: 传递进度发射器

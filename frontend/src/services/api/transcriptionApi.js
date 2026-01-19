@@ -53,9 +53,7 @@ class TranscriptionAPI {
   /**
    * 启动转录任务（加入队列）
    *
-   * v3.5 支持两种配置格式:
-   * 1. 新版 (推荐): 使用 task_config 字段
-   * 2. 旧版 (兼容): 使用 engine/model/sensevoice 字段
+   * v3.5+ 建议仅使用 task_config 字段（前端当前只发送新版配置）
    *
    * @param {string} jobId - 任务ID
    * @param {Object} settings - 转录设置
@@ -85,15 +83,6 @@ class TranscriptionAPI {
    * @param {string} [settings.task_config.compute.concurrency_strategy] - 并发策略 (auto/parallel/serial)
    * @param {number} [settings.task_config.compute.gpu_id] - GPU ID
    * @param {string} [settings.task_config.compute.temp_file_policy] - 临时文件策略
-   *
-   * === 旧版配置 (兼容) ===
-   * @param {string} settings.engine - 转录引擎 (whisper, sensevoice)
-   * @param {string} settings.model - 模型名称 (tiny, base, small, medium, large-v2, large-v3)
-   * @param {string} settings.compute_type - 计算类型 (float16, int8, etc.)
-   * @param {string} settings.device - 设备 (cuda, cpu)
-   * @param {number} settings.batch_size - 批次大小
-   * @param {boolean} settings.word_timestamps - 是否生成词级时间戳
-   * @param {Object} settings.sensevoice - SenseVoice 配置（可选）
    *
    * @returns {Promise<{job_id: string, started: boolean, queue_position: number}>}
    */

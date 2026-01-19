@@ -502,7 +502,7 @@ async function handleBatchCreate() {
 
     // 处理成功的任务 - 为每个任务启动转录
     if (result.succeeded > 0) {
-      // v3.5: 构建转录设置，使用 task_config 格式
+      // v3.5+: 构建转录设置，仅使用 task_config 格式
       const transcriptionSettings = {
         task_config: {
           preset_id: taskConfig.value.preset_id,
@@ -510,14 +510,7 @@ async function handleBatchCreate() {
           transcription: { ...taskConfig.value.transcription },
           refinement: { ...taskConfig.value.refinement },
           compute: { ...taskConfig.value.compute }
-        },
-        // 保留旧版字段用于兼容
-        engine: 'sensevoice',
-        model: taskConfig.value.transcription.whisper_model || 'medium',
-        compute_type: 'float16',
-        device: 'cuda',
-        batch_size: 16,
-        word_timestamps: false
+        }
       };
 
       // 为每个成功创建的任务启动转录
@@ -638,7 +631,7 @@ async function handleUpload() {
     // V3.1.1+dev.20260106.01: 调试日志
     console.log('[DEBUG] taskConfig.preprocessing:', JSON.stringify(taskConfig.value.preprocessing, null, 2));
 
-    // v3.5: 构建转录设置，使用 task_config 格式
+    // v3.5+: 构建转录设置，仅使用 task_config 格式
     const transcriptionSettings = {
       task_config: {
         preset_id: taskConfig.value.preset_id,
@@ -646,14 +639,7 @@ async function handleUpload() {
         transcription: { ...taskConfig.value.transcription },
         refinement: { ...taskConfig.value.refinement },
         compute: { ...taskConfig.value.compute }
-      },
-      // 保留旧版字段用于兼容
-      engine: 'sensevoice',
-      model: taskConfig.value.transcription.whisper_model || 'medium',
-      compute_type: 'float16',
-      device: 'cuda',
-      batch_size: 16,
-      word_timestamps: false
+      }
     };
 
     // V3.1.1+dev.20260106.01: 调试日志
