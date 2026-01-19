@@ -6,7 +6,7 @@
 - `backend/app/services/model_manager_service.py`：Whisper 下载/校验单一逻辑，需归档，不再调用。  
 - `backend/app/services/model_preload_manager.py`：自带缓存/预热，与 V2 重叠，迁移后删除。  
 - `backend/app/services/whisper_service.py`、`sensevoice_onnx_service.py`、`brouhaha_service.py`：包含下载/加载分散实现，迁移后仅保留推理前后处理，加载交由 V2。  
-- 其他散点：Silero VAD 直接文件引用、Demucs 直接加载 checkpoint、`core/resource_manager.py` 未与加载绑定。  
+- 其他散点：Silero VAD 直接文件引用、Demucs 直接加载 checkpoint、`archive/legacy/resource_manager/resource_manager.py` 已归档（旧资源管理未与加载绑定）。  
 - 要求：上述旧实现统一移动至 `archive/model_manager_legacy/`（或同级 archive 目录），主代码树不得再引用。
 
 ## 1. 一次性交付的目标能力
@@ -77,7 +77,7 @@ class ModelManagerV2:
 - 归档并停止引用：`backend/app/services/model_manager_service.py`、`model_manager_service.py.backup`、`model_preload_manager.py`。  
 - 剥离下载/加载：`whisper_service.py`、`sensevoice_onnx_service.py`、`brouhaha_service.py`、`demucs_service.py` 内仅保留推理/前后处理。  
 - 配置收敛：移除硬编码模型表、镜像开关，统一读取 `models.yaml`。  
-- 资源治理：用 `ResourcePool` 替换 `core/resource_manager.py` 的零散估算，实现强绑定加载流程。  
+- 资源治理：用 `ResourcePool` 替换 `archive/legacy/resource_manager/resource_manager.py` 的零散估算，实现强绑定加载流程。  
 
 ## 5. 测试与验收（聚焦模型管理）
 - 单元：ModelSpec 解析；Downloader 多镜像/断点/校验；ResourcePool 驱逐与 compute_type 降级；各 Loader 的 load/unload。  

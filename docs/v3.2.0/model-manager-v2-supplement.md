@@ -1,4 +1,4 @@
-# V3.2.0+dev.20260119.03 统一模型管理补充开发文档
+# V3.2.0+dev.20260119.05 统一模型管理补充开发文档
 
 > 目标：补齐统一模型管理在**运行参数 API**、**硬件检测接入**、**智能显存管理**、**去除预热**、**SSE 下载进度**方面的缺口。  
 > 本文档基于现有实现与代码调查结果，给出可落地的文件/代码级改造方案。
@@ -12,13 +12,13 @@
 - ModelSpec / Registry：`backend/app/core/asr/model_spec.py`、`backend/app/core/asr/registry.py`  
 - 下载器：`backend/app/services/model_downloader.py`  
 - SSE 设施：`backend/app/services/sse_service.py`（已有模型频道）  
-- 资源治理旧实现：`backend/app/core/resource_manager.py`（未接入 V2）
+- 资源治理旧实现：`archive/legacy/resource_manager/resource_manager.py`（已归档，不再接入 V2）
 
 ### 0.2 明确缺口
 1) **缺少运行参数 API**：前端无法读取/修改模型运行参数（device/compute_type/cpu_threads 等）。  
 2) **硬件检测未接入**：旧硬件检测/优化散落在 `hardware_service.py`、`cpu_affinity_service.py`、`cpu_optimizer.py`，未与 V2 整合。  
 3) **显存管理过于简单**：已补齐智能显存策略与动态预算（见第 3 节）。  
-4) **SSE 下载进度未接入**：下载进度未向前端实时推送。
+4) **SSE 下载进度已接入**：下载进度可实时推送到 `models` 频道。
 
 ---
 
@@ -237,7 +237,7 @@ score = priority_weight * keep_resident
 
 ---
 
-## 5. SSE 模型下载进度推送
+## 5. SSE 模型下载进度推送（已完成）
 
 ### 5.1 SSE 事件定义
 新增文件：`backend/app/services/model_download_event_bus.py`
@@ -256,16 +256,7 @@ model.download.cache_hit
 修改文件：`backend/app/services/model_downloader.py`
 
 - 在 `_download_from_hf` 中注入进度回调  
-- 进度来源：
-  - `huggingface_hub.snapshot_download` + `tqdm_class` 自定义  
-  - 或 `hf_hub_download` 的 `progress_callback`
-
-**伪代码**：
-```python
-bus.emit("model.download.start", {...})
-snapshot_download(..., tqdm_class=ModelDownloadTqdm)
-bus.emit("model.download.complete", {...})
-```
+- 进度来源：`huggingface_hub.snapshot_download` + `tqdm_class` 自定义  
 
 ### 5.3 API 接口
 修改文件：`backend/app/api/routes/model_routes.py`
@@ -285,8 +276,7 @@ GET /api/models/events    # SSE 订阅 models 频道
 2) 新增 `model_runtime_routes.py` 并挂载到 FastAPI  
 3) 新增 `hardware_profile_service.py` 并接入 ModelManagerV2  
 4) 新增 `model_residency_policy.py` 与 `model_residency.yaml`  
-5) 接入 SSE 下载进度  
-6) 归档旧硬件/资源管理模块
+5) 归档旧硬件/资源管理模块
 
 ### 6.2 测试清单
 - 单元：
@@ -303,10 +293,10 @@ GET /api/models/events    # SSE 订阅 models 频道
 
 ## 7. 归档策略（执行后必做）
 
-归档路径建议：`archive/model_manager_legacy/` 与 `archive/hardware_legacy/`
+归档路径：`archive/model_manager_legacy/`、`archive/legacy/hardware/`、`archive/legacy/resource_manager/`
 
-待归档文件：
-- `backend/app/core/resource_manager.py`
+已归档文件：
+- `archive/legacy/resource_manager/resource_manager.py`
 - `backend/app/services/hardware_service.py`
 - `backend/app/services/cpu_affinity_service.py`
 - `backend/app/utils/cpu_optimizer.py`

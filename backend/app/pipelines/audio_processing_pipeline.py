@@ -24,7 +24,6 @@ from app.services.audio.chunk_engine import ChunkEngine, AudioChunk
 from app.services.audio.vad_service import VADService, VADConfig
 from app.services.demucs_service import DemucsService
 from app.services.monitoring.hardware_monitor import HardwareMonitor
-from app.core.resource_manager import ResourceManager
 
 
 class SeparationStrategy(Enum):
@@ -102,7 +101,6 @@ class AudioProcessingPipeline:
         self,
         chunk_engine: Optional[ChunkEngine] = None,
         hardware_monitor: Optional[HardwareMonitor] = None,
-        resource_manager: Optional[ResourceManager] = None,
         logger: Optional[logging.Logger] = None
     ):
         """
@@ -111,13 +109,11 @@ class AudioProcessingPipeline:
         Args:
             chunk_engine: 音频切分引擎
             hardware_monitor: 硬件监控器
-            resource_manager: 资源管理器
             logger: 日志记录器
         """
         self.logger = logger or logging.getLogger(__name__)
         self.chunk_engine = chunk_engine or ChunkEngine(logger=self.logger)
         self.hardware_monitor = hardware_monitor or HardwareMonitor()
-        self.resource_manager = resource_manager
 
     async def process(
         self,
@@ -288,10 +284,6 @@ class AudioProcessingPipeline:
         else:
             vram_mb = 0
 
-        # 如果有资源管理器，使用其显存信息
-        if self.resource_manager:
-            vram_mb = self.resource_manager.get_available_vram()
-
         # 决策
         if not config.auto_strategy:
             # 手动模式：始终使用整轨分离
@@ -326,7 +318,6 @@ class AudioProcessingPipeline:
 def get_audio_processing_pipeline(
     chunk_engine: Optional[ChunkEngine] = None,
     hardware_monitor: Optional[HardwareMonitor] = None,
-    resource_manager: Optional[ResourceManager] = None,
     logger: Optional[logging.Logger] = None
 ) -> AudioProcessingPipeline:
     """
@@ -335,7 +326,6 @@ def get_audio_processing_pipeline(
     Args:
         chunk_engine: 音频切分引擎
         hardware_monitor: 硬件监控器
-        resource_manager: 资源管理器
         logger: 日志记录器
 
     Returns:
@@ -344,6 +334,5 @@ def get_audio_processing_pipeline(
     return AudioProcessingPipeline(
         chunk_engine=chunk_engine,
         hardware_monitor=hardware_monitor,
-        resource_manager=resource_manager,
         logger=logger
     )

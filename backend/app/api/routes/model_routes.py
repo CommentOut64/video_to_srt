@@ -5,9 +5,12 @@
 import logging
 from typing import List
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
 from app.services.model_manager_v2 import get_model_manager_v2
+from app.services.sse_service import get_sse_manager
+from app.services.model_download_event_bus import get_model_download_event_bus
 
 router = APIRouter(prefix="/api/models", tags=["models"])
 logger = logging.getLogger(__name__)
@@ -67,3 +70,20 @@ async def metrics():
     text = model_manager.metrics_text()
     from fastapi.responses import Response
     return Response(content=text, media_type="text/plain; version=0.0.4")
+
+
+@router.get("/events")
+async def model_events(request: Request):
+    """模型下载 SSE 事件流（频道：models）。"""
+    sse_manager = get_sse_manager()
+    event_bus = get_model_download_event_bus()
+
+    return StreamingResponse(
+        sse_manager.subscribe("models", request, initial_state_callback=event_bus.get_snapshot),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

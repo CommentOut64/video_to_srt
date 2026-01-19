@@ -361,6 +361,15 @@ SSE_SIGNAL_TAGS = {
     "signal.model_upgrade": "模型升级",
 }
 
+# 模型下载事件 Tag
+SSE_MODEL_TAGS = {
+    "model.download.start": "模型下载开始",
+    "model.download.progress": "模型下载进度",
+    "model.download.complete": "模型下载完成",
+    "model.download.error": "模型下载失败",
+    "model.download.cache_hit": "模型已在本地",
+}
+
 
 # ========== SSE 推送辅助方法 ==========
 
