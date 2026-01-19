@@ -1,0 +1,13 @@
+policy:
+  idle_unload_after_sec: 300
+  min_models_when_idle: 0
+  recency_window_sec: 1800
+  frequency_weight: 0.4
+  recency_weight: 0.4
+  size_weight: 0.2
+  priority_weight: 0.2
+  hot_use_count_threshold: 3
+  hot_recency_window_sec: 600
+  hot_bonus: 0.3
+  dynamic_vram_ratio: 0.9
+  dynamic_vram_safety_mb: 200

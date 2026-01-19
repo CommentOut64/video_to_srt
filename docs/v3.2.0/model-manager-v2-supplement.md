@@ -1,4 +1,4 @@
-# V3.2.0+dev.20260117.01 统一模型管理补充开发文档
+# V3.2.0+dev.20260119.01 统一模型管理补充开发文档
 
 > 目标：补齐统一模型管理在**运行参数 API**、**硬件检测接入**、**智能显存管理**、**去除预热**、**SSE 下载进度**方面的缺口。  
 > 本文档基于现有实现与代码调查结果，给出可落地的文件/代码级改造方案。
@@ -17,7 +17,7 @@
 ### 0.2 明确缺口
 1) **缺少运行参数 API**：前端无法读取/修改模型运行参数（device/compute_type/cpu_threads 等）。  
 2) **硬件检测未接入**：旧硬件检测/优化散落在 `hardware_service.py`、`cpu_affinity_service.py`、`cpu_optimizer.py`，未与 V2 整合。  
-3) **显存管理过于简单**：V2 仅 LRU，未结合任务队列/模型优先级/体积。  
+3) **显存管理过于简单**：已补齐智能显存策略与动态预算（见第 3 节）。  
 4) **预热逻辑仍存在**：`ModelSpec.warmup` + `ModelLoader.warmup` 仍保留。  
 5) **SSE 下载进度未接入**：下载进度未向前端实时推送。
 
@@ -161,13 +161,13 @@ class HardwareProfileProvider:
 
 ---
 
-## 3. 智能显存管理与动态预算
+## 3. 智能显存管理与动态预算（已实现）
 
-### 3.1 现状
-- ModelManagerV2 使用 `_LRUCache`，未结合任务队列与模型优先级。
-- `backend/app/core/resource_manager.py` 有旧的 eviction + idle 管理逻辑，但未接入 V2。
+### 3.1 现状（更新）
+- ModelManagerV2 已接入策略引擎与动态预算，不再仅依赖简单 LRU。
+- 旧 `ResourceManager` 仍未接入 V2（后续阶段统一归档）。
 
-### 3.2 新增“显存策略引擎”
+### 3.2 显存策略引擎（已接入）
 新增文件：`backend/app/services/model_residency_policy.py`
 
 **驱逐评分（示例）**：
@@ -207,12 +207,18 @@ score = priority_weight * keep_resident
 
 该策略需与 `JobQueueService` 的队列快照联动，建议在 `ModelResidencyPolicy` 中实现。
 
-### 3.4 动态预算调整
+### 3.4 动态预算调整（已接入）
 修改文件：`backend/app/services/model_manager_v2.py`
 
-- 每次加载前读取硬件显存状态（`torch.cuda.mem_get_info`）  
-- 动态调整 `budget.max_vram_mb`  
-- 任务空闲时降级保留模型数（例如 `max_models` 从 3 → 1）
+- 加载前读取 GPU 空闲显存（`torch.cuda.mem_get_info`），按比例计算动态预算  
+- 结合队列空闲状态调整 `max_models`（空闲期自动下调常驻模型数）  
+- 当预算不足且无可驱逐模型时，加载直接拒绝并抛出错误
+
+### 3.5 强制常驻列表（已接入）
+涉及文件：  
+- `backend/app/services/model_runtime_config_service.py`（`resident_models` 持久化）  
+- `backend/app/api/routes/model_runtime_routes.py`（`/api/models/resident`）  
+- `backend/app/services/model_manager_v2.py`（强制常驻列表应用与驱逐保护）
 
 ---
 

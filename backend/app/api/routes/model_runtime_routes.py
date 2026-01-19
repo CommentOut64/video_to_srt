@@ -309,6 +309,9 @@ _PARAM_SCHEMA: Dict[str, Any] = {
         "onnx_intra_threads": {"type": "int", "min": 1, "default": 1},
         "onnx_inter_threads": {"type": "int", "min": 1, "default": 1},
     },
+    "resident": {
+        "models": {"type": "string_list", "default": []},
+    },
     "per_model": {
         "device": {"type": "enum", "enum": ["auto", "cuda", "cpu"], "default": "auto"},
         "compute_type": {
@@ -503,6 +506,25 @@ class ModelRuntimeUpdateRequest(BaseModel):
         return value_lower
 
 
+class ResidentModelsUpdateRequest(BaseModel):
+    """强制常驻模型列表更新请求。"""
+
+    model_config = ConfigDict(validate_by_name=True, validate_by_alias=True)
+
+    models: List[str] = Field(default_factory=list)
+    mode: Optional[str] = Field(default="replace")
+
+    @field_validator("mode")
+    @classmethod
+    def _validate_mode(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        value_lower = value.lower()
+        if value_lower not in {"replace", "add", "remove"}:
+            raise ValueError("mode 仅支持 replace/add/remove")
+        return value_lower
+
+
 @router.get("/runtime")
 async def get_runtime_config() -> Dict[str, Any]:
     """获取所有模型的运行参数（含全局配置与单模型覆盖）。"""
@@ -517,6 +539,52 @@ async def get_runtime_config() -> Dict[str, Any]:
         "global": service.get_effective_global(),
         "runtime": service.get_effective_runtime_global(),
         "models": models,
+        "resident": service.get_resident_models(),
+    }
+
+
+@router.get("/resident")
+async def get_resident_models() -> Dict[str, Any]:
+    """获取强制常驻模型列表。"""
+    service = get_model_runtime_config_service()
+    manager = get_model_manager_v2()
+    resident = service.get_resident_models()
+    return {
+        "success": True,
+        "resident": resident,
+        "effective": manager.get_force_resident_models(),
+    }
+
+
+@router.put("/resident")
+async def update_resident_models(req: ResidentModelsUpdateRequest) -> Dict[str, Any]:
+    """更新强制常驻模型列表。"""
+    service = get_model_runtime_config_service()
+    manager = get_model_manager_v2()
+
+    requested = [model_id.strip() for model_id in req.models if model_id and model_id.strip()]
+    for model_id in requested:
+        try:
+            manager.registry.get(model_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    current = service.get_resident_models().get("models", [])
+    mode = (req.mode or "replace").lower()
+    if mode == "replace":
+        next_models = requested
+    elif mode == "add":
+        next_models = list(dict.fromkeys(current + requested))
+    else:
+        remove_set = set(requested)
+        next_models = [model_id for model_id in current if model_id not in remove_set]
+
+    updated = service.update_resident_models(next_models)
+    manager.set_force_resident_models(updated)
+
+    return {
+        "success": True,
+        "resident": {"models": updated},
     }
 
 
@@ -598,23 +666,13 @@ async def apply_runtime_config() -> Dict[str, Any]:
     """
     service = get_model_runtime_config_service()
     manager = get_model_manager_v2()
-    global_effective = service.get_effective_global()
-    effective = global_effective.get("effective", {})
-
-    if "max_models" in effective and effective["max_models"]:
-        manager.budget.max_models = int(effective["max_models"])
-        manager.cache.capacity = manager.budget.max_models
-    if "max_vram_mb" in effective and effective["max_vram_mb"]:
-        manager.budget.max_vram_mb = int(effective["max_vram_mb"])
-    if "reserved_vram_mb" in effective and effective["reserved_vram_mb"] is not None:
-        manager.budget.reserved_vram_mb = int(effective["reserved_vram_mb"])
-    if "allow_download" in effective and effective["allow_download"] is not None:
-        manager.downloader.allow_download = bool(effective["allow_download"])
+    global_effective = manager.refresh_runtime_config()
 
     return {
         "success": True,
         "applied": True,
         "global": global_effective,
+        "resident": service.get_resident_models(),
     }
 
 
@@ -624,6 +682,7 @@ async def get_runtime_params_schema() -> Dict[str, Any]:
     return {
         "success": True,
         "global": _PARAM_SCHEMA["global"],
+        "resident": _PARAM_SCHEMA["resident"],
         "per_model": _PARAM_SCHEMA["per_model"],
         "runtime": _PARAM_SCHEMA["runtime"],
     }

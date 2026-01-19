@@ -12,7 +12,7 @@ import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 from prometheus_client import Counter, Gauge, Histogram, CollectorRegistry, generate_latest
 
@@ -24,6 +24,11 @@ from app.services.model_validator import ModelValidator
 from app.services.model_downloader import ModelDownloader
 from app.services.model_runtime_config_service import get_model_runtime_config_service
 from app.services.hardware_profile_service import get_hardware_profile_provider
+from app.services.model_residency_policy import (
+    ModelResidencyPolicy,
+    ModelResidencyEntry,
+    QueueSnapshot,
+)
 
 try:
     from app.core.asr.loaders.onnx_loader import OnnxLoader
@@ -69,7 +74,7 @@ class _LRUCache:
             self._order[key] = None
             return self._data[key]
 
-    def put(self, key: str, value: Any) -> Optional[tuple[str, Any]]:
+    def put(self, key: str, value: Any, auto_evict: bool = True) -> Optional[tuple[str, Any]]:
         """返回被驱逐的 (key, handle)（如果有）。"""
         evicted = None
         with self._lock:
@@ -77,7 +82,7 @@ class _LRUCache:
                 self._order.pop(key, None)
             self._data[key] = value
             self._order[key] = None
-            if len(self._data) > self.capacity:
+            if auto_evict and len(self._data) > self.capacity:
                 oldest_key = next(iter(self._order))
                 self._order.pop(oldest_key, None)
                 handle = self._data.pop(oldest_key, None)
@@ -93,6 +98,29 @@ class _LRUCache:
             self._order.pop(oldest_key, None)
             handle = self._data.pop(oldest_key, None)
             return (oldest_key, handle)
+
+    def pop(self, key: str) -> Optional[Any]:
+        """按 key 移除缓存。"""
+        with self._lock:
+            self._order.pop(key, None)
+            return self._data.pop(key, None)
+
+    def touch(self, key: str) -> None:
+        """刷新 LRU 顺序。"""
+        with self._lock:
+            if key not in self._data:
+                return
+            self._order.pop(key, None)
+            self._order[key] = None
+
+    def keys(self) -> List[str]:
+        """返回缓存 key 列表。"""
+        with self._lock:
+            return list(self._data.keys())
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._data)
 
 
 class ModelManagerV2:
@@ -130,6 +158,13 @@ class ModelManagerV2:
         else:
             self.budget = budget
         self.cache = _LRUCache(self.budget.max_models)
+        self._cache_lock = threading.RLock()
+        self._usage_stats: Dict[str, ModelResidencyEntry] = {}
+        self._residency_policy = ModelResidencyPolicy.from_yaml(
+            base / "backend" / "app" / "config" / "model_residency.yaml"
+        )
+        self._force_resident_models: set[str] = set()
+        self._last_queue_activity_at = time.time()
         self._usage_vram: Dict[str, int] = {}
         hardware_info = self.hardware_profile_provider.get_hardware_info()
         self._hardware_info = hardware_info
@@ -159,6 +194,7 @@ class ModelManagerV2:
             "模型缓存显存估算",
             registry=self._registry,
         )
+        self.refresh_runtime_config()
         logger.info(
             "ModelManagerV2 初始化完成: registry=%s budget(max_models=%d,max_vram=%d,reserve=%d)",
             self.registry.config_path,
@@ -200,24 +236,239 @@ class ModelManagerV2:
         """估算显存占用，缺省返回 0 表示未知。"""
         return int(spec.resources.get("vram_mb", 0))
 
-    def _evict_for_budget(self, request_vram: int) -> None:
-        """当预计显存不足时驱逐 LRU，直到满足预算。"""
-        if request_vram <= 0:
+    def refresh_runtime_config(self) -> Dict[str, Any]:
+        """刷新运行参数与强制常驻列表。"""
+        global_effective = self._runtime_service.get_effective_global()
+        effective = global_effective.get("effective", {})
+
+        max_models = int(effective.get("max_models") or self.budget.max_models)
+        self.budget.max_models = max(1, max_models)
+        self.cache.capacity = self.budget.max_models
+
+        max_vram = effective.get("max_vram_mb")
+        if max_vram is not None:
+            self.budget.max_vram_mb = int(max_vram)
+        reserved_vram = effective.get("reserved_vram_mb")
+        if reserved_vram is not None:
+            self.budget.reserved_vram_mb = int(reserved_vram)
+        allow_download = effective.get("allow_download")
+        if allow_download is not None:
+            self.downloader.allow_download = bool(allow_download)
+
+        resident = self._runtime_service.get_resident_models().get("models", [])
+        self.set_force_resident_models(resident)
+        self._refresh_residency_overrides()
+
+        return global_effective
+
+    def get_force_resident_models(self) -> List[str]:
+        """返回强制常驻模型列表。"""
+        return sorted(self._force_resident_models)
+
+    def set_force_resident_models(self, model_ids: List[str]) -> None:
+        """设置强制常驻模型列表。"""
+        self._force_resident_models = {model_id for model_id in model_ids if model_id}
+        for entry in self._usage_stats.values():
+            entry.is_force_resident = entry.model_id in self._force_resident_models
+        self._apply_residency_policy(request_vram_mb=0, incoming_models=0)
+
+    def _refresh_residency_overrides(self) -> None:
+        """刷新已加载模型的常驻/驱逐配置。"""
+        for entry in self._usage_stats.values():
+            try:
+                spec = self.registry.get(entry.model_id)
+            except KeyError:
+                continue
+            effective = self._runtime_service.get_effective_model(spec).get("effective", {})
+            entry.is_keep_resident = bool(effective.get("keep_resident"))
+            entry.evict_priority = int(effective.get("evict_priority") or 0)
+            entry.is_force_resident = entry.model_id in self._force_resident_models
+
+    def _get_queue_snapshot(self) -> Optional[QueueSnapshot]:
+        """获取任务队列快照（失败时返回 None）。"""
+        try:
+            from app.services.job_queue_service import get_queue_service
+            queue_service = get_queue_service()
+        except Exception:
+            return None
+
+        try:
+            with queue_service.lock:
+                queued = list(queue_service.queue)
+                running_job_id = queue_service.running_job_id
+        except Exception:
+            return None
+
+        now = time.time()
+        is_idle = not running_job_id and not queued
+        if not is_idle:
+            self._last_queue_activity_at = now
+        idle_seconds = now - self._last_queue_activity_at if is_idle else 0.0
+
+        return QueueSnapshot(
+            running_job_id=running_job_id,
+            queued_job_ids=queued,
+            pending_jobs=len(queued),
+            is_idle=is_idle,
+            idle_seconds=idle_seconds,
+        )
+
+    def _resolve_available_vram_mb(self) -> int:
+        """计算动态可用显存预算。"""
+        base_budget = self.budget.available_vram_mb
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                free_bytes, _ = torch.cuda.mem_get_info()
+                free_mb = int(free_bytes / (1024 * 1024))
+                ratio = self._residency_policy.config.dynamic_vram_ratio
+                safety_mb = self._residency_policy.config.dynamic_vram_safety_mb
+                dynamic_limit = int(free_mb * ratio) - safety_mb
+                return max(0, min(base_budget, dynamic_limit))
+        except Exception as exc:
+            logger.debug("动态显存预算获取失败: %s", exc)
+
+        return base_budget
+
+    def _build_residency_entries(self) -> List[ModelResidencyEntry]:
+        return list(self._usage_stats.values())
+
+    def _apply_residency_policy(
+        self,
+        request_vram_mb: int,
+        incoming_models: int = 1,
+        apply_vram_budget: bool = True,
+    ) -> None:
+        """应用智能显存策略，必要时驱逐缓存。"""
+        entries = self._build_residency_entries()
+        if not entries and request_vram_mb <= 0:
             return
-        while True:
-            total = sum(self._usage_vram.values())
-            if total + request_vram <= self.budget.available_vram_mb:
-                return
-            evicted = self.cache.evict_oldest()
-            if not evicted:
-                raise RuntimeError("无法驱逐缓存以满足显存预算")
-            evicted_key, handle = evicted
-            self._usage_vram.pop(evicted_key, None)
+
+        snapshot = self._get_queue_snapshot()
+        max_models = self._residency_policy.resolve_max_models(self.budget.max_models, snapshot)
+        if apply_vram_budget:
+            available_vram = self._resolve_available_vram_mb()
+            current_vram = sum(entry.vram_mb for entry in entries)
+        else:
+            available_vram = 1_000_000_000
+            current_vram = 0
+            request_vram_mb = 0
+
+        plan = self._residency_policy.select_evictions(
+            entries=entries,
+            required_vram_mb=request_vram_mb,
+            max_models=max_models,
+            available_vram_mb=available_vram,
+            current_vram_mb=current_vram,
+            snapshot=snapshot,
+            incoming_models=incoming_models,
+        )
+
+        if plan.keys:
+            self._evict_keys(plan.keys, plan.reason)
+
+        freed_vram = sum(
+            entry.vram_mb for entry in entries if entry.plan_key in plan.keys
+        )
+        projected_vram = current_vram - freed_vram + max(request_vram_mb, 0)
+        projected_models = len(entries) - len(plan.keys) + incoming_models
+
+        if incoming_models > 0:
+            if projected_models > max_models:
+                raise RuntimeError("模型缓存容量不足，无法加载模型")
+            if apply_vram_budget and projected_vram > available_vram:
+                raise RuntimeError("显存预算不足，无法加载模型")
+
+    def _resolve_effective_device(self, spec: ModelSpec, device: str) -> str:
+        """解析模型最终设备，用于预算判断。"""
+        device_lower = (device or "auto").lower()
+        if device_lower in {"cpu", "cuda"}:
+            return device_lower
+        if device_lower != "auto":
+            return device_lower
+
+        framework = spec.framework
+        if framework == "onnx":
+            return "cpu"
+
+        if self._hardware_info and getattr(self._hardware_info, "cuda_available", False):
+            return "cuda"
+        return "cpu"
+
+    def _evict_keys(self, keys: List[str], reason: str) -> None:
+        """按 key 驱逐模型。"""
+        for key in keys:
+            handle = self.cache.pop(key)
+            entry = self._usage_stats.pop(key, None)
+            self._usage_vram.pop(key, None)
             if handle and hasattr(handle, "unload"):
                 try:
                     handle.unload()
                 except Exception as exc:  # pragma: no cover
                     logger.warning("缓存驱逐卸载失败: %s", exc)
+            if entry:
+                logger.info(
+                    "模型驱逐: %s reason=%s vram=%sMB",
+                    entry.model_id,
+                    reason,
+                    entry.vram_mb,
+                )
+            self._metric_cache_evicts.labels(reason=reason).inc()
+        self._metric_vram.set(sum(self._usage_vram.values()))
+
+    def _touch_usage(
+        self,
+        plan_key: str,
+        spec: ModelSpec,
+        model_runtime: Dict[str, Any],
+        vram_mb: int,
+    ) -> None:
+        """更新模型使用统计。"""
+        now = time.time()
+        entry = self._usage_stats.get(plan_key)
+        if entry:
+            entry.last_used_at = now
+            entry.use_count += 1
+            entry.evict_priority = int(model_runtime.get("evict_priority") or 0)
+            entry.is_keep_resident = bool(model_runtime.get("keep_resident"))
+            entry.is_force_resident = spec.id in self._force_resident_models
+            if vram_mb > 0:
+                entry.vram_mb = vram_mb
+            return
+
+        self._usage_stats[plan_key] = ModelResidencyEntry(
+            plan_key=plan_key,
+            model_id=spec.id,
+            vram_mb=vram_mb,
+            loaded_at=now,
+            last_used_at=now,
+            use_count=1,
+            evict_priority=int(model_runtime.get("evict_priority") or 0),
+            is_keep_resident=bool(model_runtime.get("keep_resident")),
+            is_force_resident=spec.id in self._force_resident_models,
+        )
+
+    def _register_usage(
+        self,
+        plan_key: str,
+        spec: ModelSpec,
+        model_runtime: Dict[str, Any],
+        vram_mb: int,
+    ) -> None:
+        """注册新加载模型的统计信息。"""
+        now = time.time()
+        self._usage_stats[plan_key] = ModelResidencyEntry(
+            plan_key=plan_key,
+            model_id=spec.id,
+            vram_mb=vram_mb,
+            loaded_at=now,
+            last_used_at=now,
+            use_count=1,
+            evict_priority=int(model_runtime.get("evict_priority") or 0),
+            is_keep_resident=bool(model_runtime.get("keep_resident")),
+            is_force_resident=spec.id in self._force_resident_models,
+        )
 
     def acquire(self, model_id: str, device: str = "auto", compute_type: str = "auto") -> Any:
         spec = self.registry.get(model_id)
@@ -254,19 +505,33 @@ class ModelManagerV2:
             plan.compute_type,
             plan.local_path,
         )
-        request_vram = self._estimate_vram(spec)
-        self._evict_for_budget(request_vram)
-
-        cached = self.cache.get(plan.key)
-        if cached:
-            logger.info(
-                "ModelManagerV2 命中缓存: %s device=%s compute_type=%s path=%s",
-                spec.id,
-                plan.device,
-                plan.compute_type,
-                plan.local_path,
+        effective_device = self._resolve_effective_device(spec, resolved_device)
+        request_vram = self._estimate_vram(spec) if effective_device == "cuda" else 0
+        logger.info(
+            "ModelManagerV2 预算设备解析: %s resolved=%s effective=%s vram=%sMB",
+            spec.id,
+            resolved_device,
+            effective_device,
+            request_vram,
+        )
+        with self._cache_lock:
+            self.refresh_runtime_config()
+            cached = self.cache.get(plan.key)
+            if cached:
+                self._touch_usage(plan.key, spec, model_runtime, request_vram)
+                logger.info(
+                    "ModelManagerV2 命中缓存: %s device=%s compute_type=%s path=%s",
+                    spec.id,
+                    plan.device,
+                    plan.compute_type,
+                    plan.local_path,
+                )
+                return cached
+            self._apply_residency_policy(
+                request_vram_mb=request_vram,
+                incoming_models=1,
+                apply_vram_budget=(effective_device == "cuda"),
             )
-            return cached
 
         runtime_resources = dict(spec.resources)
         if cpu_threads:
@@ -283,16 +548,18 @@ class ModelManagerV2:
         except Exception as exc:  # pragma: no cover
             logger.warning("模型预热失败（忽略继续）: %s", exc)
 
-        evicted = self.cache.put(plan.key, handle)
-        if evicted:
-            evicted_key, evicted_handle = evicted
-            self._usage_vram.pop(evicted_key, None)
-            if evicted_handle and hasattr(evicted_handle, "unload"):
+        with self._cache_lock:
+            cached = self.cache.get(plan.key)
+            if cached:
                 try:
-                    evicted_handle.unload()
+                    loader.unload(handle)
                 except Exception as exc:  # pragma: no cover
-                    logger.warning("缓存自动卸载失败: %s", exc)
-            self._metric_cache_evicts.labels(reason="capacity").inc()
+                    logger.warning("重复加载句柄卸载失败: %s", exc)
+                self._touch_usage(plan.key, spec, model_runtime, request_vram)
+                return cached
+
+            self.cache.put(plan.key, handle, auto_evict=False)
+            self._register_usage(plan.key, spec, model_runtime, request_vram)
 
         if request_vram > 0:
             self._usage_vram[plan.key] = request_vram
@@ -389,6 +656,8 @@ class ModelManagerV2:
                 except Exception as exc:  # pragma: no cover
                     logger.warning("卸载模型失败: %s", exc)
         self._usage_vram.clear()
+        self._usage_stats.clear()
+        self._metric_vram.set(0)
 
     # ========== 标点模型选择 ==========
     def select_punct_model(self, language: str) -> Optional[str]:

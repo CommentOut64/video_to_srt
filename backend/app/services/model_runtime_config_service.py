@@ -10,7 +10,7 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 from app.core.config import config
 from app.core.asr.model_spec import ModelSpec
@@ -53,6 +53,7 @@ class ModelRuntimeConfigService:
             "global": {},
             "runtime": {},
             "per_model": {},
+            "resident_models": [],
         }
         self._save_raw_config(default_config)
 
@@ -67,6 +68,8 @@ class ModelRuntimeConfigService:
                     data["runtime"] = {}
                 if "per_model" not in data:
                     data["per_model"] = {}
+                if "resident_models" not in data:
+                    data["resident_models"] = []
                 if "version" not in data:
                     data["version"] = _CONFIG_VERSION
                 return data
@@ -119,6 +122,22 @@ class ModelRuntimeConfigService:
             per_model=per_model,
             runtime=raw.get("runtime", {}),
         )
+
+    def get_resident_models(self) -> Dict[str, Any]:
+        """获取强制常驻模型列表。"""
+        raw = self._load_raw_config()
+        models = raw.get("resident_models", [])
+        return {
+            "models": list(models) if isinstance(models, list) else [],
+        }
+
+    def update_resident_models(self, model_ids: List[str]) -> List[str]:
+        """更新强制常驻模型列表。"""
+        raw = self._load_raw_config()
+        unique_ids = list(dict.fromkeys(model_ids))
+        raw["resident_models"] = unique_ids
+        self._save_raw_config(raw)
+        return unique_ids
 
     def update_global(self, updates: Dict[str, Any]) -> GlobalRuntimeConfig:
         raw = self._load_raw_config()
