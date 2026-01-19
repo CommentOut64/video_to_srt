@@ -25,6 +25,8 @@ from app.services.audio.chunk_engine import AudioChunk
 from app.services.inference.whisper_executor import WhisperExecutor
 from app.utils.prompt_builder import get_prompt_builder
 from app.core.thresholds import needs_whisper_patch, ThresholdConfig
+from app.core.asr.engine import ASREngine
+from app.core.asr.models import ASRResult
 
 
 class SlowWorker:
@@ -44,6 +46,7 @@ class SlowWorker:
         self,
         whisper_language: str = "auto",
         user_glossary: Optional[list] = None,
+        patch_engine: Optional[ASREngine] = None,
         whisper_executor: Optional[WhisperExecutor] = None,
         # V3.10: 智能补刀参数
         is_patching_mode: bool = False,
@@ -56,6 +59,7 @@ class SlowWorker:
         Args:
             whisper_language: Whisper 语言设置
             user_glossary: 用户词表
+            patch_engine: 补刀引擎（可插拔）
             whisper_executor: Whisper 执行器
             is_patching_mode: 是否为智能补刀模式（True 时根据 SenseVoice 质量跳过 Whisper）
             patching_threshold: 补刀阈值配置
@@ -64,6 +68,7 @@ class SlowWorker:
         self.whisper_language = whisper_language
         self.user_glossary = user_glossary
         self.logger = logger or logging.getLogger(__name__)
+        self.patch_engine = patch_engine
 
         # V3.10: 智能补刀配置
         self.is_patching_mode = is_patching_mode
@@ -259,6 +264,16 @@ class SlowWorker:
             audio_with_overlap = chunk.audio
             self.logger.debug("无完整音频数组，跳过 Audio Overlap")
 
+        if self.patch_engine:
+            asr_result = await self.patch_engine.transcribe(
+                audio_with_overlap,
+                language=self.whisper_language,
+                initial_prompt=initial_prompt,
+                repetition_penalty=None,
+                no_repeat_ngram_size=None,
+            )
+            return self._convert_asr_result(asr_result)
+
         # 执行 Whisper 推理
         # 注: Chunk 场景默认覆盖由 WhisperExecutor 基于运行参数来源决定
         result = await self.whisper_executor.execute(
@@ -266,10 +281,42 @@ class SlowWorker:
             start_time=chunk.start,
             end_time=chunk.end,
             language=self.whisper_language,
-            initial_prompt=initial_prompt
+            initial_prompt=initial_prompt,
         )
 
         return result
+
+    def _convert_asr_result(self, asr_result: ASRResult) -> Dict[str, Any]:
+        """将 ASRResult 转为 Whisper 结果结构。"""
+        raw_result = {}
+        if asr_result.metadata and asr_result.metadata.raw_tags:
+            raw_result = asr_result.metadata.raw_tags.get("raw_result") or {}
+
+        if not raw_result:
+            raw_segments = []
+            for segment in asr_result.segments:
+                raw_segments.append(
+                    {
+                        "start": segment.start,
+                        "end": segment.end,
+                        "text": segment.text,
+                        "avg_logprob": -0.5,
+                        "no_speech_prob": 0.0,
+                        "words": [],
+                    }
+                )
+            raw_result = {
+                "text": asr_result.text,
+                "segments": raw_segments,
+                "language": asr_result.language,
+            }
+
+        return {
+            "text": asr_result.text,
+            "confidence": float(asr_result.confidence or 0.0),
+            "language": asr_result.language,
+            "raw_result": raw_result,
+        }
 
     def _is_hallucination(self, result: Dict[str, Any], prompt: Optional[str]) -> bool:
         """
