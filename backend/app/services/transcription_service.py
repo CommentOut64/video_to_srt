@@ -2,7 +2,7 @@
 转录处理服务
 整合了processor.py和原transcription_service.py的所有功能
 """
-import os, subprocess, uuid, threading, json, math, gc, logging
+import os, threading, json, math, gc, logging
 from pathlib import Path
 from typing import List, Dict, Optional, Any, Tuple
 from enum import Enum
@@ -14,7 +14,6 @@ from app.services.whisper_service import get_whisper_service, load_audio as whis
 from app.services.audio.vad_service import VADConfig, VADMethod, get_vad_service
 from app.services.audio.chunk_engine import ChunkEngine, AudioChunk
 import torch
-import shutil
 import psutil
 import numpy as np
 
@@ -314,7 +313,7 @@ class CircuitBreakHandler:
 from app.models.job_models import JobSettings, JobState
 from app.models.hardware_models import HardwareInfo, OptimizationConfig
 from app.services.hardware_profile_service import get_hardware_profile_provider
-from app.services.job_index_service import get_job_index_service
+from app.services.job_lifecycle_service import get_job_lifecycle_service
 from app.core.config import config  # 导入统一配置
 
 class TranscriptionService:
@@ -333,8 +332,6 @@ class TranscriptionService:
         self.jobs_root = Path(jobs_root)
         self.jobs_root.mkdir(parents=True, exist_ok=True)
 
-        self.jobs: Dict[str, JobState] = {}
-        self.lock = threading.Lock()
         self.logger = logging.getLogger(__name__)
 
         # 集成硬件能力提供者
@@ -342,10 +339,8 @@ class TranscriptionService:
         self._hardware_info: Optional[HardwareInfo] = None
         self._optimization_config: Optional[OptimizationConfig] = None
 
-        # 集成任务索引服务
-        self.job_index = get_job_index_service(jobs_root)
-        # 启动时清理无效映射
-        self.job_index.cleanup_invalid_mappings()
+        # 集成任务生命周期服务（创建/恢复/持久化）
+        self.job_lifecycle = get_job_lifecycle_service(self.jobs_root, logger=self.logger)
 
         # 集成SSE管理器（用于实时进度推送）
         from app.services.sse_service import get_sse_manager
@@ -366,8 +361,7 @@ class TranscriptionService:
         # 执行硬件检测
         self._detect_hardware()
 
-        # 启动时扫描并加载所有任务（修复重启后无法打开旧任务的问题）
-        self._load_all_jobs_from_disk()
+        # 任务加载已由 JobLifecycleService 负责
 
     def _detect_hardware(self):
         """执行硬件检测并生成优化配置"""
@@ -665,26 +659,7 @@ class TranscriptionService:
         这个方法会扫描 jobs 目录中的所有任务，并加载到内存中，
         避免重启后因为内存为空导致无法访问旧任务
         """
-        try:
-            loaded_count = 0
-            for job_dir in self.jobs_root.iterdir():
-                if not job_dir.is_dir():
-                    continue
-
-                job_id = job_dir.name
-                if job_id in self.jobs:
-                    # 已加载，跳过
-                    continue
-
-                # 尝试加载任务
-                job = self.get_job(job_id)
-                if job:
-                    loaded_count += 1
-
-            if loaded_count > 0:
-                self.logger.info(f"启动时已加载 {loaded_count} 个历史任务到内存")
-        except Exception as e:
-            self.logger.error(f"加载历史任务失败: {e}")
+        self.job_lifecycle.load_all_jobs_from_disk()
     
     def get_hardware_info(self) -> Optional[HardwareInfo]:
         """获取硬件信息"""
@@ -726,82 +701,12 @@ class TranscriptionService:
         Returns:
             JobState: 创建的任务状态对象
         """
-        job_id = job_id or uuid.uuid4().hex
-        job_dir = self.jobs_root / job_id
-        job_dir.mkdir(parents=True, exist_ok=True)
-
-        dest_path = job_dir / filename
-
-        # V3.1.1+dev.20260106.01: 使用硬链接替代复制，节省磁盘空间
-        # 硬链接让 input/video.mp4 和 jobs/{job_id}/video.mp4 指向同一数据块
-        # 支持多个任务指向同一个视频文件，删除任务时不影响原始文件
-        if os.path.abspath(src_path) != os.path.abspath(dest_path):
-            try:
-                # 优先使用硬链接
-                os.link(src_path, dest_path)
-                self.logger.debug(f"硬链接创建成功: {src_path} -> {dest_path}")
-            except (OSError, NotImplementedError) as e:
-                # 硬链接失败时降级到复制（跨文件系统、网络挂载等场景）
-                self.logger.warning(f"硬链接创建失败，回退到复制: {e}")
-                try:
-                    shutil.copyfile(src_path, dest_path)
-                    self.logger.debug(f"文件已复制: {src_path} -> {dest_path}")
-                except Exception as copy_err:
-                    self.logger.warning(f"文件复制失败: {copy_err}")
-
-        # 创建任务状态对象
-        job = JobState(
-            job_id=job_id,
+        return self.job_lifecycle.create_job(
             filename=filename,
-            dir=str(job_dir),
-            input_path=src_path,
+            src_path=src_path,
             settings=settings,
-            status="uploaded",
-            phase="pending",
-            message="文件已上传"
+            job_id=job_id
         )
-
-        with self.lock:
-            self.jobs[job_id] = job
-
-        # 添加文件路径到任务ID的映射
-        self.job_index.add_mapping(src_path, job_id)
-
-        # 持久化任务元信息（重启后可恢复）
-        self.save_job_meta(job)
-
-        # 立即异步提取音频，确保前端能加载波形图（不阻塞响应）
-        audio_path = job_dir / 'audio.wav'
-        if not audio_path.exists():
-            self.logger.info(f"[{job_id}] 启动后台音频提取...")
-            import threading
-
-            def extract_audio_for_waveform():
-                """后台提取音频供波形图使用"""
-                try:
-                    import warnings
-                    import librosa
-                    import soundfile as sf
-                    # 抑制 librosa 的 PySoundFile/audioread 警告
-                    with warnings.catch_warnings():
-                        warnings.filterwarnings("ignore", message="PySoundFile failed")
-                        warnings.filterwarnings("ignore", message="audioread")
-                        audio_array, sr = librosa.load(str(dest_path), sr=16000, mono=True)
-                    sf.write(str(audio_path), audio_array, sr)
-                    self.logger.info(f"[{job_id}] 音频提取完成: {audio_path}")
-                except Exception as e:
-                    self.logger.error(f"[{job_id}] 音频提取失败: {e}")
-
-            threading.Thread(
-                target=extract_audio_for_waveform,
-                daemon=True,
-                name=f"AudioExtract-{job_id[:8]}"
-            ).start()
-        else:
-            self.logger.debug(f"[{job_id}] 音频文件已存在，跳过提取")
-
-        self.logger.info(f"任务已创建: {job_id} - {filename}")
-        return job
 
     def save_job_meta(self, job: JobState) -> bool:
         """
@@ -815,24 +720,7 @@ class TranscriptionService:
         Returns:
             bool: 是否成功保存
         """
-        job_dir = Path(job.dir)
-        meta_file = job_dir / "job_meta.json"
-
-        try:
-            job_dir.mkdir(parents=True, exist_ok=True)
-
-            # 原子写入：先写临时文件，再rename替换
-            temp_file = meta_file.with_suffix(".tmp")
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                json.dump(job.to_meta_dict(), f, indent=2, ensure_ascii=False)
-
-            # 原子替换
-            temp_file.replace(meta_file)
-            self.logger.debug(f"任务元信息已保存: {job.job_id}")
-            return True
-        except Exception as e:
-            self.logger.error(f"保存任务元信息失败 {job.job_id}: {e}")
-            return False
+        return self.job_lifecycle.save_job_meta(job)
 
     def load_job_meta(self, job_id: str) -> Optional[JobState]:
         """
@@ -844,26 +732,7 @@ class TranscriptionService:
         Returns:
             Optional[JobState]: 恢复的任务状态对象
         """
-        job_dir = self.jobs_root / job_id
-        meta_file = job_dir / "job_meta.json"
-
-        if not meta_file.exists():
-            return None
-
-        try:
-            with open(meta_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-
-            job = JobState.from_meta_dict(data)
-
-            # 确保 dir 路径正确（可能因为项目迁移而改变）
-            job.dir = str(job_dir)
-
-            self.logger.debug(f"从 job_meta.json 加载任务: {job_id}")
-            return job
-        except Exception as e:
-            self.logger.error(f"加载任务元信息失败 {job_id}: {e}")
-            return None
+        return self.job_lifecycle.load_job_meta(job_id)
 
     def get_job(self, job_id: str) -> Optional[JobState]:
         """
@@ -875,87 +744,7 @@ class TranscriptionService:
         Returns:
             Optional[JobState]: 任务状态对象，不存在则返回None
         """
-        with self.lock:
-            # 首先从内存中查找
-            if job_id in self.jobs:
-                return self.jobs[job_id]
-
-        # 如果内存中没有，尝试从 jobs 目录读取（修复重启后无法打开旧任务的问题）
-        job_dir = self.jobs_root / job_id
-        if not job_dir.exists():
-            return None
-
-        try:
-            # 优先从 job_meta.json 加载（包含完整的任务状态）
-            job = self.load_job_meta(job_id)
-            if job:
-                # 缓存到内存
-                with self.lock:
-                    self.jobs[job_id] = job
-                self.logger.info(f"从 job_meta.json 恢复任务: {job_id}")
-                return job
-
-            # 降级：从目录文件推断状态（兼容旧版本）
-            # 尝试找到原始文件
-            filename = "未知文件"
-            input_path = None
-
-            # 从目录中查找视频/音频文件
-            for ext in ['.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv', '.mp3', '.wav', '.m4a']:
-                matches = list(job_dir.glob(f"*{ext}"))
-                if matches:
-                    filename = matches[0].name
-                    input_path = str(matches[0])
-                    break
-
-            # 检查是否有 SRT 文件（表示已完成）
-            srt_files = list(job_dir.glob("*.srt"))
-            is_finished = len(srt_files) > 0
-
-            # 创建 JobState 对象
-            job = JobState(
-                job_id=job_id,
-                filename=filename,
-                dir=str(job_dir),
-                input_path=input_path,
-                status='finished' if is_finished else 'processing',
-                phase='editing' if is_finished else 'transcribing',
-                progress=100 if is_finished else 0,
-                message='已完成' if is_finished else '处理中',
-                srt_path=str(srt_files[0]) if srt_files else None
-            )
-
-            # 尝试从 checkpoint 获取更详细的信息
-            checkpoint_path = job_dir / "checkpoint.json"
-            if checkpoint_path.exists():
-                try:
-                    with open(checkpoint_path, 'r', encoding='utf-8') as f:
-                        checkpoint_data = json.load(f)
-                        total_segments = checkpoint_data.get('total_segments', 0)
-                        processed_indices = checkpoint_data.get('processed_indices', [])
-                        if total_segments > 0:
-                            job.progress = min((len(processed_indices) / total_segments) * 100, 100)
-                        job.phase = checkpoint_data.get('phase', 'transcribing')
-                        job.language = checkpoint_data.get('language')
-                        # 从checkpoint恢复segments
-                        if 'unaligned_results' in checkpoint_data:
-                            job.segments = checkpoint_data['unaligned_results']
-                except Exception as e:
-                    self.logger.warning(f"读取checkpoint失败 {checkpoint_path}: {e}")
-
-            # 缓存到内存
-            with self.lock:
-                self.jobs[job_id] = job
-
-            # 同时保存 job_meta.json 以便下次直接加载
-            self.save_job_meta(job)
-
-            self.logger.info(f"从磁盘恢复任务（旧版兼容）: {job_id}")
-            return job
-
-        except Exception as e:
-            self.logger.error(f"从磁盘读取任务失败 {job_id}: {e}")
-            return None
+        return self.job_lifecycle.get_job(job_id)
 
     def scan_incomplete_jobs(self) -> List[Dict]:
         """
@@ -964,59 +753,7 @@ class TranscriptionService:
         Returns:
             List[Dict]: 未完成任务列表
         """
-        incomplete_jobs = []
-
-        try:
-            # 遍历所有任务目录
-            for job_dir in self.jobs_root.iterdir():
-                if not job_dir.is_dir():
-                    continue
-
-                checkpoint_path = job_dir / "checkpoint.json"
-                if not checkpoint_path.exists():
-                    continue
-
-                try:
-                    # 加载检查点数据
-                    with open(checkpoint_path, 'r', encoding='utf-8') as f:
-                        checkpoint_data = json.load(f)
-
-                    job_id = checkpoint_data.get('job_id') or job_dir.name
-                    total_segments = checkpoint_data.get('total_segments', 0)
-                    processed_indices = checkpoint_data.get('processed_indices', [])
-                    processed_count = len(processed_indices)
-
-                    # 计算进度
-                    if total_segments > 0:
-                        progress = (processed_count / total_segments) * 100
-                    else:
-                        progress = 0
-
-                    # 从索引中查找文件名
-                    file_path = self.job_index.get_file_path(job_id)
-                    filename = os.path.basename(file_path) if file_path else "未知文件"
-
-                    incomplete_jobs.append({
-                        'job_id': job_id,
-                        'filename': filename,
-                        'file_path': file_path,  # 添加文件路径
-                        'progress': round(progress, 2),
-                        'processed_segments': processed_count,
-                        'total_segments': total_segments,
-                        'phase': checkpoint_data.get('phase', 'unknown'),
-                        'dir': str(job_dir)
-                    })
-
-                except Exception as e:
-                    self.logger.warning(f"读取检查点失败 {checkpoint_path}: {e}")
-                    continue
-
-            self.logger.info(f"扫描到 {len(incomplete_jobs)} 个未完成任务")
-            return incomplete_jobs
-
-        except Exception as e:
-            self.logger.error(f"扫描未完成任务失败: {e}")
-            return []
+        return self.job_lifecycle.scan_incomplete_jobs()
 
     def restore_job_from_checkpoint(self, job_id: str) -> Optional[JobState]:
         """
@@ -1028,72 +765,7 @@ class TranscriptionService:
         Returns:
             Optional[JobState]: 恢复的任务状态对象
         """
-        job_dir = self.jobs_root / job_id
-        if not job_dir.exists():
-            return None
-
-        # 尝试加载 checkpoint（可能不存在）
-        checkpoint = self._load_checkpoint(job_dir)
-
-        try:
-            # 查找原文件
-            filename = "unknown"
-            input_path = None
-
-            # 从目录中查找视频/音频文件
-            for ext in ['.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv', '.mp3', '.wav', '.m4a']:
-                matches = list(job_dir.glob(f"*{ext}"))
-                if matches:
-                    filename = matches[0].name
-                    input_path = str(matches[0])
-                    break
-
-            if not input_path:
-                self.logger.warning(f"无法找到任务 {job_id} 的输入文件")
-                return None
-
-            # 根据是否有 checkpoint 决定恢复状态
-            if checkpoint:
-                # 有 checkpoint，从断点恢复
-                phase = checkpoint.get('phase', 'pending')
-                total_segments = checkpoint.get('total_segments', 0)
-                processed_indices = checkpoint.get('processed_indices', [])
-                processed = len(processed_indices)
-                progress = round((processed / max(1, total_segments)) * 100, 2)
-                message = f"已暂停 ({processed}/{total_segments}段)"
-                self.logger.info(f"从检查点恢复任务: {job_id}")
-            else:
-                # 无 checkpoint，从头开始
-                phase = 'pending'
-                total_segments = 0
-                processed = 0
-                progress = 0
-                message = "程序重启，任务将从头开始"
-                self.logger.info(f"无检查点，任务将从头开始: {job_id}")
-
-            # 创建任务状态对象
-            job = JobState(
-                job_id=job_id,
-                filename=filename,
-                dir=str(job_dir),
-                input_path=input_path,
-                settings=JobSettings(),
-                status="paused",
-                phase=phase,
-                message=message,
-                total=total_segments,
-                processed=processed,
-                progress=progress
-            )
-
-            with self.lock:
-                self.jobs[job_id] = job
-
-            return job
-
-        except Exception as e:
-            self.logger.error(f"从检查点恢复任务失败: {e}")
-            return None
+        return self.job_lifecycle.restore_job_from_checkpoint(job_id)
 
     def check_file_checkpoint(self, file_path: str) -> Optional[Dict]:
         """
@@ -1105,40 +777,7 @@ class TranscriptionService:
         Returns:
             Optional[Dict]: 断点信息，无断点则返回None
         """
-        # 从索引中查找任务ID
-        job_id = self.job_index.get_job_id(file_path)
-        if not job_id:
-            return None
-
-        # 检查任务目录和checkpoint是否存在
-        job_dir = self.jobs_root / job_id
-        if not job_dir.exists():
-            # 清理无效映射
-            self.job_index.remove_mapping(file_path)
-            return None
-
-        checkpoint = self._load_checkpoint(job_dir)
-        if not checkpoint:
-            return None
-
-        # 返回断点信息
-        total_segments = checkpoint.get('total_segments', 0)
-        processed_indices = checkpoint.get('processed_indices', [])
-        processed_count = len(processed_indices)
-
-        if total_segments > 0:
-            progress = (processed_count / total_segments) * 100
-        else:
-            progress = 0
-
-        return {
-            'job_id': job_id,
-            'progress': round(progress, 2),
-            'processed_segments': processed_count,
-            'total_segments': total_segments,
-            'phase': checkpoint.get('phase', 'unknown'),
-            'can_resume': True
-        }
+        return self.job_lifecycle.check_file_checkpoint(file_path)
 
     def start_job(self, job_id: str):
         """
@@ -1149,23 +788,7 @@ class TranscriptionService:
         Args:
             job_id: 任务ID
         """
-        # 关键改动: 不再自动创建线程，由队列服务统一管理
-        # 新逻辑: 只更新状态，实际执行由队列服务控制
-        job = self.get_job(job_id)
-        if not job:
-            self.logger.warning(f"任务未找到: {job_id}")
-            return
-
-        if job.status not in ("uploaded", "failed", "paused", "created"):
-            self.logger.warning(f"任务无法启动: {job_id}, 状态: {job.status}")
-            return
-
-        job.canceled = False
-        job.paused = False
-        job.error = None
-        # 状态由队列服务设置，这里不改
-
-        self.logger.warning(f"start_job已废弃，请使用队列服务: {job_id}")
+        self.job_lifecycle.start_job(job_id)
 
     def pause_job(self, job_id: str) -> bool:
         """
@@ -1177,100 +800,7 @@ class TranscriptionService:
         Returns:
             bool: 是否成功设置暂停标志
         """
-        job = self.get_job(job_id)
-        if not job:
-            return False
-
-        job.paused = True
-        job.message = "暂停中..."
-        self.logger.info(f"⏸️ 任务暂停请求: {job_id}")
-        return True
-
-    def _force_remove_directory(
-        self,
-        directory: Path,
-        job_id: str,
-        max_retries: int = 3,
-        fast_fail: bool = False
-    ) -> bool:
-        """
-        V3.1.0: 强制删除目录，处理 Windows 文件占用问题
-
-        策略：
-        1. 先触发垃圾回收，释放可能的文件句柄
-        2. 尝试直接删除目录（最快）
-        3. 如果失败，等待后重试（处理延迟释放）
-        4. 如果仍失败，逐个删除文件，跳过无法删除的
-
-        Args:
-            directory: 要删除的目录路径
-            job_id: 任务ID（用于日志）
-            max_retries: 最大重试次数
-            fast_fail: True 时只尝试一次且不做延迟，快速返回给前端
-        """
-        import time
-        import stat
-
-        # 步骤1: 触发垃圾回收，释放可能的文件句柄
-        gc.collect()
-        time.sleep(0.1)  # 给系统一点时间释放资源
-
-        # 步骤2: 尝试直接删除（最快路径）
-        attempts = 1 if fast_fail else max_retries
-        for attempt in range(attempts):
-            try:
-                shutil.rmtree(directory)
-                self.logger.info(f"[强制删除] 成功删除目录: {job_id}, 尝试次数: {attempt + 1}")
-                return True
-            except PermissionError as e:
-                if fast_fail or attempt >= attempts - 1:
-                    # 快速返回给上层，由用户稍后再试
-                    self.logger.warning(
-                        f"[强制删除] 删除失败 (快速返回): {e}"
-                    )
-                    return False
-                self.logger.warning(
-                    f"[强制删除] 删除失败 (尝试 {attempt + 1}/{max_retries}): {e}, "
-                    f"等待 {0.5 * (attempt + 1)}s 后重试"
-                )
-                time.sleep(0.5 * (attempt + 1))  # 指数退避
-
-        # 步骤3: 逐个删除文件（降级策略）
-        failed_files = []
-        for root, dirs, files in os.walk(directory, topdown=False):
-            # 删除文件
-            for name in files:
-                file_path = Path(root) / name
-                try:
-                    # 尝试修改文件权限（Windows 只读文件）
-                    os.chmod(file_path, stat.S_IWRITE)
-                    file_path.unlink()
-                except Exception as e:
-                    self.logger.warning(f"[强制删除] 无法删除文件: {file_path.name}, {e}")
-                    failed_files.append(str(file_path))
-
-            # 删除空目录
-            for name in dirs:
-                dir_path = Path(root) / name
-                try:
-                    dir_path.rmdir()
-                except Exception as e:
-                    self.logger.debug(f"[强制删除] 无法删除目录: {dir_path.name}, {e}")
-
-        # 尝试删除根目录
-        try:
-            directory.rmdir()
-            self.logger.info(f"[强制删除] 逐个删除完成: {job_id}")
-            return True
-        except Exception as e:
-            if failed_files:
-                self.logger.error(
-                    f"[强制删除] 部分文件无法删除: {job_id}, "
-                    f"失败文件数: {len(failed_files)}, 错误: {e}"
-                )
-            else:
-                self.logger.warning(f"[强制删除] 根目录删除失败: {job_id}, {e}")
-            return False
+        return self.job_lifecycle.pause_job(job_id)
 
     def cancel_job(self, job_id: str, delete_data: bool = False):
         """
@@ -1283,66 +813,7 @@ class TranscriptionService:
         Returns:
             Tuple[bool, Optional[str]]: (是否成功, 失败原因)
         """
-        job = self.get_job(job_id)
-        if not job:
-            return False, "任务未找到"
-
-        job.canceled = True
-        job.message = "取消中..."
-        self.logger.info(f"🛑 任务取消请求: {job_id}, 删除数据: {delete_data}")
-
-        # 如果需要删除数据
-        if delete_data:
-            try:
-                job_dir = Path(job.dir)
-
-                # 快速占用检测，避免用户等待
-                try:
-                    from app.services.media_stream_tracker import get_active_streams
-                    active_streams = get_active_streams(job_id)
-                except Exception:
-                    active_streams = 0
-
-                if active_streams > 0:
-                    msg = "当前有进程占用，请稍后再试"
-                    self.logger.warning(f"[删除任务] 文件被占用，放弃删除: {job_id}, active_streams={active_streams}")
-                    return False, msg
-
-                # V3.1.2+dev.20260112.01: 先取消 MediaPrep 的转码任务，释放文件句柄
-                # 避免 WinError 32 文件占用问题
-                try:
-                    from app.services.media_prep_service import get_media_prep_service
-                    media_prep = get_media_prep_service()
-                    killed = media_prep.cancel_tasks(job_id)
-                    if killed > 0:
-                        self.logger.info(f"[删除任务] 已终止 {killed} 个 MediaPrep 子进程: {job_id}")
-                        # 给系统一点时间释放文件句柄
-                        import time
-                        time.sleep(0.2)
-                except Exception as e:
-                    self.logger.warning(f"[删除任务] 取消 MediaPrep 任务失败: {e}")
-
-                # 先从内存中移除任务，避免删除失败时仍显示"未知文件"
-                with self.lock:
-                    if job_id in self.jobs:
-                        del self.jobs[job_id]
-                        self.logger.info(f"已从内存移除任务: {job_id}")
-
-                # 移除文件路径映射
-                if job.input_path:
-                    self.job_index.remove_mapping(job.input_path)
-
-                # 最后删除任务目录（快速失败，交给用户重试）
-                if job_dir.exists():
-                    success = self._force_remove_directory(job_dir, job_id, max_retries=1, fast_fail=True)
-                    if not success:
-                        return False, "当前有进程占用，请稍后再试"
-                    self.logger.info(f"已删除任务数据: {job_id}")
-            except Exception as e:
-                self.logger.error(f"删除任务数据失败: {e}")
-                return False, str(e)
-
-        return True, None
+        return self.job_lifecycle.cancel_job(job_id, delete_data=delete_data)
 
     def _update_progress(
         self,
@@ -1697,28 +1168,7 @@ class TranscriptionService:
             data: 检查点数据
             job: 任务状态对象（用于获取settings）
         """
-        # 添加原始设置到 checkpoint（用于断点续传一致性）
-        data["original_settings"] = job.settings.to_dict()
-
-        checkpoint_path = job_dir / "checkpoint.json"
-        temp_path = checkpoint_path.with_suffix(".tmp")
-
-        try:
-            # 1. 写入临时文件
-            with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-
-            # 2. 原子替换（Windows/Linux/macOS 均支持）
-            # 如果程序在这里崩溃，checkpoint.json 依然是旧版本，不会损坏
-            os.replace(temp_path, checkpoint_path)
-
-            # 3. 同步保存任务元信息（用于重启后恢复任务状态）
-            # 这样每次保存检查点时，任务的进度和状态都会被持久化
-            self.save_job_meta(job)
-
-        except Exception as e:
-            self.logger.error(f"保存检查点失败: {e}")
-            # 保存失败不应中断主流程，仅记录日志
+        self.job_lifecycle._save_checkpoint(job_dir, data, job)
 
     def _load_checkpoint(self, job_dir: Path) -> Optional[dict]:
         """
@@ -1730,16 +1180,7 @@ class TranscriptionService:
         Returns:
             Optional[dict]: 检查点数据，不存在或损坏则返回 None
         """
-        checkpoint_path = job_dir / "checkpoint.json"
-        if not checkpoint_path.exists():
-            return None
-
-        try:
-            with open(checkpoint_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            self.logger.warning(f"检查点文件损坏，将重新开始任务: {checkpoint_path} - {e}")
-            return None
+        return self.job_lifecycle._load_checkpoint(job_dir)
 
     def _flush_checkpoint_after_split(
         self,
@@ -1762,38 +1203,13 @@ class TranscriptionService:
             processing_mode: 当前处理模式
             demucs_state: Demucs状态数据（可选）
         """
-        import time
-
-        checkpoint_data = {
-            "job_id": job.job_id,
-            "phase": "split_complete",  # 明确标记分段完成
-            "processing_mode": processing_mode.value,  # 记录模式
-            "total_segments": len(segments),
-            "processed_indices": [],
-            "segments": segments,
-            "unaligned_results": [],
-            "timestamp": time.time()  # 时间戳用于调试
-        }
-
-        # 添加 demucs 状态（如果提供）
-        if demucs_state:
-            checkpoint_data["demucs"] = demucs_state
-
-        # 强制同步写入（确保数据落盘）
-        self._save_checkpoint(job_dir, checkpoint_data, job)
-
-        # 验证写入成功
-        saved_checkpoint = self._load_checkpoint(job_dir)
-        if saved_checkpoint is None:
-            raise RuntimeError("checkpoint write verification failed: file not readable")
-
-        if saved_checkpoint.get('phase') != 'split_complete':
-            raise RuntimeError("checkpoint write verification failed: phase mismatch")
-
-        if len(saved_checkpoint.get('segments', [])) != len(segments):
-            raise RuntimeError("checkpoint write verification failed: segments count mismatch")
-
-        self.logger.info(f"checkpoint flushed and verified after split (mode: {processing_mode.value}, segments: {len(segments)})")
+        self.job_lifecycle._flush_checkpoint_after_split(
+            job=job,
+            job_dir=job_dir,
+            processing_mode=processing_mode,
+            segments=segments,
+            demucs_state=demucs_state,
+        )
 
 
     # ========== 核心处理方法 ==========
