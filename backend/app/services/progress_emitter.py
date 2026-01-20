@@ -524,7 +524,7 @@ class ProgressEventEmitter:
             self.detail.slow_total = total_chunks
             self.detail.slow = (slow_count / total_chunks * 100) if total_chunks > 0 else 0
 
-            # AlignmentWorker 进度
+            # 对齐阶段进度
             alignment = transcription.get("alignment", {})
             align_count = alignment.get("completed_count", 0) or len(alignment.get("finalized_indices", []))
             self.detail.align_processed = align_count

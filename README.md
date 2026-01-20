@@ -215,7 +215,7 @@ WHISPER_MODEL=large-v3  # 可选: tiny, base, small, medium, large-v3, turbo
 │             └──────────┬───────────────────┘                            │
 │                        ↓                                                │
 │              ┌──────────────────┐                                       │
-│              │ AlignmentWorker  │                                       │
+│              │ 对齐阶段         │                                       │
 │              │ 文本时间戳对齐   │                                       │
 │              │ 字级时间戳计算   │                                       │
 │              └────────┬─────────┘                                       │
@@ -299,7 +299,7 @@ WHISPER_MODEL=large-v3  # 可选: tiny, base, small, medium, large-v3, turbo
 
 ### 三级对齐策略
 
-为了确保字幕稳定性，`AlignmentWorker` 采用了级联降级策略：
+为了确保字幕稳定性，对齐阶段采用了级联降级策略：
 
 1. **Level 1 (双模态对齐):** 使用 Needleman-Wunsch 全局序列对齐算法，将 Whisper 文本映射到 SenseVoice 时间戳（黄金标准）。
 2. **Level 2 (伪对齐):** 如果序列对齐失败，使用字符/单词时长比例，将 Whisper 文本数学映射到 SenseVoice 时间窗口。

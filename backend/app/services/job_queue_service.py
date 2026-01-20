@@ -1064,25 +1064,25 @@ class JobQueueService:
             )
 
             # V3.7: 如果有历史上下文，恢复 SlowWorker 状态
-            if previous_whisper_text and async_pipeline.slow_worker:
-                async_pipeline.slow_worker.restore_prompt_cache(previous_whisper_text)
-                logger.info(f"[V3.7] 已恢复 SlowWorker 上下文: {len(previous_whisper_text)} 字符")
+            if previous_whisper_text:
+                async_pipeline.restore_prompt_cache(previous_whisper_text)
+                logger.info(f"[V3.7] 已恢复 Whisper 上下文: {len(previous_whisper_text)} 字符")
 
             # V3.1.0: 分别计算各 Worker 的基准偏移量
             # FastWorker 使用 safe_indices（用于跳过已处理的 chunk）
-            # SlowWorker 和 AlignmentWorker 使用各自实际处理的数量（用于进度计算）
+            # SlowWorker 和对齐阶段使用各自实际处理的数量（用于进度计算）
             base_slow_count = 0
             base_align_count = 0
             if is_resuming and checkpoint.transcription:
                 # SlowWorker 的基准 = checkpoint 中保存的 slow_indices 数量
                 base_slow_count = len(slow_indices) if slow_indices else len(safe_indices)
-                # AlignmentWorker 的基准 = checkpoint 中保存的 finalized_indices 数量
+                # 对齐阶段的基准 = checkpoint 中保存的 finalized_indices 数量
                 base_align_count = len(finalized) if finalized else len(safe_indices)
                 logger.info(
                     f"[V3.1.0] Worker 基准偏移量: "
                     f"FastWorker={len(fast_processed_indices)}, "
                     f"SlowWorker={base_slow_count}, "
-                    f"AlignmentWorker={base_align_count}"
+                    f"Alignment={base_align_count}"
                 )
 
             # 处理所有 Chunks（流水线并行，传递完整音频数组用于 Audio Overlap）
@@ -1094,9 +1094,9 @@ class JobQueueService:
                 job_dir=job_dir,  # V3.7
                 processed_indices=fast_processed_indices,  # V3.1.0: FastWorker 跳过的索引
                 base_slow_count=base_slow_count,  # V3.1.0: SlowWorker 的基准偏移量（已废弃）
-                base_align_count=base_align_count,  # V3.1.0: AlignmentWorker 的基准偏移量（已废弃）
+                base_align_count=base_align_count,  # V3.1.0: 对齐阶段的基准偏移量（已废弃）
                 initial_slow_processed_indices=slow_indices if is_resuming else None,  # V3.1.0: SlowWorker 初始索引
-                initial_finalized_indices=finalized if is_resuming else None  # V3.1.0: AlignmentWorker 初始索引
+                initial_finalized_indices=finalized if is_resuming else None  # V3.1.0: 对齐阶段初始索引
             )
 
             # 提取结果

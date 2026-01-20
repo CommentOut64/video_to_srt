@@ -80,7 +80,7 @@ class TranscriptionState:
     previous_whisper_text: str = ""  # Whisper 上文状态（恢复必需）
     last_processed_index: int = -1
 
-    # AlignmentWorker
+    # 对齐阶段
     finalized_indices: List[int] = field(default_factory=list)
     alignment_completed_count: int = 0
     alignment_levels: Dict[int, str] = field(default_factory=dict)
@@ -1089,7 +1089,7 @@ class CheckpointManagerV37:
             if "last_slow_chunk_index" in trans_data:
                 trans.last_processed_index = trans_data["last_slow_chunk_index"]
 
-            # AlignmentWorker 字段
+            # 对齐阶段字段
             if "align_processed_count" in trans_data:
                 trans.alignment_completed_count = trans_data["align_processed_count"]
             if "last_align_chunk_index" in trans_data:

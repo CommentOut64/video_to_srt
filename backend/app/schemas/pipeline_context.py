@@ -14,7 +14,7 @@ class ProcessingContext:
     流水线处理上下文
 
     这是唯一在流水线中流动的对象，替代散乱的参数传递。
-    在三级流水线（FastWorker → SlowWorker → AlignmentWorker）中传递数据。
+    在三级流水线（FastWorker → SlowWorker → 对齐阶段）中传递数据。
 
     Attributes:
         job_id: 任务 ID
@@ -24,9 +24,9 @@ class ProcessingContext:
 
         sv_result: FastWorker 产出（SenseVoice 推理结果）
         whisper_result: SlowWorker 产出（Whisper 推理结果）
-        final_sentences: AlignmentWorker 产出（最终句子列表）
+        final_sentences: 对齐阶段产出（最终句子列表）
 
-        is_end: 结束流标记（用于通知下游 Worker 停止）
+        is_end: 结束流标记（用于通知下游阶段停止）
         error: 异常携带（用于异常传播）
     """
     # 基础信息
@@ -41,7 +41,7 @@ class ProcessingContext:
     # 阶段产物
     sv_result: Optional[dict] = None      # FastWorker 产出
     whisper_result: Optional[dict] = None # SlowWorker 产出
-    final_sentences: List[Any] = field(default_factory=list)  # AlignmentWorker 产出
+    final_sentences: List[Any] = field(default_factory=list)  # 对齐阶段产出
 
     # 控制信号
     is_end: bool = False                  # 结束流标记
