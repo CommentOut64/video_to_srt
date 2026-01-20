@@ -21,6 +21,10 @@ from typing import Dict, Optional, List, Any, Tuple
 
 from app.models.job_models import JobState, JobSettings
 from app.services.job_index_service import JobIndexService, get_job_index_service
+from app.services.sse_service import get_sse_manager
+from app.services.task_event_bus import TaskEventBus
+from app.services.task_heartbeat import TaskHeartbeatService
+from app.services.task_state_repository import TaskStateRepository
 
 
 class JobLifecycleService:
@@ -30,9 +34,13 @@ class JobLifecycleService:
     统一管理任务元信息、断点与重启恢复。
     """
 
-    _ACTIVE_STATUSES = {
-        "processing",
+    _TERMINAL_STATUSES = {"finished", "failed", "canceled"}
+    _NON_TERMINAL_STATUSES = {
+        "created",
+        "uploaded",
         "queued",
+        "processing",
+        "paused",
         "pausing",
         "canceling",
         "transcribing",
@@ -54,27 +62,39 @@ class JobLifecycleService:
         self.job_index: JobIndexService = get_job_index_service(str(self.jobs_root))
         self.job_index.cleanup_invalid_mappings()
 
+        # V3.2.0+dev.20260120.05: 状态仓库/事件总线/心跳服务
+        self.state_repo = TaskStateRepository(self.jobs_root / "task_state.db", logger=self.logger)
+        self.event_bus = TaskEventBus(
+            self.state_repo,
+            sse_manager=get_sse_manager(),
+            logger=self.logger
+        )
+        self.heartbeat_service = TaskHeartbeatService(self.state_repo, logger=self.logger)
+
         # 启动时加载已有任务
         self.load_all_jobs_from_disk()
 
     def load_all_jobs_from_disk(self) -> None:
         """
-        启动时扫描并加载所有任务到内存。
+        启动时从状态仓库加载任务到内存。
         """
         try:
+            jobs = self.state_repo.list_tasks()
+            if not jobs:
+                self._import_legacy_tasks_from_disk()
+                jobs = self.state_repo.list_tasks()
+
             loaded_count = 0
-            for job_dir in self.jobs_root.iterdir():
-                if not job_dir.is_dir():
-                    continue
+            for job in jobs:
+                from_status = job.status
+                if self._apply_restart_pause(job):
+                    self._persist_job_state(job, from_status=from_status, reason="system_restart")
 
-                job_id = job_dir.name
                 with self.lock:
-                    if job_id in self.jobs:
+                    if job.job_id in self.jobs:
                         continue
-
-                job = self.get_job(job_id)
-                if job:
-                    loaded_count += 1
+                    self.jobs[job.job_id] = job
+                loaded_count += 1
 
             if loaded_count > 0:
                 self.logger.info(f"启动时已加载 {loaded_count} 个历史任务到内存")
@@ -125,7 +145,7 @@ class JobLifecycleService:
             self.jobs[job_id] = job
 
         self.job_index.add_mapping(src_path, job_id)
-        self.save_job_meta(job)
+        self._persist_job_state(job, from_status=None, reason="created")
 
         self._schedule_waveform_audio_extract(job_id, dest_path)
 
@@ -134,17 +154,12 @@ class JobLifecycleService:
 
     def save_job_meta(self, job: JobState) -> bool:
         """
-        保存任务元信息到 job_meta.json（用于重启后恢复）
+        保存任务元信息到状态仓库（SQLite）
         """
-        job_dir = Path(job.dir)
-        meta_file = job_dir / "job_meta.json"
-
         try:
-            job_dir.mkdir(parents=True, exist_ok=True)
-            temp_file = meta_file.with_suffix(".tmp")
-            with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(job.to_meta_dict(), f, indent=2, ensure_ascii=False)
-            temp_file.replace(meta_file)
+            existing = self.state_repo.get_task(job.job_id)
+            from_status = existing.status if existing else None
+            self._persist_job_state(job, from_status=from_status, reason=None)
             self.logger.debug(f"任务元信息已保存: {job.job_id}")
             return True
         except Exception as exc:
@@ -153,27 +168,27 @@ class JobLifecycleService:
 
     def load_job_meta(self, job_id: str) -> Optional[JobState]:
         """
-        从 job_meta.json 加载任务元信息
+        从状态仓库加载任务元信息
         """
-        job_dir = self.jobs_root / job_id
-        meta_file = job_dir / "job_meta.json"
-
-        if not meta_file.exists():
-            return None
-
         try:
-            with open(meta_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            job = self.state_repo.get_task(job_id)
+            if job:
+                self.logger.debug(f"从状态仓库加载任务: {job_id}")
+                return job
 
-            job = JobState.from_meta_dict(data)
-            job.dir = str(job_dir)
+            job_dir = self.jobs_root / job_id
+            if not job_dir.exists():
+                return None
 
-            corrected = self._normalize_orphaned_job(job)
-            if corrected:
-                self.save_job_meta(job)
+            legacy_job = self._load_job_meta_from_file(job_id, job_dir)
+            if legacy_job is None:
+                legacy_job = self._load_job_from_disk_legacy(job_id, job_dir)
 
-            self.logger.debug(f"从 job_meta.json 加载任务: {job_id}")
-            return job
+            if legacy_job:
+                self._persist_job_state(legacy_job, from_status=None, reason="legacy_import")
+                self.logger.info(f"已迁移旧任务到仓库: {job_id}")
+                return legacy_job
+            return None
         except Exception as exc:
             self.logger.error(f"加载任务元信息失败 {job_id}: {exc}")
             return None
@@ -186,78 +201,73 @@ class JobLifecycleService:
             if job_id in self.jobs:
                 return self.jobs[job_id]
 
-        job_dir = self.jobs_root / job_id
-        if not job_dir.exists():
-            return None
-
         job = self.load_job_meta(job_id)
         if job:
             with self.lock:
                 self.jobs[job_id] = job
-            self.logger.info(f"从 job_meta.json 恢复任务: {job_id}")
+            self.logger.info(f"从状态仓库恢复任务: {job_id}")
             return job
 
-        fallback_job = self._load_job_from_disk_legacy(job_id, job_dir)
-        if fallback_job:
-            with self.lock:
-                self.jobs[job_id] = fallback_job
-            self.save_job_meta(fallback_job)
-            self.logger.info(f"从磁盘恢复任务（旧版兼容）: {job_id}")
-        return fallback_job
+        return None
 
     def scan_incomplete_jobs(self) -> List[Dict[str, Any]]:
         """
-        扫描所有未完成的任务（有checkpoint.json的任务）
+        扫描所有未完成的任务（以状态仓库为准）
         """
         incomplete_jobs: List[Dict[str, Any]] = []
 
         try:
-            for job_dir in self.jobs_root.iterdir():
-                if not job_dir.is_dir():
+            jobs = self.state_repo.list_tasks()
+            for job in jobs:
+                if job.status in self._TERMINAL_STATUSES:
                     continue
 
-                checkpoint_path = job_dir / "checkpoint.json"
-                if not checkpoint_path.exists():
-                    continue
+                checkpoint_summary = self.state_repo.get_checkpoint_summary(job.job_id) or {}
+                total_segments = checkpoint_summary.get("total_segments", 0)
+                processed_indices = checkpoint_summary.get("processed_indices", [])
+                processed_count = len(processed_indices)
+                progress = (
+                    (processed_count / total_segments) * 100
+                    if total_segments > 0 else job.progress
+                )
+                file_path = self.job_index.get_file_path(job.job_id)
+                filename = os.path.basename(file_path) if file_path else job.filename
 
-                try:
-                    with open(checkpoint_path, "r", encoding="utf-8") as f:
-                        checkpoint_data = json.load(f)
-
-                    job_id = checkpoint_data.get("job_id") or job_dir.name
-                    total_segments = checkpoint_data.get("total_segments", 0)
-                    processed_indices = checkpoint_data.get("processed_indices", [])
-                    processed_count = len(processed_indices)
-                    progress = (
-                        (processed_count / total_segments) * 100
-                        if total_segments > 0 else 0
-                    )
-
-                    file_path = self.job_index.get_file_path(job_id)
-                    filename = os.path.basename(file_path) if file_path else "未知文件"
-                    job_meta = self.load_job_meta(job_id)
-                    status = job_meta.status if job_meta else "paused"
-
-                    incomplete_jobs.append({
-                        "job_id": job_id,
-                        "filename": filename,
-                        "file_path": file_path,
-                        "progress": round(progress, 2),
-                        "processed_segments": processed_count,
-                        "total_segments": total_segments,
-                        "phase": checkpoint_data.get("phase", "unknown"),
-                        "dir": str(job_dir),
-                        "status": status,
-                    })
-                except Exception as exc:
-                    self.logger.warning(f"读取检查点失败 {checkpoint_path}: {exc}")
-                    continue
+                incomplete_jobs.append({
+                    "job_id": job.job_id,
+                    "filename": filename,
+                    "file_path": file_path,
+                    "progress": round(progress, 2),
+                    "processed_segments": processed_count,
+                    "total_segments": total_segments,
+                    "phase": checkpoint_summary.get("phase", job.phase),
+                    "dir": job.dir,
+                    "status": job.status,
+                })
 
             self.logger.info(f"扫描到 {len(incomplete_jobs)} 个未完成任务")
             return incomplete_jobs
         except Exception as exc:
             self.logger.error(f"扫描未完成任务失败: {exc}")
             return []
+
+    def list_tasks_summary(self) -> List[Dict[str, Any]]:
+        """
+        返回任务摘要列表（用于前端同步）
+        """
+        summaries: List[Dict[str, Any]] = []
+        for job in self.state_repo.list_tasks():
+            summaries.append({
+                "id": job.job_id,
+                "filename": job.filename,
+                "title": job.title,
+                "status": job.status,
+                "progress": job.progress,
+                "message": job.message,
+                "created_time": job.createdAt,
+                "phase": job.phase,
+            })
+        return summaries
 
     def restore_job_from_checkpoint(self, job_id: str) -> Optional[JobState]:
         """
@@ -270,8 +280,9 @@ class JobLifecycleService:
         checkpoint = self._load_checkpoint(job_dir)
 
         try:
-            filename = "unknown"
-            input_path = None
+            existing_job = self.state_repo.get_task(job_id)
+            filename = existing_job.filename if existing_job else "unknown"
+            input_path = existing_job.input_path if existing_job else None
             for ext in [".mp4", ".avi", ".mkv", ".mov", ".flv", ".wmv", ".mp3", ".wav", ".m4a"]:
                 matches = list(job_dir.glob(f"*{ext}"))
                 if matches:
@@ -299,12 +310,13 @@ class JobLifecycleService:
                 message = "系统重启，任务已暂停"
                 self.logger.info(f"无检查点，任务将从头开始: {job_id}")
 
+            settings = existing_job.settings if existing_job else JobSettings()
             job = JobState(
                 job_id=job_id,
                 filename=filename,
                 dir=str(job_dir),
                 input_path=input_path,
-                settings=JobSettings(),
+                settings=settings,
                 status="paused",
                 phase=phase,
                 message=message,
@@ -312,12 +324,14 @@ class JobLifecycleService:
                 processed=processed,
                 progress=progress,
                 paused=True,
+                title=existing_job.title if existing_job else "",
+                createdAt=existing_job.createdAt if existing_job else None,
             )
 
             with self.lock:
                 self.jobs[job_id] = job
 
-            self.save_job_meta(job)
+            self._persist_job_state(job, from_status=existing_job.status if existing_job else None, reason="checkpoint_restore")
             return job
         except Exception as exc:
             self.logger.error(f"从检查点恢复任务失败: {exc}")
@@ -336,7 +350,9 @@ class JobLifecycleService:
             self.job_index.remove_mapping(file_path)
             return None
 
-        checkpoint = self._load_checkpoint(job_dir)
+        checkpoint = self.state_repo.get_checkpoint_summary(job_id)
+        if not checkpoint:
+            checkpoint = self._load_checkpoint(job_dir)
         if not checkpoint:
             return None
 
@@ -367,10 +383,11 @@ class JobLifecycleService:
             self.logger.warning(f"任务无法启动: {job_id}, 状态: {job.status}")
             return
 
+        from_status = job.status
         job.canceled = False
         job.paused = False
         job.error = None
-        self.save_job_meta(job)
+        self._persist_job_state(job, from_status=from_status, reason="start_job")
         self.logger.warning(f"start_job已废弃，请使用队列服务: {job_id}")
 
     def pause_job(self, job_id: str) -> bool:
@@ -381,10 +398,11 @@ class JobLifecycleService:
         if not job:
             return False
 
+        from_status = job.status
         job.paused = True
         job.status = "paused"
         job.message = "暂停中..."
-        self.save_job_meta(job)
+        self._persist_job_state(job, from_status=from_status, reason="pause_request")
         self.logger.info(f"⏸️ 任务暂停请求: {job_id}")
         return True
 
@@ -396,9 +414,10 @@ class JobLifecycleService:
         if not job:
             return False, "任务未找到"
 
+        from_status = job.status
         job.canceled = True
         job.message = "取消中..."
-        self.save_job_meta(job)
+        self._persist_job_state(job, from_status=from_status, reason="cancel_request")
         self.logger.info(f"🛑 任务取消请求: {job_id}, 删除数据: {delete_data}")
 
         if delete_data:
@@ -444,6 +463,7 @@ class JobLifecycleService:
                     if not success:
                         return False, "当前有进程占用，请稍后再试"
                     self.logger.info(f"已删除任务数据: {job_id}")
+                self.state_repo.delete_task(job_id)
             except Exception as exc:
                 self.logger.error(f"删除任务数据失败: {exc}")
                 return False, str(exc)
@@ -468,8 +488,22 @@ class JobLifecycleService:
                 json.dump(data, f, indent=2, ensure_ascii=False)
             os.replace(temp_path, checkpoint_path)
 
-            # 同步保存任务元信息（用于重启后恢复任务状态）
+            # 同步保存任务元信息与检查点摘要（用于重启恢复）
             self.save_job_meta(job)
+            summary = {
+                "job_id": data.get("job_id", job.job_id),
+                "phase": data.get("phase"),
+                "total_segments": data.get("total_segments"),
+                "processed_indices": data.get("processed_indices", []),
+                "processed": len(data.get("processed_indices", [])),
+                "language": data.get("language"),
+            }
+            self.state_repo.save_checkpoint_summary(
+                job_id=job.job_id,
+                summary=summary,
+                file_path=str(checkpoint_path),
+                checksum=None,
+            )
         except Exception as exc:
             self.logger.error(f"保存检查点失败: {exc}", exc_info=True)
             raise
@@ -528,17 +562,99 @@ class JobLifecycleService:
 
     # ====== internal helpers ======
 
-    def _normalize_orphaned_job(self, job: JobState) -> bool:
+    def _apply_restart_pause(self, job: JobState) -> bool:
         """
-        系统重启后纠偏：将运行态任务标记为暂停，避免前端显示“转录中”。
+        系统重启纠偏：将非终态任务统一标记为暂停。
         """
-        if job.status not in self._ACTIVE_STATUSES:
+        if job.status in self._TERMINAL_STATUSES:
             return False
 
+        changed = (
+            job.status != "paused"
+            or not job.paused
+            or job.message != "系统重启，任务已暂停"
+        )
         job.status = "paused"
         job.paused = True
         job.message = "系统重启，任务已暂停"
-        return True
+        return changed
+
+    def _persist_job_state(
+        self,
+        job: JobState,
+        from_status: Optional[str],
+        reason: Optional[str]
+    ) -> None:
+        with self.state_repo.transaction() as conn:
+            self.state_repo.upsert_task(job, conn=conn)
+            if from_status and from_status != job.status:
+                self.event_bus.emit_status_event(
+                    job_id=job.job_id,
+                    from_status=from_status,
+                    to_status=job.status,
+                    reason=reason,
+                    conn=conn,
+                )
+            elif reason:
+                self.event_bus.emit_status_event(
+                    job_id=job.job_id,
+                    from_status=from_status,
+                    to_status=job.status,
+                    reason=reason,
+                    conn=conn,
+                )
+
+    def _import_legacy_tasks_from_disk(self) -> None:
+        """
+        兼容迁移：从旧版 job_meta.json / checkpoint.json 导入任务。
+        """
+        imported = 0
+        for job_dir in self.jobs_root.iterdir():
+            if not job_dir.is_dir():
+                continue
+
+            job_id = job_dir.name
+            if self.state_repo.get_task(job_id):
+                continue
+
+            job = self._load_job_meta_from_file(job_id, job_dir)
+            if job is None:
+                job = self._load_job_from_disk_legacy(job_id, job_dir)
+
+            if job:
+                self.state_repo.upsert_task(job)
+                self.state_repo.record_event(
+                    job_id=job.job_id,
+                    event_type="legacy_import",
+                    from_status=None,
+                    to_status=job.status,
+                    reason="legacy_import",
+                    payload={"source": "job_meta_or_checkpoint"},
+                )
+                if job.input_path:
+                    self.job_index.add_mapping(job.input_path, job.job_id)
+                imported += 1
+
+        if imported > 0:
+            self.logger.info(f"已导入 {imported} 个旧任务到状态仓库")
+
+    def _load_job_meta_from_file(self, job_id: str, job_dir: Path) -> Optional[JobState]:
+        """
+        旧版兼容：从 job_meta.json 读取任务元信息。
+        """
+        meta_file = job_dir / "job_meta.json"
+        if not meta_file.exists():
+            return None
+        try:
+            with open(meta_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            job = JobState.from_meta_dict(data)
+            job.dir = str(job_dir)
+            self.logger.debug(f"从 job_meta.json 读取任务: {job_id}")
+            return job
+        except Exception as exc:
+            self.logger.warning(f"读取 job_meta.json 失败 {job_id}: {exc}")
+            return None
 
     def _load_job_from_disk_legacy(self, job_id: str, job_dir: Path) -> Optional[JobState]:
         """

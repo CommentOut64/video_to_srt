@@ -641,115 +641,12 @@ def create_transcription_router(
             返回所有任务列表（第二阶段修复：实时更新）
             包含活跃任务 + 历史完成任务
             """
-            from app.services.job_index_service import get_job_index_service
-            from app.core.config import config
-            from pathlib import Path
-            import json as json_module
-
-            jobs_summary = []
-
-            # 1. 添加活跃任务（从队列中）
-            with queue_service.lock:
-                for jid, job in queue_service.jobs.items():
-                    jobs_summary.append({
-                        "id": jid,
-                        "status": job.status,
-                        "progress": job.progress,
-                        "filename": job.filename,
-                        "title": job.title if hasattr(job, 'title') else "",  # 用户自定义名称
-                        "message": job.message,
-                        "created_time": job.createdAt if hasattr(job, 'createdAt') else None,
-                        "phase": job.phase if hasattr(job, 'phase') else 'unknown'
-                    })
-
-                queue_list = list(queue_service.queue)
-                running_id = queue_service.running_job_id
-                interrupted_id = queue_service.interrupted_job_id
-
-            # 2. 添加历史完成任务（从 jobs 目录）
-            try:
-                jobs_root = Path(config.JOBS_DIR)
-                job_index = get_job_index_service(config.JOBS_DIR)
-                active_job_ids = set(jid for jid, _ in queue_service.jobs.items())
-
-                for job_dir in jobs_root.iterdir():
-                    if not job_dir.is_dir():
-                        continue
-
-                    job_id = job_dir.name
-                    if job_id in active_job_ids:
-                        # 已在活跃任务中，跳过
-                        continue
-
-                    # 尝试找到文件名
-                    filename = "未知文件"
-                    file_path = job_index.get_file_path(job_id)
-                    if file_path:
-                        filename = os.path.basename(file_path)
-                    else:
-                        # 从目录中找视频文件（排除 proxy 视频）
-                        for ext in ['.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv', '.mp3', '.wav', '.m4a']:
-                            matches = list(job_dir.glob(f"*{ext}"))
-                            # 过滤掉 proxy 视频文件
-                            matches = [m for m in matches if m.name not in ['preview_360p.mp4', 'proxy_720p.mp4']]
-                            if matches:
-                                filename = matches[0].name
-                                break
-
-                    # 检查是否完成
-                    srt_files = list(job_dir.glob("*.srt"))
-                    is_finished = len(srt_files) > 0
-
-                    # 获取创建时间
-                    try:
-                        stat = job_dir.stat()
-                        created_time = int(stat.st_ctime * 1000)
-                    except:
-                        created_time = None
-
-                    # 尝试从 checkpoint 获取进度
-                    progress = 100 if is_finished else 0
-                    phase = 'editing' if is_finished else 'transcribing'
-                    status = 'finished' if is_finished else 'processing'
-
-                    checkpoint_path = job_dir / "checkpoint.json"
-                    if checkpoint_path.exists():
-                        try:
-                            with open(checkpoint_path, 'r', encoding='utf-8') as f:
-                                checkpoint_data = json_module.load(f)
-                                total_segments = checkpoint_data.get('total_segments', 0)
-                                processed_indices = checkpoint_data.get('processed_indices', [])
-                                if total_segments > 0:
-                                    progress = (len(processed_indices) / total_segments) * 100
-                                phase = checkpoint_data.get('phase', 'transcribing')
-                        except:
-                            pass
-
-                    # 尝试从 state.json 读取 title
-                    title = ""
-                    state_file = job_dir / "state.json"
-                    if state_file.exists():
-                        try:
-                            with open(state_file, 'r', encoding='utf-8') as f:
-                                state_data = json_module.load(f)
-                                title = state_data.get('title', '')
-                        except:
-                            pass
-
-                    jobs_summary.append({
-                        "id": job_id,
-                        "status": status,
-                        "progress": min(progress, 100),
-                        "filename": filename,
-                        "title": title,  # 用户自定义名称
-                        "message": "已完成" if is_finished else "处理中",
-                        "created_time": created_time,
-                        "phase": phase
-                    })
-
-            except Exception as e:
-                logger = logging.getLogger(__name__)
-                logger.warning(f"加载历史任务失败: {e}")
+            lifecycle = transcription_service.job_lifecycle
+            queue_state = lifecycle.state_repo.load_queue_state()
+            queue_list = queue_state.queue if queue_state else []
+            running_id = queue_state.running_job_id if queue_state else None
+            interrupted_id = queue_state.interrupted_job_id if queue_state else None
+            jobs_summary = lifecycle.list_tasks_summary()
 
             return {
                 "queue": queue_list,
@@ -777,141 +674,13 @@ def create_transcription_router(
         返回所有任务列表（处理中 + 已完成），前端用此接口同步后端实际存在的任务
         此接口为真实源，用于修复幽灵任务问题
         """
-        from app.services.job_index_service import get_job_index_service
-        from app.core.config import config
-        from pathlib import Path
-        import json as json_module
-
-        queue_service = get_queue_service(transcription_service)
-        job_index = get_job_index_service(config.JOBS_DIR)
-        jobs_root = Path(config.JOBS_DIR)
-
-        # 清理无效映射（任务或文件不存在的映射）
-        job_index.cleanup_invalid_mappings()
-
-        # 收集所有任务
-        all_tasks = {}  # 使用 dict 避免重复，key 为 job_id
-
-        # 1. 队列中的任务（处理中或等待中）- 优先级最高
-        # [V3.1.0] 过滤幽灵任务：检测目录是否存在，不存在则从内存移除
-        ghost_job_ids = []
-        with queue_service.lock:
-            for job_id, job in list(queue_service.jobs.items()):
-                job_dir = jobs_root / job_id
-                if not job_dir.exists():
-                    # 检测到幽灵任务
-                    ghost_job_ids.append(job_id)
-                    continue
-
-                all_tasks[job_id] = {
-                    "id": job.job_id,
-                    "filename": job.filename,
-                    "title": job.title if hasattr(job, 'title') else "",  # 用户自定义名称
-                    "status": job.status,
-                    "progress": job.progress,
-                    "message": job.message,
-                    "created_time": job.createdAt if hasattr(job, 'createdAt') else None,
-                    "phase": job.phase if hasattr(job, 'phase') else 'unknown'
-                }
-
-        # [V3.1.0] 清理检测到的幽灵任务
-        if ghost_job_ids:
-            logger = logging.getLogger(__name__)
-            with queue_service.lock:
-                for ghost_id in ghost_job_ids:
-                    if ghost_id in queue_service.jobs:
-                        del queue_service.jobs[ghost_id]
-                    if ghost_id in queue_service.queue:
-                        queue_service.queue.remove(ghost_id)
-            logger.warning(f"[sync_tasks] 清理了 {len(ghost_job_ids)} 个幽灵任务: {ghost_job_ids}")
-
-        # 2. 扫描 jobs 目录中的所有任务（包括已完成的）
-        try:
-            for job_dir in jobs_root.iterdir():
-                if not job_dir.is_dir():
-                    continue
-
-                job_id = job_dir.name
-                if job_id in all_tasks:
-                    # 已在队列中，跳过
-                    continue
-
-                # 尝试找到文件名
-                filename = "未知文件"
-
-                # 1. 从 job_index 查找
-                file_path = job_index.get_file_path(job_id)
-                if file_path:
-                    filename = os.path.basename(file_path)
-                else:
-                    # 2. 从目录中找视频文件（排除 proxy 视频）
-                    for ext in ['.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv', '.mp3', '.wav', '.m4a']:
-                        matches = list(job_dir.glob(f"*{ext}"))
-                        # 过滤掉 proxy 视频文件
-                        matches = [m for m in matches if m.name not in ['preview_360p.mp4', 'proxy_720p.mp4']]
-                        if matches:
-                            filename = matches[0].name
-                            break
-
-                # 判断任务是否完成
-                srt_files = list(job_dir.glob("*.srt"))
-                is_finished = len(srt_files) > 0
-
-                # 获取创建时间
-                try:
-                    stat = job_dir.stat()
-                    created_time = int(stat.st_ctime * 1000)
-                except:
-                    created_time = None
-
-                # 尝试从 checkpoint 获取进度信息
-                checkpoint_path = job_dir / "checkpoint.json"
-                progress = 100 if is_finished else 0
-                phase = 'editing' if is_finished else 'transcribing'
-                status = 'finished' if is_finished else 'processing'
-
-                if checkpoint_path.exists():
-                    try:
-                        with open(checkpoint_path, 'r', encoding='utf-8') as f:
-                            checkpoint_data = json_module.load(f)
-                            total_segments = checkpoint_data.get('total_segments', 0)
-                            processed_indices = checkpoint_data.get('processed_indices', [])
-                            if total_segments > 0:
-                                progress = (len(processed_indices) / total_segments) * 100
-                            phase = checkpoint_data.get('phase', 'transcribing')
-                    except:
-                        pass
-
-                # 尝试从 state.json 读取 title
-                title = ""
-                state_file = job_dir / "state.json"
-                if state_file.exists():
-                    try:
-                        with open(state_file, 'r', encoding='utf-8') as f:
-                            state_data = json_module.load(f)
-                            title = state_data.get('title', '')
-                    except:
-                        pass
-
-                all_tasks[job_id] = {
-                    "id": job_id,
-                    "filename": filename,
-                    "title": title,  # 用户自定义名称
-                    "status": status,
-                    "progress": min(progress, 100),  # 确保不超过100
-                    "message": "已完成" if is_finished else "处理中",
-                    "created_time": created_time,
-                    "phase": phase
-                }
-
-        except Exception as e:
-            logger = logging.getLogger(__name__)
-            logger.error(f"扫描 jobs 目录失败: {e}")
+        lifecycle = transcription_service.job_lifecycle
+        tasks = lifecycle.list_tasks_summary()
 
         return {
             "success": True,
-            "tasks": list(all_tasks.values()),
-            "count": len(all_tasks),
+            "tasks": tasks,
+            "count": len(tasks),
             "timestamp": int(time.time() * 1000)
         }
 
@@ -939,25 +708,24 @@ def create_transcription_router(
             job_id: 任务ID
             include_media: 是否包含媒体状态信息（默认True）
         """
-        queue_service = get_queue_service(transcription_service)
-        job = queue_service.get_job(job_id)
+        job = transcription_service.get_job(job_id)
         if not job:
-            # 如果队列服务中没有，尝试从transcription_service获取
-            job = transcription_service.get_job(job_id)
-            if not job:
-                raise HTTPException(status_code=404, detail="任务未找到")
+            raise HTTPException(status_code=404, detail="任务未找到")
 
         # 返回状态（新增queue_position字段）
         result = job.to_dict()
 
         # 计算队列位置
-        with queue_service.lock:
-            if job_id in queue_service.queue:
-                result["queue_position"] = list(queue_service.queue).index(job_id) + 1
-            elif job_id == queue_service.running_job_id:
-                result["queue_position"] = 0  # 0表示正在执行
+        queue_state = transcription_service.job_lifecycle.state_repo.load_queue_state()
+        if queue_state:
+            if job_id in queue_state.queue:
+                result["queue_position"] = queue_state.queue.index(job_id) + 1
+            elif job_id == queue_state.running_job_id:
+                result["queue_position"] = 0
             else:
-                result["queue_position"] = -1  # -1表示不在队列中
+                result["queue_position"] = -1
+        else:
+            result["queue_position"] = -1
 
         # 添加媒体状态信息（用于编辑器）
         if include_media and job.status == "finished" and job.dir:
@@ -1132,38 +900,40 @@ def create_transcription_router(
         job_dir = Path(job.dir)
         checkpoint_path = job_dir / "checkpoint.json"
 
-        if not checkpoint_path.exists():
+        summary = transcription_service.job_lifecycle.state_repo.get_checkpoint_summary(job_id)
+        if not summary and checkpoint_path.exists():
+            try:
+                with open(checkpoint_path, "r", encoding="utf-8") as f:
+                    summary = json.load(f)
+            except Exception as e:
+                return {
+                    "can_resume": False,
+                    "message": f"检查点文件损坏: {str(e)}"
+                }
+
+        if not summary:
             return {
                 "can_resume": False,
                 "message": "无检查点"
             }
 
-        try:
-            with open(checkpoint_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+        total_segments = summary.get("total_segments", 0)
+        processed_indices = summary.get("processed_indices", [])
+        processed_count = len(processed_indices)
 
-            total_segments = data.get('total_segments', 0)
-            processed_indices = data.get('processed_indices', [])
-            processed_count = len(processed_indices)
+        if total_segments > 0:
+            progress = (processed_count / total_segments) * 100
+        else:
+            progress = 0
 
-            if total_segments > 0:
-                progress = (processed_count / total_segments) * 100
-            else:
-                progress = 0
-
-            return {
-                "can_resume": True,
-                "progress": round(progress, 2),
-                "processed_segments": processed_count,
-                "total_segments": total_segments,
-                "phase": data.get('phase', 'unknown'),
-                "message": f"检测到上次进度 ({progress:.1f}%)，可从断点继续"
-            }
-        except Exception as e:
-            return {
-                "can_resume": False,
-                "message": f"检查点文件损坏: {str(e)}"
-            }
+        return {
+            "can_resume": True,
+            "progress": round(progress, 2),
+            "processed_segments": processed_count,
+            "total_segments": total_segments,
+            "phase": summary.get("phase", "unknown"),
+            "message": f"检测到上次进度 ({progress:.1f}%)，可从断点继续"
+        }
 
     @router.get("/checkpoint-settings/{job_id}")
     async def get_checkpoint_settings(job_id: str):
@@ -1175,7 +945,12 @@ def create_transcription_router(
             raise HTTPException(status_code=404, detail="任务未找到")
 
         job_dir = Path(job.dir)
-        checkpoint_path = job_dir / "checkpoint.json"
+        summary = transcription_service.job_lifecycle.state_repo.get_checkpoint_summary(job_id)
+        checkpoint_path = None
+        if summary and summary.get("_file_path"):
+            checkpoint_path = Path(summary["_file_path"])
+        if not checkpoint_path:
+            checkpoint_path = job_dir / "checkpoint.json"
 
         if not checkpoint_path.exists():
             return {"has_checkpoint": False}

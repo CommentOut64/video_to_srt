@@ -710,7 +710,7 @@ class TranscriptionService:
 
     def save_job_meta(self, job: JobState) -> bool:
         """
-        保存任务元信息到 job_meta.json（用于重启后恢复）
+        保存任务元信息到状态仓库（用于重启后恢复）
 
         使用原子写入确保断电安全：先写临时文件，再rename替换
 
@@ -724,7 +724,7 @@ class TranscriptionService:
 
     def load_job_meta(self, job_id: str) -> Optional[JobState]:
         """
-        从 job_meta.json 加载任务元信息
+        从状态仓库加载任务元信息
 
         Args:
             job_id: 任务ID

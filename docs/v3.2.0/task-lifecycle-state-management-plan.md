@@ -63,21 +63,21 @@
 
 ## 6. 实现方案（分阶段）
 
-### Phase A：引入状态仓库与读写入口
+### Phase A：引入状态仓库与读写入口（已完成）
 - 新增 `TaskStateRepository`（SQLite CRUD + 事务）。
 - `JobLifecycleService` 改为只读/写仓库，不再写 `job_meta.json` 作为权威。
 
-### Phase B：队列服务接入仓库
+### Phase B：队列服务接入仓库（已完成）
 - `JobQueueService` 只通过仓库维护队列顺序与任务状态。
 - `resume/pause/cancel` 均事务化更新任务表 + 队列表 + 事件表。
 - 重启恢复：读取 `QueueState` + `TaskHeartbeat` 自动纠偏。
 
-### Phase C：API 统一读取
+### Phase C：API 统一读取（已完成）
 - `/sync-tasks` 直接读仓库，不再扫描目录推断状态。
 - `/status/{job_id}`、`/resume/{job_id}` 统一读仓库状态。
 - SSE 状态推送基于仓库事件。
 
-### Phase D：断点恢复统一
+### Phase D：断点恢复统一（已完成）
 - `Checkpoint` 表只保存最新摘要（路径/哈希/更新时间）。
 - 断点恢复 API 从仓库读取并验证一致性。
 
@@ -100,8 +100,14 @@
 
 ## 8. 数据迁移策略
 
+**兼容性目标**：
+- 升级后**所有旧任务数据无需手动迁移**，系统启动时自动完成转换，用户无感过渡。
+- 已完成任务保持完成态，未完成任务统一进入暂停态，避免误判“转录中”。
+
+**自动迁移流程**：
 - 首次启动：读取旧 `job_meta.json` / `queue_state.json` / `checkpoint.json`，
   写入 SQLite 并记录迁移事件。
+- 若检测到任务缺少仓库记录，触发幂等导入（不会重复覆盖新状态）。
 - 迁移完成后不再依赖旧文件，只保留备份用于诊断。
 
 ## 9. 测试与验收
