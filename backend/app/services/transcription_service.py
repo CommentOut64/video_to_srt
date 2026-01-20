@@ -10,7 +10,6 @@ from dataclasses import dataclass, field
 from collections import OrderedDict  # 新增导入
 from pydub import AudioSegment, silence
 from app.services.whisper_service import get_whisper_service, load_audio as whisper_load_audio
-from app.services.config_adapter import ConfigAdapter
 # 从新架构导入 VAD 配置（2025-12-17 统一配置定义）
 from app.services.audio.vad_service import VADConfig, VADMethod, get_vad_service
 from app.services.audio.chunk_engine import ChunkEngine, AudioChunk
@@ -186,7 +185,7 @@ class CircuitBreakHandler:
 
         Args:
             job: 任务状态对象
-            settings: DemucsSettings 配置对象
+            settings: 预处理配置对象
         """
         self.job = job
         self.settings = settings
@@ -313,7 +312,7 @@ class CircuitBreakHandler:
 
 
 from app.models.job_models import JobSettings, JobState
-from app.models.hardware_models import HardwareInfo, OptimizationConfig, CPUAffinityConfig
+from app.models.hardware_models import HardwareInfo, OptimizationConfig
 from app.services.hardware_profile_service import get_hardware_profile_provider
 from app.services.job_index_service import get_job_index_service
 from app.core.config import config  # 导入统一配置
@@ -353,14 +352,6 @@ class TranscriptionService:
         self.sse_manager = get_sse_manager()
         self.logger.info("SSE管理器已集成")
 
-        # 初始化新架构 Pipeline（2025-12-17 架构改造）
-        from app.pipelines.audio_processing_pipeline import AudioProcessingPipeline
-        from app.pipelines.async_dual_pipeline import AsyncDualPipeline
-
-        self.audio_pipeline = None  # 延迟初始化，等硬件检测完成
-        self.transcription_pipeline = None  # 延迟初始化，等硬件检测完成
-        self.logger.info("Pipeline 架构已准备")
-
         # 记录CPU信息
         sys_info = self.hardware_profile_provider.get_cpu_system_info()
         if sys_info.get('supported', False):
@@ -393,57 +384,8 @@ class TranscriptionService:
                              f"内存: {hw.memory_total_mb}MB, "
                              f"优化配置: batch={opt.batch_size}, device={opt.recommended_device}")
 
-            # 硬件检测完成后，初始化 Pipeline
-            self._initialize_pipelines()
         except Exception as e:
             self.logger.error(f"硬件检测失败: {e}")
-
-    def _initialize_pipelines(self):
-        """
-        初始化新架构 Pipeline（2025-12-17 架构改造）
-
-        职责：组装 - 根据硬件配置初始化 AudioProcessingPipeline 和 AsyncDualPipeline
-
-        注意：PreprocessingPipeline 不在这里初始化，因为它需要动态配置（每个任务可能不同）
-        """
-        try:
-            from app.pipelines.audio_processing_pipeline import (
-                AudioProcessingPipeline,
-                AudioProcessingConfig
-            )
-            from app.pipelines.async_dual_pipeline import AsyncDualPipeline
-
-            # 初始化音频处理流水线（旧架构，保持向后兼容）
-            from app.services.runtime_param_resolver import build_vad_config
-
-            audio_config = AudioProcessingConfig(
-                vad_config=build_vad_config(),
-                enable_demucs=True,
-                auto_strategy=True
-            )
-            self.audio_pipeline = AudioProcessingPipeline(
-                logger=self.logger
-            )
-
-            # V3.5: 转录流水线在每次任务执行时动态创建（根据 transcription_profile 配置）
-            # 不再在这里初始化 self.transcription_pipeline
-            self.transcription_pipeline = None
-
-            self.logger.info("Pipeline 初始化完成")
-        except Exception as e:
-            self.logger.error(f"Pipeline 初始化失败: {e}")
-            self.audio_pipeline = None
-            self.transcription_pipeline = None
-
-    def _is_new_asr_engine_enabled(self) -> bool:
-        """
-        判断是否启用新 ASR 引擎适配（支持回滚开关）。
-
-        环境变量:
-            USE_NEW_ASR_ENGINE=false 时关闭新引擎路径
-        """
-        flag = os.getenv("USE_NEW_ASR_ENGINE", "true").strip().lower()
-        return flag not in {"0", "false", "no"}
 
     def _build_asr_engines(
         self,
@@ -463,27 +405,24 @@ class TranscriptionService:
         """
         from app.core.asr.engine import ASREngine
         from app.engines.factory import ASREngineFactory
-        from app.services.config_adapter import ConfigAdapter
-
-        settings = job.settings
-        engine_name = getattr(settings, "engine", "sensevoice")
-        if engine_name != "sensevoice":
-            self.logger.info("非 SenseVoice 引擎，保持旧路径: engine=%s", engine_name)
-            return None, None
 
         draft_engine: Optional[ASREngine] = ASREngineFactory.create("sensevoice")
 
         if transcription_profile == "sensevoice_only":
             return draft_engine, None
 
-        model_name = ConfigAdapter.get_whisper_model(settings)
-        device = getattr(settings, "device", "cuda")
-        compute_type = getattr(settings, "compute_type", "auto")
+        transcription = getattr(job.settings, "transcription", None)
+        model_name = getattr(transcription, "whisper_model", "medium")
+        device = (
+            self._optimization_config.recommended_device
+            if self._optimization_config
+            else "cuda"
+        )
         patch_engine: Optional[ASREngine] = ASREngineFactory.create(
             "whisper",
             model_name=model_name,
             device=device,
-            compute_type=compute_type,
+            compute_type=None,
         )
 
         return draft_engine, patch_engine
@@ -499,16 +438,13 @@ class TranscriptionService:
         注意：此方法是简化版，暂不支持断点续传、任务状态管理等复杂功能
         这些功能将在后续阶段逐步集成
 
-        支持两种预处理模式：
-        - 新架构：PreprocessingPipeline（Stage模式，支持频谱分诊、按需分离、熔断回溯）
-        - 旧架构：AudioProcessingPipeline（整轨分离）
+        使用新架构 PreprocessingPipeline + AsyncDualPipeline
 
         Args:
             job: 任务状态对象
         """
         try:
             from app.pipelines.async_dual_pipeline import AsyncDualPipeline
-            from app.services.config_adapter import ConfigAdapter
 
             job_dir = Path(job.dir)
             input_path = job_dir / job.filename
@@ -518,26 +454,9 @@ class TranscriptionService:
             # ==========================================
             self._update_progress(job, 'audio_processing', 0, '音频处理中...')
 
-            # 判断使用哪种预处理架构
-            use_new_preprocessing = self._should_use_new_preprocessing(job.settings)
-
-            if use_new_preprocessing:
-                # 使用新架构：PreprocessingPipeline（Stage模式）
-                self.logger.info("使用新架构预处理流水线（Stage模式）")
-                chunks = await self._run_new_preprocessing(job, input_path)
-            else:
-                # 使用旧架构：AudioProcessingPipeline（整轨分离）
-                self.logger.info("使用旧架构预处理流水线（整轨分离）")
-                if not self.audio_pipeline:
-                    raise RuntimeError("旧架构 Pipeline 未初始化")
-
-                audio_result = await self.audio_pipeline.process(
-                    video_path=str(input_path),
-                    progress_callback=lambda p: self._update_progress(
-                        job, 'audio_processing', p, f'音频处理中 {int(p*100)}%'
-                    )
-                )
-                chunks = audio_result.chunks
+            # 使用新架构：PreprocessingPipeline（Stage模式）
+            self.logger.info("使用新架构预处理流水线（Stage模式）")
+            chunks = await self._run_new_preprocessing(job, input_path)
 
             job.total = len(chunks)
             self.logger.info(f"音频处理完成: {len(chunks)} 个 Chunk")
@@ -549,50 +468,45 @@ class TranscriptionService:
             self._update_progress(job, 'transcription', 0, '转录中...')
 
             # 获取转录模式配置
-            transcription_profile = ConfigAdapter.get_transcription_profile(job.settings)
+            transcription = getattr(job.settings, "transcription", None)
+            transcription_profile = (
+                transcription.transcription_profile
+                if transcription else "sensevoice_only"
+            )
             self.logger.info(f"转录模式: {transcription_profile}")
 
-            use_new_asr_engine = self._is_new_asr_engine_enabled()
-            draft_engine = None
-            patch_engine = None
-            if not use_new_asr_engine:
-                self.logger.info("USE_NEW_ASR_ENGINE=false，使用旧 ASR 执行器路径")
-            if use_new_asr_engine:
-                try:
-                    draft_engine, patch_engine = self._build_asr_engines(job, transcription_profile)
-                except Exception as e:
-                    self.logger.error("新 ASR 引擎初始化失败，回退旧路径: %s", e, exc_info=True)
-                    use_new_asr_engine = False
-            if use_new_asr_engine:
-                draft_name = draft_engine.get_engine_name() if draft_engine else "none"
-                patch_name = patch_engine.get_engine_name() if patch_engine else "none"
-                self.logger.info(
-                    "新 ASR 引擎已启用: draft=%s, patch=%s, profile=%s",
-                    draft_name,
-                    patch_name,
-                    transcription_profile,
-                )
-            else:
-                self.logger.info("新 ASR 引擎未启用，继续使用旧路径")
+            draft_engine, patch_engine = self._build_asr_engines(job, transcription_profile)
+            draft_name = draft_engine.get_engine_name() if draft_engine else "none"
+            patch_name = patch_engine.get_engine_name() if patch_engine else "none"
+            self.logger.info(
+                "新 ASR 引擎已启用: draft=%s, patch=%s, profile=%s",
+                draft_name,
+                patch_name,
+                transcription_profile,
+            )
 
             from app.core.thresholds import ThresholdConfig
-            patching_threshold_value = ConfigAdapter.get_patching_threshold(job.settings)
+            patching_threshold_value = getattr(
+                transcription,
+                "patching_threshold",
+                0.60,
+            )
             patching_threshold = ThresholdConfig(
                 whisper_patch_trigger_confidence=patching_threshold_value
             )
 
             # 动态创建转录流水线
-            self.transcription_pipeline = AsyncDualPipeline(
+            transcription_pipeline = AsyncDualPipeline(
                 job_id=job.job_id,
                 transcription_profile=transcription_profile,
-                draft_engine=draft_engine if use_new_asr_engine else None,
-                patch_engine=patch_engine if use_new_asr_engine else None,
+                draft_engine=draft_engine,
+                patch_engine=patch_engine,
                 patching_threshold=patching_threshold,
                 logger=self.logger
             )
 
             # 调用转录流水线
-            results = await self.transcription_pipeline.run(
+            results = await transcription_pipeline.run(
                 audio_chunks=chunks
             )
 
@@ -688,43 +602,6 @@ class TranscriptionService:
 
         return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
-    def _should_use_new_preprocessing(self, settings: JobSettings) -> bool:
-        """
-        判断是否使用新架构预处理流水线
-
-        判断逻辑：
-        - 如果启用了频谱分诊（enable_spectral_triage=True）
-        - 或者启用了熔断回溯（enable_fuse_breaker=True）
-        - 或者使用按需分离模式（separation_mode='on_demand'）
-        则使用新架构
-
-        Args:
-            settings: 任务设置
-
-        Returns:
-            bool: True表示使用新架构，False表示使用旧架构
-        """
-        preprocessing = settings.preprocessing
-
-        # 调试日志：输出配置值
-        self.logger.info(
-            f"预处理配置检查: "
-            f"enable_spectral_triage={preprocessing.enable_spectral_triage}, "
-            f"enable_fuse_breaker={preprocessing.enable_fuse_breaker}, "
-            f"separation_mode={preprocessing.separation_mode}"
-        )
-
-        # 检查是否启用了新功能
-        use_new = (
-            preprocessing.enable_spectral_triage or
-            preprocessing.enable_fuse_breaker or
-            preprocessing.separation_mode == 'on_demand'
-        )
-
-        self.logger.info(f"使用{'新' if use_new else '旧'}架构预处理流水线")
-
-        return use_new
-
     async def _run_new_preprocessing(self, job: JobState, input_path: Path) -> List:
         """
         使用新架构预处理流水线处理音频
@@ -819,19 +696,16 @@ class TranscriptionService:
     
     def get_optimized_job_settings(self, base_settings: Optional[JobSettings] = None) -> JobSettings:
         """获取基于硬件优化的任务设置"""
-        # 使用硬件优化配置作为默认值
-        if self._optimization_config:
-            optimized = JobSettings(
-                model=base_settings.model if base_settings else "medium",
-                compute_type=base_settings.compute_type if base_settings else "auto",
-                device=self._optimization_config.recommended_device,
-                batch_size=self._optimization_config.batch_size,
-                word_timestamps=base_settings.word_timestamps if base_settings else False
-            )
-            return optimized
-        
-        # 如果没有硬件信息，使用传入的设置或默认设置
-        return base_settings or JobSettings()
+        settings = base_settings or JobSettings()
+
+        # 基于硬件推荐优化 SenseVoice 设备选择
+        if (
+            self._optimization_config
+            and settings.transcription.sensevoice_device == "auto"
+        ):
+            settings.transcription.sensevoice_device = self._optimization_config.recommended_device
+
+        return settings
 
     def create_job(
         self,
@@ -1178,15 +1052,6 @@ class TranscriptionService:
                 self.logger.warning(f"无法找到任务 {job_id} 的输入文件")
                 return None
 
-            # 创建默认的CPU亲和性配置
-            from app.models.hardware_models import CPUAffinityConfig
-            default_cpu_config = CPUAffinityConfig(
-                enabled=True,
-                strategy="auto",
-                custom_cores=None,
-                exclude_cores=None
-            )
-
             # 根据是否有 checkpoint 决定恢复状态
             if checkpoint:
                 # 有 checkpoint，从断点恢复
@@ -1212,7 +1077,7 @@ class TranscriptionService:
                 filename=filename,
                 dir=str(job_dir),
                 input_path=input_path,
-                settings=JobSettings(cpu_affinity=default_cpu_config),
+                settings=JobSettings(),
                 status="paused",
                 phase=phase,
                 message=message,
@@ -1832,33 +1697,8 @@ class TranscriptionService:
             data: 检查点数据
             job: 任务状态对象（用于获取settings）
         """
-        # 添加原始设置到checkpoint（用于校验参数兼容性）
-        # 使用 ConfigAdapter 统一新旧配置
-        demucs_strategy = ConfigAdapter.get_demucs_strategy(job.settings)
-        data["original_settings"] = {
-            "model": job.settings.model,
-            "device": job.settings.device,
-            "word_timestamps": job.settings.word_timestamps,
-            "compute_type": job.settings.compute_type,
-            "batch_size": job.settings.batch_size,
-            "demucs": {
-                "enabled": ConfigAdapter.is_demucs_enabled(job.settings),
-                "mode": demucs_strategy,
-            }
-        }
-
-        # 确保 demucs 字段存在（向后兼容）
-        if "demucs" not in data:
-            data["demucs"] = {
-                "enabled": ConfigAdapter.is_demucs_enabled(job.settings),
-                "mode": demucs_strategy,
-                "bgm_level": "none",
-                "bgm_ratios": [],
-                "global_separation_done": False,
-                "vocals_path": None,
-                "circuit_breaker": None,
-                "retry_triggered": False
-            }
+        # 添加原始设置到 checkpoint（用于断点续传一致性）
+        data["original_settings"] = job.settings.to_dict()
 
         checkpoint_path = job_dir / "checkpoint.json"
         temp_path = checkpoint_path.with_suffix(".tmp")
@@ -2159,50 +1999,6 @@ class TranscriptionService:
             from app.services.demucs_service import BGMLevel
             return BGMLevel.NONE, []
     
-    def _detect_bgm_legacy(self, audio_path: str, job: JobState):
-        """
-        [已废弃] 执行BGM检测（旧版：分位数采样 + Demucs 检测）
-        
-        ⚠️ 此方法已废弃，保留供参考和回退使用
-        问题：Demucs 分离残差约 1-3%，导致纯人声也被误判为 light
-        
-        新方法请使用 _detect_bgm()（频谱分诊版本）
-
-        Args:
-            audio_path: 音频文件路径
-            job: 任务状态对象
-
-        Returns:
-            Tuple[BGMLevel, List[float]]: (BGM强度级别, 各采样点的BGM比例列表)
-        """
-        from app.services.demucs_service import get_demucs_service, BGMLevel
-
-        self._update_progress(job, 'bgm_detect', 0, 'BGM检测中...')
-
-        try:
-            demucs = get_demucs_service()
-
-            # 执行BGM检测（旧版：分位数采样）
-            level, ratios = demucs.detect_background_music_level(audio_path)
-
-            self._update_progress(job, 'bgm_detect', 1, f'BGM检测完成: {level.value}')
-
-            # 推送SSE事件
-            self._push_sse_bgm_detected(job, level, ratios)
-
-            self.logger.info(
-                f"BGM检测结果: {level.value}, "
-                f"比例={ratios}, 最大={max(ratios) if ratios else 0:.2f}"
-            )
-
-            return level, ratios
-
-        except Exception as e:
-            self.logger.warning(f"BGM检测失败，将跳过Demucs: {e}")
-            # 失败时返回 NONE 级别，不影响主流程
-            from app.services.demucs_service import BGMLevel
-            return BGMLevel.NONE, []
-
     def _separate_vocals_global(self, audio_path: str, job: JobState) -> str:
         """
         执行全局人声分离，更新进度
@@ -2326,13 +2122,16 @@ class TranscriptionService:
             sse_manager = get_sse_manager()
             channel_id = f"job:{job.job_id}"
 
-            # 构造事件数据 (使用 ConfigAdapter 兼容新旧配置)
+            preprocessing = getattr(job.settings, "preprocessing", None)
+            max_escalations = max(1, getattr(preprocessing, "demucs_shifts", 1))
+
+            # 构造事件数据
             event_data = {
                 "from_model": from_model,
                 "to_model": to_model,
                 "reason": reason,
                 "escalation_count": breaker_state.escalation_count,
-                "max_escalations": ConfigAdapter.get_max_escalations(job.settings),
+                "max_escalations": max_escalations,
                 "stats": breaker_state.get_stats()
             }
 
@@ -2523,13 +2322,13 @@ class TranscriptionService:
     ) -> Dict[str, Any]:
         """构建 Whisper 推理参数（运行参数 + 局部覆盖）。"""
         from app.config.model_config import get_whisper_suppress_tokens
-        from app.services.config_adapter import ConfigAdapter
         from app.services.model_manager_v2 import get_model_manager_v2
         from app.services.model_runtime_config_service import get_model_runtime_config_service
         from app.services.runtime_param_resolver import get_runtime_group
         from app.services.whisper_service import get_whisper_service
 
-        model_name = ConfigAdapter.get_whisper_model(job.settings)
+        transcription = getattr(job.settings, "transcription", None)
+        model_name = getattr(transcription, "whisper_model", "medium")
         whisper_service = get_whisper_service()
         override_keys = {key for key, value in (overrides or {}).items() if value is not None}
         sources: Dict[str, str] = {}
@@ -2607,179 +2406,6 @@ class TranscriptionService:
 
         return params
 
-    def _transcribe_segment_with_retry(
-        self,
-        seg_meta: Dict,
-        model,
-        job: JobState,
-        audio_array: Optional[np.ndarray] = None,
-        circuit_breaker: Optional[CircuitBreakerState] = None
-    ) -> Optional[Dict]:
-        """
-        带重试的转录方法（支持Demucs人声分离重试 + 动态熔断）
-
-        流程：
-        1. 首次转录（使用原始音频）
-        2. 检查置信度
-        3. 如果置信度低，使用Demucs分离人声后重试
-        4. 更新熔断器状态
-        5. 检查是否触发熔断
-        6. 返回置信度更高的结果
-
-        Args:
-            seg_meta: 段落元数据
-            model: Whisper模型
-            job: 任务状态对象
-            audio_array: 完整音频数组（内存模式）
-            circuit_breaker: 熔断器状态对象
-
-        Returns:
-            Optional[Dict]: 转录结果
-
-        Raises:
-            BreakToGlobalSeparation: 当触发熔断条件时抛出
-        """
-        demucs_settings = job.settings.demucs
-
-        # 首次转录
-        result = self._transcribe_segment(seg_meta, model, job, audio_array)
-
-        if not result or not demucs_settings.enabled:
-            if circuit_breaker:
-                circuit_breaker.record_success()
-            return result
-
-        # 检查是否需要重试
-        needs_retry = self._check_transcription_confidence(
-            result,
-            demucs_settings.retry_threshold_logprob,
-            demucs_settings.retry_threshold_no_speech
-        )
-
-        if not needs_retry:
-            # 不需要重试，记录成功
-            if circuit_breaker:
-                circuit_breaker.record_success()
-            return result
-
-        # ========== 需要重试的逻辑 ==========
-        self.logger.info(f"段落 {seg_meta['index']} 置信度低，尝试人声分离重试")
-
-        # 更新熔断器状态
-        if circuit_breaker:
-            circuit_breaker.record_retry()
-
-            # 检查是否触发熔断
-            if circuit_breaker.should_break(demucs_settings):
-                stats = circuit_breaker.get_stats()
-                self.logger.warning(
-                    f"触发熔断！连续重试={stats['consecutive_retries']}, "
-                    f"总重试比例={stats['retry_ratio']:.1%}"
-                )
-                raise BreakToGlobalSeparation(
-                    f"连续{stats['consecutive_retries']}段需要Demucs重试，"
-                    f"建议升级为全局人声分离模式"
-                )
-
-        # 尝试按需分离
-        try:
-            from app.services.demucs_service import get_demucs_service
-            demucs = get_demucs_service()
-
-            start_sec = seg_meta['start']
-            end_sec = seg_meta['end']
-
-            if audio_array is not None:
-                # 内存模式：分离人声
-                vocals = demucs.separate_vocals_segment(
-                    audio_array, sr=16000,
-                    start_sec=start_sec, end_sec=end_sec
-                )
-
-                # 构造临时seg_meta
-                retry_seg = seg_meta.copy()
-                retry_seg['start'] = 0  # 因为vocals已经是切片
-                retry_seg['end'] = len(vocals) / 16000
-
-                # 重新转录
-                retry_result = self._transcribe_segment_in_memory(
-                    vocals,
-                    retry_seg,
-                    model,
-                    job,
-                    is_vocals=True  # 标记是人声
-                )
-            else:
-                # 硬盘模式：暂不支持
-                self.logger.warning("硬盘模式暂不支持Demucs重试")
-                return result
-
-            if retry_result:
-                # 校正时间偏移（恢复到原始时间轴）
-                original_start = seg_meta['start']
-                for seg in retry_result.get('segments', []):
-                    seg['start'] += original_start
-                    seg['end'] += original_start
-
-                # 比较两次结果，返回更好的
-                if self._is_better_result(retry_result, result):
-                    self.logger.info(f"段落 {seg_meta['index']} 重试成功，使用分离后的结果")
-                    retry_result['used_demucs'] = True
-                    return retry_result
-
-        except Exception as e:
-            self.logger.warning(f"Demucs重试失败: {e}")
-
-        return result
-
-    def _get_model(self, settings: JobSettings, job: Optional[JobState] = None):
-        """
-        获取 Faster-Whisper 模型（带缓存）
-
-        优先使用模型管理服务检查并下载模型，否则使用简单缓存
-
-        Args:
-            settings: 任务设置
-            job: 任务状态对象(可选,用于更新下载进度)
-
-        Returns:
-            模型对象
-        """
-        # 优先使用 ModelManager V2 统一获取模型
-        try:
-            from app.services.model_manager_v2 import get_model_manager_v2
-
-            model_mgr = get_model_manager_v2()
-            self.logger.info(
-                "通过 ModelManagerV2 获取模型: %s device=%s compute_type=%s",
-                settings.model,
-                settings.device,
-                settings.compute_type,
-            )
-            if job:
-                job.message = "检查模型可用性"
-            model_mgr.ensure_available(settings.model)
-            if job:
-                job.message = "加载模型中"
-            handle = model_mgr.acquire(
-                settings.model,
-                device=settings.device,
-                compute_type=settings.compute_type,
-            )
-            self.logger.info(
-                "ModelManagerV2 返回模型句柄: %s device=%s compute_type=%s",
-                settings.model,
-                settings.device,
-                settings.compute_type,
-            )
-            if job:
-                job.message = "模型加载完成"
-            return handle
-        except Exception as e:
-            self.logger.error(f"ModelManagerV2 获取模型失败，终止: {e}", exc_info=True)
-            raise
-
-  
     def _transcribe_segment_unaligned(
         self,
         seg: Dict,
@@ -4676,175 +4302,6 @@ class TranscriptionService:
             self.logger.info("LLM 翻译功能待实现")
 
         return subtitle_manager.get_all_sentences()
-
-    async def _process_video_sensevoice(self, job: 'JobState'):
-        """
-        SenseVoice 主处理流程（v2.1 概念澄清版）
-
-        流程说明：
-        1-4: 准备阶段（音频提取、VAD、频谱分诊、按需分离）
-        5: 转录阶段（逐Chunk转录 + 熔断回溯）
-        6-8: 后处理增强阶段（Whisper补刀、LLM校对/翻译）
-        9: 输出阶段（生成字幕）
-        """
-        from app.services.streaming_subtitle import get_streaming_subtitle_manager, remove_streaming_subtitle_manager
-        from app.services.progress_tracker import get_progress_tracker, remove_progress_tracker, ProcessPhase
-        from app.services.solution_matrix import SolutionConfig, TranslateMode
-        from app.services.demucs_service import get_demucs_service
-        from app.services.sse_service import get_sse_manager
-        from pathlib import Path
-
-        # 检查任务是否已取消
-        if job.canceled:
-            self.logger.info(f"任务已取消，停止执行: {job.job_id}")
-            return
-
-        def push_signal_event(sse_manager, job_id: str, signal_code: str, message: str = ""):
-            """推送信号事件（使用统一命名空间格式）"""
-            sse_manager.broadcast_sync(
-                f"job:{job_id}",
-                f"signal.{signal_code}",
-                {"signal": signal_code, "message": message}
-            )
-
-        # 获取方案配置 - v3.5: 优先使用新版配置，兼容旧版
-        # 检查是否有 v3.5 新版配置
-        if hasattr(job.settings, 'transcription') and hasattr(job.settings.transcription, 'transcription_profile'):
-            # v3.5 新版配置: 从 job.settings 创建 SolutionConfig
-            solution_config = SolutionConfig.from_job_settings(job.settings)
-            self.logger.info(f"使用 v3.5 配置: profile={job.settings.transcription.transcription_profile}, "
-                           f"enhancement={solution_config.enhancement.value}, "
-                           f"proofread={solution_config.proofread.value}")
-        else:
-            # 旧版配置: 从 sensevoice.preset_id 创建
-            preset_id = getattr(job.settings.sensevoice, 'preset_id', 'default')
-            solution_config = SolutionConfig.from_preset(preset_id)
-            self.logger.info(f"使用旧版预设: {preset_id}")
-
-        # 初始化管理器
-        subtitle_manager = get_streaming_subtitle_manager(job.job_id)
-        progress_tracker = get_progress_tracker(job.job_id, solution_config.preset_id)
-
-        try:
-            # ========== 新架构：使用 PreprocessingPipeline ==========
-            # 统一执行：音频提取 + VAD切分 + 频谱分诊 + 按需分离
-            from app.pipelines.preprocessing_pipeline import PreprocessingPipeline
-            from app.services.runtime_param_resolver import build_vad_config_for_profile
-            import soundfile as sf
-
-            self.logger.info("使用新架构 PreprocessingPipeline（Stage模式）")
-
-            # V3.1.0: 根据语言选择 VAD 配置
-            # 英语使用 Whisper，需要合并 VAD（避免幻觉）
-            # 其他语言使用 SenseVoice，需要保留停顿信息以获得更好的断句
-            language = getattr(job.settings, 'language', 'auto')
-            is_english = language in {'en', 'english'}
-
-            profile = "whisper" if is_english else "sensevoice"
-            vad_config = build_vad_config_for_profile(profile)
-            self.logger.info(
-                "VAD配置: %s 模式，language=%s",
-                "Whisper" if is_english else "SenseVoice",
-                language,
-            )
-
-            # 创建预处理流水线（传入 VAD 配置）
-            preprocessing_pipeline = PreprocessingPipeline(
-                config=job.settings.preprocessing,
-                vad_config=vad_config,
-                logger=self.logger
-            )
-
-            # 执行预处理（包含：音频提取、VAD、频谱分诊、按需分离）
-            progress_tracker.start_phase(ProcessPhase.EXTRACT, 1, "预处理流水线...")
-            audio_chunks = await preprocessing_pipeline.process(
-                video_path=job.input_path,
-                job_state=job
-            )
-            progress_tracker.complete_phase(ProcessPhase.EXTRACT)
-
-            # 获取预处理统计信息
-            stats = preprocessing_pipeline.get_statistics(audio_chunks)
-            self.logger.info(
-                f"PreprocessingPipeline 完成: "
-                f"总chunk数={stats['total_chunks']}, "
-                f"需要分离={stats['need_separation']}, "
-                f"已分离={stats['separated']}, "
-                f"分离比例={stats['separation_ratio']:.2%}"
-            )
-
-            # 保存音频文件供波形图使用（从第一个chunk获取采样率）
-            if audio_chunks:
-                sr = audio_chunks[0].sample_rate
-                # 重新加载完整音频用于保存（PreprocessingPipeline内部已处理）
-                import librosa
-                audio_array, _ = librosa.load(job.input_path, sr=sr, mono=True)
-                audio_path = Path(job.dir) / "audio.wav"
-                sf.write(str(audio_path), audio_array, sr)
-                self.logger.info(f"音频文件已保存: {audio_path}")
-
-            # 转换 AudioChunk 到 ChunkProcessState（兼容现有转录流程）
-            chunk_states = self._convert_audio_chunks_to_states(audio_chunks)
-
-            # 获取 demucs_service 引用（用于熔断回溯）
-            demucs_service = get_demucs_service()
-
-            # 5. 逐Chunk转录 + 熔断回溯（转录层核心）
-            progress_tracker.start_phase(ProcessPhase.SENSEVOICE, len(chunk_states), "SenseVoice 转录...")
-            all_sentences = []
-
-            for chunk_state in chunk_states:
-                # 检查任务是否已取消
-                if job.canceled:
-                    self.logger.info(f"任务已取消，停止转录: {job.job_id}")
-                    break
-
-                # 单个 Chunk 转录（含熔断回溯循环）
-                sentences = await self._transcribe_chunk_with_fusing(
-                    chunk_state=chunk_state,
-                    job=job,
-                    subtitle_manager=subtitle_manager,
-                    demucs_service=demucs_service
-                )
-                all_sentences.extend(sentences)
-                progress_tracker.update_phase(ProcessPhase.SENSEVOICE, increment=1)
-
-            progress_tracker.complete_phase(ProcessPhase.SENSEVOICE)
-
-            # 保存原始转录数据（未分句的完整数据）
-            self._save_raw_transcription(job, all_sentences)
-
-            # 6. 后处理增强（Whisper补刀、LLM校对/翻译）
-            final_results = await self._post_process_enhancement(
-                all_sentences, audio_array, job, subtitle_manager, solution_config
-            )
-
-            # 7. 生成字幕
-            progress_tracker.start_phase(ProcessPhase.SRT, 1, "生成字幕...")
-            output_path = str(Path(job.dir) / f"{job.job_id}.srt")
-            self._generate_subtitle_from_sentences(
-                final_results,
-                output_path,
-                include_translation=(solution_config.translate != TranslateMode.OFF)
-            )
-            progress_tracker.complete_phase(ProcessPhase.SRT)
-
-            # 8. 完成
-            job.status = 'completed'
-            push_signal_event(get_sse_manager(), job.job_id, "job_complete", "处理完成")
-
-        except Exception as e:
-            self.logger.error(f"SenseVoice 处理失败: {e}", exc_info=True)
-            job.status = 'failed'
-            job.error = str(e)
-            push_signal_event(get_sse_manager(), job.job_id, "job_failed", str(e))
-            raise
-
-        finally:
-            # 清理资源
-            remove_streaming_subtitle_manager(job.job_id)
-            remove_progress_tracker(job.job_id)
-
 
 # 单例处理器
 _service_instance: Optional[TranscriptionService] = None

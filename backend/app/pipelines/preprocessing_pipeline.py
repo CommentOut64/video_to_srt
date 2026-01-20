@@ -6,7 +6,7 @@ PreprocessingPipeline - 预处理流水线（新架构）
 2. 频谱分诊（可选）
 3. 人声分离（可选，支持全局/按需模式）
 
-与旧的 AudioProcessingPipeline 的区别：
+与旧的 AudioProcessingPipeline（已归档）的区别：
 - 旧版：整轨分离 + VAD切分
 - 新版：VAD切分 + 频谱分诊 + 按需分离（Stage模式）
 

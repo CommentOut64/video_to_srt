@@ -21,7 +21,6 @@ import torch
 
 from app.models.job_models import JobState
 from app.services.sse_service import get_sse_manager
-from app.services.config_adapter import ConfigAdapter
 from app.core.config import config
 from app.utils.cancellation_token import (
     CancellationToken,
@@ -543,34 +542,25 @@ class JobQueueService:
                 logger.info(f" 开始执行任务: {self.running_job_id}")
 
                 try:
-                    # 根据引擎和配置选择流水线 (使用 ConfigAdapter 统一新旧配置)
-                    engine = getattr(job.settings, 'engine', 'sensevoice')
-                    use_dual_alignment = ConfigAdapter.needs_dual_alignment(job.settings)
-                    transcription_profile = ConfigAdapter.get_transcription_profile(job.settings)
-                    preset_id = ConfigAdapter.get_preset_id(job.settings)
+                    transcription = getattr(job.settings, "transcription", None)
+                    transcription_profile = (
+                        transcription.transcription_profile
+                        if transcription else "sensevoice_only"
+                    )
+                    preset_id = getattr(job.settings, "preset_id", "balanced")
 
-                    # 调试日志: 输出配置来源和关键参数
-                    config_source = ConfigAdapter.get_config_source(job.settings)
-                    logger.info(f"路由决策: engine={engine}, use_dual_alignment={use_dual_alignment}, profile={transcription_profile}, preset={preset_id}")
-                    logger.debug(f"配置来源: {config_source}")
+                    logger.info(
+                        "路由决策: profile=%s, preset=%s",
+                        transcription_profile,
+                        preset_id,
+                    )
 
-                    if use_dual_alignment:
-                        # 双流对齐流水线 (V3.0+ 新架构)
-                        # V3.1.0: 所有 SenseVoice 模式都走新架构
-                        logger.info(f"使用双流对齐流水线 (profile={transcription_profile}, preset={preset_id})")
-                        _run_async_safely(self._run_dual_alignment_pipeline(job, preset_id))
-                    elif engine == 'sensevoice':
-                        # V3.1.0: 旧架构已废弃，所有 SenseVoice 模式都应该走新架构
-                        logger.error(f"错误：SenseVoice 任务未走新架构！profile={transcription_profile}")
-                        logger.error(f"这是一个配置错误，请检查 ConfigAdapter.needs_dual_alignment() 方法")
-                        raise RuntimeError(f"SenseVoice 任务路由错误：{transcription_profile} 应该走新架构")
-                        # 旧代码（已废弃）：
-                        # _run_async_safely(self.transcription_service._process_video_sensevoice(job))
-                    else:
-                        # 新架构 Pipeline 流水线（2025-12-17 架构改造）
-                        # 使用 AudioProcessingPipeline + AsyncDualPipeline
-                        logger.info(f"使用新架构 Pipeline 流水线")
-                        _run_async_safely(self.transcription_service._run_pipeline_v2(job))
+                    logger.info(
+                        "使用双流对齐流水线 (profile=%s, preset=%s)",
+                        transcription_profile,
+                        preset_id,
+                    )
+                    _run_async_safely(self._run_dual_alignment_pipeline(job, preset_id))
 
                     # 检查最终状态
                     if job.canceled:
@@ -786,13 +776,7 @@ class JobQueueService:
             job: 任务状态对象
             preset_id: 预设 ID
         """
-        from app.pipelines import (
-            AudioProcessingPipeline,
-            AudioProcessingConfig,
-            AsyncDualPipeline,
-            get_audio_processing_pipeline,
-            get_async_dual_pipeline
-        )
+        from app.pipelines.async_dual_pipeline import AsyncDualPipeline
         from app.services.streaming_subtitle import get_streaming_subtitle_manager, remove_streaming_subtitle_manager
         from app.services.progress_tracker import get_progress_tracker, remove_progress_tracker, ProcessPhase
         from app.services.sse_service import get_sse_manager
@@ -816,7 +800,11 @@ class JobQueueService:
         sse_manager = get_sse_manager()
 
         # V3.1.0: 初始化进度发射器
-        transcription_profile = ConfigAdapter.get_transcription_profile(job.settings)
+        transcription = getattr(job.settings, "transcription", None)
+        transcription_profile = (
+            transcription.transcription_profile
+            if transcription else "sensevoice_only"
+        )
         progress_emitter = get_progress_emitter(
             job, sse_manager,
             transcription_profile=transcription_profile
@@ -828,6 +816,9 @@ class JobQueueService:
         # V3.7: 初始化检查点管理器
         job_dir = Path(job.dir)
         checkpoint_manager = CheckpointManagerV37(job_dir, logger)
+        checkpoint_manager.save_checkpoint({
+            "original_settings": job.settings.to_dict()
+        })
 
         # 流水线配置
         from app.core.config import config as project_config
@@ -1035,33 +1026,25 @@ class JobQueueService:
 
             # V3.1.0: 异步流水线（三级流水线，错位并行）
             logger.info(f"[双流对齐] 使用异步流水线处理 {total_chunks} 个 Chunk (queue_maxsize={queue_maxsize})")
-            use_new_asr_engine = self.transcription_service._is_new_asr_engine_enabled()
-            draft_engine = None
-            patch_engine = None
-            if not use_new_asr_engine:
-                logger.info("USE_NEW_ASR_ENGINE=false，双流流水线使用旧 ASR 执行器路径")
-            if use_new_asr_engine:
-                try:
-                    draft_engine, patch_engine = self.transcription_service._build_asr_engines(
-                        job, transcription_profile
-                    )
-                except Exception as exc:
-                    logger.error("新 ASR 引擎初始化失败，回退旧路径: %s", exc, exc_info=True)
-                    use_new_asr_engine = False
-            if use_new_asr_engine:
-                draft_name = draft_engine.get_engine_name() if draft_engine else "none"
-                patch_name = patch_engine.get_engine_name() if patch_engine else "none"
-                logger.info(
-                    "新 ASR 引擎已启用: draft=%s, patch=%s, profile=%s",
-                    draft_name,
-                    patch_name,
-                    transcription_profile,
-                )
-            else:
-                logger.info("新 ASR 引擎未启用，继续使用旧路径")
+            draft_engine, patch_engine = self.transcription_service._build_asr_engines(
+                job, transcription_profile
+            )
+            draft_name = draft_engine.get_engine_name() if draft_engine else "none"
+            patch_name = patch_engine.get_engine_name() if patch_engine else "none"
+            logger.info(
+                "新 ASR 引擎已启用: draft=%s, patch=%s, profile=%s",
+                draft_name,
+                patch_name,
+                transcription_profile,
+            )
 
             from app.core.thresholds import ThresholdConfig
-            patching_threshold_value = ConfigAdapter.get_patching_threshold(job.settings)
+            transcription_config = getattr(job.settings, "transcription", None)
+            patching_threshold_value = getattr(
+                transcription_config,
+                "patching_threshold",
+                0.60,
+            )
             patching_threshold = ThresholdConfig(
                 whisper_patch_trigger_confidence=patching_threshold_value
             )
@@ -1071,9 +1054,9 @@ class JobQueueService:
                 sensevoice_language=getattr(job.settings, 'sensevoice_language', 'auto'),
                 whisper_language=getattr(job.settings, 'whisper_language', 'auto'),
                 user_glossary=getattr(job.settings, 'user_glossary', None),
-                transcription_profile=ConfigAdapter.get_transcription_profile(job.settings),
-                draft_engine=draft_engine if use_new_asr_engine else None,
-                patch_engine=patch_engine if use_new_asr_engine else None,
+                transcription_profile=transcription_profile,
+                draft_engine=draft_engine,
+                patch_engine=patch_engine,
                 patching_threshold=patching_threshold,
                 logger=logger,
                 cancellation_token=cancellation_token,  # V3.7
