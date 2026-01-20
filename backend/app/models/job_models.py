@@ -4,12 +4,7 @@
 与 preset_models.py 中的 1+3 预设模式保持一致
 """
 from dataclasses import dataclass, field, asdict
-from typing import List, Dict, Optional, TYPE_CHECKING, Any
-import torch
-
-# 使用TYPE_CHECKING避免循环导入
-if TYPE_CHECKING:
-    from app.models.hardware_models import CPUAffinityConfig
+from typing import List, Dict, Optional, Any
 
 
 # ========== 分组一: 预处理与音频设置 ==========
@@ -136,95 +131,14 @@ class ComputeConfig:
     temp_file_policy: str = "delete_on_complete"
 
 
-# ========== 兼容性: 保留旧的设置类 (带别名) ==========
-# 这些类保留用于向后兼容，新代码应使用上面的新结构
-
-@dataclass
-class DemucsSettings:
-    """
-    Demucs人声分离配置 (兼容旧版)
-    新代码请使用 PreprocessingConfig
-    """
-    # 基础配置 - 映射到新字段
-    enabled: bool = True                        # 对应 demucs_strategy != "off"
-    mode: str = "auto"                          # 对应 demucs_strategy
-
-    # 分级模型配置 - 简化为单一 model 字段
-    weak_model: str = "htdemucs"
-    strong_model: str = "htdemucs"
-    fallback_model: str = "htdemucs"
-    auto_escalation: bool = True
-    max_escalations: int = 1
-
-    # BGM检测阈值 - 映射到 spectrum_threshold
-    bgm_light_threshold: float = 0.02
-    bgm_heavy_threshold: float = 0.15
-
-    # 质量评估阈值
-    retry_threshold_logprob: float = -0.8
-    retry_threshold_no_speech: float = 0.6
-
-    # 熔断配置
-    circuit_breaker_enabled: bool = True
-    consecutive_threshold: int = 3
-    ratio_threshold: float = 0.2
-
-    # 熔断处理策略
-    on_break: str = "continue"
-    mark_problem_segments: bool = True
-    problem_segment_suffix: str = "[?]"
-
-    # 质量预设
-    quality_preset: str = "balanced"
-
-
-@dataclass
-class SenseVoiceSettings:
-    """
-    SenseVoice 转录引擎配置 (兼容旧版)
-    新代码请使用 TranscriptionConfig + RefinementConfig
-    """
-    # 预设方案
-    preset_id: str = "default"
-
-    # 增强模式 - 映射到 transcription_profile
-    enhancement: str = "off"                    # off/smart_patch/deep_listen
-
-    # 校对模式 - 映射到 llm_task + llm_scope
-    proofread: str = "off"                      # off/sparse/full
-
-    # 翻译模式 - 映射到 llm_task
-    translate: str = "off"                      # off/full/partial
-    target_language: str = "en"
-
-    # 阈值配置 - 映射到 patching_threshold
-    confidence_threshold: float = 0.6
-    whisper_patch_threshold: float = 0.5
-
-
 # ========== 任务设置 ==========
 
 @dataclass
 class JobSettings:
     """
     转录任务设置 - v3.5 重构版
-
-    支持两种配置方式:
-    1. 新版 (推荐): 使用 task_config 字段
-    2. 旧版 (兼容): 使用 demucs/sensevoice 字段
+    仅保留新版 task_config（预设 + 四分组）
     """
-    # === 转录引擎选择 (兼容旧版) ===
-    engine: str = "sensevoice"                  # whisper/sensevoice
-
-    # === 旧版设置 (兼容) ===
-    model: str = "medium"
-    compute_type: str = "auto"  # auto: 根据显存自动选择 (>=8GB用int8_float16, <8GB用int8)
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    batch_size: int = 16
-    word_timestamps: bool = False
-    cpu_affinity: Optional["CPUAffinityConfig"] = None
-    demucs: DemucsSettings = field(default_factory=DemucsSettings)
-    sensevoice: SenseVoiceSettings = field(default_factory=SenseVoiceSettings)
 
     # === 新版 1+3 预设配置 ===
     # 选择的宏预设 ID (fast/balanced/quality/custom)
@@ -275,27 +189,39 @@ class JobSettings:
                 "output_formats": self.compute.output_formats,
                 "temp_file_policy": self.compute.temp_file_policy,
             },
-            # 旧版配置 (兼容)
-            "engine": self.engine,
-            "model": self.model,
-            "compute_type": self.compute_type,
-            "device": self.device,
-            "batch_size": self.batch_size,
-            "word_timestamps": self.word_timestamps,
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "JobSettings":
         """从字典创建设置"""
+        raw_data = data
+        # 允许直接传入 task_config
+        if "task_config" in data and isinstance(data["task_config"], dict):
+            data = data["task_config"]
+
+        legacy_keys = {
+            "engine",
+            "sensevoice",
+            "demucs",
+            "model",
+            "device",
+            "compute_type",
+            "word_timestamps",
+            "batch_size",
+            "cpu_affinity",
+            "cpu_affinity_enabled",
+            "cpu_affinity_strategy",
+            "cpu_affinity_custom_cores",
+            "cpu_affinity_exclude_cores",
+        }
+        if any(key in raw_data for key in legacy_keys) or any(key in data for key in legacy_keys):
+            raise ValueError("检测到旧版任务配置字段，已停止兼容，请使用 task_config 发送新版配置。")
+
         # 解析新版配置
         preprocessing_data = data.get("preprocessing", {})
         transcription_data = data.get("transcription", {})
         refinement_data = data.get("refinement", {})
         compute_data = data.get("compute", {})
-
-        # 解析旧版配置
-        demucs_data = data.get("demucs", {})
-        sensevoice_data = data.get("sensevoice", {})
 
         return cls(
             # 新版配置
@@ -333,42 +259,6 @@ class JobSettings:
                 gpu_id=compute_data.get("gpu_id", 0),
                 output_formats=compute_data.get("output_formats", ["srt"]),
                 temp_file_policy=compute_data.get("temp_file_policy", "delete_on_complete"),
-            ),
-            # 旧版配置
-            engine=data.get("engine", "sensevoice"),
-            model=data.get("model", "medium"),
-            compute_type=data.get("compute_type", "auto"),
-            device=data.get("device", "cuda"),
-            batch_size=data.get("batch_size", 16),
-            word_timestamps=data.get("word_timestamps", False),
-            demucs=DemucsSettings(
-                enabled=demucs_data.get("enabled", True),
-                mode=demucs_data.get("mode", "auto"),
-                weak_model=demucs_data.get("weak_model", "htdemucs"),
-                strong_model=demucs_data.get("strong_model", "htdemucs"),
-                fallback_model=demucs_data.get("fallback_model", "htdemucs"),
-                auto_escalation=demucs_data.get("auto_escalation", True),
-                max_escalations=demucs_data.get("max_escalations", 1),
-                bgm_light_threshold=demucs_data.get("bgm_light_threshold", 0.02),
-                bgm_heavy_threshold=demucs_data.get("bgm_heavy_threshold", 0.15),
-                retry_threshold_logprob=demucs_data.get("retry_threshold_logprob", -0.8),
-                retry_threshold_no_speech=demucs_data.get("retry_threshold_no_speech", 0.6),
-                circuit_breaker_enabled=demucs_data.get("circuit_breaker_enabled", True),
-                consecutive_threshold=demucs_data.get("consecutive_threshold", 3),
-                ratio_threshold=demucs_data.get("ratio_threshold", 0.2),
-                on_break=demucs_data.get("on_break", "continue"),
-                mark_problem_segments=demucs_data.get("mark_problem_segments", True),
-                problem_segment_suffix=demucs_data.get("problem_segment_suffix", "[?]"),
-                quality_preset=demucs_data.get("quality_preset", "balanced"),
-            ),
-            sensevoice=SenseVoiceSettings(
-                preset_id=sensevoice_data.get("preset_id", "default"),
-                enhancement=sensevoice_data.get("enhancement", "off"),
-                proofread=sensevoice_data.get("proofread", "off"),
-                translate=sensevoice_data.get("translate", "off"),
-                target_language=sensevoice_data.get("target_language", "en"),
-                confidence_threshold=sensevoice_data.get("confidence_threshold", 0.6),
-                whisper_patch_threshold=sensevoice_data.get("whisper_patch_threshold", 0.5),
             ),
         )
 
@@ -418,9 +308,6 @@ class JobSettings:
                 output_formats=preset.compute.output_formats,
                 temp_file_policy=preset.compute.temp_file_policy,
             ),
-            # 根据预设设置旧版字段的默认值
-            engine="sensevoice",
-            model=preset.transcription.whisper_model,
         )
 
 

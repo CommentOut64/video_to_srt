@@ -17,10 +17,7 @@ from pydantic import BaseModel, Field
 import json
 
 from app.core.config import config
-from app.models.job_models import (
-    JobSettings, JobState, DemucsSettings, SenseVoiceSettings,
-    PreprocessingConfig, TranscriptionConfig, RefinementConfig, ComputeConfig
-)
+from app.models.job_models import JobSettings, JobState
 from app.services.transcription_service import TranscriptionService
 from app.services.file_service import FileManagementService
 from app.services.sse_service import get_sse_manager
@@ -111,53 +108,17 @@ class TaskConfigAPI(BaseModel):
     compute: Optional[ComputeSettingsAPI] = None
 
 
-# ========== 兼容旧版 API 模型 ==========
-
-class DemucsSettingsAPI(BaseModel):
-    """Demucs配置请求模型 (兼容旧版)"""
-    enabled: bool = True
-    mode: str = "auto"  # auto/always/never/on_demand
-    retry_threshold_logprob: float = -0.8
-    retry_threshold_no_speech: float = 0.6
-    circuit_breaker_enabled: bool = True
-    consecutive_threshold: int = 3
-    ratio_threshold: float = 0.2
-
-
-class SenseVoiceSettingsAPI(BaseModel):
-    """SenseVoice 配置请求模型 (兼容旧版)"""
-    preset_id: str = "default"  # 预设ID: default/preset1-5/custom
-    enhancement: str = "off"  # off/smart_patch/deep_listen
-    proofread: str = "off"  # off/sparse/full
-    translate: str = "off"  # off/full/partial
-    target_language: str = "en"
-    confidence_threshold: float = 0.6
-    whisper_patch_threshold: float = 0.5
-
-
 class TranscribeSettings(BaseModel):
     """
     转录设置请求模型 - v3.5 重构版
 
-    支持两种配置方式:
-    1. 新版 (推荐): 使用 task_config 字段
-    2. 旧版 (兼容): 使用 engine/model/demucs/sensevoice 字段
+    仅支持新版 task_config 字段
     """
     # === 新版 1+3 预设配置 ===
     task_config: Optional[TaskConfigAPI] = Field(
         default=None,
         description="v3.5 任务配置 (推荐使用)"
     )
-
-    # === 旧版配置 (兼容) ===
-    engine: str = "sensevoice"  # whisper 或 sensevoice
-    model: str = "medium"
-    compute_type: str = "auto"  # auto: 根据显存自动选择
-    device: str = "cuda"
-    batch_size: int = 16
-    word_timestamps: bool = False
-    demucs: Optional[DemucsSettingsAPI] = None
-    sensevoice: Optional[SenseVoiceSettingsAPI] = None
 
 
 class UploadResponse(BaseModel):
@@ -417,7 +378,8 @@ def create_transcription_router(
         try:
             from pathlib import Path
 
-            settings_obj = TranscribeSettings(**json.loads(settings))
+            settings_payload = json.loads(settings) if settings else {}
+            settings_obj = TranscribeSettings(**settings_payload)
 
             # 获取队列服务
             queue_service = get_queue_service(transcription_service)
@@ -434,80 +396,41 @@ def create_transcription_router(
             job_dir = Path(job.dir) if job.dir else None
             checkpoint_path = job_dir / "checkpoint.json" if job_dir else None
 
+            original_settings = None
             if checkpoint_path and checkpoint_path.exists():
-                # 有checkpoint，需要校验参数并强制覆盖禁止修改的参数
+                # 有 checkpoint 时优先使用原始设置，避免新旧配置不一致
                 try:
                     with open(checkpoint_path, 'r', encoding='utf-8') as f:
                         checkpoint_data = json.load(f)
-
-                    original_settings = checkpoint_data.get("original_settings", {})
-
-                    if original_settings:
-                        # 强制覆盖禁止修改的参数
-                        # 1. word_timestamps - 禁止修改
-                        if "word_timestamps" in original_settings:
-                            settings_obj.word_timestamps = original_settings["word_timestamps"]
-
-                        # 注意：device和model虽然会警告，但仍允许用户修改
-                        # 前端应该在调用此接口前显示警告并获得用户确认
+                    original_settings = checkpoint_data.get("original_settings") or None
                 except Exception as e:
-                    # 如果读取checkpoint失败，记录日志但继续
                     print(f"读取checkpoint设置失败: {e}")
 
-            # 应用设置 - v3.5 重构: 支持新旧两种配置格式
-            settings_dict = settings_obj.model_dump()
+            task_config = (
+                settings_obj.task_config.model_dump()
+                if settings_obj.task_config else {}
+            )
 
-            # 检查是否使用新版 task_config
-            if settings_dict.get('task_config'):
-                # v3.5 新版配置
-                task_config = settings_dict['task_config']
-                preset_id = task_config.get('preset_id', 'balanced')
-
-                # 如果只提供了 preset_id，从预设加载完整配置
-                if preset_id != 'custom' and not task_config.get('preprocessing'):
+            if original_settings:
+                try:
+                    job.settings = JobSettings.from_dict(original_settings)
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc))
+            elif task_config:
+                preset_id = task_config.get("preset_id", "balanced")
+                has_custom_groups = any(
+                    task_config.get(key)
+                    for key in ("preprocessing", "transcription", "refinement", "compute")
+                )
+                if preset_id != "custom" and not has_custom_groups:
                     job.settings = JobSettings.from_preset(preset_id)
                 else:
-                    # 自定义配置
-                    job.settings = JobSettings(
-                        preset_id=preset_id,
-                        preprocessing=PreprocessingConfig(
-                            **task_config.get('preprocessing', {})
-                        ) if task_config.get('preprocessing') else PreprocessingConfig(),
-                        transcription=TranscriptionConfig(
-                            **task_config.get('transcription', {})
-                        ) if task_config.get('transcription') else TranscriptionConfig(),
-                        refinement=RefinementConfig(
-                            **task_config.get('refinement', {})
-                        ) if task_config.get('refinement') else RefinementConfig(),
-                        compute=ComputeConfig(
-                            **task_config.get('compute', {})
-                        ) if task_config.get('compute') else ComputeConfig(),
-                        # 保留旧版字段兼容
-                        engine=settings_dict.get('engine', 'sensevoice'),
-                        model=settings_dict.get('model', 'medium'),
-                        compute_type=settings_dict.get('compute_type', 'auto'),
-                        device=settings_dict.get('device', 'cuda'),
-                        batch_size=settings_dict.get('batch_size', 16),
-                        word_timestamps=settings_dict.get('word_timestamps', False),
-                    )
+                    try:
+                        job.settings = JobSettings.from_dict(task_config)
+                    except ValueError as exc:
+                        raise HTTPException(status_code=400, detail=str(exc))
             else:
-                # 旧版配置 (兼容)
-                # 转换 Demucs 配置
-                if settings_dict.get('demucs'):
-                    settings_dict['demucs'] = DemucsSettings(**settings_dict['demucs'])
-                else:
-                    settings_dict.pop('demucs', None)
-
-                # 转换 SenseVoice 配置
-                if settings_dict.get('sensevoice'):
-                    settings_dict['sensevoice'] = SenseVoiceSettings(**settings_dict['sensevoice'])
-                else:
-                    settings_dict.pop('sensevoice', None)
-
-                # 移除 task_config 字段 (None)
-                settings_dict.pop('task_config', None)
-
-                job.settings = JobSettings(**settings_dict)
+                job.settings = JobSettings()
 
             # 🔥 关键改动: 如果任务不在队列中，加入队列
             with queue_service.lock:
@@ -1494,7 +1417,7 @@ def create_transcription_router(
                     "warnings": [],
                     "errors": [],
                     "force_original": {},
-                    "message": "旧版checkpoint格式，建议使用默认参数"
+                    "message": "检查点未包含原始配置，可直接继续"
                 }
 
             # 解析新设置
@@ -1504,46 +1427,18 @@ def create_transcription_router(
             errors = []
             force_original = {}
 
-            # 检查禁止修改的参数
-            # 1. word_timestamps - 禁止修改
-            if "word_timestamps" in original_settings:
-                if new_settings_obj.get("word_timestamps") != original_settings["word_timestamps"]:
-                    errors.append({
-                        "param": "word_timestamps",
-                        "reason": "修改此参数会导致前后SRT格式不一致",
-                        "impact": "严重",
-                        "original": original_settings["word_timestamps"],
-                        "new": new_settings_obj.get("word_timestamps")
-                    })
-                    force_original["word_timestamps"] = original_settings["word_timestamps"]
-
-            # 2. device - 建议不修改（中等影响）
-            if "device" in original_settings:
-                if new_settings_obj.get("device") != original_settings["device"]:
-                    warnings.append({
-                        "param": "device",
-                        "level": "medium",
-                        "reason": "不同设备的精度可能有细微差异",
-                        "impact": "中等",
-                        "original": original_settings["device"],
-                        "new": new_settings_obj.get("device"),
-                        "suggestion": "建议保持原设备设置"
-                    })
-
-            # 3. model - 允许但需严重警告
-            if "model" in original_settings:
-                if new_settings_obj.get("model") != original_settings["model"]:
-                    warnings.append({
-                        "param": "model",
-                        "level": "high",
-                        "reason": "不同模型的输出格式和质量可能不同，混用会导致前后字幕质量不一致",
-                        "impact": "高",
-                        "original": original_settings["model"],
-                        "new": new_settings_obj.get("model"),
-                        "suggestion": "仅在确认用错模型时才修改"
-                    })
-
-            # compute_type 和 batch_size 可以自由修改，不需要警告
+            task_config = new_settings_obj.get("task_config") or {}
+            if task_config and task_config != original_settings:
+                warnings.append({
+                    "param": "task_config",
+                    "level": "medium",
+                    "reason": "恢复任务应使用与检查点一致的配置",
+                    "impact": "中等",
+                    "original": original_settings,
+                    "new": task_config,
+                    "suggestion": "建议使用检查点原始配置继续"
+                })
+                force_original["task_config"] = original_settings
 
             return {
                 "valid": len(errors) == 0,

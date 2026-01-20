@@ -12,7 +12,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import json
-from typing import Optional, List
 from datetime import datetime
 
 # 添加当前目录到Python路径
@@ -335,18 +334,6 @@ transcription_router = create_transcription_router(transcription_service, file_s
 app.include_router(transcription_router)
 
 ModelPreloadConfig.print_config()
-
-class TranscribeSettings(BaseModel):
-    model: str = "medium"
-    compute_type: str = "auto"  # auto: 根据显存自动选择
-    device: str = "cuda"
-    batch_size: int = 16
-    word_timestamps: bool = False
-    # CPU亲和性配置
-    cpu_affinity_enabled: bool = True
-    cpu_affinity_strategy: str = "auto"  # "auto", "half", "custom"
-    cpu_affinity_custom_cores: Optional[List[int]] = None
-    cpu_affinity_exclude_cores: Optional[List[int]] = None
 
 class UploadResponse(BaseModel):
     job_id: str

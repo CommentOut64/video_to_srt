@@ -443,12 +443,8 @@ class CheckpointManager:
         # 检查设置兼容性（如果提供了当前设置）
         if current_settings and 'original_settings' in checkpoint_data:
             original = checkpoint_data['original_settings']
-            # 检查关键设置是否一致
-            critical_settings = ['model', 'device', 'word_timestamps']
-            for setting in critical_settings:
-                if setting in original and setting in current_settings:
-                    if original[setting] != current_settings[setting]:
-                        return False, f"设置不兼容: {setting} 已更改"
+            if original != current_settings:
+                return False, "设置不兼容: task_config 已更改"
 
         return True, None
 
@@ -907,12 +903,8 @@ class CheckpointManager:
 
         # 检查设置兼容性
         if current_settings and checkpoint.original_settings:
-            critical_settings = ['model', 'device', 'word_timestamps']
-            for setting in critical_settings:
-                orig = checkpoint.original_settings.get(setting)
-                curr = current_settings.get(setting)
-                if orig is not None and curr is not None and orig != curr:
-                    return False, f"设置不兼容: {setting} 从 {orig} 变为 {curr}"
+            if checkpoint.original_settings != current_settings:
+                return False, "设置不兼容: task_config 已更改"
 
         return True, None
 
@@ -1130,6 +1122,10 @@ class CheckpointManagerV37:
                 ctrl.paused = ctrl_data["paused"]
             if "canceled" in ctrl_data:
                 ctrl.canceled = ctrl_data["canceled"]
+
+        # 更新原始设置（用于断点续传一致性）
+        if "original_settings" in checkpoint_data:
+            self._checkpoint.original_settings = checkpoint_data["original_settings"]
 
         # 更新阶段
         self._checkpoint.phase = self._determine_current_phase()

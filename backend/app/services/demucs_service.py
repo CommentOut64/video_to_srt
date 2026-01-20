@@ -151,7 +151,7 @@ class SeparationStrategyResolver:
         初始化策略解析器
 
         Args:
-            settings: DemucsSettings 对象
+            settings: 预处理配置对象
         """
         self.settings = settings
         self.logger = logging.getLogger(__name__)
@@ -1083,7 +1083,7 @@ class DemucsService:
 
         Args:
             bgm_level: 检测到的 BGM 级别
-            settings: DemucsSettings 用户配置
+            settings: 预处理配置对象
 
         Returns:
             SeparationStrategy: 分离策略
@@ -1108,7 +1108,7 @@ class DemucsService:
 
         Args:
             current_model: 当前模型名称
-            settings: DemucsSettings 用户配置
+            settings: 预处理配置对象
 
         Returns:
             新模型名称，如果无法升级则返回 None
