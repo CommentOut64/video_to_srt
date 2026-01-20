@@ -22,7 +22,6 @@ from typing import Dict, Optional, Any
 
 from app.schemas.pipeline_context import ProcessingContext
 from app.services.audio.chunk_engine import AudioChunk
-from app.services.inference.whisper_executor import WhisperExecutor
 from app.utils.prompt_builder import get_prompt_builder
 from app.core.thresholds import needs_whisper_patch, ThresholdConfig
 from app.core.asr.engine import ASREngine
@@ -44,10 +43,9 @@ class SlowWorker:
 
     def __init__(
         self,
+        patch_engine: ASREngine,
         whisper_language: str = "auto",
         user_glossary: Optional[list] = None,
-        patch_engine: Optional[ASREngine] = None,
-        whisper_executor: Optional[WhisperExecutor] = None,
         # V3.10: 智能补刀参数
         is_patching_mode: bool = False,
         patching_threshold: Optional[ThresholdConfig] = None,
@@ -59,8 +57,7 @@ class SlowWorker:
         Args:
             whisper_language: Whisper 语言设置
             user_glossary: 用户词表
-            patch_engine: 补刀引擎（可插拔）
-            whisper_executor: Whisper 执行器
+            patch_engine: 补刀引擎（必须提供）
             is_patching_mode: 是否为智能补刀模式（True 时根据 SenseVoice 质量跳过 Whisper）
             patching_threshold: 补刀阈值配置
             logger: 日志记录器
@@ -68,6 +65,8 @@ class SlowWorker:
         self.whisper_language = whisper_language
         self.user_glossary = user_glossary
         self.logger = logger or logging.getLogger(__name__)
+        if not patch_engine:
+            raise ValueError("SlowWorker 需要提供 patch_engine")
         self.patch_engine = patch_engine
 
         # V3.10: 智能补刀配置
@@ -79,9 +78,6 @@ class SlowWorker:
                 f"SlowWorker 运行在智能补刀模式: "
                 f"confidence_threshold={self.patching_threshold.whisper_patch_trigger_confidence}"
             )
-
-        # 初始化执行器
-        self.whisper_executor = whisper_executor or WhisperExecutor()
 
         # Prompt 缓存（上一个 Chunk 的定稿文本）
         self.previous_whisper_text: Optional[str] = None
@@ -264,27 +260,14 @@ class SlowWorker:
             audio_with_overlap = chunk.audio
             self.logger.debug("无完整音频数组，跳过 Audio Overlap")
 
-        if self.patch_engine:
-            asr_result = await self.patch_engine.transcribe(
-                audio_with_overlap,
-                language=self.whisper_language,
-                initial_prompt=initial_prompt,
-                repetition_penalty=None,
-                no_repeat_ngram_size=None,
-            )
-            return self._convert_asr_result(asr_result)
-
-        # 执行 Whisper 推理
-        # 注: Chunk 场景默认覆盖由 WhisperExecutor 基于运行参数来源决定
-        result = await self.whisper_executor.execute(
-            audio=audio_with_overlap,
-            start_time=chunk.start,
-            end_time=chunk.end,
+        asr_result = await self.patch_engine.transcribe(
+            audio_with_overlap,
             language=self.whisper_language,
             initial_prompt=initial_prompt,
+            repetition_penalty=None,
+            no_repeat_ngram_size=None,
         )
-
-        return result
+        return self._convert_asr_result(asr_result)
 
     def _convert_asr_result(self, asr_result: ASRResult) -> Dict[str, Any]:
         """将 ASRResult 转为 Whisper 结果结构。"""

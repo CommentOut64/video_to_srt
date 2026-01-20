@@ -62,6 +62,8 @@ class AsyncDualPipeline:
     def __init__(
         self,
         job_id: str,
+        draft_engine: ASREngine,
+        patch_engine: Optional[ASREngine] = None,
         queue_maxsize: int = 5,
         sensevoice_language: str = "auto",
         whisper_language: str = "auto",
@@ -70,8 +72,6 @@ class AsyncDualPipeline:
         alignment_score_threshold: float = 0.3,
         enable_fallback: bool = True,
         transcription_profile: str = "sv_whisper_patch",
-        draft_engine: Optional[ASREngine] = None,
-        patch_engine: Optional[ASREngine] = None,
         segmenter: Optional[DefaultSegmenter] = None,
         aligner: Optional[DefaultAligner] = None,
         patching_threshold: Optional[ThresholdConfig] = None,
@@ -93,8 +93,8 @@ class AsyncDualPipeline:
             alignment_score_threshold: 对齐质量阈值
             enable_fallback: 是否启用降级策略
             transcription_profile: 转录模式 (sensevoice_only/sv_whisper_patch/sv_whisper_dual)
-            draft_engine: 草稿引擎实例（可选，使用新 ASR 接口时注入）
-            patch_engine: 补刀引擎实例（可选，使用新 ASR 接口时注入）
+            draft_engine: 草稿引擎实例（必须提供）
+            patch_engine: 补刀引擎实例（非极速模式必须提供）
             segmenter: 分句服务实例（可选）
             aligner: 对齐服务实例（可选）
             patching_threshold: 补刀阈值配置（可选）
@@ -108,6 +108,8 @@ class AsyncDualPipeline:
         self.transcription_profile = transcription_profile
         self.cancellation_token = cancellation_token  # V3.7
         self.progress_emitter = progress_emitter  # V3.1.0
+        if not draft_engine:
+            raise ValueError("AsyncDualPipeline 需要提供 draft_engine")
         self.draft_engine = draft_engine
         self.patch_engine = patch_engine
         self.patching_threshold = patching_threshold
@@ -124,6 +126,9 @@ class AsyncDualPipeline:
             self.logger.info("智能补刀模式: 根据 SenseVoice 质量决定是否调用 Whisper")
         else:
             self.logger.info(f"双流精校模式: 全量 Whisper 转录")
+
+        if not self.is_sensevoice_only and not self.patch_engine:
+            raise ValueError("非极速模式下必须提供 patch_engine")
 
         # 创建队列（带背压）
         self.queue_inter = asyncio.Queue(maxsize=queue_maxsize)  # FastWorker -> SlowWorker

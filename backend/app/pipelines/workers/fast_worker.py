@@ -25,7 +25,6 @@ from app.core.asr.engine import ASREngine
 from app.core.asr.models import ASRResult
 from app.schemas.pipeline_context import ProcessingContext
 from app.services.audio.chunk_engine import AudioChunk
-from app.services.inference.sensevoice_executor import SenseVoiceExecutor
 from app.services.segmentation.default_segmenter import DefaultSegmenter
 from app.services.sentence_splitter import SplitConfig
 from app.services.semantic_grouper import GroupConfig
@@ -48,12 +47,11 @@ class FastWorker:
     def __init__(
         self,
         job_id: str,
+        draft_engine: ASREngine,
         sensevoice_language: str = "auto",
-        draft_engine: Optional[ASREngine] = None,
         draft_split_config: Optional[SplitConfig] = None,
         draft_group_config: Optional[GroupConfig] = None,
         enable_semantic_grouping: bool = True,
-        sensevoice_executor: Optional[SenseVoiceExecutor] = None,
         segmenter: Optional[DefaultSegmenter] = None,
         # 熔断回溯相关参数
         enable_fuse_breaker: bool = False,
@@ -73,11 +71,10 @@ class FastWorker:
         Args:
             job_id: 任务 ID
             sensevoice_language: SenseVoice 语言设置
-            draft_engine: 草稿引擎（可插拔）
+            draft_engine: 草稿引擎（必须提供）
             draft_split_config: 快流分句配置
             draft_group_config: 快流语义分组配置
             enable_semantic_grouping: 是否启用语义分组
-            sensevoice_executor: SenseVoice 执行器
             segmenter: 分句服务（默认实现）
             enable_fuse_breaker: 是否启用熔断回溯（默认False，保持向后兼容）
             fuse_max_retry: 熔断最大重试次数（默认1，只升级到 HTDEMUCS）
@@ -96,6 +93,8 @@ class FastWorker:
 
         # V3.1.0: 跨 chunk 合并机制
         self.enable_cross_chunk_merge = enable_cross_chunk_merge
+        if not draft_engine:
+            raise ValueError("FastWorker 需要提供 draft_engine")
         self.draft_engine = draft_engine
 
         if is_final_output:
@@ -103,9 +102,6 @@ class FastWorker:
 
         if enable_cross_chunk_merge:
             self.logger.info("跨 chunk 合并已启用：将自动合并语义不完整的句子")
-
-        # 初始化执行器（兼容旧路径）
-        self.sensevoice_executor = sensevoice_executor or SenseVoiceExecutor()
 
         # 初始化熔断决策器（新增）
         self.enable_fuse_breaker = enable_fuse_breaker
@@ -283,21 +279,13 @@ class FastWorker:
         Returns:
             Dict: SenseVoice 推理结果
         """
-        if self.draft_engine:
-            asr_result = await self.draft_engine.transcribe(
-                chunk.audio,
-                language=self.sensevoice_language,
-                sample_rate=chunk.sample_rate,
-                use_itn=True,
-            )
-            return self._convert_asr_result(asr_result)
-
-        return await self.sensevoice_executor.execute(
-            audio_array=chunk.audio,
-            sample_rate=chunk.sample_rate,
+        asr_result = await self.draft_engine.transcribe(
+            chunk.audio,
             language=self.sensevoice_language,
+            sample_rate=chunk.sample_rate,
             use_itn=True,
         )
+        return self._convert_asr_result(asr_result)
 
     def _convert_asr_result(self, asr_result: ASRResult) -> Dict[str, Any]:
         """将 ASRResult 转为旧的 SenseVoice 结果结构。"""
