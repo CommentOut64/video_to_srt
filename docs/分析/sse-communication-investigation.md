@@ -1,6 +1,6 @@
 # SSE 管理和前后端通讯机制深度调查报告
 
-**版本**: V3.7.3+
+**版本**: v3.1.0.3+
 **调查日期**: 2025-12-26
 **调查范围**: SSE 核心架构、事件系统、进度推送、字幕流式传输、暂停/恢复机制
 
@@ -25,7 +25,7 @@
   - **字幕流式事件** (326-334): `subtitle.sv_segment`, `subtitle.sv_sentence`, `subtitle.whisper_patch`, `subtitle.llm_proof`, `subtitle.llm_trans`, `subtitle.batch_update`, `subtitle.draft`, `subtitle.finalized`, `subtitle.replace_chunk`, `subtitle.restored`
   - **信号事件** (336-345): `signal.job_start`, `signal.job_complete`, `signal.job_failed`, `signal.job_paused`, `signal.job_canceled`, `signal.job_resumed`, `signal.phase_start`, `signal.phase_complete`, `signal.circuit_breaker`, `signal.model_upgrade`
 
-### 后端进度发射器（V3.7.1+）
+### 后端进度发射器（v3.1.0.1+）
 
 - `backend/app/services/progress_emitter.py` (ProgressEventEmitter): 统一进度发射器
   - `ProgressEventEmitter.__init__` (96-120): 初始化模式和权重（SENSEVOICE_ONLY/WHISPER_PATCH/DUAL_STREAM）
@@ -48,8 +48,8 @@
   - `add_draft_sentences` (279-347): 添加草稿句子（快流/双模态架构）
   - `replace_chunk` (349-439): 替换 Chunk 的所有句子（慢流/双模态架构）
   - `add_finalized_sentences` (441-514): 添加定稿句子（极速模式专用）
-  - `to_checkpoint_data` (518-550): 导出字幕快照到 checkpoint（V3.7.3）
-  - `restore_from_checkpoint` (552-655): 从 checkpoint 恢复字幕状态（V3.7.3）
+  - `to_checkpoint_data` (518-550): 导出字幕快照到 checkpoint（v3.1.0.3）
+  - `restore_from_checkpoint` (552-655): 从 checkpoint 恢复字幕状态（v3.1.0.3）
   - `push_restored_subtitles_to_frontend` (657-698): 恢复后推送所有字幕到前端
 
 ### 前端 SSE 频道管理器
@@ -76,11 +76,11 @@
   - `ensureConnection` (60-139): 确保 SSE 连接已建立
   - `subscribeVideoProgress` (146-180): 订阅视频生成进度事件
 
-### 暂停/恢复 SSE 支持（V3.7+）
+### 暂停/恢复 SSE 支持（v3.1.0+）
 
 - `backend/app/services/job_queue_service.py` (暂停机制)
   - `pause_job` (175-234): 暂停任务并推送 `pause_pending` 信号
-  - V3.7.2 新增状态 `pausing`: 区分"正在暂停"和"已暂停"
+  - v3.1.0.2 新增状态 `pausing`: 区分"正在暂停"和"已暂停"
   - 预处理→转录过渡检查点 (708-718): 防止暂停信号被忽略
 
 - `backend/app/utils/cancellation_token.py` (CancellationToken)
@@ -88,7 +88,7 @@
   - `exit_atomic_region` (267-293): 退出原子区域并处理待处理暂停/取消
   - `check_and_save` (约300行): 检查暂停/取消并保存 checkpoint
 
-### 双流进度推送机制（V3.7.1+）
+### 双流进度推送机制（v3.1.0.1+）
 
 - `backend/app/services/progress_emitter.py`
   - `_push_overall` (350-391): 推送 `progress.overall` 事件，包含 `detail` 字段
@@ -121,7 +121,7 @@
     - `subtitle.finalized`: 定稿字幕（极速模式）
     - `subtitle.restored`: 恢复字幕（断点续传）
 
-### 字幕实时持久化（V3.7.3）
+### 字幕实时持久化（v3.1.0.3）
 
 - `backend/app/services/streaming_subtitle.py`
   - `to_checkpoint_data` (518-550): 导出字幕快照
@@ -160,7 +160,7 @@
     - 恢复 `StreamingSubtitleManager` 字幕快照
     - 推送 SSE 事件通知前端恢复完成
 
-- `backend/app/pipelines/preprocessing_pipeline.py` (V3.7.2)
+- `backend/app/pipelines/preprocessing_pipeline.py` (v3.1.0.2)
   - 保存 `chunks_metadata` 到 checkpoint (约170行)
   - 从 `chunks_metadata` 恢复 chunks，跳过 VAD (约95-177行)
 
@@ -197,25 +197,25 @@ video_to_srt_gpu 项目实现了一个**统一的 SSE 连接管理器**，支持
 
 #### 2. 事件类型系统（命名空间化）
 
-项目采用**命名空间化事件类型**（V3.7+），解决事件冲突和分类问题：
+项目采用**命名空间化事件类型**（v3.1.0+），解决事件冲突和分类问题：
 
 **进度事件** (`progress.*`)
-- `progress.overall` - 总体进度（V3.7.1+ 包含 `detail` 字段：fast/slow/align/preprocess）
+- `progress.overall` - 总体进度（v3.1.0.1+ 包含 `detail` 字段：fast/slow/align/preprocess）
 - `progress.extract`, `progress.vad`, `progress.demucs` - 预处理阶段
 - `progress.sensevoice`, `progress.whisper` - 转录阶段
-- `progress.fast`, `progress.slow`, `progress.align` - V3.7.2+ 双流流水线专用
+- `progress.fast`, `progress.slow`, `progress.align` - v3.1.0.2+ 双流流水线专用
 
 **字幕流式事件** (`subtitle.*`)
 - `subtitle.draft` - 草稿字幕（快流/SenseVoice，双模态架构）
 - `subtitle.finalized` - 定稿字幕（极速模式）
 - `subtitle.replace_chunk` - 替换 Chunk（慢流/Whisper，双模态架构）
-- `subtitle.restored` - 恢复字幕（断点续传后，V3.7.3）
+- `subtitle.restored` - 恢复字幕（断点续传后，v3.1.0.3）
 - `subtitle.sv_sentence`, `subtitle.whisper_patch`, `subtitle.llm_proof`, `subtitle.llm_trans` - 旧版兼容
 
 **信号事件** (`signal.*`)
 - `signal.job_start`, `signal.job_complete`, `signal.job_failed` - 任务生命周期
 - `signal.job_paused`, `signal.job_resumed`, `signal.job_canceled` - 任务控制
-- `signal.pause_pending` - V3.7.2+ 暂停挂起信号（正在等待流水线响应）
+- `signal.pause_pending` - v3.1.0.2+ 暂停挂起信号（正在等待流水线响应）
 - `signal.circuit_breaker`, `signal.model_upgrade` - 熔断和模型升级
 
 **设计优势**：
@@ -226,14 +226,14 @@ video_to_srt_gpu 项目实现了一个**统一的 SSE 连接管理器**，支持
 
 #### 3. 后端 SSE 发送链路
 
-**ProgressEventEmitter (V3.7.1+)**
+**ProgressEventEmitter (v3.1.0.1+)**
 
 项目引入了**统一进度发射器**，解决双流流水线进度不同步的问题：
 
 - **三种模式**: `SENSEVOICE_ONLY` (极速模式)、`WHISPER_PATCH` (补刀模式)、`DUAL_STREAM` (双流模式)
 - **阶段权重**: 预处理 10%、快流 50%、慢流 30%、对齐 10%（双流模式）
 - **加权进度计算**: `total = preprocess * 0.1 + fast * 0.5 + slow * 0.3 + align * 0.1`
-- **防倒退保护**: 只允许进度增加，防止节流导致的阶段不同步（V3.7.2）
+- **防倒退保护**: 只允许进度增加，防止节流导致的阶段不同步（v3.1.0.2）
 - **节流推送**: 0.5 秒节流间隔，关键节点强制推送（阶段完成时）
 - **双层推送**: 同时推送阶段进度（`progress.fast`）和总体进度（`progress.overall`）
 
@@ -278,7 +278,7 @@ video_to_srt_gpu 项目实现了一个**统一的 SSE 连接管理器**，支持
 前端实现了**完整的事件处理器映射**：
 
 ```javascript
-// V3.7.2: 区分总体进度和阶段进度
+// v3.1.0.2: 区分总体进度和阶段进度
 'progress.overall': handleOverallProgress,  // 只有这个更新主进度条
 'progress.extract': handlePhaseProgress,    // 仅日志，不更新主进度条
 'progress.fast': handlePhaseProgress,
@@ -288,7 +288,7 @@ video_to_srt_gpu 项目实现了一个**统一的 SSE 连接管理器**，支持
 // 信号事件
 'signal.job_complete': handleSignal,
 'signal.job_paused': handleSignal,
-'signal.pause_pending': handleSignal,  // V3.7.2+ 暂停挂起
+'signal.pause_pending': handleSignal,  // v3.1.0.2+ 暂停挂起
 
 // 字幕流式事件（双模态架构）
 'subtitle.draft': (data) => { handlers.onDraft?.(data) },
@@ -302,7 +302,7 @@ video_to_srt_gpu 项目实现了一个**统一的 SSE 连接管理器**，支持
 前端从 SSE 提取双流进度（而非字幕数计算）：
 
 ```javascript
-// V3.7.2 修复: 从 SSE 后端推送更新双流进度
+// v3.1.0.2 修复: 从 SSE 后端推送更新双流进度
 onProgress(data) {
   if (data.detail) {
     // 提取 detail 字段中的真实进度
@@ -315,11 +315,11 @@ onProgress(data) {
 }
 ```
 
-#### 5. 双流进度推送机制（V3.7+）
+#### 5. 双流进度推送机制（v3.1.0+）
 
 **后端设计**
 
-V3.7+ 引入了**双流独立进度推送**，解决进度卡顿问题：
+v3.1.0+ 引入了**双流独立进度推送**，解决进度卡顿问题：
 
 - **FastWorker 独立进度**: `emitter.update_fast(processed, total)` - 基于实际 Chunk 处理数
 - **SlowWorker 独立进度**: `emitter.update_slow(processed, total)` - 基于实际 Chunk 处理数
@@ -349,7 +349,7 @@ V3.7+ 引入了**双流独立进度推送**，解决进度卡顿问题：
   2. **独立性**: 快流和慢流处理进度独立，前端字幕数无法分别计算
   3. **实时性**: 后端推送真实进度，前端无需等待字幕完全生成
 
-**V3.7.2 进度抖动修复**
+**v3.1.0.2 进度抖动修复**
 
 问题：后端同时推送 `progress.overall`（总进度）和 `progress.{phase}`（阶段进度），前端将所有事件都更新主进度条，导致从 64% 突然降到 20%。
 
@@ -358,24 +358,24 @@ V3.7+ 引入了**双流独立进度推送**，解决进度卡顿问题：
 - `handlePhaseProgress`: 阶段进度处理函数（仅日志，不更新主进度条）
 - 前端防倒退保护: 检测进度倒退 > 5%，忽略异常事件
 
-#### 6. 暂停/恢复的 SSE 支持（V3.7+）
+#### 6. 暂停/恢复的 SSE 支持（v3.1.0+）
 
 **暂停机制完整覆盖**
 
-V3.7+ 实现了**完整的暂停机制**，覆盖所有阶段：
+v3.1.0+ 实现了**完整的暂停机制**，覆盖所有阶段：
 
 - **音频提取 (FFmpeg)**: 独立原子区域，等待完成后检查暂停
 - **VAD 切分**: 独立原子区域（快速 < 1 秒）
 - **频谱分诊**: 每 Chunk 检查点
 - **人声分离 (Demucs)**: 全局模式为原子区域，按需模式每 Chunk 检查点
-- **预处理→转录过渡点** (V3.7.2): 新增检查点，防止暂停信号被忽略
-- **FastWorker (极速模式)** (V3.7.2): 每 Chunk 检查点
+- **预处理→转录过渡点** (v3.1.0.2): 新增检查点，防止暂停信号被忽略
+- **FastWorker (极速模式)** (v3.1.0.2): 每 Chunk 检查点
 - **SlowWorker**: 每 Chunk 检查点
 - **AlignmentWorker**: 每 Chunk 检查点
 
 **SSE 信号事件**
 
-- `signal.pause_pending` (V3.7.2): 暂停挂起信号
+- `signal.pause_pending` (v3.1.0.2): 暂停挂起信号
   - 用户点击暂停 → 推送 `pause_pending` → 前端显示"正在暂停..."
   - 流水线响应后 → 推送 `job_paused` → 前端显示"已暂停"
 - `signal.job_paused`: 任务已暂停
@@ -464,7 +464,7 @@ V3.7+ 实现了**完整的暂停机制**，覆盖所有阶段：
 - **深拷贝句子对象** (V3.8): 避免共享引用导致的竞态条件
 - **锁外推送 SSE**: 在锁外推送 SSE 事件，避免长时间持锁导致死锁
 
-#### 8. 字幕实时持久化（V3.7.3）
+#### 8. 字幕实时持久化（v3.1.0.3）
 
 **问题**: 暂停后恢复时字幕索引从 0 重新开始，导致新字幕覆盖旧字幕
 
@@ -529,7 +529,7 @@ V3.7+ 实现了**完整的暂停机制**，覆盖所有阶段：
 3. **批量推送**: Chunk 级别批量推送字幕（`subtitle.replace_chunk`），减少 SSE 事件数量
 4. **深拷贝句子对象**: 避免共享引用导致的竞态条件（V3.8）
 5. **锁外推送 SSE**: 在锁外推送 SSE 事件，避免长时间持锁导致死锁
-6. **防倒退保护**: 只允许进度增加，防止节流导致的阶段不同步（V3.7.2）
+6. **防倒退保护**: 只允许进度增加，防止节流导致的阶段不同步（v3.1.0.2）
 7. **智能停止重连**: 检测 HTTP 404 错误（任务不存在），停止无效重连
 
 ### 4. 容错机制和边界情况处理
@@ -572,7 +572,7 @@ SSEManager (统一 SSE 连接管理器)
     │   ├─ 调用 SSEManager.broadcast_sync() 推送字幕事件
     │   ├─ 双模态架构: add_draft_sentences(), replace_chunk(), add_finalized_sentences()
     │   ├─ 推送 subtitle.draft, subtitle.replace_chunk, subtitle.finalized 事件
-    │   └─ V3.7.3 持久化: to_checkpoint_data(), restore_from_checkpoint()
+    │   └─ v3.1.0.3 持久化: to_checkpoint_data(), restore_from_checkpoint()
     │
     └─ push_progress_event, push_subtitle_event, push_signal_event (辅助函数)
         └─ 封装 SSEManager.broadcast_sync() 调用

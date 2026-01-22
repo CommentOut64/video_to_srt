@@ -45,7 +45,7 @@
 - 管理队列和背压控制
 - 处理异常传播和错误收集
 - 推送 SSE 实时事件
-- 支持暂停/恢复和断点续传 (V3.7)
+- 支持暂停/恢复和断点续传 (v3.1.0)
 
 **架构设计**:
 
@@ -69,8 +69,8 @@ VAD切分 → [FastWorker (CPU并发)] → 定稿推送 → 完成
   - `sensevoice_only`: 极速模式
   - `sv_whisper_patch`: 智能补刀模式 (V3.10)
   - `sv_whisper_dual`: 双流精校模式
-- 集成 `CancellationToken` 支持暂停/取消 (V3.7)
-- 集成 `ProgressEventEmitter` 统一进度发射器 (V3.7.1)
+- 集成 `CancellationToken` 支持暂停/取消 (v3.1.0)
+- 集成 `ProgressEventEmitter` 统一进度发射器 (v3.1.0.1)
 
 ### 1.2 FastWorker - 快流推理 Worker (CPU)
 
@@ -129,7 +129,7 @@ VAD切分 → [FastWorker (CPU并发)] → 定稿推送 → 完成
 **关键特性**:
 - **顺序处理**: 保证 Whisper 上下文连贯性
 - **并行预加载**: 在 FastWorker 启动时并行预加载 Whisper 模型
-- **上下文保存**: V3.7 支持保存 `previous_whisper_text` 用于断点续传
+- **上下文保存**: v3.1.0 支持保存 `previous_whisper_text` 用于断点续传
 
 ### 1.4 AlignmentWorker - 对齐 Worker (CPU)
 
@@ -443,17 +443,17 @@ cpu_semaphore = asyncio.Semaphore(cpu_count - 2)  # 限制 SenseVoice 并发推�
 
 ### 4.2 任务状态追踪和进度管理
 
-**V3.7 更新 - CancellationToken 集成** (`async_dual_pipeline.py:72,95,220,239-262`):
+**v3.1.0 更新 - CancellationToken 集成** (`async_dual_pipeline.py:72,95,220,239-262`):
 - 支持暂停/取消操作
 - 原子区域保护 (单个 Chunk + SSE 推送)
 - 每个 Chunk 处理完成后检查暂停/取消并保存检查点
 
-**V3.7.1 更新 - ProgressEventEmitter 集成** (`async_dual_pipeline.py:73,96,248-253`):
+**v3.1.0.1 更新 - ProgressEventEmitter 集成** (`async_dual_pipeline.py:73,96,248-253`):
 - 统一进度发射器
 - 实时同步 `job.progress` 并推送 SSE 事件
 - 支持多层进度条 (FastWorker, SlowWorker, AlignmentWorker)
 
-**V3.7.3 更新 - 字幕实时持久化** (`async_dual_pipeline.py:268-284`):
+**v3.1.0.3 更新 - 字幕实时持久化** (`async_dual_pipeline.py:268-284`):
 ```python
 # 获取字幕快照
 subtitle_checkpoint_data = self.fast_worker.subtitle_manager.to_checkpoint_data()
@@ -474,7 +474,7 @@ token.check_and_save(checkpoint_data, job_dir)
 - 任何 Worker 的异常都会传播到 `run()` 方法
 - 使用 `errors` 列表收集所有异常
 
-**V3.7.4 更新 - 暂停异常处理** (`async_dual_pipeline.py:150-151,286-294`):
+**v3.1.0.4 更新 - 暂停异常处理** (`async_dual_pipeline.py:150-151,286-294`):
 ```python
 self.pause_exception: Optional[PausedException] = None
 
@@ -515,12 +515,12 @@ if self.pause_exception:
 
 ### 4.5 暂停/恢复机制的完整覆盖
 
-**V3.7 更新 - 检查点保存** (`async_dual_pipeline.py:265-284`):
+**v3.1.0 更新 - 检查点保存** (`async_dual_pipeline.py:265-284`):
 - 每个 Chunk 处理完成后保存检查点
 - 包含 `processed_indices`, `finalized_indices`, 字幕快照
 - 支持恢复时跳过已处理的 Chunk
 
-**V3.7.4 更新 - 分别设置各 Worker 的基准偏移量** (`async_dual_pipeline.py:160-163,182-183`):
+**v3.1.0.4 更新 - 分别设置各 Worker 的基准偏移量** (`async_dual_pipeline.py:160-163,182-183`):
 ```python
 initial_slow_processed_indices: Optional[set] = None  # SlowWorker 初始索引
 initial_finalized_indices: Optional[set] = None  # AlignmentWorker 初始索引
@@ -850,19 +850,19 @@ async def get(self):
 - 延迟切分策略
 - 硬上限提高到 20 秒
 
-### V3.7.4 - 暂停异常处理优化
+### v3.1.0.4 - 暂停异常处理优化
 - 捕获取消暂停，停止派发新 Chunk
 - 分别设置各 Worker 的基准偏移量
 
-### V3.7.3 - 字幕实时持久化
+### v3.1.0.3 - 字幕实时持久化
 - 字幕快照保存与恢复
 - 解决暂停恢复时字幕覆写问题
 
-### V3.7.1 - 进度发射器集成
+### v3.1.0.1 - 进度发射器集成
 - `ProgressEventEmitter` 统一进度发射器
 - 实时同步 `job.progress` 并推送 SSE 事件
 
-### V3.7 - 暂停/恢复完整支持
+### v3.1.0 - 暂停/恢复完整支持
 - `CancellationToken` 集成
 - 原子区域保护
 - 检查点保存

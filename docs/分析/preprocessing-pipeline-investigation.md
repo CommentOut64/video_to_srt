@@ -14,7 +14,7 @@
 
 **核心特点**：
 - 采用 Stage 模式，支持灵活的预处理流程配置
-- 支持 V3.7 CancellationToken 实现暂停/取消/断点续传
+- 支持 v3.1.0 CancellationToken 实现暂停/取消/断点续传
 - 包含三个可选阶段的原子化控制
 
 **处理流程**：
@@ -33,7 +33,7 @@ Stage 3: 人声分离（可选，支持全局/按需模式）
 **关键实现细节**：
 
 - `PreprocessingPipeline.process()` (行 98-252)：主处理流程，支持断点续传
-  - V3.7.2 新增检查点恢复机制，跳过已完成的 VAD
+  - v3.1.0.2 新增检查点恢复机制，跳过已完成的 VAD
   - 原子区域管理：`token.enter_atomic_region()` / `token.exit_atomic_region()`
   - 检查点保存：每阶段完成后调用 `token.check_and_save()`
 
@@ -42,7 +42,7 @@ Stage 3: 人声分离（可选，支持全局/按需模式）
   - 传入 VADConfig 用于语言特定的 VAD 策略（V3.9.1 新增）
   - 进度回调支持
 
-- `PreprocessingPipeline._restore_chunks_from_metadata()` (行 298-370)：V3.7.2 新增
+- `PreprocessingPipeline._restore_chunks_from_metadata()` (行 298-370)：v3.1.0.2 新增
   - 从检查点恢复 chunks，避免重新执行 VAD
   - 使用已知时间戳快速切分音频
   - 边界检查和有效性验证
@@ -108,7 +108,7 @@ Stage 3: 人声分离（可选，支持全局/按需模式）
 - 逐 Chunk 批量分诊（原子单位：单个Chunk）
 - 调用 `AudioSpectrumClassifier.diagnose_chunk()` 进行分析
 - 每 5 个 Chunk 保存一次检查点（避免频繁 I/O）
-- 支持中断和恢复（V3.7）
+- 支持中断和恢复（v3.1.0）
 
 **分诊逻辑**：`AudioSpectrumClassifier` (文件：`backend/app/services/audio_spectrum_classifier.py`)
 
@@ -137,7 +137,7 @@ Stage 3: 人声分离（可选，支持全局/按需模式）
 **关键实现** (行 68-94)：
 - 支持分离模式切换
 - 传入 `job_dir` 用于检查点保存
-- 支持恢复已分离的 chunk（V3.7）
+- 支持恢复已分离的 chunk（v3.1.0）
 
 ---
 
@@ -476,7 +476,7 @@ class VADConfig:
 
 ### 4.2 进度追踪和状态管理
 
-**检查点机制** (V3.7)：
+**检查点机制** (v3.1.0)：
 
 ```
 Stage 1a: FFmpeg 提取 → 原子区域 → 检查点：audio_extracted
@@ -600,7 +600,7 @@ def get_statistics(self, chunks: List[AudioChunk]) -> dict:
 ```
 
 **统一特性**：
-- 都支持 CancellationToken（V3.7）
+- 都支持 CancellationToken（v3.1.0）
 - 都支持检查点保存和恢复
 - 都提供统计接口
 

@@ -751,7 +751,7 @@ Server-Sent Events 系统，使用命名空间统一事件类型。为前端提�
 - `backend/app/services/job_queue_service.py` (QueueService): 队列事件广播
 - `backend/app/services/transcription_service.py`: 转录进度事件发送
 - `backend/app/services/streaming_subtitle.py` (StreamingSubtitleManager): 字幕流式传输
-- `backend/app/services/progress_emitter.py` (ProgressEventEmitter): V3.7.1 统一进度发射器
+- `backend/app/services/progress_emitter.py` (ProgressEventEmitter): v3.1.0.1 统一进度发射器
 
 ### 5.3 Execution Flow (LLM Retrieval Map)
 
@@ -764,7 +764,7 @@ Server-Sent Events 系统，使用命名空间统一事件类型。为前端提�
     - 事件类型使用命名空间前缀: progress.*, signal.*, subtitle.*
   ↓
 [2] 进度事件发送
-    ProgressEventEmitter（V3.7.1）
+    ProgressEventEmitter（v3.1.0.1）
       - 统一进度发射器
       - 实时同步 job.progress 和推送 SSE
       - 计算快流、慢流、对齐、预处理的独立进度
@@ -782,7 +782,7 @@ Server-Sent Events 系统，使用命名空间统一事件类型。为前端提�
       - signal.circuit_breaker, signal.model_upgrade
 ```
 
-#### 5.3.2 V3.7.1 双流进度计算和推送
+#### 5.3.2 v3.1.0.1 双流进度计算和推送
 
 ```
 ProgressEventEmitter.update_overall_progress()
@@ -793,13 +793,13 @@ ProgressEventEmitter.update_overall_progress()
     - slow: SlowWorker 处理完成的 Chunk 数 / 总数
     - align: AlignmentWorker 处理完成的 Chunk 数 / 总数
   ↓
-[2] 推送 progress.overall 事件（V3.7.1）
+[2] 推送 progress.overall 事件（v3.1.0.1）
     {
       "percent": 45.2,              # 总进度百分比
       "phase": "sensevoice",        # 当前主阶段
       "status": "processing",       # 状态
       "total": 20,                  # 总 Chunk 数
-      "detail": {                   # V3.7.1 新增
+      "detail": {                   # v3.1.0.1 新增
         "preprocess": 100,          # 预处理进度 (%)
         "fast": 45,                 # FastWorker 进度 (%)
         "slow": 30,                 # SlowWorker 进度 (%)
@@ -818,7 +818,7 @@ ProgressEventEmitter.update_overall_progress()
 
 **进度事件（progress.*）**:
 ```
-progress.overall       # 总体进度（V3.7.1+ 含 detail 字段）
+progress.overall       # 总体进度（v3.1.0.1+ 含 detail 字段）
 progress.preprocess    # 预处理阶段
 progress.extract       # 音频提取
 progress.spectrum_analysis  # 频谱分析
@@ -836,8 +836,8 @@ progress.srt           # SRT 生成
 signal.job_start       # 任务开始
 signal.job_complete    # 任务完成
 signal.job_failed      # 任务失败
-signal.job_paused      # 任务暂停（V3.7.2）
-signal.pause_pending   # 暂停中（V3.7.2）
+signal.job_paused      # 任务暂停（v3.1.0.2）
+signal.pause_pending   # 暂停中（v3.1.0.2）
 signal.job_canceled    # 任务取消
 signal.job_resumed     # 任务恢复
 signal.circuit_breaker # 熔断触发
@@ -865,7 +865,7 @@ subtitle.batch_update  # 批量更新
   "status": "processing"
 }
 
-// 进度事件（V3.7.1+ 双流进度）
+// 进度事件（v3.1.0.1+ 双流进度）
 {
   "percent": 45.2,
   "phase": "sensevoice",
@@ -949,7 +949,7 @@ EventSource('/api/stream/{job_id}')
   └─ 'subtitle.*' → handleSubtitle()
   ↓
 [1] handleProgress()
-    - 检查 event.detail 是否存在（V3.7.2）
+    - 检查 event.detail 是否存在（v3.1.0.2）
     - 若存在: 调用 updateDualStreamProgressFromSSE()
     - 若不存在: 用传统逻辑计算进度
     - 更新 projectStore.progressTracker
@@ -966,13 +966,13 @@ EventSource('/api/stream/{job_id}')
     - 在 projectStore.sentences 中保存
 ```
 
-#### 6.3.2 双流进度条显示（V3.7.2）
+#### 6.3.2 双流进度条显示（v3.1.0.2）
 
 ```
 EditorView.vue:onProgress()
   ↓
 if (data.detail) {
-    // V3.7.2 修复: 使用后端推送的真实进度
+    // v3.1.0.2 修复: 使用后端推送的真实进度
     updateDualStreamProgressFromSSE({
         fastProgress: data.detail.fast,
         slowProgress: data.detail.slow,
@@ -1066,7 +1066,7 @@ currentTime 更新
     WaveformTimeline 更新 Region 高亮
 ```
 
-### 6.4 关键前端修复（V3.7.2）
+### 6.4 关键前端修复（v3.1.0.2）
 
 **问题**: 前端未使用后端推送的 `progress.overall` 事件中的 `detail` 字段，导致双流进度条卡住。
 
@@ -1075,7 +1075,7 @@ currentTime 更新
 // EditorView.vue
 async onProgress(data) {
     if (data.detail) {
-        // V3.7.2: 新增方法，从 SSE 事件中提取真实进度
+        // v3.1.0.2: 新增方法，从 SSE 事件中提取真实进度
         this.projectStore.updateDualStreamProgressFromSSE(data.detail)
     }
 }
@@ -1188,7 +1188,7 @@ updateDualStreamProgressFromSSE(detail) {
 │ SSE 事件处理:                                                           │
 │ - progress 事件                                                         │
 │   → 更新双流进度条（fast/slow/align）                                 │
-│   → 检查 data.detail 字段（V3.7.2）                                   │
+│   → 检查 data.detail 字段（v3.1.0.2）                                   │
 │                                                                          │
 │ - subtitle.sv_sentence                                                  │
 │   → 添加草稿字幕到列表（灰色、低透明度）                              │
@@ -1318,7 +1318,7 @@ AlignmentWorker 输出:
 | **硬上限强制保留** | hard_limit_duration=20s，force_create=True | 避免尾部词汇丢失 |
 | **Whisper 仲裁机制** | 二次听诊低置信度句子，区分幻觉vs含糊语音 | 平衡删除垃圾和保留有效内容 |
 | **双模态字幕** | 草稿（快）+ 定稿（准），分离显示 | 提升用户体验，提供快速反馈 |
-| **V3.7.1 双流进度** | SSE 中推送 detail.fast/slow/align | 前端可独立跟踪各层进度，无卡顿 |
+| **v3.1.0.1 双流进度** | SSE 中推送 detail.fast/slow/align | 前端可独立跟踪各层进度，无卡顿 |
 
 ### 8.2 性能优化决策
 
@@ -1338,7 +1338,7 @@ AlignmentWorker 输出:
 | **Whisper 仲裁删除** | 误删有效内容 | 二次听诊，低阈值（< 0.4） |
 | **Chunk 失败跳号** | 部分内容丢失 | 失败 Chunk 保留原始 SenseVoice 结果 |
 | **CTC 去重** | 误删合理重复词 | 三重条件判断，词长限制 |
-| **暂停/恢复** | 状态不一致 | Checkpoint 保存，Token 覆盖完整（V3.7） |
+| **暂停/恢复** | 状态不一致 | Checkpoint 保存，Token 覆盖完整（v3.1.0） |
 
 ---
 
@@ -1358,7 +1358,7 @@ AlignmentWorker 输出:
 | **CTC 重叠去重** | 去除 "W" + "Would" → "WWouldn't" 的重复 |
 | **Whisper 仲裁** | 对低置信度句子的二次听诊和判决 |
 | **SSE** | Server-Sent Events，实时推送事件 |
-| **ProgressEventEmitter** | V3.7.1 统一进度发射器，同步 job.progress 和推送 SSE |
+| **ProgressEventEmitter** | v3.1.0.1 统一进度发射器，同步 job.progress 和推送 SSE |
 | **TextSource** | 字幕来源枚举（SENSEVOICE、WHISPER、LLM） |
 
 ---
