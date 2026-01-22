@@ -3,7 +3,7 @@ SpectralTriageStage - 频谱分诊阶段
 
 负责为每个AudioChunk进行频谱分析，判断是否需要人声分离，并推荐合适的模型。
 
-V3.7 更新：
+v3.1.0 更新：
 - 集成 CancellationToken 支持暂停/取消
 - 支持逐 Chunk 中断和检查点保存
 
@@ -29,7 +29,7 @@ from pathlib import Path
 from app.services.audio.chunk_engine import AudioChunk
 from app.services.audio_spectrum_classifier import AudioSpectrumClassifier, get_spectrum_classifier
 
-# V3.7: 导入取消令牌
+# v3.1.0: 导入取消令牌
 if TYPE_CHECKING:
     from app.utils.cancellation_token import CancellationToken
 
@@ -50,7 +50,7 @@ class SpectralTriageStage:
     - 判断是否需要人声分离
     - 推荐合适的分离模型（htdemucs/mdx_extra）
 
-    V3.7: 支持 CancellationToken 实现暂停/取消/断点续传
+    v3.1.0: 支持 CancellationToken 实现暂停/取消/断点续传
     原子单位：单个 Chunk 分诊，可在每个 Chunk 之间中断
 
     V3.1.1+dev.20260108.02: 支持 SNR+C50 三层决策策略配置
@@ -61,7 +61,7 @@ class SpectralTriageStage:
         classifier: Optional[AudioSpectrumClassifier] = None,
         threshold: float = 0.35,
         logger: Optional[logging.Logger] = None,
-        cancellation_token: Optional["CancellationToken"] = None,  # V3.7: 新增
+        cancellation_token: Optional["CancellationToken"] = None,  # v3.1.0: 新增
         use_snr_triage: bool = True,  # V3.1.1+dev.20260108.02: 新增，默认启用
         use_smart_probe: bool = True,  # V3.1.2+dev.20260109.01: 新增，智能探针模式（默认启用）
         show_progress: bool = True  # V3.1.2+dev.20260109.01: 新增，显示命令行进度条
@@ -73,7 +73,7 @@ class SpectralTriageStage:
             classifier: 频谱分类器实例，如果为None则使用全局单例
             threshold: 分诊阈值，默认0.35
             logger: 日志记录器，如果为None则创建新的
-            cancellation_token: 取消令牌（可选，V3.7）
+            cancellation_token: 取消令牌（可选，v3.1.0）
             use_snr_triage: 是否启用 SNR+C50 三层决策策略（默认 True，V3.1.1+dev.20260108.02）
             use_smart_probe: 是否启用智能探针模式（默认 True，V3.1.2+dev.20260109.01）
             show_progress: 是否显示命令行进度条（默认 True，V3.1.2+dev.20260109.01）
@@ -82,7 +82,7 @@ class SpectralTriageStage:
         self.classifier = classifier or get_spectrum_classifier(use_snr_strategy=use_snr_triage)
         self.threshold = threshold
         self.logger = logger or logging.getLogger(__name__)
-        self.cancellation_token = cancellation_token  # V3.7
+        self.cancellation_token = cancellation_token  # v3.1.0
         self.use_snr_triage = use_snr_triage  # V3.1.1+dev.20260108.02
         self.use_smart_probe = use_smart_probe  # V3.1.2+dev.20260109.01
         self.show_progress = show_progress  # V3.1.2+dev.20260109.01
@@ -107,8 +107,8 @@ class SpectralTriageStage:
     async def process(
         self,
         chunks: List[AudioChunk],
-        job_dir: Optional[Path] = None,  # V3.7: 用于保存检查点
-        diagnosed_indices: Optional[set] = None  # V3.7: 已诊断的索引（用于恢复）
+        job_dir: Optional[Path] = None,  # v3.1.0: 用于保存检查点
+        diagnosed_indices: Optional[set] = None  # v3.1.0: 已诊断的索引（用于恢复）
     ) -> List[AudioChunk]:
         """
         批量分诊所有chunk
@@ -117,8 +117,8 @@ class SpectralTriageStage:
 
         Args:
             chunks: 待分诊的AudioChunk列表
-            job_dir: 任务目录（可选，V3.7 用于保存检查点）
-            diagnosed_indices: 已诊断的chunk索引集合（可选，V3.7 用于恢复）
+            job_dir: 任务目录（可选，v3.1.0 用于保存检查点）
+            diagnosed_indices: 已诊断的chunk索引集合（可选，v3.1.0 用于恢复）
 
         Returns:
             带有分诊结果标记的AudioChunk列表
@@ -129,7 +129,7 @@ class SpectralTriageStage:
 
         self.logger.info(f"开始频谱分诊，共 {len(chunks)} 个chunk")
 
-        token = self.cancellation_token  # V3.7: 简化引用
+        token = self.cancellation_token  # v3.1.0: 简化引用
         diagnosed_indices = diagnosed_indices or set()
         sample_rate = chunks[0].sample_rate if chunks else 16000
 
@@ -172,14 +172,14 @@ class SpectralTriageStage:
                 leave=False
             ))
 
-        # V3.7: 逐个处理 chunk，支持中断
+        # v3.1.0: 逐个处理 chunk，支持中断
         for i, chunk in iterator:
-            # V3.7: 跳过已诊断的 chunk（用于恢复）
+            # v3.1.0: 跳过已诊断的 chunk（用于恢复）
             if i in diagnosed_indices:
                 self.logger.debug(f"跳过已诊断的 chunk {i}")
                 continue
 
-            # V3.7: 单个 chunk 分诊（快速，不需要原子区域）
+            # v3.1.0: 单个 chunk 分诊（快速，不需要原子区域）
             diagnosis = self.classifier.diagnose_chunk(
                 audio=chunk.audio,
                 chunk_index=i,
@@ -208,7 +208,7 @@ class SpectralTriageStage:
             }
             triage_log.append(chunk_log)
 
-            # V3.7: 每个 chunk 之间检查取消/暂停并保存检查点
+            # v3.1.0: 每个 chunk 之间检查取消/暂停并保存检查点
             if token and job_dir:
                 # 每 5 个 chunk 保存一次检查点（避免频繁 I/O）
                 if (i + 1) % 5 == 0 or i == len(chunks) - 1:

@@ -2,7 +2,7 @@
 任务队列管理服务 - V2.4
 核心功能: 串行执行，防止并发OOM，队列持久化，插队功能
 
-V3.7 更新:
+v3.1.0 更新:
 - 集成 CancellationToken 机制，支持协作式取消/暂停
 - 在原子区域内的暂停/取消请求会被延迟执行
 """
@@ -124,7 +124,7 @@ class JobQueueService:
         # 插队设置
         self._default_prioritize_mode: PrioritizeMode = "gentle"  # 默认插队模式
 
-        # [V3.7] 取消令牌注册表
+        # [v3.1.0] 取消令牌注册表
         self.cancellation_tokens: Dict[str, CancellationToken] = {}
 
         # V3.1.2+dev.20260114.09: 720p 调度空闲通知延迟定时器
@@ -237,7 +237,7 @@ class JobQueueService:
         """
         暂停任务
 
-        V3.7 更新: 集成 CancellationToken，触发协作式暂停
+        v3.1.0 更新: 集成 CancellationToken，触发协作式暂停
         V3.1.0 更新: 区分"正在暂停"和"已暂停"状态
         - 正在运行的任务：推送 pause_pending，等待流水线响应
         - 队列中的任务：立即推送 job_paused
@@ -264,11 +264,11 @@ class JobQueueService:
                 job.status = "pausing"
                 job.message = "正在暂停，等待当前操作完成..."
 
-                # [V3.7] 触发取消令牌的暂停
+                # [v3.1.0] 触发取消令牌的暂停
                 token = self.cancellation_tokens.get(job_id)
                 if token:
                     token.pause()
-                    logger.info(f"[V3.7] 已触发取消令牌暂停: {job_id}")
+                    logger.info(f"[v3.1.0] 已触发取消令牌暂停: {job_id}")
                 else:
                     logger.info(f"设置暂停标志: {job_id}")
             elif job_id in self.queue:
@@ -299,7 +299,7 @@ class JobQueueService:
         """
         恢复暂停的任务
 
-        V3.7 更新: 智能恢复逻辑
+        v3.1.0 更新: 智能恢复逻辑
         - 如果任务仍在运行中（暂停被延迟），只需清除暂停标志
         - 如果任务已完全停止，重新加入队列等待执行
 
@@ -331,7 +331,7 @@ class JobQueueService:
         self._restore_progress_from_checkpoint(job)
 
         with self.lock:
-            # [V3.7] 检查任务是否仍在运行中
+            # [v3.1.0] 检查任务是否仍在运行中
             # 场景: 用户在原子区域内暂停后立即恢复
             is_still_running = (job_id == self.running_job_id)
             token = self.cancellation_tokens.get(job_id)
@@ -343,7 +343,7 @@ class JobQueueService:
                 job.paused = False
                 job.status = "processing"
                 job.message = "已恢复，继续执行中..."
-                logger.info(f"[V3.7] 任务仍在运行，清除暂停标志: {job_id}")
+                logger.info(f"[v3.1.0] 任务仍在运行，清除暂停标志: {job_id}")
             else:
                 # 任务已完全停止，需要重新加入队列
                 if job_id not in self.queue:
@@ -356,9 +356,9 @@ class JobQueueService:
                 if token:
                     # Token 还存在但任务不在运行（理论上不应该发生）
                     token.resume()
-                    logger.warning(f"[V3.7] Token存在但任务未运行，可能是竞态条件: {job_id}")
+                    logger.warning(f"[v3.1.0] Token存在但任务未运行，可能是竞态条件: {job_id}")
                 else:
-                    logger.info(f"[V3.7] 任务已停止，重新加入队列: {job_id}")
+                    logger.info(f"[v3.1.0] 任务已停止，重新加入队列: {job_id}")
 
         # 保存队列状态和任务元信息
         self._persist_queue_and_jobs([job], {job.job_id: from_status}, reason="resume_request")
@@ -380,7 +380,7 @@ class JobQueueService:
         - 删除数据时同步清理内存中的 self.jobs[job_id]
         - 广播 job_removed 事件，解决幽灵任务问题
 
-        V3.7 更新:
+        v3.1.0 更新:
         - 集成 CancellationToken，触发协作式取消
 
         V3.1.0 更新:
@@ -406,7 +406,7 @@ class JobQueueService:
                     if success:
                         # [V3.1.0] 推送任务删除事件（而非仅状态变更）
                         self._notify_job_removed(job_id)
-                        # [V3.7] 清理取消令牌
+                        # [v3.1.0] 清理取消令牌
                         self._remove_cancellation_token(job_id)
                         return True, None, False
                     return False, err or "删除失败", False
@@ -422,11 +422,11 @@ class JobQueueService:
             # 设置取消标志
             job.canceled = True
 
-            # [V3.7] 触发取消令牌的取消
+            # [v3.1.0] 触发取消令牌的取消
             token = self.cancellation_tokens.get(job_id)
             if token:
                 token.cancel()
-                logger.info(f"[V3.7] 已触发取消令牌取消: {job_id}")
+                logger.info(f"[v3.1.0] 已触发取消令牌取消: {job_id}")
 
             # 如果在队列中，直接移除并标记为已取消
             if job_id in self.queue:
@@ -477,7 +477,7 @@ class JobQueueService:
                     del self.jobs[job_id]
                     logger.info(f"[幽灵任务修复] 已从内存移除任务: {job_id}")
 
-            # [V3.7] 清理取消令牌
+            # [v3.1.0] 清理取消令牌
             self._remove_cancellation_token(job_id)
         else:
             success, err = True, None
@@ -560,9 +560,9 @@ class JobQueueService:
                                 self._heartbeat_ttl_seconds,
                             )
 
-                        # [V3.7] 创建取消令牌
+                        # [v3.1.0] 创建取消令牌
                         token = self._create_cancellation_token(self.running_job_id)
-                        logger.debug(f"[V3.7] 已创建取消令牌: {self.running_job_id}")
+                        logger.debug(f"[v3.1.0] 已创建取消令牌: {self.running_job_id}")
 
                         # V3.1.2+dev.20260114.11: 新任务开始前，智能处理正在运行的 720p 转码
                         self._maybe_throttle_or_pause_proxy()
@@ -610,16 +610,16 @@ class JobQueueService:
                         logger.info(f"任务完成: {self.running_job_id}")
 
                 except CancelledException as e:
-                    # [V3.7] 捕获取消异常
+                    # [v3.1.0] 捕获取消异常
                     job.status = "canceled"
                     job.message = "已取消"
-                    logger.info(f"[V3.7] 任务被取消: {e.job_id}")
+                    logger.info(f"[v3.1.0] 任务被取消: {e.job_id}")
 
                 except PausedException as e:
-                    # [V3.7] 捕获暂停异常
+                    # [v3.1.0] 捕获暂停异常
                     job.status = "paused"
                     job.message = "已暂停"
-                    logger.info(f"[V3.7] 任务已暂停: {e.job_id}")
+                    logger.info(f"[v3.1.0] 任务已暂停: {e.job_id}")
 
                 except Exception as e:
                     job.status = "failed"
@@ -638,7 +638,7 @@ class JobQueueService:
                         # [V3.1.0] 从待取消列表移除
                         self._pending_cancel_requests.pop(finished_job_id, None)
 
-                    # [V3.7] 清理取消令牌
+                    # [v3.1.0] 清理取消令牌
                     self._remove_cancellation_token(finished_job_id)
                     self.heartbeat_service.release(finished_job_id, self._lease_owner)
 
@@ -808,7 +808,7 @@ class JobQueueService:
         - async: 三级异步流水线（错位并行，性能提升 30-50%）
         - sync: 串行流水线（稳定版，V3.0 兼容）
 
-        V3.7 新特性：支持断点续传
+        v3.1.0 新特性：支持断点续传
         - 集成 CancellationToken 机制
         - 支持从 CheckpointV37 恢复
 
@@ -850,10 +850,10 @@ class JobQueueService:
             transcription_profile=transcription_profile
         )
 
-        # V3.7: 获取取消令牌
+        # v3.1.0: 获取取消令牌
         cancellation_token = self.get_cancellation_token(job.job_id)
 
-        # V3.7: 初始化检查点管理器
+        # v3.1.0: 初始化检查点管理器
         job_dir = Path(job.dir)
         checkpoint_manager = CheckpointManagerV37(job_dir, logger)
         checkpoint_manager.save_checkpoint({
@@ -867,11 +867,11 @@ class JobQueueService:
         try:
             logger.info(f"[双流对齐] 开始处理任务: {job.job_id}, preset={preset_id}")
 
-            # V3.7: 检查是否有检查点需要恢复
+            # v3.1.0: 检查是否有检查点需要恢复
             checkpoint = checkpoint_manager.load_checkpoint()
             is_resuming = checkpoint is not None
             if is_resuming:
-                logger.info(f"[V3.7] 检测到检查点，准备断点续传: phase={checkpoint.phase}")
+                logger.info(f"[v3.1.0] 检测到检查点，准备断点续传: phase={checkpoint.phase}")
                 # V3.1.0: 从检查点恢复进度并立即推送 SSE
                 if hasattr(checkpoint, 'to_dict'):
                     progress_emitter.restore_from_checkpoint(checkpoint.to_dict())
@@ -903,22 +903,23 @@ class JobQueueService:
                 language,
             )
 
-            # 创建预处理流水线（V3.7: 传递取消令牌，V3.1.0: 传递VAD配置）
+            # 创建预处理流水线（v3.1.0: 传递取消令牌，V3.1.0: 传递VAD配置）
             preprocessing_pipeline = PreprocessingPipeline(
                 config=job.settings.preprocessing,
                 vad_config=vad_config,  # V3.1.0: 新增
                 logger=logger,
-                cancellation_token=cancellation_token  # V3.7
+                cancellation_token=cancellation_token,  # v3.1.0
+                progress_emitter=progress_emitter
             )
 
-            # V3.7: 检查是否需要跳过预处理阶段
+            # v3.1.0: 检查是否需要跳过预处理阶段
             skip_preprocessing = False
             preprocessing_state = None
             if is_resuming and checkpoint.preprocessing:
                 preprocessing_state = checkpoint.preprocessing
                 if preprocessing_state.separation_completed:
                     skip_preprocessing = True
-                    logger.info("[V3.7] 预处理阶段已完成，跳过")
+                    logger.info("[v3.1.0] 预处理阶段已完成，跳过")
                     progress_emitter.update_preprocess(100, "completed", "预处理已完成")
 
             if not skip_preprocessing:
@@ -926,7 +927,7 @@ class JobQueueService:
                 audio_chunks = await preprocessing_pipeline.process(
                     video_path=job.input_path,
                     job_state=job,
-                    job_dir=job_dir  # V3.7: 传递 job_dir 用于检查点保存
+                    job_dir=job_dir  # v3.1.0: 传递 job_dir 用于检查点保存
                 )
 
                 # 获取预处理统计信息
@@ -985,7 +986,7 @@ class JobQueueService:
             total_chunks = len(audio_chunks)
             progress_tracker.start_phase(ProcessPhase.SENSEVOICE, total_chunks, "双流对齐...")
 
-            # V3.7: 检查是否需要恢复转录状态
+            # v3.1.0: 检查是否需要恢复转录状态
             # V3.1.0: 使用 min(fast, slow) 作为安全恢复点
             # 原因：finalized_indices 在当前实现中未被保存到 checkpoint，始终为空
             # 使用 min 确保不会跳过任何需要处理的 chunk
@@ -1099,14 +1100,14 @@ class JobQueueService:
                 patch_engine=patch_engine,
                 patching_threshold=patching_threshold,
                 logger=logger,
-                cancellation_token=cancellation_token,  # V3.7
+                cancellation_token=cancellation_token,  # v3.1.0
                 progress_emitter=progress_emitter  # V3.1.0: 传递进度发射器
             )
 
-            # V3.7: 如果有历史上下文，恢复 SlowWorker 状态
+            # v3.1.0: 如果有历史上下文，恢复 SlowWorker 状态
             if previous_whisper_text:
                 async_pipeline.restore_prompt_cache(previous_whisper_text)
-                logger.info(f"[V3.7] 已恢复 Whisper 上下文: {len(previous_whisper_text)} 字符")
+                logger.info(f"[v3.1.0] 已恢复 Whisper 上下文: {len(previous_whisper_text)} 字符")
 
             # V3.1.0: 分别计算各 Worker 的基准偏移量
             # FastWorker 使用 safe_indices（用于跳过已处理的 chunk）
@@ -1131,7 +1132,7 @@ class JobQueueService:
                 audio_chunks=audio_chunks,
                 full_audio_array=full_audio,
                 full_audio_sr=sr,
-                job_dir=job_dir,  # V3.7
+                job_dir=job_dir,  # v3.1.0
                 processed_indices=fast_processed_indices,  # V3.1.0: FastWorker 跳过的索引
                 base_slow_count=base_slow_count,  # V3.1.0: SlowWorker 的基准偏移量（已废弃）
                 base_align_count=base_align_count,  # V3.1.0: 对齐阶段的基准偏移量（已废弃）
@@ -1189,9 +1190,9 @@ class JobQueueService:
                 except Exception as e:
                     logger.warning(f"[V3.1.2] 保存字幕快照失败: {e}")
 
-            # V3.7: 任务完成，清理检查点
+            # v3.1.0: 任务完成，清理检查点
             checkpoint_manager.delete_checkpoint()
-            logger.info("[V3.7] 任务完成，检查点已清理")
+            logger.info("[v3.1.0] 任务完成，检查点已清理")
 
             # V3.1.0: 使用 progress_emitter 标记完成
             progress_emitter.complete("处理完成")
@@ -1675,7 +1676,7 @@ class JobQueueService:
         except Exception as e:
             logger.warning(f"[V3.1.0] 恢复进度失败，保持当前进度: {job.job_id}, error={e}")
 
-    # ==================== V3.7 取消令牌管理 ====================
+    # ==================== v3.1.0 取消令牌管理 ====================
 
     def _create_cancellation_token(self, job_id: str) -> CancellationToken:
         """
@@ -1689,7 +1690,7 @@ class JobQueueService:
         """
         # 如果已存在，先清理
         if job_id in self.cancellation_tokens:
-            logger.warning(f"[V3.7] 取消令牌已存在，覆盖: {job_id}")
+            logger.warning(f"[v3.1.0] 取消令牌已存在，覆盖: {job_id}")
 
         token = create_cancellation_token(job_id)
         self.cancellation_tokens[job_id] = token
@@ -1704,7 +1705,7 @@ class JobQueueService:
         """
         if job_id and job_id in self.cancellation_tokens:
             del self.cancellation_tokens[job_id]
-            logger.debug(f"[V3.7] 已移除取消令牌: {job_id}")
+            logger.debug(f"[v3.1.0] 已移除取消令牌: {job_id}")
 
     def get_cancellation_token(self, job_id: str) -> Optional[CancellationToken]:
         """
