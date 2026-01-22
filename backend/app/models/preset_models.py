@@ -38,7 +38,7 @@ class DemucsModel(Enum):
 class TranscriptionProfile(Enum):
     """转录流水线模式"""
     SENSEVOICE_ONLY = "sensevoice_only"     # 仅 SenseVoice (极速, 默认)
-    SV_WHISPER_PATCH = "sv_whisper_patch"   # SV + Whisper 补刀
+    SV_WHISPER_PATCH = "sv_whisper_patch"   # SV + Whisper 复核
     SV_WHISPER_DUAL = "sv_whisper_dual"     # SV + Whisper 双流并行
 
 
@@ -154,10 +154,10 @@ class TranscriptionSettings:
     # 主引擎运行设备: auto/cpu
     sensevoice_device: str = "auto"
 
-    # 辅助/补刀模型: tiny/small/medium/large-v3
+    # 辅助/复核模型: tiny/small/medium/large-v3
     whisper_model: str = "medium"
 
-    # 补刀触发阈值: 0.0-1.0, 低于此置信度的句子送给 Whisper 重跑
+    # 复核触发阈值: 0.0-1.0, 低于此置信度的句子送给 Whisper 重跑
     patching_threshold: float = 0.60
 
     def to_dict(self) -> Dict[str, Any]:
@@ -329,10 +329,10 @@ PRESET_BALANCED = MacroPreset(
         vad_filter=True,
     ),
     transcription=TranscriptionSettings(
-        transcription_profile="sv_whisper_patch",   # SV + Whisper 补刀
+        transcription_profile="sv_whisper_patch",   # SV + Whisper 复核
         sensevoice_device="auto",
-        whisper_model="medium",         # Whisper Medium 用于补刀
-        patching_threshold=0.60,        # 置信度 < 60% 触发补刀
+        whisper_model="medium",         # Whisper Medium 用于复核
+        patching_threshold=0.60,        # 置信度 < 60% 触发复核
     ),
     refinement=RefinementSettings(
         llm_task="proofread",           # 稀疏校对

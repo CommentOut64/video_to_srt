@@ -28,7 +28,7 @@
    - 引擎适配器：SenseVoiceEngine、WhisperEngine、DualStreamEngine、DummyEngine；均注册到 `ASREngineFactory`。
 2. **Worker 容器化**
    - `FastWorker` 仅负责：拉取音频 chunk、调用 draft 引擎、输出草稿（含 words、metadata）。
-   - `SlowWorker` 仅负责：接收句子/片段、调用 patch 引擎、输出补刀结果。
+   - `SlowWorker` 仅负责：接收句子/片段、调用 patch 引擎、输出复核结果。
    - 所有分句、对齐、熔断判断从 worker 中剥离。
 3. **分句/对齐服务（旧逻辑版）**
    - `DefaultSegmenter`：封装原 CTC/word-based 分句算法，对外暴露 `segment(words, text, metadata)` 接口。

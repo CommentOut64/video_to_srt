@@ -97,10 +97,10 @@ class AsyncDualPipeline:
             enable_fallback: 是否启用降级策略
             transcription_profile: 转录模式 (sensevoice_only/sv_whisper_patch/sv_whisper_dual)
             draft_engine: 草稿引擎实例（必须提供）
-            patch_engine: 补刀引擎实例（非极速模式必须提供）
+            patch_engine: 复核引擎实例（非极速模式必须提供）
             segmenter: 分句服务实例（可选）
             aligner: 对齐服务实例（可选）
-            patching_threshold: 补刀阈值配置（可选）
+            patching_threshold: 复核阈值配置（可选）
             enable_cross_chunk_merge: 是否启用跨 chunk 合并
             logger: 日志记录器
             cancellation_token: 取消令牌（可选，v3.1.0）
@@ -122,13 +122,13 @@ class AsyncDualPipeline:
 
         # 判断是否为纯 SenseVoice 模式
         self.is_sensevoice_only = (transcription_profile == "sensevoice_only")
-        # V3.10: 判断是否为智能补刀模式
+        # V3.10: 判断是否为智能复核模式
         self.is_patching_mode = (transcription_profile == "sv_whisper_patch")
 
         if self.is_sensevoice_only:
             self.logger.info("极速模式: 纯 SenseVoice 流水线，跳过 Whisper")
         elif self.is_patching_mode:
-            self.logger.info("智能补刀模式: 根据 SenseVoice 质量决定是否调用 Whisper")
+            self.logger.info("智能复核模式: 根据 SenseVoice 质量决定是否调用 Whisper")
         else:
             self.logger.info(f"双流精校模式: 全量 Whisper 转录")
 
@@ -162,7 +162,7 @@ class AsyncDualPipeline:
             self.slow_worker = None
             self.aligner = None
         else:
-            # V3.10: 智能补刀模式下设置 is_patching_mode=True
+            # V3.10: 智能复核模式下设置 is_patching_mode=True
             self.slow_worker = SlowWorker(
                 patch_engine=self.patch_engine,
                 whisper_language=whisper_language,
@@ -204,7 +204,7 @@ class AsyncDualPipeline:
 
         流程：
         - 极速模式 (sensevoice_only): 仅运行 FastWorker，直接输出定稿
-        - 补刀/双流模式: 运行完整三级流水线
+        - 复核/双流模式: 运行完整三级流水线
 
         V3.1.0: 支持分别设置各 Worker 的基准偏移量和初始索引，修复恢复后进度跳变问题
 
@@ -355,7 +355,7 @@ class AsyncDualPipeline:
         initial_finalized_indices: Optional[set] = None  # V3.1.0: 对齐阶段初始索引
     ) -> List[ProcessingContext]:
         """
-        运行完整三级流水线（补刀/双流模式）
+        运行完整三级流水线（复核/双流模式）
 
         流程：
         1. 启动三个并行任务（FastWorker, SlowWorker, 对齐阶段）
@@ -462,7 +462,7 @@ class AsyncDualPipeline:
 
     def _should_skip_whisper(self, sv_result: Dict[str, Any], chunk: AudioChunk) -> bool:
         """
-        智能补刀模式下判断是否跳过 Whisper。
+        智能复核模式下判断是否跳过 Whisper。
         """
         confidence = sv_result.get("confidence", 0.0)
         text_clean = sv_result.get("text_clean", "")
@@ -777,7 +777,7 @@ class AsyncDualPipeline:
                     whisper_result: Optional[Dict[str, Any]] = None
                     prompt: Optional[str] = None
 
-                    # 智能补刀：质量足够则跳过 Whisper
+                    # 智能复核：质量足够则跳过 Whisper
                     if self.is_patching_mode and sv_result:
                         if self._should_skip_whisper(sv_result, chunk):
                             skip_whisper = True
@@ -904,7 +904,7 @@ class AsyncDualPipeline:
 
             self.logger.debug(
                 f"Chunk {ctx.chunk_index}: SenseVoice 定稿已推送 "
-                f"({len(final_sentences)} 个句子) [智能补刀-跳过]"
+                f"({len(final_sentences)} 个句子) [智能复核-跳过]"
             )
             return
 

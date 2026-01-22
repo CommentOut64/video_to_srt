@@ -71,7 +71,7 @@ from enum import Enum
 class TextSource(Enum):
     """文本来源"""
     SENSEVOICE = "sensevoice"            # SenseVoice 原始输出
-    WHISPER_PATCH = "whisper_patch"      # Whisper 补刀替换
+    WHISPER_PATCH = "whisper_patch"      # Whisper 复核替换
     LLM_CORRECTION = "llm_correction"    # LLM 校对修正
     LLM_TRANSLATION = "llm_translation"  # LLM 翻译
 
@@ -578,7 +578,7 @@ def get_confidence_level(confidence: float, config: ThresholdConfig = None) -> C
 
 
 def needs_whisper_patch(confidence: float, config: ThresholdConfig = None) -> bool:
-    """判断是否需要 Whisper 补刀"""
+    """判断是否需要 Whisper 复核"""
     if config is None:
         config = DEFAULT_THRESHOLDS
     return confidence < config.whisper_patch_trigger_confidence
@@ -624,7 +624,7 @@ SSE_PROGRESS_TAGS = {
     "progress.demucs": "人声分离进度",
     "progress.vad": "VAD 分段进度",
     "progress.sensevoice": "SenseVoice 转录进度（流式）",
-    "progress.whisper": "Whisper 补刀进度",
+    "progress.whisper": "Whisper 复核进度",
     "progress.llm_proof": "LLM 校对进度",
     "progress.llm_trans": "LLM 翻译进度",
     "progress.srt": "SRT 生成进度",
@@ -634,7 +634,7 @@ SSE_PROGRESS_TAGS = {
 SSE_SUBTITLE_TAGS = {
     "subtitle.sv_segment": "SenseVoice 完成一个 VAD 段",
     "subtitle.sv_sentence": "SenseVoice 完成一个句子",
-    "subtitle.whisper_patch": "Whisper 补刀覆盖一个句子",
+    "subtitle.whisper_patch": "Whisper 复核覆盖一个句子",
     "subtitle.llm_proof": "LLM 校对覆盖一个句子",
     "subtitle.llm_trans": "LLM 翻译完成一个句子",
     "subtitle.batch_update": "批量更新多个句子",

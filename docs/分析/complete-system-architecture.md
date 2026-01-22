@@ -11,7 +11,7 @@
 
 1. [预处理阶段](#1-预处理阶段)
 2. [快慢双流架构](#2-快慢双流架构)
-3. [智能补刀和熔断](#3-智能补刀和熔断)
+3. [智能复核和熔断](#3-智能复核和熔断)
 4. [对齐和分句](#4-对齐和分句)
 5. [后端推送 (SSE)](#5-后端推送-sse)
 6. [前端实现](#6-前端实现)
@@ -198,7 +198,7 @@ _run_sensevoice_only()
 最终输出（无 Whisper 延迟）
 ```
 
-#### 2.3.2 智能补刀模式（sv_whisper_patch，V3.10）
+#### 2.3.2 智能复核模式（sv_whisper_patch，V3.10）
 
 ```
 VAD 切分后的 AudioChunk 列表
@@ -368,9 +368,9 @@ process(context: ProcessingContext)
     - 对疑似垃圾句子进行 Whisper 二次听诊
     - 决策: 删除 / 替换 / 保留
   ↓
-[4] 字级单字符强制补刀（V3.5）
+[4] 字级单字符强制复核（V3.5）
     - 检查单字符实词（"I", "A" 等）
-    - 置信度 < 0.9 → 触发补刀
+    - 置信度 < 0.9 → 触发复核
   ↓
 [5] 词级对齐
     - 使用 faster-whisper 的对齐结果
@@ -399,31 +399,31 @@ process(context: ProcessingContext)
 
 ---
 
-## 3. 智能补刀和熔断
+## 3. 智能复核和熔断
 
 ### 3.1 Identity
 
-SenseVoice 转录后的质量监控和自动补救机制。包括四种触发条件的 Whisper 补刀判决、FuseBreakerV2 熔断决策、加权置信度计算和自动升级策略。
+SenseVoice 转录后的质量监控和自动补救机制。包括四种触发条件的 Whisper 复核判决、FuseBreakerV2 熔断决策、加权置信度计算和自动升级策略。
 
 ### 3.2 Core Components
 
-- `backend/app/core/thresholds.py` (ThresholdConfig, needs_whisper_patch): 补刀触发条件定义
+- `backend/app/core/thresholds.py` (ThresholdConfig, needs_whisper_patch): 复核触发条件定义
 - `backend/app/services/fuse_breaker_v2.py` (FuseBreakerV2): 熔断决策器核心类
 - `backend/app/models/circuit_breaker_models.py` (FuseAction, FuseDecision, SeparationLevel): 决策数据模型
 - `backend/app/services/audio/chunk_engine.py` (AudioChunk): 包含熔断相关字段
 - `backend/app/services/demucs_service.py` (DemucsService): 分离升级服务
-- `backend/app/services/transcription_service.py` (_post_process_enhancement): 补刀判决集成
+- `backend/app/services/transcription_service.py` (_post_process_enhancement): 复核判决集成
 
 ### 3.3 Execution Flow (LLM Retrieval Map)
 
-#### 3.3.1 四种 Whisper 补刀触发条件（V3.5 增强）
+#### 3.3.1 四种 Whisper 复核触发条件（V3.5 增强）
 
 ```
 后处理增强流程
   ↓
 for sentence in sentences:
     if needs_whisper_patch(sentence):
-        触发 Whisper 补刀
+        触发 Whisper 复核
   ↓
 conditions:
   1. 置信度低: confidence < 0.6（原有逻辑）
@@ -774,7 +774,7 @@ Server-Sent Events 系统，使用命名空间统一事件类型。为前端提�
     StreamingSubtitleManager
       - add_draft_sentences()：推送 subtitle.sv_sentence（草稿）
       - add_finalized_sentences()：推送 subtitle.finalized（定稿，V3.5）
-      - update_sentence()：推送 subtitle.whisper_patch（补刀）
+      - update_sentence()：推送 subtitle.whisper_patch（复核）
   ↓
 [4] 信号事件发送
     JobQueueService
@@ -825,7 +825,7 @@ progress.spectrum_analysis  # 频谱分析
 progress.demucs        # 人声分离
 progress.vad           # 语音活动检测
 progress.sensevoice    # SenseVoice 推理
-progress.whisper       # Whisper 补刀
+progress.whisper       # Whisper 复核
 progress.llm_proof     # LLM 校对
 progress.llm_trans     # LLM 翻译
 progress.srt           # SRT 生成
@@ -848,7 +848,7 @@ signal.model_upgrade   # 模型升级
 ```
 subtitle.sv_sentence   # SenseVoice 句子生成（草稿）
 subtitle.finalized     # 定稿字幕（V3.5）
-subtitle.whisper_patch # Whisper 补刀完成
+subtitle.whisper_patch # Whisper 复核完成
 subtitle.llm_proof     # LLM 校对完成
 subtitle.llm_trans     # LLM 翻译完成
 subtitle.batch_update  # 批量更新
@@ -961,7 +961,7 @@ EventSource('/api/stream/{job_id}')
   ↓
 [3] handleSubtitle()
     - subtitle.sv_sentence → 添加草稿字幕
-    - subtitle.whisper_patch → 更新字幕（补刀）
+    - subtitle.whisper_patch → 更新字幕（复核）
     - subtitle.finalized → 标记为定稿
     - 在 projectStore.sentences 中保存
 ```
@@ -1093,7 +1093,7 @@ updateDualStreamProgressFromSSE(detail) {
 
 **为什么需要双模态字幕？**
 - 草稿: FastWorker 立即输出，给用户快速反馈
-- 定稿: Whisper 补刀后，最终输出，可直接使用
+- 定稿: Whisper 复核后，最终输出，可直接使用
 
 **为什么前端需要处理 detail 字段？**
 - 后端在多个地方（FastWorker、SlowWorker、AlignmentWorker）推送进度
@@ -1154,8 +1154,8 @@ updateDualStreamProgressFromSSE(detail) {
 │ │  ↓                                                              │    │
 │ │  Whisper 推理                                                   │    │
 │ │  + Whisper 仲裁机制（低置信度二次听诊）                         │    │
-│ │  + 字级单字符强制补刀                                          │    │
-│ │  + 推送补刀字幕 SSE                                           │    │
+│ │  + 字级单字符强制复核                                          │    │
+│ │  + 推送复核字幕 SSE                                           │    │
 │ │  ↓                                                              │    │
 │ │  Queue2                                                        │    │
 │ │                                                                │    │
@@ -1176,7 +1176,7 @@ updateDualStreamProgressFromSSE(detail) {
 │ - progress.sensevoice (FastWorker 进度)                               │
 │ - subtitle.sv_sentence (草稿字幕)                                       │
 │ - progress.whisper (SlowWorker 进度)                                  │
-│ - subtitle.whisper_patch (补刀字幕)                                     │
+│ - subtitle.whisper_patch (复核字幕)                                     │
 │ - progress.alignment (AlignmentWorker 进度)                            │
 │ - progress.overall (统一进度，含 detail 字段)                          │
 │ - signal.job_complete (任务完成)                                       │
@@ -1365,7 +1365,7 @@ AlignmentWorker 输出:
 
 **文档完成时间**: 2025-12-26
 **覆盖版本**: V3.8.0
-**主要模块**: 预处理、双流架构、补刀熔断、分句对齐、SSE 推送、前端渲染
+**主要模块**: 预处理、双流架构、复核熔断、分句对齐、SSE 推送、前端渲染
 **总代码行数引用**: 50+ 个核心文件，5000+ 行代码
 
 1. **安装CUDA和cuDNN**

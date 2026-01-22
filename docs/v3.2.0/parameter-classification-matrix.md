@@ -103,7 +103,7 @@
 - 通常是固定的经验值或调优值
 
 **是否应纳入统一管理**: ⚠️ 部分可以，但需明确区分
-- ✅ 模型级阈值（如 Whisper 补刀阈值）可以纳入
+- ✅ 模型级阈值（如 Whisper 复核阈值）可以纳入
 - ❌ 业务逻辑阈值（如频谱分诊阈值）不应纳入
 
 **示例**:
@@ -158,7 +158,7 @@
    - 模型行为: `vad_filter`, `condition_on_previous_text`, `shifts`, `overlap`
 
 2. **部分模型级阈值参数**（第 5 类的子集）
-   - Whisper 补刀阈值: `whisper_patch_trigger_confidence`
+   - Whisper 复核阈值: `whisper_patch_trigger_confidence`
    - SenseVoice 置信度阈值: `sv_confidence_low`, `sv_confidence_high`
 
 3. **部分模型级开关参数**（第 6 类的子集）
@@ -237,7 +237,7 @@
 | `device` | whisper | 运行参数 | 推理设备选择 | auto | auto/cuda/cpu | `whisper_service.py` |
 | `compute_type` | whisper | 运行参数 | 计算精度类型 | auto | float16/int8/int8_float16/auto | `whisper_service.py:36` |
 | `cpu_threads` | whisper | 运行参数 | CPU 线程数 | None（继承全局） | int > 0 | 全局配置 |
-| `vad_filter` | whisper | 运行参数 + 开关参数 | VAD 前处理开关（补刀场景） | False | bool | `whisper_executor.py:57,62` |
+| `vad_filter` | whisper | 运行参数 + 开关参数 | VAD 前处理开关（复核场景） | False | bool | `whisper_executor.py:57,62` |
 | `condition_on_previous_text` | whisper | 运行参数 + 开关参数 | 条件文本生成开关 | False | bool | `whisper_executor.py:57,62` |
 | `repetition_penalty` | whisper | 运行参数 + 输入参数 | 重复惩罚系数 | None（默认） | float >= 1.0 | `whisper_executor.py:76,120` |
 | `no_repeat_ngram_size` | whisper | 运行参数 + 输入参数 | N-gram 重复抑制大小 | None（默认） | int >= 2 | `whisper_executor.py:76,121` |
@@ -439,15 +439,15 @@
 
 ### 第 5 类：阈值参数详细清单
 
-#### 5.1 Whisper 补刀触发阈值
+#### 5.1 Whisper 复核触发阈值
 
 | 参数名 | 所属模型/阶段 | 参数分类 | 参数用途 | 默认值 | 期望格式和范围 | 代码位置 |
 |--------|--------------|---------|---------|--------|---------------|---------|
-| `whisper_patch_trigger_confidence` | whisper | 阈值参数 | 补刀触发置信度 | 0.6 | float 0-1 | `thresholds.py:43` |
+| `whisper_patch_trigger_confidence` | whisper | 阈值参数 | 复核触发置信度 | 0.6 | float 0-1 | `thresholds.py:43` |
 | `short_segment_duration` | whisper | 阈值参数 | 短片段时长 | 1.0 | float 秒 | `thresholds.py:46` |
 | `short_segment_chars` | whisper | 阈值参数 | 短片段字符数 | 3 | int | `thresholds.py:47` |
-| `single_char_force_patch` | whisper | 阈值参数 + 开关参数 | 单字符强制补刀开关 | True | bool | `thresholds.py:48` |
-| `single_char_confidence_threshold` | whisper | 阈值参数 | 单字符补刀置信度 | 0.9 | float 0-1 | `thresholds.py` |
+| `single_char_force_patch` | whisper | 阈值参数 + 开关参数 | 单字符强制复核开关 | True | bool | `thresholds.py:48` |
+| `single_char_confidence_threshold` | whisper | 阈值参数 | 单字符复核置信度 | 0.9 | float 0-1 | `thresholds.py` |
 | `word_warning_confidence` | whisper | 阈值参数 | 字级警告阈值 | 0.5 | float 0-1 | `thresholds.py:56` |
 | `word_critical_confidence` | whisper | 阈值参数 | 字级严重警告 | 0.3 | float 0-1 | `thresholds.py:57` |
 
@@ -541,7 +541,7 @@
 
 | 参数名 | 所属模型/阶段 | 参数分类 | 参数用途 | 默认值 | 代码位置 |
 |--------|--------------|---------|---------|--------|---------|
-| `single_char_force_patch` | whisper | 开关参数 | 单字符强制补刀 | True | `thresholds.py:48` |
+| `single_char_force_patch` | whisper | 开关参数 | 单字符强制复核 | True | `thresholds.py:48` |
 | `vad_filter` | whisper | 开关参数 + 运行参数 | VAD 前处理 | False | `whisper_executor.py:57` |
 | `condition_on_previous_text` | whisper | 开关参数 + 运行参数 | 条件文本生成 | False | `whisper_executor.py:57` |
 

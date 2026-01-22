@@ -5,7 +5,7 @@
 触发条件：检测到 BGM/Noise 标签 + 低置信度
 动作：回溯到原始音频，使用升级的模型重新分离
 
-注意：Whisper补刀不在此处理，那是后处理增强阶段的事
+注意：Whisper复核不在此处理，那是后处理增强阶段的事
 """
 import logging
 from typing import Optional

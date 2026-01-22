@@ -123,7 +123,7 @@
 - **置信度标记**: 生成的时间戳标记为`is_pseudo=True`，用于区分真实对齐和估算对齐
 
 **使用场景**:
-1. Whisper补刀后替换文本时，重新生成字级时间戳
+1. Whisper复核后替换文本时，重新生成字级时间戳
 2. LLM校对/翻译后，将新文本映射到原时间窗口
 3. AlignmentWorker Level 2降级策略中，作为双模态对齐失败的回退方案
 4. 字幕切分时，当缺少字级时间戳时按比例估算时间
@@ -228,7 +228,7 @@ AlignmentWorker._align_and_fallback() (Level 2)
   token[i].end = start + (i+1) * step
   ```
 - 标记: `is_pseudo=True`
-- 使用场景: Whisper补刀、LLM校对后的文本映射
+- 使用场景: Whisper复核、LLM校对后的文本映射
 
 **跨Chunk合并时的时间戳处理**:
 - `WhisperBufferPool.align_text_to_chunks()`: 将Whisper长文本对齐回原始Chunk
@@ -295,10 +295,10 @@ AlignmentWorker._align_and_fallback() (Level 2)
 
 ##### 5.4 伪对齐通用化（时间戳修复中间件）
 
-**创新点**: 伪对齐不仅用于Whisper补刀，还泛化到所有文本替换场景
+**创新点**: 伪对齐不仅用于Whisper复核，还泛化到所有文本替换场景
 
 **支持场景**:
-1. Whisper补刀后文本映射
+1. Whisper复核后文本映射
 2. LLM校对/翻译后时间戳重建
 3. 用户手动编辑后时间戳估算
 4. 字幕切分时的回退方案
@@ -350,9 +350,9 @@ VAD切分 → [FastWorker 并发] → SequencedQueue → [SlowWorker 顺序] →
 - 简单Chunk秒级完成，复杂Chunk后台慢跑（不阻塞流水线）
 - Whisper上下文连贯性保证（顺序处理维持时间轴）
 
-##### 5.8 V3.10智能补刀-跳过机制
+##### 5.8 V3.10智能复核-跳过机制
 
-**创新点**: AlignmentWorker支持快速路径，当SlowWorker判断Whisper补刀无意义时直接跳过
+**创新点**: AlignmentWorker支持快速路径，当SlowWorker判断Whisper复核无意义时直接跳过
 
 **条件**:
 - `ctx.whisper_skipped=True` → 直接使用SenseVoice草稿作为定稿
@@ -368,7 +368,7 @@ VAD切分 → [FastWorker 并发] → SequencedQueue → [SlowWorker 顺序] →
 
 1. **项目已完全移除WhisperX依赖**，从单引擎强制对齐迁移到双引擎时空解耦架构（SenseVoice时间领主 + Whisper文本权威）
 
-2. **伪对齐算法是项目的核心创新**，提供通用化的时间戳修复能力，支持Whisper补刀、LLM校对、用户编辑等所有文本替换场景
+2. **伪对齐算法是项目的核心创新**，提供通用化的时间戳修复能力，支持Whisper复核、LLM校对、用户编辑等所有文本替换场景
 
 3. **三级降级对齐策略是业界首创**，通过Level 1双模态对齐 → Level 2伪对齐 → Level 3草稿的渐进式降级，实现质量与速度的自适应平衡
 
@@ -467,7 +467,7 @@ Level 4: 任何可用文本创建单句字幕
 ```
 PseudoAlignment.apply() (核心方法)
     ↓ 被调用于
-    ├─ AlignmentWorker Level 2 (Whisper补刀后)
+    ├─ AlignmentWorker Level 2 (Whisper复核后)
     ├─ LLM校对后 (文本替换后)
     ├─ LLM翻译后 (生成目标语言时间戳)
     ├─ 字幕切分回退 (无字级时间戳时)
@@ -508,7 +508,7 @@ subtitle.chunk_replace SSE事件 (定稿替换)
 
 ```
 SlowWorker.process()
-    ↓ 判断是否需要Whisper补刀
+    ↓ 判断是否需要Whisper复核
     ├─ 需要 → ctx.whisper_skipped=False → 正常流程
     └─ 不需要 → ctx.whisper_skipped=True → 跳过推理
         ↓ 传递给

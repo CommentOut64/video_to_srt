@@ -13,8 +13,8 @@
 ### 核心创新点
 
 1. **乱序执行、顺序提交架构** - CPU 并发 + GPU 顺序的三级流水线设计
-2. **FastWorker 草稿/定稿双模式** - 支持极速模式和补刀模式动态切换
-3. **四种 Whisper 补刀触发条件** - 全方位覆盖 CTC 解码缺陷
+2. **FastWorker 草稿/定稿双模式** - 支持极速模式和复核模式动态切换
+3. **四种 Whisper 复核触发条件** - 全方位覆盖 CTC 解码缺陷
 4. **Whisper 仲裁机制** - 低置信度句子的二次安检和智能判决
 5. **CTC 重叠去重** - 三重条件判断消除口吃和重复词
 6. **调度公平性保证** - 避免 SlowWorker 饿死的精确唤醒机制
@@ -50,7 +50,7 @@
 **架构设计**:
 
 ```
-补刀模式架构：
+复核模式架构：
 VAD切分 → [FastWorker (CPU并发)] → Queue1 → [SlowWorker (GPU顺序)] → Queue2 → [AlignmentWorker] → 完成
 
 极速模式架构 (V3.5)：
@@ -67,7 +67,7 @@ VAD切分 → [FastWorker (CPU并发)] → 定稿推送 → 完成
 **关键特性**:
 - 支持 `transcription_profile` 参数动态选择执行路径 (`async_dual_pipeline.py:70-101`)
   - `sensevoice_only`: 极速模式
-  - `sv_whisper_patch`: 智能补刀模式 (V3.10)
+  - `sv_whisper_patch`: 智能复核模式 (V3.10)
   - `sv_whisper_dual`: 双流精校模式
 - 集成 `CancellationToken` 支持暂停/取消 (v3.1.0)
 - 集成 `ProgressEventEmitter` 统一进度发射器 (v3.1.0.1)
@@ -91,7 +91,7 @@ VAD切分 → [FastWorker (CPU并发)] → 定稿推送 → 完成
 
 **V3.5 更新 - 草稿/定稿双模式** (`fast_worker.py:60-61,95-96`):
 
-| 参数 | 极速模式 | 补刀模式 | 说明 |
+| 参数 | 极速模式 | 复核模式 | 说明 |
 |------|---------|---------|------|
 | `is_final_output` | `True` | `False` | 是否为最终输出 |
 | **推送方法** | `add_finalized_sentences()` | `add_draft_sentences()` | 推送定稿 vs 草稿 |
@@ -122,7 +122,7 @@ VAD切分 → [FastWorker (CPU并发)] → 定稿推送 → 完成
 - 维持 Whisper 上下文连贯性
 - 支持预加载模型
 
-**V3.10 更新 - 智能补刀模式**:
+**V3.10 更新 - 智能复核模式**:
 - `is_patching_mode=True` 时根据 SenseVoice 质量决定是否调用 Whisper
 - 减少不必要的 Whisper 推理，提升效率
 
@@ -277,14 +277,14 @@ self.not_full.notify()  # 只唤醒一个等待者
    - 不推送草稿，避免前端混淆
 
 **性能特点**:
-- 单阶段处理，无 Whisper 补刀延迟
+- 单阶段处理，无 Whisper 复核延迟
 - 适合对速度要求极高的场景 (边录边推)
 
 ---
 
 ## 3. 关键算法实现
 
-### 3.1 Whisper 补刀机制 - 四种触发条件
+### 3.1 Whisper 复核机制 - 四种触发条件
 
 **位置**: `backend/app/core/thresholds.py:137-166`
 
@@ -308,24 +308,24 @@ if duration < 1.0 and text_length < 3:
 
 **背景**: 快速语音场景 (0.6s 片段 → 10 帧 @ 60ms 分辨率)，CTC 解码容易漏字，导致 "Evil" 被识别为 "E" 且保持 90%+ 置信度。
 
-#### 条件 3: 字级补刀检查
+#### 条件 3: 字级复核检查
 ```python
 if word_level_confidence_check(...):
     return True  # 检查单词级别的置信度
 ```
 
-#### 条件 4: 单字符强制补刀
+#### 条件 4: 单字符强制复核
 ```python
 if text_length == 1 and confidence < 0.9:
-    return True  # 单字符实词 + 低置信度 => 强制补刀
+    return True  # 单字符实词 + 低置信度 => 强制复核
 ```
 
-**优先级**: 单字符强制补刀规则优先于停用词列表，因为单字符错误风险极高。
+**优先级**: 单字符强制复核规则优先于停用词列表，因为单字符错误风险极高。
 
 **配置参数** (`thresholds.py:44-47`):
 - `short_segment_duration: float = 1.0` - 短片段时长阈值
 - `short_segment_chars: int = 3` - 短片段字符数阈值
-- `single_char_force_patch: bool = True` - 单字符强制补刀开关
+- `single_char_force_patch: bool = True` - 单字符强制复核开关
 
 **设计理念**:
 - 在不影响正常流程的情况下，有效识别并修正 CTC 解码限制造成的问题
@@ -553,13 +553,13 @@ finally:
 | **用户体验** | 需等待全部完成 | 立即推送草稿 | 用户可实时预览 |
 | **上下文保证** | 不适用 | GPU 层顺序处理 | 保证 Whisper 上下文连贯性 |
 
-### 5.2 vs 传统补刀机制
+### 5.2 vs 传统复核机制
 
-| 维度 | 传统补刀 | 本项目创新 | 优势 |
+| 维度 | 传统复核 | 本项目创新 | 优势 |
 |------|---------|-----------|------|
 | **触发条件** | 仅置信度阈值 | 四种触发条件 | 全面覆盖 CTC 解码缺陷 |
 | **短片段处理** | 容易漏字 | 短片段识别 | 解决快速语音场景 |
-| **单字符错误** | 误判率高 | 单字符强制补刀 | 错误率大幅下降 |
+| **单字符错误** | 误判率高 | 单字符强制复核 | 错误率大幅下降 |
 | **仲裁机制** | 直接删除 | Whisper 二次安检 | 避免误删有效信息 |
 
 ### 5.3 vs 传统 CTC 解码
@@ -632,7 +632,7 @@ finally:
 - 条件 1: 置信度阈值 (原有逻辑)
 - 条件 2: 短片段识别 (CTC 限制)
 - 条件 3: 字级检查 (单词级置信度)
-- 条件 4: 单字符强制补刀 (错误风险高)
+- 条件 4: 单字符强制复核 (错误风险高)
 
 ### 6.4 仲裁机制模式
 
@@ -711,11 +711,11 @@ async def get(self):
 | **SlowWorker** | `backend/app/pipelines/workers/slow_worker.py` | - | 慢流推理 Worker |
 | **AlignmentWorker** | `backend/app/pipelines/workers/alignment_worker.py` | - | 对齐 Worker |
 
-### 7.2 补刀和仲裁机制
+### 7.2 复核和仲裁机制
 
 | 组件 | 文件路径 | 关键行数 | 说明 |
 |------|---------|---------|------|
-| **Whisper 补刀触发** | `backend/app/core/thresholds.py` | 137-166 | 四种触发条件 |
+| **Whisper 复核触发** | `backend/app/core/thresholds.py` | 137-166 | 四种触发条件 |
 | **Whisper 仲裁** | `backend/app/services/transcription_service.py` | 4381-4473 | 二次安检和判决 |
 | **CTC 重叠去重** | `backend/app/services/sensevoice_onnx_service.py` | 143-213 | 前缀重复去除 |
 
@@ -748,7 +748,7 @@ async def get(self):
 |------|------|------|
 | **乱序执行架构** | `/llmdoc/architecture/async-dual-pipeline.md` | 完整的流水线设计 |
 | **FastWorker 架构** | `/llmdoc/architecture/fast-worker.md` | 快流推理详解 |
-| **Whisper 补刀增强** | `/llmdoc/architecture/whisper-patch-enhancement.md` | 四种触发条件 |
+| **Whisper 复核增强** | `/llmdoc/architecture/whisper-patch-enhancement.md` | 四种触发条件 |
 | **Whisper 仲裁机制** | `/llmdoc/architecture/whisper-arbitration.md` | 二次安检和判决 |
 | **CTC 重叠去重** | `/llmdoc/architecture/ctc-deduplication.md` | 口吃修复 |
 | **预设系统** | `/llmdoc/architecture/sensevoice-presets.md` | 6 种预设方案 |
@@ -762,15 +762,15 @@ async def get(self):
 **优势**:
 1. **高吞吐量**: 乱序执行架构充分利用 CPU 多核，整体吞吐量显著提升
 2. **低延迟**: FastWorker 立即推送草稿，用户可实时预览
-3. **高质量**: 四种补刀触发条件 + Whisper 仲裁机制全面保证转录质量
-4. **灵活性**: 支持极速模式、补刀模式、双流精校模式动态切换
+3. **高质量**: 四种复核触发条件 + Whisper 仲裁机制全面保证转录质量
+4. **灵活性**: 支持极速模式、复核模式、双流精校模式动态切换
 5. **健壮性**: 完整的暂停/恢复、错误处理、容错机制
 
 **创新点**:
 1. **乱序执行、顺序提交**: 业界少见的三级流水线设计
 2. **精确唤醒机制**: 使用 `Condition` 消除惊群效应
 3. **调度公平性保证**: `await asyncio.sleep(0)` 避免 SlowWorker 饿死
-4. **四种补刀触发条件**: 全方位覆盖 CTC 解码缺陷
+4. **四种复核触发条件**: 全方位覆盖 CTC 解码缺陷
 5. **Whisper 仲裁机制**: 智能判决避免误删有效信息
 6. **跨 Chunk 合并**: 提升字幕连贯性
 
@@ -817,7 +817,7 @@ async def get(self):
    - 适合对速度要求极高的场景
    - 如边录边推、实时字幕
 
-2. **使用补刀模式**:
+2. **使用复核模式**:
    - 适合对质量有一定要求的场景
    - 如视频字幕、会议记录
 
@@ -837,7 +837,7 @@ async def get(self):
 
 ## 附录: 版本更新记录
 
-### V3.10 - 智能补刀模式
+### V3.10 - 智能复核模式
 - `is_patching_mode` 参数支持
 - 根据 SenseVoice 质量决定是否调用 Whisper
 

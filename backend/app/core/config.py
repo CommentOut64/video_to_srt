@@ -432,7 +432,7 @@ class ProjectConfig:
             engine: 'faster_whisper' | 'sensevoice'
             total_segments: 总片段数
             segments_to_separate: 需要分离的片段数
-            segments_to_retry: 需要补刀的片段数
+            segments_to_retry: 需要复核的片段数
 
         Returns:
             动态权重字典

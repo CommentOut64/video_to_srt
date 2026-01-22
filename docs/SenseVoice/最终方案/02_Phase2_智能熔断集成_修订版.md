@@ -73,12 +73,12 @@
 
 ### 2.2 熔断机制设计原则
 
-1. **熔断升级优先于 ASR 补刀**
+1. **熔断升级优先于 ASR 复核**
    - 在噪音环境下，优先升级分离模型去除噪音
-   - 已升级后才允许 Whisper 补刀
+   - 已升级后才允许 Whisper 复核
 
 2. **时空解耦原则（新增）**
-   - Whisper 补刀**仅取文本**，时间戳由 SenseVoice 确定
+   - Whisper 复核**仅取文本**，时间戳由 SenseVoice 确定
    - 默认使用伪对齐
 
 3. **止损点机制**
@@ -513,7 +513,7 @@ def get_spectrum_classifier() -> AudioSpectrumClassifier:
 > **重要**：熔断和后处理增强是两个不同的概念
 >
 > - **熔断**：转录过程中检测到BGM/Noise标签+低置信度，回溯升级分离模型，属于**实时纠错**
-> - **Whisper补刀**：转录完成后根据用户配置执行，属于**后处理增强**，不是熔断
+> - **Whisper复核**：转录完成后根据用户配置执行，属于**后处理增强**，不是熔断
 
 ### 4.2 数据模型定义
 
@@ -524,7 +524,7 @@ def get_spectrum_classifier() -> AudioSpectrumClassifier:
 熔断机制数据模型（v2.1 概念重构版）
 
 熔断 = 升级分离模型（转录过程中）
-后处理增强 = Whisper补刀 / LLM校对 / 翻译（转录完成后）
+后处理增强 = Whisper复核 / LLM校对 / 翻译（转录完成后）
 """
 from dataclasses import dataclass, field
 from enum import Enum
@@ -601,7 +601,7 @@ class FuseDecision:
 
 ## 五、熔断决策器（v2.1重构）
 
-> **注意**：熔断决策器**仅负责升级分离模型**的决策，Whisper补刀属于后处理增强，在Phase 3中处理。
+> **注意**：熔断决策器**仅负责升级分离模型**的决策，Whisper复核属于后处理增强，在Phase 3中处理。
 
 **路径**: `backend/app/services/fuse_breaker.py`
 
@@ -613,7 +613,7 @@ class FuseDecision:
 触发条件：检测到 BGM/Noise 标签 + 低置信度
 动作：回溯到原始音频，使用升级的模型重新分离
 
-注意：Whisper补刀不在此处理，那是后处理增强阶段的事
+注意：Whisper复核不在此处理，那是后处理增强阶段的事
 """
 import logging
 from typing import Optional
@@ -899,20 +899,20 @@ FRONTEND_PRESETS = [
     },
     {
         "id": "preset1",
-        "name": "智能补刀",
-        "description": "SV + Whisper 局部补刀，平衡速度与质量",
+        "name": "智能复核",
+        "description": "SV + Whisper 局部复核，平衡速度与质量",
         "timeMultiplier": 0.15
     },
     {
         "id": "preset2",
         "name": "轻度校对",
-        "description": "智能补刀 + LLM 按需校对问题片段",
+        "description": "智能复核 + LLM 按需校对问题片段",
         "timeMultiplier": 0.2
     },
     {
         "id": "preset3",
         "name": "深度校对",
-        "description": "智能补刀 + LLM 全文精修润色",
+        "description": "智能复核 + LLM 全文精修润色",
         "timeMultiplier": 0.3
     },
     {
@@ -951,7 +951,7 @@ def calculate_dynamic_weights(
         engine: 'faster_whisper' | 'sensevoice'
         total_segments: 总片段数
         segments_to_separate: 需要分离的片段数
-        segments_to_retry: 需要补刀的片段数
+        segments_to_retry: 需要复核的片段数
 
     Returns:
         动态权重字典
@@ -987,7 +987,7 @@ def calculate_dynamic_weights(
 ### 基础能力
 
 - [ ] 频谱检测器可正确识别纯人声和BGM片段
-- [ ] 熔断决策器遵循"升级优先于补刀"原则
+- [ ] 熔断决策器遵循"升级优先于复核"原则
 - [ ] 动态权重计算符合预期
 
 ### 频谱指纹分诊台（v2.1核心新增）
@@ -1014,7 +1014,7 @@ def calculate_dynamic_weights(
    - 超过重试次数后会接受低质量结果
 
 2. **时空解耦原则**：
-   - Whisper 补刀时**仅取文本**，弃用其时间戳
+   - Whisper 复核时**仅取文本**，弃用其时间戳
    - 默认使用伪对齐
 
 3. **组合方案矩阵**：

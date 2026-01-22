@@ -31,7 +31,7 @@ class SlowWorker:
         初始化 SlowWorker
 
         Args:
-            patch_engine: 补刀引擎（必须提供）
+            patch_engine: 复核引擎（必须提供）
             whisper_language: Whisper 语言设置
             logger: 日志记录器
         """

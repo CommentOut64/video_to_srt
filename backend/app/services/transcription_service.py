@@ -2910,11 +2910,11 @@ class TranscriptionService:
         is_trash_suspect: bool = False
     ) -> 'SentenceSegment':
         """
-        Whisper 补刀 + 仲裁判决（二次安检机制）
+        Whisper 复核 + 仲裁判决（二次安检机制）
 
         核心逻辑：
         - 如果是垃圾嫌疑样本，根据 Whisper 反馈判决去留
-        - 如果是常规补刀，直接采纳 Whisper 结果
+        - 如果是常规复核，直接采纳 Whisper 结果
 
         Args:
             sentence: 原始句子
@@ -2950,7 +2950,7 @@ class TranscriptionService:
         # 记录日志（调试用）
         if overlap_start < sentence.start:
             self.logger.debug(
-                f"Whisper 补刀添加 {sentence.start - overlap_start:.2f}s 前向重叠: "
+                f"Whisper 复核添加 {sentence.start - overlap_start:.2f}s 前向重叠: "
                 f"[{overlap_start:.2f}s, {sentence.end:.2f}s]"
             )
 
@@ -3050,7 +3050,7 @@ class TranscriptionService:
             underscore_ratio = whisper_text.count('_') / max(len(whisper_text), 1)
             if underscore_ratio > 0.3:  # 超过 30% 是下划线
                 self.logger.warning(
-                    f"Whisper 补刀检测到下划线幻觉 {sentence_index}: "
+                    f"Whisper 复核检测到下划线幻觉 {sentence_index}: "
                     f"'{whisper_text[:50]}...' (下划线占比 {underscore_ratio:.1%}), 回退到 SenseVoice"
                 )
                 return sentence
@@ -3063,7 +3063,7 @@ class TranscriptionService:
                 # 如果 Whisper 输出与 context 重叠度超过 80%，且长度相近，可能是照抄
                 if overlap_ratio > 0.8 and abs(len(whisper_text) - len(context)) < len(context) * 0.3:
                     self.logger.warning(
-                        f"Whisper 补刀检测到提示词重复 {sentence_index}: "
+                        f"Whisper 复核检测到提示词重复 {sentence_index}: "
                         f"与 context 重叠度 {overlap_ratio:.1%}, 回退到 SenseVoice"
                     )
                     return sentence
@@ -3111,9 +3111,9 @@ class TranscriptionService:
                     f"'{whisper_text}' (Whisper Conf {whisper_conf:.2f})"
                 )
 
-        # 常规补刀 OR 垃圾样本通过仲裁 => 采纳 Whisper 结果
+        # 常规复核 OR 垃圾样本通过仲裁 => 采纳 Whisper 结果
         if not whisper_text:
-            self.logger.warning(f"Whisper 补刀返回空文本，保留原结果")
+            self.logger.warning(f"Whisper 复核返回空文本，保留原结果")
             return sentence
 
         # 保存 Whisper 备选文本
@@ -3138,7 +3138,7 @@ class TranscriptionService:
         subtitle_manager: 'StreamingSubtitleManager'
     ) -> 'SentenceSegment':
         """
-        Whisper 补刀（时空解耦版：仅取文本）
+        Whisper 复核（时空解耦版：仅取文本）
 
         核心原则：
         - SenseVoice 确定的时间轴（start/end）不可变
@@ -3178,7 +3178,7 @@ class TranscriptionService:
         # 记录日志（调试用）
         if overlap_start < sentence.start:
             self.logger.debug(
-                f"Whisper 补刀添加 {sentence.start - overlap_start:.2f}s 前向重叠: "
+                f"Whisper 复核添加 {sentence.start - overlap_start:.2f}s 前向重叠: "
                 f"[{overlap_start:.2f}s, {sentence.end:.2f}s]"
             )
 
@@ -3257,7 +3257,7 @@ class TranscriptionService:
             underscore_ratio = whisper_text.count('_') / max(len(whisper_text), 1)
             if underscore_ratio > 0.3:  # 超过 30% 是下划线
                 self.logger.warning(
-                    f"Whisper 补刀检测到下划线幻觉 {sentence_index}: "
+                    f"Whisper 复核检测到下划线幻觉 {sentence_index}: "
                     f"'{whisper_text[:50]}...' (下划线占比 {underscore_ratio:.1%}), 回退到 SenseVoice"
                 )
                 return sentence
@@ -3270,13 +3270,13 @@ class TranscriptionService:
                 # 如果 Whisper 输出与 context 重叠度超过 80%，且长度相近，可能是照抄
                 if overlap_ratio > 0.8 and abs(len(whisper_text) - len(context)) < len(context) * 0.3:
                     self.logger.warning(
-                        f"Whisper 补刀检测到提示词重复 {sentence_index}: "
+                        f"Whisper 复核检测到提示词重复 {sentence_index}: "
                         f"与 context 重叠度 {overlap_ratio:.1%}, 回退到 SenseVoice"
                     )
                     return sentence
 
         if not whisper_text:
-            self.logger.warning(f"Whisper 补刀返回空文本，保留原结果")
+            self.logger.warning(f"Whisper 复核返回空文本，保留原结果")
             return sentence
 
         # 保存 Whisper 备选文本
@@ -3328,7 +3328,7 @@ class TranscriptionService:
         - 长文本回填对齐到原始时间戳
 
         Args:
-            patch_queue: 需要补刀的句子队列
+            patch_queue: 需要复核的句子队列
             audio_array: 完整音频数组
             job: 任务状态
             subtitle_manager: 流式字幕管理器
@@ -3497,7 +3497,7 @@ class TranscriptionService:
         后处理增强层（所有 Chunk 转录完成后执行）
 
         根据用户配置执行：
-        1. 低置信度句子 → Whisper 补刀（仅文本 + 伪对齐）
+        1. 低置信度句子 → Whisper 复核（仅文本 + 伪对齐）
         2. [可选] LLM 校对
         3. [可选] LLM 翻译
 
@@ -3527,10 +3527,10 @@ class TranscriptionService:
         # 调试日志：确认方法被调用
         self.logger.debug(f"开始后处理增强: {len(sentences)} 句, enhancement={solution_config.enhancement.value}")
 
-        # V3.1.0: 极速模式（sensevoice_only）完全跳过 Whisper 补刀
+        # V3.1.0: 极速模式（sensevoice_only）完全跳过 Whisper 复核
         # 极速模式的设计目标是纯 SenseVoice 输出，不加载 Whisper 模型
         if solution_config.enhancement == EnhancementMode.OFF:
-            self.logger.info("极速模式: 跳过所有 Whisper 补刀和仲裁")
+            self.logger.info("极速模式: 跳过所有 Whisper 复核和仲裁")
             # 仍然执行 LLM 校对/翻译（如果配置了）
             if solution_config.proofread != ProofreadMode.OFF:
                 self.logger.info("LLM 校对功能待实现")
@@ -3538,7 +3538,7 @@ class TranscriptionService:
                 self.logger.info("LLM 翻译功能待实现")
             return sentences
 
-        # 1. 收集需要 Whisper 补刀的句子（含强制补刀、常规补刀、垃圾核查）
+        # 1. 收集需要 Whisper 复核的句子（含强制复核、常规复核、垃圾核查）
         patch_queue = []
         # 阈值配置
         GARBAGE_CONFIDENCE_THRESHOLD = 0.4  # 低于此值触发 Whisper 仲裁
@@ -3549,7 +3549,7 @@ class TranscriptionService:
             is_trash_suspect = False  # 是否是"垃圾嫌疑"需要 Whisper 仲裁
 
             # === DEEP_LISTEN 快速路径 ===
-            # DEEP_LISTEN 模式下所有句子都要补刀，直接入队，跳过后续冗余判断
+            # DEEP_LISTEN 模式下所有句子都要复核，直接入队，跳过后续冗余判断
             if solution_config.enhancement == EnhancementMode.DEEP_LISTEN:
                 patch_queue.append({
                     "index": i,
@@ -3566,12 +3566,12 @@ class TranscriptionService:
             clean_text = text_clean.strip() if text_clean else ""
             text_length = len(clean_text)
 
-            # 【阶段四】强制关键补刀条件（无论用户设置如何，必须修）
+            # 【阶段四】强制关键复核条件（无论用户设置如何，必须修）
             if is_critical_patch_needed(clean_text, duration, sentence.confidence):
                 should_patch = True
                 is_critical = True
                 self.logger.warning(
-                    f"触发强制补刀: '{clean_text}' "
+                    f"触发强制复核: '{clean_text}' "
                     f"(conf={sentence.confidence:.2f}, dur={duration:.2f}s)"
                 )
 
@@ -3585,7 +3585,7 @@ class TranscriptionService:
                     f"(conf={sentence.confidence:.2f})"
                 )
 
-            # 【新增】字级强制补刀（独立检查，不受 enhancement 配置影响）
+            # 【新增】字级强制复核（独立检查，不受 enhancement 配置影响）
             # 条件1: 单字符实词且置信度 < 0.9
             # 条件2: 任意实词置信度极低 (< 0.35)，几乎肯定是识别错误
             if not should_patch and sentence.words:
@@ -3610,7 +3610,7 @@ class TranscriptionService:
                         should_patch = True
                         is_critical = True
                         self.logger.warning(
-                            f"触发字级单字符强制补刀: Sentence {i} 含单字符词 '{word_text}' "
+                            f"触发字级单字符强制复核: Sentence {i} 含单字符词 '{word_text}' "
                             f"(conf={word_conf:.2f})"
                         )
                         break
@@ -3620,7 +3620,7 @@ class TranscriptionService:
                         should_patch = True
                         is_critical = True
                         self.logger.warning(
-                            f"触发字级极低置信度强制补刀: Sentence {i} 含极低置信度词 '{word_text}' "
+                            f"触发字级极低置信度强制复核: Sentence {i} 含极低置信度词 '{word_text}' "
                             f"(conf={word_conf:.2f})"
                         )
                         break
@@ -3634,17 +3634,17 @@ class TranscriptionService:
                     should_patch = True
                     is_critical = True
                     self.logger.warning(
-                        f"触发字级多低置信度词强制补刀: Sentence {i} 含 {low_conf_word_count} 个低置信度词"
+                        f"触发字级多低置信度词强制复核: Sentence {i} 含 {low_conf_word_count} 个低置信度词"
                     )
 
-            # 常规补刀条件（遵循用户设置，仅 SMART_PATCH 模式）
+            # 常规复核条件（遵循用户设置，仅 SMART_PATCH 模式）
             # 注: DEEP_LISTEN 模式已在循环开头通过快速路径处理
             if not should_patch and solution_config.enhancement == EnhancementMode.SMART_PATCH:
-                # SMART_PATCH 模式: 仅低置信度句子触发补刀
+                # SMART_PATCH 模式: 仅低置信度句子触发复核
                 # 【阶段五】构建字级时间戳列表
                 words_data = [{"word": w.word, "confidence": w.confidence} for w in sentence.words]
 
-                # 增强版补刀判断：置信度、短片段、单字符、字级触发
+                # 增强版复核判断：置信度、短片段、单字符、字级触发
                 if needs_whisper_patch(
                     sentence.confidence,
                     duration=duration,
@@ -3661,12 +3661,12 @@ class TranscriptionService:
                     "is_trash_suspect": is_trash_suspect
                 })
 
-        # 调试日志：输出补刀队列统计
-        self.logger.debug(f"补刀队列构建完成: {len(patch_queue)} 个句子需要补刀")
+        # 调试日志：输出复核队列统计
+        self.logger.debug(f"复核队列构建完成: {len(patch_queue)} 个句子需要复核")
 
-        # 2. Whisper 补刀阶段（含仲裁判决）
+        # 2. Whisper 复核阶段（含仲裁判决）
         if patch_queue:
-            progress_tracker.start_phase(ProcessPhase.WHISPER_PATCH, len(patch_queue), "Whisper 补刀中...")
+            progress_tracker.start_phase(ProcessPhase.WHISPER_PATCH, len(patch_queue), "Whisper 复核中...")
 
             # === DEEP_LISTEN 模式: 使用 Whisper 缓冲池批量处理 ===
             if solution_config.enhancement == EnhancementMode.DEEP_LISTEN:
@@ -3682,14 +3682,14 @@ class TranscriptionService:
                 for idx, item in enumerate(patch_queue):
                     # 检查任务是否已取消
                     if job.canceled:
-                        self.logger.info(f"任务已取消，停止 Whisper 补刀: {job.job_id}")
+                        self.logger.info(f"任务已取消，停止 Whisper 复核: {job.job_id}")
                         break
 
                     sent_idx = item["index"]
                     sentence = item["sentence"]
                     is_trash_suspect = item["is_trash_suspect"]
 
-                    # 执行 Whisper 补刀并获取仲裁结果
+                    # 执行 Whisper 复核并获取仲裁结果
                     await self._whisper_text_patch_with_arbitration(
                         sentence=sentence,
                         sentence_index=sent_idx,

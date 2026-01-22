@@ -70,10 +70,10 @@ class TranscriptionConfig:
     # 主引擎运行设备: auto/cpu
     sensevoice_device: str = "auto"
 
-    # 辅助/补刀模型: tiny/small/medium/large-v3
+    # 辅助/复核模型: tiny/small/medium/large-v3
     whisper_model: str = "medium"
 
-    # 补刀触发阈值: 0.0-1.0
+    # 复核触发阈值: 0.0-1.0
     patching_threshold: float = 0.60
 
 

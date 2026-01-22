@@ -1,7 +1,7 @@
 ### 核心策略：双管齐下
 
 1.  **架构层修复（针对问题 1）：** 实施 **Post-VAD 合并策略**。这是解决“VAD 过度切分导致语义断裂”的唯一正解。单纯调整分句算法（Layer 1）是在“亡羊补牢”，而合并 VAD 片段是在“未雨绸缪”。
-2.  **系统层兜底（针对问题 2）：** 实施 **强制关键补刀（Mandatory Critical Patching）**。SenseVoice 的 LFR 机制决定了它在处理快速短音时必然存在物理极限（帧数不足）。这是模型缺陷，必须用系统手段（Whisper）来弥补，且不能依赖用户的自觉配置。
+2.  **系统层兜底（针对问题 2）：** 实施 **强制关键复核（Mandatory Critical Patching）**。SenseVoice 的 LFR 机制决定了它在处理快速短音时必然存在物理极限（帧数不足）。这是模型缺陷，必须用系统手段（Whisper）来弥补，且不能依赖用户的自觉配置。
 
 -----
 
@@ -79,7 +79,7 @@
 
 -----
 
-### 实施方案 2：强制关键补刀 (Mandatory Critical Patching)
+### 实施方案 2：强制关键复核 (Mandatory Critical Patching)
 
 即使 config 中 `enhancement` 为 OFF，对于 **极高概率错误**（如单字符结果）也必须强制启动 Whisper。这是工程上对模型缺陷的必要补偿。
 
@@ -97,7 +97,7 @@
         solution_config: 'SolutionConfig'
     ) -> List['SentenceSegment']:
         """
-        后处理增强层（含强制关键补刀）
+        后处理增强层（含强制关键复核）
         """
         from app.services.progress_tracker import get_progress_tracker, ProcessPhase
         from app.services.solution_matrix import EnhancementMode, ProofreadMode, TranslateMode
@@ -106,12 +106,12 @@
         progress_tracker = get_progress_tracker(job.job_id, solution_config.preset_id)
         patch_queue = []
 
-        # === 核心修改：构建补刀队列 ===
+        # === 核心修改：构建复核队列 ===
         for i, sentence in enumerate(sentences):
             should_patch = False
-            is_critical = False # 标记是否为强制补刀
+            is_critical = False # 标记是否为强制复核
 
-            # 1. 强制关键补刀条件 (无论用户设置如何，必须修)
+            # 1. 强制关键复核条件 (无论用户设置如何，必须修)
             # 条件：(单字符且非高置信度) 或 (极短片段且文本极短)
             # 例如 "E" (duration 0.06s) -> 命中
             duration = sentence.end - sentence.start
@@ -121,9 +121,9 @@
                (duration < 0.2 and len(clean_text) < 3):
                 should_patch = True
                 is_critical = True
-                self.logger.warning(f"触发强制补刀: '{clean_text}' (conf={sentence.confidence:.2f}, dur={duration:.2f}s)")
+                self.logger.warning(f"触发强制复核: '{clean_text}' (conf={sentence.confidence:.2f}, dur={duration:.2f}s)")
 
-            # 2. 常规补刀条件 (遵循用户设置)
+            # 2. 常规复核条件 (遵循用户设置)
             elif solution_config.enhancement != EnhancementMode.OFF:
                 from app.core.thresholds import needs_whisper_patch
                 if needs_whisper_patch(sentence.confidence):
@@ -132,7 +132,7 @@
             if should_patch:
                 patch_queue.append((i, sentence))
 
-        # 2. 执行补刀
+        # 2. 执行复核
         if patch_queue:
             progress_tracker.start_phase(ProcessPhase.WHISPER_PATCH, len(patch_queue), "Whisper 修正中...")
             
@@ -666,7 +666,7 @@ Whisper 是一个自回归模型（Decoder-only 风格），它非常依赖 **`i
 这是一个极其深刻的架构问题。既然 SenseVoice 有 CTC 延迟，VAD 吸附也可能失效，**Whisper 的时间戳是否真的还有价值？**
 
 **我的判断：**
-在 **补刀（Patching）** 场景下，**坚持“SenseVoice 时间框架 + 内部伪对齐”依然是目前最稳健的方案**，但需要引入 **“弹性约束”**。
+在 **复核（Patching）** 场景下，**坚持“SenseVoice 时间框架 + 内部伪对齐”依然是目前最稳健的方案**，但需要引入 **“弹性约束”**。
 
 #### 为什么不能直接用 Whisper 的时间戳？
 
@@ -686,7 +686,7 @@ Whisper 是一个自回归模型（Decoder-only 风格），它非常依赖 **`i
 1.  **信任边界**：
       * Start: `max(SenseVoice_Start, VAD_Snap_Start)`
       * End: `SenseVoice_End`
-      * *原则*：补刀后的句子，绝不能超出原句子的物理时间范围（除非你动了 VAD 边界）。
+      * *原则*：复核后的句子，绝不能超出原句子的物理时间范围（除非你动了 VAD 边界）。
 2.  **文本替换**：使用 Whisper 的文本替换 SenseVoice 的文本。
       * Old: "E"
       * New: "Evil"
@@ -727,5 +727,5 @@ def map_timestamps(whisper_words, sense_voice_bounds):
 ### 总结：你的 Action List
 
 1.  **触发机制**：修改 `needs_patching`，加入 `MIN_WORD_CONF` 检查（木桶效应）。
-2.  **上下文**：补刀时，只送 **Target Audio (带 buffer)**，但必须送 **Previous Text as Prompt**。
+2.  **上下文**：复核时，只送 **Target Audio (带 buffer)**，但必须送 **Previous Text as Prompt**。
 3.  **时间轴**：**死守 SenseVoice/VAD 的边界**。不要直接采纳 Whisper 的绝对时间戳。如果需要更精细的内部时间，开启 Whisper 的 `word_timestamps` 并将其 **线性映射（缩放）** 到 SenseVoice 的时间框内。

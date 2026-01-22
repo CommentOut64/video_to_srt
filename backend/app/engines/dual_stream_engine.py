@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 class DualStreamEngine(ASREngine):
-    """双流混合引擎：SenseVoice 提供时间戳，Whisper 补刀文本。"""
+    """双流混合引擎：SenseVoice 提供时间戳，Whisper 复核文本。"""
 
     def __init__(
         self,
@@ -49,7 +49,7 @@ class DualStreamEngine(ASREngine):
         language: Optional[str] = None,
         **kwargs: object,
     ) -> ASRResult:
-        """执行双流转录，必要时触发补刀。"""
+        """执行双流转录，必要时触发复核。"""
         enable_patch = bool(kwargs.get("enable_patch", True))
         patch_threshold = float(kwargs.get("patch_threshold", self.patch_threshold))
 
@@ -58,7 +58,7 @@ class DualStreamEngine(ASREngine):
             return draft_result
 
         logger.info(
-            "触发补刀: confidence=%.3f < threshold=%.3f",
+            "触发复核: confidence=%.3f < threshold=%.3f",
             draft_result.confidence,
             patch_threshold,
         )

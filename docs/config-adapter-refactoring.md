@@ -79,7 +79,7 @@
 | `get_preset_id()` | 获取预设 ID | `default` / `preset1-5` / `fast` / `balanced` / `quality` |
 | `get_demucs_strategy()` | 获取 Demucs 策略 | `off` / `auto` / `force_on` |
 | `is_demucs_enabled()` | 判断 Demucs 是否启用 | `bool` |
-| `get_patching_threshold()` | 获取 Whisper 补刀阈值 | `float` (0.0-1.0) |
+| `get_patching_threshold()` | 获取 Whisper 复核阈值 | `float` (0.0-1.0) |
 | `get_llm_task()` | 获取 LLM 任务类型 | `off` / `proofread` / `translate` |
 | `get_llm_scope()` | 获取 LLM 介入范围 | `sparse` / `global` |
 | `get_config_source()` | 判断配置来源（调试用） | `new` / `legacy` / `mixed` / `default` |

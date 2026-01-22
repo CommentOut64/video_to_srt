@@ -103,7 +103,7 @@ class StreamingSubtitleManager:
         confidence_source: str = None  # V3.1.2: 新增，指定置信度来源
     ):
         """
-        更新已有句子（Whisper 补刀或 LLM 校对）
+        更新已有句子（Whisper 复核或 LLM 校对）
 
         V3.1.2+dev.20260111.01: 新增 confidence_source 参数，用于正确计算 display_confidence
 
@@ -277,7 +277,7 @@ class StreamingSubtitleManager:
 
     def get_context_window(self, index: int, window_size: int = 3) -> str:
         """
-        获取上下文窗口（用于 LLM 校对和 Whisper 补刀）
+        获取上下文窗口（用于 LLM 校对和 Whisper 复核）
 
         Args:
             index: 当前句子索引
@@ -668,7 +668,7 @@ class StreamingSubtitleManager:
                 words_data = sentence_dict.get("words", [])
                 sentence.words = []
                 for word_dict in words_data:
-                    # V3.1.2: confidence 可能为 None（Whisper 补刀后的伪对齐）
+                    # V3.1.2: confidence 可能为 None（Whisper 复核后的伪对齐）
                     word_confidence = word_dict.get("confidence")  # 不设置默认值，保持 None
                     word = WordTimestamp(
                         word=word_dict.get("word", ""),

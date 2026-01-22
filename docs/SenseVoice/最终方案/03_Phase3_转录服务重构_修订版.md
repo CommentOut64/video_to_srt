@@ -15,13 +15,13 @@
 - ✅ **流程确认**：`音频提取 → VAD → 频谱分诊(Chunk级) → 按需分离 → 转录`
 - ✅ **组件更新**：使用 `AudioSpectrumClassifier` 替代原有 `AudioCircuitBreaker`
 - ✅ **新增**：Chunk级频谱分诊，每个VAD片段独立判断是否需要分离
-- ✅ **概念澄清**：熔断 ≠ Whisper补刀（详见下方说明）
+- ✅ **概念澄清**：熔断 ≠ Whisper复核（详见下方说明）
 - ✅ **新增**：熔断回溯机制（保留原始音频，升级分离模型）
-- ✅ **新增**：后处理增强体系（Whisper补刀、LLM校对、翻译）
+- ✅ **新增**：后处理增强体系（Whisper复核、LLM校对、翻译）
 
 ### v2.0 新增（时空解耦架构）
 
-- ✅ **核心修改**：Whisper 补刀**仅取文本**，时间戳由 SenseVoice 确定
+- ✅ **核心修改**：Whisper 复核**仅取文本**，时间戳由 SenseVoice 确定
 - ✅ **新增**：伪对齐算法集成（Phase 1 的 `pseudo_alignment.py`）
 - ✅ **新增**：字幕流式输出系统 `streaming_subtitle.py`
 - ✅ **新增**：智能进度追踪集成（Phase 1 的 `progress_tracker.py`）
@@ -41,7 +41,7 @@
 |------|------|--------|------|
 | VAD 物理切分重构 | `transcription_service.py` | P0 | 修改 |
 | **频谱分诊集成** | `transcription_service.py` | **P0** | **修改** |
-| **时空解耦补刀逻辑** | `transcription_service.py` | **P0** | **修改** |
+| **时空解耦复核逻辑** | `transcription_service.py` | **P0** | **修改** |
 | **流式字幕输出系统** | `streaming_subtitle.py` | **P0** | **新建** |
 | 时间戳偏移修正 | `transcription_service.py` | P0 | 修改 |
 | 熔断逻辑集成 | `transcription_service.py` | P0 | 修改 |
@@ -59,7 +59,7 @@
 | 概念 | 触发条件 | 发生时机 | 动作 |
 |------|----------|----------|------|
 | **熔断** | BGM/Noise标签 + 低置信度 | 单个Chunk转录后立即判断 | 回溯到原始音频，升级分离模型重做 |
-| **后处理增强** | 用户配置启用 + 低置信度 | 所有Chunk转录完成后 | Whisper补刀、LLM校对、翻译 |
+| **后处理增强** | 用户配置启用 + 低置信度 | 所有Chunk转录完成后 | Whisper复核、LLM校对、翻译 |
 
 ### 2.2 完整流程
 
@@ -115,7 +115,7 @@
 │  │             后处理增强层（根据用户配置）                     ││
 │  ═══════════════════════════════════════════════════════════════│
 │     ↓                                                           │
-│  6. [可选] Whisper 补刀（仅对低置信度句子）                      │
+│  6. [可选] Whisper 复核（仅对低置信度句子）                      │
 │     │  - 检查用户配置：enhancement != OFF                       │
 │     │  - 仅取文本，弃用时间戳                                   │
 │     │  - 应用伪对齐生成字级时间戳                               │
@@ -199,7 +199,7 @@ class StreamingSubtitleManager:
         perplexity: float = None
     ):
         """
-        更新已有句子（Whisper 补刀或 LLM 校对）
+        更新已有句子（Whisper 复核或 LLM 校对）
 
         Args:
             index: 句子索引
@@ -324,7 +324,7 @@ def remove_streaming_subtitle_manager(job_id: str):
 
 ## 四、熔断回溯机制（转录层核心）
 
-> **注意**：熔断仅指"升级分离模型"，发生在单个 Chunk 转录后。不是 Whisper 补刀。
+> **注意**：熔断仅指"升级分离模型"，发生在单个 Chunk 转录后。不是 Whisper 复核。
 
 ### 4.1 Chunk 状态管理
 
@@ -493,11 +493,11 @@ def execute_fuse_upgrade(
 
 ---
 
-## 五、后处理增强层（Whisper补刀等）
+## 五、后处理增强层（Whisper复核等）
 
 > **注意**：本节内容发生在**所有 Chunk 转录完成后**，根据用户配置执行。
 
-### 5.1 Whisper 补刀（仅取文本 + 伪对齐）
+### 5.1 Whisper 复核（仅取文本 + 伪对齐）
 
 **修改位置**: `transcription_service.py`
 
@@ -511,7 +511,7 @@ async def _whisper_text_patch(
     subtitle_manager: StreamingSubtitleManager
 ) -> SentenceSegment:
     """
-    Whisper 补刀（时空解耦版：仅取文本）
+    Whisper 复核（时空解耦版：仅取文本）
 
     核心原则：
     - SenseVoice 确定的时间轴（start/end）不可变
@@ -552,7 +552,7 @@ async def _whisper_text_patch(
     whisper_text = result.get('text', '').strip()
 
     if not whisper_text:
-        self.logger.warning(f"Whisper 补刀返回空文本，保留原结果")
+        self.logger.warning(f"Whisper 复核返回空文本，保留原结果")
         return sentence
 
     # 保存 Whisper 备选文本
@@ -603,7 +603,7 @@ async def _post_process_enhancement(
     后处理增强层（所有 Chunk 转录完成后执行）
 
     根据用户配置执行：
-    1. 低置信度句子 → Whisper 补刀（仅文本 + 伪对齐）
+    1. 低置信度句子 → Whisper 复核（仅文本 + 伪对齐）
     2. [可选] LLM 校对
     3. [可选] LLM 翻译
 
@@ -615,16 +615,16 @@ async def _post_process_enhancement(
 
     progress_tracker = get_progress_tracker(job.job_id, solution_config.preset_id)
 
-    # 1. 收集需要 Whisper 补刀的句子（根据用户配置）
+    # 1. 收集需要 Whisper 复核的句子（根据用户配置）
     patch_queue = []
     if solution_config.enhancement != EnhancementMode.OFF:
         for i, sentence in enumerate(sentences):
             if needs_whisper_patch(sentence.confidence):
                 patch_queue.append((i, sentence))
 
-    # 2. Whisper 补刀阶段
+    # 2. Whisper 复核阶段
     if patch_queue:
-        progress_tracker.start_phase(ProcessPhase.WHISPER_PATCH, len(patch_queue), "Whisper 补刀中...")
+        progress_tracker.start_phase(ProcessPhase.WHISPER_PATCH, len(patch_queue), "Whisper 复核中...")
 
         for idx, (sent_idx, sentence) in enumerate(patch_queue):
             await self._whisper_text_patch(
@@ -657,7 +657,7 @@ async def _process_video_sensevoice(self, job: JobState):
     流程说明：
     1-4: 准备阶段（音频提取、VAD、频谱分诊、按需分离）
     5: 转录阶段（逐Chunk转录 + 熔断回溯）
-    6-8: 后处理增强阶段（Whisper补刀、LLM校对/翻译）
+    6-8: 后处理增强阶段（Whisper复核、LLM校对/翻译）
     9: 输出阶段（生成字幕）
     """
     from .streaming_subtitle import get_streaming_subtitle_manager, remove_streaming_subtitle_manager
@@ -741,7 +741,7 @@ async def _process_video_sensevoice(self, job: JobState):
         # 后处理增强层（所有 Chunk 转录完成后，根据用户配置执行）
         # ═══════════════════════════════════════════════════════════════
 
-        # 6. 后处理增强（Whisper补刀、LLM校对/翻译）
+        # 6. 后处理增强（Whisper复核、LLM校对/翻译）
         final_results = await self._post_process_enhancement(
             all_sentences, audio_array, job, subtitle_manager, solution_config
         )
@@ -797,9 +797,9 @@ async def _process_video_sensevoice(self, job: JobState):
 
 ### 后处理增强层
 
-- [ ] Whisper 补刀发生在**所有 Chunk 转录完成后**
-- [ ] 仅当用户配置 `enhancement != OFF` 时才执行 Whisper 补刀
-- [ ] Whisper 补刀**仅使用文本**，时间戳不变
+- [ ] Whisper 复核发生在**所有 Chunk 转录完成后**
+- [ ] 仅当用户配置 `enhancement != OFF` 时才执行 Whisper 复核
+- [ ] Whisper 复核**仅使用文本**，时间戳不变
 - [ ] 伪对齐正确生成字级时间戳
 - [ ] `SentenceSegment.source` 正确标记来源
 

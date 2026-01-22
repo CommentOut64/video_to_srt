@@ -535,7 +535,7 @@ if checkpoint and checkpoint.get("preprocessing", {}).get("vad_completed"):
 **1. 异步处理架构** (AsyncDualPipeline)：
 
 - FastWorker（CPU）：全速并发 SenseVoice 推理（~1秒/Chunk）
-- SlowWorker（GPU）：按序执行 Whisper 补刀
+- SlowWorker（GPU）：按序执行 Whisper 复核
 - SequencedQueue：充当"整流器"，乱序放入→顺序取出
 
 **2. 懒加载机制**：

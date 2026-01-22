@@ -47,5 +47,5 @@ class ProcessingContext:
     is_end: bool = False                  # 结束流标记
     error: Optional[Exception] = None     # 异常携带
 
-    # 智能补刀标记 (V3.10)
-    whisper_skipped: bool = False         # SlowWorker 是否跳过（智能补刀模式下 SenseVoice 质量足够高时跳过 Whisper）
+    # 智能复核标记 (V3.10)
+    whisper_skipped: bool = False         # SlowWorker 是否跳过（智能复核模式下 SenseVoice 质量足够高时跳过 Whisper）

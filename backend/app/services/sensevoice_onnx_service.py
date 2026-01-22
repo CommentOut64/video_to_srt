@@ -949,7 +949,7 @@ class SenseVoiceONNXService:
         2. Token 不以空格开头 且 是字母数字 => 词的延续，合并到前一个词
         3. 标点符号 => 独立成词（视情况）
 
-        置信度策略：取最小值（木桶效应），利于触发补刀
+        置信度策略：取最小值（木桶效应），利于触发复核
 
         Args:
             tokens: 原始字符级时间戳列表
@@ -994,7 +994,7 @@ class SenseVoiceONNXService:
                 current_word["end"] = token["end"]
 
                 # 3. 置信度：取最小值（木桶效应），反映该词最弱环节的可信度
-                # 这样有利于触发 Whisper 补刀
+                # 这样有利于触发 Whisper 复核
                 current_word["confidence"] = min(
                     current_word["confidence"],
                     token["confidence"]

@@ -260,7 +260,7 @@ class SSEChannelManager extends EventEmitter {
         handlers.onSubtitleUpdate?.(data)
       },
       'subtitle.whisper_patch': (data) => {
-        console.log(`[SSE Job ${jobId}] Whisper 补刀:`, data)
+        console.log(`[SSE Job ${jobId}] Whisper 复核:`, data);
         handlers.onWhisperPatch?.(data)
         handlers.onSubtitleUpdate?.(data)
       },

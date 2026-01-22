@@ -56,10 +56,10 @@ class TranscriptionSettingsAPI(BaseModel):
     transcription_profile: str = Field(default="sensevoice_only", description="转录流水线模式")
     # 主引擎运行设备: auto/cpu
     sensevoice_device: str = Field(default="auto", description="SenseVoice 运行设备")
-    # 辅助/补刀模型: tiny/small/medium/large-v3
+    # 辅助/复核模型: tiny/small/medium/large-v3
     whisper_model: str = Field(default="medium", description="Whisper 模型")
-    # 补刀触发阈值: 0.0-1.0
-    patching_threshold: float = Field(default=0.60, ge=0.0, le=1.0, description="补刀触发阈值")
+    # 复核触发阈值: 0.0-1.0
+    patching_threshold: float = Field(default=0.60, ge=0.0, le=1.0, description="复核触发阈值")
 
 
 class RefinementSettingsAPI(BaseModel):

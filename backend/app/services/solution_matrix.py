@@ -207,20 +207,20 @@ FRONTEND_PRESETS = [
     },
     {
         "id": "preset1",
-        "name": "智能补刀",
-        "description": "SV + Whisper 局部补刀，平衡速度与质量",
+        "name": "智能复核",
+        "description": "SV + Whisper 局部复核，平衡速度与质量",
         "timeMultiplier": 0.15
     },
     {
         "id": "preset2",
         "name": "轻度校对",
-        "description": "智能补刀 + LLM 按需校对问题片段",
+        "description": "智能复核 + LLM 按需校对问题片段",
         "timeMultiplier": 0.2
     },
     {
         "id": "preset3",
         "name": "深度校对",
-        "description": "智能补刀 + LLM 全文精修润色",
+        "description": "智能复核 + LLM 全文精修润色",
         "timeMultiplier": 0.3
     },
     {

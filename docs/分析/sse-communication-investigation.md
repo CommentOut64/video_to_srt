@@ -43,7 +43,7 @@
 
 - `backend/app/services/streaming_subtitle.py` (StreamingSubtitleManager): 流式字幕管理器
   - `add_sentence` (54-91): 添加新句子（SenseVoice 阶段）并推送 SSE
-  - `update_sentence` (93-147): 更新已有句子（Whisper 补刀或 LLM 校对）
+  - `update_sentence` (93-147): 更新已有句子（Whisper 复核或 LLM 校对）
   - `mark_for_deletion` (177-202): 标记句子为待删除（Whisper 仲裁后）
   - `add_draft_sentences` (279-347): 添加草稿句子（快流/双模态架构）
   - `replace_chunk` (349-439): 替换 Chunk 的所有句子（慢流/双模态架构）
@@ -230,7 +230,7 @@ video_to_srt_gpu 项目实现了一个**统一的 SSE 连接管理器**，支持
 
 项目引入了**统一进度发射器**，解决双流流水线进度不同步的问题：
 
-- **三种模式**: `SENSEVOICE_ONLY` (极速模式)、`WHISPER_PATCH` (补刀模式)、`DUAL_STREAM` (双流模式)
+- **三种模式**: `SENSEVOICE_ONLY` (极速模式)、`WHISPER_PATCH` (复核模式)、`DUAL_STREAM` (双流模式)
 - **阶段权重**: 预处理 10%、快流 50%、慢流 30%、对齐 10%（双流模式）
 - **加权进度计算**: `total = preprocess * 0.1 + fast * 0.5 + slow * 0.3 + align * 0.1`
 - **防倒退保护**: 只允许进度增加，防止节流导致的阶段不同步（v3.1.0.2）
@@ -257,7 +257,7 @@ video_to_srt_gpu 项目实现了一个**统一的 SSE 连接管理器**，支持
 - **FastWorker 循环**: `emitter.update_fast(i + 1, total_chunks)`
   - SenseVoice 推理和立即分句
 - **SlowWorker 循环**: `emitter.update_slow(i + 1, total_chunks)`
-  - Whisper 补刀和上文更新
+  - Whisper 复核和上文更新
 - **AlignmentWorker 循环**: `emitter.update_align(i + 1, total_chunks)`
   - 字级时间戳对齐
 

@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 class ProgressMode(Enum):
     """进度模式 - 对应不同的转录流水线"""
     SENSEVOICE_ONLY = "sensevoice_only"    # 极速模式: 仅 SenseVoice
-    WHISPER_PATCH = "whisper_patch"        # 补刀模式: SenseVoice + Whisper 局部
+    WHISPER_PATCH = "whisper_patch"        # 复核模式: SenseVoice + Whisper 局部
     DUAL_STREAM = "dual_stream"            # 双流模式: SenseVoice + Whisper 全量
 
 

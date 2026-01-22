@@ -139,7 +139,7 @@
             @change="emitChange"
           >
             <option value="sensevoice_only">SenseVoice Only (极速)</option>
-            <option value="sv_whisper_patch">SV + Whisper 补刀</option>
+            <option value="sv_whisper_patch">SV + Whisper 复核</option>
             <option value="sv_whisper_dual">SV + Whisper 双流并行</option>
           </select>
         </div>
@@ -185,13 +185,13 @@
         </div>
       </div>
 
-      <!-- 补刀触发阈值 (依赖禁用) -->
+      <!-- 复核触发阈值 (依赖禁用) -->
       <div
         class="setting-row"
         :class="{ disabled: localConfig.transcription.transcription_profile !== 'sv_whisper_patch' }"
       >
         <div class="setting-label">
-          <span class="label-text">补刀触发阈值</span>
+          <span class="label-text">复核触发阈值</span>
           <span class="label-hint">patching_threshold (0.0-1.0)</span>
         </div>
         <div class="setting-control slider-control">

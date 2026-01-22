@@ -2,7 +2,7 @@
 Faster-Whisper 转录服务
 
 职责：
-- Whisper 补刀（后处理增强阶段）
+- Whisper 复核（后处理增强阶段）
 - 仅提供文本，时间戳由 SenseVoice 确定，使用伪对齐
 - 自动检测并下载缺失的 Whisper 模型（默认 medium）
 - 自动使用 HuggingFace 镜像源（hf-mirror.com）
@@ -612,7 +612,7 @@ class WhisperService:
 
     def _resolve_segment_param_overrides(self) -> Dict[str, Any]:
         """
-        解析补刀分段场景的默认覆盖参数。
+        解析复核分段场景的默认覆盖参数。
 
         当运行参数未显式覆盖时，保持历史默认行为，
         避免重复 VAD 或无必要的词级时间戳开销。
@@ -651,7 +651,7 @@ class WhisperService:
         no_repeat_ngram_size: Optional[int] = None
     ) -> Dict[str, Any]:
         """
-        转录指定时间段的音频（用于补刀场景）
+        转录指定时间段的音频（用于复核场景）
 
         Args:
             audio: 完整音频数组 (16kHz)
