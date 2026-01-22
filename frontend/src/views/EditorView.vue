@@ -7,6 +7,7 @@
       :current-task-status="taskStatus"
       :current-task-phase="taskPhase"
       :current-task-progress="taskProgress"
+      :progress-detail="progressDetail"
       :queue-completed="queueCompleted"
       :queue-total="queueTotal"
       :can-undo="canUndo"
@@ -252,6 +253,7 @@ const jobProgress = computed(() => progressStore.getRawState(jobIdRef.value))
 const taskStatus = computed(() => jobProgress.value.status || 'idle')
 const taskPhase = computed(() => jobProgress.value.phase || 'pending')
 const taskProgress = computed(() => jobProgress.value.percent || 0)
+const progressDetail = computed(() => jobProgress.value.detail || null)
 const isTranscribing = computed(() =>
   ['processing', 'queued'].includes(taskStatus.value)
 )

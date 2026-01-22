@@ -57,32 +57,28 @@
       >
         <template #reference>
           <div class="progress-capsule" :class="{ paused: isPaused }">
-            <!-- Phase 5: 双流进度条 -->
-            <div v-if="showDualStreamProgress" class="dual-progress-track">
-              <div class="progress-layer fast" :style="{ width: dualStreamProgress.fastStream + '%' }"></div>
-              <div class="progress-layer slow" :style="{ width: dualStreamProgress.slowStream + '%' }"></div>
-            </div>
-            <!-- 单流进度条 -->
-            <div v-else class="progress-track">
-              <div class="progress-fill" :style="{ width: currentTaskProgress + '%' }"></div>
-            </div>
-            <!-- 显示阶段标签和进度 -->
-            <span class="capsule-text">
-              <span
-                class="phase-tag"
-                :style="{
-                  background: phaseStyle.bgColor,
-                  color: phaseStyle.color
-                }"
-              >
-                {{ phaseLabel }}
-              </span>
-              <!-- Phase 5: 双流进度显示 -->
-              <span v-if="showDualStreamProgress" class="progress-percent dual">
-                <span class="fast-label">S</span>{{ (dualStreamProgress.fastStream || 0).toFixed(1) }}%
-                <span class="slow-label">W</span>{{ (dualStreamProgress.slowStream || 0).toFixed(1) }}%
-              </span>
-              <span v-else class="progress-percent">{{ formatProgress(currentTaskProgress) }}%</span>
+            <!-- 阶段标签 -->
+            <!-- <span
+              class="phase-tag"
+              :style="{
+                background: phaseStyle.bgColor,
+                color: phaseStyle.color
+              }"
+            >
+              {{ phaseLabel }}
+            </span> -->
+
+            <!-- V3.2.0: 双锚点进度条 -->
+            <DualAnchorProgress
+              :fast-progress="mappedProgress.fast"
+              :slow-progress="mappedProgress.slow"
+              :status="progressStatus"
+              size="lg"
+            />
+
+            <!-- V3.2.0+dev.20260122.02: 显示总进度百分比 -->
+            <span class="progress-percent">
+              {{ mappedProgress.slow.toFixed(1) }}%
             </span>
           </div>
         </template>
@@ -113,9 +109,12 @@
 
       <!-- 场景2: 当前任务完成，显示队列总进度 -->
       <div v-else class="queue-progress">
-        <div class="progress-track">
-          <div class="progress-fill complete" :style="{ width: queueProgressPercent + '%' }"></div>
-        </div>
+        <!-- V3.2.0: 简单进度条 -->
+        <SimpleProgress
+          :progress="queueProgressPercent"
+          :status="queueProgressPercent === 100 ? 'complete' : 'normal'"
+          size="md"
+        />
         <span class="progress-text">
           {{ queueCompleted }}/{{ queueTotal }} 任务完成
           <span v-if="queueProgressPercent === 100" class="complete-check">
@@ -210,13 +209,18 @@
 import { computed, ref, nextTick } from 'vue'
 import { ElMessage } from 'element-plus'
 import TaskMonitor from './TaskMonitor/index.vue'
+import DualAnchorProgress from '@/components/common/DualAnchorProgress.vue'
+import SimpleProgress from '@/components/common/SimpleProgress.vue'
 import { PHASE_CONFIG, STATUS_CONFIG, formatProgress } from '@/constants/taskPhases'
+import { PROGRESS_ALLOCATION } from '@/components/common/progress/constants'
 import transcriptionApi from '@/services/api/transcriptionApi'
 import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
 import { useProjectStore } from '@/stores/projectStore'
+import { useProgressStore } from '@/stores/progressStore'
 
 const taskStore = useUnifiedTaskStore()
 const projectStore = useProjectStore()
+const progressStore = useProgressStore()
 
 const props = defineProps({
   jobId: { type: String, required: true },
@@ -224,6 +228,7 @@ const props = defineProps({
   currentTaskStatus: { type: String, default: 'idle' },      // 'processing', 'queued', 'paused', 'finished', etc.
   currentTaskPhase: { type: String, default: 'pending' },    // 任务阶段（transcribe, align, etc.）
   currentTaskProgress: { type: Number, default: 0 },         // 0-100
+  progressDetail: { type: Object, default: null },           // SSE detail 细节
   queueCompleted: { type: Number, default: 0 },              // 已完成任务数
   queueTotal: { type: Number, default: 0 },                  // 总任务数
   canUndo: { type: Boolean, default: false },
@@ -238,6 +243,9 @@ const props = defineProps({
 })
 
 const emit = defineEmits(['undo', 'redo', 'export', 'pause', 'resume', 'cancel', 'rename'])
+
+// V3.2.0+dev.20260122.02: 从 progressStore 获取当前任务的进度状态
+const jobProgress = computed(() => progressStore.getJobProgress(props.jobId).value)
 
 // ========== 任务名称编辑 ==========
 const isEditingTitle = ref(false)
@@ -306,18 +314,62 @@ function cancelEditTitle() {
 
 // 是否暂停状态（包含正在暂停和已暂停两种状态）
 // V3.1.0: 'pausing' 状态表示正在等待当前原子操作完成，用户可以点击恢复取消暂停
-const isPaused = computed(() => ['pausing', 'paused'].includes(props.currentTaskStatus))
+const isPaused = computed(() => ['pausing', 'paused'].includes(jobProgress.value.status))
 
-// 是否显示当前任务进度（转录中、排队中、正在暂停、或已暂停）
-// V3.1.0: 新增 'pausing' 状态，表示任务正在暂停中（等待当前原子操作完成）
-const showCurrentTaskProgress = computed(() =>
-  ['processing', 'queued', 'pausing', 'paused'].includes(props.currentTaskStatus)
-)
+// V3.2.0+dev.20260122.02: 始终显示当前任务进度条，不再切换到队列进度条
+const showCurrentTaskProgress = computed(() => {
+  return ['processing', 'queued', 'pausing', 'paused', 'finished'].includes(jobProgress.value.status)
+})
 
-// Phase 5: 是否显示双流进度（双模态对齐模式）
-const showDualStreamProgress = computed(() =>
-  showCurrentTaskProgress.value && props.dualStreamProgress.totalChunks > 0
-)
+function clampPercent(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return 0
+  return Math.max(0, Math.min(100, Number(value)))
+}
+
+// V3.2.0+dev.20260122.02: 以下函数和常量保留供未来双流进度功能使用
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function mapToRange(value, start, end) {
+  const normalized = clampPercent(value) / 100
+  return start + (end - start) * normalized
+}
+
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+const PREPROCESS_PHASES = new Set([
+  'extract',
+  'vad',
+  'spectral',
+  'spectrum_analysis',
+  'separation',
+  'bgm_detect',
+  'demucs'
+])
+
+// eslint-disable-next-line @typescript-eslint/no-unused-vars, no-unused-vars
+const TRANSCRIPTION_PHASES = new Set(['sensevoice', 'whisper'])
+
+// V3.2.0+dev.20260122.02: 使用总进度值替代双流进度显示
+const mappedProgress = computed(() => {
+  const totalProgress = clampPercent(jobProgress.value.percent)
+
+  // 任务完成：强制 100%
+  if (jobProgress.value.status === 'finished') {
+    return { fast: 100, slow: 100 }
+  }
+
+  // 快慢流都使用总进度值
+  return {
+    fast: totalProgress,
+    slow: totalProgress
+  }
+})
+
+// V3.2.0+dev.20260122.02: 进度条状态映射，从 progressStore 获取
+const progressStatus = computed(() => {
+  if (jobProgress.value.status === 'failed') return 'error'
+  if (['pausing', 'paused'].includes(jobProgress.value.status)) return 'paused'
+  if (jobProgress.value.status === 'finished') return 'completed'
+  return 'running'
+})
 
 // 队列进度百分比
 const queueProgressPercent = computed(() =>
@@ -331,17 +383,18 @@ const statusClass = computed(() => {
   return 'idle'
 })
 
-// 元信息文字，只保留状态提示
+// V3.2.0+dev.20260122.02: 元信息文字，从 progressStore 获取状态
 const metaText = computed(() => {
-  if (props.currentTaskStatus === 'pausing') return '正在暂停...'
-  if (props.currentTaskStatus === 'paused') return '已暂停'
-  if (props.currentTaskStatus === 'queued') return '排队中'
-  if (props.currentTaskStatus === 'processing') return '转录中'
-  if (props.currentTaskStatus === 'canceling') return '正在取消...'
-  if (props.currentTaskStatus === 'force_canceled') return '已强制取消'
-  if (props.currentTaskStatus === 'canceled') return '已取消'
-  if (props.currentTaskStatus === 'failed') return '任务失败'
-  if (props.currentTaskStatus === 'finished') return '已完成'
+  const status = jobProgress.value.status
+  if (status === 'pausing') return '正在暂停...'
+  if (status === 'paused') return '已暂停'
+  if (status === 'queued') return '排队中'
+  if (status === 'processing') return '转录中'
+  if (status === 'canceling') return '正在取消...'
+  if (status === 'force_canceled') return '已强制取消'
+  if (status === 'canceled') return '已取消'
+  if (status === 'failed') return '任务失败'
+  if (status === 'finished') return '已完成'
   return '准备就绪'
 })
 
@@ -353,8 +406,11 @@ const lastSavedText = computed(() => {
   return `最后保存 ${time}`
 })
 
-// 获取阶段样式（与TaskMonitor保持一致）
+// V3.2.0+dev.20260122.02: 获取阶段样式，从 progressStore 获取状态
 const phaseStyle = computed(() => {
+  const status = jobProgress.value.status
+  const phase = jobProgress.value.phase
+
   // 如果任务暂停，使用暂停状态样式
   if (isPaused.value) {
     return STATUS_CONFIG.paused || {
@@ -364,28 +420,31 @@ const phaseStyle = computed(() => {
     }
   }
   // 如果任务正在处理且有阶段信息，使用阶段样式
-  if (props.currentTaskStatus === 'processing' && props.currentTaskPhase) {
-    return PHASE_CONFIG[props.currentTaskPhase] || PHASE_CONFIG.pending
+  if (status === 'processing' && phase) {
+    return PHASE_CONFIG[phase] || PHASE_CONFIG.pending
   }
   // 其他情况使用状态样式
-  return STATUS_CONFIG[props.currentTaskStatus] || STATUS_CONFIG.created
+  return STATUS_CONFIG[status] || STATUS_CONFIG.created
 })
 
-// 阶段标签
+// V3.2.0+dev.20260122.02: 阶段标签，从 progressStore 获取状态
 const phaseLabel = computed(() => {
+  const status = jobProgress.value.status
+  const phase = jobProgress.value.phase
+
   // V3.1.0: 区分"正在暂停"和"已暂停"状态
-  if (props.currentTaskStatus === 'pausing') {
+  if (status === 'pausing') {
     return '正在暂停...'
   }
-  if (props.currentTaskStatus === 'paused') {
+  if (status === 'paused') {
     return '已暂停'
   }
   // 如果任务正在处理且有阶段信息，显示阶段标签
-  if (props.currentTaskStatus === 'processing' && props.currentTaskPhase) {
-    return PHASE_CONFIG[props.currentTaskPhase]?.label || '处理中'
+  if (status === 'processing' && phase) {
+    return PHASE_CONFIG[phase]?.label || '处理中'
   }
   // 其他情况显示状态标签
-  return STATUS_CONFIG[props.currentTaskStatus]?.label || props.currentTaskStatus
+  return STATUS_CONFIG[status]?.label || status
 })
 
 // 处理导出
@@ -537,6 +596,7 @@ $header-h: 56px;
   left: 50%;
   top: 50%;
   transform: translate(-50%, -50%);
+  overflow: visible;
 }
 
 // 当前任务进度胶囊
@@ -552,92 +612,43 @@ $header-h: 56px;
 
   &:hover {
     background: var(--bg-tertiary);
-    transform: scale(1.02);
+    box-shadow: 0 0 0 1px rgba(88, 166, 255, 0.3);
   }
 
   &.paused {
     opacity: 0.85;
   }
 
-  .progress-track {
-    width: 120px;
-    height: 4px;
-    background: var(--border-muted);
-    border-radius: 2px;
-    overflow: hidden;
-
-    .progress-fill {
-      height: 100%;
-      background: var(--primary);
-      transition: width 0.3s ease;
-    }
-  }
-
-  // Phase 5: 双流进度条
-  .dual-progress-track {
-    width: 120px;
-    height: 8px;
-    background: var(--border-muted);
+  .phase-tag {
+    padding: 2px 8px;
     border-radius: 4px;
-    overflow: hidden;
-    position: relative;
-
-    .progress-layer {
-      position: absolute;
-      left: 0;
-      height: 4px;
-      transition: width 0.3s ease;
-
-      &.fast {
-        top: 0;
-        background: #58a6ff;  // SenseVoice - 蓝色
-      }
-
-      &.slow {
-        bottom: 0;
-        background: #3fb950;  // Whisper - 绿色
-      }
-    }
+    font-size: 10px;
+    font-weight: 600;
+    white-space: nowrap;
   }
 
-  .capsule-text {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 12px;
+  .progress-percent {
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+    font-size: 11px;
     white-space: nowrap;
 
-    .phase-tag {
-      padding: 2px 6px;
-      border-radius: 4px;
-      font-size: 10px;
-      font-weight: 600;
-      white-space: nowrap;
-    }
+    &.dual {
+      display: flex;
+      align-items: center;
+      gap: 4px;
 
-    .progress-percent {
-      color: var(--text-secondary);
-      font-family: var(--font-mono);
+      .fast-label {
+        color: #58a6ff;
+        font-weight: 600;
+        margin-right: 1px;
+      }
 
-      // Phase 5: 双流进度文字
-      &.dual {
-        display: flex;
-        align-items: center;
-        gap: 4px;
-        font-size: 11px;
-
-        .fast-label {
-          color: #58a6ff;
-          font-weight: 600;
-          margin-right: 1px;
-        }
-
-        .slow-label {
-          color: #3fb950;
-          font-weight: 600;
-          margin-left: 6px;
-          margin-right: 1px;
-        }
+      .slow-label {
+        color: #3fb950;
+        font-weight: 600;
+        margin-left: 6px;
+        margin-right: 1px;
       }
     }
   }
@@ -650,25 +661,7 @@ $header-h: 56px;
   gap: 12px;
   padding: 6px 16px;
   background: var(--bg-elevated);
-  border-radius: 10px;
-
-  .progress-track {
-    width: 150px;
-    height: 4px;
-    background: var(--border-muted);
-    border-radius: 2px;
-    overflow: hidden;
-
-    .progress-fill {
-      height: 100%;
-      background: var(--primary);
-      transition: width 0.5s ease;
-
-      &.complete {
-        background: var(--success);
-      }
-    }
-  }
+  border-radius: 16px;
 
   .progress-text {
     font-size: 12px;
