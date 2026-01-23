@@ -4,6 +4,8 @@ PreprocessCacheService - 预处理缓存管理
 V3.2.0+dev.20260122.03: 新增预处理缓存体系（阶段零）
 V3.2.0+dev.20260123.01: 修复分离缓存原子写入格式识别
 V3.2.0+dev.20260123.02: 修复音频原子写入的 fsync 句柄类型问题
+V3.2.0+dev.20260123.03: 分离缓存优先恢复与元数据复用
+V3.2.0+dev.20260123.04: 分离缓存容错恢复（产物完整即可跳过）
 """
 from __future__ import annotations
 
@@ -50,7 +52,7 @@ class PreprocessCacheService:
     负责 VAD / 频谱分诊 / 人声分离缓存的写入、校验与恢复。
     """
 
-    VERSION = "3.2.0+dev.20260123.02"
+    VERSION = "3.2.0+dev.20260123.04"
 
     def __init__(self, job_dir: Path, logger: Optional[logging.Logger] = None) -> None:
         self.job_dir = Path(job_dir)
@@ -198,6 +200,63 @@ class PreprocessCacheService:
 
         if not chunks:
             return None
+        return chunks
+
+    def load_chunks_metadata(self, require_completed: bool = False) -> Optional[List[Dict[str, Any]]]:
+        """读取 chunks_metadata（仅元数据，允许 VAD 音频缺失）"""
+        if require_completed:
+            if not self.paths.vad_state_path.exists():
+                return None
+            try:
+                with open(self.paths.vad_state_path, "r", encoding="utf-8") as f:
+                    vad_state = json.load(f)
+                if not vad_state.get("completed", False):
+                    return None
+            except Exception as exc:
+                self.logger.warning("加载 VAD 状态失败: %s", exc)
+                return None
+        if not self.paths.vad_chunks_metadata_path.exists():
+            return None
+        try:
+            with open(self.paths.vad_chunks_metadata_path, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+        except Exception as exc:
+            self.logger.warning("加载 chunks_metadata 失败: %s", exc)
+            return None
+        if not isinstance(metadata, list) or not metadata:
+            return None
+        sanitized: List[Dict[str, Any]] = []
+        for item in metadata:
+            if not isinstance(item, dict):
+                continue
+            index = item.get("index")
+            start_time = item.get("start_time")
+            end_time = item.get("end_time")
+            if index is None or start_time is None or end_time is None:
+                continue
+            sanitized.append(
+                {
+                    "index": int(index),
+                    "start_time": float(start_time),
+                    "end_time": float(end_time),
+                    "duration": float(item.get("duration", float(end_time) - float(start_time))),
+                    "sample_rate": int(item.get("sample_rate", 16000)),
+                }
+            )
+        return sanitized or None
+
+    def load_separation_chunks(self, expected_mode: str) -> Optional[List[AudioChunk]]:
+        """优先从分离缓存恢复 AudioChunk（无需 VAD 音频）"""
+        metadata = self.load_chunks_metadata(require_completed=False)
+        if not metadata:
+            return None
+        chunks = self._build_chunks_from_metadata(metadata)
+        processed_indices, is_completed = self.load_separation_cache(chunks, expected_mode)
+        if not is_completed or len(processed_indices) < len(chunks):
+            # 分离状态不完整时，尝试仅基于产物文件恢复，避免重跑阶段
+            if not self._fill_separation_outputs(chunks, processed_indices):
+                return None
+            self.logger.info("分离状态不完整但产物齐全，使用分离输出恢复")
         return chunks
 
     def save_vad_chunks(self, chunks: List[AudioChunk]) -> None:
@@ -675,6 +734,39 @@ class PreprocessCacheService:
             return True
         except OSError:
             return False
+
+    def _fill_separation_outputs(self, chunks: List[AudioChunk], processed_indices: Set[int]) -> bool:
+        """基于分离产物补齐缺失的音频数据（不强制依赖状态文件）"""
+        for chunk in chunks:
+            if chunk.index in processed_indices:
+                continue
+            audio_path = self.paths.separation_dir / f"chunk_{chunk.index}.wav"
+            if not audio_path.exists():
+                return False
+            try:
+                audio, sr = self._read_audio(audio_path)
+            except Exception as exc:
+                self.logger.warning("读取分离缓存失败: %s", exc)
+                return False
+            chunk.audio = audio
+            chunk.sample_rate = sr
+        return True
+
+    @staticmethod
+    def _build_chunks_from_metadata(metadata: List[Dict[str, Any]]) -> List[AudioChunk]:
+        """根据元数据构造占位 AudioChunk（音频由后续缓存填充）"""
+        chunks: List[AudioChunk] = []
+        for item in metadata:
+            chunks.append(
+                AudioChunk(
+                    index=int(item.get("index", len(chunks))),
+                    start=float(item.get("start_time", 0.0)),
+                    end=float(item.get("end_time", 0.0)),
+                    audio=np.zeros(0, dtype=np.float32),
+                    sample_rate=int(item.get("sample_rate", 16000)),
+                )
+            )
+        return chunks
 
     @staticmethod
     def _now_iso() -> str:

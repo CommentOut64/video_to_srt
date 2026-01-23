@@ -357,6 +357,8 @@ SSE_SIGNAL_TAGS = {
     "signal.job_failed": "任务失败",
     "signal.phase_start": "阶段开始",
     "signal.phase_complete": "阶段完成",
+    "signal.pause_pending": "暂停请求已接收，等待流水线响应",
+    "signal.pause_ack": "暂停已确认（检查点落盘完成）",
     "signal.circuit_breaker": "熔断触发",
     "signal.model_upgrade": "模型升级",
     "signal.cache_gc_recommend": "缓存清理提示",

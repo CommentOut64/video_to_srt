@@ -22,6 +22,11 @@ V3.1.0 更新：
 - 流水线保存 Whisper 上文状态 (previous_whisper_text)
 - 集成 ProgressEventEmitter 统一进度发射器
 - 实时同步 job.progress 并推送 SSE 事件
+
+V3.2.0+dev.20260123.05 更新：
+- 修复暂停快照实例变量未同步问题
+- 确保 _fast_processed_indices, _slow_processed_indices, _finalized_indices 实时更新
+- 解决恢复时"无可靠恢复点"导致从头开始的问题
 """
 import asyncio
 import copy
@@ -186,6 +191,13 @@ class AsyncDualPipeline:
         self.errors: List[Exception] = []
         # V3.1.0: 记录暂停异常，待数据排空后统一抛出
         self.pause_exception: Optional[PausedException] = None
+        # V3.2.0+dev.20260123.04: 暂停快照所需索引汇总（用于强制保存）
+        self._fast_processed_indices: Set[int] = set()
+        self._slow_processed_indices: Set[int] = set()
+        self._finalized_indices: Set[int] = set()
+        self._last_slow_chunk_index = -1
+        self._last_align_chunk_index = -1
+        self.is_pause_snapshot_saved = False
 
     async def run(
         self,
@@ -235,6 +247,47 @@ class AsyncDualPipeline:
                 initial_slow_processed_indices, initial_finalized_indices
             )
 
+    def _force_save_pause_checkpoint(self, job_dir: Optional[Path], total_chunks: int) -> bool:
+        """暂停时强制落盘检查点，避免排空后进度丢失。"""
+        if not job_dir:
+            return False
+        try:
+            from app.services.job.checkpoint_manager import CheckpointManagerV37
+
+            checkpoint_mgr = CheckpointManagerV37(job_dir, self.logger)
+            subtitle_data = {}
+            if self.subtitle_manager:
+                subtitle_data = self.subtitle_manager.to_checkpoint_data()
+
+            fast_indices = sorted(self._fast_processed_indices)
+            slow_indices = sorted(self._slow_processed_indices)
+            finalized_indices = sorted(self._finalized_indices)
+
+            checkpoint_data = {
+                "preprocessing": {
+                    "total_chunks": total_chunks,
+                },
+                "transcription": {
+                    "fast_processed_indices": fast_indices,
+                    "fast_processed_count": len(fast_indices),
+                    "slow_processed_indices": slow_indices,
+                    "slow_processed_count": len(slow_indices),
+                    "previous_whisper_text": self.previous_whisper_text or "",
+                    "last_slow_chunk_index": self._last_slow_chunk_index,
+                    "finalized_indices": finalized_indices,
+                    "align_processed_count": len(finalized_indices),
+                    "last_align_chunk_index": self._last_align_chunk_index,
+                    "total_chunks": total_chunks,
+                    **subtitle_data,
+                }
+            }
+            checkpoint_mgr.save_checkpoint(checkpoint_data)
+            self.logger.info("[V3.2.0+dev.20260123.05] 暂停快照已写入检查点")
+            return True
+        except Exception as exc:
+            self.logger.warning("[V3.2.0+dev.20260123.05] 暂停快照写入失败: %s", exc)
+            return False
+
     async def _run_sensevoice_only(
         self,
         audio_chunks: List[AudioChunk],
@@ -256,6 +309,8 @@ class AsyncDualPipeline:
         results: List[ProcessingContext] = []
         token = self.cancellation_token  # v3.1.0
         processed_indices = processed_indices or set()
+        self._fast_processed_indices = processed_indices
+        self._finalized_indices = processed_indices
         total_chunks = len(audio_chunks)
 
         for i, chunk in enumerate(audio_chunks):
@@ -302,6 +357,7 @@ class AsyncDualPipeline:
             # v3.1.0: 每个 Chunk 处理完成后检查暂停/取消并保存检查点
             if token and job_dir:
                 processed_indices.add(i)
+                self._last_align_chunk_index = i
 
                 # V3.1.0: 获取字幕快照用于实时持久化（极速模式）
                 subtitle_checkpoint_data = {}
@@ -336,6 +392,7 @@ class AsyncDualPipeline:
             raise self.errors[0]
 
         if self.pause_exception:
+            self.is_pause_snapshot_saved = self._force_save_pause_checkpoint(job_dir, total_chunks)
             # V3.1.0: 触发暂停时抛出异常，保持上层状态机一致
             raise self.pause_exception
 
@@ -394,6 +451,7 @@ class AsyncDualPipeline:
 
         # v3.1.0: 初始化已处理索引集合
         processed_indices = processed_indices or set()
+        self._fast_processed_indices = processed_indices
 
         # 启动三个并行任务（V3.1.0: 传递初始索引集合）
         task_fast = asyncio.create_task(
@@ -424,6 +482,7 @@ class AsyncDualPipeline:
             raise self.errors[0]
 
         if self.pause_exception:
+            self.is_pause_snapshot_saved = self._force_save_pause_checkpoint(job_dir, total_chunks)
             # V3.1.0: 等待队列排空后再通知上层暂停，避免进度回退
             raise self.pause_exception
 
@@ -663,6 +722,8 @@ class AsyncDualPipeline:
                 # v3.1.0: 每个 Chunk 处理完成后保存检查点
                 if token and job_dir:
                     processed_indices.add(i)
+                    # V3.2.0+dev.20260123.05: 同步到实例变量，用于暂停快照
+                    self._fast_processed_indices = processed_indices
                     checkpoint_data = {
                         "transcription": {
                             "fast_processed_indices": list(processed_indices),
@@ -751,6 +812,10 @@ class AsyncDualPipeline:
         slow_processed_count = 0  # v3.1.0: 追踪本次新处理的数量
         # V3.1.0: 使用累计索引集合（类似 FastWorker）
         slow_processed_indices = set(initial_slow_processed_indices) if initial_slow_processed_indices else set()
+        self._slow_processed_indices = slow_processed_indices
+        if slow_processed_indices:
+            # 恢复态时同步最后进度索引，避免暂停快照缺失
+            self._last_slow_chunk_index = max(slow_processed_indices)
         pause_requested = False  # V3.1.0: 捕获暂停后继续排空队列
 
         try:
@@ -818,6 +883,7 @@ class AsyncDualPipeline:
                     await self.queue_final.put(ctx)
                     slow_processed_count += 1
                     slow_processed_indices.add(chunk_index)  # V3.1.0: 累加到集合（类似 FastWorker）
+                    self._last_slow_chunk_index = chunk_index
 
                     # V3.1.0: 更新 SlowWorker 进度（使用累计索引数量）
                     if self.progress_emitter and total_chunks > 0:
@@ -837,6 +903,8 @@ class AsyncDualPipeline:
                 if token and job_dir:
                     # 获取当前的 Whisper 上文
                     previous_whisper_text = self.previous_whisper_text or ""
+                    # V3.2.0+dev.20260123.05: 同步到实例变量，用于暂停快照
+                    self._slow_processed_indices = slow_processed_indices
                     checkpoint_data = {
                         "transcription": {
                             "slow_processed_count": len(slow_processed_indices),  # V3.1.0: 使用累计数量
@@ -1004,6 +1072,10 @@ class AsyncDualPipeline:
         token = self.cancellation_token  # v3.1.0
         # V3.1.0: 使用累计索引集合（类似 FastWorker 和 SlowWorker）
         finalized_indices = set(initial_finalized_indices) if initial_finalized_indices else set()
+        self._finalized_indices = finalized_indices
+        if finalized_indices:
+            # 恢复态时同步最后进度索引，避免暂停快照缺失
+            self._last_align_chunk_index = max(finalized_indices)
         pause_requested = False  # V3.1.0: 捕获暂停后继续排空 queue_final
 
         try:
@@ -1031,6 +1103,7 @@ class AsyncDualPipeline:
                     # 收集结果
                     results.append(ctx)
                     finalized_indices.add(chunk_index)  # V3.1.0: 累加到集合
+                    self._last_align_chunk_index = chunk_index
 
                     # V3.1.0: 更新对齐阶段进度（使用累计索引数量）
                     if self.progress_emitter and total_chunks > 0:
@@ -1053,6 +1126,8 @@ class AsyncDualPipeline:
                     if self.subtitle_manager:
                         subtitle_checkpoint_data = self.subtitle_manager.to_checkpoint_data()
 
+                    # V3.2.0+dev.20260123.05: 同步到实例变量，用于暂停快照
+                    self._finalized_indices = finalized_indices
                     checkpoint_data = {
                         "transcription": {
                             "align_processed_count": len(finalized_indices),  # V3.1.0: 使用累计数量

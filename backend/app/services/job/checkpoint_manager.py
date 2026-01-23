@@ -137,6 +137,7 @@ class CheckpointV37:
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
         now = datetime.utcnow().isoformat() + "Z"
+
         return {
             "version": self.version,
             "job_id": self.job_id,
@@ -541,7 +542,8 @@ class CheckpointManager:
 
         # 检查版本
         version = data.get("version", "")
-        if not version.startswith("3.7"):
+        # V3.2.0+dev.20260123.05: 修复版本检查逻辑，接受 3.1.x 和 3.7.x
+        if not (version.startswith("3.1") or version.startswith("3.7")):
             # 尝试从旧格式迁移
             self.logger.debug(f"检测到旧版本检查点 ({version})，尝试迁移到 v3.1.0")
             data = self._migrate_to_v37(data)

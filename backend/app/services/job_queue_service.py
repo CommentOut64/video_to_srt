@@ -15,7 +15,7 @@ import os
 import sys
 import asyncio
 from collections import deque
-from typing import Dict, Optional, Literal
+from typing import Dict, Optional, Literal, Any
 from pathlib import Path
 import torch
 
@@ -619,6 +619,7 @@ class JobQueueService:
                     # [v3.1.0] 捕获暂停异常
                     job.status = "paused"
                     job.message = "已暂停"
+                    self._notify_pause_ack(job)
                     logger.info(f"[v3.1.0] 任务已暂停: {e.job_id}")
 
                 except Exception as e:
@@ -987,9 +988,8 @@ class JobQueueService:
             progress_tracker.start_phase(ProcessPhase.SENSEVOICE, total_chunks, "双流对齐...")
 
             # v3.1.0: 检查是否需要恢复转录状态
-            # V3.1.0: 使用 min(fast, slow) 作为安全恢复点
-            # 原因：finalized_indices 在当前实现中未被保存到 checkpoint，始终为空
-            # 使用 min 确保不会跳过任何需要处理的 chunk
+                # V3.1.0: 使用 min(fast, slow) 作为安全恢复点
+                # 若 finalized 缺失或为空，则回退到 fast/slow 交集
             fast_processed_indices = set()
             slow_processed_indices = set()
             previous_whisper_text = None
@@ -1570,6 +1570,72 @@ class JobQueueService:
 
         self.sse_manager.broadcast_sync(f"job:{job_id}", f"signal.{signal}", data)
         logger.debug(f"[单任务SSE] 推送信号: {job_id[:8]}... -> signal.{signal}")
+
+    def _build_pause_ack_payload(self, job: "JobState") -> Dict[str, Any]:
+        """构建暂停握手确认的载荷信息（包含检查点摘要）"""
+        payload: Dict[str, Any] = {
+            "signal": "pause_ack",
+            "job_id": job.job_id,
+            "status": job.status,
+            "message": job.message,
+            "percent": round(job.progress, 1),
+            "checkpoint_found": False,
+        }
+        try:
+            job_dir = Path(job.dir) if job.dir else None
+            if not job_dir or not job_dir.exists():
+                return payload
+            checkpoint_path = job_dir / "checkpoint.json"
+            if not checkpoint_path.exists():
+                return payload
+            with open(checkpoint_path, "r", encoding="utf-8") as f:
+                checkpoint_data = json.load(f)
+
+            transcription = checkpoint_data.get("transcription", {})
+            fast_indices = transcription.get("fast_processed_indices")
+            if fast_indices is None:
+                fast_indices = transcription.get("fast_worker", {}).get("processed_indices", [])
+            slow_indices = transcription.get("slow_processed_indices")
+            if slow_indices is None:
+                slow_indices = transcription.get("slow_worker", {}).get("processed_indices", [])
+            finalized_indices = transcription.get("finalized_indices")
+            if finalized_indices is None:
+                finalized_indices = transcription.get("alignment", {}).get("finalized_indices", [])
+
+            fast_count = len(fast_indices or [])
+            slow_count = len(slow_indices or [])
+            finalized_count = len(finalized_indices or [])
+            total_chunks = (
+                checkpoint_data.get("preprocessing", {}).get("total_chunks", 0)
+                or transcription.get("total_chunks", 0)
+            )
+            if total_chunks <= 0:
+                total_chunks = job.total or max(fast_count, slow_count, finalized_count, 0)
+            payload.update(
+                {
+                    "checkpoint_found": True,
+                    "checkpoint_updated_at": checkpoint_data.get("updated_at"),
+                    "phase": checkpoint_data.get("phase"),
+                    "phase_status": checkpoint_data.get("phase_status"),
+                    "total_chunks": total_chunks,
+                    "fast_processed": fast_count,
+                    "slow_processed": slow_count,
+                    "finalized": finalized_count,
+                }
+            )
+        except Exception as exc:
+            payload["checkpoint_error"] = str(exc)
+        return payload
+
+    def _notify_pause_ack(self, job: "JobState") -> None:
+        """V3.2.0+dev.20260123.04: 暂停握手确认（检查点落盘完成）"""
+        payload = self._build_pause_ack_payload(job)
+        self.sse_manager.broadcast_sync(
+            f"job:{job.job_id}",
+            "signal.pause_ack",
+            payload,
+        )
+        logger.debug(f"[单任务SSE] 推送暂停确认: {job.job_id[:8]}... -> signal.pause_ack")
 
     def _notify_job_removed(self, job_id: str):
         """
