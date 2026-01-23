@@ -359,6 +359,7 @@ SSE_SIGNAL_TAGS = {
     "signal.phase_complete": "阶段完成",
     "signal.circuit_breaker": "熔断触发",
     "signal.model_upgrade": "模型升级",
+    "signal.cache_gc_recommend": "缓存清理提示",
 }
 
 # 模型下载事件 Tag

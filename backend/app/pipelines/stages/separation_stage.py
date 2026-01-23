@@ -28,6 +28,7 @@ from app.models.circuit_breaker_models import SeparationLevel
 # v3.1.0: 导入取消令牌
 if TYPE_CHECKING:
     from app.utils.cancellation_token import CancellationToken
+    from app.services.preprocess_cache_service import PreprocessCacheService
 
 # V3.1.2+dev.20260109.01: 导入 tqdm 进度条
 try:
@@ -85,7 +86,8 @@ class SeparationStage:
         chunks: List[AudioChunk],
         audio_path: Optional[str] = None,
         job_dir: Optional[Path] = None,  # v3.1.0: 用于保存检查点
-        separated_indices: Optional[set] = None  # v3.1.0: 已分离的索引（用于恢复）
+        separated_indices: Optional[set] = None,  # v3.1.0: 已分离的索引（用于恢复）
+        cache_service: Optional["PreprocessCacheService"] = None
     ) -> List[AudioChunk]:
         """
         执行人声分离
@@ -103,16 +105,20 @@ class SeparationStage:
             self.logger.warning("收到空的chunk列表，跳过人声分离")
             return chunks
 
+        if cache_service:
+            cache_service.begin_separation(self.mode, len(chunks))
+
         if self.mode == 'global':
-            return await self._process_global(chunks, audio_path, job_dir)
+            return await self._process_global(chunks, audio_path, job_dir, cache_service)
         else:
-            return await self._process_on_demand(chunks, job_dir, separated_indices)
+            return await self._process_on_demand(chunks, job_dir, separated_indices, cache_service)
 
     async def _process_global(
         self,
         chunks: List[AudioChunk],
         audio_path: str,
-        job_dir: Optional[Path] = None  # v3.1.0
+        job_dir: Optional[Path] = None,  # v3.1.0
+        cache_service: Optional["PreprocessCacheService"] = None
     ) -> List[AudioChunk]:
         """
         全局分离模式
@@ -154,6 +160,16 @@ class SeparationStage:
                 chunks=chunks,
                 separated_path=separated_path
             )
+            if cache_service:
+                model_name = self.demucs_service.get_loaded_model_name() or self.demucs_service.config.model_name
+                try:
+                    cache_service.save_global_separation(
+                        chunks=chunks,
+                        separated_path=separated_path,
+                        separation_model=model_name
+                    )
+                except Exception as e:
+                    self.logger.warning("[V3.2.0+dev.20260122.03] 保存全局分离缓存失败: %s", e)
 
         finally:
             # v3.1.0: 退出原子区域
@@ -161,6 +177,13 @@ class SeparationStage:
                 has_pending = token.exit_atomic_region()
                 if has_pending:
                     self.logger.info("[v3.1.0] 检测到待处理的暂停/取消请求")
+
+        if token and cache_service and token.is_paused:
+            try:
+                cache_service.reset_separation_cache()
+                self.logger.info("[V3.2.0+dev.20260122.03] 全局分离暂停，已清理分离缓存")
+            except Exception as e:
+                self.logger.warning("[V3.2.0+dev.20260122.03] 清理分离缓存失败: %s", e)
 
         # v3.1.0: 原子区域结束后检查暂停/取消
         if token and job_dir:
@@ -179,7 +202,8 @@ class SeparationStage:
         self,
         chunks: List[AudioChunk],
         job_dir: Optional[Path] = None,  # v3.1.0
-        separated_indices: Optional[set] = None  # v3.1.0
+        separated_indices: Optional[set] = None,  # v3.1.0
+        cache_service: Optional["PreprocessCacheService"] = None
     ) -> List[AudioChunk]:
         """
         按需分离模式
@@ -261,14 +285,30 @@ class SeparationStage:
                 # 更新chunk
                 chunk.audio = separated_audio
                 chunk.is_separated = True
-                chunk.separation_level = SeparationLevel(model)
+                chunk.separation_level = (
+                    SeparationLevel.MDX_EXTRA
+                    if model == SeparationLevel.MDX_EXTRA.value
+                    else SeparationLevel.HTDEMUCS
+                )
                 chunk.separation_model = model
+                if cache_service:
+                    try:
+                        cache_service.save_separation_chunk(chunk, is_separated=True)
+                    except Exception as e:
+                        self.logger.warning("[V3.2.0+dev.20260122.03] 保存分离缓存失败: %s", e)
 
             except Exception as e:
                 self.logger.error(
                     f"分离 Chunk {chunk.index} 失败: {e}，保持原始音频"
                 )
-                # 分离失败，保持原始音频
+                chunk.is_separated = False
+                chunk.separation_level = SeparationLevel.NONE
+                chunk.separation_model = None
+                if cache_service:
+                    try:
+                        cache_service.save_separation_chunk(chunk, is_separated=False)
+                    except Exception as e:
+                        self.logger.warning("[V3.2.0+dev.20260122.03] 保存分离缓存失败: %s", e)
                 continue
 
             finally:

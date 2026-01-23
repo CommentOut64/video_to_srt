@@ -130,6 +130,18 @@ class PreprocessingSettings:
     # VAD 静音过滤开关
     vad_filter: bool = True
 
+    # 是否启用预处理缓存 GC（默认关闭）
+    is_preprocess_cache_gc_enabled: bool = False
+
+    # 缓存预算（GB），0 表示不限制
+    cache_budget_gb: float = 0.0
+
+    # 缓存 TTL（小时），0 表示不限制
+    ttl_hours: float = 0.0
+
+    # 缓存任务数上限，0 表示不限制
+    max_tasks: int = 0
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "demucs_strategy": self.demucs_strategy,
@@ -139,6 +151,10 @@ class PreprocessingSettings:
             "enable_spectral_triage": self.enable_spectral_triage,
             "spectrum_threshold": self.spectrum_threshold,
             "vad_filter": self.vad_filter,
+            "enable_preprocess_cache_gc": self.is_preprocess_cache_gc_enabled,
+            "cache_budget_gb": self.cache_budget_gb,
+            "ttl_hours": self.ttl_hours,
+            "max_tasks": self.max_tasks,
         }
 
 
@@ -444,6 +460,10 @@ class TaskConfig:
                 separation_mode=preprocessing_data.get("separation_mode", "on_demand"),
                 spectrum_threshold=preprocessing_data.get("spectrum_threshold", 0.35),
                 vad_filter=preprocessing_data.get("vad_filter", True),
+                is_preprocess_cache_gc_enabled=preprocessing_data.get("enable_preprocess_cache_gc", False),
+                cache_budget_gb=preprocessing_data.get("cache_budget_gb", 0.0),
+                ttl_hours=preprocessing_data.get("ttl_hours", 0.0),
+                max_tasks=preprocessing_data.get("max_tasks", 0),
             ),
             transcription=TranscriptionSettings(
                 transcription_profile=transcription_data.get("transcription_profile", "sensevoice_only"),

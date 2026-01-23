@@ -25,6 +25,7 @@ from app.pipelines.stages.spectral_triage_stage import SpectralTriageStage
 from app.pipelines.stages.separation_stage import SeparationStage
 from app.models.job_models import PreprocessingConfig, JobState
 from app.services.demucs_service import get_demucs_service
+from app.services.preprocess_cache_service import PreprocessCacheService
 
 # v3.1.0: 导入取消令牌
 if TYPE_CHECKING:
@@ -164,21 +165,55 @@ class PreprocessingPipeline:
         self.logger.info(f"开始预处理流程: {video_path}")
         token = self.cancellation_token  # v3.1.0: 简化引用
 
-        # V3.1.0: 检查是否可以从 checkpoint 恢复 chunks
+        cache_service: Optional[PreprocessCacheService] = None
+        if job_dir:
+            cache_service = PreprocessCacheService(job_dir=job_dir, logger=self.logger)
+            try:
+                cache_service.ensure_dirs()
+            except Exception as e:
+                self.logger.warning("[V3.2.0+dev.20260122.03] 初始化预处理缓存失败: %s", e)
+                cache_service = None
+            if cache_service:
+                try:
+                    cache_service.run_gc(job_dir.parent, self.config, exclude_job_id=job_dir.name)
+                except Exception as e:
+                    self.logger.warning("[V3.2.0+dev.20260122.03] 预处理缓存 GC 失败: %s", e)
+                try:
+                    cache_service.maybe_warn_cache_pressure(job_dir.name, self.config)
+                except Exception as e:
+                    self.logger.warning("[V3.2.0+dev.20260122.03] 预处理缓存告警失败: %s", e)
+
+        # V3.2.0+dev.20260122.03: 优先尝试预处理缓存
         chunks = None
         skip_vad = False
-        if checkpoint and isinstance(checkpoint, dict):
+        used_vad_cache = False
+        if cache_service:
+            cached_chunks = cache_service.load_vad_chunks()
+            if cached_chunks:
+                chunks = cached_chunks
+                skip_vad = True
+                used_vad_cache = True
+                self.logger.info("[V3.2.0+dev.20260122.03] VAD 缓存命中，跳过 VAD")
+                self._report_preprocess_progress("vad", 1.0, "VAD 缓存命中")
+
+        # V3.1.0: 检查是否可以从 checkpoint 恢复 chunks
+        if not skip_vad and checkpoint and isinstance(checkpoint, dict):
             preprocessing = checkpoint.get("preprocessing", {})
             if isinstance(preprocessing, dict):
                 chunks_metadata = preprocessing.get("chunks_metadata", [])
                 if chunks_metadata and preprocessing.get("vad_completed", False):
-                    # 从 checkpoint 恢复 chunks
                     chunks = await self._restore_chunks_from_metadata(
                         video_path, chunks_metadata
                     )
                     if chunks:
                         skip_vad = True
                         self.logger.info(f"[V3.1.0] 从 checkpoint 恢复 {len(chunks)} 个chunk，跳过 VAD")
+                        self._report_preprocess_progress("vad", 1.0, "VAD 检查点恢复")
+                        if cache_service:
+                            try:
+                                cache_service.save_vad_chunks(chunks)
+                            except Exception as e:
+                                self.logger.warning("[V3.2.0+dev.20260122.03] 保存 VAD 缓存失败: %s", e)
 
         if not skip_vad:
             # V3.1.0: Stage 1 拆分为两个原子区域
@@ -223,15 +258,49 @@ class PreprocessingPipeline:
                     }
                 }
                 token.check_and_save(checkpoint_data, job_dir)
+            if cache_service and chunks and not used_vad_cache:
+                try:
+                    cache_service.save_vad_chunks(chunks)
+                except Exception as e:
+                    self.logger.warning("[V3.2.0+dev.20260122.03] 保存 VAD 缓存失败: %s", e)
         else:
             self.logger.info("[V3.1.0] 跳过 Stage 1 (音频提取 + VAD)")
 
         # Stage 2: 频谱分诊（如果启用，逐chunk可中断）
         if self.spectral_triage_stage:
             self.logger.info("Stage 2: 频谱分诊")
-            self._report_preprocess_progress("spectrum_analysis", 0.0, "频谱分诊中...")
-            chunks = await self.spectral_triage_stage.process(chunks, job_dir=job_dir)
-            self._report_preprocess_progress("spectrum_analysis", 1.0, "频谱分诊完成")
+            used_triage_cache = False
+            if cache_service:
+                triage_cache = cache_service.load_triage_results(
+                    total_chunks=len(chunks),
+                    use_snr_triage=self.spectral_triage_stage.use_snr_triage,
+                    threshold=self.spectral_triage_stage.threshold,
+                    use_smart_probe=self.spectral_triage_stage.use_smart_probe,
+                    smart_probe_params=self.spectral_triage_stage.get_smart_probe_params(),
+                )
+                if triage_cache:
+                    cache_service.apply_triage_results(chunks, triage_cache)
+                    used_triage_cache = True
+                    self.logger.info("[V3.2.0+dev.20260122.03] 频谱分诊缓存命中，跳过分诊")
+                    self._report_preprocess_progress("spectrum_analysis", 1.0, "频谱分诊缓存命中")
+
+            if not used_triage_cache:
+                self._report_preprocess_progress("spectrum_analysis", 0.0, "频谱分诊中...")
+                chunks = await self.spectral_triage_stage.process(chunks, job_dir=job_dir)
+                self._report_preprocess_progress("spectrum_analysis", 1.0, "频谱分诊完成")
+                if cache_service:
+                    snapshot = self.spectral_triage_stage.get_cache_snapshot()
+                    try:
+                        cache_service.save_triage_results(
+                            chunks=chunks,
+                            triage_log=snapshot.get("triage_log"),
+                            probe_state=snapshot.get("probe_state"),
+                            use_snr_triage=self.spectral_triage_stage.use_snr_triage,
+                            threshold=self.spectral_triage_stage.threshold,
+                            use_smart_probe=self.spectral_triage_stage.use_smart_probe,
+                        )
+                    except Exception as e:
+                        self.logger.warning("[V3.2.0+dev.20260122.03] 保存分诊缓存失败: %s", e)
 
             # 统计分诊结果
             stats = self.spectral_triage_stage.get_statistics(chunks)
@@ -254,25 +323,51 @@ class PreprocessingPipeline:
             self._report_preprocess_progress("spectrum_analysis", 1.0, "频谱分诊跳过")
 
         # Stage 3: 人声分离（如果启用）
+        separation_mode = self.config.separation_mode if self.separation_stage else "off"
+        cached_separation_indices = set()
+        cache_separation_completed = False
+        if cache_service and chunks:
+            try:
+                cache_service.begin_separation(separation_mode, len(chunks))
+                cached_separation_indices, cache_separation_completed = cache_service.load_separation_cache(
+                    chunks=chunks,
+                    expected_mode=separation_mode,
+                )
+                if cache_separation_completed and len(cached_separation_indices) < len(chunks):
+                    self.logger.warning("[V3.2.0+dev.20260122.03] 分离缓存不完整，回退重做")
+                    cache_separation_completed = False
+                cache_service.save_passthrough_chunks(
+                    chunks=chunks,
+                    only_unseparated=self.separation_stage is not None,
+                )
+            except Exception as e:
+                self.logger.warning("[V3.2.0+dev.20260122.03] 准备分离缓存失败: %s", e)
+                cached_separation_indices = set()
+                cache_separation_completed = False
+
         if self.separation_stage:
             self.logger.info("Stage 3: 人声分离")
-            self._report_preprocess_progress("demucs", 0.0, "人声分离中...")
-
-            # 根据分离模式传递不同的参数
-            if self.config.separation_mode == "global":
-                # 全局分离模式：需要传递原始音频路径
-                chunks = await self.separation_stage.process(
-                    chunks=chunks,
-                    audio_path=video_path,
-                    job_dir=job_dir  # v3.1.0: 传递job_dir
-                )
+            if cache_separation_completed:
+                self.logger.info("[V3.2.0+dev.20260122.03] 人声分离缓存命中，跳过分离")
+                self._report_preprocess_progress("demucs", 1.0, "人声分离缓存命中")
             else:
-                # 按需分离模式：只分离标记的chunk
-                chunks = await self.separation_stage.process(
-                    chunks=chunks,
-                    job_dir=job_dir  # v3.1.0: 传递job_dir
-                )
-            self._report_preprocess_progress("demucs", 1.0, "人声分离完成")
+                self._report_preprocess_progress("demucs", 0.0, "人声分离中...")
+                if self.config.separation_mode == "global":
+                    chunks = await self.separation_stage.process(
+                        chunks=chunks,
+                        audio_path=video_path,
+                        job_dir=job_dir,
+                        separated_indices=cached_separation_indices,
+                        cache_service=cache_service
+                    )
+                else:
+                    chunks = await self.separation_stage.process(
+                        chunks=chunks,
+                        job_dir=job_dir,
+                        separated_indices=cached_separation_indices,
+                        cache_service=cache_service
+                    )
+                self._report_preprocess_progress("demucs", 1.0, "人声分离完成")
 
             # 统计分离结果
             stats = self.separation_stage.get_statistics(chunks)
@@ -280,6 +375,12 @@ class PreprocessingPipeline:
                 f"人声分离完成: {stats['separated']}/{stats['total_chunks']} "
                 f"个chunk已分离 (比例: {stats['separation_ratio']:.2%})"
             )
+
+            if cache_service:
+                try:
+                    cache_service.finalize_separation(len(chunks))
+                except Exception as e:
+                    self.logger.warning("[V3.2.0+dev.20260122.03] 完成分离缓存失败: %s", e)
 
             # v3.1.0: 人声分离完成后检查点
             if token and job_dir:
@@ -294,6 +395,11 @@ class PreprocessingPipeline:
         else:
             self.logger.info("Stage 3: 人声分离已跳过")
             self._report_preprocess_progress("demucs", 1.0, "人声分离跳过")
+            if cache_service and chunks:
+                try:
+                    cache_service.finalize_separation(len(chunks))
+                except Exception as e:
+                    self.logger.warning("[V3.2.0+dev.20260122.03] 完成分离缓存失败: %s", e)
 
         self.logger.info(f"预处理流程完成: {len(chunks)} 个chunk准备就绪")
 

@@ -23,7 +23,7 @@ V3.1.2+dev.20260109.01 更新：
 import logging
 import json
 from datetime import datetime
-from typing import List, Optional, TYPE_CHECKING
+from typing import List, Optional, TYPE_CHECKING, Dict, Any
 from pathlib import Path
 
 from app.services.audio.chunk_engine import AudioChunk
@@ -87,6 +87,8 @@ class SpectralTriageStage:
         self.use_smart_probe = use_smart_probe  # V3.1.2+dev.20260109.01
         self.show_progress = show_progress  # V3.1.2+dev.20260109.01
         self._smart_probe = None  # 懒加载
+        self._last_triage_log: List[Dict[str, Any]] = []
+        self._last_probe_state: Optional[Dict[str, Any]] = None
 
     def _get_smart_probe(self):
         """
@@ -103,6 +105,23 @@ class SpectralTriageStage:
                 self.logger.warning(f"智能探针服务加载失败: {e}")
                 self._smart_probe = None
         return self._smart_probe
+
+    def get_smart_probe_params(self) -> Optional[Dict[str, Any]]:
+        """获取智能探针当前参数"""
+        smart_probe = self._get_smart_probe()
+        if smart_probe is None:
+            return None
+        return {
+            "snr_threshold": smart_probe.threshold,
+            "max_step_chunks": smart_probe.max_step,
+        }
+
+    def get_cache_snapshot(self) -> Dict[str, Any]:
+        """获取最近一次分诊缓存快照"""
+        return {
+            "triage_log": self._last_triage_log,
+            "probe_state": self._last_probe_state,
+        }
 
     async def process(
         self,
@@ -222,6 +241,10 @@ class SpectralTriageStage:
                     }
                     token.check_and_save(checkpoint_data, job_dir)
 
+        # 保存缓存快照
+        self._last_triage_log = triage_log
+        self._last_probe_state = None
+
         # 统计和日志保存
         return self._finalize_triage(chunks, triage_log, job_dir)
 
@@ -266,7 +289,15 @@ class SpectralTriageStage:
                 pbar.refresh()
 
         # 执行智能探针检测
-        decision, cache = smart_probe.run_probe(chunks, progress_callback)
+        decision, cache, sequence = smart_probe.run_probe(chunks, progress_callback)
+        self._last_probe_state = {
+            "decision": decision,
+            "snr_threshold": smart_probe.threshold,
+            "max_step_chunks": smart_probe.max_step,
+            "sequence": sequence,
+            "cache": cache,
+            "cursor": len(sequence),
+        }
 
         if pbar:
             pbar.close()
@@ -317,6 +348,7 @@ class SpectralTriageStage:
                         "triage_layer": 0,  # 探针模式
                     })
 
+        self._last_triage_log = triage_log
         return self._finalize_triage(chunks, triage_log, job_dir)
 
     def _finalize_triage(

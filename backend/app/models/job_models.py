@@ -55,6 +55,19 @@ class PreprocessingConfig:
     # VAD 静音过滤开关
     vad_filter: bool = True
 
+    # ========== 预处理缓存配置 ==========
+    # 是否启用预处理缓存 GC（默认关闭）
+    is_preprocess_cache_gc_enabled: bool = False
+
+    # 缓存预算（GB），0 表示不限制
+    cache_budget_gb: float = 0.0
+
+    # 缓存 TTL（小时），0 表示不限制
+    ttl_hours: float = 0.0
+
+    # 缓存任务数上限，0 表示不限制
+    max_tasks: int = 0
+
 
 # ========== 分组二: 转录核心设置 ==========
 
@@ -168,6 +181,10 @@ class JobSettings:
                 "fuse_confidence_threshold": self.preprocessing.fuse_confidence_threshold,
                 "fuse_auto_upgrade": self.preprocessing.fuse_auto_upgrade,
                 "vad_filter": self.preprocessing.vad_filter,
+                "enable_preprocess_cache_gc": self.preprocessing.is_preprocess_cache_gc_enabled,
+                "cache_budget_gb": self.preprocessing.cache_budget_gb,
+                "ttl_hours": self.preprocessing.ttl_hours,
+                "max_tasks": self.preprocessing.max_tasks,
             },
             "transcription": {
                 "transcription_profile": self.transcription.transcription_profile,
@@ -239,6 +256,10 @@ class JobSettings:
                 fuse_confidence_threshold=preprocessing_data.get("fuse_confidence_threshold", 0.5),
                 fuse_auto_upgrade=preprocessing_data.get("fuse_auto_upgrade", True),
                 vad_filter=preprocessing_data.get("vad_filter", True),
+                is_preprocess_cache_gc_enabled=preprocessing_data.get("enable_preprocess_cache_gc", False),
+                cache_budget_gb=preprocessing_data.get("cache_budget_gb", 0.0),
+                ttl_hours=preprocessing_data.get("ttl_hours", 0.0),
+                max_tasks=preprocessing_data.get("max_tasks", 0),
             ),
             transcription=TranscriptionConfig(
                 transcription_profile=transcription_data.get("transcription_profile", "sensevoice_only"),
@@ -287,6 +308,10 @@ class JobSettings:
                 fuse_max_retry=1,
                 fuse_confidence_threshold=0.5,
                 fuse_auto_upgrade=False,
+                is_preprocess_cache_gc_enabled=False,
+                cache_budget_gb=0.0,
+                ttl_hours=0.0,
+                max_tasks=0,
             ),
             transcription=TranscriptionConfig(
                 transcription_profile=preset.transcription.transcription_profile,

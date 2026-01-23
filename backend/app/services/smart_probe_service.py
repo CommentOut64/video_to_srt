@@ -61,7 +61,7 @@ class SmartProbeService:
         self,
         chunks: List,
         progress_callback: Optional[callable] = None
-    ) -> Tuple[str, Dict[int, Dict]]:
+    ) -> Tuple[str, Dict[int, Dict], List[int]]:
         """
         执行中心扩散探针 (Center-Out Exponential/Linear Probe)
 
@@ -72,17 +72,20 @@ class SmartProbeService:
         Returns:
             decision: 'SEPARATE_ALL' | 'PASS_ALL'
             cache: {chunk_index: {'snr': float, 'c50': float, 'decision': str}}
+            probe_sequence: 探测顺序列表
         """
         n = len(chunks)
         if n == 0:
-            return "PASS_ALL", {}
+            return "PASS_ALL", {}, []
 
         center = n // 2
         cache = {}  # 缓存结果
+        probe_sequence: List[int] = []
 
         # 1. 优先探测中心
         is_dirty, result = self._check_chunk(chunks[center])
         cache[center] = result
+        probe_sequence.append(center)
 
         if progress_callback:
             progress_callback(1, n)
@@ -92,7 +95,7 @@ class SmartProbeService:
                 f"探针: 中心点 [{center}] 发现干扰 (SNR={result['snr']:.1f}dB)，"
                 f"触发全量分离"
             )
-            return "SEPARATE_ALL", cache
+            return "SEPARATE_ALL", cache, probe_sequence
 
         # 2. 斐波那契扩散 + 线性扫描
         fib_gen = self._fibonacci_generator()
@@ -127,6 +130,7 @@ class SmartProbeService:
                 is_dirty, result = self._check_chunk(chunks[left])
                 cache[left] = result
                 visited_indices.add(left)
+                probe_sequence.append(left)
 
                 if progress_callback:
                     progress_callback(len(visited_indices), n)
@@ -136,13 +140,14 @@ class SmartProbeService:
                         f"探针: 左翼 [{left}] 发现干扰 (SNR={result['snr']:.1f}dB)，"
                         f"触发全量分离"
                     )
-                    return "SEPARATE_ALL", cache
+                    return "SEPARATE_ALL", cache, probe_sequence
 
             # 探测右翼
             if right < n and right not in visited_indices:
                 is_dirty, result = self._check_chunk(chunks[right])
                 cache[right] = result
                 visited_indices.add(right)
+                probe_sequence.append(right)
 
                 if progress_callback:
                     progress_callback(len(visited_indices), n)
@@ -152,13 +157,13 @@ class SmartProbeService:
                         f"探针: 右翼 [{right}] 发现干扰 (SNR={result['snr']:.1f}dB)，"
                         f"触发全量分离"
                     )
-                    return "SEPARATE_ALL", cache
+                    return "SEPARATE_ALL", cache, probe_sequence
 
         coverage = len(cache) / n
         logger.info(
             f"探针: 通过智能快筛 (覆盖率 {coverage:.1%})，判定为纯净视频"
         )
-        return "PASS_ALL", cache
+        return "PASS_ALL", cache, probe_sequence
 
     def _check_chunk(self, chunk) -> Tuple[bool, Dict]:
         """
