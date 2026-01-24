@@ -340,6 +340,43 @@ class TranscriptionAPI {
       title,
     });
   }
+
+  /**
+   * V3.2.0+dev.20260124.01: 更新字幕（用户编辑）
+   * @param {string} jobId - 任务ID
+   * @param {number} sentenceIndex - 句子索引
+   * @param {Object} update - 更新内容
+   * @param {string} [update.text] - 新文本
+   * @param {number} [update.start] - 新开始时间
+   * @param {number} [update.end] - 新结束时间
+   * @returns {Promise<{success: boolean, data: Object}>}
+   */
+  async updateSubtitle(jobId, sentenceIndex, update) {
+    return apiClient.patch(`/api/jobs/${jobId}/subtitles/${sentenceIndex}`, update);
+  }
+
+  /**
+   * V3.2.0+dev.20260124.02: 新增字幕（用户手动添加）
+   * @param {string} jobId - 任务ID
+   * @param {Object} payload - 新字幕内容
+   * @param {string} [payload.text] - 文本
+   * @param {number} payload.start - 开始时间
+   * @param {number} payload.end - 结束时间
+   * @returns {Promise<{success: boolean, data: Object}>}
+   */
+  async createSubtitle(jobId, payload) {
+    return apiClient.post(`/api/jobs/${jobId}/subtitles`, payload);
+  }
+
+  /**
+   * V3.2.0+dev.20260124.02: 删除字幕（用户手动删除）
+   * @param {string} jobId - 任务ID
+   * @param {number} sentenceIndex - 句子索引
+   * @returns {Promise<{success: boolean, data: Object}>}
+   */
+  async deleteSubtitle(jobId, sentenceIndex) {
+    return apiClient.delete(`/api/jobs/${jobId}/subtitles/${sentenceIndex}`);
+  }
 }
 
 // 导出单例实例

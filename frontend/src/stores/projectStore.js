@@ -32,6 +32,9 @@ export const useProjectStore = defineStore("project", () => {
   // ========== 2. 字幕数据（Single Source of Truth） ==========
   const subtitles = ref([]);
 
+  // 用户删除的字幕索引集合（用于阻止 SSE 回补）
+  const deletedSentenceIndices = ref(new Set());
+
   // ========== 2.1 双模态架构: Chunk 索引映射 ==========
   // chunk_id -> [subtitle_id_1, subtitle_id_2, ...]
   const chunkSubtitleMap = ref(new Map());
@@ -186,6 +189,8 @@ export const useProjectStore = defineStore("project", () => {
       end: item.end,
       text: item.text,
       isDirty: false,
+      isModified: false,
+      originalText: null,
       // Phase 5: 双模态架构新增字段
       chunk_id: null, // 物理切片ID
       isDraft: false, // 已导入的SRT都是定稿
@@ -209,6 +214,7 @@ export const useProjectStore = defineStore("project", () => {
     clearHistory();
     // 清除 Chunk 映射
     chunkSubtitleMap.value.clear();
+    deletedSentenceIndices.value.clear();
   }
 
   /**
@@ -228,10 +234,12 @@ export const useProjectStore = defineStore("project", () => {
       end: seg.end,
       text: seg.text,
       isDirty: false,
+      isModified: seg.is_modified ?? false,
+      originalText: seg.original_text ?? null,
       chunk_id: null,
       isDraft: false,
       words: [],
-      confidence: seg.confidence || 1.0,
+      confidence: seg.confidence ?? null,
       display_confidence: seg.display_confidence,  // V3.1.2: 映射后准确率
       confidence_source: seg.confidence_source,    // V3.1.2: 置信度来源
       warning_type: "none",
@@ -249,6 +257,7 @@ export const useProjectStore = defineStore("project", () => {
     clearHistory();
     // 清除 Chunk 映射
     chunkSubtitleMap.value.clear();
+    deletedSentenceIndices.value.clear();
   }
 
   /**
@@ -287,29 +296,54 @@ export const useProjectStore = defineStore("project", () => {
   /**
    * 更新字幕内容
    */
-  function updateSubtitle(id, payload) {
+  function updateSubtitle(id, payload, options = {}) {
     const index = subtitles.value.findIndex((s) => s.id === id);
     if (index === -1) return;
 
     const current = subtitles.value[index];
+    const { isUserEdit = false } = options;
+    const normalizedPayload = { ...payload };
+
+    if (normalizedPayload.is_modified !== undefined && normalizedPayload.isModified === undefined) {
+      normalizedPayload.isModified = normalizedPayload.is_modified;
+    }
+    if (normalizedPayload.original_text !== undefined && normalizedPayload.originalText === undefined) {
+      normalizedPayload.originalText = normalizedPayload.original_text;
+    }
+    delete normalizedPayload.is_modified;
+    delete normalizedPayload.original_text;
 
     // 如果用户修改了文本，清空模型置信度，避免误导性徽章
-    const isTextEdited = payload.text !== undefined && payload.text !== current.text;
+    const isTextEdited = isUserEdit && normalizedPayload.text !== undefined && normalizedPayload.text !== current.text;
     const sanitizedPayload = isTextEdited
       ? {
-          ...payload,
+          ...normalizedPayload,
           confidence: null,
           display_confidence: null,
           confidence_source: 'manual',
         }
-      : payload;
+      : normalizedPayload;
+
+    if (isUserEdit) {
+      const hasUserEdit = sanitizedPayload.text !== undefined
+        || sanitizedPayload.start !== undefined
+        || sanitizedPayload.end !== undefined;
+      if (hasUserEdit) {
+        sanitizedPayload.isModified = true;
+      }
+      if (sanitizedPayload.text !== undefined && !current.originalText && !sanitizedPayload.originalText) {
+        sanitizedPayload.originalText = current.text;
+      }
+    }
 
     subtitles.value[index] = {
       ...current,
       ...sanitizedPayload,
-      isDirty: true,
+      isDirty: isUserEdit ? true : current.isDirty,
     };
-    meta.value.isDirty = true;
+    if (isUserEdit) {
+      meta.value.isDirty = true;
+    }
   }
 
   /**
@@ -325,6 +359,8 @@ export const useProjectStore = defineStore("project", () => {
       end: payload.end || 0,
       text: payload.text || "",
       isDirty: true,
+      isModified: payload.isModified ?? false,
+      originalText: payload.originalText ?? null,
       // Phase 5: 双模态架构新增字段
       chunk_id: payload.chunk_id || null,
       isDraft: payload.isDraft ?? false,
@@ -342,12 +378,32 @@ export const useProjectStore = defineStore("project", () => {
   /**
    * 删除字幕
    */
-  function removeSubtitle(id) {
+  function removeSubtitle(id, options = {}) {
     const index = subtitles.value.findIndex((s) => s.id === id);
     if (index !== -1) {
+      const subtitle = subtitles.value[index];
+      if (options.isUserEdit && subtitle?.sentenceIndex !== undefined) {
+        deletedSentenceIndices.value.add(subtitle.sentenceIndex);
+      }
+      if (subtitle?.chunk_id && chunkSubtitleMap.value.has(subtitle.chunk_id)) {
+        const list = chunkSubtitleMap.value.get(subtitle.chunk_id) || [];
+        chunkSubtitleMap.value.set(
+          subtitle.chunk_id,
+          list.filter((item) => item !== subtitle.id)
+        );
+      }
       subtitles.value.splice(index, 1);
       meta.value.isDirty = true;
     }
+  }
+
+  function isSentenceDeleted(sentenceIndex) {
+    return deletedSentenceIndices.value.has(sentenceIndex);
+  }
+
+  function markSentenceDeleted(sentenceIndex) {
+    if (sentenceIndex === undefined || sentenceIndex === null) return;
+    deletedSentenceIndices.value.add(sentenceIndex);
   }
 
   // ========== 字幕切分功能 ==========
@@ -417,6 +473,7 @@ export const useProjectStore = defineStore("project", () => {
       text: left.text,
       words: left.words || [],
       isDirty: true,
+      isModified: true,
       source: 'split',  // 标记来源为切分
     };
 
@@ -428,8 +485,11 @@ export const useProjectStore = defineStore("project", () => {
       text: right.text,
       words: right.words || [],
       isDirty: true,
+      isModified: true,
       source: 'split',
     };
+    rightSubtitle.sentenceIndex = undefined;
+    rightSubtitle.originalText = null;
 
     // 6. 原子操作：删除旧字幕，插入两个新字幕
     console.log('[ProjectStore] 切分前历史记录数:', history.value.length);
@@ -445,6 +505,7 @@ export const useProjectStore = defineStore("project", () => {
       success: true,
       leftId,
       rightId,
+      originalSentenceIndex: subtitle.sentenceIndex,
       leftSubtitle,
       rightSubtitle,
     };
@@ -607,12 +668,18 @@ export const useProjectStore = defineStore("project", () => {
       text,
       start,
       end,
-      confidence = 0.8,
+      confidence = null,
       display_confidence,  // V3.1.2: 映射后准确率
       confidence_source,   // V3.1.2: 置信度来源
       words = [],
       warning_type = "none",
     } = sentenceData;
+
+    if (deletedSentenceIndices.value.has(sentenceIndex)) {
+      console.log(`[ProjectStore] 草稿字幕已被用户删除，跳过: ${sentenceIndex}`);
+      resumeHistory();
+      return;
+    }
 
     // 生成唯一ID
     const subtitleId = `draft-${chunk_id}-${sentenceIndex}`;
@@ -627,6 +694,8 @@ export const useProjectStore = defineStore("project", () => {
       end,
       text,
       isDirty: false,
+      isModified: sentenceData.is_modified ?? false,
+      originalText: sentenceData.original_text ?? null,
       chunk_id,
       isDraft: true, // 标记为草稿
       words,
@@ -679,20 +748,28 @@ export const useProjectStore = defineStore("project", () => {
     // 暂停历史记录，SSE 推送的内容不应被撤销
     pauseHistory();
 
-    // 1. 删除该 Chunk 的所有旧字幕
+    // 1. 删除该 Chunk 的所有旧字幕（保留用户编辑）
     const oldSubtitleIds = chunkSubtitleMap.value.get(chunk_id) || [];
+    const protectedIds = oldSubtitleIds.filter((id) => {
+      const subtitle = subtitles.value.find((s) => s.id === id);
+      return subtitle?.isModified;
+    });
     subtitles.value = subtitles.value.filter(
-      (s) => !oldSubtitleIds.includes(s.id)
+      (s) => !oldSubtitleIds.includes(s.id) || protectedIds.includes(s.id)
     );
 
     console.log(
-      `[ProjectStore] 删除 Chunk ${chunk_id} 的 ${oldSubtitleIds.length} 个旧字幕`
+      `[ProjectStore] 删除 Chunk ${chunk_id} 的 ${oldSubtitleIds.length} 个旧字幕, ` +
+      `保护 ${protectedIds.length} 条用户编辑`
     );
 
     // 2. 添加新的定稿字幕
-    const newSubtitleIds = [];
+    const newSubtitleIds = [...protectedIds];
     sentences.forEach((sentence, idx) => {
-      const subtitleId = `final-${chunk_id}-${idx}`;
+      if (deletedSentenceIndices.value.has(sentence.index)) {
+        return;
+      }
+      const subtitleId = buildUniqueSubtitleId(`final-${chunk_id}-${idx}`);
       // V3.1.2+dev.20260111.01: 包含 display_confidence 和 confidence_source
       const subtitleData = {
         id: subtitleId,
@@ -700,14 +777,17 @@ export const useProjectStore = defineStore("project", () => {
         end: sentence.end,
         text: sentence.text,
         isDirty: false,
+        isModified: sentence.is_modified ?? false,
+        originalText: sentence.original_text ?? null,
         chunk_id,
         isDraft: false, // 定稿
         words: sentence.words || [],
-        confidence: sentence.confidence ?? 1.0,
+        confidence: sentence.confidence ?? null,
         display_confidence: sentence.display_confidence,  // V3.1.2: 映射后准确率
         confidence_source: sentence.confidence_source,    // V3.1.2: 置信度来源
         warning_type: sentence.warning_type || "none",
         source: sentence.source || "whisper",
+        sentenceIndex: sentence.index,
       };
 
       // 按时间顺序插入
@@ -772,6 +852,9 @@ export const useProjectStore = defineStore("project", () => {
     const beforeLength = subtitles.value.length;
 
     sentences.forEach((sentence, idx) => {
+      if (deletedSentenceIndices.value.has(sentence.index)) {
+        return;
+      }
       // 使用 restored 前缀标识恢复的字幕
       const subtitleId = `restored-${chunk_id}-${sentence.index ?? idx}`;
       // V3.1.2+dev.20260111.01: 包含 display_confidence 和 confidence_source
@@ -781,11 +864,13 @@ export const useProjectStore = defineStore("project", () => {
         end: sentence.end,
         text: sentence.text,
         isDirty: false,
+        isModified: sentence.is_modified ?? false,
+        originalText: sentence.original_text ?? null,
         chunk_id,
         isDraft: sentence.is_draft ?? false,
         isRestored: true, // 标记为恢复的字幕
         words: sentence.words || [],
-        confidence: sentence.confidence ?? 1.0,
+        confidence: sentence.confidence ?? null,
         display_confidence: sentence.display_confidence,  // V3.1.2: 映射后准确率
         confidence_source: sentence.confidence_source,    // V3.1.2: 置信度来源
         warning_type: sentence.warning_type || "none",
@@ -813,6 +898,20 @@ export const useProjectStore = defineStore("project", () => {
 
     // 恢复历史记录
     resumeHistory();
+  }
+
+  function buildUniqueSubtitleId(baseId) {
+    const existingIds = new Set(subtitles.value.map((s) => s.id));
+    if (!existingIds.has(baseId)) {
+      return baseId;
+    }
+    let counter = 1;
+    let candidate = `${baseId}-u${counter}`;
+    while (existingIds.has(candidate)) {
+      counter += 1;
+      candidate = `${baseId}-u${counter}`;
+    }
+    return candidate;
   }
 
   /**
@@ -997,6 +1096,7 @@ export const useProjectStore = defineStore("project", () => {
       draftChunks: 0,
       finalizedChunks: 0,
     };
+    deletedSentenceIndices.value.clear();
     console.log("[ProjectStore] 项目已重置");
   }
 
@@ -1086,6 +1186,8 @@ export const useProjectStore = defineStore("project", () => {
     updateSubtitle,
     addSubtitle,
     removeSubtitle,
+    markSentenceDeleted,
+    isSentenceDeleted,
     splitSubtitle,  // 字幕切分
     generateSRT,
     seekTo,

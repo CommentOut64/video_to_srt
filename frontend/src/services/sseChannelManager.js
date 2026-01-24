@@ -252,6 +252,21 @@ class SSEChannelManager extends EventEmitter {
         handlers.onFinalized?.(data)
         handlers.onSubtitleUpdate?.(data)
       },
+      'subtitle.added': (data) => {
+        console.log(`[SSE Job ${jobId}] 新增字幕:`, data)
+        handlers.onSubtitleAdded?.(data)
+        handlers.onSubtitleUpdate?.(data)
+      },
+      'subtitle.deleted': (data) => {
+        console.log(`[SSE Job ${jobId}] 删除字幕:`, data)
+        handlers.onSubtitleDeleted?.(data)
+        handlers.onSubtitleUpdate?.(data)
+      },
+      'subtitle.edited': (data) => {
+        console.log(`[SSE Job ${jobId}] 用户编辑字幕:`, data)
+        handlers.onSubtitleEdited?.(data)
+        handlers.onSubtitleUpdate?.(data)
+      },
 
       // 旧版事件 (兼容)
       'subtitle.sv_sentence': (data) => {
