@@ -8,7 +8,7 @@
 """
 import copy
 import threading
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from app.models.sensevoice_models import SentenceSegment, TextSource
 from app.services.sse_service import get_sse_manager
 import logging
@@ -120,6 +120,14 @@ class StreamingSubtitleManager:
             return
 
         sentence = self.sentences[index]
+
+        # V3.2.0+dev.20260124.01: 保护用户编辑，防止 AI 覆盖
+        if getattr(sentence, 'is_modified', False):
+            logger.info(
+                f"[V3.2.0+dev.20260124.01] 跳过更新用户已编辑的句子: "
+                f"index={index}, source={source.value}"
+            )
+            return
 
         # 应用伪对齐
         from .pseudo_alignment import PseudoAlignment
@@ -406,11 +414,22 @@ class StreamingSubtitleManager:
 
         # V3.8: 使用锁保护整个替换过程
         with self._lock:
-            # 删除旧的草稿句子
+            # 删除旧的草稿句子（V3.2.0+dev.20260124.01: 保护用户编辑）
             old_indices = self.chunk_sentences.get(chunk_index, [])
+            protected_sentences = {}  # 保存被保护的用户编辑句子
+
             for old_index in old_indices:
                 if old_index in self.sentences:
-                    del self.sentences[old_index]
+                    old_sentence = self.sentences[old_index]
+                    # 如果用户已编辑，保护该句子，不删除
+                    if getattr(old_sentence, 'is_modified', False):
+                        protected_sentences[old_index] = old_sentence
+                        logger.info(
+                            f"[V3.2.0+dev.20260124.01] 保护用户编辑: "
+                            f"chunk={chunk_index}, index={old_index}"
+                        )
+                    else:
+                        del self.sentences[old_index]
 
             # 添加新的定稿句子
             new_indices = []
@@ -420,8 +439,13 @@ class StreamingSubtitleManager:
                 self.sentence_count += 1
                 new_indices.append(index)
 
+            # 合并保护的句子（保持原索引）
+            for protected_index, protected_sentence in protected_sentences.items():
+                self.sentences[protected_index] = protected_sentence
+                new_indices.append(protected_index)
+
             # 更新 Chunk 索引映射
-            self.chunk_sentences[chunk_index] = new_indices
+            self.chunk_sentences[chunk_index] = sorted(new_indices)
 
         # 推送 SSE 事件（批量替换）- 在锁外推送，避免死锁
         # V3.1.2+dev.20260113.01: fallback 字典补充 display_confidence 和 confidence_source
@@ -704,6 +728,134 @@ class StreamingSubtitleManager:
             logger.error(f"[V3.1.0] 字幕恢复失败: job_id={self.job_id}, error={e}", exc_info=True)
             return False
 
+    def apply_user_edits(self, edits: Dict[int, Dict[str, Any]]) -> int:
+        """
+        V3.2.0+dev.20260124.02: 将用户编辑叠加到内存字幕（防止恢复后被覆盖）。
+
+        Args:
+            edits: 用户编辑映射（sentence_index -> edit data）
+
+        Returns:
+            int: 成功应用的编辑数量
+        """
+        if not edits:
+            return 0
+
+        updated_count = 0
+        for index, edit in edits.items():
+            sentence = self.sentences.get(index)
+            if not sentence:
+                continue
+
+            if edit.get("text") is not None:
+                if not sentence.is_modified and not sentence.original_text:
+                    sentence.original_text = sentence.text
+                sentence.text = edit["text"]
+                sentence.text_clean = edit["text"]
+                sentence.update_confidence(None, "manual")
+
+            if edit.get("start") is not None:
+                sentence.start = edit["start"]
+            if edit.get("end") is not None:
+                sentence.end = edit["end"]
+
+            sentence.is_modified = True
+            updated_count += 1
+
+        if updated_count:
+            logger.info(
+                "[V3.2.0+dev.20260124.02] 已应用用户编辑到字幕管理器: "
+                "job_id=%s, count=%s",
+                self.job_id,
+                updated_count
+            )
+        return updated_count
+
+    def add_manual_sentence(self, index: int, text: str, start: float, end: float) -> None:
+        """
+        V3.2.0+dev.20260124.02: 添加用户手动字幕（不影响 sentence_count）。
+        """
+        with self._lock:
+            sentence = SentenceSegment(
+                text=text,
+                text_clean=text,
+                start=start,
+                end=end,
+                confidence=None
+            )
+            sentence.source = TextSource.MANUAL
+            sentence.is_modified = True
+            self.sentences[index] = sentence
+
+    def remove_sentence_by_index(self, index: int) -> bool:
+        """
+        V3.2.0+dev.20260124.02: 删除指定索引的句子，并维护 chunk 映射。
+        """
+        removed = False
+        with self._lock:
+            if index in self.sentences:
+                del self.sentences[index]
+                removed = True
+
+            # 从 chunk 映射中移除
+            for chunk_index, indices in list(self.chunk_sentences.items()):
+                if index in indices:
+                    new_indices = [item for item in indices if item != index]
+                    if new_indices:
+                        self.chunk_sentences[chunk_index] = new_indices
+                    else:
+                        del self.chunk_sentences[chunk_index]
+
+        return removed
+
+    def apply_user_deletions(self, deleted_indices: List[int]) -> int:
+        """
+        V3.2.0+dev.20260124.02: 应用用户删除列表，防止恢复时回补。
+        """
+        if not deleted_indices:
+            return 0
+        removed_count = 0
+        for index in deleted_indices:
+            if self.remove_sentence_by_index(index):
+                removed_count += 1
+        if removed_count:
+            logger.info(
+                "[V3.2.0+dev.20260124.02] 已应用用户删除: job_id=%s, count=%s",
+                self.job_id,
+                removed_count
+            )
+        return removed_count
+
+    def apply_manual_entries(self, edits: Dict[int, Dict[str, Any]]) -> int:
+        """
+        V3.2.0+dev.20260124.02: 将手动新增字幕叠加到内存字幕。
+        """
+        if not edits:
+            return 0
+        added_count = 0
+        for index, entry in edits.items():
+            if index >= 0:
+                continue
+            if index in self.sentences:
+                continue
+            text = entry.get("text")
+            if text is None:
+                continue
+            self.add_manual_sentence(
+                index=index,
+                text=text,
+                start=entry.get("start", 0),
+                end=entry.get("end", 0)
+            )
+            added_count += 1
+        if added_count:
+            logger.info(
+                "[V3.2.0+dev.20260124.02] 已追加手动字幕: job_id=%s, count=%s",
+                self.job_id,
+                added_count
+            )
+        return added_count
+
     def push_restored_subtitles_to_frontend(self):
         """
         V3.1.0: 恢复后推送所有字幕到前端
@@ -744,6 +896,37 @@ class StreamingSubtitleManager:
                     }
                 )
 
+        # 推送手动新增字幕（不在 chunk 映射内）
+        manual_sentences = []
+        for idx, sentence in self.sentences.items():
+            if idx >= 0:
+                continue
+            sentence_dict = sentence.to_dict() if hasattr(sentence, 'to_dict') else {
+                "text": sentence.text_clean or sentence.text,
+                "start": sentence.start,
+                "end": sentence.end,
+                "confidence": sentence.confidence,
+                "display_confidence": getattr(sentence, 'display_confidence', None),
+                "confidence_source": getattr(sentence, 'confidence_source', None),
+                "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),
+            }
+            sentence_dict["index"] = idx
+            sentence_dict["is_draft"] = getattr(sentence, 'is_draft', False)
+            sentence_dict["is_finalized"] = getattr(sentence, 'is_finalized', True)
+            manual_sentences.append(sentence_dict)
+
+        if manual_sentences:
+            push_subtitle_event(
+                self.sse_manager,
+                self.job_id,
+                "restored",
+                {
+                    "chunk_index": "manual",
+                    "sentences": manual_sentences,
+                    "is_restore": True
+                }
+            )
+
         logger.info(
             f"[V3.1.0] 已推送恢复的字幕到前端: job_id={self.job_id}, "
             f"chunks={len(self.chunk_sentences)}, "
@@ -762,6 +945,11 @@ def get_streaming_subtitle_manager(job_id: str) -> StreamingSubtitleManager:
     if job_id not in _subtitle_managers:
         _subtitle_managers[job_id] = StreamingSubtitleManager(job_id)
     return _subtitle_managers[job_id]
+
+
+def get_streaming_subtitle_manager_if_exists(job_id: str) -> Optional[StreamingSubtitleManager]:
+    """仅在存在时返回字幕管理器，避免完成态无意义实例化。"""
+    return _subtitle_managers.get(job_id)
 
 
 def remove_streaming_subtitle_manager(job_id: str):

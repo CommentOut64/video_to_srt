@@ -345,13 +345,18 @@ class JobQueueService:
                 job.message = "已恢复，继续执行中..."
                 logger.info(f"[v3.1.0] 任务仍在运行，清除暂停标志: {job_id}")
             else:
-                # 任务已完全停止，需要重新加入队列
-                if job_id not in self.queue:
+                # 任务已完全停止：优先保留既有队列顺序
+                if job_id in self.queue:
+                    queue_position = list(self.queue).index(job_id) + 1
+                    job.status = "queued"
+                    job.paused = False
+                    job.message = f"已恢复，等待执行 (位置: {queue_position})"
+                    logger.info(f"[V3.2.0+dev.20260124.01] 任务已在恢复队列中: {job_id}")
+                else:
                     self.queue.append(job_id)
-
-                job.status = "queued"
-                job.paused = False
-                job.message = f"已恢复，排队中 (位置: {len(self.queue)})"
+                    job.status = "queued"
+                    job.paused = False
+                    job.message = f"已恢复，排队中 (位置: {len(self.queue)})"
 
                 if token:
                     # Token 还存在但任务不在运行（理论上不应该发生）
@@ -525,27 +530,30 @@ class JobQueueService:
                             self.queue.popleft()
                             continue
 
-                        if job.status in ["paused", "canceled", "canceling", "force_canceled"]:
-                            logger.info(f"⏭️ 跳过已暂停/取消的任务: {job_id}")
+                        if job.status == "paused":
+                            # V3.2.0+dev.20260124.01: 重启后保留队列顺序，等待用户恢复
+                            logger.info(f"[V3.2.0+dev.20260124.01] 队列头任务已暂停，等待恢复: {job_id}")
+                        elif job.status in ["canceled", "canceling", "force_canceled", "failed"]:
+                            logger.info(f"⏭️ 跳过已取消/失败的任务: {job_id}")
                             self.queue.popleft()
                             continue
+                        else:
+                            # 正式从队列移除
+                            self.queue.popleft()
+                            self.running_job_id = job_id
+                            self._current_executing_job_id = job_id  # [V3.1.0] 记录实际执行的任务ID
+                            job.status = "processing"
+                            job.message = "开始处理"
 
-                        # 正式从队列移除
-                        self.queue.popleft()
-                        self.running_job_id = job_id
-                        self._current_executing_job_id = job_id  # [V3.1.0] 记录实际执行的任务ID
-                        job.status = "processing"
-                        job.message = "开始处理"
+                            # V3.1.0: 在推送 SSE 之前，先从 checkpoint 恢复进度
+                            # 这样断点续传时前端收到的进度是正确的，而非 0
+                            self._restore_progress_from_checkpoint(job)
 
-                        # V3.1.0: 在推送 SSE 之前，先从 checkpoint 恢复进度
-                        # 这样断点续传时前端收到的进度是正确的，而非 0
-                        self._restore_progress_from_checkpoint(job)
-
-                        # 推送队列变化和任务状态通知（在lock内，避免数据不一致）
-                        self._notify_queue_change()
-                        self._notify_job_status(job_id, "processing")
-                        # 推送初始进度（让前端立即知道任务的初始状态）
-                        self._notify_job_progress(job_id)
+                            # 推送队列变化和任务状态通知（在lock内，避免数据不一致）
+                            self._notify_queue_change()
+                            self._notify_job_status(job_id, "processing")
+                            # 推送初始进度（让前端立即知道任务的初始状态）
+                            self._notify_job_progress(job_id)
 
                     # 任务开始执行前保存状态（确保断电后能恢复 running 任务）
                     if self.running_job_id:
@@ -1056,6 +1064,22 @@ class JobQueueService:
                     }
                     if subtitle_manager.restore_from_checkpoint(subtitle_checkpoint_data):
                         logger.info(f"[V3.1.0] 字幕状态已恢复: {len(transcription_state.sentences_snapshot)} 个句子")
+
+                        # V3.2.0+dev.20260124.02: 恢复后叠加用户编辑，避免恢复覆盖
+                        try:
+                            from app.services.subtitle_edit_store import (
+                                load_deleted_indices,
+                                load_edits
+                            )
+
+                            edits = load_edits(job_dir)
+                            deleted_indices = load_deleted_indices(job_dir)
+                            subtitle_manager.apply_user_edits(edits)
+                            subtitle_manager.apply_user_deletions(list(deleted_indices))
+                            subtitle_manager.apply_manual_entries(edits)
+                        except Exception as exc:
+                            logger.warning("[V3.2.0+dev.20260124.02] 叠加用户编辑失败: %s", exc)
+
                         # 推送已恢复的字幕到前端
                         subtitle_manager.push_restored_subtitles_to_frontend()
                     else:
@@ -1928,6 +1952,45 @@ class JobQueueService:
         logger.warning(f"无法恢复任务: {job_id}")
         return None
 
+    def _build_recovery_queue(self, state: QueueState) -> list[str]:
+        """
+        重启恢复时重建队列顺序（running -> interrupted -> queue）。
+
+        保证顺序唯一性，避免重复任务占位。
+        """
+        ordered: list[str] = []
+
+        def _append(job_id: Optional[str]) -> None:
+            if not job_id:
+                return
+            if job_id not in ordered:
+                ordered.append(job_id)
+
+        _append(state.running_job_id)
+        _append(state.interrupted_job_id)
+        for job_id in state.queue:
+            _append(job_id)
+
+        return ordered
+
+    def _apply_restart_pause(
+        self,
+        job: JobState,
+        expired_jobs: set[str],
+        timeout_jobs: set[str],
+    ) -> None:
+        """重启纠偏：统一标记暂停并设置原因提示。"""
+        if job.status in ("finished", "failed", "canceled"):
+            return
+        job.status = "paused"
+        job.paused = True
+        if job.job_id in expired_jobs:
+            job.message = "租约过期，任务已暂停"
+        elif job.job_id in timeout_jobs:
+            job.message = "心跳超时，任务已暂停"
+        else:
+            job.message = "程序重启，任务已暂停，请手动恢复"
+
     def _load_state(self):
         """
         启动时恢复队列状态
@@ -1935,7 +1998,7 @@ class JobQueueService:
         恢复逻辑:
         1. 读取状态仓库
         2. 兼容旧 queue_state.json（仅迁移一次）
-        3. 重启后所有非终态任务统一置为暂停
+        3. 重启后所有非终态任务统一置为暂停并保留队列顺序
         """
         try:
             state = self.state_repo.load_queue_state()
@@ -1959,11 +2022,8 @@ class JobQueueService:
                 logger.info("无队列状态，从空队列启动")
                 return
 
-            job_ids = set(state.queue)
-            if state.running_job_id:
-                job_ids.add(state.running_job_id)
-            if state.interrupted_job_id:
-                job_ids.add(state.interrupted_job_id)
+            recovery_queue = self._build_recovery_queue(state)
+            job_ids = set(recovery_queue)
             # V3.2.0+dev.20260120.06: 加载仓库中的暂停任务，避免重启后无法恢复
             for job in self.state_repo.list_tasks():
                 is_non_terminal = job.status not in ("finished", "failed", "canceled")
@@ -1973,32 +2033,51 @@ class JobQueueService:
             expired_jobs = set(self.heartbeat_service.list_expired_leases())
             timeout_jobs = set(self.heartbeat_service.list_heartbeat_timeouts(60.0))
 
-            for job_id in job_ids:
+            self.queue.clear()
+            self.running_job_id = None
+            self.interrupted_job_id = None
+
+            jobs_to_persist: list[JobState] = []
+            from_status_map: Dict[str, Optional[str]] = {}
+
+            for job_id in recovery_queue:
                 job = self._load_job_for_recovery(job_id)
                 if not job:
                     continue
 
-                from_status = job.status
-                if job.status not in ("finished", "failed", "canceled"):
-                    job.status = "paused"
-                    job.paused = True
-                    job.message = "程序重启，任务已暂停，请手动恢复"
-                    if job_id in expired_jobs:
-                        job.message = "租约过期，任务已暂停"
-                    elif job_id in timeout_jobs:
-                        job.message = "心跳超时，任务已暂停"
+                if job.status in ("finished", "failed", "canceled"):
+                    logger.info(f"[V3.2.0+dev.20260124.01] 过滤终态任务: {job_id}")
+                    continue
 
+                from_status_map[job_id] = job.status
+                self._apply_restart_pause(job, expired_jobs, timeout_jobs)
+                self.queue.append(job_id)
                 self.jobs[job_id] = job
-                self._persist_queue_and_jobs([job], {job.job_id: from_status}, reason="system_restart")
+                jobs_to_persist.append(job)
 
-            # 重启后清空内存队列
-            self.queue.clear()
-            self.running_job_id = None
-            self.interrupted_job_id = None
-            self._save_state()
+            for job_id in job_ids:
+                if job_id in self.jobs:
+                    continue
+                job = self._load_job_for_recovery(job_id)
+                if not job:
+                    continue
+                if job.status in ("finished", "failed", "canceled"):
+                    continue
+                from_status_map[job_id] = job.status
+                self._apply_restart_pause(job, expired_jobs, timeout_jobs)
+                self.jobs[job_id] = job
+                jobs_to_persist.append(job)
+
+            if jobs_to_persist:
+                self._persist_queue_and_jobs(jobs_to_persist, from_status_map, reason="system_restart")
+            else:
+                self._save_state()
 
             paused_count = len([j for j in self.jobs.values() if j.status == "paused"])
-            logger.info(f"队列恢复完成: {paused_count}个暂停任务")
+            logger.info(
+                f"[V3.2.0+dev.20260124.01] 队列恢复完成: "
+                f"{paused_count}个暂停任务, queue={len(self.queue)}"
+            )
 
         except Exception as e:
             logger.error(f"恢复队列状态失败: {e}")
