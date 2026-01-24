@@ -165,6 +165,7 @@
  */
 import { ref, computed, nextTick, watch } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
+import transcriptionApi from '@/services/api/transcriptionApi'
 import ContextMenu from '@/components/editor/ContextMenu.vue'
 
 const props = defineProps({
@@ -388,7 +389,7 @@ function handleTextareaContextMenu(e) {
 }
 
 // 右键菜单项选择处理
-function handleContextMenuSelect(key) {
+async function handleContextMenuSelect(key) {
   console.log('[SubtitleItem] 菜单项被选择:', key)
 
   // 重置菜单打开标志
@@ -407,9 +408,63 @@ function handleContextMenuSelect(key) {
       console.error('[SubtitleItem] 切分失败:', result.error)
     } else {
       console.log('[SubtitleItem] 切分成功:', result)
+      await syncSplitSubtitles(result)
       // 切分成功后退出编辑模式
       isEditing.value = false
     }
+  }
+}
+
+async function syncSplitSubtitles(result) {
+  const jobId = projectStore.meta.jobId
+  if (!jobId) return
+
+  const { originalSentenceIndex, leftSubtitle, rightSubtitle } = result
+  if (!leftSubtitle || !rightSubtitle) return
+
+  try {
+    if (originalSentenceIndex !== undefined) {
+      await transcriptionApi.updateSubtitle(jobId, originalSentenceIndex, {
+        text: leftSubtitle.text,
+        start: leftSubtitle.start,
+        end: leftSubtitle.end
+      })
+      projectStore.updateSubtitle(leftSubtitle.id, {
+        sentenceIndex: originalSentenceIndex,
+        isModified: true,
+        source: 'split'
+      }, { isUserEdit: true })
+    } else {
+      const leftResp = await transcriptionApi.createSubtitle(jobId, {
+        text: leftSubtitle.text,
+        start: leftSubtitle.start,
+        end: leftSubtitle.end
+      })
+      const leftData = leftResp?.data?.data || leftResp?.data
+      if (leftData?.index !== undefined) {
+        projectStore.updateSubtitle(leftSubtitle.id, {
+          sentenceIndex: leftData.index,
+          isModified: true,
+          source: leftData.source || 'manual'
+        }, { isUserEdit: true })
+      }
+    }
+
+    const rightResp = await transcriptionApi.createSubtitle(jobId, {
+      text: rightSubtitle.text,
+      start: rightSubtitle.start,
+      end: rightSubtitle.end
+    })
+    const rightData = rightResp?.data?.data || rightResp?.data
+    if (rightData?.index !== undefined) {
+      projectStore.updateSubtitle(rightSubtitle.id, {
+        sentenceIndex: rightData.index,
+        isModified: true,
+        source: rightData.source || 'manual'
+      }, { isUserEdit: true })
+    }
+  } catch (error) {
+    console.warn('[SubtitleItem] 切分同步失败:', error)
   }
 }
 
