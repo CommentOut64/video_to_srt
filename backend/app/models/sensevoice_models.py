@@ -35,6 +35,7 @@ class TextSource(Enum):
     WHISPER_PATCH = "whisper_patch"      # Whisper 复核替换
     LLM_CORRECTION = "llm_correction"    # LLM 校对修正
     LLM_TRANSLATION = "llm_translation"  # LLM 翻译
+    MANUAL = "manual"                    # 用户手动编辑/新增
 
 
 class WarningType(Enum):
