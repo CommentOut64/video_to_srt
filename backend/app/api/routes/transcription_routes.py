@@ -888,6 +888,310 @@ def create_transcription_router(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"复制文件失败: {str(e)}")
 
+    # V3.2.0+dev.20260124.02: 用户编辑字幕接口
+    class SubtitleCreateRequest(BaseModel):
+        """字幕新增请求模型"""
+        text: Optional[str] = ""
+        start: float
+        end: float
+
+    class SubtitleUpdateRequest(BaseModel):
+        """字幕更新请求模型"""
+        text: Optional[str] = None
+        start: Optional[float] = None
+        end: Optional[float] = None
+
+    @router.post("/jobs/{job_id}/subtitles")
+    async def create_subtitle(job_id: str, payload: SubtitleCreateRequest):
+        """
+        V3.2.0+dev.20260124.02: 用户新增字幕接口
+        """
+        from pathlib import Path
+        from app.services.sse_service import get_sse_manager, push_subtitle_event
+        from app.services.streaming_subtitle import get_streaming_subtitle_manager_if_exists
+        from app.services.subtitle_edit_store import create_manual_entry
+
+        job = transcription_service.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="任务未找到")
+
+        if payload.start < 0 or payload.end <= payload.start:
+            raise HTTPException(status_code=400, detail="时间戳不合法")
+
+        try:
+            job_dir = Path(job.dir)
+            text = payload.text or ""
+            index, entry = create_manual_entry(job_dir, text, payload.start, payload.end)
+
+            subtitle_manager = get_streaming_subtitle_manager_if_exists(job_id)
+            if subtitle_manager:
+                subtitle_manager.add_manual_sentence(index, text, payload.start, payload.end)
+
+            sentence_payload = {
+                "index": index,
+                "text": text,
+                "start": payload.start,
+                "end": payload.end,
+                "confidence": None,
+                "display_confidence": None,
+                "confidence_source": "manual",
+                "source": entry.get("source", "manual"),
+                "is_modified": True,
+                "original_text": entry.get("original_text")
+            }
+
+            sse_manager = get_sse_manager()
+            push_subtitle_event(
+                sse_manager,
+                job_id,
+                "added",
+                {
+                    "index": index,
+                    "sentence": sentence_payload,
+                    "source": "user_add",
+                    "is_update": True
+                }
+            )
+
+            return {
+                "success": True,
+                "data": sentence_payload
+            }
+
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"新增字幕失败: {str(exc)}")
+
+    @router.patch("/jobs/{job_id}/subtitles/{sentence_index}")
+    async def update_subtitle(
+        job_id: str,
+        sentence_index: int,
+        update: SubtitleUpdateRequest
+    ):
+        """
+        V3.2.0+dev.20260124.02: 用户编辑字幕接口
+
+        核心功能：
+        1. 接收前端的实时编辑
+        2. 标记为 is_modified=True，防止 AI 覆盖
+        3. 持久化到编辑落盘文件，必要时同步快照
+
+        Args:
+            job_id: 任务 ID
+            sentence_index: 句子索引
+            update: 更新内容（text/start/end）
+        """
+        from pathlib import Path
+        from app.services.sse_service import get_sse_manager, push_subtitle_event
+        from app.services.streaming_subtitle import get_streaming_subtitle_manager_if_exists
+        from app.services.subtitle_edit_store import (
+            apply_edit_to_snapshot_data,
+            get_sentence_from_snapshot,
+            load_deleted_indices,
+            load_edits,
+            load_transcription_snapshot,
+            persist_snapshot,
+            save_edit
+        )
+
+        job = transcription_service.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="任务未找到")
+
+        try:
+            job_dir = Path(job.dir)
+            update_payload = update.dict(exclude_none=True)
+            if not update_payload:
+                raise HTTPException(status_code=400, detail="更新内容为空")
+            deleted_indices = load_deleted_indices(job_dir)
+            if sentence_index in deleted_indices:
+                raise HTTPException(status_code=404, detail=f"句子索引 {sentence_index} 已被删除")
+            subtitle_manager = get_streaming_subtitle_manager_if_exists(job_id)
+            sentence = None
+            snapshot_sentence = None
+            manual_sentence = None
+            original_text = None
+
+            if subtitle_manager and sentence_index in subtitle_manager.sentences:
+                sentence = subtitle_manager.sentences[sentence_index]
+
+                # 更新字段
+                if update.text is not None:
+                    if not sentence.is_modified:
+                        sentence.original_text = sentence.text
+                    sentence.text = update.text
+                    sentence.text_clean = update.text
+                    # 用户编辑后清空置信度，避免误导
+                    sentence.update_confidence(None, "manual")
+
+                if update.start is not None:
+                    sentence.start = update.start
+
+                if update.end is not None:
+                    sentence.end = update.end
+
+                # 标记为用户修改（核心：防止 AI 覆盖）
+                sentence.is_modified = True
+                original_text = sentence.original_text
+            else:
+                # 无内存句子时，尝试从持久化快照中查找
+                snapshot_info = load_transcription_snapshot(job_dir)
+                if snapshot_info:
+                    snapshot_path, snapshot_data, snapshot_kind = snapshot_info
+                    snapshot_sentence = get_sentence_from_snapshot(
+                        snapshot_data,
+                        sentence_index,
+                        snapshot_kind
+                    )
+                    if snapshot_sentence:
+                        original_text = snapshot_sentence.get("original_text") or snapshot_sentence.get("text", "")
+
+                        # 仅在完成态或无管理器时写回快照，避免频繁全量写
+                        should_update_snapshot = subtitle_manager is None or job.status in {
+                            "completed",
+                            "finished",
+                            "failed",
+                            "canceled"
+                        }
+                        updated = apply_edit_to_snapshot_data(
+                            snapshot_data,
+                            sentence_index,
+                            update_payload,
+                            original_text,
+                            snapshot_kind
+                        )
+                        if updated and should_update_snapshot:
+                            persist_snapshot(snapshot_path, snapshot_data)
+                if snapshot_sentence is None and sentence is None:
+                    edits = load_edits(job_dir)
+                    manual_sentence = edits.get(sentence_index)
+                    deleted_indices = load_deleted_indices(job_dir)
+                    if sentence_index in deleted_indices and not manual_sentence:
+                        raise HTTPException(status_code=404, detail=f"句子索引 {sentence_index} 已被删除")
+                    if manual_sentence:
+                        original_text = manual_sentence.get("original_text") or manual_sentence.get("text", "")
+                    else:
+                        raise HTTPException(status_code=404, detail=f"句子索引 {sentence_index} 不存在")
+
+            # V3.2.0+dev.20260124.02: 记录用户编辑落盘（轻量叠加）
+            save_edit(job_dir, sentence_index, update_payload, original_text)
+
+            # V3.2.0+dev.20260124.02: 广播用户编辑事件，确保多端一致
+            sentence_payload = None
+            if sentence:
+                sentence_payload = sentence.to_dict()
+            elif snapshot_sentence:
+                sentence_payload = dict(snapshot_sentence)
+            elif manual_sentence:
+                manual_sentence.update(update_payload)
+                sentence_payload = {
+                    "index": sentence_index,
+                    "text": manual_sentence.get("text", ""),
+                    "start": manual_sentence.get("start", 0),
+                    "end": manual_sentence.get("end", 0),
+                    "confidence": None,
+                    "display_confidence": None,
+                    "confidence_source": "manual",
+                    "source": manual_sentence.get("source", "manual"),
+                    "is_modified": True,
+                    "original_text": manual_sentence.get("original_text")
+                }
+            if sentence_payload is not None:
+                sentence_payload["index"] = sentence_index
+                sse_manager = get_sse_manager()
+                push_subtitle_event(
+                    sse_manager,
+                    job_id,
+                    "edited",
+                    {
+                        "index": sentence_index,
+                        "sentence": sentence_payload,
+                        "source": "user_edit",
+                        "is_update": True
+                    }
+                )
+
+            fallback_text = None
+            fallback_start = None
+            fallback_end = None
+            if sentence:
+                fallback_text = sentence.text
+                fallback_start = sentence.start
+                fallback_end = sentence.end
+            elif snapshot_sentence:
+                fallback_text = snapshot_sentence.get("text")
+                fallback_start = snapshot_sentence.get("start")
+                fallback_end = snapshot_sentence.get("end")
+            elif manual_sentence:
+                fallback_text = manual_sentence.get("text")
+                fallback_start = manual_sentence.get("start")
+                fallback_end = manual_sentence.get("end")
+
+            return {
+                "success": True,
+                "data": {
+                    "index": sentence_index,
+                    "text": update.text if update.text is not None else fallback_text,
+                    "start": update.start if update.start is not None else fallback_start,
+                    "end": update.end if update.end is not None else fallback_end,
+                    "is_modified": True,
+                    "original_text": original_text
+                }
+            }
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"更新字幕失败: {str(e)}")
+
+    @router.delete("/jobs/{job_id}/subtitles/{sentence_index}")
+    async def delete_subtitle(job_id: str, sentence_index: int):
+        """
+        V3.2.0+dev.20260124.02: 用户删除字幕接口
+        """
+        from pathlib import Path
+        from app.services.sse_service import get_sse_manager, push_subtitle_event
+        from app.services.streaming_subtitle import get_streaming_subtitle_manager_if_exists
+        from app.services.subtitle_edit_store import add_deletion
+
+        job = transcription_service.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="任务未找到")
+
+        try:
+            job_dir = Path(job.dir)
+            add_deletion(job_dir, sentence_index)
+
+            subtitle_manager = get_streaming_subtitle_manager_if_exists(job_id)
+            if subtitle_manager:
+                subtitle_manager.remove_sentence_by_index(sentence_index)
+
+            sse_manager = get_sse_manager()
+            push_subtitle_event(
+                sse_manager,
+                job_id,
+                "deleted",
+                {
+                    "index": sentence_index,
+                    "source": "user_delete",
+                    "is_update": True
+                }
+            )
+
+            return {
+                "success": True,
+                "data": {
+                    "index": sentence_index,
+                    "is_deleted": True
+                }
+            }
+
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"删除字幕失败: {str(exc)}")
+
     @router.get("/check-resume/{job_id}")
     async def check_resume(job_id: str):
         """检查任务是否可以断点续传"""
@@ -1038,12 +1342,25 @@ def create_transcription_router(
             # V3.1.0+: 优先从 transcription.sentences_snapshot 读取（实时字幕快照）
             transcription = transcription_data or {}
             sentences_snapshot = transcription.get("sentences_snapshot", [])
+            from app.services.subtitle_edit_store import (
+                apply_deletions_to_segments,
+                apply_edits_to_segments,
+                apply_edits_to_sentences_snapshot,
+                build_manual_segments,
+                load_deleted_indices,
+                load_edits
+            )
+            edits = load_edits(job_dir)
+            deleted_indices = load_deleted_indices(job_dir)
 
             all_segments = []
             detected_language = None
             need_update_checkpoint = False  # V3.1.2: 标记是否需要更新 checkpoint
 
             if sentences_snapshot:
+                # V3.2.0+dev.20260124.02: 叠加用户编辑落盘数据
+                if edits:
+                    apply_edits_to_sentences_snapshot(sentences_snapshot, edits)
                 # 使用新格式（V3.1.0+ 实时字幕快照）
                 # V3.1.2+dev.20260111.02: 增加 display_confidence 支持
                 from app.core.confidence_mapper import ConfidenceMapper
@@ -1076,7 +1393,9 @@ def create_transcription_router(
                         "confidence": raw_conf,  # 可能为 None
                         "display_confidence": display_conf,  # 可能为 None（旧数据无置信度）
                         "confidence_source": confidence_source,  # 可能为 None
-                        "source": source
+                        "source": source,
+                        "is_modified": sentence.get("is_modified", False),
+                        "original_text": sentence.get("original_text")
                     })
 
                 # 按 _index 排序（已经是正确顺序，但保险起见）
@@ -1121,6 +1440,20 @@ def create_transcription_router(
                 processed_count = len(data.get("processed_indices", []))
                 total_chunks = data.get("total_segments", 0)
 
+                # V3.2.0+dev.20260124.02: 旧格式下同样叠加用户编辑
+                if edits:
+                    apply_edits_to_segments(all_segments, edits)
+
+            # V3.2.0+dev.20260124.02: 过滤用户删除的字幕
+            if deleted_indices:
+                all_segments = apply_deletions_to_segments(all_segments, deleted_indices)
+
+            # V3.2.0+dev.20260124.02: 追加用户新增字幕
+            manual_segments = build_manual_segments(edits, deleted_indices)
+            if manual_segments:
+                all_segments.extend(manual_segments)
+                all_segments.sort(key=lambda x: x.get('start', 0))
+
             # 快照模式下补充进度信息，避免 percentage 为 0
             if using_snapshot:
                 if not processed_count:
@@ -1134,7 +1467,7 @@ def create_transcription_router(
                 "has_snapshot": using_snapshot,
                 "language": detected_language or "unknown",
                 "segments": all_segments,
-                "sentence_count": transcription.get("sentence_count", len(all_segments)),
+                "sentence_count": len(all_segments),
                 "progress": {
                     "processed": processed_count,
                     "total": total_chunks,
