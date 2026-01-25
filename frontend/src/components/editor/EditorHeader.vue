@@ -347,19 +347,72 @@ const PREPROCESS_PHASES = new Set([
 // eslint-disable-next-line @typescript-eslint/no-unused-vars, no-unused-vars
 const TRANSCRIPTION_PHASES = new Set(['sensevoice', 'whisper'])
 
-// V3.2.0+dev.20260122.02: 使用总进度值替代双流进度显示
+// V3.2.0+dev.20260125.04: 修复双流模式和智能复核模式进度映射逻辑
+// 关键理解：
+// - 双流模式：fast 和 slow 处理同一批 chunk，都映射到 20%-75%
+// - 智能复核模式：快流 70%（20%-58.5%），慢流 30%（58.5%-75%）
+// - 转录完成后，后端总进度从 75% 跳到 95%（跳过精修），再到 100%（导出完成）
+// - 对齐阶段废除，不计入进度
 const mappedProgress = computed(() => {
-  const totalProgress = clampPercent(jobProgress.value.percent)
-
   // 任务完成：强制 100%
   if (jobProgress.value.status === 'finished') {
     return { fast: 100, slow: 100 }
   }
 
-  // 快慢流都使用总进度值
+  // 从 SSE 获取详细进度（后端推送的 detail 字段）
+  const detail = jobProgress.value.detail || {}
+  const mode = jobProgress.value.mode || 'dual_stream'
+  const preprocess = clampPercent(detail.preprocess || 0)
+  const fast = clampPercent(detail.fast || 0)
+  const slow = clampPercent(detail.slow || 0)
+
+  // 阶段分配常量（与设计文档保持一致）
+  const PREPROCESS_RANGE = 20    // 前处理 0-20%
+  const TRANSCRIPTION_RANGE = 55 // 转录占 55%（20%-75%）
+
+  // 1. 前处理阶段（0-20%）
+  const preprocessProgress = (preprocess / 100) * PREPROCESS_RANGE
+
+  // V3.2.0+dev.20260125.04: 智能复核模式特殊处理
+  if (mode === 'whisper_patch') {
+    // 智能复核模式：快流 70%，慢流 30%
+    const FAST_RANGE = TRANSCRIPTION_RANGE * 0.7   // 38.5%
+    const SLOW_RANGE = TRANSCRIPTION_RANGE * 0.3   // 16.5%
+    const FAST_END = PREPROCESS_RANGE + FAST_RANGE // 58.5%
+
+    // 快流映射到 20%-58.5%
+    const fastProgress = (fast / 100) * FAST_RANGE
+    const mappedFast = Math.min(FAST_END, preprocessProgress + fastProgress)
+
+    // 慢流映射到 58.5%-75%（在快流完成后才开始）
+    // 注意：慢流进度需要叠加在快流结束点之上
+    const slowProgress = (slow / 100) * SLOW_RANGE
+    // 快流完成后，慢流从 58.5% 开始
+    const mappedSlow = fast >= 100
+      ? Math.min(75, FAST_END + slowProgress)
+      : mappedFast  // 快流未完成时，慢流跟随快流
+
+    return {
+      fast: mappedFast,
+      slow: mappedSlow
+    }
+  }
+
+  // 2. 双流模式和极速模式：快慢流都映射到 20%-75%
+  // 快流：用于前端追赶动画
+  const fastTranscriptionProgress = (fast / 100) * TRANSCRIPTION_RANGE
+  // 慢流：代表真实转录进度
+  const slowTranscriptionProgress = (slow / 100) * TRANSCRIPTION_RANGE
+
+  // 快流显示进度 = 前处理 + 快流转录（最大到 75%）
+  const mappedFast = Math.min(75, preprocessProgress + fastTranscriptionProgress)
+
+  // 慢流显示进度 = 前处理 + 慢流转录（最大到 75%）
+  const mappedSlow = Math.min(75, preprocessProgress + slowTranscriptionProgress)
+
   return {
-    fast: totalProgress,
-    slow: totalProgress
+    fast: mappedFast,
+    slow: mappedSlow
   }
 })
 

@@ -8,10 +8,18 @@
     <div v-if="status === 'error'" class="error-layer"></div>
 
     <!-- Level 2: 快流层 -->
-    <div class="fast-layer" :style="{ width: `calc(${fastProgress}% + var(--track-height) / 2)` }"></div>
+    <div
+      v-if="fastProgress > 0"
+      class="fast-layer"
+      :style="{ width: `calc(${fastProgress}% + var(--track-height) / 2)` }"
+    ></div>
 
     <!-- Level 3: 慢流层 -->
-    <div class="slow-layer" :style="{ width: `calc(${slowProgress}% + var(--track-height) / 2)` }">
+    <div
+      v-if="slowProgress > 0"
+      class="slow-layer"
+      :style="{ width: `calc(${slowProgress}% + var(--track-height) / 2)` }"
+    >
       <div class="glow-tip"></div>
     </div>
 
