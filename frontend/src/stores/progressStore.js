@@ -10,6 +10,7 @@
 import { defineStore } from 'pinia'
 import { reactive, computed } from 'vue'
 import { useUnifiedTaskStore } from './unifiedTaskStore'
+import { normalizeTimestamp } from '@/utils/timestamp'
 
 // [V3.1.0] 清理配置
 const CLEANUP_CONFIG = {
@@ -49,6 +50,7 @@ function createState(jobId) {
     lastSource: 'init',
     lastUpdate: 0,
     lastSseAt: 0,
+    lastServerAt: 0,
     lastRejected: null
   }
 }
@@ -81,6 +83,8 @@ export const useProgressStore = defineStore('progress', () => {
       processed: state.processed,
       total: state.total,
       language: state.language
+    }, {
+      updated_at: state.lastServerAt
     })
   }
 
@@ -119,6 +123,18 @@ export const useProgressStore = defineStore('progress', () => {
   function apply(jobId, payload = {}, source = 'unknown') {
     const state = ensureState(jobId)
     const now = Date.now()
+    const incomingAt = normalizeTimestamp(payload.updated_at ?? payload.timestamp)
+    if (incomingAt && state.lastServerAt && incomingAt < state.lastServerAt) {
+      state.lastRejected = {
+        percent: clampPercent(payload.percent ?? payload.progress),
+        source,
+        at: now
+      }
+      return state
+    }
+    if (incomingAt) {
+      state.lastServerAt = incomingAt
+    }
     const nextStatus = payload.status || state.status
     let dirty = false
 

@@ -58,7 +58,7 @@ class SSEChannelManager extends EventEmitter {
       },
       queue_update: (data) => {
         console.log('[SSE Global] 队列更新:', data)
-        handlers.onQueueUpdate?.(data.queue)
+        handlers.onQueueUpdate?.(data.queue, data)
       },
       job_status: (data) => {
         // V3.1.0: 状态事件不应该包含进度信息，避免归零
@@ -76,6 +76,10 @@ class SSEChannelManager extends EventEmitter {
         console.log('[SSE Global] 任务进度:', data.id || data.job_id, percent)
         // 使用 data.id 而非 data.job_id，兼容全局频道的字段名
         handlers.onJobProgress?.(data.id || data.job_id, percent, { ...data, percent })
+      },
+      job_renamed: (data) => {
+        console.log('[SSE Global] 任务重命名:', data.job_id, data.title)
+        handlers.onJobRenamed?.(data)
       },
       // [V3.1.0] 新增：任务删除事件，解决幽灵任务问题
       job_removed: (data) => {
