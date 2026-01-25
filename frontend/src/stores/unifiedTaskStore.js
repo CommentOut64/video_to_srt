@@ -8,6 +8,7 @@ import { defineStore } from 'pinia'
 import { ref, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useProjectStore } from './projectStore'
+import { normalizeTimestamp } from '@/utils/timestamp'
 
 export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
   const router = useRouter()
@@ -40,6 +41,7 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
 
   // 队列顺序索引（单一事实来源）
   const queueOrder = ref([])
+  const queueUpdatedAt = ref(0)
 
   // SSE 连接状态
   const sseConnected = ref(false)
@@ -104,28 +106,33 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
       .slice(0, 8)
   })
 
-  // ========== 自动状态转换 ==========
-  // 监听任务状态变化，自动进入编辑模式
-  watch(() => tasksMap.value, (newTasks) => {
-    for (const [id, task] of newTasks) {
-      // 转录完成且进度100%，自动切换到编辑阶段
-      if (task.status === TaskStatus.FINISHED &&
-          task.phase === TaskPhase.TRANSCRIBING &&
-          task.progress === 100) {
-        console.log(`[UnifiedTaskStore] 任务 ${id} 转录完成，自动进入编辑模式`)
-        task.phase = TaskPhase.EDITING
-        // 自动跳转到编辑器
-        router.push(`/editor/${id}`)
-      }
-    }
-  }, { deep: true })
-
   // ========== 工具函数 ==========
   function normalizeProgress(value) {
     if (value === null || value === undefined) return null
     const num = Number(value)
     if (Number.isNaN(num)) return null
     return Math.round(Math.max(0, Math.min(100, num)) * 10) / 10
+  }
+
+  function shouldApplyServerUpdate(task, incomingAt) {
+    if (!incomingAt) return true
+    if (!task.serverUpdatedAt) return true
+    return incomingAt >= task.serverUpdatedAt
+  }
+
+  function applyUpdateTimestamp(task, incomingAt, isServer = true) {
+    if (isServer) {
+      if (incomingAt && task.serverUpdatedAt && incomingAt < task.serverUpdatedAt) {
+        return false
+      }
+      if (incomingAt) {
+        task.serverUpdatedAt = incomingAt
+        task.updatedAt = incomingAt
+        return true
+      }
+    }
+    task.updatedAt = Date.now()
+    return true
   }
 
   /**
@@ -175,6 +182,9 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
    * 添加新任务
    */
   function addTask(taskData) {
+    const serverUpdatedAt = normalizeTimestamp(
+      taskData.updated_at ?? taskData.updatedAt ?? taskData.timestamp
+    )
     const task = {
       job_id: taskData.job_id,
       filename: taskData.filename,
@@ -189,7 +199,8 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
       processed: taskData.processed || 0,
       total: taskData.total || 0,
       createdAt: taskData.createdAt || Date.now(),
-      updatedAt: Date.now(),
+      updatedAt: serverUpdatedAt || Date.now(),
+      serverUpdatedAt: serverUpdatedAt || 0,
       completed_at: taskData.completed_at || null,  // 完成时间
       paused_at: taskData.paused_at || null,        // 暂停时间
       failed_at: taskData.failed_at || null,        // 失败时间
@@ -215,14 +226,20 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
    * 更新任务状态（不更新进度）
    * V3.1.0: 专门用于状态变更，避免进度被覆盖
    */
-  function updateTaskStatus(jobId, status, message = null) {
+  function updateTaskStatus(jobId, status, message = null, meta = {}) {
     const task = tasksMap.value.get(jobId)
     if (task) {
+      const incomingAt = normalizeTimestamp(
+        meta.updated_at ?? meta.updatedAt ?? meta.timestamp
+      )
+      const isServer = meta.isServer !== false
+      if (!applyUpdateTimestamp(task, incomingAt, isServer)) {
+        return
+      }
       task.status = status
       if (message !== null) {
         task.message = message
       }
-      task.updatedAt = Date.now()
       saveTasks()
       console.log(`[UnifiedTaskStore] 任务状态已更新: ${jobId} -> ${status}`)
     }
@@ -231,9 +248,17 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
   /**
    * 更新任务进度
    */
-  function updateTaskProgress(jobId, percent, status, extraData = {}) {
+  function updateTaskProgress(jobId, percent, status, extraData = {}, meta = {}) {
     const task = tasksMap.value.get(jobId)
     if (!task) return
+
+    const incomingAt = normalizeTimestamp(
+      meta.updated_at ?? meta.updatedAt ?? meta.timestamp
+    )
+    const isServer = meta.isServer !== false
+    if (!applyUpdateTimestamp(task, incomingAt, isServer)) {
+      return
+    }
 
     applyProgressField(task, percent, status)
 
@@ -253,21 +278,29 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
     task.sseConnected = true
     task.lastError = null  // 清除错误信息
 
-    task.updatedAt = Date.now()
     // 进度更新频繁，不立即保存到 localStorage
   }
 
   /**
    * 更新任务 SSE 连接状态
    */
-  function updateTaskSSEStatus(jobId, connected, error = null) {
+  function updateTaskSSEStatus(jobId, connected, error = null, meta = {}) {
     const task = tasksMap.value.get(jobId)
     if (task) {
+      const incomingAt = normalizeTimestamp(
+        meta.updated_at ?? meta.updatedAt ?? meta.timestamp
+      )
+      const isServer = meta.isServer === true
+      if (isServer && !applyUpdateTimestamp(task, incomingAt, true)) {
+        return
+      }
       task.sseConnected = connected
       // 如果是被踢下线的情况，记录错误提示，供 UI 展示弹窗/提示
       if (error) task.lastError = error
       else if (connected) task.lastError = null
-      task.updatedAt = Date.now()
+      if (!isServer) {
+        task.updatedAt = Date.now()
+      }
     }
   }
 
@@ -303,9 +336,16 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
   /**
    * 通用更新任务方法（更新任意字段）
    */
-  function updateTask(jobId, updates) {
+  function updateTask(jobId, updates, meta = {}) {
     const task = tasksMap.value.get(jobId)
     if (!task) return
+    const incomingAt = normalizeTimestamp(
+      meta.updated_at ?? meta.updatedAt ?? meta.timestamp
+    )
+    const isServer = meta.isServer !== false
+    if (!applyUpdateTimestamp(task, incomingAt, isServer)) {
+      return
+    }
 
     // 检测任务是否刚完成
     if (updates.status === 'finished' && task.status !== 'finished') {
@@ -336,9 +376,76 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
       delete updates.progress
     }
 
-    Object.assign(task, updates, { updatedAt: Date.now() })
+    Object.assign(task, updates)
     saveTasks()
     console.log(`[UnifiedTaskStore] 任务已更新: ${jobId}`, updates)
+  }
+
+  function applyTaskSnapshot(snapshot, meta = {}) {
+    if (!snapshot) return false
+    const jobId = snapshot.id || snapshot.job_id
+    if (!jobId) return false
+
+    const incomingAt = normalizeTimestamp(
+      snapshot.updated_at ?? snapshot.updatedAt ?? snapshot.timestamp ?? meta.timestamp
+    )
+    const task = tasksMap.value.get(jobId)
+    if (task) {
+      if (!shouldApplyServerUpdate(task, incomingAt)) {
+        return false
+      }
+
+      if (!applyUpdateTimestamp(task, incomingAt, true)) {
+        return false
+      }
+
+      if (snapshot.status) task.status = snapshot.status
+      if (snapshot.message !== undefined) task.message = snapshot.message
+      if (snapshot.filename) task.filename = snapshot.filename
+      if (snapshot.title !== undefined) task.title = snapshot.title
+      if (snapshot.phase) task.phase = snapshot.phase
+      if (snapshot.phase_percent !== undefined) {
+        task.phase_percent = Math.round(snapshot.phase_percent * 10) / 10
+      }
+      if (snapshot.processed !== undefined) task.processed = snapshot.processed
+      if (snapshot.total !== undefined) task.total = snapshot.total
+      if (snapshot.language !== undefined) task.language = snapshot.language
+      if (snapshot.created_time) task.createdAt = snapshot.created_time
+      if (snapshot.progress !== undefined) {
+        applyProgressField(task, snapshot.progress, snapshot.status)
+      }
+      saveTasks()
+      return true
+    }
+
+    addTask({
+      job_id: jobId,
+      filename: snapshot.filename,
+      status: snapshot.status,
+      progress: snapshot.progress,
+      phase_percent: snapshot.phase_percent || 0,
+      message: snapshot.message,
+      phase: snapshot.phase,
+      language: snapshot.language,
+      processed: snapshot.processed || 0,
+      total: snapshot.total || 0,
+      createdAt: snapshot.created_time || Date.now(),
+      updated_at: incomingAt
+    })
+    return true
+  }
+
+  function applyQueueOrder(queue, meta = {}) {
+    if (!Array.isArray(queue)) {
+      return false
+    }
+    const incomingAt = normalizeTimestamp(meta.updated_at ?? meta.updatedAt ?? meta.timestamp)
+    if (incomingAt && queueUpdatedAt.value && incomingAt < queueUpdatedAt.value) {
+      return false
+    }
+    queueOrder.value = queue
+    queueUpdatedAt.value = incomingAt || Date.now()
+    return true
   }
 
   /**
@@ -360,7 +467,7 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
     currentTask.value = task
     activeTaskId.value = jobId
 
-    // 自动跳转到编辑器
+    // 仅在用户触发加载时进入编辑器
     if (router.currentRoute.value.path !== `/editor/${jobId}`) {
       router.push(`/editor/${jobId}`)
     }
@@ -475,45 +582,22 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
         }
 
         const existingTask = tasksMap.value.get(backendTask.id)
+        const applied = applyTaskSnapshot(backendTask)
         if (existingTask) {
-          // 更新现有任务（只更新关键字段）
-          existingTask.status = backendTask.status
-          applyProgressField(existingTask, backendTask.progress, backendTask.status)
-          existingTask.phase_percent = backendTask.phase_percent || 0
-          existingTask.message = backendTask.message
-          existingTask.filename = backendTask.filename
-          existingTask.phase = backendTask.phase
-          existingTask.language = backendTask.language
-          existingTask.processed = backendTask.processed || 0
-          existingTask.total = backendTask.total || 0
-          existingTask.updatedAt = Date.now()
-          // 如果任务正在处理中，标记为 SSE 待连接（等 SSE 连接后会更新为 true）
-          if (backendTask.status === 'processing') {
+          if (applied && backendTask.status === 'processing') {
             existingTask.sseConnected = false
           }
-          updatedCount++
-        } else {
-          // 添加新任务
-          addTask({
-            job_id: backendTask.id,
-            filename: backendTask.filename,
-            status: backendTask.status,
-            progress: backendTask.progress,
-            phase_percent: backendTask.phase_percent || 0,
-            message: backendTask.message,
-            phase: backendTask.phase || (backendTask.status === 'finished' ? 'editing' : 'transcribing'),
-            language: backendTask.language,
-            processed: backendTask.processed || 0,
-            total: backendTask.total || 0,
-            createdAt: backendTask.created_time || Date.now()
-          })
+          if (applied) {
+            updatedCount++
+          }
+        } else if (applied) {
           addedCount++
         }
       }
 
       // 4. 更新队列顺序
       if (response.queue) {
-        queueOrder.value = response.queue
+        applyQueueOrder(response.queue, { timestamp: response.queue_updated_at })
         console.log(`[UnifiedTaskStore] 队列顺序已同步: ${queueOrder.value.length} 个任务`)
       }
 
@@ -650,6 +734,7 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
     activeTaskId,
     currentTask,
     queueOrder,
+    queueUpdatedAt,
     sseConnected,
     lastHeartbeat,
 
@@ -671,9 +756,11 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
     updateTaskSSEStatus,
     updateTaskMessage,
     updateTask,
+    applyTaskSnapshot,
     loadTask,
     saveCurrentTask,
     deleteTask,
+    applyQueueOrder,
     reorderQueue,
     syncTasksFromBackend,
     clearAllTasks,

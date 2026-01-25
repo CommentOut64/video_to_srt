@@ -10,7 +10,7 @@ import uuid
 import shutil
 import time
 import logging
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Request, Body
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -142,6 +142,23 @@ def create_transcription_router(
     # 获取SSE管理器
     sse_manager = get_sse_manager()
 
+    def _build_task_snapshot(job: JobState) -> Dict[str, Any]:
+        """构建前端任务状态快照（包含时间戳，用于版本校验）。"""
+        return {
+            "id": job.job_id,
+            "filename": job.filename,
+            "title": job.title,
+            "status": job.status,
+            "progress": job.progress,
+            "phase": job.phase,
+            "phase_percent": job.phase_percent,
+            "message": job.message,
+            "processed": job.processed,
+            "total": job.total,
+            "language": job.language,
+            "updated_at": job.updatedAt,
+        }
+
     @router.get("/stream/{job_id}")
     async def stream_job_progress(job_id: str, request: Request):
         """
@@ -211,6 +228,9 @@ def create_transcription_router(
                     "error": error
                 }
 
+            persisted_job = transcription_service.job_lifecycle.state_repo.get_task(job_id)
+            updated_at = persisted_job.updatedAt if persisted_job else None
+
             if current_job:
                 return {
                     "job_id": current_job.job_id,
@@ -221,6 +241,7 @@ def create_transcription_router(
                     "processed": current_job.processed,
                     "total": current_job.total,
                     "language": current_job.language or "",
+                    "updated_at": updated_at,
                     # 追加当前 Proxy/预览状态，断线重连时立即同步
                     "proxy": _build_proxy_state()
                 }
@@ -487,12 +508,17 @@ def create_transcription_router(
             else:
                 status = 400
             raise HTTPException(status_code=status, detail=err or "任务未找到")
+        job_snapshot = None
+        job = transcription_service.job_lifecycle.state_repo.get_task(job_id)
+        if job:
+            job_snapshot = _build_task_snapshot(job)
         return {
             "job_id": job_id,
             "canceled": ok,
             "data_deleted": delete_data,
             "message": err,
-            "pending_delete": pending_delete
+            "pending_delete": pending_delete,
+            "task": job_snapshot,
         }
 
     @router.post("/pause/{job_id}")
@@ -502,7 +528,11 @@ def create_transcription_router(
         ok = queue_service.pause_job(job_id)
         if not ok:
             raise HTTPException(status_code=404, detail="任务未找到")
-        return {"job_id": job_id, "paused": ok}
+        job_snapshot = None
+        job = transcription_service.job_lifecycle.state_repo.get_task(job_id)
+        if job:
+            job_snapshot = _build_task_snapshot(job)
+        return {"job_id": job_id, "paused": ok, "task": job_snapshot}
 
     @router.post("/resume/{job_id}")
     async def resume_job(job_id: str):
@@ -522,12 +552,17 @@ def create_transcription_router(
         queue_position = 0
         if job_id in queue_service.queue:
             queue_position = list(queue_service.queue).index(job_id) + 1
+        job_snapshot = None
+        persisted_job = transcription_service.job_lifecycle.state_repo.get_task(job_id)
+        if persisted_job:
+            job_snapshot = _build_task_snapshot(persisted_job)
 
         return {
             "job_id": job_id,
             "resumed": True,
             "status": job.status if job else "queued",
-            "queue_position": queue_position
+            "queue_position": queue_position,
+            "task": job_snapshot,
         }
 
     @router.post("/prioritize/{job_id}")
@@ -652,6 +687,7 @@ def create_transcription_router(
                 "queue": queue_list,
                 "running": running_id,
                 "interrupted": interrupted_id,
+                "queue_updated_at": queue_state.updated_at if queue_state else None,
                 "jobs": jobs_summary
             }
 
@@ -676,11 +712,14 @@ def create_transcription_router(
         """
         lifecycle = transcription_service.job_lifecycle
         tasks = lifecycle.list_tasks_summary()
+        queue_state = lifecycle.state_repo.load_queue_state()
 
         return {
             "success": True,
             "tasks": tasks,
             "count": len(tasks),
+            "queue": queue_state.queue if queue_state else [],
+            "queue_updated_at": queue_state.updated_at if queue_state else None,
             "timestamp": int(time.time() * 1000)
         }
 
@@ -1590,6 +1629,9 @@ def create_transcription_router(
 
             # 更新 title 字段
             job.title = title.strip() if title else ""
+            saved = transcription_service.job_lifecycle.save_job_meta(job)
+            if not saved:
+                raise HTTPException(status_code=500, detail="任务重命名保存失败")
 
             # 保存任务状态到文件
             if job.dir:
@@ -1604,18 +1646,30 @@ def create_transcription_router(
                 except Exception as e:
                     print(f"保存任务状态失败: {e}")
 
+            persisted_job = transcription_service.job_lifecycle.state_repo.get_task(job_id)
+            if not persisted_job or persisted_job.updatedAt is None:
+                raise HTTPException(status_code=500, detail="任务重命名更新时间戳缺失")
+            updated_at = persisted_job.updatedAt
+            job_snapshot = _build_task_snapshot(persisted_job)
             # 通知 SSE 订阅者任务信息已更新
-            sse_manager.broadcast_sync("global", "job_renamed", {
-                "job_id": job_id,
-                "title": job.title,
-                "filename": job.filename
-            })
+            sse_manager.broadcast_sync(
+                "global",
+                "job_renamed",
+                {
+                    "job_id": job_id,
+                    "title": job.title,
+                    "filename": job.filename,
+                    "updated_at": updated_at
+                }
+            )
 
             return {
                 "success": True,
                 "job_id": job_id,
                 "title": job.title,
-                "message": "任务重命名成功"
+                "message": "任务重命名成功",
+                "task": job_snapshot,
+                "updated_at": updated_at
             }
 
         except HTTPException:

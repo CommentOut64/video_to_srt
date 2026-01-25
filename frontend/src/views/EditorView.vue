@@ -193,7 +193,7 @@
  * - 智能进度显示和多任务管理
  */
 import { ref, computed, onMounted, onUnmounted, provide, watch, toRef } from 'vue'
-import { useRouter, onBeforeRouteLeave } from 'vue-router'
+import { onBeforeRouteLeave } from 'vue-router'
 import { useProjectStore } from '@/stores/projectStore'
 import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
 import { useProgressStore } from '@/stores/progressStore'
@@ -218,8 +218,7 @@ const props = defineProps({
   jobId: { type: String, required: true }
 })
 
-// Router & Stores
-const router = useRouter()
+// Stores
 const projectStore = useProjectStore()
 const taskStore = useUnifiedTaskStore()
 
@@ -543,7 +542,6 @@ async function loadProject() {
       try {
         await taskStore.deleteTask(props.jobId)
         loadError.value = '任务不存在（已被删除），本地记录已清理'
-        setTimeout(() => router.push('/tasks'), 2000)
       } catch (deleteError) {
         loadError.value = '任务不存在，且清理本地记录失败，请刷新页面'
       }
@@ -671,8 +669,14 @@ function subscribeSSE() {
 
     async onComplete(data) {
       console.log('[EditorView] 任务完成:', data)
-      progressStore.markStatus(props.jobId, 'finished', { percent: 100, phase: 'complete' })
-      taskStore.updateTaskStatus(props.jobId, 'finished')
+      progressStore.markStatus(props.jobId, 'finished', {
+        percent: 100,
+        phase: 'complete',
+        updated_at: data.updated_at ?? data.timestamp
+      })
+      taskStore.updateTaskStatus(props.jobId, 'finished', null, {
+        updated_at: data.updated_at ?? data.timestamp
+      })
 
       // V3.1.2+dev.20260111.02: 任务完成处理
       // 优先保留 SSE 推送的字幕（含置信度），无数据时从 API 加载
@@ -705,8 +709,13 @@ function subscribeSSE() {
 
     onFailed(data) {
       console.log('[EditorView] 任务失败:', data)
-      progressStore.markStatus(props.jobId, 'failed', { message: data.message })
-      taskStore.updateTaskStatus(props.jobId, 'failed')
+      progressStore.markStatus(props.jobId, 'failed', {
+        message: data.message,
+        updated_at: data.updated_at ?? data.timestamp
+      })
+      taskStore.updateTaskStatus(props.jobId, 'failed', null, {
+        updated_at: data.updated_at ?? data.timestamp
+      })
       taskStore.updateTaskSSEStatus(props.jobId, true, data.message || '转录失败')
       stopProgressPolling()
       // 任务失败后关闭SSE连接
@@ -715,15 +724,23 @@ function subscribeSSE() {
 
     onPaused(data) {
       console.log('[EditorView] 任务已暂停:', data)
-      progressStore.markStatus(props.jobId, 'paused')
-      taskStore.updateTaskStatus(props.jobId, 'paused')
+      progressStore.markStatus(props.jobId, 'paused', {
+        updated_at: data.updated_at ?? data.timestamp
+      })
+      taskStore.updateTaskStatus(props.jobId, 'paused', null, {
+        updated_at: data.updated_at ?? data.timestamp
+      })
       // 保持SSE连接和进度显示
     },
 
     onCanceled(data) {
       console.log('[EditorView] 任务已取消:', data)
-      progressStore.markStatus(props.jobId, 'canceled')
-      taskStore.updateTaskStatus(props.jobId, 'canceled')
+      progressStore.markStatus(props.jobId, 'canceled', {
+        updated_at: data.updated_at ?? data.timestamp
+      })
+      taskStore.updateTaskStatus(props.jobId, 'canceled', null, {
+        updated_at: data.updated_at ?? data.timestamp
+      })
       stopProgressPolling()
       cleanupSSE()
     },
@@ -731,8 +748,12 @@ function subscribeSSE() {
     onResumed(data) {
       // 新增：处理任务恢复信号
       console.log('[EditorView] 任务已恢复:', data)
-      progressStore.markStatus(props.jobId, data.status || 'queued')
-      taskStore.updateTaskStatus(props.jobId, data.status || 'queued')
+      progressStore.markStatus(props.jobId, data.status || 'queued', {
+        updated_at: data.updated_at ?? data.timestamp
+      })
+      taskStore.updateTaskStatus(props.jobId, data.status || 'queued', null, {
+        updated_at: data.updated_at ?? data.timestamp
+      })
       startProgressPolling()
     },
 
@@ -1206,10 +1227,16 @@ async function saveProject() {
 
 async function pauseTranscription() {
   try {
-    await transcriptionApi.pauseJob(props.jobId)
-    progressStore.markStatus(props.jobId, 'paused')
-    // 更新本地store状态
-    taskStore.updateTaskStatus(props.jobId, 'paused')
+    const result = await transcriptionApi.pauseJob(props.jobId)
+    if (result?.task) {
+      taskStore.applyTaskSnapshot(result.task)
+      progressStore.markStatus(props.jobId, result.task.status || 'paused', {
+        updated_at: result.task.updated_at
+      })
+    } else {
+      progressStore.markStatus(props.jobId, 'paused')
+      taskStore.updateTaskStatus(props.jobId, 'paused', null, { isServer: false })
+    }
     // 暂停后保留SSE连接，以便恢复时能继续接收更新
     console.log('[EditorView] 任务已暂停，保留SSE连接')
   } catch (error) {
@@ -1222,11 +1249,16 @@ async function resumeTranscription() {
     // 使用新的 resumeJob API，恢复暂停的任务（重新加入队列）
     const result = await transcriptionApi.resumeJob(props.jobId)
 
-    // 根据后端返回值设置状态（应该是 queued，而不是 processing）
-    progressStore.markStatus(props.jobId, result.status || 'queued')
-
-    // 更新本地store状态
-    taskStore.updateTaskStatus(props.jobId, result.status || 'queued')
+    if (result?.task) {
+      taskStore.applyTaskSnapshot(result.task)
+      progressStore.markStatus(props.jobId, result.task.status || 'queued', {
+        updated_at: result.task.updated_at
+      })
+    } else {
+      // 根据后端返回值设置状态（应该是 queued，而不是 processing）
+      progressStore.markStatus(props.jobId, result.status || 'queued')
+      taskStore.updateTaskStatus(props.jobId, result.status || 'queued', null, { isServer: false })
+    }
 
     console.log('[EditorView] 任务已恢复，状态:', result.status, '队列位置:', result.queue_position)
 
@@ -1240,10 +1272,16 @@ async function resumeTranscription() {
 async function cancelTranscription() {
   if (!confirm('确定要取消当前转录任务吗?')) return
   try {
-    await transcriptionApi.cancelJob(props.jobId, false)
-    progressStore.markStatus(props.jobId, 'canceled')
-    // 更新本地store状态
-    taskStore.updateTaskStatus(props.jobId, 'canceled')
+    const result = await transcriptionApi.cancelJob(props.jobId, false)
+    if (result?.task) {
+      taskStore.applyTaskSnapshot(result.task)
+      progressStore.markStatus(props.jobId, result.task.status || 'canceled', {
+        updated_at: result.task.updated_at
+      })
+    } else {
+      progressStore.markStatus(props.jobId, 'canceled')
+      taskStore.updateTaskStatus(props.jobId, 'canceled', null, { isServer: false })
+    }
     // 取消后关闭SSE连接
     cleanupSSE()
     stopProgressPolling()

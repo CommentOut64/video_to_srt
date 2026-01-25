@@ -1504,7 +1504,8 @@ class JobQueueService:
                 "queue": list(self.queue),
                 "running": self.running_job_id,
                 "interrupted": self.interrupted_job_id,
-                "timestamp": time.time()
+                "timestamp": time.time(),
+                "updated_at": int(time.time() * 1000)
             }
 
         self.sse_manager.broadcast_sync("global", "queue_update", data)
@@ -1516,6 +1517,8 @@ class JobQueueService:
         if not job:
             return
 
+        updated_at_ms = int(time.time() * 1000)
+        job.updatedAt = updated_at_ms
         data = {
             "id": job_id,
             "status": status,
@@ -1523,7 +1526,8 @@ class JobQueueService:
             "message": job.message,
             "filename": job.filename,
             "phase": job.phase,  # 新增：阶段信息
-            "timestamp": time.time()
+            "timestamp": time.time(),
+            "updated_at": updated_at_ms
         }
 
         self.sse_manager.broadcast_sync("global", "job_status", data)
@@ -1557,6 +1561,8 @@ class JobQueueService:
         if not job:
             return
 
+        updated_at_ms = int(time.time() * 1000)
+        job.updatedAt = updated_at_ms
         data = {
             "id": job_id,
             "percent": round(job.progress, 1),  # 统一字段名为 percent，保留1位小数
@@ -1565,7 +1571,8 @@ class JobQueueService:
             "message": job.message,
             "processed": job.processed,
             "total": job.total,
-            "timestamp": time.time()
+            "timestamp": time.time(),
+            "updated_at": updated_at_ms
         }
 
         self.sse_manager.broadcast_sync("global", "job_progress", data)
@@ -1589,7 +1596,8 @@ class JobQueueService:
             "job_id": job_id,
             "status": job.status,
             "message": job.message,
-            "percent": round(job.progress, 1)
+            "percent": round(job.progress, 1),
+            "updated_at": int(time.time() * 1000)
         }
 
         self.sse_manager.broadcast_sync(f"job:{job_id}", f"signal.{signal}", data)

@@ -2,7 +2,7 @@
 转录处理服务
 整合了processor.py和原transcription_service.py的所有功能
 """
-import os, threading, json, math, gc, logging
+import os, threading, json, math, gc, logging, time
 from pathlib import Path
 from typing import List, Dict, Optional, Any, Tuple
 from enum import Enum
@@ -872,6 +872,7 @@ class TranscriptionService:
 
             # 1. 推送到单任务频道（EditorView 使用）
             channel_id = f"job:{job.job_id}"
+            updated_at_ms = int(time.time() * 1000)
             progress_data = {
                 "job_id": job.job_id,
                 "phase": job.phase,
@@ -881,7 +882,9 @@ class TranscriptionService:
                 "status": job.status,
                 "processed": job.processed,
                 "total": job.total,
-                "language": job.language or ""
+                "language": job.language or "",
+                "updated_at": updated_at_ms,
+                "timestamp": time.time()
             }
             sse_manager.broadcast_sync(channel_id, "progress.overall", progress_data)
 
@@ -894,7 +897,9 @@ class TranscriptionService:
                 "status": job.status,
                 "phase": job.phase,
                 "processed": job.processed,
-                "total": job.total
+                "total": job.total,
+                "updated_at": updated_at_ms,
+                "timestamp": time.time()
             }
             sse_manager.broadcast_sync("global", "job_progress", global_progress_data)
 
@@ -925,7 +930,8 @@ class TranscriptionService:
                     "signal": signal_code,
                     "message": message or job.message,
                     "status": job.status,
-                    "percent": job.progress
+                    "percent": job.progress,
+                    "updated_at": int(time.time() * 1000)
                 }
             )
         except Exception as e:
