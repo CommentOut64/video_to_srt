@@ -521,6 +521,8 @@ class TaskStateRepository:
     def _job_to_row(self, job: JobState) -> Dict[str, Any]:
         created_at = self._normalize_created_at(job.createdAt)
         settings_json = json.dumps(job.settings.to_dict())
+        now_seconds = time.time()
+        job.updatedAt = int(now_seconds * 1000)
         return {
             "job_id": job.job_id,
             "filename": job.filename,
@@ -540,7 +542,7 @@ class TaskStateRepository:
             "canceled": 1 if job.canceled else 0,
             "paused": 1 if job.paused else 0,
             "settings_json": settings_json,
-            "updated_at": time.time(),
+            "updated_at": now_seconds,
             "created_at": created_at,
         }
 
@@ -548,6 +550,9 @@ class TaskStateRepository:
         settings_data = json.loads(row["settings_json"]) if row["settings_json"] else {}
         settings = JobSettings.from_dict(settings_data)
         created_at_ms = self._format_created_at(row["created_at"])
+        updated_at_ms = None
+        if row["updated_at"] is not None:
+            updated_at_ms = int(row["updated_at"] * 1000)
         return JobState(
             job_id=row["job_id"],
             filename=row["filename"] or "unknown",
@@ -568,6 +573,7 @@ class TaskStateRepository:
             canceled=bool(row["canceled"]),
             paused=bool(row["paused"]),
             createdAt=created_at_ms,
+            updatedAt=updated_at_ms,
         )
 
     def _normalize_created_at(self, created_at: Optional[int]) -> Optional[float]:

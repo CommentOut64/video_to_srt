@@ -353,6 +353,7 @@ class ProgressEventEmitter:
 
         channel_id = f"job:{self.job.job_id}"
         event_type = f"progress.{phase}"
+        data["updated_at"] = int(time.time() * 1000)
 
         logger.debug(f"[ProgressEmitter] 推送进度: {phase}={data.get('percent', 0):.1f}%")
         self.sse_manager.broadcast_sync(channel_id, event_type, data)
@@ -365,6 +366,7 @@ class ProgressEventEmitter:
 
         channel_id = f"job:{self.job.job_id}"
         job_id = self.job.job_id
+        updated_at_ms = int(time.time() * 1000)
 
         # 构建总体进度数据
         overall_data = {
@@ -383,7 +385,9 @@ class ProgressEventEmitter:
                 "fast": self.detail.fast,
                 "slow": self.detail.slow,
                 "align": self.detail.align
-            }
+            },
+            "updated_at": updated_at_ms,
+            "timestamp": time.time()
         }
 
         logger.debug(f"[ProgressEmitter] 推送总体进度: {self.detail.total:.1f}% (fast={self.detail.fast:.1f}%, slow={self.detail.slow:.1f}%)")
@@ -395,7 +399,9 @@ class ProgressEventEmitter:
             "id": job_id,
             "percent": self.detail.total,
             "message": self._get_current_message(),
-            "status": self.job.status
+            "status": self.job.status,
+            "updated_at": updated_at_ms,
+            "timestamp": time.time()
         }
         self.sse_manager.broadcast_sync("global", "job_progress", global_data)
 
@@ -408,7 +414,8 @@ class ProgressEventEmitter:
         signal_data = {
             "job_id": self.job.job_id,
             "signal": signal_type,
-            "message": message
+            "message": message,
+            "updated_at": int(time.time() * 1000)
         }
 
         self.sse_manager.broadcast_sync(channel_id, f"signal.{signal_type}", signal_data)

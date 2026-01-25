@@ -263,9 +263,14 @@ class JobLifecycleService:
                 "title": job.title,
                 "status": job.status,
                 "progress": job.progress,
+                "phase_percent": job.phase_percent,
                 "message": job.message,
                 "created_time": job.createdAt,
+                "updated_at": job.updatedAt,
                 "phase": job.phase,
+                "processed": job.processed,
+                "total": job.total,
+                "language": job.language,
             })
         return summaries
 
