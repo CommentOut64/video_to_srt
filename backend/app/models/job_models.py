@@ -372,6 +372,7 @@ class JobState:
     paused: bool = False  # 暂停标志
     title: str = ""  # 用户自定义的任务名称，为空时使用 filename
     createdAt: Optional[int] = None  # 创建时间戳
+    updatedAt: Optional[int] = None  # 更新时间戳（毫秒）
 
     # 媒体状态（用于编辑器，转录完成后更新）
     media_status: Optional[MediaStatus] = None
@@ -423,6 +424,9 @@ class JobState:
         """
         settings_data = data.get("settings", {})
         settings = JobSettings.from_dict(settings_data)
+        updated_at = data.get("updated_at", data.get("updatedAt"))
+        if updated_at is not None and updated_at < 1_000_000_000_000:
+            updated_at = int(updated_at * 1000)
 
         return cls(
             job_id=data["job_id"],
@@ -443,6 +447,7 @@ class JobState:
             srt_path=data.get("srt_path"),
             canceled=data.get("canceled", False),
             paused=data.get("paused", False),
+            updatedAt=updated_at,
         )
 
     def update_media_status(self, job_dir: str):
