@@ -85,6 +85,7 @@ llmdoc/
 test_*
 *_test.py
 tests_output/
+*.test.*
 
 CLAUDE.md
 backend/models/pretrained/sensevoice/
