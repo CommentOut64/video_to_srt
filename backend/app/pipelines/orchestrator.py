@@ -1,0 +1,511 @@
+"""
+PipelineOrchestrator - 流水线编排器 V3.2.0+dev.20260125.07
+
+统一管理预处理、转录、收尾流程，从 TranscriptionService 解耦。
+
+职责：
+1. 流水线完整执行（run_pipeline）
+2. 预处理阶段编排（run_preprocessing）
+3. Profile 选择逻辑（resolve_profiles）
+4. 恢复上下文构建（build_resume_context）
+
+V3.2.0+dev.20260125.07: 支持运行时依赖注入（方案 B）
+- 核心依赖：构造函数注入（job_lifecycle, sse_manager, hardware_profile_provider）
+- 运行时依赖：run_pipeline() 参数（cancellation_token, progress_emitter 等）
+"""
+from __future__ import annotations
+
+import logging
+import time
+from pathlib import Path
+from typing import List, Optional, TYPE_CHECKING
+
+import numpy as np
+
+from app.core.config import config
+from app.models.job_models import JobState
+from app.schemas.profile_config import ProfileConfig
+from app.schemas.resume_context import ResumeContext
+
+if TYPE_CHECKING:
+    from app.services.hardware_profile_service import HardwareProfileProvider
+    from app.services.job_lifecycle_service import JobLifecycleService
+    from app.services.sse_service import SSEManager
+    from app.services.job.checkpoint_manager import CheckpointManagerV37
+    from app.services.progress_emitter import ProgressEventEmitter
+    from app.services.progress_tracker import ProgressTracker
+    from app.services.streaming_subtitle import StreamingSubtitleManager
+    from app.utils.cancellation_token import CancellationToken
+
+
+class PipelineOrchestrator:
+    """流水线编排器 - 统一管理预处理、转录、收尾流程"""
+
+    def __init__(
+        self,
+        job_lifecycle: "JobLifecycleService",
+        sse_manager: "SSEManager",
+        hardware_profile_provider: "HardwareProfileProvider",
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        self.job_lifecycle = job_lifecycle
+        self.sse_manager = sse_manager
+        self.hardware_profile_provider = hardware_profile_provider
+        self.logger = logger or logging.getLogger(__name__)
+
+    async def run_pipeline(
+        self,
+        job: JobState,
+        *,
+        cancellation_token: Optional["CancellationToken"] = None,
+        progress_emitter: Optional["ProgressEventEmitter"] = None,
+        progress_tracker: Optional["ProgressTracker"] = None,
+        subtitle_manager: Optional["StreamingSubtitleManager"] = None,
+        checkpoint_manager: Optional["CheckpointManagerV37"] = None,
+        job_dir: Optional[Path] = None,
+        full_audio_array: Optional[np.ndarray] = None,
+        full_audio_sr: int = 16000,
+    ) -> None:
+        """
+        完整流水线执行入口
+
+        V3.2.0+dev.20260125.07: 支持运行时依赖注入
+
+        Args:
+            job: 任务状态对象
+            cancellation_token: 取消令牌（可选）
+            progress_emitter: 进度发射器（可选，用于细粒度进度推送）
+            progress_tracker: 进度追踪器（可选）
+            subtitle_manager: 字幕管理器（可选，外部传入避免重复创建）
+            checkpoint_manager: 检查点管理器（可选）
+            job_dir: 任务目录（可选，默认从 job.dir 获取）
+            full_audio_array: 完整音频数组（可选，用于 Audio Overlap）
+            full_audio_sr: 音频采样率（默认 16000）
+        """
+        try:
+            from app.pipelines.async_dual_pipeline import AsyncDualPipeline
+            from app.services.streaming_subtitle import get_streaming_subtitle_manager
+
+            # V3.2.0+dev.20260125.07: 使用传入的 job_dir，否则从 job.dir 获取
+            _job_dir = job_dir if job_dir else Path(job.dir)
+            input_path = _job_dir / job.filename
+
+            # 构建恢复上下文和 Profile 配置
+            # V3.2.0+dev.20260125.07: 支持外部传入 checkpoint_manager
+            resume_context = self.build_resume_context(job, checkpoint_manager, _job_dir)
+            profile_config = self.resolve_profiles(job)
+
+            # 阶段 1: 预处理
+            if progress_emitter:
+                progress_emitter.update_preprocess(0, "extract", "音频前处理...")
+            self._update_progress(job, "audio_processing", 0, "音频处理中...")
+            self.logger.info("使用新架构预处理流水线（Stage模式）")
+            chunks = await self.run_preprocessing(
+                job,
+                input_path,
+                profile_config,
+                resume_context,
+                cancellation_token=cancellation_token,
+                progress_emitter=progress_emitter,
+            )
+
+            job.total = len(chunks)
+            self.logger.info(f"音频处理完成: {len(chunks)} 个 Chunk")
+
+            # V3.2.0+dev.20260125.07: 预处理完成
+            if progress_emitter:
+                progress_emitter.update_preprocess(100, "completed", "预处理完成")
+
+            # 阶段 2: 转录
+            if progress_emitter:
+                progress_emitter.update_fast(0, len(chunks), force_push=True)
+            self._update_progress(job, "transcription", 0, "转录中...")
+            self.logger.info(f"转录模式: {profile_config.transcription_profile}")
+
+            draft_name = (
+                profile_config.draft_engine.get_engine_name()
+                if profile_config.draft_engine
+                else "none"
+            )
+            patch_name = (
+                profile_config.patch_engine.get_engine_name()
+                if profile_config.patch_engine
+                else "none"
+            )
+            self.logger.info(
+                "新 ASR 引擎已启用: draft=%s, patch=%s, profile=%s",
+                draft_name,
+                patch_name,
+                profile_config.transcription_profile,
+            )
+
+            # V3.2.0+dev.20260125.07: 使用传入的 subtitle_manager，否则获取
+            _subtitle_manager = subtitle_manager if subtitle_manager else get_streaming_subtitle_manager(job.job_id)
+
+            # 恢复字幕状态
+            if resume_context.is_resuming and resume_context.sentences_snapshot:
+                subtitle_checkpoint_data = {
+                    "sentences_snapshot": resume_context.sentences_snapshot,
+                    "sentence_count": resume_context.sentence_count,
+                    "chunk_sentences_map": resume_context.chunk_sentences_map,
+                }
+                if _subtitle_manager.restore_from_checkpoint(subtitle_checkpoint_data):
+                    self.logger.info(
+                        "字幕状态已恢复: %s 个句子",
+                        len(resume_context.sentences_snapshot),
+                    )
+                    _subtitle_manager.push_restored_subtitles_to_frontend()
+                else:
+                    self.logger.warning("字幕恢复失败，将从头生成字幕")
+
+            # 创建转录流水线
+            transcription_pipeline = AsyncDualPipeline(
+                job_id=job.job_id,
+                transcription_profile=profile_config.transcription_profile,
+                draft_engine=profile_config.draft_engine,
+                patch_engine=profile_config.patch_engine,
+                patching_threshold=profile_config.patching_threshold,
+                logger=self.logger,
+                cancellation_token=cancellation_token,
+                progress_emitter=progress_emitter,
+            )
+
+            # 恢复 Whisper 上下文
+            if resume_context.previous_whisper_text:
+                transcription_pipeline.restore_prompt_cache(
+                    resume_context.previous_whisper_text
+                )
+                self.logger.info(
+                    "[v3.1.0] 已恢复 Whisper 上下文: %s 字符",
+                    len(resume_context.previous_whisper_text),
+                )
+
+            # 执行转录
+            contexts = await transcription_pipeline.run(
+                audio_chunks=chunks,
+                full_audio_array=full_audio_array,
+                full_audio_sr=full_audio_sr,
+                job_dir=_job_dir,
+                processed_indices=(
+                    resume_context.safe_processed_indices
+                    if resume_context.is_resuming
+                    else None
+                ),
+                initial_slow_processed_indices=(
+                    resume_context.slow_processed_indices
+                    if resume_context.is_resuming
+                    else None
+                ),
+                initial_finalized_indices=(
+                    resume_context.finalized_indices
+                    if resume_context.is_resuming
+                    else None
+                ),
+            )
+
+            # V3.2.0+dev.20260125.07: 转录完成，推送细粒度进度
+            total_chunks = len(chunks)
+            if progress_emitter:
+                progress_emitter.update_fast(total_chunks, total_chunks, force_push=True)
+                progress_emitter.update_slow(total_chunks, total_chunks, force_push=True)
+                progress_emitter.update_align(total_chunks, total_chunks, force_push=True)
+
+            # 收集最终句子
+            pipeline_sentences = []
+            for ctx in contexts:
+                if hasattr(ctx, "sv_result") and ctx.sv_result:
+                    chunk_indices = _subtitle_manager.chunk_sentences.get(
+                        ctx.chunk_index, []
+                    )
+                    for idx in chunk_indices:
+                        if idx in _subtitle_manager.sentences:
+                            pipeline_sentences.append(_subtitle_manager.sentences[idx])
+
+            final_sentences = pipeline_sentences
+            subtitle_snapshot = _subtitle_manager.get_all_sentences()
+            if subtitle_snapshot:
+                final_sentences = subtitle_snapshot
+
+            self.logger.info(f"转录完成: {len(final_sentences)} 个句子")
+
+            # 阶段 3: 生成 SRT 文件
+            self._update_progress(job, "finalize", 0, "生成字幕文件...")
+            srt_path = _job_dir / f"{Path(job.filename).stem}.srt"
+            self._generate_srt_from_sentences(final_sentences, srt_path)
+
+            job.srt_path = str(srt_path)
+            job.status = "completed"
+            job.message = "转录完成"
+            job.progress = 100
+
+            # V3.2.0+dev.20260125.07: 使用 progress_emitter 标记完成
+            if progress_emitter:
+                progress_emitter.complete("处理完成")
+
+            self.logger.info(f"任务完成: {job.job_id}")
+
+        except Exception as exc:
+            self.logger.error(f"Pipeline 执行失败: {exc}", exc_info=True)
+            job.status = "failed"
+            job.error = str(exc)
+            job.message = f"失败: {str(exc)}"
+            raise
+
+    async def run_preprocessing(
+        self,
+        job: JobState,
+        input_path: Path,
+        profile_config: ProfileConfig,
+        resume_context: Optional[ResumeContext] = None,
+        *,
+        cancellation_token: Optional["CancellationToken"] = None,
+        progress_emitter: Optional["ProgressEventEmitter"] = None,
+    ) -> List:
+        """预处理阶段
+
+        V3.2.0+dev.20260125.07: 支持 cancellation_token 和 progress_emitter
+        """
+        from app.pipelines.preprocessing_pipeline import PreprocessingPipeline
+        from app.services.audio.chunk_engine import ChunkEngine
+
+        if profile_config.vad_profile == "whisper":
+            vad_label = "Whisper"
+        else:
+            vad_label = "SenseVoice"
+        self.logger.info("使用 %s VAD 配置", vad_label)
+
+        chunk_engine = ChunkEngine(logger=self.logger)
+
+        preprocessing_pipeline = PreprocessingPipeline(
+            config=job.settings.preprocessing,
+            chunk_engine=chunk_engine,
+            vad_config=profile_config.vad_config,
+            logger=self.logger,
+        )
+
+        checkpoint_data = (
+            resume_context.checkpoint if resume_context and resume_context.checkpoint else None
+        )
+        chunks = await preprocessing_pipeline.process(
+            video_path=str(input_path),
+            job_state=job,
+            job_dir=Path(job.dir),
+            checkpoint=checkpoint_data,
+        )
+
+        stats = preprocessing_pipeline.get_statistics(chunks)
+        self.logger.info(
+            "预处理统计: "
+            "总chunk数=%s, "
+            "需要分离=%s, "
+            "已分离=%s, "
+            "分离比例=%.2f%%, "
+            "熔断重试总次数=%s, "
+            "最大重试次数=%s",
+            stats["total_chunks"],
+            stats["need_separation"],
+            stats["separated"],
+            stats["separation_ratio"] * 100,
+            stats["fuse_retry_total"],
+            stats["fuse_retry_max"],
+        )
+
+        return chunks
+
+    def resolve_profiles(self, job: JobState) -> ProfileConfig:
+        """Profile 选择逻辑"""
+        from app.core.thresholds import ThresholdConfig
+        from app.engines.factory import ASREngineFactory
+        from app.services.runtime_param_resolver import build_vad_config_for_profile
+
+        transcription = getattr(job.settings, "transcription", None)
+        transcription_profile = (
+            transcription.transcription_profile
+            if transcription
+            else "sensevoice_only"
+        )
+
+        # VAD Profile 选择：英语用 Whisper，其他用 SenseVoice
+        language = getattr(job.settings, "language", "auto")
+        is_english = language in {"en", "english"}
+        vad_profile = "whisper" if is_english else "sensevoice"
+        vad_config = build_vad_config_for_profile(vad_profile)
+
+        # 构建 ASR 引擎
+        draft_engine = ASREngineFactory.create("sensevoice")
+        patch_engine = None
+        if transcription_profile != "sensevoice_only":
+            model_name = getattr(transcription, "whisper_model", "medium")
+            optimization_config = None
+            try:
+                hardware_info = self.hardware_profile_provider.get_hardware_info(
+                    is_force_refresh=False
+                )
+                optimization_config = self.hardware_profile_provider.get_optimization_config(
+                    hardware_info
+                )
+            except Exception as exc:
+                self.logger.warning("获取硬件优化配置失败: %s", exc)
+
+            device = (
+                optimization_config.recommended_device
+                if optimization_config
+                else "cuda"
+            )
+            patch_engine = ASREngineFactory.create(
+                "whisper",
+                model_name=model_name,
+                device=device,
+                compute_type=None,
+            )
+
+        # 补刀阈值
+        patching_threshold_value = getattr(
+            transcription,
+            "patching_threshold",
+            0.60,
+        )
+        patching_threshold = ThresholdConfig(
+            whisper_patch_trigger_confidence=patching_threshold_value
+        )
+
+        return ProfileConfig(
+            transcription_profile=transcription_profile,
+            vad_profile=vad_profile,
+            vad_config=vad_config,
+            draft_engine=draft_engine,
+            patch_engine=patch_engine,
+            patching_threshold=patching_threshold,
+        )
+
+    def build_resume_context(
+        self,
+        job: JobState,
+        checkpoint_manager: Optional["CheckpointManagerV37"] = None,
+        job_dir: Optional[Path] = None,
+    ) -> ResumeContext:
+        """构建恢复上下文
+
+        V3.2.0+dev.20260125.07: 支持外部传入 checkpoint_manager
+        """
+        from app.services.job.checkpoint_manager import CheckpointManagerV37
+
+        _job_dir = job_dir if job_dir else Path(job.dir)
+        _checkpoint_manager = checkpoint_manager if checkpoint_manager else CheckpointManagerV37(_job_dir, logger=self.logger)
+        checkpoint = _checkpoint_manager.load_checkpoint()
+        if not checkpoint:
+            return ResumeContext(checkpoint=None)
+
+        checkpoint_dict = (
+            checkpoint.to_dict() if hasattr(checkpoint, "to_dict") else checkpoint
+        )
+        return ResumeContext.from_checkpoint(checkpoint_dict)
+
+    def _update_progress(
+        self,
+        job: JobState,
+        phase: str,
+        phase_ratio: float,
+        message: str = "",
+    ) -> None:
+        """更新进度"""
+        job.phase = phase
+        job.phase_percent = round(max(0.0, min(1.0, phase_ratio)) * 100, 1)
+
+        phase_weights = config.PHASE_WEIGHTS
+        total_weight = config.TOTAL_WEIGHT
+
+        done_weight = 0
+        for phase_name, weight in phase_weights.items():
+            if phase_name == phase:
+                break
+            done_weight += weight
+
+        current_weight = phase_weights.get(phase, 0) * max(
+            0.0, min(1.0, phase_ratio)
+        )
+        job.progress = round((done_weight + current_weight) / total_weight * 100, 1)
+
+        if message:
+            job.message = message
+
+        self._push_sse_progress(job)
+
+    def _push_sse_progress(self, job: JobState) -> None:
+        """推送 SSE 进度事件"""
+        if not self.sse_manager:
+            return
+        try:
+            channel_id = f"job:{job.job_id}"
+            updated_at_ms = int(time.time() * 1000)
+            progress_data = {
+                "job_id": job.job_id,
+                "phase": job.phase,
+                "percent": job.progress,
+                "phase_percent": job.phase_percent,
+                "message": job.message,
+                "status": job.status,
+                "processed": job.processed,
+                "total": job.total,
+                "language": job.language or "",
+                "updated_at": updated_at_ms,
+                "timestamp": time.time(),
+            }
+            self.sse_manager.broadcast_sync(
+                channel_id, "progress.overall", progress_data
+            )
+
+            global_progress_data = {
+                "id": job.job_id,
+                "percent": job.progress,
+                "phase_percent": job.phase_percent,
+                "message": job.message,
+                "status": job.status,
+                "phase": job.phase,
+                "processed": job.processed,
+                "total": job.total,
+                "updated_at": updated_at_ms,
+                "timestamp": time.time(),
+            }
+            self.sse_manager.broadcast_sync(
+                "global", "job_progress", global_progress_data
+            )
+
+        except Exception as exc:
+            self.logger.debug("SSE推送失败: %s", exc)
+
+    def _generate_srt_from_sentences(self, sentences: List, output_path: Path) -> None:
+        """从句子列表生成 SRT 文件"""
+        from app.utils.text_utils import repair_timestamp_overlaps, detect_timestamp_overlaps
+
+        segments = []
+        for sentence in sentences:
+            segments.append(
+                {"start": sentence.start, "end": sentence.end, "text": sentence.text}
+            )
+
+        overlaps = detect_timestamp_overlaps(segments)
+        if overlaps:
+            self.logger.warning(
+                "检测到 %s 处时间戳重叠，自动修复中...", len(overlaps)
+            )
+            segments = repair_timestamp_overlaps(segments, gap_ms=1.0)
+            self.logger.info("已修复 %s 处时间戳重叠", len(overlaps))
+
+        srt_content = []
+        for i, seg in enumerate(segments, 1):
+            start = self._format_srt_timestamp(seg["start"])
+            end = self._format_srt_timestamp(seg["end"])
+            text = seg["text"]
+            srt_content.append(f"{i}\n{start} --> {end}\n{text}\n")
+
+        output_path.write_text("\n".join(srt_content), encoding="utf-8")
+        self.logger.info("SRT 文件已生成: %s", output_path)
+
+    def _format_srt_timestamp(self, seconds: float) -> str:
+        """格式化 SRT 时间戳"""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        millis = int((seconds % 1) * 1000)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
