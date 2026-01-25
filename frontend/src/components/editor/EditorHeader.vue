@@ -286,10 +286,20 @@ async function finishEditTitle() {
   
   try {
     // 调用 API 重命名任务
-    await transcriptionApi.renameJob(props.jobId, newTitle)
-    
+    const result = await transcriptionApi.renameJob(props.jobId, newTitle)
+
     // 更新 unifiedTaskStore
-    taskStore.updateTask(props.jobId, { title: newTitle })
+    if (result?.task) {
+      taskStore.applyTaskSnapshot(result.task, {
+        updated_at: result.task.updated_at ?? result.updated_at
+      })
+    } else {
+      taskStore.updateTask(
+        props.jobId,
+        { title: newTitle },
+        { updated_at: result?.updated_at }
+      )
+    }
     
     // 更新 projectStore.meta.title
     projectStore.meta.title = newTitle

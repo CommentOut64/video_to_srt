@@ -752,7 +752,16 @@ async function deleteTask(jobId) {
       const res = await transcriptionApi.cancelJob(jobId, true);
       // 后端现在区分“正在执行，等待取消后删除”与“已立即删除”
       if (res.pending_delete) {
-        taskStore.updateTaskStatus(jobId, "canceling", res.message || "已请求取消并将在结束后删除");
+        if (res.task) {
+          taskStore.applyTaskSnapshot(res.task);
+        } else {
+          taskStore.updateTaskStatus(
+            jobId,
+            "canceling",
+            res.message || "已请求取消并将在结束后删除",
+            { isServer: false }
+          );
+        }
         ElMessage.info(res.message || "任务正在执行，已请求取消，结束后将删除");
         // 任务会在原子段结束后自动删除，此处不删卡片
       } else {
@@ -771,7 +780,7 @@ async function deleteTask(jobId) {
       const detail = error?.response?.data?.detail || error?.message;
       if (status === 409) {
         ElMessage.info(detail || "任务正在取消中，稍后再试删除");
-        taskStore.updateTaskStatus(jobId, "canceling", detail);
+        taskStore.updateTaskStatus(jobId, "canceling", detail, { isServer: false });
         return;
       }
       if (status === 423) {
@@ -882,12 +891,20 @@ async function finishEditTitle(task) {
 
   try {
     // 调用 API 重命名任务
-    await transcriptionApi.renameJob(task.job_id, newTitle);
+    const result = await transcriptionApi.renameJob(task.job_id, newTitle);
 
     // 更新本地 store
-    taskStore.updateTask(task.job_id, {
-      title: newTitle,
-    });
+    if (result?.task) {
+      taskStore.applyTaskSnapshot(result.task, {
+        updated_at: result.task.updated_at ?? result.updated_at
+      });
+    } else {
+      taskStore.updateTask(
+        task.job_id,
+        { title: newTitle },
+        { updated_at: result?.updated_at }
+      );
+    }
 
     ElMessage.success("重命名成功");
   } catch (error) {
