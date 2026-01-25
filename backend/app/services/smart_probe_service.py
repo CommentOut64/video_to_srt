@@ -3,17 +3,17 @@ SmartProbeService - 智能探针分诊服务
 
 V3.1.2+dev.20260109.01: 新增智能探针分诊策略
 
-使用中心扩散探针策略，快速判断视频是否需要全量分离：
+使用中心扩散探针策略，快速判断视频是否需要全量探测：
 - 从中心点开始探测
 - 使用斐波那契数列扩散（1, 1, 2, 3, 5, 8...）
 - 达到最大步长后转为线性扫描
-- 一旦发现"脏"chunk（SNR < 阈值），立即触发全量分离
+- 一旦发现"脏"chunk（SNR < 阈值），立即触发全量探测
 - 如果全部通过，则判定为纯净视频
 
 核心优势：
 - 快速筛选：平均只需检测 30-40% 的 chunks
 - 智能扩散：优先检测中心区域，逐步扩散到边缘
-- 保守策略：一旦发现干扰，立即触发全量分离
+- 保守策略：一旦发现干扰，立即触发全量探测
 """
 import logging
 from typing import List, Dict, Tuple, Optional
@@ -28,7 +28,7 @@ class SmartProbeService:
     智能探针分诊服务
 
     使用中心扩散探针策略（Center-Out Exponential/Linear Probe）
-    快速判断视频是否需要全量分离
+    快速判断视频是否需要全量探测
     """
 
     def __init__(
@@ -93,7 +93,7 @@ class SmartProbeService:
         if is_dirty:
             logger.info(
                 f"探针: 中心点 [{center}] 发现干扰 (SNR={result['snr']:.1f}dB)，"
-                f"触发全量分离"
+                f"触发全量探测"
             )
             return "SEPARATE_ALL", cache, probe_sequence
 
@@ -138,7 +138,7 @@ class SmartProbeService:
                 if is_dirty:
                     logger.info(
                         f"探针: 左翼 [{left}] 发现干扰 (SNR={result['snr']:.1f}dB)，"
-                        f"触发全量分离"
+                        f"触发全量探测"
                     )
                     return "SEPARATE_ALL", cache, probe_sequence
 
@@ -155,7 +155,7 @@ class SmartProbeService:
                 if is_dirty:
                     logger.info(
                         f"探针: 右翼 [{right}] 发现干扰 (SNR={result['snr']:.1f}dB)，"
-                        f"触发全量分离"
+                        f"触发全量探测"
                     )
                     return "SEPARATE_ALL", cache, probe_sequence
 

@@ -259,7 +259,11 @@ class SpectralTriageStage:
         智能探针分诊模式
 
         V3.1.2+dev.20260109.01: 新增
-        使用中心扩散探针策略快速判断是否需要全量分离
+        V3.2.0+dev.20260125.01: 修复 - 探针发现脏chunk后触发顺序全量探测，而非立即启动分离
+
+        使用中心扩散探针策略快速判断视频是否需要全量探测：
+        - 如果探针判定为 PASS_ALL（纯净视频），直接标记所有chunk无需分离
+        - 如果探针判定为 SEPARATE_ALL（发现干扰），回退到标准分诊模式完成所有chunk的探测
         """
         smart_probe = self._get_smart_probe()
         if smart_probe is None:
@@ -302,30 +306,47 @@ class SpectralTriageStage:
         if pbar:
             pbar.close()
 
-        # 根据探针结果标记所有 chunks
+        # V3.2.0+dev.20260125.01: 修复 - 根据探针结果决定后续流程
         if decision == "SEPARATE_ALL":
-            self.logger.info("智能探针判定：需要全量分离")
-            for chunk in chunks:
-                chunk.needs_separation = True
-                chunk.recommended_model = "htdemucs"
-                # 如果该 chunk 已被探针检测，使用缓存的结果
-                if chunk.index in cache:
-                    result = cache[chunk.index]
+            # 探针发现干扰，触发顺序全量探测（而非立即启动分离）
+            self.logger.info("智能探针判定：发现干扰，触发顺序全量探测")
+            self.logger.info(f"探针已检测 {len(cache)} 个chunk，现在继续探测剩余 {len(chunks) - len(cache)} 个chunk")
+
+            # 回退到标准分诊模式，完成所有chunk的探测
+            # 将探针已检测的chunk索引加入 diagnosed_indices，避免重复探测
+            for chunk_index in cache.keys():
+                diagnosed_indices.add(chunk_index)
+                # 将探针缓存的结果应用到对应的chunk
+                if chunk_index < len(chunks):
+                    chunk = chunks[chunk_index]
+                    result = cache[chunk_index]
+                    # 根据探针结果标记chunk
+                    chunk.needs_separation = result['probe_decision'] == 'separate'
+                    chunk.recommended_model = "htdemucs" if chunk.needs_separation else None
+                    # 记录到日志
                     triage_log.append({
-                        "chunk_index": chunk.index,
+                        "chunk_index": chunk_index,
                         "start_time": round(chunk.start, 3),
                         "end_time": round(chunk.end, 3),
                         "duration": round(chunk.end - chunk.start, 3),
-                        "need_separation": True,
-                        "recommended_model": "htdemucs",
-                        "reason": f"[智能探针] 全量分离 (SNR={result['snr']:.1f}dB)",
+                        "need_separation": chunk.needs_separation,
+                        "recommended_model": chunk.recommended_model,
+                        "reason": f"[智能探针] SNR={result['snr']:.1f}dB",
                         "snr": round(result['snr'], 2),
                         "c50": round(result['c50'], 2),
                         "snr_level": None,
                         "c50_level": None,
                         "triage_layer": 0,  # 探针模式
                     })
+
+            # 继续使用标准模式探测剩余的chunk
+            return await self._process_standard(
+                chunks, job_dir, diagnosed_indices, triage_log,
+                chunks[0].sample_rate if chunks else 16000,
+                self.cancellation_token
+            )
         else:
+            # 探针判定为纯净视频，直接标记所有chunk无需分离
             self.logger.info("智能探针判定：纯净视频，无需分离")
             for chunk in chunks:
                 chunk.needs_separation = False
@@ -348,8 +369,8 @@ class SpectralTriageStage:
                         "triage_layer": 0,  # 探针模式
                     })
 
-        self._last_triage_log = triage_log
-        return self._finalize_triage(chunks, triage_log, job_dir)
+            self._last_triage_log = triage_log
+            return self._finalize_triage(chunks, triage_log, job_dir)
 
     def _finalize_triage(
         self,
