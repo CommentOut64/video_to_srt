@@ -42,6 +42,8 @@ from app.core.config import config  # 导入统一配置
 from app.services.subtitle_output_service import get_subtitle_output_service
 # V3.2.0+dev.20260125.11: 引入 SSEPublisher 进行统一事件推送
 from app.services.sse_publisher import get_sse_publisher
+# V3.2.0+dev.20260125.11: 引入参数构建服务
+from app.services.transcribe_param_builder import get_transcribe_param_builder
 
 class TranscriptionService:
     """
@@ -1217,98 +1219,6 @@ class TranscriptionService:
         # 新结果的logprob更高（更接近0）则更好
         return new_logprob > old_logprob
 
-    def _build_whisper_transcribe_params(
-        self,
-        job: JobState,
-        overrides: Optional[Dict[str, Any]] = None,
-        context: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """构建 Whisper 推理参数（运行参数 + 局部覆盖）。"""
-        from app.config.model_config import get_whisper_suppress_tokens
-        from app.services.model_manager_v2 import get_model_manager_v2
-        from app.services.model_runtime_config_service import get_model_runtime_config_service
-        from app.services.runtime_param_resolver import get_runtime_group
-        from app.services.whisper_service import get_whisper_service
-
-        transcription = getattr(job.settings, "transcription", None)
-        model_name = getattr(transcription, "whisper_model", "medium")
-        whisper_service = get_whisper_service()
-        override_keys = {key for key, value in (overrides or {}).items() if value is not None}
-        sources: Dict[str, str] = {}
-
-        try:
-            model_id = whisper_service.resolve_model_id(model_name)
-            manager = get_model_manager_v2()
-            spec = manager.registry.get(model_id)
-            runtime_data = get_model_runtime_config_service().get_effective_runtime_for_model(spec)
-            runtime = runtime_data.get("effective", {})
-            sources = runtime_data.get("sources", {})
-        except Exception as exc:
-            self.logger.debug("Whisper 运行参数回退分组: %s", exc)
-            runtime = get_runtime_group("whisper")
-
-        params: Dict[str, Any] = {
-            "language": runtime.get("language"),
-            "initial_prompt": runtime.get("initial_prompt"),
-            "word_timestamps": runtime.get("word_timestamps"),
-            "beam_size": runtime.get("beam_size"),
-            "vad_filter": runtime.get("vad_filter"),
-            "vad_parameters": runtime.get("vad_parameters"),
-            "temperature": runtime.get("temperature"),
-            "condition_on_previous_text": runtime.get("condition_on_previous_text"),
-            "suppress_tokens": runtime.get("suppress_tokens"),
-            "repetition_penalty": runtime.get("repetition_penalty"),
-            "no_repeat_ngram_size": runtime.get("no_repeat_ngram_size"),
-        }
-
-        if overrides:
-            for key, value in overrides.items():
-                if value is not None:
-                    params[key] = value
-
-        language = params.get("language")
-        if language is None or language == "auto" or language == "":
-            params["language"] = None
-
-        if params.get("word_timestamps") is None:
-            params["word_timestamps"] = False
-        if params.get("beam_size") is None:
-            params["beam_size"] = 5
-        if params.get("vad_filter") is None:
-            params["vad_filter"] = True
-        if params.get("temperature") is None:
-            params["temperature"] = 0.0
-        if params.get("condition_on_previous_text") is None:
-            params["condition_on_previous_text"] = True
-        if params.get("repetition_penalty") is None:
-            params["repetition_penalty"] = 1.0
-        if params.get("no_repeat_ngram_size") is None:
-            params["no_repeat_ngram_size"] = 0
-
-        if context == "patch":
-            if not sources:
-                if "word_timestamps" not in override_keys:
-                    params["word_timestamps"] = False
-                if "condition_on_previous_text" not in override_keys:
-                    params["condition_on_previous_text"] = False
-            else:
-                if (
-                    "word_timestamps" not in override_keys
-                    and sources.get("word_timestamps") == "default"
-                ):
-                    params["word_timestamps"] = False
-                if (
-                    "condition_on_previous_text" not in override_keys
-                    and sources.get("condition_on_previous_text") == "default"
-                ):
-                    params["condition_on_previous_text"] = False
-
-        if params.get("suppress_tokens") is None:
-            suppress_tokens = get_whisper_suppress_tokens(model_name)
-            params["suppress_tokens"] = suppress_tokens if suppress_tokens else None
-
-        return params
-
     def _transcribe_segment_unaligned(
         self,
         seg: Dict,
@@ -1336,7 +1246,8 @@ class TranscriptionService:
 
         try:
             # 使用 Faster-Whisper 转录
-            params = self._build_whisper_transcribe_params(
+            builder = get_transcribe_param_builder(logger=self.logger)
+            params = builder.build_whisper_params(
                 job,
                 overrides={"language": job.language, "vad_filter": True},
             )
@@ -1407,7 +1318,8 @@ class TranscriptionService:
 
         try:
             # 使用 Faster-Whisper 转录
-            params = self._build_whisper_transcribe_params(
+            builder = get_transcribe_param_builder(logger=self.logger)
+            params = builder.build_whisper_params(
                 job,
                 overrides={"language": job.language, "vad_filter": False},
             )
@@ -1470,7 +1382,8 @@ class TranscriptionService:
 
         try:
             # 使用 Faster-Whisper 转录
-            params = self._build_whisper_transcribe_params(
+            builder = get_transcribe_param_builder(logger=self.logger)
+            params = builder.build_whisper_params(
                 job,
                 overrides={"language": job.language, "vad_filter": True},
             )
@@ -1851,18 +1764,6 @@ class TranscriptionService:
             f.write('\n'.join(lines))
 
         self.logger.info(f"SRT文件已生成: {path}, 共{len(all_entries)}条字幕")
-
-    def clear_model_cache(self):
-        """
-        清空模型缓存（供队列服务调用）
-
-        注意: 新架构已移除对齐模型，仅清理 Whisper 模型
-        """
-        from app.services.model_manager_v2 import get_model_manager_v2
-
-        manager = get_model_manager_v2()
-        manager.unload_all()
-        self.logger.info("ModelManagerV2 缓存已清空")
 
     # ==========================================
     # SenseVoice 集成方法（Phase 3）
@@ -2426,7 +2327,8 @@ class TranscriptionService:
         context = subtitle_manager.get_context_window(sentence_index)
 
         # Whisper 转录
-        params = self._build_whisper_transcribe_params(
+        builder = get_transcribe_param_builder(logger=self.logger)
+        params = builder.build_whisper_params(
             job,
             overrides={
                 "language": getattr(job.settings, 'language', 'auto'),
@@ -2654,7 +2556,8 @@ class TranscriptionService:
         context = subtitle_manager.get_context_window(sentence_index)
 
         # Whisper 转录（仅取文本，弃用时间戳）
-        params = self._build_whisper_transcribe_params(
+        builder = get_transcribe_param_builder(logger=self.logger)
+        params = builder.build_whisper_params(
             job,
             overrides={
                 "language": getattr(job.settings, 'language', 'auto'),

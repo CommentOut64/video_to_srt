@@ -1131,7 +1131,9 @@ class JobQueueService:
 
         # 1. 清空 Whisper 模型缓存
         try:
-            self.transcription_service.clear_model_cache()
+            from app.services.model_cache_service import get_model_cache_service
+
+            get_model_cache_service(logger=logger).clear_whisper_cache()
         except Exception as e:
             logger.warning(f"清空模型缓存失败: {e}")
 
