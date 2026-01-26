@@ -91,3 +91,5 @@ backend/models/pretrained/sensevoice/
 tools/python
 build_patch.bat
 patch_tools/apply_patch.py
+
+scripts
