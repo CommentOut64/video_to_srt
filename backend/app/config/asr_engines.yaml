@@ -1,0 +1,58 @@
+version: 1
+
+plugins:
+  module_dirs:
+    - backend/app/engines/plugins
+  modules: []
+
+engines:
+  sensevoice:
+    class_path: app.engines.sensevoice_engine.SenseVoiceEngine
+    defaults:
+      language: auto
+  whisper:
+    class_path: app.engines.whisper_engine.WhisperEngine
+    defaults:
+      model_name: medium
+      device: cuda
+      compute_type: null
+  dual_stream:
+    class_path: app.engines.dual_stream_engine.DualStreamEngine
+    defaults:
+      patch_threshold: 0.7
+    components:
+      draft_engine: sensevoice
+      patch_engine: whisper
+  dummy:
+    class_path: app.engines.dummy_engine.DummyEngine
+    defaults: {}
+
+profiles:
+  sensevoice_only:
+    draft_engine:
+      id: sensevoice
+      params:
+        language: ${job.language|auto}
+    patch_engine: null
+  sv_whisper_patch:
+    draft_engine:
+      id: sensevoice
+      params:
+        language: ${job.language|auto}
+    patch_engine:
+      id: whisper
+      params:
+        model_name: ${transcription.whisper_model|medium}
+        device: ${runtime.device|cuda}
+        compute_type: ${runtime.compute_type|null}
+  sv_whisper_dual:
+    draft_engine:
+      id: sensevoice
+      params:
+        language: ${job.language|auto}
+    patch_engine:
+      id: whisper
+      params:
+        model_name: ${transcription.whisper_model|medium}
+        device: ${runtime.device|cuda}
+        compute_type: ${runtime.compute_type|null}
