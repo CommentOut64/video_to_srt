@@ -87,9 +87,10 @@ test_*
 tests_output/
 
 CLAUDE.md
-backend/models/pretrained/sensevoice/
+backend/models/pretrained/
 tools/python
 build_patch.bat
 patch_tools/apply_patch.py
 
 scripts
+archive
