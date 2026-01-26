@@ -126,6 +126,48 @@
 
 ---
 
+## 统一集成测试流水线规划（CI + 全模型）
+
+### 目标
+- 后台自洽、无需前端：跑通 preprocess → pipeline → output → state → SSE 全阶段。
+- 可扩展：新增/修改功能只需新增用例配置或阶段断言插件，不重写测试逻辑。
+- 可定位：失败时输出足够诊断信息（日志、checkpoint、输出产物、事件流）。
+- 两套测试：CI/CD 轻量无模型 + 生产一致全模型。
+
+### 分阶段实施计划
+1. **阶段 0：基线对齐与约束**
+   - 定义统一阶段节点与断言标准（preprocess/pipeline/output/state/SSE）。
+   - 固化环境策略：CI 用 `.venv`，全模型用嵌入式 Python，全局 Python 不参与。
+   - 明确样本与产物清单（小音频/视频样本 + SRT/VTT/ASS 输出）。
+2. **阶段 1：统一 Harness 框架**
+   - 新增 `tests/integration_harness/`：Runner、用例加载、阶段断言插件接口。
+   - 用 YAML/JSON 描述用例：输入、期望输出、阶段断言开关、超时。
+   - 统一环境变量：`INTEGRATION_PROFILE=ci|full`、`TEST_LOG_LEVEL`。
+3. **阶段 2：CI 轻量套（无模型）**
+   - 使用 DummyEngine/StubASR，禁用模型加载与 GPU。
+   - 覆盖完整阶段链路与产物验证（SRT/VTT/ASS、checkpoint、SSE）。
+   - 本地/CI 执行：`pytest -m integration_ci`。
+4. **阶段 3：全模型真实套**
+   - 使用嵌入式 Python + 真实模型 + 真实样本，流程与前端等价。
+   - 覆盖模型加载、真实转录、修复、SSE 进度流。
+   - 执行入口：`pytest -m integration_full`，模型缺失时明确 skip。
+5. **阶段 4：日志抑制与诊断包**
+   - 测试入口统一抑制 debug（默认 WARNING）。
+   - 失败时自动打包 `logs + checkpoint + outputs + case config + SSE events`。
+   - 提供 `TEST_LOG_LEVEL=DEBUG` 以便深度排查。
+6. **阶段 5：GitHub Actions 集成**
+   - 仅跑 `integration_ci`（无模型），保证 PR/主干稳定。
+   - 缓存 pip 与小样本素材，失败上传诊断包 artifact。
+7. **阶段 6：文档与扩展规范**
+   - `docs/testing/integration.md` 说明两套测试运行方式、依赖与扩展流程。
+   - 新功能只需新增用例配置或阶段断言插件。
+
+### 运行方式（建议）
+- CI 轻量：`.venv/Scripts/python.exe -m pytest -m integration_ci`
+- 全模型：`build/.../tools/python/python.exe -m pytest -m integration_full`
+
+---
+
 ## 互斥与依赖总结
 - `v3.2.0` 完成后，Fast/Slow Worker 不再持有分句/对齐逻辑，否则无法在后续版本中无痛替换实现。
 - `v3.2.1` 的 LangID 是 `v3.2.2` 标点分句、`v3.2.3` Bridge 提示词、`v3.2.4` 置信度高亮的前提。

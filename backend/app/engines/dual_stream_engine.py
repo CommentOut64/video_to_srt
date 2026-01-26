@@ -13,9 +13,6 @@ import numpy as np
 from app.core.asr.engine import ASREngine
 from app.core.asr.enums import ASRCapability, TimestampPrecision
 from app.core.asr.models import ASRResult
-from app.engines.sensevoice_engine import SenseVoiceEngine
-from app.engines.whisper_engine import WhisperEngine
-
 logger = logging.getLogger(__name__)
 
 
@@ -28,8 +25,10 @@ class DualStreamEngine(ASREngine):
         patch_engine: Optional[ASREngine] = None,
         patch_threshold: float = 0.7,
     ) -> None:
-        self.draft_engine = draft_engine or SenseVoiceEngine()
-        self.patch_engine = patch_engine or WhisperEngine()
+        if draft_engine is None or patch_engine is None:
+            raise ValueError("DualStreamEngine requires draft_engine and patch_engine")
+        self.draft_engine = draft_engine
+        self.patch_engine = patch_engine
         self.patch_threshold = patch_threshold
 
     def get_capabilities(self) -> List[ASRCapability]:

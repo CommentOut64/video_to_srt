@@ -9,6 +9,7 @@ __pycache__/
 .pytest_cache/
 .coverage
 .claude
+.gemini
 .github
 
 # PyInstaller 构建文件

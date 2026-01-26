@@ -813,27 +813,25 @@ class JobQueueService:
         """
         运行双流对齐流水线
 
-        V3.1.0 新特性：支持两种流水线模式
-        - async: 三级异步流水线（错位并行，性能提升 30-50%）
-        - sync: 串行流水线（稳定版，V3.0 兼容）
-
-        v3.1.0 新特性：支持断点续传
-        - 集成 CancellationToken 机制
-        - 支持从 CheckpointV37 恢复
+        V3.2.0+dev.20260125.08: 重构为委托模式
+        - 核心编排逻辑委托给 PipelineOrchestrator
+        - 保留：管理器初始化、音频加载、用户编辑叠加、Proxy 触发
+        - 移除：预处理、转录、SRT 生成（由 Orchestrator 处理）
 
         Args:
             job: 任务状态对象
             preset_id: 预设 ID
         """
-        from app.pipelines.async_dual_pipeline import AsyncDualPipeline
+        from app.pipelines.orchestrator import PipelineOrchestrator
         from app.services.streaming_subtitle import get_streaming_subtitle_manager, remove_streaming_subtitle_manager
-        from app.services.progress_tracker import get_progress_tracker, remove_progress_tracker, ProcessPhase
+        from app.services.progress_tracker import get_progress_tracker, remove_progress_tracker
         from app.services.sse_service import get_sse_manager
         from app.services.job.checkpoint_manager import CheckpointManagerV37
-        from app.services.progress_emitter import (
-            get_progress_emitter, remove_progress_emitter, ProgressMode
-        )
+        from app.services.progress_emitter import get_progress_emitter, remove_progress_emitter
+        from app.services.subtitle_edit_store import load_deleted_indices, load_edits
         from pathlib import Path
+        import librosa
+        import soundfile as sf
 
         def push_signal_event(sse_manager, job_id: str, signal_code: str, message: str = ""):
             """推送信号事件"""
@@ -848,7 +846,6 @@ class JobQueueService:
         progress_tracker = get_progress_tracker(job.job_id, preset_id)
         sse_manager = get_sse_manager()
 
-        # V3.1.0: 初始化进度发射器
         transcription = getattr(job.settings, "transcription", None)
         transcription_profile = (
             transcription.transcription_profile
@@ -859,371 +856,77 @@ class JobQueueService:
             transcription_profile=transcription_profile
         )
 
-        # v3.1.0: 获取取消令牌
         cancellation_token = self.get_cancellation_token(job.job_id)
 
-        # v3.1.0: 初始化检查点管理器
         job_dir = Path(job.dir)
         checkpoint_manager = CheckpointManagerV37(job_dir, logger)
-        checkpoint_manager.save_checkpoint({
-            "original_settings": job.settings.to_dict()
-        })
-
-        # 流水线配置
-        from app.core.config import config as project_config
-        queue_maxsize = project_config.PIPELINE_QUEUE_MAXSIZE
+        checkpoint_manager.save_checkpoint({"original_settings": job.settings.to_dict()})
 
         try:
             logger.info(f"[双流对齐] 开始处理任务: {job.job_id}, preset={preset_id}")
 
-            # v3.1.0: 检查是否有检查点需要恢复
+            # 从检查点恢复进度
             checkpoint = checkpoint_manager.load_checkpoint()
-            is_resuming = checkpoint is not None
-            if is_resuming:
-                logger.info(f"[v3.1.0] 检测到检查点，准备断点续传: phase={checkpoint.phase}")
-                # V3.1.0: 从检查点恢复进度并立即推送 SSE
-                if hasattr(checkpoint, 'to_dict'):
-                    progress_emitter.restore_from_checkpoint(checkpoint.to_dict())
-                    logger.info(f"[V3.1.0] 已恢复进度: {job.progress:.1f}%")
+            if checkpoint and hasattr(checkpoint, "to_dict"):
+                progress_emitter.restore_from_checkpoint(checkpoint.to_dict())
+                logger.info(f"[V3.1.0] 已恢复进度: {job.progress:.1f}%")
 
-            # === 预触发 Proxy 生成（不阻塞主流程）===
+            # 预触发 Proxy 生成（不阻塞主流程）
             await self._maybe_trigger_proxy_generation(job)
 
-            # 阶段 1: 音频前处理（使用新架构 PreprocessingPipeline）
-            progress_tracker.start_phase(ProcessPhase.EXTRACT, 1, "音频前处理...")
-            progress_emitter.update_preprocess(0, "extract", "音频前处理...")
+            # 加载完整音频（用于 Audio Overlap）
+            full_audio, sr = librosa.load(job.input_path, sr=16000, mono=True)
+            audio_path = job_dir / "audio.wav"
+            sf.write(str(audio_path), full_audio, sr)
+            logger.info(f"音频文件已保存: {audio_path}")
 
-            from app.pipelines.preprocessing_pipeline import PreprocessingPipeline
-            import soundfile as sf
-            import librosa
-
-            logger.info("使用新架构 PreprocessingPipeline（Stage模式）")
-
-            # V3.1.0: 根据语言选择VAD配置（迁移自旧架构）
-            from app.services.runtime_param_resolver import build_vad_config_for_profile
-            language = getattr(job.settings, 'language', 'auto')
-            is_english = language in {'en', 'english'}
-
-            profile = "whisper" if is_english else "sensevoice"
-            vad_config = build_vad_config_for_profile(profile)
-            logger.info(
-                "VAD配置: %s 模式，language=%s",
-                "Whisper" if is_english else "SenseVoice",
-                language,
-            )
-
-            # 创建预处理流水线（v3.1.0: 传递取消令牌，V3.1.0: 传递VAD配置）
-            preprocessing_pipeline = PreprocessingPipeline(
-                config=job.settings.preprocessing,
-                vad_config=vad_config,  # V3.1.0: 新增
-                logger=logger,
-                cancellation_token=cancellation_token,  # v3.1.0
-                progress_emitter=progress_emitter
-            )
-
-            # v3.1.0: 检查是否需要跳过预处理阶段
-            skip_preprocessing = False
-            preprocessing_state = None
-            if is_resuming and checkpoint.preprocessing:
-                preprocessing_state = checkpoint.preprocessing
-                if preprocessing_state.separation_completed:
-                    skip_preprocessing = True
-                    logger.info("[v3.1.0] 预处理阶段已完成，跳过")
-                    progress_emitter.update_preprocess(100, "completed", "预处理已完成")
-
-            if not skip_preprocessing:
-                # 执行预处理（包含：音频提取、VAD、频谱分诊、按需分离）
-                audio_chunks = await preprocessing_pipeline.process(
-                    video_path=job.input_path,
-                    job_state=job,
-                    job_dir=job_dir  # v3.1.0: 传递 job_dir 用于检查点保存
-                )
-
-                # 获取预处理统计信息
-                stats = preprocessing_pipeline.get_statistics(audio_chunks)
-                logger.info(
-                    f"PreprocessingPipeline 完成: "
-                    f"总chunk数={stats['total_chunks']}, "
-                    f"需要分离={stats['need_separation']}, "
-                    f"已分离={stats['separated']}, "
-                    f"分离比例={stats['separation_ratio']:.2%}"
-                )
-            else:
-                # V3.1.0: 从检查点恢复 AudioChunk（传递 checkpoint 数据给预处理流水线）
-                # 预处理流水线会根据 checkpoint 中的 chunks_metadata 跳过 VAD
-                logger.info("[V3.1.0] 从检查点恢复预处理状态...")
-
-                # 将 checkpoint 转换为字典格式供预处理流水线使用
-                checkpoint_dict = checkpoint.to_dict() if hasattr(checkpoint, 'to_dict') else None
-
-                audio_chunks = await preprocessing_pipeline.process(
-                    video_path=job.input_path,
-                    job_state=job,
-                    job_dir=job_dir,
-                    checkpoint=checkpoint_dict  # V3.1.0: 传递 checkpoint 用于跳过 VAD
-                )
-
-            # 加载完整音频（用于双流对齐的 Audio Overlap 功能）
-            if audio_chunks:
-                sr = audio_chunks[0].sample_rate
-                full_audio, _ = librosa.load(job.input_path, sr=sr, mono=True)
-
-                # 保存音频文件供波形图使用
-                audio_path = Path(job.dir) / "audio.wav"
-                sf.write(str(audio_path), full_audio, sr)
-                logger.info(f"音频文件已保存: {audio_path}")
-            else:
-                raise RuntimeError("PreprocessingPipeline 未返回任何 AudioChunk")
-
-            progress_tracker.complete_phase(ProcessPhase.EXTRACT)
-            # V3.1.0: 预处理完成
-            progress_emitter.update_preprocess(100, "completed", "预处理完成")
-
-            # V3.1.0: 预处理→转录过渡检查点
-            # 在开始转录前检查是否有待处理的暂停/取消请求
-            if cancellation_token and job_dir:
-                checkpoint_data = {
-                    "preprocessing": {
-                        "completed": True,
-                        "total_chunks": len(audio_chunks)
-                    }
-                }
-                cancellation_token.check_and_save(checkpoint_data, job_dir)
-                logger.debug("[V3.1.0] 预处理→转录过渡检查点已保存")
-
-            # 阶段 2: 双流对齐处理
-            total_chunks = len(audio_chunks)
-            progress_tracker.start_phase(ProcessPhase.SENSEVOICE, total_chunks, "双流对齐...")
-
-            # v3.1.0: 检查是否需要恢复转录状态
-                # V3.1.0: 使用 min(fast, slow) 作为安全恢复点
-                # 若 finalized 缺失或为空，则回退到 fast/slow 交集
-            fast_processed_indices = set()
-            slow_processed_indices = set()
-            previous_whisper_text = None
-            if is_resuming and checkpoint.transcription:
+            # 恢复字幕状态并叠加用户编辑（保留在调用方）
+            if checkpoint and getattr(checkpoint, "transcription", None):
                 transcription_state = checkpoint.transcription
-
-                # 获取各 Worker 的已处理索引
-                fast_indices = set(transcription_state.fast_processed_indices) if transcription_state.fast_processed_indices else set()
-                slow_indices = set(transcription_state.slow_processed_indices) if transcription_state.slow_processed_indices else set()
-                finalized = set(transcription_state.finalized_indices) if transcription_state.finalized_indices else set()
-
-                # V3.1.0: 使用安全恢复策略
-                # 优先使用 finalized_indices（如果有）
-                # 否则使用 fast 和 slow 的交集（两者都已处理的 chunk）
-                if finalized:
-                    # V3.1.0: 使用 finalized 的最大索引+1 作为安全恢复点
-                    # finalized_indices 包含已完成对齐的 chunk 索引
-                    # 例如：{0, 1, ..., 15}，我们应该跳过 0-15，从 16 开始
-                    max_finalized = max(finalized)
-                    safe_indices = set(range(max_finalized + 1))
-                    logger.info(
-                        f"[V3.1.0] 使用 finalized_indices 的最大值作为恢复点: "
-                        f"max={max_finalized}, 跳过 0-{max_finalized} 共 {len(safe_indices)} 个 Chunk"
-                    )
-                elif fast_indices and slow_indices:
-                    # 使用交集：只有两个 Worker 都处理过的 chunk 才能跳过
-                    safe_indices = fast_indices & slow_indices
-                    logger.info(f"[V3.1.0] 使用 fast & slow 交集作为恢复点: {len(safe_indices)} 个")
-                elif slow_indices:
-                    # 只有 slow 数据（不太可能，但以防万一）
-                    safe_indices = slow_indices
-                    logger.info(f"[V3.1.0] 使用 slow_indices 作为恢复点: {len(slow_indices)} 个")
-                else:
-                    # 没有可靠的恢复点，从头开始
-                    safe_indices = set()
-                    logger.info("[V3.1.0] 无可靠恢复点，从头开始")
-
-                fast_processed_indices = safe_indices
-                slow_processed_indices = safe_indices
-
-                previous_whisper_text = transcription_state.previous_whisper_text
-                logger.info(
-                    f"[V3.1.0] 恢复转录状态: safe={len(safe_indices)}, "
-                    f"checkpoint.fast={len(fast_indices)}, "
-                    f"checkpoint.slow={len(slow_indices)}, "
-                    f"finalized={len(finalized)}"
-                )
-                # V3.1.0: 更新进度发射器的已处理数（使用 safe_indices）
-                progress_emitter.update_fast(len(safe_indices), total_chunks, force_push=True)
-
-                # V3.1.0: 同步 progress_tracker 的已完成数量
-                # 修复进度归零问题：start_phase 会将 completed_items 重置为 0
-                # 这里需要恢复正确的已完成数量
-                progress_tracker.update_phase(ProcessPhase.SENSEVOICE, completed=len(safe_indices))
-                logger.info(f"[V3.1.0] progress_tracker 已同步: {len(safe_indices)}/{total_chunks} 个 Chunk")
-
-                # V3.1.0: 恢复字幕状态（核心修复）
-                # 从 checkpoint 恢复已生成的字幕，确保新字幕索引不会与已有字幕冲突
                 if transcription_state.sentences_snapshot:
                     subtitle_checkpoint_data = {
                         "sentences_snapshot": transcription_state.sentences_snapshot,
                         "sentence_count": transcription_state.sentence_count,
-                        "chunk_sentences_map": transcription_state.chunk_sentences_map
+                        "chunk_sentences_map": transcription_state.chunk_sentences_map,
                     }
                     if subtitle_manager.restore_from_checkpoint(subtitle_checkpoint_data):
-                        logger.info(f"[V3.1.0] 字幕状态已恢复: {len(transcription_state.sentences_snapshot)} 个句子")
-
-                        # V3.2.0+dev.20260124.02: 恢复后叠加用户编辑，避免恢复覆盖
+                        logger.info(
+                            "[V3.1.0] 字幕状态已恢复: %s 个句子",
+                            len(transcription_state.sentences_snapshot),
+                        )
+                        # V3.2.0+dev.20260125.08: 叠加用户编辑
                         try:
-                            from app.services.subtitle_edit_store import (
-                                load_deleted_indices,
-                                load_edits
-                            )
-
                             edits = load_edits(job_dir)
                             deleted_indices = load_deleted_indices(job_dir)
                             subtitle_manager.apply_user_edits(edits)
                             subtitle_manager.apply_user_deletions(list(deleted_indices))
                             subtitle_manager.apply_manual_entries(edits)
                         except Exception as exc:
-                            logger.warning("[V3.2.0+dev.20260124.02] 叠加用户编辑失败: %s", exc)
-
-                        # 推送已恢复的字幕到前端
+                            logger.warning("叠加用户编辑失败: %s", exc)
                         subtitle_manager.push_restored_subtitles_to_frontend()
                     else:
                         logger.warning("[V3.1.0] 字幕恢复失败，将从头生成字幕")
                 else:
                     logger.info("[V3.1.0] checkpoint 中无字幕快照，字幕将从头生成")
 
-            pipeline_sentences = []  # 用于收集本轮流水线产出的句子，作为无字幕快照时的兜底
-
-            # V3.1.0: 异步流水线（三级流水线，错位并行）
-            logger.info(f"[双流对齐] 使用异步流水线处理 {total_chunks} 个 Chunk (queue_maxsize={queue_maxsize})")
-            draft_engine, patch_engine = self.transcription_service._build_asr_engines(
-                job, transcription_profile
-            )
-            draft_name = draft_engine.get_engine_name() if draft_engine else "none"
-            patch_name = patch_engine.get_engine_name() if patch_engine else "none"
-            logger.info(
-                "新 ASR 引擎已启用: draft=%s, patch=%s, profile=%s",
-                draft_name,
-                patch_name,
-                transcription_profile,
-            )
-
-            from app.core.thresholds import ThresholdConfig
-            transcription_config = getattr(job.settings, "transcription", None)
-            patching_threshold_value = getattr(
-                transcription_config,
-                "patching_threshold",
-                0.60,
-            )
-            patching_threshold = ThresholdConfig(
-                whisper_patch_trigger_confidence=patching_threshold_value
-            )
-            async_pipeline = AsyncDualPipeline(
-                job_id=job.job_id,
-                queue_maxsize=queue_maxsize,
-                sensevoice_language=getattr(job.settings, 'sensevoice_language', 'auto'),
-                whisper_language=getattr(job.settings, 'whisper_language', 'auto'),
-                user_glossary=getattr(job.settings, 'user_glossary', None),
-                transcription_profile=transcription_profile,
-                draft_engine=draft_engine,
-                patch_engine=patch_engine,
-                patching_threshold=patching_threshold,
+            # V3.2.0+dev.20260125.08: 委托给 PipelineOrchestrator
+            orchestrator = PipelineOrchestrator(
+                job_lifecycle=self.transcription_service.job_lifecycle,
+                sse_manager=sse_manager,
+                hardware_profile_provider=self.transcription_service.hardware_profile_provider,
                 logger=logger,
-                cancellation_token=cancellation_token,  # v3.1.0
-                progress_emitter=progress_emitter  # V3.1.0: 传递进度发射器
             )
-
-            # v3.1.0: 如果有历史上下文，恢复 SlowWorker 状态
-            if previous_whisper_text:
-                async_pipeline.restore_prompt_cache(previous_whisper_text)
-                logger.info(f"[v3.1.0] 已恢复 Whisper 上下文: {len(previous_whisper_text)} 字符")
-
-            # V3.1.0: 分别计算各 Worker 的基准偏移量
-            # FastWorker 使用 safe_indices（用于跳过已处理的 chunk）
-            # SlowWorker 和对齐阶段使用各自实际处理的数量（用于进度计算）
-            base_slow_count = 0
-            base_align_count = 0
-            if is_resuming and checkpoint.transcription:
-                # SlowWorker 的基准 = checkpoint 中保存的 slow_indices 数量
-                base_slow_count = len(slow_indices) if slow_indices else len(safe_indices)
-                # 对齐阶段的基准 = checkpoint 中保存的 finalized_indices 数量
-                base_align_count = len(finalized) if finalized else len(safe_indices)
-                logger.info(
-                    f"[V3.1.0] Worker 基准偏移量: "
-                    f"FastWorker={len(fast_processed_indices)}, "
-                    f"SlowWorker={base_slow_count}, "
-                    f"Alignment={base_align_count}"
-                )
-
-            # 处理所有 Chunks（流水线并行，传递完整音频数组用于 Audio Overlap）
-            # V3.1.0: 传递初始索引集合，修复恢复后进度不准确问题
-            contexts = await async_pipeline.run(
-                audio_chunks=audio_chunks,
+            await orchestrator.run_pipeline(
+                job,
+                cancellation_token=cancellation_token,
+                progress_emitter=progress_emitter,
+                progress_tracker=progress_tracker,
+                subtitle_manager=subtitle_manager,
+                checkpoint_manager=checkpoint_manager,
+                job_dir=job_dir,
                 full_audio_array=full_audio,
                 full_audio_sr=sr,
-                job_dir=job_dir,  # v3.1.0
-                processed_indices=fast_processed_indices,  # V3.1.0: FastWorker 跳过的索引
-                base_slow_count=base_slow_count,  # V3.1.0: SlowWorker 的基准偏移量（已废弃）
-                base_align_count=base_align_count,  # V3.1.0: 对齐阶段的基准偏移量（已废弃）
-                initial_slow_processed_indices=slow_indices if is_resuming else None,  # V3.1.0: SlowWorker 初始索引
-                initial_finalized_indices=finalized if is_resuming else None  # V3.1.0: 对齐阶段初始索引
             )
-
-            # 提取结果
-            for ctx in contexts:
-                pipeline_sentences.extend(ctx.final_sentences)
-
-            progress_tracker.complete_phase(ProcessPhase.SENSEVOICE)
-            # V3.1.0: 双流对齐完成
-            progress_emitter.update_fast(total_chunks, total_chunks, force_push=True)
-            progress_emitter.update_slow(total_chunks, total_chunks, force_push=True)
-            progress_emitter.update_align(total_chunks, total_chunks, force_push=True)
-
-            # 阶段 3: 生成字幕文件
-            progress_tracker.start_phase(ProcessPhase.SRT, 1, "生成字幕...")
-
-            # 选取用于导出的字幕集合：优先使用字幕管理器的完整快照，确保恢复场景下包含暂停前的句子
-            final_sentences = pipeline_sentences
-            if subtitle_manager:
-                subtitle_snapshot = subtitle_manager.get_all_sentences()
-                if subtitle_snapshot:
-                    final_sentences = subtitle_snapshot
-                    logger.info(
-                        f"[V3.1.0] 使用字幕管理器快照生成 SRT: sentences={len(final_sentences)}"
-                    )
-                else:
-                    logger.info("[V3.1.0] 字幕管理器无有效句子，回退到流水线结果")
-
-            # 按时间排序
-            final_sentences.sort(key=lambda s: s.start)
-
-            # 生成 SRT
-            output_path = str(Path(job.dir) / f"{job.job_id}.srt")
-            self.transcription_service._generate_subtitle_from_sentences(
-                final_sentences,
-                output_path,
-                include_translation=False
-            )
-
-            progress_tracker.complete_phase(ProcessPhase.SRT)
-
-            # V3.1.2+dev.20260114.01: 任务完成前持久化字幕快照，供后台转录后显示准确率
-            # 只保存精简版的 sentences_snapshot，避免删除 checkpoint 后丢失 display_confidence
-            if subtitle_manager and job_dir:
-                try:
-                    snapshot_data = subtitle_manager.to_checkpoint_data()
-                    snapshot_path = job_dir / "transcription_text.json"
-                    with open(snapshot_path, "w", encoding="utf-8") as f:
-                        json.dump(snapshot_data, f, ensure_ascii=False, indent=2)
-                    logger.info(f"[V3.1.2] 已保存字幕快照供编辑器复用: {snapshot_path}")
-                except Exception as e:
-                    logger.warning(f"[V3.1.2] 保存字幕快照失败: {e}")
-
-            # v3.1.0: 任务完成，清理检查点
-            checkpoint_manager.delete_checkpoint()
-            logger.info("[v3.1.0] 任务完成，检查点已清理")
-
-            # V3.1.0: 使用 progress_emitter 标记完成
-            progress_emitter.complete("处理完成")
-
-            # 完成
-            job.status = 'completed'
-            # push_signal_event 已在 progress_emitter.complete() 中调用
 
             logger.info(f"[双流对齐] 任务完成: {job.job_id}")
 
@@ -1238,7 +941,7 @@ class JobQueueService:
             # 清理资源
             remove_streaming_subtitle_manager(job.job_id)
             remove_progress_tracker(job.job_id)
-            remove_progress_emitter(job.job_id)  # V3.1.0: 清理进度发射器
+            remove_progress_emitter(job.job_id)
 
     async def _maybe_trigger_proxy_generation(self, job: 'JobState'):
         """
@@ -1428,7 +1131,9 @@ class JobQueueService:
 
         # 1. 清空 Whisper 模型缓存
         try:
-            self.transcription_service.clear_model_cache()
+            from app.services.model_cache_service import get_model_cache_service
+
+            get_model_cache_service(logger=logger).clear_whisper_cache()
         except Exception as e:
             logger.warning(f"清空模型缓存失败: {e}")
 
