@@ -12,7 +12,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import json
-from typing import Optional, List
 from datetime import datetime
 
 # 添加当前目录到Python路径
@@ -25,19 +24,12 @@ from app.core.logging import setup_logging
 # 导入新的转录服务（替换processor）
 from app.services.transcription_service import get_transcription_service
 from app.models.job_models import JobSettings
-from app.services.cpu_affinity_service import CPUAffinityConfig
-from app.services.model_preload_manager import (
-    PreloadConfig,
-    get_model_manager,
-    initialize_model_manager,
-    preload_default_models,
-    get_preload_status,
-    get_cache_status
-)
+from app.services.model_manager_v2 import get_model_manager_v2
 from app.config.model_config import ModelPreloadConfig
 
 # 导入API路由
 from app.api.routes import model_routes
+from app.api.routes import model_runtime_routes
 from app.api.routes import media_routes  # 新增：媒体资源路由
 from app.api.routes.transcription_routes import create_transcription_router
 from app.api.routes.demucs_routes import create_demucs_router  # 新增：Demucs配置路由
@@ -205,6 +197,7 @@ app.add_middleware(
 
 # 注册API路由
 app.include_router(model_routes.router)
+app.include_router(model_runtime_routes.router)
 app.include_router(media_routes.router)  # 新增：媒体资源路由
 app.include_router(system_routes.router)  # 新增：系统管理路由
 app.include_router(config_routes.router)  # 新增：用户配置路由
@@ -249,8 +242,8 @@ async def startup_event():
 
         # 3. 初始化模型管理器（此时事件循环已设置，后台验证可以正常推送SSE）
         logger.info("步骤 3/4: 初始化模型管理器...")
-        model_manager = initialize_model_manager(preload_config)
-        logger.info("模型管理器初始化成功")
+        model_manager = get_model_manager_v2()
+        logger.info("模型管理器初始化成功 (V2)")
 
         # 4. 初始化队列服务（新增）
         logger.info("步骤 4/4: 初始化任务队列服务...")
@@ -340,23 +333,7 @@ app.include_router(file_router)
 transcription_router = create_transcription_router(transcription_service, file_service, OUTPUT_DIR)
 app.include_router(transcription_router)
 
-# 初始化模型预加载管理器
-preload_config = ModelPreloadConfig.get_preload_config()
-
-# 打印配置信息
 ModelPreloadConfig.print_config()
-
-class TranscribeSettings(BaseModel):
-    model: str = "medium"
-    compute_type: str = "auto"  # auto: 根据显存自动选择
-    device: str = "cuda"
-    batch_size: int = 16
-    word_timestamps: bool = False
-    # CPU亲和性配置
-    cpu_affinity_enabled: bool = True
-    cpu_affinity_strategy: str = "auto"  # "auto", "half", "custom"
-    cpu_affinity_custom_cores: Optional[List[int]] = None
-    cpu_affinity_exclude_cores: Optional[List[int]] = None
 
 class UploadResponse(BaseModel):
     job_id: str
@@ -478,7 +455,9 @@ async def test_sse_stream(request: Request):
 async def get_cpu_info():
     """获取系统CPU信息和亲和性支持状态"""
     try:
-        cpu_info = transcription_service.cpu_manager.get_system_info()
+        from app.services.hardware_profile_service import get_hardware_profile_provider
+        provider = get_hardware_profile_provider()
+        cpu_info = provider.get_cpu_system_info()
         return {
             "success": True,
             "cpu_info": cpu_info,
@@ -495,10 +474,9 @@ async def get_cpu_info():
 async def get_hardware_basic():
     """获取核心硬件信息"""
     try:
-        # 创建临时的硬件检测服务以获取信息
-        from app.services.hardware_service import get_hardware_detector
-        detector = get_hardware_detector()
-        hardware_info = detector.detect()
+        from app.services.hardware_profile_service import get_hardware_profile_provider
+        provider = get_hardware_profile_provider()
+        hardware_info = provider.get_hardware_info()
         
         return {
             "success": True,
@@ -515,12 +493,10 @@ async def get_hardware_basic():
 async def get_hardware_optimization():
     """获取基于硬件的优化配置"""
     try:
-        from app.services.hardware_service import get_hardware_detector, get_hardware_optimizer
-        detector = get_hardware_detector()
-        optimizer = get_hardware_optimizer()
-        
-        hardware_info = detector.detect()
-        optimization_config = optimizer.get_optimization_config(hardware_info)
+        from app.services.hardware_profile_service import get_hardware_profile_provider
+        provider = get_hardware_profile_provider()
+        hardware_info = provider.get_hardware_info()
+        optimization_config = provider.get_optimization_config(hardware_info)
         
         return {
             "success": True,
@@ -537,12 +513,10 @@ async def get_hardware_optimization():
 async def get_hardware_status():
     """获取完整的硬件状态和优化信息"""
     try:
-        from app.services.hardware_service import get_hardware_detector, get_hardware_optimizer
-        detector = get_hardware_detector()
-        optimizer = get_hardware_optimizer()
-        
-        hardware_info = detector.detect()
-        optimization_config = optimizer.get_optimization_config(hardware_info)
+        from app.services.hardware_profile_service import get_hardware_profile_provider
+        provider = get_hardware_profile_provider()
+        hardware_info = provider.get_hardware_info()
+        optimization_config = provider.get_optimization_config(hardware_info)
         
         return {
             "success": True,
@@ -557,304 +531,39 @@ async def get_hardware_status():
         }
 
 # 模型管理API端点
-@app.get("/api/models/preload/status")
-async def get_models_preload_status():
-    """获取模型预加载状态"""
-    try:
-        status = get_preload_status()
-        return {
-            "success": True,
-            "data": status,
-            "message": "获取预加载状态成功"
-        }
-    except Exception as e:
-        logger.error(f"获取预加载状态失败: {str(e)}", exc_info=True)
-        return {
-            "success": False,
-            "message": f"获取预加载状态失败: {str(e)}"
-        }
-
-@app.get("/api/models/cache/status")
-async def get_models_cache_status():
-    """获取模型缓存状态"""
-    try:
-        status = get_cache_status()
-        return {
-            "success": True,
-            "data": status,
-            "message": "获取缓存状态成功"
-        }
-    except Exception as e:
-        logger.error(f"获取缓存状态失败: {str(e)}", exc_info=True)
-        return {
-            "success": False,
-            "message": f"获取缓存状态失败: {str(e)}"
-        }
-
-@app.post("/api/models/preload/start")
-async def start_models_preload():
-    """手动启动模型预加载 - 简化版本，实现真正的幂等性"""
-    try:
-        logger.info("收到模型预加载请求")
-
-        # 检查模型管理器
-        model_manager = get_model_manager()
-        if not model_manager:
-            logger.error("模型管理器未初始化")
-            return {"success": False, "message": "模型管理器未初始化"}
-
-        # 直接调用模型管理器的预加载方法 - 它已经实现了幂等性
-        result = await model_manager.preload_models()
-        
-        if result["success"]:
-            logger.info(f"模型预加载成功: {result.get('loaded_models', 0)}/{result.get('total_models', 0)} 个模型")
-            return {
-                "success": True,
-                "message": "预加载已启动",
-                "loaded_models": result.get("loaded_models", 0),
-                "total_models": result.get("total_models", 0)
-            }
-        else:
-            logger.warning(f"模型预加载未成功: {result.get('message', 'Unknown error')}")
-            return {
-                "success": False,
-                "message": result.get("message", "预加载失败"),
-                "failed_attempts": result.get("failed_attempts", 0)
-            }
-
-    except Exception as e:
-        logger.error(f"模型预加载异常: {str(e)}", exc_info=True)
-        return {"success": False, "message": f"启动预加载失败: {str(e)}"}
-
 @app.post("/api/models/cache/clear")
 async def clear_models_cache():
-    """清空模型缓存 - 简化版本，立即同步状态"""
+    """清空模型缓存（ModelManager V2）。"""
     try:
-        from app.services.model_preload_manager import get_model_manager
-        model_manager = get_model_manager()
-        
-        if model_manager:
-            model_manager.clear_cache()
-            logger.info("手动清空模型缓存成功")
-            return {
-                "success": True,
-                "message": "模型缓存已清空",
-                "cache_version": model_manager.get_preload_status().get("cache_version", 0)
-            }
-        else:
-            return {
-                "success": False,
-                "message": "模型管理器未初始化"
-            }
-            
+        model_manager = get_model_manager_v2()
+        model_manager.unload_all()
+        logger.info("手动清空模型缓存成功")
+        return {
+            "success": True,
+            "message": "模型缓存已清空"
+        }
     except Exception as e:
         logger.error(f"清空模型缓存失败: {str(e)}", exc_info=True)
         return {
             "success": False,
             "message": f"清空缓存失败: {str(e)}"
         }
-
-@app.post("/api/models/preload/reset")
-async def reset_preload_attempts():
-    """重置预加载失败计数"""
-    try:
-        from app.services.model_preload_manager import get_model_manager
-        model_manager = get_model_manager()
-
-        if model_manager:
-            model_manager.reset_preload_attempts()
-            logger.info("手动重置预加载失败计数成功")
-            return {
-                "success": True,
-                "message": "预加载失败计数已重置"
-            }
-        else:
-            return {
-                "success": False,
-                "message": "模型管理器未初始化"
-            }
-    except Exception as e:
-        logger.error(f"重置预加载失败计数失败: {str(e)}", exc_info=True)
-        return {
-            "success": False,
-            "message": f"重置失败: {str(e)}"
-        }
-
 # ========== 默认预加载模型配置API ==========
-
-@app.get("/api/models/preload/config")
-async def get_default_preload_config():
-    """获取默认预加载模型配置"""
-    try:
-        from app.services.user_config_service import get_user_config_service
-        from app.services.model_manager_service import get_model_manager
-
-        user_config = get_user_config_service()
-        model_manager = get_model_manager()
-
-        # 获取用户选择的模型
-        user_selected = user_config.get_default_preload_model()
-
-        # 获取所有ready的模型
-        ready_models = model_manager.get_ready_whisper_models() if model_manager else []
-
-        # 获取体积最大的ready模型
-        largest_model = model_manager.get_largest_ready_model() if model_manager else None
-
-        # 确定实际会使用的模型
-        actual_model = user_selected if user_selected and user_selected in ready_models else largest_model
-
-        return {
-            "success": True,
-            "data": {
-                "user_selected": user_selected,  # 用户选择的模型
-                "largest_model": largest_model,  # 体积最大的ready模型
-                "actual_model": actual_model,    # 实际会使用的模型
-                "ready_models": ready_models     # 所有ready的模型列表
-            }
-        }
-    except Exception as e:
-        logger.error(f"获取默认预加载配置失败: {str(e)}", exc_info=True)
-        return {
-            "success": False,
-            "message": f"获取配置失败: {str(e)}"
-        }
-
-@app.post("/api/models/preload/config")
-async def set_default_preload_model(request: dict):
-    """设置默认预加载模型"""
-    try:
-        from app.services.user_config_service import get_user_config_service
-
-        model_id = request.get("model_id")
-        user_config = get_user_config_service()
-
-        success = user_config.set_default_preload_model(model_id)
-
-        if success:
-            logger.info(f"设置默认预加载模型: {model_id}")
-            return {
-                "success": True,
-                "message": f"默认预加载模型已设置为: {model_id or '自动选择'}"
-            }
-        else:
-            return {
-                "success": False,
-                "message": "设置失败"
-            }
-    except Exception as e:
-        logger.error(f"设置默认预加载模型失败: {str(e)}", exc_info=True)
-        return {
-            "success": False,
-            "message": f"设置失败: {str(e)}"
-        }
-
-# ========== 模型加载/卸载API ==========
 
 @app.post("/api/models/cache/unload")
 async def unload_model(request: dict):
-    """卸载指定模型"""
+    """卸载指定模型（使用 ModelManager V2）。"""
     try:
-        from app.services.model_preload_manager import get_model_manager as get_preload_manager
-
         model_id = request.get("model_id")
-        device = request.get("device", "cuda")
-        compute_type = request.get("compute_type", "auto")
-
         if not model_id:
-            return {
-                "success": False,
-                "message": "缺少model_id参数"
-            }
-
-        preload_manager = get_preload_manager()
-        if not preload_manager:
-            return {
-                "success": False,
-                "message": "模型管理器未初始化"
-            }
-
-        preload_manager.evict_model(model_id, device, compute_type)
-        logger.info(f"卸载模型: {model_id}")
-
-        return {
-            "success": True,
-            "message": f"模型 {model_id} 已卸载"
-        }
+            return {"success": False, "message": "缺少model_id参数"}
+        model_manager = get_model_manager_v2()
+        model_manager.unload_all()
+        logger.info(f"卸载模型: {model_id} (清空缓存)")
+        return {"success": True, "message": f"模型 {model_id} 已从缓存卸载"}
     except Exception as e:
         logger.error(f"卸载模型失败: {str(e)}", exc_info=True)
-        return {
-            "success": False,
-            "message": f"卸载失败: {str(e)}"
-        }
-
-@app.post("/api/models/preload/load-specific")
-async def load_specific_model(request: dict):
-    """加载指定模型"""
-    try:
-        from app.services.model_preload_manager import get_model_manager as get_preload_manager, PreloadConfig
-        from app.models.job_models import JobSettings
-        import torch
-
-        model_id = request.get("model_id")
-
-        if not model_id:
-            return {
-                "success": False,
-                "message": "缺少model_id参数"
-            }
-
-        preload_manager = get_preload_manager()
-        if not preload_manager:
-            return {
-                "success": False,
-                "message": "模型管理器未初始化"
-            }
-
-        # 检查模型状态
-        from app.services.model_manager_service import get_model_manager
-        model_mgr = get_model_manager()
-        status, local_path, detail = model_mgr._check_whisper_model_exists(model_id)
-
-        if status != "ready":
-            return {
-                "success": False,
-                "message": f"模型未就绪: {status}"
-            }
-
-        # 准备加载参数
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        settings = JobSettings(
-            model=model_id,
-            compute_type="auto",  # 自动根据显存选择
-            device=device
-        )
-
-        # 加载模型
-        logger.info(f"开始加载模型: {model_id}")
-        model = await asyncio.get_event_loop().run_in_executor(
-            None,
-            preload_manager.get_model,
-            settings
-        )
-
-        if model:
-            logger.info(f"模型加载成功: {model_id}")
-            return {
-                "success": True,
-                "message": f"模型 {model_id} 加载成功"
-            }
-        else:
-            return {
-                "success": False,
-                "message": "模型加载失败"
-            }
-    except Exception as e:
-        logger.error(f"加载模型失败: {str(e)}", exc_info=True)
-        return {
-            "success": False,
-            "message": f"加载失败: {str(e)}"
-        }
+        return {"success": False, "message": f"卸载失败: {str(e)}"}
 
 @app.post("/api/shutdown")
 async def shutdown_server():
@@ -863,10 +572,9 @@ async def shutdown_server():
         logger.info("收到关闭服务器请求")
 
         # 清理资源
-        from app.services.model_preload_manager import get_model_manager
-        model_manager = get_model_manager()
+        model_manager = get_model_manager_v2()
         if model_manager:
-            model_manager.clear_cache()
+            model_manager.unload_all()
             logger.info("已清理模型缓存")
         
         # 返回成功响应

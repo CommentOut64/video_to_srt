@@ -9,6 +9,7 @@ __pycache__/
 .pytest_cache/
 .coverage
 .claude
+.gemini
 .github
 
 # PyInstaller 构建文件
@@ -51,7 +52,7 @@ Thumbs.db
 *~
 
 # Python 虚拟环境
-venv/
+.venv
 env/
 ENV/
 
@@ -59,6 +60,8 @@ ENV/
 *.tmp
 *.temp
 .cache/
+.env_installed
+.req_hash
 
 # 备份文件
 *.bak
@@ -85,6 +88,7 @@ llmdoc/
 test_*
 *_test.py
 tests_output/
+*.test.*
 
 CLAUDE.md
 backend/models/pretrained/

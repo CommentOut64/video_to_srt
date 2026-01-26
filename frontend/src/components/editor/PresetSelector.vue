@@ -293,8 +293,8 @@ const transcriptionOptions = computed(() => [
   },
   {
     value: 'sv_whisper_patch',
-    label: '智能补刀',
-    hint: 'SenseVoice+Whisper补刀',
+    label: '智能复核',
+    hint: 'SenseVoice+Whisper复核',
     disabled: !hasGpu.value
   },
   {

@@ -7,7 +7,7 @@
 - 生成的字级时间戳标记为 is_pseudo=True
 
 V3.1.2+dev.20260111.01: 词级置信度改为 None（表示无词级置信度）
-- Whisper 补刀后，无法提供精确的词级置信度
+- Whisper 复核后，无法提供精确的词级置信度
 - confidence=None 表示"无词级置信度"，前端显示为灰色或无高亮
 """
 from typing import List, Optional, TYPE_CHECKING

@@ -104,7 +104,7 @@ F:\video_to_srt_gpu\.venv\lib\site-packages\torch\nn\modules\activation.py:1230:
 
 
 1.Post-VAD 智能合并层
-2：强制关键补刀
+2：强制关键复核
 第2点特别注意：默认使用medium模型，但提供更高的配置选项，whisper模型统一接入现有的模型下载管理器；对于强制对齐的细节在文档末尾还有讨论仔细阅读分析。
 3.过滤 Tags
 4.VAD 边缘吸附

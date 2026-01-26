@@ -835,8 +835,7 @@ class WhisperBufferService:
             language=language,
             initial_prompt=initial_prompt,
             word_timestamps=True,  # 启用词级时间戳以支持精确对齐
-            vad_filter=False,      # 已经是 VAD 切片，不需要再过滤
-            condition_on_previous_text=True  # 长音频可以启用
+            vad_filter=False  # 已经是 VAD 切片，不需要再过滤
         )
 
         whisper_text = result.get("text", "").strip()

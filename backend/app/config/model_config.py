@@ -7,50 +7,25 @@ from typing import List
 
 
 class ModelPreloadConfig:
-    """模型预加载配置"""
-    
-    # 基础配置
+    """保留配置打印，预加载功能已并入 ModelManager V2。"""
+
     ENABLED = os.getenv("MODEL_PRELOAD_ENABLED", "true").lower() == "true"
-    
-    # 默认预加载的模型列表
     DEFAULT_MODELS = os.getenv("MODEL_PRELOAD_MODELS", "medium").split(",")
-    
-    # 缓存配置
     MAX_CACHE_SIZE = int(os.getenv("MODEL_CACHE_SIZE", "3"))
     MEMORY_THRESHOLD = float(os.getenv("MODEL_MEMORY_THRESHOLD", "0.8"))
-    
-    # 预加载配置
     PRELOAD_TIMEOUT = int(os.getenv("MODEL_PRELOAD_TIMEOUT", "300"))
     WARMUP_ENABLED = os.getenv("MODEL_WARMUP_ENABLED", "true").lower() == "true"
-
-  
-    # 内存监控配置
     MEMORY_CHECK_INTERVAL = int(os.getenv("MEMORY_CHECK_INTERVAL", "60"))  # 秒
-    
-    @classmethod
-    def get_preload_config(cls):
-        """获取预加载配置对象"""
-        from app.services.model_preload_manager import PreloadConfig
-        
-        return PreloadConfig(
-            enabled=cls.ENABLED,
-            default_models=cls.DEFAULT_MODELS,
-            max_cache_size=cls.MAX_CACHE_SIZE,
-            memory_threshold=cls.MEMORY_THRESHOLD,
-            preload_timeout=cls.PRELOAD_TIMEOUT,
-            warmup_enabled=cls.WARMUP_ENABLED
-        )
-    
+
     @classmethod
     def print_config(cls):
-        """打印当前配置"""
-        print("模型预加载配置:")
-        print(f"  启用预加载: {cls.ENABLED}")
+        """打印当前配置（仅日志用途）。"""
+        print("模型管理配置:")
         print(f"  默认模型: {cls.DEFAULT_MODELS}")
         print(f"  最大缓存大小: {cls.MAX_CACHE_SIZE}")
         print(f"  内存阈值: {cls.MEMORY_THRESHOLD}")
         print(f"  预加载超时: {cls.PRELOAD_TIMEOUT}s")
-        print(f"  启用预热: {cls.WARMUP_ENABLED}")
+        print(f"  启用预热标记: {cls.WARMUP_ENABLED}")
 
 
 # 常用模型配置

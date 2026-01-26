@@ -7,7 +7,7 @@
 | 功能点 | 当前状态 | 关键文件 |
 |--------|----------|----------|
 | Post-VAD 合并 | ❌ 未实现 | `transcription_service.py` |
-| 强制关键补刀 | ⚠️ 部分实现（有基础补刀，无强制逻辑） | `transcription_service.py`, `thresholds.py` |
+| 强制关键复核 | ⚠️ 部分实现（有基础复核，无强制逻辑） | `transcription_service.py`, `thresholds.py` |
 | Tags 过滤 | ⚠️ text 已过滤，word_timestamps 未过滤 | `sensevoice_onnx_service.py` |
 | VAD 边缘吸附 | ❌ 未实现 | `transcription_service.py` |
 | Word-Level Trigger | ❌ 未实现（仅句级触发） | `thresholds.py` |
@@ -272,17 +272,17 @@ def _split_sentences(
 
 ---
 
-## 阶段四：强制关键补刀
+## 阶段四：强制关键复核
 
 ### 问题描述
-即使用户选择"极速"预设（enhancement=OFF），对于极高概率错误（如单字符结果 "E"）也应强制启动 Whisper 补刀。
+即使用户选择"极速"预设（enhancement=OFF），对于极高概率错误（如单字符结果 "E"）也应强制启动 Whisper 复核。
 
 ### 当前实现
 - `thresholds.py` 已有三种触发条件：低置信度、短片段、单字符
-- `_post_process_enhancement` 方法遵循用户设置，enhancement=OFF 时不补刀
+- `_post_process_enhancement` 方法遵循用户设置，enhancement=OFF 时不复核
 
 ### 修改文件
-1. `backend/app/core/thresholds.py` - 新增强制补刀判断函数
+1. `backend/app/core/thresholds.py` - 新增强制复核判断函数
 2. `backend/app/services/transcription_service.py` - 修改后处理逻辑
 
 ### 修改位置
@@ -291,7 +291,7 @@ def _split_sentences(
 
 ### 具体修改
 
-#### 4.1 新增强制补刀判断函数
+#### 4.1 新增强制复核判断函数
 
 在 `backend/app/core/thresholds.py` 中添加：
 
@@ -302,7 +302,7 @@ def is_critical_patch_needed(
     confidence: float
 ) -> bool:
     """
-    判断是否需要强制补刀（无论用户设置如何）
+    判断是否需要强制复核（无论用户设置如何）
 
     强制条件（二选一）：
     1. 单字符结果且置信度 < 0.9（极可能是 CTC 漏字）
@@ -314,7 +314,7 @@ def is_critical_patch_needed(
         confidence: 置信度
 
     Returns:
-        True 表示必须强制补刀
+        True 表示必须强制复核
     """
     clean_text = text.strip()
 
@@ -343,7 +343,7 @@ async def _post_process_enhancement(
     solution_config: 'SolutionConfig'
 ) -> List['SentenceSegment']:
     """
-    后处理增强层（含强制关键补刀）
+    后处理增强层（含强制关键复核）
     """
     from app.services.progress_tracker import get_progress_tracker, ProcessPhase
     from app.services.solution_matrix import EnhancementMode
@@ -352,7 +352,7 @@ async def _post_process_enhancement(
     progress_tracker = get_progress_tracker(job.job_id, solution_config.preset_id)
     patch_queue = []
 
-    # === 构建补刀队列 ===
+    # === 构建复核队列 ===
     for i, sentence in enumerate(sentences):
         should_patch = False
         is_critical = False
@@ -360,16 +360,16 @@ async def _post_process_enhancement(
         duration = sentence.end - sentence.start
         clean_text = sentence.text_clean.strip()
 
-        # 1. 强制关键补刀条件（无论用户设置如何，必须修）
+        # 1. 强制关键复核条件（无论用户设置如何，必须修）
         if is_critical_patch_needed(clean_text, duration, sentence.confidence):
             should_patch = True
             is_critical = True
             self.logger.warning(
-                f"触发强制补刀: '{clean_text}' "
+                f"触发强制复核: '{clean_text}' "
                 f"(conf={sentence.confidence:.2f}, dur={duration:.2f}s)"
             )
 
-        # 2. 常规补刀条件（遵循用户设置）
+        # 2. 常规复核条件（遵循用户设置）
         elif solution_config.enhancement != EnhancementMode.OFF:
             text_length = len(clean_text)
             if needs_whisper_patch(sentence.confidence, duration, text_length):
@@ -378,7 +378,7 @@ async def _post_process_enhancement(
         if should_patch:
             patch_queue.append((i, sentence, is_critical))
 
-    # === 执行补刀 ===
+    # === 执行复核 ===
     if patch_queue:
         progress_tracker.start_phase(
             ProcessPhase.WHISPER_PATCH,
@@ -389,10 +389,9 @@ async def _post_process_enhancement(
         # 确保 Whisper 服务可用
         from app.services.whisper_service import get_whisper_service
         whisper_service = get_whisper_service()
-        whisper_service.warmup()
 
         for idx, (sent_idx, sentence, is_critical) in enumerate(patch_queue):
-            # 获取前文作为 Prompt（提升补刀准确性）
+            # 获取前文作为 Prompt（提升复核准确性）
             prev_text = ""
             if sent_idx > 0 and sent_idx - 1 < len(subtitle_manager.sentences):
                 prev_sent = subtitle_manager.sentences[sent_idx - 1]
@@ -414,7 +413,7 @@ async def _post_process_enhancement(
     return sentences
 ```
 
-#### 4.3 修改 Whisper 补刀方法支持 initial_prompt
+#### 4.3 修改 Whisper 复核方法支持 initial_prompt
 
 在 `_whisper_text_patch` 方法中添加 `initial_prompt` 参数：
 
@@ -428,7 +427,7 @@ async def _whisper_text_patch(
     subtitle_manager: 'StreamingSubtitleManager',
     initial_prompt: str = ""  # 【新增】上下文提示
 ):
-    """Whisper 补刀（带上下文）"""
+    """Whisper 复核（带上下文）"""
     # ... 现有逻辑 ...
 
     # 调用 Whisper 时传入 initial_prompt
@@ -447,20 +446,20 @@ async def _whisper_text_patch(
 **无需额外修改**，Whisper 服务已正确接入模型管理器。
 
 ### 预期效果
-- "E"（0.06s, conf 0.48）等极端情况被强制补刀
+- "E"（0.06s, conf 0.48）等极端情况被强制复核
 - 即使用户选择"极速"预设，也能拦截不可接受的错误
-- 补刀时利用前文上下文，提高修正准确性
+- 复核时利用前文上下文，提高修正准确性
 
 ### 测试要点
 - 使用"极速"预设处理包含快速语音的视频
-- 检查单字符结果是否被强制补刀
+- 检查单字符结果是否被强制复核
 
 ---
 
 ## 阶段五：Word-Level Trigger（字级触发）
 
 ### 问题描述
-当前补刀触发基于整句平均置信度，但如果一句话有 10 个词，9 个词置信度 0.99，1 个关键词置信度 0.4，平均置信度依然高达 0.93，导致漏补。
+当前复核触发基于整句平均置信度，但如果一句话有 10 个词，9 个词置信度 0.99，1 个关键词置信度 0.4，平均置信度依然高达 0.93，导致漏补。
 
 ### 当前实现
 - `needs_whisper_patch` 函数仅检查句级置信度
@@ -481,7 +480,7 @@ def needs_whisper_patch(
     config: ThresholdConfig = None
 ) -> bool:
     """
-    判断是否需要 Whisper 补刀
+    判断是否需要 Whisper 复核
 
     触发条件（任意满足即触发）：
     1. 句级置信度低于阈值
@@ -509,7 +508,7 @@ def needs_whisper_patch(
     # 检查是否有实词的置信度低于阈值
     if words:
         MIN_WORD_CONF = config.word_warning_confidence  # 使用已有的字级警告阈值 (0.5)
-        # 停用词列表（这些词即使置信度低也不触发补刀）
+        # 停用词列表（这些词即使置信度低也不触发复核）
         STOP_WORDS = {"the", "a", "an", "is", "it", "to", "of", "and", "in", "on"}
 
         for w in words:
@@ -522,7 +521,7 @@ def needs_whisper_patch(
             if word_text in STOP_WORDS:
                 continue
 
-            # 任意实词置信度低于阈值，触发整句补刀
+            # 任意实词置信度低于阈值，触发整句复核
             if word_conf < MIN_WORD_CONF:
                 return True
 
@@ -534,7 +533,7 @@ def needs_whisper_patch(
 在 `_post_process_enhancement` 中传入 words 参数：
 
 ```python
-# 常规补刀条件（遵循用户设置）
+# 常规复核条件（遵循用户设置）
 elif solution_config.enhancement != EnhancementMode.OFF:
     text_length = len(clean_text)
     # 传入字级时间戳列表
@@ -549,12 +548,12 @@ elif solution_config.enhancement != EnhancementMode.OFF:
 ```
 
 ### 预期效果
-- 即使整句平均置信度高，只要有一个实词置信度崩了，也会触发补刀
+- 即使整句平均置信度高，只要有一个实词置信度崩了，也会触发复核
 - 提高对局部错误的检测能力
 
 ### 测试要点
 - 构造测试用例：大部分词高置信度，个别词低置信度
-- 验证是否正确触发补刀
+- 验证是否正确触发复核
 
 ---
 
@@ -745,7 +744,7 @@ Head Snap 在 `_split_sentences` 中执行，位于 Layer 1 和 Layer 2 之间�
                                                             │
 阶段二 (Post-VAD 合并) ─┬─ 阶段三 (VAD 边缘吸附) ──────────┤
                         │                                    │
-                        └─ 阶段四 (强制关键补刀) ──────────┤
+                        └─ 阶段四 (强制关键复核) ──────────┤
                                       │                      │
                                       └─ 阶段五 (字级触发) ─┤
                                                             │
@@ -758,7 +757,7 @@ Head Snap 在 `_split_sentences` 中执行，位于 Layer 1 和 Layer 2 之间�
 1. 阶段一（Tags 过滤）- 立竿见影，修复时间戳前移
 2. 阶段三（VAD 边缘吸附）- 修复时间戳后移
 3. 阶段二（Post-VAD 合并）- 提升识别准确性
-4. 阶段四（强制补刀）+ 阶段五（字级触发）- 可并行开发
+4. 阶段四（强制复核）+ 阶段五（字级触发）- 可并行开发
 5. 阶段六（前端高亮）- 用户体验增强
 6. 阶段七（系统审视）- 整体验证
 
@@ -771,7 +770,7 @@ Head Snap 在 `_split_sentences` 中执行，位于 Layer 1 和 Layer 2 之间�
 | 一 | 低 | 简单过滤，影响范围小 | 充分测试不同语言 |
 | 二 | 中 | 合并策略可能导致过长片段 | 设置 max_duration 上限 |
 | 三 | 低 | 简单时间调整 | 设置吸附阈值上限 |
-| 四 | 中 | Whisper 调用增加处理时间 | 仅对极端情况强制补刀 |
+| 四 | 中 | Whisper 调用增加处理时间 | 仅对极端情况强制复核 |
 | 五 | 中 | 字级检查增加计算开销 | 使用停用词过滤 |
 | 六 | 低 | 前端样式修改 | 保持向后兼容 |
 | 七 | 低 | 验证性工作 | 分层测试 |
@@ -784,7 +783,7 @@ Head Snap 在 `_split_sentences` 中执行，位于 Layer 1 和 Layer 2 之间�
 
 1. `llmdoc/architecture/sensevoice-presets.md` - 更新预设行为说明
 2. `llmdoc/reference/threshold-config.md` - 新增字级触发参数
-3. `llmdoc/architecture/whisper-patch-enhancement.md` - 新增强制补刀说明
+3. `llmdoc/architecture/whisper-patch-enhancement.md` - 新增强制复核说明
 4. `llmdoc/index.md` - 更新最后修改日期和内容
 
 ---

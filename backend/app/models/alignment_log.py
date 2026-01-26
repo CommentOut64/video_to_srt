@@ -1,7 +1,7 @@
 """
 对齐日志数据模型
 
-用于记录 AlignmentWorker 的详细对齐过程
+用于记录对齐阶段的详细对齐过程
 """
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Dict, Any

@@ -7,9 +7,12 @@ Phase 3 实现 - 2025-12-10
 """
 
 from .alignment_service import AlignmentService
+from .default_aligner import DefaultAligner, AlignmentLevel
 from .keyword_extractor import KeywordExtractor
 
 __all__ = [
     "AlignmentService",
+    "DefaultAligner",
+    "AlignmentLevel",
     "KeywordExtractor",
 ]

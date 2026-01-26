@@ -5,7 +5,7 @@
 前端预设对应后端具体配置。
 
 v3.5 更新: 支持从新版 transcription_profile 和 refinement 配置创建 SolutionConfig
-v3.1.0 更新: 使用 ConfigAdapter 统一新旧配置访问
+v3.1.0 更新: 统一从新版配置生成方案
 """
 from dataclasses import dataclass
 from enum import Enum
@@ -92,9 +92,7 @@ class SolutionConfig:
     @classmethod
     def from_job_settings(cls, job_settings) -> 'SolutionConfig':
         """
-        从 JobSettings 创建配置 (使用 ConfigAdapter 统一新旧配置)
-
-        v3.1.0 更新: 使用 ConfigAdapter 自动兼容新旧配置格式
+        从 JobSettings 创建配置
 
         映射关系:
         - transcription_profile -> enhancement
@@ -107,15 +105,18 @@ class SolutionConfig:
           - proofread + global -> proofread=FULL
           - translate -> translate=FULL (含校对)
         """
-        from app.services.config_adapter import ConfigAdapter
+        transcription = getattr(job_settings, "transcription", None)
+        refinement = getattr(job_settings, "refinement", None)
 
-        # 使用 ConfigAdapter 统一获取配置 (自动兼容新旧格式)
-        transcription_profile = ConfigAdapter.get_transcription_profile(job_settings)
-        preset_id = ConfigAdapter.get_preset_id(job_settings)
-        llm_task = ConfigAdapter.get_llm_task(job_settings)
-        llm_scope = ConfigAdapter.get_llm_scope(job_settings)
-        target_language = ConfigAdapter.get_target_language(job_settings)
-        confidence_threshold = ConfigAdapter.get_patching_threshold(job_settings)
+        transcription_profile = (
+            transcription.transcription_profile
+            if transcription else "sensevoice_only"
+        )
+        preset_id = getattr(job_settings, "preset_id", "balanced")
+        llm_task = getattr(refinement, "llm_task", "off")
+        llm_scope = getattr(refinement, "llm_scope", "sparse")
+        target_language = getattr(refinement, "target_language", "zh")
+        confidence_threshold = getattr(transcription, "patching_threshold", 0.60)
 
         # 映射 transcription_profile -> enhancement
         profile_to_enhancement = {
@@ -206,20 +207,20 @@ FRONTEND_PRESETS = [
     },
     {
         "id": "preset1",
-        "name": "智能补刀",
-        "description": "SV + Whisper 局部补刀，平衡速度与质量",
+        "name": "智能复核",
+        "description": "SV + Whisper 局部复核，平衡速度与质量",
         "timeMultiplier": 0.15
     },
     {
         "id": "preset2",
         "name": "轻度校对",
-        "description": "智能补刀 + LLM 按需校对问题片段",
+        "description": "智能复核 + LLM 按需校对问题片段",
         "timeMultiplier": 0.2
     },
     {
         "id": "preset3",
         "name": "深度校对",
-        "description": "智能补刀 + LLM 全文精修润色",
+        "description": "智能复核 + LLM 全文精修润色",
         "timeMultiplier": 0.3
     },
     {

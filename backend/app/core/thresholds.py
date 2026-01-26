@@ -26,7 +26,7 @@ class ThresholdConfig:
     # SenseVoice 置信度阈值
     sv_confidence_high: float = 0.85      # 高置信度
     sv_confidence_medium: float = 0.6     # 中等置信度
-    sv_confidence_low: float = 0.4        # 低置信度（触发补刀）
+    sv_confidence_low: float = 0.4        # 低置信度（触发复核）
 
     # Whisper 阈值
     whisper_logprob_good: float = -0.5    # 好的 logprob
@@ -39,13 +39,13 @@ class ThresholdConfig:
     llm_perplexity_poor: float = 80.0     # 差的困惑度
 
     # ========== 触发阈值 ==========
-    # Whisper 补刀触发条件
-    whisper_patch_trigger_confidence: float = 0.6  # 低于此值触发补刀
+    # Whisper 复核触发条件
+    whisper_patch_trigger_confidence: float = 0.6  # 低于此值触发复核
 
-    # 短片段强制补刀条件 (应对 CTC 对快速语音的限制)
+    # 短片段强制复核条件 (应对 CTC 对快速语音的限制)
     short_segment_duration: float = 1.0  # 短片段时长阈值(秒)
     short_segment_chars: int = 3         # 短片段字符数阈值
-    single_char_force_patch: bool = True # 单字符结果强制补刀
+    single_char_force_patch: bool = True # 单字符结果强制复核
 
     # LLM 校对触发条件
     llm_proof_trigger_confidence: float = 0.7      # 低于此值触发校对
@@ -97,7 +97,7 @@ def needs_whisper_patch(
     config: ThresholdConfig = None
 ) -> bool:
     """
-    判断是否需要 Whisper 补刀
+    判断是否需要 Whisper 复核
 
     触发条件（满足任一即触发）：
     1. 置信度低于阈值
@@ -113,7 +113,7 @@ def needs_whisper_patch(
         config: 阈值配置
 
     Returns:
-        是否需要补刀
+        是否需要复核
     """
     if config is None:
         config = DEFAULT_THRESHOLDS
@@ -129,17 +129,17 @@ def needs_whisper_patch(
             text_length < config.short_segment_chars):
             return True
 
-    # 条件 3: 单字符结果强制补刀 (极可能是 CTC 漏字)
+    # 条件 3: 单字符结果强制复核 (极可能是 CTC 漏字)
     if config.single_char_force_patch and text_length is not None:
         if text_length == 1:
             return True
 
-    # 条件 4: 【阶段五】字级木桶效应 + 字级单字符强制补刀
+    # 条件 4: 【阶段五】字级木桶效应 + 字级单字符强制复核
     # 检查是否有实词的置信度低于阈值，或存在单字符词（极可能是 CTC 漏字）
     if words:
         MIN_WORD_CONF = config.word_warning_confidence  # 使用已有的字级警告阈值 (0.5)
-        SINGLE_CHAR_CONF = 0.9  # 单字符词的高置信度要求（低于此值强制补刀）
-        # 停用词列表（这些词即使置信度低也不触发补刀，但单字符规则优先）
+        SINGLE_CHAR_CONF = 0.9  # 单字符词的高置信度要求（低于此值强制复核）
+        # 停用词列表（这些词即使置信度低也不触发复核，但单字符规则优先）
         STOP_WORDS = {"the", "a", "an", "is", "it", "to", "of", "and", "in", "on"}
 
         for w in words:
@@ -151,7 +151,7 @@ def needs_whisper_patch(
             if not word_text or (len(word_text) == 1 and not word_text.isalnum()):
                 continue
 
-            # 【强制补刀】单字符实词 + 置信度 < 0.9 => 极可能是 CTC 漏字（如 "E" 应为 "Evil"）
+            # 【强制复核】单字符实词 + 置信度 < 0.9 => 极可能是 CTC 漏字（如 "E" 应为 "Evil"）
             # 此规则优先于停用词列表，因为单字符错误风险极高
             if len(word_text) == 1 and word_text.isalnum() and word_conf < SINGLE_CHAR_CONF:
                 return True
@@ -160,7 +160,7 @@ def needs_whisper_patch(
             if word_text in STOP_WORDS:
                 continue
 
-            # 任意实词置信度低于阈值，触发整句补刀
+            # 任意实词置信度低于阈值，触发整句复核
             if word_conf < MIN_WORD_CONF:
                 return True
 
@@ -239,7 +239,7 @@ def is_critical_patch_needed(
     confidence: float
 ) -> bool:
     """
-    【阶段四】判断是否需要强制补刀（无论用户设置如何）
+    【阶段四】判断是否需要强制复核（无论用户设置如何）
 
     强制条件（二选一）：
     1. 单字符结果且置信度 < 0.9（极可能是 CTC 漏字）
@@ -251,7 +251,7 @@ def is_critical_patch_needed(
         confidence: 置信度
 
     Returns:
-        True 表示必须强制补刀
+        True 表示必须强制复核
     """
     clean_text = text.strip()
 

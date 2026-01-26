@@ -28,8 +28,8 @@
 ### 1.3 集成目标
 
 1. **SenseVoice 作为主要转录引擎**：使用 ONNX Runtime (INT8 量化) 部署
-2. **Whisper 作为补刀引擎**：仅处理低置信度片段（<0.6）
-3. **智能熔断机制**：人声分离与 ASR 补刀协调联动
+2. **Whisper 作为复核引擎**：仅处理低置信度片段（<0.6）
+3. **智能熔断机制**：人声分离与 ASR 复核协调联动
 4. **统一模型管理**：复用现有 LRU 缓存机制
 5. **向后兼容**：支持用户选择 Faster-Whisper 或 SenseVoice
 
@@ -40,11 +40,11 @@
 ### 2.1 进度条逻辑僵化
 
 **问题描述**：当前设计给转录阶段分配固定权重（如 70%），无法区分不同场景：
-- "仅运行 SenseVoice" vs "SenseVoice + Whisper 补刀"
-- 开启补刀时进度条可能停滞或回跳
-- 关闭补刀时进度条可能过早走完
+- "仅运行 SenseVoice" vs "SenseVoice + Whisper 复核"
+- 开启复核时进度条可能停滞或回跳
+- 关闭复核时进度条可能过早走完
 
-**解决方案**：动态权重调整机制，根据实际需要补刀的片段数量调整权重分配。
+**解决方案**：动态权重调整机制，根据实际需要复核的片段数量调整权重分配。
 
 ### 2.2 缺乏句级切分（语义粒度缺失）
 
@@ -54,9 +54,9 @@
 
 ### 2.3 熔断机制割裂
 
-**问题描述**：人声分离（Demucs）的升级逻辑与 ASR（Whisper）的补刀逻辑是分离的。系统可能在背景噪音极大的情况下直接让 Whisper 补刀（效果依然差），而不是先升级分离模型去除噪音。
+**问题描述**：人声分离（Demucs）的升级逻辑与 ASR（Whisper）的复核逻辑是分离的。系统可能在背景噪音极大的情况下直接让 Whisper 复核（效果依然差），而不是先升级分离模型去除噪音。
 
-**解决方案**：整合智能熔断机制，熔断升级优先于 ASR 补刀。
+**解决方案**：整合智能熔断机制，熔断升级优先于 ASR 复核。
 
 ### 2.4 VAD 角色定位模糊
 
@@ -384,7 +384,7 @@ class SentenceSplitter:
          |                |                     |
          |     已升级?────────未升级             |
          |        |              |              |
-         |   Whisper补刀    升级分离模型        |
+         |   Whisper复核    升级分离模型        |
          |                       |              |
          |                  重新转录            |
          |                       |              |
@@ -398,12 +398,12 @@ class SentenceSplitter:
 ```python
 class FuseBreaker:
     """
-    熔断决策器 - 协调人声分离与ASR补刀
+    熔断决策器 - 协调人声分离与ASR复核
 
     决策原则：
-    1. 熔断升级优先于ASR补刀
-    2. 已升级后才允许Whisper补刀
-    3. 避免在噪音环境下盲目补刀
+    1. 熔断升级优先于ASR复核
+    2. 已升级后才允许Whisper复核
+    3. 避免在噪音环境下盲目复核
     """
 
     def __init__(self, config: dict = None):
@@ -430,7 +430,7 @@ class FuseBreaker:
         Returns:
             'accept': 接受结果
             'upgrade_separation': 升级分离模型
-            'whisper_retry': Whisper补刀
+            'whisper_retry': Whisper复核
         """
         # 高置信度：直接接受
         if confidence >= self.config['confidence_threshold']:
@@ -446,7 +446,7 @@ class FuseBreaker:
             if separation_level != 'mdx_extra':
                 return 'upgrade_separation'
 
-        # 已升级或无需升级：Whisper补刀
+        # 已升级或无需升级：Whisper复核
         return 'whisper_retry'
 ```
 
@@ -454,7 +454,7 @@ class FuseBreaker:
 
 #### 3.5.1 场景分析
 
-| 场景 | 转录权重 | 补刀权重 | 分离权重 |
+| 场景 | 转录权重 | 复核权重 | 分离权重 |
 |------|----------|----------|----------|
 | 纯净语音 | 80% | 0% | 0% |
 | 轻度BGM | 70% | 5% | 5% |
@@ -476,7 +476,7 @@ def calculate_dynamic_weights(
     Args:
         total_segments: 总片段数
         segments_to_separate: 需要分离的片段数
-        segments_to_retry: 需要补刀的片段数（预估）
+        segments_to_retry: 需要复核的片段数（预估）
         engine: 转录引擎
 
     Returns:
@@ -556,7 +556,7 @@ SSE 逐句推送
     }
 }
 
-# 补刀事件
+# 复核事件
 {
     "event": "retry_started",
     "data": {
@@ -838,7 +838,7 @@ def _generate_recommended_config(hardware: dict) -> dict:
 #### 2.3 验收标准
 
 - 频谱预判可正确识别 BGM 片段
-- 熔断决策逻辑正确（升级优先于补刀）
+- 熔断决策逻辑正确（升级优先于复核）
 - 动态权重可根据场景调整
 
 ---
@@ -856,7 +856,7 @@ def _generate_recommended_config(hardware: dict) -> dict:
 | 分句集成 | `transcription_service.py` | P0 |
 | 熔断逻辑集成 | `transcription_service.py` | P0 |
 | 句级 SSE 推送 | `transcription_service.py` | P1 |
-| Whisper 补刀机制 | `transcription_service.py` | P1 |
+| Whisper 复核机制 | `transcription_service.py` | P1 |
 | 模型管理集成 | `model_preload_manager.py` | P1 |
 
 #### 3.2 核心修改
@@ -895,7 +895,7 @@ async def _process_video_sensevoice(self, job: JobState):
             await self._push_sse_sentence(job, sentence)
             transcript_results.append(sentence)
 
-    # 6. 熔断检查 + Whisper 补刀
+    # 6. 熔断检查 + Whisper 复核
     final_results = await self._fuse_and_retry(
         transcript_results, processed_segments, job
     )
@@ -909,7 +909,7 @@ async def _process_video_sensevoice(self, job: JobState):
 - [x] 重构后的 `transcription_service.py`
 - [x] VAD 物理切分逻辑
 - [x] 句级 SSE 推送逻辑
-- [x] 熔断+补刀完整流程
+- [x] 熔断+复核完整流程
 - [x] 集成测试用例
 
 #### 3.4 验收标准
@@ -1105,7 +1105,7 @@ test_cases = [
 
 - **SenseVoice 必须使用 ONNX Runtime (INT8 量化)**
 - **无 GPU 时默认关闭人声分离**
-- **熔断升级优先于 Whisper 补刀**
+- **熔断升级优先于 Whisper 复核**
 - **VAD 负责物理切分，分句算法负责语义切分**
 
 实施建议：按照 Phase 1 → Phase 5 顺序开发，每阶段充分测试后再进入下一阶段。

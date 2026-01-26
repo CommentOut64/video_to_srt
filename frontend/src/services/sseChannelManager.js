@@ -58,7 +58,7 @@ class SSEChannelManager extends EventEmitter {
       },
       queue_update: (data) => {
         console.log('[SSE Global] 队列更新:', data)
-        handlers.onQueueUpdate?.(data.queue)
+        handlers.onQueueUpdate?.(data.queue, data)
       },
       job_status: (data) => {
         // V3.1.0: 状态事件不应该包含进度信息，避免归零
@@ -76,6 +76,10 @@ class SSEChannelManager extends EventEmitter {
         console.log('[SSE Global] 任务进度:', data.id || data.job_id, percent)
         // 使用 data.id 而非 data.job_id，兼容全局频道的字段名
         handlers.onJobProgress?.(data.id || data.job_id, percent, { ...data, percent })
+      },
+      job_renamed: (data) => {
+        console.log('[SSE Global] 任务重命名:', data.job_id, data.title)
+        handlers.onJobRenamed?.(data)
       },
       // [V3.1.0] 新增：任务删除事件，解决幽灵任务问题
       job_removed: (data) => {
@@ -252,6 +256,21 @@ class SSEChannelManager extends EventEmitter {
         handlers.onFinalized?.(data)
         handlers.onSubtitleUpdate?.(data)
       },
+      'subtitle.added': (data) => {
+        console.log(`[SSE Job ${jobId}] 新增字幕:`, data)
+        handlers.onSubtitleAdded?.(data)
+        handlers.onSubtitleUpdate?.(data)
+      },
+      'subtitle.deleted': (data) => {
+        console.log(`[SSE Job ${jobId}] 删除字幕:`, data)
+        handlers.onSubtitleDeleted?.(data)
+        handlers.onSubtitleUpdate?.(data)
+      },
+      'subtitle.edited': (data) => {
+        console.log(`[SSE Job ${jobId}] 用户编辑字幕:`, data)
+        handlers.onSubtitleEdited?.(data)
+        handlers.onSubtitleUpdate?.(data)
+      },
 
       // 旧版事件 (兼容)
       'subtitle.sv_sentence': (data) => {
@@ -260,7 +279,7 @@ class SSEChannelManager extends EventEmitter {
         handlers.onSubtitleUpdate?.(data)
       },
       'subtitle.whisper_patch': (data) => {
-        console.log(`[SSE Job ${jobId}] Whisper 补刀:`, data)
+        console.log(`[SSE Job ${jobId}] Whisper 复核:`, data);
         handlers.onWhisperPatch?.(data)
         handlers.onSubtitleUpdate?.(data)
       },

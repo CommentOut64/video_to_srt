@@ -3,7 +3,7 @@ SpectralTriageStage - 频谱分诊阶段
 
 负责为每个AudioChunk进行频谱分析，判断是否需要人声分离，并推荐合适的模型。
 
-V3.7 更新：
+v3.1.0 更新：
 - 集成 CancellationToken 支持暂停/取消
 - 支持逐 Chunk 中断和检查点保存
 
@@ -23,13 +23,13 @@ V3.1.2+dev.20260109.01 更新：
 import logging
 import json
 from datetime import datetime
-from typing import List, Optional, TYPE_CHECKING
+from typing import List, Optional, TYPE_CHECKING, Dict, Any
 from pathlib import Path
 
 from app.services.audio.chunk_engine import AudioChunk
 from app.services.audio_spectrum_classifier import AudioSpectrumClassifier, get_spectrum_classifier
 
-# V3.7: 导入取消令牌
+# v3.1.0: 导入取消令牌
 if TYPE_CHECKING:
     from app.utils.cancellation_token import CancellationToken
 
@@ -50,7 +50,7 @@ class SpectralTriageStage:
     - 判断是否需要人声分离
     - 推荐合适的分离模型（htdemucs/mdx_extra）
 
-    V3.7: 支持 CancellationToken 实现暂停/取消/断点续传
+    v3.1.0: 支持 CancellationToken 实现暂停/取消/断点续传
     原子单位：单个 Chunk 分诊，可在每个 Chunk 之间中断
 
     V3.1.1+dev.20260108.02: 支持 SNR+C50 三层决策策略配置
@@ -61,7 +61,7 @@ class SpectralTriageStage:
         classifier: Optional[AudioSpectrumClassifier] = None,
         threshold: float = 0.35,
         logger: Optional[logging.Logger] = None,
-        cancellation_token: Optional["CancellationToken"] = None,  # V3.7: 新增
+        cancellation_token: Optional["CancellationToken"] = None,  # v3.1.0: 新增
         use_snr_triage: bool = True,  # V3.1.1+dev.20260108.02: 新增，默认启用
         use_smart_probe: bool = True,  # V3.1.2+dev.20260109.01: 新增，智能探针模式（默认启用）
         show_progress: bool = True  # V3.1.2+dev.20260109.01: 新增，显示命令行进度条
@@ -73,7 +73,7 @@ class SpectralTriageStage:
             classifier: 频谱分类器实例，如果为None则使用全局单例
             threshold: 分诊阈值，默认0.35
             logger: 日志记录器，如果为None则创建新的
-            cancellation_token: 取消令牌（可选，V3.7）
+            cancellation_token: 取消令牌（可选，v3.1.0）
             use_snr_triage: 是否启用 SNR+C50 三层决策策略（默认 True，V3.1.1+dev.20260108.02）
             use_smart_probe: 是否启用智能探针模式（默认 True，V3.1.2+dev.20260109.01）
             show_progress: 是否显示命令行进度条（默认 True，V3.1.2+dev.20260109.01）
@@ -82,11 +82,13 @@ class SpectralTriageStage:
         self.classifier = classifier or get_spectrum_classifier(use_snr_strategy=use_snr_triage)
         self.threshold = threshold
         self.logger = logger or logging.getLogger(__name__)
-        self.cancellation_token = cancellation_token  # V3.7
+        self.cancellation_token = cancellation_token  # v3.1.0
         self.use_snr_triage = use_snr_triage  # V3.1.1+dev.20260108.02
         self.use_smart_probe = use_smart_probe  # V3.1.2+dev.20260109.01
         self.show_progress = show_progress  # V3.1.2+dev.20260109.01
         self._smart_probe = None  # 懒加载
+        self._last_triage_log: List[Dict[str, Any]] = []
+        self._last_probe_state: Optional[Dict[str, Any]] = None
 
     def _get_smart_probe(self):
         """
@@ -104,11 +106,28 @@ class SpectralTriageStage:
                 self._smart_probe = None
         return self._smart_probe
 
+    def get_smart_probe_params(self) -> Optional[Dict[str, Any]]:
+        """获取智能探针当前参数"""
+        smart_probe = self._get_smart_probe()
+        if smart_probe is None:
+            return None
+        return {
+            "snr_threshold": smart_probe.threshold,
+            "max_step_chunks": smart_probe.max_step,
+        }
+
+    def get_cache_snapshot(self) -> Dict[str, Any]:
+        """获取最近一次分诊缓存快照"""
+        return {
+            "triage_log": self._last_triage_log,
+            "probe_state": self._last_probe_state,
+        }
+
     async def process(
         self,
         chunks: List[AudioChunk],
-        job_dir: Optional[Path] = None,  # V3.7: 用于保存检查点
-        diagnosed_indices: Optional[set] = None  # V3.7: 已诊断的索引（用于恢复）
+        job_dir: Optional[Path] = None,  # v3.1.0: 用于保存检查点
+        diagnosed_indices: Optional[set] = None  # v3.1.0: 已诊断的索引（用于恢复）
     ) -> List[AudioChunk]:
         """
         批量分诊所有chunk
@@ -117,8 +136,8 @@ class SpectralTriageStage:
 
         Args:
             chunks: 待分诊的AudioChunk列表
-            job_dir: 任务目录（可选，V3.7 用于保存检查点）
-            diagnosed_indices: 已诊断的chunk索引集合（可选，V3.7 用于恢复）
+            job_dir: 任务目录（可选，v3.1.0 用于保存检查点）
+            diagnosed_indices: 已诊断的chunk索引集合（可选，v3.1.0 用于恢复）
 
         Returns:
             带有分诊结果标记的AudioChunk列表
@@ -129,7 +148,7 @@ class SpectralTriageStage:
 
         self.logger.info(f"开始频谱分诊，共 {len(chunks)} 个chunk")
 
-        token = self.cancellation_token  # V3.7: 简化引用
+        token = self.cancellation_token  # v3.1.0: 简化引用
         diagnosed_indices = diagnosed_indices or set()
         sample_rate = chunks[0].sample_rate if chunks else 16000
 
@@ -172,14 +191,14 @@ class SpectralTriageStage:
                 leave=False
             ))
 
-        # V3.7: 逐个处理 chunk，支持中断
+        # v3.1.0: 逐个处理 chunk，支持中断
         for i, chunk in iterator:
-            # V3.7: 跳过已诊断的 chunk（用于恢复）
+            # v3.1.0: 跳过已诊断的 chunk（用于恢复）
             if i in diagnosed_indices:
                 self.logger.debug(f"跳过已诊断的 chunk {i}")
                 continue
 
-            # V3.7: 单个 chunk 分诊（快速，不需要原子区域）
+            # v3.1.0: 单个 chunk 分诊（快速，不需要原子区域）
             diagnosis = self.classifier.diagnose_chunk(
                 audio=chunk.audio,
                 chunk_index=i,
@@ -208,7 +227,7 @@ class SpectralTriageStage:
             }
             triage_log.append(chunk_log)
 
-            # V3.7: 每个 chunk 之间检查取消/暂停并保存检查点
+            # v3.1.0: 每个 chunk 之间检查取消/暂停并保存检查点
             if token and job_dir:
                 # 每 5 个 chunk 保存一次检查点（避免频繁 I/O）
                 if (i + 1) % 5 == 0 or i == len(chunks) - 1:
@@ -221,6 +240,10 @@ class SpectralTriageStage:
                         }
                     }
                     token.check_and_save(checkpoint_data, job_dir)
+
+        # 保存缓存快照
+        self._last_triage_log = triage_log
+        self._last_probe_state = None
 
         # 统计和日志保存
         return self._finalize_triage(chunks, triage_log, job_dir)
@@ -236,7 +259,11 @@ class SpectralTriageStage:
         智能探针分诊模式
 
         V3.1.2+dev.20260109.01: 新增
-        使用中心扩散探针策略快速判断是否需要全量分离
+        V3.2.0+dev.20260125.01: 修复 - 探针发现脏chunk后触发顺序全量探测，而非立即启动分离
+
+        使用中心扩散探针策略快速判断视频是否需要全量探测：
+        - 如果探针判定为 PASS_ALL（纯净视频），直接标记所有chunk无需分离
+        - 如果探针判定为 SEPARATE_ALL（发现干扰），回退到标准分诊模式完成所有chunk的探测
         """
         smart_probe = self._get_smart_probe()
         if smart_probe is None:
@@ -266,35 +293,60 @@ class SpectralTriageStage:
                 pbar.refresh()
 
         # 执行智能探针检测
-        decision, cache = smart_probe.run_probe(chunks, progress_callback)
+        decision, cache, sequence = smart_probe.run_probe(chunks, progress_callback)
+        self._last_probe_state = {
+            "decision": decision,
+            "snr_threshold": smart_probe.threshold,
+            "max_step_chunks": smart_probe.max_step,
+            "sequence": sequence,
+            "cache": cache,
+            "cursor": len(sequence),
+        }
 
         if pbar:
             pbar.close()
 
-        # 根据探针结果标记所有 chunks
+        # V3.2.0+dev.20260125.01: 修复 - 根据探针结果决定后续流程
         if decision == "SEPARATE_ALL":
-            self.logger.info("智能探针判定：需要全量分离")
-            for chunk in chunks:
-                chunk.needs_separation = True
-                chunk.recommended_model = "htdemucs"
-                # 如果该 chunk 已被探针检测，使用缓存的结果
-                if chunk.index in cache:
-                    result = cache[chunk.index]
+            # 探针发现干扰，触发顺序全量探测（而非立即启动分离）
+            self.logger.info("智能探针判定：发现干扰，触发顺序全量探测")
+            self.logger.info(f"探针已检测 {len(cache)} 个chunk，现在继续探测剩余 {len(chunks) - len(cache)} 个chunk")
+
+            # 回退到标准分诊模式，完成所有chunk的探测
+            # 将探针已检测的chunk索引加入 diagnosed_indices，避免重复探测
+            for chunk_index in cache.keys():
+                diagnosed_indices.add(chunk_index)
+                # 将探针缓存的结果应用到对应的chunk
+                if chunk_index < len(chunks):
+                    chunk = chunks[chunk_index]
+                    result = cache[chunk_index]
+                    # 根据探针结果标记chunk
+                    chunk.needs_separation = result['probe_decision'] == 'separate'
+                    chunk.recommended_model = "htdemucs" if chunk.needs_separation else None
+                    # 记录到日志
                     triage_log.append({
-                        "chunk_index": chunk.index,
+                        "chunk_index": chunk_index,
                         "start_time": round(chunk.start, 3),
                         "end_time": round(chunk.end, 3),
                         "duration": round(chunk.end - chunk.start, 3),
-                        "need_separation": True,
-                        "recommended_model": "htdemucs",
-                        "reason": f"[智能探针] 全量分离 (SNR={result['snr']:.1f}dB)",
+                        "need_separation": chunk.needs_separation,
+                        "recommended_model": chunk.recommended_model,
+                        "reason": f"[智能探针] SNR={result['snr']:.1f}dB",
                         "snr": round(result['snr'], 2),
                         "c50": round(result['c50'], 2),
                         "snr_level": None,
                         "c50_level": None,
                         "triage_layer": 0,  # 探针模式
                     })
+
+            # 继续使用标准模式探测剩余的chunk
+            return await self._process_standard(
+                chunks, job_dir, diagnosed_indices, triage_log,
+                chunks[0].sample_rate if chunks else 16000,
+                self.cancellation_token
+            )
         else:
+            # 探针判定为纯净视频，直接标记所有chunk无需分离
             self.logger.info("智能探针判定：纯净视频，无需分离")
             for chunk in chunks:
                 chunk.needs_separation = False
@@ -317,7 +369,8 @@ class SpectralTriageStage:
                         "triage_layer": 0,  # 探针模式
                     })
 
-        return self._finalize_triage(chunks, triage_log, job_dir)
+            self._last_triage_log = triage_log
+            return self._finalize_triage(chunks, triage_log, job_dir)
 
     def _finalize_triage(
         self,

@@ -6,11 +6,11 @@ PreprocessingPipeline - 预处理流水线（新架构）
 2. 频谱分诊（可选）
 3. 人声分离（可选，支持全局/按需模式）
 
-与旧的 AudioProcessingPipeline 的区别：
+与旧的 AudioProcessingPipeline（已归档）的区别：
 - 旧版：整轨分离 + VAD切分
 - 新版：VAD切分 + 频谱分诊 + 按需分离（Stage模式）
 
-V3.7 更新：
+v3.1.0 更新：
 - 集成 CancellationToken 支持暂停/取消
 - 支持断点续传检查点保存
 """
@@ -25,10 +25,12 @@ from app.pipelines.stages.spectral_triage_stage import SpectralTriageStage
 from app.pipelines.stages.separation_stage import SeparationStage
 from app.models.job_models import PreprocessingConfig, JobState
 from app.services.demucs_service import get_demucs_service
+from app.services.preprocess_cache_service import PreprocessCacheService
 
-# V3.7: 导入取消令牌
+# v3.1.0: 导入取消令牌
 if TYPE_CHECKING:
     from app.utils.cancellation_token import CancellationToken
+    from app.services.progress_emitter import ProgressEventEmitter
 
 
 class PreprocessingPipeline:
@@ -37,8 +39,15 @@ class PreprocessingPipeline:
 
     采用 Stage 模式，支持灵活的预处理流程配置。
 
-    V3.7: 支持 CancellationToken 实现暂停/取消/断点续传
+    v3.1.0: 支持 CancellationToken 实现暂停/取消/断点续传
     """
+
+    PREPROCESS_STAGE_WEIGHTS = {
+        "vad": 7.0,
+        "spectrum_analysis": 6.0,
+        "demucs": 7.0
+    }
+    PREPROCESS_TOTAL_WEIGHT = 20.0
 
     def __init__(
         self,
@@ -46,7 +55,8 @@ class PreprocessingPipeline:
         chunk_engine: Optional[ChunkEngine] = None,
         vad_config: Optional[VADConfig] = None,  # V3.1.0: 新增 VAD 配置参数
         logger: Optional[logging.Logger] = None,
-        cancellation_token: Optional["CancellationToken"] = None  # V3.7: 新增
+        cancellation_token: Optional["CancellationToken"] = None,  # v3.1.0: 新增
+        progress_emitter: Optional["ProgressEventEmitter"] = None
     ):
         """
         初始化预处理流水线
@@ -56,12 +66,19 @@ class PreprocessingPipeline:
             chunk_engine: 音频切分引擎（可选）
             vad_config: VAD 配置（可选，V3.1.0 新增，用于语言特定的 VAD 策略）
             logger: 日志记录器（可选）
-            cancellation_token: 取消令牌（可选，V3.7）
+            cancellation_token: 取消令牌（可选，v3.1.0）
+            progress_emitter: 进度发射器（可选）
         """
         self.config = config
         self.logger = logger or logging.getLogger(__name__)
-        self.cancellation_token = cancellation_token  # V3.7
-        self.vad_config = vad_config  # V3.1.0: 保存 VAD 配置
+        self.cancellation_token = cancellation_token  # v3.1.0
+        self.progress_emitter = progress_emitter
+        if vad_config is None:
+            from app.services.runtime_param_resolver import build_vad_config
+
+            self.vad_config = build_vad_config()
+        else:
+            self.vad_config = vad_config  # V3.1.0: 保存 VAD 配置
 
         # 初始化 ChunkEngine（用于音频提取和VAD切分）
         self.chunk_engine = chunk_engine or ChunkEngine(logger=self.logger)
@@ -71,7 +88,8 @@ class PreprocessingPipeline:
             self.spectral_triage_stage = SpectralTriageStage(
                 threshold=config.spectrum_threshold,
                 logger=self.logger,
-                cancellation_token=cancellation_token  # V3.7: 传递令牌
+                cancellation_token=cancellation_token,  # v3.1.0: 传递令牌
+                use_snr_triage=config.use_snr_triage
             )
             self.logger.info(
                 f"频谱分诊已启用: threshold={config.spectrum_threshold}"
@@ -94,7 +112,7 @@ class PreprocessingPipeline:
                 mode=config.separation_mode,
                 demucs_service=demucs_service,
                 logger=self.logger,
-                cancellation_token=cancellation_token  # V3.7: 传递令牌
+                cancellation_token=cancellation_token  # v3.1.0: 传递令牌
             )
             self.logger.info(
                 f"人声分离已启用: mode={config.separation_mode}, "
@@ -104,11 +122,27 @@ class PreprocessingPipeline:
             self.separation_stage = None
             self.logger.info("人声分离已禁用")
 
+    def _report_preprocess_progress(self, stage: str, ratio: float, message: str = "") -> None:
+        if not self.progress_emitter:
+            return
+        if stage not in self.PREPROCESS_STAGE_WEIGHTS:
+            return
+        ratio = max(0.0, min(1.0, ratio))
+        completed = 0.0
+        for key in ("vad", "spectrum_analysis", "demucs"):
+            weight = self.PREPROCESS_STAGE_WEIGHTS[key]
+            if key == stage:
+                completed += weight * ratio
+                break
+            completed += weight
+        percent = (completed / self.PREPROCESS_TOTAL_WEIGHT) * 100
+        self.progress_emitter.update_preprocess(percent, stage, message)
+
     async def process(
         self,
         video_path: str,
         job_state: Optional[JobState] = None,
-        job_dir: Optional[Path] = None,  # V3.7: 用于保存检查点
+        job_dir: Optional[Path] = None,  # v3.1.0: 用于保存检查点
         checkpoint: Optional[dict] = None  # V3.1.0: 用于跳过已完成的步骤
     ) -> List[AudioChunk]:
         """
@@ -122,30 +156,82 @@ class PreprocessingPipeline:
         Args:
             video_path: 视频/音频文件路径
             job_state: 任务状态（可选，用于进度回调）
-            job_dir: 任务目录（可选，V3.7 用于保存检查点）
+            job_dir: 任务目录（可选，v3.1.0 用于保存检查点）
             checkpoint: 检查点数据（可选，V3.1.0 用于跳过已完成的步骤）
 
         Returns:
             List[AudioChunk]: 预处理完成的 Chunk 列表
         """
         self.logger.info(f"开始预处理流程: {video_path}")
-        token = self.cancellation_token  # V3.7: 简化引用
+        token = self.cancellation_token  # v3.1.0: 简化引用
 
-        # V3.1.0: 检查是否可以从 checkpoint 恢复 chunks
+        cache_service: Optional[PreprocessCacheService] = None
+        if job_dir:
+            cache_service = PreprocessCacheService(job_dir=job_dir, logger=self.logger)
+            try:
+                cache_service.ensure_dirs()
+            except Exception as e:
+                self.logger.warning("[V3.2.0+dev.20260122.03] 初始化预处理缓存失败: %s", e)
+                cache_service = None
+            if cache_service:
+                try:
+                    cache_service.run_gc(job_dir.parent, self.config, exclude_job_id=job_dir.name)
+                except Exception as e:
+                    self.logger.warning("[V3.2.0+dev.20260122.03] 预处理缓存 GC 失败: %s", e)
+                try:
+                    cache_service.maybe_warn_cache_pressure(job_dir.name, self.config)
+                except Exception as e:
+                    self.logger.warning("[V3.2.0+dev.20260122.03] 预处理缓存告警失败: %s", e)
+
+        # V3.2.0+dev.20260123.03: 优先尝试分离缓存（统一输出层优先）
+        separation_mode = self.config.separation_mode if self.separation_stage else "off"
         chunks = None
         skip_vad = False
-        if checkpoint and isinstance(checkpoint, dict):
+        skip_triage = False
+        skip_separation = False
+        used_vad_cache = False
+        used_separation_cache = False
+        if cache_service:
+            separation_chunks = cache_service.load_separation_chunks(expected_mode=separation_mode)
+            if separation_chunks:
+                chunks = separation_chunks
+                skip_vad = True
+                skip_triage = True
+                skip_separation = True
+                used_separation_cache = True
+                self.logger.info("[V3.2.0+dev.20260123.03] 分离缓存命中，跳过 VAD/分诊/分离")
+                self._report_preprocess_progress("vad", 1.0, "分离缓存命中")
+                self._report_preprocess_progress("spectrum_analysis", 1.0, "分离缓存命中")
+                self._report_preprocess_progress("demucs", 1.0, "分离缓存命中")
+
+        # V3.2.0+dev.20260122.03: 优先尝试预处理缓存
+        if cache_service and not skip_vad:
+            cached_chunks = cache_service.load_vad_chunks()
+            if cached_chunks:
+                chunks = cached_chunks
+                skip_vad = True
+                used_vad_cache = True
+                self.logger.info("[V3.2.0+dev.20260122.03] VAD 缓存命中，跳过 VAD")
+                self._report_preprocess_progress("vad", 1.0, "VAD 缓存命中")
+
+        # V3.1.0: 检查是否可以从 checkpoint 恢复 chunks
+        if not skip_vad and checkpoint and isinstance(checkpoint, dict):
             preprocessing = checkpoint.get("preprocessing", {})
             if isinstance(preprocessing, dict):
                 chunks_metadata = preprocessing.get("chunks_metadata", [])
                 if chunks_metadata and preprocessing.get("vad_completed", False):
-                    # 从 checkpoint 恢复 chunks
                     chunks = await self._restore_chunks_from_metadata(
                         video_path, chunks_metadata
                     )
                     if chunks:
                         skip_vad = True
                         self.logger.info(f"[V3.1.0] 从 checkpoint 恢复 {len(chunks)} 个chunk，跳过 VAD")
+                        self._report_preprocess_progress("vad", 1.0, "VAD 检查点恢复")
+                        if cache_service:
+                            try:
+                                cache_service.save_vad_chunks(chunks)
+                            except Exception as e:
+                                self.logger.warning("[V3.2.0+dev.20260122.03] 保存 VAD 缓存失败: %s", e)
 
         if not skip_vad:
             # V3.1.0: Stage 1 拆分为两个原子区域
@@ -190,13 +276,53 @@ class PreprocessingPipeline:
                     }
                 }
                 token.check_and_save(checkpoint_data, job_dir)
+            if cache_service and chunks and not used_vad_cache and not used_separation_cache:
+                try:
+                    cache_service.save_vad_chunks(chunks)
+                except Exception as e:
+                    self.logger.warning("[V3.2.0+dev.20260122.03] 保存 VAD 缓存失败: %s", e)
         else:
             self.logger.info("[V3.1.0] 跳过 Stage 1 (音频提取 + VAD)")
 
         # Stage 2: 频谱分诊（如果启用，逐chunk可中断）
         if self.spectral_triage_stage:
             self.logger.info("Stage 2: 频谱分诊")
-            chunks = await self.spectral_triage_stage.process(chunks, job_dir=job_dir)
+            used_triage_cache = False
+            if skip_triage:
+                used_triage_cache = True
+                self.logger.info("[V3.2.0+dev.20260123.03] 分离缓存命中，跳过分诊")
+                self._report_preprocess_progress("spectrum_analysis", 1.0, "分离缓存命中")
+            elif cache_service:
+                triage_cache = cache_service.load_triage_results(
+                    total_chunks=len(chunks),
+                    use_snr_triage=self.spectral_triage_stage.use_snr_triage,
+                    threshold=self.spectral_triage_stage.threshold,
+                    use_smart_probe=self.spectral_triage_stage.use_smart_probe,
+                    smart_probe_params=self.spectral_triage_stage.get_smart_probe_params(),
+                )
+                if triage_cache:
+                    cache_service.apply_triage_results(chunks, triage_cache)
+                    used_triage_cache = True
+                    self.logger.info("[V3.2.0+dev.20260122.03] 频谱分诊缓存命中，跳过分诊")
+                    self._report_preprocess_progress("spectrum_analysis", 1.0, "频谱分诊缓存命中")
+
+            if not used_triage_cache:
+                self._report_preprocess_progress("spectrum_analysis", 0.0, "频谱分诊中...")
+                chunks = await self.spectral_triage_stage.process(chunks, job_dir=job_dir)
+                self._report_preprocess_progress("spectrum_analysis", 1.0, "频谱分诊完成")
+                if cache_service:
+                    snapshot = self.spectral_triage_stage.get_cache_snapshot()
+                    try:
+                        cache_service.save_triage_results(
+                            chunks=chunks,
+                            triage_log=snapshot.get("triage_log"),
+                            probe_state=snapshot.get("probe_state"),
+                            use_snr_triage=self.spectral_triage_stage.use_snr_triage,
+                            threshold=self.spectral_triage_stage.threshold,
+                            use_smart_probe=self.spectral_triage_stage.use_smart_probe,
+                        )
+                    except Exception as e:
+                        self.logger.warning("[V3.2.0+dev.20260122.03] 保存分诊缓存失败: %s", e)
 
             # 统计分诊结果
             stats = self.spectral_triage_stage.get_statistics(chunks)
@@ -205,7 +331,7 @@ class PreprocessingPipeline:
                 f"个chunk需要分离 (比例: {stats['separation_ratio']:.2%})"
             )
 
-            # V3.7: 频谱分诊完成后检查点
+            # v3.1.0: 频谱分诊完成后检查点
             if token and job_dir:
                 checkpoint_data = {
                     "spectral_triage": {
@@ -216,25 +342,57 @@ class PreprocessingPipeline:
                 token.check_and_save(checkpoint_data, job_dir)
         else:
             self.logger.info("Stage 2: 频谱分诊已跳过")
+            self._report_preprocess_progress("spectrum_analysis", 1.0, "频谱分诊跳过")
 
         # Stage 3: 人声分离（如果启用）
+        cached_separation_indices = set()
+        cache_separation_completed = False
+        if cache_service and chunks and not used_separation_cache:
+            try:
+                cache_service.begin_separation(separation_mode, len(chunks))
+                cached_separation_indices, cache_separation_completed = cache_service.load_separation_cache(
+                    chunks=chunks,
+                    expected_mode=separation_mode,
+                )
+                if cache_separation_completed and len(cached_separation_indices) < len(chunks):
+                    self.logger.warning("[V3.2.0+dev.20260122.03] 分离缓存不完整，回退重做")
+                    cache_separation_completed = False
+                cache_service.save_passthrough_chunks(
+                    chunks=chunks,
+                    only_unseparated=self.separation_stage is not None,
+                )
+            except Exception as e:
+                self.logger.warning("[V3.2.0+dev.20260122.03] 准备分离缓存失败: %s", e)
+                cached_separation_indices = set()
+                cache_separation_completed = False
+
         if self.separation_stage:
             self.logger.info("Stage 3: 人声分离")
-
-            # 根据分离模式传递不同的参数
-            if self.config.separation_mode == "global":
-                # 全局分离模式：需要传递原始音频路径
-                chunks = await self.separation_stage.process(
-                    chunks=chunks,
-                    audio_path=video_path,
-                    job_dir=job_dir  # V3.7: 传递job_dir
-                )
+            if skip_separation:
+                cache_separation_completed = True
+                self.logger.info("[V3.2.0+dev.20260123.03] 分离缓存命中，跳过分离")
+                self._report_preprocess_progress("demucs", 1.0, "分离缓存命中")
+            elif cache_separation_completed:
+                self.logger.info("[V3.2.0+dev.20260122.03] 人声分离缓存命中，跳过分离")
+                self._report_preprocess_progress("demucs", 1.0, "人声分离缓存命中")
             else:
-                # 按需分离模式：只分离标记的chunk
-                chunks = await self.separation_stage.process(
-                    chunks=chunks,
-                    job_dir=job_dir  # V3.7: 传递job_dir
-                )
+                self._report_preprocess_progress("demucs", 0.0, "人声分离中...")
+                if self.config.separation_mode == "global":
+                    chunks = await self.separation_stage.process(
+                        chunks=chunks,
+                        audio_path=video_path,
+                        job_dir=job_dir,
+                        separated_indices=cached_separation_indices,
+                        cache_service=cache_service
+                    )
+                else:
+                    chunks = await self.separation_stage.process(
+                        chunks=chunks,
+                        job_dir=job_dir,
+                        separated_indices=cached_separation_indices,
+                        cache_service=cache_service
+                    )
+                self._report_preprocess_progress("demucs", 1.0, "人声分离完成")
 
             # 统计分离结果
             stats = self.separation_stage.get_statistics(chunks)
@@ -243,7 +401,13 @@ class PreprocessingPipeline:
                 f"个chunk已分离 (比例: {stats['separation_ratio']:.2%})"
             )
 
-            # V3.7: 人声分离完成后检查点
+            if cache_service and not used_separation_cache:
+                try:
+                    cache_service.finalize_separation(len(chunks))
+                except Exception as e:
+                    self.logger.warning("[V3.2.0+dev.20260122.03] 完成分离缓存失败: %s", e)
+
+            # v3.1.0: 人声分离完成后检查点
             if token and job_dir:
                 checkpoint_data = {
                     "separation": {
@@ -255,6 +419,12 @@ class PreprocessingPipeline:
                 token.check_and_save(checkpoint_data, job_dir)
         else:
             self.logger.info("Stage 3: 人声分离已跳过")
+            self._report_preprocess_progress("demucs", 1.0, "人声分离跳过")
+            if cache_service and chunks and not used_separation_cache:
+                try:
+                    cache_service.finalize_separation(len(chunks))
+                except Exception as e:
+                    self.logger.warning("[V3.2.0+dev.20260122.03] 完成分离缓存失败: %s", e)
 
         self.logger.info(f"预处理流程完成: {len(chunks)} 个chunk准备就绪")
 
@@ -278,7 +448,12 @@ class PreprocessingPipeline:
             List[AudioChunk]: VAD切分后的 Chunk 列表
         """
         # V3.1.0: 使用传入的 VAD 配置，如果没有则使用默认配置
-        vad_config = self.vad_config or VADConfig()
+        if self.vad_config is None:
+            from app.services.runtime_param_resolver import build_vad_config
+
+            vad_config = build_vad_config()
+        else:
+            vad_config = self.vad_config
         self.logger.info(f"VAD配置: merge_max_gap={vad_config.merge_max_gap}s, merge_max_duration={vad_config.merge_max_duration}s")
 
         # 定义进度回调
@@ -287,6 +462,7 @@ class PreprocessingPipeline:
                 job_state.phase_percent = progress * 100
                 job_state.message = message
                 self.logger.debug(f"进度: {progress:.1%} - {message}")
+            self._report_preprocess_progress("vad", progress, message)
 
         # 使用 ChunkEngine 处理音频（不启用Demucs）
         chunks, full_audio, sr = self.chunk_engine.process_audio(
@@ -429,7 +605,8 @@ def get_preprocessing_pipeline(
     config: PreprocessingConfig,
     chunk_engine: Optional[ChunkEngine] = None,
     logger: Optional[logging.Logger] = None,
-    cancellation_token: Optional["CancellationToken"] = None  # V3.7: 新增
+    cancellation_token: Optional["CancellationToken"] = None,  # v3.1.0: 新增
+    progress_emitter: Optional["ProgressEventEmitter"] = None
 ) -> PreprocessingPipeline:
     """
     获取预处理流水线实例
@@ -438,7 +615,8 @@ def get_preprocessing_pipeline(
         config: 预处理配置
         chunk_engine: 音频切分引擎（可选）
         logger: 日志记录器（可选）
-        cancellation_token: 取消令牌（可选，V3.7）
+        cancellation_token: 取消令牌（可选，v3.1.0）
+        progress_emitter: 进度发射器（可选）
 
     Returns:
         PreprocessingPipeline 实例
@@ -447,5 +625,6 @@ def get_preprocessing_pipeline(
         config=config,
         chunk_engine=chunk_engine,
         logger=logger,
-        cancellation_token=cancellation_token  # V3.7
+        cancellation_token=cancellation_token,  # v3.1.0
+        progress_emitter=progress_emitter
     )

@@ -78,13 +78,13 @@ class PresetWeights:
             # 极速模式：仅 SenseVoice
             'default': cls(sensevoice=50, srt=10),
 
-            # 智能补刀：SV + Whisper 局部
+            # 智能复核：SV + Whisper 局部
             'preset1': cls(sensevoice=35, whisper=20, srt=10),
 
-            # 轻度校对：智能补刀 + LLM 按需校对
+            # 轻度校对：智能复核 + LLM 按需校对
             'preset2': cls(sensevoice=30, whisper=15, llm_proof=15, srt=10),
 
-            # 深度校对：智能补刀 + LLM 全文精修
+            # 深度校对：智能复核 + LLM 全文精修
             'preset3': cls(sensevoice=25, whisper=15, llm_proof=25, srt=10),
 
             # 校对+翻译：深度校对 + 全文翻译

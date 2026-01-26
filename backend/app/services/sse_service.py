@@ -334,7 +334,7 @@ SSE_PROGRESS_TAGS = {
     "progress.demucs": "人声分离进度",
     "progress.vad": "VAD 分段进度",
     "progress.sensevoice": "SenseVoice 转录进度（流式）",
-    "progress.whisper": "Whisper 补刀进度",
+    "progress.whisper": "Whisper 复核进度",
     "progress.llm_proof": "LLM 校对进度",
     "progress.llm_trans": "LLM 翻译进度",
     "progress.srt": "SRT 生成进度",
@@ -344,7 +344,7 @@ SSE_PROGRESS_TAGS = {
 SSE_SUBTITLE_TAGS = {
     "subtitle.sv_segment": "SenseVoice 完成一个 VAD 段",
     "subtitle.sv_sentence": "SenseVoice 完成一个句子",
-    "subtitle.whisper_patch": "Whisper 补刀覆盖一个句子",
+    "subtitle.whisper_patch": "Whisper 复核覆盖一个句子",
     "subtitle.llm_proof": "LLM 校对覆盖一个句子",
     "subtitle.llm_trans": "LLM 翻译完成一个句子",
     "subtitle.batch_update": "批量更新多个句子",
@@ -357,8 +357,20 @@ SSE_SIGNAL_TAGS = {
     "signal.job_failed": "任务失败",
     "signal.phase_start": "阶段开始",
     "signal.phase_complete": "阶段完成",
+    "signal.pause_pending": "暂停请求已接收，等待流水线响应",
+    "signal.pause_ack": "暂停已确认（检查点落盘完成）",
     "signal.circuit_breaker": "熔断触发",
     "signal.model_upgrade": "模型升级",
+    "signal.cache_gc_recommend": "缓存清理提示",
+}
+
+# 模型下载事件 Tag
+SSE_MODEL_TAGS = {
+    "model.download.start": "模型下载开始",
+    "model.download.progress": "模型下载进度",
+    "model.download.complete": "模型下载完成",
+    "model.download.error": "模型下载失败",
+    "model.download.cache_hit": "模型已在本地",
 }
 
 

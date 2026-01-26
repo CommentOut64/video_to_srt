@@ -44,7 +44,7 @@ class CheckpointData:
 
 @dataclass
 class PreprocessingState:
-    """V3.7 预处理阶段状态"""
+    """v3.1.0 预处理阶段状态"""
     audio_extracted: bool = False
     audio_path: Optional[str] = None
     audio_duration_sec: float = 0.0
@@ -68,7 +68,7 @@ class PreprocessingState:
 
 @dataclass
 class TranscriptionState:
-    """V3.7 转录阶段状态"""
+    """v3.1.0 转录阶段状态"""
     # FastWorker (SenseVoice)
     fast_processed_indices: List[int] = field(default_factory=list)
     fast_completed_count: int = 0
@@ -80,7 +80,7 @@ class TranscriptionState:
     previous_whisper_text: str = ""  # Whisper 上文状态（恢复必需）
     last_processed_index: int = -1
 
-    # AlignmentWorker
+    # 对齐阶段
     finalized_indices: List[int] = field(default_factory=list)
     alignment_completed_count: int = 0
     alignment_levels: Dict[int, str] = field(default_factory=dict)
@@ -94,7 +94,7 @@ class TranscriptionState:
 
 @dataclass
 class ControlState:
-    """V3.7 控制状态"""
+    """v3.1.0 控制状态"""
     paused: bool = False
     canceled: bool = False
     pending_pause: bool = False
@@ -105,7 +105,7 @@ class ControlState:
 @dataclass
 class CheckpointV37:
     """
-    V3.7 统一检查点格式
+    v3.1.0 统一检查点格式
 
     支持完整的断点续传，包括：
     - 预处理阶段状态
@@ -137,6 +137,7 @@ class CheckpointV37:
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
         now = datetime.utcnow().isoformat() + "Z"
+
         return {
             "version": self.version,
             "job_id": self.job_id,
@@ -443,12 +444,8 @@ class CheckpointManager:
         # 检查设置兼容性（如果提供了当前设置）
         if current_settings and 'original_settings' in checkpoint_data:
             original = checkpoint_data['original_settings']
-            # 检查关键设置是否一致
-            critical_settings = ['model', 'device', 'word_timestamps']
-            for setting in critical_settings:
-                if setting in original and setting in current_settings:
-                    if original[setting] != current_settings[setting]:
-                        return False, f"设置不兼容: {setting} 已更改"
+            if original != current_settings:
+                return False, "设置不兼容: task_config 已更改"
 
         return True, None
 
@@ -507,7 +504,7 @@ class CheckpointManager:
 
         return merged
 
-    # ==================== V3.7 新增方法 ====================
+    # ==================== v3.1.0 新增方法 ====================
 
     def save_checkpoint_v37(
         self,
@@ -515,11 +512,11 @@ class CheckpointManager:
         checkpoint: CheckpointV37
     ) -> bool:
         """
-        保存 V3.7 格式检查点
+        保存 v3.1.0 格式检查点
 
         Args:
             job_dir: 任务目录
-            checkpoint: V3.7 检查点对象
+            checkpoint: v3.1.0 检查点对象
 
         Returns:
             bool: 保存是否成功
@@ -528,7 +525,7 @@ class CheckpointManager:
 
     def load_checkpoint_v37(self, job_dir: Path) -> Optional[CheckpointV37]:
         """
-        加载 V3.7 格式检查点
+        加载 v3.1.0 格式检查点
 
         自动处理版本兼容性。
 
@@ -545,22 +542,23 @@ class CheckpointManager:
 
         # 检查版本
         version = data.get("version", "")
-        if not version.startswith("3.7"):
+        # V3.2.0+dev.20260123.05: 修复版本检查逻辑，接受 3.1.x 和 3.7.x
+        if not (version.startswith("3.1") or version.startswith("3.7")):
             # 尝试从旧格式迁移
-            self.logger.debug(f"检测到旧版本检查点 ({version})，尝试迁移到 V3.7")
+            self.logger.debug(f"检测到旧版本检查点 ({version})，尝试迁移到 v3.1.0")
             data = self._migrate_to_v37(data)
 
         return CheckpointV37.from_dict(data)
 
     def _migrate_to_v37(self, old_data: Dict[str, Any]) -> Dict[str, Any]:
         """
-        将旧版本检查点迁移到 V3.7 格式
+        将旧版本检查点迁移到 v3.1.0 格式
 
         Args:
             old_data: 旧版本检查点数据
 
         Returns:
-            Dict[str, Any]: V3.7 格式数据
+            Dict[str, Any]: v3.1.0 格式数据
         """
         now = datetime.utcnow().isoformat() + "Z"
 
@@ -571,7 +569,7 @@ class CheckpointManager:
         processed_chunks = old_data.get("processed_chunks", 0)
         processed_indices = old_data.get("processed_indices", [])
 
-        # 构建 V3.7 格式
+        # 构建 v3.1.0 格式
         new_data = {
             "version": CHECKPOINT_VERSION,
             "job_id": job_id,
@@ -638,7 +636,7 @@ class CheckpointManager:
 
     def create_checkpoint_v37(self, job_id: str) -> CheckpointV37:
         """
-        创建新的 V3.7 检查点
+        创建新的 v3.1.0 检查点
 
         Args:
             job_id: 任务ID
@@ -888,7 +886,7 @@ class CheckpointManager:
         current_settings: Optional[Dict[str, Any]] = None
     ) -> tuple[bool, Optional[str]]:
         """
-        验证 V3.7 检查点的完整性和兼容性
+        验证 v3.1.0 检查点的完整性和兼容性
 
         Args:
             checkpoint: 检查点对象
@@ -907,12 +905,8 @@ class CheckpointManager:
 
         # 检查设置兼容性
         if current_settings and checkpoint.original_settings:
-            critical_settings = ['model', 'device', 'word_timestamps']
-            for setting in critical_settings:
-                orig = checkpoint.original_settings.get(setting)
-                curr = current_settings.get(setting)
-                if orig is not None and curr is not None and orig != curr:
-                    return False, f"设置不兼容: {setting} 从 {orig} 变为 {curr}"
+            if checkpoint.original_settings != current_settings:
+                return False, "设置不兼容: task_config 已更改"
 
         return True, None
 
@@ -933,7 +927,7 @@ def get_checkpoint_manager(logger: Optional[logging.Logger] = None) -> Checkpoin
 
 def create_checkpoint_v37(job_id: str) -> CheckpointV37:
     """
-    创建新的 V3.7 检查点
+    创建新的 v3.1.0 检查点
 
     Args:
         job_id: 任务ID
@@ -950,7 +944,7 @@ def create_checkpoint_v37(job_id: str) -> CheckpointV37:
 
 class CheckpointManagerV37:
     """
-    V3.7 检查点管理器（简化包装）
+    v3.1.0 检查点管理器（简化包装）
 
     提供更便捷的 API 用于流水线中的检查点保存和加载。
     与 CancellationToken 的 check_and_save 方法配合使用。
@@ -958,7 +952,7 @@ class CheckpointManagerV37:
 
     def __init__(self, job_dir: Path, logger: Optional[logging.Logger] = None):
         """
-        初始化 V3.7 检查点管理器
+        初始化 v3.1.0 检查点管理器
 
         Args:
             job_dir: 任务目录
@@ -1097,7 +1091,7 @@ class CheckpointManagerV37:
             if "last_slow_chunk_index" in trans_data:
                 trans.last_processed_index = trans_data["last_slow_chunk_index"]
 
-            # AlignmentWorker 字段
+            # 对齐阶段字段
             if "align_processed_count" in trans_data:
                 trans.alignment_completed_count = trans_data["align_processed_count"]
             if "last_align_chunk_index" in trans_data:
@@ -1130,6 +1124,10 @@ class CheckpointManagerV37:
                 ctrl.paused = ctrl_data["paused"]
             if "canceled" in ctrl_data:
                 ctrl.canceled = ctrl_data["canceled"]
+
+        # 更新原始设置（用于断点续传一致性）
+        if "original_settings" in checkpoint_data:
+            self._checkpoint.original_settings = checkpoint_data["original_settings"]
 
         # 更新阶段
         self._checkpoint.phase = self._determine_current_phase()

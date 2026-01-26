@@ -2,7 +2,7 @@
 熔断机制数据模型（v2.1 概念重构版）
 
 熔断 = 升级分离模型（转录过程中）
-后处理增强 = Whisper补刀 / LLM校对 / 翻译（转录完成后）
+后处理增强 = Whisper复核 / LLM校对 / 翻译（转录完成后）
 """
 from dataclasses import dataclass, field
 from enum import Enum

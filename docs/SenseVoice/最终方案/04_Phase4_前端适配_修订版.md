@@ -84,7 +84,7 @@
     <!-- 当前配置摘要 -->
     <div class="config-summary" v-if="selectedPreset !== 'custom'">
       <div class="summary-item" v-if="currentConfig.enhancement !== 'off'">
-        Whisper 补刀: {{ getEnhancementLabel(currentConfig.enhancement) }}
+        Whisper 复核: {{ getEnhancementLabel(currentConfig.enhancement) }}
       </div>
       <div class="summary-item" v-if="currentConfig.proofread !== 'off'">
         LLM 校对: {{ getProofreadLabel(currentConfig.proofread) }}
@@ -113,22 +113,22 @@ export default {
         },
         {
           id: 'preset1',
-          name: '智能补刀',
-          description: 'SV + Whisper 局部补刀，平衡速度与质量',
+          name: '智能复核',
+          description: 'SV + Whisper 局部复核，平衡速度与质量',
           timeMultiplier: 0.15,
           recommended: true
         },
         {
           id: 'preset2',
           name: '轻度校对',
-          description: '智能补刀 + LLM 按需校对问题片段',
+          description: '智能复核 + LLM 按需校对问题片段',
           timeMultiplier: 0.2,
           recommended: false
         },
         {
           id: 'preset3',
           name: '深度校对',
-          description: '智能补刀 + LLM 全文精修润色',
+          description: '智能复核 + LLM 全文精修润色',
           timeMultiplier: 0.3,
           recommended: false
         },
@@ -182,7 +182,7 @@ export default {
     getEnhancementLabel(mode) {
       const labels = {
         'off': '关闭',
-        'smart_patch': '智能补刀',
+        'smart_patch': '智能复核',
         'deep_listen': '深度重听'
       }
       return labels[mode] || mode

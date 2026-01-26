@@ -75,6 +75,8 @@
 import { ref, computed, watch, nextTick } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
 import { usePlaybackManager } from '@/services/PlaybackManager'
+import { useSubtitleSync } from '@/composables'  // V3.2.0+dev.20260124.01: 导入字幕同步
+import transcriptionApi from '@/services/api/transcriptionApi'
 // Phase 5: 导入 SubtitleItem 组件
 import SubtitleItem from './SubtitleItem.vue'
 
@@ -92,6 +94,10 @@ const projectStore = useProjectStore()
 // 全局播放管理器
 const playbackManager = usePlaybackManager()
 
+const jobId = computed(() => projectStore.meta.jobId)
+// V3.2.0+dev.20260124.02: 字幕同步（防止 AI 覆盖用户编辑）
+const { onSubtitleEdit, applyPendingEditsToStore, forceSyncNow, pendingCount } = useSubtitleSync(jobId)
+
 // Refs
 const listRef = ref(null)
 
@@ -99,6 +105,7 @@ const listRef = ref(null)
 const searchText = ref('')
 const animationEnabled = ref(true)  // 批量更新时禁用动画
 let previousSubtitleCount = 0  // 上一次字幕数量
+const hasAppliedPending = ref(false)
 
 // Computed
 const subtitles = computed(() => projectStore.subtitles)
@@ -114,6 +121,29 @@ const filteredSubtitles = computed(() => {
   return subtitles.value.filter(sub => sub.text.toLowerCase().includes(search))
 })
 
+watch(
+  () => jobId.value,
+  async () => {
+    hasAppliedPending.value = false
+    if (pendingCount() > 0) {
+      await forceSyncNow()
+    }
+  }
+)
+
+watch(
+  () => subtitles.value.length,
+  async (length) => {
+    if (!jobId.value || length === 0 || hasAppliedPending.value) return
+    const applied = applyPendingEditsToStore(projectStore)
+    if (applied > 0) {
+      await forceSyncNow()
+    }
+    hasAppliedPending.value = true
+  },
+  { immediate: true }
+)
+
 // Methods
 function onSubtitleClick(subtitle) {
   projectStore.view.selectedSubtitleId = subtitle.id
@@ -124,32 +154,86 @@ function onSubtitleClick(subtitle) {
 
 function updateTime(id, field, value) {
   if (isNaN(value)) return
-  projectStore.updateSubtitle(id, { [field]: value })
+
+  // 1. 乐观更新本地状态
+  projectStore.updateSubtitle(id, { [field]: value }, { isUserEdit: true })
   emit('subtitle-edit', id, field, value)
+
+  // 2. V3.2.0+dev.20260124.01: 同步到后端（防抖）
+  const subtitle = projectStore.subtitles.find(s => s.id === id)
+  if (subtitle && subtitle.sentenceIndex !== undefined) {
+    onSubtitleEdit(subtitle.sentenceIndex, {
+      [field]: value
+    })
+  }
 }
 
 function updateText(id, text) {
-  projectStore.updateSubtitle(id, { text })
+  // 1. 乐观更新本地状态
+  projectStore.updateSubtitle(id, { text }, { isUserEdit: true })
   emit('subtitle-edit', id, 'text', text)
+
+  // 2. V3.2.0+dev.20260124.01: 同步到后端（防抖）
+  const subtitle = projectStore.subtitles.find(s => s.id === id)
+  if (subtitle && subtitle.sentenceIndex !== undefined) {
+    onSubtitleEdit(subtitle.sentenceIndex, {
+      text
+    })
+  }
 }
 
-function deleteSubtitle(id) {
-  projectStore.removeSubtitle(id)
+async function deleteSubtitle(id) {
+  const subtitle = projectStore.subtitles.find(s => s.id === id)
+  projectStore.removeSubtitle(id, { isUserEdit: true })
   emit('subtitle-delete', id)
+
+  if (!subtitle || subtitle.sentenceIndex === undefined) {
+    return
+  }
+
+  try {
+    await transcriptionApi.deleteSubtitle(projectStore.meta.jobId, subtitle.sentenceIndex)
+  } catch (error) {
+    console.warn('[SubtitleList] 删除字幕同步失败:', error)
+  }
 }
 
-function addNewSubtitle() {
+async function addNewSubtitle() {
   const lastSubtitle = subtitles.value[subtitles.value.length - 1]
   const newStart = lastSubtitle ? lastSubtitle.end : 0
-  projectStore.addSubtitle(subtitles.value.length, {
+  const insertIndex = subtitles.value.length
+  projectStore.addSubtitle(insertIndex, {
     start: newStart,
     end: newStart + 3,
-    text: ''
+    text: '',
+    isModified: true,
+    source: 'manual'
   })
   nextTick(() => {
     scrollToBottom()
   })
   emit('subtitle-add', subtitles.value.length - 1)
+
+  try {
+    const response = await transcriptionApi.createSubtitle(projectStore.meta.jobId, {
+      text: '',
+      start: newStart,
+      end: newStart + 3
+    })
+    const data = response?.data?.data || response?.data
+    if (data?.index !== undefined) {
+      const newSubtitle = projectStore.subtitles[insertIndex]
+      if (newSubtitle) {
+        projectStore.updateSubtitle(newSubtitle.id, {
+          sentenceIndex: data.index,
+          isModified: true,
+          source: data.source || 'manual'
+        }, { isUserEdit: true })
+      }
+    }
+  } catch (error) {
+    console.warn('[SubtitleList] 新增字幕同步失败:', error)
+  }
 }
 
 function insertBefore(index) {
@@ -157,7 +241,8 @@ function insertBefore(index) {
   const prev = subtitles.value[index - 1]
   const start = prev ? prev.end : Math.max(0, current.start - 3)
   const end = current.start
-  projectStore.addSubtitle(index, { start, end, text: '' })
+  projectStore.addSubtitle(index, { start, end, text: '', isModified: true, source: 'manual' })
+  syncInsertedSubtitle(index, start, end, '')
 }
 
 function insertAfter(index) {
@@ -165,7 +250,31 @@ function insertAfter(index) {
   const next = subtitles.value[index + 1]
   const start = current.end
   const end = next ? next.start : current.end + 3
-  projectStore.addSubtitle(index + 1, { start, end, text: '' })
+  projectStore.addSubtitle(index + 1, { start, end, text: '', isModified: true, source: 'manual' })
+  syncInsertedSubtitle(index + 1, start, end, '')
+}
+
+async function syncInsertedSubtitle(insertIndex, start, end, text) {
+  try {
+    const response = await transcriptionApi.createSubtitle(projectStore.meta.jobId, {
+      text,
+      start,
+      end
+    })
+    const data = response?.data?.data || response?.data
+    if (data?.index !== undefined) {
+      const newSubtitle = projectStore.subtitles[insertIndex]
+      if (newSubtitle) {
+        projectStore.updateSubtitle(newSubtitle.id, {
+          sentenceIndex: data.index,
+          isModified: true,
+          source: data.source || 'manual'
+        }, { isUserEdit: true })
+      }
+    }
+  } catch (error) {
+    console.warn('[SubtitleList] 插入字幕同步失败:', error)
+  }
 }
 
 function scrollToBottom() {

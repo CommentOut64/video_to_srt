@@ -2,7 +2,7 @@
 Faster-Whisper 转录服务
 
 职责：
-- Whisper 补刀（后处理增强阶段）
+- Whisper 复核（后处理增强阶段）
 - 仅提供文本，时间戳由 SenseVoice 确定，使用伪对齐
 - 自动检测并下载缺失的 Whisper 模型（默认 medium）
 - 自动使用 HuggingFace 镜像源（hf-mirror.com）
@@ -161,6 +161,36 @@ class WhisperService:
         """获取当前加载的模型名称"""
         return self._model_name
 
+    def _resolve_model_id(self, model_name: str) -> str:
+        """
+        将传入的模型名称解析为注册表中的模型ID。
+
+        统一入口：优先直接匹配，再尝试添加 whisper- 前缀，以及仓库名尾部。
+        """
+        from app.services.model_manager_v2 import get_model_manager_v2
+
+        manager = get_model_manager_v2()
+        candidates = [model_name]
+        # 兼容 medium → whisper-medium，medium.en → whisper-medium-en
+        candidates.append(f"whisper-{model_name.replace('.', '-')}")
+        # 兼容传入仓库ID Systran/faster-whisper-medium
+        if "/" in model_name:
+            tail = model_name.split("/")[-1]
+            candidates.extend([tail, f"whisper-{tail.replace('.', '-')}"])
+
+        for mid in candidates:
+            try:
+                manager.registry.get(mid)
+                return mid
+            except Exception:
+                continue
+        raise KeyError(f"未在模型注册表中找到匹配的 Whisper 模型: {model_name}")
+
+    def resolve_model_id(self, model_name: Optional[str] = None) -> str:
+        """对外暴露的模型ID解析方法。"""
+        target = model_name or self._model_name or DEFAULT_WHISPER_MODEL
+        return self._resolve_model_id(target)
+
     @property
     def device(self) -> str:
         """获取当前设备"""
@@ -211,66 +241,25 @@ class WhisperService:
             logger.debug(f"模型 {model_name} (compute_type={compute_type}) 已加载，跳过")
             return self
 
-        # 卸载旧模型
-        self.unload_model()
+        # 统一走 ModelManagerV2
+        model_id = self._resolve_model_id(model_name)
+        from app.services.model_manager_v2 import get_model_manager_v2
 
-        # 设置下载目录
-        if download_root is None:
-            download_root = str(config.HF_CACHE_DIR)
-        
-        # 确保下载目录存在
-        Path(download_root).mkdir(parents=True, exist_ok=True)
+        manager = get_model_manager_v2()
+        logger.info(
+            "WhisperService 使用 ModelManagerV2 加载: id=%s device=%s compute_type=%s",
+            model_id,
+            device,
+            compute_type,
+        )
+        manager.ensure_available(model_id)
+        handle = manager.acquire(model_id, device=device, compute_type=compute_type)
 
-        # 确保镜像源配置
-        self._setup_hf_mirror()
-
-        # 获取完整的仓库 ID
-        model_repo_id = self.get_model_repo_id(model_name)
-
-        logger.info(f"=" * 50)
-        logger.info(f"加载 Faster-Whisper 模型")
-        logger.info(f"  模型名称: {model_name}")
-        logger.info(f"  仓库 ID: {model_repo_id}")
-        logger.info(f"  设备: {device}, 计算类型: {compute_type}")
-        logger.info(f"  缓存目录: {download_root}")
-        logger.info(f"  镜像源: {os.environ.get('HF_ENDPOINT', '官方源')}")
-        logger.info(f"=" * 50)
-
-        try:
-            # 检查模型是否存在本地，不存在则下载
-            if auto_download:
-                model_path = self._ensure_model_downloaded(
-                    model_repo_id, 
-                    download_root,
-                    force_download=False
-                )
-                if model_path:
-                    # 使用本地路径加载
-                    logger.info(f"使用本地模型路径: {model_path}")
-                    model_repo_id = model_path
-
-            # 加载模型
-            # 延迟导入 faster_whisper，避免启动时加载 ctranslate2 导致首次启动卡死
-            from faster_whisper import WhisperModel
-
-            self.model = WhisperModel(
-                model_repo_id,
-                device=device,
-                compute_type=compute_type,
-                download_root=download_root,
-                local_files_only=local_files_only
-            )
-
-            self._model_name = model_name
-            self._device = device
-            self._compute_type = compute_type
-
-            logger.info(f"✓ Faster-Whisper 模型加载完成: {model_name}")
-
-        except Exception as e:
-            logger.error(f"✗ 加载 Faster-Whisper 模型失败: {e}")
-            raise
-
+        self.model = handle
+        self._model_name = model_name
+        self._device = device
+        self._compute_type = compute_type
+        logger.info("WhisperService 完成加载: model_id=%s", model_id)
         return self
 
     def _ensure_model_downloaded(
@@ -462,17 +451,17 @@ class WhisperService:
     def transcribe(
         self,
         audio: Union[str, np.ndarray],
-        language: str = None,
-        initial_prompt: str = None,
-        word_timestamps: bool = False,
-        beam_size: int = 5,
-        vad_filter: bool = True,
-        vad_parameters: dict = None,
-        temperature: float = 0.0,
-        condition_on_previous_text: bool = True,
-        suppress_tokens: list = None,  # 幻觉抑制 Token ID 列表
-        repetition_penalty: float = 1.0,  # 重复惩罚系数（>1 抑制重复）
-        no_repeat_ngram_size: int = 0  # 禁止重复的 N-gram 大小（0=禁用）
+        language: Optional[str] = None,
+        initial_prompt: Optional[str] = None,
+        word_timestamps: Optional[bool] = None,
+        beam_size: Optional[int] = None,
+        vad_filter: Optional[bool] = None,
+        vad_parameters: Optional[dict] = None,
+        temperature: Optional[float] = None,
+        condition_on_previous_text: Optional[bool] = None,
+        suppress_tokens: Optional[list] = None,  # 幻觉抑制 Token ID 列表
+        repetition_penalty: Optional[float] = None,  # 重复惩罚系数（>1 抑制重复）
+        no_repeat_ngram_size: Optional[int] = None  # 禁止重复的 N-gram 大小（0=禁用）
     ) -> Dict[str, Any]:
         """
         转录音频
@@ -501,6 +490,49 @@ class WhisperService:
         """
         if not self.model:
             raise RuntimeError("模型未加载，请先调用 load_model()")
+
+        from app.services.runtime_param_resolver import get_runtime_group_for_model, get_runtime_group
+
+        try:
+            runtime = get_runtime_group_for_model(self.resolve_model_id())
+        except Exception as exc:
+            logger.debug("Whisper 运行参数获取失败，回退默认: %s", exc)
+            runtime = get_runtime_group("whisper")
+
+        def pick_value(key: str, value: Optional[Any]) -> Any:
+            if value is not None:
+                return value
+            return runtime.get(key)
+
+        language = pick_value("language", language)
+        initial_prompt = pick_value("initial_prompt", initial_prompt)
+        word_timestamps = pick_value("word_timestamps", word_timestamps)
+        beam_size = pick_value("beam_size", beam_size)
+        vad_filter = pick_value("vad_filter", vad_filter)
+        vad_parameters = pick_value("vad_parameters", vad_parameters)
+        temperature = pick_value("temperature", temperature)
+        condition_on_previous_text = pick_value(
+            "condition_on_previous_text",
+            condition_on_previous_text,
+        )
+        suppress_tokens = pick_value("suppress_tokens", suppress_tokens)
+        repetition_penalty = pick_value("repetition_penalty", repetition_penalty)
+        no_repeat_ngram_size = pick_value("no_repeat_ngram_size", no_repeat_ngram_size)
+
+        if word_timestamps is None:
+            word_timestamps = False
+        if beam_size is None:
+            beam_size = 5
+        if vad_filter is None:
+            vad_filter = True
+        if temperature is None:
+            temperature = 0.0
+        if condition_on_previous_text is None:
+            condition_on_previous_text = True
+        if repetition_penalty is None:
+            repetition_penalty = 1.0
+        if no_repeat_ngram_size is None:
+            no_repeat_ngram_size = 0
 
         # 处理语言代码：'auto' 或空字符串应转换为 None（自动检测）
         if language is None or language == 'auto' or language == '':
@@ -578,18 +610,48 @@ class WhisperService:
 
         return result
 
+    def _resolve_segment_param_overrides(self) -> Dict[str, Any]:
+        """
+        解析复核分段场景的默认覆盖参数。
+
+        当运行参数未显式覆盖时，保持历史默认行为，
+        避免重复 VAD 或无必要的词级时间戳开销。
+        """
+        from app.services.model_runtime_config_service import get_model_runtime_config_service
+        from app.services.model_manager_v2 import get_model_manager_v2
+
+        try:
+            model_id = self.resolve_model_id(self._model_name or DEFAULT_WHISPER_MODEL)
+            manager = get_model_manager_v2()
+            spec = manager.registry.get(model_id)
+            runtime_data = get_model_runtime_config_service().get_effective_runtime_for_model(spec)
+            sources = runtime_data.get("sources", {})
+        except Exception as exc:
+            logger.debug("Whisper Segment 默认参数回退: %s", exc)
+            return {
+                "word_timestamps": False,
+                "vad_filter": False,
+            }
+
+        overrides: Dict[str, Any] = {}
+        if sources.get("word_timestamps") == "default":
+            overrides["word_timestamps"] = False
+        if sources.get("vad_filter") == "default":
+            overrides["vad_filter"] = False
+        return overrides
+
     def transcribe_segment(
         self,
         audio: Union[str, np.ndarray],
         start_time: float,
         end_time: float,
-        language: str = None,
-        initial_prompt: str = None,
-        repetition_penalty: float = 1.0,
-        no_repeat_ngram_size: int = 0
+        language: Optional[str] = None,
+        initial_prompt: Optional[str] = None,
+        repetition_penalty: Optional[float] = None,
+        no_repeat_ngram_size: Optional[int] = None
     ) -> Dict[str, Any]:
         """
-        转录指定时间段的音频（用于补刀场景）
+        转录指定时间段的音频（用于复核场景）
 
         Args:
             audio: 完整音频数组 (16kHz)
@@ -618,34 +680,16 @@ class WhisperService:
             end_sample = int(end_time * sr)
             audio_segment = full_audio[start_sample:end_sample]
 
+        overrides = self._resolve_segment_param_overrides()
+
         return self.transcribe(
             audio=audio_segment,
             language=language,
             initial_prompt=initial_prompt,
-            word_timestamps=False,  # 补刀场景使用伪对齐，不需要词级时间戳
-            beam_size=5,
-            vad_filter=False,  # 已经是切片，不需要 VAD
             repetition_penalty=repetition_penalty,
-            no_repeat_ngram_size=no_repeat_ngram_size
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            **overrides
         )
-
-    def warmup(self):
-        """预热模型（空跑一次确保完全加载到显存）"""
-        if not self.model:
-            logger.warning("模型未加载，无法预热")
-            return
-
-        logger.debug("开始 Faster-Whisper 模型预热")
-
-        # 创建 1 秒静音音频
-        dummy_audio = np.zeros(16000, dtype=np.float32)
-
-        try:
-            segments, _ = self.model.transcribe(dummy_audio)
-            _ = list(segments)  # 触发生成器执行
-            logger.debug("Faster-Whisper 模型预热完成")
-        except Exception as e:
-            logger.warning(f"模型预热失败: {e}")
 
     def estimate_confidence(self, result: Dict[str, Any]) -> float:
         """

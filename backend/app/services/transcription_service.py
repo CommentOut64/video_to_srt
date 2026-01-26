@@ -2,20 +2,18 @@
 转录处理服务
 整合了processor.py和原transcription_service.py的所有功能
 """
-import os, subprocess, uuid, threading, json, math, gc, logging
+import os, threading, json, math, gc, logging, time
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Any, Tuple
 from enum import Enum
-from dataclasses import dataclass, field
+# V3.2.0+dev.20260125.09: 移除未使用的 dataclass, field 导入
 from collections import OrderedDict  # 新增导入
 from pydub import AudioSegment, silence
 from app.services.whisper_service import get_whisper_service, load_audio as whisper_load_audio
-from app.services.config_adapter import ConfigAdapter
 # 从新架构导入 VAD 配置（2025-12-17 统一配置定义）
 from app.services.audio.vad_service import VADConfig, VADMethod, get_vad_service
 from app.services.audio.chunk_engine import ChunkEngine, AudioChunk
 import torch
-import shutil
 import psutil
 import numpy as np
 
@@ -31,300 +29,21 @@ class ProcessingMode(Enum):
     DISK = "disk"      # 硬盘模式（已废弃，仅保留用于向后兼容）
 
 
-class BreakToGlobalSeparation(Exception):
-    """熔断异常：触发时需要升级为全局人声分离模式"""
-    pass
-
-
-@dataclass
-class CircuitBreakerState:
-    """
-    熔断器状态（支持模型升级）
-
-    用于监控转录质量，当大量段落需要重试时：
-    1. 优先尝试升级模型（如果允许且未达上限）
-    2. 无法升级时才触发熔断
-    """
-    consecutive_retries: int = 0        # 连续重试计数
-    total_retries: int = 0              # 总重试次数
-    total_segments: int = 0             # 总段落数
-    processed_segments: int = 0         # 已处理段落数
-
-    # === Phase 3: 升级跟踪 ===
-    escalation_count: int = 0                           # 已升级次数
-    current_model: Optional[str] = None                 # 当前使用的模型
-    escalation_history: List[str] = field(default_factory=list)  # 升级历史
-
-    def record_retry(self):
-        """记录一次重试"""
-        self.consecutive_retries += 1
-        self.total_retries += 1
-
-    def record_success(self):
-        """记录一次成功（重置连续计数）"""
-        self.consecutive_retries = 0
-        self.processed_segments += 1
-
-    def record_escalation(self, new_model: str):
-        """
-        记录一次模型升级
-
-        Args:
-            new_model: 升级后的模型名称
-        """
-        if self.current_model:
-            self.escalation_history.append(f"{self.current_model} -> {new_model}")
-        self.current_model = new_model
-        self.escalation_count += 1
-        # 升级后重置连续重试计数，给新模型机会
-        self.consecutive_retries = 0
-
-    def should_escalate(self, demucs_settings) -> bool:
-        """
-        判断是否应该升级模型（优先于熔断）
-
-        升级条件：
-        1. 允许自动升级 (auto_escalation=True)
-        2. 未达到最大升级次数
-        3. 满足熔断条件（连续重试或比例过高）
-
-        Args:
-            demucs_settings: Demucs配置对象
-
-        Returns:
-            bool: True表示应该升级模型
-        """
-        if not demucs_settings.auto_escalation:
-            return False
-
-        if self.escalation_count >= demucs_settings.max_escalations:
-            return False
-
-        # 满足熔断条件时，优先升级
-        return self._check_break_condition(demucs_settings)
-
-    def should_break(self, demucs_settings) -> bool:
-        """
-        判断是否应该触发熔断
-
-        注意：只有在无法升级时才触发熔断
-
-        Args:
-            demucs_settings: Demucs配置对象
-
-        Returns:
-            bool: True表示应该触发熔断
-        """
-        if not demucs_settings.circuit_breaker_enabled:
-            return False
-
-        # 如果还能升级，不触发熔断
-        if self.should_escalate(demucs_settings):
-            return False
-
-        return self._check_break_condition(demucs_settings)
-
-    def _check_break_condition(self, demucs_settings) -> bool:
-        """
-        检查是否满足熔断/升级条件
-
-        熔断条件（满足任一即触发）：
-        1. 连续 N 个 segment 都触发重试（默认N=3）
-        2. 总重试比例超过阈值（默认20%）
-
-        Args:
-            demucs_settings: Demucs配置对象
-
-        Returns:
-            bool: True表示满足熔断/升级条件
-        """
-        # 条件1：连续重试次数
-        if self.consecutive_retries >= demucs_settings.consecutive_threshold:
-            return True
-
-        # 条件2：总重试比例（至少处理5个segment后才检查）
-        if self.processed_segments >= 5:
-            retry_ratio = self.total_retries / self.processed_segments
-            if retry_ratio >= demucs_settings.ratio_threshold:
-                return True
-
-        return False
-
-    def get_stats(self) -> Dict:
-        """获取统计信息（扩展）"""
-        return {
-            "consecutive_retries": self.consecutive_retries,
-            "total_retries": self.total_retries,
-            "total_segments": self.total_segments,
-            "processed_segments": self.processed_segments,
-            "retry_ratio": self.total_retries / max(1, self.processed_segments),
-            # Phase 3 新增
-            "escalation_count": self.escalation_count,
-            "current_model": self.current_model,
-            "escalation_history": self.escalation_history,
-        }
-
-
-class CircuitBreakAction(Enum):
-    """熔断后的处理动作"""
-    CONTINUE = "continue"           # 继续处理，标记问题段落
-    FALLBACK_ORIGINAL = "fallback"  # 降级使用原始音频
-    FAIL = "fail"                   # 任务失败
-    PAUSE = "pause"                 # 暂停等待人工介入
-
-
-class CircuitBreakHandler:
-    """
-    熔断异常处理器
-
-    负责在熔断触发时执行用户配置的处理策略
-    """
-
-    def __init__(self, job: "JobState", settings):
-        """
-        初始化熔断处理器
-
-        Args:
-            job: 任务状态对象
-            settings: DemucsSettings 配置对象
-        """
-        self.job = job
-        self.settings = settings
-        self.logger = logging.getLogger(__name__)
-        self.problem_segments: List[int] = []  # 记录问题段落索引
-
-    def handle(
-        self,
-        breaker_state: CircuitBreakerState,
-        current_segment_idx: int,
-        sse_manager = None
-    ) -> CircuitBreakAction:
-        """
-        处理熔断异常
-
-        Args:
-            breaker_state: 熔断器状态
-            current_segment_idx: 当前段落索引
-            sse_manager: SSE管理器（用于推送事件）
-
-        Returns:
-            CircuitBreakAction: 处理动作
-        """
-        action_str = self.settings.on_break
-
-        # 解析处理动作
-        try:
-            action = CircuitBreakAction(action_str)
-        except ValueError:
-            # 如果配置值无效，默认使用 CONTINUE
-            self.logger.warning(f"无效的熔断处理策略: {action_str}，使用默认值 continue")
-            action = CircuitBreakAction.CONTINUE
-
-        # 记录问题段落
-        self.problem_segments.append(current_segment_idx)
-
-        # 推送 SSE 事件
-        if sse_manager:
-            self._push_circuit_break_event(breaker_state, action, sse_manager)
-
-        # 根据策略执行操作
-        if action == CircuitBreakAction.FAIL:
-            self.logger.error(
-                f"熔断触发，任务终止。问题段落: {self.problem_segments}"
-            )
-            raise BreakToGlobalSeparation(
-                f"熔断触发，任务终止。问题段落: {self.problem_segments}"
-            )
-
-        elif action == CircuitBreakAction.PAUSE:
-            self.logger.warning(
-                f"熔断触发，等待人工介入。问题段落: {self.problem_segments}"
-            )
-            self.job.paused = True
-            self.job.status = "paused"
-            self.job.message = f"熔断触发，等待人工介入。问题段落: {self.problem_segments}"
-            raise BreakToGlobalSeparation(self.job.message)
-
-        else:  # CONTINUE 或 FALLBACK_ORIGINAL
-            self.logger.warning(
-                f"熔断触发，采用 {action.value} 策略继续处理。"
-                f"问题段落: {self.problem_segments}"
-            )
-
-        return action
-
-    def get_problem_report(self) -> Dict:
-        """
-        获取问题报告
-
-        Returns:
-            包含问题统计和建议的字典
-        """
-        return {
-            "total_problem_segments": len(self.problem_segments),
-            "problem_indices": self.problem_segments,
-            "suggestion": self._get_suggestion()
-        }
-
-    def _get_suggestion(self) -> str:
-        """
-        根据问题段落数量给出建议
-
-        Returns:
-            建议文本
-        """
-        count = len(self.problem_segments)
-        if count == 0:
-            return "所有段落处理正常"
-        elif count <= 3:
-            return "少量段落可能需要手动调整时间轴"
-        elif count <= 10:
-            return "建议检查这些段落的字幕准确性"
-        else:
-            return "大量段落有问题，建议使用更高质量的模型重新处理"
-
-    def _push_circuit_break_event(
-        self,
-        state: CircuitBreakerState,
-        action: CircuitBreakAction,
-        sse_manager
-    ):
-        """
-        推送熔断处理事件
-
-        Args:
-            state: 熔断器状态
-            action: 处理动作
-            sse_manager: SSE管理器
-        """
-        try:
-            sse_manager.push_event(
-                self.job.job_id,
-                "circuit_breaker_handled",
-                {
-                    "action": action.value,
-                    "problem_segments": self.problem_segments,
-                    "stats": state.get_stats(),
-                    "suggestion": self._get_suggestion()
-                }
-            )
-        except Exception as e:
-            self.logger.debug(f"SSE推送失败（非致命）: {e}")
+# V3.2.0+dev.20260125.09: CircuitBreaker 相关类已归档到 archive/legacy/transcription/
+# 新架构使用 FuseBreakerV2（backend/app/services/fuse_breaker.py）
 
 
 from app.models.job_models import JobSettings, JobState
 from app.models.hardware_models import HardwareInfo, OptimizationConfig
-from app.services.hardware_service import get_hardware_detector, get_hardware_optimizer
-from app.services.cpu_affinity_service import CPUAffinityManager, CPUAffinityConfig
-from app.services.job_index_service import get_job_index_service
+from app.services.hardware_profile_service import get_hardware_profile_provider
+from app.services.job_lifecycle_service import get_job_lifecycle_service
 from app.core.config import config  # 导入统一配置
-
-# 全局模型缓存 (按 (model, compute_type, device) 键)
-_model_cache: Dict[Tuple[str, str, str], object] = {}
-
-
-_model_lock = threading.Lock()
-
+# V3.2.0+dev.20260125.11: 导入 SubtitleOutputService 用于 SRT 生成
+from app.services.subtitle_output_service import get_subtitle_output_service
+# V3.2.0+dev.20260125.11: 引入 SSEPublisher 进行统一事件推送
+from app.services.sse_publisher import get_sse_publisher
+# V3.2.0+dev.20260125.11: 引入参数构建服务
+from app.services.transcribe_param_builder import get_transcribe_param_builder
 
 class TranscriptionService:
     """
@@ -342,39 +61,23 @@ class TranscriptionService:
         self.jobs_root = Path(jobs_root)
         self.jobs_root.mkdir(parents=True, exist_ok=True)
 
-        self.jobs: Dict[str, JobState] = {}
-        self.lock = threading.Lock()
         self.logger = logging.getLogger(__name__)
 
-        # 集成CPU亲和性管理器
-        self.cpu_manager = CPUAffinityManager()
-
-        # 集成硬件检测
-        self.hardware_detector = get_hardware_detector()
-        self.hardware_optimizer = get_hardware_optimizer()
+        # 集成硬件能力提供者
+        self.hardware_profile_provider = get_hardware_profile_provider()
         self._hardware_info: Optional[HardwareInfo] = None
         self._optimization_config: Optional[OptimizationConfig] = None
 
-        # 集成任务索引服务
-        self.job_index = get_job_index_service(jobs_root)
-        # 启动时清理无效映射
-        self.job_index.cleanup_invalid_mappings()
+        # 集成任务生命周期服务（创建/恢复/持久化）
+        self.job_lifecycle = get_job_lifecycle_service(self.jobs_root, logger=self.logger)
 
         # 集成SSE管理器（用于实时进度推送）
         from app.services.sse_service import get_sse_manager
         self.sse_manager = get_sse_manager()
         self.logger.info("SSE管理器已集成")
 
-        # 初始化新架构 Pipeline（2025-12-17 架构改造）
-        from app.pipelines.audio_processing_pipeline import AudioProcessingPipeline
-        from app.pipelines.async_dual_pipeline import AsyncDualPipeline
-
-        self.audio_pipeline = None  # 延迟初始化，等硬件检测完成
-        self.transcription_pipeline = None  # 延迟初始化，等硬件检测完成
-        self.logger.info("Pipeline 架构已准备")
-
         # 记录CPU信息
-        sys_info = self.cpu_manager.get_system_info()
+        sys_info = self.hardware_profile_provider.get_cpu_system_info()
         if sys_info.get('supported', False):
             self.logger.info(
                 f" CPU信息: {sys_info['logical_cores']}个逻辑核心, "
@@ -387,63 +90,68 @@ class TranscriptionService:
         # 执行硬件检测
         self._detect_hardware()
 
-        # 启动时扫描并加载所有任务（修复重启后无法打开旧任务的问题）
-        self._load_all_jobs_from_disk()
+        # 任务加载已由 JobLifecycleService 负责
+
+    def _get_sse_publisher(self, job: JobState):
+        """获取 SSE 发布器（集中管理 SSE 推送）"""
+        try:
+            if self.sse_manager is None:
+                from app.services.sse_service import get_sse_manager
+                self.sse_manager = get_sse_manager()
+            return get_sse_publisher(job.job_id, self.sse_manager, job=job)
+        except Exception as e:
+            self.logger.debug(f"SSEPublisher 获取失败: {e}")
+            return None
 
     def _detect_hardware(self):
         """执行硬件检测并生成优化配置"""
         try:
             self.logger.info("开始硬件检测...")
-            self._hardware_info = self.hardware_detector.detect()
-            self._optimization_config = self.hardware_optimizer.get_optimization_config(self._hardware_info)
+            self._hardware_info = self.hardware_profile_provider.get_hardware_info(is_force_refresh=True)
+            self._optimization_config = self.hardware_profile_provider.get_optimization_config(self._hardware_info)
 
             # 记录检测结果
             hw = self._hardware_info
             opt = self._optimization_config
             self.logger.info(f"硬件检测完成GPU: {'' if hw.cuda_available else ''}, "
-                           f"CPU: {hw.cpu_cores}核/{hw.cpu_threads}线程, "
-                           f"内存: {hw.memory_total_mb}MB, "
-                           f"优化配置: batch={opt.batch_size}, device={opt.recommended_device}")
+                             f"CPU: {hw.cpu_cores}核/{hw.cpu_threads}线程, "
+                             f"内存: {hw.memory_total_mb}MB, "
+                             f"优化配置: batch={opt.batch_size}, device={opt.recommended_device}")
 
-            # 硬件检测完成后，初始化 Pipeline
-            self._initialize_pipelines()
         except Exception as e:
             self.logger.error(f"硬件检测失败: {e}")
 
-    def _initialize_pipelines(self):
+    def _build_asr_engines(
+        self,
+        job: "JobState",
+        transcription_profile: str
+    ) -> Tuple[Optional["ASREngine"], Optional["ASREngine"]]:
         """
-        初始化新架构 Pipeline（2025-12-17 架构改造）
+        根据任务配置构建 ASR 引擎实例（用于流水线注入）。
 
-        职责：组装 - 根据硬件配置初始化 AudioProcessingPipeline 和 AsyncDualPipeline
+        Args:
+            job: 任务状态对象
+            transcription_profile: 转录模式
 
-        注意：PreprocessingPipeline 不在这里初始化，因为它需要动态配置（每个任务可能不同）
+        Returns:
+            Tuple[Optional[ASREngine], Optional[ASREngine]]:
+                (draft_engine, patch_engine)
         """
-        try:
-            from app.pipelines.audio_processing_pipeline import (
-                AudioProcessingPipeline,
-                AudioProcessingConfig
-            )
-            from app.pipelines.async_dual_pipeline import AsyncDualPipeline
+        from app.core.asr.engine import ASREngine
+        from app.core.asr.engine_resolver import EngineResolver
 
-            # 初始化音频处理流水线（旧架构，保持向后兼容）
-            audio_config = AudioProcessingConfig(
-                vad_config=VADConfig(),  # 使用默认 VAD 配置
-                enable_demucs=True,
-                auto_strategy=True
-            )
-            self.audio_pipeline = AudioProcessingPipeline(
-                logger=self.logger
-            )
-
-            # V3.5: 转录流水线在每次任务执行时动态创建（根据 transcription_profile 配置）
-            # 不再在这里初始化 self.transcription_pipeline
-            self.transcription_pipeline = None
-
-            self.logger.info("Pipeline 初始化完成")
-        except Exception as e:
-            self.logger.error(f"Pipeline 初始化失败: {e}")
-            self.audio_pipeline = None
-            self.transcription_pipeline = None
+        resolver = EngineResolver(
+            hardware_profile_provider=self.hardware_profile_provider,
+            logger=self.logger,
+        )
+        draft_engine: Optional[ASREngine]
+        patch_engine: Optional[ASREngine]
+        draft_engine, patch_engine = resolver.resolve_profile_engines(
+            transcription_profile,
+            job=job,
+            optimization_config=self._optimization_config,
+        )
+        return draft_engine, patch_engine
 
     async def _run_pipeline_v2(self, job: JobState):
         """
@@ -456,16 +164,13 @@ class TranscriptionService:
         注意：此方法是简化版，暂不支持断点续传、任务状态管理等复杂功能
         这些功能将在后续阶段逐步集成
 
-        支持两种预处理模式：
-        - 新架构：PreprocessingPipeline（Stage模式，支持频谱分诊、按需分离、熔断回溯）
-        - 旧架构：AudioProcessingPipeline（整轨分离）
+        使用新架构 PreprocessingPipeline + AsyncDualPipeline
 
         Args:
             job: 任务状态对象
         """
         try:
             from app.pipelines.async_dual_pipeline import AsyncDualPipeline
-            from app.services.config_adapter import ConfigAdapter
 
             job_dir = Path(job.dir)
             input_path = job_dir / job.filename
@@ -475,26 +180,9 @@ class TranscriptionService:
             # ==========================================
             self._update_progress(job, 'audio_processing', 0, '音频处理中...')
 
-            # 判断使用哪种预处理架构
-            use_new_preprocessing = self._should_use_new_preprocessing(job.settings)
-
-            if use_new_preprocessing:
-                # 使用新架构：PreprocessingPipeline（Stage模式）
-                self.logger.info("使用新架构预处理流水线（Stage模式）")
-                chunks = await self._run_new_preprocessing(job, input_path)
-            else:
-                # 使用旧架构：AudioProcessingPipeline（整轨分离）
-                self.logger.info("使用旧架构预处理流水线（整轨分离）")
-                if not self.audio_pipeline:
-                    raise RuntimeError("旧架构 Pipeline 未初始化")
-
-                audio_result = await self.audio_pipeline.process(
-                    video_path=str(input_path),
-                    progress_callback=lambda p: self._update_progress(
-                        job, 'audio_processing', p, f'音频处理中 {int(p*100)}%'
-                    )
-                )
-                chunks = audio_result.chunks
+            # 使用新架构：PreprocessingPipeline（Stage模式）
+            self.logger.info("使用新架构预处理流水线（Stage模式）")
+            chunks = await self._run_new_preprocessing(job, input_path)
 
             job.total = len(chunks)
             self.logger.info(f"音频处理完成: {len(chunks)} 个 Chunk")
@@ -506,18 +194,45 @@ class TranscriptionService:
             self._update_progress(job, 'transcription', 0, '转录中...')
 
             # 获取转录模式配置
-            transcription_profile = ConfigAdapter.get_transcription_profile(job.settings)
+            transcription = getattr(job.settings, "transcription", None)
+            transcription_profile = (
+                transcription.transcription_profile
+                if transcription else "sensevoice_only"
+            )
             self.logger.info(f"转录模式: {transcription_profile}")
 
+            draft_engine, patch_engine = self._build_asr_engines(job, transcription_profile)
+            draft_name = draft_engine.get_engine_name() if draft_engine else "none"
+            patch_name = patch_engine.get_engine_name() if patch_engine else "none"
+            self.logger.info(
+                "新 ASR 引擎已启用: draft=%s, patch=%s, profile=%s",
+                draft_name,
+                patch_name,
+                transcription_profile,
+            )
+
+            from app.core.thresholds import ThresholdConfig
+            patching_threshold_value = getattr(
+                transcription,
+                "patching_threshold",
+                0.60,
+            )
+            patching_threshold = ThresholdConfig(
+                whisper_patch_trigger_confidence=patching_threshold_value
+            )
+
             # 动态创建转录流水线
-            self.transcription_pipeline = AsyncDualPipeline(
+            transcription_pipeline = AsyncDualPipeline(
                 job_id=job.job_id,
                 transcription_profile=transcription_profile,
+                draft_engine=draft_engine,
+                patch_engine=patch_engine,
+                patching_threshold=patching_threshold,
                 logger=self.logger
             )
 
             # 调用转录流水线
-            results = await self.transcription_pipeline.run(
+            results = await transcription_pipeline.run(
                 audio_chunks=chunks
             )
 
@@ -537,11 +252,14 @@ class TranscriptionService:
 
             # ==========================================
             # 阶段 3: 生成 SRT 文件（收尾）
+            # V3.2.0+dev.20260125.11: 使用 SubtitleOutputService 替代内部方法
             # ==========================================
             self._update_progress(job, 'finalize', 0, '生成字幕文件...')
 
             srt_path = job_dir / f"{Path(job.filename).stem}.srt"
-            self._generate_srt_from_sentences(final_sentences, srt_path)
+            subtitle_output = get_subtitle_output_service()
+            segments = subtitle_output.build_segments(final_sentences)
+            subtitle_output.write_srt(segments, srt_path)
 
             job.srt_path = str(srt_path)
             job.status = 'completed'
@@ -557,98 +275,7 @@ class TranscriptionService:
             job.message = f'失败: {str(e)}'
             raise
 
-    def _generate_srt_from_sentences(self, sentences: List, output_path: Path):
-        """
-        从句子列表生成 SRT 文件
-        V3.1.1+dev.20260106.03: 生成前自动修复时间戳重叠
-
-        Args:
-            sentences: 句子列表
-            output_path: 输出路径
-        """
-        # V3.1.1+dev.20260106.03: 转换为字典列表以便修复重叠
-        from app.utils.text_utils import repair_timestamp_overlaps, detect_timestamp_overlaps
-
-        segments = []
-        for sentence in sentences:
-            segments.append({
-                'start': sentence.start,
-                'end': sentence.end,
-                'text': sentence.text
-            })
-
-        # 检测并修复重叠
-        overlaps = detect_timestamp_overlaps(segments)
-        if overlaps:
-            self.logger.warning(f"检测到 {len(overlaps)} 处时间戳重叠，自动修复中...")
-            segments = repair_timestamp_overlaps(segments, gap_ms=1.0)
-            self.logger.info(f"已修复 {len(overlaps)} 处时间戳重叠")
-
-        # 生成 SRT 内容
-        srt_content = []
-        for i, seg in enumerate(segments, 1):
-            start = self._format_srt_timestamp(seg['start'])
-            end = self._format_srt_timestamp(seg['end'])
-            text = seg['text']
-
-            srt_content.append(f"{i}\n{start} --> {end}\n{text}\n")
-
-        output_path.write_text('\n'.join(srt_content), encoding='utf-8')
-        self.logger.info(f"SRT 文件已生成: {output_path}")
-
-    def _format_srt_timestamp(self, seconds: float) -> str:
-        """
-        格式化 SRT 时间戳
-
-        Args:
-            seconds: 秒数
-
-        Returns:
-            SRT 格式时间戳 (HH:MM:SS,mmm)
-        """
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        secs = int(seconds % 60)
-        millis = int((seconds % 1) * 1000)
-
-        return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
-
-    def _should_use_new_preprocessing(self, settings: JobSettings) -> bool:
-        """
-        判断是否使用新架构预处理流水线
-
-        判断逻辑：
-        - 如果启用了频谱分诊（enable_spectral_triage=True）
-        - 或者启用了熔断回溯（enable_fuse_breaker=True）
-        - 或者使用按需分离模式（separation_mode='on_demand'）
-        则使用新架构
-
-        Args:
-            settings: 任务设置
-
-        Returns:
-            bool: True表示使用新架构，False表示使用旧架构
-        """
-        preprocessing = settings.preprocessing
-
-        # 调试日志：输出配置值
-        self.logger.info(
-            f"预处理配置检查: "
-            f"enable_spectral_triage={preprocessing.enable_spectral_triage}, "
-            f"enable_fuse_breaker={preprocessing.enable_fuse_breaker}, "
-            f"separation_mode={preprocessing.separation_mode}"
-        )
-
-        # 检查是否启用了新功能
-        use_new = (
-            preprocessing.enable_spectral_triage or
-            preprocessing.enable_fuse_breaker or
-            preprocessing.separation_mode == 'on_demand'
-        )
-
-        self.logger.info(f"使用{'新' if use_new else '旧'}架构预处理流水线")
-
-        return use_new
+    # V3.2.0+dev.20260125.11: SRT 输出已迁移至 SubtitleOutputService
 
     async def _run_new_preprocessing(self, job: JobState, input_path: Path) -> List:
         """
@@ -663,7 +290,7 @@ class TranscriptionService:
         """
         from app.pipelines.preprocessing_pipeline import PreprocessingPipeline
         from app.services.audio.chunk_engine import ChunkEngine
-        from app.services.audio.vad_service import VADConfig
+        from app.services.runtime_param_resolver import build_vad_config_for_profile
 
         # V3.9: 根据引擎类型选择 VAD 配置
         # 英语使用 Whisper，需要合并 VAD（避免幻觉）
@@ -671,33 +298,18 @@ class TranscriptionService:
         language = getattr(job.settings, 'language', 'auto')
         is_english = language in {'en', 'english'}
 
-        if is_english:
-            # Whisper 模式：合并 VAD，避免幻觉
-            vad_config = VADConfig(
-                merge_max_gap=1.0,
-                merge_max_duration=12.0,
-                smart_target_duration=12.0
-            )
-            self.logger.info("使用 Whisper VAD 配置（合并模式）")
-        else:
-            # SenseVoice 模式：保留停顿信息
-            vad_config = VADConfig(
-                merge_max_gap=0.3,           # 只合并极短停顿
-                merge_max_duration=8.0,      # 更短的 chunk
-                smart_target_duration=8.0    # 软上限降低
-            )
-            self.logger.info("使用 SenseVoice VAD 配置（保留停顿）")
+        profile = "whisper" if is_english else "sensevoice"
+        vad_config = build_vad_config_for_profile(profile)
+        self.logger.info("使用 %s VAD 配置", "Whisper" if is_english else "SenseVoice")
 
         # 创建自定义 ChunkEngine
-        chunk_engine = ChunkEngine(
-            vad_config=vad_config,
-            logger=self.logger
-        )
+        chunk_engine = ChunkEngine(logger=self.logger)
 
         # 创建 PreprocessingPipeline 实例
         preprocessing_pipeline = PreprocessingPipeline(
             config=job.settings.preprocessing,
             chunk_engine=chunk_engine,
+            vad_config=vad_config,
             logger=self.logger
         )
 
@@ -728,26 +340,7 @@ class TranscriptionService:
         这个方法会扫描 jobs 目录中的所有任务，并加载到内存中，
         避免重启后因为内存为空导致无法访问旧任务
         """
-        try:
-            loaded_count = 0
-            for job_dir in self.jobs_root.iterdir():
-                if not job_dir.is_dir():
-                    continue
-
-                job_id = job_dir.name
-                if job_id in self.jobs:
-                    # 已加载，跳过
-                    continue
-
-                # 尝试加载任务
-                job = self.get_job(job_id)
-                if job:
-                    loaded_count += 1
-
-            if loaded_count > 0:
-                self.logger.info(f"启动时已加载 {loaded_count} 个历史任务到内存")
-        except Exception as e:
-            self.logger.error(f"加载历史任务失败: {e}")
+        self.job_lifecycle.load_all_jobs_from_disk()
     
     def get_hardware_info(self) -> Optional[HardwareInfo]:
         """获取硬件信息"""
@@ -759,19 +352,16 @@ class TranscriptionService:
     
     def get_optimized_job_settings(self, base_settings: Optional[JobSettings] = None) -> JobSettings:
         """获取基于硬件优化的任务设置"""
-        # 使用硬件优化配置作为默认值
-        if self._optimization_config:
-            optimized = JobSettings(
-                model=base_settings.model if base_settings else "medium",
-                compute_type=base_settings.compute_type if base_settings else "auto",
-                device=self._optimization_config.recommended_device,
-                batch_size=self._optimization_config.batch_size,
-                word_timestamps=base_settings.word_timestamps if base_settings else False
-            )
-            return optimized
-        
-        # 如果没有硬件信息，使用传入的设置或默认设置
-        return base_settings or JobSettings()
+        settings = base_settings or JobSettings()
+
+        # 基于硬件推荐优化 SenseVoice 设备选择
+        if (
+            self._optimization_config
+            and settings.transcription.sensevoice_device == "auto"
+        ):
+            settings.transcription.sensevoice_device = self._optimization_config.recommended_device
+
+        return settings
 
     def create_job(
         self,
@@ -792,86 +382,16 @@ class TranscriptionService:
         Returns:
             JobState: 创建的任务状态对象
         """
-        job_id = job_id or uuid.uuid4().hex
-        job_dir = self.jobs_root / job_id
-        job_dir.mkdir(parents=True, exist_ok=True)
-
-        dest_path = job_dir / filename
-
-        # V3.1.1+dev.20260106.01: 使用硬链接替代复制，节省磁盘空间
-        # 硬链接让 input/video.mp4 和 jobs/{job_id}/video.mp4 指向同一数据块
-        # 支持多个任务指向同一个视频文件，删除任务时不影响原始文件
-        if os.path.abspath(src_path) != os.path.abspath(dest_path):
-            try:
-                # 优先使用硬链接
-                os.link(src_path, dest_path)
-                self.logger.debug(f"硬链接创建成功: {src_path} -> {dest_path}")
-            except (OSError, NotImplementedError) as e:
-                # 硬链接失败时降级到复制（跨文件系统、网络挂载等场景）
-                self.logger.warning(f"硬链接创建失败，回退到复制: {e}")
-                try:
-                    shutil.copyfile(src_path, dest_path)
-                    self.logger.debug(f"文件已复制: {src_path} -> {dest_path}")
-                except Exception as copy_err:
-                    self.logger.warning(f"文件复制失败: {copy_err}")
-
-        # 创建任务状态对象
-        job = JobState(
-            job_id=job_id,
+        return self.job_lifecycle.create_job(
             filename=filename,
-            dir=str(job_dir),
-            input_path=src_path,
+            src_path=src_path,
             settings=settings,
-            status="uploaded",
-            phase="pending",
-            message="文件已上传"
+            job_id=job_id
         )
-
-        with self.lock:
-            self.jobs[job_id] = job
-
-        # 添加文件路径到任务ID的映射
-        self.job_index.add_mapping(src_path, job_id)
-
-        # 持久化任务元信息（重启后可恢复）
-        self.save_job_meta(job)
-
-        # 立即异步提取音频，确保前端能加载波形图（不阻塞响应）
-        audio_path = job_dir / 'audio.wav'
-        if not audio_path.exists():
-            self.logger.info(f"[{job_id}] 启动后台音频提取...")
-            import threading
-
-            def extract_audio_for_waveform():
-                """后台提取音频供波形图使用"""
-                try:
-                    import warnings
-                    import librosa
-                    import soundfile as sf
-                    # 抑制 librosa 的 PySoundFile/audioread 警告
-                    with warnings.catch_warnings():
-                        warnings.filterwarnings("ignore", message="PySoundFile failed")
-                        warnings.filterwarnings("ignore", message="audioread")
-                        audio_array, sr = librosa.load(str(dest_path), sr=16000, mono=True)
-                    sf.write(str(audio_path), audio_array, sr)
-                    self.logger.info(f"[{job_id}] 音频提取完成: {audio_path}")
-                except Exception as e:
-                    self.logger.error(f"[{job_id}] 音频提取失败: {e}")
-
-            threading.Thread(
-                target=extract_audio_for_waveform,
-                daemon=True,
-                name=f"AudioExtract-{job_id[:8]}"
-            ).start()
-        else:
-            self.logger.debug(f"[{job_id}] 音频文件已存在，跳过提取")
-
-        self.logger.info(f"任务已创建: {job_id} - {filename}")
-        return job
 
     def save_job_meta(self, job: JobState) -> bool:
         """
-        保存任务元信息到 job_meta.json（用于重启后恢复）
+        保存任务元信息到状态仓库（用于重启后恢复）
 
         使用原子写入确保断电安全：先写临时文件，再rename替换
 
@@ -881,28 +401,11 @@ class TranscriptionService:
         Returns:
             bool: 是否成功保存
         """
-        job_dir = Path(job.dir)
-        meta_file = job_dir / "job_meta.json"
-
-        try:
-            job_dir.mkdir(parents=True, exist_ok=True)
-
-            # 原子写入：先写临时文件，再rename替换
-            temp_file = meta_file.with_suffix(".tmp")
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                json.dump(job.to_meta_dict(), f, indent=2, ensure_ascii=False)
-
-            # 原子替换
-            temp_file.replace(meta_file)
-            self.logger.debug(f"任务元信息已保存: {job.job_id}")
-            return True
-        except Exception as e:
-            self.logger.error(f"保存任务元信息失败 {job.job_id}: {e}")
-            return False
+        return self.job_lifecycle.save_job_meta(job)
 
     def load_job_meta(self, job_id: str) -> Optional[JobState]:
         """
-        从 job_meta.json 加载任务元信息
+        从状态仓库加载任务元信息
 
         Args:
             job_id: 任务ID
@@ -910,26 +413,7 @@ class TranscriptionService:
         Returns:
             Optional[JobState]: 恢复的任务状态对象
         """
-        job_dir = self.jobs_root / job_id
-        meta_file = job_dir / "job_meta.json"
-
-        if not meta_file.exists():
-            return None
-
-        try:
-            with open(meta_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-
-            job = JobState.from_meta_dict(data)
-
-            # 确保 dir 路径正确（可能因为项目迁移而改变）
-            job.dir = str(job_dir)
-
-            self.logger.debug(f"从 job_meta.json 加载任务: {job_id}")
-            return job
-        except Exception as e:
-            self.logger.error(f"加载任务元信息失败 {job_id}: {e}")
-            return None
+        return self.job_lifecycle.load_job_meta(job_id)
 
     def get_job(self, job_id: str) -> Optional[JobState]:
         """
@@ -941,87 +425,7 @@ class TranscriptionService:
         Returns:
             Optional[JobState]: 任务状态对象，不存在则返回None
         """
-        with self.lock:
-            # 首先从内存中查找
-            if job_id in self.jobs:
-                return self.jobs[job_id]
-
-        # 如果内存中没有，尝试从 jobs 目录读取（修复重启后无法打开旧任务的问题）
-        job_dir = self.jobs_root / job_id
-        if not job_dir.exists():
-            return None
-
-        try:
-            # 优先从 job_meta.json 加载（包含完整的任务状态）
-            job = self.load_job_meta(job_id)
-            if job:
-                # 缓存到内存
-                with self.lock:
-                    self.jobs[job_id] = job
-                self.logger.info(f"从 job_meta.json 恢复任务: {job_id}")
-                return job
-
-            # 降级：从目录文件推断状态（兼容旧版本）
-            # 尝试找到原始文件
-            filename = "未知文件"
-            input_path = None
-
-            # 从目录中查找视频/音频文件
-            for ext in ['.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv', '.mp3', '.wav', '.m4a']:
-                matches = list(job_dir.glob(f"*{ext}"))
-                if matches:
-                    filename = matches[0].name
-                    input_path = str(matches[0])
-                    break
-
-            # 检查是否有 SRT 文件（表示已完成）
-            srt_files = list(job_dir.glob("*.srt"))
-            is_finished = len(srt_files) > 0
-
-            # 创建 JobState 对象
-            job = JobState(
-                job_id=job_id,
-                filename=filename,
-                dir=str(job_dir),
-                input_path=input_path,
-                status='finished' if is_finished else 'processing',
-                phase='editing' if is_finished else 'transcribing',
-                progress=100 if is_finished else 0,
-                message='已完成' if is_finished else '处理中',
-                srt_path=str(srt_files[0]) if srt_files else None
-            )
-
-            # 尝试从 checkpoint 获取更详细的信息
-            checkpoint_path = job_dir / "checkpoint.json"
-            if checkpoint_path.exists():
-                try:
-                    with open(checkpoint_path, 'r', encoding='utf-8') as f:
-                        checkpoint_data = json.load(f)
-                        total_segments = checkpoint_data.get('total_segments', 0)
-                        processed_indices = checkpoint_data.get('processed_indices', [])
-                        if total_segments > 0:
-                            job.progress = min((len(processed_indices) / total_segments) * 100, 100)
-                        job.phase = checkpoint_data.get('phase', 'transcribing')
-                        job.language = checkpoint_data.get('language')
-                        # 从checkpoint恢复segments
-                        if 'unaligned_results' in checkpoint_data:
-                            job.segments = checkpoint_data['unaligned_results']
-                except Exception as e:
-                    self.logger.warning(f"读取checkpoint失败 {checkpoint_path}: {e}")
-
-            # 缓存到内存
-            with self.lock:
-                self.jobs[job_id] = job
-
-            # 同时保存 job_meta.json 以便下次直接加载
-            self.save_job_meta(job)
-
-            self.logger.info(f"从磁盘恢复任务（旧版兼容）: {job_id}")
-            return job
-
-        except Exception as e:
-            self.logger.error(f"从磁盘读取任务失败 {job_id}: {e}")
-            return None
+        return self.job_lifecycle.get_job(job_id)
 
     def scan_incomplete_jobs(self) -> List[Dict]:
         """
@@ -1030,59 +434,7 @@ class TranscriptionService:
         Returns:
             List[Dict]: 未完成任务列表
         """
-        incomplete_jobs = []
-
-        try:
-            # 遍历所有任务目录
-            for job_dir in self.jobs_root.iterdir():
-                if not job_dir.is_dir():
-                    continue
-
-                checkpoint_path = job_dir / "checkpoint.json"
-                if not checkpoint_path.exists():
-                    continue
-
-                try:
-                    # 加载检查点数据
-                    with open(checkpoint_path, 'r', encoding='utf-8') as f:
-                        checkpoint_data = json.load(f)
-
-                    job_id = checkpoint_data.get('job_id') or job_dir.name
-                    total_segments = checkpoint_data.get('total_segments', 0)
-                    processed_indices = checkpoint_data.get('processed_indices', [])
-                    processed_count = len(processed_indices)
-
-                    # 计算进度
-                    if total_segments > 0:
-                        progress = (processed_count / total_segments) * 100
-                    else:
-                        progress = 0
-
-                    # 从索引中查找文件名
-                    file_path = self.job_index.get_file_path(job_id)
-                    filename = os.path.basename(file_path) if file_path else "未知文件"
-
-                    incomplete_jobs.append({
-                        'job_id': job_id,
-                        'filename': filename,
-                        'file_path': file_path,  # 添加文件路径
-                        'progress': round(progress, 2),
-                        'processed_segments': processed_count,
-                        'total_segments': total_segments,
-                        'phase': checkpoint_data.get('phase', 'unknown'),
-                        'dir': str(job_dir)
-                    })
-
-                except Exception as e:
-                    self.logger.warning(f"读取检查点失败 {checkpoint_path}: {e}")
-                    continue
-
-            self.logger.info(f"扫描到 {len(incomplete_jobs)} 个未完成任务")
-            return incomplete_jobs
-
-        except Exception as e:
-            self.logger.error(f"扫描未完成任务失败: {e}")
-            return []
+        return self.job_lifecycle.scan_incomplete_jobs()
 
     def restore_job_from_checkpoint(self, job_id: str) -> Optional[JobState]:
         """
@@ -1094,81 +446,7 @@ class TranscriptionService:
         Returns:
             Optional[JobState]: 恢复的任务状态对象
         """
-        job_dir = self.jobs_root / job_id
-        if not job_dir.exists():
-            return None
-
-        # 尝试加载 checkpoint（可能不存在）
-        checkpoint = self._load_checkpoint(job_dir)
-
-        try:
-            # 查找原文件
-            filename = "unknown"
-            input_path = None
-
-            # 从目录中查找视频/音频文件
-            for ext in ['.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv', '.mp3', '.wav', '.m4a']:
-                matches = list(job_dir.glob(f"*{ext}"))
-                if matches:
-                    filename = matches[0].name
-                    input_path = str(matches[0])
-                    break
-
-            if not input_path:
-                self.logger.warning(f"无法找到任务 {job_id} 的输入文件")
-                return None
-
-            # 创建默认的CPU亲和性配置
-            from app.services.cpu_affinity_service import CPUAffinityConfig
-            default_cpu_config = CPUAffinityConfig(
-                enabled=True,
-                strategy="auto",
-                custom_cores=None,
-                exclude_cores=None
-            )
-
-            # 根据是否有 checkpoint 决定恢复状态
-            if checkpoint:
-                # 有 checkpoint，从断点恢复
-                phase = checkpoint.get('phase', 'pending')
-                total_segments = checkpoint.get('total_segments', 0)
-                processed_indices = checkpoint.get('processed_indices', [])
-                processed = len(processed_indices)
-                progress = round((processed / max(1, total_segments)) * 100, 2)
-                message = f"已暂停 ({processed}/{total_segments}段)"
-                self.logger.info(f"从检查点恢复任务: {job_id}")
-            else:
-                # 无 checkpoint，从头开始
-                phase = 'pending'
-                total_segments = 0
-                processed = 0
-                progress = 0
-                message = "程序重启，任务将从头开始"
-                self.logger.info(f"无检查点，任务将从头开始: {job_id}")
-
-            # 创建任务状态对象
-            job = JobState(
-                job_id=job_id,
-                filename=filename,
-                dir=str(job_dir),
-                input_path=input_path,
-                settings=JobSettings(cpu_affinity=default_cpu_config),
-                status="paused",
-                phase=phase,
-                message=message,
-                total=total_segments,
-                processed=processed,
-                progress=progress
-            )
-
-            with self.lock:
-                self.jobs[job_id] = job
-
-            return job
-
-        except Exception as e:
-            self.logger.error(f"从检查点恢复任务失败: {e}")
-            return None
+        return self.job_lifecycle.restore_job_from_checkpoint(job_id)
 
     def check_file_checkpoint(self, file_path: str) -> Optional[Dict]:
         """
@@ -1180,40 +458,7 @@ class TranscriptionService:
         Returns:
             Optional[Dict]: 断点信息，无断点则返回None
         """
-        # 从索引中查找任务ID
-        job_id = self.job_index.get_job_id(file_path)
-        if not job_id:
-            return None
-
-        # 检查任务目录和checkpoint是否存在
-        job_dir = self.jobs_root / job_id
-        if not job_dir.exists():
-            # 清理无效映射
-            self.job_index.remove_mapping(file_path)
-            return None
-
-        checkpoint = self._load_checkpoint(job_dir)
-        if not checkpoint:
-            return None
-
-        # 返回断点信息
-        total_segments = checkpoint.get('total_segments', 0)
-        processed_indices = checkpoint.get('processed_indices', [])
-        processed_count = len(processed_indices)
-
-        if total_segments > 0:
-            progress = (processed_count / total_segments) * 100
-        else:
-            progress = 0
-
-        return {
-            'job_id': job_id,
-            'progress': round(progress, 2),
-            'processed_segments': processed_count,
-            'total_segments': total_segments,
-            'phase': checkpoint.get('phase', 'unknown'),
-            'can_resume': True
-        }
+        return self.job_lifecycle.check_file_checkpoint(file_path)
 
     def start_job(self, job_id: str):
         """
@@ -1224,23 +469,7 @@ class TranscriptionService:
         Args:
             job_id: 任务ID
         """
-        # 关键改动: 不再自动创建线程，由队列服务统一管理
-        # 新逻辑: 只更新状态，实际执行由队列服务控制
-        job = self.get_job(job_id)
-        if not job:
-            self.logger.warning(f"任务未找到: {job_id}")
-            return
-
-        if job.status not in ("uploaded", "failed", "paused", "created"):
-            self.logger.warning(f"任务无法启动: {job_id}, 状态: {job.status}")
-            return
-
-        job.canceled = False
-        job.paused = False
-        job.error = None
-        # 状态由队列服务设置，这里不改
-
-        self.logger.warning(f"start_job已废弃，请使用队列服务: {job_id}")
+        self.job_lifecycle.start_job(job_id)
 
     def pause_job(self, job_id: str) -> bool:
         """
@@ -1252,100 +481,7 @@ class TranscriptionService:
         Returns:
             bool: 是否成功设置暂停标志
         """
-        job = self.get_job(job_id)
-        if not job:
-            return False
-
-        job.paused = True
-        job.message = "暂停中..."
-        self.logger.info(f"⏸️ 任务暂停请求: {job_id}")
-        return True
-
-    def _force_remove_directory(
-        self,
-        directory: Path,
-        job_id: str,
-        max_retries: int = 3,
-        fast_fail: bool = False
-    ) -> bool:
-        """
-        V3.1.0: 强制删除目录，处理 Windows 文件占用问题
-
-        策略：
-        1. 先触发垃圾回收，释放可能的文件句柄
-        2. 尝试直接删除目录（最快）
-        3. 如果失败，等待后重试（处理延迟释放）
-        4. 如果仍失败，逐个删除文件，跳过无法删除的
-
-        Args:
-            directory: 要删除的目录路径
-            job_id: 任务ID（用于日志）
-            max_retries: 最大重试次数
-            fast_fail: True 时只尝试一次且不做延迟，快速返回给前端
-        """
-        import time
-        import stat
-
-        # 步骤1: 触发垃圾回收，释放可能的文件句柄
-        gc.collect()
-        time.sleep(0.1)  # 给系统一点时间释放资源
-
-        # 步骤2: 尝试直接删除（最快路径）
-        attempts = 1 if fast_fail else max_retries
-        for attempt in range(attempts):
-            try:
-                shutil.rmtree(directory)
-                self.logger.info(f"[强制删除] 成功删除目录: {job_id}, 尝试次数: {attempt + 1}")
-                return True
-            except PermissionError as e:
-                if fast_fail or attempt >= attempts - 1:
-                    # 快速返回给上层，由用户稍后再试
-                    self.logger.warning(
-                        f"[强制删除] 删除失败 (快速返回): {e}"
-                    )
-                    return False
-                self.logger.warning(
-                    f"[强制删除] 删除失败 (尝试 {attempt + 1}/{max_retries}): {e}, "
-                    f"等待 {0.5 * (attempt + 1)}s 后重试"
-                )
-                time.sleep(0.5 * (attempt + 1))  # 指数退避
-
-        # 步骤3: 逐个删除文件（降级策略）
-        failed_files = []
-        for root, dirs, files in os.walk(directory, topdown=False):
-            # 删除文件
-            for name in files:
-                file_path = Path(root) / name
-                try:
-                    # 尝试修改文件权限（Windows 只读文件）
-                    os.chmod(file_path, stat.S_IWRITE)
-                    file_path.unlink()
-                except Exception as e:
-                    self.logger.warning(f"[强制删除] 无法删除文件: {file_path.name}, {e}")
-                    failed_files.append(str(file_path))
-
-            # 删除空目录
-            for name in dirs:
-                dir_path = Path(root) / name
-                try:
-                    dir_path.rmdir()
-                except Exception as e:
-                    self.logger.debug(f"[强制删除] 无法删除目录: {dir_path.name}, {e}")
-
-        # 尝试删除根目录
-        try:
-            directory.rmdir()
-            self.logger.info(f"[强制删除] 逐个删除完成: {job_id}")
-            return True
-        except Exception as e:
-            if failed_files:
-                self.logger.error(
-                    f"[强制删除] 部分文件无法删除: {job_id}, "
-                    f"失败文件数: {len(failed_files)}, 错误: {e}"
-                )
-            else:
-                self.logger.warning(f"[强制删除] 根目录删除失败: {job_id}, {e}")
-            return False
+        return self.job_lifecycle.pause_job(job_id)
 
     def cancel_job(self, job_id: str, delete_data: bool = False):
         """
@@ -1358,66 +494,7 @@ class TranscriptionService:
         Returns:
             Tuple[bool, Optional[str]]: (是否成功, 失败原因)
         """
-        job = self.get_job(job_id)
-        if not job:
-            return False, "任务未找到"
-
-        job.canceled = True
-        job.message = "取消中..."
-        self.logger.info(f"🛑 任务取消请求: {job_id}, 删除数据: {delete_data}")
-
-        # 如果需要删除数据
-        if delete_data:
-            try:
-                job_dir = Path(job.dir)
-
-                # 快速占用检测，避免用户等待
-                try:
-                    from app.services.media_stream_tracker import get_active_streams
-                    active_streams = get_active_streams(job_id)
-                except Exception:
-                    active_streams = 0
-
-                if active_streams > 0:
-                    msg = "当前有进程占用，请稍后再试"
-                    self.logger.warning(f"[删除任务] 文件被占用，放弃删除: {job_id}, active_streams={active_streams}")
-                    return False, msg
-
-                # V3.1.2+dev.20260112.01: 先取消 MediaPrep 的转码任务，释放文件句柄
-                # 避免 WinError 32 文件占用问题
-                try:
-                    from app.services.media_prep_service import get_media_prep_service
-                    media_prep = get_media_prep_service()
-                    killed = media_prep.cancel_tasks(job_id)
-                    if killed > 0:
-                        self.logger.info(f"[删除任务] 已终止 {killed} 个 MediaPrep 子进程: {job_id}")
-                        # 给系统一点时间释放文件句柄
-                        import time
-                        time.sleep(0.2)
-                except Exception as e:
-                    self.logger.warning(f"[删除任务] 取消 MediaPrep 任务失败: {e}")
-
-                # 先从内存中移除任务，避免删除失败时仍显示"未知文件"
-                with self.lock:
-                    if job_id in self.jobs:
-                        del self.jobs[job_id]
-                        self.logger.info(f"已从内存移除任务: {job_id}")
-
-                # 移除文件路径映射
-                if job.input_path:
-                    self.job_index.remove_mapping(job.input_path)
-
-                # 最后删除任务目录（快速失败，交给用户重试）
-                if job_dir.exists():
-                    success = self._force_remove_directory(job_dir, job_id, max_retries=1, fast_fail=True)
-                    if not success:
-                        return False, "当前有进程占用，请稍后再试"
-                    self.logger.info(f"已删除任务数据: {job_id}")
-            except Exception as e:
-                self.logger.error(f"删除任务数据失败: {e}")
-                return False, str(e)
-
-        return True, None
+        return self.job_lifecycle.cancel_job(job_id, delete_data=delete_data)
 
     def _update_progress(
         self,
@@ -1470,38 +547,10 @@ class TranscriptionService:
             job: 任务状态对象
         """
         try:
-            # 动态获取SSE管理器（确保获取到已设置loop的实例）
-            from app.services.sse_service import get_sse_manager
-            sse_manager = get_sse_manager()
-
-            # 1. 推送到单任务频道（EditorView 使用）
-            channel_id = f"job:{job.job_id}"
-            progress_data = {
-                "job_id": job.job_id,
-                "phase": job.phase,
-                "percent": job.progress,
-                "phase_percent": job.phase_percent,  # 新增：阶段内进度
-                "message": job.message,
-                "status": job.status,
-                "processed": job.processed,
-                "total": job.total,
-                "language": job.language or ""
-            }
-            sse_manager.broadcast_sync(channel_id, "progress.overall", progress_data)
-
-            # 2. 推送到全局频道（TaskMonitor 使用）
-            global_progress_data = {
-                "id": job.job_id,  # 全局频道使用 "id"
-                "percent": job.progress,
-                "phase_percent": job.phase_percent,  # 新增：阶段内进度
-                "message": job.message,
-                "status": job.status,
-                "phase": job.phase,
-                "processed": job.processed,
-                "total": job.total
-            }
-            sse_manager.broadcast_sync("global", "job_progress", global_progress_data)
-
+            publisher = self._get_sse_publisher(job)
+            if publisher is None:
+                return
+            publisher.publish_job_progress(job)
         except Exception as e:
             # SSE推送失败不应影响转录流程
             self.logger.debug(f"SSE推送失败: {e}")
@@ -1516,22 +565,10 @@ class TranscriptionService:
             message: 附加消息
         """
         try:
-            # 动态获取SSE管理器（确保获取到已设置loop的实例）
-            from app.services.sse_service import get_sse_manager
-            sse_manager = get_sse_manager()
-
-            channel_id = f"job:{job.job_id}"
-            sse_manager.broadcast_sync(
-                channel_id,
-                f"signal.{signal_code}",
-                {
-                    "job_id": job.job_id,
-                    "signal": signal_code,
-                    "message": message or job.message,
-                    "status": job.status,
-                    "percent": job.progress
-                }
-            )
+            publisher = self._get_sse_publisher(job)
+            if publisher is None:
+                return
+            publisher.publish_job_signal(job, signal_code, message or job.message)
         except Exception as e:
             self.logger.debug(f"SSE信号推送失败（非致命）: {e}")
 
@@ -1702,26 +739,10 @@ class TranscriptionService:
             total: 总segment数量
         """
         try:
-            # 动态获取SSE管理器
-            from app.services.sse_service import get_sse_manager
-            sse_manager = get_sse_manager()
-
-            channel_id = f"job:{job.job_id}"
-            sse_manager.broadcast_sync(
-                channel_id,
-                "subtitle.segment",
-                {
-                    "segment_index": segment_result.get('segment_index', 0),
-                    "segments": segment_result.get('segments', []),
-                    "language": segment_result.get('language', job.language),
-                    "progress": {
-                        "processed": processed,
-                        "total": total,
-                        "percentage": round(processed / max(1, total) * 100, 2)
-                    }
-                }
-            )
-            self.logger.debug(f"推送segment #{segment_result.get('segment_index', 0)} 转录结果")
+            publisher = self._get_sse_publisher(job)
+            if publisher is None:
+                return
+            publisher.publish_segment(job, segment_result, processed, total)
         except Exception as e:
             # SSE推送失败不应影响转录流程
             self.logger.debug(f"SSE segment推送失败（非致命）: {e}")
@@ -1735,29 +756,10 @@ class TranscriptionService:
             aligned_results: 对齐后的结果列表
         """
         try:
-            # 动态获取SSE管理器
-            from app.services.sse_service import get_sse_manager
-            sse_manager = get_sse_manager()
-
-            channel_id = f"job:{job.job_id}"
-
-            # 提取对齐后的segments
-            segments = []
-            word_segments = []
-            if aligned_results and len(aligned_results) > 0:
-                segments = aligned_results[0].get('segments', [])
-                word_segments = aligned_results[0].get('word_segments', [])
-
-            sse_manager.broadcast_sync(
-                channel_id,
-                "subtitle.aligned",
-                {
-                    "segments": segments,
-                    "word_segments": word_segments,
-                    "message": "对齐完成"
-                }
-            )
-            self.logger.info(f"推送对齐完成事件，共 {len(segments)} 条字幕")
+            publisher = self._get_sse_publisher(job)
+            if publisher is None:
+                return
+            publisher.publish_aligned(job, aligned_results)
         except Exception as e:
             # SSE推送失败不应影响转录流程
             self.logger.debug(f"SSE aligned推送失败（非致命）: {e}")
@@ -1772,53 +774,7 @@ class TranscriptionService:
             data: 检查点数据
             job: 任务状态对象（用于获取settings）
         """
-        # 添加原始设置到checkpoint（用于校验参数兼容性）
-        # 使用 ConfigAdapter 统一新旧配置
-        demucs_strategy = ConfigAdapter.get_demucs_strategy(job.settings)
-        data["original_settings"] = {
-            "model": job.settings.model,
-            "device": job.settings.device,
-            "word_timestamps": job.settings.word_timestamps,
-            "compute_type": job.settings.compute_type,
-            "batch_size": job.settings.batch_size,
-            "demucs": {
-                "enabled": ConfigAdapter.is_demucs_enabled(job.settings),
-                "mode": demucs_strategy,
-            }
-        }
-
-        # 确保 demucs 字段存在（向后兼容）
-        if "demucs" not in data:
-            data["demucs"] = {
-                "enabled": ConfigAdapter.is_demucs_enabled(job.settings),
-                "mode": demucs_strategy,
-                "bgm_level": "none",
-                "bgm_ratios": [],
-                "global_separation_done": False,
-                "vocals_path": None,
-                "circuit_breaker": None,
-                "retry_triggered": False
-            }
-
-        checkpoint_path = job_dir / "checkpoint.json"
-        temp_path = checkpoint_path.with_suffix(".tmp")
-
-        try:
-            # 1. 写入临时文件
-            with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-
-            # 2. 原子替换（Windows/Linux/macOS 均支持）
-            # 如果程序在这里崩溃，checkpoint.json 依然是旧版本，不会损坏
-            os.replace(temp_path, checkpoint_path)
-
-            # 3. 同步保存任务元信息（用于重启后恢复任务状态）
-            # 这样每次保存检查点时，任务的进度和状态都会被持久化
-            self.save_job_meta(job)
-
-        except Exception as e:
-            self.logger.error(f"保存检查点失败: {e}")
-            # 保存失败不应中断主流程，仅记录日志
+        self.job_lifecycle._save_checkpoint(job_dir, data, job)
 
     def _load_checkpoint(self, job_dir: Path) -> Optional[dict]:
         """
@@ -1830,16 +786,7 @@ class TranscriptionService:
         Returns:
             Optional[dict]: 检查点数据，不存在或损坏则返回 None
         """
-        checkpoint_path = job_dir / "checkpoint.json"
-        if not checkpoint_path.exists():
-            return None
-
-        try:
-            with open(checkpoint_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            self.logger.warning(f"检查点文件损坏，将重新开始任务: {checkpoint_path} - {e}")
-            return None
+        return self.job_lifecycle._load_checkpoint(job_dir)
 
     def _flush_checkpoint_after_split(
         self,
@@ -1862,38 +809,13 @@ class TranscriptionService:
             processing_mode: 当前处理模式
             demucs_state: Demucs状态数据（可选）
         """
-        import time
-
-        checkpoint_data = {
-            "job_id": job.job_id,
-            "phase": "split_complete",  # 明确标记分段完成
-            "processing_mode": processing_mode.value,  # 记录模式
-            "total_segments": len(segments),
-            "processed_indices": [],
-            "segments": segments,
-            "unaligned_results": [],
-            "timestamp": time.time()  # 时间戳用于调试
-        }
-
-        # 添加 demucs 状态（如果提供）
-        if demucs_state:
-            checkpoint_data["demucs"] = demucs_state
-
-        # 强制同步写入（确保数据落盘）
-        self._save_checkpoint(job_dir, checkpoint_data, job)
-
-        # 验证写入成功
-        saved_checkpoint = self._load_checkpoint(job_dir)
-        if saved_checkpoint is None:
-            raise RuntimeError("checkpoint write verification failed: file not readable")
-
-        if saved_checkpoint.get('phase') != 'split_complete':
-            raise RuntimeError("checkpoint write verification failed: phase mismatch")
-
-        if len(saved_checkpoint.get('segments', [])) != len(segments):
-            raise RuntimeError("checkpoint write verification failed: segments count mismatch")
-
-        self.logger.info(f"checkpoint flushed and verified after split (mode: {processing_mode.value}, segments: {len(segments)})")
+        self.job_lifecycle._flush_checkpoint_after_split(
+            job=job,
+            job_dir=job_dir,
+            processing_mode=processing_mode,
+            segments=segments,
+            demucs_state=demucs_state,
+        )
 
 
     # ========== 核心处理方法 ==========
@@ -2059,9 +981,13 @@ class TranscriptionService:
             audio_array, sr = librosa.load(audio_path, sr=16000)
             
             # 使用频谱分诊器进行快速全局预判
+            from app.services.runtime_param_resolver import get_demucs_runtime_params
+
             spectrum_classifier = get_spectrum_classifier()
+            runtime_demucs = get_demucs_runtime_params()
+            sample_duration = runtime_demucs.get("bgm_sample_duration", 10.0)
             level_str, avg_score = spectrum_classifier.quick_global_diagnosis(
-                audio_array, sr=sr, sample_duration=10.0
+                audio_array, sr=sr, sample_duration=sample_duration
             )
             
             # 转换为 BGMLevel 枚举
@@ -2095,50 +1021,6 @@ class TranscriptionService:
             from app.services.demucs_service import BGMLevel
             return BGMLevel.NONE, []
     
-    def _detect_bgm_legacy(self, audio_path: str, job: JobState):
-        """
-        [已废弃] 执行BGM检测（旧版：分位数采样 + Demucs 检测）
-        
-        ⚠️ 此方法已废弃，保留供参考和回退使用
-        问题：Demucs 分离残差约 1-3%，导致纯人声也被误判为 light
-        
-        新方法请使用 _detect_bgm()（频谱分诊版本）
-
-        Args:
-            audio_path: 音频文件路径
-            job: 任务状态对象
-
-        Returns:
-            Tuple[BGMLevel, List[float]]: (BGM强度级别, 各采样点的BGM比例列表)
-        """
-        from app.services.demucs_service import get_demucs_service, BGMLevel
-
-        self._update_progress(job, 'bgm_detect', 0, 'BGM检测中...')
-
-        try:
-            demucs = get_demucs_service()
-
-            # 执行BGM检测（旧版：分位数采样）
-            level, ratios = demucs.detect_background_music_level(audio_path)
-
-            self._update_progress(job, 'bgm_detect', 1, f'BGM检测完成: {level.value}')
-
-            # 推送SSE事件
-            self._push_sse_bgm_detected(job, level, ratios)
-
-            self.logger.info(
-                f"BGM检测结果: {level.value}, "
-                f"比例={ratios}, 最大={max(ratios) if ratios else 0:.2f}"
-            )
-
-            return level, ratios
-
-        except Exception as e:
-            self.logger.warning(f"BGM检测失败，将跳过Demucs: {e}")
-            # 失败时返回 NONE 级别，不影响主流程
-            from app.services.demucs_service import BGMLevel
-            return BGMLevel.NONE, []
-
     def _separate_vocals_global(self, audio_path: str, job: JobState) -> str:
         """
         执行全局人声分离，更新进度
@@ -2188,26 +1070,14 @@ class TranscriptionService:
             ratios: 各采样点的BGM比例列表
         """
         try:
-            from app.services.sse_service import get_sse_manager
-
-            sse_manager = get_sse_manager()
-            channel_id = f"job:{job.job_id}"
-
+            publisher = self._get_sse_publisher(job)
+            if publisher is None:
+                return
             # 将numpy类型转换为Python原生类型，避免JSON序列化错误
             native_ratios = [float(r) for r in ratios] if ratios else []
             max_ratio = float(max(ratios)) if ratios else 0.0
-
-            # 构造事件数据
-            event_data = {
-                "level": level.value,
-                "ratios": native_ratios,
-                "max_ratio": max_ratio,
-                "recommendation": self._get_demucs_recommendation(level)
-            }
-
-            # 广播事件
-            sse_manager.broadcast_sync(channel_id, "signal.bgm_detected", event_data)
-
+            recommendation = self._get_demucs_recommendation(level)
+            publisher.publish_bgm_detected(level, native_ratios, max_ratio, recommendation)
         except Exception as e:
             # SSE推送失败不应影响主流程
             self.logger.debug(f"SSE推送失败（非致命）: {e}")
@@ -2221,128 +1091,17 @@ class TranscriptionService:
             strategy: SeparationStrategy 对象
         """
         try:
-            from app.services.sse_service import get_sse_manager
-
-            sse_manager = get_sse_manager()
-            channel_id = f"job:{job.job_id}"
-
-            # 使用 strategy.to_dict() 获取事件数据
-            event_data = strategy.to_dict()
-
-            # 广播事件
-            sse_manager.broadcast_sync(channel_id, "signal.separation_strategy", event_data)
-
+            publisher = self._get_sse_publisher(job)
+            if publisher is None:
+                return
+            publisher.publish_separation_strategy(strategy)
             self.logger.debug(f"分离策略事件已推送: {strategy.reason}")
-
         except Exception as e:
             # SSE推送失败不应影响主流程
             self.logger.debug(f"SSE推送失败（非致命）: {e}")
 
-    def _push_sse_model_escalated(
-        self,
-        job: JobState,
-        from_model: str,
-        to_model: str,
-        reason: str,
-        breaker_state: CircuitBreakerState
-    ):
-        """
-        推送模型升级事件
-
-        Args:
-            job: 任务状态对象
-            from_model: 原模型名称
-            to_model: 新模型名称
-            reason: 升级原因
-            breaker_state: 熔断器状态
-        """
-        try:
-            from app.services.sse_service import get_sse_manager
-
-            sse_manager = get_sse_manager()
-            channel_id = f"job:{job.job_id}"
-
-            # 构造事件数据 (使用 ConfigAdapter 兼容新旧配置)
-            event_data = {
-                "from_model": from_model,
-                "to_model": to_model,
-                "reason": reason,
-                "escalation_count": breaker_state.escalation_count,
-                "max_escalations": ConfigAdapter.get_max_escalations(job.settings),
-                "stats": breaker_state.get_stats()
-            }
-
-            # 广播事件
-            sse_manager.broadcast_sync(channel_id, "signal.model_upgrade", event_data)
-
-            self.logger.info(f"模型升级事件已推送: {from_model} -> {to_model}")
-
-        except Exception as e:
-            # SSE推送失败不应影响主流程
-            self.logger.debug(f"SSE推送失败（非致命）: {e}")
-
-    def _push_sse_circuit_breaker_triggered(
-        self,
-        job: JobState,
-        circuit_breaker: Optional[CircuitBreakerState]
-    ):
-        """
-        推送熔断触发事件（Phase 4: 扩展包含升级信息）
-
-        Args:
-            job: 任务状态对象
-            circuit_breaker: 熔断器状态对象
-        """
-        try:
-            from app.services.sse_service import get_sse_manager
-
-            sse_manager = get_sse_manager()
-            channel_id = f"job:{job.job_id}"
-
-            # 构造事件数据（扩展包含升级历史）
-            stats = circuit_breaker.get_stats() if circuit_breaker else {}
-            event_data = {
-                "triggered": True,
-                "reason": self._get_circuit_break_reason(circuit_breaker),
-                "stats": stats,
-                "action": "升级为全局人声分离模式"
-            }
-
-            # 广播事件
-            sse_manager.broadcast_sync(channel_id, "signal.circuit_breaker", event_data)
-
-            self.logger.info("熔断事件已推送到前端")
-
-        except Exception as e:
-            # SSE推送失败不应影响主流程
-            self.logger.debug(f"SSE推送失败（非致命）: {e}")
-
-    def _get_circuit_break_reason(self, circuit_breaker: Optional[CircuitBreakerState]) -> str:
-        """
-        生成熔断原因描述
-
-        Args:
-            circuit_breaker: 熔断器状态
-
-        Returns:
-            熔断原因描述字符串
-        """
-        if not circuit_breaker:
-            return "转录质量低，触发熔断升级"
-
-        stats = circuit_breaker.get_stats()
-
-        # 如果有升级历史，说明已经尝试过升级
-        if circuit_breaker.escalation_count > 0:
-            return (
-                f"已升级 {circuit_breaker.escalation_count} 次模型仍未改善，触发熔断。"
-                f"升级历史: {', '.join(circuit_breaker.escalation_history)}"
-            )
-        else:
-            return (
-                f"连续 {stats['consecutive_retries']} 个段落重试失败，"
-                f"总重试率 {stats['retry_ratio']:.1%}，触发熔断"
-            )
+    # V3.2.0+dev.20260125.09: 已删除 _push_sse_model_escalated, _push_sse_circuit_breaker_triggered, _get_circuit_break_reason
+    # 这些方法依赖已归档的 CircuitBreakerState，新架构使用 FuseBreakerV2
 
     def _get_demucs_recommendation(self, level) -> str:
         """
@@ -2451,287 +1210,6 @@ class TranscriptionService:
         # 新结果的logprob更高（更接近0）则更好
         return new_logprob > old_logprob
 
-    def _transcribe_segment_with_retry(
-        self,
-        seg_meta: Dict,
-        model,
-        job: JobState,
-        audio_array: Optional[np.ndarray] = None,
-        circuit_breaker: Optional[CircuitBreakerState] = None
-    ) -> Optional[Dict]:
-        """
-        带重试的转录方法（支持Demucs人声分离重试 + 动态熔断）
-
-        流程：
-        1. 首次转录（使用原始音频）
-        2. 检查置信度
-        3. 如果置信度低，使用Demucs分离人声后重试
-        4. 更新熔断器状态
-        5. 检查是否触发熔断
-        6. 返回置信度更高的结果
-
-        Args:
-            seg_meta: 段落元数据
-            model: Whisper模型
-            job: 任务状态对象
-            audio_array: 完整音频数组（内存模式）
-            circuit_breaker: 熔断器状态对象
-
-        Returns:
-            Optional[Dict]: 转录结果
-
-        Raises:
-            BreakToGlobalSeparation: 当触发熔断条件时抛出
-        """
-        demucs_settings = job.settings.demucs
-
-        # 首次转录
-        result = self._transcribe_segment(seg_meta, model, job, audio_array)
-
-        if not result or not demucs_settings.enabled:
-            if circuit_breaker:
-                circuit_breaker.record_success()
-            return result
-
-        # 检查是否需要重试
-        needs_retry = self._check_transcription_confidence(
-            result,
-            demucs_settings.retry_threshold_logprob,
-            demucs_settings.retry_threshold_no_speech
-        )
-
-        if not needs_retry:
-            # 不需要重试，记录成功
-            if circuit_breaker:
-                circuit_breaker.record_success()
-            return result
-
-        # ========== 需要重试的逻辑 ==========
-        self.logger.info(f"段落 {seg_meta['index']} 置信度低，尝试人声分离重试")
-
-        # 更新熔断器状态
-        if circuit_breaker:
-            circuit_breaker.record_retry()
-
-            # 检查是否触发熔断
-            if circuit_breaker.should_break(demucs_settings):
-                stats = circuit_breaker.get_stats()
-                self.logger.warning(
-                    f"触发熔断！连续重试={stats['consecutive_retries']}, "
-                    f"总重试比例={stats['retry_ratio']:.1%}"
-                )
-                raise BreakToGlobalSeparation(
-                    f"连续{stats['consecutive_retries']}段需要Demucs重试，"
-                    f"建议升级为全局人声分离模式"
-                )
-
-        # 尝试按需分离
-        try:
-            from app.services.demucs_service import get_demucs_service
-            demucs = get_demucs_service()
-
-            start_sec = seg_meta['start']
-            end_sec = seg_meta['end']
-
-            if audio_array is not None:
-                # 内存模式：分离人声
-                vocals = demucs.separate_vocals_segment(
-                    audio_array, sr=16000,
-                    start_sec=start_sec, end_sec=end_sec
-                )
-
-                # 构造临时seg_meta
-                retry_seg = seg_meta.copy()
-                retry_seg['start'] = 0  # 因为vocals已经是切片
-                retry_seg['end'] = len(vocals) / 16000
-
-                # 重新转录
-                retry_result = self._transcribe_segment_in_memory(
-                    vocals,
-                    retry_seg,
-                    model,
-                    job,
-                    is_vocals=True  # 标记是人声
-                )
-            else:
-                # 硬盘模式：暂不支持
-                self.logger.warning("硬盘模式暂不支持Demucs重试")
-                return result
-
-            if retry_result:
-                # 校正时间偏移（恢复到原始时间轴）
-                original_start = seg_meta['start']
-                for seg in retry_result.get('segments', []):
-                    seg['start'] += original_start
-                    seg['end'] += original_start
-
-                # 比较两次结果，返回更好的
-                if self._is_better_result(retry_result, result):
-                    self.logger.info(f"段落 {seg_meta['index']} 重试成功，使用分离后的结果")
-                    retry_result['used_demucs'] = True
-                    return retry_result
-
-        except Exception as e:
-            self.logger.warning(f"Demucs重试失败: {e}")
-
-        return result
-
-    def _get_model(self, settings: JobSettings, job: Optional[JobState] = None):
-        """
-        获取 Faster-Whisper 模型（带缓存）
-
-        优先使用模型管理服务检查并下载模型，否则使用简单缓存
-
-        Args:
-            settings: 任务设置
-            job: 任务状态对象(可选,用于更新下载进度)
-
-        Returns:
-            模型对象
-        """
-        # 尝试使用模型管理服务检查并下载模型
-        try:
-            from app.services.model_manager_service import get_model_manager
-            model_mgr = get_model_manager()
-            whisper_model_info = model_mgr.whisper_models.get(settings.model)
-
-            if whisper_model_info:
-                # 检查模型状态
-                if whisper_model_info.status == "not_downloaded" or whisper_model_info.status == "incomplete":
-                    self.logger.warning(f"Whisper模型未下载或不完整: {settings.model}")
-
-                    # 获取模型大小信息
-                    model_size_mb = whisper_model_info.size_mb
-
-                    # 如果模型大小>=1GB,给出特殊提示
-                    download_msg = ""
-                    if model_size_mb >= 1024:
-                        size_gb = model_size_mb / 1024
-                        download_msg = f"当前下载模型大于1GB ({size_gb:.1f}GB),请耐心等待"
-                        self.logger.info(f"{download_msg}")
-                    else:
-                        download_msg = f"开始下载模型 {settings.model} ({model_size_mb}MB)"
-
-                    # 更新任务状态
-                    if job:
-                        job.message = download_msg
-
-                    self.logger.info(f"自动触发下载Whisper模型: {settings.model} ({model_size_mb}MB)")
-
-                    # 触发下载
-                    success = model_mgr.download_whisper_model(settings.model)
-                    if not success:
-                        self.logger.warning(f"模型管理器下载失败或已在下载中,使用备用方式")
-                        raise RuntimeError("模型管理器下载失败")
-
-                    # 等待下载完成（最多等待10分钟）
-                    import time
-                    max_wait_time = 600  # 10分钟
-                    wait_interval = 5  # 每5秒检查一次
-                    elapsed = 0
-
-                    while elapsed < max_wait_time:
-                        time.sleep(wait_interval)
-                        elapsed += wait_interval
-
-                        current_status = model_mgr.whisper_models[settings.model].status
-                        progress = model_mgr.whisper_models[settings.model].download_progress
-
-                        if current_status == "ready":
-                            self.logger.info(f"Whisper模型下载完成: {settings.model}")
-                            if job:
-                                job.message = f"模型下载完成,准备加载"
-                            break
-                        elif current_status == "error":
-                            self.logger.error(f"模型管理器下载失败,使用备用方式")
-                            raise RuntimeError(f"Whisper模型下载失败: {settings.model}")
-                        else:
-                            # 如果模型大小>=1GB,定期提醒用户耐心等待
-                            if model_size_mb >= 1024 and elapsed % 30 == 0:  # 每30秒提醒一次
-                                wait_msg = f"当前下载模型大于1GB,请耐心等待... {progress:.1f}% ({elapsed}s/{max_wait_time}s)"
-                                self.logger.info(f"{wait_msg}")
-                                if job:
-                                    job.message = wait_msg
-                            else:
-                                wait_msg = f"等待模型下载... {progress:.1f}%"
-                                self.logger.info(f"{wait_msg} ({elapsed}s/{max_wait_time}s)")
-                                # 更新任务状态(每次都更新,这样用户可以看到进度变化)
-                                if job:
-                                    job.message = wait_msg
-
-                    if elapsed >= max_wait_time:
-                        self.logger.error(f"模型下载超时,使用备用方式")
-                        raise TimeoutError(f"Whisper模型下载超时: {settings.model}")
-
-        except Exception as e:
-            self.logger.warning(f"模型管理服务检查失败,使用备用方式: {e}")
-
-        # 尝试使用模型预加载管理器
-        try:
-            from app.services.model_preload_manager import get_model_manager as get_preload_manager
-            model_manager = get_preload_manager()
-            if model_manager:
-                self.logger.debug("使用模型预加载管理器获取模型")
-                if job:
-                    job.message = "加载模型中"
-                return model_manager.get_model(settings)
-        except Exception as e:
-            self.logger.debug(f"无法使用模型预加载管理器，回退到本地缓存: {e}")
-            pass
-
-        # 回退到简单缓存机制
-        key = (settings.model, settings.compute_type, settings.device)
-        with _model_lock:
-            if key in _model_cache:
-                self.logger.debug(f"命中模型缓存: {key}")
-                if job:
-                    job.message = "使用缓存的模型"
-                return _model_cache[key]
-
-            self.logger.info(f"加载模型: {key}")
-            if job:
-                job.message = f"加载模型 {settings.model}"
-
-            # 处理 auto 模式：解析为具体的计算类型
-            compute_type_resolved = settings.compute_type
-            if compute_type_resolved == "auto":
-                from app.services.whisper_service import get_auto_compute_type
-                compute_type_resolved = get_auto_compute_type(settings.device)
-                self.logger.info(f"auto模式已解析为: {compute_type_resolved}")
-
-            # 首先尝试仅使用本地文件 (使用 Faster-Whisper)
-            try:
-                from app.core.config import config
-                from faster_whisper import WhisperModel
-                m = WhisperModel(
-                    settings.model,
-                    device=settings.device,
-                    compute_type=compute_type_resolved,  # 使用解析后的计算类型
-                    download_root=str(config.HF_CACHE_DIR),
-                    local_files_only=True  # 禁止自动下载，只使用本地文件
-                )
-                _model_cache[key] = m
-                if job:
-                    job.message = "模型加载完成"
-                return m
-            except Exception as e:
-                self.logger.warning(f"本地加载失败,允许下载: {e}")
-                if job:
-                    job.message = "本地模型不存在,正在下载"
-                # 如果本地加载失败,允许下载
-                m = WhisperModel(
-                    settings.model,
-                    device=settings.device,
-                    compute_type=compute_type_resolved,  # 使用解析后的计算类型
-                    download_root=str(config.HF_CACHE_DIR),
-                    local_files_only=False  # 允许下载
-                )
-                _model_cache[key] = m
-                if job:
-                    job.message = "模型下载并加载完成"
-                return m
-
-  
     def _transcribe_segment_unaligned(
         self,
         seg: Dict,
@@ -2759,12 +1237,12 @@ class TranscriptionService:
 
         try:
             # 使用 Faster-Whisper 转录
-            segments_gen, info = model.transcribe(
-                audio,
-                language=job.language,
-                beam_size=5,
-                vad_filter=True
+            builder = get_transcribe_param_builder(logger=self.logger)
+            params = builder.build_whisper_params(
+                job,
+                overrides={"language": job.language, "vad_filter": True},
             )
+            segments_gen, info = model.transcribe(audio, **params)
 
             # 转换生成器为列表
             segments_list = list(segments_gen)
@@ -2831,12 +1309,12 @@ class TranscriptionService:
 
         try:
             # 使用 Faster-Whisper 转录
-            segments_gen, info = model.transcribe(
-                audio_slice,
-                language=job.language,
-                beam_size=5,
-                vad_filter=False  # 已经是切片，不需要再做 VAD
+            builder = get_transcribe_param_builder(logger=self.logger)
+            params = builder.build_whisper_params(
+                job,
+                overrides={"language": job.language, "vad_filter": False},
             )
+            segments_gen, info = model.transcribe(audio_slice, **params)
 
             # 转换生成器为列表
             segments_list = list(segments_gen)
@@ -2895,12 +1373,12 @@ class TranscriptionService:
 
         try:
             # 使用 Faster-Whisper 转录
-            segments_gen, info = model.transcribe(
-                audio,
-                language=job.language,
-                beam_size=5,
-                vad_filter=True
+            builder = get_transcribe_param_builder(logger=self.logger)
+            params = builder.build_whisper_params(
+                job,
+                overrides={"language": job.language, "vad_filter": True},
             )
+            segments_gen, info = model.transcribe(audio, **params)
 
             # 转换生成器为列表
             segments_list = list(segments_gen)
@@ -3048,35 +1526,16 @@ class TranscriptionService:
             total_count: 总segment数量
         """
         try:
-            from app.services.sse_service import get_sse_manager
-            sse_manager = get_sse_manager()
-
-            channel_id = f"job:{job.job_id}"
-
-            # 计算百分比
-            batch_progress = (current_batch / total_batches) * 100 if total_batches > 0 else 0
-            segment_progress = (aligned_count / total_count) * 100 if total_count > 0 else 0
-
-            sse_manager.broadcast_sync(
-                channel_id,
-                "progress.align",
-                {
-                    "job_id": job.job_id,
-                    "phase": "align",
-                    "batch": {
-                        "current": current_batch,
-                        "total": total_batches,
-                        "progress": round(batch_progress, 2)
-                    },
-                    "segments": {
-                        "aligned": aligned_count,
-                        "total": total_count,
-                        "progress": round(segment_progress, 2)
-                    },
-                    "message": f"aligning batch {current_batch}/{total_batches} ({aligned_count}/{total_count} segments)"
-                }
+            publisher = self._get_sse_publisher(job)
+            if publisher is None:
+                return
+            publisher.publish_align_progress(
+                job,
+                current_batch,
+                total_batches,
+                aligned_count,
+                total_count,
             )
-
         except Exception as e:
             self.logger.debug(f"SSE align progress push failed (non-fatal): {e}")
 
@@ -3204,116 +1663,6 @@ class TranscriptionService:
         self.logger.info(f"字幕时间微调: 延迟开始25ms, 延长结束25ms")
         return adjusted
 
-    def _format_ts(self, sec: float) -> str:
-        """
-        格式化时间戳为SRT格式
-
-        Args:
-            sec: 秒数
-
-        Returns:
-            str: SRT时间戳 (HH:MM:SS,mmm)
-        """
-        if sec < 0:
-            sec = 0
-
-        ms = int(round(sec * 1000))
-        h = ms // 3600000
-        ms %= 3600000
-        m = ms // 60000
-        ms %= 60000
-        s = ms // 1000
-        ms %= 1000
-
-        return f"{h:02}:{m:02}:{s:02},{ms:03}"
-
-    def _generate_srt(self, results: List[Dict], path: str, word_level: bool):
-        """
-        生成SRT字幕文件
-        V3.1.1+dev.20260106.03: 生成前自动修复时间戳重叠
-
-        Args:
-            results: 转录结果列表
-            path: 输出文件路径
-            word_level: 是否使用词级时间戳
-        """
-        # V3.1.1+dev.20260106.03: 导入重叠修复函数
-        from app.utils.text_utils import repair_timestamp_overlaps, detect_timestamp_overlaps
-
-        all_entries = []
-
-        for r in results:
-            if not r:
-                continue
-
-            # 词级时间戳模式
-            if word_level and r.get('word_segments'):
-                for w in r['word_segments']:
-                    if w.get('start') is not None and w.get('end') is not None:
-                        txt = (w.get('word') or '').strip()
-                        if txt:
-                            all_entries.append({
-                                'start': w['start'],
-                                'end': w['end'],
-                                'text': txt
-                            })
-
-            # 句子级时间戳模式（默认）
-            elif r.get('segments'):
-                for s in r['segments']:
-                    if s.get('start') is not None and s.get('end') is not None:
-                        txt = (s.get('text') or '').strip()
-                        if txt:
-                            all_entries.append({
-                                'start': s['start'],
-                                'end': s['end'],
-                                'text': txt
-                            })
-
-        # 过滤无效时间戳
-        all_entries = [e for e in all_entries if e['end'] > e['start']]
-
-        # V3.1.1+dev.20260106.03: 检测并修复重叠
-        if all_entries:
-            overlaps = detect_timestamp_overlaps(all_entries)
-            if overlaps:
-                self.logger.warning(f"检测到 {len(overlaps)} 处时间戳重叠，自动修复中...")
-                all_entries = repair_timestamp_overlaps(all_entries, gap_ms=1.0)
-                self.logger.info(f"已修复 {len(overlaps)} 处时间戳重叠")
-
-        # 写入SRT格式
-        lines = []
-        for n, e in enumerate(all_entries, 1):
-            lines.append(str(n))  # 序号
-            lines.append(
-                f"{self._format_ts(e['start'])} --> {self._format_ts(e['end'])}"
-            )  # 时间戳
-            lines.append(e['text'])  # 字幕文本
-            lines.append("")  # 空行
-
-        # 写入文件
-        with open(path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(lines))
-
-        self.logger.info(f"SRT文件已生成: {path}, 共{len(all_entries)}条字幕")
-
-    def clear_model_cache(self):
-        """
-        清空模型缓存（供队列服务调用）
-
-        注意: 新架构已移除对齐模型，仅清理 Whisper 模型
-        """
-        global _model_cache
-
-        with _model_lock:
-            for key in list(_model_cache.keys()):
-                try:
-                    del _model_cache[key]
-                except:
-                    pass
-            _model_cache.clear()
-            self.logger.info("Whisper模型缓存已清空")
-
     # ==========================================
     # SenseVoice 集成方法（Phase 3）
     # ==========================================
@@ -3356,11 +1705,9 @@ class TranscriptionService:
                 service.load_model()
 
             # 调用转录（返回字典）
-            # 注: SenseVoice 的 language 参数实际上是自动检测，这里传入 "auto" 即可
             result_dict = service.transcribe_audio_array(
                 audio_array=audio_array,
-                sample_rate=sample_rate,
-                language="auto"
+                sample_rate=sample_rate
             )
 
             # 转换为 SenseVoiceResult 对象
@@ -3536,57 +1883,6 @@ class TranscriptionService:
             ))
 
         return words
-
-    def _generate_subtitle_from_sentences(
-        self,
-        sentences: List['SentenceSegment'],
-        output_path: str,
-        include_translation: bool = False
-    ) -> str:
-        """
-        从句子列表生成 SRT 字幕文件
-
-        Args:
-            sentences: 句子列表
-            output_path: 输出文件路径
-            include_translation: 是否包含翻译（双语字幕）
-
-        Returns:
-            str: 生成的SRT文件路径
-        """
-        self.logger.info(f"生成SRT字幕: {len(sentences)} 句 -> {output_path}")
-
-        lines = []
-        for idx, sentence in enumerate(sentences, 1):
-            # 序号
-            lines.append(str(idx))
-
-            # 时间戳
-            start_ts = self._format_ts(sentence.start)
-            end_ts = self._format_ts(sentence.end)
-            lines.append(f"{start_ts} --> {end_ts}")
-
-            # 字幕文本（使用清洗后的文本）
-            if include_translation and sentence.translation:
-                # 双语字幕：原文 + 翻译
-                lines.append(sentence.text_clean or sentence.text)
-                lines.append(sentence.translation)
-            else:
-                lines.append(sentence.text_clean or sentence.text)
-
-            # 空行分隔
-            lines.append("")
-
-        # 写入文件
-        # 确保父目录存在
-        from pathlib import Path
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(lines))
-
-        self.logger.info(f"SRT字幕生成完成: {output_path}")
-        return output_path
 
     def _save_raw_transcription(
         self,
@@ -3830,11 +2126,11 @@ class TranscriptionService:
         is_trash_suspect: bool = False
     ) -> 'SentenceSegment':
         """
-        Whisper 补刀 + 仲裁判决（二次安检机制）
+        Whisper 复核 + 仲裁判决（二次安检机制）
 
         核心逻辑：
         - 如果是垃圾嫌疑样本，根据 Whisper 反馈判决去留
-        - 如果是常规补刀，直接采纳 Whisper 结果
+        - 如果是常规复核，直接采纳 Whisper 结果
 
         Args:
             sentence: 原始句子
@@ -3870,7 +2166,7 @@ class TranscriptionService:
         # 记录日志（调试用）
         if overlap_start < sentence.start:
             self.logger.debug(
-                f"Whisper 补刀添加 {sentence.start - overlap_start:.2f}s 前向重叠: "
+                f"Whisper 复核添加 {sentence.start - overlap_start:.2f}s 前向重叠: "
                 f"[{overlap_start:.2f}s, {sentence.end:.2f}s]"
             )
 
@@ -3878,13 +2174,16 @@ class TranscriptionService:
         context = subtitle_manager.get_context_window(sentence_index)
 
         # Whisper 转录
-        result = whisper_service.transcribe(
-            audio=audio_segment,
-            initial_prompt=context,
-            language=getattr(job.settings, 'language', 'auto'),
-            word_timestamps=False,
-            condition_on_previous_text=False  # 禁用前文条件化，避免与 initial_prompt 形成双重提示词增益
+        builder = get_transcribe_param_builder(logger=self.logger)
+        params = builder.build_whisper_params(
+            job,
+            overrides={
+                "language": getattr(job.settings, 'language', 'auto'),
+                "initial_prompt": context,
+            },
+            context="patch",
         )
+        result = whisper_service.transcribe(audio=audio_segment, **params)
 
         whisper_text = result.get('text', '').strip()
         whisper_conf = self._estimate_whisper_confidence(result)
@@ -3968,7 +2267,7 @@ class TranscriptionService:
             underscore_ratio = whisper_text.count('_') / max(len(whisper_text), 1)
             if underscore_ratio > 0.3:  # 超过 30% 是下划线
                 self.logger.warning(
-                    f"Whisper 补刀检测到下划线幻觉 {sentence_index}: "
+                    f"Whisper 复核检测到下划线幻觉 {sentence_index}: "
                     f"'{whisper_text[:50]}...' (下划线占比 {underscore_ratio:.1%}), 回退到 SenseVoice"
                 )
                 return sentence
@@ -3981,7 +2280,7 @@ class TranscriptionService:
                 # 如果 Whisper 输出与 context 重叠度超过 80%，且长度相近，可能是照抄
                 if overlap_ratio > 0.8 and abs(len(whisper_text) - len(context)) < len(context) * 0.3:
                     self.logger.warning(
-                        f"Whisper 补刀检测到提示词重复 {sentence_index}: "
+                        f"Whisper 复核检测到提示词重复 {sentence_index}: "
                         f"与 context 重叠度 {overlap_ratio:.1%}, 回退到 SenseVoice"
                     )
                     return sentence
@@ -4029,9 +2328,9 @@ class TranscriptionService:
                     f"'{whisper_text}' (Whisper Conf {whisper_conf:.2f})"
                 )
 
-        # 常规补刀 OR 垃圾样本通过仲裁 => 采纳 Whisper 结果
+        # 常规复核 OR 垃圾样本通过仲裁 => 采纳 Whisper 结果
         if not whisper_text:
-            self.logger.warning(f"Whisper 补刀返回空文本，保留原结果")
+            self.logger.warning(f"Whisper 复核返回空文本，保留原结果")
             return sentence
 
         # 保存 Whisper 备选文本
@@ -4056,7 +2355,7 @@ class TranscriptionService:
         subtitle_manager: 'StreamingSubtitleManager'
     ) -> 'SentenceSegment':
         """
-        Whisper 补刀（时空解耦版：仅取文本）
+        Whisper 复核（时空解耦版：仅取文本）
 
         核心原则：
         - SenseVoice 确定的时间轴（start/end）不可变
@@ -4096,7 +2395,7 @@ class TranscriptionService:
         # 记录日志（调试用）
         if overlap_start < sentence.start:
             self.logger.debug(
-                f"Whisper 补刀添加 {sentence.start - overlap_start:.2f}s 前向重叠: "
+                f"Whisper 复核添加 {sentence.start - overlap_start:.2f}s 前向重叠: "
                 f"[{overlap_start:.2f}s, {sentence.end:.2f}s]"
             )
 
@@ -4104,13 +2403,16 @@ class TranscriptionService:
         context = subtitle_manager.get_context_window(sentence_index)
 
         # Whisper 转录（仅取文本，弃用时间戳）
-        result = whisper_service.transcribe(
-            audio=audio_segment,
-            initial_prompt=context,
-            language=getattr(job.settings, 'language', 'auto'),
-            word_timestamps=False,  # 不需要字级时间戳，使用伪对齐
-            condition_on_previous_text=False  # 禁用前文条件化，避免与 initial_prompt 形成双重提示词增益
+        builder = get_transcribe_param_builder(logger=self.logger)
+        params = builder.build_whisper_params(
+            job,
+            overrides={
+                "language": getattr(job.settings, 'language', 'auto'),
+                "initial_prompt": context,
+            },
+            context="patch",
         )
+        result = whisper_service.transcribe(audio=audio_segment, **params)
 
         whisper_text = result.get('text', '').strip()
         segments = result.get('segments', [])
@@ -4173,7 +2475,7 @@ class TranscriptionService:
             underscore_ratio = whisper_text.count('_') / max(len(whisper_text), 1)
             if underscore_ratio > 0.3:  # 超过 30% 是下划线
                 self.logger.warning(
-                    f"Whisper 补刀检测到下划线幻觉 {sentence_index}: "
+                    f"Whisper 复核检测到下划线幻觉 {sentence_index}: "
                     f"'{whisper_text[:50]}...' (下划线占比 {underscore_ratio:.1%}), 回退到 SenseVoice"
                 )
                 return sentence
@@ -4186,13 +2488,13 @@ class TranscriptionService:
                 # 如果 Whisper 输出与 context 重叠度超过 80%，且长度相近，可能是照抄
                 if overlap_ratio > 0.8 and abs(len(whisper_text) - len(context)) < len(context) * 0.3:
                     self.logger.warning(
-                        f"Whisper 补刀检测到提示词重复 {sentence_index}: "
+                        f"Whisper 复核检测到提示词重复 {sentence_index}: "
                         f"与 context 重叠度 {overlap_ratio:.1%}, 回退到 SenseVoice"
                     )
                     return sentence
 
         if not whisper_text:
-            self.logger.warning(f"Whisper 补刀返回空文本，保留原结果")
+            self.logger.warning(f"Whisper 复核返回空文本，保留原结果")
             return sentence
 
         # 保存 Whisper 备选文本
@@ -4244,7 +2546,7 @@ class TranscriptionService:
         - 长文本回填对齐到原始时间戳
 
         Args:
-            patch_queue: 需要补刀的句子队列
+            patch_queue: 需要复核的句子队列
             audio_array: 完整音频数组
             job: 任务状态
             subtitle_manager: 流式字幕管理器
@@ -4413,7 +2715,7 @@ class TranscriptionService:
         后处理增强层（所有 Chunk 转录完成后执行）
 
         根据用户配置执行：
-        1. 低置信度句子 → Whisper 补刀（仅文本 + 伪对齐）
+        1. 低置信度句子 → Whisper 复核（仅文本 + 伪对齐）
         2. [可选] LLM 校对
         3. [可选] LLM 翻译
 
@@ -4443,10 +2745,10 @@ class TranscriptionService:
         # 调试日志：确认方法被调用
         self.logger.debug(f"开始后处理增强: {len(sentences)} 句, enhancement={solution_config.enhancement.value}")
 
-        # V3.1.0: 极速模式（sensevoice_only）完全跳过 Whisper 补刀
+        # V3.1.0: 极速模式（sensevoice_only）完全跳过 Whisper 复核
         # 极速模式的设计目标是纯 SenseVoice 输出，不加载 Whisper 模型
         if solution_config.enhancement == EnhancementMode.OFF:
-            self.logger.info("极速模式: 跳过所有 Whisper 补刀和仲裁")
+            self.logger.info("极速模式: 跳过所有 Whisper 复核和仲裁")
             # 仍然执行 LLM 校对/翻译（如果配置了）
             if solution_config.proofread != ProofreadMode.OFF:
                 self.logger.info("LLM 校对功能待实现")
@@ -4454,7 +2756,7 @@ class TranscriptionService:
                 self.logger.info("LLM 翻译功能待实现")
             return sentences
 
-        # 1. 收集需要 Whisper 补刀的句子（含强制补刀、常规补刀、垃圾核查）
+        # 1. 收集需要 Whisper 复核的句子（含强制复核、常规复核、垃圾核查）
         patch_queue = []
         # 阈值配置
         GARBAGE_CONFIDENCE_THRESHOLD = 0.4  # 低于此值触发 Whisper 仲裁
@@ -4465,7 +2767,7 @@ class TranscriptionService:
             is_trash_suspect = False  # 是否是"垃圾嫌疑"需要 Whisper 仲裁
 
             # === DEEP_LISTEN 快速路径 ===
-            # DEEP_LISTEN 模式下所有句子都要补刀，直接入队，跳过后续冗余判断
+            # DEEP_LISTEN 模式下所有句子都要复核，直接入队，跳过后续冗余判断
             if solution_config.enhancement == EnhancementMode.DEEP_LISTEN:
                 patch_queue.append({
                     "index": i,
@@ -4482,12 +2784,12 @@ class TranscriptionService:
             clean_text = text_clean.strip() if text_clean else ""
             text_length = len(clean_text)
 
-            # 【阶段四】强制关键补刀条件（无论用户设置如何，必须修）
+            # 【阶段四】强制关键复核条件（无论用户设置如何，必须修）
             if is_critical_patch_needed(clean_text, duration, sentence.confidence):
                 should_patch = True
                 is_critical = True
                 self.logger.warning(
-                    f"触发强制补刀: '{clean_text}' "
+                    f"触发强制复核: '{clean_text}' "
                     f"(conf={sentence.confidence:.2f}, dur={duration:.2f}s)"
                 )
 
@@ -4501,7 +2803,7 @@ class TranscriptionService:
                     f"(conf={sentence.confidence:.2f})"
                 )
 
-            # 【新增】字级强制补刀（独立检查，不受 enhancement 配置影响）
+            # 【新增】字级强制复核（独立检查，不受 enhancement 配置影响）
             # 条件1: 单字符实词且置信度 < 0.9
             # 条件2: 任意实词置信度极低 (< 0.35)，几乎肯定是识别错误
             if not should_patch and sentence.words:
@@ -4526,7 +2828,7 @@ class TranscriptionService:
                         should_patch = True
                         is_critical = True
                         self.logger.warning(
-                            f"触发字级单字符强制补刀: Sentence {i} 含单字符词 '{word_text}' "
+                            f"触发字级单字符强制复核: Sentence {i} 含单字符词 '{word_text}' "
                             f"(conf={word_conf:.2f})"
                         )
                         break
@@ -4536,7 +2838,7 @@ class TranscriptionService:
                         should_patch = True
                         is_critical = True
                         self.logger.warning(
-                            f"触发字级极低置信度强制补刀: Sentence {i} 含极低置信度词 '{word_text}' "
+                            f"触发字级极低置信度强制复核: Sentence {i} 含极低置信度词 '{word_text}' "
                             f"(conf={word_conf:.2f})"
                         )
                         break
@@ -4550,17 +2852,17 @@ class TranscriptionService:
                     should_patch = True
                     is_critical = True
                     self.logger.warning(
-                        f"触发字级多低置信度词强制补刀: Sentence {i} 含 {low_conf_word_count} 个低置信度词"
+                        f"触发字级多低置信度词强制复核: Sentence {i} 含 {low_conf_word_count} 个低置信度词"
                     )
 
-            # 常规补刀条件（遵循用户设置，仅 SMART_PATCH 模式）
+            # 常规复核条件（遵循用户设置，仅 SMART_PATCH 模式）
             # 注: DEEP_LISTEN 模式已在循环开头通过快速路径处理
             if not should_patch and solution_config.enhancement == EnhancementMode.SMART_PATCH:
-                # SMART_PATCH 模式: 仅低置信度句子触发补刀
+                # SMART_PATCH 模式: 仅低置信度句子触发复核
                 # 【阶段五】构建字级时间戳列表
                 words_data = [{"word": w.word, "confidence": w.confidence} for w in sentence.words]
 
-                # 增强版补刀判断：置信度、短片段、单字符、字级触发
+                # 增强版复核判断：置信度、短片段、单字符、字级触发
                 if needs_whisper_patch(
                     sentence.confidence,
                     duration=duration,
@@ -4577,12 +2879,12 @@ class TranscriptionService:
                     "is_trash_suspect": is_trash_suspect
                 })
 
-        # 调试日志：输出补刀队列统计
-        self.logger.debug(f"补刀队列构建完成: {len(patch_queue)} 个句子需要补刀")
+        # 调试日志：输出复核队列统计
+        self.logger.debug(f"复核队列构建完成: {len(patch_queue)} 个句子需要复核")
 
-        # 2. Whisper 补刀阶段（含仲裁判决）
+        # 2. Whisper 复核阶段（含仲裁判决）
         if patch_queue:
-            progress_tracker.start_phase(ProcessPhase.WHISPER_PATCH, len(patch_queue), "Whisper 补刀中...")
+            progress_tracker.start_phase(ProcessPhase.WHISPER_PATCH, len(patch_queue), "Whisper 复核中...")
 
             # === DEEP_LISTEN 模式: 使用 Whisper 缓冲池批量处理 ===
             if solution_config.enhancement == EnhancementMode.DEEP_LISTEN:
@@ -4598,14 +2900,14 @@ class TranscriptionService:
                 for idx, item in enumerate(patch_queue):
                     # 检查任务是否已取消
                     if job.canceled:
-                        self.logger.info(f"任务已取消，停止 Whisper 补刀: {job.job_id}")
+                        self.logger.info(f"任务已取消，停止 Whisper 复核: {job.job_id}")
                         break
 
                     sent_idx = item["index"]
                     sentence = item["sentence"]
                     is_trash_suspect = item["is_trash_suspect"]
 
-                    # 执行 Whisper 补刀并获取仲裁结果
+                    # 执行 Whisper 复核并获取仲裁结果
                     await self._whisper_text_patch_with_arbitration(
                         sentence=sentence,
                         sentence_index=sent_idx,
@@ -4634,184 +2936,6 @@ class TranscriptionService:
             self.logger.info("LLM 翻译功能待实现")
 
         return subtitle_manager.get_all_sentences()
-
-    async def _process_video_sensevoice(self, job: 'JobState'):
-        """
-        SenseVoice 主处理流程（v2.1 概念澄清版）
-
-        流程说明：
-        1-4: 准备阶段（音频提取、VAD、频谱分诊、按需分离）
-        5: 转录阶段（逐Chunk转录 + 熔断回溯）
-        6-8: 后处理增强阶段（Whisper补刀、LLM校对/翻译）
-        9: 输出阶段（生成字幕）
-        """
-        from app.services.streaming_subtitle import get_streaming_subtitle_manager, remove_streaming_subtitle_manager
-        from app.services.progress_tracker import get_progress_tracker, remove_progress_tracker, ProcessPhase
-        from app.services.solution_matrix import SolutionConfig, TranslateMode
-        from app.services.demucs_service import get_demucs_service
-        from app.services.sse_service import get_sse_manager
-        from pathlib import Path
-
-        # 检查任务是否已取消
-        if job.canceled:
-            self.logger.info(f"任务已取消，停止执行: {job.job_id}")
-            return
-
-        def push_signal_event(sse_manager, job_id: str, signal_code: str, message: str = ""):
-            """推送信号事件（使用统一命名空间格式）"""
-            sse_manager.broadcast_sync(
-                f"job:{job_id}",
-                f"signal.{signal_code}",
-                {"signal": signal_code, "message": message}
-            )
-
-        # 获取方案配置 - v3.5: 优先使用新版配置，兼容旧版
-        # 检查是否有 v3.5 新版配置
-        if hasattr(job.settings, 'transcription') and hasattr(job.settings.transcription, 'transcription_profile'):
-            # v3.5 新版配置: 从 job.settings 创建 SolutionConfig
-            solution_config = SolutionConfig.from_job_settings(job.settings)
-            self.logger.info(f"使用 v3.5 配置: profile={job.settings.transcription.transcription_profile}, "
-                           f"enhancement={solution_config.enhancement.value}, "
-                           f"proofread={solution_config.proofread.value}")
-        else:
-            # 旧版配置: 从 sensevoice.preset_id 创建
-            preset_id = getattr(job.settings.sensevoice, 'preset_id', 'default')
-            solution_config = SolutionConfig.from_preset(preset_id)
-            self.logger.info(f"使用旧版预设: {preset_id}")
-
-        # 初始化管理器
-        subtitle_manager = get_streaming_subtitle_manager(job.job_id)
-        progress_tracker = get_progress_tracker(job.job_id, solution_config.preset_id)
-
-        try:
-            # ========== 新架构：使用 PreprocessingPipeline ==========
-            # 统一执行：音频提取 + VAD切分 + 频谱分诊 + 按需分离
-            from app.pipelines.preprocessing_pipeline import PreprocessingPipeline
-            from app.services.audio.vad_service import VADConfig
-            import soundfile as sf
-
-            self.logger.info("使用新架构 PreprocessingPipeline（Stage模式）")
-
-            # V3.1.0: 根据语言选择 VAD 配置
-            # 英语使用 Whisper，需要合并 VAD（避免幻觉）
-            # 其他语言使用 SenseVoice，需要保留停顿信息以获得更好的断句
-            language = getattr(job.settings, 'language', 'auto')
-            is_english = language in {'en', 'english'}
-
-            if is_english:
-                # Whisper 模式：合并 VAD，避免幻觉
-                vad_config = VADConfig(
-                    merge_max_gap=1.0,
-                    merge_max_duration=12.0,
-                    smart_target_duration=12.0
-                )
-                self.logger.info(f"VAD配置: Whisper模式（合并），language={language}")
-            else:
-                # SenseVoice 模式：保留停顿信息，获得更自然的断句
-                vad_config = VADConfig(
-                    merge_max_gap=0.3,           # 只合并极短停顿（保留自然停顿）
-                    merge_max_duration=8.0,      # 更短的 chunk（避免强制切分）
-                    smart_target_duration=8.0    # 软上限降低
-                )
-                self.logger.info(f"VAD配置: SenseVoice模式（保留停顿），language={language}")
-
-            # 创建预处理流水线（传入 VAD 配置）
-            preprocessing_pipeline = PreprocessingPipeline(
-                config=job.settings.preprocessing,
-                vad_config=vad_config,
-                logger=self.logger
-            )
-
-            # 执行预处理（包含：音频提取、VAD、频谱分诊、按需分离）
-            progress_tracker.start_phase(ProcessPhase.EXTRACT, 1, "预处理流水线...")
-            audio_chunks = await preprocessing_pipeline.process(
-                video_path=job.input_path,
-                job_state=job
-            )
-            progress_tracker.complete_phase(ProcessPhase.EXTRACT)
-
-            # 获取预处理统计信息
-            stats = preprocessing_pipeline.get_statistics(audio_chunks)
-            self.logger.info(
-                f"PreprocessingPipeline 完成: "
-                f"总chunk数={stats['total_chunks']}, "
-                f"需要分离={stats['need_separation']}, "
-                f"已分离={stats['separated']}, "
-                f"分离比例={stats['separation_ratio']:.2%}"
-            )
-
-            # 保存音频文件供波形图使用（从第一个chunk获取采样率）
-            if audio_chunks:
-                sr = audio_chunks[0].sample_rate
-                # 重新加载完整音频用于保存（PreprocessingPipeline内部已处理）
-                import librosa
-                audio_array, _ = librosa.load(job.input_path, sr=sr, mono=True)
-                audio_path = Path(job.dir) / "audio.wav"
-                sf.write(str(audio_path), audio_array, sr)
-                self.logger.info(f"音频文件已保存: {audio_path}")
-
-            # 转换 AudioChunk 到 ChunkProcessState（兼容现有转录流程）
-            chunk_states = self._convert_audio_chunks_to_states(audio_chunks)
-
-            # 获取 demucs_service 引用（用于熔断回溯）
-            demucs_service = get_demucs_service()
-
-            # 5. 逐Chunk转录 + 熔断回溯（转录层核心）
-            progress_tracker.start_phase(ProcessPhase.SENSEVOICE, len(chunk_states), "SenseVoice 转录...")
-            all_sentences = []
-
-            for chunk_state in chunk_states:
-                # 检查任务是否已取消
-                if job.canceled:
-                    self.logger.info(f"任务已取消，停止转录: {job.job_id}")
-                    break
-
-                # 单个 Chunk 转录（含熔断回溯循环）
-                sentences = await self._transcribe_chunk_with_fusing(
-                    chunk_state=chunk_state,
-                    job=job,
-                    subtitle_manager=subtitle_manager,
-                    demucs_service=demucs_service
-                )
-                all_sentences.extend(sentences)
-                progress_tracker.update_phase(ProcessPhase.SENSEVOICE, increment=1)
-
-            progress_tracker.complete_phase(ProcessPhase.SENSEVOICE)
-
-            # 保存原始转录数据（未分句的完整数据）
-            self._save_raw_transcription(job, all_sentences)
-
-            # 6. 后处理增强（Whisper补刀、LLM校对/翻译）
-            final_results = await self._post_process_enhancement(
-                all_sentences, audio_array, job, subtitle_manager, solution_config
-            )
-
-            # 7. 生成字幕
-            progress_tracker.start_phase(ProcessPhase.SRT, 1, "生成字幕...")
-            output_path = str(Path(job.dir) / f"{job.job_id}.srt")
-            self._generate_subtitle_from_sentences(
-                final_results,
-                output_path,
-                include_translation=(solution_config.translate != TranslateMode.OFF)
-            )
-            progress_tracker.complete_phase(ProcessPhase.SRT)
-
-            # 8. 完成
-            job.status = 'completed'
-            push_signal_event(get_sse_manager(), job.job_id, "job_complete", "处理完成")
-
-        except Exception as e:
-            self.logger.error(f"SenseVoice 处理失败: {e}", exc_info=True)
-            job.status = 'failed'
-            job.error = str(e)
-            push_signal_event(get_sse_manager(), job.job_id, "job_failed", str(e))
-            raise
-
-        finally:
-            # 清理资源
-            remove_streaming_subtitle_manager(job.job_id)
-            remove_progress_tracker(job.job_id)
-
 
 # 单例处理器
 _service_instance: Optional[TranscriptionService] = None

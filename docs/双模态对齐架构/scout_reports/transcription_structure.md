@@ -68,9 +68,9 @@
 - `_detect_bgm_legacy` (2419-2462): 传统BGM检测
 - `_separate_vocals_global` (2463-2667): 全局人声分离
 
-#### Whisper补刀系统（约300行）
-- `_whisper_text_patch_with_arbitration` (4381-4479): 带仲裁的补刀
-- `_whisper_text_patch` (4480-4551): 标准补刀
+#### Whisper复核系统（约300行）
+- `_whisper_text_patch_with_arbitration` (4381-4479): 带仲裁的复核
+- `_whisper_text_patch` (4480-4551): 标准复核
 - `_estimate_whisper_confidence` (4552-4569): 置信度估算
 - `_post_process_enhancement` (4570-4787): 后处理增强
 
@@ -143,7 +143,7 @@ TranscriptionService类承担了至少8个不同的职责：
 
 ### whisper_service.py (606行)
 **优点**:
-- 职责清晰：Whisper补刀服务
+- 职责清晰：Whisper复核服务
 - 模型管理：自动检测和下载
 - 配置合理：模型列表和镜像配置
 

@@ -208,14 +208,14 @@ WHISPER_MODEL=large-v3  # 可选: tiny, base, small, medium, large-v3, turbo
 │  │  SenseVoice ONNX     │       │  Whisper Large-v3    │               │
 │  └──────────┬───────────┘       └──────────┬───────────┘               │
 │             │                              │                            │
-│             │  草稿字幕                    │  补刀字幕                  │
+│             │  草稿字幕                    │  复核字幕                  │
 │             │  SSE 推送                    │  SSE 推送                  │
 │             │    斜体                      │    正体                   │
 │             │                              │                            │
 │             └──────────┬───────────────────┘                            │
 │                        ↓                                                │
 │              ┌──────────────────┐                                       │
-│              │ AlignmentWorker  │                                       │
+│              │ 对齐阶段         │                                       │
 │              │ 文本时间戳对齐   │                                       │
 │              │ 字级时间戳计算   │                                       │
 │              └────────┬─────────┘                                       │
@@ -243,7 +243,7 @@ WHISPER_MODEL=large-v3  # 可选: tiny, base, small, medium, large-v3, turbo
 └─────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────┐
-│ 4. 智能补刀与熔断                                                        │
+│ 4. 智能复核与熔断                                                        │
 │                                                                          │
 │  触发条件: 低置信度 / 短片段 / 单字符 / 字级检查                        │
 │      ↓                                                                  │
@@ -271,7 +271,7 @@ WHISPER_MODEL=large-v3  # 可选: tiny, base, small, medium, large-v3, turbo
 系统采用“乱序执行、顺序提交”的架构，以最大化资源利用率：
 
 * **快流 (CPU 层):** `FastWorker` 在 CPU 上并发执行。它负责音频切分、SenseVoice 推理，并通过 SSE (Server-Sent Events) 推送“草稿”字幕，实现即时预览。
-* **慢流 (GPU 层):** `SlowWorker` 在 GPU 上顺序执行。它维护音频上下文以确保 Whisper 的语义连贯性，对草稿字幕进行“补刀”处理，生成“定稿”输出。
+* **慢流 (GPU 层):** `SlowWorker` 在 GPU 上顺序执行。它维护音频上下文以确保 Whisper 的语义连贯性，对草稿字幕进行“复核”处理，生成“定稿”输出。
 * **序列化队列 (SequencedQueue):** 充当双流之间的整流器，允许短音频块在 CPU 上乱序处理，同时确保 GPU 严格按照时间顺序接收任务以保留上下文。
 
 ## 关键技术特性
@@ -299,7 +299,7 @@ WHISPER_MODEL=large-v3  # 可选: tiny, base, small, medium, large-v3, turbo
 
 ### 三级对齐策略
 
-为了确保字幕稳定性，`AlignmentWorker` 采用了级联降级策略：
+为了确保字幕稳定性，对齐阶段采用了级联降级策略：
 
 1. **Level 1 (双模态对齐):** 使用 Needleman-Wunsch 全局序列对齐算法，将 Whisper 文本映射到 SenseVoice 时间戳（黄金标准）。
 2. **Level 2 (伪对齐):** 如果序列对齐失败，使用字符/单词时长比例，将 Whisper 文本数学映射到 SenseVoice 时间窗口。

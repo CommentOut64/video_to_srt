@@ -5,22 +5,18 @@
  * 职责：
  * - 启动时同步后端任务列表（修复幽灵任务）
  * - 全局 SSE 事件监听
- * - 自动跳转到编辑器（转录完成时）
  * - 全局任务状态同步
  * - 启动心跳服务（标签页重用机制）
  * - V3.1.1+dev.20260105.01: 启动时自动检查更新
  * - V3.1.1+dev.20260106.01: 使用 sessionStorage 防止会话内重复检查更新
  */
 import { ref, onMounted, onUnmounted } from 'vue'
-import { useRouter, useRoute } from 'vue-router'
 import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
 import { useUpdateChecker } from '@/composables'
 import sseChannelManager from '@/services/sseChannelManager'
 import { heartbeatService } from '@/services/heartbeat'
 import UpdateDialog from '@/components/UpdateDialog.vue'
 
-const router = useRouter()
-const route = useRoute()
 const taskStore = useUnifiedTaskStore()
 
 // V3.1.1+dev.20260105.01: 更新相关状态
@@ -114,7 +110,7 @@ onMounted(async () => {
 
       // 同步队列顺序
       if (state.queue && Array.isArray(state.queue)) {
-        taskStore.queueOrder = state.queue
+        taskStore.applyQueueOrder(state.queue, { timestamp: state.queue_updated_at })
         console.log(`[App] 初始队列顺序已同步: ${state.queue.length} 个任务`)
       }
 
@@ -127,34 +123,12 @@ onMounted(async () => {
             return
           }
 
-          // 检查 store 中是否已有此任务
-          const existingTask = taskStore.getTask(job.id)
-          if (!existingTask) {
-            // 添加新任务（包含完整信息）
-            taskStore.addTask({
-              job_id: job.id,
-              filename: job.filename,
-              status: job.status,
-              progress: job.progress,
-              message: job.message,
-              phase: job.phase || (job.status === 'finished' ? 'editing' : 'transcribing'),
-              createdAt: job.created_time || Date.now()
-            })
-          } else {
-            // 更新现有任务
-            taskStore.updateTask(job.id, {
-              status: job.status,
-              progress: job.progress,
-              message: job.message,
-              phase: job.phase || existingTask.phase,
-              createdAt: job.created_time || existingTask.createdAt
-            })
-          }
+          taskStore.applyTaskSnapshot(job)
         })
       }
     },
 
-    onQueueUpdate(queue) {
+    onQueueUpdate(queue, data) {
       console.log('[App] 队列更新:', queue)
 
       // 更新心跳
@@ -162,7 +136,9 @@ onMounted(async () => {
 
       // 更新队列顺序到 store
       if (Array.isArray(queue)) {
-        taskStore.queueOrder = queue
+        taskStore.applyQueueOrder(queue, {
+          updated_at: data?.updated_at ?? data?.timestamp
+        })
         console.log(`[App] 队列顺序已更新: ${queue.length} 个任务`)
       }
     },
@@ -179,23 +155,10 @@ onMounted(async () => {
         // V3.1.0: onJobStatus 只更新 status 和 message，不更新 progress
         // 避免后端推送的低进度（如恢复时的 0）覆盖前端已有的高进度
         // progress 的更新由 onJobProgress 专门负责
-        taskStore.updateTaskStatus(jobId, status, data.message || '')
+        taskStore.updateTaskStatus(jobId, status, data.message || '', {
+          updated_at: data.updated_at ?? data.timestamp
+        })
 
-        // 转录完成自动跳转到编辑器
-        if (status === 'finished' && task.phase === 'transcribing') {
-          console.log(`[App] 任务 ${jobId} 转录完成，准备跳转到编辑器`)
-
-          // 更新阶段为编辑
-          taskStore.updateTask(jobId, {
-            phase: 'editing'
-          })
-
-          // 自动跳转到编辑器（仅在当前不在编辑器页面时）
-          if (!route.path.startsWith('/editor/')) {
-            console.log(`[App] 自动跳转到编辑器: /editor/${jobId}`)
-            router.push(`/editor/${jobId}`)
-          }
-        }
       }
     },
 
@@ -213,6 +176,19 @@ onMounted(async () => {
         processed: data.processed,
         total: data.total,
         language: data.language
+      }, {
+        updated_at: data.updated_at ?? data.timestamp
+      })
+    },
+    onJobRenamed(data) {
+      console.log('[App] 任务重命名:', data.job_id, data.title)
+
+      const updates = {}
+      if (data.title !== undefined) updates.title = data.title
+      if (data.filename !== undefined) updates.filename = data.filename
+
+      taskStore.updateTask(data.job_id, updates, {
+        updated_at: data.updated_at ?? data.timestamp
       })
     },
 
@@ -226,11 +202,6 @@ onMounted(async () => {
       // 从 store 中彻底移除任务
       taskStore.deleteTask(jobId)
 
-      // 如果当前在该任务的编辑器页面，跳转回任务列表
-      if (route.path === `/editor/${jobId}`) {
-        console.log(`[App] 当前任务已删除，跳转回任务列表`)
-        router.push('/tasks')
-      }
     },
 
     onConnected(data) {

@@ -10,6 +10,7 @@
 import { defineStore } from 'pinia'
 import { reactive, computed } from 'vue'
 import { useUnifiedTaskStore } from './unifiedTaskStore'
+import { normalizeTimestamp } from '@/utils/timestamp'
 
 // [V3.1.0] 清理配置
 const CLEANUP_CONFIG = {
@@ -34,6 +35,12 @@ function createState(jobId) {
     processed: 0,
     total: 0,
     language: null,
+    detail: {
+      preprocess: 0,
+      fast: 0,
+      slow: 0,
+      align: 0
+    },
     dualStream: {
       fastStream: 0,
       slowStream: 0,
@@ -43,6 +50,7 @@ function createState(jobId) {
     lastSource: 'init',
     lastUpdate: 0,
     lastSseAt: 0,
+    lastServerAt: 0,
     lastRejected: null
   }
 }
@@ -60,16 +68,9 @@ export const useProgressStore = defineStore('progress', () => {
     if (!jobStates[jobId]) {
       jobStates[jobId] = createState(jobId)
 
-      // V3.1.0: 首次创建状态时，从 unifiedTaskStore 同步初始进度
-      // 避免页面刷新后进度显示为 0%
-      const task = taskStore.getTask(jobId)
-      if (task && typeof task.progress === 'number' && !Number.isNaN(task.progress)) {
-        jobStates[jobId].percent = task.progress
-        jobStates[jobId].status = task.status || 'idle'
-        jobStates[jobId].phase = task.phase || 'pending'
-        jobStates[jobId].message = task.message || ''
-        console.log(`[ProgressStore] 从 unifiedTaskStore 同步初始进度: ${jobId} -> ${task.progress}%`)
-      }
+      // V3.2.0+dev.20260122.01: 初始化时不从 unifiedTaskStore 同步进度
+      // 始终从 0% 开始，等待 SSE 推送真实进度，避免进度回退
+      console.log(`[ProgressStore] 创建新任务状态: ${jobId}，初始进度 0%`)
     }
     return jobStates[jobId]
   }
@@ -82,6 +83,8 @@ export const useProgressStore = defineStore('progress', () => {
       processed: state.processed,
       total: state.total,
       language: state.language
+    }, {
+      updated_at: state.lastServerAt
     })
   }
 
@@ -120,6 +123,18 @@ export const useProgressStore = defineStore('progress', () => {
   function apply(jobId, payload = {}, source = 'unknown') {
     const state = ensureState(jobId)
     const now = Date.now()
+    const incomingAt = normalizeTimestamp(payload.updated_at ?? payload.timestamp)
+    if (incomingAt && state.lastServerAt && incomingAt < state.lastServerAt) {
+      state.lastRejected = {
+        percent: clampPercent(payload.percent ?? payload.progress),
+        source,
+        at: now
+      }
+      return state
+    }
+    if (incomingAt) {
+      state.lastServerAt = incomingAt
+    }
     const nextStatus = payload.status || state.status
     let dirty = false
 
@@ -149,6 +164,14 @@ export const useProgressStore = defineStore('progress', () => {
     }
     if (payload.language !== undefined) {
       state.language = payload.language
+      dirty = true
+    }
+
+    if (payload.detail && typeof payload.detail === 'object') {
+      state.detail = {
+        ...state.detail,
+        ...payload.detail
+      }
       dirty = true
     }
 
