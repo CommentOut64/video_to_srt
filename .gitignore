@@ -52,7 +52,7 @@ Thumbs.db
 *~
 
 # Python 虚拟环境
-venv/
+.venv
 env/
 ENV/
 
@@ -60,6 +60,8 @@ ENV/
 *.tmp
 *.temp
 .cache/
+.env_installed
+.req_hash
 
 # 备份文件
 *.bak
@@ -89,9 +91,10 @@ tests_output/
 *.test.*
 
 CLAUDE.md
-backend/models/pretrained/sensevoice/
+backend/models/pretrained/
 tools/python
 build_patch.bat
 patch_tools/apply_patch.py
 
 scripts
+archive
