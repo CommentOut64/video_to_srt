@@ -198,38 +198,47 @@ def parse_srt_content(content: str) -> List[Dict]:
     # 按空行分割字幕块
     blocks = re.split(r'\n\s*\n', content.strip())
 
+    time_pattern = re.compile(
+        r'(\d{2}:\d{2}:\d{2}[,\.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,\.]\d{3})'
+    )
+
     for block in blocks:
         lines = block.strip().split('\n')
         if len(lines) < 2:
             continue
 
-        try:
-            # 第一行是序号
-            index = int(lines[0].strip())
+        first_line = lines[0].lstrip("\ufeff").strip()
+        second_line = lines[1].strip()
 
-            # 第二行是时间戳
-            time_line = lines[1].strip()
-            time_match = re.match(
-                r'(\d{2}:\d{2}:\d{2}[,\.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,\.]\d{3})',
-                time_line
-            )
+        time_match = time_pattern.match(first_line)
+        if time_match:
+            index = len(segments) + 1
+            text_lines = lines[1:]
+        else:
+            time_match = time_pattern.match(second_line)
             if not time_match:
                 continue
+            try:
+                index = int(first_line)
+            except ValueError:
+                index = len(segments) + 1
+            text_lines = lines[2:]
 
+        try:
             start = _parse_srt_timestamp(time_match.group(1))
             end = _parse_srt_timestamp(time_match.group(2))
-
-            # 剩余行是字幕文本
-            text = '\n'.join(lines[2:]).strip()
-
-            segments.append({
-                'index': index,
-                'start': start,
-                'end': end,
-                'text': text
-            })
         except (ValueError, IndexError):
             continue
+
+        # 剩余行是字幕文本
+        text = '\n'.join(text_lines).strip()
+
+        segments.append({
+            'index': index,
+            'start': start,
+            'end': end,
+            'text': text
+        })
 
     return segments
 

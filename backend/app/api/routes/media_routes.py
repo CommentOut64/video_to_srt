@@ -23,7 +23,12 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from app.core.config import config
 from app.utils.ass_converter import ASSConverter
-from app.utils.text_utils import repair_srt_overlaps, repair_timestamp_overlaps, detect_timestamp_overlaps
+from app.utils.text_utils import (
+    repair_srt_overlaps,
+    repair_timestamp_overlaps,
+    detect_timestamp_overlaps,
+    parse_srt_content,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1774,27 +1779,9 @@ async def generate_ass_from_srt(job_id: str, request: Request):
         auto_repair = body.get("auto_repair", True)  # V3.1.1+dev.20260106.03: 默认启用自动修复
 
         # 读取 SRT 文件并解析为字幕数据
-        subtitles = []
         with open(srt_file, 'r', encoding='utf-8') as f:
             content = f.read()
-
-        # 简单的 SRT 解析
-        blocks = content.strip().split('\n\n')
-        for block in blocks:
-            lines = block.strip().split('\n')
-            if len(lines) >= 3:
-                # 解析时间戳行
-                time_line = lines[1]
-                if ' --> ' in time_line:
-                    start_str, end_str = time_line.split(' --> ')
-                    start = _parse_srt_timestamp(start_str.strip())
-                    end = _parse_srt_timestamp(end_str.strip())
-                    text = '\n'.join(lines[2:])
-                    subtitles.append({
-                        "start": start,
-                        "end": end,
-                        "text": text
-                    })
+        subtitles = parse_srt_content(content)
 
         # V3.1.1+dev.20260106.03: 自动修复时间戳重叠
         repaired_count = 0
@@ -1836,22 +1823,6 @@ async def generate_ass_from_srt(job_id: str, request: Request):
     except Exception as e:
         logger.error(f"生成ASS文件失败: {str(e)}")
         raise HTTPException(status_code=500, detail=f"生成ASS文件失败: {str(e)}")
-
-
-def _parse_srt_timestamp(timestamp: str) -> float:
-    """
-    解析 SRT 时间戳为秒数
-
-    Args:
-        timestamp: SRT 时间戳 (HH:MM:SS,mmm)
-
-    Returns:
-        秒数
-    """
-    time_part, ms_part = timestamp.replace(',', '.').split('.')
-    h, m, s = map(int, time_part.split(':'))
-    ms = int(ms_part)
-    return h * 3600 + m * 60 + s + ms / 1000
 
 
 @router.get("/{job_id}/info")

@@ -283,8 +283,7 @@ class TranscriptionService:
             job.message = f'失败: {str(e)}'
             raise
 
-    # V3.2.0+dev.20260125.11: 移除 _generate_srt_from_sentences 和 _format_srt_timestamp
-    # 已迁移至 SubtitleOutputService
+    # V3.2.0+dev.20260125.11: SRT 输出已迁移至 SubtitleOutputService
 
     async def _run_new_preprocessing(self, job: JobState, input_path: Path) -> List:
         """
@@ -1672,99 +1671,6 @@ class TranscriptionService:
         self.logger.info(f"字幕时间微调: 延迟开始25ms, 延长结束25ms")
         return adjusted
 
-    def _format_ts(self, sec: float) -> str:
-        """
-        格式化时间戳为SRT格式
-
-        Args:
-            sec: 秒数
-
-        Returns:
-            str: SRT时间戳 (HH:MM:SS,mmm)
-        """
-        if sec < 0:
-            sec = 0
-
-        ms = int(round(sec * 1000))
-        h = ms // 3600000
-        ms %= 3600000
-        m = ms // 60000
-        ms %= 60000
-        s = ms // 1000
-        ms %= 1000
-
-        return f"{h:02}:{m:02}:{s:02},{ms:03}"
-
-    def _generate_srt(self, results: List[Dict], path: str, word_level: bool):
-        """
-        生成SRT字幕文件
-        V3.1.1+dev.20260106.03: 生成前自动修复时间戳重叠
-
-        Args:
-            results: 转录结果列表
-            path: 输出文件路径
-            word_level: 是否使用词级时间戳
-        """
-        # V3.1.1+dev.20260106.03: 导入重叠修复函数
-        from app.utils.text_utils import repair_timestamp_overlaps, detect_timestamp_overlaps
-
-        all_entries = []
-
-        for r in results:
-            if not r:
-                continue
-
-            # 词级时间戳模式
-            if word_level and r.get('word_segments'):
-                for w in r['word_segments']:
-                    if w.get('start') is not None and w.get('end') is not None:
-                        txt = (w.get('word') or '').strip()
-                        if txt:
-                            all_entries.append({
-                                'start': w['start'],
-                                'end': w['end'],
-                                'text': txt
-                            })
-
-            # 句子级时间戳模式（默认）
-            elif r.get('segments'):
-                for s in r['segments']:
-                    if s.get('start') is not None and s.get('end') is not None:
-                        txt = (s.get('text') or '').strip()
-                        if txt:
-                            all_entries.append({
-                                'start': s['start'],
-                                'end': s['end'],
-                                'text': txt
-                            })
-
-        # 过滤无效时间戳
-        all_entries = [e for e in all_entries if e['end'] > e['start']]
-
-        # V3.1.1+dev.20260106.03: 检测并修复重叠
-        if all_entries:
-            overlaps = detect_timestamp_overlaps(all_entries)
-            if overlaps:
-                self.logger.warning(f"检测到 {len(overlaps)} 处时间戳重叠，自动修复中...")
-                all_entries = repair_timestamp_overlaps(all_entries, gap_ms=1.0)
-                self.logger.info(f"已修复 {len(overlaps)} 处时间戳重叠")
-
-        # 写入SRT格式
-        lines = []
-        for n, e in enumerate(all_entries, 1):
-            lines.append(str(n))  # 序号
-            lines.append(
-                f"{self._format_ts(e['start'])} --> {self._format_ts(e['end'])}"
-            )  # 时间戳
-            lines.append(e['text'])  # 字幕文本
-            lines.append("")  # 空行
-
-        # 写入文件
-        with open(path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(lines))
-
-        self.logger.info(f"SRT文件已生成: {path}, 共{len(all_entries)}条字幕")
-
     # ==========================================
     # SenseVoice 集成方法（Phase 3）
     # ==========================================
@@ -1985,57 +1891,6 @@ class TranscriptionService:
             ))
 
         return words
-
-    def _generate_subtitle_from_sentences(
-        self,
-        sentences: List['SentenceSegment'],
-        output_path: str,
-        include_translation: bool = False
-    ) -> str:
-        """
-        从句子列表生成 SRT 字幕文件
-
-        Args:
-            sentences: 句子列表
-            output_path: 输出文件路径
-            include_translation: 是否包含翻译（双语字幕）
-
-        Returns:
-            str: 生成的SRT文件路径
-        """
-        self.logger.info(f"生成SRT字幕: {len(sentences)} 句 -> {output_path}")
-
-        lines = []
-        for idx, sentence in enumerate(sentences, 1):
-            # 序号
-            lines.append(str(idx))
-
-            # 时间戳
-            start_ts = self._format_ts(sentence.start)
-            end_ts = self._format_ts(sentence.end)
-            lines.append(f"{start_ts} --> {end_ts}")
-
-            # 字幕文本（使用清洗后的文本）
-            if include_translation and sentence.translation:
-                # 双语字幕：原文 + 翻译
-                lines.append(sentence.text_clean or sentence.text)
-                lines.append(sentence.translation)
-            else:
-                lines.append(sentence.text_clean or sentence.text)
-
-            # 空行分隔
-            lines.append("")
-
-        # 写入文件
-        # 确保父目录存在
-        from pathlib import Path
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(lines))
-
-        self.logger.info(f"SRT字幕生成完成: {output_path}")
-        return output_path
 
     def _save_raw_transcription(
         self,
