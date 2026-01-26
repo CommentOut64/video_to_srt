@@ -16,7 +16,6 @@ V3.2.0+dev.20260125.07: 支持运行时依赖注入（方案 B）
 from __future__ import annotations
 
 import logging
-import time
 from pathlib import Path
 from typing import List, Optional, TYPE_CHECKING
 
@@ -36,6 +35,11 @@ if TYPE_CHECKING:
     from app.services.progress_tracker import ProgressTracker
     from app.services.streaming_subtitle import StreamingSubtitleManager
     from app.utils.cancellation_token import CancellationToken
+
+# V3.2.0+dev.20260125.11: 导入 SubtitleOutputService 用于 SRT 生成
+from app.services.subtitle_output_service import get_subtitle_output_service
+# V3.2.0+dev.20260125.11: 使用 SSEPublisher 统一推送进度事件
+from app.services.sse_publisher import get_sse_publisher
 
 
 class PipelineOrchestrator:
@@ -229,9 +233,12 @@ class PipelineOrchestrator:
             self.logger.info(f"转录完成: {len(final_sentences)} 个句子")
 
             # 阶段 3: 生成 SRT 文件
+            # V3.2.0+dev.20260125.11: 使用 SubtitleOutputService 替代内部方法
             self._update_progress(job, "finalize", 0, "生成字幕文件...")
             srt_path = _job_dir / f"{Path(job.filename).stem}.srt"
-            self._generate_srt_from_sentences(final_sentences, srt_path)
+            subtitle_output = get_subtitle_output_service()
+            segments = subtitle_output.build_segments(final_sentences)
+            subtitle_output.write_srt(segments, srt_path)
 
             job.srt_path = str(srt_path)
             job.status = "completed"
@@ -436,76 +443,10 @@ class PipelineOrchestrator:
         if not self.sse_manager:
             return
         try:
-            channel_id = f"job:{job.job_id}"
-            updated_at_ms = int(time.time() * 1000)
-            progress_data = {
-                "job_id": job.job_id,
-                "phase": job.phase,
-                "percent": job.progress,
-                "phase_percent": job.phase_percent,
-                "message": job.message,
-                "status": job.status,
-                "processed": job.processed,
-                "total": job.total,
-                "language": job.language or "",
-                "updated_at": updated_at_ms,
-                "timestamp": time.time(),
-            }
-            self.sse_manager.broadcast_sync(
-                channel_id, "progress.overall", progress_data
-            )
-
-            global_progress_data = {
-                "id": job.job_id,
-                "percent": job.progress,
-                "phase_percent": job.phase_percent,
-                "message": job.message,
-                "status": job.status,
-                "phase": job.phase,
-                "processed": job.processed,
-                "total": job.total,
-                "updated_at": updated_at_ms,
-                "timestamp": time.time(),
-            }
-            self.sse_manager.broadcast_sync(
-                "global", "job_progress", global_progress_data
-            )
-
+            publisher = get_sse_publisher(job.job_id, self.sse_manager, job=job)
+            publisher.publish_job_progress(job)
         except Exception as exc:
             self.logger.debug("SSE推送失败: %s", exc)
 
-    def _generate_srt_from_sentences(self, sentences: List, output_path: Path) -> None:
-        """从句子列表生成 SRT 文件"""
-        from app.utils.text_utils import repair_timestamp_overlaps, detect_timestamp_overlaps
-
-        segments = []
-        for sentence in sentences:
-            segments.append(
-                {"start": sentence.start, "end": sentence.end, "text": sentence.text}
-            )
-
-        overlaps = detect_timestamp_overlaps(segments)
-        if overlaps:
-            self.logger.warning(
-                "检测到 %s 处时间戳重叠，自动修复中...", len(overlaps)
-            )
-            segments = repair_timestamp_overlaps(segments, gap_ms=1.0)
-            self.logger.info("已修复 %s 处时间戳重叠", len(overlaps))
-
-        srt_content = []
-        for i, seg in enumerate(segments, 1):
-            start = self._format_srt_timestamp(seg["start"])
-            end = self._format_srt_timestamp(seg["end"])
-            text = seg["text"]
-            srt_content.append(f"{i}\n{start} --> {end}\n{text}\n")
-
-        output_path.write_text("\n".join(srt_content), encoding="utf-8")
-        self.logger.info("SRT 文件已生成: %s", output_path)
-
-    def _format_srt_timestamp(self, seconds: float) -> str:
-        """格式化 SRT 时间戳"""
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        secs = int(seconds % 60)
-        millis = int((seconds % 1) * 1000)
-        return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+    # V3.2.0+dev.20260125.11: 移除 _generate_srt_from_sentences 和 _format_srt_timestamp
+    # 已迁移至 SubtitleOutputService

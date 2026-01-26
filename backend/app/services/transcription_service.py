@@ -38,6 +38,10 @@ from app.models.hardware_models import HardwareInfo, OptimizationConfig
 from app.services.hardware_profile_service import get_hardware_profile_provider
 from app.services.job_lifecycle_service import get_job_lifecycle_service
 from app.core.config import config  # 导入统一配置
+# V3.2.0+dev.20260125.11: 导入 SubtitleOutputService 用于 SRT 生成
+from app.services.subtitle_output_service import get_subtitle_output_service
+# V3.2.0+dev.20260125.11: 引入 SSEPublisher 进行统一事件推送
+from app.services.sse_publisher import get_sse_publisher
 
 class TranscriptionService:
     """
@@ -85,6 +89,17 @@ class TranscriptionService:
         self._detect_hardware()
 
         # 任务加载已由 JobLifecycleService 负责
+
+    def _get_sse_publisher(self, job: JobState):
+        """获取 SSE 发布器（集中管理 SSE 推送）"""
+        try:
+            if self.sse_manager is None:
+                from app.services.sse_service import get_sse_manager
+                self.sse_manager = get_sse_manager()
+            return get_sse_publisher(job.job_id, self.sse_manager, job=job)
+        except Exception as e:
+            self.logger.debug(f"SSEPublisher 获取失败: {e}")
+            return None
 
     def _detect_hardware(self):
         """执行硬件检测并生成优化配置"""
@@ -243,11 +258,14 @@ class TranscriptionService:
 
             # ==========================================
             # 阶段 3: 生成 SRT 文件（收尾）
+            # V3.2.0+dev.20260125.11: 使用 SubtitleOutputService 替代内部方法
             # ==========================================
             self._update_progress(job, 'finalize', 0, '生成字幕文件...')
 
             srt_path = job_dir / f"{Path(job.filename).stem}.srt"
-            self._generate_srt_from_sentences(final_sentences, srt_path)
+            subtitle_output = get_subtitle_output_service()
+            segments = subtitle_output.build_segments(final_sentences)
+            subtitle_output.write_srt(segments, srt_path)
 
             job.srt_path = str(srt_path)
             job.status = 'completed'
@@ -263,61 +281,8 @@ class TranscriptionService:
             job.message = f'失败: {str(e)}'
             raise
 
-    def _generate_srt_from_sentences(self, sentences: List, output_path: Path):
-        """
-        从句子列表生成 SRT 文件
-        V3.1.1+dev.20260106.03: 生成前自动修复时间戳重叠
-
-        Args:
-            sentences: 句子列表
-            output_path: 输出路径
-        """
-        # V3.1.1+dev.20260106.03: 转换为字典列表以便修复重叠
-        from app.utils.text_utils import repair_timestamp_overlaps, detect_timestamp_overlaps
-
-        segments = []
-        for sentence in sentences:
-            segments.append({
-                'start': sentence.start,
-                'end': sentence.end,
-                'text': sentence.text
-            })
-
-        # 检测并修复重叠
-        overlaps = detect_timestamp_overlaps(segments)
-        if overlaps:
-            self.logger.warning(f"检测到 {len(overlaps)} 处时间戳重叠，自动修复中...")
-            segments = repair_timestamp_overlaps(segments, gap_ms=1.0)
-            self.logger.info(f"已修复 {len(overlaps)} 处时间戳重叠")
-
-        # 生成 SRT 内容
-        srt_content = []
-        for i, seg in enumerate(segments, 1):
-            start = self._format_srt_timestamp(seg['start'])
-            end = self._format_srt_timestamp(seg['end'])
-            text = seg['text']
-
-            srt_content.append(f"{i}\n{start} --> {end}\n{text}\n")
-
-        output_path.write_text('\n'.join(srt_content), encoding='utf-8')
-        self.logger.info(f"SRT 文件已生成: {output_path}")
-
-    def _format_srt_timestamp(self, seconds: float) -> str:
-        """
-        格式化 SRT 时间戳
-
-        Args:
-            seconds: 秒数
-
-        Returns:
-            SRT 格式时间戳 (HH:MM:SS,mmm)
-        """
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        secs = int(seconds % 60)
-        millis = int((seconds % 1) * 1000)
-
-        return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+    # V3.2.0+dev.20260125.11: 移除 _generate_srt_from_sentences 和 _format_srt_timestamp
+    # 已迁移至 SubtitleOutputService
 
     async def _run_new_preprocessing(self, job: JobState, input_path: Path) -> List:
         """
@@ -589,43 +554,10 @@ class TranscriptionService:
             job: 任务状态对象
         """
         try:
-            # 动态获取SSE管理器（确保获取到已设置loop的实例）
-            from app.services.sse_service import get_sse_manager
-            sse_manager = get_sse_manager()
-
-            # 1. 推送到单任务频道（EditorView 使用）
-            channel_id = f"job:{job.job_id}"
-            updated_at_ms = int(time.time() * 1000)
-            progress_data = {
-                "job_id": job.job_id,
-                "phase": job.phase,
-                "percent": job.progress,
-                "phase_percent": job.phase_percent,  # 新增：阶段内进度
-                "message": job.message,
-                "status": job.status,
-                "processed": job.processed,
-                "total": job.total,
-                "language": job.language or "",
-                "updated_at": updated_at_ms,
-                "timestamp": time.time()
-            }
-            sse_manager.broadcast_sync(channel_id, "progress.overall", progress_data)
-
-            # 2. 推送到全局频道（TaskMonitor 使用）
-            global_progress_data = {
-                "id": job.job_id,  # 全局频道使用 "id"
-                "percent": job.progress,
-                "phase_percent": job.phase_percent,  # 新增：阶段内进度
-                "message": job.message,
-                "status": job.status,
-                "phase": job.phase,
-                "processed": job.processed,
-                "total": job.total,
-                "updated_at": updated_at_ms,
-                "timestamp": time.time()
-            }
-            sse_manager.broadcast_sync("global", "job_progress", global_progress_data)
-
+            publisher = self._get_sse_publisher(job)
+            if publisher is None:
+                return
+            publisher.publish_job_progress(job)
         except Exception as e:
             # SSE推送失败不应影响转录流程
             self.logger.debug(f"SSE推送失败: {e}")
@@ -640,23 +572,10 @@ class TranscriptionService:
             message: 附加消息
         """
         try:
-            # 动态获取SSE管理器（确保获取到已设置loop的实例）
-            from app.services.sse_service import get_sse_manager
-            sse_manager = get_sse_manager()
-
-            channel_id = f"job:{job.job_id}"
-            sse_manager.broadcast_sync(
-                channel_id,
-                f"signal.{signal_code}",
-                {
-                    "job_id": job.job_id,
-                    "signal": signal_code,
-                    "message": message or job.message,
-                    "status": job.status,
-                    "percent": job.progress,
-                    "updated_at": int(time.time() * 1000)
-                }
-            )
+            publisher = self._get_sse_publisher(job)
+            if publisher is None:
+                return
+            publisher.publish_job_signal(job, signal_code, message or job.message)
         except Exception as e:
             self.logger.debug(f"SSE信号推送失败（非致命）: {e}")
 
@@ -827,26 +746,10 @@ class TranscriptionService:
             total: 总segment数量
         """
         try:
-            # 动态获取SSE管理器
-            from app.services.sse_service import get_sse_manager
-            sse_manager = get_sse_manager()
-
-            channel_id = f"job:{job.job_id}"
-            sse_manager.broadcast_sync(
-                channel_id,
-                "subtitle.segment",
-                {
-                    "segment_index": segment_result.get('segment_index', 0),
-                    "segments": segment_result.get('segments', []),
-                    "language": segment_result.get('language', job.language),
-                    "progress": {
-                        "processed": processed,
-                        "total": total,
-                        "percentage": round(processed / max(1, total) * 100, 2)
-                    }
-                }
-            )
-            self.logger.debug(f"推送segment #{segment_result.get('segment_index', 0)} 转录结果")
+            publisher = self._get_sse_publisher(job)
+            if publisher is None:
+                return
+            publisher.publish_segment(job, segment_result, processed, total)
         except Exception as e:
             # SSE推送失败不应影响转录流程
             self.logger.debug(f"SSE segment推送失败（非致命）: {e}")
@@ -860,29 +763,10 @@ class TranscriptionService:
             aligned_results: 对齐后的结果列表
         """
         try:
-            # 动态获取SSE管理器
-            from app.services.sse_service import get_sse_manager
-            sse_manager = get_sse_manager()
-
-            channel_id = f"job:{job.job_id}"
-
-            # 提取对齐后的segments
-            segments = []
-            word_segments = []
-            if aligned_results and len(aligned_results) > 0:
-                segments = aligned_results[0].get('segments', [])
-                word_segments = aligned_results[0].get('word_segments', [])
-
-            sse_manager.broadcast_sync(
-                channel_id,
-                "subtitle.aligned",
-                {
-                    "segments": segments,
-                    "word_segments": word_segments,
-                    "message": "对齐完成"
-                }
-            )
-            self.logger.info(f"推送对齐完成事件，共 {len(segments)} 条字幕")
+            publisher = self._get_sse_publisher(job)
+            if publisher is None:
+                return
+            publisher.publish_aligned(job, aligned_results)
         except Exception as e:
             # SSE推送失败不应影响转录流程
             self.logger.debug(f"SSE aligned推送失败（非致命）: {e}")
@@ -1193,26 +1077,14 @@ class TranscriptionService:
             ratios: 各采样点的BGM比例列表
         """
         try:
-            from app.services.sse_service import get_sse_manager
-
-            sse_manager = get_sse_manager()
-            channel_id = f"job:{job.job_id}"
-
+            publisher = self._get_sse_publisher(job)
+            if publisher is None:
+                return
             # 将numpy类型转换为Python原生类型，避免JSON序列化错误
             native_ratios = [float(r) for r in ratios] if ratios else []
             max_ratio = float(max(ratios)) if ratios else 0.0
-
-            # 构造事件数据
-            event_data = {
-                "level": level.value,
-                "ratios": native_ratios,
-                "max_ratio": max_ratio,
-                "recommendation": self._get_demucs_recommendation(level)
-            }
-
-            # 广播事件
-            sse_manager.broadcast_sync(channel_id, "signal.bgm_detected", event_data)
-
+            recommendation = self._get_demucs_recommendation(level)
+            publisher.publish_bgm_detected(level, native_ratios, max_ratio, recommendation)
         except Exception as e:
             # SSE推送失败不应影响主流程
             self.logger.debug(f"SSE推送失败（非致命）: {e}")
@@ -1226,19 +1098,11 @@ class TranscriptionService:
             strategy: SeparationStrategy 对象
         """
         try:
-            from app.services.sse_service import get_sse_manager
-
-            sse_manager = get_sse_manager()
-            channel_id = f"job:{job.job_id}"
-
-            # 使用 strategy.to_dict() 获取事件数据
-            event_data = strategy.to_dict()
-
-            # 广播事件
-            sse_manager.broadcast_sync(channel_id, "signal.separation_strategy", event_data)
-
+            publisher = self._get_sse_publisher(job)
+            if publisher is None:
+                return
+            publisher.publish_separation_strategy(strategy)
             self.logger.debug(f"分离策略事件已推送: {strategy.reason}")
-
         except Exception as e:
             # SSE推送失败不应影响主流程
             self.logger.debug(f"SSE推送失败（非致命）: {e}")
@@ -1758,35 +1622,16 @@ class TranscriptionService:
             total_count: 总segment数量
         """
         try:
-            from app.services.sse_service import get_sse_manager
-            sse_manager = get_sse_manager()
-
-            channel_id = f"job:{job.job_id}"
-
-            # 计算百分比
-            batch_progress = (current_batch / total_batches) * 100 if total_batches > 0 else 0
-            segment_progress = (aligned_count / total_count) * 100 if total_count > 0 else 0
-
-            sse_manager.broadcast_sync(
-                channel_id,
-                "progress.align",
-                {
-                    "job_id": job.job_id,
-                    "phase": "align",
-                    "batch": {
-                        "current": current_batch,
-                        "total": total_batches,
-                        "progress": round(batch_progress, 2)
-                    },
-                    "segments": {
-                        "aligned": aligned_count,
-                        "total": total_count,
-                        "progress": round(segment_progress, 2)
-                    },
-                    "message": f"aligning batch {current_batch}/{total_batches} ({aligned_count}/{total_count} segments)"
-                }
+            publisher = self._get_sse_publisher(job)
+            if publisher is None:
+                return
+            publisher.publish_align_progress(
+                job,
+                current_batch,
+                total_batches,
+                aligned_count,
+                total_count,
             )
-
         except Exception as e:
             self.logger.debug(f"SSE align progress push failed (non-fatal): {e}")
 
