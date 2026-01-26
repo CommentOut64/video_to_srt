@@ -75,18 +75,18 @@ backend/app/
 
 - **PresetConfig**: 预设配置数据模型
   - 显存要求配置
-  - 增强模式（纯 SenseVoice / 智能补刀 / 深度聆听）
-  - Whisper 补刀配置
+  - 增强模式（纯 SenseVoice / 智能复核 / 深度聆听）
+  - Whisper 复核配置
   - LLM 配置（校对/翻译）
   - 序列化/反序列化支持
 
 - **预定义预设方案**: 6 个预设
   - preset_0_pure_sv: 纯 SenseVoice（最快）
-  - preset_1_smart_patch: 智能补刀（推荐）
+  - preset_1_smart_patch: 智能复核（推荐）
   - preset_2_deep_listen: 深度聆听（最高准确度）
-  - preset_3_with_proofread: 智能补刀 + LLM 校对
+  - preset_3_with_proofread: 智能复核 + LLM 校对
   - preset_4_full_quality: 深度聆听 + 全量校对
-  - preset_5_with_translation: 智能补刀 + LLM 翻译
+  - preset_5_with_translation: 智能复核 + LLM 翻译
 
 - **辅助函数**:
   - `get_preset()`: 获取单个预设

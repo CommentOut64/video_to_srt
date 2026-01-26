@@ -36,7 +36,7 @@
   需重做或新增的关键环节
 
   - TranscriptionService._process_video_sensevoice 及 _transcribe_chunk_with_fusing / _post_process_enhancement
-    必须重构为“串行双模型 + 对齐”的主干，历史的补刀触发和仲裁逻辑可以删除或转化为“草稿→成品”状态
+    必须重构为“串行双模型 + 对齐”的主干，历史的复核触发和仲裁逻辑可以删除或转化为“草稿→成品”状态
     机（llmdoc/agent/video_to_srt_gpu_complete_pipeline_architecture_report.md:50, llmdoc/agent/
     video_to_srt_gpu_complete_pipeline_architecture_report.md:60）。
   - WhisperService 不再是条件调用，需要支持全量 chunk 级推理、可选 GPU/CPU 分时、int8/float16 自动切换等；
@@ -45,7 +45,7 @@
     败时自动回退到 Whisper 时间戳或降级的声学估计。
   - SSE 管线增加 subtitle.draft/subtitle.overwrite、前端列表支持同 ID 覆盖、任务频道对“草稿/定稿”进行视觉区分（docs/新架
     构阐述.md:278, docs/新架构阐述.md:333）。
-  - 旧的 needs_whisper_patch、_whisper_text_patch_with_arbitration、伪对齐与补刀事件需要整体淘汰，以防逻辑冲突。相应数据
+  - 旧的 needs_whisper_patch、_whisper_text_patch_with_arbitration、伪对齐与复核事件需要整体淘汰，以防逻辑冲突。相应数据
     库/状态字段若绑定旧模式，要同步迁移。
 
   优化与补充建议

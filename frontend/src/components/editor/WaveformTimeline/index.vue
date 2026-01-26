@@ -106,6 +106,8 @@ import { useProjectStore } from "@/stores/projectStore";
 import { usePlaybackManager } from "@/services/PlaybackManager";
 import ContextMenu from "@/components/editor/ContextMenu.vue";
 import { detectOverlappingSubtitles, OVERLAP_COLORS } from "@/utils/subtitleUtils";
+import { useSubtitleSync } from "@/composables";
+import transcriptionApi from "@/services/api/transcriptionApi";
 
 // ============ 缩放配置常量 ============
 const ZOOM_MIN = 20; // 最小缩放 20%
@@ -114,6 +116,21 @@ const ZOOM_STEP = 5; // 滑块精度 5%
 const ZOOM_BUTTON_STEP = 20; // 按钮步进 20%（提高步进速度）
 const ZOOM_WHEEL_STEP = 10; // 滚轮步进 10%（提高滚轮缩放速度）
 const ZOOM_BASE_PX_PER_SEC = 50; // 100%缩放时的基准：每秒50像素
+
+/**
+ * 简单防抖工具，避免高频拖拽导致频繁同步。
+ */
+function debounce(fn, delay) {
+  let timer = null;
+  return function (...args) {
+    if (timer) {
+      clearTimeout(timer);
+    }
+    timer = setTimeout(() => {
+      fn.apply(this, args);
+    }, delay);
+  };
+}
 
 // Props
 const props = defineProps({
@@ -139,6 +156,8 @@ const emit = defineEmits([
 
 // Store
 const projectStore = useProjectStore();
+const jobIdRef = computed(() => props.jobId || projectStore.meta.jobId);
+const { onSubtitleEdit } = useSubtitleSync(jobIdRef);
 
 // 全局播放管理器（单例）
 const playbackManager = usePlaybackManager();
@@ -208,6 +227,13 @@ let cachedMaxScrollLeft = 0;
 let wavesurfer = null;
 let regionsPlugin = null;
 let regionUpdateTimer = null;
+
+// V3.2.0+dev.20260124.04: 波形拖拽时间同步节流，避免高频写入
+const debouncedRegionSync = debounce((sentenceIndex, start, end) => {
+  if (sentenceIndex === undefined || sentenceIndex === null) return;
+  if (projectStore.isSentenceDeleted?.(sentenceIndex)) return;
+  onSubtitleEdit(sentenceIndex, { start, end });
+}, 200);
 
 // Computed
 const audioSource = computed(() => {
@@ -475,10 +501,19 @@ function setupRegionEvents() {
   // WaveSurfer.js 7.x 使用 'region-updated' 事件
   regionsPlugin.on("region-updated", (region) => {
     if (isUpdatingRegions.value) return;
-    projectStore.updateSubtitle(region.id, {
-      start: region.start,
-      end: region.end,
-    });
+    projectStore.updateSubtitle(
+      region.id,
+      {
+        start: region.start,
+        end: region.end,
+      },
+      { isUserEdit: true }
+    );
+    // V3.2.0+dev.20260124.04: 波形拖拽同步到后端（节流）
+    const subtitle = projectStore.subtitles.find((s) => s.id === region.id);
+    if (subtitle && subtitle.sentenceIndex !== undefined) {
+      debouncedRegionSync(subtitle.sentenceIndex, region.start, region.end);
+    }
     emit("region-update", region);
 
     // V3.1.1+dev.20260106.03: 拖拽结束后检测并标记重叠区域
@@ -1383,7 +1418,7 @@ function handleWaveformContextMenu(e) {
 /**
  * 右键菜单项选择处理
  */
-function handleContextMenuSelect(key) {
+async function handleContextMenuSelect(key) {
   if (key === 'split' && contextMenuTarget.value) {
     const result = projectStore.splitSubtitle(contextMenuTarget.value, {
       splitTime: contextMenuTime.value
@@ -1393,12 +1428,80 @@ function handleContextMenuSelect(key) {
       console.error('[WaveformTimeline] 切分失败:', result.error);
     } else {
       console.log('[WaveformTimeline] 切分成功:', result);
+      await syncSplitSubtitles(result);
     }
   }
 
   // 清空状态
   contextMenuTarget.value = null;
   contextMenuTime.value = 0;
+}
+
+/**
+ * V3.2.0+dev.20260124.04: 波形切分结果同步到后端
+ */
+async function syncSplitSubtitles(result) {
+  const jobId = jobIdRef.value;
+  if (!jobId) return;
+  const { leftSubtitle, rightSubtitle, originalSentenceIndex } = result || {};
+  if (!leftSubtitle || !rightSubtitle) return;
+
+  try {
+    if (originalSentenceIndex !== undefined) {
+      await transcriptionApi.updateSubtitle(jobId, originalSentenceIndex, {
+        text: leftSubtitle.text,
+        start: leftSubtitle.start,
+        end: leftSubtitle.end,
+      });
+      projectStore.updateSubtitle(
+        leftSubtitle.id,
+        {
+          sentenceIndex: originalSentenceIndex,
+          isModified: true,
+          source: "split",
+        },
+        { isUserEdit: true }
+      );
+    } else {
+      const leftResp = await transcriptionApi.createSubtitle(jobId, {
+        text: leftSubtitle.text,
+        start: leftSubtitle.start,
+        end: leftSubtitle.end,
+      });
+      const leftData = leftResp?.data?.data || leftResp?.data;
+      if (leftData?.index !== undefined) {
+        projectStore.updateSubtitle(
+          leftSubtitle.id,
+          {
+            sentenceIndex: leftData.index,
+            isModified: true,
+            source: leftData.source || "manual",
+          },
+          { isUserEdit: true }
+        );
+      }
+    }
+
+    const rightResp = await transcriptionApi.createSubtitle(jobId, {
+      text: rightSubtitle.text,
+      start: rightSubtitle.start,
+      end: rightSubtitle.end,
+    });
+    const rightData = rightResp?.data?.data || rightResp?.data;
+    if (rightData?.index !== undefined) {
+      projectStore.updateSubtitle(
+        rightSubtitle.id,
+        {
+          sentenceIndex: rightData.index,
+          isModified: true,
+          source: rightData.source || "manual",
+        },
+        { isUserEdit: true }
+      );
+    }
+  } catch (error) {
+    console.warn("[WaveformTimeline] 切分同步失败:", error);
+  }
 }
 
 // ============ 自定义滚动条逻辑 ============

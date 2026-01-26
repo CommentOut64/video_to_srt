@@ -113,7 +113,7 @@ audio_segment = audio_array[start_sample:end_sample]
 # 记录日志（调试用）
 if overlap_start < sentence.start:
     self.logger.debug(
-        f"Whisper 补刀添加 {sentence.start - overlap_start:.2f}s 前向重叠: "
+        f"Whisper 复核添加 {sentence.start - overlap_start:.2f}s 前向重叠: "
         f"[{overlap_start:.2f}s, {sentence.end:.2f}s]"
     )
 ```
@@ -474,7 +474,7 @@ if not sensevoice_text and whisper_text:
 
 | 方案 | 适用场景 | 延迟 | 幻觉抑制能力 | GPU 利用率 |
 |------|---------|------|-------------|-----------|
-| 逐句补刀 (SMART_PATCH) | 快速处理 | 低 | 中等 | 低 |
+| 逐句复核 (SMART_PATCH) | 快速处理 | 低 | 中等 | 低 |
 | 缓冲池批量 (DEEP_LISTEN) | 高质量需求 | 较高 | 强 | 高 |
 
 ### 6.2 架构设计

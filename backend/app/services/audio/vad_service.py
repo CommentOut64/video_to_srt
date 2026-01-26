@@ -33,7 +33,7 @@ class OptimizedOnnxWrapper:
     优化版 Silero VAD ONNX Wrapper
 
     相比原版 OnnxWrapper 的改进：
-    1. 使用 cpu_optimizer 智能计算线程数（而非硬编码为 1）
+    1. 使用硬件能力提供者智能计算线程数（而非硬编码为 1）
     2. 支持 Intel 混合架构 P-Core 亲和性绑定
     3. 启用 ONNX Runtime CPU 优化选项
     """
@@ -51,7 +51,7 @@ class OptimizedOnnxWrapper:
         self.logger = logger or logging.getLogger(__name__)
         self._np = __import__('numpy')
 
-        # 使用 cpu_optimizer 获取优化的 SessionOptions
+        # 使用硬件能力提供者获取优化的 SessionOptions
         sess_options = self._create_optimized_session_options()
 
         # 创建 ONNX 推理会话（强制使用 CPU，确保 P-Core 亲和性生效）
@@ -73,16 +73,11 @@ class OptimizedOnnxWrapper:
     def _create_optimized_session_options(self):
         """创建优化的 ONNX SessionOptions"""
         try:
-            from app.utils.cpu_optimizer import ONNXThreadOptimizer
+            from app.services.hardware_profile_service import get_hardware_profile_provider
 
-            # 使用 cpu_optimizer 计算最优线程数
-            optimal_threads, info = ONNXThreadOptimizer.calculate_optimal_threads(
-                usage_ratio=0.6  # 使用 60% 核心
-            )
-
-            # 获取配置好的 SessionOptions
-            sess_options = ONNXThreadOptimizer.get_onnx_session_options(
-                optimal_threads=optimal_threads
+            provider = get_hardware_profile_provider()
+            sess_options, optimal_threads, info = provider.build_onnx_session_options(
+                usage_ratio=0.6
             )
 
             self.logger.info(
@@ -95,7 +90,7 @@ class OptimizedOnnxWrapper:
         except Exception as e:
             # 回退：使用默认配置
             import onnxruntime as ort
-            self.logger.warning(f"cpu_optimizer 不可用，使用默认配置: {e}")
+            self.logger.warning(f"硬件能力提供者不可用，使用默认配置: {e}")
 
             sess_options = ort.SessionOptions()
             sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -111,41 +106,10 @@ class OptimizedOnnxWrapper:
         避免 ONNX 推理任务被调度到 E-Core 导致性能下降。
         """
         try:
-            from app.utils.cpu_optimizer import CPUArchitectureDetector
-            import psutil
+            from app.services.hardware_profile_service import get_hardware_profile_provider
 
-            detector = CPUArchitectureDetector()
-            cpu_name = None
-
-            # 尝试获取 CPU 名称
-            try:
-                from app.services.hardware_service import get_hardware_detector
-                hw = get_hardware_detector().detect()
-                cpu_name = hw.cpu_name
-            except:
-                pass
-
-            # 检测是否为 Intel 混合架构
-            if not detector.is_intel_hybrid_architecture(cpu_name):
-                self.logger.debug("非 Intel 混合架构，跳过 P-Core 亲和性设置")
-                return
-
-            # 获取 P-Core 数量
-            physical_cores = detector.get_physical_cores()
-            p_cores = detector.detect_intel_p_cores(cpu_name, physical_cores)
-
-            # P-Core 通常是前 N 个逻辑核心（每个 P-Core 有 2 个超线程）
-            # 例如 i7-12700: P-Core 0-7 对应逻辑核心 0-15
-            p_core_logical_ids = list(range(p_cores * 2))
-
-            # 设置当前进程的 CPU 亲和性
-            process = psutil.Process()
-            process.cpu_affinity(p_core_logical_ids)
-
-            self.logger.info(
-                f"Silero VAD P-Core 亲和性: 绑定到核心 {p_core_logical_ids[:4]}... "
-                f"(共 {len(p_core_logical_ids)} 个逻辑核心)"
-            )
+            provider = get_hardware_profile_provider()
+            provider.apply_pcore_affinity(context="Silero VAD P-Core")
 
         except Exception as e:
             # 亲和性设置失败不是致命错误
@@ -387,16 +351,27 @@ class VADService:
         # 使用 silero-vad 库的 get_speech_timestamps 函数
         from silero_vad import get_speech_timestamps
 
-        # 使用项目内置的 ONNX 模型
-        builtin_model_path = Path(__file__).parent.parent.parent / "assets" / "silero" / "silero_vad.onnx"
+        # 通过 ModelManagerV2 统一获取模型路径，回退到内置模型
+        try:
+            from app.services.model_manager_v2 import get_model_manager_v2
+
+            manager = get_model_manager_v2()
+            vad_dir = Path(manager.ensure_available("silero-vad"))
+            builtin_model_path = vad_dir / "silero_vad.onnx"
+            self.logger.info(f"Silero VAD 使用 ModelManagerV2 模型: {builtin_model_path}")
+        except Exception as exc:
+            builtin_model_path = Path(__file__).parent.parent.parent / "assets" / "silero" / "silero_vad.onnx"
+            self.logger.warning(
+                "ModelManagerV2 获取 Silero VAD 失败，回退内置路径: %s (reason=%s)",
+                builtin_model_path,
+                exc,
+            )
 
         if not builtin_model_path.exists():
             raise FileNotFoundError(
-                f"内置Silero VAD模型不存在: {builtin_model_path}\n"
+                f"Silero VAD 模型不存在: {builtin_model_path}\n"
                 "请确保项目完整，或重新从源码仓库获取"
             )
-
-        self.logger.info(f"使用内置模型: {builtin_model_path}")
 
         # 使用优化版 OnnxWrapper（多线程 + P-Core 亲和性）
         model = OptimizedOnnxWrapper(str(builtin_model_path), logger=self.logger)

@@ -38,7 +38,7 @@ class DemucsModel(Enum):
 class TranscriptionProfile(Enum):
     """转录流水线模式"""
     SENSEVOICE_ONLY = "sensevoice_only"     # 仅 SenseVoice (极速, 默认)
-    SV_WHISPER_PATCH = "sv_whisper_patch"   # SV + Whisper 补刀
+    SV_WHISPER_PATCH = "sv_whisper_patch"   # SV + Whisper 复核
     SV_WHISPER_DUAL = "sv_whisper_dual"     # SV + Whisper 双流并行
 
 
@@ -130,6 +130,18 @@ class PreprocessingSettings:
     # VAD 静音过滤开关
     vad_filter: bool = True
 
+    # 是否启用预处理缓存 GC（默认关闭）
+    is_preprocess_cache_gc_enabled: bool = False
+
+    # 缓存预算（GB），0 表示不限制
+    cache_budget_gb: float = 0.0
+
+    # 缓存 TTL（小时），0 表示不限制
+    ttl_hours: float = 0.0
+
+    # 缓存任务数上限，0 表示不限制
+    max_tasks: int = 0
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "demucs_strategy": self.demucs_strategy,
@@ -139,6 +151,10 @@ class PreprocessingSettings:
             "enable_spectral_triage": self.enable_spectral_triage,
             "spectrum_threshold": self.spectrum_threshold,
             "vad_filter": self.vad_filter,
+            "enable_preprocess_cache_gc": self.is_preprocess_cache_gc_enabled,
+            "cache_budget_gb": self.cache_budget_gb,
+            "ttl_hours": self.ttl_hours,
+            "max_tasks": self.max_tasks,
         }
 
 
@@ -154,10 +170,10 @@ class TranscriptionSettings:
     # 主引擎运行设备: auto/cpu
     sensevoice_device: str = "auto"
 
-    # 辅助/补刀模型: tiny/small/medium/large-v3
+    # 辅助/复核模型: tiny/small/medium/large-v3
     whisper_model: str = "medium"
 
-    # 补刀触发阈值: 0.0-1.0, 低于此置信度的句子送给 Whisper 重跑
+    # 复核触发阈值: 0.0-1.0, 低于此置信度的句子送给 Whisper 重跑
     patching_threshold: float = 0.60
 
     def to_dict(self) -> Dict[str, Any]:
@@ -329,10 +345,10 @@ PRESET_BALANCED = MacroPreset(
         vad_filter=True,
     ),
     transcription=TranscriptionSettings(
-        transcription_profile="sv_whisper_patch",   # SV + Whisper 补刀
+        transcription_profile="sv_whisper_patch",   # SV + Whisper 复核
         sensevoice_device="auto",
-        whisper_model="medium",         # Whisper Medium 用于补刀
-        patching_threshold=0.60,        # 置信度 < 60% 触发补刀
+        whisper_model="medium",         # Whisper Medium 用于复核
+        patching_threshold=0.60,        # 置信度 < 60% 触发复核
     ),
     refinement=RefinementSettings(
         llm_task="proofread",           # 稀疏校对
@@ -444,6 +460,10 @@ class TaskConfig:
                 separation_mode=preprocessing_data.get("separation_mode", "on_demand"),
                 spectrum_threshold=preprocessing_data.get("spectrum_threshold", 0.35),
                 vad_filter=preprocessing_data.get("vad_filter", True),
+                is_preprocess_cache_gc_enabled=preprocessing_data.get("enable_preprocess_cache_gc", False),
+                cache_budget_gb=preprocessing_data.get("cache_budget_gb", 0.0),
+                ttl_hours=preprocessing_data.get("ttl_hours", 0.0),
+                max_tasks=preprocessing_data.get("max_tasks", 0),
             ),
             transcription=TranscriptionSettings(
                 transcription_profile=transcription_data.get("transcription_profile", "sensevoice_only"),

@@ -18,24 +18,26 @@ class TranscriptionAPI {
    * @returns {Promise<{job_id: string, filename: string, message: string, queue_position: number}>}
    */
   async uploadFile(file, onProgress = null) {
-    const formData = new FormData()
-    formData.append('file', file)
+    const formData = new FormData();
+    formData.append("file", file);
 
     const config = {
       headers: {
-        'Content-Type': 'multipart/form-data'
-      }
-    }
+        "Content-Type": "multipart/form-data",
+      },
+    };
 
     // 添加上传进度监听
     if (onProgress) {
       config.onUploadProgress = (progressEvent) => {
-        const percent = Math.round((progressEvent.loaded * 100) / progressEvent.total)
-        onProgress(percent)
-      }
+        const percent = Math.round(
+          (progressEvent.loaded * 100) / progressEvent.total,
+        );
+        onProgress(percent);
+      };
     }
 
-    return apiClient.post('/api/upload', formData, config)
+    return apiClient.post("/api/upload", formData, config);
   }
 
   /**
@@ -44,18 +46,16 @@ class TranscriptionAPI {
    * @returns {Promise<{job_id: string, filename: string}>}
    */
   async createJob(filename) {
-    const formData = new FormData()
-    formData.append('filename', filename)
+    const formData = new FormData();
+    formData.append("filename", filename);
 
-    return apiClient.post('/api/create-job', formData)
+    return apiClient.post("/api/create-job", formData);
   }
 
   /**
    * 启动转录任务（加入队列）
    *
-   * v3.5 支持两种配置格式:
-   * 1. 新版 (推荐): 使用 task_config 字段
-   * 2. 旧版 (兼容): 使用 engine/model/sensevoice 字段
+   * v3.5+ 建议仅使用 task_config 字段（前端当前只发送新版配置）
    *
    * @param {string} jobId - 任务ID
    * @param {Object} settings - 转录设置
@@ -73,7 +73,7 @@ class TranscriptionAPI {
    * @param {string} [settings.task_config.transcription.transcription_profile] - 转录流水线 (sensevoice_only/sv_whisper_patch/sv_whisper_dual)
    * @param {string} [settings.task_config.transcription.sensevoice_device] - SenseVoice 设备 (auto/cpu)
    * @param {string} [settings.task_config.transcription.whisper_model] - Whisper 模型 (tiny/small/medium/large-v3)
-   * @param {number} [settings.task_config.transcription.patching_threshold] - 补刀触发阈值 (0.0-1.0)
+   * @param {number} [settings.task_config.transcription.patching_threshold] - 复核触发阈值 (0.0-1.0)
    * @param {Object} [settings.task_config.refinement] - 增强设置
    * @param {string} [settings.task_config.refinement.llm_task] - LLM 任务 (off/proofread/translate)
    * @param {string} [settings.task_config.refinement.llm_scope] - LLM 范围 (sparse/global)
@@ -86,28 +86,19 @@ class TranscriptionAPI {
    * @param {number} [settings.task_config.compute.gpu_id] - GPU ID
    * @param {string} [settings.task_config.compute.temp_file_policy] - 临时文件策略
    *
-   * === 旧版配置 (兼容) ===
-   * @param {string} settings.engine - 转录引擎 (whisper, sensevoice)
-   * @param {string} settings.model - 模型名称 (tiny, base, small, medium, large-v2, large-v3)
-   * @param {string} settings.compute_type - 计算类型 (float16, int8, etc.)
-   * @param {string} settings.device - 设备 (cuda, cpu)
-   * @param {number} settings.batch_size - 批次大小
-   * @param {boolean} settings.word_timestamps - 是否生成词级时间戳
-   * @param {Object} settings.sensevoice - SenseVoice 配置（可选）
-   *
    * @returns {Promise<{job_id: string, started: boolean, queue_position: number}>}
    */
   async startJob(jobId, settings) {
-    const formData = new FormData()
-    formData.append('job_id', jobId)
-    formData.append('settings', JSON.stringify(settings))
+    const formData = new FormData();
+    formData.append("job_id", jobId);
+    formData.append("settings", JSON.stringify(settings));
 
     // FormData 会自动设置正确的 Content-Type (multipart/form-data with boundary)
-    return apiClient.post('/api/start', formData, {
+    return apiClient.post("/api/start", formData, {
       headers: {
-        'Content-Type': 'multipart/form-data'
-      }
-    })
+        "Content-Type": "multipart/form-data",
+      },
+    });
   }
 
   /**
@@ -118,8 +109,8 @@ class TranscriptionAPI {
    */
   async cancelJob(jobId, deleteData = false) {
     return apiClient.post(`/api/cancel/${jobId}`, null, {
-      params: { delete_data: deleteData }
-    })
+      params: { delete_data: deleteData },
+    });
   }
 
   /**
@@ -128,7 +119,7 @@ class TranscriptionAPI {
    * @returns {Promise<{job_id: string, paused: boolean}>}
    */
   async pauseJob(jobId) {
-    return apiClient.post(`/api/pause/${jobId}`)
+    return apiClient.post(`/api/pause/${jobId}`);
   }
 
   /**
@@ -142,7 +133,7 @@ class TranscriptionAPI {
    * @returns {Promise<{job_id: string, resumed: boolean, status: string, queue_position: number}>}
    */
   async resumeJob(jobId) {
-    return apiClient.post(`/api/resume/${jobId}`)
+    return apiClient.post(`/api/resume/${jobId}`);
   }
 
   /**
@@ -151,10 +142,10 @@ class TranscriptionAPI {
    * @param {string} mode - 插队模式 ('gentle' | 'force')
    * @returns {Promise<{job_id: string, prioritized: boolean, mode: string, queue_position: number}>}
    */
-  async prioritizeJob(jobId, mode = 'gentle') {
+  async prioritizeJob(jobId, mode = "gentle") {
     return apiClient.post(`/api/prioritize/${jobId}`, null, {
-      params: { mode }
-    })
+      params: { mode },
+    });
   }
 
   /**
@@ -165,8 +156,8 @@ class TranscriptionAPI {
    */
   async getJobStatus(jobId, includeMedia = true) {
     return apiClient.get(`/api/status/${jobId}`, {
-      params: { include_media: includeMedia }
-    })
+      params: { include_media: includeMedia },
+    });
   }
 
   /**
@@ -174,7 +165,7 @@ class TranscriptionAPI {
    * @returns {Promise<{queue: string[], running: string, interrupted: string, jobs: Object}>}
    */
   async getQueueStatus() {
-    return apiClient.get('/api/queue-status')
+    return apiClient.get("/api/queue-status");
   }
 
   /**
@@ -182,7 +173,7 @@ class TranscriptionAPI {
    * @returns {Promise<{default_prioritize_mode: string}>}
    */
   async getQueueSettings() {
-    return apiClient.get('/api/queue-settings')
+    return apiClient.get("/api/queue-settings");
   }
 
   /**
@@ -191,9 +182,9 @@ class TranscriptionAPI {
    * @returns {Promise<{success: boolean, settings: Object}>}
    */
   async updateQueueSettings(defaultPrioritizeMode) {
-    return apiClient.post('/api/queue-settings', {
-      default_prioritize_mode: defaultPrioritizeMode
-    })
+    return apiClient.post("/api/queue-settings", {
+      default_prioritize_mode: defaultPrioritizeMode,
+    });
   }
 
   /**
@@ -202,9 +193,9 @@ class TranscriptionAPI {
    * @returns {Promise<{reordered: boolean, queue: string[]}>}
    */
   async reorderQueue(jobIds) {
-    return apiClient.post('/api/reorder-queue', {
-      job_ids: jobIds
-    })
+    return apiClient.post("/api/reorder-queue", {
+      job_ids: jobIds,
+    });
   }
 
   /**
@@ -216,9 +207,9 @@ class TranscriptionAPI {
   async downloadResult(jobId, copyToSource = false) {
     const response = await apiClient.get(`/api/download/${jobId}`, {
       params: { copy_to_source: copyToSource },
-      responseType: 'blob'
-    })
-    return response
+      responseType: "blob",
+    });
+    return response;
   }
 
   /**
@@ -227,7 +218,7 @@ class TranscriptionAPI {
    * @returns {Promise<{success: boolean, message: string, target_path: string}>}
    */
   async copyResultToSource(jobId) {
-    return apiClient.post(`/api/copy-result/${jobId}`)
+    return apiClient.post(`/api/copy-result/${jobId}`);
   }
 
   /**
@@ -242,11 +233,11 @@ class TranscriptionAPI {
    */
   async generateASS(jobId, options = {}) {
     return apiClient.post(`/api/media/${jobId}/ass/generate`, {
-      style_preset: options.style_preset || 'default',
-      title: options.title || 'Untitled',
+      style_preset: options.style_preset || "default",
+      title: options.title || "Untitled",
       video_width: options.video_width || 1920,
-      video_height: options.video_height || 1080
-    })
+      video_height: options.video_height || 1080,
+    });
   }
 
   /**
@@ -255,7 +246,7 @@ class TranscriptionAPI {
    * @returns {Promise<{job_id: string, filename: string, content: string, encoding: string}>}
    */
   async getASSContent(jobId) {
-    return apiClient.get(`/api/media/${jobId}/ass`)
+    return apiClient.get(`/api/media/${jobId}/ass`);
   }
 
   /**
@@ -268,7 +259,7 @@ class TranscriptionAPI {
    * @returns {Promise<{success: boolean, tasks: Array, count: number, timestamp: number}>}
    */
   async syncTasks() {
-    return apiClient.get('/api/sync-tasks')
+    return apiClient.get("/api/sync-tasks");
   }
 
   /**
@@ -276,7 +267,7 @@ class TranscriptionAPI {
    * @returns {Promise<{jobs: Object[], count: number}>}
    */
   async getIncompleteJobs() {
-    return apiClient.get('/api/incomplete-jobs')
+    return apiClient.get("/api/incomplete-jobs");
   }
 
   /**
@@ -285,7 +276,7 @@ class TranscriptionAPI {
    * @returns {Promise<{can_resume: boolean, progress: number, message: string}>}
    */
   async checkResume(jobId) {
-    return apiClient.get(`/api/check-resume/${jobId}`)
+    return apiClient.get(`/api/check-resume/${jobId}`);
   }
 
   /**
@@ -294,7 +285,7 @@ class TranscriptionAPI {
    * @returns {Promise<Object>} 任务对象
    */
   async restoreJob(jobId) {
-    return apiClient.post(`/api/restore-job/${jobId}`)
+    return apiClient.post(`/api/restore-job/${jobId}`);
   }
 
   /**
@@ -303,7 +294,7 @@ class TranscriptionAPI {
    * @returns {Promise<{has_checkpoint: boolean, original_settings: Object, progress: Object}>}
    */
   async getCheckpointSettings(jobId) {
-    return apiClient.get(`/api/checkpoint-settings/${jobId}`)
+    return apiClient.get(`/api/checkpoint-settings/${jobId}`);
   }
 
   /**
@@ -312,7 +303,7 @@ class TranscriptionAPI {
    * @returns {Promise<{job_id: string, segments: Array, progress: Object}>}
    */
   async getTranscriptionText(jobId) {
-    return apiClient.get(`/api/transcription-text/${jobId}`)
+    return apiClient.get(`/api/transcription-text/${jobId}`);
   }
 
   /**
@@ -322,11 +313,11 @@ class TranscriptionAPI {
    * @returns {Promise<{valid: boolean, warnings: Array, errors: Array, force_original: Object}>}
    */
   async validateResumeSettings(jobId, newSettings) {
-    const formData = new FormData()
-    formData.append('job_id', jobId)
-    formData.append('new_settings', JSON.stringify(newSettings))
+    const formData = new FormData();
+    formData.append("job_id", jobId);
+    formData.append("new_settings", JSON.stringify(newSettings));
 
-    return apiClient.post('/api/validate-resume-settings', formData)
+    return apiClient.post("/api/validate-resume-settings", formData);
   }
 
   /**
@@ -335,7 +326,7 @@ class TranscriptionAPI {
    * @returns {Promise<{thumbnail: string|null, message: string}>} Base64编码的JPEG缩略图或null
    */
   async getThumbnail(jobId) {
-    return apiClient.get(`/api/media/${jobId}/thumbnail`)
+    return apiClient.get(`/api/media/${jobId}/thumbnail`);
   }
 
   /**
@@ -346,8 +337,45 @@ class TranscriptionAPI {
    */
   async renameJob(jobId, title) {
     return apiClient.post(`/api/rename-job/${jobId}`, {
-      title
-    })
+      title,
+    });
+  }
+
+  /**
+   * V3.2.0+dev.20260124.01: 更新字幕（用户编辑）
+   * @param {string} jobId - 任务ID
+   * @param {number} sentenceIndex - 句子索引
+   * @param {Object} update - 更新内容
+   * @param {string} [update.text] - 新文本
+   * @param {number} [update.start] - 新开始时间
+   * @param {number} [update.end] - 新结束时间
+   * @returns {Promise<{success: boolean, data: Object}>}
+   */
+  async updateSubtitle(jobId, sentenceIndex, update) {
+    return apiClient.patch(`/api/jobs/${jobId}/subtitles/${sentenceIndex}`, update);
+  }
+
+  /**
+   * V3.2.0+dev.20260124.02: 新增字幕（用户手动添加）
+   * @param {string} jobId - 任务ID
+   * @param {Object} payload - 新字幕内容
+   * @param {string} [payload.text] - 文本
+   * @param {number} payload.start - 开始时间
+   * @param {number} payload.end - 结束时间
+   * @returns {Promise<{success: boolean, data: Object}>}
+   */
+  async createSubtitle(jobId, payload) {
+    return apiClient.post(`/api/jobs/${jobId}/subtitles`, payload);
+  }
+
+  /**
+   * V3.2.0+dev.20260124.02: 删除字幕（用户手动删除）
+   * @param {string} jobId - 任务ID
+   * @param {number} sentenceIndex - 句子索引
+   * @returns {Promise<{success: boolean, data: Object}>}
+   */
+  async deleteSubtitle(jobId, sentenceIndex) {
+    return apiClient.delete(`/api/jobs/${jobId}/subtitles/${sentenceIndex}`);
   }
 }
 

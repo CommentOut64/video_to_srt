@@ -147,8 +147,17 @@ class BrouhahaService:
             device: 推理设备 ("auto" / "cuda" / "cpu")
             hf_token: HuggingFace Token（首次下载需要，可从环境变量读取）
         """
+        # 优先通过 ModelManagerV2 统一管理获取路径
         if model_dir is None:
-            self.model_dir = self.DEFAULT_MODEL_DIR
+            try:
+                from app.services.model_manager_v2 import get_model_manager_v2
+
+                manager = get_model_manager_v2()
+                self.model_dir = Path(manager.ensure_available("brouhaha-quality"))
+                logger.info("Brouhaha 使用 ModelManagerV2 路径: %s", self.model_dir)
+            except Exception as exc:
+                logger.warning("ModelManagerV2 获取 Brouhaha 模型失败，回退默认路径: %s", exc)
+                self.model_dir = self.DEFAULT_MODEL_DIR
         else:
             self.model_dir = Path(model_dir)
 
@@ -236,9 +245,21 @@ class BrouhahaService:
 
             logger.info(f"从本地加载 Brouhaha 模型: {self.model_dir}")
 
+            # 检测 Git LFS 指针文件，避免 torch.load 读取失败
+            is_pointer_file = False
+            try:
+                header = weights_path.read_bytes()[:200]
+                if b"git-lfs" in header:
+                    is_pointer_file = True
+                    logger.warning(
+                        "检测到 Git LFS 指针文件，跳过直接加载并改用缓存/下载: %s", weights_path
+                    )
+            except Exception as exc:  # pragma: no cover
+                logger.debug("读取权重文件头失败（忽略）: %s", exc)
+
             # 方式1（推荐）: 直接从本地 checkpoint 文件加载
             # 适用于整合包分发场景，不依赖 HuggingFace 缓存
-            if weights_path.exists():
+            if weights_path.exists() and not is_pointer_file:
                 try:
                     # V3.1.1+dev.20260108.04: 抑制版本不匹配警告
                     # 这些警告来自 pyannote.audio 和 torch 版本差异，实际运行正常

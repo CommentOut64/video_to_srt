@@ -1,7 +1,7 @@
 """
 CancellationToken - 协作式取消令牌
 
-V3.7 断点续传基础设施 - Phase 1
+v3.1.0 断点续传基础设施 - Phase 1
 
 核心职责：
 1. 提供协作式任务取消/暂停能力，贯穿整个流水线
@@ -338,7 +338,7 @@ class CancellationToken:
 
         在每个原子操作完成后调用此方法。
 
-        V3.7 更新：支持直接传递 job_dir，自动创建 CheckpointManagerV37
+        v3.1.0 更新：支持直接传递 job_dir，自动创建 CheckpointManagerV37
 
         Args:
             checkpoint_data: 要保存的检查点数据
@@ -351,7 +351,7 @@ class CancellationToken:
             CancelledException: 如果已取消
             PausedException: 如果已暂停
         """
-        # V3.7: 直接使用 CheckpointManagerV37 保存
+        # v3.1.0: 直接使用 CheckpointManagerV37 保存
         if job_dir is not None:
             from app.services.job.checkpoint_manager import CheckpointManagerV37
             from pathlib import Path

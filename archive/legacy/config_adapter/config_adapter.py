@@ -75,7 +75,7 @@ class ConfigAdapter:
 
         V3.1.0: 所有 SenseVoice 模式都走新架构（支持 ProgressEmitter）
         - sensevoice_only (极速模式)
-        - sv_whisper_patch (智能补刀)
+        - sv_whisper_patch (智能复核)
         - sv_whisper_dual (双流精校)
 
         Returns:
@@ -199,7 +199,7 @@ class ConfigAdapter:
     @staticmethod
     def get_patching_threshold(settings: "JobSettings") -> float:
         """
-        获取 Whisper 补刀触发阈值
+        获取 Whisper 复核触发阈值
 
         Returns:
             float: 阈值 (0.0-1.0)

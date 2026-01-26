@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 from pathlib import Path
 
+from app.services.runtime_param_resolver import get_yamnet_runtime_params
+
 logger = logging.getLogger(__name__)
 
 
@@ -189,9 +191,32 @@ class YAMNetClassifier:
 
         # 类别名称映射 (懒加载)
         self._class_names: Optional[List[str]] = None
+        self._acappella_threshold = 0.3
+        self._music_max_threshold = 0.15
+        self._music_avg_threshold = 0.10
+        self._speech_max_threshold = 0.8
+        self._speech_max_music_threshold = 0.1
+        self._speech_dominant_delta = 0.3
+        self._speech_dominant_music_max = 0.15
+        self._probe_window_count = 3
+
+        self.apply_runtime_params()
 
         self._init_model()
 
+    def apply_runtime_params(self) -> None:
+        """应用运行参数配置。"""
+        runtime = get_yamnet_runtime_params()
+        self._acappella_threshold = float(runtime.get("acappella_threshold", 0.3))
+        self._music_max_threshold = float(runtime.get("music_max_threshold", 0.15))
+        self._music_avg_threshold = float(runtime.get("music_avg_threshold", 0.10))
+        self._speech_max_threshold = float(runtime.get("speech_max_threshold", 0.8))
+        self._speech_max_music_threshold = float(runtime.get("speech_max_music_threshold", 0.1))
+        self._speech_dominant_delta = float(runtime.get("speech_dominant_delta", 0.3))
+        self._speech_dominant_music_max = float(runtime.get("speech_dominant_music_max", 0.15))
+        self._probe_window_count = int(runtime.get("probe_window_count", 3))
+        duration_sec = float(runtime.get("probe_window_duration_sec", 0.975))
+        self.window_samples = max(1, int(self.sample_rate * duration_sec))
     def _init_model(self):
         """初始化 ONNX 模型（GPU 优先，CPU 回退）"""
         try:
@@ -239,16 +264,11 @@ class YAMNetClassifier:
         import onnxruntime as ort
 
         try:
-            from app.utils.cpu_optimizer import ONNXThreadOptimizer
+            from app.services.hardware_profile_service import get_hardware_profile_provider
 
-            # 使用 cpu_optimizer 计算最优线程数
-            optimal_threads, info = ONNXThreadOptimizer.calculate_optimal_threads(
-                usage_ratio=0.6  # 使用 60% 核心
-            )
-
-            # 获取配置好的 SessionOptions
-            sess_options = ONNXThreadOptimizer.get_onnx_session_options(
-                optimal_threads=optimal_threads
+            provider = get_hardware_profile_provider()
+            sess_options, optimal_threads, info = provider.build_onnx_session_options(
+                usage_ratio=0.6
             )
 
             logger.info(
@@ -260,7 +280,7 @@ class YAMNetClassifier:
 
         except Exception as e:
             # 回退：使用默认配置
-            logger.warning(f"cpu_optimizer 不可用，使用默认配置: {e}")
+            logger.warning(f"硬件能力提供者不可用，使用默认配置: {e}")
 
             sess_options = ort.SessionOptions()
             sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -276,40 +296,10 @@ class YAMNetClassifier:
         避免 ONNX 推理任务被调度到 E-Core 导致性能下降。
         """
         try:
-            from app.utils.cpu_optimizer import CPUArchitectureDetector
-            import psutil
+            from app.services.hardware_profile_service import get_hardware_profile_provider
 
-            detector = CPUArchitectureDetector()
-            cpu_name = None
-
-            # 尝试获取 CPU 名称
-            try:
-                from app.services.hardware_service import get_hardware_detector
-                hw = get_hardware_detector().detect()
-                cpu_name = hw.cpu_name
-            except:
-                pass
-
-            # 检测是否为 Intel 混合架构
-            if not detector.is_intel_hybrid_architecture(cpu_name):
-                logger.debug("非 Intel 混合架构，跳过 P-Core 亲和性设置")
-                return
-
-            # 获取 P-Core 数量
-            physical_cores = detector.get_physical_cores()
-            p_cores = detector.detect_intel_p_cores(cpu_name, physical_cores)
-
-            # P-Core 通常是前 N 个逻辑核心（每个 P-Core 有 2 个超线程）
-            p_core_logical_ids = list(range(p_cores * 2))
-
-            # 设置当前进程的 CPU 亲和性
-            process = psutil.Process()
-            process.cpu_affinity(p_core_logical_ids)
-
-            logger.info(
-                f"YAMNet P-Core 亲和性: 绑定到核心 {p_core_logical_ids[:4]}... "
-                f"(共 {len(p_core_logical_ids)} 个逻辑核心)"
-            )
+            provider = get_hardware_profile_provider()
+            provider.apply_pcore_affinity(context="YAMNet P-Core")
 
         except Exception as e:
             # 亲和性设置失败不是致命错误
@@ -343,7 +333,7 @@ class YAMNetClassifier:
         """
         获取探针窗口
 
-        策略：取音频的 首、中、尾 3 个位置各 0.975s
+        策略：按运行参数决定采样数量与窗口时长
         """
         total_len = len(audio)
         window_size = self.window_samples
@@ -353,19 +343,28 @@ class YAMNetClassifier:
             audio = np.pad(audio, (0, window_size - total_len))
             return [audio]
 
+        count = max(1, self._probe_window_count)
+        max_start = max(0, total_len - window_size)
         probes = []
 
-        # 头部
-        probes.append(audio[:window_size])
+        if count == 1:
+            start = max_start // 2
+            probes.append(audio[start:start + window_size])
+            return probes
 
-        # 中部
-        mid = total_len // 2
-        start = max(0, mid - window_size // 2)
-        probes.append(audio[start:start + window_size])
-
-        # 尾部
-        if total_len > window_size:
+        if count == 2:
+            probes.append(audio[:window_size])
             probes.append(audio[-window_size:])
+            return probes
+
+        positions = np.linspace(0, max_start, num=count)
+        seen = set()
+        for pos in positions:
+            start = int(round(pos))
+            if start in seen:
+                continue
+            seen.add(start)
+            probes.append(audio[start:start + window_size])
 
         return probes
 
@@ -477,7 +476,7 @@ class YAMNetClassifier:
 
         # 规则 A: A Cappella (清唱) 豁免
         # 如果检测到清唱，这是纯人声，不需要分离
-        if max_acappella > 0.3:
+        if max_acappella > self._acappella_threshold:
             tags.append("Acappella")
             return YAMNetClassificationResult(
                 is_music=False,
@@ -491,7 +490,7 @@ class YAMNetClassifier:
         # 规则 B: 明显背景音乐熔断 (优先级最高)
         # 降低阈值：max_music > 0.15 或 avg_music > 0.10
         # 因为带 BGM 的人声场景，music 分数通常不会很高
-        if max_music > 0.15 or avg_music > 0.10:
+        if max_music > self._music_max_threshold or avg_music > self._music_avg_threshold:
             # 标记是否同时有人声
             if max_speech > 0.3:
                 tags.append("SpeechWithBGM")
@@ -509,7 +508,7 @@ class YAMNetClassifier:
 
         # 规则 C: 纯净人声豁免
         # 只有当人声极高且音乐极低时才豁免
-        if max_speech > 0.8 and max_music < 0.1:
+        if max_speech > self._speech_max_threshold and max_music < self._speech_max_music_threshold:
             tags.append("CleanSpeech")
             return YAMNetClassificationResult(
                 is_music=False,
@@ -522,7 +521,7 @@ class YAMNetClassifier:
 
         # 规则 D: 人声主导豁免
         # 人声必须远高于音乐，且音乐很弱
-        if avg_speech > avg_music + 0.3 and max_music < 0.15:
+        if avg_speech > avg_music + self._speech_dominant_delta and max_music < self._speech_dominant_music_max:
             tags.append("SpeechDominant")
             return YAMNetClassificationResult(
                 is_music=False,
@@ -560,4 +559,6 @@ def get_yamnet_classifier() -> YAMNetClassifier:
     global _yamnet_instance
     if _yamnet_instance is None:
         _yamnet_instance = YAMNetClassifier()
+    else:
+        _yamnet_instance.apply_runtime_params()
     return _yamnet_instance

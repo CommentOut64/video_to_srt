@@ -1,0 +1,284 @@
+"""
+默认对齐服务（封装旧对齐逻辑）。
+V3.2.0+dev.20260119.06
+"""
+
+from __future__ import annotations
+
+import logging
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+
+from app.models.sensevoice_models import SentenceSegment, TextSource, WordTimestamp
+from app.services.alignment.alignment_service import AlignmentService, AlignmentConfig
+from app.services.pseudo_alignment import PseudoAlignment
+from app.services.sentence_splitter import SentenceSplitter, SplitConfig
+from app.services.semantic_grouper import SemanticGrouper, GroupConfig
+
+if TYPE_CHECKING:
+    from app.services.audio.chunk_engine import AudioChunk
+
+
+class AlignmentLevel(Enum):
+    """对齐级别（三级降级策略）。"""
+
+    DUAL_MODAL = "dual_modal"
+    WHISPER_PSEUDO = "whisper_pseudo"
+    SENSEVOICE_ONLY = "sensevoice_only"
+
+
+class DefaultAligner:
+    """默认对齐服务：双流对齐 + 伪对齐 + 草稿兜底。"""
+
+    def __init__(
+        self,
+        alignment_config: Optional[AlignmentConfig] = None,
+        final_split_config: Optional[SplitConfig] = None,
+        final_group_config: Optional[GroupConfig] = None,
+        is_enable_semantic_grouping: bool = True,
+        alignment_score_threshold: float = 0.3,
+        is_enable_fallback: bool = True,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        self.logger = logger or logging.getLogger(__name__)
+        self.is_enable_semantic_grouping = is_enable_semantic_grouping
+        self.alignment_score_threshold = alignment_score_threshold
+        self.is_enable_fallback = is_enable_fallback
+
+        if alignment_config is None:
+            alignment_config = AlignmentConfig()
+        self.alignment_service = AlignmentService(
+            config=alignment_config,
+            logger=self.logger,
+        )
+
+        if final_split_config is None:
+            final_split_config = SplitConfig(
+                prefer_punctuation_break=True,
+                use_dynamic_pause=True,
+                pause_threshold=0.5,
+                max_duration=5.0,
+                enable_hard_limit=True,
+                hard_limit_duration=20.0,
+                delay_split_to_punctuation=True,
+                delay_split_max_wait=15.0,
+                merge_short_sentences=True,
+            )
+        self.final_splitter = SentenceSplitter(final_split_config)
+
+        if final_group_config is None:
+            final_group_config = GroupConfig(
+                max_group_gap=2.0,
+                max_group_duration=10.0,
+                max_group_sentences=5,
+                enable_overlap_detection=True,
+            )
+        self.final_grouper = SemanticGrouper(final_group_config)
+
+    async def align(
+        self,
+        whisper_result: Dict[str, Any],
+        sv_result: Dict[str, Any],
+        chunk: AudioChunk,
+    ) -> Tuple[List[SentenceSegment], AlignmentLevel]:
+        """执行双流对齐并完成降级兜底。"""
+        detected_language = whisper_result.get("language", "auto")
+        self.final_splitter.config.language = detected_language
+        self.logger.debug("使用 Whisper 检测到的语言: %s", detected_language)
+
+        whisper_text = whisper_result.get("text", "").strip()
+        sv_text_clean = sv_result.get("text_clean", "").strip()
+
+        if whisper_text:
+            word_count = len(whisper_text.split())
+            if word_count < 2 and sv_text_clean:
+                self.logger.warning(
+                    "Whisper 单词数过少（%d < 2），直接降级到 SenseVoice",
+                    word_count,
+                )
+                sentences = self.split_sensevoice_only(sv_result, chunk)
+                return sentences, AlignmentLevel.SENSEVOICE_ONLY
+
+        if sv_text_clean:
+            len_whisper = len(whisper_text)
+            len_sv = len(sv_text_clean)
+
+            if len_whisper > 3 * len_sv + 10:
+                whisper_confidence = whisper_result.get("confidence", 0.5)
+                if whisper_confidence < 0.5:
+                    self.logger.warning(
+                        "Whisper 长度暴涨且置信度低，直接降级到 SenseVoice",
+                    )
+                    sentences = self.split_sensevoice_only(sv_result, chunk)
+                    return sentences, AlignmentLevel.SENSEVOICE_ONLY
+
+            elif len_whisper < len_sv * 0.65:
+                self.logger.warning(
+                    "Whisper 输出明显短于 SenseVoice，直接降级到 SenseVoice",
+                )
+                sentences = self.split_sensevoice_only(sv_result, chunk)
+                return sentences, AlignmentLevel.SENSEVOICE_ONLY
+
+        try:
+            sv_words_data = sv_result.get("words", [])
+            if not whisper_text or not sv_words_data:
+                raise ValueError("Whisper 或 SenseVoice 结果为空")
+
+            sv_tokens = self._build_words(sv_words_data)
+
+            aligned_subtitle = await self.alignment_service.align(
+                whisper_text=whisper_text,
+                sv_tokens=sv_tokens,
+                vad_range=(0.0, chunk.duration),
+                chunk_offset=chunk.start,
+                audio_array=chunk.audio,
+                sample_rate=chunk.sample_rate,
+            )
+
+            if aligned_subtitle.alignment_score < self.alignment_score_threshold:
+                raise ValueError(f"对齐质量过低: {aligned_subtitle.alignment_score:.2f}")
+
+            aligned_words = [
+                WordTimestamp(
+                    word=word.word,
+                    start=word.start,
+                    end=word.end,
+                    confidence=word.final_confidence,
+                    is_pseudo=word.is_pseudo,
+                )
+                for word in aligned_subtitle.words
+            ]
+
+            sentences = self._split_with_final(aligned_words, whisper_text)
+            for sentence in sentences:
+                sentence.source = TextSource.WHISPER_PATCH
+                sentence.is_finalized = True
+                sentence.is_draft = False
+                sentence.alignment_score = aligned_subtitle.alignment_score
+                sentence.matched_ratio = aligned_subtitle.matched_ratio
+                sentence.whisper_text = whisper_text
+
+            self.logger.debug(
+                "双模态对齐成功: alignment_score=%.2f, matched_ratio=%.2f, 分句数=%d",
+                aligned_subtitle.alignment_score,
+                aligned_subtitle.matched_ratio,
+                len(sentences),
+            )
+
+            return sentences, AlignmentLevel.DUAL_MODAL
+
+        except Exception as exc:
+            self.logger.warning("双模态对齐失败: %s，降级到 Whisper 伪对齐", exc)
+            if not self.is_enable_fallback:
+                raise
+
+            try:
+                if not whisper_text:
+                    raise ValueError("Whisper 结果为空")
+
+                words = PseudoAlignment.apply(
+                    original_start=0.0,
+                    original_end=chunk.duration,
+                    new_text=whisper_text,
+                )
+
+                for word in words:
+                    word.start += chunk.start
+                    word.end += chunk.start
+
+                sentences = self._split_with_final(words, whisper_text)
+                for sentence in sentences:
+                    sentence.source = TextSource.WHISPER_PATCH
+                    sentence.is_finalized = True
+                    sentence.is_draft = False
+                    sentence.alignment_score = 0.5
+                    sentence.whisper_text = whisper_text
+
+                self.logger.debug("Whisper 伪对齐成功, 分句数=%d", len(sentences))
+                return sentences, AlignmentLevel.WHISPER_PSEUDO
+
+            except Exception as exc2:
+                self.logger.error("Whisper 伪对齐失败: %s，降级到 SenseVoice", exc2)
+                sentences = self.split_sensevoice_only(sv_result, chunk)
+                return sentences, AlignmentLevel.SENSEVOICE_ONLY
+
+    def split_sensevoice_only(
+        self,
+        sv_result: Dict[str, Any],
+        chunk: AudioChunk,
+    ) -> List[SentenceSegment]:
+        """将 SenseVoice 结果作为最终输出。"""
+        sentences = self._split_from_sv(sv_result, chunk)
+        for sentence in sentences:
+            sentence.is_finalized = True
+            sentence.is_draft = False
+        return sentences
+
+    def _split_with_final(
+        self,
+        words: List[WordTimestamp],
+        text: str,
+    ) -> List[SentenceSegment]:
+        sentences = self.final_splitter.split(words, text)
+        if self.is_enable_semantic_grouping:
+            sentences = self.final_grouper.group(sentences)
+        return sentences
+
+    def _split_from_sv(
+        self,
+        sv_result: Dict[str, Any],
+        chunk: AudioChunk,
+    ) -> List[SentenceSegment]:
+        text_clean = sv_result.get("text_clean", "")
+        words_data = sv_result.get("words", [])
+        words = self._build_words(words_data)
+
+        if not words:
+            if text_clean and text_clean.strip():
+                self.logger.warning(
+                    "SenseVoice 没有字级时间戳但有文本，创建兜底单句: "
+                    "text='%s...', chunk=[%.2fs, %.2fs]",
+                    text_clean[:50],
+                    chunk.start,
+                    chunk.end,
+                )
+                return [
+                    SentenceSegment(
+                        text=text_clean.strip(),
+                        start=chunk.start,
+                        end=chunk.end,
+                        words=[],
+                        source=TextSource.SENSEVOICE,
+                        confidence=sv_result.get("confidence", 0.5),
+                        is_finalized=True,
+                        is_draft=False,
+                    )
+                ]
+            self.logger.warning("SenseVoice 结果没有字级时间戳且无文本，无法分句")
+            return []
+
+        sentences = self._split_with_final(words, text_clean)
+
+        for sentence in sentences:
+            sentence.start += chunk.start
+            sentence.end += chunk.start
+            sentence.source = TextSource.SENSEVOICE
+            for word in sentence.words:
+                word.start += chunk.start
+                word.end += chunk.start
+
+        return sentences
+
+    @staticmethod
+    def _build_words(words_data: List[Dict[str, Any]]) -> List[WordTimestamp]:
+        words: List[WordTimestamp] = []
+        for word in words_data:
+            words.append(
+                WordTimestamp(
+                    word=word.get("word", ""),
+                    start=word.get("start", 0.0),
+                    end=word.get("end", 0.0),
+                    confidence=word.get("confidence", 1.0),
+                )
+            )
+        return words

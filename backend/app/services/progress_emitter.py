@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 class ProgressMode(Enum):
     """进度模式 - 对应不同的转录流水线"""
     SENSEVOICE_ONLY = "sensevoice_only"    # 极速模式: 仅 SenseVoice
-    WHISPER_PATCH = "whisper_patch"        # 补刀模式: SenseVoice + Whisper 局部
+    WHISPER_PATCH = "whisper_patch"        # 复核模式: SenseVoice + Whisper 局部
     DUAL_STREAM = "dual_stream"            # 双流模式: SenseVoice + Whisper 全量
 
 
@@ -71,25 +71,35 @@ class ProgressEventEmitter:
     """
 
     # 阶段权重配置 (不同模式)
-    # V3.1.0 调整: 提高 fast (SenseVoice) 权重，让用户能看到明显的进度变化
+    # V3.2.0+dev.20260125.03: 修复双流模式进度计算逻辑
+    # 总进度分配：前处理 20% + 转录 55% + 精修 20% + 导出 5%
+    # 注意：精修目前跳过，转录完成（75%）后直接跳到95%，然后到100%
+    #
+    # 关键理解：
+    # - 双流模式下，fast 和 slow 处理的是同一批 chunk，不应相加
+    # - 转录进度应以慢流（定稿）为准，快流（草稿）仅用于前端追赶动画
+    # - 慢流完成时总进度到达 75%，然后跳到 95%（跳过精修），再到 100%（导出完成）
+    # - 对齐阶段废除，不计入总进度（权重为0）
     WEIGHTS = {
         ProgressMode.SENSEVOICE_ONLY: {
-            "preprocess": 0.15,
-            "fast": 0.85,
-            "slow": 0.0,
-            "align": 0.0
+            "preprocess": 0.20,  # 前处理 20%
+            "fast": 0.55,        # 转录 55%（SenseVoice 完成即转录完成，到达 75%）
+            "slow": 0.0,         # 极速模式不使用 Whisper
+            "align": 0.0         # 对齐废除，不计入总进度
         },
+        # V3.2.0+dev.20260125.04: 智能复核模式采用 70%/30% 分配
+        # 快流完成后才知道慢流需要复核多少 Chunk，因此快流占大头
         ProgressMode.WHISPER_PATCH: {
-            "preprocess": 0.10,
-            "fast": 0.50,  # V3.1.0: 45% → 50%，让 SenseVoice 完成时进度更明显
-            "slow": 0.30,  # V3.1.0: 35% → 30%
-            "align": 0.10
+            "preprocess": 0.20,  # 前处理 20%
+            "fast": 0.385,       # 快流占转录的 70%（55% × 70% = 38.5%）
+            "slow": 0.165,       # 慢流占转录的 30%（55% × 30% = 16.5%）
+            "align": 0.0         # 对齐废除，不计入总进度
         },
         ProgressMode.DUAL_STREAM: {
-            "preprocess": 0.10,
-            "fast": 0.50,  # V3.1.0: 35% → 50%，让 SenseVoice 完成时进度达到 60%
-            "slow": 0.30,  # V3.1.0: 40% → 30%
-            "align": 0.10  # V3.1.0: 15% → 10%
+            "preprocess": 0.20,  # 前处理 20%
+            "fast": 0.0,         # 快流（草稿）不计入总进度，仅用于前端追赶动画
+            "slow": 0.55,        # 慢流（定稿）完成即转录完成（到达 75%）
+            "align": 0.0         # 对齐废除，不计入总进度
         }
     }
 
@@ -343,6 +353,7 @@ class ProgressEventEmitter:
 
         channel_id = f"job:{self.job.job_id}"
         event_type = f"progress.{phase}"
+        data["updated_at"] = int(time.time() * 1000)
 
         logger.debug(f"[ProgressEmitter] 推送进度: {phase}={data.get('percent', 0):.1f}%")
         self.sse_manager.broadcast_sync(channel_id, event_type, data)
@@ -355,6 +366,7 @@ class ProgressEventEmitter:
 
         channel_id = f"job:{self.job.job_id}"
         job_id = self.job.job_id
+        updated_at_ms = int(time.time() * 1000)
 
         # 构建总体进度数据
         overall_data = {
@@ -373,7 +385,9 @@ class ProgressEventEmitter:
                 "fast": self.detail.fast,
                 "slow": self.detail.slow,
                 "align": self.detail.align
-            }
+            },
+            "updated_at": updated_at_ms,
+            "timestamp": time.time()
         }
 
         logger.debug(f"[ProgressEmitter] 推送总体进度: {self.detail.total:.1f}% (fast={self.detail.fast:.1f}%, slow={self.detail.slow:.1f}%)")
@@ -385,7 +399,9 @@ class ProgressEventEmitter:
             "id": job_id,
             "percent": self.detail.total,
             "message": self._get_current_message(),
-            "status": self.job.status
+            "status": self.job.status,
+            "updated_at": updated_at_ms,
+            "timestamp": time.time()
         }
         self.sse_manager.broadcast_sync("global", "job_progress", global_data)
 
@@ -398,7 +414,8 @@ class ProgressEventEmitter:
         signal_data = {
             "job_id": self.job.job_id,
             "signal": signal_type,
-            "message": message
+            "message": message,
+            "updated_at": int(time.time() * 1000)
         }
 
         self.sse_manager.broadcast_sync(channel_id, f"signal.{signal_type}", signal_data)
@@ -524,7 +541,7 @@ class ProgressEventEmitter:
             self.detail.slow_total = total_chunks
             self.detail.slow = (slow_count / total_chunks * 100) if total_chunks > 0 else 0
 
-            # AlignmentWorker 进度
+            # 对齐阶段进度
             alignment = transcription.get("alignment", {})
             align_count = alignment.get("completed_count", 0) or len(alignment.get("finalized_indices", []))
             self.detail.align_processed = align_count

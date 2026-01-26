@@ -285,7 +285,7 @@ class JobManager:
             # 重建 JobState 对象
             # 注意：需要处理嵌套的 JobSettings 对象
             if 'settings' in job_dict and isinstance(job_dict['settings'], dict):
-                job_dict['settings'] = JobSettings(**job_dict['settings'])
+                job_dict['settings'] = JobSettings.from_dict(job_dict['settings'])
 
             job = JobState(**job_dict)
 

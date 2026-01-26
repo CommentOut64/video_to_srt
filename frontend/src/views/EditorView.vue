@@ -7,6 +7,7 @@
       :current-task-status="taskStatus"
       :current-task-phase="taskPhase"
       :current-task-progress="taskProgress"
+      :progress-detail="progressDetail"
       :queue-completed="queueCompleted"
       :queue-total="queueTotal"
       :can-undo="canUndo"
@@ -192,7 +193,7 @@
  * - 智能进度显示和多任务管理
  */
 import { ref, computed, onMounted, onUnmounted, provide, watch, toRef } from 'vue'
-import { useRouter, onBeforeRouteLeave } from 'vue-router'
+import { onBeforeRouteLeave } from 'vue-router'
 import { useProjectStore } from '@/stores/projectStore'
 import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
 import { useProgressStore } from '@/stores/progressStore'
@@ -200,6 +201,7 @@ import { mediaApi, transcriptionApi } from '@/services/api'
 import sseChannelManager from '@/services/sseChannelManager'
 import { useShortcuts } from '@/hooks/useShortcuts'
 import { useProxyVideo } from '@/composables/useProxyVideo'
+import { useSubtitleSync } from '@/composables'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { repairSubtitleOverlaps } from '@/utils/subtitleUtils'
 import { ElMessage } from 'element-plus'
@@ -216,8 +218,7 @@ const props = defineProps({
   jobId: { type: String, required: true }
 })
 
-// Router & Stores
-const router = useRouter()
+// Stores
 const projectStore = useProjectStore()
 const taskStore = useUnifiedTaskStore()
 
@@ -226,6 +227,7 @@ const playbackManager = usePlaybackManager()
 
 // 创建响应式 jobId ref，用于监听路由变化
 const jobIdRef = toRef(props, 'jobId')
+const { forceSyncNow } = useSubtitleSync(jobIdRef)
 
 // Proxy 视频加载状态（新重构版本）
 const proxyVideo = useProxyVideo(jobIdRef)
@@ -252,6 +254,7 @@ const jobProgress = computed(() => progressStore.getRawState(jobIdRef.value))
 const taskStatus = computed(() => jobProgress.value.status || 'idle')
 const taskPhase = computed(() => jobProgress.value.phase || 'pending')
 const taskProgress = computed(() => jobProgress.value.percent || 0)
+const progressDetail = computed(() => jobProgress.value.detail || null)
 const isTranscribing = computed(() =>
   ['processing', 'queued'].includes(taskStatus.value)
 )
@@ -479,51 +482,19 @@ async function loadProject() {
     // V3.1.2+dev.20260112.01: 恢复策略优化
     // 优先级: memoryCache → SmartSaver → segments API → SRT fallback
     const restored = await projectStore.restoreProject(props.jobId)
-    if (restored && projectStore.subtitles.length > 0) {
+    const hasLocalRestore = restored && projectStore.subtitles.length > 0
+    if (hasLocalRestore) {
       console.log('[EditorView] 从本地存储恢复成功')
 
       // V3.1.2: 检查缓存数据格式完整性
       // 必须有 sentenceIndex 字段才能支持 SSE 匹配
       const hasValidFormat = projectStore.subtitles.every(s => s.sentenceIndex !== undefined)
-
-      // V3.1.2: 检查缓存数据是否有置信度（用于已完成任务的数据完整性）
-      const hasConfidenceData = projectStore.subtitles.some(
-        s => s.display_confidence !== undefined && s.display_confidence !== null
-      )
-
       if (!hasValidFormat) {
         // 缓存数据是旧格式，需要重新从 API 加载以获取 sentenceIndex
         console.log('[EditorView] 缓存数据格式过旧（缺少 sentenceIndex），重新从 API 加载')
         await loadTranscribingSegments()
-      } else if (jobStatus.status === 'finished' && !hasConfidenceData) {
-        // V3.1.2: 已完成任务但缓存无置信度数据，尝试从 API 重新加载
-        console.log('[EditorView] 已完成任务缓存无置信度数据，尝试从 API 补充')
-        await loadTranscribingSegments()
       }
-
-      // 即使从本地恢复，如果任务仍在处理中或暂停，也需要订阅SSE以接收实时更新
-      if (['processing', 'queued'].includes(jobStatus.status)) {
-        console.log('[EditorView] 任务仍在处理中，需要订阅SSE')
-        subscribeSSE()
-        startProgressPolling()
-        startProxyPolling()
-      } else if (jobStatus.status === 'paused') {
-        // 暂停状态也需要订阅SSE，以便接收恢复信号
-        console.log('[EditorView] 任务已暂停，订阅SSE以接收恢复信号')
-        subscribeSSE()
-        // V3.1.0: 暂停状态下立即刷新一次进度，不等待 SSE 连接
-        refreshTaskProgress()
-        startProxyPolling()
-      } else if (jobStatus.status === 'finished') {
-        // 任务已完成，useProxyVideo会自动处理视频转码状态
-        console.log('[EditorView] 本地恢复后任务已完成，useProxyVideo将自动检查视频转码状态')
-        // 若视频尚未就绪（如720p仍在生成），继续订阅 SSE 以接收 proxy/remux 事件
-        if (!proxyVideo.isReady.value) {
-          subscribeSSE()
-          startProxyPolling()
-        }
-      }
-      return
+      // V3.2.0+dev.20260124.02: 后端为唯一真理，后续仍会从 API 刷新覆盖
     }
 
     // 3. 根据任务状态从后端加载字幕数据
@@ -571,7 +542,6 @@ async function loadProject() {
       try {
         await taskStore.deleteTask(props.jobId)
         loadError.value = '任务不存在（已被删除），本地记录已清理'
-        setTimeout(() => router.push('/tasks'), 2000)
       } catch (deleteError) {
         loadError.value = '任务不存在，且清理本地记录失败，请刷新页面'
       }
@@ -699,8 +669,14 @@ function subscribeSSE() {
 
     async onComplete(data) {
       console.log('[EditorView] 任务完成:', data)
-      progressStore.markStatus(props.jobId, 'finished', { percent: 100, phase: 'complete' })
-      taskStore.updateTaskStatus(props.jobId, 'finished')
+      progressStore.markStatus(props.jobId, 'finished', {
+        percent: 100,
+        phase: 'complete',
+        updated_at: data.updated_at ?? data.timestamp
+      })
+      taskStore.updateTaskStatus(props.jobId, 'finished', null, {
+        updated_at: data.updated_at ?? data.timestamp
+      })
 
       // V3.1.2+dev.20260111.02: 任务完成处理
       // 优先保留 SSE 推送的字幕（含置信度），无数据时从 API 加载
@@ -733,8 +709,13 @@ function subscribeSSE() {
 
     onFailed(data) {
       console.log('[EditorView] 任务失败:', data)
-      progressStore.markStatus(props.jobId, 'failed', { message: data.message })
-      taskStore.updateTaskStatus(props.jobId, 'failed')
+      progressStore.markStatus(props.jobId, 'failed', {
+        message: data.message,
+        updated_at: data.updated_at ?? data.timestamp
+      })
+      taskStore.updateTaskStatus(props.jobId, 'failed', null, {
+        updated_at: data.updated_at ?? data.timestamp
+      })
       taskStore.updateTaskSSEStatus(props.jobId, true, data.message || '转录失败')
       stopProgressPolling()
       // 任务失败后关闭SSE连接
@@ -743,15 +724,23 @@ function subscribeSSE() {
 
     onPaused(data) {
       console.log('[EditorView] 任务已暂停:', data)
-      progressStore.markStatus(props.jobId, 'paused')
-      taskStore.updateTaskStatus(props.jobId, 'paused')
+      progressStore.markStatus(props.jobId, 'paused', {
+        updated_at: data.updated_at ?? data.timestamp
+      })
+      taskStore.updateTaskStatus(props.jobId, 'paused', null, {
+        updated_at: data.updated_at ?? data.timestamp
+      })
       // 保持SSE连接和进度显示
     },
 
     onCanceled(data) {
       console.log('[EditorView] 任务已取消:', data)
-      progressStore.markStatus(props.jobId, 'canceled')
-      taskStore.updateTaskStatus(props.jobId, 'canceled')
+      progressStore.markStatus(props.jobId, 'canceled', {
+        updated_at: data.updated_at ?? data.timestamp
+      })
+      taskStore.updateTaskStatus(props.jobId, 'canceled', null, {
+        updated_at: data.updated_at ?? data.timestamp
+      })
       stopProgressPolling()
       cleanupSSE()
     },
@@ -759,8 +748,12 @@ function subscribeSSE() {
     onResumed(data) {
       // 新增：处理任务恢复信号
       console.log('[EditorView] 任务已恢复:', data)
-      progressStore.markStatus(props.jobId, data.status || 'queued')
-      taskStore.updateTaskStatus(props.jobId, data.status || 'queued')
+      progressStore.markStatus(props.jobId, data.status || 'queued', {
+        updated_at: data.updated_at ?? data.timestamp
+      })
+      taskStore.updateTaskStatus(props.jobId, data.status || 'queued', null, {
+        updated_at: data.updated_at ?? data.timestamp
+      })
       startProgressPolling()
     },
 
@@ -814,6 +807,16 @@ function subscribeSSE() {
     onFinalized(data) {
       console.log('[EditorView] 收到定稿字幕:', data)
       handleFinalizedSubtitle(data)
+    },
+
+    onSubtitleAdded(data) {
+      console.log('[EditorView] 收到新增字幕:', data)
+      handleStreamingSubtitle(data)
+    },
+
+    onSubtitleDeleted(data) {
+      console.log('[EditorView] 收到删除字幕:', data)
+      handleSubtitleDeleted(data)
     },
 
     // 新增：BGM 检测事件
@@ -907,6 +910,11 @@ function handleStreamingSubtitle(data) {
     return
   }
 
+  if (projectStore.isSentenceDeleted(sentenceIndex)) {
+    console.log(`[EditorView] 字幕已被用户删除，忽略 SSE: ${sentenceIndex}`)
+    return
+  }
+
   // 暂停历史记录，SSE 推送的内容不应被撤销
   projectStore.pauseHistory()
 
@@ -925,7 +933,9 @@ function handleStreamingSubtitle(data) {
     display_confidence: displayConfidence,
     confidence_source: confidenceSource,
     warning_type: warningType,
-    source
+    source,
+    isModified: sentence.is_modified ?? false,
+    originalText: sentence.original_text ?? null
   }
 
   if (existingIndex >= 0) {
@@ -967,11 +977,13 @@ function handleDraftSubtitle(data) {
     text: sentence.text || '',
     start: sentence.start ?? 0,
     end: sentence.end ?? 0,
-    confidence: sentence.confidence ?? 0.8,
+    confidence: sentence.confidence ?? null,
     display_confidence: sentence.display_confidence,  // V3.1.2: 映射后准确率
     confidence_source: sentence.confidence_source,    // V3.1.2: 置信度来源
     words: sentence.words || [],
-    warning_type: sentence.warning_type || 'none'
+    warning_type: sentence.warning_type || 'none',
+    is_modified: sentence.is_modified ?? false,
+    original_text: sentence.original_text ?? null
   }
 
   // 调用 projectStore 的草稿处理方法，传递两个参数
@@ -994,12 +1006,14 @@ function handleReplaceChunk(data) {
     text: sentence.text || '',
     start: sentence.start ?? 0,
     end: sentence.end ?? 0,
-    confidence: sentence.confidence ?? 1.0,
+    confidence: sentence.confidence ?? null,
     display_confidence: sentence.display_confidence,  // V3.1.2: 映射后准确率
     confidence_source: sentence.confidence_source,    // V3.1.2: 置信度来源
     words: sentence.words || [],
     warning_type: sentence.warning_type || 'none',
-    source: sentence.source || 'whisper'
+    source: sentence.source || 'whisper',
+    is_modified: sentence.is_modified ?? false,
+    original_text: sentence.original_text ?? null
   }))
 
   // 调用 projectStore 的替换方法
@@ -1029,20 +1043,33 @@ function handleRestoredChunk(data) {
     text: sentence.text || '',
     start: sentence.start ?? 0,
     end: sentence.end ?? 0,
-    confidence: sentence.confidence ?? 1.0,
+    confidence: sentence.confidence ?? null,
     display_confidence: sentence.display_confidence,  // V3.1.2: 映射后准确率
     confidence_source: sentence.confidence_source,    // V3.1.2: 置信度来源
     words: sentence.words || [],
     warning_type: sentence.warning_type || 'none',
     source: sentence.source || 'restored',
     is_draft: sentence.is_draft ?? false,
-    is_finalized: sentence.is_finalized ?? true
+    is_finalized: sentence.is_finalized ?? true,
+    is_modified: sentence.is_modified ?? false,
+    original_text: sentence.original_text ?? null
   }))
 
   // 调用 projectStore 的恢复方法
   projectStore.restoreChunk(chunkIndex, formattedSentences)
 
   console.log(`[EditorView] 恢复 Chunk ${chunkIndex}，共 ${formattedSentences.length} 条字幕`)
+}
+
+function handleSubtitleDeleted(data) {
+  if (!data) return
+  const sentenceIndex = data.index ?? data.sentence_index
+  if (sentenceIndex === undefined || sentenceIndex === null) return
+  projectStore.markSentenceDeleted(sentenceIndex)
+  const target = projectStore.subtitles.find(s => s.sentenceIndex === sentenceIndex)
+  if (target) {
+    projectStore.removeSubtitle(target.id)
+  }
 }
 
 /**
@@ -1062,11 +1089,13 @@ function handleFinalizedSubtitle(data) {
     text: sentence.text || '',
     start: sentence.start ?? 0,
     end: sentence.end ?? 0,
-    confidence: sentence.confidence ?? 1.0,
+    confidence: sentence.confidence ?? null,
     display_confidence: sentence.display_confidence,  // V3.1.2: 映射后准确率
     confidence_source: sentence.confidence_source,    // V3.1.2: 置信度来源
     words: sentence.words || [],
-    warning_type: sentence.warning_type || 'none'
+    warning_type: sentence.warning_type || 'none',
+    is_modified: sentence.is_modified ?? false,
+    original_text: sentence.original_text ?? null
   }
 
   // 调用草稿方法，但数据已标记为定稿
@@ -1198,10 +1227,16 @@ async function saveProject() {
 
 async function pauseTranscription() {
   try {
-    await transcriptionApi.pauseJob(props.jobId)
-    progressStore.markStatus(props.jobId, 'paused')
-    // 更新本地store状态
-    taskStore.updateTaskStatus(props.jobId, 'paused')
+    const result = await transcriptionApi.pauseJob(props.jobId)
+    if (result?.task) {
+      taskStore.applyTaskSnapshot(result.task)
+      progressStore.markStatus(props.jobId, result.task.status || 'paused', {
+        updated_at: result.task.updated_at
+      })
+    } else {
+      progressStore.markStatus(props.jobId, 'paused')
+      taskStore.updateTaskStatus(props.jobId, 'paused', null, { isServer: false })
+    }
     // 暂停后保留SSE连接，以便恢复时能继续接收更新
     console.log('[EditorView] 任务已暂停，保留SSE连接')
   } catch (error) {
@@ -1214,11 +1249,16 @@ async function resumeTranscription() {
     // 使用新的 resumeJob API，恢复暂停的任务（重新加入队列）
     const result = await transcriptionApi.resumeJob(props.jobId)
 
-    // 根据后端返回值设置状态（应该是 queued，而不是 processing）
-    progressStore.markStatus(props.jobId, result.status || 'queued')
-
-    // 更新本地store状态
-    taskStore.updateTaskStatus(props.jobId, result.status || 'queued')
+    if (result?.task) {
+      taskStore.applyTaskSnapshot(result.task)
+      progressStore.markStatus(props.jobId, result.task.status || 'queued', {
+        updated_at: result.task.updated_at
+      })
+    } else {
+      // 根据后端返回值设置状态（应该是 queued，而不是 processing）
+      progressStore.markStatus(props.jobId, result.status || 'queued')
+      taskStore.updateTaskStatus(props.jobId, result.status || 'queued', null, { isServer: false })
+    }
 
     console.log('[EditorView] 任务已恢复，状态:', result.status, '队列位置:', result.queue_position)
 
@@ -1232,10 +1272,16 @@ async function resumeTranscription() {
 async function cancelTranscription() {
   if (!confirm('确定要取消当前转录任务吗?')) return
   try {
-    await transcriptionApi.cancelJob(props.jobId, false)
-    progressStore.markStatus(props.jobId, 'canceled')
-    // 更新本地store状态
-    taskStore.updateTaskStatus(props.jobId, 'canceled')
+    const result = await transcriptionApi.cancelJob(props.jobId, false)
+    if (result?.task) {
+      taskStore.applyTaskSnapshot(result.task)
+      progressStore.markStatus(props.jobId, result.task.status || 'canceled', {
+        updated_at: result.task.updated_at
+      })
+    } else {
+      progressStore.markStatus(props.jobId, 'canceled')
+      taskStore.updateTaskStatus(props.jobId, 'canceled', null, { isServer: false })
+    }
     // 取消后关闭SSE连接
     cleanupSSE()
     stopProgressPolling()
@@ -1260,33 +1306,39 @@ onUnmounted(() => {
   window.removeEventListener('header-export', handleExportEvent)
 })
 
-function handleExportEvent(event) {
+async function handleExportEvent(event) {
   const format = event.detail
-  handleExport(format)
+  await handleExport(format)
 }
 
-function handleExport(format) {
+async function handleExport(format) {
+  const segments = await fetchLatestSegments()
+  if (!segments || segments.length === 0) {
+    alert('导出失败：后端未返回字幕数据')
+    return
+  }
+
   let content = ''
   let filename = projectName.value.replace(/\.[^/.]+$/, '')
 
   switch (format) {
     case 'srt':
-      content = projectStore.generateSRT()
+      content = segmentsToSRT(segments)
       filename += '.srt'
       break
     case 'ass':
-      handleASSExport()
+      await handleASSExport(segments)
       return
     case 'vtt':
-      content = generateVTT()
+      content = generateVTTFromSegments(segments)
       filename += '.vtt'
       break
     case 'txt':
-      content = projectStore.subtitles.map(s => s.text).join('\n')
+      content = segments.map(s => s.text).join('\n')
       filename += '.txt'
       break
     case 'json':
-      content = JSON.stringify(projectStore.subtitles, null, 2)
+      content = JSON.stringify(segments, null, 2)
       filename += '.json'
       break
   }
@@ -1294,9 +1346,23 @@ function handleExport(format) {
   downloadFile(content, filename)
 }
 
-async function handleASSExport() {
+async function fetchLatestSegments() {
+  try {
+    await forceSyncNow()
+    const response = await transcriptionApi.getTranscriptionText(props.jobId)
+    return response?.segments || []
+  } catch (error) {
+    console.error('[EditorView] 获取后端字幕失败:', error)
+    return []
+  }
+}
+
+async function handleASSExport(segments) {
   try {
     console.log('[EditorView] 开始生成 ASS 字幕文件')
+
+    const srtContent = segmentsToSRT(segments)
+    await mediaApi.saveSRTContent(props.jobId, srtContent)
 
     // 调用后端 API 生成 ASS 文件
     await transcriptionApi.generateASS(props.jobId, {
@@ -1322,9 +1388,9 @@ async function handleASSExport() {
 /**
  * V3.1.1+dev.20260106.04: 导出前自动修复时间戳重叠
  */
-function generateVTT() {
+function generateVTTFromSegments(segments) {
   // 修复时间戳重叠（使用1ms间隔）
-  const repairedSubtitles = repairSubtitleOverlaps(projectStore.subtitles, 1)
+  const repairedSubtitles = repairSubtitleOverlaps(segments, 1)
 
   let vtt = 'WEBVTT\n\n'
   repairedSubtitles.forEach((sub, i) => {

@@ -1,0 +1,204 @@
+- id: sensevoice-small
+  kind: asr
+  framework: onnx
+  format: onnx
+  default_device: auto
+  compute_type: int8
+  source:
+    local_path: backend/models/pretrained/sensevoice
+    repo_id: FunAudioLLM/SenseVoiceSmall
+    files: [model_quant.onnx, tokens.json]
+    mirrors: []
+  resources: {vram_mb: 800, cpu_threads: 8}
+  features: {languages: [zh, en, yue, ja, ko], timestamps: char}
+
+- id: whisper-medium
+  kind: asr
+  framework: ctranslate2
+  format: ct2
+  default_device: cuda
+  compute_type: int8_float16
+  source:
+    local_path: models/huggingface/models--Systran--faster-whisper-medium/snapshots/08e178d48790749d25932bbc082711ddcfdfbc4f
+    repo_id: Systran/faster-whisper-medium
+    files: [model.bin, config.json, tokenizer.json]
+  resources: {vram_mb: 2000}
+  features: {timestamps: word, languages: multi}
+
+# V3.2.0+dev.20260116.03: 添加所有 Whisper 模型支持
+- id: whisper-tiny
+  kind: asr
+  framework: ctranslate2
+  format: ct2
+  default_device: cuda
+  compute_type: int8
+  source:
+    repo_id: Systran/faster-whisper-tiny
+    files: [model.bin, config.json, tokenizer.json]
+  resources: {vram_mb: 500}
+  features: {timestamps: word, languages: multi}
+
+- id: whisper-base
+  kind: asr
+  framework: ctranslate2
+  format: ct2
+  default_device: cuda
+  compute_type: int8
+  source:
+    repo_id: Systran/faster-whisper-base
+    files: [model.bin, config.json, tokenizer.json]
+  resources: {vram_mb: 800}
+  features: {timestamps: word, languages: multi}
+
+- id: whisper-small
+  kind: asr
+  framework: ctranslate2
+  format: ct2
+  default_device: cuda
+  compute_type: int8_float16
+  source:
+    repo_id: Systran/faster-whisper-small
+    files: [model.bin, config.json, tokenizer.json]
+  resources: {vram_mb: 1500}
+  features: {timestamps: word, languages: multi}
+
+- id: whisper-large
+  kind: asr
+  framework: ctranslate2
+  format: ct2
+  default_device: cuda
+  compute_type: int8_float16
+  source:
+    repo_id: Systran/faster-whisper-large
+    files: [model.bin, config.json, tokenizer.json]
+  resources: {vram_mb: 6000}
+  features: {timestamps: word, languages: multi}
+
+- id: whisper-large-v2
+  kind: asr
+  framework: ctranslate2
+  format: ct2
+  default_device: cuda
+  compute_type: int8_float16
+  source:
+    repo_id: Systran/faster-whisper-large-v2
+    files: [model.bin, config.json, tokenizer.json]
+  resources: {vram_mb: 6000}
+  features: {timestamps: word, languages: multi}
+
+- id: whisper-large-v3
+  kind: asr
+  framework: ctranslate2
+  format: ct2
+  default_device: cuda
+  compute_type: int8_float16
+  source:
+    repo_id: Systran/faster-whisper-large-v3
+    files: [model.bin, config.json, tokenizer.json]
+  resources: {vram_mb: 6000}
+  features: {timestamps: word, languages: multi}
+
+- id: whisper-turbo
+  kind: asr
+  framework: ctranslate2
+  format: ct2
+  default_device: cuda
+  compute_type: int8_float16
+  source:
+    repo_id: Systran/faster-whisper-large-v3-turbo
+    files: [model.bin, config.json, tokenizer.json]
+  resources: {vram_mb: 5000}
+  features: {timestamps: word, languages: multi}
+
+- id: whisper-distil-large-v3
+  kind: asr
+  framework: ctranslate2
+  format: ct2
+  default_device: cuda
+  compute_type: int8_float16
+  source:
+    repo_id: Systran/faster-distil-whisper-large-v3
+    files: [model.bin, config.json, tokenizer.json]
+  resources: {vram_mb: 4000}
+  features: {timestamps: word, languages: multi}
+
+- id: brouhaha-quality
+  kind: quality
+  framework: torch
+  format: pth
+  default_device: auto
+  compute_type: fp32
+  source:
+    local_path: backend/models/pretrained/brouhaha
+    repo_id: pyannote/brouhaha
+    files: [pytorch_model.bin, config.yaml]
+  env:
+    pip: ["pyannote.audio==3.1.1", "torch==2.1.2"]
+  resources: {vram_mb: 1000}
+
+- id: demucs-htdemucs
+  kind: separation
+  framework: demucs
+  format: pth
+  default_device: cuda
+  compute_type: fp32
+  source:
+    local_path: backend/models/pretrained
+    files: [htdemucs.th]
+  features:
+    model_name: htdemucs
+  resources: {vram_mb: 1500}
+
+- id: silero-vad
+  kind: vad
+  framework: onnx
+  format: onnx
+  default_device: auto
+  compute_type: int8
+  source:
+    local_path: backend/models/pretrained/silero-vad
+    files: [silero_vad.onnx]
+  resources: {cpu_threads: 4}
+
+- id: langid-voxlingua
+  kind: langid
+  framework: torch
+  format: pth
+  default_device: cpu
+  compute_type: int8
+  source:
+    repo_id: speechbrain/lang-id-voxlingua107-ecapa
+  resources: {cpu_threads: 4}
+
+- id: punct-zh
+  kind: punct
+  framework: onnx
+  format: onnx
+  default_device: auto
+  compute_type: int8
+  source:
+    repo_id: example/punct-zh
+  features: {languages: [zh]}
+  fallback: []
+
+- id: punct-en
+  kind: punct
+  framework: onnx
+  format: onnx
+  default_device: auto
+  compute_type: int8
+  source:
+    repo_id: example/punct-en
+  features: {languages: [en]}
+  fallback: []
+
+- id: punct-ja
+  kind: punct
+  framework: onnx
+  format: onnx
+  default_device: auto
+  compute_type: int8
+  source:
+    repo_id: example/punct-ja
+  features: {languages: [ja]}
+  fallback: [punct-en]

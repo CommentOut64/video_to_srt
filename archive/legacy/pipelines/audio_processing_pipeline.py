@@ -24,7 +24,6 @@ from app.services.audio.chunk_engine import ChunkEngine, AudioChunk
 from app.services.audio.vad_service import VADService, VADConfig
 from app.services.demucs_service import DemucsService
 from app.services.monitoring.hardware_monitor import HardwareMonitor
-from app.core.resource_manager import ResourceManager
 
 
 class SeparationStrategy(Enum):
@@ -59,7 +58,9 @@ class AudioProcessingConfig:
     def __post_init__(self):
         """初始化后处理"""
         if self.vad_config is None:
-            self.vad_config = VADConfig()
+            from app.services.runtime_param_resolver import build_vad_config
+
+            self.vad_config = build_vad_config()
 
 
 @dataclass
@@ -100,7 +101,6 @@ class AudioProcessingPipeline:
         self,
         chunk_engine: Optional[ChunkEngine] = None,
         hardware_monitor: Optional[HardwareMonitor] = None,
-        resource_manager: Optional[ResourceManager] = None,
         logger: Optional[logging.Logger] = None
     ):
         """
@@ -109,13 +109,11 @@ class AudioProcessingPipeline:
         Args:
             chunk_engine: 音频切分引擎
             hardware_monitor: 硬件监控器
-            resource_manager: 资源管理器
             logger: 日志记录器
         """
         self.logger = logger or logging.getLogger(__name__)
         self.chunk_engine = chunk_engine or ChunkEngine(logger=self.logger)
         self.hardware_monitor = hardware_monitor or HardwareMonitor()
-        self.resource_manager = resource_manager
 
     async def process(
         self,
@@ -179,10 +177,14 @@ class AudioProcessingPipeline:
             )
         else:
             # 大块切分（暂时使用整轨分离的轻量模型）
+            from app.services.runtime_param_resolver import get_demucs_runtime_params
+
+            runtime_demucs = get_demucs_runtime_params()
+            runtime_model = runtime_demucs.get("model_name") or "htdemucs"
             chunks, full_audio, sr = self.chunk_engine.process_audio(
                 audio_path,
                 enable_demucs=True,
-                demucs_model="htdemucs",  # 使用快速模型
+                demucs_model=runtime_model,  # 使用运行参数默认模型
                 vad_config=config.vad_config,
                 progress_callback=progress_callback
             )
@@ -282,10 +284,6 @@ class AudioProcessingPipeline:
         else:
             vram_mb = 0
 
-        # 如果有资源管理器，使用其显存信息
-        if self.resource_manager:
-            vram_mb = self.resource_manager.get_available_vram()
-
         # 决策
         if not config.auto_strategy:
             # 手动模式：始终使用整轨分离
@@ -320,7 +318,6 @@ class AudioProcessingPipeline:
 def get_audio_processing_pipeline(
     chunk_engine: Optional[ChunkEngine] = None,
     hardware_monitor: Optional[HardwareMonitor] = None,
-    resource_manager: Optional[ResourceManager] = None,
     logger: Optional[logging.Logger] = None
 ) -> AudioProcessingPipeline:
     """
@@ -329,7 +326,6 @@ def get_audio_processing_pipeline(
     Args:
         chunk_engine: 音频切分引擎
         hardware_monitor: 硬件监控器
-        resource_manager: 资源管理器
         logger: 日志记录器
 
     Returns:
@@ -338,6 +334,5 @@ def get_audio_processing_pipeline(
     return AudioProcessingPipeline(
         chunk_engine=chunk_engine,
         hardware_monitor=hardware_monitor,
-        resource_manager=resource_manager,
         logger=logger
     )

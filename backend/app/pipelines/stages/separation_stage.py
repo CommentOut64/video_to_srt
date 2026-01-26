@@ -4,7 +4,7 @@ SeparationStage - 人声分离阶段
 负责根据分离模式和频谱分诊结果，执行人声分离。
 支持全局分离和按需分离两种模式。
 
-V3.7 更新：
+v3.1.0 更新：
 - 集成 CancellationToken 支持暂停/取消
 - 全局模式：整轨分离为原子操作
 - 按需模式：逐 Chunk 可中断
@@ -25,9 +25,10 @@ from app.services.audio.chunk_engine import AudioChunk
 from app.services.demucs_service import DemucsService, get_demucs_service
 from app.models.circuit_breaker_models import SeparationLevel
 
-# V3.7: 导入取消令牌
+# v3.1.0: 导入取消令牌
 if TYPE_CHECKING:
     from app.utils.cancellation_token import CancellationToken
+    from app.services.preprocess_cache_service import PreprocessCacheService
 
 # V3.1.2+dev.20260109.01: 导入 tqdm 进度条
 try:
@@ -47,7 +48,7 @@ class SeparationStage:
     - 按需分离模式：仅分离标记的chunk
     - 保存原始音频用于熔断回溯
 
-    V3.7: 支持 CancellationToken 实现暂停/取消/断点续传
+    v3.1.0: 支持 CancellationToken 实现暂停/取消/断点续传
     原子单位：
     - 全局模式：整轨分离为原子操作
     - 按需模式：单个 Chunk 分离，可在每个 Chunk 之间中断
@@ -58,7 +59,7 @@ class SeparationStage:
         mode: str = 'on_demand',
         demucs_service: Optional[DemucsService] = None,
         logger: Optional[logging.Logger] = None,
-        cancellation_token: Optional["CancellationToken"] = None,  # V3.7: 新增
+        cancellation_token: Optional["CancellationToken"] = None,  # v3.1.0: 新增
         show_progress: bool = True  # V3.1.2+dev.20260109.01: 新增，显示命令行进度条
     ):
         """
@@ -68,13 +69,13 @@ class SeparationStage:
             mode: 分离模式，'global' 或 'on_demand'
             demucs_service: Demucs服务实例，如果为None则使用全局单例
             logger: 日志记录器，如果为None则创建新的
-            cancellation_token: 取消令牌（可选，V3.7）
+            cancellation_token: 取消令牌（可选，v3.1.0）
             show_progress: 是否显示命令行进度条（默认 True，V3.1.2+dev.20260109.01）
         """
         self.mode = mode
         self.demucs_service = demucs_service or get_demucs_service()
         self.logger = logger or logging.getLogger(__name__)
-        self.cancellation_token = cancellation_token  # V3.7
+        self.cancellation_token = cancellation_token  # v3.1.0
         self.show_progress = show_progress  # V3.1.2+dev.20260109.01
 
         if mode not in ['global', 'on_demand']:
@@ -84,8 +85,9 @@ class SeparationStage:
         self,
         chunks: List[AudioChunk],
         audio_path: Optional[str] = None,
-        job_dir: Optional[Path] = None,  # V3.7: 用于保存检查点
-        separated_indices: Optional[set] = None  # V3.7: 已分离的索引（用于恢复）
+        job_dir: Optional[Path] = None,  # v3.1.0: 用于保存检查点
+        separated_indices: Optional[set] = None,  # v3.1.0: 已分离的索引（用于恢复）
+        cache_service: Optional["PreprocessCacheService"] = None
     ) -> List[AudioChunk]:
         """
         执行人声分离
@@ -93,8 +95,8 @@ class SeparationStage:
         Args:
             chunks: 待处理的AudioChunk列表
             audio_path: 原始音频文件路径（全局分离模式需要）
-            job_dir: 任务目录（可选，V3.7 用于保存检查点）
-            separated_indices: 已分离的chunk索引集合（可选，V3.7 用于恢复）
+            job_dir: 任务目录（可选，v3.1.0 用于保存检查点）
+            separated_indices: 已分离的chunk索引集合（可选，v3.1.0 用于恢复）
 
         Returns:
             处理后的AudioChunk列表
@@ -103,28 +105,32 @@ class SeparationStage:
             self.logger.warning("收到空的chunk列表，跳过人声分离")
             return chunks
 
+        if cache_service:
+            cache_service.begin_separation(self.mode, len(chunks))
+
         if self.mode == 'global':
-            return await self._process_global(chunks, audio_path, job_dir)
+            return await self._process_global(chunks, audio_path, job_dir, cache_service)
         else:
-            return await self._process_on_demand(chunks, job_dir, separated_indices)
+            return await self._process_on_demand(chunks, job_dir, separated_indices, cache_service)
 
     async def _process_global(
         self,
         chunks: List[AudioChunk],
         audio_path: str,
-        job_dir: Optional[Path] = None  # V3.7
+        job_dir: Optional[Path] = None,  # v3.1.0
+        cache_service: Optional["PreprocessCacheService"] = None
     ) -> List[AudioChunk]:
         """
         全局分离模式
 
         对整个音频文件进行分离，然后更新所有chunk的音频数据
 
-        V3.7: 整轨分离为原子操作，不可中断
+        v3.1.0: 整轨分离为原子操作，不可中断
 
         Args:
             chunks: AudioChunk列表
             audio_path: 原始音频文件路径
-            job_dir: 任务目录（可选，V3.7）
+            job_dir: 任务目录（可选，v3.1.0）
 
         Returns:
             更新后的AudioChunk列表
@@ -134,9 +140,9 @@ class SeparationStage:
 
         self.logger.info(f"执行全局人声分离: {audio_path}")
 
-        token = self.cancellation_token  # V3.7
+        token = self.cancellation_token  # v3.1.0
 
-        # V3.7: 进入原子区域（整轨分离不可中断）
+        # v3.1.0: 进入原子区域（整轨分离不可中断）
         if token:
             token.enter_atomic_region("demucs_global_separation")
 
@@ -154,15 +160,32 @@ class SeparationStage:
                 chunks=chunks,
                 separated_path=separated_path
             )
+            if cache_service:
+                model_name = self.demucs_service.get_loaded_model_name() or self.demucs_service.config.model_name
+                try:
+                    cache_service.save_global_separation(
+                        chunks=chunks,
+                        separated_path=separated_path,
+                        separation_model=model_name
+                    )
+                except Exception as e:
+                    self.logger.warning("[V3.2.0+dev.20260122.03] 保存全局分离缓存失败: %s", e)
 
         finally:
-            # V3.7: 退出原子区域
+            # v3.1.0: 退出原子区域
             if token:
                 has_pending = token.exit_atomic_region()
                 if has_pending:
-                    self.logger.info("[V3.7] 检测到待处理的暂停/取消请求")
+                    self.logger.info("[v3.1.0] 检测到待处理的暂停/取消请求")
 
-        # V3.7: 原子区域结束后检查暂停/取消
+        if token and cache_service and token.is_paused:
+            try:
+                cache_service.reset_separation_cache()
+                self.logger.info("[V3.2.0+dev.20260122.03] 全局分离暂停，已清理分离缓存")
+            except Exception as e:
+                self.logger.warning("[V3.2.0+dev.20260122.03] 清理分离缓存失败: %s", e)
+
+        # v3.1.0: 原子区域结束后检查暂停/取消
         if token and job_dir:
             checkpoint_data = {
                 "separation": {
@@ -178,21 +201,22 @@ class SeparationStage:
     async def _process_on_demand(
         self,
         chunks: List[AudioChunk],
-        job_dir: Optional[Path] = None,  # V3.7
-        separated_indices: Optional[set] = None  # V3.7
+        job_dir: Optional[Path] = None,  # v3.1.0
+        separated_indices: Optional[set] = None,  # v3.1.0
+        cache_service: Optional["PreprocessCacheService"] = None
     ) -> List[AudioChunk]:
         """
         按需分离模式
 
         仅对标记为needs_separation=True的chunk进行分离
 
-        V3.7: 逐 Chunk 可中断，每个 Chunk 分离后保存检查点
+        v3.1.0: 逐 Chunk 可中断，每个 Chunk 分离后保存检查点
         V3.1.2+dev.20260109.01: 添加命令行进度条支持
 
         Args:
             chunks: AudioChunk列表
-            job_dir: 任务目录（可选，V3.7）
-            separated_indices: 已分离的chunk索引集合（可选，V3.7）
+            job_dir: 任务目录（可选，v3.1.0）
+            separated_indices: 已分离的chunk索引集合（可选，v3.1.0）
 
         Returns:
             更新后的AudioChunk列表
@@ -206,8 +230,16 @@ class SeparationStage:
             self.logger.info("无需分离的chunk，跳过分离阶段")
             return chunks
 
-        token = self.cancellation_token  # V3.7
+        token = self.cancellation_token  # v3.1.0
         separated_indices = separated_indices or set()
+        runtime_model = None
+        try:
+            from app.services.runtime_param_resolver import get_demucs_runtime_params
+
+            runtime_demucs = get_demucs_runtime_params()
+            runtime_model = runtime_demucs.get("model_name")
+        except Exception:
+            runtime_model = None
 
         # V3.1.2+dev.20260109.01: 创建进度条
         iterator = need_sep_chunks
@@ -222,12 +254,12 @@ class SeparationStage:
 
         # 逐个分离需要分离的chunk
         for chunk in iterator:
-            # V3.7: 跳过已分离的 chunk（用于恢复）
+            # v3.1.0: 跳过已分离的 chunk（用于恢复）
             if chunk.index in separated_indices:
                 self.logger.debug(f"跳过已分离的 chunk {chunk.index}")
                 continue
 
-            # V3.7: 进入原子区域（单个 Chunk 分离）
+            # v3.1.0: 进入原子区域（单个 Chunk 分离）
             if token:
                 token.enter_atomic_region(f"demucs_chunk_{chunk.index}")
 
@@ -237,7 +269,7 @@ class SeparationStage:
                     chunk.original_audio = chunk.audio.copy()
 
                 # 选择分离模型
-                model = chunk.recommended_model or 'htdemucs'
+                model = chunk.recommended_model or runtime_model or 'htdemucs'
 
                 self.logger.debug(
                     f"分离 Chunk {chunk.index}: 使用模型 {model}"
@@ -253,24 +285,40 @@ class SeparationStage:
                 # 更新chunk
                 chunk.audio = separated_audio
                 chunk.is_separated = True
-                chunk.separation_level = SeparationLevel(model)
+                chunk.separation_level = (
+                    SeparationLevel.MDX_EXTRA
+                    if model == SeparationLevel.MDX_EXTRA.value
+                    else SeparationLevel.HTDEMUCS
+                )
                 chunk.separation_model = model
+                if cache_service:
+                    try:
+                        cache_service.save_separation_chunk(chunk, is_separated=True)
+                    except Exception as e:
+                        self.logger.warning("[V3.2.0+dev.20260122.03] 保存分离缓存失败: %s", e)
 
             except Exception as e:
                 self.logger.error(
                     f"分离 Chunk {chunk.index} 失败: {e}，保持原始音频"
                 )
-                # 分离失败，保持原始音频
+                chunk.is_separated = False
+                chunk.separation_level = SeparationLevel.NONE
+                chunk.separation_model = None
+                if cache_service:
+                    try:
+                        cache_service.save_separation_chunk(chunk, is_separated=False)
+                    except Exception as e:
+                        self.logger.warning("[V3.2.0+dev.20260122.03] 保存分离缓存失败: %s", e)
                 continue
 
             finally:
-                # V3.7: 退出原子区域
+                # v3.1.0: 退出原子区域
                 if token:
                     has_pending = token.exit_atomic_region()
                     if has_pending:
-                        self.logger.info(f"[V3.7] Chunk {chunk.index} 分离完成后检测到待处理请求")
+                        self.logger.info(f"[v3.1.0] Chunk {chunk.index} 分离完成后检测到待处理请求")
 
-            # V3.7: 每个 Chunk 分离完成后检查暂停/取消并保存检查点
+            # v3.1.0: 每个 Chunk 分离完成后检查暂停/取消并保存检查点
             if token and job_dir:
                 separated_indices.add(chunk.index)
                 checkpoint_data = {

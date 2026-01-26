@@ -7,7 +7,7 @@ SenseVoice 数据模型定义（时空解耦版 v2.0）
 - LLM 为逻辑胶水，校对/翻译
 
 V3.1.2+dev.20260111.01: 新增 display_confidence 和 confidence_source 字段
-- confidence: 原始置信度（内部逻辑使用，如补刀触发、熔断决策）
+- confidence: 原始置信度（内部逻辑使用，如复核触发、熔断决策）
 - display_confidence: 映射后的准确率（前端显示使用）
 - confidence_source: 置信度来源（sensevoice/whisper）
 """
@@ -20,6 +20,7 @@ from enum import Enum
 class SenseVoiceConfig:
     """SenseVoice 配置"""
     model_dir: str = "iic/SenseVoiceSmall"  # ModelScope 模型ID
+    model_type: str = "quantized"  # quantized/fp32，用于选择 ONNX 文件
     batch_size: int = 1
     quantize: bool = True  # 使用量化模型（INT8）
     device: str = "auto"  # V3.5: auto/cuda/cpu，auto时GPU优先，无GPU降级CPU
@@ -31,9 +32,10 @@ class SenseVoiceConfig:
 class TextSource(Enum):
     """文本来源"""
     SENSEVOICE = "sensevoice"            # SenseVoice 原始输出
-    WHISPER_PATCH = "whisper_patch"      # Whisper 补刀替换
+    WHISPER_PATCH = "whisper_patch"      # Whisper 复核替换
     LLM_CORRECTION = "llm_correction"    # LLM 校对修正
     LLM_TRANSLATION = "llm_translation"  # LLM 翻译
+    MANUAL = "manual"                    # 用户手动编辑/新增
 
 
 class WarningType(Enum):
@@ -63,7 +65,7 @@ class WordTimestamp:
 
     V3.1.2+dev.20260111.01: confidence 改为 Optional，None 表示无词级置信度
     - SenseVoice 原始输出：有精确的词级置信度
-    - Whisper 补刀后（伪对齐）：无词级置信度，confidence=None
+    - Whisper 复核后（伪对齐）：无词级置信度，confidence=None
     """
     word: str
     start: float

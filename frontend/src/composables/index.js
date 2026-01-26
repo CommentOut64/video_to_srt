@@ -5,3 +5,4 @@
 export { useSseManager } from './useSseManager'
 export { useProxyVideo, ProxyState, TranscodeDecision } from './useProxyVideo'
 export { useUpdateChecker } from './useUpdateChecker'
+export { useSubtitleSync } from './useSubtitleSync'

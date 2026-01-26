@@ -10,17 +10,14 @@ import uuid
 import shutil
 import time
 import logging
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Request, Body
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 import json
 
 from app.core.config import config
-from app.models.job_models import (
-    JobSettings, JobState, DemucsSettings, SenseVoiceSettings,
-    PreprocessingConfig, TranscriptionConfig, RefinementConfig, ComputeConfig
-)
+from app.models.job_models import JobSettings, JobState
 from app.services.transcription_service import TranscriptionService
 from app.services.file_service import FileManagementService
 from app.services.sse_service import get_sse_manager
@@ -59,10 +56,10 @@ class TranscriptionSettingsAPI(BaseModel):
     transcription_profile: str = Field(default="sensevoice_only", description="转录流水线模式")
     # 主引擎运行设备: auto/cpu
     sensevoice_device: str = Field(default="auto", description="SenseVoice 运行设备")
-    # 辅助/补刀模型: tiny/small/medium/large-v3
+    # 辅助/复核模型: tiny/small/medium/large-v3
     whisper_model: str = Field(default="medium", description="Whisper 模型")
-    # 补刀触发阈值: 0.0-1.0
-    patching_threshold: float = Field(default=0.60, ge=0.0, le=1.0, description="补刀触发阈值")
+    # 复核触发阈值: 0.0-1.0
+    patching_threshold: float = Field(default=0.60, ge=0.0, le=1.0, description="复核触发阈值")
 
 
 class RefinementSettingsAPI(BaseModel):
@@ -111,53 +108,17 @@ class TaskConfigAPI(BaseModel):
     compute: Optional[ComputeSettingsAPI] = None
 
 
-# ========== 兼容旧版 API 模型 ==========
-
-class DemucsSettingsAPI(BaseModel):
-    """Demucs配置请求模型 (兼容旧版)"""
-    enabled: bool = True
-    mode: str = "auto"  # auto/always/never/on_demand
-    retry_threshold_logprob: float = -0.8
-    retry_threshold_no_speech: float = 0.6
-    circuit_breaker_enabled: bool = True
-    consecutive_threshold: int = 3
-    ratio_threshold: float = 0.2
-
-
-class SenseVoiceSettingsAPI(BaseModel):
-    """SenseVoice 配置请求模型 (兼容旧版)"""
-    preset_id: str = "default"  # 预设ID: default/preset1-5/custom
-    enhancement: str = "off"  # off/smart_patch/deep_listen
-    proofread: str = "off"  # off/sparse/full
-    translate: str = "off"  # off/full/partial
-    target_language: str = "en"
-    confidence_threshold: float = 0.6
-    whisper_patch_threshold: float = 0.5
-
-
 class TranscribeSettings(BaseModel):
     """
     转录设置请求模型 - v3.5 重构版
 
-    支持两种配置方式:
-    1. 新版 (推荐): 使用 task_config 字段
-    2. 旧版 (兼容): 使用 engine/model/demucs/sensevoice 字段
+    仅支持新版 task_config 字段
     """
     # === 新版 1+3 预设配置 ===
     task_config: Optional[TaskConfigAPI] = Field(
         default=None,
         description="v3.5 任务配置 (推荐使用)"
     )
-
-    # === 旧版配置 (兼容) ===
-    engine: str = "sensevoice"  # whisper 或 sensevoice
-    model: str = "medium"
-    compute_type: str = "auto"  # auto: 根据显存自动选择
-    device: str = "cuda"
-    batch_size: int = 16
-    word_timestamps: bool = False
-    demucs: Optional[DemucsSettingsAPI] = None
-    sensevoice: Optional[SenseVoiceSettingsAPI] = None
 
 
 class UploadResponse(BaseModel):
@@ -180,6 +141,23 @@ def create_transcription_router(
 
     # 获取SSE管理器
     sse_manager = get_sse_manager()
+
+    def _build_task_snapshot(job: JobState) -> Dict[str, Any]:
+        """构建前端任务状态快照（包含时间戳，用于版本校验）。"""
+        return {
+            "id": job.job_id,
+            "filename": job.filename,
+            "title": job.title,
+            "status": job.status,
+            "progress": job.progress,
+            "phase": job.phase,
+            "phase_percent": job.phase_percent,
+            "message": job.message,
+            "processed": job.processed,
+            "total": job.total,
+            "language": job.language,
+            "updated_at": job.updatedAt,
+        }
 
     @router.get("/stream/{job_id}")
     async def stream_job_progress(job_id: str, request: Request):
@@ -250,6 +228,9 @@ def create_transcription_router(
                     "error": error
                 }
 
+            persisted_job = transcription_service.job_lifecycle.state_repo.get_task(job_id)
+            updated_at = persisted_job.updatedAt if persisted_job else None
+
             if current_job:
                 return {
                     "job_id": current_job.job_id,
@@ -260,6 +241,7 @@ def create_transcription_router(
                     "processed": current_job.processed,
                     "total": current_job.total,
                     "language": current_job.language or "",
+                    "updated_at": updated_at,
                     # 追加当前 Proxy/预览状态，断线重连时立即同步
                     "proxy": _build_proxy_state()
                 }
@@ -417,7 +399,8 @@ def create_transcription_router(
         try:
             from pathlib import Path
 
-            settings_obj = TranscribeSettings(**json.loads(settings))
+            settings_payload = json.loads(settings) if settings else {}
+            settings_obj = TranscribeSettings(**settings_payload)
 
             # 获取队列服务
             queue_service = get_queue_service(transcription_service)
@@ -434,80 +417,41 @@ def create_transcription_router(
             job_dir = Path(job.dir) if job.dir else None
             checkpoint_path = job_dir / "checkpoint.json" if job_dir else None
 
+            original_settings = None
             if checkpoint_path and checkpoint_path.exists():
-                # 有checkpoint，需要校验参数并强制覆盖禁止修改的参数
+                # 有 checkpoint 时优先使用原始设置，避免新旧配置不一致
                 try:
                     with open(checkpoint_path, 'r', encoding='utf-8') as f:
                         checkpoint_data = json.load(f)
-
-                    original_settings = checkpoint_data.get("original_settings", {})
-
-                    if original_settings:
-                        # 强制覆盖禁止修改的参数
-                        # 1. word_timestamps - 禁止修改
-                        if "word_timestamps" in original_settings:
-                            settings_obj.word_timestamps = original_settings["word_timestamps"]
-
-                        # 注意：device和model虽然会警告，但仍允许用户修改
-                        # 前端应该在调用此接口前显示警告并获得用户确认
+                    original_settings = checkpoint_data.get("original_settings") or None
                 except Exception as e:
-                    # 如果读取checkpoint失败，记录日志但继续
                     print(f"读取checkpoint设置失败: {e}")
 
-            # 应用设置 - v3.5 重构: 支持新旧两种配置格式
-            settings_dict = settings_obj.model_dump()
+            task_config = (
+                settings_obj.task_config.model_dump()
+                if settings_obj.task_config else {}
+            )
 
-            # 检查是否使用新版 task_config
-            if settings_dict.get('task_config'):
-                # v3.5 新版配置
-                task_config = settings_dict['task_config']
-                preset_id = task_config.get('preset_id', 'balanced')
-
-                # 如果只提供了 preset_id，从预设加载完整配置
-                if preset_id != 'custom' and not task_config.get('preprocessing'):
+            if original_settings:
+                try:
+                    job.settings = JobSettings.from_dict(original_settings)
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc))
+            elif task_config:
+                preset_id = task_config.get("preset_id", "balanced")
+                has_custom_groups = any(
+                    task_config.get(key)
+                    for key in ("preprocessing", "transcription", "refinement", "compute")
+                )
+                if preset_id != "custom" and not has_custom_groups:
                     job.settings = JobSettings.from_preset(preset_id)
                 else:
-                    # 自定义配置
-                    job.settings = JobSettings(
-                        preset_id=preset_id,
-                        preprocessing=PreprocessingConfig(
-                            **task_config.get('preprocessing', {})
-                        ) if task_config.get('preprocessing') else PreprocessingConfig(),
-                        transcription=TranscriptionConfig(
-                            **task_config.get('transcription', {})
-                        ) if task_config.get('transcription') else TranscriptionConfig(),
-                        refinement=RefinementConfig(
-                            **task_config.get('refinement', {})
-                        ) if task_config.get('refinement') else RefinementConfig(),
-                        compute=ComputeConfig(
-                            **task_config.get('compute', {})
-                        ) if task_config.get('compute') else ComputeConfig(),
-                        # 保留旧版字段兼容
-                        engine=settings_dict.get('engine', 'sensevoice'),
-                        model=settings_dict.get('model', 'medium'),
-                        compute_type=settings_dict.get('compute_type', 'auto'),
-                        device=settings_dict.get('device', 'cuda'),
-                        batch_size=settings_dict.get('batch_size', 16),
-                        word_timestamps=settings_dict.get('word_timestamps', False),
-                    )
+                    try:
+                        job.settings = JobSettings.from_dict(task_config)
+                    except ValueError as exc:
+                        raise HTTPException(status_code=400, detail=str(exc))
             else:
-                # 旧版配置 (兼容)
-                # 转换 Demucs 配置
-                if settings_dict.get('demucs'):
-                    settings_dict['demucs'] = DemucsSettings(**settings_dict['demucs'])
-                else:
-                    settings_dict.pop('demucs', None)
-
-                # 转换 SenseVoice 配置
-                if settings_dict.get('sensevoice'):
-                    settings_dict['sensevoice'] = SenseVoiceSettings(**settings_dict['sensevoice'])
-                else:
-                    settings_dict.pop('sensevoice', None)
-
-                # 移除 task_config 字段 (None)
-                settings_dict.pop('task_config', None)
-
-                job.settings = JobSettings(**settings_dict)
+                job.settings = JobSettings()
 
             # 🔥 关键改动: 如果任务不在队列中，加入队列
             with queue_service.lock:
@@ -564,12 +508,17 @@ def create_transcription_router(
             else:
                 status = 400
             raise HTTPException(status_code=status, detail=err or "任务未找到")
+        job_snapshot = None
+        job = transcription_service.job_lifecycle.state_repo.get_task(job_id)
+        if job:
+            job_snapshot = _build_task_snapshot(job)
         return {
             "job_id": job_id,
             "canceled": ok,
             "data_deleted": delete_data,
             "message": err,
-            "pending_delete": pending_delete
+            "pending_delete": pending_delete,
+            "task": job_snapshot,
         }
 
     @router.post("/pause/{job_id}")
@@ -579,7 +528,11 @@ def create_transcription_router(
         ok = queue_service.pause_job(job_id)
         if not ok:
             raise HTTPException(status_code=404, detail="任务未找到")
-        return {"job_id": job_id, "paused": ok}
+        job_snapshot = None
+        job = transcription_service.job_lifecycle.state_repo.get_task(job_id)
+        if job:
+            job_snapshot = _build_task_snapshot(job)
+        return {"job_id": job_id, "paused": ok, "task": job_snapshot}
 
     @router.post("/resume/{job_id}")
     async def resume_job(job_id: str):
@@ -599,12 +552,17 @@ def create_transcription_router(
         queue_position = 0
         if job_id in queue_service.queue:
             queue_position = list(queue_service.queue).index(job_id) + 1
+        job_snapshot = None
+        persisted_job = transcription_service.job_lifecycle.state_repo.get_task(job_id)
+        if persisted_job:
+            job_snapshot = _build_task_snapshot(persisted_job)
 
         return {
             "job_id": job_id,
             "resumed": True,
             "status": job.status if job else "queued",
-            "queue_position": queue_position
+            "queue_position": queue_position,
+            "task": job_snapshot,
         }
 
     @router.post("/prioritize/{job_id}")
@@ -718,120 +676,18 @@ def create_transcription_router(
             返回所有任务列表（第二阶段修复：实时更新）
             包含活跃任务 + 历史完成任务
             """
-            from app.services.job_index_service import get_job_index_service
-            from app.core.config import config
-            from pathlib import Path
-            import json as json_module
-
-            jobs_summary = []
-
-            # 1. 添加活跃任务（从队列中）
-            with queue_service.lock:
-                for jid, job in queue_service.jobs.items():
-                    jobs_summary.append({
-                        "id": jid,
-                        "status": job.status,
-                        "progress": job.progress,
-                        "filename": job.filename,
-                        "title": job.title if hasattr(job, 'title') else "",  # 用户自定义名称
-                        "message": job.message,
-                        "created_time": job.createdAt if hasattr(job, 'createdAt') else None,
-                        "phase": job.phase if hasattr(job, 'phase') else 'unknown'
-                    })
-
-                queue_list = list(queue_service.queue)
-                running_id = queue_service.running_job_id
-                interrupted_id = queue_service.interrupted_job_id
-
-            # 2. 添加历史完成任务（从 jobs 目录）
-            try:
-                jobs_root = Path(config.JOBS_DIR)
-                job_index = get_job_index_service(config.JOBS_DIR)
-                active_job_ids = set(jid for jid, _ in queue_service.jobs.items())
-
-                for job_dir in jobs_root.iterdir():
-                    if not job_dir.is_dir():
-                        continue
-
-                    job_id = job_dir.name
-                    if job_id in active_job_ids:
-                        # 已在活跃任务中，跳过
-                        continue
-
-                    # 尝试找到文件名
-                    filename = "未知文件"
-                    file_path = job_index.get_file_path(job_id)
-                    if file_path:
-                        filename = os.path.basename(file_path)
-                    else:
-                        # 从目录中找视频文件（排除 proxy 视频）
-                        for ext in ['.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv', '.mp3', '.wav', '.m4a']:
-                            matches = list(job_dir.glob(f"*{ext}"))
-                            # 过滤掉 proxy 视频文件
-                            matches = [m for m in matches if m.name not in ['preview_360p.mp4', 'proxy_720p.mp4']]
-                            if matches:
-                                filename = matches[0].name
-                                break
-
-                    # 检查是否完成
-                    srt_files = list(job_dir.glob("*.srt"))
-                    is_finished = len(srt_files) > 0
-
-                    # 获取创建时间
-                    try:
-                        stat = job_dir.stat()
-                        created_time = int(stat.st_ctime * 1000)
-                    except:
-                        created_time = None
-
-                    # 尝试从 checkpoint 获取进度
-                    progress = 100 if is_finished else 0
-                    phase = 'editing' if is_finished else 'transcribing'
-                    status = 'finished' if is_finished else 'processing'
-
-                    checkpoint_path = job_dir / "checkpoint.json"
-                    if checkpoint_path.exists():
-                        try:
-                            with open(checkpoint_path, 'r', encoding='utf-8') as f:
-                                checkpoint_data = json_module.load(f)
-                                total_segments = checkpoint_data.get('total_segments', 0)
-                                processed_indices = checkpoint_data.get('processed_indices', [])
-                                if total_segments > 0:
-                                    progress = (len(processed_indices) / total_segments) * 100
-                                phase = checkpoint_data.get('phase', 'transcribing')
-                        except:
-                            pass
-
-                    # 尝试从 state.json 读取 title
-                    title = ""
-                    state_file = job_dir / "state.json"
-                    if state_file.exists():
-                        try:
-                            with open(state_file, 'r', encoding='utf-8') as f:
-                                state_data = json_module.load(f)
-                                title = state_data.get('title', '')
-                        except:
-                            pass
-
-                    jobs_summary.append({
-                        "id": job_id,
-                        "status": status,
-                        "progress": min(progress, 100),
-                        "filename": filename,
-                        "title": title,  # 用户自定义名称
-                        "message": "已完成" if is_finished else "处理中",
-                        "created_time": created_time,
-                        "phase": phase
-                    })
-
-            except Exception as e:
-                logger = logging.getLogger(__name__)
-                logger.warning(f"加载历史任务失败: {e}")
+            lifecycle = transcription_service.job_lifecycle
+            queue_state = lifecycle.state_repo.load_queue_state()
+            queue_list = queue_state.queue if queue_state else []
+            running_id = queue_state.running_job_id if queue_state else None
+            interrupted_id = queue_state.interrupted_job_id if queue_state else None
+            jobs_summary = lifecycle.list_tasks_summary()
 
             return {
                 "queue": queue_list,
                 "running": running_id,
                 "interrupted": interrupted_id,
+                "queue_updated_at": queue_state.updated_at if queue_state else None,
                 "jobs": jobs_summary
             }
 
@@ -854,141 +710,16 @@ def create_transcription_router(
         返回所有任务列表（处理中 + 已完成），前端用此接口同步后端实际存在的任务
         此接口为真实源，用于修复幽灵任务问题
         """
-        from app.services.job_index_service import get_job_index_service
-        from app.core.config import config
-        from pathlib import Path
-        import json as json_module
-
-        queue_service = get_queue_service(transcription_service)
-        job_index = get_job_index_service(config.JOBS_DIR)
-        jobs_root = Path(config.JOBS_DIR)
-
-        # 清理无效映射（任务或文件不存在的映射）
-        job_index.cleanup_invalid_mappings()
-
-        # 收集所有任务
-        all_tasks = {}  # 使用 dict 避免重复，key 为 job_id
-
-        # 1. 队列中的任务（处理中或等待中）- 优先级最高
-        # [V3.1.0] 过滤幽灵任务：检测目录是否存在，不存在则从内存移除
-        ghost_job_ids = []
-        with queue_service.lock:
-            for job_id, job in list(queue_service.jobs.items()):
-                job_dir = jobs_root / job_id
-                if not job_dir.exists():
-                    # 检测到幽灵任务
-                    ghost_job_ids.append(job_id)
-                    continue
-
-                all_tasks[job_id] = {
-                    "id": job.job_id,
-                    "filename": job.filename,
-                    "title": job.title if hasattr(job, 'title') else "",  # 用户自定义名称
-                    "status": job.status,
-                    "progress": job.progress,
-                    "message": job.message,
-                    "created_time": job.createdAt if hasattr(job, 'createdAt') else None,
-                    "phase": job.phase if hasattr(job, 'phase') else 'unknown'
-                }
-
-        # [V3.1.0] 清理检测到的幽灵任务
-        if ghost_job_ids:
-            logger = logging.getLogger(__name__)
-            with queue_service.lock:
-                for ghost_id in ghost_job_ids:
-                    if ghost_id in queue_service.jobs:
-                        del queue_service.jobs[ghost_id]
-                    if ghost_id in queue_service.queue:
-                        queue_service.queue.remove(ghost_id)
-            logger.warning(f"[sync_tasks] 清理了 {len(ghost_job_ids)} 个幽灵任务: {ghost_job_ids}")
-
-        # 2. 扫描 jobs 目录中的所有任务（包括已完成的）
-        try:
-            for job_dir in jobs_root.iterdir():
-                if not job_dir.is_dir():
-                    continue
-
-                job_id = job_dir.name
-                if job_id in all_tasks:
-                    # 已在队列中，跳过
-                    continue
-
-                # 尝试找到文件名
-                filename = "未知文件"
-
-                # 1. 从 job_index 查找
-                file_path = job_index.get_file_path(job_id)
-                if file_path:
-                    filename = os.path.basename(file_path)
-                else:
-                    # 2. 从目录中找视频文件（排除 proxy 视频）
-                    for ext in ['.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv', '.mp3', '.wav', '.m4a']:
-                        matches = list(job_dir.glob(f"*{ext}"))
-                        # 过滤掉 proxy 视频文件
-                        matches = [m for m in matches if m.name not in ['preview_360p.mp4', 'proxy_720p.mp4']]
-                        if matches:
-                            filename = matches[0].name
-                            break
-
-                # 判断任务是否完成
-                srt_files = list(job_dir.glob("*.srt"))
-                is_finished = len(srt_files) > 0
-
-                # 获取创建时间
-                try:
-                    stat = job_dir.stat()
-                    created_time = int(stat.st_ctime * 1000)
-                except:
-                    created_time = None
-
-                # 尝试从 checkpoint 获取进度信息
-                checkpoint_path = job_dir / "checkpoint.json"
-                progress = 100 if is_finished else 0
-                phase = 'editing' if is_finished else 'transcribing'
-                status = 'finished' if is_finished else 'processing'
-
-                if checkpoint_path.exists():
-                    try:
-                        with open(checkpoint_path, 'r', encoding='utf-8') as f:
-                            checkpoint_data = json_module.load(f)
-                            total_segments = checkpoint_data.get('total_segments', 0)
-                            processed_indices = checkpoint_data.get('processed_indices', [])
-                            if total_segments > 0:
-                                progress = (len(processed_indices) / total_segments) * 100
-                            phase = checkpoint_data.get('phase', 'transcribing')
-                    except:
-                        pass
-
-                # 尝试从 state.json 读取 title
-                title = ""
-                state_file = job_dir / "state.json"
-                if state_file.exists():
-                    try:
-                        with open(state_file, 'r', encoding='utf-8') as f:
-                            state_data = json_module.load(f)
-                            title = state_data.get('title', '')
-                    except:
-                        pass
-
-                all_tasks[job_id] = {
-                    "id": job_id,
-                    "filename": filename,
-                    "title": title,  # 用户自定义名称
-                    "status": status,
-                    "progress": min(progress, 100),  # 确保不超过100
-                    "message": "已完成" if is_finished else "处理中",
-                    "created_time": created_time,
-                    "phase": phase
-                }
-
-        except Exception as e:
-            logger = logging.getLogger(__name__)
-            logger.error(f"扫描 jobs 目录失败: {e}")
+        lifecycle = transcription_service.job_lifecycle
+        tasks = lifecycle.list_tasks_summary()
+        queue_state = lifecycle.state_repo.load_queue_state()
 
         return {
             "success": True,
-            "tasks": list(all_tasks.values()),
-            "count": len(all_tasks),
+            "tasks": tasks,
+            "count": len(tasks),
+            "queue": queue_state.queue if queue_state else [],
+            "queue_updated_at": queue_state.updated_at if queue_state else None,
             "timestamp": int(time.time() * 1000)
         }
 
@@ -1016,25 +747,24 @@ def create_transcription_router(
             job_id: 任务ID
             include_media: 是否包含媒体状态信息（默认True）
         """
-        queue_service = get_queue_service(transcription_service)
-        job = queue_service.get_job(job_id)
+        job = transcription_service.get_job(job_id)
         if not job:
-            # 如果队列服务中没有，尝试从transcription_service获取
-            job = transcription_service.get_job(job_id)
-            if not job:
-                raise HTTPException(status_code=404, detail="任务未找到")
+            raise HTTPException(status_code=404, detail="任务未找到")
 
         # 返回状态（新增queue_position字段）
         result = job.to_dict()
 
         # 计算队列位置
-        with queue_service.lock:
-            if job_id in queue_service.queue:
-                result["queue_position"] = list(queue_service.queue).index(job_id) + 1
-            elif job_id == queue_service.running_job_id:
-                result["queue_position"] = 0  # 0表示正在执行
+        queue_state = transcription_service.job_lifecycle.state_repo.load_queue_state()
+        if queue_state:
+            if job_id in queue_state.queue:
+                result["queue_position"] = queue_state.queue.index(job_id) + 1
+            elif job_id == queue_state.running_job_id:
+                result["queue_position"] = 0
             else:
-                result["queue_position"] = -1  # -1表示不在队列中
+                result["queue_position"] = -1
+        else:
+            result["queue_position"] = -1
 
         # 添加媒体状态信息（用于编辑器）
         if include_media and job.status == "finished" and job.dir:
@@ -1197,6 +927,310 @@ def create_transcription_router(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"复制文件失败: {str(e)}")
 
+    # V3.2.0+dev.20260124.02: 用户编辑字幕接口
+    class SubtitleCreateRequest(BaseModel):
+        """字幕新增请求模型"""
+        text: Optional[str] = ""
+        start: float
+        end: float
+
+    class SubtitleUpdateRequest(BaseModel):
+        """字幕更新请求模型"""
+        text: Optional[str] = None
+        start: Optional[float] = None
+        end: Optional[float] = None
+
+    @router.post("/jobs/{job_id}/subtitles")
+    async def create_subtitle(job_id: str, payload: SubtitleCreateRequest):
+        """
+        V3.2.0+dev.20260124.02: 用户新增字幕接口
+        """
+        from pathlib import Path
+        from app.services.sse_service import get_sse_manager, push_subtitle_event
+        from app.services.streaming_subtitle import get_streaming_subtitle_manager_if_exists
+        from app.services.subtitle_edit_store import create_manual_entry
+
+        job = transcription_service.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="任务未找到")
+
+        if payload.start < 0 or payload.end <= payload.start:
+            raise HTTPException(status_code=400, detail="时间戳不合法")
+
+        try:
+            job_dir = Path(job.dir)
+            text = payload.text or ""
+            index, entry = create_manual_entry(job_dir, text, payload.start, payload.end)
+
+            subtitle_manager = get_streaming_subtitle_manager_if_exists(job_id)
+            if subtitle_manager:
+                subtitle_manager.add_manual_sentence(index, text, payload.start, payload.end)
+
+            sentence_payload = {
+                "index": index,
+                "text": text,
+                "start": payload.start,
+                "end": payload.end,
+                "confidence": None,
+                "display_confidence": None,
+                "confidence_source": "manual",
+                "source": entry.get("source", "manual"),
+                "is_modified": True,
+                "original_text": entry.get("original_text")
+            }
+
+            sse_manager = get_sse_manager()
+            push_subtitle_event(
+                sse_manager,
+                job_id,
+                "added",
+                {
+                    "index": index,
+                    "sentence": sentence_payload,
+                    "source": "user_add",
+                    "is_update": True
+                }
+            )
+
+            return {
+                "success": True,
+                "data": sentence_payload
+            }
+
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"新增字幕失败: {str(exc)}")
+
+    @router.patch("/jobs/{job_id}/subtitles/{sentence_index}")
+    async def update_subtitle(
+        job_id: str,
+        sentence_index: int,
+        update: SubtitleUpdateRequest
+    ):
+        """
+        V3.2.0+dev.20260124.02: 用户编辑字幕接口
+
+        核心功能：
+        1. 接收前端的实时编辑
+        2. 标记为 is_modified=True，防止 AI 覆盖
+        3. 持久化到编辑落盘文件，必要时同步快照
+
+        Args:
+            job_id: 任务 ID
+            sentence_index: 句子索引
+            update: 更新内容（text/start/end）
+        """
+        from pathlib import Path
+        from app.services.sse_service import get_sse_manager, push_subtitle_event
+        from app.services.streaming_subtitle import get_streaming_subtitle_manager_if_exists
+        from app.services.subtitle_edit_store import (
+            apply_edit_to_snapshot_data,
+            get_sentence_from_snapshot,
+            load_deleted_indices,
+            load_edits,
+            load_transcription_snapshot,
+            persist_snapshot,
+            save_edit
+        )
+
+        job = transcription_service.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="任务未找到")
+
+        try:
+            job_dir = Path(job.dir)
+            update_payload = update.dict(exclude_none=True)
+            if not update_payload:
+                raise HTTPException(status_code=400, detail="更新内容为空")
+            deleted_indices = load_deleted_indices(job_dir)
+            if sentence_index in deleted_indices:
+                raise HTTPException(status_code=404, detail=f"句子索引 {sentence_index} 已被删除")
+            subtitle_manager = get_streaming_subtitle_manager_if_exists(job_id)
+            sentence = None
+            snapshot_sentence = None
+            manual_sentence = None
+            original_text = None
+
+            if subtitle_manager and sentence_index in subtitle_manager.sentences:
+                sentence = subtitle_manager.sentences[sentence_index]
+
+                # 更新字段
+                if update.text is not None:
+                    if not sentence.is_modified:
+                        sentence.original_text = sentence.text
+                    sentence.text = update.text
+                    sentence.text_clean = update.text
+                    # 用户编辑后清空置信度，避免误导
+                    sentence.update_confidence(None, "manual")
+
+                if update.start is not None:
+                    sentence.start = update.start
+
+                if update.end is not None:
+                    sentence.end = update.end
+
+                # 标记为用户修改（核心：防止 AI 覆盖）
+                sentence.is_modified = True
+                original_text = sentence.original_text
+            else:
+                # 无内存句子时，尝试从持久化快照中查找
+                snapshot_info = load_transcription_snapshot(job_dir)
+                if snapshot_info:
+                    snapshot_path, snapshot_data, snapshot_kind = snapshot_info
+                    snapshot_sentence = get_sentence_from_snapshot(
+                        snapshot_data,
+                        sentence_index,
+                        snapshot_kind
+                    )
+                    if snapshot_sentence:
+                        original_text = snapshot_sentence.get("original_text") or snapshot_sentence.get("text", "")
+
+                        # 仅在完成态或无管理器时写回快照，避免频繁全量写
+                        should_update_snapshot = subtitle_manager is None or job.status in {
+                            "completed",
+                            "finished",
+                            "failed",
+                            "canceled"
+                        }
+                        updated = apply_edit_to_snapshot_data(
+                            snapshot_data,
+                            sentence_index,
+                            update_payload,
+                            original_text,
+                            snapshot_kind
+                        )
+                        if updated and should_update_snapshot:
+                            persist_snapshot(snapshot_path, snapshot_data)
+                if snapshot_sentence is None and sentence is None:
+                    edits = load_edits(job_dir)
+                    manual_sentence = edits.get(sentence_index)
+                    deleted_indices = load_deleted_indices(job_dir)
+                    if sentence_index in deleted_indices and not manual_sentence:
+                        raise HTTPException(status_code=404, detail=f"句子索引 {sentence_index} 已被删除")
+                    if manual_sentence:
+                        original_text = manual_sentence.get("original_text") or manual_sentence.get("text", "")
+                    else:
+                        raise HTTPException(status_code=404, detail=f"句子索引 {sentence_index} 不存在")
+
+            # V3.2.0+dev.20260124.02: 记录用户编辑落盘（轻量叠加）
+            save_edit(job_dir, sentence_index, update_payload, original_text)
+
+            # V3.2.0+dev.20260124.02: 广播用户编辑事件，确保多端一致
+            sentence_payload = None
+            if sentence:
+                sentence_payload = sentence.to_dict()
+            elif snapshot_sentence:
+                sentence_payload = dict(snapshot_sentence)
+            elif manual_sentence:
+                manual_sentence.update(update_payload)
+                sentence_payload = {
+                    "index": sentence_index,
+                    "text": manual_sentence.get("text", ""),
+                    "start": manual_sentence.get("start", 0),
+                    "end": manual_sentence.get("end", 0),
+                    "confidence": None,
+                    "display_confidence": None,
+                    "confidence_source": "manual",
+                    "source": manual_sentence.get("source", "manual"),
+                    "is_modified": True,
+                    "original_text": manual_sentence.get("original_text")
+                }
+            if sentence_payload is not None:
+                sentence_payload["index"] = sentence_index
+                sse_manager = get_sse_manager()
+                push_subtitle_event(
+                    sse_manager,
+                    job_id,
+                    "edited",
+                    {
+                        "index": sentence_index,
+                        "sentence": sentence_payload,
+                        "source": "user_edit",
+                        "is_update": True
+                    }
+                )
+
+            fallback_text = None
+            fallback_start = None
+            fallback_end = None
+            if sentence:
+                fallback_text = sentence.text
+                fallback_start = sentence.start
+                fallback_end = sentence.end
+            elif snapshot_sentence:
+                fallback_text = snapshot_sentence.get("text")
+                fallback_start = snapshot_sentence.get("start")
+                fallback_end = snapshot_sentence.get("end")
+            elif manual_sentence:
+                fallback_text = manual_sentence.get("text")
+                fallback_start = manual_sentence.get("start")
+                fallback_end = manual_sentence.get("end")
+
+            return {
+                "success": True,
+                "data": {
+                    "index": sentence_index,
+                    "text": update.text if update.text is not None else fallback_text,
+                    "start": update.start if update.start is not None else fallback_start,
+                    "end": update.end if update.end is not None else fallback_end,
+                    "is_modified": True,
+                    "original_text": original_text
+                }
+            }
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"更新字幕失败: {str(e)}")
+
+    @router.delete("/jobs/{job_id}/subtitles/{sentence_index}")
+    async def delete_subtitle(job_id: str, sentence_index: int):
+        """
+        V3.2.0+dev.20260124.02: 用户删除字幕接口
+        """
+        from pathlib import Path
+        from app.services.sse_service import get_sse_manager, push_subtitle_event
+        from app.services.streaming_subtitle import get_streaming_subtitle_manager_if_exists
+        from app.services.subtitle_edit_store import add_deletion
+
+        job = transcription_service.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="任务未找到")
+
+        try:
+            job_dir = Path(job.dir)
+            add_deletion(job_dir, sentence_index)
+
+            subtitle_manager = get_streaming_subtitle_manager_if_exists(job_id)
+            if subtitle_manager:
+                subtitle_manager.remove_sentence_by_index(sentence_index)
+
+            sse_manager = get_sse_manager()
+            push_subtitle_event(
+                sse_manager,
+                job_id,
+                "deleted",
+                {
+                    "index": sentence_index,
+                    "source": "user_delete",
+                    "is_update": True
+                }
+            )
+
+            return {
+                "success": True,
+                "data": {
+                    "index": sentence_index,
+                    "is_deleted": True
+                }
+            }
+
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"删除字幕失败: {str(exc)}")
+
     @router.get("/check-resume/{job_id}")
     async def check_resume(job_id: str):
         """检查任务是否可以断点续传"""
@@ -1209,38 +1243,40 @@ def create_transcription_router(
         job_dir = Path(job.dir)
         checkpoint_path = job_dir / "checkpoint.json"
 
-        if not checkpoint_path.exists():
+        summary = transcription_service.job_lifecycle.state_repo.get_checkpoint_summary(job_id)
+        if not summary and checkpoint_path.exists():
+            try:
+                with open(checkpoint_path, "r", encoding="utf-8") as f:
+                    summary = json.load(f)
+            except Exception as e:
+                return {
+                    "can_resume": False,
+                    "message": f"检查点文件损坏: {str(e)}"
+                }
+
+        if not summary:
             return {
                 "can_resume": False,
                 "message": "无检查点"
             }
 
-        try:
-            with open(checkpoint_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+        total_segments = summary.get("total_segments", 0)
+        processed_indices = summary.get("processed_indices", [])
+        processed_count = len(processed_indices)
 
-            total_segments = data.get('total_segments', 0)
-            processed_indices = data.get('processed_indices', [])
-            processed_count = len(processed_indices)
+        if total_segments > 0:
+            progress = (processed_count / total_segments) * 100
+        else:
+            progress = 0
 
-            if total_segments > 0:
-                progress = (processed_count / total_segments) * 100
-            else:
-                progress = 0
-
-            return {
-                "can_resume": True,
-                "progress": round(progress, 2),
-                "processed_segments": processed_count,
-                "total_segments": total_segments,
-                "phase": data.get('phase', 'unknown'),
-                "message": f"检测到上次进度 ({progress:.1f}%)，可从断点继续"
-            }
-        except Exception as e:
-            return {
-                "can_resume": False,
-                "message": f"检查点文件损坏: {str(e)}"
-            }
+        return {
+            "can_resume": True,
+            "progress": round(progress, 2),
+            "processed_segments": processed_count,
+            "total_segments": total_segments,
+            "phase": summary.get("phase", "unknown"),
+            "message": f"检测到上次进度 ({progress:.1f}%)，可从断点继续"
+        }
 
     @router.get("/checkpoint-settings/{job_id}")
     async def get_checkpoint_settings(job_id: str):
@@ -1252,7 +1288,12 @@ def create_transcription_router(
             raise HTTPException(status_code=404, detail="任务未找到")
 
         job_dir = Path(job.dir)
-        checkpoint_path = job_dir / "checkpoint.json"
+        summary = transcription_service.job_lifecycle.state_repo.get_checkpoint_summary(job_id)
+        checkpoint_path = None
+        if summary and summary.get("_file_path"):
+            checkpoint_path = Path(summary["_file_path"])
+        if not checkpoint_path:
+            checkpoint_path = job_dir / "checkpoint.json"
 
         if not checkpoint_path.exists():
             return {"has_checkpoint": False}
@@ -1340,12 +1381,25 @@ def create_transcription_router(
             # V3.1.0+: 优先从 transcription.sentences_snapshot 读取（实时字幕快照）
             transcription = transcription_data or {}
             sentences_snapshot = transcription.get("sentences_snapshot", [])
+            from app.services.subtitle_edit_store import (
+                apply_deletions_to_segments,
+                apply_edits_to_segments,
+                apply_edits_to_sentences_snapshot,
+                build_manual_segments,
+                load_deleted_indices,
+                load_edits
+            )
+            edits = load_edits(job_dir)
+            deleted_indices = load_deleted_indices(job_dir)
 
             all_segments = []
             detected_language = None
             need_update_checkpoint = False  # V3.1.2: 标记是否需要更新 checkpoint
 
             if sentences_snapshot:
+                # V3.2.0+dev.20260124.02: 叠加用户编辑落盘数据
+                if edits:
+                    apply_edits_to_sentences_snapshot(sentences_snapshot, edits)
                 # 使用新格式（V3.1.0+ 实时字幕快照）
                 # V3.1.2+dev.20260111.02: 增加 display_confidence 支持
                 from app.core.confidence_mapper import ConfidenceMapper
@@ -1378,7 +1432,9 @@ def create_transcription_router(
                         "confidence": raw_conf,  # 可能为 None
                         "display_confidence": display_conf,  # 可能为 None（旧数据无置信度）
                         "confidence_source": confidence_source,  # 可能为 None
-                        "source": source
+                        "source": source,
+                        "is_modified": sentence.get("is_modified", False),
+                        "original_text": sentence.get("original_text")
                     })
 
                 # 按 _index 排序（已经是正确顺序，但保险起见）
@@ -1423,6 +1479,20 @@ def create_transcription_router(
                 processed_count = len(data.get("processed_indices", []))
                 total_chunks = data.get("total_segments", 0)
 
+                # V3.2.0+dev.20260124.02: 旧格式下同样叠加用户编辑
+                if edits:
+                    apply_edits_to_segments(all_segments, edits)
+
+            # V3.2.0+dev.20260124.02: 过滤用户删除的字幕
+            if deleted_indices:
+                all_segments = apply_deletions_to_segments(all_segments, deleted_indices)
+
+            # V3.2.0+dev.20260124.02: 追加用户新增字幕
+            manual_segments = build_manual_segments(edits, deleted_indices)
+            if manual_segments:
+                all_segments.extend(manual_segments)
+                all_segments.sort(key=lambda x: x.get('start', 0))
+
             # 快照模式下补充进度信息，避免 percentage 为 0
             if using_snapshot:
                 if not processed_count:
@@ -1436,7 +1506,7 @@ def create_transcription_router(
                 "has_snapshot": using_snapshot,
                 "language": detected_language or "unknown",
                 "segments": all_segments,
-                "sentence_count": transcription.get("sentence_count", len(all_segments)),
+                "sentence_count": len(all_segments),
                 "progress": {
                     "processed": processed_count,
                     "total": total_chunks,
@@ -1494,7 +1564,7 @@ def create_transcription_router(
                     "warnings": [],
                     "errors": [],
                     "force_original": {},
-                    "message": "旧版checkpoint格式，建议使用默认参数"
+                    "message": "检查点未包含原始配置，可直接继续"
                 }
 
             # 解析新设置
@@ -1504,46 +1574,18 @@ def create_transcription_router(
             errors = []
             force_original = {}
 
-            # 检查禁止修改的参数
-            # 1. word_timestamps - 禁止修改
-            if "word_timestamps" in original_settings:
-                if new_settings_obj.get("word_timestamps") != original_settings["word_timestamps"]:
-                    errors.append({
-                        "param": "word_timestamps",
-                        "reason": "修改此参数会导致前后SRT格式不一致",
-                        "impact": "严重",
-                        "original": original_settings["word_timestamps"],
-                        "new": new_settings_obj.get("word_timestamps")
-                    })
-                    force_original["word_timestamps"] = original_settings["word_timestamps"]
-
-            # 2. device - 建议不修改（中等影响）
-            if "device" in original_settings:
-                if new_settings_obj.get("device") != original_settings["device"]:
-                    warnings.append({
-                        "param": "device",
-                        "level": "medium",
-                        "reason": "不同设备的精度可能有细微差异",
-                        "impact": "中等",
-                        "original": original_settings["device"],
-                        "new": new_settings_obj.get("device"),
-                        "suggestion": "建议保持原设备设置"
-                    })
-
-            # 3. model - 允许但需严重警告
-            if "model" in original_settings:
-                if new_settings_obj.get("model") != original_settings["model"]:
-                    warnings.append({
-                        "param": "model",
-                        "level": "high",
-                        "reason": "不同模型的输出格式和质量可能不同，混用会导致前后字幕质量不一致",
-                        "impact": "高",
-                        "original": original_settings["model"],
-                        "new": new_settings_obj.get("model"),
-                        "suggestion": "仅在确认用错模型时才修改"
-                    })
-
-            # compute_type 和 batch_size 可以自由修改，不需要警告
+            task_config = new_settings_obj.get("task_config") or {}
+            if task_config and task_config != original_settings:
+                warnings.append({
+                    "param": "task_config",
+                    "level": "medium",
+                    "reason": "恢复任务应使用与检查点一致的配置",
+                    "impact": "中等",
+                    "original": original_settings,
+                    "new": task_config,
+                    "suggestion": "建议使用检查点原始配置继续"
+                })
+                force_original["task_config"] = original_settings
 
             return {
                 "valid": len(errors) == 0,
@@ -1587,6 +1629,9 @@ def create_transcription_router(
 
             # 更新 title 字段
             job.title = title.strip() if title else ""
+            saved = transcription_service.job_lifecycle.save_job_meta(job)
+            if not saved:
+                raise HTTPException(status_code=500, detail="任务重命名保存失败")
 
             # 保存任务状态到文件
             if job.dir:
@@ -1601,18 +1646,30 @@ def create_transcription_router(
                 except Exception as e:
                     print(f"保存任务状态失败: {e}")
 
+            persisted_job = transcription_service.job_lifecycle.state_repo.get_task(job_id)
+            if not persisted_job or persisted_job.updatedAt is None:
+                raise HTTPException(status_code=500, detail="任务重命名更新时间戳缺失")
+            updated_at = persisted_job.updatedAt
+            job_snapshot = _build_task_snapshot(persisted_job)
             # 通知 SSE 订阅者任务信息已更新
-            sse_manager.broadcast_sync("global", "job_renamed", {
-                "job_id": job_id,
-                "title": job.title,
-                "filename": job.filename
-            })
+            sse_manager.broadcast_sync(
+                "global",
+                "job_renamed",
+                {
+                    "job_id": job_id,
+                    "title": job.title,
+                    "filename": job.filename,
+                    "updated_at": updated_at
+                }
+            )
 
             return {
                 "success": True,
                 "job_id": job_id,
                 "title": job.title,
-                "message": "任务重命名成功"
+                "message": "任务重命名成功",
+                "task": job_snapshot,
+                "updated_at": updated_at
             }
 
         except HTTPException:

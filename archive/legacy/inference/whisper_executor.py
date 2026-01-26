@@ -34,6 +34,36 @@ class WhisperExecutor:
         """
         self.service = service or WhisperService()
         self.logger = logger or logging.getLogger(__name__)
+
+    def _resolve_chunk_param_overrides(self) -> Dict[str, Any]:
+        """
+        解析 Chunk 场景的默认覆盖参数。
+
+        仅当运行参数来源为 default 时才应用覆盖，
+        以便用户显式配置时优先使用统一管理参数。
+        """
+        from app.services.model_runtime_config_service import get_model_runtime_config_service
+        from app.services.model_manager_v2 import get_model_manager_v2
+
+        try:
+            model_id = self.service.resolve_model_id()
+            manager = get_model_manager_v2()
+            spec = manager.registry.get(model_id)
+            runtime_data = get_model_runtime_config_service().get_effective_runtime_for_model(spec)
+            sources = runtime_data.get("sources", {})
+        except Exception as exc:
+            self.logger.debug("Whisper Chunk 默认参数回退: %s", exc)
+            return {
+                "vad_filter": False,
+                "condition_on_previous_text": False,
+            }
+
+        overrides: Dict[str, Any] = {}
+        if sources.get("vad_filter") == "default":
+            overrides["vad_filter"] = False
+        if sources.get("condition_on_previous_text") == "default":
+            overrides["condition_on_previous_text"] = False
+        return overrides
     
     async def execute(
         self,
@@ -42,8 +72,8 @@ class WhisperExecutor:
         end_time: float,
         language: Optional[str] = None,
         initial_prompt: Optional[str] = None,
-        repetition_penalty: float = 1.2,
-        no_repeat_ngram_size: int = 3
+        repetition_penalty: Optional[float] = None,
+        no_repeat_ngram_size: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         执行 Whisper 推理
@@ -54,8 +84,8 @@ class WhisperExecutor:
             end_time: Chunk 结束时间（秒）- 仅用于日志，不用于切片
             language: 语言代码（zh/en/auto）
             initial_prompt: 初始提示词（用于引导识别）
-            repetition_penalty: 重复惩罚系数，>1 抑制重复（默认 1.2，推荐 1.1-1.3）
-            no_repeat_ngram_size: 禁止重复的 N-gram 大小（默认 3，0=禁用）
+            repetition_penalty: 重复惩罚系数，>1 抑制重复（None 表示使用运行参数默认值）
+            no_repeat_ngram_size: 禁止重复的 N-gram 大小（None 表示使用运行参数默认值）
 
         Returns:
             Dict: 推理结果
@@ -80,30 +110,16 @@ class WhisperExecutor:
             f'prompt={initial_prompt[:50] if initial_prompt else None}'
         )
 
-        # 自适应 beam_size：短 chunk 用 greedy（快），长 chunk 用 beam（质量）
-        if duration < 10.0:
-            beam_size = 1  # <10s：greedy 解码，速度提升 3倍
-            self.logger.debug(f'短 chunk ({duration:.1f}s)，使用 beam_size=1 快速模式')
-        elif duration < 15.0:
-            beam_size = 2  # 10-15s：小 beam，平衡
-            self.logger.debug(f'中等 chunk ({duration:.1f}s)，使用 beam_size=2 平衡模式')
-        else:
-            beam_size = 5  # >15s：大 beam，保证质量
-            self.logger.debug(f'长 chunk ({duration:.1f}s)，使用 beam_size=5 高质量模式')
-
         # 直接调用 transcribe，不进行二次切片
         # 传入的 audio 已经是切片后的 Chunk 音频
-        # 禁用 condition_on_previous_text 避免基于前文截断音频末尾内容
+        overrides = self._resolve_chunk_param_overrides()
         result = self.service.transcribe(
             audio=audio,
             language=language,
             initial_prompt=initial_prompt,
-            word_timestamps=False,  # 使用伪对齐，不需要词级时间戳
-            beam_size=beam_size,  # 自适应 beam_size
-            vad_filter=False,  # 已经是 VAD 切片，不需要再次 VAD
-            condition_on_previous_text=False,  # 禁用前文条件化，保留 prompt 用于词汇引导
             repetition_penalty=repetition_penalty,  # 重复惩罚
-            no_repeat_ngram_size=no_repeat_ngram_size  # N-gram 重复抑制
+            no_repeat_ngram_size=no_repeat_ngram_size,  # N-gram 重复抑制
+            **overrides
         )
         
         # 估算置信度

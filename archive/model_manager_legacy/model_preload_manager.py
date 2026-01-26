@@ -231,7 +231,7 @@ class ModelPreloadManager:
 
             # ===== 【移除】不再预加载 Whisper 模型 =====
             # 原来的 Whisper 预加载代码已删除
-            # Whisper 仅在后处理补刀阶段按需加载
+            # Whisper 仅在后处理复核阶段按需加载
 
             # 完成预加载
             success = success_count > 0
