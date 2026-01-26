@@ -138,27 +138,19 @@ class TranscriptionService:
                 (draft_engine, patch_engine)
         """
         from app.core.asr.engine import ASREngine
-        from app.engines.factory import ASREngineFactory
+        from app.core.asr.engine_resolver import EngineResolver
 
-        draft_engine: Optional[ASREngine] = ASREngineFactory.create("sensevoice")
-
-        if transcription_profile == "sensevoice_only":
-            return draft_engine, None
-
-        transcription = getattr(job.settings, "transcription", None)
-        model_name = getattr(transcription, "whisper_model", "medium")
-        device = (
-            self._optimization_config.recommended_device
-            if self._optimization_config
-            else "cuda"
+        resolver = EngineResolver(
+            hardware_profile_provider=self.hardware_profile_provider,
+            logger=self.logger,
         )
-        patch_engine: Optional[ASREngine] = ASREngineFactory.create(
-            "whisper",
-            model_name=model_name,
-            device=device,
-            compute_type=None,
+        draft_engine: Optional[ASREngine]
+        patch_engine: Optional[ASREngine]
+        draft_engine, patch_engine = resolver.resolve_profile_engines(
+            transcription_profile,
+            job=job,
+            optimization_config=self._optimization_config,
         )
-
         return draft_engine, patch_engine
 
     async def _run_pipeline_v2(self, job: JobState):

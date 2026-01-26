@@ -321,8 +321,8 @@ class PipelineOrchestrator:
 
     def resolve_profiles(self, job: JobState) -> ProfileConfig:
         """Profile 选择逻辑"""
+        from app.core.asr.engine_resolver import EngineResolver
         from app.core.thresholds import ThresholdConfig
-        from app.engines.factory import ASREngineFactory
         from app.services.runtime_param_resolver import build_vad_config_for_profile
 
         transcription = getattr(job.settings, "transcription", None)
@@ -339,32 +339,26 @@ class PipelineOrchestrator:
         vad_config = build_vad_config_for_profile(vad_profile)
 
         # 构建 ASR 引擎
-        draft_engine = ASREngineFactory.create("sensevoice")
-        patch_engine = None
-        if transcription_profile != "sensevoice_only":
-            model_name = getattr(transcription, "whisper_model", "medium")
-            optimization_config = None
-            try:
-                hardware_info = self.hardware_profile_provider.get_hardware_info(
-                    is_force_refresh=False
-                )
-                optimization_config = self.hardware_profile_provider.get_optimization_config(
-                    hardware_info
-                )
-            except Exception as exc:
-                self.logger.warning("获取硬件优化配置失败: %s", exc)
+        optimization_config = None
+        try:
+            hardware_info = self.hardware_profile_provider.get_hardware_info(
+                is_force_refresh=False
+            )
+            optimization_config = self.hardware_profile_provider.get_optimization_config(
+                hardware_info
+            )
+        except Exception as exc:
+            self.logger.warning("获取硬件优化配置失败: %s", exc)
 
-            device = (
-                optimization_config.recommended_device
-                if optimization_config
-                else "cuda"
-            )
-            patch_engine = ASREngineFactory.create(
-                "whisper",
-                model_name=model_name,
-                device=device,
-                compute_type=None,
-            )
+        resolver = EngineResolver(
+            hardware_profile_provider=self.hardware_profile_provider,
+            logger=self.logger,
+        )
+        draft_engine, patch_engine = resolver.resolve_profile_engines(
+            transcription_profile,
+            job=job,
+            optimization_config=optimization_config,
+        )
 
         # 补刀阈值
         patching_threshold_value = getattr(
