@@ -61,6 +61,9 @@ class AudioChunk:
     language: Optional[str] = None      # 语言标签（ISO 639-3，低置信度可标记为 auto）
     language_confidence: Optional[float] = None  # 语言检测置信度 [0, 1]
 
+    # V3.2.0+dev.20260127.06: 声纹向量字段（用于后续说话人聚类）
+    speaker_embedding: Optional[List[float]] = None  # 192 维声纹向量
+
     @property
     def duration(self) -> float:
         """片段时长（秒）"""
@@ -85,6 +88,8 @@ class AudioChunk:
             "last_confidence": self.last_confidence,
             "language": self.language,
             "language_confidence": self.language_confidence,
+            # 避免日志/序列化膨胀，仅记录声纹维度
+            "speaker_embedding_dim": len(self.speaker_embedding) if self.speaker_embedding else None,
         }
 
 
