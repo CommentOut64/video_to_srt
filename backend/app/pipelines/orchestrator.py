@@ -288,6 +288,8 @@ class PipelineOrchestrator:
             chunk_engine=chunk_engine,
             vad_config=profile_config.vad_config,
             logger=self.logger,
+            cancellation_token=cancellation_token,
+            progress_emitter=progress_emitter,
         )
 
         checkpoint_data = (
