@@ -85,6 +85,7 @@ output/
 llmdoc/
 
 # 测试文件
+tests
 test_*
 *_test.py
 tests_output/
@@ -101,3 +102,5 @@ archive
 openspec
 openspec
 AGENTS.md
+
+artifacts
