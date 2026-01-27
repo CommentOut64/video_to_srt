@@ -426,6 +426,44 @@ class PreprocessingPipeline:
                 except Exception as e:
                     self.logger.warning("[V3.2.0+dev.20260122.03] 完成分离缓存失败: %s", e)
 
+        # Stage 4: LangID 语言检测（失败不阻断）
+        if chunks:
+            self.logger.info("Stage 4: 语言检测")
+            try:
+                from app.services.speech_analysis_service import get_speech_analysis_service
+
+                langid_service = get_speech_analysis_service(logger=self.logger)
+                lang_map = langid_service.detect_languages(
+                    chunks=chunks,
+                    mode=self.config.language_detection_mode,
+                    device=self.config.language_detection_device,
+                    whitelist=self.config.langid_whitelist,
+                    logit_bias_score=self.config.langid_logit_bias_score,
+                )
+
+                for chunk in chunks:
+                    prediction = lang_map.get(chunk.index)
+                    if not prediction:
+                        chunk.language = "auto"
+                        chunk.language_confidence = 0.0
+                        continue
+                    chunk.language = prediction.language
+                    chunk.language_confidence = prediction.confidence
+                    if prediction.confidence < self.config.langid_confidence_threshold:
+                        chunk.language = "auto"
+
+                languages = [chunk.language for chunk in chunks if chunk.language]
+                if languages:
+                    from collections import Counter
+
+                    dominant = Counter(languages).most_common(1)[0][0]
+                    self.logger.info("LangID 完成: dominant=%s, chunks=%d", dominant, len(chunks))
+            except Exception as e:
+                self.logger.error("[V3.2.0+dev.20260127.02] LangID 失败，回退为 auto: %s", e)
+                for chunk in chunks:
+                    chunk.language = "auto"
+                    chunk.language_confidence = 0.0
+
         self.logger.info(f"预处理流程完成: {len(chunks)} 个chunk准备就绪")
 
         return chunks

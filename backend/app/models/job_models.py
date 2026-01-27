@@ -55,6 +55,14 @@ class PreprocessingConfig:
     # VAD 静音过滤开关
     vad_filter: bool = True
 
+    # ========== LangID 语言检测配置 ==========
+    # V3.2.0+dev.20260127.02: 语言检测模式与设备选择
+    language_detection_mode: str = "balanced"  # fast/balanced/precise
+    language_detection_device: str = "auto"    # auto/cpu/cuda
+    langid_confidence_threshold: float = 0.7
+    langid_whitelist: List[str] = field(default_factory=lambda: ["zh", "ja", "en"])
+    langid_logit_bias_score: float = 2.5
+
     # ========== 预处理缓存配置 ==========
     # 是否启用预处理缓存 GC（默认关闭）
     is_preprocess_cache_gc_enabled: bool = False
@@ -181,6 +189,11 @@ class JobSettings:
                 "fuse_confidence_threshold": self.preprocessing.fuse_confidence_threshold,
                 "fuse_auto_upgrade": self.preprocessing.fuse_auto_upgrade,
                 "vad_filter": self.preprocessing.vad_filter,
+                "language_detection_mode": self.preprocessing.language_detection_mode,
+                "language_detection_device": self.preprocessing.language_detection_device,
+                "langid_confidence_threshold": self.preprocessing.langid_confidence_threshold,
+                "langid_whitelist": self.preprocessing.langid_whitelist,
+                "langid_logit_bias_score": self.preprocessing.langid_logit_bias_score,
                 "enable_preprocess_cache_gc": self.preprocessing.is_preprocess_cache_gc_enabled,
                 "cache_budget_gb": self.preprocessing.cache_budget_gb,
                 "ttl_hours": self.preprocessing.ttl_hours,
@@ -240,6 +253,14 @@ class JobSettings:
         refinement_data = data.get("refinement", {})
         compute_data = data.get("compute", {})
 
+        raw_whitelist = preprocessing_data.get("langid_whitelist", ["zh", "ja", "en"])
+        if isinstance(raw_whitelist, str):
+            langid_whitelist = [raw_whitelist]
+        elif isinstance(raw_whitelist, list):
+            langid_whitelist = raw_whitelist
+        else:
+            langid_whitelist = ["zh", "ja", "en"]
+
         return cls(
             # 新版配置
             preset_id=data.get("preset_id", "balanced"),
@@ -256,6 +277,11 @@ class JobSettings:
                 fuse_confidence_threshold=preprocessing_data.get("fuse_confidence_threshold", 0.5),
                 fuse_auto_upgrade=preprocessing_data.get("fuse_auto_upgrade", True),
                 vad_filter=preprocessing_data.get("vad_filter", True),
+                language_detection_mode=preprocessing_data.get("language_detection_mode", "balanced"),
+                language_detection_device=preprocessing_data.get("language_detection_device", "auto"),
+                langid_confidence_threshold=preprocessing_data.get("langid_confidence_threshold", 0.7),
+                langid_whitelist=langid_whitelist,
+                langid_logit_bias_score=preprocessing_data.get("langid_logit_bias_score", 2.5),
                 is_preprocess_cache_gc_enabled=preprocessing_data.get("enable_preprocess_cache_gc", False),
                 cache_budget_gb=preprocessing_data.get("cache_budget_gb", 0.0),
                 ttl_hours=preprocessing_data.get("ttl_hours", 0.0),
@@ -308,6 +334,11 @@ class JobSettings:
                 fuse_max_retry=1,
                 fuse_confidence_threshold=0.5,
                 fuse_auto_upgrade=False,
+                language_detection_mode="balanced",
+                language_detection_device="auto",
+                langid_confidence_threshold=0.7,
+                langid_whitelist=["zh", "ja", "en"],
+                langid_logit_bias_score=2.5,
                 is_preprocess_cache_gc_enabled=False,
                 cache_budget_gb=0.0,
                 ttl_hours=0.0,
