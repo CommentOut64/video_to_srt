@@ -4,6 +4,7 @@ SpeechAnalysisService - LangID 语言检测服务
 V3.2.0+dev.20260127.02: 实现 LangID 三模式检测与中心裁剪批推理。
 V3.2.0+dev.20260127.03: 支持 Logit Bias + 动态白名单。
 V3.2.0+dev.20260127.04: 解析 LangID 标签前缀代码并用于白名单匹配。
+V3.2.0+dev.20260127.05: 增加缓存元数据与分批回调钩子。
 """
 from __future__ import annotations
 
@@ -11,7 +12,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -25,6 +26,11 @@ class LangIDPrediction:
     """LangID 预测结果（仅保留关键字段）"""
     language: str
     confidence: float
+
+
+LangIDPredictionCallback = Optional[
+    Callable[[Sequence[AudioChunk], Sequence["LangIDPrediction"]], None]
+]
 
 
 @dataclass(frozen=True)
@@ -47,6 +53,23 @@ class SpeechAnalysisService:
     DEFAULT_MODEL_ID = "langid-voxlingua"
     DEFAULT_LANGUAGE_WHITELIST = ("zh", "ja", "en")
     DEFAULT_LOGIT_BIAS_SCORE = 2.5
+    LANGUAGE_CODE_STANDARD = "label-prefix"
+    # 统一白名单格式，避免 ISO-639-3/区域标签导致回退为 auto
+    LANGUAGE_CODE_ALIASES = {
+        "zho": "zh",
+        "chi": "zh",
+        "cmn": "zh",
+        "yue": "zh",
+        "mandarin": "zh",
+        "chinese": "zh",
+        "cantonese": "zh",
+        "eng": "en",
+        "english": "en",
+        "jpn": "ja",
+        "japanese": "ja",
+        "kor": "ko",
+        "korean": "ko",
+    }
 
     TARGET_DURATION_SECONDS = 4.0
     GROUP_WINDOW_SECONDS = 60.0
@@ -80,6 +103,7 @@ class SpeechAnalysisService:
         device: str = "auto",
         whitelist: Optional[Sequence[str]] = None,
         logit_bias_score: Optional[float] = None,
+        on_predictions: LangIDPredictionCallback = None,
     ) -> Dict[int, LangIDPrediction]:
         """检测所有 Chunk 的语言标签。"""
         if not chunks:
@@ -92,10 +116,93 @@ class SpeechAnalysisService:
         bias_score = self._normalize_logit_bias_score(logit_bias_score)
 
         if resolved_mode == "fast":
-            return self._detect_fast(chunks, resolved_device, normalized_whitelist, bias_score)
+            return self._detect_fast(
+                chunks,
+                resolved_device,
+                normalized_whitelist,
+                bias_score,
+                on_predictions=on_predictions,
+            )
         if resolved_mode == "precise":
-            return self._detect_precise(chunks, resolved_device, normalized_whitelist, bias_score)
-        return self._detect_balanced(chunks, resolved_device, normalized_whitelist, bias_score)
+            return self._detect_precise(
+                chunks,
+                resolved_device,
+                normalized_whitelist,
+                bias_score,
+                on_predictions=on_predictions,
+            )
+        return self._detect_balanced(
+            chunks,
+            resolved_device,
+            normalized_whitelist,
+            bias_score,
+            on_predictions=on_predictions,
+        )
+
+    def build_langid_cache_metadata(
+        self,
+        mode: LangIDMode,
+        device: str,
+        whitelist: Optional[Sequence[str]],
+        logit_bias_score: Optional[float],
+    ) -> Dict[str, Any]:
+        """构建 LangID 缓存元数据，确保命中一致性。"""
+        resolved_mode = mode if mode in ("fast", "balanced", "precise") else "balanced"
+        resolved_device, _ = self._resolve_runtime(resolved_mode, device)
+        batch_size = self.BATCH_SIZE_GPU if resolved_device != "cpu" else self.BATCH_SIZE_CPU
+        normalized_whitelist = self._normalize_language_whitelist(whitelist)
+        bias_score = self._normalize_logit_bias_score(logit_bias_score)
+
+        model_repo = None
+        model_hash = None
+        try:
+            from app.services.model_manager_v2 import get_model_manager_v2
+
+            spec = get_model_manager_v2().registry.get(self.model_id)
+            model_repo = spec.source.repo_id
+            model_hash = spec.source.hash
+        except Exception as exc:
+            self.logger.debug("LangID 缓存元数据获取模型信息失败: %s", exc)
+
+        torch_version = None
+        speechbrain_version = None
+        try:
+            import torch
+
+            torch_version = getattr(torch, "__version__", None)
+        except Exception:
+            pass
+        try:
+            import speechbrain
+
+            speechbrain_version = getattr(speechbrain, "__version__", None)
+        except Exception:
+            pass
+
+        return {
+            "schema_version": "1.0",
+            "mode": resolved_mode,
+            "model_id": self.model_id,
+            "model_repo": model_repo,
+            "model_hash": model_hash,
+            "target_duration_seconds": self.TARGET_DURATION_SECONDS,
+            "batch_size": batch_size,
+            "resolved_device": resolved_device,
+            "torch_version": torch_version,
+            "speechbrain_version": speechbrain_version,
+            "language_code_standard": self.LANGUAGE_CODE_STANDARD,
+            "whitelist": normalized_whitelist or [],
+            "logit_bias_score": bias_score,
+        }
+
+    @staticmethod
+    def _emit_predictions(
+        on_predictions: LangIDPredictionCallback,
+        chunks: Sequence[AudioChunk],
+        predictions: Sequence[LangIDPrediction],
+    ) -> None:
+        if on_predictions:
+            on_predictions(chunks, predictions)
 
     def _detect_fast(
         self,
@@ -103,26 +210,50 @@ class SpeechAnalysisService:
         device: str,
         whitelist: Optional[Sequence[str]],
         logit_bias_score: float,
+        on_predictions: LangIDPredictionCallback = None,
     ) -> Dict[int, LangIDPrediction]:
         sample_indices = self._select_fast_sample_indices(len(chunks))
         if len(sample_indices) < self.FAST_SAMPLE_MIN:
             self.logger.info("LangID fast 模式样本不足，降级为 balanced")
-            return self._detect_balanced(chunks, device, whitelist, logit_bias_score)
+            return self._detect_balanced(
+                chunks,
+                device,
+                whitelist,
+                logit_bias_score,
+                on_predictions=on_predictions,
+            )
 
         sample_chunks = [chunks[i] for i in sample_indices]
-        predictions = self._classify_chunks_in_batches(sample_chunks, device, whitelist, logit_bias_score)
+        predictions = self._classify_chunks_in_batches(
+            sample_chunks,
+            device,
+            whitelist,
+            logit_bias_score,
+            on_predictions=None,
+        )
         if not predictions:
             raise RuntimeError("LangID fast 模式推理结果为空")
 
         dominant, ratio, mean_confidence = self._calculate_consensus(predictions)
         if ratio >= self.FAST_CONSENSUS_RATIO and mean_confidence >= self.FAST_CONFIDENCE_THRESHOLD:
+            broadcast_predictions = [
+                LangIDPrediction(dominant, mean_confidence)
+                for _ in chunks
+            ]
+            self._emit_predictions(on_predictions, chunks, broadcast_predictions)
             return {
-                chunk.index: LangIDPrediction(dominant, mean_confidence)
-                for chunk in chunks
+                chunk.index: prediction
+                for chunk, prediction in zip(chunks, broadcast_predictions)
             }
 
         self.logger.info("LangID fast 模式一致性不足，降级为 balanced")
-        return self._detect_balanced(chunks, device, whitelist, logit_bias_score)
+        return self._detect_balanced(
+            chunks,
+            device,
+            whitelist,
+            logit_bias_score,
+            on_predictions=on_predictions,
+        )
 
     def _detect_balanced(
         self,
@@ -130,6 +261,7 @@ class SpeechAnalysisService:
         device: str,
         whitelist: Optional[Sequence[str]],
         logit_bias_score: float,
+        on_predictions: LangIDPredictionCallback = None,
     ) -> Dict[int, LangIDPrediction]:
         groups = self._group_chunks_by_time(chunks, self.GROUP_WINDOW_SECONDS)
         results: Dict[int, LangIDPrediction] = {}
@@ -141,7 +273,13 @@ class SpeechAnalysisService:
         for group_index, group in enumerate(groups):
             probe_chunks = self._select_group_probes(group)
             if len(probe_chunks) < 3:
-                group_predictions = self._classify_chunks_in_batches(group, device, whitelist, logit_bias_score)
+                group_predictions = self._classify_chunks_in_batches(
+                    group,
+                    device,
+                    whitelist,
+                    logit_bias_score,
+                    on_predictions=on_predictions,
+                )
                 for chunk, prediction in zip(group, group_predictions):
                     results[chunk.index] = prediction
                 decisions[group_index] = self._build_group_decision(group_predictions, "full_scan")
@@ -156,6 +294,7 @@ class SpeechAnalysisService:
             device,
             whitelist,
             logit_bias_score,
+            on_predictions=None,
         ) if probes else []
         group_probe_results: Dict[int, List[LangIDPrediction]] = {}
         for (group_index, _), prediction in zip(probe_map, probe_predictions):
@@ -167,7 +306,13 @@ class SpeechAnalysisService:
 
             probe_results = group_probe_results.get(group_index, [])
             if not probe_results:
-                group_predictions = self._classify_chunks_in_batches(group, device, whitelist, logit_bias_score)
+                group_predictions = self._classify_chunks_in_batches(
+                    group,
+                    device,
+                    whitelist,
+                    logit_bias_score,
+                    on_predictions=on_predictions,
+                )
                 for chunk, prediction in zip(group, group_predictions):
                     results[chunk.index] = prediction
                 decisions[group_index] = self._build_group_decision(group_predictions, "full_scan")
@@ -175,15 +320,26 @@ class SpeechAnalysisService:
 
             dominant, ratio, mean_confidence = self._calculate_consensus(probe_results)
             if ratio == 1.0:
-                for chunk in group:
-                    results[chunk.index] = LangIDPrediction(dominant, mean_confidence)
+                broadcast_predictions = [
+                    LangIDPrediction(dominant, mean_confidence)
+                    for _ in group
+                ]
+                self._emit_predictions(on_predictions, group, broadcast_predictions)
+                for chunk, prediction in zip(group, broadcast_predictions):
+                    results[chunk.index] = prediction
                 decisions[group_index] = LangIDGroupDecision(
                     language=dominant,
                     mean_confidence=mean_confidence,
                     decision="broadcast",
                 )
             else:
-                group_predictions = self._classify_chunks_in_batches(group, device, whitelist, logit_bias_score)
+                group_predictions = self._classify_chunks_in_batches(
+                    group,
+                    device,
+                    whitelist,
+                    logit_bias_score,
+                    on_predictions=on_predictions,
+                )
                 for chunk, prediction in zip(group, group_predictions):
                     results[chunk.index] = prediction
                 decisions[group_index] = self._build_group_decision(group_predictions, "full_scan")
@@ -195,6 +351,7 @@ class SpeechAnalysisService:
             device,
             whitelist,
             logit_bias_score,
+            on_predictions=on_predictions,
         )
         return results
 
@@ -204,8 +361,15 @@ class SpeechAnalysisService:
         device: str,
         whitelist: Optional[Sequence[str]],
         logit_bias_score: float,
+        on_predictions: LangIDPredictionCallback = None,
     ) -> Dict[int, LangIDPrediction]:
-        predictions = self._classify_chunks_in_batches(chunks, device, whitelist, logit_bias_score)
+        predictions = self._classify_chunks_in_batches(
+            chunks,
+            device,
+            whitelist,
+            logit_bias_score,
+            on_predictions=on_predictions,
+        )
         return {
             chunk.index: prediction
             for chunk, prediction in zip(chunks, predictions)
@@ -219,6 +383,7 @@ class SpeechAnalysisService:
         device: str,
         whitelist: Optional[Sequence[str]],
         logit_bias_score: float,
+        on_predictions: LangIDPredictionCallback = None,
     ) -> None:
         for index in range(len(groups) - 1):
             left = decisions[index]
@@ -239,6 +404,7 @@ class SpeechAnalysisService:
                 device,
                 whitelist,
                 logit_bias_score,
+                on_predictions=on_predictions,
             )
             for chunk, prediction in zip(boundary_chunks, boundary_predictions):
                 results[chunk.index] = prediction
@@ -249,6 +415,7 @@ class SpeechAnalysisService:
         device: str,
         whitelist: Optional[Sequence[str]],
         logit_bias_score: float,
+        on_predictions: LangIDPredictionCallback = None,
     ) -> List[LangIDPrediction]:
         if not chunks:
             return []
@@ -257,7 +424,9 @@ class SpeechAnalysisService:
         predictions: List[LangIDPrediction] = []
         for start in range(0, len(chunks), batch_size):
             batch = chunks[start:start + batch_size]
-            predictions.extend(self._classify_batch(batch, device, whitelist, logit_bias_score))
+            batch_predictions = self._classify_batch(batch, device, whitelist, logit_bias_score)
+            self._emit_predictions(on_predictions, batch, batch_predictions)
+            predictions.extend(batch_predictions)
         return predictions
 
     def _classify_batch(
@@ -482,17 +651,44 @@ class SpeechAnalysisService:
         whitelist: Optional[Sequence[str]],
     ) -> Optional[List[str]]:
         if whitelist is None:
-            return [lang.lower() for lang in cls.DEFAULT_LANGUAGE_WHITELIST]
+            raw_items: Sequence[str] = cls.DEFAULT_LANGUAGE_WHITELIST
+        else:
+            raw_items = whitelist
+
         normalized: List[str] = []
-        for item in whitelist:
-            if not item:
-                continue
-            text = str(item).strip().lower()
-            if text:
-                normalized.append(text)
+        for item in raw_items:
+            code = cls._normalize_language_code(item)
+            if code:
+                normalized.append(code)
         if not normalized:
             return []
         return list(dict.fromkeys(normalized))
+
+    @classmethod
+    def _normalize_language_code(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip().lower()
+        if not text:
+            return None
+        text = text.replace("_", "-")
+        if text in {"auto", "und"}:
+            return None
+
+        alias = cls.LANGUAGE_CODE_ALIASES.get(text)
+        if alias:
+            return alias
+
+        if "-" in text:
+            base = text.split("-", 1)[0]
+            if not base:
+                return None
+            alias = cls.LANGUAGE_CODE_ALIASES.get(base, base)
+            return alias if len(alias) in (2, 3) else None
+
+        if len(text) in (2, 3):
+            return text
+        return None
 
     @classmethod
     def _normalize_logit_bias_score(cls, logit_bias_score: Optional[float]) -> float:
