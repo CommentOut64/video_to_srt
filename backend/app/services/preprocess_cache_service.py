@@ -48,6 +48,7 @@ class PreprocessCachePaths:
     langid_language_map_path: Path
     langid_progress_path: Path
     langid_metadata_path: Path
+    langid_report_path: Path
     speaker_dir: Path
     speaker_embeddings_path: Path
     speaker_index_map_path: Path
@@ -99,6 +100,7 @@ class PreprocessCacheService:
             langid_language_map_path=langid_dir / "language_map.json",
             langid_progress_path=langid_dir / "progress.json",
             langid_metadata_path=langid_dir / "metadata.json",
+            langid_report_path=langid_dir / "langid_report.json",
             speaker_dir=speaker_dir,
             speaker_embeddings_path=speaker_dir / "embeddings.npy",
             speaker_index_map_path=speaker_dir / "index_map.json",
@@ -651,6 +653,13 @@ class PreprocessCacheService:
             str(index): {
                 "language": str(payload.get("language", "auto")),
                 "confidence": float(payload.get("confidence", 0.0)),
+                "raw_label": payload.get("raw_label"),
+                "raw_language": payload.get("raw_language"),
+                "raw_confidence": (
+                    float(payload.get("raw_confidence"))
+                    if payload.get("raw_confidence") is not None
+                    else None
+                ),
             }
             for index, payload in language_map.items()
         }
@@ -666,6 +675,56 @@ class PreprocessCacheService:
             state_file=str(Path("langid") / self.paths.langid_progress_path.name),
             extra={"total_chunks": progress.get("total_chunks") if progress else len(language_map)},
         )
+
+    def save_langid_report(
+        self,
+        chunks: List[AudioChunk],
+        language_map: Dict[int, Dict[str, Any]],
+        metadata: Dict[str, Any],
+        confidence_threshold: float,
+    ) -> None:
+        """写入 LangID 详细报告（包含白名单前后标签与置信度）"""
+        if not chunks:
+            return
+        if not language_map:
+            return
+        self.ensure_dirs()
+
+        report_items: List[Dict[str, Any]] = []
+        for chunk in chunks:
+            payload = language_map.get(chunk.index, {})
+            raw_confidence = payload.get("raw_confidence")
+            if raw_confidence is None:
+                raw_confidence = payload.get("confidence", 0.0)
+            report_items.append(
+                {
+                    "chunk_index": int(chunk.index),
+                    "raw_label": payload.get("raw_label"),
+                    "raw_language": payload.get("raw_language"),
+                    "language_whitelist": payload.get("language", "auto"),
+                    "confidence": float(raw_confidence or 0.0),
+                }
+            )
+
+        report = {
+            "schema_version": "1.0",
+            "job_id": self.job_dir.name,
+            "generated_at": self._now_iso(),
+            "total_chunks": len(chunks),
+            "confidence_threshold": float(confidence_threshold),
+            "metadata": {
+                "mode": metadata.get("mode"),
+                "model_id": metadata.get("model_id"),
+                "model_repo": metadata.get("model_repo"),
+                "model_hash": metadata.get("model_hash"),
+                "resolved_device": metadata.get("resolved_device"),
+                "whitelist": metadata.get("whitelist", []),
+                "logit_bias_score": metadata.get("logit_bias_score"),
+            },
+            "items": report_items,
+        }
+
+        self._atomic_write_json(self.paths.langid_report_path, report)
 
     @staticmethod
     def build_langid_progress(
@@ -1081,6 +1140,13 @@ class PreprocessCacheService:
             normalized[index] = {
                 "language": str(language),
                 "confidence": confidence_value,
+                "raw_label": payload.get("raw_label"),
+                "raw_language": payload.get("raw_language"),
+                "raw_confidence": (
+                    float(payload.get("raw_confidence"))
+                    if payload.get("raw_confidence") is not None
+                    else None
+                ),
             }
         return normalized
 
