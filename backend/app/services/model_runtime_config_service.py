@@ -335,7 +335,7 @@ class ModelRuntimeConfigService:
             "punctuation": {
                 "enable_punctuation": True,
                 "default_language": "zh",
-                "fallback_to_multilingual": True,
+                "fallback_priority": "fast",
                 "cache_models": True,
                 "max_cached_models": 3,
                 "device": "cpu",
