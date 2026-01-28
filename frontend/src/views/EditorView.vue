@@ -839,6 +839,18 @@ function subscribeSSE() {
       console.log('[EditorView] 熔断触发:', data)
     },
 
+    onLangidEvent(eventType, data) {
+      if (eventType === 'preprocessing.langid.error') {
+        ElMessage.error(data?.message || '语言检测失败')
+      }
+    },
+
+    onSpeakerEvent(eventType, data) {
+      if (eventType === 'preprocessing.speaker.error') {
+        ElMessage.error(data?.message || '声纹提取失败')
+      }
+    },
+
     // === Proxy 视频转码事件（转发到 useProxyVideo）===
     onAnalyzeComplete(data) {
       console.log('[EditorView] 转发 analyze_complete 到 useProxyVideo')

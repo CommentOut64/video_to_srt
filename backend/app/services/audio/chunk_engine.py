@@ -57,6 +57,13 @@ class AudioChunk:
     fuse_retry_count: int = 0           # 熔断重试次数
     last_confidence: float = 1.0        # 上次转录的置信度
 
+    # V3.2.0+dev.20260127.02: LangID 语言检测字段
+    language: Optional[str] = None      # 语言标签（ISO 639-3，低置信度可标记为 auto）
+    language_confidence: Optional[float] = None  # 语言检测置信度 [0, 1]
+
+    # V3.2.0+dev.20260127.06: 声纹向量字段（用于后续说话人聚类）
+    speaker_embedding: Optional[List[float]] = None  # 192 维声纹向量
+
     @property
     def duration(self) -> float:
         """片段时长（秒）"""
@@ -78,7 +85,11 @@ class AudioChunk:
             "recommended_model": self.recommended_model,
             "separation_level": self.separation_level.value if self.separation_level else None,
             "fuse_retry_count": self.fuse_retry_count,
-            "last_confidence": self.last_confidence
+            "last_confidence": self.last_confidence,
+            "language": self.language,
+            "language_confidence": self.language_confidence,
+            # 避免日志/序列化膨胀，仅记录声纹维度
+            "speaker_embedding_dim": len(self.speaker_embedding) if self.speaker_embedding else None,
         }
 
 

@@ -305,7 +305,7 @@ async def shutdown_event():
             pass
 
         # 清理模型缓存
-        model_manager = get_model_manager()
+        model_manager = get_model_manager_v2()
         if model_manager:
             model_manager.clear_cache()
             logger.info("已清理模型缓存")

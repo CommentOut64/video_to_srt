@@ -68,3 +68,7 @@ prometheus_client
 # brouhaha-vad 提供 Brouhaha 模型架构定义 (CustomPyanNetModel)
 # 注意: 首次下载模型需要配置 HF_TOKEN 环境变量，之后可离线使用
 pyannote.audio>=3.1.0
+
+# --- SpeechBrain (语言识别/声纹) ---
+speechbrain==1.0.3
+huggingface-hub==0.24.6

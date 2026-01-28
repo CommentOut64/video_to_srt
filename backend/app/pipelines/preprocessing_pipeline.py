@@ -16,7 +16,8 @@ v3.1.0 更新：
 """
 
 import logging
-from typing import List, Optional, TYPE_CHECKING
+import time
+from typing import Any, Dict, List, Optional, Set, TYPE_CHECKING
 from pathlib import Path
 
 from app.services.audio.chunk_engine import ChunkEngine, AudioChunk
@@ -164,6 +165,17 @@ class PreprocessingPipeline:
         """
         self.logger.info(f"开始预处理流程: {video_path}")
         token = self.cancellation_token  # v3.1.0: 简化引用
+        job_id = job_state.job_id if job_state else None
+        sse_manager = None
+        if job_id:
+            from app.services.sse_service import get_sse_manager
+
+            sse_manager = get_sse_manager()
+
+        def broadcast_preprocess_event(event: str, payload: Dict[str, Any]) -> None:
+            if not sse_manager or not job_id:
+                return
+            sse_manager.broadcast_sync(f"job:{job_id}", event, payload)
 
         cache_service: Optional[PreprocessCacheService] = None
         if job_dir:
@@ -425,6 +437,377 @@ class PreprocessingPipeline:
                     cache_service.finalize_separation(len(chunks))
                 except Exception as e:
                     self.logger.warning("[V3.2.0+dev.20260122.03] 完成分离缓存失败: %s", e)
+
+        # Stage 4: LangID 语言检测（失败不阻断）
+        if chunks:
+            self.logger.info("Stage 4: 语言检测")
+            try:
+                from app.services.speech_analysis_service import get_speech_analysis_service
+                from app.utils.cancellation_token import CancelledException, PausedException
+
+                langid_service = get_speech_analysis_service(logger=self.logger)
+                langid_metadata: Optional[Dict[str, Any]] = None
+                lang_map: Dict[int, Dict[str, Any]] = {}
+                missing_indices = [chunk.index for chunk in chunks]
+                cache_complete = False
+                langid_started_at = time.time()
+                total_chunks = len(chunks)
+                resolved_mode = self.config.language_detection_mode
+                resolved_device = self.config.language_detection_device
+
+                if cache_service:
+                    try:
+                        langid_metadata = langid_service.build_langid_cache_metadata(
+                            mode=self.config.language_detection_mode,
+                            device=self.config.language_detection_device,
+                            whitelist=self.config.langid_whitelist,
+                            logit_bias_score=self.config.langid_logit_bias_score,
+                        )
+                        recovered = cache_service.recover_langid_cache(
+                            chunks=chunks,
+                            expected_metadata=langid_metadata,
+                        )
+                        if recovered:
+                            lang_map, missing_indices, cache_complete = recovered
+                            if not missing_indices:
+                                self.logger.info(
+                                    "[V3.2.0+dev.20260127.05] LangID 缓存命中: %d/%d",
+                                    len(lang_map),
+                                    len(chunks),
+                                )
+                        else:
+                            lang_map = {}
+                            missing_indices = [chunk.index for chunk in chunks]
+                    except Exception as exc:
+                        self.logger.warning("[V3.2.0+dev.20260127.05] LangID 缓存恢复失败: %s", exc)
+                        lang_map = {}
+                        missing_indices = [chunk.index for chunk in chunks]
+                        cache_complete = False
+
+                if langid_metadata:
+                    resolved_mode = langid_metadata.get("mode", resolved_mode)
+                    resolved_device = langid_metadata.get("resolved_device", resolved_device)
+
+                broadcast_preprocess_event(
+                    "preprocessing.langid.started",
+                    {
+                        "schema_version": "1.0",
+                        "job_id": job_id,
+                        "mode": resolved_mode,
+                        "total_chunks": total_chunks,
+                        "resolved_device": resolved_device,
+                        "model_id": langid_metadata.get("model_id") if langid_metadata else None,
+                        "language_code_standard": "ISO-639-3",
+                    },
+                )
+
+                if missing_indices:
+                    missing_set = set(missing_indices)
+                    target_chunks = [chunk for chunk in chunks if chunk.index in missing_set]
+                    processed_indices: Set[int] = set(lang_map.keys())
+
+                    def on_predictions(batch_chunks, predictions):
+                        for chunk, prediction in zip(batch_chunks, predictions):
+                            lang_map[chunk.index] = {
+                                "language": prediction.language,
+                                "confidence": prediction.confidence,
+                                "raw_label": prediction.raw_label,
+                                "raw_language": prediction.raw_language,
+                                "raw_confidence": prediction.raw_confidence,
+                            }
+                            processed_indices.add(chunk.index)
+                        broadcast_preprocess_event(
+                            "preprocessing.langid.progress",
+                            {
+                                "schema_version": "1.0",
+                                "job_id": job_id,
+                                "processed": len(processed_indices),
+                                "total": total_chunks,
+                                "percentage": round(len(processed_indices) / max(1, total_chunks) * 100, 2),
+                            },
+                        )
+                        if cache_service and langid_metadata:
+                            try:
+                                progress = cache_service.build_langid_progress(
+                                    processed_indices,
+                                    total_chunks,
+                                    complete=False,
+                                )
+                                cache_service.save_langid_cache(lang_map, langid_metadata, progress)
+                            except Exception as cache_exc:
+                                self.logger.warning("[V3.2.0+dev.20260127.05] LangID 缓存写入失败: %s", cache_exc)
+                        if token:
+                            if job_dir and (token.is_canceled or token.is_paused):
+                                token.check_and_save({"preprocessing": {"total_chunks": total_chunks}}, job_dir)
+                            else:
+                                token.raise_if_canceled()
+                                token.raise_if_paused()
+
+                    lang_predictions = langid_service.detect_languages(
+                        chunks=target_chunks,
+                        mode=resolved_mode,
+                        device=resolved_device,
+                        whitelist=self.config.langid_whitelist,
+                        logit_bias_score=self.config.langid_logit_bias_score,
+                        on_predictions=on_predictions,
+                    )
+                    for chunk_index, prediction in lang_predictions.items():
+                        lang_map[chunk_index] = {
+                            "language": prediction.language,
+                            "confidence": prediction.confidence,
+                            "raw_label": prediction.raw_label,
+                            "raw_language": prediction.raw_language,
+                            "raw_confidence": prediction.raw_confidence,
+                        }
+
+                    if cache_service and langid_metadata:
+                        processed_indices.update(lang_map.keys())
+                        try:
+                            progress = cache_service.build_langid_progress(
+                                processed_indices,
+                                total_chunks,
+                                complete=len(processed_indices) >= total_chunks,
+                            )
+                            cache_service.save_langid_cache(lang_map, langid_metadata, progress)
+                        except Exception as cache_exc:
+                            self.logger.warning("[V3.2.0+dev.20260127.05] LangID 缓存写入失败: %s", cache_exc)
+                elif cache_service and langid_metadata and lang_map and not cache_complete:
+                    try:
+                        progress = cache_service.build_langid_progress(
+                            lang_map.keys(),
+                            len(chunks),
+                            complete=True,
+                        )
+                        cache_service.save_langid_cache(lang_map, langid_metadata, progress)
+                    except Exception as cache_exc:
+                        self.logger.warning("[V3.2.0+dev.20260127.05] LangID 缓存写入失败: %s", cache_exc)
+
+                for chunk in chunks:
+                    cached = lang_map.get(chunk.index)
+                    if not cached:
+                        chunk.language = "auto"
+                        chunk.language_confidence = 0.0
+                        continue
+                    chunk.language = cached.get("language", "auto")
+                    chunk.language_confidence = float(cached.get("confidence", 0.0))
+                    if chunk.language_confidence < self.config.langid_confidence_threshold:
+                        chunk.language = "auto"
+
+                languages = [chunk.language for chunk in chunks if chunk.language]
+                if languages:
+                    from collections import Counter
+
+                    dominant = Counter(languages).most_common(1)[0][0]
+                    self.logger.info("LangID 完成: dominant=%s, chunks=%d", dominant, len(chunks))
+                    language_distribution = dict(Counter(languages))
+                else:
+                    dominant = None
+                    language_distribution = {}
+
+                if cache_service and langid_metadata:
+                    try:
+                        cache_service.save_langid_report(
+                            chunks=chunks,
+                            language_map=lang_map,
+                            metadata=langid_metadata,
+                            confidence_threshold=self.config.langid_confidence_threshold,
+                        )
+                    except Exception as report_exc:
+                        self.logger.warning("[V3.2.0+dev.20260127.10] LangID 报告写入失败: %s", report_exc)
+
+                broadcast_preprocess_event(
+                    "preprocessing.langid.completed",
+                    {
+                        "schema_version": "1.0",
+                        "job_id": job_id,
+                        "total_chunks": len(chunks),
+                        "duration_ms": int((time.time() - langid_started_at) * 1000),
+                        "language_distribution": language_distribution,
+                        "dominant_language": dominant,
+                        "coverage_ratio": round(len(lang_map) / max(1, len(chunks)), 4),
+                        "cache_saved": bool(cache_service and langid_metadata),
+                    },
+                )
+            except (CancelledException, PausedException):
+                raise
+            except Exception as e:
+                self.logger.error("[V3.2.0+dev.20260127.05] LangID 失败，回退为 auto: %s", e)
+                broadcast_preprocess_event(
+                    "preprocessing.langid.error",
+                    {
+                        "schema_version": "1.0",
+                        "job_id": job_id,
+                        "error_type": "langid_failed",
+                        "message": str(e),
+                        "fallback_strategy": "all_chunks_set_to_auto",
+                    },
+                )
+                for chunk in chunks:
+                    chunk.language = "auto"
+                    chunk.language_confidence = 0.0
+
+        # Stage 5: Speaker 声纹提取（可选，失败不阻断）
+        if chunks and self.config.enable_speaker_embedding:
+            self.logger.info("Stage 5: 声纹提取")
+            try:
+                from app.services.speaker_embedding_service import get_speaker_embedding_service
+                from app.utils.cancellation_token import CancelledException, PausedException
+
+                speaker_service = get_speaker_embedding_service(logger=self.logger)
+                speaker_metadata: Optional[Dict[str, Any]] = None
+                embedding_map: Dict[int, List[float]] = {}
+                missing_indices = [chunk.index for chunk in chunks]
+                cache_complete = False
+                speaker_started_at = time.time()
+                total_chunks = len(chunks)
+                resolved_device = self.config.language_detection_device
+
+                if cache_service:
+                    try:
+                        speaker_metadata = speaker_service.build_speaker_cache_metadata(
+                            mode=self.config.language_detection_mode,
+                            device=self.config.language_detection_device,
+                        )
+                        recovered = cache_service.recover_speaker_cache(
+                            chunks=chunks,
+                            expected_metadata=speaker_metadata,
+                        )
+                        if recovered:
+                            embedding_map, missing_indices, cache_complete = recovered
+                            if not missing_indices:
+                                self.logger.info(
+                                    "[V3.2.0+dev.20260127.06] Speaker 缓存命中: %d/%d",
+                                    len(embedding_map),
+                                    len(chunks),
+                                )
+                        else:
+                            embedding_map = {}
+                            missing_indices = [chunk.index for chunk in chunks]
+                    except Exception as exc:
+                        self.logger.warning("[V3.2.0+dev.20260127.06] Speaker 缓存恢复失败: %s", exc)
+                        embedding_map = {}
+                        missing_indices = [chunk.index for chunk in chunks]
+                        cache_complete = False
+
+                if speaker_metadata:
+                    resolved_device = speaker_metadata.get("resolved_device", resolved_device)
+
+                broadcast_preprocess_event(
+                    "preprocessing.speaker.started",
+                    {
+                        "schema_version": "1.0",
+                        "job_id": job_id,
+                        "total_chunks": total_chunks,
+                        "embedding_dim": speaker_metadata.get("embedding_dim") if speaker_metadata else 192,
+                        "model_id": speaker_metadata.get("model_id") if speaker_metadata else None,
+                        "resolved_device": resolved_device,
+                    },
+                )
+
+                if missing_indices:
+                    missing_set = set(missing_indices)
+                    target_chunks = [chunk for chunk in chunks if chunk.index in missing_set]
+                    processed_indices: Set[int] = set(embedding_map.keys())
+
+                    def on_embeddings(batch_chunks, embeddings):
+                        for chunk, embedding in zip(batch_chunks, embeddings):
+                            embedding_map[chunk.index] = embedding.embedding
+                            processed_indices.add(chunk.index)
+                        broadcast_preprocess_event(
+                            "preprocessing.speaker.progress",
+                            {
+                                "schema_version": "1.0",
+                                "job_id": job_id,
+                                "processed": len(processed_indices),
+                                "total": total_chunks,
+                                "percentage": round(len(processed_indices) / max(1, total_chunks) * 100, 2),
+                            },
+                        )
+                        if cache_service and speaker_metadata:
+                            try:
+                                progress = cache_service.build_speaker_progress(
+                                    processed_indices,
+                                    total_chunks,
+                                    complete=False,
+                                )
+                                cache_service.save_speaker_cache(embedding_map, speaker_metadata, progress)
+                            except Exception as cache_exc:
+                                self.logger.warning(
+                                    "[V3.2.0+dev.20260127.06] Speaker 缓存写入失败: %s",
+                                    cache_exc,
+                                )
+                        if token:
+                            if job_dir and (token.is_canceled or token.is_paused):
+                                token.check_and_save({"preprocessing": {"total_chunks": total_chunks}}, job_dir)
+                            else:
+                                token.raise_if_canceled()
+                                token.raise_if_paused()
+
+                    speaker_results = speaker_service.extract_embeddings(
+                        chunks=target_chunks,
+                        device=resolved_device,
+                        mode=self.config.language_detection_mode,
+                        on_embeddings=on_embeddings,
+                    )
+                    for chunk_index, embedding in speaker_results.items():
+                        embedding_map[chunk_index] = embedding.embedding
+
+                    if cache_service and speaker_metadata:
+                        processed_indices.update(embedding_map.keys())
+                        try:
+                            progress = cache_service.build_speaker_progress(
+                                processed_indices,
+                                total_chunks,
+                                complete=len(processed_indices) >= total_chunks,
+                            )
+                            cache_service.save_speaker_cache(embedding_map, speaker_metadata, progress)
+                        except Exception as cache_exc:
+                            self.logger.warning(
+                                "[V3.2.0+dev.20260127.06] Speaker 缓存写入失败: %s",
+                                cache_exc,
+                            )
+                elif cache_service and speaker_metadata and embedding_map and not cache_complete:
+                    try:
+                        progress = cache_service.build_speaker_progress(
+                            embedding_map.keys(),
+                            len(chunks),
+                            complete=True,
+                        )
+                        cache_service.save_speaker_cache(embedding_map, speaker_metadata, progress)
+                    except Exception as cache_exc:
+                        self.logger.warning(
+                            "[V3.2.0+dev.20260127.06] Speaker 缓存写入失败: %s",
+                            cache_exc,
+                        )
+
+                for chunk in chunks:
+                    chunk.speaker_embedding = embedding_map.get(chunk.index)
+
+                broadcast_preprocess_event(
+                    "preprocessing.speaker.completed",
+                    {
+                        "schema_version": "1.0",
+                        "job_id": job_id,
+                        "total_embeddings": len(embedding_map),
+                        "duration_ms": int((time.time() - speaker_started_at) * 1000),
+                        "cache_saved": bool(cache_service and speaker_metadata),
+                    },
+                )
+            except (CancelledException, PausedException):
+                raise
+            except Exception as e:
+                self.logger.error("[V3.2.0+dev.20260127.06] Speaker 失败，已跳过: %s", e)
+                broadcast_preprocess_event(
+                    "preprocessing.speaker.error",
+                    {
+                        "schema_version": "1.0",
+                        "job_id": job_id,
+                        "error_type": "speaker_failed",
+                        "message": str(e),
+                    },
+                )
+                for chunk in chunks:
+                    chunk.speaker_embedding = None
 
         self.logger.info(f"预处理流程完成: {len(chunks)} 个chunk准备就绪")
 

@@ -160,15 +160,46 @@
     files: [silero_vad.onnx]
   resources: {cpu_threads: 4}
 
+# V3.2.0+dev.20260127.01: SpeechBrain LangID/声纹本地化
 - id: langid-voxlingua
   kind: langid
   framework: torch
   format: pth
   default_device: cpu
-  compute_type: int8
+  compute_type: fp32
   source:
+    local_path: backend/models/pretrained/lang-id-voxlingua107-ecapa
     repo_id: speechbrain/lang-id-voxlingua107-ecapa
-  resources: {cpu_threads: 4}
+    files:
+      [
+        classifier.ckpt,
+        embedding_model.ckpt,
+        normalizer.ckpt,
+        hyperparams.yaml,
+        label_encoder.txt,
+        config.json,
+      ]
+  resources: {cpu_threads: 4, vram_mb: 200}
+
+- id: speaker-ecapa-voxceleb
+  kind: speaker
+  framework: torch
+  format: pth
+  default_device: cpu
+  compute_type: fp32
+  source:
+    local_path: backend/models/pretrained/spkrec-ecapa-voxceleb
+    repo_id: speechbrain/spkrec-ecapa-voxceleb
+    files:
+      [
+        classifier.ckpt,
+        embedding_model.ckpt,
+        mean_var_norm_emb.ckpt,
+        hyperparams.yaml,
+        label_encoder.txt,
+        config.json,
+      ]
+  resources: {cpu_threads: 4, vram_mb: 100}
 
 - id: punct-zh
   kind: punct

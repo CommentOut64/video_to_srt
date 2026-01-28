@@ -1,7 +1,8 @@
 """
 模型规格与来源定义（ModelSpec）
-用于统一描述各类模型（ASR/标点/VAD/分离/质量/LangID 等），支持多框架与扩展。
+用于统一描述各类模型（ASR/标点/VAD/分离/质量/LangID/声纹等），支持多框架与扩展。
 V3.2.0+dev.20260114.01
+V3.2.0+dev.20260127.01: 增加 speaker 模型类型。
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Any
 
 Framework = Literal["onnx", "torch", "ctranslate2", "external"]
-ModelKind = Literal["asr", "punct", "vad", "separation", "quality", "langid"]
+ModelKind = Literal["asr", "punct", "vad", "separation", "quality", "langid", "speaker"]
 
 
 @dataclass

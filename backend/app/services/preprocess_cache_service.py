@@ -6,6 +6,7 @@ V3.2.0+dev.20260123.01: 修复分离缓存原子写入格式识别
 V3.2.0+dev.20260123.02: 修复音频原子写入的 fsync 句柄类型问题
 V3.2.0+dev.20260123.03: 分离缓存优先恢复与元数据复用
 V3.2.0+dev.20260123.04: 分离缓存容错恢复（产物完整即可跳过）
+V3.2.0+dev.20260127.05: 增加 LangID/Speaker 缓存与进度恢复
 """
 from __future__ import annotations
 
@@ -43,6 +44,16 @@ class PreprocessCachePaths:
     separation_full_dir: Path
     separation_full_audio_path: Path
     separation_full_state_path: Path
+    langid_dir: Path
+    langid_language_map_path: Path
+    langid_progress_path: Path
+    langid_metadata_path: Path
+    langid_report_path: Path
+    speaker_dir: Path
+    speaker_embeddings_path: Path
+    speaker_index_map_path: Path
+    speaker_progress_path: Path
+    speaker_metadata_path: Path
 
 
 class PreprocessCacheService:
@@ -52,7 +63,7 @@ class PreprocessCacheService:
     负责 VAD / 频谱分诊 / 人声分离缓存的写入、校验与恢复。
     """
 
-    VERSION = "3.2.0+dev.20260123.04"
+    VERSION = "3.2.0+dev.20260127.05"
 
     def __init__(self, job_dir: Path, logger: Optional[logging.Logger] = None) -> None:
         self.job_dir = Path(job_dir)
@@ -70,6 +81,8 @@ class PreprocessCacheService:
         triage_dir = base_dir / "triage"
         separation_dir = base_dir / "separation"
         separation_full_dir = base_dir / "separation_full"
+        langid_dir = base_dir / "langid"
+        speaker_dir = base_dir / "speaker"
         return PreprocessCachePaths(
             base_dir=base_dir,
             manifest_path=base_dir / "manifest.json",
@@ -83,6 +96,16 @@ class PreprocessCacheService:
             separation_full_dir=separation_full_dir,
             separation_full_audio_path=separation_full_dir / "vocals_full.wav",
             separation_full_state_path=separation_full_dir / "separation_full_state.json",
+            langid_dir=langid_dir,
+            langid_language_map_path=langid_dir / "language_map.json",
+            langid_progress_path=langid_dir / "progress.json",
+            langid_metadata_path=langid_dir / "metadata.json",
+            langid_report_path=langid_dir / "langid_report.json",
+            speaker_dir=speaker_dir,
+            speaker_embeddings_path=speaker_dir / "embeddings.npy",
+            speaker_index_map_path=speaker_dir / "index_map.json",
+            speaker_progress_path=speaker_dir / "progress.json",
+            speaker_metadata_path=speaker_dir / "metadata.json",
         )
 
     def ensure_dirs(self) -> None:
@@ -92,6 +115,8 @@ class PreprocessCacheService:
         self.paths.triage_dir.mkdir(parents=True, exist_ok=True)
         self.paths.separation_dir.mkdir(parents=True, exist_ok=True)
         self.paths.separation_full_dir.mkdir(parents=True, exist_ok=True)
+        self.paths.langid_dir.mkdir(parents=True, exist_ok=True)
+        self.paths.speaker_dir.mkdir(parents=True, exist_ok=True)
 
     def load_manifest(self) -> Dict[str, Any]:
         """加载 manifest，如果不存在则创建默认结构"""
@@ -577,6 +602,264 @@ class PreprocessCacheService:
             extra={"processed": processed, "total_chunks": total_chunks},
         )
 
+    def recover_langid_cache(
+        self,
+        chunks: Iterable[AudioChunk],
+        expected_metadata: Dict[str, Any],
+    ) -> Optional[Tuple[Dict[int, Dict[str, Any]], List[int], bool]]:
+        """恢复 LangID 缓存，返回 (语言映射, 缺失索引, 是否完成)"""
+        if not expected_metadata:
+            return None
+        if not self.paths.langid_metadata_path.exists():
+            return None
+        if not self.paths.langid_language_map_path.exists():
+            return None
+
+        cached_metadata = self._load_json(self.paths.langid_metadata_path)
+        if cached_metadata is None:
+            return None
+        if not self._match_langid_metadata(cached_metadata, expected_metadata):
+            return None
+
+        raw_map = self._load_json(self.paths.langid_language_map_path)
+        lang_map = self._normalize_langid_map(raw_map)
+        if not lang_map:
+            return None
+
+        progress = self._load_json(self.paths.langid_progress_path) or {}
+        chunk_indices = {chunk.index for chunk in chunks}
+        cached_indices = set(lang_map.keys())
+        complete = bool(progress.get("complete", False))
+        if not progress:
+            complete = cached_indices == chunk_indices
+        if complete and cached_indices != chunk_indices:
+            return None
+
+        missing = sorted(chunk_indices - cached_indices)
+        return lang_map, missing, complete
+
+    def save_langid_cache(
+        self,
+        language_map: Dict[int, Dict[str, Any]],
+        metadata: Dict[str, Any],
+        progress: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """写入 LangID 缓存（language_map + metadata + progress）"""
+        if not language_map:
+            return
+        self.ensure_dirs()
+
+        sanitized_map = {
+            str(index): {
+                "language": str(payload.get("language", "auto")),
+                "confidence": float(payload.get("confidence", 0.0)),
+                "raw_label": payload.get("raw_label"),
+                "raw_language": payload.get("raw_language"),
+                "raw_confidence": (
+                    float(payload.get("raw_confidence"))
+                    if payload.get("raw_confidence") is not None
+                    else None
+                ),
+            }
+            for index, payload in language_map.items()
+        }
+        self._atomic_write_json(self.paths.langid_language_map_path, sanitized_map)
+        self._atomic_write_json(self.paths.langid_metadata_path, metadata)
+        if progress:
+            self._atomic_write_json(self.paths.langid_progress_path, progress)
+
+        completed = bool(progress.get("complete", True)) if progress else True
+        self.update_manifest_stage(
+            stage="langid",
+            completed=completed,
+            state_file=str(Path("langid") / self.paths.langid_progress_path.name),
+            extra={"total_chunks": progress.get("total_chunks") if progress else len(language_map)},
+        )
+
+    def save_langid_report(
+        self,
+        chunks: List[AudioChunk],
+        language_map: Dict[int, Dict[str, Any]],
+        metadata: Dict[str, Any],
+        confidence_threshold: float,
+    ) -> None:
+        """写入 LangID 详细报告（包含白名单前后标签与置信度）"""
+        if not chunks:
+            return
+        if not language_map:
+            return
+        self.ensure_dirs()
+
+        report_items: List[Dict[str, Any]] = []
+        for chunk in chunks:
+            payload = language_map.get(chunk.index, {})
+            raw_confidence = payload.get("raw_confidence")
+            if raw_confidence is None:
+                raw_confidence = payload.get("confidence", 0.0)
+            report_items.append(
+                {
+                    "chunk_index": int(chunk.index),
+                    "raw_label": payload.get("raw_label"),
+                    "raw_language": payload.get("raw_language"),
+                    "language_whitelist": payload.get("language", "auto"),
+                    "confidence": float(raw_confidence or 0.0),
+                }
+            )
+
+        report = {
+            "schema_version": "1.0",
+            "job_id": self.job_dir.name,
+            "generated_at": self._now_iso(),
+            "total_chunks": len(chunks),
+            "confidence_threshold": float(confidence_threshold),
+            "metadata": {
+                "mode": metadata.get("mode"),
+                "model_id": metadata.get("model_id"),
+                "model_repo": metadata.get("model_repo"),
+                "model_hash": metadata.get("model_hash"),
+                "resolved_device": metadata.get("resolved_device"),
+                "whitelist": metadata.get("whitelist", []),
+                "logit_bias_score": metadata.get("logit_bias_score"),
+            },
+            "items": report_items,
+        }
+
+        self._atomic_write_json(self.paths.langid_report_path, report)
+
+    @staticmethod
+    def build_langid_progress(
+        processed_indices: Iterable[int],
+        total_chunks: int,
+        complete: bool,
+    ) -> Dict[str, Any]:
+        """构建 LangID 进度快照"""
+        processed = sorted({int(idx) for idx in processed_indices})
+        last_batch_end = processed[-1] if processed else -1
+        return {
+            "complete": bool(complete),
+            "processed_indices": processed,
+            "last_batch_end": last_batch_end,
+            "total_chunks": int(total_chunks),
+            "updated_at": PreprocessCacheService._now_iso(),
+        }
+
+    def recover_speaker_cache(
+        self,
+        chunks: Iterable[AudioChunk],
+        expected_metadata: Dict[str, Any],
+    ) -> Optional[Tuple[Dict[int, List[float]], List[int], bool]]:
+        """恢复 Speaker 缓存，返回 (embedding映射, 缺失索引, 是否完成)"""
+        if not expected_metadata:
+            return None
+        if not self.paths.speaker_metadata_path.exists():
+            return None
+        if not self.paths.speaker_index_map_path.exists():
+            return None
+        if not self.paths.speaker_embeddings_path.exists():
+            return None
+
+        cached_metadata = self._load_json(self.paths.speaker_metadata_path)
+        if cached_metadata is None:
+            return None
+        if not self._match_speaker_metadata(cached_metadata, expected_metadata):
+            return None
+
+        raw_index_map = self._load_json(self.paths.speaker_index_map_path)
+        index_map = self._normalize_index_map(raw_index_map)
+        if not index_map:
+            return None
+
+        try:
+            embeddings = np.load(self.paths.speaker_embeddings_path)
+        except Exception as exc:
+            self.logger.warning("加载 speaker embeddings 失败: %s", exc)
+            return None
+        if embeddings.ndim != 2:
+            return None
+
+        embedding_map: Dict[int, List[float]] = {}
+        for chunk in chunks:
+            idx = index_map.get(chunk.index)
+            if idx is None or idx >= embeddings.shape[0]:
+                continue
+            embedding_map[chunk.index] = embeddings[idx].astype(float).tolist()
+
+        progress = self._load_json(self.paths.speaker_progress_path) or {}
+        chunk_indices = {chunk.index for chunk in chunks}
+        cached_indices = set(embedding_map.keys())
+        complete = bool(progress.get("complete", False))
+        if not progress:
+            complete = cached_indices == chunk_indices
+        if complete and cached_indices != chunk_indices:
+            return None
+
+        missing = sorted(chunk_indices - cached_indices)
+        return embedding_map, missing, complete
+
+    def save_speaker_cache(
+        self,
+        embedding_map: Dict[int, List[float]],
+        metadata: Dict[str, Any],
+        progress: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """写入 Speaker 缓存（embeddings.npy + index_map + metadata + progress）"""
+        if not embedding_map:
+            return
+        self.ensure_dirs()
+
+        vectors: List[np.ndarray] = []
+        index_map: Dict[str, int] = {}
+        embedding_dim: Optional[int] = metadata.get("embedding_dim") if metadata else None
+        for chunk_index, vector in embedding_map.items():
+            array = np.asarray(vector, dtype=np.float32).reshape(-1)
+            if embedding_dim is None:
+                embedding_dim = int(array.shape[0])
+            if int(array.shape[0]) != int(embedding_dim):
+                self.logger.warning("Speaker embedding 维度不一致: chunk=%s", chunk_index)
+                continue
+            index_map[str(chunk_index)] = len(vectors)
+            vectors.append(array)
+
+        if not vectors:
+            return
+
+        if metadata is None:
+            metadata = {}
+        if embedding_dim is not None:
+            metadata = {**metadata, "embedding_dim": int(embedding_dim)}
+
+        embeddings = np.stack(vectors, axis=0)
+        self._atomic_write_numpy(self.paths.speaker_embeddings_path, embeddings)
+        self._atomic_write_json(self.paths.speaker_index_map_path, index_map)
+        self._atomic_write_json(self.paths.speaker_metadata_path, metadata)
+        if progress:
+            self._atomic_write_json(self.paths.speaker_progress_path, progress)
+
+        completed = bool(progress.get("complete", True)) if progress else True
+        self.update_manifest_stage(
+            stage="speaker",
+            completed=completed,
+            state_file=str(Path("speaker") / self.paths.speaker_progress_path.name),
+            extra={"total_chunks": progress.get("total_chunks") if progress else len(index_map)},
+        )
+
+    @staticmethod
+    def build_speaker_progress(
+        processed_indices: Iterable[int],
+        total_chunks: int,
+        complete: bool,
+    ) -> Dict[str, Any]:
+        """构建 Speaker 进度快照"""
+        processed = sorted({int(idx) for idx in processed_indices})
+        last_batch_end = processed[-1] if processed else -1
+        return {
+            "complete": bool(complete),
+            "processed_indices": processed,
+            "last_batch_end": last_batch_end,
+            "total_chunks": int(total_chunks),
+            "updated_at": PreprocessCacheService._now_iso(),
+        }
+
     def reset_separation_cache(self) -> None:
         """清理分离缓存（全局分离暂停回滚）"""
         state = self._separation_state or self._load_separation_state()
@@ -768,6 +1051,119 @@ class PreprocessCacheService:
             )
         return chunks
 
+    def _load_json(self, path: Path) -> Optional[Any]:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as exc:
+            self.logger.warning("加载缓存文件失败: %s -> %s", path, exc)
+            return None
+
+    @staticmethod
+    def _float_equal(left: Optional[float], right: Optional[float], tol: float = 1e-6) -> bool:
+        if left is None or right is None:
+            return left is right
+        try:
+            return abs(float(left) - float(right)) <= tol
+        except (TypeError, ValueError):
+            return False
+
+    def _match_langid_metadata(self, cached: Dict[str, Any], expected: Dict[str, Any]) -> bool:
+        keys = (
+            "schema_version",
+            "mode",
+            "model_id",
+            "model_repo",
+            "model_hash",
+            "target_duration_seconds",
+            "batch_size",
+            "resolved_device",
+            "torch_version",
+            "speechbrain_version",
+            "language_code_standard",
+            "whitelist",
+            "logit_bias_score",
+        )
+        for key in keys:
+            expected_value = expected.get(key)
+            cached_value = cached.get(key)
+            if key in {"target_duration_seconds", "logit_bias_score"}:
+                if not self._float_equal(cached_value, expected_value):
+                    return False
+                continue
+            if expected_value is None:
+                continue
+            if cached_value != expected_value:
+                return False
+        return True
+
+    def _match_speaker_metadata(self, cached: Dict[str, Any], expected: Dict[str, Any]) -> bool:
+        keys = (
+            "schema_version",
+            "model_id",
+            "model_repo",
+            "model_hash",
+            "embedding_dim",
+            "resolved_device",
+            "torch_version",
+            "speechbrain_version",
+        )
+        for key in keys:
+            expected_value = expected.get(key)
+            cached_value = cached.get(key)
+            if expected_value is None:
+                continue
+            if cached_value != expected_value:
+                return False
+        return True
+
+    @staticmethod
+    def _normalize_langid_map(raw_map: Any) -> Dict[int, Dict[str, Any]]:
+        if not isinstance(raw_map, dict):
+            return {}
+        normalized: Dict[int, Dict[str, Any]] = {}
+        for raw_key, payload in raw_map.items():
+            try:
+                index = int(raw_key)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            language = payload.get("language")
+            if language is None:
+                continue
+            confidence = payload.get("confidence", 0.0)
+            try:
+                confidence_value = float(confidence)
+            except (TypeError, ValueError):
+                confidence_value = 0.0
+            normalized[index] = {
+                "language": str(language),
+                "confidence": confidence_value,
+                "raw_label": payload.get("raw_label"),
+                "raw_language": payload.get("raw_language"),
+                "raw_confidence": (
+                    float(payload.get("raw_confidence"))
+                    if payload.get("raw_confidence") is not None
+                    else None
+                ),
+            }
+        return normalized
+
+    @staticmethod
+    def _normalize_index_map(raw_map: Any) -> Dict[int, int]:
+        if not isinstance(raw_map, dict):
+            return {}
+        normalized: Dict[int, int] = {}
+        for raw_key, raw_value in raw_map.items():
+            try:
+                index = int(raw_key)
+                value = int(raw_value)
+            except (TypeError, ValueError):
+                continue
+            normalized[index] = value
+        return normalized
+
     @staticmethod
     def _now_iso() -> str:
         return datetime.utcnow().isoformat() + "Z"
@@ -785,6 +1181,16 @@ class PreprocessCacheService:
         temp_path = path.with_suffix(path.suffix + ".tmp")
         with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+
+    @staticmethod
+    def _atomic_write_numpy(path: Path, array: np.ndarray) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_suffix(path.suffix + ".tmp")
+        with open(temp_path, "wb") as f:
+            np.save(f, array)
             f.flush()
             os.fsync(f.fileno())
         os.replace(temp_path, path)

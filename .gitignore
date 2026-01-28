@@ -85,6 +85,7 @@ output/
 llmdoc/
 
 # 测试文件
+tests
 test_*
 *_test.py
 tests_output/
@@ -98,3 +99,8 @@ patch_tools/apply_patch.py
 
 scripts
 archive
+openspec
+openspec
+AGENTS.md
+
+artifacts
