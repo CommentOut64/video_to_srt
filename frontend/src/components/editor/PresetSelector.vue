@@ -83,6 +83,33 @@
             <span v-if="option.hint" class="option-hint">{{ option.hint }}</span>
           </label>
         </div>
+        <div class="mt-2 flex flex-col gap-2">
+          <div class="text-[11px] text-[var(--text-muted)]">语言检测</div>
+          <label class="flex items-center gap-2 text-[11px]">
+            <span class="w-16 text-[var(--text-muted)]">模式</span>
+            <select
+              v-model="localConfig.preprocessing.language_detection_mode"
+              class="flex-1 rounded border border-[var(--border-default)] bg-[var(--bg-tertiary)] px-2 py-1 text-[11px] text-[var(--text-normal)]"
+              @change="onModuleChange"
+            >
+              <option value="fast">极速</option>
+              <option value="balanced">智能平衡</option>
+              <option value="precise">精准</option>
+            </select>
+          </label>
+          <label class="flex items-center gap-2 text-[11px]">
+            <input
+              type="checkbox"
+              v-model="localConfig.preprocessing.enable_speaker_embedding"
+              class="h-3 w-3 accent-[var(--primary)]"
+              @change="onModuleChange"
+            />
+            <span class="text-[var(--text-normal)]">启用声纹提取</span>
+          </label>
+          <div class="text-[10px] text-[var(--text-muted)]">
+            声纹数据仅用于后续说话人聚类（默认关闭）
+          </div>
+        </div>
       </div>
 
       <!-- 模块二: 转录核心 -->
@@ -168,7 +195,13 @@ const props = defineProps({
         separation_mode: 'on_demand',
         spectrum_threshold: 0.35,
         vad_filter: true,
-        enable_spectral_triage: true
+        enable_spectral_triage: true,
+        language_detection_mode: 'balanced',
+        language_detection_device: 'auto',
+        enable_speaker_embedding: false,
+        langid_confidence_threshold: 0.7,
+        langid_whitelist: ['zh', 'ja', 'en'],
+        langid_logit_bias_score: 2.5
       },
       transcription: {
         transcription_profile: 'sv_whisper_patch',
@@ -226,7 +259,13 @@ const macroPresets = [
     requiresGpu: false,
     config: {
       // 直通模式: 完全跳过频谱分诊和人声分离
-      preprocessing: { demucs_strategy: 'off', separation_mode: 'on_demand', enable_spectral_triage: false },
+      preprocessing: {
+        demucs_strategy: 'off',
+        separation_mode: 'on_demand',
+        enable_spectral_triage: false,
+        language_detection_mode: 'balanced',
+        enable_speaker_embedding: false
+      },
       transcription: { transcription_profile: 'sensevoice_only' },
       refinement: { llm_task: 'off', llm_scope: 'sparse' }
     }
@@ -240,7 +279,13 @@ const macroPresets = [
     requiresGpu: true,
     config: {
       // 智能模式: 启用频谱分诊，按需分离
-      preprocessing: { demucs_strategy: 'auto', separation_mode: 'on_demand', enable_spectral_triage: true },
+      preprocessing: {
+        demucs_strategy: 'auto',
+        separation_mode: 'on_demand',
+        enable_spectral_triage: true,
+        language_detection_mode: 'balanced',
+        enable_speaker_embedding: false
+      },
       transcription: { transcription_profile: 'sv_whisper_patch' },
       refinement: { llm_task: 'proofread', llm_scope: 'sparse' }
     }
@@ -254,7 +299,13 @@ const macroPresets = [
     requiresGpu: true,
     config: {
       // 极致模式: 强制全局分离，频谱分诊可跳过（因为会强制分离）
-      preprocessing: { demucs_strategy: 'force_on', separation_mode: 'global', enable_spectral_triage: false },
+      preprocessing: {
+        demucs_strategy: 'force_on',
+        separation_mode: 'global',
+        enable_spectral_triage: false,
+        language_detection_mode: 'balanced',
+        enable_speaker_embedding: false
+      },
       transcription: { transcription_profile: 'sv_whisper_dual' },
       refinement: { llm_task: 'proofread', llm_scope: 'global' }
     }
@@ -491,6 +542,8 @@ function onModuleChange() {
   const matchedPreset = macroPresets.find(preset => {
     return (
       localConfig.value.preprocessing.demucs_strategy === preset.config.preprocessing.demucs_strategy &&
+      localConfig.value.preprocessing.language_detection_mode === preset.config.preprocessing.language_detection_mode &&
+      localConfig.value.preprocessing.enable_speaker_embedding === preset.config.preprocessing.enable_speaker_embedding &&
       localConfig.value.transcription.transcription_profile === preset.config.transcription.transcription_profile &&
       localConfig.value.refinement.llm_task === preset.config.refinement.llm_task &&
       localConfig.value.refinement.llm_scope === preset.config.refinement.llm_scope

@@ -392,7 +392,13 @@ const taskConfig = ref({
     separation_mode: 'on_demand',
     spectrum_threshold: 0.35,
     vad_filter: true,
-    enable_spectral_triage: true
+    enable_spectral_triage: true,
+    language_detection_mode: 'balanced',
+    language_detection_device: 'auto',
+    enable_speaker_embedding: false,
+    langid_confidence_threshold: 0.7,
+    langid_whitelist: ['zh', 'ja', 'en'],
+    langid_logit_bias_score: 2.5
   },
   transcription: {
     transcription_profile: 'sv_whisper_patch',
