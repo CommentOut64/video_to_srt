@@ -5,6 +5,7 @@ V3.2.0+dev.20260127.02: 实现 LangID 三模式检测与中心裁剪批推理。
 V3.2.0+dev.20260127.03: 支持 Logit Bias + 动态白名单。
 V3.2.0+dev.20260127.04: 解析 LangID 标签前缀代码并用于白名单匹配。
 V3.2.0+dev.20260127.05: 增加缓存元数据与分批回调钩子。
+V3.2.0+dev.20260127.08: 设备选择与批处理大小自适应。
 """
 from __future__ import annotations
 
@@ -26,6 +27,9 @@ class LangIDPrediction:
     """LangID 预测结果（仅保留关键字段）"""
     language: str
     confidence: float
+    raw_label: Optional[str] = None
+    raw_language: Optional[str] = None
+    raw_confidence: Optional[float] = None
 
 
 LangIDPredictionCallback = Optional[
@@ -110,7 +114,7 @@ class SpeechAnalysisService:
             return {}
 
         resolved_mode = mode if mode in ("fast", "balanced", "precise") else "balanced"
-        resolved_device, cpu_threads = self._resolve_runtime(resolved_mode, device)
+        resolved_device, cpu_threads, batch_size = self._resolve_runtime(resolved_mode, device)
         self._apply_cpu_threads(resolved_device, cpu_threads)
         normalized_whitelist = self._normalize_language_whitelist(whitelist)
         bias_score = self._normalize_logit_bias_score(logit_bias_score)
@@ -119,6 +123,7 @@ class SpeechAnalysisService:
             return self._detect_fast(
                 chunks,
                 resolved_device,
+                batch_size,
                 normalized_whitelist,
                 bias_score,
                 on_predictions=on_predictions,
@@ -127,6 +132,7 @@ class SpeechAnalysisService:
             return self._detect_precise(
                 chunks,
                 resolved_device,
+                batch_size,
                 normalized_whitelist,
                 bias_score,
                 on_predictions=on_predictions,
@@ -134,6 +140,7 @@ class SpeechAnalysisService:
         return self._detect_balanced(
             chunks,
             resolved_device,
+            batch_size,
             normalized_whitelist,
             bias_score,
             on_predictions=on_predictions,
@@ -148,8 +155,7 @@ class SpeechAnalysisService:
     ) -> Dict[str, Any]:
         """构建 LangID 缓存元数据，确保命中一致性。"""
         resolved_mode = mode if mode in ("fast", "balanced", "precise") else "balanced"
-        resolved_device, _ = self._resolve_runtime(resolved_mode, device)
-        batch_size = self.BATCH_SIZE_GPU if resolved_device != "cpu" else self.BATCH_SIZE_CPU
+        resolved_device, cpu_threads, batch_size = self._resolve_runtime(resolved_mode, device)
         normalized_whitelist = self._normalize_language_whitelist(whitelist)
         bias_score = self._normalize_logit_bias_score(logit_bias_score)
 
@@ -208,6 +214,7 @@ class SpeechAnalysisService:
         self,
         chunks: Sequence[AudioChunk],
         device: str,
+        batch_size: int,
         whitelist: Optional[Sequence[str]],
         logit_bias_score: float,
         on_predictions: LangIDPredictionCallback = None,
@@ -218,6 +225,7 @@ class SpeechAnalysisService:
             return self._detect_balanced(
                 chunks,
                 device,
+                batch_size,
                 whitelist,
                 logit_bias_score,
                 on_predictions=on_predictions,
@@ -227,6 +235,7 @@ class SpeechAnalysisService:
         predictions = self._classify_chunks_in_batches(
             sample_chunks,
             device,
+            batch_size,
             whitelist,
             logit_bias_score,
             on_predictions=None,
@@ -250,6 +259,7 @@ class SpeechAnalysisService:
         return self._detect_balanced(
             chunks,
             device,
+            batch_size,
             whitelist,
             logit_bias_score,
             on_predictions=on_predictions,
@@ -259,6 +269,7 @@ class SpeechAnalysisService:
         self,
         chunks: Sequence[AudioChunk],
         device: str,
+        batch_size: int,
         whitelist: Optional[Sequence[str]],
         logit_bias_score: float,
         on_predictions: LangIDPredictionCallback = None,
@@ -276,6 +287,7 @@ class SpeechAnalysisService:
                 group_predictions = self._classify_chunks_in_batches(
                     group,
                     device,
+                    batch_size,
                     whitelist,
                     logit_bias_score,
                     on_predictions=on_predictions,
@@ -292,6 +304,7 @@ class SpeechAnalysisService:
         probe_predictions = self._classify_chunks_in_batches(
             probes,
             device,
+            batch_size,
             whitelist,
             logit_bias_score,
             on_predictions=None,
@@ -309,6 +322,7 @@ class SpeechAnalysisService:
                 group_predictions = self._classify_chunks_in_batches(
                     group,
                     device,
+                    batch_size,
                     whitelist,
                     logit_bias_score,
                     on_predictions=on_predictions,
@@ -336,6 +350,7 @@ class SpeechAnalysisService:
                 group_predictions = self._classify_chunks_in_batches(
                     group,
                     device,
+                    batch_size,
                     whitelist,
                     logit_bias_score,
                     on_predictions=on_predictions,
@@ -349,6 +364,7 @@ class SpeechAnalysisService:
             decisions,
             results,
             device,
+            batch_size,
             whitelist,
             logit_bias_score,
             on_predictions=on_predictions,
@@ -359,6 +375,7 @@ class SpeechAnalysisService:
         self,
         chunks: Sequence[AudioChunk],
         device: str,
+        batch_size: int,
         whitelist: Optional[Sequence[str]],
         logit_bias_score: float,
         on_predictions: LangIDPredictionCallback = None,
@@ -366,6 +383,7 @@ class SpeechAnalysisService:
         predictions = self._classify_chunks_in_batches(
             chunks,
             device,
+            batch_size,
             whitelist,
             logit_bias_score,
             on_predictions=on_predictions,
@@ -381,6 +399,7 @@ class SpeechAnalysisService:
         decisions: Sequence[Optional[LangIDGroupDecision]],
         results: Dict[int, LangIDPrediction],
         device: str,
+        batch_size: int,
         whitelist: Optional[Sequence[str]],
         logit_bias_score: float,
         on_predictions: LangIDPredictionCallback = None,
@@ -402,6 +421,7 @@ class SpeechAnalysisService:
             boundary_predictions = self._classify_chunks_in_batches(
                 boundary_chunks,
                 device,
+                batch_size,
                 whitelist,
                 logit_bias_score,
                 on_predictions=on_predictions,
@@ -413,6 +433,7 @@ class SpeechAnalysisService:
         self,
         chunks: Sequence[AudioChunk],
         device: str,
+        batch_size: int,
         whitelist: Optional[Sequence[str]],
         logit_bias_score: float,
         on_predictions: LangIDPredictionCallback = None,
@@ -420,10 +441,11 @@ class SpeechAnalysisService:
         if not chunks:
             return []
 
-        batch_size = self.BATCH_SIZE_GPU if device != "cpu" else self.BATCH_SIZE_CPU
+        effective_batch_size = batch_size or (self.BATCH_SIZE_GPU if device != "cpu" else self.BATCH_SIZE_CPU)
+        effective_batch_size = max(1, int(effective_batch_size))
         predictions: List[LangIDPrediction] = []
-        for start in range(0, len(chunks), batch_size):
-            batch = chunks[start:start + batch_size]
+        for start in range(0, len(chunks), effective_batch_size):
+            batch = chunks[start:start + effective_batch_size]
             batch_predictions = self._classify_batch(batch, device, whitelist, logit_bias_score)
             self._emit_predictions(on_predictions, batch, batch_predictions)
             predictions.extend(batch_predictions)
@@ -608,22 +630,35 @@ class SpeechAnalysisService:
         predictions: List[LangIDPrediction] = []
         for i in range(batch_size):
             label = labels[i] if labels and i < len(labels) else "auto"
-            language = self._extract_label_code(label)
+            raw_label = label
+            raw_language = self._extract_label_code(raw_label)
+            raw_confidence = float(confidences[i].item())
 
             # V3.2.0+dev.20260127.05: 添加详细调试日志
             self.logger.debug(
-                f"LangID 样本 {i}: 原始标签={label}, 提取语言={language}, "
-                f"置信度={confidences[i].item():.4f}, 白名单={whitelist_set}"
+                f"LangID 样本 {i}: 原始标签={raw_label}, 提取语言={raw_language}, "
+                f"置信度={raw_confidence:.4f}, 白名单={whitelist_set}"
             )
 
-            if whitelist_set and language not in whitelist_set:
-                self.logger.debug(f"LangID 样本 {i}: 语言 '{language}' 不在白名单中，回退到 auto")
-                predictions.append(LangIDPrediction(language="auto", confidence=0.0))
+            if whitelist_set and raw_language not in whitelist_set:
+                self.logger.debug(f"LangID 样本 {i}: 语言 '{raw_language}' 不在白名单中，回退到 auto")
+                predictions.append(
+                    LangIDPrediction(
+                        language="auto",
+                        confidence=0.0,
+                        raw_label=raw_label,
+                        raw_language=raw_language,
+                        raw_confidence=raw_confidence,
+                    )
+                )
                 continue
             predictions.append(
                 LangIDPrediction(
-                    language=language,
-                    confidence=float(confidences[i].item()),
+                    language=raw_language or "auto",
+                    confidence=raw_confidence,
+                    raw_label=raw_label,
+                    raw_language=raw_language,
+                    raw_confidence=raw_confidence,
                 )
             )
         return predictions
@@ -774,10 +809,10 @@ class SpeechAnalysisService:
             labels = list(labels)
         if isinstance(labels, list):
             if len(labels) == batch_size and all(isinstance(item, str) for item in labels):
-                return [SpeechAnalysisService._extract_label_code(item) for item in labels]
+                return labels
             if len(labels) == batch_size and all(isinstance(item, (list, tuple)) for item in labels):
                 return [
-                    SpeechAnalysisService._extract_label_code(item[0]) if item else "auto"
+                    str(item[0]) if item else "auto"
                     for item in labels
                 ]
         return None
@@ -786,8 +821,11 @@ class SpeechAnalysisService:
         self,
         mode: LangIDMode,
         device_preference: str,
-    ) -> Tuple[str, Optional[int]]:
+    ) -> Tuple[str, Optional[int], int]:
         cpu_threads: Optional[int] = None
+        runtime_device: Optional[str] = None
+        hardware_info = None
+        max_vram_mb: Optional[int] = None
 
         try:
             from app.services.model_manager_v2 import get_model_manager_v2
@@ -797,21 +835,61 @@ class SpeechAnalysisService:
             spec = manager.registry.get(self.model_id)
             runtime = get_model_runtime_config_service().get_effective_model(spec).get("effective", {})
             cpu_threads = runtime.get("cpu_threads")
+            runtime_device = runtime.get("device")
         except Exception as exc:
             self.logger.warning("LangID 运行参数回退: %s", exc)
 
+        try:
+            from app.services.hardware_profile_service import get_hardware_profile_provider
+
+            hardware_info = get_hardware_profile_provider().get_hardware_info()
+        except Exception as exc:
+            self.logger.debug("LangID 硬件信息获取失败: %s", exc)
+
+        if cpu_threads is None and hardware_info:
+            base_threads = hardware_info.cpu_threads or hardware_info.cpu_cores or 1
+            cpu_threads = max(1, int(base_threads) - 4)
+
+        if hardware_info and hardware_info.gpu_memory_mb:
+            max_vram_mb = max(hardware_info.gpu_memory_mb)
+
         if device_preference != "auto":
             resolved_device = device_preference
+        elif runtime_device and runtime_device != "auto":
+            resolved_device = runtime_device
         elif mode == "precise" and self._cuda_available():
             resolved_device = "cuda"
         else:
             resolved_device = "cpu"
 
-        if resolved_device == "cuda" and not self._cuda_available():
+        if resolved_device.startswith("cuda") and not self._cuda_available():
             self.logger.warning("LangID 选择 GPU 失败，回退 CPU")
             resolved_device = "cpu"
 
-        return resolved_device, cpu_threads
+        batch_size = self._resolve_batch_size(resolved_device, cpu_threads, max_vram_mb)
+
+        return resolved_device, cpu_threads, batch_size
+
+    @classmethod
+    def _resolve_batch_size(
+        cls,
+        device: str,
+        cpu_threads: Optional[int],
+        max_vram_mb: Optional[int],
+    ) -> int:
+        if device == "cpu":
+            batch_size = cls.BATCH_SIZE_CPU
+            if cpu_threads and cpu_threads < 4:
+                batch_size = max(8, int(cpu_threads) * 4)
+            return batch_size
+
+        if max_vram_mb is None:
+            return cls.BATCH_SIZE_GPU
+        if max_vram_mb < 2000:
+            return 16
+        if max_vram_mb < 4000:
+            return 32
+        return cls.BATCH_SIZE_GPU
 
     def _apply_cpu_threads(self, device: str, cpu_threads: Optional[int]) -> None:
         if device != "cpu" or not cpu_threads:

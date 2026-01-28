@@ -2,6 +2,7 @@
 SpeakerEmbeddingService - 声纹提取服务
 
 V3.2.0+dev.20260127.06: 新增声纹批量推理与缓存元数据构建。
+V3.2.0+dev.20260127.08: 设备选择与批处理大小自适应。
 """
 from __future__ import annotations
 
@@ -79,9 +80,8 @@ class SpeakerEmbeddingService(SpeakerEmbeddingProvider):
         if not chunks:
             return {}
 
-        resolved_device, cpu_threads = self._resolve_runtime(mode, device)
+        resolved_device, cpu_threads, batch_size = self._resolve_runtime(mode, device)
         self._apply_cpu_threads(resolved_device, cpu_threads)
-        batch_size = self.BATCH_SIZE_GPU if resolved_device != "cpu" else self.BATCH_SIZE_CPU
 
         results: Dict[int, SpeakerEmbeddingResult] = {}
         for start in range(0, len(chunks), batch_size):
@@ -99,8 +99,7 @@ class SpeakerEmbeddingService(SpeakerEmbeddingProvider):
         device: str,
     ) -> Dict[str, Any]:
         """构建 Speaker 缓存元数据，确保命中一致性。"""
-        resolved_device, _ = self._resolve_runtime(mode, device)
-        batch_size = self.BATCH_SIZE_GPU if resolved_device != "cpu" else self.BATCH_SIZE_CPU
+        resolved_device, _, batch_size = self._resolve_runtime(mode, device)
 
         model_repo = None
         model_hash = None
@@ -235,8 +234,11 @@ class SpeakerEmbeddingService(SpeakerEmbeddingProvider):
         self,
         mode: Optional[str],
         device_preference: str,
-    ) -> Tuple[str, Optional[int]]:
+    ) -> Tuple[str, Optional[int], int]:
         cpu_threads: Optional[int] = None
+        runtime_device: Optional[str] = None
+        hardware_info = None
+        max_vram_mb: Optional[int] = None
 
         try:
             from app.services.model_manager_v2 import get_model_manager_v2
@@ -246,11 +248,28 @@ class SpeakerEmbeddingService(SpeakerEmbeddingProvider):
             spec = manager.registry.get(self.model_id)
             runtime = get_model_runtime_config_service().get_effective_model(spec).get("effective", {})
             cpu_threads = runtime.get("cpu_threads")
+            runtime_device = runtime.get("device")
         except Exception as exc:
             self.logger.warning("Speaker 运行参数回退: %s", exc)
 
+        try:
+            from app.services.hardware_profile_service import get_hardware_profile_provider
+
+            hardware_info = get_hardware_profile_provider().get_hardware_info()
+        except Exception as exc:
+            self.logger.debug("Speaker 硬件信息获取失败: %s", exc)
+
+        if cpu_threads is None and hardware_info:
+            base_threads = hardware_info.cpu_threads or hardware_info.cpu_cores or 1
+            cpu_threads = max(1, int(base_threads) - 4)
+
+        if hardware_info and hardware_info.gpu_memory_mb:
+            max_vram_mb = max(hardware_info.gpu_memory_mb)
+
         if device_preference != "auto":
             resolved_device = device_preference
+        elif runtime_device and runtime_device != "auto":
+            resolved_device = runtime_device
         elif mode == "precise" and self._cuda_available():
             resolved_device = "cuda"
         else:
@@ -260,7 +279,30 @@ class SpeakerEmbeddingService(SpeakerEmbeddingProvider):
             self.logger.warning("Speaker 选择 GPU 失败，回退 CPU")
             resolved_device = "cpu"
 
-        return resolved_device, cpu_threads
+        batch_size = self._resolve_batch_size(resolved_device, cpu_threads, max_vram_mb)
+
+        return resolved_device, cpu_threads, batch_size
+
+    @classmethod
+    def _resolve_batch_size(
+        cls,
+        device: str,
+        cpu_threads: Optional[int],
+        max_vram_mb: Optional[int],
+    ) -> int:
+        if device == "cpu":
+            batch_size = cls.BATCH_SIZE_CPU
+            if cpu_threads and cpu_threads < 4:
+                batch_size = max(8, int(cpu_threads) * 4)
+            return batch_size
+
+        if max_vram_mb is None:
+            return cls.BATCH_SIZE_GPU
+        if max_vram_mb < 2000:
+            return 16
+        if max_vram_mb < 4000:
+            return 32
+        return cls.BATCH_SIZE_GPU
 
     def _apply_cpu_threads(self, device: str, cpu_threads: Optional[int]) -> None:
         if device != "cpu" or not cpu_threads:
