@@ -1,0 +1,21 @@
+default_language: zh
+fallback_priority: fast
+
+chinese:
+  model_id: punct-ct-transformer-zh
+  itn_first: true
+  fallback_on_oov: true
+
+english:
+  model_id: punct-edge-punct-en
+  overlap_words: 10
+
+japanese:
+  model_id: punct-char-bert-ja
+
+scheduler:
+  mode: fast_only
+  fast_confidence_threshold: 0.55
+  alignment_coverage_threshold: 0.7
+  arbiter_conflict_threshold: 0.35
+  max_slow_retries: 1
