@@ -270,7 +270,7 @@
 ### 4.8 标点模型（Punctuation）
 - `enable_punctuation`: `true | false`，默认 `true`
 - `default_language`: 任意语言码，默认 `zh`
-- `fallback_to_multilingual`: `true | false`，默认 `true`
+- `fallback_priority`: `fast | slow`，默认 `fast`
 - `cache_models`: `true | false`，默认 `true`
 - `max_cached_models`: `>= 1`，默认 `3`
 - `device`: `cpu | cuda`，默认 `cpu`
