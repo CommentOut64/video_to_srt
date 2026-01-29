@@ -1,11 +1,6 @@
-"""标点服务包。"""
+"""
+标点服务包入口。
+"""
+from app.services.punctuation.service import PunctuationService, get_punctuation_service
 
-from app.services.punctuation.service import PunctuationService  # noqa: F401
-from app.services.punctuation.registry import PunctuationRegistry  # noqa: F401
-from app.services.punctuation.scheduler import (  # noqa: F401
-    PunctuationDecision,
-    PunctuationMode,
-    PunctuationPolicy,
-    PunctuationScheduler,
-    PunctuationTrigger,
-)
+__all__ = ["PunctuationService", "get_punctuation_service"]
