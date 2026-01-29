@@ -215,7 +215,7 @@ class YAMNetRuntimeParams(_RuntimeBase):
 class PunctuationRuntimeParams(_RuntimeBase):
     is_enable_punctuation: Optional[bool] = Field(default=None, alias="enable_punctuation")
     default_language: Optional[str] = Field(default=None)
-    is_fallback_to_multilingual: Optional[bool] = Field(default=None, alias="fallback_to_multilingual")
+    fallback_priority: Optional[str] = Field(default=None)
     is_cache_models: Optional[bool] = Field(default=None, alias="cache_models")
     max_cached_models: Optional[int] = Field(default=None, ge=1)
     device: Optional[str] = Field(default=None)
@@ -248,6 +248,16 @@ class PunctuationRuntimeParams(_RuntimeBase):
         value_lower = value.lower()
         if value_lower not in {"cpu", "cuda"}:
             raise ValueError("device 仅支持 cpu 或 cuda")
+        return value_lower
+
+    @field_validator("fallback_priority")
+    @classmethod
+    def _validate_fallback_priority(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        value_lower = value.lower()
+        if value_lower not in {"fast", "slow"}:
+            raise ValueError("fallback_priority 仅支持 fast 或 slow")
         return value_lower
 
     @field_validator("alignment_method")
@@ -402,7 +412,7 @@ _PARAM_SCHEMA: Dict[str, Any] = {
         "punctuation": {
             "enable_punctuation": {"type": "bool", "default": True},
             "default_language": {"type": "string", "default": "zh"},
-            "fallback_to_multilingual": {"type": "bool", "default": True},
+            "fallback_priority": {"type": "enum", "enum": ["fast", "slow"], "default": "fast"},
             "cache_models": {"type": "bool", "default": True},
             "max_cached_models": {"type": "int", "min": 1, "default": 3},
             "device": {"type": "enum", "enum": ["cpu", "cuda"], "default": "cpu"},
