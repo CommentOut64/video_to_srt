@@ -11,7 +11,7 @@ english:
   overlap_words: 10
 
 japanese:
-  model_id: punct-char-bert-ja
+  model_id: punct-pcs-47lang
 
 scheduler:
   mode: fast_only

@@ -209,7 +209,7 @@
   compute_type: int8
   source:
     local_path: backend/models/pretrained/punctuation/ct_transformer_zh
-    files: [model.onnx, config.json, vocab.txt]
+    files: [model.onnx, config.json, tokens.json, vocab.txt]
   resources: {cpu_threads: 1}
   features: {languages: [zh, yue]}
   fallback: []
@@ -222,7 +222,7 @@
   compute_type: int8
   source:
     local_path: backend/models/pretrained/punctuation/edge_punct_casing_en
-    files: [model.onnx, config.json, vocab.txt]
+    files: [model.onnx, model.int8.onnx, config.json, vocab.txt]
   resources: {cpu_threads: 1}
   features: {languages: [en]}
   fallback: []
@@ -238,6 +238,25 @@
     files: [model.onnx, config.json, vocab.txt]
   resources: {cpu_threads: 1}
   features: {languages: [ja]}
+  fallback: []
+
+- id: punct-pcs-47lang
+  kind: punct
+  framework: onnx
+  format: onnx
+  default_device: cpu
+  compute_type: int8
+  source:
+    local_path: backend/models/pretrained/punctuation/punct_cap_seg_47_language
+    files:
+      [
+        punct_cap_seg_47lang_int8.onnx,
+        spe_unigram_64k_lowercase_47lang.model,
+        config.yaml,
+      ]
+  resources: {cpu_threads: 1}
+  features: {languages: [ja]}
+  fallback: [punct-char-bert-ja]
   fallback: [punct-distilbert-multi]
 
 - id: punct-distilbert-multi
