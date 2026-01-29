@@ -7,12 +7,15 @@ FastWorker - 快流推理 Worker（CPU）
 """
 import copy
 import logging
-from typing import Dict, Optional, Any
+from typing import Any, Dict, List, Optional
 
 from app.core.asr.engine import ASREngine
 from app.core.asr.models import ASRResult
 from app.schemas.pipeline_context import ProcessingContext
 from app.services.audio.chunk_engine import AudioChunk
+from app.services.punctuation.base import PunctuationResult
+from app.services.punctuation.service import PunctuationService
+from app.services.punctuation.scheduler import get_punctuation_scheduler
 
 
 class FastWorker:
@@ -29,6 +32,7 @@ class FastWorker:
         job_id: str,
         draft_engine: ASREngine,
         sensevoice_language: str = "auto",
+        punctuation_service: Optional[PunctuationService] = None,
         logger: Optional[logging.Logger] = None
     ):
         """
@@ -38,11 +42,14 @@ class FastWorker:
             job_id: 任务 ID
             sensevoice_language: SenseVoice 语言设置
             draft_engine: 草稿引擎（必须提供）
+            punctuation_service: 标点服务（可选）
             logger: 日志记录器
         """
         self.job_id = job_id
         self.sensevoice_language = sensevoice_language
+        self.punctuation_service = punctuation_service
         self.logger = logger or logging.getLogger(__name__)
+        self._punctuation_scheduler = get_punctuation_scheduler()
 
         if not draft_engine:
             raise ValueError("FastWorker 需要提供 draft_engine")
@@ -62,6 +69,10 @@ class FastWorker:
         chunk = ctx.audio_chunk
         self.logger.debug(f"Chunk {ctx.chunk_index}: SenseVoice 快流推理")
         sv_result = await self._run_sensevoice(chunk)
+
+        # V3.2.0+dev.20260129.01: FastWorker 标点集成（可选）
+        if self.punctuation_service:
+            sv_result = await self._apply_punctuation(sv_result, chunk)
 
         # V3.8 修复竞态条件：深拷贝 sv_result，避免下游修改影响其他协程
         ctx.sv_result = copy.deepcopy(sv_result)
@@ -114,4 +125,111 @@ class FastWorker:
             "language": asr_result.language or self.sensevoice_language,
             "emotion": asr_result.emotion,
             "event": event_tag,
+        }
+
+    async def _apply_punctuation(
+        self,
+        sv_result: Dict[str, Any],
+        chunk: AudioChunk,
+    ) -> Dict[str, Any]:
+        """调用标点服务并写入结果元信息。"""
+        if not sv_result:
+            return sv_result
+
+        words = sv_result.get("words", [])
+        cleaned_words = self._merge_punctuation_timestamps(words)
+        sv_result["words"] = cleaned_words
+
+        text = sv_result.get("text_clean") or sv_result.get("text") or ""
+        language = chunk.language or sv_result.get("language") or self.sensevoice_language
+
+        try:
+            result = await self.punctuation_service.restore(
+                text=text,
+                language=language,
+                word_timestamps=cleaned_words,
+            )
+        except Exception as exc:
+            self.logger.warning("FastWorker 标点恢复失败，继续主流程: %s", exc)
+            return sv_result
+
+        if result:
+            metadata = sv_result.setdefault("metadata", {})
+            metadata["punctuation"] = self._punctuation_result_to_dict(result)
+            # V3.2.0+dev.20260129.02: 写入快流标点调度决策
+            decision = self._punctuation_scheduler.evaluate_fast(
+                result,
+                sv_confidence=sv_result.get("confidence"),
+            )
+            metadata["punctuation_decision"] = {
+                "is_slow_requested": decision.is_slow_requested,
+                "reason": decision.reason,
+                "mode": self._punctuation_scheduler.policy.mode.value,
+            }
+        return sv_result
+
+    def _merge_punctuation_timestamps(self, words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """合并标点 token 的时间戳并移除标点 token。"""
+        if not words:
+            return []
+
+        punctuation_set = set(",.!?;:'\"()[]{}，。！？；：、（）【】《》“”‘’「」『』")
+        left_punct = set("([{“‘（【《「『")
+        cleaned: List[Dict[str, Any]] = []
+        words_copy = [word.copy() for word in words]
+
+        for idx, word in enumerate(words_copy):
+            token = word.get("word", "")
+            if token in punctuation_set:
+                merge_to_next = token in left_punct
+                if merge_to_next:
+                    merged = False
+                    for next_word in words_copy[idx + 1:]:
+                        if next_word.get("word", "") not in punctuation_set:
+                            next_start = next_word.get("start", 0.0)
+                            next_word["start"] = min(next_start, float(word.get("start", next_start)))
+                            merged = True
+                            break
+                    if merged:
+                        continue
+                if cleaned:
+                    prev = cleaned[-1]
+                    prev_end = prev.get("end", 0.0)
+                    prev["end"] = max(prev_end, float(word.get("end", prev_end)))
+                else:
+                    for next_word in words_copy[idx + 1:]:
+                        if next_word.get("word", "") not in punctuation_set:
+                            next_start = next_word.get("start", 0.0)
+                            next_word["start"] = min(next_start, float(word.get("start", next_start)))
+                            break
+                continue
+            cleaned.append(word)
+
+        return cleaned
+
+    @staticmethod
+    def _punctuation_result_to_dict(result: PunctuationResult) -> Dict[str, Any]:
+        """将标点结果转换为可序列化结构。"""
+        return {
+            "text": result.text,
+            "split_points": [
+                {
+                    "char_index": point.char_index,
+                    "relative_time": point.relative_time,
+                    "punctuation": point.punctuation,
+                    "confidence": point.confidence,
+                }
+                for point in result.split_points
+            ],
+            "punctuation_positions": [
+                {
+                    "char_index": position.char_index,
+                    "punctuation": position.punctuation,
+                    "confidence": position.confidence,
+                }
+                for position in result.punctuation_positions
+            ],
+            "confidence": result.confidence,
+            "model_id": result.model_id,
+            "processing_time_ms": result.processing_time_ms,
         }
