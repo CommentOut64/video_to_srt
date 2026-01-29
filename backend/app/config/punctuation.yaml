@@ -7,7 +7,7 @@ chinese:
   fallback_on_oov: true
 
 english:
-  model_id: punct-edge-punct-en
+  model_id: punct-distilbert-en
   overlap_words: 10
 
 japanese:

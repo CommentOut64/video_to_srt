@@ -70,11 +70,19 @@ class CTTransformerOnnxAdapter(OnnxPunctuationAdapter):
         if model_dir is None:
             raise RuntimeError("模型目录未就绪")
         tokens_path = Path(model_dir) / "tokens.json"
-        config_path = Path(model_dir) / "config.json"
+        config_json_path = Path(model_dir) / "config.json"
+        config_yaml_path = Path(model_dir) / "config.yaml"
         tokens = json.loads(tokens_path.read_text(encoding="utf-8"))
         self._token_to_id = {token: idx for idx, token in enumerate(tokens)}
         self._unk_id = self._token_to_id.get("<unk>", 0)
-        config = json.loads(config_path.read_text(encoding="utf-8"))
+        if config_json_path.exists():
+            config = json.loads(config_json_path.read_text(encoding="utf-8"))
+        elif config_yaml_path.exists():
+            import yaml
+
+            config = yaml.safe_load(config_yaml_path.read_text(encoding="utf-8")) or {}
+        else:
+            raise FileNotFoundError(f"未找到 config.json/config.yaml: {model_dir}")
         self._punc_list = config.get("model_conf", {}).get("punc_list", [])
         return self._token_to_id
 

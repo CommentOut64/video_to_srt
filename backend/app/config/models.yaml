@@ -214,6 +214,7 @@
   features: {languages: [zh, yue]}
   fallback: []
 
+
 - id: punct-edge-punct-en
   kind: punct
   framework: onnx
@@ -225,6 +226,27 @@
     files: [model.onnx, model.int8.onnx, config.json, vocab.txt]
   resources: {cpu_threads: 1}
   features: {languages: [en]}
+  fallback: []
+
+- id: punct-distilbert-en
+  kind: punct
+  framework: onnx
+  format: onnx
+  default_device: cpu
+  compute_type: int8
+  source:
+    local_path: backend/models/pretrained/punctuation/distilbert_punctuator_en
+    files:
+      [
+        model_int8.onnx,
+        config.json,
+        tokenizer.json,
+        tokenizer_config.json,
+        special_tokens_map.json,
+        vocab.txt,
+      ]
+  resources: {cpu_threads: 1}
+  features: {languages: [en], model_file: model_int8.onnx}
   fallback: []
 
 - id: punct-char-bert-ja

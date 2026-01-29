@@ -41,6 +41,7 @@ nvidia-cudnn-cu12==8.9.7.29
 onnxruntime-gpu==1.18.0
 punctuators
 sentencepiece
+tokenizers
 
 # --- 音频处理 ---
 librosa

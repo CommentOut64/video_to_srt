@@ -26,7 +26,7 @@ def _default_config() -> Dict[str, Any]:
             "fallback_on_oov": True,
         },
         "english": {
-            "model_id": "punct-edge-punct-en",
+            "model_id": "punct-distilbert-en",
             "overlap_words": 10,
         },
         "japanese": {

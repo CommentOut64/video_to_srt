@@ -1,5 +1,5 @@
 """
-英文标点策略（Edge-Punct-Casing 适配）。
+英文标点策略（DistilBERT 适配）。
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from app.services.punctuation.base import (
     build_split_points,
 )
 from app.services.punctuation.config import get_punctuation_config
-from app.services.punctuation.models import EdgePunctOnnxAdapter
+from app.services.punctuation.models import DistilBertPunctOnnxAdapter
 
 
 class EnglishPunctuationStrategy(PunctuationStrategy):
@@ -23,9 +23,9 @@ class EnglishPunctuationStrategy(PunctuationStrategy):
 
     def __init__(self) -> None:
         config = get_punctuation_config().get("english", {})
-        self._model_id = config.get("model_id", "punct-edge-punct-en")
+        self._model_id = config.get("model_id", "punct-distilbert-en")
         self._overlap_words = int(config.get("overlap_words", 10))
-        self._adapter = EdgePunctOnnxAdapter(self._model_id)
+        self._adapter = DistilBertPunctOnnxAdapter(self._model_id)
 
     @property
     def supported_languages(self) -> List[str]:
@@ -109,6 +109,7 @@ class EnglishPunctuationStrategy(PunctuationStrategy):
                 )
             )
         return trimmed
+
 
     @staticmethod
     def _estimate_confidence(positions: List[PuncPosition]) -> float:
