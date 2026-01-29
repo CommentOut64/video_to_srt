@@ -1,41 +1,34 @@
 """
-日文标点恢复策略：字符级 BERT。
+日文标点策略（字符级 BERT 适配）。
 """
-
 from __future__ import annotations
 
-import asyncio
-import logging
 import time
 from typing import List, Optional, Sequence
 
-from app.services.model_manager_v2 import get_model_manager_v2
 from app.services.punctuation.base import (
     PuncPosition,
-    PunctuationModelError,
     PunctuationResult,
     PunctuationStrategy,
     WordTimestampLike,
     apply_punctuation,
     build_split_points,
-    measure_processing_ms,
 )
-from app.services.punctuation.models.char_bert_onnx import CharBertOnnxAdapter
+from app.services.punctuation.config import get_punctuation_config
+from app.services.punctuation.models import PunctCapSegOnnxAdapter
 
 
 class JapanesePunctuationStrategy(PunctuationStrategy):
-    """日文标点恢复策略。"""
+    """日文标点策略（策略模式：独立封装日文标点恢复流程）。"""
 
-    def __init__(
-        self,
-        model_id: str = "punct-char-bert-ja",
-        logger: Optional[logging.Logger] = None,
-        adapter: Optional[CharBertOnnxAdapter] = None,
-    ) -> None:
-        self._model_id = model_id
-        self._logger = logger or logging.getLogger(__name__)
-        self._adapter = adapter or CharBertOnnxAdapter(model_id=model_id, logger=self._logger)
-        self._loaded = False
+    def __init__(self) -> None:
+        config = get_punctuation_config().get("japanese", {})
+        self._model_id = config.get("model_id", "punct-pcs-47lang")
+        # 日文标点优先使用全角符号集合，避免误判半角英文标点
+        self._adapter = PunctCapSegOnnxAdapter(
+            self._model_id,
+            punctuation_chars="、。！？「」『』（）",
+        )
 
     @property
     def supported_languages(self) -> List[str]:
@@ -51,35 +44,25 @@ class JapanesePunctuationStrategy(PunctuationStrategy):
         word_timestamps: Optional[Sequence[WordTimestampLike]] = None,
         context: Optional[str] = None,
     ) -> PunctuationResult:
-        start_time = time.time()
+        start = time.perf_counter()
         if not text:
-            return PunctuationResult(
-                text="",
-                model_id=self.model_id,
-                processing_time_ms=measure_processing_ms(start_time),
-            )
+            return PunctuationResult(text="", model_id=self._model_id)
 
-        try:
-            await self._ensure_loaded()
-        except PunctuationModelError as exc:
-            self._logger.warning("日文标点模型不可用，降级为原文: %s", exc)
-            return PunctuationResult(
-                text=text,
-                model_id="fallback",
-                processing_time_ms=measure_processing_ms(start_time),
-            )
-
-        positions = await self._predict_async(text)
-        final_text = apply_punctuation(text, positions)
-        split_points = build_split_points(text, positions, word_timestamps)
-        confidence = self._aggregate_confidence(positions)
+        positions = self._adapter.predict(text)
+        punct_text = apply_punctuation(text, positions)
+        split_points = build_split_points(
+            text=punct_text,
+            positions=positions,
+            word_timestamps=word_timestamps,
+        )
+        elapsed_ms = (time.perf_counter() - start) * 1000
         return PunctuationResult(
-            text=final_text,
+            text=punct_text,
             split_points=split_points,
             punctuation_positions=positions,
-            confidence=confidence,
-            model_id=self.model_id,
-            processing_time_ms=measure_processing_ms(start_time),
+            confidence=self._estimate_confidence(positions),
+            model_id=self._model_id,
+            processing_time_ms=elapsed_ms,
         )
 
     def get_split_suggestion(
@@ -88,34 +71,10 @@ class JapanesePunctuationStrategy(PunctuationStrategy):
         min_sentence_length: int = 5,
         max_sentence_length: int = 50,
     ) -> List[int]:
-        suggestions: List[int] = []
-        last_index = 0
-        for point in result.split_points:
-            length = point.char_index - last_index + 1
-            if length < min_sentence_length:
-                continue
-            if length > max_sentence_length:
-                continue
-            suggestions.append(point.char_index)
-            last_index = point.char_index + 1
-        return suggestions
-
-    async def _ensure_loaded(self) -> None:
-        if self._loaded:
-            return
-        manager = get_model_manager_v2()
-        try:
-            manager.ensure_available(self.model_id)
-            self._adapter.load("")
-        except Exception as exc:
-            raise PunctuationModelError(f"日文标点模型加载失败: {exc}") from exc
-        self._loaded = True
-
-    async def _predict_async(self, text: str) -> List[PuncPosition]:
-        return await asyncio.to_thread(self._adapter.predict, text)
+        return [point.char_index for point in result.split_points]
 
     @staticmethod
-    def _aggregate_confidence(positions: Sequence[PuncPosition]) -> float:
+    def _estimate_confidence(positions: List[PuncPosition]) -> float:
         if not positions:
-            return 0.0
-        return sum(p.confidence for p in positions) / len(positions)
+            return 1.0
+        return sum(pos.confidence for pos in positions) / len(positions)
