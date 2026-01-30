@@ -21,6 +21,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, TYPE_CHECKING
 
+from app.services.user_config_service import get_user_config_service
 from app.utils.text_utils import (
     detect_timestamp_overlaps,
     format_srt_timestamp,
@@ -172,6 +173,8 @@ class SubtitleOutputService:
         self,
         sentences: List["SentenceSegment"],
         include_translation: bool = False,
+        apply_offset: bool = True,
+        offset_override: float | None = None,
     ) -> List[Segment]:
         """
         从句子列表构建标准化 segments
@@ -179,10 +182,16 @@ class SubtitleOutputService:
         Args:
             sentences: SentenceSegment 列表
             include_translation: 是否包含翻译（双语字幕）
+            apply_offset: 是否应用全局字幕时间偏移
 
         Returns:
             List[Segment]: 标准化字幕段落列表
         """
+        # V3.2.0+dev.20260130.09: 输出阶段统一应用全局字幕时间偏移
+        offset = 0.0
+        if apply_offset:
+            offset = offset_override if offset_override is not None else get_user_config_service().get_subtitle_time_offset()
+
         segments: List[Segment] = []
         for sentence in sentences:
             # 优先使用清洗后的文本
@@ -194,9 +203,16 @@ class SubtitleOutputService:
             else:
                 text = base_text
 
+            start = float(sentence.start) + offset
+            end = float(sentence.end) + offset
+            if start < 0:
+                start = 0.0
+            if end < start:
+                end = start
+
             segments.append({
-                "start": sentence.start,
-                "end": sentence.end,
+                "start": start,
+                "end": end,
                 "text": text,
             })
 
