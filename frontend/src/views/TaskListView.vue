@@ -1093,7 +1093,9 @@ async function handleExit() {
 </script>
 
 <style lang="scss" scoped>
-@use "@/styles/variables" as *;
+// 注意：SCSS 变量已迁移到主题系统
+// 旧的 SCSS 文件位于 @/styles/legacy/ 供参考
+// 现在使用 CSS Variables（由主题系统注入）
 
 // 加载动画
 @keyframes spin {
@@ -1123,7 +1125,7 @@ async function handleExit() {
   justify-content: space-between;
   position: sticky;
   top: 0;
-  z-index: $z-sticky;
+  z-index: 200; /* 使用硬编码值替代 $z-sticky */
   box-shadow: var(--shadow-sm);
 
   .header-left {

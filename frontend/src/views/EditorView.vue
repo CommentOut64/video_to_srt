@@ -1683,8 +1683,9 @@ onBeforeRouteLeave(async (to, from) => {
 </script>
 
 <style lang="scss" scoped>
-@use '@/styles/variables' as *;
-@use '@/styles/mixins' as *;
+// 注意：SCSS 变量和 mixins 已迁移到主题系统
+// 旧的 SCSS 文件位于 @/styles/legacy/ 供参考
+// 现在使用 CSS Variables（由主题系统注入）
 
 .editor-view {
   display: flex;
