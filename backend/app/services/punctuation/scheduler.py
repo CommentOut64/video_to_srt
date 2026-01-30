@@ -1,32 +1,24 @@
 """
-标点调度层数据结构与接口骨架。
+标点调度器（快慢流触发判定）。
+V3.2.0+dev.20260129.02
 """
-
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Optional
 
 from app.services.punctuation.base import PunctuationResult
+from app.services.punctuation.config import get_punctuation_config
 
 
 class PunctuationMode(str, Enum):
-    """标点调度模式。"""
+    """调度模式枚举。"""
 
     FAST_ONLY = "fast_only"
     DUAL = "dual"
     SMART_REVIEW = "smart_review"
-
-
-@dataclass
-class PunctuationTrigger:
-    """触发慢流标点的原因。"""
-
-    reason: str
-    level: str = "info"
-    detail: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -39,22 +31,14 @@ class PunctuationPolicy:
     arbiter_conflict_threshold: float = 0.35
     max_slow_retries: int = 1
 
-    @property
-    def is_slow_allowed(self) -> bool:
-        return self.mode in {PunctuationMode.DUAL, PunctuationMode.SMART_REVIEW}
-
     @classmethod
-    def from_config(cls, data: Optional[Dict[str, Any]]) -> "PunctuationPolicy":
-        if not data:
-            return cls()
-
-        scheduler = data.get("scheduler", data)
-        mode_value = str(scheduler.get("mode", cls.mode.value)).lower()
+    def from_config(cls, config: dict) -> "PunctuationPolicy":
+        scheduler = config.get("scheduler", {}) if isinstance(config, dict) else {}
+        mode_raw = str(scheduler.get("mode", cls.mode.value)).lower()
         try:
-            mode = PunctuationMode(mode_value)
+            mode = PunctuationMode(mode_raw)
         except ValueError:
-            mode = PunctuationMode.FAST_ONLY
-
+            mode = cls.mode
         return cls(
             mode=mode,
             fast_confidence_threshold=float(
@@ -71,59 +55,15 @@ class PunctuationPolicy:
 
 
 @dataclass
-class PunctuationDecision:
+class PunctuationScheduleDecision:
     """调度决策结果。"""
 
     is_slow_requested: bool
-    reason: str
-    level: str
-    policy_mode: str
-    triggers: List[PunctuationTrigger] = field(default_factory=list)
-
-    @classmethod
-    def skip(
-        cls,
-        reason: str,
-        level: str,
-        policy_mode: str,
-        triggers: Optional[List[PunctuationTrigger]] = None,
-    ) -> "PunctuationDecision":
-        return cls(
-            is_slow_requested=False,
-            reason=reason,
-            level=level,
-            policy_mode=policy_mode,
-            triggers=list(triggers or []),
-        )
-
-    @classmethod
-    def request_slow(
-        cls,
-        reason: str,
-        level: str,
-        policy_mode: str,
-        triggers: Optional[List[PunctuationTrigger]] = None,
-    ) -> "PunctuationDecision":
-        return cls(
-            is_slow_requested=True,
-            reason=reason,
-            level=level,
-            policy_mode=policy_mode,
-            triggers=list(triggers or []),
-        )
-
-    def to_log_fields(self) -> Dict[str, Any]:
-        return {
-            "reason": self.reason,
-            "level": self.level,
-            "policy_mode": self.policy_mode,
-            "is_slow_requested": self.is_slow_requested,
-            "trigger_reasons": [trigger.reason for trigger in self.triggers],
-        }
+    reason: str = ""
 
 
 class PunctuationScheduler:
-    """标点调度层（Fast/Slow 决策骨架）。"""
+    """根据快流结果决定是否触发慢流标点补跑。"""
 
     def __init__(
         self,
@@ -139,131 +79,47 @@ class PunctuationScheduler:
 
     def evaluate_fast(
         self,
-        punct_result: PunctuationResult,
+        fast_result: Optional[PunctuationResult],
         sv_confidence: Optional[float] = None,
-        alignment_coverage: Optional[float] = None,
-        arbiter_conflict: Optional[float] = None,
-    ) -> PunctuationDecision:
-        triggers = self._collect_triggers(
-            sv_confidence=sv_confidence,
-            alignment_coverage=alignment_coverage,
-            arbiter_conflict=arbiter_conflict,
-            punct_confidence=punct_result.confidence,
-        )
+    ) -> PunctuationScheduleDecision:
+        """基于快流标点结果做初步决策。"""
+        if self._policy.mode == PunctuationMode.FAST_ONLY:
+            return PunctuationScheduleDecision(False, reason="fast_only")
 
-        if not self._policy.is_slow_allowed:
-            decision = PunctuationDecision.skip(
-                reason="fast_only",
-                level="info",
-                policy_mode=self._policy.mode.value,
-                triggers=triggers,
+        if not fast_result:
+            return PunctuationScheduleDecision(True, reason="fast_result_missing")
+
+        threshold = self._policy.fast_confidence_threshold
+        if fast_result.confidence < threshold:
+            self._logger.debug(
+                "快流标点置信度不足: %.2f < %.2f",
+                fast_result.confidence,
+                threshold,
             )
-            self._log_decision(decision)
-            return decision
+            return PunctuationScheduleDecision(True, reason="low_confidence")
 
-        if triggers:
-            decision = PunctuationDecision.request_slow(
-                reason=triggers[0].reason,
-                level=triggers[0].level,
-                policy_mode=self._policy.mode.value,
-                triggers=triggers,
+        if sv_confidence is not None and sv_confidence < threshold:
+            self._logger.debug(
+                "SenseVoice 置信度不足: %.2f < %.2f",
+                sv_confidence,
+                threshold,
             )
-            self._log_decision(decision)
-            return decision
+            return PunctuationScheduleDecision(True, reason="low_confidence")
 
-        decision = PunctuationDecision.skip(
-            reason="no_trigger",
-            level="info",
-            policy_mode=self._policy.mode.value,
-        )
-        self._log_decision(decision)
-        return decision
+        return PunctuationScheduleDecision(False, reason="fast_confidence_ok")
 
-    def evaluate_slow(
-        self,
-        triggers: Optional[List[PunctuationTrigger]] = None,
-        reason: str = "slow_review",
-    ) -> PunctuationDecision:
-        if not self._policy.is_slow_allowed:
-            decision = PunctuationDecision.skip(
-                reason="fast_only",
-                level="info",
-                policy_mode=self._policy.mode.value,
-            )
-            self._log_decision(decision)
-            return decision
+    def allow_retry(self, retry_count: int) -> bool:
+        """检查是否允许慢流补跑重试。"""
+        return retry_count < self._policy.max_slow_retries
 
-        decision = PunctuationDecision.request_slow(
-            reason=reason,
-            level="info",
-            policy_mode=self._policy.mode.value,
-            triggers=triggers,
-        )
-        self._log_decision(decision)
-        return decision
 
-    def _collect_triggers(
-        self,
-        sv_confidence: Optional[float],
-        alignment_coverage: Optional[float],
-        arbiter_conflict: Optional[float],
-        punct_confidence: Optional[float],
-    ) -> List[PunctuationTrigger]:
-        triggers: List[PunctuationTrigger] = []
+_scheduler: Optional[PunctuationScheduler] = None
 
-        if sv_confidence is not None and sv_confidence < self._policy.fast_confidence_threshold:
-            triggers.append(
-                PunctuationTrigger(
-                    reason="low_confidence",
-                    level="warn",
-                    detail={
-                        "sv_confidence": sv_confidence,
-                        "threshold": self._policy.fast_confidence_threshold,
-                    },
-                )
-            )
 
-        if alignment_coverage is not None and alignment_coverage < self._policy.alignment_coverage_threshold:
-            triggers.append(
-                PunctuationTrigger(
-                    reason="low_alignment_coverage",
-                    level="warn",
-                    detail={
-                        "alignment_coverage": alignment_coverage,
-                        "threshold": self._policy.alignment_coverage_threshold,
-                    },
-                )
-            )
-
-        if arbiter_conflict is not None and arbiter_conflict > self._policy.arbiter_conflict_threshold:
-            triggers.append(
-                PunctuationTrigger(
-                    reason="arbiter_conflict",
-                    level="warn",
-                    detail={
-                        "arbiter_conflict": arbiter_conflict,
-                        "threshold": self._policy.arbiter_conflict_threshold,
-                    },
-                )
-            )
-
-        if (
-            punct_confidence is not None
-            and punct_confidence < self._policy.fast_confidence_threshold
-            and sv_confidence is None
-        ):
-            triggers.append(
-                PunctuationTrigger(
-                    reason="low_punctuation_confidence",
-                    level="info",
-                    detail={
-                        "punct_confidence": punct_confidence,
-                        "threshold": self._policy.fast_confidence_threshold,
-                    },
-                )
-            )
-
-        return triggers
-
-    def _log_decision(self, decision: PunctuationDecision) -> None:
-        self._logger.debug("标点调度决策: %s", decision.to_log_fields())
+def get_punctuation_scheduler() -> PunctuationScheduler:
+    """获取调度器单例。"""
+    global _scheduler
+    if _scheduler is None:
+        config = get_punctuation_config()
+        _scheduler = PunctuationScheduler(policy=PunctuationPolicy.from_config(config))
+    return _scheduler

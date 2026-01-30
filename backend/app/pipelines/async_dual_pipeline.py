@@ -50,6 +50,7 @@ from app.utils.cancellation_token import CancelledException, PausedException  # 
 if TYPE_CHECKING:
     from app.utils.cancellation_token import CancellationToken
     from app.services.progress_emitter import ProgressEventEmitter  # V3.1.0
+    from app.services.punctuation.service import PunctuationService
 
 
 class AsyncDualPipeline:
@@ -74,6 +75,7 @@ class AsyncDualPipeline:
         patch_engine: Optional[ASREngine] = None,
         queue_maxsize: int = 5,
         sensevoice_language: str = "auto",
+        punctuation_service: Optional["PunctuationService"] = None,
         whisper_language: str = "auto",
         user_glossary: Optional[list] = None,
         enable_semantic_grouping: bool = True,
@@ -95,6 +97,7 @@ class AsyncDualPipeline:
             job_id: 任务 ID
             queue_maxsize: 队列最大长度（背压控制）
             sensevoice_language: SenseVoice 语言设置
+            punctuation_service: 标点服务（可选）
             whisper_language: Whisper 语言设置
             user_glossary: 用户词表
             enable_semantic_grouping: 是否启用语义分组
@@ -154,11 +157,19 @@ class AsyncDualPipeline:
         self.segmenter = segmenter
         self.subtitle_manager = get_streaming_subtitle_manager(job_id)
 
+        # V3.2.0+dev.20260129.01: 标点服务注入
+        if punctuation_service is None:
+            from app.services.punctuation.service import get_punctuation_service
+
+            punctuation_service = get_punctuation_service()
+        self.punctuation_service = punctuation_service
+
         # 实例化 FastWorker（仅推理）
         self.fast_worker = FastWorker(
             job_id=job_id,
             draft_engine=self.draft_engine,
             sensevoice_language=sensevoice_language,
+            punctuation_service=self.punctuation_service,
             logger=self.logger
         )
 

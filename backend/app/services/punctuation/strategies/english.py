@@ -1,44 +1,31 @@
 """
-英文标点恢复策略：Edge-Punct-Casing + 重叠上下文。
+英文标点策略（DistilBERT 适配）。
 """
-
 from __future__ import annotations
 
-import asyncio
-import logging
 import time
 from typing import List, Optional, Sequence
 
-from app.services.model_manager_v2 import get_model_manager_v2
 from app.services.punctuation.base import (
     PuncPosition,
-    PunctuationModelError,
     PunctuationResult,
     PunctuationStrategy,
     WordTimestampLike,
     apply_punctuation,
     build_split_points,
-    measure_processing_ms,
 )
-from app.services.punctuation.models.edge_punct_onnx import EdgePunctOnnxAdapter
+from app.services.punctuation.config import get_punctuation_config
+from app.services.punctuation.models import DistilBertPunctOnnxAdapter
 
 
 class EnglishPunctuationStrategy(PunctuationStrategy):
-    """英文标点恢复策略。"""
+    """英文标点策略（策略模式：独立封装英文标点恢复流程）。"""
 
-    def __init__(
-        self,
-        model_id: str = "punct-edge-punct-en",
-        overlap_words: int = 10,
-        logger: Optional[logging.Logger] = None,
-        adapter: Optional[EdgePunctOnnxAdapter] = None,
-    ) -> None:
-        self._model_id = model_id
-        self._overlap_words = overlap_words
-        self._logger = logger or logging.getLogger(__name__)
-        self._adapter = adapter or EdgePunctOnnxAdapter(model_id=model_id, logger=self._logger)
-        self._prev_tail: Optional[str] = None
-        self._loaded = False
+    def __init__(self) -> None:
+        config = get_punctuation_config().get("english", {})
+        self._model_id = config.get("model_id", "punct-distilbert-en")
+        self._overlap_words = int(config.get("overlap_words", 10))
+        self._adapter = DistilBertPunctOnnxAdapter(self._model_id)
 
     @property
     def supported_languages(self) -> List[str]:
@@ -54,39 +41,35 @@ class EnglishPunctuationStrategy(PunctuationStrategy):
         word_timestamps: Optional[Sequence[WordTimestampLike]] = None,
         context: Optional[str] = None,
     ) -> PunctuationResult:
-        start_time = time.time()
+        start = time.perf_counter()
         if not text:
-            return PunctuationResult(
-                text="",
-                model_id=self.model_id,
-                processing_time_ms=measure_processing_ms(start_time),
-            )
+            return PunctuationResult(text="", model_id=self._model_id)
 
-        try:
-            await self._ensure_loaded()
-        except PunctuationModelError as exc:
-            self._logger.warning("英文标点模型不可用，降级为原文: %s", exc)
-            return PunctuationResult(
-                text=text,
-                model_id="fallback",
-                processing_time_ms=measure_processing_ms(start_time),
-            )
+        context_text = self._select_context(context)
+        if context_text:
+            input_text = f"{context_text} {text}"
+            context_len = len(context_text) + 1
+        else:
+            input_text = text
+            context_len = 0
 
-        input_text, context_len = self._build_input(text, context)
-        positions = await self._predict_async(input_text)
-        trimmed = self._trim_context_positions(positions, context_len)
-        final_text = apply_punctuation(text, trimmed)
-        split_points = build_split_points(text, trimmed, word_timestamps)
-        confidence = self._aggregate_confidence(trimmed)
-        self._prev_tail = self._extract_tail(text)
+        positions = self._adapter.predict(input_text)
+        mapped = self._trim_context_positions(positions, context_len)
+        punct_text = apply_punctuation(text, mapped)
 
+        split_points = build_split_points(
+            text=punct_text,
+            positions=mapped,
+            word_timestamps=word_timestamps,
+        )
+        elapsed_ms = (time.perf_counter() - start) * 1000
         return PunctuationResult(
-            text=final_text,
+            text=punct_text,
             split_points=split_points,
-            punctuation_positions=trimmed,
-            confidence=confidence,
-            model_id=self.model_id,
-            processing_time_ms=measure_processing_ms(start_time),
+            punctuation_positions=mapped,
+            confidence=self._estimate_confidence(mapped),
+            model_id=self._model_id,
+            processing_time_ms=elapsed_ms,
         )
 
     def get_split_suggestion(
@@ -95,70 +78,41 @@ class EnglishPunctuationStrategy(PunctuationStrategy):
         min_sentence_length: int = 5,
         max_sentence_length: int = 50,
     ) -> List[int]:
-        suggestions: List[int] = []
-        last_index = 0
-        for point in result.split_points:
-            length = point.char_index - last_index + 1
-            if length < min_sentence_length:
-                continue
-            if length > max_sentence_length:
-                continue
-            suggestions.append(point.char_index)
-            last_index = point.char_index + 1
-        return suggestions
+        return [point.char_index for point in result.split_points]
 
-    def reset_context(self) -> None:
-        """手动重置上下文缓存。"""
-        self._prev_tail = None
-
-    async def _ensure_loaded(self) -> None:
-        if self._loaded:
-            return
-        manager = get_model_manager_v2()
-        try:
-            manager.ensure_available(self.model_id)
-            self._adapter.load("")
-        except Exception as exc:
-            raise PunctuationModelError(f"英文标点模型加载失败: {exc}") from exc
-        self._loaded = True
-
-    async def _predict_async(self, text: str) -> List[PuncPosition]:
-        return await asyncio.to_thread(self._adapter.predict, text)
-
-    def _build_input(self, text: str, context: Optional[str]) -> tuple[str, int]:
-        if context:
-            input_text = f"{context} {text}"
-            return input_text, len(context) + 1
-        if self._prev_tail:
-            input_text = f"{self._prev_tail} {text}"
-            return input_text, len(self._prev_tail) + 1
-        return text, 0
+    def _select_context(self, context: Optional[str]) -> str:
+        if not context:
+            return ""
+        words = context.strip().split()
+        if not words:
+            return ""
+        if len(words) <= self._overlap_words:
+            return " ".join(words)
+        return " ".join(words[-self._overlap_words :])
 
     @staticmethod
-    def _trim_context_positions(positions: List[PuncPosition], context_len: int) -> List[PuncPosition]:
+    def _trim_context_positions(
+        positions: List[PuncPosition],
+        context_len: int,
+    ) -> List[PuncPosition]:
         if context_len <= 0:
             return positions
         trimmed: List[PuncPosition] = []
-        for position in positions:
-            if position.char_index < context_len:
+        for pos in positions:
+            if pos.char_index < context_len:
                 continue
             trimmed.append(
                 PuncPosition(
-                    char_index=position.char_index - context_len,
-                    punctuation=position.punctuation,
-                    confidence=position.confidence,
+                    char_index=pos.char_index - context_len,
+                    punctuation=pos.punctuation,
+                    confidence=pos.confidence,
                 )
             )
         return trimmed
 
-    def _extract_tail(self, text: str) -> str:
-        words = text.split()
-        if len(words) <= self._overlap_words:
-            return text
-        return " ".join(words[-self._overlap_words :])
 
     @staticmethod
-    def _aggregate_confidence(positions: Sequence[PuncPosition]) -> float:
+    def _estimate_confidence(positions: List[PuncPosition]) -> float:
         if not positions:
-            return 0.0
-        return sum(p.confidence for p in positions) / len(positions)
+            return 1.0
+        return sum(pos.confidence for pos in positions) / len(positions)

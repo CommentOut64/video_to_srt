@@ -1,48 +1,34 @@
 """
-中文标点恢复策略：WeTextProcessing + CT-Transformer。
+中文标点策略（WeTextProcessing + CT-Transformer 适配）。
 """
-
 from __future__ import annotations
 
-import asyncio
-import logging
 import time
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence
 
-from app.services.model_manager_v2 import get_model_manager_v2
 from app.services.punctuation.base import (
     PuncPosition,
-    PunctuationModelError,
     PunctuationResult,
     PunctuationStrategy,
     WordTimestampLike,
     apply_punctuation,
     build_split_points,
-    measure_processing_ms,
 )
-from app.services.punctuation.models.ct_transformer_onnx import CTTransformerOnnxAdapter
-from app.services.punctuation.models.wetext_processor import TextNormalizationResult, WeTextProcessor
+from app.services.punctuation.config import get_punctuation_config
+from app.services.punctuation.models import CTTransformerOnnxAdapter, WeTextProcessor
+from app.services.punctuation.models.wetext_processor import CharMapping
 
 
 class ChinesePunctuationStrategy(PunctuationStrategy):
-    """中文标点恢复策略。"""
+    """中文标点策略（策略模式：独立封装中文标点恢复流程）。"""
 
-    def __init__(
-        self,
-        model_id: str = "punct-ct-transformer-zh",
-        itn_first: bool = True,
-        fallback_on_oov: bool = True,
-        logger: Optional[logging.Logger] = None,
-        wetext_processor: Optional[WeTextProcessor] = None,
-        adapter: Optional[CTTransformerOnnxAdapter] = None,
-    ) -> None:
-        self._model_id = model_id
-        self._itn_first = itn_first
-        self._fallback_on_oov = fallback_on_oov
-        self._logger = logger or logging.getLogger(__name__)
-        self._wetext = wetext_processor
-        self._adapter = adapter or CTTransformerOnnxAdapter(model_id=model_id, logger=self._logger)
-        self._loaded = False
+    def __init__(self) -> None:
+        config = get_punctuation_config().get("chinese", {})
+        self._model_id = config.get("model_id", "punct-ct-transformer-zh")
+        self._itn_first = bool(config.get("itn_first", True))
+        self._fallback_on_oov = bool(config.get("fallback_on_oov", True))
+        self._adapter = CTTransformerOnnxAdapter(self._model_id)
+        self._wetext = WeTextProcessor()
 
     @property
     def supported_languages(self) -> List[str]:
@@ -58,55 +44,37 @@ class ChinesePunctuationStrategy(PunctuationStrategy):
         word_timestamps: Optional[Sequence[WordTimestampLike]] = None,
         context: Optional[str] = None,
     ) -> PunctuationResult:
-        start_time = time.time()
+        start = time.perf_counter()
         if not text:
-            return PunctuationResult(
-                text="",
-                model_id=self.model_id,
-                processing_time_ms=measure_processing_ms(start_time),
-            )
-
-        try:
-            await self._ensure_loaded()
-        except PunctuationModelError as exc:
-            self._logger.warning("中文标点模型不可用，降级为原文: %s", exc)
-            return PunctuationResult(
-                text=text,
-                model_id="fallback",
-                processing_time_ms=measure_processing_ms(start_time),
-            )
+            return PunctuationResult(text="", model_id=self._model_id)
 
         if self._itn_first:
             itn_result = await self._wetext.process(text)
-            normalized_text = itn_result.normalized_text
-            positions = await self._predict_async(normalized_text)
-            mapped, is_complete = self._map_back_positions(positions, itn_result)
-            if not is_complete and self._fallback_on_oov:
-                self._logger.info("中文 ITN 映射不完整，回退到原文标点策略")
-                mapped = await self._predict_async(text)
-            final_text = apply_punctuation(text, mapped)
-            split_points = build_split_points(text, mapped, word_timestamps)
-            confidence = self._aggregate_confidence(mapped)
-            return PunctuationResult(
-                text=final_text,
-                split_points=split_points,
-                punctuation_positions=mapped,
-                confidence=confidence,
-                model_id=self.model_id,
-                processing_time_ms=measure_processing_ms(start_time),
+            positions = self._adapter.predict(itn_result.normalized_text)
+            mapped = self._map_positions(
+                positions,
+                itn_result.char_mapping,
+                len(itn_result.original_text),
             )
+            punct_text = apply_punctuation(itn_result.original_text, mapped)
+        else:
+            positions = self._adapter.predict(text)
+            mapped = positions
+            punct_text = apply_punctuation(text, positions)
 
-        positions = await self._predict_async(text)
-        final_text = apply_punctuation(text, positions)
-        split_points = build_split_points(text, positions, word_timestamps)
-        confidence = self._aggregate_confidence(positions)
+        split_points = build_split_points(
+            text=punct_text,
+            positions=mapped,
+            word_timestamps=word_timestamps,
+        )
+        elapsed_ms = (time.perf_counter() - start) * 1000
         return PunctuationResult(
-            text=final_text,
+            text=punct_text,
             split_points=split_points,
-            punctuation_positions=positions,
-            confidence=confidence,
-            model_id=self.model_id,
-            processing_time_ms=measure_processing_ms(start_time),
+            punctuation_positions=mapped,
+            confidence=self._estimate_confidence(mapped),
+            model_id=self._model_id,
+            processing_time_ms=elapsed_ms,
         )
 
     def get_split_suggestion(
@@ -115,77 +83,50 @@ class ChinesePunctuationStrategy(PunctuationStrategy):
         min_sentence_length: int = 5,
         max_sentence_length: int = 50,
     ) -> List[int]:
-        suggestions: List[int] = []
-        last_index = 0
-        for point in result.split_points:
-            length = point.char_index - last_index + 1
-            if length < min_sentence_length:
-                continue
-            if length > max_sentence_length:
-                continue
-            suggestions.append(point.char_index)
-            last_index = point.char_index + 1
-        return suggestions
+        return [point.char_index for point in result.split_points]
 
-    async def _ensure_loaded(self) -> None:
-        if self._loaded:
-            return
-        manager = get_model_manager_v2()
-        try:
-            manager.ensure_available(self.model_id)
-            self._adapter.load("")
-        except Exception as exc:
-            raise PunctuationModelError(f"中文标点模型加载失败: {exc}") from exc
-        if self._wetext is None:
-            try:
-                self._wetext = WeTextProcessor(logger=self._logger)
-            except Exception as exc:
-                self._logger.warning("WeTextProcessor 初始化失败，回退身份映射: %s", exc)
-                self._wetext = WeTextProcessor(logger=self._logger)
-        self._loaded = True
-
-    async def _predict_async(self, text: str) -> List[PuncPosition]:
-        return await asyncio.to_thread(self._adapter.predict, text)
-
-    @staticmethod
-    def _aggregate_confidence(positions: Sequence[PuncPosition]) -> float:
-        if not positions:
-            return 0.0
-        return sum(p.confidence for p in positions) / len(positions)
-
-    @staticmethod
-    def _map_back_positions(
-        positions: Sequence[PuncPosition],
-        itn_result: TextNormalizationResult,
-    ) -> Tuple[List[PuncPosition], bool]:
-        if not positions:
-            return [], True
-
+    def _map_positions(
+        self,
+        positions: List[PuncPosition],
+        mappings: List[CharMapping],
+        original_length: int,
+    ) -> List[PuncPosition]:
+        if not positions or not mappings:
+            return positions
         mapped: List[PuncPosition] = []
-        is_complete = True
-        for position in positions:
-            mapped_index = _map_index(position.char_index, itn_result)
+        for pos in positions:
+            mapped_index = self._map_char_index(pos.char_index, mappings)
             if mapped_index is None:
-                is_complete = False
-                mapped_index = position.char_index
+                if self._fallback_on_oov:
+                    mapped_index = pos.char_index
+                else:
+                    continue
+            mapped_index = max(0, min(mapped_index, max(original_length - 1, 0)))
             mapped.append(
                 PuncPosition(
                     char_index=mapped_index,
-                    punctuation=position.punctuation,
-                    confidence=position.confidence,
+                    punctuation=pos.punctuation,
+                    confidence=pos.confidence,
                 )
             )
-        return mapped, is_complete
+        return mapped
 
-
-def _map_index(
-    normalized_index: int,
-    itn_result: TextNormalizationResult,
-) -> Optional[int]:
-    for mapping in itn_result.char_mapping:
-        start, end = mapping.normalized_range
-        if start <= normalized_index < end:
-            if mapping.mapping_type == "expand":
+    @staticmethod
+    def _map_char_index(char_index: int, mappings: List[CharMapping]) -> Optional[int]:
+        for mapping in mappings:
+            start, end = mapping.normalized_range
+            if start <= char_index < end:
+                if mapping.mapping_type == "identity":
+                    return mapping.original_range[0] + (char_index - start)
+                if mapping.mapping_type == "expand":
+                    return mapping.original_range[0]
+                if mapping.mapping_type == "collapse":
+                    return max(mapping.original_range[1] - 1, mapping.original_range[0])
                 return mapping.original_range[0]
-            return max(mapping.original_range[1] - 1, 0)
-    return None
+        return None
+
+    @staticmethod
+    def _estimate_confidence(positions: List[PuncPosition]) -> float:
+        if not positions:
+            return 1.0
+        return sum(pos.confidence for pos in positions) / len(positions)

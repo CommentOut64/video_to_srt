@@ -39,6 +39,9 @@ nvidia-cudnn-cu12==8.9.7.29
 # 强制排除 CPU 版本，只使用 GPU 版本
 # onnxruntime-gpu 完全兼容 CPU 推理，可用于标点/ASR ONNX 推理
 onnxruntime-gpu==1.18.0
+punctuators
+sentencepiece
+tokenizers
 
 # --- 音频处理 ---
 librosa

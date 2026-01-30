@@ -1,59 +1,71 @@
 """
-标点策略注册表，负责语言路由。
+标点策略注册表。
+V3.2.0+dev.20260129.02
 """
-
 from __future__ import annotations
 
-import threading
+import logging
 from typing import Dict, List, Optional
 
 from app.services.punctuation.base import PunctuationStrategy
 
 
 def normalize_language(language: Optional[str]) -> str:
-    """规范化语言标签，统一成基础语言码。"""
+    """规范化语言标签（仅保留主语言）。"""
     if not language:
-        return "auto"
-    language = language.strip().lower()
-    if "-" in language:
-        return language.split("-", 1)[0]
-    if "_" in language:
-        return language.split("_", 1)[0]
-    return language
+        return ""
+    value = str(language).strip().lower()
+    if not value:
+        return ""
+    value = value.replace("_", "-")
+    return value.split("-", 1)[0]
 
 
 class PunctuationRegistry:
-    """语言到策略的映射表。"""
+    """管理语言到标点策略的映射。"""
 
-    def __init__(self) -> None:
+    def __init__(self, logger: Optional[logging.Logger] = None) -> None:
         self._strategies: Dict[str, PunctuationStrategy] = {}
         self._fallback: Optional[PunctuationStrategy] = None
-        self._lock = threading.RLock()
+        self._logger = logger or logging.getLogger(__name__)
 
     def register(self, strategy: PunctuationStrategy) -> None:
         """注册策略。"""
-        with self._lock:
-            for language in strategy.supported_languages:
-                self._strategies[normalize_language(language)] = strategy
+        for language in strategy.supported_languages:
+            normalized = normalize_language(language)
+            if normalized in {"*", "default"}:
+                self._fallback = strategy
+                continue
+            self._strategies[normalized] = strategy
+        self._logger.debug(
+            "已注册标点策略: %s -> %s",
+            strategy.supported_languages,
+            strategy.model_id,
+        )
 
-    def set_fallback(self, strategy: PunctuationStrategy) -> None:
-        """设置兜底策略。"""
-        with self._lock:
-            self._fallback = strategy
-
-    def get(self, language: Optional[str]) -> Optional[PunctuationStrategy]:
-        """按语言获取策略，失败返回兜底策略。"""
+    def get(self, language: str) -> Optional[PunctuationStrategy]:
+        """获取匹配语言的策略，找不到则返回兜底策略。"""
         normalized = normalize_language(language)
-        with self._lock:
-            return self._strategies.get(normalized) or self._fallback
+        if not normalized:
+            return self._fallback
+        strategy = self._strategies.get(normalized)
+        return strategy or self._fallback
 
     def list_languages(self) -> List[str]:
         """列出已注册语言。"""
-        with self._lock:
-            return sorted(self._strategies.keys())
+        return sorted(self._strategies.keys())
 
-    def clear(self) -> None:
-        """清空注册表（仅用于测试）。"""
-        with self._lock:
-            self._strategies.clear()
-            self._fallback = None
+    def set_fallback(self, strategy: PunctuationStrategy) -> None:
+        """设置兜底策略。"""
+        self._fallback = strategy
+
+
+_registry: Optional[PunctuationRegistry] = None
+
+
+def get_punctuation_registry() -> PunctuationRegistry:
+    """获取注册表单例。"""
+    global _registry
+    if _registry is None:
+        _registry = PunctuationRegistry()
+    return _registry
