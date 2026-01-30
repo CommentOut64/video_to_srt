@@ -13,7 +13,13 @@ from app.core.asr.engine import ASREngine
 from app.core.asr.models import ASRResult
 from app.schemas.pipeline_context import ProcessingContext
 from app.services.audio.chunk_engine import AudioChunk
-from app.services.punctuation.base import PunctuationResult
+from app.services.punctuation.base import PunctuationResult, build_split_points
+from app.services.punctuation.postprocess import (
+    PunctuationPostprocessResult,
+    build_clean_text,
+    get_postprocess_config,
+    postprocess_punctuation,
+)
 from app.services.punctuation.service import PunctuationService
 from app.services.punctuation.scheduler import get_punctuation_scheduler
 
@@ -70,7 +76,7 @@ class FastWorker:
         self.logger.debug(f"Chunk {ctx.chunk_index}: SenseVoice 快流推理")
         sv_result = await self._run_sensevoice(chunk)
 
-        # V3.2.0+dev.20260129.01: FastWorker 标点集成（可选）
+        # V3.2.0+dev.20260130.01: FastWorker 标点集成 + 统一后处理（可选）
         if self.punctuation_service:
             sv_result = await self._apply_punctuation(sv_result, chunk)
 
@@ -140,12 +146,15 @@ class FastWorker:
         cleaned_words = self._merge_punctuation_timestamps(words)
         sv_result["words"] = cleaned_words
 
-        text = sv_result.get("text_clean") or sv_result.get("text") or ""
+        raw_text = sv_result.get("text_clean") or sv_result.get("text") or ""
+        clean_text, _, _ = build_clean_text(raw_text)
+        if not clean_text:
+            clean_text = raw_text
         language = chunk.language or sv_result.get("language") or self.sensevoice_language
 
         try:
             result = await self.punctuation_service.restore(
-                text=text,
+                text=clean_text,
                 language=language,
                 word_timestamps=cleaned_words,
             )
@@ -155,10 +164,24 @@ class FastWorker:
 
         if result:
             metadata = sv_result.setdefault("metadata", {})
-            metadata["punctuation"] = self._punctuation_result_to_dict(result)
+            post_config = get_postprocess_config("fast")
+            post = postprocess_punctuation(
+                raw_text=raw_text,
+                words=cleaned_words,
+                language=language,
+                mode="fast",
+                candidates=result.punctuation_positions,
+                config=post_config,
+            )
+            metadata["punctuation"] = self._postprocess_result_to_dict(
+                result,
+                post,
+                cleaned_words,
+                mode="fast",
+            )
             # V3.2.0+dev.20260129.02: 写入快流标点调度决策
             decision = self._punctuation_scheduler.evaluate_fast(
-                result,
+                self._build_postprocess_result(result, post, cleaned_words),
                 sv_confidence=sv_result.get("confidence"),
             )
             metadata["punctuation_decision"] = {
@@ -207,11 +230,23 @@ class FastWorker:
 
         return cleaned
 
-    @staticmethod
-    def _punctuation_result_to_dict(result: PunctuationResult) -> Dict[str, Any]:
-        """将标点结果转换为可序列化结构。"""
+    def _postprocess_result_to_dict(
+        self,
+        model_result: PunctuationResult,
+        post_result: PunctuationPostprocessResult,
+        words: List[Dict[str, Any]],
+        *,
+        mode: str,
+    ) -> Dict[str, Any]:
+        """将后处理结果转换为可序列化结构。"""
+        positions = post_result.final_positions
+        split_points = build_split_points(
+            text=post_result.final_text,
+            positions=positions,
+            word_timestamps=words,
+        )
         return {
-            "text": result.text,
+            "text": post_result.final_text,
             "split_points": [
                 {
                     "char_index": point.char_index,
@@ -219,7 +254,7 @@ class FastWorker:
                     "punctuation": point.punctuation,
                     "confidence": point.confidence,
                 }
-                for point in result.split_points
+                for point in split_points
             ],
             "punctuation_positions": [
                 {
@@ -227,9 +262,56 @@ class FastWorker:
                     "punctuation": position.punctuation,
                     "confidence": position.confidence,
                 }
-                for position in result.punctuation_positions
+                for position in positions
             ],
-            "confidence": result.confidence,
-            "model_id": result.model_id,
-            "processing_time_ms": result.processing_time_ms,
+            "confidence": self._estimate_positions_confidence(positions, model_result.confidence),
+            "model_id": model_result.model_id,
+            "processing_time_ms": model_result.processing_time_ms,
+            "postprocess": {
+                "mode": mode,
+                "decision_log": [
+                    {
+                        "char_index": decision.char_index,
+                        "punctuation": decision.punctuation,
+                        "action": decision.action,
+                        "reason": decision.reason,
+                        "raw_conf": decision.raw_conf,
+                        "cand_conf": decision.cand_conf,
+                    }
+                    for decision in post_result.decision_log
+                ],
+                "metrics": post_result.metrics,
+            },
         }
+
+    @staticmethod
+    def _estimate_positions_confidence(
+        positions: List[Any],
+        fallback: float,
+    ) -> float:
+        """估算后处理标点置信度。"""
+        if not positions:
+            return float(fallback or 0.0)
+        return sum(float(pos.confidence) for pos in positions) / len(positions)
+
+    @staticmethod
+    def _build_postprocess_result(
+        model_result: PunctuationResult,
+        post_result: PunctuationPostprocessResult,
+        words: List[Dict[str, Any]],
+    ) -> PunctuationResult:
+        """构造用于调度器的标点结果。"""
+        positions = post_result.final_positions
+        split_points = build_split_points(
+            text=post_result.final_text,
+            positions=positions,
+            word_timestamps=words,
+        )
+        return PunctuationResult(
+            text=post_result.final_text,
+            split_points=split_points,
+            punctuation_positions=positions,
+            confidence=FastWorker._estimate_positions_confidence(positions, model_result.confidence),
+            model_id=model_result.model_id,
+            processing_time_ms=model_result.processing_time_ms,
+        )
