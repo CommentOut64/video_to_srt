@@ -1,6 +1,6 @@
 """
 标点服务入口。
-V3.2.0+dev.20260129.02
+V3.2.0+dev.20260130.06
 """
 from __future__ import annotations
 
@@ -43,6 +43,9 @@ class PunctuationService:
         self._is_punctuation_enabled = True
         self._default_language = "zh"
         self._fallback_priority = "fast"
+        self._logged_runtime = False
+        self._logged_strategies: set[str] = set()
+        self._logged_first_success = False
         if not self._is_custom_registry:
             self._ensure_default_strategies()
 
@@ -87,16 +90,32 @@ class PunctuationService:
     ) -> PunctuationResult:
         """恢复标点并返回结果。"""
         self._refresh_runtime_config()
+        if not self._logged_runtime:
+            self._logger.info(
+                "标点服务状态: enabled=%s, default_language=%s, fallback_priority=%s",
+                self._is_punctuation_enabled,
+                self._default_language,
+                self._fallback_priority,
+            )
+            self._logged_runtime = True
         if not text:
             return self._build_empty_result("", model_id="empty", processing_time_ms=0.0)
 
         if not self._is_punctuation_enabled:
             return self._build_empty_result(text, model_id="disabled", processing_time_ms=0.0)
 
-        strategy = self.get_strategy(language or self._default_language)
+        resolved_language = language or self._default_language
+        strategy = self.get_strategy(resolved_language)
         if strategy is None:
             self._logger.warning("未找到标点策略，使用兜底逻辑")
             return self._build_fallback_result(text, fallback_text, 0.0)
+        if resolved_language not in self._logged_strategies:
+            self._logger.info(
+                "标点策略启用: language=%s, model_id=%s",
+                resolved_language,
+                strategy.model_id,
+            )
+            self._logged_strategies.add(resolved_language)
 
         if strategy.model_id == "asr_fallback":
             if self._fallback_priority == "slow" and fallback_text:
@@ -122,6 +141,17 @@ class PunctuationService:
             elapsed_ms = (time.perf_counter() - start) * 1000
             self._logger.warning("标点恢复失败，回退兜底: %s", exc)
             return self._build_fallback_result(text, fallback_text, elapsed_ms)
+
+        if not self._logged_first_success and result.model_id not in {"asr_fallback", "disabled", "empty"}:
+            self._logger.info(
+                "标点恢复完成(首次): language=%s, model_id=%s, ms=%.2f, text_len=%d, positions=%d",
+                resolved_language,
+                result.model_id,
+                float(result.processing_time_ms or 0.0),
+                len(text),
+                len(result.punctuation_positions),
+            )
+            self._logged_first_success = True
 
         return result
 

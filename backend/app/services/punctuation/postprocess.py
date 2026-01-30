@@ -79,7 +79,7 @@ class _MappedCandidate:
     confidence: float
 
 
-_PUNCTUATION_SET = set(",.!?;:'\"()[]{}，。！？；：、（）【】《》“”‘’「」『』")
+_PUNCTUATION_SET = set(",.!?;:\"()[]{}，。！？；：、（）【】《》“”「」『』")
 _LEFT_PUNCT = set("([{“‘（【《「『")
 _SENTENCE_END = set("。！？.!?")
 _QUESTION_PUNCT = {"?", "？"}
