@@ -136,6 +136,20 @@ class UserConfigService:
             logger.error(f"❌ 设置字幕时间偏移失败: {e}")
             return False
 
+    def resolve_subtitle_time_offset(self, task_offset: Optional[float]) -> float:
+        """
+        解析任务级/全局字幕偏移
+
+        Args:
+            task_offset: 任务级偏移（None 表示使用全局默认）
+
+        Returns:
+            float: 生效偏移（秒）
+        """
+        if task_offset is None:
+            return self.get_subtitle_time_offset()
+        return float(task_offset)
+
     def get_all_config(self) -> Dict[str, Any]:
         """获取所有用户配置"""
         return self._load_config()
