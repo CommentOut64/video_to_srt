@@ -37,11 +37,18 @@ from pathlib import Path
 from app.core.asr.engine import ASREngine
 from app.core.thresholds import ThresholdConfig, needs_whisper_patch
 from app.schemas.pipeline_context import ProcessingContext
+from app.models.sensevoice_models import SentenceSegment
 from app.services.audio.chunk_engine import AudioChunk
 from app.services.alignment.default_aligner import DefaultAligner
 from app.services.sse_service import get_sse_manager
 from app.services.segmentation.default_segmenter import DefaultSegmenter
 from app.services.streaming_subtitle import get_streaming_subtitle_manager
+from app.services.punctuation.base import PunctuationResult, PuncPosition, SplitPoint
+from app.services.punctuation.semantic_buffer import (
+    PunctuationDecision,
+    SemanticBuffer,
+    SemanticBufferInput,
+)
 from app.pipelines.workers import FastWorker, SlowWorker
 from app.utils.prompt_builder import get_prompt_builder
 from app.utils.cancellation_token import CancelledException, PausedException  # V3.1.0: 捕获取消/暂停异常
@@ -79,6 +86,8 @@ class AsyncDualPipeline:
         whisper_language: str = "auto",
         user_glossary: Optional[list] = None,
         enable_semantic_grouping: bool = True,
+        enable_semantic_buffer: bool = True,
+        semantic_buffer: Optional[SemanticBuffer] = None,
         alignment_score_threshold: float = 0.3,
         enable_fallback: bool = True,
         transcription_profile: str = "sv_whisper_patch",
@@ -101,6 +110,8 @@ class AsyncDualPipeline:
             whisper_language: Whisper 语言设置
             user_glossary: 用户词表
             enable_semantic_grouping: 是否启用语义分组
+            enable_semantic_buffer: 是否启用 SemanticBuffer 语义缓冲
+            semantic_buffer: 语义缓冲器实例（可选）
             alignment_score_threshold: 对齐质量阈值
             enable_fallback: 是否启用降级策略
             transcription_profile: 转录模式 (sensevoice_only/sv_whisper_patch/sv_whisper_dual)
@@ -156,6 +167,12 @@ class AsyncDualPipeline:
             )
         self.segmenter = segmenter
         self.subtitle_manager = get_streaming_subtitle_manager(job_id)
+
+        # V3.2.0+dev.20260130.03: SemanticBuffer 语义缓冲（Phase C 接入）
+        self.enable_semantic_buffer = enable_semantic_buffer
+        self.semantic_buffer = semantic_buffer if enable_semantic_buffer else None
+        if self.semantic_buffer is None and enable_semantic_buffer:
+            self.semantic_buffer = SemanticBuffer(logger=self.logger)
 
         # V3.2.0+dev.20260129.01: 标点服务注入
         if punctuation_service is None:
@@ -323,6 +340,7 @@ class AsyncDualPipeline:
         self._fast_processed_indices = processed_indices
         self._finalized_indices = processed_indices
         total_chunks = len(audio_chunks)
+        last_chunk_index: Optional[int] = None
 
         for i, chunk in enumerate(audio_chunks):
             # v3.1.0: 跳过已处理的 chunk（用于恢复）
@@ -347,6 +365,7 @@ class AsyncDualPipeline:
                 await self.fast_worker.process(ctx)
                 self._emit_draft_sentences(ctx, is_final_output=True)
                 results.append(ctx)
+                last_chunk_index = i
 
                 # V3.1.0: 更新进度（极速模式只有 fast 阶段）
                 if self.progress_emitter:
@@ -406,6 +425,9 @@ class AsyncDualPipeline:
             self.is_pause_snapshot_saved = self._force_save_pause_checkpoint(job_dir, total_chunks)
             # V3.1.0: 触发暂停时抛出异常，保持上层状态机一致
             raise self.pause_exception
+
+        if last_chunk_index is not None:
+            self._flush_semantic_buffer(is_final_output=True, chunk_index=last_chunk_index)
 
         self.logger.info(f"极速模式完成: {len(results)} 个 Chunk 已处理")
         return results
@@ -512,6 +534,10 @@ class AsyncDualPipeline:
         if not ctx.sv_result or not ctx.audio_chunk:
             return
 
+        semantic_sentences = self._emit_semantic_sentences(ctx, is_final_output)
+        if semantic_sentences is not None:
+            return
+
         is_draft = not is_final_output
         sentences = self.segmenter.split_draft(
             ctx.sv_result,
@@ -529,6 +555,155 @@ class AsyncDualPipeline:
             self.logger.debug(
                 f"Chunk {ctx.chunk_index}: 草稿已推送 ({len(sentences)} 个句子)"
             )
+
+    def _emit_semantic_sentences(
+        self,
+        ctx: ProcessingContext,
+        is_final_output: bool,
+    ) -> Optional[List[SentenceSegment]]:
+        """使用 SemanticBuffer 生成句子并推送字幕。"""
+        if not self.semantic_buffer or not ctx.sv_result or not ctx.audio_chunk:
+            return None
+
+        semantic_input = self._build_semantic_input(ctx)
+        if semantic_input is None:
+            return None
+
+        chunks = self.semantic_buffer.add(semantic_input)
+        if not chunks:
+            return []
+
+        total_sentences = 0
+        for chunk in chunks:
+            sentences = chunk.sentences
+            if is_final_output:
+                for sentence in sentences:
+                    sentence.is_finalized = True
+                    sentence.is_draft = False
+                self.subtitle_manager.add_finalized_sentences(ctx.chunk_index, sentences)
+            else:
+                self.subtitle_manager.add_draft_sentences(ctx.chunk_index, sentences)
+            total_sentences += len(sentences)
+
+        phase = "定稿" if is_final_output else "草稿"
+        self.logger.debug(
+            "Chunk %s: SemanticBuffer %s推送 (%d 个句子)",
+            ctx.chunk_index,
+            phase,
+            total_sentences,
+        )
+        return [sentence for chunk in chunks for sentence in chunk.sentences]
+
+    def _build_semantic_input(self, ctx: ProcessingContext) -> Optional[SemanticBufferInput]:
+        """构建 SemanticBuffer 输入。"""
+        sv_result = ctx.sv_result or {}
+        chunk = ctx.audio_chunk
+        metadata = sv_result.get("metadata", {}) if isinstance(sv_result, dict) else {}
+        punctuation_meta = metadata.get("punctuation")
+        decision_meta = metadata.get("punctuation_decision")
+
+        if not isinstance(punctuation_meta, dict):
+            return None
+        if not punctuation_meta.get("split_points") and not punctuation_meta.get("punctuation_positions"):
+            return None
+
+        text = sv_result.get("text_clean") or sv_result.get("text") or ""
+        words = sv_result.get("words") if isinstance(sv_result, dict) else None
+        punctuation_result = self._build_punctuation_result(punctuation_meta, text)
+        if punctuation_result and punctuation_result.text:
+            text = punctuation_result.text
+
+        if not text:
+            return None
+
+        decision = self._build_punctuation_decision(decision_meta)
+        source_chunks = [f"chunk-{chunk.index}"]
+        return SemanticBufferInput(
+            chunk_id=f"chunk-{ctx.chunk_index}",
+            text=text,
+            audio_range=(chunk.start, chunk.end),
+            language=chunk.language or sv_result.get("language") or "auto",
+            punctuation_result=punctuation_result,
+            punctuation_decision=decision,
+            word_timestamps=words if isinstance(words, list) else None,
+            source_chunks=source_chunks,
+            speaker_id=None,
+        )
+
+    @staticmethod
+    def _build_punctuation_decision(meta: Optional[Dict[str, Any]]) -> Optional[PunctuationDecision]:
+        if not meta or not isinstance(meta, dict):
+            return None
+        return PunctuationDecision.from_dict(meta)
+
+    @staticmethod
+    def _build_punctuation_result(
+        meta: Optional[Dict[str, Any]],
+        fallback_text: str,
+    ) -> Optional[PunctuationResult]:
+        if not meta or not isinstance(meta, dict):
+            return None
+
+        text = meta.get("text") or fallback_text
+        raw_split_points = meta.get("split_points", []) or []
+        raw_positions = meta.get("punctuation_positions", []) or []
+        split_points: List[SplitPoint] = []
+        for item in raw_split_points:
+            if not isinstance(item, dict):
+                continue
+            split_points.append(
+                SplitPoint(
+                    char_index=int(item.get("char_index", 0)),
+                    relative_time=float(item.get("relative_time", 0.0)),
+                    punctuation=str(item.get("punctuation", "")),
+                    confidence=float(item.get("confidence", 1.0)),
+                )
+            )
+        positions: List[PuncPosition] = []
+        for item in raw_positions:
+            if not isinstance(item, dict):
+                continue
+            positions.append(
+                PuncPosition(
+                    char_index=int(item.get("char_index", 0)),
+                    punctuation=str(item.get("punctuation", "")),
+                    confidence=float(item.get("confidence", 1.0)),
+                )
+            )
+
+        return PunctuationResult(
+            text=str(text),
+            model_id=str(meta.get("model_id", "unknown")),
+            split_points=split_points,
+            punctuation_positions=positions,
+            confidence=float(meta.get("confidence", 1.0)),
+            processing_time_ms=float(meta.get("processing_time_ms", 0.0)),
+        )
+
+    def _flush_semantic_buffer(self, *, is_final_output: bool, chunk_index: int) -> None:
+        """刷新 SemanticBuffer 尾部内容并推送字幕。"""
+        if not self.semantic_buffer:
+            return
+        chunks = self.semantic_buffer.flush(reason="pipeline_end")
+        if not chunks:
+            return
+        total_sentences = 0
+        for chunk in chunks:
+            sentences = chunk.sentences
+            if is_final_output:
+                for sentence in sentences:
+                    sentence.is_finalized = True
+                    sentence.is_draft = False
+                self.subtitle_manager.add_finalized_sentences(chunk_index, sentences)
+            else:
+                self.subtitle_manager.add_draft_sentences(chunk_index, sentences)
+            total_sentences += len(sentences)
+        phase = "定稿" if is_final_output else "草稿"
+        self.logger.info(
+            "SemanticBuffer 尾部刷新完成: %s %d 个句子",
+            phase,
+            total_sentences,
+        )
 
     def _should_skip_whisper(self, sv_result: Dict[str, Any], chunk: AudioChunk) -> bool:
         """
@@ -686,6 +861,7 @@ class AsyncDualPipeline:
         fast_processed_count = 0  # V3.1.0: 追踪本次新处理的数量
         pause_requested = False  # V3.1.0: 捕获暂停后进入排空模式
         should_send_end_signal = True  # V3.1.0: 控制是否需要发送正常结束信号
+        last_chunk_index: Optional[int] = None
 
         try:
             for i, chunk in enumerate(chunks):
@@ -715,6 +891,7 @@ class AsyncDualPipeline:
                     # 放入队列（如果队列满了，会自动阻塞，实现背压）
                     await self.queue_inter.put(ctx)
                     fast_processed_count += 1  # V3.1.0
+                    last_chunk_index = i
 
                     # V3.1.0: 更新 FastWorker 进度（叠加基准偏移量）
                     if self.progress_emitter:
@@ -786,6 +963,8 @@ class AsyncDualPipeline:
             return
         finally:
             if should_send_end_signal:
+                if last_chunk_index is not None:
+                    self._flush_semantic_buffer(is_final_output=False, chunk_index=last_chunk_index)
                 end_ctx = ProcessingContext(
                     job_id=self.job_id,
                     chunk_index=-1,

@@ -7,7 +7,7 @@ FastWorker - 快流推理 Worker（CPU）
 """
 import copy
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from app.core.asr.engine import ASREngine
 from app.core.asr.models import ASRResult
@@ -20,8 +20,10 @@ from app.services.punctuation.postprocess import (
     get_postprocess_config,
     postprocess_punctuation,
 )
-from app.services.punctuation.service import PunctuationService
 from app.services.punctuation.scheduler import get_punctuation_scheduler
+
+if TYPE_CHECKING:
+    from app.services.punctuation.service import PunctuationService
 
 
 class FastWorker:
@@ -38,7 +40,7 @@ class FastWorker:
         job_id: str,
         draft_engine: ASREngine,
         sensevoice_language: str = "auto",
-        punctuation_service: Optional[PunctuationService] = None,
+        punctuation_service: Optional["PunctuationService"] = None,
         logger: Optional[logging.Logger] = None
     ):
         """
