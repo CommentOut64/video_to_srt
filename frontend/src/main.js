@@ -7,9 +7,15 @@ import ElementPlus from 'element-plus'
 import * as ElementPlusIconsVue from '@element-plus/icons-vue'
 import 'element-plus/dist/index.css'
 // 注意: 需要在 element-plus 之后导入自定义样式以覆盖默认样式
+import './styles/element-override.css'
 import './styles/main.scss'
 import App from './App.vue'
 import router from './router'
+import { useTheme } from './theme'
+
+// 初始化主题系统（必须在创建应用实例之前）
+const { initialize: initializeTheme } = useTheme()
+initializeTheme()
 
 // 创建应用实例
 const app = createApp(App)
