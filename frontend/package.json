@@ -13,6 +13,7 @@
     "@vueuse/components": "^14.0.0",
     "@vueuse/core": "^14.0.0",
     "axios": "^1.13.2",
+    "clsx": "^2.1.1",
     "element-plus": "^2.11.8",
     "eventemitter3": "^5.0.1",
     "localforage": "^1.10.0",
@@ -29,6 +30,11 @@
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^6.0.1",
+    "autoprefixer": "^10.4.23",
+    "postcss": "^8.5.6",
+    "stylelint": "^17.1.0",
+    "stylelint-config-standard": "^40.0.0",
+    "tailwindcss": "^3.4.19",
     "vite": "^7.2.4"
   }
 }
