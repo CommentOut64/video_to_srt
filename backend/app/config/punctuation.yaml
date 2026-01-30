@@ -19,3 +19,31 @@ scheduler:
   alignment_coverage_threshold: 0.7
   arbiter_conflict_threshold: 0.35
   max_slow_retries: 1
+
+postprocess:
+  fast:
+    candidate_min_conf: 0.30
+    add_mid_conf: 0.70
+    add_end_conf: 0.75
+    keep_raw_mid_conf: 0.60
+    keep_raw_end_conf: 0.70
+    drop_raw_mid_conf: 0.35
+    drop_raw_end_conf: 0.50
+    question_gate_min_conf: 0.85
+    pause_end_min_sec: 0.35
+  dual:
+    candidate_min_conf: 0.25
+    add_mid_conf: 0.60
+    add_end_conf: 0.65
+    keep_raw_mid_conf: 0.55
+    keep_raw_end_conf: 0.60
+    drop_raw_mid_conf: 0.30
+    drop_raw_end_conf: 0.40
+    question_gate_min_conf: 0.75
+    pause_end_min_sec: 0.25
+  shared:
+    candidate_window_words: 1
+    conflict_window_chars: 1
+    max_repeat_punct: 1
+    allowed_punct_zh: "。？！；：，、"
+    allowed_punct_en: ".!?,;:"
