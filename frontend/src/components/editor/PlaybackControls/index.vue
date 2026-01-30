@@ -7,7 +7,7 @@
       <el-tooltip content="快退5秒" placement="top" :show-after="500">
         <button class="ctrl-btn" :disabled="!isVideoReady" @click="seek(-seekStep)">
           <svg viewBox="0 0 24 24" fill="currentColor">
-            <path d="M11 18V6l-8.5 6 8.5 6zm.5-6l8.5 6V6l-8.5 6z"/>
+            <path d="M11 18V6l-8.5 6 8.5 6zm.5-6l8.5 6V6l-8.5 6z" />
           </svg>
         </button>
       </el-tooltip>
@@ -16,10 +16,10 @@
       <el-tooltip :content="isPlaying ? '暂停' : '播放'" placement="top" :show-after="500">
         <button class="ctrl-btn ctrl-btn--play" :disabled="!isVideoReady" @click="togglePlay">
           <svg v-if="!isPlaying" viewBox="0 0 24 24" fill="currentColor">
-            <path d="M8 5v14l11-7z"/>
+            <path d="M8 5v14l11-7z" />
           </svg>
           <svg v-else viewBox="0 0 24 24" fill="currentColor">
-            <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>
+            <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z" />
           </svg>
         </button>
       </el-tooltip>
@@ -28,22 +28,23 @@
       <el-tooltip content="快进5秒" placement="top" :show-after="500">
         <button class="ctrl-btn" :disabled="!isVideoReady" @click="seek(seekStep)">
           <svg viewBox="0 0 24 24" fill="currentColor">
-            <path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z"/>
+            <path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z" />
           </svg>
         </button>
       </el-tooltip>
     </div>
 
     <!-- 进度条区域 -->
-    <div class="controls-progress">
+    <div class="controls-progress" :class="{ dragging: isDraggingProgress }">
       <span class="time-display time-current">{{ formatTime(currentTime) }}</span>
 
-      <div class="progress-bar" ref="progressRef" @click="handleProgressClick" @mousedown="startDrag">
+      <div class="progress-bar" ref="progressRef" @mousedown="handleProgressMouseDown">
         <div class="progress-track">
           <div class="progress-buffered" :style="{ width: bufferedPercent + '%' }"></div>
-          <div class="progress-played" :style="{ width: progressPercent + '%' }"></div>
+          <div class="progress-fill" :style="{ width: progressPercent + '%' }">
+            <div class="progress-thumb"></div>
+          </div>
         </div>
-        <div class="progress-thumb" :style="{ left: progressPercent + '%' }"></div>
       </div>
 
       <span class="time-display time-total">{{ formatTime(duration) }}</span>
@@ -56,15 +57,21 @@
         <el-tooltip :content="isMuted ? '取消静音' : '静音'" placement="top" :show-after="500">
           <button class="ctrl-btn ctrl-btn--sm" @click="toggleMute">
             <svg v-if="isMuted || volume === 0" viewBox="0 0 24 24" fill="currentColor">
-              <path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/>
+              <path
+                d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"
+              />
             </svg>
-          <svg v-else-if="volume < 0.5" viewBox="0 0 24 24" fill="currentColor">
-            <path d="M18.5 12c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM5 9v6h4l5 5V4L9 9H5z"/>
-          </svg>
-          <svg v-else viewBox="0 0 24 24" fill="currentColor">
-            <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>
-          </svg>
-        </button>
+            <svg v-else-if="volume < 0.5" viewBox="0 0 24 24" fill="currentColor">
+              <path
+                d="M18.5 12c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM5 9v6h4l5 5V4L9 9H5z"
+              />
+            </svg>
+            <svg v-else viewBox="0 0 24 24" fill="currentColor">
+              <path
+                d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"
+              />
+            </svg>
+          </button>
         </el-tooltip>
         <div class="volume-slider" @click.stop>
           <input
@@ -98,15 +105,13 @@
 
       <!-- 循环播放 -->
       <el-tooltip v-if="showLoop" content="循环播放" placement="top" :show-after="500">
-        <button
-          class="ctrl-btn ctrl-btn--sm"
-          :class="{ active: isLooping }"
-          @click="toggleLoop"
-        >
+        <button class="ctrl-btn ctrl-btn--sm" :class="{ active: isLooping }" @click="toggleLoop">
           <svg viewBox="0 0 24 24" fill="currentColor">
-          <path d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46C19.54 15.03 20 13.57 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74C4.46 8.97 4 10.43 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/>
-        </svg>
-      </button>
+            <path
+              d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46C19.54 15.03 20 13.57 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74C4.46 8.97 4 10.43 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"
+            />
+          </svg>
+        </button>
       </el-tooltip>
     </div>
   </div>
@@ -120,12 +125,12 @@ import { usePlaybackManager } from '@/services/PlaybackManager'
 // Props
 const props = defineProps({
   compact: { type: Boolean, default: false },
-  pedestal: { type: Boolean, default: false },  // 底座模式：融入背景，无圆角
+  pedestal: { type: Boolean, default: false }, // 底座模式：融入背景，无圆角
   showSpeed: { type: Boolean, default: true },
   showVolume: { type: Boolean, default: true },
   showLoop: { type: Boolean, default: true },
   seekStep: { type: Number, default: 5 },
-  microSeekStep: { type: Number, default: 0.1 }
+  microSeekStep: { type: Number, default: 0.1 },
 })
 
 const emit = defineEmits(['play', 'pause', 'seek', 'speed-change', 'volume-change'])
@@ -151,6 +156,8 @@ const isMuted = ref(false)
 const previousVolume = ref(1)
 const showSpeedMenu = ref(false)
 const bufferedPercent = ref(0)
+const isDraggingProgress = ref(false) // 是否正在拖动进度条
+const dragProgressPercent = ref(0) // 拖动时的进度百分比
 
 // 倍速选项
 const speedOptions = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2]
@@ -160,10 +167,14 @@ const currentTime = computed(() => projectStore.player.currentTime)
 const duration = computed(() => projectStore.meta.duration || 0)
 const isPlaying = computed(() => projectStore.player.isPlaying)
 const playbackRate = computed(() => projectStore.player.playbackRate)
-const volume = computed(() => isMuted.value ? 0 : projectStore.player.volume)
+const volume = computed(() => (isMuted.value ? 0 : projectStore.player.volume))
 
 // 进度百分比
 const progressPercent = computed(() => {
+  // 拖动时使用本地状态，避免响应式更新延迟导致的视觉分离
+  if (isDraggingProgress.value) {
+    return dragProgressPercent.value
+  }
   if (!duration.value) return 0
   return (currentTime.value / duration.value) * 100
 })
@@ -189,46 +200,78 @@ function seek(seconds) {
   emit('seek', newTime)
 }
 
-// 进度条点击
-function handleProgressClick(e) {
+// 进度条交互 - 统一处理点击和拖拽
+let rafId = null // requestAnimationFrame ID，用于节流
+let pendingTime = null // 待更新的时间
+
+function handleProgressMouseDown(e) {
   if (!isVideoReady.value) {
     console.warn('[PlaybackControls] 视频未就绪，进度条操作被拦截')
     return
   }
   if (!progressRef.value || !duration.value) return
-  const rect = progressRef.value.getBoundingClientRect()
-  const percent = (e.clientX - rect.left) / rect.width
-  const newTime = percent * duration.value
-  playbackManager.seekTo(newTime)
-  emit('seek', newTime)
-}
 
-// 拖拽进度条
-function startDrag(e) {
-  if (!isVideoReady.value) {
-    console.warn('[PlaybackControls] 视频未就绪，拖拽操作被拦截')
-    return
-  }
-  e.preventDefault()  // 阻止默认行为，防止文本选择干扰拖拽
+  e.preventDefault() // 阻止默认行为，防止文本选择
+
+  // 计算点击位置
+  const rect = progressRef.value.getBoundingClientRect()
+  const percent = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
+  const newTime = percent * duration.value
+
+  // 更新本地进度（立即响应 UI）
+  isDraggingProgress.value = true
+  dragProgressPercent.value = percent * 100
+  pendingTime = newTime
+
+  // 通知播放管理器开始拖拽（暂停播放同步）
   playbackManager.startDragging('progressBar')
+
+  // 监听后续拖拽
   document.addEventListener('mousemove', onDrag)
   document.addEventListener('mouseup', stopDrag)
 }
 
 function onDrag(e) {
   if (!progressRef.value || !duration.value) return
-  if (!playbackManager.isDragging()) return  // 如果不在拖拽状态，停止处理
-  
+  if (!isDraggingProgress.value) return
+
   const rect = progressRef.value.getBoundingClientRect()
   const percent = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
-  const newTime = percent * duration.value
-  playbackManager.updateDragging(newTime)
+
+  // 立即更新本地进度百分比（UI 响应）
+  dragProgressPercent.value = percent * 100
+  pendingTime = percent * duration.value
+
+  // 使用 RAF 节流更新 store（减少频繁更新导致的卡顿）
+  if (!rafId) {
+    rafId = requestAnimationFrame(() => {
+      if (pendingTime !== null) {
+        playbackManager.updateDragging(pendingTime)
+      }
+      rafId = null
+    })
+  }
 }
 
 function stopDrag() {
   document.removeEventListener('mousemove', onDrag)
   document.removeEventListener('mouseup', stopDrag)
-  playbackManager.stopDragging()
+
+  // 取消未完成的 RAF
+  if (rafId) {
+    cancelAnimationFrame(rafId)
+    rafId = null
+  }
+
+  if (isDraggingProgress.value) {
+    // 最终 seek 到目标位置
+    if (pendingTime !== null) {
+      playbackManager.updateDragging(pendingTime)
+    }
+    playbackManager.stopDragging()
+    isDraggingProgress.value = false
+    pendingTime = null
+  }
 }
 
 // 音量控制
@@ -280,8 +323,12 @@ function formatTime(seconds) {
 
 // 点击外部关闭倍速菜单
 function handleClickOutside(e) {
-  if (speedBtnRef.value && !speedBtnRef.value.contains(e.target) &&
-      speedMenuRef.value && !speedMenuRef.value.contains(e.target)) {
+  if (
+    speedBtnRef.value &&
+    !speedBtnRef.value.contains(e.target) &&
+    speedMenuRef.value &&
+    !speedMenuRef.value.contains(e.target)
+  ) {
     showSpeedMenu.value = false
   }
 }
@@ -311,7 +358,7 @@ onUnmounted(() => {
   align-items: center;
   gap: 16px;
   padding: 12px 16px;
-  background: var(--bg-secondary);
+  background: var(--af-bg-secondary);
   border-radius: var(--radius-lg);
   user-select: none;
 
@@ -321,14 +368,16 @@ onUnmounted(() => {
     padding: 8px 12px;
 
     .controls-progress {
-      .time-display { font-size: 11px; }
+      .time-display {
+        font-size: 11px;
+      }
     }
   }
 
   // 底座模式：融入背景，无圆角
   &.pedestal {
     border-radius: 0;
-    background: var(--bg-primary);
+    background: var(--af-bg-primary);
     height: 48px;
     padding: 0 20px;
     border: none;
@@ -360,9 +409,9 @@ onUnmounted(() => {
   justify-content: center;
   width: 36px;
   height: 36px;
-  border-radius: var(--radius-md);
-  color: var(--text-secondary);
-  transition: all var(--transition-fast);
+  border-radius: var(--af-radius-md);
+  color: var(--af-text-secondary);
+  transition: all var(--af-transition-fast);
 
   svg {
     width: 20px;
@@ -371,19 +420,22 @@ onUnmounted(() => {
 
   &:hover {
     color: var(--text-primary);
-    background: var(--bg-tertiary);
+    background: var(--af-bg-tertiary);
   }
 
   &--play {
     width: 44px;
     height: 44px;
-    background: var(--primary);
+    background: var(--af-accent-primary);
     color: white;
 
-    svg { width: 24px; height: 24px; }
+    svg {
+      width: 24px;
+      height: 24px;
+    }
 
     &:hover {
-      background: var(--primary-hover);
+      background: var(--af-accent-primary-hover);
       color: white;
     }
   }
@@ -391,7 +443,10 @@ onUnmounted(() => {
   &--sm {
     width: 32px;
     height: 32px;
-    svg { width: 18px; height: 18px; }
+    svg {
+      width: 18px;
+      height: 18px;
+    }
   }
 
   &--text {
@@ -399,11 +454,11 @@ onUnmounted(() => {
     padding: 0 10px;
     font-size: 13px;
     font-weight: 500;
-    font-family: var(--font-mono);
+    font-family: var(--af-font-mono);
   }
 
   &.active {
-    color: var(--primary);
+    color: var(--af-accent-primary);
     background: rgba(88, 166, 255, 0.15);
   }
 
@@ -424,11 +479,13 @@ onUnmounted(() => {
 
   .time-display {
     font-size: 12px;
-    font-family: var(--font-mono);
-    color: var(--text-muted);
+    font-family: var(--af-font-mono);
+    color: var(--af-text-muted);
     min-width: 45px;
 
-    &.time-total { text-align: right; }
+    &.time-total {
+      text-align: right;
+    }
   }
 
   .progress-bar {
@@ -440,45 +497,70 @@ onUnmounted(() => {
     position: relative;
 
     &:hover {
-      .progress-track { height: 6px; }
-      .progress-thumb { opacity: 1; transform: translateX(-50%) scale(1); }
+      .progress-track {
+        height: 6px;
+      }
+      .progress-thumb {
+        opacity: 1;
+        transform: translateX(50%) translateY(-50%) scale(1);
+      }
     }
   }
 
   .progress-track {
     width: 100%;
     height: 4px;
-    background: var(--bg-tertiary);
+    background: var(--af-bg-tertiary);
     border-radius: 2px;
     position: relative;
-    transition: height var(--transition-fast);
-    overflow: hidden;
+    transition: height 0.15s ease-out;
   }
 
   .progress-buffered {
     position: absolute;
+    left: 0;
+    top: 0;
     height: 100%;
     background: rgba(255, 255, 255, 0.1);
     border-radius: 2px;
   }
 
-  .progress-played {
+  // 已播放进度 - 包含 thumb
+  // 使用 CSS transition 实现丝滑进度更新
+  .progress-fill {
     position: absolute;
+    left: 0;
+    top: 0;
     height: 100%;
-    background: var(--primary);
+    background: var(--af-accent-primary);
     border-radius: 2px;
+    min-width: 0;
+    // 平滑过渡：在两次 timeupdate 之间插值
+    transition: width 0.25s linear;
+    will-change: width;
   }
 
+  // Thumb 固定在 fill 的右边缘
   .progress-thumb {
     position: absolute;
+    right: 0;
+    top: 50%;
     width: 14px;
     height: 14px;
-    background: var(--primary);
+    background: var(--af-accent-primary);
     border-radius: 50%;
-    transform: translateX(-50%) scale(0.8);
+    transform: translateX(50%) translateY(-50%) scale(0.8);
     opacity: 0;
-    transition: all var(--transition-fast);
+    transition:
+      opacity 0.15s ease-out,
+      transform 0.15s ease-out;
     box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+    pointer-events: none;
+  }
+
+  // 拖拽时禁用进度条过渡，实现即时响应
+  &.dragging .progress-fill {
+    transition: none;
   }
 }
 
@@ -497,25 +579,42 @@ onUnmounted(() => {
 
   .volume-slider {
     width: 80px;
+    display: flex;
+    align-items: center;
 
-    input[type="range"] {
+    input[type='range'] {
       -webkit-appearance: none;
+      appearance: none;
       width: 100%;
       height: 4px;
-      background: var(--bg-tertiary);
+      margin: 0;
+      padding: 0;
+      background: var(--af-bg-tertiary);
       border-radius: 2px;
       cursor: pointer;
 
       &::-webkit-slider-thumb {
         -webkit-appearance: none;
+        appearance: none;
         width: 12px;
         height: 12px;
         background: var(--text-primary);
         border-radius: 50%;
         cursor: pointer;
-        transition: transform var(--transition-fast);
+        transition: transform var(--af-transition-fast);
 
-        &:hover { transform: scale(1.2); }
+        &:hover {
+          transform: scale(1.2);
+        }
+      }
+
+      &::-moz-range-thumb {
+        width: 12px;
+        height: 12px;
+        background: var(--text-primary);
+        border: none;
+        border-radius: 50%;
+        cursor: pointer;
       }
     }
   }
@@ -532,8 +631,8 @@ onUnmounted(() => {
     transform: translateX(-50%);
     margin-bottom: 8px;
     background: var(--bg-elevated);
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-md);
+    border: 1px solid var(--af-border-default);
+    border-radius: var(--af-radius-md);
     padding: 4px;
     box-shadow: var(--shadow-lg);
     z-index: 100;
@@ -544,18 +643,18 @@ onUnmounted(() => {
     width: 100%;
     padding: 6px 16px;
     font-size: 13px;
-    font-family: var(--font-mono);
-    color: var(--text-normal);
+    font-family: var(--af-font-mono);
+    color: var(--af-text-normal);
     text-align: center;
-    border-radius: var(--radius-sm);
-    transition: all var(--transition-fast);
+    border-radius: var(--af-radius-sm);
+    transition: all var(--af-transition-fast);
 
     &:hover {
-      background: var(--bg-tertiary);
+      background: var(--af-bg-tertiary);
     }
 
     &.active {
-      color: var(--primary);
+      color: var(--af-accent-primary);
       background: rgba(88, 166, 255, 0.15);
     }
   }

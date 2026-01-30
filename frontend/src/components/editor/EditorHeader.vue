@@ -1,7 +1,7 @@
 <template>
-  <header class="editor-header">
+  <header class="editor-header tw-flex tw-items-center tw-justify-between tw-h-14 tw-px-4 tw-bg-bg-secondary tw-border-b tw-border-border tw-flex-shrink-0">
     <!-- 左侧：返回 + 任务信息堆叠 -->
-    <div class="header-left">
+    <div class="header-left tw-flex tw-items-center tw-gap-3">
       <el-tooltip content="返回任务列表" placement="bottom" :show-after="500">
         <router-link to="/tasks" class="nav-back">
           <svg viewBox="0 0 24 24" fill="currentColor">
@@ -476,11 +476,7 @@ const phaseStyle = computed(() => {
 
   // 如果任务暂停，使用暂停状态样式
   if (isPaused.value) {
-    return STATUS_CONFIG.paused || {
-      bgColor: 'rgba(210, 153, 34, 0.15)',
-      color: '#d29922',
-      label: '已暂停'
-    }
+    return STATUS_CONFIG.paused
   }
   // 如果任务正在处理且有阶段信息，使用阶段样式
   if (status === 'processing' && phase) {
@@ -524,8 +520,8 @@ $header-h: 56px;
 
 .editor-header {
   height: $header-h;
-  background: var(--bg-primary);
-  border-bottom: 1px solid var(--border-default);
+  background: var(--af-bg-primary);
+  border-bottom: 1px solid var(--af-border-default);
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -546,8 +542,8 @@ $header-h: 56px;
     justify-content: center;
     width: 36px;
     height: 36px;
-    border-radius: var(--radius-md);
-    color: var(--text-secondary);
+    border-radius: var(--af-radius-md);
+    color: var(--af-text-secondary);
     transition: all 0.2s;
 
     svg {
@@ -556,7 +552,7 @@ $header-h: 56px;
     }
 
     &:hover {
-      background: var(--bg-tertiary);
+      background: var(--af-bg-tertiary);
       color: var(--text-primary);
     }
   }
@@ -583,11 +579,11 @@ $header-h: 56px;
       white-space: nowrap;
       cursor: pointer;
       padding: 2px 4px;
-      border-radius: var(--radius-sm);
+      border-radius: var(--af-radius-sm);
       transition: background 0.2s;
 
       &:hover {
-        background: var(--bg-tertiary);
+        background: var(--af-bg-tertiary);
       }
     }
 
@@ -595,9 +591,9 @@ $header-h: 56px;
       font-size: 14px;
       font-weight: 500;
       color: var(--text-primary);
-      background: var(--bg-tertiary);
-      border: 1px solid var(--primary);
-      border-radius: var(--radius-sm);
+      background: var(--af-bg-tertiary);
+      border: 1px solid var(--af-accent-primary);
+      border-radius: var(--af-radius-sm);
       padding: 2px 6px;
       width: 200px;
       max-width: 300px;
@@ -620,28 +616,28 @@ $header-h: 56px;
         border-radius: 50%;
 
         &.processing {
-          background: var(--primary);
+          background: var(--af-accent-primary);
           animation: pulse 1.5s infinite;
         }
-        &.complete { background: var(--success); }
-        &.idle { background: var(--text-muted); }
+        &.complete { background: var(--af-accent-success); }
+        &.idle { background: var(--af-text-muted); }
       }
 
       .meta-text {
         font-size: 11px;
-        color: var(--text-muted);
+        color: var(--af-text-muted);
       }
 
       .save-text {
         font-size: 11px;
-        color: var(--text-secondary);
+        color: var(--af-text-secondary);
         display: flex;
         align-items: center;
         gap: 4px;
 
         &::before {
           content: '-';
-          color: var(--text-muted);
+          color: var(--af-text-muted);
         }
       }
     }
@@ -674,7 +670,7 @@ $header-h: 56px;
   transition: all 0.2s;
 
   &:hover {
-    background: var(--bg-tertiary);
+    background: var(--af-bg-tertiary);
     box-shadow: 0 0 0 1px rgba(88, 166, 255, 0.3);
   }
 
@@ -691,8 +687,8 @@ $header-h: 56px;
   }
 
   .progress-percent {
-    color: var(--text-secondary);
-    font-family: var(--font-mono);
+    color: var(--af-text-secondary);
+    font-family: var(--af-font-mono);
     font-size: 11px;
     white-space: nowrap;
 
@@ -702,13 +698,13 @@ $header-h: 56px;
       gap: 4px;
 
       .fast-label {
-        color: #58a6ff;
+        color: var(--af-accent-primary);
         font-weight: 600;
         margin-right: 1px;
       }
 
       .slow-label {
-        color: #3fb950;
+        color: var(--af-accent-success);
         font-weight: 600;
         margin-left: 6px;
         margin-right: 1px;
@@ -728,14 +724,14 @@ $header-h: 56px;
 
   .progress-text {
     font-size: 12px;
-    color: var(--text-secondary);
+    color: var(--af-text-secondary);
     white-space: nowrap;
     display: flex;
     align-items: center;
     gap: 6px;
 
     .complete-check {
-      color: var(--success);
+      color: var(--af-accent-success);
       display: flex;
       align-items: center;
     }
@@ -746,7 +742,7 @@ $header-h: 56px;
 .hover-controls {
   .label {
     font-size: 12px;
-    color: var(--text-muted);
+    color: var(--af-text-muted);
     margin-bottom: 10px;
   }
 
@@ -772,8 +768,8 @@ $header-h: 56px;
       position: absolute;
       top: 0;
       right: 0;
-      background: var(--primary);
-      color: #fff;
+      background: var(--af-accent-primary);
+      color: white;
       font-size: 10px;
       padding: 0 4px;
       min-width: 16px;
@@ -796,8 +792,8 @@ $header-h: 56px;
     justify-content: center;
     background: transparent;
     border: none;
-    border-radius: var(--radius-md);
-    color: var(--text-secondary);
+    border-radius: var(--af-radius-md);
+    color: var(--af-text-secondary);
     cursor: pointer;
     transition: all 0.2s;
 
@@ -808,7 +804,7 @@ $header-h: 56px;
 
     &:hover:not(.disabled) {
       color: var(--text-primary);
-      background: var(--bg-tertiary);
+      background: var(--af-bg-tertiary);
     }
 
     &.disabled {
@@ -823,10 +819,10 @@ $header-h: 56px;
     display: flex;
     align-items: center;
     gap: 6px;
-    background: var(--primary);
+    background: var(--af-accent-primary);
     color: white;
     border: none;
-    border-radius: var(--radius-md);
+    border-radius: var(--af-radius-md);
     font-size: 13px;
     cursor: pointer;
     transition: background 0.2s;
@@ -843,7 +839,7 @@ $header-h: 56px;
     }
 
     &:hover {
-      background: var(--primary-hover);
+      background: var(--af-accent-primary-hover);
     }
   }
 }
@@ -860,36 +856,36 @@ $header-h: 56px;
 // 全局样式：Popover 深色主题
 .control-popover-dark {
   background: var(--bg-elevated) !important;
-  border-color: var(--border-default) !important;
+  border-color: var(--af-border-default) !important;
 
   .el-popper__arrow::before {
     background: var(--bg-elevated) !important;
-    border-color: var(--border-default) !important;
+    border-color: var(--af-border-default) !important;
   }
 }
 
 .task-monitor-popover {
-  background: var(--bg-secondary) !important;
-  border-color: var(--border-default) !important;
+  background: var(--af-bg-secondary) !important;
+  border-color: var(--af-border-default) !important;
   padding: 0 !important;
 
   .el-popper__arrow::before {
-    background: var(--bg-secondary) !important;
-    border-color: var(--border-default) !important;
+    background: var(--af-bg-secondary) !important;
+    border-color: var(--af-border-default) !important;
   }
 }
 
 // 导出下拉菜单样式 - 与任务监控配色一致
 .el-dropdown__popper.el-popper {
-  background: var(--bg-secondary) !important;
-  border: 1px solid var(--border-default) !important;
+  background: var(--af-bg-secondary) !important;
+  border: 1px solid var(--af-border-default) !important;
   border-radius: 6px !important;
   box-shadow: var(--shadow-lg) !important;
   padding: 4px 0 !important;
 
   .el-popper__arrow::before {
-    background: var(--bg-secondary) !important;
-    border-color: var(--border-default) !important;
+    background: var(--af-bg-secondary) !important;
+    border-color: var(--af-border-default) !important;
   }
 
   .el-dropdown-menu {

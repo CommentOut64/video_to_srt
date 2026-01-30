@@ -1683,6 +1683,10 @@ onBeforeRouteLeave(async (to, from) => {
 </script>
 
 <style lang="scss" scoped>
+// 临时导入 SCSS mixins（Phase 0 修复）
+// 注意：这是临时方案，Phase 3-5 会逐步移除对 mixin 的依赖
+@import '@/styles/mixins';
+
 // 注意：SCSS 变量和 mixins 已迁移到主题系统
 // 旧的 SCSS 文件位于 @/styles/legacy/ 供参考
 // 现在使用 CSS Variables（由主题系统注入）
