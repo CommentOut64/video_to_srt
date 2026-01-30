@@ -1,0 +1,214 @@
+/**
+ * Element Plus 样式覆盖
+ * 使用 Element Plus 官方 CSS 变量系统与 AnchorFlux 主题系统集成
+ */
+
+/* ==============================================
+   全局 Element Plus 主题变量
+   ============================================== */
+
+:root {
+  /* 主色系 */
+  --el-color-primary: var(--af-accent-primary);
+  --el-color-success: var(--af-accent-success);
+  --el-color-warning: var(--af-accent-warning);
+  --el-color-danger: var(--af-accent-danger);
+  --el-color-info: var(--af-text-secondary);
+
+  /* 背景色 */
+  --el-bg-color: var(--af-bg-primary);
+  --el-bg-color-page: var(--af-bg-base);
+  --el-bg-color-overlay: var(--af-bg-overlay);
+
+  /* 文本色 */
+  --el-text-color-primary: var(--af-text-normal);
+  --el-text-color-regular: var(--af-text-normal);
+  --el-text-color-secondary: var(--af-text-secondary);
+  --el-text-color-placeholder: var(--af-text-muted);
+  --el-text-color-disabled: var(--af-text-disabled);
+
+  /* 边框 */
+  --el-border-color: var(--af-border-default);
+  --el-border-color-light: var(--af-border-muted);
+  --el-border-color-lighter: var(--af-border-subtle);
+  --el-border-color-extra-light: var(--af-border-subtle);
+  --el-border-color-dark: var(--af-border-default);
+  --el-border-color-darker: var(--af-border-default);
+
+  /* 填充色（用于禁用状态等） */
+  --el-fill-color: var(--af-bg-secondary);
+  --el-fill-color-light: var(--af-bg-tertiary);
+  --el-fill-color-lighter: var(--af-bg-tertiary);
+  --el-fill-color-extra-light: var(--af-bg-secondary);
+  --el-fill-color-dark: var(--af-bg-secondary);
+  --el-fill-color-darker: var(--af-bg-primary);
+  --el-fill-color-blank: transparent;
+
+  /* 圆角 */
+  --el-border-radius-base: var(--af-radius-md);
+  --el-border-radius-small: var(--af-radius-sm);
+  --el-border-radius-round: var(--af-radius-full);
+  --el-border-radius-circle: 50%;
+
+  /* 阴影 */
+  --el-box-shadow: var(--af-shadow-md);
+  --el-box-shadow-light: var(--af-shadow-sm);
+  --el-box-shadow-lighter: var(--af-shadow-sm);
+  --el-box-shadow-dark: var(--af-shadow-lg);
+}
+
+/* ==============================================
+   组件专属覆盖
+   ============================================== */
+
+/* 按钮 */
+.el-button {
+  --el-button-bg-color: var(--af-bg-secondary);
+  --el-button-border-color: var(--af-border-default);
+  --el-button-text-color: var(--af-text-normal);
+  --el-button-hover-bg-color: var(--af-bg-tertiary);
+  --el-button-hover-border-color: var(--af-border-default);
+  --el-button-hover-text-color: var(--af-text-primary);
+  --el-button-active-bg-color: var(--af-bg-tertiary);
+  --el-button-active-border-color: var(--af-accent-primary);
+}
+
+/* 输入框 */
+.el-input {
+  --el-input-bg-color: var(--af-bg-secondary);
+  --el-input-border-color: var(--af-border-default);
+  --el-input-text-color: var(--af-text-normal);
+  --el-input-placeholder-color: var(--af-text-muted);
+  --el-input-hover-border-color: var(--af-accent-primary);
+  --el-input-focus-border-color: var(--af-accent-primary);
+}
+
+.el-textarea {
+  --el-input-bg-color: var(--af-bg-secondary);
+  --el-input-border-color: var(--af-border-default);
+  --el-input-text-color: var(--af-text-normal);
+}
+
+/* 对话框 */
+.el-dialog {
+  --el-dialog-bg-color: var(--af-bg-secondary);
+  --el-dialog-border-radius: var(--af-radius-lg);
+  --el-dialog-box-shadow: var(--af-shadow-xl);
+}
+
+/* 卡片 */
+.el-card {
+  --el-card-bg-color: var(--af-bg-secondary);
+  --el-card-border-color: var(--af-border-default);
+}
+
+/* 下拉菜单 */
+.el-dropdown-menu {
+  --el-dropdown-menuItem-hover-fill: var(--af-bg-tertiary);
+  --el-dropdown-menuItem-hover-color: var(--af-text-primary);
+}
+
+/* 消息提示 */
+.el-message {
+  --el-message-bg-color: var(--af-bg-elevated);
+  --el-message-border-color: var(--af-border-default);
+  --el-message-text-color: var(--af-text-normal);
+}
+
+/* 通知 */
+.el-notification {
+  --el-notification-bg-color: var(--af-bg-elevated);
+  --el-notification-border-color: var(--af-border-default);
+  --el-notification-text-color: var(--af-text-normal);
+}
+
+/* 弹出框 */
+.el-popover {
+  --el-popover-bg-color: var(--af-bg-elevated);
+  --el-popover-border-color: var(--af-border-default);
+}
+
+/* 提示框 */
+.el-tooltip {
+  --el-tooltip-bg-color: var(--af-bg-elevated);
+  --el-tooltip-text-color: var(--af-text-primary);
+}
+
+/* 表格 */
+.el-table {
+  --el-table-bg-color: var(--af-bg-secondary);
+  --el-table-tr-bg-color: var(--af-bg-secondary);
+  --el-table-header-bg-color: var(--af-bg-tertiary);
+  --el-table-row-hover-bg-color: var(--af-bg-tertiary);
+  --el-table-border-color: var(--af-border-default);
+  --el-table-text-color: var(--af-text-normal);
+  --el-table-header-text-color: var(--af-text-primary);
+}
+
+/* 分页 */
+.el-pagination {
+  --el-pagination-bg-color: var(--af-bg-secondary);
+  --el-pagination-text-color: var(--af-text-normal);
+  --el-pagination-button-bg-color: var(--af-bg-secondary);
+  --el-pagination-hover-color: var(--af-accent-primary);
+}
+
+/* 选择器 */
+.el-select {
+  --el-select-input-bg-color: var(--af-bg-secondary);
+  --el-select-border-color: var(--af-border-default);
+}
+
+.el-select-dropdown {
+  --el-select-dropdown-bg-color: var(--af-bg-elevated);
+  --el-select-dropdown-border: 1px solid var(--af-border-default);
+}
+
+/* 开关 */
+.el-switch {
+  --el-switch-on-color: var(--af-accent-primary);
+  --el-switch-off-color: var(--af-bg-tertiary);
+}
+
+/* 滑块 */
+.el-slider {
+  --el-slider-main-bg-color: var(--af-accent-primary);
+  --el-slider-runway-bg-color: var(--af-bg-tertiary);
+  --el-slider-button-wrapper-bg-color: var(--af-bg-elevated);
+}
+
+/* 进度条 */
+.el-progress {
+  --el-progress-text-color: var(--af-text-normal);
+}
+
+/* 标签页 */
+.el-tabs {
+  --el-tabs-header-bg-color: var(--af-bg-secondary);
+}
+
+/* 折叠面板 */
+.el-collapse {
+  --el-collapse-header-bg-color: var(--af-bg-secondary);
+  --el-collapse-content-bg-color: var(--af-bg-secondary);
+  --el-collapse-border-color: var(--af-border-default);
+}
+
+/* ==============================================
+   特殊覆盖（无官方 CSS 变量支持）
+   ============================================== */
+
+/* 原因：Element Plus 不提供对应的 CSS 变量 */
+.el-loading-mask {
+  background-color: var(--af-bg-overlay);
+}
+
+/* 原因：需要统一深色模式下的图标颜色 */
+.el-icon {
+  color: inherit;
+}
+
+/* 原因：优化对话框在深色模式下的视觉效果 */
+.el-overlay {
+  background-color: var(--af-bg-overlay);
+}
