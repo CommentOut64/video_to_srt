@@ -5,6 +5,15 @@
 import { baseTokens } from '../tokens/base.js'
 
 /**
+ * 将驼峰命名转换为 kebab-case
+ * @param {string} str - 驼峰命名字符串
+ * @returns {string} kebab-case 字符串
+ */
+function toKebabCase(str) {
+  return str.replace(/([a-z0-9])([A-Z])/g, '$1-$2').toLowerCase()
+}
+
+/**
  * 将嵌套对象展平为 CSS 变量格式
  * @param {object} obj - 嵌套对象
  * @param {string} prefix - 前缀
@@ -14,7 +23,9 @@ function flattenObject(obj, prefix = '') {
   const result = {}
 
   for (const [key, value] of Object.entries(obj)) {
-    const newKey = prefix ? `${prefix}-${key}` : key
+    // 将驼峰命名转换为 kebab-case
+    const kebabKey = toKebabCase(key)
+    const newKey = prefix ? `${prefix}-${kebabKey}` : kebabKey
 
     if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
       Object.assign(result, flattenObject(value, newKey))

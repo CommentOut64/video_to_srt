@@ -65,8 +65,11 @@ export const darkTheme = {
     // 状态颜色
     status: {
       processing: '#028AC5',
+      processingRgb: '2, 138, 197',
       warning: '#e67700',
+      warningRgb: '230, 119, 0',
       error: '#f85149',
+      errorRgb: '248, 81, 73',
     },
 
     // 波形图专用颜色
