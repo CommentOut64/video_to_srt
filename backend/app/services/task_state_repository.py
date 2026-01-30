@@ -80,6 +80,7 @@ class TaskStateRepository:
                     srt_path TEXT,
                     canceled INTEGER,
                     paused INTEGER,
+                    subtitle_time_offset REAL,
                     settings_json TEXT,
                     updated_at REAL,
                     created_at REAL
@@ -141,6 +142,14 @@ class TaskStateRepository:
                 )
                 """
             )
+            self._ensure_tasks_column(conn, "subtitle_time_offset", "REAL")
+
+    def _ensure_tasks_column(self, conn: sqlite3.Connection, name: str, column_type: str) -> None:
+        cursor = conn.execute("PRAGMA table_info(tasks)")
+        columns = {row["name"] for row in cursor.fetchall()}
+        if name in columns:
+            return
+        conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {column_type}")
 
     def upsert_task(self, job: JobState, conn: Optional[sqlite3.Connection] = None) -> None:
         payload = self._job_to_row(job)
@@ -151,11 +160,11 @@ class TaskStateRepository:
                 INSERT INTO tasks (
                     job_id, filename, title, dir, input_path, status, phase, progress,
                     phase_percent, message, error, processed, total, language, srt_path,
-                    canceled, paused, settings_json, updated_at, created_at
+                    canceled, paused, subtitle_time_offset, settings_json, updated_at, created_at
                 ) VALUES (
                     :job_id, :filename, :title, :dir, :input_path, :status, :phase, :progress,
                     :phase_percent, :message, :error, :processed, :total, :language, :srt_path,
-                    :canceled, :paused, :settings_json, :updated_at, :created_at
+                    :canceled, :paused, :subtitle_time_offset, :settings_json, :updated_at, :created_at
                 )
                 ON CONFLICT(job_id) DO UPDATE SET
                     filename=excluded.filename,
@@ -174,6 +183,7 @@ class TaskStateRepository:
                     srt_path=excluded.srt_path,
                     canceled=excluded.canceled,
                     paused=excluded.paused,
+                    subtitle_time_offset=excluded.subtitle_time_offset,
                     settings_json=excluded.settings_json,
                     updated_at=excluded.updated_at,
                     created_at=COALESCE(tasks.created_at, excluded.created_at)
@@ -541,6 +551,7 @@ class TaskStateRepository:
             "srt_path": job.srt_path,
             "canceled": 1 if job.canceled else 0,
             "paused": 1 if job.paused else 0,
+            "subtitle_time_offset": job.subtitle_time_offset,
             "settings_json": settings_json,
             "updated_at": now_seconds,
             "created_at": created_at,
@@ -572,6 +583,7 @@ class TaskStateRepository:
             srt_path=row["srt_path"],
             canceled=bool(row["canceled"]),
             paused=bool(row["paused"]),
+            subtitle_time_offset=row["subtitle_time_offset"],
             createdAt=created_at_ms,
             updatedAt=updated_at_ms,
         )
