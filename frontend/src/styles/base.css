@@ -1,0 +1,140 @@
+/**
+ * 基础样式文件
+ * 包含 CSS Reset、全局样式、滚动条等
+ * 注意：所有颜色值使用 CSS Variables，由主题系统注入
+ */
+
+/* ==============================================
+   CSS Reset & 基础样式
+   ============================================== */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+  background-color: var(--af-bg-primary);
+  color: var(--af-text-normal);
+  line-height: 1.5;
+  min-height: 100vh;
+  user-select: none;
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+}
+
+/* ==============================================
+   全局滚动条样式
+   ============================================== */
+
+body::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+body::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+body::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 8px;
+}
+
+body::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+/* ==============================================
+   链接样式
+   ============================================== */
+
+a {
+  color: var(--af-accent-primary);
+  text-decoration: none;
+  transition: color var(--af-transition-fast);
+}
+
+a:hover {
+  color: var(--af-accent-primary-hover);
+}
+
+/* ==============================================
+   按钮重置
+   ============================================== */
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+  cursor: pointer;
+  border: none;
+  outline: none;
+  background: transparent;
+}
+
+/* ==============================================
+   输入框重置
+   ============================================== */
+
+input,
+textarea,
+select {
+  font-family: inherit;
+  font-size: inherit;
+  outline: none;
+  user-select: text;
+  -webkit-user-select: text;
+  -moz-user-select: text;
+  -ms-user-select: text;
+}
+
+/* ==============================================
+   工具类（兼容旧代码）
+   ============================================== */
+
+.text-center {
+  text-align: center;
+}
+
+.text-muted {
+  color: var(--af-text-muted);
+}
+
+.text-success {
+  color: var(--af-accent-success);
+}
+
+.text-warning {
+  color: var(--af-accent-warning);
+}
+
+.text-danger {
+  color: var(--af-accent-danger);
+}
+
+/* 间距工具类（使用 CSS 变量） */
+.mt-1 { margin-top: 4px; }
+.mt-2 { margin-top: 8px; }
+.mt-3 { margin-top: 16px; }
+.mt-4 { margin-top: 24px; }
+
+.mb-1 { margin-bottom: 4px; }
+.mb-2 { margin-bottom: 8px; }
+.mb-3 { margin-bottom: 16px; }
+.mb-4 { margin-bottom: 24px; }
+
+.p-1 { padding: 4px; }
+.p-2 { padding: 8px; }
+.p-3 { padding: 16px; }
+.p-4 { padding: 24px; }

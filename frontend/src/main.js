@@ -7,6 +7,7 @@ import ElementPlus from 'element-plus'
 import * as ElementPlusIconsVue from '@element-plus/icons-vue'
 import 'element-plus/dist/index.css'
 // 注意: 需要在 element-plus 之后导入自定义样式以覆盖默认样式
+import './styles/base.css'
 import './styles/element-override.css'
 import './styles/main.scss'
 import App from './App.vue'
