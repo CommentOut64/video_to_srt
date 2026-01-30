@@ -1,0 +1,8 @@
+/**
+ * Tailwind CSS 入口文件
+ * 导入 Tailwind 的基础层、组件层和工具层
+ */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;

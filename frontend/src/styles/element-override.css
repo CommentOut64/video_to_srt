@@ -129,9 +129,30 @@
 }
 
 /* 提示框 */
-.el-tooltip {
-  --el-tooltip-bg-color: var(--af-bg-elevated);
-  --el-tooltip-text-color: var(--af-text-primary);
+/* 原因：Element Plus 使用 .el-popper.is-dark/.is-light，默认会反转全局 CSS 变量导致颜色错误 */
+/* 解决方案：直接覆盖 .el-popper 主题类，设置背景和文字颜色 */
+.el-popper.is-dark {
+  background-color: var(--af-bg-elevated) !important;
+  color: var(--af-text-primary) !important;
+  border: 1px solid var(--af-border-default) !important;
+}
+
+/* tooltip 箭头 */
+.el-popper.is-dark .el-popper__arrow::before {
+  background: var(--af-bg-elevated) !important;
+  border: 1px solid var(--af-border-default) !important;
+}
+
+/* 浅色主题 tooltip */
+.el-popper.is-light {
+  background-color: var(--af-bg-elevated) !important;
+  color: var(--af-text-primary) !important;
+  border: 1px solid var(--af-border-default) !important;
+}
+
+.el-popper.is-light .el-popper__arrow::before {
+  background: var(--af-bg-elevated) !important;
+  border: 1px solid var(--af-border-default) !important;
 }
 
 /* 表格 */
