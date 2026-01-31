@@ -73,6 +73,30 @@
   --el-button-active-border-color: var(--af-accent-primary);
 }
 
+/* danger 类型按钮 */
+.el-button--danger {
+  --el-button-bg-color: var(--af-accent-danger);
+  --el-button-border-color: var(--af-accent-danger);
+  --el-button-text-color: var(--af-text-inverse);
+  --el-button-hover-bg-color: var(--af-accent-danger-dim);
+  --el-button-hover-border-color: var(--af-accent-danger-dim);
+  --el-button-hover-text-color: var(--af-text-inverse);
+  --el-button-active-bg-color: var(--af-accent-danger-dim);
+  --el-button-active-border-color: var(--af-accent-danger-dim);
+}
+
+/* success 类型按钮 */
+.el-button--success {
+  --el-button-bg-color: var(--af-accent-success);
+  --el-button-border-color: var(--af-accent-success);
+  --el-button-text-color: var(--af-text-inverse);
+  --el-button-hover-bg-color: var(--af-accent-success-dim);
+  --el-button-hover-border-color: var(--af-accent-success-dim);
+  --el-button-hover-text-color: var(--af-text-inverse);
+  --el-button-active-bg-color: var(--af-accent-success-dim);
+  --el-button-active-border-color: var(--af-accent-success-dim);
+}
+
 /* 输入框 */
 .el-input {
   --el-input-bg-color: var(--af-bg-secondary);
@@ -232,4 +256,68 @@
 /* 原因：优化对话框在深色模式下的视觉效果 */
 .el-overlay {
   background-color: var(--af-bg-overlay);
+}
+
+/* ==============================================
+   EditorHeader 专用全局样式覆盖
+   ============================================== */
+
+/* 原因：Popover 深色主题需要覆盖 Element Plus 默认样式 */
+.control-popover-dark {
+  background: var(--af-bg-elevated) !important;
+  border-color: var(--af-border-default) !important;
+}
+
+.control-popover-dark .el-popper__arrow::before {
+  background: var(--af-bg-elevated) !important;
+  border-color: var(--af-border-default) !important;
+}
+
+.task-monitor-popover {
+  background: var(--af-bg-secondary) !important;
+  border-color: var(--af-border-default) !important;
+  padding: 0 !important;
+}
+
+.task-monitor-popover .el-popper__arrow::before {
+  background: var(--af-bg-secondary) !important;
+  border-color: var(--af-border-default) !important;
+}
+
+/* 原因：导出下拉菜单需要与任务监控配色一致 */
+.el-dropdown__popper.el-popper {
+  background: var(--af-bg-secondary) !important;
+  border: 1px solid var(--af-border-default) !important;
+  border-radius: 6px !important;
+  box-shadow: var(--af-shadow-lg) !important;
+  padding: 4px 0 !important;
+}
+
+.el-dropdown__popper.el-popper .el-popper__arrow::before {
+  background: var(--af-bg-secondary) !important;
+  border-color: var(--af-border-default) !important;
+}
+
+.el-dropdown__popper.el-popper .el-dropdown-menu {
+  background: transparent !important;
+  border: none !important;
+  padding: 0 !important;
+}
+
+.el-dropdown__popper.el-popper .el-dropdown-menu .el-dropdown-menu__item {
+  padding: 8px 16px !important;
+  font-size: 13px !important;
+  color: var(--af-text-primary) !important;
+  background: transparent !important;
+  transition: all 0.2s !important;
+}
+
+.el-dropdown__popper.el-popper .el-dropdown-menu .el-dropdown-menu__item:hover {
+  background: rgba(255, 255, 255, 0.03) !important;
+  color: var(--af-text-primary) !important;
+}
+
+.el-dropdown__popper.el-popper .el-dropdown-menu .el-dropdown-menu__item:focus {
+  background: rgba(255, 255, 255, 0.03) !important;
+  color: var(--af-text-primary) !important;
 }
