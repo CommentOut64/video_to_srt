@@ -45,7 +45,7 @@ class PunctuationService:
         self._fallback_priority = "fast"
         self._logged_runtime = False
         self._logged_strategies: set[str] = set()
-        self._logged_first_success = False
+        self._logged_first_success_languages: set[str] = set()
         if not self._is_custom_registry:
             self._ensure_default_strategies()
 
@@ -142,7 +142,10 @@ class PunctuationService:
             self._logger.warning("标点恢复失败，回退兜底: %s", exc)
             return self._build_fallback_result(text, fallback_text, elapsed_ms)
 
-        if not self._logged_first_success and result.model_id not in {"asr_fallback", "disabled", "empty"}:
+        if (
+            resolved_language not in self._logged_first_success_languages
+            and result.model_id not in {"asr_fallback", "disabled", "empty"}
+        ):
             self._logger.info(
                 "标点恢复完成(首次): language=%s, model_id=%s, ms=%.2f, text_len=%d, positions=%d",
                 resolved_language,
@@ -151,7 +154,7 @@ class PunctuationService:
                 len(text),
                 len(result.punctuation_positions),
             )
-            self._logged_first_success = True
+            self._logged_first_success_languages.add(resolved_language)
 
         return result
 

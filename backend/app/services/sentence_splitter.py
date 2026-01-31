@@ -562,6 +562,9 @@ class SentenceSplitter:
 
             # 1. 句末标点切分
             if word.word in self.config.sentence_end_punctuation:
+                if self._is_decimal_separator(words, i):
+                    # 数字小数点，不作为断句点
+                    continue
                 # V3.9: 标点切分也要检查语义完整性
                 strategy = self.config.get_strategy()
                 # 构建当前累积的文本
@@ -1244,25 +1247,38 @@ class SentenceSplitter:
         if not text:
             return []
 
-        # 使用正则按句末标点切分
-        pattern = f"([{re.escape(self.config.sentence_end_punctuation)}])"
-        parts = re.split(pattern, text)
-
         sentences = []
         current = ""
+        punct_set = set(self.config.sentence_end_punctuation)
 
-        for part in parts:
-            current += part
-            if part in self.config.sentence_end_punctuation:
-                if current.strip():
-                    sentences.append(current.strip())
-                current = ""
+        for idx, char in enumerate(text):
+            current += char
+            if char not in punct_set:
+                continue
+            if char == "." and 0 < idx < len(text) - 1:
+                if text[idx - 1].isdigit() and text[idx + 1].isdigit():
+                    # 数字小数点，不作为断句点
+                    continue
+            if current.strip():
+                sentences.append(current.strip())
+            current = ""
 
-        # 处理最后一部分
         if current.strip():
             sentences.append(current.strip())
 
         return sentences
+
+    @staticmethod
+    def _is_decimal_separator(words: List['WordTimestamp'], index: int) -> bool:
+        """判断当前标点是否为数字小数点。"""
+        if index <= 0 or index >= len(words) - 1:
+            return False
+        token = str(words[index].word or "").strip()
+        if token != ".":
+            return False
+        prev_token = str(words[index - 1].word or "").strip()
+        next_token = str(words[index + 1].word or "").strip()
+        return prev_token.isdigit() and next_token.isdigit()
 
 
 # 单例访问

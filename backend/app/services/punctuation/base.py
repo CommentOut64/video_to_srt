@@ -112,6 +112,9 @@ class PunctuationStrategy(ABC):
         """返回切分建议的字符位置。"""
 
 
+_PUNCTUATION_SET = set(",.!?;:\"()[]{}，。！？；：、（）【】《》“”‘’「」『』")
+
+
 def apply_punctuation(text: str, positions: Sequence[PuncPosition]) -> str:
     """将标点按位置插入到文本中。"""
     if not text or not positions:
@@ -142,6 +145,42 @@ def apply_punctuation(text: str, positions: Sequence[PuncPosition]) -> str:
     return "".join(chunks)
 
 
+def _build_clean_index_map(text: str) -> List[int]:
+    """建立 clean_index -> text_index 的映射。"""
+    mapping: List[int] = []
+    for idx, char in enumerate(text):
+        if char in _PUNCTUATION_SET:
+            continue
+        mapping.append(idx)
+    return mapping
+
+
+def _is_decimal_punctuation(text: str, clean_index: int, punct: str, clean_map: List[int]) -> bool:
+    """判断标点是否为数字小数点，避免将 2.5 等拆分成断句。"""
+    if punct != ".":
+        return False
+    if clean_index < 0 or clean_index >= len(clean_map):
+        return False
+    text_index = clean_map[clean_index]
+    if text_index < 0 or text_index >= len(text):
+        return False
+    left_char = text[text_index]
+    if not left_char.isdigit():
+        return False
+
+    cursor = text_index + 1
+    while cursor < len(text) and text[cursor] in _PUNCTUATION_SET:
+        cursor += 1
+    if cursor >= len(text):
+        return False
+    right_char = text[cursor]
+    if not right_char.isdigit():
+        return False
+
+    punct_cluster = text[text_index + 1:cursor]
+    return punct in punct_cluster
+
+
 def build_split_points(
     text: str,
     positions: Sequence[PuncPosition],
@@ -153,9 +192,12 @@ def build_split_points(
         return []
     sentence_end = set(sentence_end_chars or "。！？.!?")
     relative_time = _estimate_relative_time(word_timestamps)
+    clean_map = _build_clean_index_map(text)
     split_points: List[SplitPoint] = []
     for position in positions:
         if position.punctuation not in sentence_end:
+            continue
+        if _is_decimal_punctuation(text, position.char_index, position.punctuation, clean_map):
             continue
         split_points.append(
             SplitPoint(
