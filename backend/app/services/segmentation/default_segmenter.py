@@ -242,6 +242,9 @@ class DefaultSegmenter:
                     start=word.get("start", 0.0),
                     end=word.get("end", 0.0),
                     confidence=word.get("confidence", 1.0),
+                    confidence_raw=word.get("confidence_raw"),
+                    confidence_display_raw=word.get("confidence_display_raw"),
+                    token_type=word.get("token_type"),
                 )
             )
         return words
@@ -272,17 +275,31 @@ class DefaultSegmenter:
         merged_end = sent2.end
         merged_words = sent1.words + sent2.words
 
-        if sent1.confidence is None or sent2.confidence is None:
-            avg_confidence = sent1.confidence or sent2.confidence or 0.0
-        else:
-            avg_confidence = (sent1.confidence + sent2.confidence) / 2
+        sent1_conf = sent1.confidence or 0.0
+        sent2_conf = sent2.confidence or 0.0
+        strict_confidence = min(sent1_conf, sent2_conf)
+
+        sent1_display = sent1.confidence_display_raw
+        sent2_display = sent2.confidence_display_raw
+        if sent1_display is None:
+            sent1_display = sent1_conf
+        if sent2_display is None:
+            sent2_display = sent2_conf
+        weight1 = max(sent1.end - sent1.start, 0.0)
+        weight2 = max(sent2.end - sent2.start, 0.0)
+        total_weight = (weight1 if weight1 > 0.0 else 1.0) + (weight2 if weight2 > 0.0 else 1.0)
+        display_raw = (
+            ((sent1_display * (weight1 if weight1 > 0.0 else 1.0)) +
+             (sent2_display * (weight2 if weight2 > 0.0 else 1.0))) / total_weight
+        ) if total_weight > 0.0 else None
 
         merged_sentence = SentenceSegment(
             text=merged_text,
             start=merged_start,
             end=merged_end,
             words=merged_words,
-            confidence=avg_confidence,
+            confidence=strict_confidence,
+            confidence_display_raw=display_raw,
             is_draft=sent1.is_draft,
             is_finalized=sent1.is_finalized,
             source=sent1.source,
