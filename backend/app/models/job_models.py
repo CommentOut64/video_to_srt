@@ -407,6 +407,8 @@ class JobState:
     title: str = ""  # 用户自定义的任务名称，为空时使用 filename
     createdAt: Optional[int] = None  # 创建时间戳
     updatedAt: Optional[int] = None  # 更新时间戳（毫秒）
+    # V3.2.0+dev.20260130.10: 任务级字幕时间偏移（秒，None 表示使用全局默认）
+    subtitle_time_offset: Optional[float] = None
 
     # 媒体状态（用于编辑器，转录完成后更新）
     media_status: Optional[MediaStatus] = None
@@ -442,6 +444,7 @@ class JobState:
             "canceled": self.canceled,
             "paused": self.paused,
             "settings": self.settings.to_dict(),
+            "subtitle_time_offset": self.subtitle_time_offset,
             "updated_at": time.time()
         }
 
@@ -482,6 +485,7 @@ class JobState:
             canceled=data.get("canceled", False),
             paused=data.get("paused", False),
             updatedAt=updated_at,
+            subtitle_time_offset=data.get("subtitle_time_offset"),
         )
 
     def update_media_status(self, job_dir: str):

@@ -62,6 +62,16 @@ class TranscriptionSettingsAPI(BaseModel):
     patching_threshold: float = Field(default=0.60, ge=0.0, le=1.0, description="复核触发阈值")
 
 
+class TaskSubtitleTimeOffsetRequest(BaseModel):
+    """任务字幕时间偏移请求"""
+    offset: float = Field(
+        ...,
+        ge=-10.0,
+        le=10.0,
+        description="偏移量（秒），正值延后，负值提前，范围 -10.0 到 10.0"
+    )
+
+
 class RefinementSettingsAPI(BaseModel):
     """
     分组三: 增强与润色设置 API 模型
@@ -788,6 +798,58 @@ def create_transcription_router(
                 }
 
         return result
+
+    @router.get("/jobs/{job_id}/subtitle-time-offset")
+    async def get_job_subtitle_time_offset(job_id: str):
+        """
+        获取任务级字幕时间偏移（无则回退全局）
+        """
+        from app.services.user_config_service import get_user_config_service
+
+        job = transcription_service.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="任务未找到")
+
+        config_service = get_user_config_service()
+        global_offset = config_service.get_subtitle_time_offset()
+        task_offset = getattr(job, "subtitle_time_offset", None)
+
+        if task_offset is None:
+            return {"success": True, "offset": global_offset, "source": "global"}
+        return {"success": True, "offset": float(task_offset), "source": "job"}
+
+    @router.post("/jobs/{job_id}/subtitle-time-offset")
+    async def set_job_subtitle_time_offset(job_id: str, req: TaskSubtitleTimeOffsetRequest):
+        """
+        设置任务级字幕时间偏移（等于全局时不保存）
+        """
+        from app.services.user_config_service import get_user_config_service
+
+        job = transcription_service.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="任务未找到")
+
+        config_service = get_user_config_service()
+        global_offset = config_service.get_subtitle_time_offset()
+        normalized = round(float(req.offset), 3)
+        global_normalized = round(float(global_offset), 3)
+
+        if normalized == global_normalized:
+            job.subtitle_time_offset = None
+            source = "global"
+            effective_offset = global_normalized
+        else:
+            job.subtitle_time_offset = normalized
+            source = "job"
+            effective_offset = normalized
+
+        transcription_service.save_job_meta(job)
+
+        return {
+            "success": True,
+            "offset": effective_offset,
+            "source": source
+        }
 
     @router.get("/download/{job_id}")
     async def download_result(job_id: str, copy_to_source: bool = False, auto_repair: bool = True):

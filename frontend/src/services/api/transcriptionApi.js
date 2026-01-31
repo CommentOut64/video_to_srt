@@ -161,6 +161,25 @@ class TranscriptionAPI {
   }
 
   /**
+   * 获取任务级字幕时间偏移（无则回退全局）
+   * @param {string} jobId - 任务ID
+   * @returns {Promise<{offset: number, source: string}>}
+   */
+  async getJobSubtitleTimeOffset(jobId) {
+    return apiClient.get(`/api/jobs/${jobId}/subtitle-time-offset`);
+  }
+
+  /**
+   * 设置任务级字幕时间偏移（等于全局则不保存）
+   * @param {string} jobId - 任务ID
+   * @param {number} offset - 偏移量（秒）
+   * @returns {Promise<{offset: number, source: string}>}
+   */
+  async setJobSubtitleTimeOffset(jobId, offset) {
+    return apiClient.post(`/api/jobs/${jobId}/subtitle-time-offset`, { offset });
+  }
+
+  /**
    * 获取队列状态摘要
    * @returns {Promise<{queue: string[], running: string, interrupted: string, jobs: Object}>}
    */

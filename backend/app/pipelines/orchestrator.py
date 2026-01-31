@@ -237,7 +237,15 @@ class PipelineOrchestrator:
             self._update_progress(job, "finalize", 0, "生成字幕文件...")
             srt_path = _job_dir / f"{Path(job.filename).stem}.srt"
             subtitle_output = get_subtitle_output_service()
-            segments = subtitle_output.build_segments(final_sentences)
+            from app.services.user_config_service import get_user_config_service
+            offset = get_user_config_service().resolve_subtitle_time_offset(
+                getattr(job, "subtitle_time_offset", None)
+            )
+            segments = subtitle_output.build_segments(
+                final_sentences,
+                apply_offset=True,
+                offset_override=offset
+            )
             subtitle_output.write_srt(segments, srt_path)
 
             job.srt_path = str(srt_path)

@@ -215,10 +215,12 @@ async function addNewSubtitle() {
   emit('subtitle-add', subtitles.value.length - 1)
 
   try {
+    const baseStart = projectStore.toBaseTime(newStart)
+    const baseEnd = projectStore.toBaseTime(newStart + 3)
     const response = await transcriptionApi.createSubtitle(projectStore.meta.jobId, {
       text: '',
-      start: newStart,
-      end: newStart + 3
+      start: baseStart,
+      end: baseEnd
     })
     const data = response?.data?.data || response?.data
     if (data?.index !== undefined) {
@@ -256,10 +258,12 @@ function insertAfter(index) {
 
 async function syncInsertedSubtitle(insertIndex, start, end, text) {
   try {
+    const baseStart = projectStore.toBaseTime(start)
+    const baseEnd = projectStore.toBaseTime(end)
     const response = await transcriptionApi.createSubtitle(projectStore.meta.jobId, {
       text,
-      start,
-      end
+      start: baseStart,
+      end: baseEnd
     })
     const data = response?.data?.data || response?.data
     if (data?.index !== undefined) {

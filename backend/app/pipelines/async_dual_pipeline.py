@@ -609,6 +609,7 @@ class AsyncDualPipeline:
 
         text = sv_result.get("text_clean") or sv_result.get("text") or ""
         words = sv_result.get("words") if isinstance(sv_result, dict) else None
+        raw_tokens = sv_result.get("raw_tokens") if isinstance(sv_result, dict) else None
         punctuation_result = self._build_punctuation_result(punctuation_meta, text)
         if punctuation_result and punctuation_result.text:
             text = punctuation_result.text
@@ -626,6 +627,7 @@ class AsyncDualPipeline:
             punctuation_result=punctuation_result,
             punctuation_decision=decision,
             word_timestamps=words if isinstance(words, list) else None,
+            raw_tokens=raw_tokens if isinstance(raw_tokens, list) else None,
             source_chunks=source_chunks,
             speaker_id=None,
         )

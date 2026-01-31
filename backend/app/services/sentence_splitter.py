@@ -17,7 +17,7 @@ import re
 import logging
 import statistics
 from abc import ABC, abstractmethod
-from typing import List, Optional, Set, TYPE_CHECKING
+from typing import List, Optional, Set, TYPE_CHECKING, Tuple
 from dataclasses import dataclass
 
 if TYPE_CHECKING:
@@ -988,6 +988,49 @@ class SentenceSplitter:
 
         return result
 
+    @staticmethod
+    def _compute_sentence_confidence(
+        words: List['WordTimestamp']
+    ) -> Tuple[float, Optional[float]]:
+        """
+        计算句级置信度（严格口径 + 显示口径）。
+
+        - confidence: 取最小值（严格口径，用于内部决策）
+        - confidence_display_raw: 按时长加权均值（显示口径）
+        """
+        if not words:
+            return 0.0, None
+
+        raw_values: List[float] = []
+        display_values: List[float] = []
+        display_weights: List[float] = []
+
+        for word in words:
+            conf = getattr(word, "confidence", None)
+            if conf is not None:
+                raw_values.append(conf)
+
+            display_conf = getattr(word, "confidence_display_raw", None)
+            if display_conf is None:
+                display_conf = conf
+            if display_conf is None:
+                continue
+
+            duration = max(getattr(word, "end", 0.0) - getattr(word, "start", 0.0), 0.0)
+            weight = duration if duration > 0.0 else 1.0
+            display_values.append(display_conf)
+            display_weights.append(weight)
+
+        strict_confidence = min(raw_values) if raw_values else 0.0
+
+        if not display_values:
+            return strict_confidence, None
+
+        weighted_sum = sum(val * w for val, w in zip(display_values, display_weights))
+        total_weight = sum(display_weights)
+        display_raw = weighted_sum / total_weight if total_weight > 0.0 else None
+        return strict_confidence, display_raw
+
     def _create_sentence(
         self,
         words: List['WordTimestamp'],
@@ -1040,8 +1083,8 @@ class SentenceSplitter:
         if not force_create and len(text_clean.strip()) < self.config.min_chars:
             return None
 
-        # 计算平均置信度
-        avg_confidence = sum(w.confidence for w in words) / len(words)
+        # 计算句级置信度（严格口径 + 显示口径）
+        strict_confidence, display_raw = self._compute_sentence_confidence(words)
 
         # V3.9: 中文字幕句末标点处理（移除句末句号）
         strategy = self.config.get_strategy()
@@ -1055,7 +1098,8 @@ class SentenceSplitter:
             start=words[0].start,
             end=words[-1].end,
             words=words.copy(),
-            confidence=avg_confidence
+            confidence=strict_confidence,
+            confidence_display_raw=display_raw
         )
 
         # Layer 1 优化: 修剪边界静音
@@ -1123,11 +1167,7 @@ class SentenceSplitter:
                         merged_text_clean = (prev.text_clean or prev.text).rstrip() + ' ' + (current.text_clean or current.text).lstrip()
                         merged_words = prev.words + current.words
 
-                        avg_confidence = (
-                            (prev.confidence * len(prev.words) +
-                             current.confidence * len(current.words)) /
-                            len(merged_words)
-                        ) if merged_words else prev.confidence
+                        strict_confidence, display_raw = self._compute_sentence_confidence(merged_words)
 
                         # 更新前一句
                         prev.text = merged_text
@@ -1135,7 +1175,7 @@ class SentenceSplitter:
                         prev.end = current.end
                         prev.words = merged_words
                         # V3.1.2+dev.20260111.01: 使用 update_confidence 确保 display_confidence 同步更新
-                        prev.update_confidence(avg_confidence)
+                        prev.update_confidence(strict_confidence, display_raw=display_raw)
 
                         logger.info(
                             f"向前合并短句: [{current_duration:.2f}s, {len(current.text)}字符] "
@@ -1160,11 +1200,7 @@ class SentenceSplitter:
                     if (merged_duration <= self.config.max_duration and
                         len(merged_text) <= max_chars):
 
-                        avg_confidence = (
-                            (current.confidence * len(current.words) +
-                             next_sent.confidence * len(next_sent.words)) /
-                            len(merged_words)
-                        ) if merged_words else current.confidence
+                        strict_confidence, display_raw = self._compute_sentence_confidence(merged_words)
 
                         merged_sentence = SentenceSegment(
                             text=merged_text,
@@ -1172,7 +1208,8 @@ class SentenceSplitter:
                             start=current.start,
                             end=next_sent.end,
                             words=merged_words,
-                            confidence=avg_confidence
+                            confidence=strict_confidence,
+                            confidence_display_raw=display_raw
                         )
 
                         # 保留其他属性

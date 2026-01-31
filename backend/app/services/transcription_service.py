@@ -258,7 +258,15 @@ class TranscriptionService:
 
             srt_path = job_dir / f"{Path(job.filename).stem}.srt"
             subtitle_output = get_subtitle_output_service()
-            segments = subtitle_output.build_segments(final_sentences)
+            from app.services.user_config_service import get_user_config_service
+            offset = get_user_config_service().resolve_subtitle_time_offset(
+                getattr(job, "subtitle_time_offset", None)
+            )
+            segments = subtitle_output.build_segments(
+                final_sentences,
+                apply_offset=True,
+                offset_override=offset
+            )
             subtitle_output.write_srt(segments, srt_path)
 
             job.srt_path = str(srt_path)
@@ -1715,12 +1723,17 @@ class TranscriptionService:
                 WordTimestamp(**w) if isinstance(w, dict) else w
                 for w in result_dict.get('words', [])
             ]
+            raw_tokens = [
+                WordTimestamp(**w) if isinstance(w, dict) else w
+                for w in result_dict.get('raw_tokens', []) or []
+            ]
 
             result = SenseVoiceResult(
                 text=result_dict.get('text', ''),
                 text_clean=result_dict.get('text_clean', ''),
                 confidence=result_dict.get('confidence', 1.0),
                 words=words,
+                raw_tokens=raw_tokens or None,
                 start=0.0,  # Chunk 级别的起始时间，由调用者设置
                 end=len(audio_array) / sample_rate,
                 language=result_dict.get('language'),
@@ -1799,8 +1812,12 @@ class TranscriptionService:
             sentence.start += chunk_start_time
             sentence.end += chunk_start_time
             sentence.source = TextSource.SENSEVOICE
-            # V3.1.2+dev.20260111.01: 使用 update_confidence 确保 display_confidence 同步更新
-            sentence.update_confidence(sv_result.confidence, source="sensevoice")
+            # V3.2.0+dev.20260131.02: 保留分句计算的置信度口径，仅同步映射
+            sentence.update_confidence(
+                sentence.confidence,
+                source="sensevoice",
+                display_raw=sentence.confidence_display_raw
+            )
 
             # 调整字级时间戳的偏移
             for word in sentence.words:

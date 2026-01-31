@@ -426,8 +426,8 @@ async function syncSplitSubtitles(result) {
     if (originalSentenceIndex !== undefined) {
       await transcriptionApi.updateSubtitle(jobId, originalSentenceIndex, {
         text: leftSubtitle.text,
-        start: leftSubtitle.start,
-        end: leftSubtitle.end
+        start: projectStore.toBaseTime(leftSubtitle.start),
+        end: projectStore.toBaseTime(leftSubtitle.end)
       })
       projectStore.updateSubtitle(leftSubtitle.id, {
         sentenceIndex: originalSentenceIndex,
@@ -437,8 +437,8 @@ async function syncSplitSubtitles(result) {
     } else {
       const leftResp = await transcriptionApi.createSubtitle(jobId, {
         text: leftSubtitle.text,
-        start: leftSubtitle.start,
-        end: leftSubtitle.end
+        start: projectStore.toBaseTime(leftSubtitle.start),
+        end: projectStore.toBaseTime(leftSubtitle.end)
       })
       const leftData = leftResp?.data?.data || leftResp?.data
       if (leftData?.index !== undefined) {
@@ -452,8 +452,8 @@ async function syncSplitSubtitles(result) {
 
     const rightResp = await transcriptionApi.createSubtitle(jobId, {
       text: rightSubtitle.text,
-      start: rightSubtitle.start,
-      end: rightSubtitle.end
+      start: projectStore.toBaseTime(rightSubtitle.start),
+      end: projectStore.toBaseTime(rightSubtitle.end)
     })
     const rightData = rightResp?.data?.data || rightResp?.data
     if (rightData?.index !== undefined) {
@@ -519,7 +519,8 @@ function renderTextWithHighlight() {
   let html = ''
   for (let i = 0; i < processedWords.length; i++) {
     const word = processedWords[i]
-    const conf = word.confidence !== undefined ? word.confidence : 1.0
+    const rawConf = word.confidence_display_raw ?? word.confidence
+    const conf = rawConf !== undefined && rawConf !== null ? rawConf : 1.0
     const wordText = escapeHtml(word.word)
 
     if (conf < CRITICAL_THRESHOLD) {

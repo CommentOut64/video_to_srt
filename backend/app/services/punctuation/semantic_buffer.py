@@ -1,21 +1,107 @@
 """
 语义缓冲器（Phase C 语义缓冲实现）。
-V3.2.0+dev.20260130.08
+V3.2.0+dev.20260131.04
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Dict, Any, Sequence
 
-from app.models.sensevoice_models import SentenceSegment, TextSource
+from app.models.sensevoice_models import SentenceSegment, TextSource, WordTimestamp
 from app.services.punctuation.base import PunctuationResult, SplitPoint
 
 
 _WEAK_PUNCTUATION = set("，、；,;:")
 _PUNCTUATION_SET = set(",.!?;:\"()[]{}，。！？；：、（）【】《》“”「」『』")
 _TRAILING_PUNCTUATION = set(",，;:；：、。.")
+_CONTRACTION_MAP: Dict[str, str] = {
+    "im": "i'm",
+    "ive": "i've",
+    "id": "i'd",
+    "youre": "you're",
+    "youve": "you've",
+    "youd": "you'd",
+    "theyre": "they're",
+    "theyve": "they've",
+    "theyd": "they'd",
+    "theres": "there's",
+    "thats": "that's",
+    "whats": "what's",
+    "whos": "who's",
+    "wheres": "where's",
+    "whens": "when's",
+    "whys": "why's",
+    "hows": "how's",
+    "dont": "don't",
+    "doesnt": "doesn't",
+    "didnt": "didn't",
+    "wont": "won't",
+    "shouldnt": "shouldn't",
+    "wouldnt": "wouldn't",
+    "couldnt": "couldn't",
+    "mustnt": "mustn't",
+    "isnt": "isn't",
+    "arent": "aren't",
+    "wasnt": "wasn't",
+    "werent": "weren't",
+    "hasnt": "hasn't",
+    "havent": "haven't",
+    "hadnt": "hadn't",
+    "hes": "he's",
+    "shes": "she's",
+    "yall": "y'all",
+}
+_CONTRACTION_PATTERN = re.compile(r"\b[A-Za-z]+\b")
+
+
+def _apply_contraction_case(source: str, replacement: str) -> str:
+    if not source:
+        return replacement
+    if source.isupper():
+        return replacement.upper()
+    if source[0].isupper() and source[1:].islower():
+        return replacement[0].upper() + replacement[1:]
+    return replacement.lower()
+
+
+def _restore_english_contractions(text: str) -> str:
+    if not text:
+        return text
+
+    def repl(match: re.Match[str]) -> str:
+        word = match.group(0)
+        replacement = _CONTRACTION_MAP.get(word.lower())
+        if not replacement:
+            return word
+        return _apply_contraction_case(word, replacement)
+
+    return _CONTRACTION_PATTERN.sub(repl, text)
+
+
+def _is_likely_english(text: str) -> bool:
+    if not text:
+        return False
+    if any("\u4e00" <= char <= "\u9fff" for char in text):
+        return False
+    letters = [char for char in text if char.isalpha()]
+    if len(letters) < 3:
+        return False
+    ascii_letters = sum(1 for char in letters if char.isascii())
+    return (ascii_letters / len(letters)) >= 0.8
+
+
+def _should_restore_contractions(text: str, language: Optional[str]) -> bool:
+    if not text:
+        return False
+    lang = (language or "").lower()
+    if lang.startswith("en"):
+        return True
+    if lang and lang != "auto":
+        return False
+    return _is_likely_english(text)
 
 
 @dataclass
@@ -46,6 +132,7 @@ class SemanticBufferInput:
     punctuation_result: Optional[PunctuationResult] = None
     punctuation_decision: Optional[PunctuationDecision] = None
     word_timestamps: Optional[List[Dict[str, Any]]] = None
+    raw_tokens: Optional[List[Dict[str, Any]]] = None
     source_chunks: List[str] = field(default_factory=list)
     speaker_id: Optional[str] = None
 
@@ -108,7 +195,8 @@ class SemanticBuffer:
         combined_end = float(item.audio_range[1])
         combined_language = item.language or self._pending_language or "auto"
         combined_sources = self._pending_source_chunks + (item.source_chunks or [item.chunk_id])
-        current_words = self._normalize_words(item.word_timestamps, item.audio_range)
+        selected_words = self._select_words(item.word_timestamps, item.raw_tokens, item.language)
+        current_words = self._normalize_words(selected_words, item.audio_range)
         combined_words = self._pending_words + current_words
 
         decision = item.punctuation_decision or self._pending_decision
@@ -331,7 +419,14 @@ class SemanticBuffer:
         word_timestamps: Optional[List[Dict[str, Any]]] = None,
     ) -> SemanticChunk:
         confidence = punctuation_result.confidence if punctuation_result else 1.0
-        sentences = self._build_sentences(text, audio_range, split_end_indices, confidence, word_timestamps or [])
+        sentences = self._build_sentences(
+            text,
+            audio_range,
+            split_end_indices,
+            confidence,
+            word_timestamps or [],
+            language,
+        )
         return SemanticChunk(
             chunk_id=self._build_chunk_id(source_chunks),
             text=text,
@@ -352,6 +447,7 @@ class SemanticBuffer:
         split_end_indices: List[int],
         confidence: float,
         word_timestamps: List[Dict[str, Any]],
+        language: str,
     ) -> List[SentenceSegment]:
         if not text:
             return []
@@ -390,14 +486,23 @@ class SemanticBuffer:
                 seg_start = audio_end
             if seg_end > audio_end:
                 seg_end = audio_end
+            sentence_words = self._select_words_by_time(word_timestamps, seg_start, seg_end)
+            strict_confidence, display_raw = self._compute_sentence_confidence(sentence_words)
+            sentence_confidence = strict_confidence if sentence_words else confidence
+            sentence_word_models = self._build_word_models(sentence_words)
+            display_text = self._strip_trailing_punctuation(sentence_text).strip()
+            # V3.2.0+dev.20260131.04: 仅修复英文展示文本的缩写撇号，避免影响时间戳与切分。
+            if _should_restore_contractions(display_text, language):
+                display_text = _restore_english_contractions(display_text)
             sentences.append(
                 SentenceSegment(
                     text=sentence_text,
-                    text_clean=self._strip_trailing_punctuation(sentence_text).strip(),
+                    text_clean=display_text,
                     start=seg_start,
                     end=seg_end,
-                    words=[],
-                    confidence=confidence,
+                    words=sentence_word_models,
+                    confidence=sentence_confidence,
+                    confidence_display_raw=display_raw,
                     source=TextSource.SENSEVOICE,
                     is_draft=True,
                     is_finalized=False,
@@ -406,6 +511,96 @@ class SemanticBuffer:
             last_end_time = seg_end
             start_idx = end_idx + 1
         return sentences
+
+    @staticmethod
+    def _select_words_by_time(
+        words: Sequence[Dict[str, Any]],
+        seg_start: float,
+        seg_end: float,
+    ) -> List[Dict[str, Any]]:
+        """根据时间范围选取词级时间戳，避免整段无高亮。"""
+        if not words:
+            return []
+        selected: List[Dict[str, Any]] = []
+        for word in words:
+            start = float(word.get("start", 0.0) or 0.0)
+            end = float(word.get("end", start) or start)
+            mid = (start + end) / 2.0
+            if seg_start <= mid <= seg_end:
+                selected.append(word)
+        return selected
+
+    @staticmethod
+    def _build_word_models(words: Sequence[Dict[str, Any]]) -> List[WordTimestamp]:
+        """将词级字典转换为 WordTimestamp，确保 SentenceSegment.to_dict 可用。"""
+        models: List[WordTimestamp] = []
+        for word in words:
+            if isinstance(word, WordTimestamp):
+                models.append(word)
+                continue
+            if not isinstance(word, dict):
+                continue
+            models.append(
+                WordTimestamp(
+                    word=str(word.get("word", "")),
+                    start=float(word.get("start", 0.0) or 0.0),
+                    end=float(word.get("end", 0.0) or 0.0),
+                    confidence=word.get("confidence"),
+                    confidence_raw=word.get("confidence_raw"),
+                    confidence_display_raw=word.get("confidence_display_raw"),
+                    token_type=word.get("token_type"),
+                    is_pseudo=bool(word.get("is_pseudo", False)),
+                )
+            )
+        return models
+
+    @staticmethod
+    def _compute_sentence_confidence(
+        words: Sequence[Dict[str, Any]],
+    ) -> Tuple[float, Optional[float]]:
+        """计算句级置信度（严格口径 + 显示口径）。"""
+        if not words:
+            return 0.0, None
+
+        raw_values: List[float] = []
+        display_values: List[float] = []
+        display_weights: List[float] = []
+
+        for word in words:
+            conf = word.get("confidence") if isinstance(word, dict) else getattr(word, "confidence", None)
+            if conf is not None:
+                raw_values.append(float(conf))
+
+            display_conf = (
+                word.get("confidence_display_raw")
+                if isinstance(word, dict)
+                else getattr(word, "confidence_display_raw", None)
+            )
+            if display_conf is None:
+                display_conf = conf
+            if display_conf is None:
+                continue
+
+            if isinstance(word, dict):
+                start = float(word.get("start", 0.0) or 0.0)
+                end = float(word.get("end", start) or start)
+            else:
+                start = float(getattr(word, "start", 0.0) or 0.0)
+                end = float(getattr(word, "end", start) or start)
+            duration = max(end - start, 0.0)
+            weight = duration if duration > 0.0 else 1.0
+            display_values.append(float(display_conf))
+            display_weights.append(weight)
+
+        strict_confidence = min(raw_values) if raw_values else 0.0
+
+        if not display_values:
+            return strict_confidence, None
+
+        weighted_sum = sum(val * w for val, w in zip(display_values, display_weights))
+        total_weight = sum(display_weights)
+        display_raw = weighted_sum / total_weight if total_weight > 0.0 else None
+        return strict_confidence, display_raw
 
     def _split_audio_range(
         self,
@@ -517,6 +712,30 @@ class SemanticBuffer:
             end -= 1
         return text[:end]
 
+    def _select_words(
+        self,
+        words: Optional[Sequence[Dict[str, Any]]],
+        raw_tokens: Optional[Sequence[Dict[str, Any]]],
+        language: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        """
+        选择用于时间戳估算的词列表。
+
+        当 word_timestamps 粒度过粗时，回退使用 raw_tokens 重新合并。
+        """
+        if words and (len(words) > 1 or not raw_tokens):
+            return list(words)
+        if raw_tokens:
+            try:
+                from app.services.token_merge_service import merge_tokens
+
+                merge_result = merge_tokens(list(raw_tokens), language=language)
+                if merge_result.words:
+                    return merge_result.words
+            except Exception as exc:
+                self._logger.debug("SemanticBuffer 回退合并失败: %s", exc)
+        return list(words) if words else []
+
     @staticmethod
     def _normalize_words(
         words: Optional[Sequence[Dict[str, Any]]],
@@ -528,7 +747,8 @@ class SemanticBuffer:
         normalized: List[Dict[str, Any]] = []
         for word in words:
             token = str(word.get("word", "") or "")
-            if not token:
+            token = token.lstrip(" ▁")
+            if not token or token in _PUNCTUATION_SET:
                 continue
             start = word.get("start", 0.0)
             end = word.get("end", 0.0)
@@ -544,6 +764,8 @@ class SemanticBuffer:
                     "start": audio_start + start_val,
                     "end": audio_start + end_val,
                     "confidence": word.get("confidence", 1.0),
+                    "confidence_display_raw": word.get("confidence_display_raw"),
+                    "token_type": word.get("token_type"),
                 }
             )
         return normalized
