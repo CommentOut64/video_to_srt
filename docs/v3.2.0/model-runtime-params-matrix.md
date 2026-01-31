@@ -294,6 +294,11 @@
 - `hard_limit_duration`: `>= 0.0`，默认 `20.0`
 - `min_chunk_duration`: `>= 0.0`，默认 `1.0`
 - `prefer_punctuation_split`: `true | false`，默认 `true`
+- `min_subtitle_chars_zh_ja`: `>= 1`，默认 `4`
+- `min_subtitle_words_en`: `>= 1`，默认 `4`
+- `min_subtitle_duration_sec`: `>= 0.0`，默认 `0.8`
+- `fast_delay_budget_sec`: `>= 0.0`，默认 `2.0`
+- `force_split_on_sentence_end_punct`: `true | false`，默认 `true`
 
 ### 4.9 流水线默认参数（Pipeline）
 - `batch_size`
