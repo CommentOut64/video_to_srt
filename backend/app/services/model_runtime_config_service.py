@@ -359,6 +359,11 @@ class ModelRuntimeConfigService:
                 "hard_limit_duration": 20.0,
                 "min_chunk_duration": 1.0,
                 "prefer_punctuation_split": True,
+                "min_subtitle_chars_zh_ja": 4,
+                "min_subtitle_words_en": 4,
+                "min_subtitle_duration_sec": 0.8,
+                "fast_delay_budget_sec": 2.0,
+                "force_split_on_sentence_end_punct": True,
             },
             "pipeline": {
                 "batch_size": 16,

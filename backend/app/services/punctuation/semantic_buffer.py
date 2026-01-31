@@ -10,7 +10,8 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Dict, Any, Sequence
 
-from app.models.sensevoice_models import SentenceSegment, TextSource, WordTimestamp
+from app.models.sensevoice_models import SentenceSegment, TextSource, WordTimestamp, WarningType
+from app.services.model_runtime_config_service import get_model_runtime_config_service
 from app.services.punctuation.base import PunctuationResult, SplitPoint
 
 
@@ -55,6 +56,16 @@ _CONTRACTION_MAP: Dict[str, str] = {
     "yall": "y'all",
 }
 _CONTRACTION_PATTERN = re.compile(r"\b[A-Za-z]+\b")
+_EN_WORD_PATTERN = re.compile(r"[A-Za-z0-9']+")
+
+
+def _get_language_strategy(language: str):
+    """延迟导入语言策略，避免循环依赖。"""
+    try:
+        from app.services.sentence_splitter import get_language_strategy
+        return get_language_strategy(language)
+    except ImportError:
+        return None
 
 
 def _apply_contraction_case(source: str, replacement: str) -> str:
@@ -164,9 +175,17 @@ class SemanticBuffer:
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self._logger = logger or logging.getLogger(__name__)
+        self._runtime_service = get_model_runtime_config_service()
         self._max_pending_chars = max(1, int(max_pending_chars))
         self._max_pending_duration = max(0.0, float(max_pending_duration))
         self._force_flush_duration = max(0.0, float(force_flush_duration))
+        self._min_subtitle_chars_zh_ja = 4
+        self._min_subtitle_words_en = 4
+        self._min_subtitle_duration_sec = 0.8
+        self._fast_delay_budget_sec = 2.0
+        self._min_sentence_gap = 0.3
+        self._hard_limit_duration = self._force_flush_duration
+        self._force_split_on_sentence_end_punct = True
         self._pending_text = ""
         self._pending_audio_start = 0.0
         self._pending_audio_end = 0.0
@@ -181,6 +200,7 @@ class SemanticBuffer:
         """添加快流标点结果，返回可输出的语义块。"""
         if not item.text:
             return []
+        self._refresh_runtime_config()
         outputs: List[SemanticChunk] = []
 
         if self._should_flush_for_speaker(item.speaker_id):
@@ -218,6 +238,7 @@ class SemanticBuffer:
 
     def flush(self, reason: str = "force") -> List[SemanticChunk]:
         """强制输出所有缓冲内容。"""
+        self._refresh_runtime_config()
         if not self._pending_text:
             return []
         chunk = self._build_chunk(
@@ -227,6 +248,7 @@ class SemanticBuffer:
             source_chunks=self._pending_source_chunks,
             decision=self._pending_decision,
             split_end_indices=[len(self._pending_text) - 1],
+            locked_end_indices=set(),
             pending_tail="",
             punctuation_result=self._pending_punctuation_result,
             word_timestamps=self._pending_words,
@@ -234,6 +256,69 @@ class SemanticBuffer:
         self._reset_pending()
         self._logger.debug("语义缓冲强制刷新: reason=%s", reason)
         return [chunk]
+
+    def _refresh_runtime_config(self) -> None:
+        """刷新运行参数（用于字幕切分与合并阈值）。"""
+        try:
+            runtime = self._runtime_service.get_effective_runtime_global()
+        except Exception as exc:
+            self._logger.debug("SemanticBuffer 运行参数读取失败（忽略）: %s", exc)
+            return
+
+        punct = runtime.get("effective", {}).get("punctuation", {})
+
+        def _to_int(value: Any, fallback: int) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return fallback
+
+        def _to_float(value: Any, fallback: float) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return fallback
+
+        self._min_subtitle_chars_zh_ja = max(1, _to_int(
+            punct.get("min_subtitle_chars_zh_ja", self._min_subtitle_chars_zh_ja),
+            self._min_subtitle_chars_zh_ja,
+        ))
+        self._min_subtitle_words_en = max(1, _to_int(
+            punct.get("min_subtitle_words_en", self._min_subtitle_words_en),
+            self._min_subtitle_words_en,
+        ))
+        self._min_subtitle_duration_sec = max(0.0, _to_float(
+            punct.get("min_subtitle_duration_sec", self._min_subtitle_duration_sec),
+            self._min_subtitle_duration_sec,
+        ))
+        self._fast_delay_budget_sec = max(0.0, _to_float(
+            punct.get("fast_delay_budget_sec", self._fast_delay_budget_sec),
+            self._fast_delay_budget_sec,
+        ))
+        force_split = punct.get("force_split_on_sentence_end_punct")
+        if force_split is not None:
+            self._force_split_on_sentence_end_punct = bool(force_split)
+        self._min_sentence_gap = max(0.0, _to_float(
+            punct.get("min_sentence_gap", self._min_sentence_gap),
+            self._min_sentence_gap,
+        ))
+        hard_limit = _to_float(
+            punct.get("hard_limit_duration", self._hard_limit_duration),
+            self._hard_limit_duration,
+        )
+        self._hard_limit_duration = max(0.0, hard_limit)
+
+        max_buffer = punct.get("max_buffer_duration")
+        if max_buffer is not None:
+            self._max_pending_duration = max(
+                self._min_subtitle_duration_sec,
+                _to_float(max_buffer, self._max_pending_duration),
+            )
+        self._force_flush_duration = max(
+            self._force_flush_duration,
+            self._hard_limit_duration,
+            self._min_subtitle_duration_sec,
+        )
 
     def _split_and_update(
         self,
@@ -258,6 +343,16 @@ class SemanticBuffer:
                 split_clean_indices,
             )
             if split_end_indices:
+                locked_end_indices = set(split_end_indices)
+                split_end_indices = self._trim_trailing_short_boundaries(
+                    text=combined_text,
+                    end_indices=split_end_indices,
+                    audio_range=audio_range,
+                    word_timestamps=combined_words,
+                    language=language,
+                    locked_end_indices=locked_end_indices,
+                )
+            if split_end_indices:
                 last_end = split_end_indices[-1]
                 chunk_text = combined_text[: last_end + 1]
                 chunk_range, pending_range = self._split_audio_range(audio_range, combined_text, last_end)
@@ -275,6 +370,7 @@ class SemanticBuffer:
                     source_chunks=source_chunks,
                     decision=decision,
                     split_end_indices=split_end_indices,
+                    locked_end_indices=locked_end_indices if split_end_indices else set(),
                     pending_tail=combined_text[last_end + 1 :],
                     punctuation_result=self._clone_result(punct_result, chunk_text, split_end_indices, chunk_range),
                     word_timestamps=chunk_words,
@@ -351,6 +447,257 @@ class SemanticBuffer:
             last_end = end_index
         return results
 
+    def _trim_trailing_short_boundaries(
+        self,
+        *,
+        text: str,
+        end_indices: List[int],
+        audio_range: Tuple[float, float],
+        word_timestamps: List[Dict[str, Any]],
+        language: str,
+        locked_end_indices: Optional[set[int]] = None,
+    ) -> List[int]:
+        if not end_indices:
+            return []
+        indices = list(end_indices)
+        locked = locked_end_indices or set()
+        if self._force_split_on_sentence_end_punct and indices and indices[-1] in locked:
+            return indices
+        if self._fast_delay_budget_sec <= 0.0:
+            return indices
+
+        clean_len = self._clean_length(text)
+        clean_map = self._build_clean_index_map(text)
+        clean_text = self._build_clean_text(text)
+        clean_to_word = self._build_clean_to_word_map(clean_text, word_timestamps) if word_timestamps else []
+        audio_start, audio_end = audio_range
+
+        while indices:
+            start_idx = indices[-2] + 1 if len(indices) > 1 else 0
+            end_idx = indices[-1]
+            segment_text = text[start_idx:end_idx + 1]
+            if not segment_text.strip():
+                indices.pop()
+                continue
+
+            seg_start, seg_end = self._estimate_sentence_time(
+                text=text,
+                clean_len=clean_len,
+                clean_map=clean_map,
+                clean_to_word=clean_to_word,
+                word_timestamps=word_timestamps,
+                audio_start=audio_start,
+                audio_end=audio_end,
+                start_text_index=start_idx,
+                end_text_index=end_idx,
+            )
+            duration = max(seg_end - seg_start, 0.0)
+            if not self._is_short_segment(segment_text, duration, language):
+                break
+
+            pending_duration = max(audio_end - seg_start, 0.0)
+            if pending_duration > self._fast_delay_budget_sec:
+                self._logger.debug(
+                    "短句延迟预算超限: pending=%.2fs > budget=%.2fs，保持切分点",
+                    pending_duration,
+                    self._fast_delay_budget_sec,
+                )
+                break
+
+            self._logger.debug(
+                "短句延迟输出: duration=%.2fs, text='%s'",
+                duration,
+                segment_text.strip()[:30],
+            )
+            indices.pop()
+
+        return indices
+
+    def _merge_short_sentences(
+        self,
+        sentences: List[SentenceSegment],
+        language: str,
+        locked_end_flags: Optional[List[bool]] = None,
+    ) -> List[SentenceSegment]:
+        if len(sentences) <= 1:
+            return sentences
+
+        merged: List[SentenceSegment] = []
+        merged_locked: List[bool] = []
+        i = 0
+        strategy = _get_language_strategy(language)
+        locked_flags = locked_end_flags or []
+
+        while i < len(sentences):
+            current = sentences[i]
+            current_locked = locked_flags[i] if i < len(locked_flags) else False
+
+            if not self._is_short_sentence(current, language):
+                merged.append(current)
+                merged_locked.append(current_locked)
+                i += 1
+                continue
+
+            prev = merged[-1] if merged else None
+            prev_locked = merged_locked[-1] if merged_locked else False
+            next_sent = sentences[i + 1] if i + 1 < len(sentences) else None
+            next_locked = locked_flags[i + 1] if i + 1 < len(locked_flags) else False
+
+            prefer_forward = self._prefer_forward_merge(
+                current,
+                next_sent,
+                strategy=strategy,
+            )
+
+            if (
+                prev
+                and not prefer_forward
+                and not prev_locked
+                and self._can_merge_sentences(prev, current)
+            ):
+                merged[-1] = self._merge_sentence_pair(prev, current, language)
+                merged_locked[-1] = current_locked
+                i += 1
+                continue
+
+            if (
+                next_sent
+                and not current_locked
+                and self._can_merge_sentences(current, next_sent)
+            ):
+                merged.append(self._merge_sentence_pair(current, next_sent, language))
+                merged_locked.append(next_locked)
+                i += 2
+                continue
+
+            if prev and not prev_locked and self._can_merge_sentences(prev, current):
+                merged[-1] = self._merge_sentence_pair(prev, current, language)
+                merged_locked[-1] = current_locked
+                i += 1
+                continue
+
+            merged.append(current)
+            merged_locked.append(current_locked)
+            i += 1
+
+        return merged
+
+    @staticmethod
+    def _build_locked_flags(
+        end_indices_used: List[int],
+        locked_end_indices: Optional[set[int]],
+    ) -> List[bool]:
+        if not end_indices_used:
+            return []
+        locked = locked_end_indices or set()
+        return [end_idx in locked for end_idx in end_indices_used]
+
+    def _prefer_forward_merge(
+        self,
+        current: SentenceSegment,
+        next_sent: Optional[SentenceSegment],
+        *,
+        strategy: Optional[Any],
+    ) -> bool:
+        if strategy:
+            try:
+                if strategy.is_incomplete_ending((current.text_clean or current.text).strip()):
+                    return True
+            except Exception:
+                pass
+        if next_sent:
+            gap = max(next_sent.start - current.end, 0.0)
+            if gap < self._min_sentence_gap:
+                return True
+            if strategy:
+                try:
+                    if strategy.is_continuation((next_sent.text_clean or next_sent.text).strip()):
+                        return True
+                except Exception:
+                    pass
+        return False
+
+    def _can_merge_sentences(self, left: SentenceSegment, right: SentenceSegment) -> bool:
+        merged_duration = max(right.end - left.start, 0.0)
+        if self._hard_limit_duration > 0.0 and merged_duration > self._hard_limit_duration:
+            return False
+        return True
+
+    def _merge_sentence_pair(
+        self,
+        left: SentenceSegment,
+        right: SentenceSegment,
+        language: str,
+    ) -> SentenceSegment:
+        merged_text = f"{left.text}{right.text}"
+        merged_clean = self._strip_trailing_punctuation(merged_text).strip()
+        if _should_restore_contractions(merged_clean, language):
+            merged_clean = _restore_english_contractions(merged_clean)
+
+        merged_words = list(left.words) + list(right.words)
+        strict_confidence, display_raw = self._compute_sentence_confidence(merged_words)
+        merged_sentence = SentenceSegment(
+            text=merged_text,
+            text_clean=merged_clean,
+            start=left.start,
+            end=right.end,
+            words=merged_words,
+            confidence=strict_confidence if merged_words else left.confidence,
+            confidence_display_raw=display_raw,
+            confidence_source=left.confidence_source or right.confidence_source,
+            source=left.source,
+            is_draft=left.is_draft,
+            is_finalized=left.is_finalized,
+            warning_type=(
+                left.warning_type
+                if left.warning_type != WarningType.NONE
+                else right.warning_type
+            ),
+        )
+        return merged_sentence
+
+    def _is_short_sentence(self, sentence: SentenceSegment, language: str) -> bool:
+        duration = max(sentence.end - sentence.start, 0.0)
+        return self._is_short_segment(sentence.text_clean or sentence.text, duration, language)
+
+    def _is_short_segment(self, text: str, duration: float, language: str) -> bool:
+        if duration < self._min_subtitle_duration_sec:
+            return True
+        unit_count = self._count_units(text, language)
+        if self._resolve_language_group(text, language) == "en":
+            return unit_count < self._min_subtitle_words_en
+        return unit_count < self._min_subtitle_chars_zh_ja
+
+    def _count_units(self, text: str, language: str) -> int:
+        normalized = self._strip_trailing_punctuation(text).strip()
+        if not normalized:
+            return 0
+        if self._resolve_language_group(normalized, language) == "en":
+            return self._count_english_words(normalized)
+        return self._count_cjk_chars(normalized)
+
+    @staticmethod
+    def _count_english_words(text: str) -> int:
+        return len(_EN_WORD_PATTERN.findall(text))
+
+    @staticmethod
+    def _count_cjk_chars(text: str) -> int:
+        return sum(1 for char in text if char not in _PUNCTUATION_SET and not char.isspace())
+
+    @staticmethod
+    def _resolve_language_group(text: str, language: str) -> str:
+        lang = (language or "auto").lower()
+        if lang.startswith(("zh", "yue", "ja", "jp")):
+            return "cjk"
+        if lang.startswith("en"):
+            return "en"
+        if lang == "auto":
+            if _is_likely_english(text):
+                return "en"
+            if any("\u4e00" <= char <= "\u9fff" for char in text):
+                return "cjk"
+        return "en"
+
     def _force_split_if_needed(self) -> List[SemanticChunk]:
         outputs: List[SemanticChunk] = []
         if not self._pending_text:
@@ -384,6 +731,7 @@ class SemanticBuffer:
             source_chunks=self._pending_source_chunks,
             decision=self._pending_decision,
             split_end_indices=[weak_index],
+            locked_end_indices=set(),
             pending_tail=self._pending_text[weak_index + 1 :],
             punctuation_result=self._clone_result(
                 self._pending_punctuation_result,
@@ -414,12 +762,13 @@ class SemanticBuffer:
         source_chunks: List[str],
         decision: Optional[PunctuationDecision],
         split_end_indices: List[int],
+        locked_end_indices: Optional[set[int]] = None,
         pending_tail: str,
         punctuation_result: Optional[PunctuationResult],
         word_timestamps: Optional[List[Dict[str, Any]]] = None,
     ) -> SemanticChunk:
         confidence = punctuation_result.confidence if punctuation_result else 1.0
-        sentences = self._build_sentences(
+        sentences, end_indices_used = self._build_sentences(
             text,
             audio_range,
             split_end_indices,
@@ -427,6 +776,11 @@ class SemanticBuffer:
             word_timestamps or [],
             language,
         )
+        locked_flags = self._build_locked_flags(
+            end_indices_used,
+            locked_end_indices if self._force_split_on_sentence_end_punct else None,
+        )
+        sentences = self._merge_short_sentences(sentences, language, locked_flags)
         return SemanticChunk(
             chunk_id=self._build_chunk_id(source_chunks),
             text=text,
@@ -448,12 +802,13 @@ class SemanticBuffer:
         confidence: float,
         word_timestamps: List[Dict[str, Any]],
         language: str,
-    ) -> List[SentenceSegment]:
+    ) -> Tuple[List[SentenceSegment], List[int]]:
         if not text:
-            return []
+            return [], []
         if not split_end_indices:
             split_end_indices = [len(text) - 1]
         sentences: List[SentenceSegment] = []
+        end_indices_used: List[int] = []
         start_idx = 0
         clean_len = self._clean_length(text)
         clean_map = self._build_clean_index_map(text)
@@ -508,9 +863,10 @@ class SemanticBuffer:
                     is_finalized=False,
                 )
             )
+            end_indices_used.append(end_idx)
             last_end_time = seg_end
             start_idx = end_idx + 1
-        return sentences
+        return sentences, end_indices_used
 
     @staticmethod
     def _select_words_by_time(
