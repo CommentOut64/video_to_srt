@@ -19,8 +19,16 @@ class WordTimestamp:
     start: float
     end: float
     confidence: Optional[float] = None
+    confidence_raw: Optional[float] = None
+    confidence_display_raw: Optional[float] = None
     is_pseudo: bool = False
     probability: Optional[float] = None
+    token_type: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        """兼容旧数据：confidence_raw 默认对齐 confidence。"""
+        if self.confidence_raw is None:
+            self.confidence_raw = self.confidence
 
 
 @dataclass
@@ -60,5 +68,6 @@ class ASRResult:
     metadata: ASRMetadata
     text_clean: Optional[str] = None
     words: Optional[List[WordTimestamp]] = None
+    raw_tokens: Optional[List[Dict[str, Any]]] = None
     emotion: Optional[str] = None
     event_tags: Optional[List[str]] = None
