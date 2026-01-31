@@ -291,6 +291,14 @@ class PipelineOrchestrator:
 
         chunk_engine = ChunkEngine(logger=self.logger)
 
+        # V3.2.0+dev.20260131: 创建诊断服务
+        from app.services.segmentation_diagnostic_service import get_diagnostic_service
+        diagnostic_service = get_diagnostic_service(
+            job_id=job.job_id,
+            job_dir=Path(job.dir) if job.dir else None,
+            enabled=None  # 默认启用，可通过环境变量控制
+        )
+
         preprocessing_pipeline = PreprocessingPipeline(
             config=job.settings.preprocessing,
             chunk_engine=chunk_engine,
@@ -298,6 +306,7 @@ class PipelineOrchestrator:
             logger=self.logger,
             cancellation_token=cancellation_token,
             progress_emitter=progress_emitter,
+            diagnostic_service=diagnostic_service,  # V3.2.0+dev.20260131: 传递诊断服务
         )
 
         checkpoint_data = (
@@ -326,6 +335,15 @@ class PipelineOrchestrator:
             stats["fuse_retry_total"],
             stats["fuse_retry_max"],
         )
+
+        # V3.2.0+dev.20260131: 导出诊断文件
+        if diagnostic_service:
+            try:
+                diagnostic_file = diagnostic_service.export_to_file()
+                if diagnostic_file:
+                    self.logger.info(f"断句诊断文件已保存: {diagnostic_file}")
+            except Exception as e:
+                self.logger.warning(f"导出诊断文件失败: {e}", exc_info=True)
 
         return chunks
 

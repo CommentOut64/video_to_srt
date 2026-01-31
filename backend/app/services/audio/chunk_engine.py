@@ -9,7 +9,7 @@ Phase 2 实现 - 2025-12-10
 
 import logging
 import warnings
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -125,7 +125,8 @@ class ChunkEngine:
         enable_demucs: bool = False,
         demucs_model: Optional[str] = None,
         vad_config: Optional[VADConfig] = None,
-        progress_callback: Optional[callable] = None
+        progress_callback: Optional[callable] = None,
+        diagnostic_service: Optional[Any] = None  # V3.2.0+dev.20260131: 诊断服务
     ) -> Tuple[List[AudioChunk], np.ndarray, int]:
         """
         处理音频文件，返回切分后的 Chunk 列表
@@ -142,6 +143,7 @@ class ChunkEngine:
             demucs_model: Demucs 模型名称（可选）
             vad_config: VAD 配置（可选，使用默认配置）
             progress_callback: 进度回调 callback(progress: float, message: str)
+            diagnostic_service: 诊断服务实例（可选，V3.2.0+dev.20260131）
 
         Returns:
             Tuple[List[AudioChunk], np.ndarray, int]:
@@ -190,7 +192,7 @@ class ChunkEngine:
             from app.services.runtime_param_resolver import build_vad_config
 
             vad_config = build_vad_config()
-        segments = self._detect_speech_segments(separated_audio, sr, vad_config)
+        segments = self._detect_speech_segments(separated_audio, sr, vad_config, diagnostic_service)
 
         self.logger.info(f"VAD 检测完成: {len(segments)} 个语音段")
 
@@ -262,7 +264,8 @@ class ChunkEngine:
         self,
         audio_array: np.ndarray,
         sr: int,
-        vad_config: VADConfig
+        vad_config: VADConfig,
+        diagnostic_service: Optional[Any] = None  # V3.2.0+dev.20260131: 诊断服务
     ) -> List[dict]:
         """
         使用 VAD 检测语音段
@@ -271,11 +274,14 @@ class ChunkEngine:
             audio_array: 音频数组
             sr: 采样率
             vad_config: VAD 配置
+            diagnostic_service: 诊断服务实例（可选）
 
         Returns:
             List[dict]: 语音段元数据列表
         """
-        return self.vad_service.detect_speech_segments(audio_array, sr, vad_config)
+        return self.vad_service.detect_speech_segments(
+            audio_array, sr, vad_config, diagnostic_service=diagnostic_service
+        )
 
     def _create_chunks(
         self,

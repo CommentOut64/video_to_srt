@@ -57,7 +57,8 @@ class PreprocessingPipeline:
         vad_config: Optional[VADConfig] = None,  # V3.1.0: 新增 VAD 配置参数
         logger: Optional[logging.Logger] = None,
         cancellation_token: Optional["CancellationToken"] = None,  # v3.1.0: 新增
-        progress_emitter: Optional["ProgressEventEmitter"] = None
+        progress_emitter: Optional["ProgressEventEmitter"] = None,
+        diagnostic_service: Optional[Any] = None  # V3.2.0+dev.20260131: 诊断服务
     ):
         """
         初始化预处理流水线
@@ -69,11 +70,13 @@ class PreprocessingPipeline:
             logger: 日志记录器（可选）
             cancellation_token: 取消令牌（可选，v3.1.0）
             progress_emitter: 进度发射器（可选）
+            diagnostic_service: 诊断服务实例（可选，V3.2.0+dev.20260131）
         """
         self.config = config
         self.logger = logger or logging.getLogger(__name__)
         self.cancellation_token = cancellation_token  # v3.1.0
         self.progress_emitter = progress_emitter
+        self.diagnostic_service = diagnostic_service  # V3.2.0+dev.20260131
         if vad_config is None:
             from app.services.runtime_param_resolver import build_vad_config
 
@@ -852,7 +855,8 @@ class PreprocessingPipeline:
             audio_path=video_path,
             enable_demucs=False,  # 关键：不在这里执行Demucs
             vad_config=vad_config,
-            progress_callback=progress_callback
+            progress_callback=progress_callback,
+            diagnostic_service=self.diagnostic_service  # V3.2.0+dev.20260131: 传递诊断服务
         )
 
         self.logger.info(
