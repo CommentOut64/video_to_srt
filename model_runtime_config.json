@@ -1,6 +1,11 @@
 {
   "version": "1.1",
   "global": {},
-  "runtime": {},
-  "per_model": {}
+  "runtime": {
+    "punctuation": {
+      "force_split_on_sentence_end_punct": true
+    }
+  },
+  "per_model": {},
+  "resident_models": []
 }
