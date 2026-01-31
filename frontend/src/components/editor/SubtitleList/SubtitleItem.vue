@@ -519,7 +519,8 @@ function renderTextWithHighlight() {
   let html = ''
   for (let i = 0; i < processedWords.length; i++) {
     const word = processedWords[i]
-    const conf = word.confidence !== undefined ? word.confidence : 1.0
+    const rawConf = word.confidence_display_raw ?? word.confidence
+    const conf = rawConf !== undefined && rawConf !== null ? rawConf : 1.0
     const wordText = escapeHtml(word.word)
 
     if (conf < CRITICAL_THRESHOLD) {
