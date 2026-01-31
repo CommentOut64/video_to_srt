@@ -83,6 +83,16 @@ _PUNCTUATION_SET = set(",.!?;:\"()[]{}，。！？；：、（）【】《》“
 _LEFT_PUNCT = set("([{“‘（【《「『")
 _SENTENCE_END = set("。！？.!?")
 _QUESTION_PUNCT = {"?", "？"}
+# V3.2.0+dev.20260131.05: 小数点保护（避免 1.4 被当作句号）
+_DECIMAL_DOT_CHARS = {".", "。", "．"}
+
+
+def _is_decimal_dot(text: str, index: int) -> bool:
+    if index <= 0 or index >= len(text) - 1:
+        return False
+    if text[index] not in _DECIMAL_DOT_CHARS:
+        return False
+    return text[index - 1].isdigit() and text[index + 1].isdigit()
 
 _DEFAULT_POSTPROCESS = {
     "fast": {
@@ -151,7 +161,7 @@ def build_clean_text(raw_text: str) -> Tuple[str, List[int], List[Optional[int]]
     raw_to_clean: List[Optional[int]] = []
     clean_idx = 0
     for idx, char in enumerate(raw_text):
-        if char in _PUNCTUATION_SET:
+        if char in _PUNCTUATION_SET and not _is_decimal_dot(raw_text, idx):
             raw_to_clean.append(None)
             continue
         clean_chars.append(char)
@@ -325,6 +335,8 @@ def _extract_raw_marks(
     marks: List[_RawMark] = []
     for idx, char in enumerate(raw_text):
         if char not in _PUNCTUATION_SET:
+            continue
+        if _is_decimal_dot(raw_text, idx):
             continue
         clean_idx = _map_raw_punct_to_clean_index(idx, raw_text, raw_to_clean, char)
         if clean_idx is None:
