@@ -113,6 +113,16 @@ class PunctuationStrategy(ABC):
 
 
 _PUNCTUATION_SET = set(",.!?;:\"()[]{}，。！？；：、（）【】《》“”‘’「」『』")
+# V3.2.0+dev.20260131.05: 保护小数点（中文句号误判）
+_DECIMAL_PUNCTUATION = {".", "。"}
+
+
+def _is_decimal_char(text: str, index: int) -> bool:
+    if index <= 0 or index >= len(text) - 1:
+        return False
+    if text[index] not in _DECIMAL_PUNCTUATION:
+        return False
+    return text[index - 1].isdigit() and text[index + 1].isdigit()
 
 
 def apply_punctuation(text: str, positions: Sequence[PuncPosition]) -> str:
@@ -149,7 +159,7 @@ def _build_clean_index_map(text: str) -> List[int]:
     """建立 clean_index -> text_index 的映射。"""
     mapping: List[int] = []
     for idx, char in enumerate(text):
-        if char in _PUNCTUATION_SET:
+        if char in _PUNCTUATION_SET and not _is_decimal_char(text, idx):
             continue
         mapping.append(idx)
     return mapping
@@ -157,7 +167,7 @@ def _build_clean_index_map(text: str) -> List[int]:
 
 def _is_decimal_punctuation(text: str, clean_index: int, punct: str, clean_map: List[int]) -> bool:
     """判断标点是否为数字小数点，避免将 2.5 等拆分成断句。"""
-    if punct != ".":
+    if punct not in _DECIMAL_PUNCTUATION:
         return False
     if clean_index < 0 or clean_index >= len(clean_map):
         return False

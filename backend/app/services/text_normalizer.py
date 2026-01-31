@@ -34,6 +34,9 @@ class TextNormalizer:
         ''': "'", ''': "'", '（': '(', '）': ')',
         '【': '[', '】': ']', '《': '<', '》': '>',
     }
+    # V3.2.0+dev.20260131.05: 保护小数点，避免归一化成句号导致误断句
+    DECIMAL_DOT_PLACEHOLDER = "__DECIMAL_DOT__"
+    DECIMAL_DOT_PATTERN = re.compile(r"(?<=\d)[\.\u3002\uFF0E](?=\d)")
 
     # Whisper 幻觉检测模式
     # 重复子串检测: 长度>=4 且重复>=3次的子串
@@ -354,6 +357,8 @@ class TextNormalizer:
         if not text:
             return ""
 
+        text = TextNormalizer._protect_decimal_dots(text)
+
         if to_fullwidth:
             # 半角转全角
             mapping = {v: k for k, v in TextNormalizer.PUNCTUATION_MAP.items()}
@@ -364,7 +369,19 @@ class TextNormalizer:
         for old, new in mapping.items():
             text = text.replace(old, new)
 
-        return text
+        return TextNormalizer._restore_decimal_dots(text)
+
+    @staticmethod
+    def _protect_decimal_dots(text: str) -> str:
+        if not text:
+            return ""
+        return TextNormalizer.DECIMAL_DOT_PATTERN.sub(TextNormalizer.DECIMAL_DOT_PLACEHOLDER, text)
+
+    @staticmethod
+    def _restore_decimal_dots(text: str) -> str:
+        if not text:
+            return ""
+        return text.replace(TextNormalizer.DECIMAL_DOT_PLACEHOLDER, ".")
 
     @staticmethod
     def extract_tags(text: str) -> dict:
