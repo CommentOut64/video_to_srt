@@ -239,6 +239,14 @@ class PunctuationRuntimeParams(_RuntimeBase):
     hard_limit_duration: Optional[float] = Field(default=None, ge=0.0)
     min_chunk_duration: Optional[float] = Field(default=None, ge=0.0)
     is_prefer_punctuation_split: Optional[bool] = Field(default=None, alias="prefer_punctuation_split")
+    min_subtitle_chars_zh_ja: Optional[int] = Field(default=None, ge=1)
+    min_subtitle_words_en: Optional[int] = Field(default=None, ge=1)
+    min_subtitle_duration_sec: Optional[float] = Field(default=None, ge=0.0)
+    fast_delay_budget_sec: Optional[float] = Field(default=None, ge=0.0)
+    is_force_split_on_sentence_end_punct: Optional[bool] = Field(
+        default=None,
+        alias="force_split_on_sentence_end_punct",
+    )
 
     @field_validator("device")
     @classmethod
@@ -436,6 +444,11 @@ _PARAM_SCHEMA: Dict[str, Any] = {
             "hard_limit_duration": {"type": "float", "min": 0.0, "default": 20.0},
             "min_chunk_duration": {"type": "float", "min": 0.0, "default": 1.0},
             "prefer_punctuation_split": {"type": "bool", "default": True},
+            "min_subtitle_chars_zh_ja": {"type": "int", "min": 1, "default": 4},
+            "min_subtitle_words_en": {"type": "int", "min": 1, "default": 4},
+            "min_subtitle_duration_sec": {"type": "float", "min": 0.0, "default": 0.8},
+            "fast_delay_budget_sec": {"type": "float", "min": 0.0, "default": 2.0},
+            "force_split_on_sentence_end_punct": {"type": "bool", "default": True},
         },
         "pipeline": {
             "batch_size": {"type": "int", "min": 1, "default": 16},
