@@ -121,14 +121,22 @@ class FastWorker:
                         "start": word.start,
                         "end": word.end,
                         "confidence": confidence,
+                        "confidence_raw": word.confidence,
+                        "confidence_display_raw": word.confidence_display_raw,
                         "is_pseudo": word.is_pseudo,
+                        "token_type": word.token_type,
                     }
                 )
+
+        raw_tokens = asr_result.raw_tokens
+        if raw_tokens is None and asr_result.metadata and asr_result.metadata.raw_tags:
+            raw_tokens = asr_result.metadata.raw_tags.get("raw_tokens")
 
         return {
             "text": asr_result.text,
             "text_clean": asr_result.text_clean or asr_result.text,
             "words": words,
+            "raw_tokens": raw_tokens,
             "confidence": float(asr_result.confidence or 0.0),
             "language": asr_result.language or self.sensevoice_language,
             "emotion": asr_result.emotion,
@@ -145,8 +153,7 @@ class FastWorker:
             return sv_result
 
         words = sv_result.get("words", [])
-        cleaned_words = self._merge_punctuation_timestamps(words)
-        sv_result["words"] = cleaned_words
+        cleaned_words = words
 
         raw_text = sv_result.get("text_clean") or sv_result.get("text") or ""
         clean_text, _, _ = build_clean_text(raw_text)
