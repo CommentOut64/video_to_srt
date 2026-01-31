@@ -1274,7 +1274,8 @@ class SentenceSplitter:
         if index <= 0 or index >= len(words) - 1:
             return False
         token = str(words[index].word or "").strip()
-        if token != ".":
+        # V3.2.0+dev.20260131.05: 兼容中文句号误判的小数点
+        if token not in {".", "。"}:
             return False
         prev_token = str(words[index - 1].word or "").strip()
         next_token = str(words[index + 1].word or "").strip()

@@ -15,8 +15,39 @@ from app.services.model_runtime_config_service import get_model_runtime_config_s
 from app.services.punctuation.base import PunctuationResult, SplitPoint
 
 
+def _is_decimal_point(text: str, index: int) -> bool:
+    """
+    判断指定位置的 '.'/'。' 是否为小数点（如 2.2、3.14）。
+    V3.2.0+dev.20260201.01
+    """
+    # V3.2.0+dev.20260131.05: 兼容中文句号被误归一化为小数点场景
+    decimal_marks = {".", "。"}
+    if index < 0 or index >= len(text):
+        return False
+    if text[index] not in decimal_marks:
+        return False
+
+    # 检查左边是否有数字
+    left_idx = index - 1
+    while left_idx >= 0 and text[left_idx] in _PUNCTUATION_SET:
+        left_idx -= 1
+    if left_idx < 0 or not text[left_idx].isdigit():
+        return False
+
+    # 检查右边是否有数字
+    right_idx = index + 1
+    while right_idx < len(text) and text[right_idx] in _PUNCTUATION_SET and text[right_idx] not in decimal_marks:
+        right_idx += 1
+    if right_idx >= len(text) or not text[right_idx].isdigit():
+        return False
+
+    return True
+
+
 _WEAK_PUNCTUATION = set("，、；,;:")
-_PUNCTUATION_SET = set(",.!?;:\"()[]{}，。！？；：、（）【】《》“”「」『』")
+_PUNCTUATION_SET = set(",.!?;:\"()[]{}，。！？；：、（）【】《》""「」『』")
+# V3.2.0+dev.20260201.02: 不包含 "." 的标点集合，用于 clean_text 构建，避免小数点丢失
+_SENTENCE_PUNCTUATION_SET = set(",!?;:\"()[]{}，。！？；：、（）【】《》""「」『』")
 _TRAILING_PUNCTUATION = set(",，;:；：、。.")
 _CONTRACTION_MAP: Dict[str, str] = {
     "im": "i'm",
@@ -439,7 +470,11 @@ class SemanticBuffer:
             else:
                 base_index = clean_map[clean_idx]
             end_index = base_index
+            # V3.2.0+dev.20260201.01: 向右扩展标点符号时，跳过小数点（如 2.2）
             while end_index + 1 < len(text) and text[end_index + 1] in _PUNCTUATION_SET:
+                # 检查下一个字符是否为小数点
+                if _is_decimal_point(text, end_index + 1):
+                    break
                 end_index += 1
             if end_index <= last_end:
                 continue
@@ -1042,15 +1077,27 @@ class SemanticBuffer:
 
     @staticmethod
     def _clean_length(text: str) -> int:
-        return sum(1 for char in text if char not in _PUNCTUATION_SET)
+        """
+        计算去除标点后的文本长度，但保留小数点（如 2.2）。
+        V3.2.0+dev.20260201.02
+        """
+        return sum(1 for char in text if char not in _SENTENCE_PUNCTUATION_SET)
 
     @staticmethod
     def _build_clean_index_map(text: str) -> List[int]:
-        return [idx for idx, char in enumerate(text) if char not in _PUNCTUATION_SET]
+        """
+        构建 clean_text 索引映射，保留小数点（如 2.2）。
+        V3.2.0+dev.20260201.02
+        """
+        return [idx for idx, char in enumerate(text) if char not in _SENTENCE_PUNCTUATION_SET]
 
     @staticmethod
     def _build_clean_text(text: str) -> str:
-        return "".join(char for char in text if char not in _PUNCTUATION_SET)
+        """
+        构建去除标点的文本，但保留小数点（如 2.2）。
+        V3.2.0+dev.20260201.02
+        """
+        return "".join(char for char in text if char not in _SENTENCE_PUNCTUATION_SET)
 
     @staticmethod
     def _find_last_weak_punctuation(text: str) -> Optional[int]:
@@ -1061,10 +1108,17 @@ class SemanticBuffer:
 
     @staticmethod
     def _strip_trailing_punctuation(text: str) -> str:
+        """
+        移除尾部标点符号，但跳过小数点（如 2.2、3.14）。
+        V3.2.0+dev.20260201.01
+        """
         if not text:
             return text
         end = len(text)
         while end > 0 and text[end - 1] in _TRAILING_PUNCTUATION:
+            # V3.2.0+dev.20260201.01: 检查是否为小数点，如果是则停止移除
+            if _is_decimal_point(text, end - 1):
+                break
             end -= 1
         return text[:end]
 
