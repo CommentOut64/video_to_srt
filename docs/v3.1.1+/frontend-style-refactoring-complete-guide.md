@@ -14,9 +14,10 @@
 4. [主题系统](#4-主题系统)
 5. [分阶段开发计划](#5-分阶段开发计划)
 6. [组件重构指南](#6-组件重构指南)
-7. [验收标准](#7-验收标准)
-8. [风险与缓解](#8-风险与缓解)
-9. [附录](#9-附录)
+7. [组件最终审核规则](#7-组件最终审核规则-)
+8. [验收标准](#8-验收标准)
+9. [风险与缓解](#9-风险与缓解)
+10. [附录](#10-附录)
 
 ---
 
@@ -1040,9 +1041,726 @@ export default {
 
 ---
 
-## 7. 验收标准
+## 7. 组件最终审核规则 🔍
 
-### 7.1 代码指标
+### 7.1 核心审核原则
+
+**本章节定义了每个 Vue 组件完成重构后必须通过的强制性审核规则。**
+
+这些规则是**不可妥协的红线**，任何违反都必须修复后才能合并代码。
+
+#### 审核目标
+
+| 目标 | 说明 |
+|------|------|
+| **零 SCSS 依赖** | 已迁移组件完全不使用 SCSS 特性 |
+| **样式隔离** | 组件样式不污染全局命名空间 |
+| **可维护性** | 样式代码清晰、一致、易于理解 |
+| **工具可检测** | 所有规则可通过自动化工具验证 |
+
+---
+
+### 7.2 强制性规则清单 🚫
+
+#### 规则 1：禁止使用任何 SCSS 特性
+
+**适用范围**：所有已完成迁移的 Vue 组件
+
+| SCSS 特性 | 状态 | 替代方案 |
+|-----------|------|----------|
+| SCSS 变量 (`$variable`) | ❌ 完全禁止 | CSS Variables (`var(--af-*)`) |
+| SCSS 嵌套 (`&` 选择器) | ❌ 完全禁止 | 展平选择器或使用 PostCSS |
+| SCSS 函数 (`darken()`, `lighten()`) | ❌ 完全禁止 | CSS `color-mix()` 或预定义变量 |
+| SCSS Mixins (`@mixin`, `@include`) | ❌ 完全禁止 | Tailwind 工具类或 CSS 自定义属性 |
+| SCSS 运算 (`$size * 2`) | ❌ 完全禁止 | CSS `calc()` |
+| SCSS 导入 (`@import`) | ❌ 完全禁止 | CSS `@import` 或 ES6 import |
+
+**检查方法**：
+```bash
+# 检查是否使用 SCSS 变量
+grep -r '\$[a-zA-Z]' frontend/src/components/**/*.vue
+
+# 检查是否使用 SCSS 嵌套
+grep -r '&:' frontend/src/components/**/*.vue
+
+# 检查是否使用 SCSS 函数
+grep -rE '(darken|lighten|saturate|desaturate|mix)\(' frontend/src/components/**/*.vue
+```
+
+**违规示例**：
+```vue
+<!-- ❌ 错误：使用 SCSS 变量 -->
+<style lang="scss" scoped>
+$header-height: 56px;
+.header { height: $header-height; }
+</style>
+
+<!-- ✅ 正确：使用 CSS Variables -->
+<style scoped>
+.header {
+  --header-height: 56px;
+  height: var(--header-height);
+}
+</style>
+```
+
+---
+
+#### 规则 2：禁止混用 scoped 和非 scoped 样式块
+
+**适用范围**：所有 Vue 组件
+
+**核心原则**：一个组件文件只能有一个 `<style scoped>` 块，不得出现无 `scoped` 的 `<style>` 块。
+
+| 模式 | 状态 | 说明 |
+|------|------|------|
+| 单个 `<style scoped>` | ✅ 允许 | 标准模式 |
+| 多个 `<style scoped>` | ⚠️ 不推荐 | 应合并为一个 |
+| `<style>` (无 scoped) | ❌ 禁止 | 污染全局命名空间 |
+| 混用 scoped 和非 scoped | ❌ 严格禁止 | 违反样式隔离原则 |
+
+**全局样式的正确位置**：
+
+| 样式类型 | 正确位置 | 示例 |
+|---------|---------|------|
+| Element Plus 覆盖 | `src/styles/element-override.css` | `:root { --el-color-primary: ... }` |
+| 全局工具类 | `src/styles/utilities.css` | `.text-ellipsis { ... }` |
+| 基础样式 | `src/styles/base.css` | `body { ... }` |
+| 第三方库覆盖 | `src/styles/vendor-override.css` | `.some-lib { ... }` |
+
+**检查方法**：
+```bash
+# 检查是否存在无 scoped 的 style 块
+grep -rn '<style lang="scss">' frontend/src/components/**/*.vue | grep -v scoped
+
+# 检查是否混用
+awk '/<style/ {count++} END {if(count>1) print FILENAME " has multiple style blocks"}' frontend/src/components/**/*.vue
+```
+
+**违规示例**：
+```vue
+<!-- ❌ 错误：混用 scoped 和非 scoped -->
+<template>...</template>
+
+<style scoped>
+.my-component { ... }
+</style>
+
+<style>
+/* 全局样式，污染命名空间！ */
+.el-button { background: red; }
+</style>
+```
+
+**正确做法**：
+```vue
+<!-- ✅ 方案 A：使用 :deep() -->
+<style scoped>
+.my-component { ... }
+
+:deep(.el-button) {
+  background: var(--af-accent-primary);
+}
+</style>
+
+<!-- ✅ 方案 B：移到全局样式文件 -->
+<!-- src/styles/element-override.css -->
+.el-button {
+  background: var(--af-accent-primary);
+}
+```
+
+---
+
+### 7.3 条件性规则清单 ⚠️
+
+#### 规则 3：非必须禁止使用 :deep()
+
+**原则**：`:deep()` 是样式穿透的最后手段，应尽量避免使用。
+
+**允许使用的场景**：
+
+| 场景 | 是否允许 | 条件 |
+|------|---------|------|
+| Element Plus 组件样式覆盖 | ✅ 允许 | 官方 CSS 变量无法满足需求 |
+| 第三方库组件覆盖 | ✅ 允许 | 无其他方式修改样式 |
+| 动态插入的 DOM | ✅ 允许 | 如富文本编辑器内容 |
+| 子组件内部样式 | ❌ 禁止 | 应通过 Props 或 CSS Variables 传递 |
+| 覆盖自己的子组件 | ❌ 禁止 | 直接在子组件中修改 |
+
+**使用 :deep() 的正确姿势**：
+
+```vue
+<style scoped>
+/* ✅ 正确：针对特定组件，添加注释说明原因 */
+.my-dialog :deep(.el-dialog__header) {
+  /* 原因：Element Plus 不提供 header 背景色的 CSS 变量 */
+  background: var(--af-bg-secondary);
+}
+
+/* ❌ 错误：过度使用，应该用 CSS 变量 */
+.my-button :deep(.el-button) {
+  background: red; /* 应该用 --el-button-bg-color */
+}
+
+/* ❌ 错误：穿透自己的子组件 */
+.parent :deep(.my-child-component) {
+  /* 应该在 MyChildComponent.vue 中直接修改 */
+  color: blue;
+}
+</style>
+```
+
+**检查方法**：
+```bash
+# 统计 :deep() 使用次数
+grep -rn ':deep(' frontend/src/components/**/*.vue | wc -l
+
+# 查看所有 :deep() 使用位置
+grep -rn ':deep(' frontend/src/components/**/*.vue
+```
+
+**目标值**：每个组件 `:deep()` 使用次数 ≤ 3
+
+---
+
+### 7.4 代码质量规则
+
+#### 规则 4：禁止硬编码颜色
+
+**原则**：所有颜色必须使用 CSS Variables，不得使用 Hex、RGB、HSL 等硬编码值。
+
+| 颜色格式 | 状态 | 替代方案 |
+|---------|------|----------|
+| Hex (`#ffffff`) | ❌ 禁止 | `var(--af-bg-primary)` |
+| RGB (`rgb(255, 255, 255)`) | ❌ 禁止 | `var(--af-text-normal)` |
+| RGBA (`rgba(0, 0, 0, 0.5)`) | ⚠️ 特殊情况 | `rgba(var(--af-accent-primary-rgb), 0.5)` |
+| HSL (`hsl(0, 0%, 100%)`) | ❌ 禁止 | `var(--af-bg-primary)` |
+| 颜色关键字 (`white`, `black`) | ❌ 禁止 | `var(--af-text-primary)` |
+
+**特殊情况：透明度**
+
+当需要动态透明度时，使用 RGB 变量：
+
+```css
+/* ✅ 正确：使用 RGB 变量 + 动态透明度 */
+.overlay {
+  background: rgba(var(--af-accent-primary-rgb), 0.3);
+}
+
+/* ❌ 错误：硬编码 RGBA */
+.overlay {
+  background: rgba(88, 166, 255, 0.3);
+}
+```
+
+---
+
+#### 规则 5：严格限制 !important 使用
+
+**原则**：`!important` 是样式优先级问题的症状，不是解决方案。
+
+**目标值**：每个组件 `!important` 使用次数 ≤ 1
+
+**允许使用的场景**：
+
+| 场景 | 是否允许 | 替代方案 |
+|------|---------|----------|
+| 覆盖第三方库内联样式 | ✅ 允许 | 无其他方式 |
+| 覆盖 Element Plus | ❌ 禁止 | 使用 CSS 变量或提高选择器优先级 |
+| 覆盖自己的样式 | ❌ 禁止 | 重构选择器结构 |
+| 工具类 | ⚠️ 谨慎使用 | 仅在 `utilities.css` 中 |
+
+**正确的优先级提升方法**：
+
+```css
+/* ❌ 错误：使用 !important */
+.button {
+  background: red !important;
+}
+
+/* ✅ 方案 A：提高选择器优先级 */
+.my-component .button {
+  background: var(--af-accent-danger);
+}
+
+/* ✅ 方案 B：使用 CSS 层级 */
+@layer components {
+  .button {
+    background: var(--af-accent-danger);
+  }
+}
+
+/* ✅ 方案 C：使用 Element Plus CSS 变量 */
+.my-component {
+  --el-button-bg-color: var(--af-accent-danger);
+}
+```
+
+---
+
+### 7.5 Stylelint 自动化检测配置 🤖
+
+**目标**：通过 Stylelint 自动检测所有违规行为，确保规则可强制执行。
+
+#### 7.5.1 完整 Stylelint 配置
+
+创建 `frontend/.stylelintrc.js`：
+
+```javascript
+module.exports = {
+  extends: [
+    'stylelint-config-standard',
+    'stylelint-config-recommended-vue'
+  ],
+
+  plugins: [
+    'stylelint-scss',
+    'stylelint-order'
+  ],
+
+  customSyntax: 'postcss-html',
+
+  rules: {
+    // ========== 规则 1：禁止 SCSS 特性 ==========
+
+    // 禁止 SCSS 变量（$variable）
+    'scss/dollar-variable-pattern': null,
+    'scss/at-rule-no-unknown': null,
+
+    // 禁止 SCSS 嵌套（&）
+    'selector-nested-pattern': null,
+
+    // 禁止 SCSS 函数
+    'function-no-unknown': [
+      true,
+      {
+        ignoreFunctions: [
+          'var',           // CSS Variables
+          'calc',          // CSS calc
+          'rgba',          // CSS rgba
+          'rgb',           // CSS rgb
+          'url',           // CSS url
+          'linear-gradient',
+          'radial-gradient'
+        ]
+      }
+    ],
+
+    // ========== 规则 4：禁止硬编码颜色 ==========
+
+    // 禁止 Hex 颜色
+    'color-no-hex': true,
+
+    // 禁止颜色关键字（除了 transparent 和 currentColor）
+    'color-named': [
+      'never',
+      {
+        ignore: ['inside-function']
+      }
+    ],
+
+    // 允许 rgba() 但必须使用 CSS Variables
+    'function-allowed-list': null,
+
+    // ========== 规则 5：限制 !important ==========
+
+    // 警告使用 !important（不完全禁止，但需要审查）
+    'declaration-no-important': [
+      true,
+      {
+        severity: 'warning'
+      }
+    ],
+
+    // ========== 代码质量规则 ==========
+
+    // 禁止未知的伪类选择器
+    'selector-pseudo-class-no-unknown': [
+      true,
+      {
+        ignorePseudoClasses: ['deep', 'global', 'slotted']
+      }
+    ],
+
+    // 禁止未知的伪元素选择器
+    'selector-pseudo-element-no-unknown': [
+      true,
+      {
+        ignorePseudoElements: ['v-deep', 'v-global', 'v-slotted']
+      }
+    ],
+
+    // 属性顺序（提高可读性）
+    'order/properties-order': [
+      'position',
+      'top',
+      'right',
+      'bottom',
+      'left',
+      'z-index',
+      'display',
+      'flex',
+      'flex-direction',
+      'flex-wrap',
+      'justify-content',
+      'align-items',
+      'gap',
+      'width',
+      'height',
+      'padding',
+      'margin',
+      'background',
+      'border',
+      'border-radius',
+      'color',
+      'font-size',
+      'font-weight',
+      'transition',
+      'animation'
+    ],
+
+    // 禁止空规则
+    'block-no-empty': true,
+
+    // 禁止重复的选择器
+    'no-duplicate-selectors': true,
+
+    // 禁止重复的属性
+    'declaration-block-no-duplicate-properties': true,
+
+    // 最大嵌套深度（防止过度嵌套）
+    'max-nesting-depth': [
+      3,
+      {
+        ignore: ['pseudo-classes']
+      }
+    ],
+
+    // 选择器类名模式（推荐 kebab-case）
+    'selector-class-pattern': [
+      '^[a-z][a-z0-9]*(-[a-z0-9]+)*$',
+      {
+        message: 'Expected class selector to be kebab-case'
+      }
+    ]
+  },
+
+  overrides: [
+    {
+      // 对 Vue 文件的特殊规则
+      files: ['**/*.vue'],
+      rules: {
+        // Vue 文件中允许使用 :deep()
+        'selector-pseudo-class-no-unknown': [
+          true,
+          {
+            ignorePseudoClasses: ['deep', 'global', 'slotted']
+          }
+        ]
+      }
+    },
+    {
+      // 全局样式文件可以使用 Hex 颜色（仅限定义 CSS Variables）
+      files: ['**/styles/**/*.css'],
+      rules: {
+        'color-no-hex': null
+      }
+    }
+  ]
+}
+```
+
+#### 7.5.2 安装依赖
+
+```bash
+npm install -D \
+  stylelint \
+  stylelint-config-standard \
+  stylelint-config-recommended-vue \
+  stylelint-scss \
+  stylelint-order \
+  postcss-html
+```
+
+#### 7.5.3 package.json 脚本
+
+在 `frontend/package.json` 中添加：
+
+```json
+{
+  "scripts": {
+    "lint:style": "stylelint 'src/**/*.{vue,css,scss}'",
+    "lint:style:fix": "stylelint 'src/**/*.{vue,css,scss}' --fix",
+    "lint:style:report": "stylelint 'src/**/*.{vue,css,scss}' --formatter json --output-file stylelint-report.json"
+  }
+}
+```
+
+#### 7.5.4 VSCode 集成
+
+在 `.vscode/settings.json` 中添加：
+
+```json
+{
+  "stylelint.enable": true,
+  "stylelint.validate": ["css", "scss", "vue"],
+  "editor.codeActionsOnSave": {
+    "source.fixAll.stylelint": true
+  },
+  "css.validate": false,
+  "scss.validate": false
+}
+```
+
+---
+
+### 7.6 审核流程 📋
+
+#### 7.6.1 自动化检查（必须通过）
+
+**在提交代码前，必须运行以下命令并确保全部通过：**
+
+```bash
+# 1. Stylelint 检查
+npm run lint:style
+
+# 2. 检查 SCSS 特性使用
+grep -rn '\$[a-zA-Z]' src/components/**/*.vue
+grep -rn '&:' src/components/**/*.vue
+
+# 3. 检查混用 scoped/非 scoped
+grep -rn '<style lang="scss">' src/components/**/*.vue | grep -v scoped
+
+# 4. 统计 :deep() 使用次数
+grep -rn ':deep(' src/components/**/*.vue | wc -l
+
+# 5. 统计 !important 使用次数
+grep -rn '!important' src/components/**/*.vue | wc -l
+```
+
+**通过标准**：
+- Stylelint 0 errors
+- SCSS 特性使用：0 处
+- 混用 scoped/非 scoped：0 处
+- :deep() 使用：≤ 3 处/组件
+- !important 使用：≤ 1 处/组件
+
+#### 7.6.2 人工审查（代码审查）
+
+**审查者必须检查以下项目：**
+
+| 检查项 | 检查方法 | 不通过标准 |
+|--------|---------|-----------|
+| **SCSS 特性** | 查看 `<style>` 块 | 存在 `$`、`&`、`@mixin` 等 |
+| **样式隔离** | 查看 `<style>` 标签 | 存在无 `scoped` 的块 |
+| **:deep() 使用** | 查看每个 `:deep()` | 无注释说明原因 |
+| **颜色使用** | 查看颜色值 | 存在 Hex、RGB 硬编码 |
+| **!important** | 查看每个 `!important` | 无注释说明原因 |
+| **Tailwind 使用** | 查看布局样式 | 手写 flex/grid 而非 Tailwind |
+
+#### 7.6.3 审核不通过的处理
+
+**如果审核不通过，必须：**
+
+1. **立即修复**：违反强制性规则（规则 1、2、4、5）
+2. **添加注释**：违反条件性规则（规则 3）但有合理原因
+3. **重新审核**：修复后重新提交审核
+
+**审核不通过示例**：
+
+```vue
+<!-- ❌ 审核不通过：使用 SCSS 变量 -->
+<style lang="scss" scoped>
+$spacing: 16px;
+.container { padding: $spacing; }
+</style>
+
+<!-- ✅ 修复后：使用 CSS Variables -->
+<style scoped>
+.container {
+  --spacing: 16px;
+  padding: var(--spacing);
+}
+</style>
+```
+
+---
+
+### 7.7 完整检查清单 ✅
+
+**每个组件完成重构后，必须逐项检查以下清单：**
+
+#### 7.7.1 强制性检查（必须全部通过）
+
+```
+□ 移除所有 SCSS 变量（$variable）
+□ 移除所有 SCSS 嵌套（& 选择器）
+□ 移除所有 SCSS 函数（darken、lighten 等）
+□ 移除所有 SCSS Mixins（@mixin、@include）
+□ 只有一个 <style scoped> 块
+□ 无 <style>（非 scoped）块
+□ 所有颜色使用 CSS Variables（var(--af-*)）
+□ 无 Hex 颜色（#ffffff）
+□ 无 RGB/HSL 硬编码
+□ 布局样式已迁移到 Tailwind（tw-flex、tw-grid 等）
+□ Stylelint 检查通过（0 errors）
+```
+
+#### 7.7.2 条件性检查（需要审查）
+
+```
+□ :deep() 使用次数 ≤ 3
+□ 每个 :deep() 都有注释说明原因
+□ !important 使用次数 ≤ 1
+□ 每个 !important 都有注释说明原因
+□ 保留的 scoped CSS 都有注释说明为什么不能用 Tailwind
+```
+
+#### 7.7.3 代码质量检查
+
+```
+□ 保留原有类名（可能被 JS 引用）
+□ 选择器嵌套深度 ≤ 3 层
+□ 无重复的选择器
+□ 无重复的属性
+□ 无空的样式规则
+□ 类名使用 kebab-case
+□ 属性按推荐顺序排列
+```
+
+#### 7.7.4 功能验证检查
+
+```
+□ 所有原有功能正常工作
+□ 视觉效果与重构前一致
+□ 控制台无错误或警告
+□ 交互响应正常（悬停、点击、焦点等）
+□ 在不同窗口大小下正常显示
+□ 主题切换正常（如果支持）
+```
+
+#### 7.7.5 文档检查
+
+```
+□ 复杂样式有注释说明
+□ :deep() 使用有注释说明原因
+□ !important 使用有注释说明原因
+□ 特殊处理有注释说明
+```
+
+---
+
+### 7.8 常见违规案例与修复 🔧
+
+#### 案例 1：使用 SCSS 变量
+
+```vue
+<!-- ❌ 违规 -->
+<style lang="scss" scoped>
+$header-height: 56px;
+.header { height: $header-height; }
+</style>
+
+<!-- ✅ 修复方案 A：CSS Variables -->
+<style scoped>
+.header {
+  --header-height: 56px;
+  height: var(--header-height);
+}
+</style>
+
+<!-- ✅ 修复方案 B：直接使用值（如果只用一次）-->
+<style scoped>
+.header { height: 56px; }
+</style>
+```
+
+#### 案例 2：混用 scoped 和非 scoped
+
+```vue
+<!-- ❌ 违规 -->
+<style scoped>
+.my-component { ... }
+</style>
+
+<style>
+.el-button { background: red; }
+</style>
+
+<!-- ✅ 修复：移到全局样式文件 -->
+<!-- src/styles/element-override.css -->
+.el-button {
+  --el-button-bg-color: var(--af-accent-danger);
+}
+```
+
+#### 案例 3：硬编码颜色
+
+```vue
+<!-- ❌ 违规 -->
+<style scoped>
+.button {
+  background: #58a6ff;
+  color: #ffffff;
+  border: 1px solid rgba(88, 166, 255, 0.3);
+}
+</style>
+
+<!-- ✅ 修复 -->
+<style scoped>
+.button {
+  background: var(--af-accent-primary);
+  color: var(--af-text-primary);
+  border: 1px solid rgba(var(--af-accent-primary-rgb), 0.3);
+}
+</style>
+```
+
+#### 案例 4：过度使用 :deep()
+
+```vue
+<!-- ❌ 违规：穿透自己的子组件 -->
+<style scoped>
+.parent :deep(.my-child) {
+  color: red;
+}
+</style>
+
+<!-- ✅ 修复：在子组件中直接修改 -->
+<!-- MyChild.vue -->
+<style scoped>
+.my-child {
+  color: var(--af-accent-danger);
+}
+</style>
+```
+
+#### 案例 5：滥用 !important
+
+```vue
+<!-- ❌ 违规 -->
+<style scoped>
+.button {
+  background: red !important;
+  color: white !important;
+}
+</style>
+
+<!-- ✅ 修复：提高选择器优先级 -->
+<style scoped>
+.my-component .button {
+  background: var(--af-accent-danger);
+  color: var(--af-text-primary);
+}
+</style>
+```
+
+---
+
+## 8. 验收标准
+
+### 8.1 代码指标
 
 | 指标 | 当前值 | 目标值 | 检查方法 |
 |------|--------|--------|----------|
@@ -1052,7 +1770,7 @@ export default {
 | SCSS 文件 | 多个 | 0 (或仅 legacy) | 目录检查 |
 | 新增 SCSS | - | 0 | CR 检查 |
 
-### 7.2 功能验收清单
+### 8.2 功能验收清单
 
 - [ ] **任务列表页**
   - [ ] 任务卡片显示正常
@@ -1073,7 +1791,7 @@ export default {
   - [ ] 主题持久化正常
   - [ ] Element Plus 组件主题正确
 
-### 7.3 质量验收清单
+### 8.3 质量验收清单
 
 - [ ] Stylelint 检查通过
 - [ ] 构建无错误和警告
@@ -1082,7 +1800,7 @@ export default {
 
 ---
 
-## 8. 风险与缓解
+## 9. 风险与缓解
 
 | 风险 | 可能性 | 影响 | 缓解措施 |
 |------|--------|------|----------|
@@ -1095,9 +1813,9 @@ export default {
 
 ---
 
-## 9. 附录
+## 10. 附录
 
-### 9.1 Tailwind 类名速查表
+### 10.1 Tailwind 类名速查表
 
 ```
 布局:
@@ -1135,7 +1853,7 @@ export default {
   tw-duration-fast tw-duration-normal tw-duration-slow
 ```
 
-### 9.2 CSS Variables 完整列表
+### 10.2 CSS Variables 完整列表
 
 ```css
 /* 背景 */
@@ -1175,7 +1893,7 @@ export default {
 --af-z-dropdown, --af-z-sticky, --af-z-fixed, --af-z-modal-backdrop, --af-z-modal, --af-z-popover, --af-z-tooltip, --af-z-notification
 ```
 
-### 9.3 迁移检查清单
+### 10.3 迁移检查清单
 
 每个组件迁移后，检查以下项目：
 
