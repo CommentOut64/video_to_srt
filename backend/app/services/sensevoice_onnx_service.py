@@ -663,10 +663,6 @@ class SenseVoiceONNXService:
 
             word_timestamps = clean_word_timestamps
 
-            # 【新增】Token 合并：将 BPE/SentencePiece Subword Tokens 合并为完整单词
-            # 修复 "laval" 被拆分为 " la" + "val" 的问题
-            word_timestamps = self._merge_tokens_to_words(word_timestamps)
-
             # 4. 过滤未知情感标签（仅影响原始文本）
             if ban_emo_unk:
                 text = self._strip_unknown_emotion_tags(text)
@@ -682,18 +678,27 @@ class SenseVoiceONNXService:
             # 使用检测到的语言进行文本清洗和标点归一化
             process_result = normalizer.process(text, extract_info=True, language=detected_language)
 
+            # V3.2.0+dev.20260131.02: Token 合并统一入口
+            # 将标点时间戳并入相邻词，并根据语言/脚本策略生成词级时间戳
+            from app.services.token_merge_service import merge_tokens
+
+            merge_result = merge_tokens(word_timestamps, language=detected_language)
+            word_timestamps = merge_result.words
+            raw_tokens = merge_result.raw_tokens
+
             # 6. 构建结果
             result = {
                 "text": text,
                 "text_clean": process_result["text_clean"],
                 "words": word_timestamps,
+                "raw_tokens": raw_tokens,
                 "confidence": confidence,
                 "language": detected_language,
                 "emotion": process_result["tags"]["emotion"] if process_result["tags"] else None,
                 "event": process_result["tags"]["event"] if process_result["tags"] else None
             }
 
-            self.logger.debug(f"转录完成: {len(word_timestamps)} 个字符, 置信度 {confidence:.3f}")
+            self.logger.debug(f"转录完成: {len(word_timestamps)} 个词/字, 置信度 {confidence:.3f}")
             return result
 
         except Exception as e:
@@ -934,82 +939,6 @@ class SenseVoiceONNXService:
                 results.append(result)
 
         return results
-
-    def _merge_tokens_to_words(self, tokens: List[Dict]) -> List[Dict]:
-        """
-        将 BPE/SentencePiece Subword Tokens 合并为完整单词
-
-        典型场景：
-        - " la" (0.900) + "val" (0.687) => " laval" (min=0.687)
-        - 原因：SenseVoice 使用 Subword 分词器（BPE/SentencePiece）
-        - 目标：将字符级时间戳聚合为词级时间戳
-
-        合并规则：
-        1. Token 以空格/▁ 开头 => 新词开始
-        2. Token 不以空格开头 且 是字母数字 => 词的延续，合并到前一个词
-        3. 标点符号 => 独立成词（视情况）
-
-        置信度策略：取最小值（木桶效应），利于触发复核
-
-        Args:
-            tokens: 原始字符级时间戳列表
-
-        Returns:
-            List[Dict]: 合并后的词级时间戳列表
-        """
-        if not tokens:
-            return []
-
-        merged_words = []
-        current_word = None
-
-        for token in tokens:
-            text = token["word"]
-
-            # 判断是否是新词的开始
-            # 规则1：以空格开头（如 " la"）或 SentencePiece 符号 ▁ 开头
-            # 规则2：当前没有正在构建的词
-            # 规则3：标点符号通常独立（可选，这里暂不处理）
-            is_new_word = (
-                text.startswith(" ") or
-                text.startswith("▁") or  # SentencePiece 词边界标记 (U+2581)
-                current_word is None
-            )
-
-            if is_new_word:
-                # 归档上一个词
-                if current_word is not None:
-                    # 清理 SentencePiece 符号 ▁ 和前导空格
-                    current_word["word"] = current_word["word"].lstrip("▁ ")
-                    merged_words.append(current_word)
-
-                # 开始新词
-                current_word = token.copy()
-            else:
-                # 合并到当前词
-                # 1. 文本拼接
-                current_word["word"] += text
-
-                # 2. 时间延展（结束时间更新为当前 token 的结束时间）
-                current_word["end"] = token["end"]
-
-                # 3. 置信度：取最小值（木桶效应），反映该词最弱环节的可信度
-                # 这样有利于触发 Whisper 复核
-                current_word["confidence"] = min(
-                    current_word["confidence"],
-                    token["confidence"]
-                )
-
-                # 4. 标记伪对齐状态
-                if token.get("is_pseudo"):
-                    current_word["is_pseudo"] = True
-
-        # 归档最后一个词（同样清理前缀）
-        if current_word is not None:
-            current_word["word"] = current_word["word"].lstrip("▁ ")
-            merged_words.append(current_word)
-
-        return merged_words
 
     def _strip_unknown_emotion_tags(self, text: str) -> str:
         """
