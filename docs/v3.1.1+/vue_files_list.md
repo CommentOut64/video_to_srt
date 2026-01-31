@@ -11,7 +11,7 @@
 - [ ] frontend\src\components\editor\ContextMenu.vue
 - [x] frontend\src\components\editor\EditorHeader.vue
 - [ ] frontend\src\components\editor\PresetSelector.vue
-- [ ] frontend\src\components\editor\PlaybackControls\index.vue
+- [x] frontend\src\components\editor\PlaybackControls\index.vue
 - [x] frontend\src\components\editor\SubtitleList\index.vue
 - [ ] frontend\src\components\editor\SubtitleList\SubtitleItem.vue
 - [ ] frontend\src\components\editor\TaskMonitor\index.vue

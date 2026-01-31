@@ -14,7 +14,7 @@
 
       <!-- 播放/暂停 -->
       <el-tooltip :content="isPlaying ? '暂停' : '播放'" placement="top" :show-after="500">
-        <button class="ctrl-btn ctrl-btn--play" :disabled="!isVideoReady" @click="togglePlay">
+        <button class="ctrl-btn play" :disabled="!isVideoReady" @click="togglePlay">
           <svg v-if="!isPlaying" viewBox="0 0 24 24" fill="currentColor">
             <path d="M8 5v14l11-7z" />
           </svg>
@@ -55,7 +55,7 @@
       <!-- 音量控制 -->
       <div class="volume-control" v-if="showVolume">
         <el-tooltip :content="isMuted ? '取消静音' : '静音'" placement="top" :show-after="500">
-          <button class="ctrl-btn ctrl-btn--sm" @click="toggleMute">
+          <button class="ctrl-btn sm" @click="toggleMute">
             <svg v-if="isMuted || volume === 0" viewBox="0 0 24 24" fill="currentColor">
               <path
                 d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"
@@ -87,7 +87,7 @@
 
       <!-- 倍速控制 -->
       <div class="speed-control" v-if="showSpeed">
-        <button class="ctrl-btn ctrl-btn--text" @click="toggleSpeedMenu" ref="speedBtnRef">
+        <button class="ctrl-btn text" @click="toggleSpeedMenu" ref="speedBtnRef">
           {{ playbackRate }}x
         </button>
         <div class="speed-menu" v-show="showSpeedMenu" ref="speedMenuRef">
@@ -105,7 +105,7 @@
 
       <!-- 循环播放 -->
       <el-tooltip v-if="showLoop" content="循环播放" placement="top" :show-after="500">
-        <button class="ctrl-btn ctrl-btn--sm" :class="{ active: isLooping }" @click="toggleLoop">
+        <button class="ctrl-btn sm" :class="{ active: isLooping }" @click="toggleLoop">
           <svg viewBox="0 0 24 24" fill="currentColor">
             <path
               d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46C19.54 15.03 20 13.57 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74C4.46 8.97 4 10.43 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"
@@ -352,311 +352,307 @@ onUnmounted(() => {
 })
 </script>
 
-<style lang="scss" scoped>
+<style scoped>
 .playback-controls {
   display: flex;
   align-items: center;
   gap: 16px;
   padding: 12px 16px;
   background: var(--af-bg-secondary);
-  border-radius: var(--radius-lg);
+  border-radius: var(--af-radius-lg);
   user-select: none;
-
-  // 紧凑模式
-  &.compact {
-    gap: 12px;
-    padding: 8px 12px;
-
-    .controls-progress {
-      .time-display {
-        font-size: 11px;
-      }
-    }
-  }
-
-  // 底座模式：融入背景，无圆角
-  &.pedestal {
-    border-radius: 0;
-    background: var(--af-bg-primary);
-    height: 48px;
-    padding: 0 20px;
-    border: none;
-
-    .controls-progress .time-display {
-      font-size: 11px;
-    }
-  }
-
-  // 禁用状态：视频未就绪时整体变灰
-  &.disabled {
-    opacity: 0.5;
-    pointer-events: none;
-    cursor: not-allowed;
-  }
 }
 
-// 主控制按钮
+/* 紧凑模式 */
+.playback-controls.compact {
+  gap: 12px;
+  padding: 8px 12px;
+}
+
+/* 底座模式：融入背景，无圆角 */
+.playback-controls.pedestal {
+  height: 48px;
+  padding: 0 20px;
+  background: var(--af-bg-primary);
+  border: none;
+  border-radius: 0;
+}
+
+/* 禁用状态：视频未就绪时整体变灰 */
+.playback-controls.disabled {
+  cursor: not-allowed;
+  pointer-events: none;
+  opacity: 0.5;
+}
+
+/* 主控制按钮 */
 .controls-main {
   display: flex;
   align-items: center;
   gap: 4px;
 }
 
-// 控制按钮
+/* 控制按钮 */
 .ctrl-btn {
   display: flex;
-  align-items: center;
   justify-content: center;
+  align-items: center;
   width: 36px;
   height: 36px;
   border-radius: var(--af-radius-md);
   color: var(--af-text-secondary);
   transition: all var(--af-transition-fast);
-
-  svg {
-    width: 20px;
-    height: 20px;
-  }
-
-  &:hover {
-    color: var(--text-primary);
-    background: var(--af-bg-tertiary);
-  }
-
-  &--play {
-    width: 44px;
-    height: 44px;
-    background: var(--af-accent-primary);
-    color: white;
-
-    svg {
-      width: 24px;
-      height: 24px;
-    }
-
-    &:hover {
-      background: var(--af-accent-primary-hover);
-      color: white;
-    }
-  }
-
-  &--sm {
-    width: 32px;
-    height: 32px;
-    svg {
-      width: 18px;
-      height: 18px;
-    }
-  }
-
-  &--text {
-    width: auto;
-    padding: 0 10px;
-    font-size: 13px;
-    font-weight: 500;
-    font-family: var(--af-font-mono);
-  }
-
-  &.active {
-    color: var(--af-accent-primary);
-    background: rgba(88, 166, 255, 0.15);
-  }
-
-  &:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
-    pointer-events: none;
-  }
 }
 
-// 进度条区域
+.ctrl-btn svg {
+  width: 20px;
+  height: 20px;
+}
+
+.ctrl-btn:hover {
+  background: var(--af-bg-tertiary);
+  color: var(--af-text-primary);
+}
+
+.ctrl-btn.play {
+  width: 44px;
+  height: 44px;
+  background: var(--af-accent-primary);
+  color: var(--af-text-inverse);
+}
+
+.ctrl-btn.play svg {
+  width: 24px;
+  height: 24px;
+}
+
+.ctrl-btn.play:hover {
+  background: var(--af-accent-primary-hover);
+  color: var(--af-text-inverse);
+}
+
+.ctrl-btn.sm {
+  width: 32px;
+  height: 32px;
+}
+
+.ctrl-btn.sm svg {
+  width: 18px;
+  height: 18px;
+}
+
+.ctrl-btn.text {
+  width: auto;
+  padding: 0 10px;
+  font-size: 13px;
+  font-weight: 500;
+  font-family: var(--af-font-mono);
+}
+
+.ctrl-btn.active {
+  background: var(--af-accent-primary-bg);
+  color: var(--af-accent-primary);
+}
+
+.ctrl-btn:disabled {
+  cursor: not-allowed;
+  pointer-events: none;
+  opacity: 0.4;
+}
+
+/* 进度条区域 */
 .controls-progress {
-  flex: 1;
   display: flex;
+  flex: 1;
   align-items: center;
   gap: 12px;
   min-width: 200px;
-
-  .time-display {
-    font-size: 12px;
-    font-family: var(--af-font-mono);
-    color: var(--af-text-muted);
-    min-width: 45px;
-
-    &.time-total {
-      text-align: right;
-    }
-  }
-
-  .progress-bar {
-    flex: 1;
-    height: 24px;
-    display: flex;
-    align-items: center;
-    cursor: pointer;
-    position: relative;
-
-    &:hover {
-      .progress-track {
-        height: 6px;
-      }
-      .progress-thumb {
-        opacity: 1;
-        transform: translateX(50%) translateY(-50%) scale(1);
-      }
-    }
-  }
-
-  .progress-track {
-    width: 100%;
-    height: 4px;
-    background: var(--af-bg-tertiary);
-    border-radius: 2px;
-    position: relative;
-    transition: height 0.15s ease-out;
-  }
-
-  .progress-buffered {
-    position: absolute;
-    left: 0;
-    top: 0;
-    height: 100%;
-    background: rgba(255, 255, 255, 0.1);
-    border-radius: 2px;
-  }
-
-  // 已播放进度 - 包含 thumb
-  // 使用 CSS transition 实现丝滑进度更新
-  .progress-fill {
-    position: absolute;
-    left: 0;
-    top: 0;
-    height: 100%;
-    background: var(--af-accent-primary);
-    border-radius: 2px;
-    min-width: 0;
-    // 平滑过渡：在两次 timeupdate 之间插值
-    transition: width 0.25s linear;
-    will-change: width;
-  }
-
-  // Thumb 固定在 fill 的右边缘
-  .progress-thumb {
-    position: absolute;
-    right: 0;
-    top: 50%;
-    width: 14px;
-    height: 14px;
-    background: var(--af-accent-primary);
-    border-radius: 50%;
-    transform: translateX(50%) translateY(-50%) scale(0.8);
-    opacity: 0;
-    transition:
-      opacity 0.15s ease-out,
-      transform 0.15s ease-out;
-    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
-    pointer-events: none;
-  }
-
-  // 拖拽时禁用进度条过渡，实现即时响应
-  &.dragging .progress-fill {
-    transition: none;
-  }
 }
 
-// 辅助控制
+.controls-progress .time-display {
+  min-width: 45px;
+  color: var(--af-text-muted);
+  font-size: 12px;
+  font-family: var(--af-font-mono);
+}
+
+.controls-progress .time-display.time-total {
+  text-align: right;
+}
+
+.playback-controls.compact .controls-progress .time-display {
+  font-size: 11px;
+}
+
+.playback-controls.pedestal .controls-progress .time-display {
+  font-size: 11px;
+}
+
+.controls-progress .progress-track {
+  position: relative;
+  width: 100%;
+  height: 4px;
+  background: var(--af-bg-tertiary);
+  border-radius: 2px;
+  transition: height 0.15s ease-out;
+}
+
+.controls-progress .progress-thumb {
+  position: absolute;
+  top: 50%;
+  right: 0;
+  width: 14px;
+  height: 14px;
+  background: var(--af-accent-primary);
+  border-radius: 50%;
+  transform: translateX(50%) translateY(-50%) scale(0.8);
+  opacity: 0;
+  transition:
+    opacity 0.15s ease-out,
+    transform 0.15s ease-out;
+  box-shadow: var(--af-shadow-sm);
+  pointer-events: none;
+}
+
+.controls-progress .progress-bar {
+  position: relative;
+  display: flex;
+  flex: 1;
+  align-items: center;
+  height: 24px;
+  cursor: pointer;
+}
+
+.controls-progress .progress-bar:hover .progress-track {
+  height: 6px;
+}
+
+.controls-progress .progress-bar:hover .progress-thumb {
+  transform: translateX(50%) translateY(-50%) scale(1);
+  opacity: 1;
+}
+
+.controls-progress .progress-buffered {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  background: var(--af-bg-buffered);
+  border-radius: 2px;
+}
+
+/* 已播放进度 - 包含 thumb，使用 CSS transition 实现丝滑进度更新 */
+.controls-progress .progress-fill {
+  position: absolute;
+  top: 0;
+  left: 0;
+  min-width: 0;
+  height: 100%;
+  background: var(--af-accent-primary);
+  border-radius: 2px;
+
+  /* 平滑过渡：在两次 timeupdate 之间插值 */
+  transition: width 0.25s linear;
+  will-change: width;
+}
+
+
+/* 拖拽时禁用进度条过渡，实现即时响应 */
+.controls-progress.dragging .progress-fill {
+  transition: none;
+}
+
+/* 辅助控制 */
 .controls-extra {
   display: flex;
   align-items: center;
   gap: 8px;
 }
 
-// 音量控制
+/* 音量控制 */
 .volume-control {
   display: flex;
   align-items: center;
   gap: 8px;
-
-  .volume-slider {
-    width: 80px;
-    display: flex;
-    align-items: center;
-
-    input[type='range'] {
-      -webkit-appearance: none;
-      appearance: none;
-      width: 100%;
-      height: 4px;
-      margin: 0;
-      padding: 0;
-      background: var(--af-bg-tertiary);
-      border-radius: 2px;
-      cursor: pointer;
-
-      &::-webkit-slider-thumb {
-        -webkit-appearance: none;
-        appearance: none;
-        width: 12px;
-        height: 12px;
-        background: var(--text-primary);
-        border-radius: 50%;
-        cursor: pointer;
-        transition: transform var(--af-transition-fast);
-
-        &:hover {
-          transform: scale(1.2);
-        }
-      }
-
-      &::-moz-range-thumb {
-        width: 12px;
-        height: 12px;
-        background: var(--text-primary);
-        border: none;
-        border-radius: 50%;
-        cursor: pointer;
-      }
-    }
-  }
 }
 
-// 倍速控制
+.volume-control .volume-slider {
+  display: flex;
+  align-items: center;
+  width: 80px;
+}
+
+.volume-control .volume-slider input[type='range'] {
+  width: 100%;
+  height: 4px;
+  padding: 0;
+  margin: 0;
+  background: var(--af-bg-tertiary);
+  border-radius: 2px;
+  cursor: pointer;
+  appearance: none;
+}
+
+.volume-control .volume-slider input[type='range']::-webkit-slider-thumb {
+  width: 12px;
+  height: 12px;
+  background: var(--af-text-primary);
+  border-radius: 50%;
+  cursor: pointer;
+  transition: transform var(--af-transition-fast);
+  appearance: none;
+}
+
+.volume-control .volume-slider input[type='range']::-webkit-slider-thumb:hover {
+  transform: scale(1.2);
+}
+
+.volume-control .volume-slider input[type='range']::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  background: var(--af-text-primary);
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+/* 倍速控制 */
 .speed-control {
   position: relative;
+}
 
-  .speed-menu {
-    position: absolute;
-    bottom: 100%;
-    left: 50%;
-    transform: translateX(-50%);
-    margin-bottom: 8px;
-    background: var(--bg-elevated);
-    border: 1px solid var(--af-border-default);
-    border-radius: var(--af-radius-md);
-    padding: 4px;
-    box-shadow: var(--shadow-lg);
-    z-index: 100;
-  }
+.speed-control .speed-menu {
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  z-index: 100;
+  padding: 4px;
+  background: var(--af-bg-elevated);
+  border: 1px solid var(--af-border-default);
+  border-radius: var(--af-radius-md);
+  transform: translateX(-50%);
+  margin-bottom: 8px;
+  box-shadow: var(--af-shadow-lg);
+}
 
-  .speed-option {
-    display: block;
-    width: 100%;
-    padding: 6px 16px;
-    font-size: 13px;
-    font-family: var(--af-font-mono);
-    color: var(--af-text-normal);
-    text-align: center;
-    border-radius: var(--af-radius-sm);
-    transition: all var(--af-transition-fast);
+.speed-control .speed-option {
+  display: block;
+  width: 100%;
+  padding: 6px 16px;
+  border-radius: var(--af-radius-sm);
+  color: var(--af-text-normal);
+  font-size: 13px;
+  font-family: var(--af-font-mono);
+  text-align: center;
+  transition: all var(--af-transition-fast);
+}
 
-    &:hover {
-      background: var(--af-bg-tertiary);
-    }
+.speed-control .speed-option:hover {
+  background: var(--af-bg-tertiary);
+}
 
-    &.active {
-      color: var(--af-accent-primary);
-      background: rgba(88, 166, 255, 0.15);
-    }
-  }
+.speed-control .speed-option.active {
+  background: var(--af-accent-primary-bg);
+  color: var(--af-accent-primary);
 }
 </style>
