@@ -14,10 +14,10 @@
 - [x] frontend\src\components\editor\PlaybackControls\index.vue
 - [x] frontend\src\components\editor\SubtitleList\index.vue
 - [x] frontend\src\components\editor\SubtitleList\SubtitleItem.vue
-- [ ] frontend\src\components\editor\TaskMonitor\index.vue
+- [x] frontend\src\components\editor\TaskMonitor\index.vue
 - [x] frontend\src\components\editor\TaskMonitor\TaskCard.vue
 - [x] frontend\src\components\editor\TaskMonitor\TaskGroup.vue
-- [ ] frontend\src\components\editor\VideoStage\index.vue
+- [x] frontend\src\components\editor\VideoStage\index.vue
 - [ ] frontend\src\components\editor\WaveformTimeline\index.vue
 - [ ] frontend\src\views\EditorView.vue
 - [ ] frontend\src\views\TaskListView.vue

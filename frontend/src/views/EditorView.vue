@@ -179,6 +179,27 @@
         </button>
       </div>
     </footer>
+
+    <!-- 高级设置对话框 -->
+    <el-dialog
+      v-model="showAdvancedSettings"
+      title="高级设置"
+      width="600px"
+      :close-on-click-modal="false"
+      :close-on-press-escape="true"
+      @close="handleCloseAdvancedSettings"
+    >
+      <AdvancedSettings
+        v-model="advancedConfig"
+        @change="handleAdvancedSettingsChange"
+      />
+      <template #footer>
+        <span class="dialog-footer">
+          <el-button @click="handleCancelAdvancedSettings">取消</el-button>
+          <el-button type="primary" @click="handleSaveAdvancedSettings">保存设置</el-button>
+        </span>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -212,6 +233,7 @@ import PlaybackControls from '@/components/editor/PlaybackControls/index.vue'
 import VideoStage from '@/components/editor/VideoStage/index.vue'
 import SubtitleList from '@/components/editor/SubtitleList/index.vue'
 import WaveformTimeline from '@/components/editor/WaveformTimeline/index.vue'
+import AdvancedSettings from '@/components/editor/AdvancedSettings.vue'
 
 // Props
 const props = defineProps({
@@ -246,6 +268,44 @@ const isResizing = ref(false)
 // 加载状态
 const isLoading = ref(true)
 const loadError = ref(null)
+
+// 高级设置状态
+const showAdvancedSettings = ref(false)
+const advancedConfig = ref({
+  general: {
+    global_time_offset: 0,
+    duration_adjust: 0,
+    auto_save_interval: 60,
+    preview_font_size: 24,
+    enable_shortcuts: true
+  },
+  preprocessing: {
+    demucs_strategy: 'auto',
+    demucs_model: 'htdemucs',
+    demucs_shifts: 1,
+    spectrum_threshold: 0.5,
+    vad_filter: true
+  },
+  transcription: {
+    transcription_profile: 'sv_whisper_dual',
+    sensevoice_device: 'cuda',
+    whisper_model: 'large-v3',
+    patching_threshold: 0.3
+  },
+  refinement: {
+    llm_task: 'off',
+    llm_scope: 'sparse',
+    sparse_threshold: 0.5,
+    target_language: 'zh',
+    llm_model_name: 'gpt-4o-mini'
+  },
+  compute: {
+    concurrency_strategy: 'auto',
+    gpu_id: 0,
+    temp_file_policy: 'delete_on_complete'
+  },
+  preset_id: 'default'
+})
 
 // 统一进度状态
 const progressStore = useProgressStore()
@@ -1527,8 +1587,38 @@ function handleSubtitleEdit(id, field, value) {
 }
 
 function showSettings() {
-  // TODO: 实现设置面板
-  console.log('打开设置')
+  showAdvancedSettings.value = true
+}
+
+function handleAdvancedSettingsChange(config) {
+  // 实时响应设置变化（可选）
+  console.log('[EditorView] 高级设置变化:', config)
+}
+
+async function handleSaveAdvancedSettings() {
+  try {
+    // TODO: 将配置保存到后端或本地存储
+    console.log('[EditorView] 保存高级设置:', advancedConfig.value)
+    
+    // 这里可以调用 API 保存设置
+    // await transcriptionApi.saveAdvancedSettings(jobIdRef.value, advancedConfig.value)
+    
+    ElMessage.success('高级设置已保存')
+    showAdvancedSettings.value = false
+  } catch (error) {
+    console.error('[EditorView] 保存高级设置失败:', error)
+    ElMessage.error('保存高级设置失败: ' + (error.message || '未知错误'))
+  }
+}
+
+function handleCancelAdvancedSettings() {
+  console.log('[EditorView] 取消高级设置')
+  showAdvancedSettings.value = false
+}
+
+function handleCloseAdvancedSettings() {
+  console.log('[EditorView] 关闭高级设置对话框')
+  showAdvancedSettings.value = false
 }
 
 function formatLastSaved(timestamp) {

@@ -13,6 +13,125 @@
       </button>
     </div>
 
+    <!-- 分组零: 常规设置 -->
+    <div v-show="activeTab === 'general'" class="settings-panel">
+      <div class="panel-header">
+        <span class="panel-title">常规设置</span>
+      </div>
+
+      <!-- 全局时间偏移 -->
+      <div class="setting-row">
+        <div class="setting-label">
+          <span class="label-text">全局时间偏移</span>
+          <span class="label-hint">global_time_offset (秒)</span>
+        </div>
+        <div class="setting-control slider-control">
+          <input
+            type="range"
+            min="-10"
+            max="10"
+            step="0.1"
+            v-model.number="localConfig.general.global_time_offset"
+            @change="emitChange"
+          />
+          <span class="slider-value">{{ localConfig.general.global_time_offset.toFixed(1) }}s</span>
+        </div>
+      </div>
+
+      <!-- 精确时间偏移输入 -->
+      <div class="setting-row">
+        <div class="setting-label">
+          <span class="label-text">精确偏移值</span>
+          <span class="label-hint">输入精确数值（秒）</span>
+        </div>
+        <div class="setting-control">
+          <input
+            type="number"
+            step="0.01"
+            v-model.number="localConfig.general.global_time_offset"
+            @input="emitChange"
+            placeholder="0.00"
+          />
+        </div>
+      </div>
+
+      <!-- 字幕显示时长调整 -->
+      <div class="setting-row">
+        <div class="setting-label">
+          <span class="label-text">字幕显示时长调整</span>
+          <span class="label-hint">duration_adjust (秒)</span>
+        </div>
+        <div class="setting-control slider-control">
+          <input
+            type="range"
+            min="-2"
+            max="2"
+            step="0.1"
+            v-model.number="localConfig.general.duration_adjust"
+            @change="emitChange"
+          />
+          <span class="slider-value">{{ localConfig.general.duration_adjust >= 0 ? '+' : '' }}{{ localConfig.general.duration_adjust.toFixed(1) }}s</span>
+        </div>
+      </div>
+
+      <!-- 自动保存间隔 -->
+      <div class="setting-row">
+        <div class="setting-label">
+          <span class="label-text">自动保存间隔</span>
+          <span class="label-hint">auto_save_interval (秒)</span>
+        </div>
+        <div class="setting-control">
+          <select
+            v-model.number="localConfig.general.auto_save_interval"
+            @change="emitChange"
+          >
+            <option :value="0">关闭</option>
+            <option :value="30">30 秒</option>
+            <option :value="60">1 分钟</option>
+            <option :value="120">2 分钟</option>
+            <option :value="300">5 分钟</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- 字幕预览字体大小 -->
+      <div class="setting-row">
+        <div class="setting-label">
+          <span class="label-text">预览字体大小</span>
+          <span class="label-hint">preview_font_size (px)</span>
+        </div>
+        <div class="setting-control slider-control">
+          <input
+            type="range"
+            min="12"
+            max="48"
+            step="1"
+            v-model.number="localConfig.general.preview_font_size"
+            @change="emitChange"
+          />
+          <span class="slider-value">{{ localConfig.general.preview_font_size }}px</span>
+        </div>
+      </div>
+
+      <!-- 快捷键启用 -->
+      <div class="setting-row">
+        <div class="setting-label">
+          <span class="label-text">启用快捷键</span>
+          <span class="label-hint">enable_shortcuts</span>
+        </div>
+        <div class="setting-control">
+          <label class="toggle-switch">
+            <input
+              type="checkbox"
+              v-model="localConfig.general.enable_shortcuts"
+              @change="emitChange"
+            />
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+      </div>
+    </div>
+
     <!-- 分组一: 预处理与音频 -->
     <div v-show="activeTab === 'audio'" class="settings-panel">
       <div class="panel-header">
@@ -416,10 +535,11 @@ const props = defineProps({
 const emit = defineEmits(['update:modelValue', 'change'])
 
 // 当前激活的 Tab
-const activeTab = ref('audio')
+const activeTab = ref('general')
 
 // Tab 定义
 const tabs = [
+  { id: 'general', label: '常规' },
   { id: 'audio', label: 'Audio' },
   { id: 'asr', label: 'ASR' },
   { id: 'llm', label: 'LLM' },
