@@ -9,7 +9,7 @@ Phase 2 实现 - 2025-12-10
 
 import logging
 import warnings
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -58,8 +58,10 @@ class AudioChunk:
     last_confidence: float = 1.0        # 上次转录的置信度
 
     # V3.2.0+dev.20260127.02: LangID 语言检测字段
-    language: Optional[str] = None      # 语言标签（ISO 639-3，低置信度可标记为 auto）
-    language_confidence: Optional[float] = None  # 语言检测置信度 [0, 1]
+    # V3.2.2+dev.20260201.01: language_confidence 改为字典格式，存储 Top-2 语言置信度
+    # 语言代码格式：zh/en/ja/ko/yue 等简化代码（非 ISO 639-3）
+    language: Optional[str] = None      # 语言标签（低置信度可标记为 auto）
+    language_confidence: Optional[Dict[str, float]] = None  # 语言置信度字典 {"zh": 0.85, "en": 0.12}
 
     # V3.2.0+dev.20260127.06: 声纹向量字段（用于后续说话人聚类）
     speaker_embedding: Optional[List[float]] = None  # 192 维声纹向量

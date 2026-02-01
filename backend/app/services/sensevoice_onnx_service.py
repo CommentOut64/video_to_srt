@@ -19,6 +19,7 @@ import os
 import re
 import logging
 import numpy as np
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Dict, Union, Tuple, Any
 import threading
@@ -27,6 +28,14 @@ import json
 from app.services.runtime_param_resolver import get_runtime_group_for_model
 
 logger = logging.getLogger(__name__)
+
+
+# V3.2.2+dev.20260201.01: SenseVoice 语言标签置信度结构
+@dataclass
+class SenseVoiceLanguageInfo:
+    """SenseVoice 检测到的语言信息"""
+    language: Optional[str] = None  # 检测到的语言代码（zh/en/ja/ko/yue）
+    confidence: float = 0.0         # 该语言标签的 CTC 置信度
 
 
 class CTCDecoder:
@@ -51,11 +60,14 @@ class CTCDecoder:
         self.blank_id = blank_id
         self.logger = logging.getLogger(__name__)
 
+        # V3.2.2+dev.20260201.01: SenseVoice 语言标签集合
+        self.LANGUAGE_TAGS = {"<|zh|>", "<|en|>", "<|ja|>", "<|ko|>", "<|yue|>", "<|auto|>"}
+
     def decode(
         self,
         logits: np.ndarray,
         time_stride: float = 0.06
-    ) -> Tuple[str, List[Dict], float]:
+    ) -> Tuple[str, List[Dict], float, SenseVoiceLanguageInfo]:
         """
         CTC 解码（贪心算法 + 字级时间戳提取）
 
@@ -64,10 +76,11 @@ class CTCDecoder:
             time_stride: 时间步长（秒），SenseVoice 默认 60ms
 
         Returns:
-            Tuple[str, List[Dict], float]:
+            Tuple[str, List[Dict], float, SenseVoiceLanguageInfo]:
                 - text: 解码后的文本
                 - word_timestamps: 字级时间戳列表
                 - confidence: 平均置信度
+                - language_info: 语言标签信息（V3.2.2+dev.20260201.01）
         """
         # 1. Softmax 转换为概率
         probs = self._softmax(logits)
@@ -81,6 +94,9 @@ class CTCDecoder:
         word_timestamps = []
         prev_token = self.blank_id
         char_start_time = None
+
+        # V3.2.2+dev.20260201.01: 记录语言标签信息
+        language_info = SenseVoiceLanguageInfo()
         char_probs = []
 
         for t, (token_id, prob) in enumerate(zip(token_ids, token_probs)):
@@ -146,13 +162,24 @@ class CTCDecoder:
         # 【新增】CTC 重叠去重：移除前缀重复（如 "W" + "Would" => "Would"）
         word_timestamps = self._remove_overlap_duplicates(word_timestamps)
 
+        # V3.2.2+dev.20260201.01: 提取语言标签置信度
+        for wt in word_timestamps:
+            word = wt.get("word", "")
+            if word in self.LANGUAGE_TAGS:
+                # 提取语言代码（去掉 <| 和 |>）
+                lang_code = word[2:-2].lower()
+                if lang_code != "auto":
+                    language_info.language = lang_code
+                    language_info.confidence = wt.get("confidence", 0.0)
+                break  # 只取第一个语言标签
+
         # 4. 拼接文本
         text = "".join([wt["word"] for wt in word_timestamps])
 
         # 5. 计算平均置信度
         avg_confidence = np.mean([wt["confidence"] for wt in word_timestamps]) if word_timestamps else 0.0
 
-        return text, word_timestamps, float(avg_confidence)
+        return text, word_timestamps, float(avg_confidence), language_info
 
     def _remove_overlap_duplicates(self, word_timestamps: List[Dict]) -> List[Dict]:
         """
@@ -640,7 +667,8 @@ class SenseVoiceONNXService:
             logits = self._run_inference(audio_features, language=language, use_itn=use_itn)
 
             # 3. CTC 解码
-            text, word_timestamps, confidence = self.decoder.decode(logits, self.time_stride)
+            # V3.2.2+dev.20260201.01: 增加返回 SenseVoice 语言标签置信度
+            text, word_timestamps, confidence, sv_language_info = self.decoder.decode(logits, self.time_stride)
 
             # 【阶段一】过滤特殊标记，并补偿时间偏移
             # 特殊标记格式：<|xxx|>，如 <|en|>, <|EMO_UNKNOWN|>, <|Speech|>, <|withitn|>
@@ -695,7 +723,12 @@ class SenseVoiceONNXService:
                 "confidence": confidence,
                 "language": detected_language,
                 "emotion": process_result["tags"]["emotion"] if process_result["tags"] else None,
-                "event": process_result["tags"]["event"] if process_result["tags"] else None
+                "event": process_result["tags"]["event"] if process_result["tags"] else None,
+                # V3.2.2+dev.20260201.01: SenseVoice 语言标签置信度
+                "sv_language_info": {
+                    "language": sv_language_info.language,
+                    "confidence": sv_language_info.confidence,
+                } if sv_language_info.language else None
             }
 
             self.logger.debug(f"转录完成: {len(word_timestamps)} 个词/字, 置信度 {confidence:.3f}")

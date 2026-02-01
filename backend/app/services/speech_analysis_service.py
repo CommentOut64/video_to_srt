@@ -27,6 +27,8 @@ class LangIDPrediction:
     """LangID 预测结果（仅保留关键字段）"""
     language: str
     confidence: float
+    # V3.2.2+dev.20260201.01: 添加 Top-2 语言置信度字典
+    top2_confidence: Optional[Dict[str, float]] = None  # {"zh": 0.85, "en": 0.12}
     raw_label: Optional[str] = None
     raw_language: Optional[str] = None
     raw_confidence: Optional[float] = None
@@ -599,7 +601,8 @@ class SpeechAnalysisService:
 
             # 重新计算 softmax 和置信度
             indices = torch.argmax(logits, dim=-1)
-            confidences = torch.softmax(logits, dim=-1).max(dim=-1).values.clamp(0.0, 1.0)
+            all_probs_normalized = torch.softmax(logits, dim=-1)
+            confidences = all_probs_normalized.max(dim=-1).values.clamp(0.0, 1.0)
             labels = self._extract_labels(
                 result,
                 classifier,
@@ -619,6 +622,8 @@ class SpeechAnalysisService:
                     confidences = torch.exp(probs).max(dim=-1).values.clamp(0.0, 1.0)
             else:
                 confidences = torch.exp(probs).max(dim=-1).values.clamp(0.0, 1.0)
+            # V3.2.2+dev.20260201.01: 计算归一化概率用于 Top-2 提取
+            all_probs_normalized = torch.softmax(probs, dim=-1)
             labels = self._extract_labels(
                 result,
                 classifier,
@@ -627,6 +632,9 @@ class SpeechAnalysisService:
                 allow_result_labels=True,
             )
 
+        # V3.2.2+dev.20260201.01: 构建索引到语言代码的映射
+        index_to_lang = self._build_index_to_lang_map(classifier)
+
         predictions: List[LangIDPrediction] = []
         for i in range(batch_size):
             label = labels[i] if labels and i < len(labels) else "auto"
@@ -634,10 +642,16 @@ class SpeechAnalysisService:
             raw_language = self._extract_label_code(raw_label)
             raw_confidence = float(confidences[i].item())
 
+            # V3.2.2+dev.20260201.01: 提取 Top-2 语言置信度
+            top2_confidence = self._extract_top2_confidence(
+                all_probs_normalized[i],
+                index_to_lang,
+            )
+
             # V3.2.0+dev.20260127.05: 添加详细调试日志
             self.logger.debug(
                 f"LangID 样本 {i}: 原始标签={raw_label}, 提取语言={raw_language}, "
-                f"置信度={raw_confidence:.4f}, 白名单={whitelist_set}"
+                f"置信度={raw_confidence:.4f}, Top-2={top2_confidence}, 白名单={whitelist_set}"
             )
 
             if whitelist_set and raw_language not in whitelist_set:
@@ -646,6 +660,7 @@ class SpeechAnalysisService:
                     LangIDPrediction(
                         language="auto",
                         confidence=0.0,
+                        top2_confidence=top2_confidence,
                         raw_label=raw_label,
                         raw_language=raw_language,
                         raw_confidence=raw_confidence,
@@ -656,6 +671,7 @@ class SpeechAnalysisService:
                 LangIDPrediction(
                     language=raw_language or "auto",
                     confidence=raw_confidence,
+                    top2_confidence=top2_confidence,
                     raw_label=raw_label,
                     raw_language=raw_language,
                     raw_confidence=raw_confidence,
@@ -788,6 +804,81 @@ class SpeechAnalysisService:
                     mapping.setdefault(code, int(index))
             return mapping
         return {}
+
+    @staticmethod
+    def _build_index_to_lang_map(classifier: Any) -> Dict[int, str]:
+        """
+        V3.2.2+dev.20260201.01: 构建索引到语言代码的映射。
+
+        返回 {index: language_code} 字典，用于从概率索引获取语言代码。
+        """
+        encoder = getattr(getattr(classifier, "hparams", None), "label_encoder", None)
+        if not encoder:
+            return {}
+
+        ind2lab = getattr(encoder, "ind2lab", None)
+        if isinstance(ind2lab, dict):
+            mapping: Dict[int, str] = {}
+            for index, label in ind2lab.items():
+                code = SpeechAnalysisService._extract_label_code(label)
+                if code and code != "auto":
+                    # 标准化语言代码
+                    normalized = SpeechAnalysisService._normalize_language_code(code)
+                    mapping[int(index)] = normalized or code
+            return mapping
+        if isinstance(ind2lab, (list, tuple)):
+            mapping = {}
+            for index, label in enumerate(ind2lab):
+                code = SpeechAnalysisService._extract_label_code(label)
+                if code and code != "auto":
+                    normalized = SpeechAnalysisService._normalize_language_code(code)
+                    mapping[int(index)] = normalized or code
+            return mapping
+        return {}
+
+    def _extract_top2_confidence(
+        self,
+        probs: Any,
+        index_to_lang: Dict[int, str],
+    ) -> Dict[str, float]:
+        """
+        V3.2.2+dev.20260201.01: 提取 Top-2 语言的置信度。
+
+        Args:
+            probs: 单个样本的归一化概率张量 [vocab_size]
+            index_to_lang: 索引到语言代码的映射
+
+        Returns:
+            Dict[str, float]: Top-2 语言置信度字典，按置信度降序排列
+            如果置信度相同则按语言代码字典序升序
+        """
+        import torch
+
+        if not isinstance(probs, torch.Tensor) or probs.numel() == 0:
+            return {}
+
+        # 获取 Top-2 的索引和值
+        k = min(2, probs.shape[-1])
+        top_values, top_indices = torch.topk(probs, k)
+
+        result: Dict[str, float] = {}
+        for i in range(k):
+            idx = int(top_indices[i].item())
+            conf = float(top_values[i].item())
+            lang = index_to_lang.get(idx)
+            if lang and lang != "auto":
+                result[lang] = round(conf, 4)
+
+        # 如果结果不足 2 个，直接返回
+        if len(result) < 2:
+            return result
+
+        # 按置信度降序排列，置信度相同时按语言代码升序
+        sorted_items = sorted(
+            result.items(),
+            key=lambda x: (-x[1], x[0])
+        )
+        return dict(sorted_items[:2])
 
     def _decode_indices(self, classifier: Any, indices: Any) -> Optional[Any]:
         encoder = getattr(getattr(classifier, "hparams", None), "label_encoder", None)
