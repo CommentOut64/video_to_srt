@@ -26,6 +26,7 @@ export const darkTheme = {
       muted: '#6e7681',
       mutedRgb: '110, 118, 129',
       disabled: '#484f58',
+      inverse: '#ffffff',
       onDark: '#ffffff',
       onDarkRgb: '255, 255, 255',
     },

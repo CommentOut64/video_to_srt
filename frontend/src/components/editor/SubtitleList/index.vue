@@ -42,10 +42,10 @@
     <div class="list-container tw-flex-1 tw-overflow-y-auto tw-p-1.5 tw-relative" ref="listRef">
       <div v-if="filteredSubtitles.length === 0" class="empty-state tw-flex tw-flex-col tw-items-center tw-justify-center tw-px-4 tw-py-8 tw-text-text-muted">
         <svg viewBox="0 0 24 24" fill="currentColor" class="tw-w-12 tw-h-12 tw-mb-3 tw-opacity-50">
-          <path d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zM4 18V6h16v12H4zm2-1h2v-2H6v2zm0-3h8v-2H6v2zm10 3h2v-5h-2v5zm-4 0h2v-2h-2v2zm0-3h4v-2h-4v2z"/>
+          <path d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H4V6h16v12zM6 10h2v2H6v-2zm0 4h8v2H6v-2zm10 0h2v2h-2v-2zm0-4h2v2h-2v-2zm-4 4h2v2h-2v-2zm0-4h2v2h-2v-2z"/>
         </svg>
         <p class="tw-text-[13px] tw-mb-3">暂无字幕</p>
-        <button class="add-first-btn tw-px-4 tw-py-1.5 tw-bg-accent-primary tw-text-white tw-rounded-md tw-text-[13px] tw-transition-colors tw-duration-fast hover:tw-bg-accent-primary-hover" @click="addNewSubtitle">添加第一条字幕</button>
+        <button class="add-first-btn" @click="addNewSubtitle">添加第一条字幕</button>
       </div>
 
       <!-- 使用 SubtitleItem 组件替代内联渲染 -->
@@ -490,9 +490,11 @@ svg {
 .empty-state .add-first-btn {
   padding: 6px 16px;
   background: var(--af-accent-primary);
+  border: none;
   border-radius: var(--af-radius-md);
   color: var(--af-text-inverse);
   font-size: 13px;
+  cursor: pointer;
   transition: background var(--af-transition-fast);
 }
 

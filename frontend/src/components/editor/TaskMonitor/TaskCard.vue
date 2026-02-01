@@ -226,7 +226,7 @@ function formatTime(timestamp) {
   display: flex;
   gap: 12px;
   padding: 12px;
-  background: rgb(var(--af-text-on-dark-rgb), 0.3);
+  background: rgb(var(--af-text-on-dark-rgb), 0.03);
   border: 1px solid transparent;
   border-radius: 6px;
   margin-bottom: 8px;
