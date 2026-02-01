@@ -1,13 +1,13 @@
 """
 Bridge 控制器（完整实现）。
-V3.2.0+dev.20260201.04
+V3.2.0+dev.20260201.07
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 
 from app.models.sensevoice_models import SentenceSegment
 from app.services.bridge.batch_builder import BatchBuilder, BridgeBatch
@@ -41,6 +41,7 @@ class BridgeController:
         self._last_speaker_id: Optional[str] = None
         self._last_tail_prompt = ""
         self._arbiter_feedback: Optional[PunctuationDecision] = None
+        self._slow_results: Dict[str, Any] = {}
 
     def is_backpressure_active(self) -> bool:
         return self._queue.is_backpressure_active()
@@ -51,6 +52,18 @@ class BridgeController:
     def update_arbiter_feedback(self, decision: Optional[PunctuationDecision]) -> None:
         """更新仲裁反馈，用于标点调度融合。"""
         self._arbiter_feedback = decision
+
+    def record_slow_result(self, batch_id: str, result: Any) -> None:
+        """记录 SlowWorker 批次结果，供后续仲裁使用。"""
+        if not batch_id:
+            return
+        self._slow_results[batch_id] = result
+
+    def get_slow_result(self, batch_id: str) -> Optional[Any]:
+        """获取 SlowWorker 批次结果。"""
+        if not batch_id:
+            return None
+        return self._slow_results.get(batch_id)
 
     async def add_semantic_chunk(self, chunk: SemanticChunk) -> Optional[BridgeBatch]:
         """添加语义 Chunk，满足条件时输出批次。"""

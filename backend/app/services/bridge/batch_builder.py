@@ -1,6 +1,6 @@
 """
 Bridge 批次构建器。
-V3.2.0+dev.20260201.04
+V3.2.0+dev.20260201.07
 """
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ class BridgeBatch:
     overlap_audio: Optional[Any]
     flush_reason: str
     source_chunks: List[str]
+    semantic_chunks: List[SemanticChunk] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
 
 
@@ -77,6 +78,7 @@ class BatchBuilder:
             overlap_audio=None if overlap_duration <= 0 else None,
             flush_reason=flush_reason,
             source_chunks=source_chunks,
+            semantic_chunks=ordered,
         )
 
     @staticmethod
