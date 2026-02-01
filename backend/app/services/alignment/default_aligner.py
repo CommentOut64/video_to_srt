@@ -207,11 +207,71 @@ class DefaultAligner:
         sv_result: Dict[str, Any],
         chunk: AudioChunk,
     ) -> List[SentenceSegment]:
-        """将 SenseVoice 结果作为最终输出。"""
-        sentences = self._split_from_sv(sv_result, chunk)
+        """将 SenseVoice 结果作为最终输出（极速模式，跳过二次切分）。
+
+        V3.2.0+dev.20260201.12: 修复词中间切分问题
+        - sensevoice_only 模式直接使用 SenseVoice 的原始 sentences
+        - 不调用 final_splitter 进行二次切分
+        - 避免 Phase F 标点后处理导致的切分点错位
+        """
+        # 直接使用 SenseVoice 的 sentences，不进行二次切分
+        sentences = sv_result.get("sentences", [])
+
+        if not sentences:
+            # 兜底：如果 SenseVoice 没有返回 sentences，使用 words 创建单个句子
+            text_clean = sv_result.get("text_clean", "")
+            words_data = sv_result.get("words", [])
+            words = self._build_words(words_data)
+
+            if not words:
+                if text_clean and text_clean.strip():
+                    self.logger.warning(
+                        "SenseVoice 没有字级时间戳但有文本，创建兜底单句: "
+                        "text='%s...', chunk=[%.2fs, %.2fs]",
+                        text_clean[:50],
+                        chunk.start,
+                        chunk.end,
+                    )
+                    return [
+                        SentenceSegment(
+                            text=text_clean.strip(),
+                            start=chunk.start,
+                            end=chunk.end,
+                            words=[],
+                            source=TextSource.SENSEVOICE,
+                            confidence=sv_result.get("confidence", 0.5),
+                            is_finalized=True,
+                            is_draft=False,
+                        )
+                    ]
+                self.logger.warning("SenseVoice 结果没有字级时间戳且无文本，无法分句")
+                return []
+
+            # 创建单个句子包含所有 words
+            sentences = [
+                SentenceSegment(
+                    text=text_clean.strip(),
+                    start=words[0].start,
+                    end=words[-1].end,
+                    words=words,
+                    source=TextSource.SENSEVOICE,
+                    confidence=sv_result.get("confidence", 0.5),
+                    is_finalized=True,
+                    is_draft=False,
+                )
+            ]
+
+        # 调整时间戳到全局坐标
         for sentence in sentences:
+            sentence.start += chunk.start
+            sentence.end += chunk.start
+            sentence.source = TextSource.SENSEVOICE
             sentence.is_finalized = True
             sentence.is_draft = False
+            for word in sentence.words:
+                word.start += chunk.start
+                word.end += chunk.start
+
         return sentences
 
     def _split_with_final(

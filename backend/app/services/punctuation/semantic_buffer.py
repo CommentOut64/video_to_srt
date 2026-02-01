@@ -46,9 +46,22 @@ def _is_decimal_point(text: str, index: int) -> bool:
 
 _WEAK_PUNCTUATION = set("，、；,;:")
 _PUNCTUATION_SET = set(",.!?;:\"()[]{}，。！？；：、（）【】《》""「」『』")
-# V3.2.0+dev.20260201.02: 不包含 "." 的标点集合，用于 clean_text 构建，避免小数点丢失
-_SENTENCE_PUNCTUATION_SET = set(",!?;:\"()[]{}，。！？；：、（）【】《》""「」『』")
-_TRAILING_PUNCTUATION = set(",，;:；：、。.")
+_TRAILING_PUNCTUATION = set(",，;:；：、。.") 
+
+
+def _is_removable_punctuation(text: str, index: int) -> bool:
+    """
+    判断该位置字符是否应从 clean_text 中移除。
+    V3.2.0+dev.20260201.14: 句末句号可移除，但小数点必须保留。
+    """
+    if index < 0 or index >= len(text):
+        return False
+    char = text[index]
+    if char not in _PUNCTUATION_SET:
+        return False
+    if char in {".", "。"} and _is_decimal_point(text, index):
+        return False
+    return True
 _CONTRACTION_MAP: Dict[str, str] = {
     "im": "i'm",
     "ive": "i've",
@@ -1096,25 +1109,25 @@ class SemanticBuffer:
     def _clean_length(text: str) -> int:
         """
         计算去除标点后的文本长度，但保留小数点（如 2.2）。
-        V3.2.0+dev.20260201.02
+        V3.2.0+dev.20260201.14
         """
-        return sum(1 for char in text if char not in _SENTENCE_PUNCTUATION_SET)
+        return sum(1 for idx, _ in enumerate(text) if not _is_removable_punctuation(text, idx))
 
     @staticmethod
     def _build_clean_index_map(text: str) -> List[int]:
         """
         构建 clean_text 索引映射，保留小数点（如 2.2）。
-        V3.2.0+dev.20260201.02
+        V3.2.0+dev.20260201.14
         """
-        return [idx for idx, char in enumerate(text) if char not in _SENTENCE_PUNCTUATION_SET]
+        return [idx for idx, _ in enumerate(text) if not _is_removable_punctuation(text, idx)]
 
     @staticmethod
     def _build_clean_text(text: str) -> str:
         """
         构建去除标点的文本，但保留小数点（如 2.2）。
-        V3.2.0+dev.20260201.02
+        V3.2.0+dev.20260201.14
         """
-        return "".join(char for char in text if char not in _SENTENCE_PUNCTUATION_SET)
+        return "".join(char for idx, char in enumerate(text) if not _is_removable_punctuation(text, idx))
 
     @staticmethod
     def _find_last_weak_punctuation(text: str) -> Optional[int]:
@@ -1421,7 +1434,7 @@ class SemanticBuffer:
     def _text_index_to_clean_index(text: str, text_index: int) -> int:
         clean_idx = -1
         for idx, char in enumerate(text):
-            if char in _PUNCTUATION_SET:
+            if _is_removable_punctuation(text, idx):
                 continue
             clean_idx += 1
             if idx >= text_index:
