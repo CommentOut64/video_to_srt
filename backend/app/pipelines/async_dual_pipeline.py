@@ -44,7 +44,7 @@ from app.services.sse_service import get_sse_manager
 from app.services.segmentation.default_segmenter import DefaultSegmenter
 from app.services.streaming_subtitle import get_streaming_subtitle_manager
 from app.services.punctuation.base import PunctuationResult, PuncPosition, SplitPoint
-from app.services.bridge.bridge_mvp import BridgeBatch, BridgeMVP
+from app.services.bridge.bridge_controller import BridgeBatch, BridgeController
 from app.services.punctuation.semantic_buffer import (
     PunctuationDecision,
     SemanticBuffer,
@@ -97,8 +97,8 @@ class AsyncDualPipeline:
         aligner: Optional[DefaultAligner] = None,
         patching_threshold: Optional[ThresholdConfig] = None,
         enable_cross_chunk_merge: bool = True,
-        enable_bridge_mvp: bool = True,
-        bridge_mvp: Optional[BridgeMVP] = None,
+        enable_bridge_controller: bool = True,
+        bridge_controller: Optional[BridgeController] = None,
         debug_punctuation: bool = False,
         logger: Optional[logging.Logger] = None,
         cancellation_token: Optional["CancellationToken"] = None,  # v3.1.0: 新增
@@ -126,8 +126,8 @@ class AsyncDualPipeline:
             aligner: 对齐服务实例（可选）
             patching_threshold: 复核阈值配置（可选）
             enable_cross_chunk_merge: 是否启用跨 chunk 合并
-            enable_bridge_mvp: 是否启用 Bridge MVP
-            bridge_mvp: Bridge MVP 实例（可选）
+            enable_bridge_controller: 是否启用 Bridge 控制器
+            bridge_controller: Bridge 控制器实例（可选）
             debug_punctuation: 是否启用标点调试输出
             logger: 日志记录器
             cancellation_token: 取消令牌（可选，v3.1.0）
@@ -186,10 +186,10 @@ class AsyncDualPipeline:
         if self.semantic_buffer is None and enable_semantic_buffer:
             self.semantic_buffer = SemanticBuffer(logger=self.logger)
 
-        # V3.2.0+dev.20260201.02: Bridge MVP（Phase D 接入）
-        self.bridge_mvp = bridge_mvp if enable_bridge_mvp else None
-        if self.bridge_mvp is None and enable_bridge_mvp:
-            self.bridge_mvp = BridgeMVP(logger=self.logger)
+        # V3.2.0+dev.20260201.04: Bridge 控制器（Phase E 完整实现）
+        self.bridge_controller = bridge_controller if enable_bridge_controller else None
+        if self.bridge_controller is None and enable_bridge_controller:
+            self.bridge_controller = BridgeController(logger=self.logger)
 
         # V3.2.0+dev.20260129.01: 标点服务注入
         if punctuation_service is None:
@@ -383,7 +383,7 @@ class AsyncDualPipeline:
             try:
                 # FastWorker 处理（仅推理）
                 await self.fast_worker.process(ctx)
-                self._emit_draft_sentences(ctx, is_final_output=True)
+                await self._emit_draft_sentences(ctx, is_final_output=True)
                 results.append(ctx)
                 last_chunk_index = i
 
@@ -447,7 +447,7 @@ class AsyncDualPipeline:
             raise self.pause_exception
 
         if last_chunk_index is not None:
-            self._flush_semantic_buffer(is_final_output=True, chunk_index=last_chunk_index)
+            await self._flush_semantic_buffer(is_final_output=True, chunk_index=last_chunk_index)
 
         self.logger.info(f"极速模式完成: {len(results)} 个 Chunk 已处理")
         return results
@@ -543,7 +543,7 @@ class AsyncDualPipeline:
 
         return results
 
-    def _emit_draft_sentences(self, ctx: ProcessingContext, is_final_output: bool) -> None:
+    async def _emit_draft_sentences(self, ctx: ProcessingContext, is_final_output: bool) -> None:
         """
         使用 DefaultSegmenter 生成句子并推送字幕事件。
 
@@ -554,7 +554,7 @@ class AsyncDualPipeline:
         if not ctx.sv_result or not ctx.audio_chunk:
             return
 
-        semantic_sentences = self._emit_semantic_sentences(ctx, is_final_output)
+        semantic_sentences = await self._emit_semantic_sentences(ctx, is_final_output)
         if semantic_sentences is not None:
             return
 
@@ -576,7 +576,7 @@ class AsyncDualPipeline:
                 f"Chunk {ctx.chunk_index}: 草稿已推送 ({len(sentences)} 个句子)"
             )
 
-    def _emit_semantic_sentences(
+    async def _emit_semantic_sentences(
         self,
         ctx: ProcessingContext,
         is_final_output: bool,
@@ -593,7 +593,7 @@ class AsyncDualPipeline:
         if not chunks:
             return []
 
-        self._ingest_bridge_chunks(chunks)
+        await self._ingest_bridge_chunks(chunks)
 
         total_sentences = 0
         for chunk in chunks:
@@ -616,31 +616,31 @@ class AsyncDualPipeline:
         )
         return [sentence for chunk in chunks for sentence in chunk.sentences]
 
-    def _ingest_bridge_chunks(self, chunks: List[SemanticChunk]) -> None:
-        """将语义 Chunk 送入 Bridge MVP，更新提示词缓存。"""
-        if not self.bridge_mvp:
+    async def _ingest_bridge_chunks(self, chunks: List[SemanticChunk]) -> None:
+        """将语义 Chunk 送入 Bridge 控制器，更新提示词缓存。"""
+        if not self.bridge_controller:
             return
         for chunk in chunks:
-            batch = self.bridge_mvp.add(chunk)
+            batch = await self.bridge_controller.add_semantic_chunk(chunk)
             if batch:
                 self._bridge_last_batch = batch
                 self._bridge_prompt_hint = batch.prompt or None
                 self.logger.debug(
-                    "BridgeMVP 批次就绪: batch_id=%s, prompt_len=%d",
+                    "Bridge 批次就绪: batch_id=%s, prompt_len=%d",
                     batch.batch_id,
                     len(batch.prompt or ""),
                 )
 
-    def _flush_bridge_mvp(self) -> None:
-        """强制刷新 Bridge MVP 缓冲。"""
-        if not self.bridge_mvp:
+    async def _flush_bridge_controller(self) -> None:
+        """强制刷新 Bridge 控制器缓冲。"""
+        if not self.bridge_controller:
             return
-        batch = self.bridge_mvp.flush()
+        batch = await self.bridge_controller.flush(reason="pipeline_flush")
         if batch:
             self._bridge_last_batch = batch
             self._bridge_prompt_hint = batch.prompt or None
             self.logger.debug(
-                "BridgeMVP 强制刷新: batch_id=%s, prompt_len=%d",
+                "Bridge 强制刷新: batch_id=%s, prompt_len=%d",
                 batch.batch_id,
                 len(batch.prompt or ""),
             )
@@ -733,14 +733,14 @@ class AsyncDualPipeline:
             processing_time_ms=float(meta.get("processing_time_ms", 0.0)),
         )
 
-    def _flush_semantic_buffer(self, *, is_final_output: bool, chunk_index: int) -> None:
+    async def _flush_semantic_buffer(self, *, is_final_output: bool, chunk_index: int) -> None:
         """刷新 SemanticBuffer 尾部内容并推送字幕。"""
         if not self.semantic_buffer:
             return
         chunks = self.semantic_buffer.flush(reason="pipeline_end")
         if not chunks:
             return
-        self._ingest_bridge_chunks(chunks)
+        await self._ingest_bridge_chunks(chunks)
         total_sentences = 0
         for chunk in chunks:
             sentences = chunk.sentences
@@ -758,7 +758,7 @@ class AsyncDualPipeline:
             phase,
             total_sentences,
         )
-        self._flush_bridge_mvp()
+        await self._flush_bridge_controller()
 
     def _should_skip_whisper(self, sv_result: Dict[str, Any], chunk: AudioChunk) -> bool:
         """
@@ -951,7 +951,7 @@ class AsyncDualPipeline:
                 try:
                     # FastWorker 处理（仅推理）
                     await self.fast_worker.process(ctx)
-                    self._emit_draft_sentences(ctx, is_final_output=False)
+                    await self._emit_draft_sentences(ctx, is_final_output=False)
 
                     # 放入队列（如果队列满了，会自动阻塞，实现背压）
                     await self.queue_inter.put(ctx)
@@ -1033,7 +1033,7 @@ class AsyncDualPipeline:
         finally:
             if should_send_end_signal:
                 if last_chunk_index is not None:
-                    self._flush_semantic_buffer(is_final_output=False, chunk_index=last_chunk_index)
+                    await self._flush_semantic_buffer(is_final_output=False, chunk_index=last_chunk_index)
                 end_ctx = ProcessingContext(
                     job_id=self.job_id,
                     chunk_index=-1,
