@@ -61,12 +61,22 @@ export function injectTheme(theme) {
 
   // 处理 colors
   if (theme.colors) {
-    Object.assign(vars, flattenObject(theme.colors))
+    const colorVars = flattenObject(theme.colors)
+    Object.assign(vars, colorVars)
+
+    // 调试日志：打印 accent-success 相关变量
+    console.log('[Theme Debug] Accent success variables:',
+      Object.keys(colorVars).filter(k => k.includes('success')))
   }
 
   // 处理 functional
   if (theme.functional) {
-    Object.assign(vars, flattenObject(theme.functional))
+    const functionalVars = flattenObject(theme.functional, 'functional')
+    Object.assign(vars, functionalVars)
+
+    // 调试日志：打印 functional 相关变量
+    console.log('[Theme Debug] Functional variables generated:',
+      Object.keys(functionalVars).filter(k => k.includes('processing')))
   }
 
   // === 兼容层：生成旧变量名映射 ===
@@ -78,6 +88,13 @@ export function injectTheme(theme) {
   for (const [key, value] of Object.entries(vars)) {
     root.style.setProperty(key, value)
   }
+
+  // 调试日志：验证变量是否成功注入到 DOM
+  console.log('[Theme Debug] --af-functional-status-processing =',
+    getComputedStyle(root).getPropertyValue('--af-functional-status-processing'))
+  console.log('[Theme Debug] --af-accent-success-rgb =',
+    getComputedStyle(root).getPropertyValue('--af-accent-success-rgb'))
+  console.log('[Theme Debug] Total variables injected:', Object.keys(vars).length)
 }
 
 /**

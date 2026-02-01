@@ -27,6 +27,7 @@ export const darkTheme = {
       mutedRgb: '110, 118, 129',
       disabled: '#484f58',
       onDark: '#ffffff',
+      onDarkRgb: '255, 255, 255',
     },
 
     // 强调色

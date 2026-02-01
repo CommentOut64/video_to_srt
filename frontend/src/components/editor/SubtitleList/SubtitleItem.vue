@@ -601,12 +601,12 @@ function formatDuration(seconds) {
 
 .subtitle-item.is-active {
   border-color: var(--af-accent-primary);
-  background: rgb(var(--af-accent-primary-rgb) / 8%);
+  background: rgb(var(--af-accent-primary-rgb), 0.8);
 }
 
 .subtitle-item.is-current {
   border-color: var(--af-accent-success);
-  background: rgb(var(--af-accent-success-rgb) / 8%);
+  background: rgb(var(--af-accent-success-rgb), 0.8);
 }
 
 /* 暂停时显示呼吸灯动画 */
@@ -616,25 +616,25 @@ function formatDuration(seconds) {
 
 /* 草稿状态样式 */
 .subtitle-item.is-draft {
-  background: rgb(var(--af-text-muted-rgb) / 5%);
-  border-color: rgb(var(--af-text-muted-rgb) / 20%);
+  background: rgb(var(--af-text-muted-rgb), 0.5);
+  border-color: rgb(var(--af-text-muted-rgb), 0.20);
   cursor: wait;
 }
 
 /* 置信度警告高亮样式 */
 .subtitle-item.warning-low-confidence {
   border-color: var(--af-accent-warning);
-  background: rgb(var(--af-accent-warning-rgb) / 6%);
+  background: rgb(var(--af-accent-warning-rgb), 0.6);
 }
 
 .subtitle-item.warning-high-perplexity {
   border-color: var(--af-status-warning);
-  background: rgb(var(--af-status-warning-rgb) / 6%);
+  background: rgb(var(--af-status-warning-rgb), 0.6);
 }
 
 .subtitle-item.warning-both {
   border-color: var(--af-accent-danger);
-  background: rgb(var(--af-accent-danger-rgb) / 8%);
+  background: rgb(var(--af-accent-danger-rgb), 0.8);
   border-width: 2px;
 }
 
@@ -745,7 +745,7 @@ function formatDuration(seconds) {
   align-items: center;
   gap: 4px;
   padding: 2px 8px;
-  background: rgb(var(--af-draft-bg-rgb) / 15%);
+  background: rgb(var(--af-draft-bg-rgb), 0.15);
   border-radius: var(--af-radius-full);
   color: var(--af-draft-text);
   font-size: 10px;
@@ -754,7 +754,7 @@ function formatDuration(seconds) {
 .draft-indicator .spinner {
   width: 10px;
   height: 10px;
-  border: 2px solid rgb(var(--af-text-secondary-rgb) / 30%);
+  border: 2px solid rgb(var(--af-text-secondary-rgb), 0.30);
   border-top-color: var(--af-draft-text);
   border-radius: 50%;
   animation: spin 1s linear infinite;
@@ -776,7 +776,7 @@ function formatDuration(seconds) {
 
   50% {
     border-color: var(--af-accent-success);
-    box-shadow: 0 0 8px rgb(var(--af-accent-success-rgb) / 50%);
+    box-shadow: 0 0 8px rgb(var(--af-accent-success-rgb), 0.50);
   }
 }
 
@@ -790,17 +790,17 @@ function formatDuration(seconds) {
 }
 
 .confidence-badge.badge-good {
-  background: rgb(var(--af-accent-success-rgb) / 15%);
+  background: rgb(var(--af-accent-success-rgb), 0.15);
   color: var(--af-accent-success);
 }
 
 .confidence-badge.badge-warning {
-  background: rgb(var(--af-accent-warning-rgb) / 15%);
+  background: rgb(var(--af-accent-warning-rgb), 0.15);
   color: var(--af-accent-warning);
 }
 
 .confidence-badge.badge-danger {
-  background: rgb(var(--af-accent-danger-rgb) / 15%);
+  background: rgb(var(--af-accent-danger-rgb), 0.15);
   color: var(--af-accent-danger);
 }
 
@@ -826,7 +826,7 @@ function formatDuration(seconds) {
 
 /* 草稿文本样式 */
 .text-row .text-draft {
-  background: rgb(var(--af-draft-bg-rgb) / 8%);
+  background: rgb(var(--af-draft-bg-rgb), 0.8);
   color: var(--af-draft-text);
   font-style: italic;
   cursor: wait;
@@ -848,14 +848,14 @@ function formatDuration(seconds) {
 
 /* 字级警告高亮样式 */
 .text-row .text-preview :deep(.word-warning) {
-  background-color: rgb(var(--af-confidence-warning-rgb) / 25%);
+  background-color: rgb(var(--af-confidence-warning-rgb), 0.25);
   border-bottom: 2px solid var(--af-confidence-warning);
   padding: 0 2px;
   border-radius: 2px;
 }
 
 .text-row .text-preview :deep(.word-critical) {
-  background-color: rgb(var(--af-confidence-critical-rgb) / 25%);
+  background-color: rgb(var(--af-confidence-critical-rgb), 0.25);
   border-bottom: 2px solid var(--af-confidence-critical);
   padding: 0 2px;
   border-radius: 2px;
@@ -906,7 +906,7 @@ function formatDuration(seconds) {
 .warning-banner {
   margin-top: 6px;
   padding: 4px 8px;
-  background: rgb(var(--af-accent-warning-rgb) / 10%);
+  background: rgb(var(--af-accent-warning-rgb), 0.10);
   border-left: 3px solid var(--af-accent-warning);
   border-radius: var(--af-radius-sm);
 }
@@ -950,7 +950,7 @@ function formatDuration(seconds) {
 }
 
 .item-actions .action-btn-danger:hover {
-  background: rgb(var(--af-accent-danger-rgb) / 15%);
+  background: rgb(var(--af-accent-danger-rgb), 0.15);
   color: var(--af-accent-danger);
 }
 
@@ -989,6 +989,6 @@ function formatDuration(seconds) {
 }
 
 .delete-btn-confirming:hover {
-  background: rgb(var(--af-accent-danger-rgb) / 10%);
+  background: rgb(var(--af-accent-danger-rgb), 0.10);
 }
 </style>
