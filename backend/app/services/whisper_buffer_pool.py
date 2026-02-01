@@ -187,9 +187,12 @@ class WhisperBufferPool:
         """缓冲池是否为空"""
         return len(self._buffer) == 0
 
-    def get_concatenated_audio(self) -> Tuple[np.ndarray, float, float]:
+    def get_concatenated_audio(self, preserve_gaps: bool = False) -> Tuple[np.ndarray, float, float]:
         """
         获取拼接后的完整音频
+
+        Args:
+            preserve_gaps: 是否保留 Chunk 之间的真实时间间隔（插入静音）
 
         Returns:
             Tuple[np.ndarray, float, float]: (拼接音频, 起始时间, 结束时间)
@@ -197,13 +200,33 @@ class WhisperBufferPool:
         if not self._buffer:
             return np.array([], dtype=np.float32), 0.0, 0.0
 
-        # 按时间顺序拼接音频
-        audio_segments = [chunk.audio for chunk in self._buffer]
-        concatenated = np.concatenate(audio_segments)
-
         start_time = self._buffer[0].start
         end_time = self._buffer[-1].end
 
+        # V3.2.0+dev.20260201.07: 可选保留间隔拼接
+        if not preserve_gaps:
+            # 按时间顺序拼接音频（不保留间隔）
+            audio_segments = [chunk.audio for chunk in self._buffer]
+            concatenated = np.concatenate(audio_segments)
+            return concatenated, start_time, end_time
+
+        # 保留间隔：在相邻 Chunk 之间插入静音
+        audio_parts: List[np.ndarray] = []
+        current_time = start_time
+        for chunk in self._buffer:
+            if chunk.start > current_time:
+                gap = chunk.start - current_time
+                if gap > 0:
+                    gap_samples = int(gap * self._sample_rate)
+                    if gap_samples > 0:
+                        audio_parts.append(np.zeros(gap_samples, dtype=chunk.audio.dtype))
+            audio_parts.append(chunk.audio)
+            current_time = chunk.end
+
+        if audio_parts:
+            concatenated = np.concatenate(audio_parts)
+        else:
+            concatenated = np.array([], dtype=np.float32)
         return concatenated, start_time, end_time
 
     def get_chunk_boundaries(self) -> List[Dict[str, Any]]:
