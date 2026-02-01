@@ -51,7 +51,7 @@ from app.services.punctuation.semantic_buffer import (
     SemanticBufferInput,
     SemanticChunk,
 )
-from app.pipelines.workers import FastWorker, SlowWorker
+from app.pipelines.workers import FastWorker, SlowWorker, SlowWorkerResult
 from app.utils.prompt_builder import get_prompt_builder
 from app.utils.cancellation_token import CancelledException, PausedException  # V3.1.0: 捕获取消/暂停异常
 
@@ -150,6 +150,11 @@ class AsyncDualPipeline:
         self._job_dir: Optional[Path] = None
         self._bridge_prompt_hint: Optional[str] = None
         self._bridge_last_batch: Optional[BridgeBatch] = None
+        self._enable_bridge_batches: bool = False
+        self._context_cache: Dict[int, ProcessingContext] = {}
+        self._audio_chunks_by_index: Dict[int, AudioChunk] = {}
+        self._full_audio_array: Optional[Any] = None
+        self._full_audio_sr: int = 16000
 
         # 判断是否为纯 SenseVoice 模式
         self.is_sensevoice_only = (transcription_profile == "sensevoice_only")
@@ -190,6 +195,9 @@ class AsyncDualPipeline:
         self.bridge_controller = bridge_controller if enable_bridge_controller else None
         if self.bridge_controller is None and enable_bridge_controller:
             self.bridge_controller = BridgeController(logger=self.logger)
+        self._enable_bridge_batches = bool(
+            self.bridge_controller and self.semantic_buffer and not self.is_sensevoice_only
+        )
 
         # V3.2.0+dev.20260129.01: 标点服务注入
         if punctuation_service is None:
@@ -216,6 +224,7 @@ class AsyncDualPipeline:
             self.slow_worker = SlowWorker(
                 patch_engine=self.patch_engine,
                 whisper_language=whisper_language,
+                punctuation_service=self.punctuation_service,
                 logger=self.logger
             )
 
@@ -496,6 +505,12 @@ class AsyncDualPipeline:
         self.errors.clear()
         self.pause_exception = None
 
+        # V3.2.0+dev.20260201.07: 记录完整音频与 Chunk 映射，供 Bridge 批次使用
+        self._full_audio_array = full_audio_array
+        self._full_audio_sr = full_audio_sr
+        self._audio_chunks_by_index = {chunk.index: chunk for chunk in audio_chunks}
+        self._context_cache = {}
+
         total_chunks = len(audio_chunks)  # V3.1.0: 保存总数用于进度计算
         self.logger.info(f"开始三级流水线: {total_chunks} 个 Chunk")
 
@@ -543,7 +558,7 @@ class AsyncDualPipeline:
 
         return results
 
-    async def _emit_draft_sentences(self, ctx: ProcessingContext, is_final_output: bool) -> None:
+    async def _emit_draft_sentences(self, ctx: ProcessingContext, is_final_output: bool) -> bool:
         """
         使用 DefaultSegmenter 生成句子并推送字幕事件。
 
@@ -552,11 +567,11 @@ class AsyncDualPipeline:
             is_final_output: 是否为定稿输出
         """
         if not ctx.sv_result or not ctx.audio_chunk:
-            return
+            return False
 
         semantic_sentences = await self._emit_semantic_sentences(ctx, is_final_output)
         if semantic_sentences is not None:
-            return
+            return True
 
         is_draft = not is_final_output
         sentences = self.segmenter.split_draft(
@@ -575,6 +590,7 @@ class AsyncDualPipeline:
             self.logger.debug(
                 f"Chunk {ctx.chunk_index}: 草稿已推送 ({len(sentences)} 个句子)"
             )
+        return False
 
     async def _emit_semantic_sentences(
         self,
@@ -630,6 +646,7 @@ class AsyncDualPipeline:
                     batch.batch_id,
                     len(batch.prompt or ""),
                 )
+                await self._enqueue_bridge_batch(batch)
 
     async def _flush_bridge_controller(self) -> None:
         """强制刷新 Bridge 控制器缓冲。"""
@@ -644,6 +661,13 @@ class AsyncDualPipeline:
                 batch.batch_id,
                 len(batch.prompt or ""),
             )
+            await self._enqueue_bridge_batch(batch)
+
+    async def _enqueue_bridge_batch(self, batch: BridgeBatch) -> None:
+        """将 Bridge 批次送入 SlowWorker 队列。"""
+        if not self._enable_bridge_batches:
+            return
+        await self.queue_inter.put(batch)
 
     def _build_semantic_input(self, ctx: ProcessingContext) -> Optional[SemanticBufferInput]:
         """构建 SemanticBuffer 输入。"""
@@ -653,17 +677,15 @@ class AsyncDualPipeline:
         punctuation_meta = metadata.get("punctuation")
         decision_meta = metadata.get("punctuation_decision")
 
-        if not isinstance(punctuation_meta, dict):
-            return None
-        if not punctuation_meta.get("split_points") and not punctuation_meta.get("punctuation_positions"):
-            return None
-
         text = sv_result.get("text_clean") or sv_result.get("text") or ""
         words = sv_result.get("words") if isinstance(sv_result, dict) else None
         raw_tokens = sv_result.get("raw_tokens") if isinstance(sv_result, dict) else None
-        punctuation_result = self._build_punctuation_result(punctuation_meta, text)
-        if punctuation_result and punctuation_result.text:
-            text = punctuation_result.text
+        punctuation_result = None
+        # V3.2.0+dev.20260201.10: 即使缺少标点元信息，也走语义缓冲与 Bridge 批次，旧逐Chunk仅作备份
+        if isinstance(punctuation_meta, dict):
+            punctuation_result = self._build_punctuation_result(punctuation_meta, text)
+            if punctuation_result and punctuation_result.text:
+                text = punctuation_result.text
 
         if not text:
             return None
@@ -801,6 +823,281 @@ class AsyncDualPipeline:
                 return f"Context: {context_text}. {base_prompt}"
             return f"Context: {context_text}."
         return base_prompt
+
+    @staticmethod
+    def _parse_source_chunk_indices(source_chunks: List[str]) -> List[int]:
+        """解析 source_chunks 中的 chunk 索引。"""
+        indices: List[int] = []
+        for chunk_id in source_chunks or []:
+            if not isinstance(chunk_id, str):
+                continue
+            parts = chunk_id.split("+")
+            for part in parts:
+                part = part.strip()
+                if not part.startswith("chunk-"):
+                    continue
+                try:
+                    indices.append(int(part.split("-")[-1]))
+                except ValueError:
+                    continue
+        return sorted(set(indices))
+
+    @staticmethod
+    def _distance_to_range(value: float, span: tuple[float, float]) -> float:
+        start, end = span
+        if start <= value <= end:
+            return 0.0
+        if value < start:
+            return start - value
+        return value - end
+
+    @staticmethod
+    def _estimate_segment_confidence(
+        segments: List[Dict[str, Any]],
+        fallback: float,
+    ) -> float:
+        if not segments:
+            return float(fallback or 0.0)
+        avg_logprob = sum(float(seg.get("avg_logprob", -1.0)) for seg in segments) / len(segments)
+        avg_no_speech = sum(float(seg.get("no_speech_prob", 0.0)) for seg in segments) / len(segments)
+        confidence = min(1.0, max(0.0, 1.0 + avg_logprob))
+        confidence *= (1.0 - avg_no_speech)
+        return float(confidence)
+
+    def _split_whisper_result_by_chunks(
+        self,
+        whisper_result: Dict[str, Any],
+        chunk_indices: List[int],
+        batch_start: float,
+    ) -> Dict[int, Dict[str, Any]]:
+        """按 Chunk 时间范围拆分 Whisper 结果。"""
+        if not whisper_result or not chunk_indices:
+            return {}
+
+        chunk_ranges: Dict[int, tuple[float, float]] = {}
+        for idx in chunk_indices:
+            chunk = self._audio_chunks_by_index.get(idx)
+            if chunk:
+                chunk_ranges[idx] = (float(chunk.start), float(chunk.end))
+
+        raw = whisper_result.get("raw_result", {}) if isinstance(whisper_result, dict) else {}
+        raw_segments = raw.get("segments", []) if isinstance(raw, dict) else []
+
+        if not raw_segments:
+            first = chunk_indices[0]
+            return {
+                first: {
+                    "text": str(whisper_result.get("text", "")),
+                    "confidence": float(whisper_result.get("confidence", 0.0) or 0.0),
+                    "language": str(whisper_result.get("language", "auto")),
+                    "raw_result": {"segments": []},
+                }
+            }
+
+        assignments: Dict[int, List[Dict[str, Any]]] = {idx: [] for idx in chunk_ranges}
+        ordered_indices = sorted(chunk_ranges.keys())
+
+        for seg in raw_segments:
+            seg_start = float(seg.get("start", 0.0) or 0.0) + batch_start
+            seg_end = float(seg.get("end", 0.0) or 0.0) + batch_start
+            seg_mid = (seg_start + seg_end) / 2.0
+
+            target_idx = None
+            for idx in ordered_indices:
+                start, end = chunk_ranges[idx]
+                if start <= seg_mid <= end:
+                    target_idx = idx
+                    break
+
+            if target_idx is None and ordered_indices:
+                target_idx = min(
+                    ordered_indices,
+                    key=lambda idx: self._distance_to_range(seg_mid, chunk_ranges[idx]),
+                )
+
+            if target_idx is not None:
+                assignments[target_idx].append(seg)
+
+        results: Dict[int, Dict[str, Any]] = {}
+        language = str(whisper_result.get("language", "auto"))
+        fallback_conf = float(whisper_result.get("confidence", 0.0) or 0.0)
+
+        for idx in ordered_indices:
+            segs = assignments.get(idx, [])
+            text = "".join(str(seg.get("text", "")) for seg in segs).strip()
+            confidence = self._estimate_segment_confidence(segs, fallback_conf)
+            results[idx] = {
+                "text": text,
+                "confidence": confidence,
+                "language": language,
+                "raw_result": {"segments": segs},
+            }
+        return results
+
+    async def _process_bridge_batch(
+        self,
+        batch: BridgeBatch,
+        *,
+        job_dir: Optional[Path],
+        total_chunks: int,
+        slow_processed_indices: Set[int],
+        token: Optional["CancellationToken"],
+    ) -> bool:
+        """处理 Bridge 批次并推送到对齐阶段。"""
+        if not self.slow_worker:
+            return False
+
+        chunk_indices = self._parse_source_chunk_indices(batch.source_chunks)
+        if not chunk_indices:
+            self.logger.warning("Bridge 批次缺少 source_chunks: batch_id=%s", batch.batch_id)
+            return False
+
+        contexts: List[tuple[int, ProcessingContext]] = []
+        for idx in chunk_indices:
+            ctx = self._context_cache.get(idx)
+            if ctx:
+                contexts.append((idx, ctx))
+
+        if not contexts:
+            self.logger.warning("Bridge 批次缺少上下文缓存: batch_id=%s", batch.batch_id)
+            return False
+
+        skip_map: Dict[int, bool] = {}
+        if self.is_patching_mode:
+            for idx, ctx in contexts:
+                if ctx.sv_result and ctx.audio_chunk:
+                    skip_map[idx] = self._should_skip_whisper(ctx.sv_result, ctx.audio_chunk)
+                else:
+                    skip_map[idx] = False
+
+        if self.is_patching_mode and all(skip_map.values()):
+            for _, ctx in contexts:
+                ctx.whisper_skipped = True
+                ctx.whisper_result = {}
+            return await self._push_batch_contexts(
+                contexts,
+                slow_processed_indices,
+                total_chunks=total_chunks,
+                job_dir=job_dir,
+                token=token,
+            )
+
+        if self._full_audio_array is None:
+            self.logger.warning("Bridge 批次缺少完整音频，跳过慢流: batch_id=%s", batch.batch_id)
+            for _, ctx in contexts:
+                ctx.whisper_skipped = True
+                ctx.whisper_result = {}
+            return await self._push_batch_contexts(
+                contexts,
+                slow_processed_indices,
+                total_chunks=total_chunks,
+                job_dir=job_dir,
+                token=token,
+            )
+
+        slow_result: SlowWorkerResult = await self.slow_worker.process_batch(
+            batch,
+            full_audio_array=self._full_audio_array,
+            full_audio_sr=self._full_audio_sr,
+        )
+        if self.bridge_controller:
+            self.bridge_controller.record_slow_result(batch.batch_id, slow_result)
+
+        whisper_result = slow_result.whisper_result or {}
+        prompt = batch.prompt or None
+        if whisper_result and self._is_hallucination(whisper_result, prompt):
+            self.logger.warning("Bridge 批次检测到 Whisper 幻觉，回退快流: batch_id=%s", batch.batch_id)
+            for _, ctx in contexts:
+                ctx.whisper_skipped = True
+                ctx.whisper_result = {}
+            return await self._push_batch_contexts(
+                contexts,
+                slow_processed_indices,
+                total_chunks=total_chunks,
+                job_dir=job_dir,
+                token=token,
+            )
+
+        if whisper_result.get("text"):
+            self._update_prompt_cache(str(whisper_result.get("text", "")))
+
+        batch_start = min((seg[0] for seg in batch.audio_segments), default=0.0)
+        chunk_results = self._split_whisper_result_by_chunks(
+            whisper_result,
+            [idx for idx, _ in contexts],
+            batch_start=batch_start,
+        )
+
+        for idx, ctx in contexts:
+            if skip_map.get(idx):
+                ctx.whisper_skipped = True
+                ctx.whisper_result = {}
+                continue
+            ctx.whisper_skipped = False
+            ctx.whisper_result = chunk_results.get(
+                idx,
+                {
+                    "text": "",
+                    "confidence": float(whisper_result.get("confidence", 0.0) or 0.0),
+                    "language": str(whisper_result.get("language", "auto")),
+                    "raw_result": {"segments": []},
+                },
+            )
+
+        return await self._push_batch_contexts(
+            contexts,
+            slow_processed_indices,
+            total_chunks=total_chunks,
+            job_dir=job_dir,
+            token=token,
+        )
+
+    async def _push_batch_contexts(
+        self,
+        contexts: List[tuple[int, ProcessingContext]],
+        slow_processed_indices: Set[int],
+        *,
+        total_chunks: int,
+        job_dir: Optional[Path],
+        token: Optional["CancellationToken"],
+    ) -> bool:
+        """批量推送上下文并更新进度/检查点。"""
+        pause_requested = False
+        for idx, ctx in sorted(contexts, key=lambda item: item[0]):
+            await self.queue_final.put(ctx)
+            self._context_cache.pop(idx, None)
+            slow_processed_indices.add(idx)
+            self._last_slow_chunk_index = idx
+
+            if self.progress_emitter and total_chunks > 0:
+                total_processed = len(slow_processed_indices)
+                self.progress_emitter.update_slow(
+                    total_processed,
+                    total_chunks,
+                    message=f"Whisper: {total_processed}/{total_chunks}",
+                )
+
+            if token and job_dir:
+                previous_whisper_text = self.previous_whisper_text or ""
+                self._slow_processed_indices = slow_processed_indices
+                checkpoint_data = {
+                    "transcription": {
+                        "slow_processed_count": len(slow_processed_indices),
+                        "slow_processed_indices": list(slow_processed_indices),
+                        "previous_whisper_text": previous_whisper_text,
+                        "last_slow_chunk_index": idx,
+                    }
+                }
+                try:
+                    token.check_and_save(checkpoint_data, job_dir)
+                except PausedException as e:
+                    if not pause_requested:
+                        self.logger.info("[V3.1.0] SlowWorker 捕获暂停信号，继续排空队列")
+                    pause_requested = True
+                    if not self.pause_exception:
+                        self.pause_exception = e
+
+        return pause_requested
 
     def _extract_audio_with_overlap(self, ctx: ProcessingContext) -> Any:
         """
@@ -951,10 +1248,13 @@ class AsyncDualPipeline:
                 try:
                     # FastWorker 处理（仅推理）
                     await self.fast_worker.process(ctx)
-                    await self._emit_draft_sentences(ctx, is_final_output=False)
+                    # V3.2.0+dev.20260201.07: 缓存上下文，供 Bridge 批次使用
+                    self._context_cache[ctx.chunk_index] = ctx
+                    used_semantic = await self._emit_draft_sentences(ctx, is_final_output=False)
 
                     # 放入队列（如果队列满了，会自动阻塞，实现背压）
-                    await self.queue_inter.put(ctx)
+                    if not self._enable_bridge_batches or not used_semantic:
+                        await self.queue_inter.put(ctx)
                     fast_processed_count += 1  # V3.1.0
                     last_chunk_index = i
 
@@ -1081,8 +1381,21 @@ class AsyncDualPipeline:
 
         try:
             while True:
-                # 从队列取 context
-                ctx = await self.queue_inter.get()
+                # 从队列取输入（ProcessingContext / BridgeBatch）
+                payload = await self.queue_inter.get()
+
+                if isinstance(payload, BridgeBatch):
+                    if await self._process_bridge_batch(
+                        payload,
+                        job_dir=job_dir,
+                        total_chunks=total_chunks,
+                        slow_processed_indices=slow_processed_indices,
+                        token=token,
+                    ):
+                        pause_requested = True
+                    continue
+
+                ctx = payload
 
                 # 检查结束信号或错误
                 if ctx.is_end or ctx.error:
@@ -1142,6 +1455,7 @@ class AsyncDualPipeline:
 
                     # 放入队列
                     await self.queue_final.put(ctx)
+                    self._context_cache.pop(chunk_index, None)
                     slow_processed_count += 1
                     slow_processed_indices.add(chunk_index)  # V3.1.0: 累加到集合（类似 FastWorker）
                     self._last_slow_chunk_index = chunk_index
