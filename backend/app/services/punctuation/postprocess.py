@@ -32,6 +32,11 @@ class PunctuationPostprocessConfig:
     max_repeat_punct: int
     allowed_punct_zh: str
     allowed_punct_en: str
+    is_comma_guard_enabled: bool
+    comma_guard_min_conf: float
+    comma_guard_min_chars: int
+    comma_guard_min_words: int
+    comma_guard_pause_min_sec: float
 
 
 @dataclass
@@ -83,6 +88,7 @@ _PUNCTUATION_SET = set(",.!?;:\"()[]{}，。！？；：、（）【】《》“
 _LEFT_PUNCT = set("([{“‘（【《「『")
 _SENTENCE_END = set("。！？.!?")
 _QUESTION_PUNCT = {"?", "？"}
+_COMMA_PUNCT = {"，", "、"}
 # V3.2.0+dev.20260131.05: 小数点保护（避免 1.4 被当作句号）
 _DECIMAL_DOT_CHARS = {".", "。", "．"}
 
@@ -123,6 +129,11 @@ _DEFAULT_POSTPROCESS = {
         "max_repeat_punct": 1,
         "allowed_punct_zh": "。？！；：，、",
         "allowed_punct_en": ".!?,;:",
+        "comma_guard_enabled": False,
+        "comma_guard_min_conf": 0.85,
+        "comma_guard_min_chars": 6,
+        "comma_guard_min_words": 4,
+        "comma_guard_pause_min_sec": 0.25,
     },
 }
 
@@ -151,6 +162,11 @@ def get_postprocess_config(mode: Mode, config: Optional[Dict[str, Any]] = None) 
         max_repeat_punct=int(shared["max_repeat_punct"]),
         allowed_punct_zh=str(shared["allowed_punct_zh"]),
         allowed_punct_en=str(shared["allowed_punct_en"]),
+        is_comma_guard_enabled=bool(shared.get("comma_guard_enabled", False)),
+        comma_guard_min_conf=float(shared.get("comma_guard_min_conf", 0.85)),
+        comma_guard_min_chars=int(shared.get("comma_guard_min_chars", 6)),
+        comma_guard_min_words=int(shared.get("comma_guard_min_words", 4)),
+        comma_guard_pause_min_sec=float(shared.get("comma_guard_pause_min_sec", 0.25)),
     )
 
 
@@ -561,6 +577,8 @@ def _candidate_is_valid(
 ) -> bool:
     if cand.confidence < _add_threshold(cand.punctuation, config):
         return False
+    if not _comma_guard_ok(cand, words, language, config):
+        return False
     if cand.punctuation in _QUESTION_PUNCT:
         if not _pass_question_gate(
             words=words,
@@ -576,6 +594,34 @@ def _candidate_is_valid(
         if not _pause_ok(words, cand.word_index, config.pause_end_min_sec):
             return False
     return True
+
+
+def _comma_guard_ok(
+    cand: _MappedCandidate,
+    words: Sequence[WordTimestampLike],
+    language: str,
+    config: PunctuationPostprocessConfig,
+) -> bool:
+    if not config.is_comma_guard_enabled:
+        return True
+    if language not in {"zh", "yue"}:
+        return True
+    if cand.punctuation not in _COMMA_PUNCT:
+        return True
+    if cand.confidence < config.comma_guard_min_conf:
+        return False
+    word_count, char_count = _count_segment_since_pause(
+        words,
+        cand.word_index,
+        config.comma_guard_pause_min_sec,
+    )
+    words_ok = config.comma_guard_min_words <= 0 or word_count >= config.comma_guard_min_words
+    chars_ok = config.comma_guard_min_chars <= 0 or char_count >= config.comma_guard_min_chars
+    pause_after = _get_pause_after(words, cand.word_index)
+    pause_ok = False
+    if config.comma_guard_pause_min_sec > 0:
+        pause_ok = pause_after is not None and pause_after >= config.comma_guard_pause_min_sec
+    return words_ok or chars_ok or pause_ok
 
 
 def _pass_question_gate(
@@ -630,6 +676,50 @@ def _pause_ok(words: Sequence[WordTimestampLike], word_index: int, threshold: fl
     if end_time is None or next_start is None:
         return True
     return (next_start - end_time) >= threshold
+
+
+def _get_pause_after(words: Sequence[WordTimestampLike], word_index: int) -> Optional[float]:
+    if word_index < 0 or word_index >= len(words) - 1:
+        return None
+    end_time = _get_word_end(words[word_index])
+    next_start = _get_word_start(words[word_index + 1])
+    if end_time is None or next_start is None:
+        return None
+    return max(0.0, next_start - end_time)
+
+
+def _count_segment_since_pause(
+    words: Sequence[WordTimestampLike],
+    word_index: int,
+    pause_threshold: float,
+) -> Tuple[int, int]:
+    if word_index < 0 or word_index >= len(words):
+        return 0, 0
+    if pause_threshold <= 0:
+        start_index = 0
+    else:
+        start_index = word_index
+        while start_index > 0:
+            prev_end = _get_word_end(words[start_index - 1])
+            curr_start = _get_word_start(words[start_index])
+            if prev_end is None or curr_start is None:
+                break
+            if (curr_start - prev_end) >= pause_threshold:
+                break
+            start_index -= 1
+    word_count = 0
+    char_count = 0
+    for idx in range(start_index, word_index + 1):
+        token = _get_word_text(words[idx])
+        if not token:
+            continue
+        word_count += 1
+        char_count += _count_effective_chars(token)
+    return word_count, char_count
+
+
+def _count_effective_chars(token: str) -> int:
+    return sum(1 for ch in token if not ch.isspace())
 
 
 def _find_candidate_in_window(
