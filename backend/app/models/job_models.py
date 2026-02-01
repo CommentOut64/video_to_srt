@@ -153,6 +153,16 @@ class ComputeConfig:
     temp_file_policy: str = "delete_on_complete"
 
 
+# ========== 调试配置 ==========
+
+@dataclass
+class DebugConfig:
+    """
+    调试配置（按需启用）。
+    """
+    punctuation_output: bool = False  # 标点调试输出（SSE + 文件）
+
+
 # ========== 任务设置 ==========
 
 @dataclass
@@ -171,6 +181,7 @@ class JobSettings:
     transcription: TranscriptionConfig = field(default_factory=TranscriptionConfig)
     refinement: RefinementConfig = field(default_factory=RefinementConfig)
     compute: ComputeConfig = field(default_factory=ComputeConfig)
+    debug: DebugConfig = field(default_factory=DebugConfig)
 
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
@@ -221,6 +232,9 @@ class JobSettings:
                 "output_formats": self.compute.output_formats,
                 "temp_file_policy": self.compute.temp_file_policy,
             },
+            "debug": {
+                "punctuation_output": self.debug.punctuation_output,
+            },
         }
 
     @classmethod
@@ -254,6 +268,7 @@ class JobSettings:
         transcription_data = data.get("transcription", {})
         refinement_data = data.get("refinement", {})
         compute_data = data.get("compute", {})
+        debug_data = data.get("debug", {})
 
         raw_whitelist = preprocessing_data.get("langid_whitelist", ["zh", "ja", "en"])
         if isinstance(raw_whitelist, str):
@@ -309,6 +324,9 @@ class JobSettings:
                 gpu_id=compute_data.get("gpu_id", 0),
                 output_formats=compute_data.get("output_formats", ["srt"]),
                 temp_file_policy=compute_data.get("temp_file_policy", "delete_on_complete"),
+            ),
+            debug=DebugConfig(
+                punctuation_output=bool(debug_data.get("punctuation_output", False)),
             ),
         )
 

@@ -4,6 +4,7 @@
 用于三级流水线架构中的数据传递
 """
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional, List, Any
 import numpy as np
 
@@ -33,6 +34,8 @@ class ProcessingContext:
     job_id: str
     chunk_index: int
     audio_chunk: Any  # AudioChunk 对象
+    job_dir: Optional[Path] = None
+    debug_punctuation: bool = False
 
     # 音频上下文（用于 Audio Overlap）
     full_audio_array: Optional[np.ndarray] = None  # 完整音频数组（16kHz，单声道）
