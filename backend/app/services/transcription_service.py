@@ -221,6 +221,13 @@ class TranscriptionService:
                 whisper_patch_trigger_confidence=patching_threshold_value
             )
 
+            from app.services.punctuation.debug_utils import is_debug_punctuation_enabled
+            debug_config = getattr(job.settings, "debug", None)
+            debug_punctuation = is_debug_punctuation_enabled(
+                env_value=os.getenv("DEBUG_PUNCTUATION"),
+                config_value=bool(getattr(debug_config, "punctuation_output", False)),
+            )
+
             # 动态创建转录流水线
             transcription_pipeline = AsyncDualPipeline(
                 job_id=job.job_id,
@@ -228,12 +235,14 @@ class TranscriptionService:
                 draft_engine=draft_engine,
                 patch_engine=patch_engine,
                 patching_threshold=patching_threshold,
+                debug_punctuation=debug_punctuation,
                 logger=self.logger
             )
 
             # 调用转录流水线
             results = await transcription_pipeline.run(
-                audio_chunks=chunks
+                audio_chunks=chunks,
+                job_dir=job_dir,
             )
 
             # 从 ProcessingContext 中提取句子
