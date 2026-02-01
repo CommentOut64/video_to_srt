@@ -240,6 +240,9 @@ class JobSettings:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "JobSettings":
         """从字典创建设置"""
+        if not isinstance(data, dict):
+            raise ValueError("task_config 必须是对象结构。")
+
         raw_data = data
         # 允许直接传入 task_config
         if "task_config" in data and isinstance(data["task_config"], dict):
@@ -264,11 +267,11 @@ class JobSettings:
             raise ValueError("检测到旧版任务配置字段，已停止兼容，请使用 task_config 发送新版配置。")
 
         # 解析新版配置
-        preprocessing_data = data.get("preprocessing", {})
-        transcription_data = data.get("transcription", {})
-        refinement_data = data.get("refinement", {})
-        compute_data = data.get("compute", {})
-        debug_data = data.get("debug", {})
+        preprocessing_data = data.get("preprocessing") or {}
+        transcription_data = data.get("transcription") or {}
+        refinement_data = data.get("refinement") or {}
+        compute_data = data.get("compute") or {}
+        debug_data = data.get("debug") or {}
 
         raw_whitelist = preprocessing_data.get("langid_whitelist", ["zh", "ja", "en"])
         if isinstance(raw_whitelist, str):
