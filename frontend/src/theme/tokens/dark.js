@@ -22,8 +22,11 @@ export const darkTheme = {
       primary: '#e6edf3',
       normal: '#c9d1d9',
       secondary: '#8b949e',
+      secondaryRgb: '139, 148, 158',
       muted: '#6e7681',
+      mutedRgb: '110, 118, 129',
       disabled: '#484f58',
+      onDark: '#ffffff',
     },
 
     // 强调色
@@ -55,6 +58,13 @@ export const darkTheme = {
 
   // 功能性颜色
   functional: {
+    // 草稿状态颜色
+    draft: {
+      bg: '#6b7280',
+      bgRgb: '107, 114, 128',
+      text: '#9ca3af',
+    },
+
     // 阶段标记颜色
     stage: {
       sensevoice: '#58a6ff',
@@ -70,6 +80,14 @@ export const darkTheme = {
       warningRgb: '230, 119, 0',
       error: '#f85149',
       errorRgb: '248, 81, 73',
+    },
+
+    // 字级置信度高亮颜色
+    confidence: {
+      warning: '#ffc107',
+      warningRgb: '255, 193, 7',
+      critical: '#f44336',
+      criticalRgb: '244, 67, 54',
     },
 
     // 波形图专用颜色
