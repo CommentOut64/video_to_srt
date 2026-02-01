@@ -79,6 +79,8 @@ class SenseVoiceEngine(ASREngine):
                 "event_tag": event_tag,
                 "text_with_tags": result.get("text"),
                 "raw_tokens": raw_tokens,
+                # V3.2.2+dev.20260201.01: SenseVoice 语言标签置信度
+                "sv_language_info": result.get("sv_language_info"),
             },
         )
 

@@ -558,6 +558,8 @@ class PreprocessingPipeline:
                         lang_map[chunk_index] = {
                             "language": prediction.language,
                             "confidence": prediction.confidence,
+                            # V3.2.2+dev.20260201.01: 添加 Top-2 语言置信度
+                            "top2_confidence": prediction.top2_confidence,
                             "raw_label": prediction.raw_label,
                             "raw_language": prediction.raw_language,
                             "raw_confidence": prediction.raw_confidence,
@@ -589,11 +591,23 @@ class PreprocessingPipeline:
                     cached = lang_map.get(chunk.index)
                     if not cached:
                         chunk.language = "auto"
-                        chunk.language_confidence = 0.0
+                        chunk.language_confidence = {}
                         continue
+
+                    # V3.2.2+dev.20260201.01: 使用 Top-2 置信度字典
+                    top2_conf = cached.get("top2_confidence")
+                    if top2_conf and isinstance(top2_conf, dict):
+                        chunk.language_confidence = top2_conf
+                    else:
+                        # 回退：使用单一置信度
+                        lang = cached.get("language", "auto")
+                        conf = float(cached.get("confidence", 0.0))
+                        chunk.language_confidence = {lang: conf} if lang != "auto" and conf > 0 else {}
+
                     chunk.language = cached.get("language", "auto")
-                    chunk.language_confidence = float(cached.get("confidence", 0.0))
-                    if chunk.language_confidence < self.config.langid_confidence_threshold:
+                    # 获取 Top-1 置信度用于阈值判断
+                    top1_confidence = max(chunk.language_confidence.values()) if chunk.language_confidence else 0.0
+                    if top1_confidence < self.config.langid_confidence_threshold:
                         chunk.language = "auto"
 
                 languages = [chunk.language for chunk in chunks if chunk.language]
@@ -647,7 +661,7 @@ class PreprocessingPipeline:
                 )
                 for chunk in chunks:
                     chunk.language = "auto"
-                    chunk.language_confidence = 0.0
+                    chunk.language_confidence = {}
 
         # Stage 5: Speaker 声纹提取（可选，失败不阻断）
         if chunks and self.config.enable_speaker_embedding:
