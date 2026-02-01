@@ -16,6 +16,7 @@ V3.2.0+dev.20260125.07: 支持运行时依赖注入（方案 B）
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import List, Optional, TYPE_CHECKING
 
@@ -163,12 +164,19 @@ class PipelineOrchestrator:
                     self.logger.warning("字幕恢复失败，将从头生成字幕")
 
             # 创建转录流水线
+            from app.services.punctuation.debug_utils import is_debug_punctuation_enabled
+            debug_config = getattr(job.settings, "debug", None)
+            debug_punctuation = is_debug_punctuation_enabled(
+                env_value=os.getenv("DEBUG_PUNCTUATION"),
+                config_value=bool(getattr(debug_config, "punctuation_output", False)),
+            )
             transcription_pipeline = AsyncDualPipeline(
                 job_id=job.job_id,
                 transcription_profile=profile_config.transcription_profile,
                 draft_engine=profile_config.draft_engine,
                 patch_engine=profile_config.patch_engine,
                 patching_threshold=profile_config.patching_threshold,
+                debug_punctuation=debug_punctuation,
                 logger=self.logger,
                 cancellation_token=cancellation_token,
                 progress_emitter=progress_emitter,

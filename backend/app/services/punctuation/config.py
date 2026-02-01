@@ -68,6 +68,11 @@ def _default_config() -> Dict[str, Any]:
                 "max_repeat_punct": 1,
                 "allowed_punct_zh": "。？！；：，、",
                 "allowed_punct_en": ".!?,;:",
+                "comma_guard_enabled": False,
+                "comma_guard_min_conf": 0.85,
+                "comma_guard_min_chars": 6,
+                "comma_guard_min_words": 4,
+                "comma_guard_pause_min_sec": 0.25,
             },
         },
     }

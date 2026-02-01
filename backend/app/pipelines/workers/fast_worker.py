@@ -14,6 +14,7 @@ from app.core.asr.models import ASRResult
 from app.schemas.pipeline_context import ProcessingContext
 from app.services.audio.chunk_engine import AudioChunk
 from app.services.punctuation.base import PunctuationResult, build_split_points
+from app.services.punctuation.debug_utils import append_debug_punctuation_line
 from app.services.punctuation.postprocess import (
     PunctuationPostprocessResult,
     build_clean_text,
@@ -21,6 +22,7 @@ from app.services.punctuation.postprocess import (
     postprocess_punctuation,
 )
 from app.services.punctuation.scheduler import get_punctuation_scheduler
+from app.services.sse_service import get_sse_manager
 
 if TYPE_CHECKING:
     from app.services.punctuation.service import PunctuationService
@@ -80,7 +82,7 @@ class FastWorker:
 
         # V3.2.0+dev.20260130.01: FastWorker 标点集成 + 统一后处理（可选）
         if self.punctuation_service:
-            sv_result = await self._apply_punctuation(sv_result, chunk)
+            sv_result = await self._apply_punctuation(sv_result, chunk, ctx)
 
         # V3.8 修复竞态条件：深拷贝 sv_result，避免下游修改影响其他协程
         ctx.sv_result = copy.deepcopy(sv_result)
@@ -147,6 +149,7 @@ class FastWorker:
         self,
         sv_result: Dict[str, Any],
         chunk: AudioChunk,
+        ctx: Optional[ProcessingContext] = None,
     ) -> Dict[str, Any]:
         """调用标点服务并写入结果元信息。"""
         if not sv_result:
@@ -198,7 +201,53 @@ class FastWorker:
                 "reason": decision.reason,
                 "mode": self._punctuation_scheduler.policy.mode.value,
             }
+            self._emit_debug_outputs(ctx, raw_text, metadata, sv_result.get("confidence"))
         return sv_result
+
+    def _emit_debug_outputs(
+        self,
+        ctx: Optional[ProcessingContext],
+        raw_text: str,
+        metadata: Dict[str, Any],
+        sv_confidence: Optional[float],
+    ) -> None:
+        """输出标点调试信息（SSE + 文件）。"""
+        if not ctx or not getattr(ctx, "debug_punctuation", False):
+            return
+
+        punctuation = metadata.get("punctuation", {}) if isinstance(metadata, dict) else {}
+        if not punctuation:
+            return
+
+        payload = {
+            "chunk_id": f"chunk-{ctx.chunk_index}",
+            "original_text": raw_text,
+            "punctuated_text": punctuation.get("text", ""),
+            "split_points": punctuation.get("split_points", []),
+            "model_id": punctuation.get("model_id", ""),
+            "processing_time_ms": punctuation.get("processing_time_ms", 0.0),
+            "confidence": punctuation.get("confidence", 0.0),
+        }
+
+        sse_manager = get_sse_manager()
+        sse_manager.broadcast_sync(f"job:{self.job_id}", "debug.punctuation", payload)
+        append_debug_punctuation_line(ctx.job_dir, payload, logger=self.logger)
+
+        decision = metadata.get("punctuation_decision", {})
+        if isinstance(decision, dict):
+            scheduler_payload = {
+                "chunk_id": payload["chunk_id"],
+                "is_slow_requested": bool(decision.get("is_slow_requested", False)),
+                "reason": str(decision.get("reason", "")),
+                "mode": str(decision.get("mode", "")),
+                "punct_confidence": punctuation.get("confidence", 0.0),
+                "sv_confidence": sv_confidence,
+            }
+            sse_manager.broadcast_sync(
+                f"job:{self.job_id}",
+                "debug.punctuation_scheduler",
+                scheduler_payload,
+            )
 
     def _merge_punctuation_timestamps(self, words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """合并标点 token 的时间戳并移除标点 token。"""
