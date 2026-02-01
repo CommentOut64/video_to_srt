@@ -98,7 +98,7 @@ function toggleCollapse() {
 .group-header .group-title {
   color: var(--af-text-primary);
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 500;
 }
 
 .group-header .group-count {

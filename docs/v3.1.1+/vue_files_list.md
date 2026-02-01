@@ -15,8 +15,8 @@
 - [x] frontend\src\components\editor\SubtitleList\index.vue
 - [x] frontend\src\components\editor\SubtitleList\SubtitleItem.vue
 - [ ] frontend\src\components\editor\TaskMonitor\index.vue
-- [ ] frontend\src\components\editor\TaskMonitor\TaskCard.vue
-- [ ] frontend\src\components\editor\TaskMonitor\TaskGroup.vue
+- [x] frontend\src\components\editor\TaskMonitor\TaskCard.vue
+- [x] frontend\src\components\editor\TaskMonitor\TaskGroup.vue
 - [ ] frontend\src\components\editor\VideoStage\index.vue
 - [ ] frontend\src\components\editor\WaveformTimeline\index.vue
 - [ ] frontend\src\views\EditorView.vue
