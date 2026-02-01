@@ -351,7 +351,7 @@ import { useUnifiedTaskStore } from "@/stores/unifiedTaskStore";
 import { transcriptionApi, systemApi } from "@/services/api";
 import fileApi from "@/services/api/fileApi"; // 导入文件 API
 // V3.1.0: 移除 sseChannelManager 导入，SSE 订阅由 App.vue 统一管理
-import PresetSelector from "@/components/editor/PresetSelector.vue"; // v3.5 预设选择器
+import PresetSelector from "@/components/task/PresetSelector.vue"; // v3.5 预设选择器
 import AboutDialog from "@/components/AboutDialog.vue"; // 关于对话框
 
 const router = useRouter();
