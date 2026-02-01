@@ -52,99 +52,96 @@ function toggleCollapse() {
 }
 </script>
 
-<style lang="scss" scoped>
+<style scoped>
 .task-group {
-  background: var(--bg-tertiary);
-  border: 1px solid var(--border-default);
+  width: 100%;
+  background: var(--af-bg-tertiary);
+  border: 1px solid var(--af-border-default);
   border-radius: 8px;
   margin-bottom: 12px;
   overflow: hidden;
-  width: 100%;  // 强制宽度为 100%，防止动画导致宽度变化
-  box-sizing: border-box;  // 确保 border 和 padding 不影响总宽度
+  box-sizing: border-box;
 }
 
 .group-header {
   display: flex;
-  align-items: center;
   justify-content: space-between;
+  align-items: center;
+  width: 100%;
   padding: 8px 12px;
+  transition: background 0.2s;
   cursor: pointer;
   user-select: none;
-  transition: background 0.2s;
-  width: 100%;  // 强制宽度
   box-sizing: border-box;
-
-  &:hover {
-    background: var(--bg-elevated);
-  }
-
-  .header-left {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    min-width: 0;  // 允许内容压缩
-    flex: 1;  // 占据剩余空间
-  }
-
-  .status-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--text-muted);
-    flex-shrink: 0;  // 不压缩
-  }
-
-  .group-title {
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--text-primary);
-  }
-
-  .group-count {
-    font-size: 11px;
-    color: var(--text-muted);
-  }
-
-  .header-right {
-    flex-shrink: 0;  // 右侧图标不压缩
-  }
-
-  .collapse-icon {
-    width: 16px;
-    height: 16px;
-    color: var(--text-muted);
-    transition: transform 0.3s ease;
-
-    &.collapsed {
-      transform: rotate(-90deg);
-    }
-  }
 }
 
-// CSS Grid 折叠动画
+.group-header:hover {
+  background: var(--af-bg-elevated);
+}
+
+.group-header .header-left {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.group-header .status-dot {
+  width: 6px;
+  height: 6px;
+  background: var(--af-text-muted);
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.group-header .group-title {
+  color: var(--af-text-primary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.group-header .group-count {
+  color: var(--af-text-muted);
+  font-size: 11px;
+}
+
+.group-header .header-right {
+  flex-shrink: 0;
+}
+
+.group-header .collapse-icon {
+  width: 16px;
+  height: 16px;
+  color: var(--af-text-muted);
+  transition: transform 0.3s ease;
+}
+
+.group-header .collapse-icon.collapsed {
+  transform: rotate(-90deg);
+}
+
+/* CSS Grid 折叠动画 */
 .group-content-wrapper {
   display: grid;
-  grid-template-rows: 1fr;
+  width: 100%;
   transition: grid-template-rows 300ms ease-out;
-  width: 100%;  // 强制宽度
+  grid-template-rows: 1fr;
   box-sizing: border-box;
-  // 防止折叠时内容溢出导致宽度变化
   min-width: 0;
-  overflow: hidden;  // 确保内容不会溢出
+  overflow: hidden;
+}
 
-  &.collapsed {
-    grid-template-rows: 0fr;
-  }
+.group-content-wrapper.collapsed {
+  grid-template-rows: 0fr;
 }
 
 .group-content {
-  overflow: hidden;  // 隐藏溢出内容
-  // 折叠时移除 padding，防止露出内容
-  transition: padding 300ms ease-out;
+  width: 100%;
   padding: 0 12px 12px;
-  width: 100%;  // 强制宽度
+  transition: padding 300ms ease-out;
+  overflow: hidden;
   box-sizing: border-box;
-  // 防止内容溢出导致宽度变化
   min-width: 0;
 }
 
@@ -152,9 +149,20 @@ function toggleCollapse() {
   padding: 0;
 }
 
-// 变体样式
-.variant-primary .status-dot { background: var(--primary); }
-.variant-success .status-dot { background: var(--success); }
-.variant-warning .status-dot { background: var(--warning); }
-.variant-danger .status-dot { background: var(--danger); }
+/* 变体样式 */
+.variant-primary .status-dot {
+  background: var(--af-accent-primary);
+}
+
+.variant-success .status-dot {
+  background: var(--af-accent-success);
+}
+
+.variant-warning .status-dot {
+  background: var(--af-accent-warning);
+}
+
+.variant-danger .status-dot {
+  background: var(--af-accent-danger);
+}
 </style>
