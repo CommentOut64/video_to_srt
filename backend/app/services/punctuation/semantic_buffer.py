@@ -192,6 +192,7 @@ class SemanticChunk:
     audio_range: Tuple[float, float]
     language: str
     source_chunks: List[str]
+    speaker_id: Optional[str] = None  # V3.2.0+dev.20260201.04: 透传说话人标识
     word_timestamps: List[Dict[str, Any]] = field(default_factory=list)
 
 
@@ -221,6 +222,7 @@ class SemanticBuffer:
         self._pending_audio_start = 0.0
         self._pending_audio_end = 0.0
         self._pending_language = "auto"
+        self._pending_speaker_id: Optional[str] = None  # V3.2.0+dev.20260201.04: 记录说话人
         self._pending_source_chunks: List[str] = []
         self._pending_decision: Optional[PunctuationDecision] = None
         self._pending_punctuation_result: Optional[PunctuationResult] = None
@@ -245,6 +247,7 @@ class SemanticBuffer:
         combined_start = self._pending_audio_start if self._pending_text else float(item.audio_range[0])
         combined_end = float(item.audio_range[1])
         combined_language = item.language or self._pending_language or "auto"
+        combined_speaker_id = item.speaker_id or self._pending_speaker_id
         combined_sources = self._pending_source_chunks + (item.source_chunks or [item.chunk_id])
         selected_words = self._select_words(item.word_timestamps, item.raw_tokens, item.language)
         current_words = self._normalize_words(selected_words, item.audio_range)
@@ -257,6 +260,7 @@ class SemanticBuffer:
                 combined_text=combined_text,
                 audio_range=(combined_start, combined_end),
                 language=combined_language,
+                speaker_id=combined_speaker_id,
                 source_chunks=combined_sources,
                 decision=decision,
                 punct_result=punct_result,
@@ -276,6 +280,7 @@ class SemanticBuffer:
             text=self._pending_text,
             audio_range=(self._pending_audio_start, self._pending_audio_end),
             language=self._pending_language,
+            speaker_id=self._pending_speaker_id,
             source_chunks=self._pending_source_chunks,
             decision=self._pending_decision,
             split_end_indices=[len(self._pending_text) - 1],
@@ -357,6 +362,7 @@ class SemanticBuffer:
         combined_text: str,
         audio_range: Tuple[float, float],
         language: str,
+        speaker_id: Optional[str],
         source_chunks: List[str],
         decision: Optional[PunctuationDecision],
         punct_result: Optional[PunctuationResult],
@@ -398,6 +404,7 @@ class SemanticBuffer:
                     text=chunk_text,
                     audio_range=chunk_range,
                     language=language,
+                    speaker_id=speaker_id,
                     source_chunks=source_chunks,
                     decision=decision,
                     split_end_indices=split_end_indices,
@@ -411,6 +418,7 @@ class SemanticBuffer:
                     text=combined_text[last_end + 1 :],
                     audio_range=pending_range,
                     language=language,
+                    speaker_id=speaker_id,
                     source_chunks=source_chunks,
                     decision=decision,
                     punctuation_result=punct_result,
@@ -421,6 +429,7 @@ class SemanticBuffer:
                     text=combined_text,
                     audio_range=audio_range,
                     language=language,
+                    speaker_id=speaker_id,
                     source_chunks=source_chunks,
                     decision=decision,
                     punctuation_result=punct_result,
@@ -431,6 +440,7 @@ class SemanticBuffer:
                 text=combined_text,
                 audio_range=audio_range,
                 language=language,
+                speaker_id=speaker_id,
                 source_chunks=source_chunks,
                 decision=decision,
                 punctuation_result=punct_result,
@@ -763,6 +773,7 @@ class SemanticBuffer:
             text=chunk_text,
             audio_range=chunk_range,
             language=self._pending_language,
+            speaker_id=self._pending_speaker_id,
             source_chunks=self._pending_source_chunks,
             decision=self._pending_decision,
             split_end_indices=[weak_index],
@@ -781,6 +792,7 @@ class SemanticBuffer:
             text=self._pending_text[weak_index + 1 :],
             audio_range=pending_range,
             language=self._pending_language,
+            speaker_id=self._pending_speaker_id,
             source_chunks=self._pending_source_chunks,
             decision=self._pending_decision,
             punctuation_result=self._pending_punctuation_result,
@@ -794,6 +806,7 @@ class SemanticBuffer:
         text: str,
         audio_range: Tuple[float, float],
         language: str,
+        speaker_id: Optional[str],
         source_chunks: List[str],
         decision: Optional[PunctuationDecision],
         split_end_indices: List[int],
@@ -825,6 +838,7 @@ class SemanticBuffer:
             pending_tail=pending_tail,
             audio_range=audio_range,
             language=language,
+            speaker_id=speaker_id,
             source_chunks=source_chunks,
             word_timestamps=word_timestamps or [],
         )
@@ -1036,6 +1050,7 @@ class SemanticBuffer:
         text: str,
         audio_range: Tuple[float, float],
         language: str,
+        speaker_id: Optional[str],
         source_chunks: List[str],
         decision: Optional[PunctuationDecision],
         punctuation_result: Optional[PunctuationResult],
@@ -1045,6 +1060,7 @@ class SemanticBuffer:
         self._pending_audio_start = float(audio_range[0])
         self._pending_audio_end = float(audio_range[1])
         self._pending_language = language or self._pending_language
+        self._pending_speaker_id = speaker_id or self._pending_speaker_id
         self._pending_source_chunks = list(source_chunks)
         self._pending_decision = decision
         self._pending_punctuation_result = punctuation_result
@@ -1055,6 +1071,7 @@ class SemanticBuffer:
         self._pending_audio_start = 0.0
         self._pending_audio_end = 0.0
         self._pending_language = "auto"
+        self._pending_speaker_id = None
         self._pending_source_chunks = []
         self._pending_decision = None
         self._pending_punctuation_result = None
