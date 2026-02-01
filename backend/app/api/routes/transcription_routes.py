@@ -104,6 +104,13 @@ class ComputeSettingsAPI(BaseModel):
     temp_file_policy: str = Field(default="delete_on_complete", description="临时文件策略")
 
 
+class DebugSettingsAPI(BaseModel):
+    """
+    调试配置 API 模型
+    """
+    punctuation_output: bool = Field(default=False, description="标点调试输出（SSE + 文件）")
+
+
 class TaskConfigAPI(BaseModel):
     """
     v3.5 完整任务配置 API 模型
@@ -116,6 +123,7 @@ class TaskConfigAPI(BaseModel):
     transcription: Optional[TranscriptionSettingsAPI] = None
     refinement: Optional[RefinementSettingsAPI] = None
     compute: Optional[ComputeSettingsAPI] = None
+    debug: Optional[DebugSettingsAPI] = None
 
 
 class TranscribeSettings(BaseModel):

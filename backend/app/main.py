@@ -36,6 +36,7 @@ from app.api.routes.demucs_routes import create_demucs_router  # 新增：Demucs
 from app.api.routes.file_routes import create_file_router  # 新增：文件管理路由
 from app.api.routes import system_routes  # 新增：系统管理路由
 from app.api.routes import config_routes  # 新增：用户配置路由
+from app.api.routes import debug_routes  # 新增：调试路由
 from app.services.file_service import FileManagementService
 
 # 导入FFmpeg管理器
@@ -201,6 +202,7 @@ app.include_router(model_runtime_routes.router)
 app.include_router(media_routes.router)  # 新增：媒体资源路由
 app.include_router(system_routes.router)  # 新增：系统管理路由
 app.include_router(config_routes.router)  # 新增：用户配置路由
+app.include_router(debug_routes.router)  # 新增：调试路由
 
 # 注册Demucs配置路由（需要在转录路由之前注册）
 demucs_router = create_demucs_router()
