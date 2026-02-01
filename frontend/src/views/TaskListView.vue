@@ -279,7 +279,6 @@
           <PresetSelector
             v-model="taskConfig"
             :compact="true"
-            @change="handlePresetChange"
           />
         </div>
       </div>
@@ -335,6 +334,7 @@
 
 <script setup>
 import { ref, computed, onMounted, watch, nextTick } from "vue";
+import { storeToRefs } from "pinia";
 import { useRouter } from "vue-router";
 import { ElMessage, ElMessageBox, ElLoading } from "element-plus";
 import {
@@ -348,6 +348,7 @@ import {
   ArrowDown,
 } from "@element-plus/icons-vue";
 import { useUnifiedTaskStore } from "@/stores/unifiedTaskStore";
+import { useTranscriptionConfigStore } from "@/stores/transcriptionConfigStore";
 import { transcriptionApi, systemApi } from "@/services/api";
 import fileApi from "@/services/api/fileApi"; // 导入文件 API
 // V3.1.0: 移除 sseChannelManager 导入，SSE 订阅由 App.vue 统一管理
@@ -356,6 +357,8 @@ import AboutDialog from "@/components/AboutDialog.vue"; // 关于对话框
 
 const router = useRouter();
 const taskStore = useUnifiedTaskStore();
+const transcriptionConfigStore = useTranscriptionConfigStore();
+const { taskConfig } = storeToRefs(transcriptionConfigStore);
 
 // 响应式数据 - 上传相关
 const showUploadDialog = ref(false);
@@ -382,50 +385,6 @@ const titleInputRef = ref(null); // 输入框引用
 
 // 转录设置相关 - v3.5 预设模式
 const showAdvancedSettings = ref(false); // 是否显示高级设置
-// v3.5 任务配置（默认使用 balanced 预设）
-const taskConfig = ref({
-  preset_id: 'balanced',
-  preprocessing: {
-    demucs_strategy: 'auto',
-    demucs_model: 'htdemucs',
-    demucs_shifts: 1,
-    separation_mode: 'on_demand',
-    spectrum_threshold: 0.35,
-    vad_filter: true,
-    enable_spectral_triage: true,
-    language_detection_mode: 'balanced',
-    language_detection_device: 'auto',
-    enable_speaker_embedding: false,
-    langid_confidence_threshold: 0.7,
-    langid_whitelist: ['zh', 'ja', 'en'],
-    langid_logit_bias_score: 2.5
-  },
-  transcription: {
-    transcription_profile: 'sv_whisper_patch',
-    sensevoice_device: 'auto',
-    whisper_model: 'medium',
-    patching_threshold: 0.60
-  },
-  refinement: {
-    llm_task: 'proofread',
-    llm_scope: 'sparse',
-    sparse_threshold: 0.70,
-    target_language: 'zh',
-    llm_provider: 'openai_compatible',
-    llm_model_name: 'gpt-4o-mini'
-  },
-  compute: {
-    concurrency_strategy: 'auto',
-    gpu_id: 0,
-    output_formats: ['srt'],
-    temp_file_policy: 'delete_on_complete'
-  }
-});
-
-// 处理预设变更事件
-function handlePresetChange(newConfig) {
-  taskConfig.value = { ...newConfig };
-}
 
 // 计算属性 - 使用 computed 包装确保响应式
 const tasks = computed(() => taskStore.tasks);
