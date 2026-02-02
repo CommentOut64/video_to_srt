@@ -120,6 +120,7 @@ class ChunkEngine:
         self.logger = logger or logging.getLogger(__name__)
         self.vad_service = vad_service or VADService(logger=self.logger)
         self.demucs_service = demucs_service or DemucsService()
+        self._last_vad_segments: Optional[List[Dict[str, float]]] = None
 
     def process_audio(
         self,
@@ -195,6 +196,7 @@ class ChunkEngine:
 
             vad_config = build_vad_config()
         segments = self._detect_speech_segments(separated_audio, sr, vad_config, diagnostic_service)
+        self._last_vad_segments = list(segments) if segments else []
 
         self.logger.info(f"VAD 检测完成: {len(segments)} 个语音段")
 
@@ -217,6 +219,12 @@ class ChunkEngine:
 
         self.logger.info(f"音频处理完成: {len(chunks)} 个 Chunk")
         return chunks, audio_array, sr
+
+    def get_last_vad_segments(self) -> Optional[List[Dict[str, float]]]:
+        """获取最近一次 VAD 检测结果（秒级区间）。"""
+        if self._last_vad_segments is None:
+            return None
+        return list(self._last_vad_segments)
 
     def _load_audio(self, audio_path: str, target_sr: int = 16000) -> Tuple[np.ndarray, int]:
         """

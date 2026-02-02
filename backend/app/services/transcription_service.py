@@ -75,6 +75,7 @@ class TranscriptionService:
         from app.services.sse_service import get_sse_manager
         self.sse_manager = get_sse_manager()
         self.logger.info("SSE管理器已集成")
+        self._vad_intervals: Optional[List[Tuple[float, float]]] = None
 
         # 记录CPU信息
         sys_info = self.hardware_profile_provider.get_cpu_system_info()
@@ -243,6 +244,7 @@ class TranscriptionService:
             results = await transcription_pipeline.run(
                 audio_chunks=chunks,
                 job_dir=job_dir,
+                vad_intervals=self._vad_intervals,
             )
 
             # 从 ProcessingContext 中提取句子
@@ -305,6 +307,7 @@ class TranscriptionService:
         Returns:
             List[AudioChunk]: 预处理完成的 Chunk 列表
         """
+        self._vad_intervals = None
         from app.pipelines.preprocessing_pipeline import PreprocessingPipeline
         from app.services.audio.chunk_engine import ChunkEngine
         from app.services.runtime_param_resolver import build_vad_config_for_profile
@@ -335,6 +338,7 @@ class TranscriptionService:
             video_path=str(input_path),
             job_state=job
         )
+        self._vad_intervals = preprocessing_pipeline.get_vad_intervals()
 
         # 记录统计信息
         stats = preprocessing_pipeline.get_statistics(chunks)
