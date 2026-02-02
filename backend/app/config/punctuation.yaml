@@ -3,7 +3,7 @@ fallback_priority: fast
 
 chinese:
   model_id: punct-ct-transformer-zh
-  itn_first: true
+  itn_first: false
   fallback_on_oov: true
 
 english:
