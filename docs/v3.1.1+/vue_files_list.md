@@ -40,7 +40,3 @@
 | `frontend\src\components\editor\VideoStage`       | 1      |
 | `frontend\src\components\editor\WaveformTimeline` | 1      |
 | `frontend\src\views`                              | 2      |
-
----
-
-**生成时间：** 2026年1月30日
