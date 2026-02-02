@@ -45,6 +45,7 @@ class ProcessingContext:
     sv_result: Optional[dict] = None      # FastWorker 产出
     whisper_result: Optional[dict] = None # SlowWorker 产出
     final_sentences: List[Any] = field(default_factory=list)  # 对齐阶段产出
+    arbitration_result: Optional[Any] = None  # V3.2.0+dev.20260202.08: 仲裁结果（Phase G-3）
 
     # 控制信号
     is_end: bool = False                  # 结束流标记

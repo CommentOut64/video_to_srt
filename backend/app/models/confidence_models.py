@@ -3,9 +3,14 @@
 
 用于双流对齐架构中的置信度追踪和对齐结果表示
 """
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, TYPE_CHECKING
 from enum import Enum
+
+if TYPE_CHECKING:
+    from app.services.alignment.gap_resolver import GapResolution
 
 
 class AlignmentStatus(Enum):
@@ -98,6 +103,10 @@ class AlignedSubtitle:
     # 对齐质量
     alignment_score: float = 1.0                 # 对齐质量分数 (0-1)
     matched_ratio: float = 1.0                   # 匹配比例
+    coverage: float = 1.0                        # 对齐覆盖率
+    gap_ratio: float = 0.0                       # Gap 比例
+    gap_resolution: Optional["GapResolution"] = None  # Gap 处理策略
+    gap_positions: List[int] = field(default_factory=list)  # Gap 聚集位置
 
     # 来源信息
     sv_text: Optional[str] = None                # SenseVoice 原始文本
@@ -148,6 +157,10 @@ class AlignedSubtitle:
             "min_confidence": self.min_confidence,
             "alignment_score": self.alignment_score,
             "matched_ratio": self.matched_ratio,
+            "coverage": self.coverage,
+            "gap_ratio": self.gap_ratio,
+            "gap_resolution": self.gap_resolution.value if self.gap_resolution else None,
+            "gap_positions": self.gap_positions,
             "sv_text": self.sv_text,
             "whisper_text": self.whisper_text,
             "vad_start": self.vad_start,
