@@ -279,6 +279,11 @@ class ModelRuntimeConfigService:
                 "repetition_penalty": 1.0,
                 "no_repeat_ngram_size": 0,
             },
+            "whisper_sanitize": {
+                "enabled": True,
+                "min_text_length": 2,
+                "patterns": [],
+            },
             "sensevoice": {
                 "language": "auto",
                 "use_itn": True,
