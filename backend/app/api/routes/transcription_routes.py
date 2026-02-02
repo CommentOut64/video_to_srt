@@ -1563,6 +1563,15 @@ def create_transcription_router(
                 all_segments.extend(manual_segments)
                 all_segments.sort(key=lambda x: x.get('start', 0))
 
+            # V3.2.0+dev.20260202.06: 统一按时间排序，避免前端展示/导出乱序
+            all_segments.sort(
+                key=lambda x: (
+                    x.get("start", 0),
+                    x.get("end", 0),
+                    x.get("id", 0),
+                )
+            )
+
             # 快照模式下补充进度信息，避免 percentage 为 0
             if using_snapshot:
                 if not processed_count:

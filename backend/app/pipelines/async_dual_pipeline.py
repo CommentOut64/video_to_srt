@@ -40,9 +40,12 @@ from app.schemas.pipeline_context import ProcessingContext
 from app.models.sensevoice_models import SentenceSegment
 from app.services.audio.chunk_engine import AudioChunk
 from app.services.alignment.default_aligner import DefaultAligner
+from app.services.alignment.text_normalizer import get_alignment_text_normalizer
+from app.services.alignment.types import NormalizationResult
 from app.services.sse_service import get_sse_manager
 from app.services.segmentation.default_segmenter import DefaultSegmenter
 from app.services.streaming_subtitle import get_streaming_subtitle_manager
+from app.services.punctuation.fast_punctuation_pipeline import FastPunctuationPipeline
 from app.services.punctuation.base import PunctuationResult, PuncPosition, SplitPoint
 from app.services.bridge.bridge_controller import BridgeBatch, BridgeController
 from app.services.punctuation.semantic_buffer import (
@@ -51,6 +54,7 @@ from app.services.punctuation.semantic_buffer import (
     SemanticBufferInput,
     SemanticChunk,
 )
+from app.services.whisper.whisper_text_sanitizer import WhisperTextSanitizer
 from app.pipelines.workers import FastWorker, SlowWorker, SlowWorkerResult
 from app.utils.prompt_builder import get_prompt_builder
 from app.utils.cancellation_token import CancelledException, PausedException  # V3.1.0: 捕获取消/暂停异常
@@ -206,12 +210,20 @@ class AsyncDualPipeline:
             punctuation_service = get_punctuation_service()
         self.punctuation_service = punctuation_service
 
+        # V3.2.0+dev.20260202.03: 统一规范化与 Whisper 最小清洗器
+        self._text_normalizer = get_alignment_text_normalizer(logger=self.logger)
+        self._whisper_sanitizer = WhisperTextSanitizer(logger=self.logger)
+        self._fast_punctuator = FastPunctuationPipeline(
+            job_id=self.job_id,
+            punctuation_service=self.punctuation_service,
+            logger=self.logger,
+        )
+
         # 实例化 FastWorker（仅推理）
         self.fast_worker = FastWorker(
             job_id=job_id,
             draft_engine=self.draft_engine,
             sensevoice_language=sensevoice_language,
-            punctuation_service=self.punctuation_service,
             logger=self.logger
         )
 
@@ -392,6 +404,8 @@ class AsyncDualPipeline:
             try:
                 # FastWorker 处理（仅推理）
                 await self.fast_worker.process(ctx)
+                normalized = self._normalize_sensevoice_result(ctx)
+                await self._apply_fast_punctuation(ctx, normalized)
                 await self._emit_draft_sentences(ctx, is_final_output=True)
                 results.append(ctx)
                 last_chunk_index = i
@@ -669,6 +683,36 @@ class AsyncDualPipeline:
             return
         await self.queue_inter.put(batch)
 
+    def _normalize_sensevoice_result(
+        self,
+        ctx: ProcessingContext,
+    ) -> Optional[NormalizationResult]:
+        """统一规范化 SenseVoice 输出（V3.2.0+dev.20260202.05）。"""
+        if not ctx.sv_result or not ctx.audio_chunk:
+            return None
+        sv_result = ctx.sv_result
+        raw_text = str(sv_result.get("text_clean") or sv_result.get("text") or "")
+        language = ctx.audio_chunk.language or sv_result.get("language") or "auto"
+        normalized = self._text_normalizer.normalize(raw_text, language)
+        sv_result["text_itn_raw"] = normalized.text_itn_raw
+        sv_result["text_clean"] = normalized.text_clean or normalized.text_itn_raw
+        return normalized
+
+    async def _apply_fast_punctuation(
+        self,
+        ctx: ProcessingContext,
+        normalized: Optional[NormalizationResult],
+    ) -> None:
+        """快流标点恢复与后处理（V3.2.0+dev.20260202.03）。"""
+        if not normalized or not ctx.sv_result or not ctx.audio_chunk:
+            return
+        await self._fast_punctuator.apply(
+            ctx.sv_result,
+            chunk=ctx.audio_chunk,
+            ctx=ctx,
+            normalization=normalized,
+        )
+
     def _build_semantic_input(self, ctx: ProcessingContext) -> Optional[SemanticBufferInput]:
         """构建 SemanticBuffer 输入。"""
         sv_result = ctx.sv_result or {}
@@ -677,13 +721,14 @@ class AsyncDualPipeline:
         punctuation_meta = metadata.get("punctuation")
         decision_meta = metadata.get("punctuation_decision")
 
-        text = sv_result.get("text_clean") or sv_result.get("text") or ""
+        raw_text = sv_result.get("text_itn_raw") or sv_result.get("text") or ""
+        text = sv_result.get("text_clean") or raw_text
         words = sv_result.get("words") if isinstance(sv_result, dict) else None
         raw_tokens = sv_result.get("raw_tokens") if isinstance(sv_result, dict) else None
         punctuation_result = None
         # V3.2.0+dev.20260201.10: 即使缺少标点元信息，也走语义缓冲与 Bridge 批次，旧逐Chunk仅作备份
         if isinstance(punctuation_meta, dict):
-            punctuation_result = self._build_punctuation_result(punctuation_meta, text)
+            punctuation_result = self._build_punctuation_result(punctuation_meta, raw_text)
             if punctuation_result and punctuation_result.text:
                 text = punctuation_result.text
 
@@ -869,6 +914,7 @@ class AsyncDualPipeline:
         whisper_result: Dict[str, Any],
         chunk_indices: List[int],
         batch_start: float,
+        language_override: Optional[str] = None,
     ) -> Dict[int, Dict[str, Any]]:
         """按 Chunk 时间范围拆分 Whisper 结果。"""
         if not whisper_result or not chunk_indices:
@@ -919,7 +965,7 @@ class AsyncDualPipeline:
                 assignments[target_idx].append(seg)
 
         results: Dict[int, Dict[str, Any]] = {}
-        language = str(whisper_result.get("language", "auto"))
+        language = str(language_override or whisper_result.get("language", "auto"))
         fallback_conf = float(whisper_result.get("confidence", 0.0) or 0.0)
 
         for idx in ordered_indices:
@@ -1005,6 +1051,9 @@ class AsyncDualPipeline:
 
         whisper_result = slow_result.whisper_result or {}
         prompt = batch.prompt or None
+        whisper_text_raw = str(whisper_result.get("text", "") or "")
+        whisper_result["text_raw"] = whisper_text_raw
+        whisper_result["text"] = self._whisper_sanitizer.sanitize_minimal(whisper_text_raw, prompt=prompt)
         if whisper_result and self._is_hallucination(whisper_result, prompt):
             self.logger.warning("Bridge 批次检测到 Whisper 幻觉，回退快流: batch_id=%s", batch.batch_id)
             for _, ctx in contexts:
@@ -1018,6 +1067,13 @@ class AsyncDualPipeline:
                 token=token,
             )
 
+        batch_language = batch.language or whisper_result.get("language") or "auto"
+        normalized_whisper = self._text_normalizer.normalize(whisper_result.get("text", ""), batch_language)
+        whisper_result["text_itn_raw"] = normalized_whisper.text_itn_raw
+        whisper_result["text_clean"] = normalized_whisper.text_clean
+        whisper_result["text"] = normalized_whisper.text_clean or whisper_result.get("text", "")
+        whisper_result["language"] = batch_language
+
         if whisper_result.get("text"):
             self._update_prompt_cache(str(whisper_result.get("text", "")))
 
@@ -1026,6 +1082,7 @@ class AsyncDualPipeline:
             whisper_result,
             [idx for idx, _ in contexts],
             batch_start=batch_start,
+            language_override=batch_language,
         )
 
         for idx, ctx in contexts:
@@ -1034,15 +1091,24 @@ class AsyncDualPipeline:
                 ctx.whisper_result = {}
                 continue
             ctx.whisper_skipped = False
-            ctx.whisper_result = chunk_results.get(
+            chunk_result = chunk_results.get(
                 idx,
                 {
                     "text": "",
                     "confidence": float(whisper_result.get("confidence", 0.0) or 0.0),
-                    "language": str(whisper_result.get("language", "auto")),
+                    "language": batch_language,
                     "raw_result": {"segments": []},
                 },
             )
+            chunk_text_raw = str(chunk_result.get("text", "") or "")
+            chunk_result["text_raw"] = chunk_text_raw
+            chunk_result["text"] = self._whisper_sanitizer.sanitize_minimal(chunk_text_raw, prompt=None)
+            normalized_chunk = self._text_normalizer.normalize(chunk_result.get("text", ""), batch_language)
+            chunk_result["text_itn_raw"] = normalized_chunk.text_itn_raw
+            chunk_result["text_clean"] = normalized_chunk.text_clean
+            chunk_result["text"] = normalized_chunk.text_clean or chunk_result.get("text", "")
+            chunk_result["language"] = batch_language
+            ctx.whisper_result = chunk_result
 
         return await self._push_batch_contexts(
             contexts,
@@ -1248,6 +1314,8 @@ class AsyncDualPipeline:
                 try:
                     # FastWorker 处理（仅推理）
                     await self.fast_worker.process(ctx)
+                    normalized = self._normalize_sensevoice_result(ctx)
+                    await self._apply_fast_punctuation(ctx, normalized)
                     # V3.2.0+dev.20260201.07: 缓存上下文，供 Bridge 批次使用
                     self._context_cache[ctx.chunk_index] = ctx
                     used_semantic = await self._emit_draft_sentences(ctx, is_final_output=False)
@@ -1437,12 +1505,32 @@ class AsyncDualPipeline:
                             initial_prompt=prompt,
                         )
 
+                        whisper_text_raw = str(whisper_result.get("text", "") or "")
+                        whisper_result["text_raw"] = whisper_text_raw
+                        whisper_result["text"] = self._whisper_sanitizer.sanitize_minimal(
+                            whisper_text_raw,
+                            prompt=prompt,
+                        )
                         if self._is_hallucination(whisper_result, prompt):
                             self.logger.warning(
                                 f"Chunk {chunk_index}: 检测到 Whisper 幻觉，回退到 SenseVoice"
                             )
-                            whisper_result["text"] = sv_result.get("text_clean", "")
+                            fallback_text = sv_result.get("text_clean", "")
+                            whisper_result["text"] = fallback_text
+                            whisper_result["text_itn_raw"] = sv_result.get("text_itn_raw") or fallback_text
+                            whisper_result["text_clean"] = fallback_text
+                            whisper_result["language"] = sv_result.get("language", "auto")
                             whisper_result["is_hallucination"] = True
+                        else:
+                            whisper_language = chunk.language or whisper_result.get("language") or "auto"
+                            normalized = self._text_normalizer.normalize(
+                                whisper_result.get("text", ""),
+                                whisper_language,
+                            )
+                            whisper_result["text_itn_raw"] = normalized.text_itn_raw
+                            whisper_result["text_clean"] = normalized.text_clean
+                            whisper_result["text"] = normalized.text_clean or whisper_result.get("text", "")
+                            whisper_result["language"] = whisper_language
 
                         ctx.whisper_result = copy.deepcopy(whisper_result)
                         ctx.whisper_skipped = False
