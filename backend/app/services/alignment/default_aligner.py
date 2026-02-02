@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 from app.models.sensevoice_models import SentenceSegment, TextSource, WordTimestamp
 from app.services.alignment.alignment_service import AlignmentService, AlignmentConfig
 from app.services.pseudo_alignment import PseudoAlignment
+from app.services.punctuation.base import PuncPosition
+from app.services.punctuation.semantic_injector import SemanticInjector
 from app.services.sentence_splitter import SentenceSplitter, SplitConfig
 from app.services.semantic_grouper import SemanticGrouper, GroupConfig
 
@@ -74,14 +76,22 @@ class DefaultAligner:
                 enable_overlap_detection=True,
             )
         self.final_grouper = SemanticGrouper(final_group_config)
+        # V3.2.0+dev.20260202.08: 语义注入器（对齐后标点注入）
+        self._semantic_injector = SemanticInjector(logger=self.logger)
+        self.last_alignment_stats: Optional[Dict[str, Any]] = None
 
     async def align(
         self,
         whisper_result: Dict[str, Any],
         sv_result: Dict[str, Any],
         chunk: AudioChunk,
+        vad_intervals: Optional[List[Tuple[float, float]]] = None,
+        *,
+        punctuation_positions: Optional[List[PuncPosition]] = None,
+        punctuation_clean_text: Optional[str] = None,
     ) -> Tuple[List[SentenceSegment], AlignmentLevel]:
         """执行双流对齐并完成降级兜底。"""
+        self.last_alignment_stats = None
         detected_language = whisper_result.get("language", "auto")
         self.final_splitter.config.language = detected_language
         self.logger.debug("使用 Whisper 检测到的语言: %s", detected_language)
@@ -133,12 +143,22 @@ class DefaultAligner:
                 chunk_offset=chunk.start,
                 audio_array=chunk.audio,
                 sample_rate=chunk.sample_rate,
+                vad_intervals=vad_intervals,
             )
+
+            self.last_alignment_stats = {
+                "coverage": aligned_subtitle.coverage,
+                "gap_ratio": aligned_subtitle.gap_ratio,
+                "alignment_score": aligned_subtitle.alignment_score,
+                "gap_positions": aligned_subtitle.gap_positions,
+                "gap_resolution": aligned_subtitle.gap_resolution,
+            }
 
             if aligned_subtitle.alignment_score < self.alignment_score_threshold:
                 raise ValueError(f"对齐质量过低: {aligned_subtitle.alignment_score:.2f}")
 
-            aligned_words = [
+            aligned_words = aligned_subtitle.words
+            words_for_split = [
                 WordTimestamp(
                     word=word.word,
                     start=word.start,
@@ -146,10 +166,24 @@ class DefaultAligner:
                     confidence=word.final_confidence,
                     is_pseudo=word.is_pseudo,
                 )
-                for word in aligned_subtitle.words
+                for word in aligned_words
             ]
 
-            sentences = self._split_with_final(aligned_words, whisper_text)
+            text_for_split = whisper_text
+            if punctuation_positions and punctuation_clean_text is not None:
+                injection = self._semantic_injector.inject(
+                    aligned_words,
+                    punctuation_clean_text,
+                    punctuation_positions,
+                )
+                if injection.annotated_words:
+                    words_for_split = self._semantic_injector.build_word_timestamps(
+                        aligned_words,
+                        injection.annotated_words,
+                    )
+                    text_for_split = injection.punctuated_text or text_for_split
+
+            sentences = self._split_with_final(words_for_split, text_for_split)
             for sentence in sentences:
                 sentence.source = TextSource.WHISPER_PATCH
                 sentence.is_finalized = True

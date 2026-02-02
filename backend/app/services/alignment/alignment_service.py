@@ -19,6 +19,8 @@ from app.models.confidence_models import (
     ConfidenceLevel
 )
 from app.models.sensevoice_models import WordTimestamp
+from app.services.alignment.gap_resolver import GapResolver
+from app.services.alignment.quality_stats import QualityStatsCalculator
 from app.utils.text_utils import smart_join_words
 
 
@@ -68,6 +70,8 @@ class AlignmentService:
         """
         self.config = config or AlignmentConfig()
         self.logger = logger or logging.getLogger(__name__)
+        self.gap_resolver = GapResolver(logger=self.logger)
+        self.quality_stats_calculator = QualityStatsCalculator(logger=self.logger)
 
     async def align(
         self,
@@ -76,7 +80,8 @@ class AlignmentService:
         vad_range: Tuple[float, float],
         chunk_offset: float = 0.0,
         audio_array: Optional[np.ndarray] = None,
-        sample_rate: int = 16000
+        sample_rate: int = 16000,
+        vad_intervals: Optional[List[Tuple[float, float]]] = None,
     ) -> AlignedSubtitle:
         """
         执行双流对齐
@@ -113,7 +118,15 @@ class AlignmentService:
             chunk_offset
         )
 
-        # 4. 能量锚点校准（如果提供了音频）
+        # 4. Gap 处理（插值/合并/降级）
+        gap_result = self.gap_resolver.resolve_gaps(
+            aligned_words,
+            vad_intervals=vad_intervals,
+            vad_range=vad_range,
+        )
+        aligned_words = gap_result.words
+
+        # 5. 能量锚点校准（如果提供了音频）
         if self.config.enable_energy_anchor and audio_array is not None:
             aligned_words = self._apply_energy_anchor(
                 aligned_words,
@@ -121,20 +134,31 @@ class AlignmentService:
                 sample_rate
             )
 
-        # 5. VAD 边界校准
+        # 6. VAD 边界校准
         if self.config.enable_vad_calibration:
             aligned_words = self._apply_vad_calibration(
                 aligned_words,
                 vad_range
             )
 
-        # 6. 构建 AlignedSubtitle
+        # 7. 构建 AlignedSubtitle
         result = self._build_aligned_subtitle(
             aligned_words,
             whisper_text,
             sv_tokens,
             vad_range
         )
+        quality_stats = self.quality_stats_calculator.compute(
+            aligned_words,
+            total_tokens=len(sv_tokens),
+            gap_positions=gap_result.gap_positions,
+            gap_resolution=gap_result.resolution,
+        )
+        result.coverage = quality_stats.coverage
+        result.gap_ratio = quality_stats.gap_ratio
+        result.alignment_score = quality_stats.alignment_score
+        result.gap_positions = quality_stats.gap_positions
+        result.gap_resolution = quality_stats.gap_resolution
 
         self.logger.info(
             f"对齐完成: {len(aligned_words)} 个词, "
