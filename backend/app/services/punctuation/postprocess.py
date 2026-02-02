@@ -194,8 +194,12 @@ def postprocess_punctuation(
     mode: Mode,
     candidates: Optional[Sequence[PuncPosition]],
     config: PunctuationPostprocessConfig,
+    *,
+    clean_text: Optional[str] = None,
+    raw_to_clean: Optional[Sequence[Optional[int]]] = None,
+    clean_to_raw: Optional[Sequence[int]] = None,
 ) -> PunctuationPostprocessResult:
-    """统一后处理入口。"""
+    """统一后处理入口（支持分轨文本输入）。"""
     if not raw_text:
         return PunctuationPostprocessResult(
             final_text="",
@@ -204,7 +208,8 @@ def postprocess_punctuation(
             metrics=_build_metrics([]),
         )
 
-    clean_text, clean_to_raw, raw_to_clean = build_clean_text(raw_text)
+    if clean_text is None or raw_to_clean is None or clean_to_raw is None:
+        clean_text, clean_to_raw, raw_to_clean = build_clean_text(raw_text)
     if not clean_text:
         return PunctuationPostprocessResult(
             final_text=raw_text,
