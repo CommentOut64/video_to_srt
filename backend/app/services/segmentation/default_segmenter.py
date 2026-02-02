@@ -127,21 +127,22 @@ class DefaultSegmenter:
     ) -> List[SentenceSegment]:
         """慢流降级：使用 SenseVoice 结果分句。"""
         text_clean = sv_result.get("text_clean", "")
+        text_display = sv_result.get("text_itn_raw") or text_clean
         words_data = sv_result.get("words", [])
         words = self._build_words(words_data)
 
         if not words:
-            if text_clean and text_clean.strip():
+            if text_display and text_display.strip():
                 self.logger.warning(
                     "SenseVoice 没有字级时间戳但有文本，创建兜底单句: "
                     "text='%s...', chunk=[%.2fs, %.2fs]",
-                    text_clean[:50],
+                    text_display[:50],
                     chunk.start,
                     chunk.end,
                 )
                 return [
                     SentenceSegment(
-                        text=text_clean.strip(),
+                        text=text_display.strip(),
                         start=chunk.start,
                         end=chunk.end,
                         words=[],
@@ -157,7 +158,7 @@ class DefaultSegmenter:
         if language:
             self.final_splitter.config.language = language
 
-        sentences = self.final_splitter.split(words, text_clean)
+        sentences = self.final_splitter.split(words, text_display)
         if self.is_enable_semantic_grouping:
             sentences = self.final_grouper.group(sentences)
 
@@ -180,21 +181,22 @@ class DefaultSegmenter:
         is_draft: bool,
     ) -> List[SentenceSegment]:
         text_clean = sv_result.get("text_clean", "")
+        text_display = sv_result.get("text_itn_raw") or text_clean
         words_data = sv_result.get("words", [])
         words = self._build_words(words_data)
 
         if not words:
-            if text_clean and text_clean.strip():
+            if text_display and text_display.strip():
                 self.logger.warning(
                     "SenseVoice 没有字级时间戳但有文本，创建兜底单句: "
                     "text='%s...', chunk=[%.2fs, %.2fs]",
-                    text_clean[:50],
+                    text_display[:50],
                     chunk.start,
                     chunk.end,
                 )
                 return [
                     SentenceSegment(
-                        text=text_clean.strip(),
+                        text=text_display.strip(),
                         start=chunk.start,
                         end=chunk.end,
                         words=[],
@@ -211,9 +213,9 @@ class DefaultSegmenter:
         is_chinese = detected_language in {"zh", "yue"}
 
         if is_chinese:
-            sentences = self.chinese_splitter.split(words, text_clean)
+            sentences = self.chinese_splitter.split(words, text_display)
         else:
-            sentences = self.draft_splitter.split(words, text_clean)
+            sentences = self.draft_splitter.split(words, text_display)
 
         if self.is_enable_semantic_grouping:
             sentences = self.draft_grouper.group(sentences)

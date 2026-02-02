@@ -1,6 +1,6 @@
 """
 Bridge 控制器（完整实现）。
-V3.2.0+dev.20260201.07
+V3.2.0+dev.20260202.01
 """
 from __future__ import annotations
 
@@ -76,6 +76,16 @@ class BridgeController:
             if pre_flush:
                 return pre_flush
 
+            pre_flush = self._flush_if_language_changed(chunk)
+            if pre_flush:
+                await self._push_chunk(chunk)
+                self._last_input_time = now
+                self._last_audio_end = max(self._last_audio_end, chunk.audio_range[1])
+                self._last_language = chunk.language or self._last_language
+                if chunk.speaker_id:
+                    self._last_speaker_id = chunk.speaker_id
+                return pre_flush
+
             pre_flush = self._flush_if_speaker_changed(chunk)
             if pre_flush:
                 await self._push_chunk(chunk)
@@ -146,6 +156,18 @@ class BridgeController:
         if chunk.speaker_id == self._last_speaker_id:
             return None
         return self._build_batch(flush_reason="speaker_change")
+
+    def _flush_if_language_changed(self, chunk: SemanticChunk) -> Optional[BridgeBatch]:
+        """检测语言切换，必要时刷新当前批次。"""
+        if len(self._queue) == 0:
+            return None
+        current_language = self._normalize_language(chunk.language)
+        last_language = self._normalize_language(self._last_language)
+        if not current_language or not last_language:
+            return None
+        if current_language == last_language:
+            return None
+        return self._build_batch(flush_reason="language_change")
 
     def _flush_if_long_pause(self, chunk: SemanticChunk) -> Optional[BridgeBatch]:
         if len(self._queue) == 0:
@@ -239,6 +261,16 @@ class BridgeController:
         if lang.startswith(("zh", "ja")):
             return sum(len(sentence.text) for sentence in sentences if sentence and sentence.text)
         return sum(len(sentence.text.split()) for sentence in sentences if sentence and sentence.text)
+
+    @staticmethod
+    def _normalize_language(language: Optional[str]) -> Optional[str]:
+        """标准化语言标签，auto/空值视为未知。"""
+        if not language:
+            return None
+        normalized = str(language).strip().lower()
+        if not normalized or normalized == "auto":
+            return None
+        return normalized
 
     @staticmethod
     def _classify_speech_rate(language: str, rate: float) -> Tuple[bool, bool]:

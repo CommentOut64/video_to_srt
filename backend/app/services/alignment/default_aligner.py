@@ -220,21 +220,22 @@ class DefaultAligner:
         if not sentences:
             # 兜底：如果 SenseVoice 没有返回 sentences，使用 words 创建单个句子
             text_clean = sv_result.get("text_clean", "")
+            text_display = sv_result.get("text_itn_raw") or text_clean
             words_data = sv_result.get("words", [])
             words = self._build_words(words_data)
 
             if not words:
-                if text_clean and text_clean.strip():
+                if text_display and text_display.strip():
                     self.logger.warning(
                         "SenseVoice 没有字级时间戳但有文本，创建兜底单句: "
                         "text='%s...', chunk=[%.2fs, %.2fs]",
-                        text_clean[:50],
+                        text_display[:50],
                         chunk.start,
                         chunk.end,
                     )
                     return [
                         SentenceSegment(
-                            text=text_clean.strip(),
+                            text=text_display.strip(),
                             start=chunk.start,
                             end=chunk.end,
                             words=[],
@@ -250,7 +251,7 @@ class DefaultAligner:
             # 创建单个句子包含所有 words
             sentences = [
                 SentenceSegment(
-                    text=text_clean.strip(),
+                    text=text_display.strip(),
                     start=words[0].start,
                     end=words[-1].end,
                     words=words,
@@ -290,21 +291,22 @@ class DefaultAligner:
         chunk: AudioChunk,
     ) -> List[SentenceSegment]:
         text_clean = sv_result.get("text_clean", "")
+        text_display = sv_result.get("text_itn_raw") or text_clean
         words_data = sv_result.get("words", [])
         words = self._build_words(words_data)
 
         if not words:
-            if text_clean and text_clean.strip():
+            if text_display and text_display.strip():
                 self.logger.warning(
                     "SenseVoice 没有字级时间戳但有文本，创建兜底单句: "
                     "text='%s...', chunk=[%.2fs, %.2fs]",
-                    text_clean[:50],
+                    text_display[:50],
                     chunk.start,
                     chunk.end,
                 )
                 return [
                     SentenceSegment(
-                        text=text_clean.strip(),
+                        text=text_display.strip(),
                         start=chunk.start,
                         end=chunk.end,
                         words=[],
@@ -317,7 +319,7 @@ class DefaultAligner:
             self.logger.warning("SenseVoice 结果没有字级时间戳且无文本，无法分句")
             return []
 
-        sentences = self._split_with_final(words, text_clean)
+        sentences = self._split_with_final(words, text_display)
 
         for sentence in sentences:
             sentence.start += chunk.start
