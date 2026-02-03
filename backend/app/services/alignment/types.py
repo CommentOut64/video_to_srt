@@ -43,6 +43,7 @@ class TextTrack:
     char_mapping: List[CharMapping]
     raw_to_clean: List[Optional[int]]
     clean_to_raw: List[int]
+    language: str = "auto"
     source: str = ""
     itn_fallback: bool = False
     itn_fallback_reason: Optional[str] = None

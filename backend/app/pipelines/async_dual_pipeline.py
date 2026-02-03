@@ -711,6 +711,7 @@ class AsyncDualPipeline:
         raw_text: str,
         normalized: NormalizationResult,
         source: str,
+        language: str,
     ) -> TextTrack:
         return TextTrack(
             raw_text=raw_text,
@@ -719,6 +720,7 @@ class AsyncDualPipeline:
             char_mapping=normalized.char_mapping,
             raw_to_clean=normalized.raw_to_clean,
             clean_to_raw=normalized.clean_to_raw,
+            language=language or "auto",
             source=source,
             itn_fallback=normalized.itn_fallback,
             itn_fallback_reason=normalized.itn_fallback_reason,
@@ -747,7 +749,12 @@ class AsyncDualPipeline:
         sv_result["text_itn_raw"] = normalized.text_itn_raw
         sv_result["text_clean"] = normalized.text_clean or normalized.text_itn_raw
         tracks = self._ensure_text_tracks(ctx)
-        tracks.sv_track = self._build_text_track(raw_text, normalized, source="sv")
+        tracks.sv_track = self._build_text_track(
+            raw_text,
+            normalized,
+            source="sv",
+            language=language,
+        )
         return normalized
 
     def _apply_whisper_full_sanitize(self, ctx: ProcessingContext) -> None:
@@ -769,7 +776,12 @@ class AsyncDualPipeline:
         whisper_result["text_clean"] = normalized.text_clean
         whisper_result["text"] = normalized.text_clean or sanitized
         tracks = self._ensure_text_tracks(ctx)
-        tracks.whisper_track = self._build_text_track(sanitized, normalized, source="whisper")
+        tracks.whisper_track = self._build_text_track(
+            sanitized,
+            normalized,
+            source="whisper",
+            language=language,
+        )
 
     def _is_arbitration_enabled(self) -> bool:
         runtime = get_model_runtime_config_service().get_effective_runtime_global()
@@ -1435,6 +1447,7 @@ class AsyncDualPipeline:
                 raw_text_for_track,
                 normalized_chunk,
                 source="whisper",
+                language=batch_language,
             )
 
         return await self._push_batch_contexts(
