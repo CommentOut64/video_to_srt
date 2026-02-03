@@ -170,9 +170,11 @@ class AlignmentService:
 
     def _tokenize(self, text: str) -> List[str]:
         """
-        文本分词
+        语言感知的文本分词
 
-        简单的空格分词，支持中英文混合。
+        V3.2.0+dev.20260203.05: 修复中日韩分词缺陷
+        - CJK 语言：字符级分词（与 SenseVoice 对齐）
+        - 其他语言：空格分词
 
         Args:
             text: 输入文本
@@ -180,9 +182,52 @@ class AlignmentService:
         Returns:
             List[str]: 词列表
         """
-        words = text.strip().split()
-        words = [w for w in words if w]
-        return words
+        text = text.strip()
+        if not text:
+            return []
+
+        # 检测是否为 CJK 文本
+        if self._is_cjk_text(text):
+            # 字符级分词（与 SenseVoice 字符级 token 对齐）
+            tokens = [ch for ch in text if not ch.isspace()]
+            self.logger.debug(f"CJK 字符级分词: {len(tokens)} 个字符（已过滤空白）")
+            return tokens
+        else:
+            # 空格分词（英文等）
+            words = text.split()
+            words = [w for w in words if w]
+            self.logger.debug(f"空格分词: {len(words)} 个词")
+            return words
+
+    @staticmethod
+    def _is_cjk_text(text: str) -> bool:
+        """
+        检测文本是否主要为 CJK 字符
+
+        V3.2.0+dev.20260203.05: CJK 文本检测
+
+        Args:
+            text: 待检测文本
+
+        Returns:
+            bool: True 表示 CJK 文本，False 表示其他语言
+        """
+        import re
+        # Unicode 范围：
+        # \u4e00-\u9fff: 中文汉字
+        # \u3040-\u309f: 日文平假名
+        # \u30a0-\u30ff: 日文片假名
+        # \uac00-\ud7af: 韩文音节
+        cjk_pattern = re.compile(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]')
+        cjk_chars = len(cjk_pattern.findall(text))
+        total_chars = len(text)
+
+        if total_chars == 0:
+            return False
+
+        # 如果 30% 以上为 CJK 字符，则判定为 CJK 文本
+        ratio = cjk_chars / total_chars
+        return ratio > 0.3
 
     def _needleman_wunsch(
         self,

@@ -1,6 +1,6 @@
 """
 默认分句服务（封装旧分句逻辑）。
-V3.2.0+dev.20260119.06
+V3.2.0+dev.20260203.01
 """
 
 from __future__ import annotations
@@ -8,9 +8,10 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from app.models.sensevoice_models import SentenceSegment, TextSource, WordTimestamp
+from app.models.sensevoice_models import SentenceSegment
 from app.services.sentence_splitter import SentenceSplitter, SplitConfig
 from app.services.semantic_grouper import SemanticGrouper, GroupConfig
+from app.services.segmentation.unified_splitter import UnifiedSplitter
 
 if TYPE_CHECKING:
     from app.services.audio.chunk_engine import AudioChunk
@@ -95,6 +96,7 @@ class DefaultSegmenter:
                 enable_overlap_detection=True,
             )
         self.final_grouper = SemanticGrouper(final_group_config)
+        self.unified_splitter = UnifiedSplitter(logger=self.logger)
 
     def split_draft(
         self,
@@ -126,52 +128,15 @@ class DefaultSegmenter:
         language: Optional[str] = None,
     ) -> List[SentenceSegment]:
         """慢流降级：使用 SenseVoice 结果分句。"""
-        text_clean = sv_result.get("text_clean", "")
-        text_display = sv_result.get("text_itn_raw") or text_clean
-        words_data = sv_result.get("words", [])
-        words = self._build_words(words_data)
-
-        if not words:
-            if text_display and text_display.strip():
-                self.logger.warning(
-                    "SenseVoice 没有字级时间戳但有文本，创建兜底单句: "
-                    "text='%s...', chunk=[%.2fs, %.2fs]",
-                    text_display[:50],
-                    chunk.start,
-                    chunk.end,
-                )
-                return [
-                    SentenceSegment(
-                        text=text_display.strip(),
-                        start=chunk.start,
-                        end=chunk.end,
-                        words=[],
-                        source=TextSource.SENSEVOICE,
-                        confidence=sv_result.get("confidence", 0.5),
-                        is_finalized=True,
-                        is_draft=False,
-                    )
-                ]
-            self.logger.warning("SenseVoice 结果没有字级时间戳且无文本，无法分句")
-            return []
-
-        if language:
-            self.final_splitter.config.language = language
-
-        sentences = self.final_splitter.split(words, text_display)
-        if self.is_enable_semantic_grouping:
+        sentences = self.unified_splitter.split_draft_from_sv(
+            sv_result,
+            chunk_start=chunk.start,
+            chunk_end=chunk.end,
+            is_final_output=True,
+            language=language,
+        )
+        if self.is_enable_semantic_grouping and sentences:
             sentences = self.final_grouper.group(sentences)
-
-        for sentence in sentences:
-            sentence.start += chunk.start
-            sentence.end += chunk.start
-            sentence.source = TextSource.SENSEVOICE
-            sentence.is_finalized = True
-            sentence.is_draft = False
-            for word in sentence.words:
-                word.start += chunk.start
-                word.end += chunk.start
-
         return sentences
 
     def _split_draft_core(
@@ -180,76 +145,17 @@ class DefaultSegmenter:
         chunk: AudioChunk,
         is_draft: bool,
     ) -> List[SentenceSegment]:
-        text_clean = sv_result.get("text_clean", "")
-        text_display = sv_result.get("text_itn_raw") or text_clean
-        words_data = sv_result.get("words", [])
-        words = self._build_words(words_data)
-
-        if not words:
-            if text_display and text_display.strip():
-                self.logger.warning(
-                    "SenseVoice 没有字级时间戳但有文本，创建兜底单句: "
-                    "text='%s...', chunk=[%.2fs, %.2fs]",
-                    text_display[:50],
-                    chunk.start,
-                    chunk.end,
-                )
-                return [
-                    SentenceSegment(
-                        text=text_display.strip(),
-                        start=chunk.start,
-                        end=chunk.end,
-                        words=[],
-                        source=TextSource.SENSEVOICE,
-                        confidence=sv_result.get("confidence", 0.5),
-                        is_finalized=not is_draft,
-                        is_draft=is_draft,
-                    )
-                ]
-            self.logger.warning("SenseVoice 结果没有字级时间戳且无文本，无法分句")
-            return []
-
-        detected_language = sv_result.get("language", "auto")
-        is_chinese = detected_language in {"zh", "yue"}
-
-        if is_chinese:
-            sentences = self.chinese_splitter.split(words, text_display)
-        else:
-            sentences = self.draft_splitter.split(words, text_display)
-
-        if self.is_enable_semantic_grouping:
+        sentences = self.unified_splitter.split_draft_from_sv(
+            sv_result,
+            chunk_start=chunk.start,
+            chunk_end=chunk.end,
+            is_final_output=not is_draft,
+        )
+        if self.is_enable_semantic_grouping and sentences:
             sentences = self.draft_grouper.group(sentences)
             self.logger.debug("快流语义分组: %d 个句子（物理约束）", len(sentences))
-
-        for sentence in sentences:
-            sentence.start += chunk.start
-            sentence.end += chunk.start
-            sentence.is_draft = is_draft
-            sentence.is_finalized = not is_draft
-            sentence.source = TextSource.SENSEVOICE
-            for word in sentence.words:
-                word.start += chunk.start
-                word.end += chunk.start
-
         self.logger.debug("快流分句完成: %d 个句子", len(sentences))
         return sentences
-
-    @staticmethod
-    def _build_words(words_data: List[Dict[str, Any]]) -> List[WordTimestamp]:
-        words: List[WordTimestamp] = []
-        for word in words_data:
-            words.append(
-                WordTimestamp(
-                    word=word.get("word", ""),
-                    start=word.get("start", 0.0),
-                    end=word.get("end", 0.0),
-                    confidence=word.get("confidence", 1.0),
-                    confidence_raw=word.get("confidence_raw"),
-                    confidence_display_raw=word.get("confidence_display_raw"),
-                    token_type=word.get("token_type"),
-                )
-            )
-        return words
 
     def _is_sentence_incomplete(self, sentence: SentenceSegment) -> bool:
         """判断句子是否语义不完整，用于跨 chunk 合并。"""

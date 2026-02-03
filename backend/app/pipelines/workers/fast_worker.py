@@ -13,6 +13,7 @@ from app.core.asr.engine import ASREngine
 from app.core.asr.models import ASRResult
 from app.schemas.pipeline_context import ProcessingContext
 from app.services.audio.chunk_engine import AudioChunk
+from app.services.model_runtime_config_service import get_model_runtime_config_service
 
 
 class FastWorker:
@@ -80,11 +81,15 @@ class FastWorker:
         # 优先使用 chunk.language（LangID 检测结果），回退到全局设置
         language = chunk.language or self.sensevoice_language
         
+        # V3.2.0+dev.20260203.04: 对齐运行参数 use_itn，避免分支结果不一致
+        runtime = get_model_runtime_config_service().get_effective_runtime_global()
+        use_itn = runtime.get("effective", {}).get("sensevoice", {}).get("use_itn", True)
+
         asr_result = await self.draft_engine.transcribe(
             chunk.audio,
             language=language,
             sample_rate=chunk.sample_rate,
-            use_itn=True,
+            use_itn=use_itn,
         )
         result = self._convert_asr_result(asr_result)
 

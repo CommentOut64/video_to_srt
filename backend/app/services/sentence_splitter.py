@@ -796,6 +796,10 @@ class SentenceSplitter:
         current_last = current_word[-1] if current_word else ''
         next_first = next_word[0] if next_word else ''
 
+        # 规则0：相邻数字不加空格，避免数字序列被拆开
+        if current_last.isdigit() and next_first.isdigit():
+            return False
+
         # 规则1：如果当前词或下一词包含中文字符，不加空格
         if self._is_chinese_char(current_last) or self._is_chinese_char(next_first):
             return False

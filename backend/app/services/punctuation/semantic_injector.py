@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 from app.models.confidence_models import AlignedWord
 from app.models.sensevoice_models import WordTimestamp
@@ -57,6 +57,8 @@ class SemanticInjector:
         aligned_words: List[AlignedWord],
         clean_text: str,
         positions: List[PuncPosition],
+        *,
+        language: Optional[str] = None,
     ) -> SemanticInjectionResult:
         """将标点注入到对齐词流（仅改文本，不改时间戳）。"""
         if not aligned_words:
@@ -69,7 +71,11 @@ class SemanticInjector:
             ]
             return SemanticInjectionResult(annotated_words=annotated, punctuated_text=clean_text)
 
-        char_to_word, coverage = self._build_char_to_word_map(clean_text, aligned_words)
+        char_to_word, coverage = self._build_char_to_word_map(
+            clean_text,
+            aligned_words,
+            language,
+        )
         if coverage < self._min_mapping_coverage:
             annotated = [
                 AnnotatedWord(word=word.word, start=word.start, end=word.end)
@@ -172,20 +178,33 @@ class SemanticInjector:
             )
         return words
 
+    # V3.2.0+dev.20260203.08: 支持外部传入 clean_text/raw_to_clean，统一清洗口径。
     @staticmethod
-    def extract_raw_punctuation_positions(raw_text: str) -> Tuple[str, List[PuncPosition]]:
+    def extract_raw_punctuation_positions(
+        raw_text: str,
+        *,
+        clean_text: Optional[str] = None,
+        raw_to_clean: Optional[Sequence[Optional[int]]] = None,
+    ) -> Tuple[str, List[PuncPosition]]:
         """从原文中提取标点位置（以 clean_text 为基准）。"""
         if not raw_text:
             return "", []
-        clean_text, _, raw_to_clean = build_clean_text(raw_text)
+        if clean_text is None or raw_to_clean is None:
+            clean_text, _, raw_to_clean = build_clean_text(raw_text)
+        if raw_to_clean is None:
+            return clean_text or "", []
         positions: List[PuncPosition] = []
         for raw_idx, char in enumerate(raw_text):
             if char not in _PUNCTUATION_SET:
+                continue
+            if raw_idx >= len(raw_to_clean):
                 continue
             if raw_to_clean[raw_idx] is not None:
                 continue
             prev_clean = None
             for back in range(raw_idx - 1, -1, -1):
+                if back >= len(raw_to_clean):
+                    continue
                 prev_clean = raw_to_clean[back]
                 if prev_clean is not None:
                     break
@@ -194,19 +213,27 @@ class SemanticInjector:
             positions.append(PuncPosition(char_index=prev_clean, punctuation=char, confidence=1.0))
         return clean_text, positions
 
+    # V3.2.0+dev.20260203.09: 语言感知映射（跳过空白 token + 规范化匹配 + 拼接兜底）。
     def _build_char_to_word_map(
         self,
         clean_text: str,
         aligned_words: List[AlignedWord],
+        language: Optional[str],
     ) -> tuple[List[Optional[int]], float]:
         mapping: List[Optional[int]] = [None] * len(clean_text)
         total_chars = sum(1 for ch in clean_text if not ch.isspace())
         matched_chars = 0
         cursor = 0
         for idx, word in enumerate(aligned_words):
-            token = word.word
+            raw_token = word.word or ""
+            if self._is_whitespace_token(raw_token):
+                cursor = self._skip_whitespace(clean_text, cursor)
+                continue
+
+            token = self._normalize_token_for_match(raw_token, language)
             if not token:
                 continue
+
             cursor = self._skip_whitespace(clean_text, cursor)
             if cursor >= len(clean_text):
                 break
@@ -239,6 +266,53 @@ class SemanticInjector:
             elif last_idx is not None:
                 mapping[i] = last_idx
         coverage = matched_chars / max(total_chars, 1)
+        if coverage < self._min_mapping_coverage:
+            fallback_mapping, fallback_coverage = self._build_char_to_word_map_by_concat(
+                clean_text,
+                aligned_words,
+            )
+            if fallback_coverage > coverage:
+                return fallback_mapping, fallback_coverage
+        return mapping, coverage
+
+    @staticmethod
+    def _is_whitespace_token(token: str) -> bool:
+        return bool(token) and token.isspace()
+
+    @staticmethod
+    def _is_cjk_language(language: Optional[str]) -> bool:
+        lang = (language or "auto").lower()
+        return lang.startswith(("zh", "yue", "ja", "jp", "ko"))
+
+    def _normalize_token_for_match(self, token: str, language: Optional[str]) -> str:
+        normalized = token.replace("▁", " ").strip()
+        if not normalized:
+            return ""
+        if self._is_cjk_language(language):
+            normalized = normalized.replace(" ", "")
+        normalized = normalized.strip("".join(_PUNCTUATION_SET))
+        return normalized
+
+    def _build_char_to_word_map_by_concat(
+        self,
+        clean_text: str,
+        aligned_words: List[AlignedWord],
+    ) -> tuple[List[Optional[int]], float]:
+        concat = "".join(word.word for word in aligned_words)
+        if concat != clean_text:
+            return [None] * len(clean_text), 0.0
+        mapping: List[Optional[int]] = [None] * len(clean_text)
+        cursor = 0
+        for idx, word in enumerate(aligned_words):
+            token = word.word or ""
+            if not token:
+                continue
+            for _ in token:
+                if cursor >= len(mapping):
+                    break
+                mapping[cursor] = idx
+                cursor += 1
+        coverage = 1.0 if clean_text else 0.0
         return mapping, coverage
 
     @staticmethod

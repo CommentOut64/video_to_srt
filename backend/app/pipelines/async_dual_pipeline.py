@@ -825,6 +825,46 @@ class AsyncDualPipeline:
             whisper_result["text"] = chosen_text_clean
             whisper_result["text_clean"] = chosen_text_clean
 
+    # V3.2.0+dev.20260203.08: 统一规范化映射提取标点，避免数字归一化导致的错位。
+    def _extract_raw_punctuation_positions_with_normalizer(
+        self,
+        raw_text: str,
+        language: str,
+    ) -> Tuple[str, List[PuncPosition]]:
+        """使用统一规范化结果提取标点位置（修复数字归一化导致的错位）。"""
+        if not raw_text:
+            return "", []
+        normalized = self._text_normalizer.normalize(raw_text, language)
+        clean_text = normalized.text_clean or normalized.text_itn_raw
+        if not clean_text:
+            return "", []
+        clean_text, positions = SemanticInjector.extract_raw_punctuation_positions(
+            raw_text,
+            clean_text=clean_text,
+            raw_to_clean=normalized.raw_to_clean,
+        )
+        return clean_text, positions
+
+    def _resolve_whisper_punctuation_positions(
+        self,
+        raw_text: str,
+        clean_text: str,
+        language: str,
+    ) -> Tuple[List[PuncPosition], str, bool]:
+        """优先使用现有清洗口径提取标点，失败时尝试统一规范化回退。"""
+        if not raw_text:
+            return [], "", False
+        wh_clean_text, wh_positions = SemanticInjector.extract_raw_punctuation_positions(raw_text)
+        if wh_clean_text and wh_clean_text == clean_text:
+            return wh_positions, wh_clean_text, True
+        normalized_text, normalized_positions = self._extract_raw_punctuation_positions_with_normalizer(
+            raw_text,
+            language,
+        )
+        if normalized_text and normalized_text == clean_text:
+            return normalized_positions, normalized_text, True
+        return wh_positions, wh_clean_text, False
+
     def _resolve_punctuation_positions(
         self,
         sv_result: Dict[str, Any],
@@ -836,6 +876,11 @@ class AsyncDualPipeline:
         clean_text = chosen_text_clean
         if not clean_text:
             return None, clean_text
+        language = (
+            whisper_result.get("language")
+            or sv_result.get("language")
+            or "auto"
+        )
 
         sv_positions = self._extract_sv_punctuation_positions(sv_result, clean_text)
         if punct_source == "sv":
@@ -843,15 +888,40 @@ class AsyncDualPipeline:
 
         if punct_source == "whisper":
             raw_text = str(whisper_result.get("text_itn_raw") or whisper_result.get("text") or "")
-            wh_clean_text, wh_positions = SemanticInjector.extract_raw_punctuation_positions(raw_text)
-            if not wh_clean_text or wh_clean_text != clean_text:
-                self.logger.debug("标点源清洗文本不一致，放弃 whisper 标点回写")
+            wh_positions, wh_clean_text, matched = self._resolve_whisper_punctuation_positions(
+                raw_text,
+                clean_text,
+                language,
+            )
+            if not matched:
+                # V3.1.2+dev.20260203.01: 增强诊断日志
+                self.logger.warning(
+                    "标点源清洗文本不一致 - punct_source=whisper wh_clean_len=%d clean_len=%d wh_punct_count=%d",
+                    len(wh_clean_text) if wh_clean_text else 0,
+                    len(clean_text),
+                    len(wh_positions),
+                )
+                self.logger.debug("wh_clean_text[:100]='%s'", (wh_clean_text or "")[:100])
+                self.logger.debug("clean_text[:100]='%s'", clean_text[:100])
                 return None, clean_text
             return (wh_positions or None), wh_clean_text
 
         raw_text = str(whisper_result.get("text_itn_raw") or whisper_result.get("text") or "")
-        wh_clean_text, wh_positions = SemanticInjector.extract_raw_punctuation_positions(raw_text)
-        if not wh_clean_text or wh_clean_text != clean_text:
+        wh_positions, wh_clean_text, matched = self._resolve_whisper_punctuation_positions(
+            raw_text,
+            clean_text,
+            language,
+        )
+        if not matched:
+            # V3.1.2+dev.20260203.01: 增强诊断日志（merged 模式）
+            if wh_clean_text:
+                self.logger.warning(
+                    "标点源清洗文本不一致（merged 模式）- wh_clean_len=%d clean_len=%d",
+                    len(wh_clean_text),
+                    len(clean_text),
+                )
+                self.logger.debug("wh_clean_text[:100]='%s'", wh_clean_text[:100])
+                self.logger.debug("clean_text[:100]='%s'", clean_text[:100])
             wh_positions = []
         if sv_positions and wh_positions and clean_text == (sv_result.get("text_clean") or clean_text):
             merged = self._merge_punctuation_positions(sv_positions, wh_positions)
@@ -870,8 +940,30 @@ class AsyncDualPipeline:
         if not isinstance(punctuation_meta, dict):
             return []
         if clean_text and sv_result.get("text_clean") and clean_text != sv_result.get("text_clean"):
+            # V3.1.2+dev.20260203.01: 增强诊断日志
+            sv_clean = sv_result.get("text_clean", "")
+            self.logger.warning(
+                "SV 标点源文本不一致 - sv_clean_len=%d clean_len=%d",
+                len(sv_clean),
+                len(clean_text),
+            )
+            self.logger.debug("sv_clean[:100]='%s'", sv_clean[:100])
+            self.logger.debug("clean_text[:100]='%s'", clean_text[:100])
             return []
         result = self._build_punctuation_result(punctuation_meta, clean_text)
+        # V3.1.2+dev.20260203.01: 记录标点位置分布
+        if result and result.punctuation_positions:
+            positions = result.punctuation_positions
+            if clean_text:
+                text_len = len(clean_text)
+                tail_threshold = int(text_len * 0.8)
+                tail_count = sum(1 for p in positions if p.char_index >= tail_threshold)
+                self.logger.debug(
+                    "SV 标点分布：总数=%d 末尾20%%区域=%d 文本长度=%d",
+                    len(positions),
+                    tail_count,
+                    text_len,
+                )
         return result.punctuation_positions if result else []
 
     @staticmethod

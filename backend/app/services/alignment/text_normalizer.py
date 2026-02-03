@@ -1,6 +1,6 @@
 """
 统一规范化层（WeText ITN + 安全标点标记 + 清洗）。
-V3.2.0+dev.20260203.03
+V3.2.0+dev.20260203.04
 """
 from __future__ import annotations
 
@@ -18,6 +18,21 @@ _HYPHEN_CHARS = {"-", "‐", "‑", "–", "—"}
 _JAPANESE_MIDDLE_DOT = "・"
 _EN_ABBREV_PATTERN = re.compile(r"(?:\b[A-Za-z]\.){2,}[A-Za-z]\.?")
 _ABNORMAL_ALNUM_PATTERN = re.compile(r"(?:[A-Za-z]{3,}\d{2,}|\d{2,}[A-Za-z]{3,})")
+_CJK_CHAR_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+_SPACED_DIGIT_PATTERN = re.compile(r"(?<=\d)\s+(?=\d)")
+_CJK_SINGLE_DIGIT_PATTERN = re.compile(r"(?<=[\u4e00-\u9fff])([0-9])(?=[\u4e00-\u9fff])")
+_CJK_DIGIT_MAP = {
+    "0": "零",
+    "1": "一",
+    "2": "二",
+    "3": "三",
+    "4": "四",
+    "5": "五",
+    "6": "六",
+    "7": "七",
+    "8": "八",
+    "9": "九",
+}
 
 
 class TextNormalizer:
@@ -78,6 +93,14 @@ class TextNormalizer:
         return itn.normalize(text)
 
     def _get_itn(self, lang: str):
+        """
+        获取或创建 ITN 归一化器
+
+        V3.2.0+dev.20260203.07: 修复单个数字转换问题
+        - 设置 enable_0_to_9=False（官方推荐）
+        - 保持口语化表达："想一想" 不会变成 "想1想"
+        - 连续数字仍然转换："六六六" → "666"
+        """
         if lang not in self._itn_cache:
             try:
                 from wetext import Normalizer
@@ -87,19 +110,24 @@ class TextNormalizer:
             self._itn_cache[lang] = Normalizer(
                 lang=wetext_lang,
                 operator="itn",
-                enable_0_to_9=True,
+                enable_0_to_9=False,  # 官方推荐：保持单个数字口语化
             )
         return self._itn_cache[lang]
 
     def _post_itn_cleanup(self, text: str, lang: str) -> str:
-        """ITN 后清理（英文时间/字母数字粘连修正）。"""
+        """ITN 后清理（数字空格修正 + 单字数字回转 + 英文修正）。"""
         if not text:
-            return text
-        lang_key = (lang or "").lower()
-        if not lang_key.startswith("en"):
             return text
 
         normalized = text
+        if _has_cjk(normalized):
+            normalized = _collapse_spaced_digits(normalized)
+            normalized = _convert_single_digit_in_cjk(normalized)
+
+        lang_key = (lang or "").lower()
+        if not lang_key.startswith("en"):
+            return normalized
+
         normalized = re.sub(
             r"\b([APap])\s*\.?\s*m\.?m?\.?\b",
             lambda m: f"{m.group(1).upper()}M",
@@ -180,6 +208,26 @@ def _mark_safe_punct(text: str, lang: str) -> Set[int]:
         if ch == _JAPANESE_MIDDLE_DOT and _is_japanese_middle_dot(lang):
             safe.add(idx)
     return safe
+
+
+def _has_cjk(text: str) -> bool:
+    return bool(_CJK_CHAR_PATTERN.search(text))
+
+
+def _collapse_spaced_digits(text: str) -> str:
+    if not text:
+        return text
+    return _SPACED_DIGIT_PATTERN.sub("", text)
+
+
+def _convert_single_digit_in_cjk(text: str) -> str:
+    if not text:
+        return text
+
+    def _replace(match: re.Match) -> str:
+        return _CJK_DIGIT_MAP.get(match.group(1), match.group(1))
+
+    return _CJK_SINGLE_DIGIT_PATTERN.sub(_replace, text)
 
 
 def _is_decimal_dot(text: str, index: int) -> bool:

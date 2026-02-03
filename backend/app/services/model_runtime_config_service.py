@@ -286,6 +286,7 @@ class ModelRuntimeConfigService:
             },
             "sensevoice": {
                 "language": "auto",
+                # V3.2.0+dev.20260203.08: 恢复默认开启模型端 ITN
                 "use_itn": True,
                 "ban_emo_unk": False,
                 "model_type": "quantized",
@@ -369,6 +370,7 @@ class ModelRuntimeConfigService:
                 "min_subtitle_duration_sec": 0.8,
                 "fast_delay_budget_sec": 2.0,
                 "force_split_on_sentence_end_punct": True,
+                "keep_sentence_end_punct": False,
             },
             "pipeline": {
                 "batch_size": 16,
