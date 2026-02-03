@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Literal
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
@@ -76,6 +76,41 @@ class WhisperRuntimeParams(_RuntimeBase):
             if not isinstance(item, int) or item < 0:
                 raise ValueError("suppress_tokens 仅允许非负整数")
         return value
+
+
+class SanitizePattern(BaseModel):
+    """Whisper 清洗规则模式。"""
+
+    type: Literal["phrase", "regex"] = Field(
+        default="phrase",
+        description="匹配类型：phrase=短语匹配，regex=正则表达式",
+    )
+    value: str = Field(..., min_length=1, description="匹配内容")
+    position: Literal["prefix", "suffix", "any"] = Field(
+        default="any",
+        description="匹配位置：prefix=前缀，suffix=后缀，any=任意位置",
+    )
+    flags: Optional[str] = Field(
+        default="",
+        description="正则标志（如 i 表示忽略大小写）",
+    )
+
+
+class WhisperSanitizeRuntimeParams(_RuntimeBase):
+    is_enabled: Optional[bool] = Field(
+        default=None,
+        alias="enabled",
+        description="是否启用 Whisper 清洗",
+    )
+    min_text_length: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="最小有效文本长度",
+    )
+    patterns: Optional[List[SanitizePattern]] = Field(
+        default=None,
+        description="清洗规则列表",
+    )
 
 
 class SenseVoiceRuntimeParams(_RuntimeBase):
@@ -297,6 +332,7 @@ class RuntimeGroupUpdateRequest(_RuntimeBase):
 
 _RUNTIME_GROUP_MODELS = {
     "whisper": WhisperRuntimeParams,
+    "whisper_sanitize": WhisperSanitizeRuntimeParams,
     "sensevoice": SenseVoiceRuntimeParams,
     "demucs": DemucsRuntimeParams,
     "vad": VADRuntimeParams,
@@ -355,6 +391,11 @@ _PARAM_SCHEMA: Dict[str, Any] = {
             "suppress_tokens": {"type": "int_list", "min": 0, "default": None},
             "repetition_penalty": {"type": "float", "min": 0.0, "default": 1.0},
             "no_repeat_ngram_size": {"type": "int", "min": 0, "default": 0},
+        },
+        "whisper_sanitize": {
+            "enabled": {"type": "bool", "default": True},
+            "min_text_length": {"type": "int", "min": 0, "default": 2},
+            "patterns": {"type": "object", "default": []},
         },
         "sensevoice": {
             "language": {

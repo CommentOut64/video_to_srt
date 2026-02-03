@@ -42,6 +42,8 @@ class BridgeController:
         self._last_tail_prompt = ""
         self._arbiter_feedback: Optional[PunctuationDecision] = None
         self._slow_results: Dict[str, Any] = {}
+        # V3.2.0+dev.20260202.08: 记录最新仲裁结果（调试/后续策略用）
+        self._last_arbitration: Optional[Any] = None
 
     def is_backpressure_active(self) -> bool:
         return self._queue.is_backpressure_active()
@@ -58,6 +60,10 @@ class BridgeController:
         if not batch_id:
             return
         self._slow_results[batch_id] = result
+
+    def record_arbitration_result(self, result: Any) -> None:
+        """记录最新仲裁结果（便于调试与后续策略迭代）。"""
+        self._last_arbitration = result
 
     def get_slow_result(self, batch_id: str) -> Optional[Any]:
         """获取 SlowWorker 批次结果。"""

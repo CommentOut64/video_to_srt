@@ -17,7 +17,7 @@ v3.1.0 更新：
 
 import logging
 import time
-from typing import Any, Dict, List, Optional, Set, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 from pathlib import Path
 
 from app.services.audio.chunk_engine import ChunkEngine, AudioChunk
@@ -77,6 +77,7 @@ class PreprocessingPipeline:
         self.cancellation_token = cancellation_token  # v3.1.0
         self.progress_emitter = progress_emitter
         self.diagnostic_service = diagnostic_service  # V3.2.0+dev.20260131
+        self._vad_intervals: Optional[List[Tuple[float, float]]] = None
         if vad_config is None:
             from app.services.runtime_param_resolver import build_vad_config
 
@@ -169,6 +170,7 @@ class PreprocessingPipeline:
         self.logger.info(f"开始预处理流程: {video_path}")
         token = self.cancellation_token  # v3.1.0: 简化引用
         job_id = job_state.job_id if job_state else None
+        self._vad_intervals = None
         sse_manager = None
         if job_id:
             from app.services.sse_service import get_sse_manager
@@ -298,6 +300,8 @@ class PreprocessingPipeline:
                     self.logger.warning("[V3.2.0+dev.20260122.03] 保存 VAD 缓存失败: %s", e)
         else:
             self.logger.info("[V3.1.0] 跳过 Stage 1 (音频提取 + VAD)")
+            if self._vad_intervals is None:
+                self.logger.info("VAD 区间缺失（使用缓存/检查点恢复），对齐阶段将跳过 VAD 锚点约束")
 
         # Stage 2: 频谱分诊（如果启用，逐chunk可中断）
         if self.spectral_triage_stage:
@@ -872,6 +876,11 @@ class PreprocessingPipeline:
             progress_callback=progress_callback,
             diagnostic_service=self.diagnostic_service  # V3.2.0+dev.20260131: 传递诊断服务
         )
+        self._vad_intervals = self._build_vad_intervals_from_segments(
+            self.chunk_engine.get_last_vad_segments()
+        )
+        if not self._vad_intervals:
+            self.logger.info("未获取到真实 VAD 区间，对齐阶段将跳过 VAD 锚点约束")
 
         self.logger.info(
             f"VAD切分完成: {len(chunks)} 个chunk, "
@@ -954,6 +963,37 @@ class PreprocessingPipeline:
         except Exception as e:
             self.logger.error(f"[V3.1.0] 从 checkpoint 恢复 chunks 失败: {e}")
             return None
+
+    def get_vad_intervals(self) -> Optional[List[Tuple[float, float]]]:
+        """返回最近一次 VAD 语音区间（秒级）。"""
+        if not self._vad_intervals:
+            return None
+        return list(self._vad_intervals)
+
+    @staticmethod
+    def _build_vad_intervals_from_segments(
+        segments: Optional[List[Dict[str, Any]]],
+    ) -> Optional[List[Tuple[float, float]]]:
+        """从 VAD 段列表提取区间，过滤无效边界。"""
+        if not segments:
+            return None
+        intervals: List[Tuple[float, float]] = []
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            start = seg.get("start")
+            end = seg.get("end")
+            if start is None or end is None:
+                continue
+            try:
+                start_val = float(start)
+                end_val = float(end)
+            except (TypeError, ValueError):
+                continue
+            if end_val <= start_val:
+                continue
+            intervals.append((start_val, end_val))
+        return intervals or None
 
     def get_statistics(self, chunks: List[AudioChunk]) -> dict:
         """

@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import List, Optional, TYPE_CHECKING
+from typing import List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
 
@@ -57,6 +57,7 @@ class PipelineOrchestrator:
         self.sse_manager = sse_manager
         self.hardware_profile_provider = hardware_profile_provider
         self.logger = logger or logging.getLogger(__name__)
+        self._preprocess_vad_intervals: Optional[List[Tuple[float, float]]] = None
 
     async def run_pipeline(
         self,
@@ -113,6 +114,7 @@ class PipelineOrchestrator:
                 cancellation_token=cancellation_token,
                 progress_emitter=progress_emitter,
             )
+            vad_intervals = self._preprocess_vad_intervals
 
             job.total = len(chunks)
             self.logger.info(f"音频处理完成: {len(chunks)} 个 Chunk")
@@ -198,6 +200,7 @@ class PipelineOrchestrator:
                 full_audio_array=full_audio_array,
                 full_audio_sr=full_audio_sr,
                 job_dir=_job_dir,
+                vad_intervals=vad_intervals,
                 processed_indices=(
                     resume_context.safe_processed_indices
                     if resume_context.is_resuming
@@ -288,6 +291,7 @@ class PipelineOrchestrator:
 
         V3.2.0+dev.20260125.07: 支持 cancellation_token 和 progress_emitter
         """
+        self._preprocess_vad_intervals = None
         from app.pipelines.preprocessing_pipeline import PreprocessingPipeline
         from app.services.audio.chunk_engine import ChunkEngine
 
@@ -353,6 +357,7 @@ class PipelineOrchestrator:
             except Exception as e:
                 self.logger.warning(f"导出诊断文件失败: {e}", exc_info=True)
 
+        self._preprocess_vad_intervals = preprocessing_pipeline.get_vad_intervals()
         return chunks
 
     def resolve_profiles(self, job: JobState) -> ProfileConfig:
