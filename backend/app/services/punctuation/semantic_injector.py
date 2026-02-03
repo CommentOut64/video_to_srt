@@ -1,6 +1,6 @@
 """
 语义注入器（词边界标点注入）。
-V3.2.0+dev.20260202.08
+V3.2.0+dev.20260203.03
 """
 from __future__ import annotations
 
@@ -37,13 +37,20 @@ class SemanticInjectionResult:
     annotated_words: List[AnnotatedWord]
     punctuated_text: str
     unmatched_positions: List[PuncPosition] = field(default_factory=list)
+    mapping_coverage: float = 0.0
+    is_mapping_blocked: bool = False
 
 
 class SemanticInjector:
     """语义注入器（管道模式：按规则顺序注入标点，保持时间戳不变）。"""
 
-    def __init__(self, logger: Optional[logging.Logger] = None) -> None:
+    def __init__(
+        self,
+        logger: Optional[logging.Logger] = None,
+        min_mapping_coverage: float = 0.6,
+    ) -> None:
         self._logger = logger or logging.getLogger(__name__)
+        self._min_mapping_coverage = min_mapping_coverage
 
     def inject(
         self,
@@ -62,7 +69,23 @@ class SemanticInjector:
             ]
             return SemanticInjectionResult(annotated_words=annotated, punctuated_text=clean_text)
 
-        char_to_word = self._build_char_to_word_map(clean_text, aligned_words)
+        char_to_word, coverage = self._build_char_to_word_map(clean_text, aligned_words)
+        if coverage < self._min_mapping_coverage:
+            annotated = [
+                AnnotatedWord(word=word.word, start=word.start, end=word.end)
+                for word in aligned_words
+            ]
+            self._logger.debug(
+                "语义注入映射覆盖率过低=%.2f，跳过标点注入",
+                coverage,
+            )
+            return SemanticInjectionResult(
+                annotated_words=annotated,
+                punctuated_text=clean_text,
+                unmatched_positions=positions,
+                mapping_coverage=coverage,
+                is_mapping_blocked=True,
+            )
         leading_marks: List[List[str]] = [[] for _ in aligned_words]
         trailing_marks: List[List[str]] = [[] for _ in aligned_words]
         unmatched: List[PuncPosition] = []
@@ -126,6 +149,7 @@ class SemanticInjector:
             annotated_words=annotated_words,
             punctuated_text=punctuated_text,
             unmatched_positions=unmatched,
+            mapping_coverage=coverage,
         )
 
     @staticmethod
@@ -174,8 +198,10 @@ class SemanticInjector:
         self,
         clean_text: str,
         aligned_words: List[AlignedWord],
-    ) -> List[Optional[int]]:
+    ) -> tuple[List[Optional[int]], float]:
         mapping: List[Optional[int]] = [None] * len(clean_text)
+        total_chars = sum(1 for ch in clean_text if not ch.isspace())
+        matched_chars = 0
         cursor = 0
         for idx, word in enumerate(aligned_words):
             token = word.word
@@ -188,6 +214,7 @@ class SemanticInjector:
                 for offset in range(len(token)):
                     if cursor + offset < len(mapping):
                         mapping[cursor + offset] = idx
+                matched_chars += self._count_nonspace(clean_text[cursor:cursor + len(token)])
                 cursor += len(token)
                 continue
 
@@ -196,6 +223,7 @@ class SemanticInjector:
                 for offset in range(len(token)):
                     if found + offset < len(mapping):
                         mapping[found + offset] = idx
+                matched_chars += self._count_nonspace(clean_text[found:found + len(token)])
                 cursor = found + len(token)
                 continue
 
@@ -210,7 +238,12 @@ class SemanticInjector:
                 last_idx = value
             elif last_idx is not None:
                 mapping[i] = last_idx
-        return mapping
+        coverage = matched_chars / max(total_chars, 1)
+        return mapping, coverage
+
+    @staticmethod
+    def _count_nonspace(text: str) -> int:
+        return sum(1 for ch in text if not ch.isspace())
 
     @staticmethod
     def _skip_whitespace(text: str, cursor: int) -> int:
