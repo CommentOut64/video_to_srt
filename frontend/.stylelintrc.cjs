@@ -126,10 +126,12 @@ module.exports = {
     ],
 
     // 选择器类名模式（推荐 kebab-case）
+    // 允许: kebab-case (my-class), Element Plus BEM (el-*, is-*, has-*, 包含双下划线)
     'selector-class-pattern': [
-      '^[a-z][a-z0-9]*(-[a-z0-9]+)*$',
+      '^([a-z][a-z0-9]*(-[a-z0-9]+)*|el-[a-z0-9_-]+|is-[a-z0-9-]+|has-[a-z0-9-]+)$',
       {
-        message: 'Expected class selector to be kebab-case'
+        message: 'Expected class selector to be kebab-case (except third-party libraries like Element Plus)',
+        resolveNestedSelectors: true
       }
     ],
 
@@ -149,10 +151,11 @@ module.exports = {
     ],
 
     // 自定义属性命名规范：必须以 --af- 开头
+    // 允许第三方库的 CSS 变量（如 Element Plus 的 --el-*）
     'custom-property-pattern': [
-      '^af-[a-z]([a-z0-9-]+)?$',
+      '^(af-[a-z]([a-z0-9-]+)?|el-.*)$',
       {
-        message: 'CSS 变量必须以 --af- 开头并使用 kebab-case 命名（如 --af-bg-primary）'
+        message: 'CSS 变量必须以 --af- 开头并使用 kebab-case 命名（如 --af-bg-primary），第三方库变量除外'
       }
     ],
 

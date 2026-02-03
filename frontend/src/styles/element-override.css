@@ -7,6 +7,31 @@
    全局 Element Plus 主题变量
    ============================================== */
 
+/* 修复对话框打开时页面抖动（滚动条消失导致） */
+/* document.scrollingElement 返回 HTML，滚动容器是 <html>
+   方案：禁用 EP 对 body 的操作，改为锁定 html 滚动 */
+
+/* 1. 禁用 Element Plus 对 body 的滚动锁定（防止左移） */
+body.el-popup-parent--hidden {
+  overflow: visible !important;
+  padding-right: 0 !important;
+  width: auto !important;
+  position: static !important;
+}
+
+/* 2. 改为锁定 html 滚动（滚动条保持可见但不可滚动） */
+html.el-popup-parent--hidden {
+  overflow-y: scroll !important;
+  pointer-events: none;
+}
+
+/* 3. 弹窗层保持可交互 */
+html.el-popup-parent--hidden .el-overlay,
+html.el-popup-parent--hidden .el-dialog,
+html.el-popup-parent--hidden .el-message-box__wrapper {
+  pointer-events: auto;
+}
+
 :root {
   /* 主色系 */
   --el-color-primary: var(--af-accent-primary);
@@ -44,10 +69,10 @@
   --el-fill-color-darker: var(--af-bg-primary);
   --el-fill-color-blank: transparent;
 
-  /* 圆角 */
-  --el-border-radius-base: var(--af-radius-md);
-  --el-border-radius-small: var(--af-radius-sm);
-  --el-border-radius-round: var(--af-radius-full);
+  /* 圆角 - 使用 Element Plus 默认值 */
+  --el-border-radius-base: 4px;
+  --el-border-radius-small: 2px;
+  --el-border-radius-round: 20px;
   --el-border-radius-circle: 50%;
 
   /* 阴影 */
@@ -71,6 +96,17 @@
   --el-button-hover-text-color: var(--af-text-primary);
   --el-button-active-bg-color: var(--af-bg-tertiary);
   --el-button-active-border-color: var(--af-accent-primary);
+  --el-button-disabled-bg-color: var(--af-bg-tertiary);
+  --el-button-disabled-border-color: var(--af-border-default);
+  --el-button-disabled-text-color: var(--af-text-disabled);
+}
+
+/* 禁用按钮样式 */
+.el-button.is-disabled,
+.el-button:disabled {
+  --el-button-disabled-bg-color: var(--af-bg-tertiary);
+  --el-button-disabled-border-color: var(--af-border-default);
+  --el-button-disabled-text-color: var(--af-text-disabled);
 }
 
 /* danger 类型按钮 */
@@ -132,12 +168,7 @@
   --el-dropdown-menuItem-hover-color: var(--af-text-primary);
 }
 
-/* 消息提示 */
-.el-message {
-  --el-message-bg-color: var(--af-bg-elevated);
-  --el-message-border-color: var(--af-border-default);
-  --el-message-text-color: var(--af-text-normal);
-}
+/* 消息提示 - 使用 Element Plus 默认样式 */
 
 /* 通知 */
 .el-notification {

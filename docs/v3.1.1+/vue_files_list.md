@@ -20,7 +20,7 @@
 - [x] frontend\src\components\editor\VideoStage\index.vue
 - [x] frontend\src\components\editor\WaveformTimeline\index.vue
 - [x] frontend\src\views\EditorView.vue
-- [ ] frontend\src\views\TaskListView.vue
+- [x] frontend\src\views\TaskListView.vue
 
 ## 统计信息
 
