@@ -5,12 +5,12 @@
 - [ ] frontend\src\App.vue
 - [ ] frontend\src\components\AboutDialog.vue
 - [ ] frontend\src\components\UpdateDialog.vue
-- [ ] frontend\src\components\common\DualAnchorProgress.vue
-- [ ] frontend\src\components\common\SimpleProgress.vue
-- [ ] frontend\src\components\editor\AdvancedSettings.vue
-- [ ] frontend\src\components\editor\ContextMenu.vue
-- [x] frontend\src\components\editor\EditorHeader.vue
-- [ ] frontend\src\components\editor\PresetSelector.vue
+- [ ] frontend\src\components\common\DualAnchorProgress.vue（需重新设计）
+- [ ] frontend\src\components\common\SimpleProgress.vue（需重新设计）
+- [ ] frontend\src\components\task\PresetSelector.vue（需重新设计）
+- [ ] frontend\src\components\editor\AdvancedSettings.vue（需重新设计）
+- [x] frontend\src\components\editor\ContextMenu.vue（需重新设计）
+- [x] frontend\src\components\editor\EditorHeader.vue1
 - [x] frontend\src\components\editor\PlaybackControls\index.vue
 - [x] frontend\src\components\editor\SubtitleList\index.vue
 - [x] frontend\src\components\editor\SubtitleList\SubtitleItem.vue
@@ -18,8 +18,8 @@
 - [x] frontend\src\components\editor\TaskMonitor\TaskCard.vue
 - [x] frontend\src\components\editor\TaskMonitor\TaskGroup.vue
 - [x] frontend\src\components\editor\VideoStage\index.vue
-- [ ] frontend\src\components\editor\WaveformTimeline\index.vue
-- [ ] frontend\src\views\EditorView.vue
+- [x] frontend\src\components\editor\WaveformTimeline\index.vue
+- [x] frontend\src\views\EditorView.vue
 - [ ] frontend\src\views\TaskListView.vue
 
 ## 统计信息
