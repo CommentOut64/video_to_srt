@@ -31,6 +31,7 @@ V3.2.0+dev.20260123.05 更新：
 import asyncio
 import copy
 import logging
+from dataclasses import replace
 from typing import List, Optional, Any, TYPE_CHECKING, Set, Dict, Tuple
 from pathlib import Path
 
@@ -41,7 +42,7 @@ from app.models.sensevoice_models import SentenceSegment
 from app.services.audio.chunk_engine import AudioChunk
 from app.services.alignment.default_aligner import DefaultAligner
 from app.services.alignment.text_normalizer import get_alignment_text_normalizer
-from app.services.alignment.types import NormalizationResult
+from app.services.alignment.types import NormalizationResult, TextTrack, TextTrackBundle
 from app.services.arbitration.arbiter import Arbiter, ArbitrationResult
 from app.services.arbitration.hallucination_detector import HallucinationDetector
 from app.services.model_runtime_config_service import get_model_runtime_config_service
@@ -49,6 +50,7 @@ from app.services.sse_service import get_sse_manager
 from app.services.segmentation.default_segmenter import DefaultSegmenter
 from app.services.streaming_subtitle import get_streaming_subtitle_manager
 from app.services.punctuation.fast_punctuation_pipeline import FastPunctuationPipeline
+from app.services.punctuation.debug_utils import append_debug_whisper_line
 from app.services.punctuation.base import PunctuationResult, PuncPosition, SplitPoint
 from app.services.bridge.bridge_controller import BridgeBatch, BridgeController
 from app.services.punctuation.semantic_buffer import (
@@ -698,6 +700,39 @@ class AsyncDualPipeline:
             return
         await self.queue_inter.put(batch)
 
+    @staticmethod
+    def _ensure_text_tracks(ctx: ProcessingContext) -> TextTrackBundle:
+        if ctx.text_tracks is None:
+            ctx.text_tracks = TextTrackBundle()
+        return ctx.text_tracks
+
+    @staticmethod
+    def _build_text_track(
+        raw_text: str,
+        normalized: NormalizationResult,
+        source: str,
+    ) -> TextTrack:
+        return TextTrack(
+            raw_text=raw_text,
+            text_itn_raw=normalized.text_itn_raw,
+            text_clean=normalized.text_clean or normalized.text_itn_raw,
+            char_mapping=normalized.char_mapping,
+            raw_to_clean=normalized.raw_to_clean,
+            clean_to_raw=normalized.clean_to_raw,
+            source=source,
+            itn_fallback=normalized.itn_fallback,
+            itn_fallback_reason=normalized.itn_fallback_reason,
+        )
+
+    @staticmethod
+    def _clone_text_track(track: TextTrack, source: str) -> TextTrack:
+        return replace(
+            track,
+            source=source,
+            clean_to_word=list(track.clean_to_word),
+            punct_positions=list(track.punct_positions),
+        )
+
     def _normalize_sensevoice_result(
         self,
         ctx: ProcessingContext,
@@ -711,6 +746,8 @@ class AsyncDualPipeline:
         normalized = self._text_normalizer.normalize(raw_text, language)
         sv_result["text_itn_raw"] = normalized.text_itn_raw
         sv_result["text_clean"] = normalized.text_clean or normalized.text_itn_raw
+        tracks = self._ensure_text_tracks(ctx)
+        tracks.sv_track = self._build_text_track(raw_text, normalized, source="sv")
         return normalized
 
     def _apply_whisper_full_sanitize(self, ctx: ProcessingContext) -> None:
@@ -731,6 +768,8 @@ class AsyncDualPipeline:
         whisper_result["text_itn_raw"] = normalized.text_itn_raw
         whisper_result["text_clean"] = normalized.text_clean
         whisper_result["text"] = normalized.text_clean or sanitized
+        tracks = self._ensure_text_tracks(ctx)
+        tracks.whisper_track = self._build_text_track(sanitized, normalized, source="whisper")
 
     def _is_arbitration_enabled(self) -> bool:
         runtime = get_model_runtime_config_service().get_effective_runtime_global()
@@ -804,16 +843,17 @@ class AsyncDualPipeline:
 
         if punct_source == "whisper":
             raw_text = str(whisper_result.get("text_itn_raw") or whisper_result.get("text") or "")
-            clean_text, wh_positions = SemanticInjector.extract_raw_punctuation_positions(raw_text)
-            if not clean_text:
-                clean_text = chosen_text_clean
-            return (wh_positions or None), clean_text
+            wh_clean_text, wh_positions = SemanticInjector.extract_raw_punctuation_positions(raw_text)
+            if not wh_clean_text or wh_clean_text != clean_text:
+                self.logger.debug("标点源清洗文本不一致，放弃 whisper 标点回写")
+                return None, clean_text
+            return (wh_positions or None), wh_clean_text
 
         raw_text = str(whisper_result.get("text_itn_raw") or whisper_result.get("text") or "")
-        clean_text, wh_positions = SemanticInjector.extract_raw_punctuation_positions(raw_text)
-        if not clean_text:
-            clean_text = chosen_text_clean
-        if sv_positions and clean_text == (sv_result.get("text_clean") or clean_text):
+        wh_clean_text, wh_positions = SemanticInjector.extract_raw_punctuation_positions(raw_text)
+        if not wh_clean_text or wh_clean_text != clean_text:
+            wh_positions = []
+        if sv_positions and wh_positions and clean_text == (sv_result.get("text_clean") or clean_text):
             merged = self._merge_punctuation_positions(sv_positions, wh_positions)
             return (merged or None), clean_text
         return (wh_positions or None), clean_text
@@ -1130,6 +1170,42 @@ class AsyncDualPipeline:
             }
         return results
 
+    def _emit_whisper_debug(
+        self,
+        job_dir: Optional[Path],
+        batch: BridgeBatch,
+        whisper_result: Dict[str, Any],
+        chunk_indices: List[int],
+    ) -> None:
+        """记录 Whisper 批次调试信息。"""
+        raw_result = whisper_result.get("raw_result", {}) if isinstance(whisper_result, dict) else {}
+        raw_segments = raw_result.get("segments", []) if isinstance(raw_result, dict) else []
+        seg_count = len(raw_segments)
+        avg_logprob = None
+        avg_no_speech = None
+        if seg_count > 0:
+            avg_logprob = sum(
+                float(seg.get("avg_logprob", 0.0) or 0.0) for seg in raw_segments
+            ) / seg_count
+            avg_no_speech = sum(
+                float(seg.get("no_speech_prob", 0.0) or 0.0) for seg in raw_segments
+            ) / seg_count
+        raw_text = str(whisper_result.get("text_raw", "") or "")
+        sanitized_text = str(whisper_result.get("text", "") or "")
+        seg_text = "".join(str(seg.get("text", "")) for seg in raw_segments).strip()
+        payload = {
+            "batch_id": batch.batch_id,
+            "chunk_indices": chunk_indices,
+            "text_len": len(sanitized_text),
+            "raw_text_len": len(raw_text),
+            "seg_text_len": len(seg_text),
+            "segments_count": seg_count,
+            "avg_logprob": avg_logprob,
+            "avg_no_speech_prob": avg_no_speech,
+            "language": whisper_result.get("language", "auto"),
+        }
+        append_debug_whisper_line(job_dir, payload, logger=self.logger)
+
     async def _process_bridge_batch(
         self,
         batch: BridgeBatch,
@@ -1205,6 +1281,7 @@ class AsyncDualPipeline:
         whisper_result["text_raw"] = whisper_text_raw
         whisper_result["prompt"] = prompt
         whisper_result["text"] = self._whisper_sanitizer.sanitize_minimal(whisper_text_raw, prompt=prompt)
+        self._emit_whisper_debug(job_dir, batch, whisper_result, chunk_indices)
         if whisper_result and self._hallucination_detector.is_hallucination(whisper_result, prompt):
             self.logger.warning("Bridge 批次检测到 Whisper 幻觉，回退快流: batch_id=%s", batch.batch_id)
             for _, ctx in contexts:
@@ -1254,12 +1331,19 @@ class AsyncDualPipeline:
             chunk_text_raw = str(chunk_result.get("text", "") or "")
             chunk_result["text_raw"] = chunk_text_raw
             chunk_result["text"] = self._whisper_sanitizer.sanitize_minimal(chunk_text_raw, prompt=None)
+            raw_text_for_track = str(chunk_result.get("text", "") or "")
             normalized_chunk = self._text_normalizer.normalize(chunk_result.get("text", ""), batch_language)
             chunk_result["text_itn_raw"] = normalized_chunk.text_itn_raw
             chunk_result["text_clean"] = normalized_chunk.text_clean
-            chunk_result["text"] = normalized_chunk.text_clean or chunk_result.get("text", "")
+            chunk_result["text"] = normalized_chunk.text_clean or raw_text_for_track
             chunk_result["language"] = batch_language
             ctx.whisper_result = chunk_result
+            tracks = self._ensure_text_tracks(ctx)
+            tracks.whisper_track = self._build_text_track(
+                raw_text_for_track,
+                normalized_chunk,
+                source="whisper",
+            )
 
         return await self._push_batch_contexts(
             contexts,
@@ -1733,6 +1817,10 @@ class AsyncDualPipeline:
             self.logger.info(f"Chunk {ctx.chunk_index}: Whisper 跳过，直接使用 SenseVoice 定稿")
             final_sentences = self.aligner.split_sensevoice_only(ctx.sv_result, chunk)
 
+            tracks = self._ensure_text_tracks(ctx)
+            if tracks.sv_track and tracks.chosen_track is None:
+                tracks.chosen_track = self._clone_text_track(tracks.sv_track, source="chosen")
+
             ctx.final_sentences = final_sentences
 
             # 推送定稿
@@ -1776,6 +1864,25 @@ class AsyncDualPipeline:
             arbitration_result,
             chosen_text_clean,
         )
+        tracks = self._ensure_text_tracks(ctx)
+        base_track = (
+            tracks.sv_track if arbitration_result.text_source == "sv" else tracks.whisper_track
+        )
+        if base_track:
+            chosen_track = self._clone_text_track(base_track, source="chosen")
+            if chosen_text_clean and chosen_track.text_clean != chosen_text_clean:
+                chosen_track.text_clean = chosen_text_clean
+            if (
+                punctuation_positions
+                and punctuation_clean_text
+                and punctuation_clean_text == chosen_track.text_clean
+            ):
+                chosen_track.punct_positions = list(punctuation_positions)
+            else:
+                if punctuation_positions:
+                    self.logger.debug("仲裁标点 clean_text 不一致，清空回写位置")
+                chosen_track.punct_positions = []
+            tracks.chosen_track = chosen_track
         if self.bridge_controller:
             self.bridge_controller.record_arbitration_result(arbitration_result)
         self.logger.info(
@@ -1795,6 +1902,23 @@ class AsyncDualPipeline:
             punctuation_positions=punctuation_positions,
             punctuation_clean_text=punctuation_clean_text,
         )
+        if self.aligner.last_alignment_stats:
+            ctx.finalization_metrics = dict(self.aligner.last_alignment_stats)
+            if tracks.chosen_track:
+                mapping_cov = self.aligner.last_alignment_stats.get("split_mapping_coverage")
+                if mapping_cov is not None:
+                    tracks.chosen_track.mapping_coverage = float(mapping_cov)
+                ctx.finalization_metrics["itn_fallback"] = (
+                    1.0 if tracks.chosen_track.itn_fallback else 0.0
+                )
+            if tracks.sv_track:
+                ctx.finalization_metrics["sv_itn_fallback"] = (
+                    1.0 if tracks.sv_track.itn_fallback else 0.0
+                )
+            if tracks.whisper_track:
+                ctx.finalization_metrics["whisper_itn_fallback"] = (
+                    1.0 if tracks.whisper_track.itn_fallback else 0.0
+                )
 
         ctx.final_sentences = final_sentences
         if ctx.arbitration_result and self.aligner.last_alignment_stats:

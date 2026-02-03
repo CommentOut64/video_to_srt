@@ -1,6 +1,6 @@
 """
 默认对齐服务（封装旧对齐逻辑）。
-V3.2.0+dev.20260119.06
+V3.2.0+dev.20260203.03
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from app.services.alignment.alignment_service import AlignmentService, Alignment
 from app.services.pseudo_alignment import PseudoAlignment
 from app.services.punctuation.base import PuncPosition
 from app.services.punctuation.semantic_injector import SemanticInjector
-from app.services.sentence_splitter import SentenceSplitter, SplitConfig
+from app.services.punctuation.final_splitter import FinalSplitter, FinalSplitConfig
 from app.services.semantic_grouper import SemanticGrouper, GroupConfig
 
 if TYPE_CHECKING:
@@ -35,7 +35,7 @@ class DefaultAligner:
     def __init__(
         self,
         alignment_config: Optional[AlignmentConfig] = None,
-        final_split_config: Optional[SplitConfig] = None,
+        final_split_config: Optional[FinalSplitConfig] = None,
         final_group_config: Optional[GroupConfig] = None,
         is_enable_semantic_grouping: bool = True,
         alignment_score_threshold: float = 0.3,
@@ -55,18 +55,16 @@ class DefaultAligner:
         )
 
         if final_split_config is None:
-            final_split_config = SplitConfig(
-                prefer_punctuation_break=True,
-                use_dynamic_pause=True,
-                pause_threshold=0.5,
-                max_duration=5.0,
-                enable_hard_limit=True,
-                hard_limit_duration=20.0,
-                delay_split_to_punctuation=True,
-                delay_split_max_wait=15.0,
-                merge_short_sentences=True,
+            final_split_config = FinalSplitConfig(
+                min_tokens=5,
+                max_tokens=50,
+                min_duration=0.5,
+                max_duration=10.0,
+                soft_pause=0.35,
+                long_pause=0.8,
+                min_mapping_coverage=0.6,
             )
-        self.final_splitter = SentenceSplitter(final_split_config)
+        self.final_splitter = FinalSplitter(final_split_config, logger=self.logger)
 
         if final_group_config is None:
             final_group_config = GroupConfig(
@@ -77,7 +75,10 @@ class DefaultAligner:
             )
         self.final_grouper = SemanticGrouper(final_group_config)
         # V3.2.0+dev.20260202.08: 语义注入器（对齐后标点注入）
-        self._semantic_injector = SemanticInjector(logger=self.logger)
+        self._semantic_injector = SemanticInjector(
+            logger=self.logger,
+            min_mapping_coverage=final_split_config.min_mapping_coverage,
+        )
         self.last_alignment_stats: Optional[Dict[str, Any]] = None
 
     async def align(
@@ -93,7 +94,7 @@ class DefaultAligner:
         """执行双流对齐并完成降级兜底。"""
         self.last_alignment_stats = None
         detected_language = whisper_result.get("language", "auto")
-        self.final_splitter.config.language = detected_language
+        self.final_splitter.set_language(detected_language)
         self.logger.debug("使用 Whisper 检测到的语言: %s", detected_language)
 
         whisper_text = whisper_result.get("text", "").strip()
@@ -170,20 +171,38 @@ class DefaultAligner:
             ]
 
             text_for_split = whisper_text
+            injection_stats: Dict[str, Any] = {
+                "injection_positions_total": len(punctuation_positions or []),
+                "injection_unmatched_total": 0,
+                "injection_miss_ratio": 0.0,
+                "injection_mapping_coverage": 0.0,
+                "injection_blocked": 0.0,
+            }
             if punctuation_positions and punctuation_clean_text is not None:
                 injection = self._semantic_injector.inject(
                     aligned_words,
                     punctuation_clean_text,
                     punctuation_positions,
                 )
-                if injection.annotated_words:
+                injection_stats["injection_unmatched_total"] = len(injection.unmatched_positions)
+                injection_stats["injection_miss_ratio"] = (
+                    len(injection.unmatched_positions) / max(len(punctuation_positions), 1)
+                )
+                injection_stats["injection_mapping_coverage"] = injection.mapping_coverage
+                injection_stats["injection_blocked"] = 1.0 if injection.is_mapping_blocked else 0.0
+                if injection.annotated_words and not injection.is_mapping_blocked:
                     words_for_split = self._semantic_injector.build_word_timestamps(
                         aligned_words,
                         injection.annotated_words,
                     )
                     text_for_split = injection.punctuated_text or text_for_split
 
-            sentences = self._split_with_final(words_for_split, text_for_split)
+            sentences = self._split_with_final(
+                words_for_split,
+                text_for_split,
+                punctuation_positions=punctuation_positions,
+                punctuation_clean_text=punctuation_clean_text,
+            )
             for sentence in sentences:
                 sentence.source = TextSource.WHISPER_PATCH
                 sentence.is_finalized = True
@@ -191,6 +210,13 @@ class DefaultAligner:
                 sentence.alignment_score = aligned_subtitle.alignment_score
                 sentence.matched_ratio = aligned_subtitle.matched_ratio
                 sentence.whisper_text = whisper_text
+
+            split_stats = self.final_splitter.last_split_stats or {}
+            if self.last_alignment_stats is None:
+                self.last_alignment_stats = {}
+            self.last_alignment_stats.update(injection_stats)
+            for key, value in split_stats.items():
+                self.last_alignment_stats[f"split_{key}"] = value
 
             self.logger.debug(
                 "双模态对齐成功: alignment_score=%.2f, matched_ratio=%.2f, 分句数=%d",
@@ -220,7 +246,12 @@ class DefaultAligner:
                     word.start += chunk.start
                     word.end += chunk.start
 
-                sentences = self._split_with_final(words, whisper_text)
+                sentences = self._split_with_final(
+                    words,
+                    whisper_text,
+                    punctuation_positions=punctuation_positions,
+                    punctuation_clean_text=punctuation_clean_text,
+                )
                 for sentence in sentences:
                     sentence.source = TextSource.WHISPER_PATCH
                     sentence.is_finalized = True
@@ -229,6 +260,11 @@ class DefaultAligner:
                     sentence.whisper_text = whisper_text
 
                 self.logger.debug("Whisper 伪对齐成功, 分句数=%d", len(sentences))
+                split_stats = self.final_splitter.last_split_stats or {}
+                if self.last_alignment_stats is None:
+                    self.last_alignment_stats = {}
+                for key, value in split_stats.items():
+                    self.last_alignment_stats[f"split_{key}"] = value
                 return sentences, AlignmentLevel.WHISPER_PSEUDO
 
             except Exception as exc2:
@@ -313,8 +349,15 @@ class DefaultAligner:
         self,
         words: List[WordTimestamp],
         text: str,
+        *,
+        punctuation_positions: Optional[List[PuncPosition]] = None,
+        punctuation_clean_text: Optional[str] = None,
     ) -> List[SentenceSegment]:
-        sentences = self.final_splitter.split(words, text)
+        sentences = self.final_splitter.split(
+            words,
+            clean_text=punctuation_clean_text,
+            punctuation_positions=punctuation_positions,
+        )
         if self.is_enable_semantic_grouping:
             sentences = self.final_grouper.group(sentences)
         return sentences
@@ -353,7 +396,11 @@ class DefaultAligner:
             self.logger.warning("SenseVoice 结果没有字级时间戳且无文本，无法分句")
             return []
 
-        sentences = self._split_with_final(words, text_display)
+        sentences = self._split_with_final(
+            words,
+            text_display,
+            punctuation_clean_text=text_display,
+        )
 
         for sentence in sentences:
             sentence.start += chunk.start
