@@ -16,6 +16,7 @@ class WhisperTextSanitizer:
     """Whisper 文本清洗器（策略模式：分层清洗，避免误删正文）。"""
 
     _REPEAT_CHAR_PATTERN = re.compile(r"(.)\1{9,}")
+    _PROMPT_ECHO_MAX_LEN = 120
     _HALLUCINATION_PATTERNS = [
         re.compile(r"^字幕.*?制作", re.IGNORECASE),
         re.compile(r"^翻译[:：]", re.IGNORECASE),
@@ -37,8 +38,23 @@ class WhisperTextSanitizer:
         text = self._remove_hallucination_markers(text)
         text = self._remove_extreme_repetition(text)
 
+        if not text and raw_text.strip():
+            # 兜底策略：避免 Prompt 回显剥离后把正文清空
+            fallback_text = self._remove_hallucination_markers(raw_text.strip())
+            fallback_text = self._remove_extreme_repetition(fallback_text)
+            self._logger.warning(
+                "Whisper 最小清洗触发回退: prompt_len=%d, raw_len=%d",
+                len(prompt or ""),
+                len(raw_text),
+            )
+            text = fallback_text
+
         if raw_text != text:
-            self._logger.debug("Whisper 最小清洗完成: raw_len=%d -> clean_len=%d", len(raw_text), len(text))
+            self._logger.debug(
+                "Whisper 最小清洗完成: raw_len=%d -> clean_len=%d",
+                len(raw_text),
+                len(text),
+            )
         return text.strip()
 
     def sanitize_full(self, text: str, prompt: Optional[str] = None) -> str:
@@ -66,11 +82,15 @@ class WhisperTextSanitizer:
             self._logger.debug("Whisper 完整清洗完成: raw_len=%d -> clean_len=%d", len(raw_text), len(text))
         return text.strip()
 
-    @staticmethod
-    def _remove_prompt_echo(text: str, prompt: Optional[str]) -> str:
+    def _remove_prompt_echo(self, text: str, prompt: Optional[str]) -> str:
         if not text or not prompt:
             return text
         prompt_clean = prompt.strip()
+        if not prompt_clean:
+            return text
+        if len(prompt_clean) > self._PROMPT_ECHO_MAX_LEN:
+            # Prompt 过长时不做回显剥离，避免把正文整体删掉
+            return text
         if prompt_clean and text.startswith(prompt_clean):
             return text[len(prompt_clean):].lstrip()
         return text

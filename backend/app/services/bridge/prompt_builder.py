@@ -4,9 +4,21 @@ V3.2.0+dev.20260201.04
 """
 from __future__ import annotations
 
+import re
+from collections import Counter
 from typing import List, Optional
 
 from app.models.sensevoice_models import SentenceSegment
+
+_EN_STOPWORDS = {
+    "the", "and", "but", "this", "that", "there", "here",
+    "when", "what", "who", "where", "why", "how",
+    "then", "now", "so", "or", "if", "as", "at",
+    "it", "its", "i", "you", "he", "she", "we", "they",
+}
+_CJK_STOPWORDS = {"这个", "那个", "什么", "怎么", "为什么", "因为", "所以", "但是", "然后"}
+_EN_WORD_PATTERN = re.compile(r"[A-Za-z0-9']+")
+_CJK_WORD_PATTERN = re.compile(r"[\u4e00-\u9fff]{2,4}")
 
 
 def _has_cjk(text: str) -> bool:
@@ -22,8 +34,28 @@ def _join_sentences(sentences: List[SentenceSegment]) -> str:
     return " ".join(part.strip() for part in parts if part.strip())
 
 
+def _extract_keywords(text: str, *, min_word_length: int = 3) -> Counter:
+    counter: Counter = Counter()
+    if not text:
+        return counter
+
+    for word in _EN_WORD_PATTERN.findall(text):
+        normalized = word.lower()
+        if normalized in _EN_STOPWORDS:
+            continue
+        if len(normalized) < min_word_length:
+            continue
+        counter[word] += 1
+
+    for word in _CJK_WORD_PATTERN.findall(text):
+        if word in _CJK_STOPWORDS:
+            continue
+        counter[word] += 1
+    return counter
+
+
 class PromptBuilder:
-    """Prompt 构建器（建造者模式）：集中处理上下文拼接与尾句截取。"""
+    """Prompt 构建器（建造者模式）：输出受限的 Glossary，避免正文回显。"""
 
     def build_tail(self, sentences: List[SentenceSegment], max_sentences: int = 2) -> str:
         if not sentences:
@@ -38,10 +70,38 @@ class PromptBuilder:
         history_context: Optional[str] = None,
         tail_context: str = "",
         max_context_sentences: int = 6,
+        max_keywords: int = 20,
+        max_prompt_length: int = 160,
     ) -> str:
         context_sentences = sentences[-max(1, int(max_context_sentences)) :]
         context_text = _join_sentences(context_sentences)
-        segments = [seg for seg in [tail_context, history_context, context_text] if seg]
+        segments = [
+            segment.strip()
+            for segment in [tail_context, history_context, context_text]
+            if segment and segment.strip()
+        ]
         if not segments:
             return ""
-        return " ".join(segment.strip() for segment in segments if segment.strip())
+        source_text = " ".join(segments)
+        keywords = _extract_keywords(source_text)
+        if not keywords:
+            return ""
+
+        sorted_keywords = sorted(
+            keywords.items(),
+            key=lambda item: (-item[1], item[0].lower()),
+        )
+        selected: List[str] = []
+        current_length = len("Glossary: .")
+        for word, _ in sorted_keywords:
+            if len(selected) >= max(1, int(max_keywords)):
+                break
+            additional = len(word) + (2 if selected else 0)
+            if current_length + additional > max_prompt_length:
+                break
+            selected.append(word)
+            current_length += additional
+
+        if not selected:
+            return ""
+        return f"Glossary: {', '.join(selected)}."
