@@ -1,15 +1,17 @@
 """
 统一规范化层（WeText ITN + 安全标点标记 + 清洗）。
-V3.2.0+dev.20260203.04
+V3.2.0+dev.20260204.02
 """
 from __future__ import annotations
 
-import logging
 import re
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
+from app.core.logging import resolve_loguru_logger
 from app.services.alignment.number_utils import normalize_numbers
 from app.services.alignment.types import CharMapping, NormalizationResult
+from app.services.text_normalizer import TextNormalizer as MinimalTextNormalizer
+from app.services.text_pipeline_config import NormalizationConfig, TextPipelineConfig
 
 
 _PUNCTUATION_SET = set(",.!?;:\"()[]{}，。！？；：、（）【】《》“”‘’「」『』")
@@ -33,17 +35,44 @@ _CJK_DIGIT_MAP = {
     "8": "八",
     "9": "九",
 }
+_DECIMAL_DOT_PLACEHOLDER = "__DECIMAL_DOT__"
+_DECIMAL_DOT_PATTERN = re.compile(r"(?<=\d)[\.\u3002\uFF0E](?=\d)")
+_PUNCT_TO_FULLWIDTH = {
+    ",": "，",
+    ".": "。",
+    "!": "！",
+    "?": "？",
+    ";": "；",
+    ":": "：",
+    "(": "（",
+    ")": "）",
+    "[": "【",
+    "]": "】",
+}
+_PUNCT_TO_HALFWIDTH = {value: key for key, value in _PUNCT_TO_FULLWIDTH.items()}
+_PUNCT_TO_HALFWIDTH.update({"．": "."})
 
 
 class TextNormalizer:
     """统一规范化器（单例模式：复用 WeText 实例，避免重复初始化）。"""
 
-    def __init__(self, logger: Optional[logging.Logger] = None) -> None:
-        self._logger = logger or logging.getLogger(__name__)
+    def __init__(self, logger: Optional[Any] = None) -> None:
+        self._logger = resolve_loguru_logger(
+            logger,
+            __name__,
+            layer="L1",
+            processor_name="text_normalizer",
+        )
         self._itn_cache: Dict[str, object] = {}
 
-    def normalize(self, text: str, lang: str) -> NormalizationResult:
-        """统一规范化：ITN → 安全标点标记 → 清洗，输出分轨文本。"""
+    def normalize(
+        self,
+        text: str,
+        lang: str,
+        *,
+        config: Optional[NormalizationConfig] = None,
+    ) -> NormalizationResult:
+        """统一规范化：最小清洗 → ITN → 后清理 → 标点宽度统一 → 安全标点清洗。"""
         if not text:
             return NormalizationResult(
                 text_itn_raw="",
@@ -51,21 +80,33 @@ class TextNormalizer:
                 char_mapping=[],
                 raw_to_clean=[],
                 clean_to_raw=[],
+                mapping_coverage=0.0,
             )
 
-        text_itn_raw, itn_fallback, itn_reason = self._apply_itn_safely(text, lang)
-        text_itn_raw = self._post_itn_cleanup(text_itn_raw, lang)
-        if not itn_fallback:
-            quality_ok, quality_reason = self._check_itn_quality(text, text_itn_raw)
-            if not quality_ok:
-                self._logger.warning("ITN 质量不达标，回退 number_utils: %s", quality_reason)
-                text_itn_raw = normalize_numbers(text, lang=lang)
-                text_itn_raw = self._post_itn_cleanup(text_itn_raw, lang)
-                itn_fallback = True
-                itn_reason = quality_reason
+        active_config = config or self._load_config()
+        base_text = MinimalTextNormalizer.clean(text)
+        if not base_text and text:
+            base_text = text
+
+        text_itn_raw, itn_fallback, itn_reason = self._apply_itn_pipeline(
+            base_text,
+            lang,
+            active_config,
+        )
+        text_itn_raw = self._normalize_punctuation_width(text_itn_raw, lang, active_config)
         text_clean, mapping, raw_to_clean, clean_to_raw = self._clean_punctuation(
             text_itn_raw,
             lang,
+            active_config,
+        )
+        mapping_coverage = _calc_mapping_coverage(raw_to_clean)
+        self._logger.info(
+            "L1 规范化完成 input_len={} clean_len={} itn_fallback={} mapping_cov={:.2f} lang={}",
+            len(base_text),
+            len(text_clean),
+            1 if itn_fallback else 0,
+            mapping_coverage,
+            lang or "auto",
         )
         return NormalizationResult(
             text_itn_raw=text_itn_raw,
@@ -75,7 +116,32 @@ class TextNormalizer:
             clean_to_raw=clean_to_raw,
             itn_fallback=itn_fallback,
             itn_fallback_reason=itn_reason,
+            mapping_coverage=mapping_coverage,
         )
+
+    @staticmethod
+    def _load_config() -> NormalizationConfig:
+        return TextPipelineConfig.from_runtime().normalization
+
+    def _apply_itn_pipeline(
+        self,
+        text: str,
+        lang: str,
+        config: NormalizationConfig,
+    ) -> Tuple[str, bool, Optional[str]]:
+        if not config.is_itn_enabled:
+            return self._post_itn_cleanup(text, lang, config), False, None
+        text_itn_raw, itn_fallback, itn_reason = self._apply_itn_safely(text, lang)
+        text_itn_raw = self._post_itn_cleanup(text_itn_raw, lang, config)
+        if not itn_fallback:
+            quality_ok, quality_reason = self._check_itn_quality(text, text_itn_raw, config)
+            if not quality_ok:
+                self._logger.warning("ITN 质量不达标，回退 number_utils: {}", quality_reason)
+                text_itn_raw = normalize_numbers(text, lang=lang)
+                text_itn_raw = self._post_itn_cleanup(text_itn_raw, lang, config)
+                itn_fallback = True
+                itn_reason = quality_reason
+        return text_itn_raw, itn_fallback, itn_reason
 
     def _apply_itn_safely(self, text: str, lang: str) -> tuple[str, bool, Optional[str]]:
         if not text:
@@ -83,7 +149,7 @@ class TextNormalizer:
         try:
             return self._apply_itn(text, lang), False, None
         except Exception as exc:
-            self._logger.warning("WeText ITN 失败，回退 number_utils: %s", exc)
+            self._logger.warning("WeText ITN 失败，回退 number_utils: {}", exc)
             return normalize_numbers(text, lang=lang), True, "itn_exception"
 
     def _apply_itn(self, text: str, lang: str) -> str:
@@ -114,39 +180,45 @@ class TextNormalizer:
             )
         return self._itn_cache[lang]
 
-    def _post_itn_cleanup(self, text: str, lang: str) -> str:
+    def _post_itn_cleanup(self, text: str, lang: str, config: NormalizationConfig) -> str:
         """ITN 后清理（数字空格修正 + 单字数字回转 + 英文修正）。"""
         if not text:
             return text
 
         normalized = text
         if _has_cjk(normalized):
-            normalized = _collapse_spaced_digits(normalized)
-            normalized = _convert_single_digit_in_cjk(normalized)
+            if config.is_cjk_digit_merge:
+                normalized = _collapse_spaced_digits(normalized)
+            if config.is_cjk_single_digit_to_zh:
+                normalized = _convert_single_digit_in_cjk(normalized)
 
         lang_key = (lang or "").lower()
-        if not lang_key.startswith("en"):
-            return normalized
+        if lang_key.startswith("en"):
+            normalized = re.sub(
+                r"\b([APap])\s*\.?\s*m\.?m?\.?\b",
+                lambda m: f"{m.group(1).upper()}M",
+                normalized,
+            )
+            normalized = re.sub(r"([A-Za-z]{2,})(\d)", r"\1 \2", normalized)
 
-        normalized = re.sub(
-            r"\b([APap])\s*\.?\s*m\.?m?\.?\b",
-            lambda m: f"{m.group(1).upper()}M",
-            normalized,
-        )
-        normalized = re.sub(r"([A-Za-z]{2,})(\d)", r"\1 \2", normalized)
+            def _split_digit_word(match: re.Match) -> str:
+                suffix = match.group(2)
+                if suffix.lower() in {"st", "nd", "rd", "th"}:
+                    return match.group(0)
+                return f"{match.group(1)} {suffix}"
 
-        def _split_digit_word(match: re.Match) -> str:
-            suffix = match.group(2)
-            if suffix.lower() in {"st", "nd", "rd", "th"}:
-                return match.group(0)
-            return f"{match.group(1)} {suffix}"
+            normalized = re.sub(r"(\d)([A-Za-z]{2,})", _split_digit_word, normalized)
 
-        normalized = re.sub(r"(\d)([A-Za-z]{2,})", _split_digit_word, normalized)
-        normalized = re.sub(r"\s{2,}", " ", normalized)
+        if config.is_collapse_spaces:
+            normalized = re.sub(r"\s{2,}", " ", normalized)
         return normalized.strip()
 
     @staticmethod
-    def _check_itn_quality(original: str, normalized: str) -> tuple[bool, Optional[str]]:
+    def _check_itn_quality(
+        original: str,
+        normalized: str,
+        config: NormalizationConfig,
+    ) -> tuple[bool, Optional[str]]:
         """检查 ITN 质量，异常返回 False。"""
         if not normalized:
             return False, "empty_itn"
@@ -155,7 +227,7 @@ class TextNormalizer:
         origin_len = len(original)
         norm_len = len(normalized)
         ratio = norm_len / max(origin_len, 1)
-        if origin_len >= 8 and (ratio < 0.3 or ratio > 3.0):
+        if origin_len >= 8 and (ratio < config.itn_quality_min_ratio or ratio > config.itn_quality_max_ratio):
             return False, f"length_ratio_outlier:{ratio:.2f}"
         abnormal = _ABNORMAL_ALNUM_PATTERN.findall(normalized)
         if len(abnormal) >= 2:
@@ -166,8 +238,9 @@ class TextNormalizer:
         self,
         text: str,
         lang: str,
+        config: NormalizationConfig,
     ) -> tuple[str, List[CharMapping], List[Optional[int]], List[int]]:
-        safe_marks = _mark_safe_punct(text, lang)
+        safe_marks = _mark_safe_punct(text, lang, config)
         clean_chars: List[str] = []
         mapping: List[CharMapping] = []
         raw_to_clean: List[Optional[int]] = []
@@ -184,25 +257,55 @@ class TextNormalizer:
             clean_to_raw.append(idx)
         return "".join(clean_chars), mapping, raw_to_clean, clean_to_raw
 
+    def _normalize_punctuation_width(
+        self,
+        text: str,
+        lang: str,
+        config: NormalizationConfig,
+    ) -> str:
+        """统一全角/半角标点（小数点保护可选）。"""
+        if not text:
+            return text
+        mode = (config.punct_width or "auto").lower()
+        if mode == "full":
+            is_to_fullwidth = True
+        elif mode == "half":
+            is_to_fullwidth = False
+        else:
+            is_to_fullwidth = _should_use_fullwidth(lang, text)
+
+        normalized = text
+        if config.is_decimal_protection_enabled:
+            normalized = _DECIMAL_DOT_PATTERN.sub(_DECIMAL_DOT_PLACEHOLDER, normalized)
+        mapping = _PUNCT_TO_FULLWIDTH if is_to_fullwidth else _PUNCT_TO_HALFWIDTH
+        for old, new in mapping.items():
+            normalized = normalized.replace(old, new)
+        if config.is_decimal_protection_enabled:
+            normalized = normalized.replace(_DECIMAL_DOT_PLACEHOLDER, ".")
+        return normalized
+
 
 def _is_punct(ch: str) -> bool:
     return ch in _PUNCTUATION_SET
 
 
-def _mark_safe_punct(text: str, lang: str) -> Set[int]:
+def _mark_safe_punct(text: str, lang: str, config: NormalizationConfig) -> Set[int]:
     safe: Set[int] = set()
-    for match in _EN_ABBREV_PATTERN.finditer(text):
-        for idx in range(match.start(), match.end()):
-            if text[idx] == ".":
-                safe.add(idx)
+    if not config.is_safe_punct_enabled:
+        return safe
+    if config.is_abbrev_dot_protection_enabled:
+        for match in _EN_ABBREV_PATTERN.finditer(text):
+            for idx in range(match.start(), match.end()):
+                if text[idx] == ".":
+                    safe.add(idx)
     for idx, ch in enumerate(text):
-        if ch in _DECIMAL_DOT_CHARS and _is_decimal_dot(text, idx):
+        if config.is_decimal_protection_enabled and ch in _DECIMAL_DOT_CHARS and _is_decimal_dot(text, idx):
             safe.add(idx)
             continue
-        if ch == "." and _is_english_abbrev_dot(text, idx):
+        if config.is_abbrev_dot_protection_enabled and ch == "." and _is_english_abbrev_dot(text, idx):
             safe.add(idx)
             continue
-        if ch in _HYPHEN_CHARS and _is_english_hyphen(text, idx):
+        if config.is_hyphen_protection_enabled and ch in _HYPHEN_CHARS and _is_english_hyphen(text, idx):
             safe.add(idx)
             continue
         if ch == _JAPANESE_MIDDLE_DOT and _is_japanese_middle_dot(lang):
@@ -259,10 +362,26 @@ def _is_japanese_middle_dot(lang: str) -> bool:
     return lang_key.startswith("ja")
 
 
+def _should_use_fullwidth(lang: str, text: str) -> bool:
+    lang_key = (lang or "").lower()
+    if lang_key.startswith(("zh", "ja", "jp", "yue", "ko")):
+        return True
+    if lang_key.startswith("en"):
+        return False
+    return _has_cjk(text)
+
+
+def _calc_mapping_coverage(raw_to_clean: List[Optional[int]]) -> float:
+    if not raw_to_clean:
+        return 0.0
+    mapped = sum(1 for idx in raw_to_clean if idx is not None)
+    return mapped / max(len(raw_to_clean), 1)
+
+
 _normalizer_instance: Optional[TextNormalizer] = None
 
 
-def get_alignment_text_normalizer(logger: Optional[logging.Logger] = None) -> TextNormalizer:
+def get_alignment_text_normalizer(logger: Optional[Any] = None) -> TextNormalizer:
     """获取统一规范化器单例（单例模式：减少 WeText 初始化开销）。"""
     global _normalizer_instance
     if _normalizer_instance is None:
