@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 
 from app.core.asr.engine import ASREngine
 from app.core.asr.models import ASRResult
+from app.core.logging import resolve_loguru_logger
 from app.schemas.pipeline_context import ProcessingContext
 from app.services.audio.chunk_engine import AudioChunk
 from app.services.model_runtime_config_service import get_model_runtime_config_service
@@ -43,7 +44,12 @@ class FastWorker:
         """
         self.job_id = job_id
         self.sensevoice_language = sensevoice_language
-        self.logger = logger or logging.getLogger(__name__)
+        self.logger = resolve_loguru_logger(
+            logger,
+            __name__,
+            job_id=job_id,
+            layer="L0",
+        )
 
         if not draft_engine:
             raise ValueError("FastWorker 需要提供 draft_engine")
@@ -61,7 +67,8 @@ class FastWorker:
             ctx: 处理上下文
         """
         chunk = ctx.audio_chunk
-        self.logger.debug(f"Chunk {ctx.chunk_index}: SenseVoice 快流推理")
+        log = self.logger.bind(chunk_index=ctx.chunk_index)
+        log.debug(f"Chunk {ctx.chunk_index}: SenseVoice 快流推理")
         sv_result = await self._run_sensevoice(chunk)
 
         # V3.8 修复竞态条件：深拷贝 sv_result，避免下游修改影响其他协程
@@ -128,7 +135,8 @@ class FastWorker:
         # 策略 1：非 auto 时透传
         if chunk_language != "auto":
             sv_result["language"] = chunk_language
-            self.logger.debug(
+            log = self.logger.bind(chunk_index=chunk.index)
+            log.debug(
                 f"Chunk {chunk.index}: 透传 LangID 语言={chunk_language}"
             )
             return sv_result
@@ -142,7 +150,8 @@ class FastWorker:
 
         # 如果 LangID 没有结果，直接使用 SenseVoice 的结果
         if not chunk_confidence:
-            self.logger.debug(
+            log = self.logger.bind(chunk_index=chunk.index)
+            log.debug(
                 f"Chunk {chunk.index}: LangID 无结果，使用 SenseVoice 语言={sv_language}"
             )
             return sv_result
@@ -162,13 +171,15 @@ class FastWorker:
         if scores:
             best_lang = max(scores.keys(), key=lambda k: (scores[k], -ord(k[0]) if k else 0))
             sv_result["language"] = best_lang
-            self.logger.debug(
+            log = self.logger.bind(chunk_index=chunk.index)
+            log.debug(
                 f"Chunk {chunk.index}: 语言融合 LangID={chunk_confidence}, "
                 f"SV={sv_language}(conf={sv_confidence:.3f}) -> {best_lang} (score={scores[best_lang]:.3f})"
             )
         else:
             sv_result["language"] = sv_language
-            self.logger.debug(
+            log = self.logger.bind(chunk_index=chunk.index)
+            log.debug(
                 f"Chunk {chunk.index}: 无有效分数，使用 SenseVoice 语言={sv_language}"
             )
 
@@ -182,8 +193,9 @@ class FastWorker:
         elif asr_result.metadata and asr_result.metadata.raw_tags:
             event_tag = asr_result.metadata.raw_tags.get("event_tag")
 
-        words = []
+        words = None
         if asr_result.words:
+            words = []
             for word in asr_result.words:
                 confidence = word.confidence if word.confidence is not None else 1.0
                 words.append(
@@ -208,16 +220,20 @@ class FastWorker:
         if asr_result.metadata and asr_result.metadata.raw_tags:
             sv_language_info = asr_result.metadata.raw_tags.get("sv_language_info")
 
+        # V3.2.0+dev.20260203.10: L0 仅透传原始文本与置信度来源
+        raw_text = asr_result.text if asr_result.text is not None else None
         return {
-            "text": asr_result.text,
-            "text_clean": asr_result.text_clean or asr_result.text,
+            "raw_text": raw_text,
             "words": words,
             "raw_tokens": raw_tokens,
-            "confidence": float(asr_result.confidence or 0.0),
-            "language": asr_result.language or self.sensevoice_language,
+            "confidence": float(asr_result.confidence) if asr_result.confidence is not None else None,
+            "confidence_source": "fast",
+            "language": asr_result.language if asr_result.language is not None else None,
             "emotion": asr_result.emotion,
             "event": event_tag,
             # V3.2.2+dev.20260201.01: SenseVoice 语言标签置信度
             "sv_language_info": sv_language_info,
+            "source": "fast",
+            "segments": None,
         }
 
