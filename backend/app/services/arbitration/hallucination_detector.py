@@ -1,12 +1,12 @@
 """
 Whisper 幻觉检测器。
-V3.2.0+dev.20260202.08
+V3.2.0+dev.20260204.03
 """
 from __future__ import annotations
 
-import logging
 from typing import Any, Dict, Optional
 
+from app.core.logging import resolve_loguru_logger
 from app.services.text_normalizer import TextNormalizer
 
 
@@ -15,8 +15,13 @@ class HallucinationDetector:
 
     _PROMPT_ECHO_MAX_LEN = 120
 
-    def __init__(self, logger: Optional[logging.Logger] = None) -> None:
-        self._logger = logger or logging.getLogger(__name__)
+    def __init__(self, logger: Optional[Any] = None) -> None:
+        self._logger = resolve_loguru_logger(
+            logger,
+            __name__,
+            layer="L2",
+            processor_name="hallucination_detector",
+        )
 
     def is_hallucination(self, result: Dict[str, Any], prompt: Optional[str]) -> bool:
         """判断 Whisper 输出是否为幻觉。"""
@@ -25,7 +30,7 @@ class HallucinationDetector:
         candidate_text = text.strip()
         if not candidate_text and raw_text.strip():
             candidate_text = raw_text.strip()
-            self._logger.warning("检测到清洗后空文本，改用 raw_text 继续检测: raw_len=%d", len(raw_text))
+            self._logger.warning("检测到清洗后空文本，改用 raw_text 继续检测: raw_len={}", len(raw_text))
         if not candidate_text:
             self._logger.warning("检测到空输出幻觉: Whisper 返回空文本")
             return True
@@ -49,7 +54,7 @@ class HallucinationDetector:
         underscore_ratio = text.count("_") / max(len(text), 1)
         if underscore_ratio > 0.3:
             self._logger.warning(
-                "检测到下划线幻觉: 下划线占比 %.1f%%, text='%s...'",
+                "检测到下划线幻觉: 下划线占比 {:.1f}%, text='{}...'",
                 underscore_ratio * 100,
                 text[:50],
             )
@@ -72,7 +77,7 @@ class HallucinationDetector:
         overlap_ratio = len(prompt_words & text_words) / len(prompt_words)
         if overlap_ratio > 0.8 and abs(len(text) - len(prompt_clean)) < len(prompt_clean) * 0.3:
             self._logger.warning(
-                "检测到提示词重复: 与 prompt 重叠度 %.1f%%, prompt='%s...', text='%s...'",
+                "检测到提示词重复: 与 prompt 重叠度 {:.1f}%, prompt='{}...', text='{}...'",
                 overlap_ratio * 100,
                 prompt_clean[:30],
                 text[:30],
@@ -90,14 +95,14 @@ class HallucinationDetector:
         avg_no_speech = sum(s.get("no_speech_prob", 0.0) for s in segments) / len(segments)
         if avg_logprob < -1.0:
             self._logger.warning(
-                "检测到低置信度幻觉: avg_logprob=%.2f < -1.0, text='%s...'",
+                "检测到低置信度幻觉: avg_logprob={:.2f} < -1.0, text='{}...'",
                 avg_logprob,
                 text[:50],
             )
             return True
         if avg_no_speech > 0.6 and text:
             self._logger.warning(
-                "检测到静音段误识别: no_speech_prob=%.2f > 0.6, text='%s...'",
+                "检测到静音段误识别: no_speech_prob={:.2f} > 0.6, text='{}...'",
                 avg_no_speech,
                 text[:50],
             )
