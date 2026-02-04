@@ -24,3 +24,9 @@ class BridgeConfig:
     is_enable_dynamic_thresholds: bool = True
     dynamic_sentence_step: int = 1
     dynamic_duration_step: float = 2.0
+    # V3.2.0+dev.20260204.01: 性能优化计划 - 动态批处理与保守调度
+    is_enable_dynamic_batch: bool = False
+    dynamic_batch_max_wait_ms: int = 300
+    queue_low_watermark: int = 2
+    queue_high_watermark: int = 6
+    force_flush_on_gpu_idle: bool = True
