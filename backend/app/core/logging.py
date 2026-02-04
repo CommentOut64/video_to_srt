@@ -22,6 +22,51 @@ except ImportError:  # pragma: no cover - 允许无 Loguru 环境运行
     loguru_logger = None
 
 
+class _FallbackLoggerAdapter:
+    """Loguru 缺失时的最小兼容层，提供 bind 接口。"""
+
+    def __init__(self, logger: logging.Logger, extra: Optional[Dict[str, Any]] = None) -> None:
+        self._logger = logger
+        self._extra = dict(extra or {})
+
+    def bind(self, **fields: Any) -> "_FallbackLoggerAdapter":
+        merged = dict(self._extra)
+        merged.update(fields)
+        return _FallbackLoggerAdapter(self._logger, merged)
+
+    def _log(self, level: int, message: str, *args: Any, **kwargs: Any) -> None:
+        if self._extra:
+            extra = dict(kwargs.get("extra") or {})
+            extra.update(self._extra)
+            kwargs["extra"] = extra
+        if (args or kwargs) and "{" in message:
+            try:
+                message = message.format(*args, **kwargs)
+                args = ()
+            except (IndexError, KeyError, ValueError):
+                pass
+        self._logger.log(level, message, *args, **kwargs)
+
+    def debug(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._log(logging.DEBUG, message, *args, **kwargs)
+
+    def info(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._log(logging.INFO, message, *args, **kwargs)
+
+    def warning(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._log(logging.WARNING, message, *args, **kwargs)
+
+    def error(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._log(logging.ERROR, message, *args, **kwargs)
+
+    def exception(self, message: str, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("exc_info", True)
+        self._log(logging.ERROR, message, *args, **kwargs)
+
+    def critical(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._log(logging.CRITICAL, message, *args, **kwargs)
+
+
 class MillisecondFormatter(logging.Formatter):
     """包含毫秒精度的日志格式化器"""
 
@@ -265,7 +310,8 @@ def _shorten_logger_name(name: str) -> str:
 def get_loguru_logger(name: str, **bind_fields: Any):
     """获取 Loguru 记录器并绑定上下文字段。"""
     if loguru_logger is None:
-        raise RuntimeError("Loguru 未安装，无法获取记录器")
+        base_logger = logging.getLogger(name)
+        return _FallbackLoggerAdapter(base_logger, bind_fields)
     base_logger = loguru_logger.bind(logger=_shorten_logger_name(name))
     if bind_fields:
         base_logger = base_logger.bind(**bind_fields)
@@ -279,7 +325,10 @@ def resolve_loguru_logger(
 ):
     """强制使用 Loguru 记录器，忽略非 Loguru 的入参。"""
     if loguru_logger is None:
-        raise RuntimeError("Loguru 未安装，无法解析记录器")
+        if logger is not None and hasattr(logger, "bind"):
+            return logger.bind(**bind_fields) if bind_fields else logger
+        base_logger = logging.getLogger(name)
+        return _FallbackLoggerAdapter(base_logger, bind_fields)
     if logger is not None and hasattr(logger, "bind"):
         base_logger = logger.bind(logger=_shorten_logger_name(name))
     else:
