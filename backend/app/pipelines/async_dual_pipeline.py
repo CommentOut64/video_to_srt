@@ -36,6 +36,7 @@ from typing import List, Optional, Any, TYPE_CHECKING, Set, Dict, Tuple
 from pathlib import Path
 
 from app.core.asr.engine import ASREngine
+from app.core.logging import resolve_loguru_logger
 from app.core.thresholds import ThresholdConfig, needs_whisper_patch
 from app.schemas.pipeline_context import ProcessingContext
 from app.models.sensevoice_models import SentenceSegment
@@ -144,7 +145,12 @@ class AsyncDualPipeline:
             progress_emitter: 进度发射器（可选，V3.1.0）
         """
         self.job_id = job_id
-        self.logger = logger or logging.getLogger(__name__)
+        self.logger = resolve_loguru_logger(
+            logger,
+            __name__,
+            job_id=job_id,
+            layer="L0",
+        )
         self.transcription_profile = transcription_profile
         self.cancellation_token = cancellation_token  # v3.1.0
         self.progress_emitter = progress_emitter  # V3.1.0
@@ -277,6 +283,64 @@ class AsyncDualPipeline:
         self._last_slow_chunk_index = -1
         self._last_align_chunk_index = -1
         self.is_pause_snapshot_saved = False
+
+    def _bind_log(
+        self,
+        *,
+        chunk_index: Optional[int] = None,
+        batch_id: Optional[str] = None,
+    ):
+        log = self.logger
+        if chunk_index is not None:
+            log = log.bind(chunk_index=chunk_index)
+        if batch_id is not None:
+            log = log.bind(batch_id=batch_id)
+        return log
+
+    @staticmethod
+    def _extract_primary_speaker_id(chunk: AudioChunk) -> Optional[str]:
+        """从 AudioChunk 中提取主说话人标识（L0 透传）。"""
+        if getattr(chunk, "primary_speaker_id", None):
+            return chunk.primary_speaker_id
+        if getattr(chunk, "speaker_id", None):
+            return chunk.speaker_id
+        speaker_tracks = getattr(chunk, "speaker_tracks", None)
+        if speaker_tracks:
+            for track in speaker_tracks:
+                if isinstance(track, dict) and track.get("is_primary"):
+                    return track.get("speaker_id")
+            first = speaker_tracks[0]
+            if isinstance(first, dict):
+                return first.get("speaker_id")
+        return None
+
+    def _validate_l0_result(
+        self,
+        result: Dict[str, Any],
+        *,
+        source: str,
+        chunk_index: Optional[int] = None,
+    ) -> None:
+        """L0 仅做完整性校验，不做补全或降级。"""
+        if not isinstance(result, dict):
+            return
+        missing_fields: List[str] = []
+        raw_text = result.get("raw_text")
+        if raw_text is None or str(raw_text).strip() == "":
+            missing_fields.append("raw_text")
+        if source == "fast" and result.get("words") is None:
+            missing_fields.append("words")
+        if source == "slow" and result.get("segments") is None:
+            missing_fields.append("segments")
+        if missing_fields:
+            result["l0_error_code"] = "E_L0_MISSING_INPUT"
+            result["l0_missing_fields"] = list(missing_fields)
+            log = self._bind_log(chunk_index=chunk_index)
+            log.warning(
+                "L0 输入缺失: source=%s missing=%s",
+                source,
+                ",".join(missing_fields),
+            )
 
     async def run(
         self,
@@ -418,6 +482,8 @@ class AsyncDualPipeline:
             try:
                 # FastWorker 处理（仅推理）
                 await self.fast_worker.process(ctx)
+                if ctx.sv_result:
+                    self._validate_l0_result(ctx.sv_result, source="fast", chunk_index=i)
                 normalized = self._normalize_sensevoice_result(ctx)
                 await self._apply_fast_punctuation(ctx, normalized)
                 await self._emit_draft_sentences(ctx, is_final_output=True)
@@ -439,7 +505,7 @@ class AsyncDualPipeline:
                 if token:
                     has_pending = token.exit_atomic_region()
                     if has_pending:
-                        self.logger.info(f"[v3.1.0] Chunk {i} 处理完成后检测到待处理请求")
+                        self.logger.debug(f"[v3.1.0] Chunk {i} 处理完成后检测到待处理请求")
 
             # v3.1.0: 每个 Chunk 处理完成后检查暂停/取消并保存检查点
             if token and job_dir:
@@ -469,7 +535,7 @@ class AsyncDualPipeline:
                     # V3.1.0: 捕获取消暂停，停止派发新 Chunk，等待上层处理
                     if not self.pause_exception:
                         self.pause_exception = e
-                    self.logger.info(
+                    self.logger.debug(
                         f"[V3.1.0] 极速模式捕获暂停信号，已处理 {len(processed_indices)} / {total_chunks} 个 Chunk"
                     )
                     break
@@ -743,7 +809,12 @@ class AsyncDualPipeline:
         if not ctx.sv_result or not ctx.audio_chunk:
             return None
         sv_result = ctx.sv_result
-        raw_text = str(sv_result.get("text_clean") or sv_result.get("text") or "")
+        # V3.2.0+dev.20260203.10: L0 使用 raw_text 作为规范化入口
+        raw_text = sv_result.get("raw_text")
+        if raw_text is None:
+            raw_text = ""
+        if not sv_result.get("confidence_source"):
+            sv_result["confidence_source"] = "fast"
         language = ctx.audio_chunk.language or sv_result.get("language") or "auto"
         normalized = self._text_normalizer.normalize(raw_text, language)
         sv_result["text_itn_raw"] = normalized.text_itn_raw
@@ -762,12 +833,16 @@ class AsyncDualPipeline:
         if not ctx.whisper_result or not ctx.audio_chunk:
             return
         whisper_result = ctx.whisper_result
-        raw_text = str(whisper_result.get("text") or "")
-        if not raw_text:
+        raw_text = whisper_result.get("raw_text") or ""
+        min_clean_text = whisper_result.get("min_clean_text") or ""
+        base_text = min_clean_text or raw_text
+        if not base_text:
             return
+        if raw_text and not whisper_result.get("text_raw"):
+            whisper_result["text_raw"] = raw_text
         prompt = whisper_result.get("prompt")
-        sanitized = self._whisper_sanitizer.sanitize_full(raw_text, prompt=prompt)
-        if sanitized == raw_text:
+        sanitized = self._whisper_sanitizer.sanitize_full(base_text, prompt=prompt)
+        if sanitized == base_text:
             return
 
         language = whisper_result.get("language") or ctx.audio_chunk.language or "auto"
@@ -1015,7 +1090,7 @@ class AsyncDualPipeline:
         punctuation_meta = metadata.get("punctuation")
         decision_meta = metadata.get("punctuation_decision")
 
-        raw_text = sv_result.get("text_itn_raw") or sv_result.get("text") or ""
+        raw_text = sv_result.get("raw_text") or ""
         text = sv_result.get("text_clean") or raw_text
         words = sv_result.get("words") if isinstance(sv_result, dict) else None
         raw_tokens = sv_result.get("raw_tokens") if isinstance(sv_result, dict) else None
@@ -1031,6 +1106,7 @@ class AsyncDualPipeline:
 
         decision = self._build_punctuation_decision(decision_meta)
         source_chunks = [f"chunk-{chunk.index}"]
+        speaker_id = self._extract_primary_speaker_id(chunk)
         return SemanticBufferInput(
             chunk_id=f"chunk-{ctx.chunk_index}",
             text=text,
@@ -1041,7 +1117,7 @@ class AsyncDualPipeline:
             word_timestamps=words if isinstance(words, list) else None,
             raw_tokens=raw_tokens if isinstance(raw_tokens, list) else None,
             source_chunks=source_chunks,
-            speaker_id=None,
+            speaker_id=speaker_id,
         )
 
     @staticmethod
@@ -1114,7 +1190,7 @@ class AsyncDualPipeline:
                 self.subtitle_manager.add_draft_sentences(chunk_index, sentences)
             total_sentences += len(sentences)
         phase = "定稿" if is_final_output else "草稿"
-        self.logger.info(
+        self.logger.debug(
             "SemanticBuffer 尾部刷新完成: %s %d 个句子",
             phase,
             total_sentences,
@@ -1380,11 +1456,16 @@ class AsyncDualPipeline:
             self.bridge_controller.record_slow_result(batch.batch_id, slow_result)
 
         whisper_result = slow_result.whisper_result or {}
+        self._validate_l0_result(whisper_result, source="slow")
         prompt = batch.prompt or None
-        whisper_text_raw = str(whisper_result.get("text", "") or "")
+        whisper_text_raw = str(whisper_result.get("raw_text") or "")
         whisper_result["text_raw"] = whisper_text_raw
         whisper_result["prompt"] = prompt
-        whisper_result["text"] = self._whisper_sanitizer.sanitize_minimal(whisper_text_raw, prompt=prompt)
+        base_text = whisper_result.get("min_clean_text") or whisper_text_raw
+        whisper_result["text"] = self._whisper_sanitizer.sanitize_minimal(
+            str(base_text or ""),
+            prompt=prompt,
+        )
         self._emit_whisper_debug(job_dir, batch, whisper_result, chunk_indices)
         if whisper_result and self._hallucination_detector.is_hallucination(whisper_result, prompt):
             self.logger.warning("Bridge 批次检测到 Whisper 幻觉，回退快流: batch_id=%s", batch.batch_id)
@@ -1498,7 +1579,7 @@ class AsyncDualPipeline:
                     token.check_and_save(checkpoint_data, job_dir)
                 except PausedException as e:
                     if not pause_requested:
-                        self.logger.info("[V3.1.0] SlowWorker 捕获暂停信号，继续排空队列")
+                        self.logger.debug("[V3.1.0] SlowWorker 捕获暂停信号，继续排空队列")
                     pause_requested = True
                     if not self.pause_exception:
                         self.pause_exception = e
@@ -1606,6 +1687,8 @@ class AsyncDualPipeline:
                 try:
                     # FastWorker 处理（仅推理）
                     await self.fast_worker.process(ctx)
+                    if ctx.sv_result:
+                        self._validate_l0_result(ctx.sv_result, source="fast", chunk_index=i)
                     normalized = self._normalize_sensevoice_result(ctx)
                     await self._apply_fast_punctuation(ctx, normalized)
                     # V3.2.0+dev.20260201.07: 缓存上下文，供 Bridge 批次使用
@@ -1630,7 +1713,7 @@ class AsyncDualPipeline:
                     if token:
                         has_pending = token.exit_atomic_region()
                         if has_pending:
-                            self.logger.info(f"[v3.1.0] FastWorker chunk {i} 完成后检测到待处理请求")
+                            self.logger.debug(f"[v3.1.0] FastWorker chunk {i} 完成后检测到待处理请求")
 
                 # v3.1.0: 每个 Chunk 处理完成后保存检查点
                 if token and job_dir:
@@ -1651,7 +1734,7 @@ class AsyncDualPipeline:
                         pause_requested = True
                         if not self.pause_exception:
                             self.pause_exception = e
-                        self.logger.info(
+                        self.logger.debug(
                             f"[V3.1.0] FastWorker 捕获暂停信号，已完成 {len(processed_indices)} / {len(chunks)} 个 Chunk"
                         )
                         break
@@ -1704,7 +1787,7 @@ class AsyncDualPipeline:
                 )
                 await self.queue_inter.put(end_ctx)
                 if pause_requested:
-                    self.logger.info("[V3.1.0] FastWorker 已发送暂停结束信号，等待下游排空")
+                    self.logger.debug("[V3.1.0] FastWorker 已发送暂停结束信号，等待下游排空")
                 else:
                     self.logger.info("FastWorker 循环完成")
 
@@ -1738,11 +1821,22 @@ class AsyncDualPipeline:
             # 恢复态时同步最后进度索引，避免暂停快照缺失
             self._last_slow_chunk_index = max(slow_processed_indices)
         pause_requested = False  # V3.1.0: 捕获暂停后继续排空队列
+        idle_poll_interval = 0.5  # V3.2.0+dev.20260204.01: GPU 空闲检测轮询间隔（秒）
 
         try:
             while True:
                 # 从队列取输入（ProcessingContext / BridgeBatch）
-                payload = await self.queue_inter.get()
+                try:
+                    payload = await asyncio.wait_for(
+                        self.queue_inter.get(),
+                        timeout=idle_poll_interval,
+                    )
+                except asyncio.TimeoutError:
+                    if self.bridge_controller and self.bridge_controller.should_flush_on_idle(
+                        self.queue_inter.qsize()
+                    ):
+                        await self._flush_bridge_controller()
+                    continue
 
                 if isinstance(payload, BridgeBatch):
                     if await self._process_bridge_batch(
@@ -1782,7 +1876,7 @@ class AsyncDualPipeline:
                             skip_whisper = True
                             ctx.whisper_skipped = True
                             ctx.whisper_result = {}
-                            self.logger.info(
+                            self.logger.debug(
                                 f"Chunk {chunk_index}: SenseVoice 质量足够，跳过 Whisper "
                                 f"(confidence={sv_result.get('confidence', 0):.2f})"
                             )
@@ -1796,14 +1890,16 @@ class AsyncDualPipeline:
                             audio_with_overlap,
                             initial_prompt=prompt,
                         )
+                        self._validate_l0_result(whisper_result, source="slow", chunk_index=chunk_index)
 
-                        whisper_text_raw = str(whisper_result.get("text", "") or "")
-                        whisper_result["text_raw"] = whisper_text_raw
-                        whisper_result["prompt"] = prompt
-                        whisper_result["text"] = self._whisper_sanitizer.sanitize_minimal(
-                            whisper_text_raw,
-                            prompt=prompt,
-                        )
+        whisper_text_raw = str(whisper_result.get("raw_text") or "")
+        whisper_result["text_raw"] = whisper_text_raw
+        whisper_result["prompt"] = prompt
+        base_text = whisper_result.get("min_clean_text") or whisper_text_raw
+        whisper_result["text"] = self._whisper_sanitizer.sanitize_minimal(
+            str(base_text or ""),
+            prompt=prompt,
+        )
                         if self._hallucination_detector.is_hallucination(whisper_result, prompt):
                             self.logger.warning(
                                 f"Chunk {chunk_index}: 检测到 Whisper 幻觉，回退到 SenseVoice"
@@ -1829,7 +1925,7 @@ class AsyncDualPipeline:
                         ctx.whisper_skipped = False
                         self._update_prompt_cache(whisper_result.get("text", ""))
 
-                        self.logger.info(
+                        self.logger.debug(
                             f"Chunk {chunk_index}: Whisper 推理完成 "
                             f"(text_length={len(whisper_result.get('text', ''))})"
                         )
@@ -1853,7 +1949,7 @@ class AsyncDualPipeline:
                     if token:
                         has_pending = token.exit_atomic_region()
                         if has_pending:
-                            self.logger.info(f"[v3.1.0] SlowWorker chunk {chunk_index} 完成后检测到待处理请求")
+                            self.logger.debug(f"[v3.1.0] SlowWorker chunk {chunk_index} 完成后检测到待处理请求")
 
                 # v3.1.0: 每个 Chunk 处理完成后保存检查点（包含关键的 previous_whisper_text）
                 if token and job_dir:
@@ -1873,7 +1969,7 @@ class AsyncDualPipeline:
                         token.check_and_save(checkpoint_data, job_dir)
                     except PausedException as e:
                         if not pause_requested:
-                            self.logger.info("[V3.1.0] SlowWorker 捕获暂停信号，继续排空 queue_inter")
+                            self.logger.debug("[V3.1.0] SlowWorker 捕获暂停信号，继续排空 queue_inter")
                         pause_requested = True
                         if not self.pause_exception:
                             self.pause_exception = e
@@ -1898,7 +1994,7 @@ class AsyncDualPipeline:
             await self.queue_final.put(error_ctx)
         finally:
             if pause_requested:
-                self.logger.info("[V3.1.0] SlowWorker 已完成排空，等待对齐阶段同步完成")
+                self.logger.debug("[V3.1.0] SlowWorker 已完成排空，等待对齐阶段同步完成")
 
     # V3.2.0+dev.20260120.03: 对齐阶段下放到流水线
     async def _run_alignment_stage(self, ctx: ProcessingContext) -> None:
@@ -1919,7 +2015,7 @@ class AsyncDualPipeline:
         if ctx.whisper_skipped:
             if ctx.sv_result is None:
                 raise ValueError("对齐阶段缺少 SenseVoice 推理结果")
-            self.logger.info(f"Chunk {ctx.chunk_index}: Whisper 跳过，直接使用 SenseVoice 定稿")
+            self.logger.debug(f"Chunk {ctx.chunk_index}: Whisper 跳过，直接使用 SenseVoice 定稿")
             final_sentences = self.aligner.split_sensevoice_only(ctx.sv_result, chunk)
 
             tracks = self._ensure_text_tracks(ctx)
@@ -1990,7 +2086,7 @@ class AsyncDualPipeline:
             tracks.chosen_track = chosen_track
         if self.bridge_controller:
             self.bridge_controller.record_arbitration_result(arbitration_result)
-        self.logger.info(
+        self.logger.debug(
             "Chunk %s: 仲裁完成 text_source=%s punct_source=%s reason=%s coverage=%.2f",
             ctx.chunk_index,
             arbitration_result.text_source,
@@ -2161,7 +2257,7 @@ class AsyncDualPipeline:
                     if token:
                         has_pending = token.exit_atomic_region()
                         if has_pending:
-                            self.logger.info(f"[v3.1.0] 对齐阶段 chunk {chunk_index} 完成后检测到待处理请求")
+                            self.logger.debug(f"[v3.1.0] 对齐阶段 chunk {chunk_index} 完成后检测到待处理请求")
 
                 # v3.1.0: 每个 Chunk 处理完成后保存检查点
                 if token and job_dir:
@@ -2187,7 +2283,7 @@ class AsyncDualPipeline:
                         token.check_and_save(checkpoint_data, job_dir)
                     except PausedException as e:
                         if not pause_requested:
-                            self.logger.info("[V3.1.0] 对齐阶段捕获暂停信号，继续排空 queue_final")
+                            self.logger.debug("[V3.1.0] 对齐阶段捕获暂停信号，继续排空 queue_final")
                         pause_requested = True
                         if not self.pause_exception:
                             self.pause_exception = e
@@ -2200,7 +2296,7 @@ class AsyncDualPipeline:
             self.errors.append(e)
         finally:
             if pause_requested:
-                self.logger.info("[V3.1.0] 对齐阶段已排空所有上下文，等待上层暂停")
+                self.logger.debug("[V3.1.0] 对齐阶段已排空所有上下文，等待上层暂停")
 
     def get_statistics(self) -> dict:
         """
