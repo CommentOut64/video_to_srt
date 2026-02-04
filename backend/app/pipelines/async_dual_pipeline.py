@@ -43,8 +43,17 @@ from app.models.sensevoice_models import SentenceSegment
 from app.services.audio.chunk_engine import AudioChunk
 from app.services.alignment.default_aligner import DefaultAligner
 from app.services.alignment.text_normalizer import get_alignment_text_normalizer
-from app.services.alignment.types import NormalizationResult, TextTrack, TextTrackBundle
-from app.services.arbitration.arbiter import Arbiter, ArbitrationResult
+from app.services.alignment.text_normalizer_processor import TextNormalizerProcessor
+from app.services.alignment.types import (
+    L1Input,
+    L2Input,
+    L2Output,
+    NormalizationResult,
+    QualitySignals,
+    TextTrack,
+    TextTrackBundle,
+)
+from app.services.arbitration.arbiter import TextArbiterProcessor
 from app.services.arbitration.hallucination_detector import HallucinationDetector
 from app.services.model_runtime_config_service import get_model_runtime_config_service
 from app.services.sse_service import get_sse_manager
@@ -61,6 +70,7 @@ from app.services.punctuation.semantic_buffer import (
     SemanticChunk,
 )
 from app.services.punctuation.semantic_injector import SemanticInjector
+from app.services.text_normalizer import TextNormalizer
 from app.services.whisper.whisper_text_sanitizer import WhisperTextSanitizer
 from app.pipelines.workers import FastWorker, SlowWorker, SlowWorkerResult
 from app.utils.prompt_builder import get_prompt_builder
@@ -225,13 +235,15 @@ class AsyncDualPipeline:
 
         # V3.2.0+dev.20260202.03: 统一规范化与 Whisper 最小清洗器
         self._text_normalizer = get_alignment_text_normalizer(logger=self.logger)
-        self._whisper_sanitizer = WhisperTextSanitizer(logger=self.logger)
-        # V3.2.0+dev.20260202.08: 仲裁器与幻觉检测器
-        self._hallucination_detector = HallucinationDetector(logger=self.logger)
-        self._arbiter = Arbiter(
+        # V3.2.0+dev.20260204.02: L1 规范化处理器（Processor 入口）
+        self._l1_processor = TextNormalizerProcessor(
+            normalizer=self._text_normalizer,
             logger=self.logger,
-            hallucination_detector=self._hallucination_detector,
         )
+        self._whisper_sanitizer = WhisperTextSanitizer(logger=self.logger)
+        # V3.2.0+dev.20260204.03: L2 仲裁处理器与幻觉检测器
+        self._hallucination_detector = HallucinationDetector(logger=self.logger)
+        self._l2_processor = TextArbiterProcessor(logger=self.logger)
         self._fast_punctuator = FastPunctuationPipeline(
             job_id=self.job_id,
             punctuation_service=self.punctuation_service,
@@ -790,6 +802,20 @@ class AsyncDualPipeline:
             source=source,
             itn_fallback=normalized.itn_fallback,
             itn_fallback_reason=normalized.itn_fallback_reason,
+            mapping_coverage=normalized.mapping_coverage,
+        )
+
+    @staticmethod
+    def _build_normalization_from_track(track: TextTrack) -> NormalizationResult:
+        return NormalizationResult(
+            text_itn_raw=track.text_itn_raw,
+            text_clean=track.text_clean,
+            char_mapping=track.char_mapping,
+            raw_to_clean=track.raw_to_clean,
+            clean_to_raw=track.clean_to_raw,
+            itn_fallback=track.itn_fallback,
+            itn_fallback_reason=track.itn_fallback_reason,
+            mapping_coverage=track.mapping_coverage,
         )
 
     @staticmethod
@@ -811,22 +837,27 @@ class AsyncDualPipeline:
         sv_result = ctx.sv_result
         # V3.2.0+dev.20260203.10: L0 使用 raw_text 作为规范化入口
         raw_text = sv_result.get("raw_text")
-        if raw_text is None:
-            raw_text = ""
+        if raw_text is None or str(raw_text).strip() == "":
+            self.logger.warning("L1 规范化缺失 raw_text，跳过规范化")
+            return None
         if not sv_result.get("confidence_source"):
             sv_result["confidence_source"] = "fast"
         language = ctx.audio_chunk.language or sv_result.get("language") or "auto"
-        normalized = self._text_normalizer.normalize(raw_text, language)
-        sv_result["text_itn_raw"] = normalized.text_itn_raw
-        sv_result["text_clean"] = normalized.text_clean or normalized.text_itn_raw
-        tracks = self._ensure_text_tracks(ctx)
-        tracks.sv_track = self._build_text_track(
-            raw_text,
-            normalized,
-            source="sv",
-            language=language,
+        l1_output = self._l1_processor.process(
+            L1Input(
+                sv_raw_result=sv_result,
+                wh_raw_result=None,
+                language_hint=language,
+            )
         )
-        return normalized
+        if not l1_output.sv_track:
+            return None
+        sv_track = l1_output.sv_track
+        sv_result["text_itn_raw"] = sv_track.text_itn_raw
+        sv_result["text_clean"] = sv_track.text_clean or sv_track.text_itn_raw
+        tracks = self._ensure_text_tracks(ctx)
+        tracks.sv_track = sv_track
+        return self._build_normalization_from_track(sv_track)
 
     def _apply_whisper_full_sanitize(self, ctx: ProcessingContext) -> None:
         """Whisper 清洗增强与规范化重算（V3.2.0+dev.20260202.07）。"""
@@ -835,82 +866,143 @@ class AsyncDualPipeline:
         whisper_result = ctx.whisper_result
         raw_text = whisper_result.get("raw_text") or ""
         min_clean_text = whisper_result.get("min_clean_text") or ""
-        base_text = min_clean_text or raw_text
+        base_text = raw_text or min_clean_text
         if not base_text:
             return
         if raw_text and not whisper_result.get("text_raw"):
             whisper_result["text_raw"] = raw_text
         prompt = whisper_result.get("prompt")
         sanitized = self._whisper_sanitizer.sanitize_full(base_text, prompt=prompt)
-        if sanitized == base_text:
-            return
 
         language = whisper_result.get("language") or ctx.audio_chunk.language or "auto"
-        normalized = self._text_normalizer.normalize(sanitized, language)
-        whisper_result["text_itn_raw"] = normalized.text_itn_raw
-        whisper_result["text_clean"] = normalized.text_clean
-        whisper_result["text"] = normalized.text_clean or sanitized
-        tracks = self._ensure_text_tracks(ctx)
-        tracks.whisper_track = self._build_text_track(
-            sanitized,
-            normalized,
-            source="whisper",
-            language=language,
+        temp_result = dict(whisper_result)
+        temp_result["raw_text"] = sanitized
+        temp_result["min_clean_text"] = None
+        temp_result["text_clean"] = None
+        temp_result["text"] = None
+        l1_output = self._l1_processor.process(
+            L1Input(
+                sv_raw_result=None,
+                wh_raw_result=temp_result,
+                language_hint=language,
+            )
         )
-
-    def _is_arbitration_enabled(self) -> bool:
-        runtime = get_model_runtime_config_service().get_effective_runtime_global()
-        punct_config = runtime.get("effective", {}).get("punctuation", {})
-        return bool(punct_config.get("enable_arbitration", True))
+        if not l1_output.whisper_track:
+            return
+        wh_track = l1_output.whisper_track
+        whisper_result["text_itn_raw"] = wh_track.text_itn_raw
+        whisper_result["text_clean"] = wh_track.text_clean
+        whisper_result["text"] = wh_track.text_clean or sanitized
+        whisper_result["language"] = language
+        tracks = self._ensure_text_tracks(ctx)
+        tracks.whisper_track = wh_track
 
     def _run_arbitration(
         self,
         ctx: ProcessingContext,
         sv_result: Dict[str, Any],
         whisper_result: Dict[str, Any],
-    ) -> ArbitrationResult:
-        if not self._is_arbitration_enabled():
-            return ArbitrationResult(
-                text_source="whisper",
-                punct_source="sv",
-                reason="disabled",
-                coverage=1.0,
-                sv_score=0.0,
-                wh_score=0.0,
-                gap_positions=[],
+    ) -> L2Output:
+        tracks = self._ensure_text_tracks(ctx)
+        quality_signals = self._build_quality_signals(
+            sv_result=sv_result,
+            whisper_result=whisper_result,
+            tracks=tracks,
+        )
+        return self._l2_processor.process(
+            L2Input(
+                sv_track=tracks.sv_track,
+                whisper_track=tracks.whisper_track,
+                quality_signals=quality_signals,
             )
-        prompt = whisper_result.get("prompt")
-        return self._arbiter.arbitrate(sv_result, whisper_result, prompt=prompt)
+        )
 
     @staticmethod
     def _select_text_for_alignment(
-        sv_result: Dict[str, Any],
-        whisper_result: Dict[str, Any],
-        arbitration_result: ArbitrationResult,
+        chosen_track: Optional[TextTrack],
     ) -> str:
-        if arbitration_result.text_source == "sv":
-            return str(
-                sv_result.get("text_clean")
-                or sv_result.get("text_itn_raw")
-                or sv_result.get("text")
-                or ""
-            )
-        return str(whisper_result.get("text_clean") or whisper_result.get("text") or "")
+        if not chosen_track:
+            return ""
+        return str(
+            chosen_track.text_clean
+            or chosen_track.text_itn_raw
+            or chosen_track.raw_text
+            or ""
+        )
 
     def _apply_arbitration_text(
         self,
         whisper_result: Dict[str, Any],
         sv_result: Dict[str, Any],
-        arbitration_result: ArbitrationResult,
+        chosen_source: str,
         chosen_text_clean: str,
     ) -> None:
-        if arbitration_result.text_source == "sv":
+        if chosen_source == "fast":
             whisper_result["text"] = chosen_text_clean
             whisper_result["text_clean"] = chosen_text_clean
             whisper_result["text_itn_raw"] = sv_result.get("text_itn_raw") or chosen_text_clean
         else:
             whisper_result["text"] = chosen_text_clean
             whisper_result["text_clean"] = chosen_text_clean
+
+    def _build_quality_signals(
+        self,
+        *,
+        sv_result: Dict[str, Any],
+        whisper_result: Dict[str, Any],
+        tracks: TextTrackBundle,
+    ) -> QualitySignals:
+        sv_text = tracks.sv_track.text_clean if tracks.sv_track else ""
+        wh_text = tracks.whisper_track.text_clean if tracks.whisper_track else ""
+        length_ratio = 0.0
+        if sv_text and wh_text:
+            length_ratio = len(sv_text) / max(len(wh_text), 1)
+        confidence_fast = float(sv_result.get("confidence", 0.0) or 0.0)
+        confidence_slow = float(whisper_result.get("confidence", 0.0) or 0.0)
+
+        is_hallucination = bool(whisper_result.get("is_hallucination")) if whisper_result else False
+
+        is_repetition = False
+        if wh_text:
+            is_repetition, reason = TextNormalizer.detect_intra_block_repetition(wh_text)
+            if is_repetition:
+                self.logger.debug("L2 仲裁检测到重复: reason=%s", reason)
+
+        is_itn_fallback = bool(
+            (tracks.whisper_track and tracks.whisper_track.itn_fallback)
+            or (tracks.sv_track and tracks.sv_track.itn_fallback)
+        )
+        coverage_values = [
+            track.mapping_coverage
+            for track in (tracks.sv_track, tracks.whisper_track)
+            if track
+        ]
+        mapping_coverage = min(coverage_values) if coverage_values else 0.0
+
+        return QualitySignals(
+            length_ratio=length_ratio,
+            confidence_fast=confidence_fast,
+            confidence_slow=confidence_slow,
+            is_repetition=is_repetition,
+            is_hallucination=is_hallucination,
+            is_itn_fallback=is_itn_fallback,
+            mapping_coverage=mapping_coverage,
+            alignment_score=0.0,
+            gap_ratio=0.0,
+        )
+
+    def _resolve_punctuation_source_preference(self) -> str:
+        runtime = get_model_runtime_config_service().get_effective_runtime_global()
+        punct_config = runtime.get("effective", {}).get("punctuation", {})
+        preference = (
+            punct_config.get("source_preference")
+            or punct_config.get("fallback_priority")
+            or "merged"
+        )
+        normalized = str(preference).lower()
+        if normalized not in {"fast", "slow", "merged"}:
+            normalized = "merged"
+        return normalized
 
     # V3.2.0+dev.20260203.08: 统一规范化映射提取标点，避免数字归一化导致的错位。
     def _extract_raw_punctuation_positions_with_normalizer(
@@ -956,24 +1048,23 @@ class AsyncDualPipeline:
         self,
         sv_result: Dict[str, Any],
         whisper_result: Dict[str, Any],
-        arbitration_result: ArbitrationResult,
         chosen_text_clean: str,
     ) -> Tuple[Optional[List[PuncPosition]], Optional[str]]:
-        punct_source = arbitration_result.punct_source
-        clean_text = chosen_text_clean
-        if not clean_text:
-            return None, clean_text
         language = (
             whisper_result.get("language")
             or sv_result.get("language")
             or "auto"
         )
+        punct_source = self._resolve_punctuation_source_preference()
+        clean_text = chosen_text_clean
+        if not clean_text:
+            return None, clean_text
 
         sv_positions = self._extract_sv_punctuation_positions(sv_result, clean_text)
-        if punct_source == "sv":
+        if punct_source == "fast":
             return (sv_positions or None), clean_text
 
-        if punct_source == "whisper":
+        if punct_source == "slow":
             raw_text = str(whisper_result.get("text_itn_raw") or whisper_result.get("text") or "")
             wh_positions, wh_clean_text, matched = self._resolve_whisper_punctuation_positions(
                 raw_text,
@@ -983,7 +1074,7 @@ class AsyncDualPipeline:
             if not matched:
                 # V3.1.2+dev.20260203.01: 增强诊断日志
                 self.logger.warning(
-                    "标点源清洗文本不一致 - punct_source=whisper wh_clean_len=%d clean_len=%d wh_punct_count=%d",
+                    "标点源清洗文本不一致 - punct_source=slow wh_clean_len=%d clean_len=%d wh_punct_count=%d",
                     len(wh_clean_text) if wh_clean_text else 0,
                     len(clean_text),
                     len(wh_positions),
@@ -1891,15 +1982,14 @@ class AsyncDualPipeline:
                             initial_prompt=prompt,
                         )
                         self._validate_l0_result(whisper_result, source="slow", chunk_index=chunk_index)
-
-        whisper_text_raw = str(whisper_result.get("raw_text") or "")
-        whisper_result["text_raw"] = whisper_text_raw
-        whisper_result["prompt"] = prompt
-        base_text = whisper_result.get("min_clean_text") or whisper_text_raw
-        whisper_result["text"] = self._whisper_sanitizer.sanitize_minimal(
-            str(base_text or ""),
-            prompt=prompt,
-        )
+                        whisper_text_raw = str(whisper_result.get("raw_text") or "")
+                        whisper_result["text_raw"] = whisper_text_raw
+                        whisper_result["prompt"] = prompt
+                        base_text = whisper_result.get("min_clean_text") or whisper_text_raw
+                        whisper_result["text"] = self._whisper_sanitizer.sanitize_minimal(
+                            str(base_text or ""),
+                            prompt=prompt,
+                        )
                         if self._hallucination_detector.is_hallucination(whisper_result, prompt):
                             self.logger.warning(
                                 f"Chunk {chunk_index}: 检测到 Whisper 幻觉，回退到 SenseVoice"
@@ -2046,51 +2136,48 @@ class AsyncDualPipeline:
         # V3.2.0+dev.20260202.07: Whisper 清洗增强 + 规范化重算
         self._apply_whisper_full_sanitize(ctx)
 
-        arbitration_result = self._run_arbitration(ctx, sv_result, whisper_result)
+        arbitration_output = self._run_arbitration(ctx, sv_result, whisper_result)
+        arbitration_result = arbitration_output.arbitration_result
         ctx.arbitration_result = arbitration_result
-        chosen_text_clean = self._select_text_for_alignment(
-            sv_result,
-            whisper_result,
-            arbitration_result,
-        )
+        tracks = self._ensure_text_tracks(ctx)
+        if arbitration_output.chosen_text_track:
+            tracks.chosen_track = arbitration_output.chosen_text_track
+        elif tracks.chosen_track is None:
+            fallback_track = tracks.sv_track or tracks.whisper_track
+            if fallback_track:
+                tracks.chosen_track = self._clone_text_track(fallback_track, source="chosen")
+
+        chosen_text_clean = self._select_text_for_alignment(tracks.chosen_track)
         self._apply_arbitration_text(
             whisper_result,
             sv_result,
-            arbitration_result,
+            arbitration_result.chosen_source,
             chosen_text_clean,
         )
         punctuation_positions, punctuation_clean_text = self._resolve_punctuation_positions(
             sv_result,
             whisper_result,
-            arbitration_result,
             chosen_text_clean,
         )
-        tracks = self._ensure_text_tracks(ctx)
-        base_track = (
-            tracks.sv_track if arbitration_result.text_source == "sv" else tracks.whisper_track
-        )
-        if base_track:
-            chosen_track = self._clone_text_track(base_track, source="chosen")
-            if chosen_text_clean and chosen_track.text_clean != chosen_text_clean:
-                chosen_track.text_clean = chosen_text_clean
+        if tracks.chosen_track:
+            if chosen_text_clean and tracks.chosen_track.text_clean != chosen_text_clean:
+                tracks.chosen_track.text_clean = chosen_text_clean
             if (
                 punctuation_positions
                 and punctuation_clean_text
-                and punctuation_clean_text == chosen_track.text_clean
+                and punctuation_clean_text == tracks.chosen_track.text_clean
             ):
-                chosen_track.punct_positions = list(punctuation_positions)
+                tracks.chosen_track.punct_positions = list(punctuation_positions)
             else:
                 if punctuation_positions:
                     self.logger.debug("仲裁标点 clean_text 不一致，清空回写位置")
-                chosen_track.punct_positions = []
-            tracks.chosen_track = chosen_track
+                tracks.chosen_track.punct_positions = []
         if self.bridge_controller:
             self.bridge_controller.record_arbitration_result(arbitration_result)
         self.logger.debug(
-            "Chunk %s: 仲裁完成 text_source=%s punct_source=%s reason=%s coverage=%.2f",
+            "Chunk %s: 仲裁完成 chosen_source=%s reason=%s coverage=%.2f",
             ctx.chunk_index,
-            arbitration_result.text_source,
-            arbitration_result.punct_source,
+            arbitration_result.chosen_source,
             arbitration_result.reason,
             arbitration_result.coverage,
         )

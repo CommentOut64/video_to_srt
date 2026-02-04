@@ -1,6 +1,6 @@
 """
 标点服务入口。
-V3.2.0+dev.20260130.06
+V3.2.0+dev.20260204.03
 """
 from __future__ import annotations
 
@@ -70,7 +70,8 @@ class PunctuationService:
             or self._static_config.get("default_language", "zh")
         )
         self._fallback_priority = (
-            punct_config.get("fallback_priority")
+            punct_config.get("source_preference")
+            or punct_config.get("fallback_priority")
             or self._static_config.get("fallback_priority", "fast")
         )
 
@@ -92,7 +93,7 @@ class PunctuationService:
         self._refresh_runtime_config()
         if not self._logged_runtime:
             self._logger.info(
-                "标点服务状态: enabled=%s, default_language=%s, fallback_priority=%s",
+                "标点服务状态: enabled=%s, default_language=%s, source_preference=%s",
                 self._is_punctuation_enabled,
                 self._default_language,
                 self._fallback_priority,
