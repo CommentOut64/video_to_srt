@@ -1049,6 +1049,14 @@ class AsyncDualPipeline:
         if not positions:
             return None
         avg_conf = sum(float(pos.confidence or 0.0) for pos in positions) / max(len(positions), 1)
+        # V3.2.0+dev.20260205.03: 记录 slow_raw 来源细节，定位词级逗号密集问题
+        self.logger.debug(
+            "L1 slow_raw 标点候选: clean_len=%d positions=%d avg_conf=%.2f sample=%s",
+            len(clean_text),
+            len(positions),
+            avg_conf,
+            positions[:20],
+        )
         return PunctSource(
             clean_text_ref=clean_text,
             positions=positions,
@@ -1238,12 +1246,25 @@ class AsyncDualPipeline:
         punctuation_meta = metadata.get("punctuation")
         decision_meta = metadata.get("punctuation_decision")
 
-        raw_text = sv_result.get("raw_text") or ""
-        track_text = None
+        raw_text = str(sv_result.get("raw_text") or "")
+        sv_text_clean = str(sv_result.get("text_clean") or "")
+        track_text: Optional[str] = None
         tracks = getattr(ctx, "text_tracks", None)
         if tracks and getattr(tracks, "sv_track", None):
-            track_text = tracks.sv_track.text_clean
-        text = track_text or sv_result.get("text_clean") or raw_text
+            track_text = str(tracks.sv_track.text_clean or "")
+
+        # V3.2.0+dev.20260205.08:
+        # SemanticBuffer 的文本输入必须优先使用 L1 的 clean 口径，禁止在 clean 为空时回退到带 <|...|>/▁ 的 raw_text。
+        if track_text is not None:
+            text = track_text
+        elif sv_text_clean:
+            text = sv_text_clean
+        elif raw_text and self._is_semantic_clean_text(raw_text):
+            text = raw_text
+        else:
+            if raw_text:
+                self.logger.debug("SemanticBuffer 跳过污染 raw_text: %s", raw_text[:50])
+            text = ""
         words = sv_result.get("words") if isinstance(sv_result, dict) else None
         raw_tokens = sv_result.get("raw_tokens") if isinstance(sv_result, dict) else None
         punctuation_result = None

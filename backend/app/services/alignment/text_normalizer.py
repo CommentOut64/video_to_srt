@@ -85,8 +85,27 @@ class TextNormalizer:
 
         active_config = config or self._load_config()
         base_text = MinimalTextNormalizer.clean(text)
-        if not base_text and text:
-            base_text = text
+        if not base_text:
+            # V3.2.0+dev.20260205.08:
+            # 最小清洗后为空通常意味着输入仅包含 <|...|> / ▁ 等模型内部标记。
+            # 为避免污染在分层链路中“回流”为 text_clean，这里视为无有效文本，交由上层按质量信号降级/跳过。
+            self._logger.warning(
+                "最小清洗后为空，视为无有效文本以避免标签/▁污染: raw_len={} has_tag={} has_sp={} lang={}",
+                len(text),
+                1 if "<|" in text else 0,
+                1 if "▁" in text else 0,
+                lang or "auto",
+            )
+            return NormalizationResult(
+                text_itn_raw="",
+                text_clean="",
+                char_mapping=[],
+                raw_to_clean=[],
+                clean_to_raw=[],
+                itn_fallback=False,
+                itn_fallback_reason="empty_after_min_clean",
+                mapping_coverage=0.0,
+            )
 
         text_itn_raw, itn_fallback, itn_reason = self._apply_itn_pipeline(
             base_text,
