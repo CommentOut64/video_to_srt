@@ -1,11 +1,15 @@
 """
 Faster-Whisper 转录服务
+V3.2.0+dev.20260205.03
 
 职责：
 - Whisper 复核（后处理增强阶段）
 - 仅提供文本，时间戳由 SenseVoice 确定，使用伪对齐
 - 自动检测并下载缺失的 Whisper 模型（默认 medium）
 - 自动使用 HuggingFace 镜像源（hf-mirror.com）
+
+更新日志：
+- V3.2.0+dev.20260205.03: 语言感知的 condition_on_previous_text 自适应，避免西方语言密集标点感染
 """
 # 延迟导入 faster_whisper，避免启动时加载 ctranslate2 导致首次启动卡死
 # from faster_whisper import WhisperModel  # 已移至 load_model() 内部延迟导入
@@ -538,12 +542,42 @@ class WhisperService:
         if language is None or language == 'auto' or language == '':
             language = None
 
+        # V3.2.0+dev.20260205.03: 语言感知的 condition_on_previous_text 自适应
+        # 对于西方语言（英/德/法/西等），禁用前文条件以避免密集标点"感染"
+        # 如果是自动检测(None)，为安全起见也禁用（因为无法提前判断语言）
+        western_languages = ('en', 'de', 'fr', 'es', 'it', 'pt', 'nl', 'sv', 'no', 'da', 'fi')
+        if condition_on_previous_text:
+            if language is None:
+                # 自动检测语言时，为避免首个 segment 标点感染，统一禁用
+                condition_on_previous_text = False
+                logger.debug("自动检测语言，禁用 condition_on_previous_text 以避免标点感染")
+            elif language in western_languages:
+                condition_on_previous_text = False
+                logger.debug("检测到西方语言 '%s'，禁用 condition_on_previous_text 以避免标点感染", language)
+
         # 获取幻觉抑制 Token ID（如果未指定）
         if suppress_tokens is None:
             from app.config.model_config import get_whisper_suppress_tokens
             suppress_tokens = get_whisper_suppress_tokens(self._model_name)
             if suppress_tokens:
                 logger.debug(f"启用幻觉抑制: {len(suppress_tokens)} 个 Token ID")
+
+        suppress_count = len(suppress_tokens) if suppress_tokens else 0
+        logger.debug(
+            "Whisper 解码参数: language=%s condition_on_previous_text=%s temperature=%s beam_size=%s "
+            "word_timestamps=%s vad_filter=%s repetition_penalty=%s no_repeat_ngram_size=%s "
+            "suppress_tokens=%d prompt_len=%d",
+            language,
+            condition_on_previous_text,
+            temperature,
+            beam_size,
+            word_timestamps,
+            vad_filter,
+            repetition_penalty,
+            no_repeat_ngram_size,
+            suppress_count,
+            len(initial_prompt) if initial_prompt else 0,
+        )
 
         # 执行转录
         segments_generator, info = self.model.transcribe(
@@ -582,9 +616,11 @@ class WhisperService:
         for seg in segment_list:
             seg.text = clean_prompt_leak(seg.text)
 
+        assembled_text = " ".join(seg.text.strip() for seg in segment_list)
+
         # 构建统一格式的返回结果
         result = {
-            "text": " ".join(seg.text.strip() for seg in segment_list),
+            "text": assembled_text,
             "segments": [
                 {
                     "start": seg.start,
