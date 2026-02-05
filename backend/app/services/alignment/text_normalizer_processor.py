@@ -1,6 +1,6 @@
 """
 L1 规范化处理器（Processor）。
-V3.2.0+dev.20260204.12
+V3.2.0+dev.20260205.06
 """
 from __future__ import annotations
 
@@ -77,24 +77,20 @@ class TextNormalizerProcessor:
         self._attach_clean_to_word(track, raw_result, source=source)
         return track
 
-    @staticmethod
-    def _attach_word_level_punctuation(track: TextTrack, raw_result: Dict[str, Any], *, source: str) -> None:
+    def _attach_word_level_punctuation(self, track: TextTrack, raw_result: Dict[str, Any], *, source: str) -> None:
         if not track.text_clean:
             return
         words = TextNormalizerProcessor._extract_words_for_punct(raw_result, source=source)
         try:
             punct_config = TextPipelineConfig.from_runtime().punctuation
             min_cov = float(punct_config.raw_source_min_mapping_coverage)
-            max_weak = float(punct_config.raw_source_max_weak_ratio)
         except Exception:
             min_cov = 0.6
-            max_weak = 0.8
         if words:
-            _, positions, _ = SemanticInjector.extract_word_punctuation_positions(
+            _, positions, coverage = SemanticInjector.extract_word_punctuation_positions(
                 words,
                 clean_text=track.text_clean,
                 min_mapping_coverage=min_cov,
-                max_weak_ratio=max_weak,
             )
             if positions:
                 track.punct_positions = list(positions or [])
@@ -111,10 +107,9 @@ class TextNormalizerProcessor:
         )
         if not positions or clean_text != track.text_clean:
             return
-        token_count = TextNormalizerProcessor._estimate_token_count(track.text_clean)
-        weak_count = sum(1 for pos in positions if pos.punctuation in _WEAK_PUNCT)
-        if token_count >= 6 and max_weak > 0 and weak_count / max(token_count, 1) >= max_weak:
-            return
+        # V3.2.0+dev.20260205.06: 移除弱标点过滤逻辑
+        # 原因：密集标点问题已从根源修复（Prompt格式 + condition_on_previous_text禁用）
+        # 弱标点过滤会误伤英文等语言的正常逗号，且 L3 后处理已有规则引擎过滤异常标点
         track.punct_positions = list(positions)
 
     @staticmethod

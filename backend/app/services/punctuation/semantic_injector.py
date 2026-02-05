@@ -1,6 +1,6 @@
 """
 语义注入器（词边界标点注入）。
-V3.2.0+dev.20260204.10
+V3.2.0+dev.20260205.06
 """
 from __future__ import annotations
 
@@ -82,10 +82,6 @@ class SemanticInjector:
                 AnnotatedWord(word=word.word, start=word.start, end=word.end)
                 for word in aligned_words
             ]
-            self._logger.debug(
-                "语义注入映射覆盖率过低=%.2f，跳过标点注入",
-                coverage,
-            )
             return SemanticInjectionResult(
                 annotated_words=annotated,
                 punctuated_text=clean_text,
@@ -146,12 +142,6 @@ class SemanticInjector:
             )
 
         punctuated_text = apply_punctuation(clean_text, positions)
-        if unmatched:
-            self._logger.debug(
-                "语义注入未命中标点=%d，clean_text_len=%d",
-                len(unmatched),
-                len(clean_text),
-            )
         return SemanticInjectionResult(
             annotated_words=annotated_words,
             punctuated_text=punctuated_text,
@@ -221,8 +211,14 @@ class SemanticInjector:
         *,
         clean_text: str,
         min_mapping_coverage: float = 0.6,
-        max_weak_ratio: float = 0.8,
+        max_weak_ratio: float = 0.8,  # 保留参数以保持向后兼容，但不再使用
+        language: Optional[str] = None,  # 保留参数以保持向后兼容，但不再使用
     ) -> Tuple[str, List[PuncPosition], float]:
+        """基于词级时间戳提取标点位置（以 clean_text 为基准）。
+        
+        注意：max_weak_ratio 和 language 参数保留用于向后兼容，但自 V3.2.0+dev.20260205.06 起已不再使用。
+        弱标点过滤逻辑已移除，因为密集标点问题已从根源修复。
+        """
         """基于词级时间戳提取标点位置（以 clean_text 为基准）。"""
         if not clean_text or not word_timestamps:
             return clean_text or "", [], 0.0
@@ -262,7 +258,26 @@ class SemanticInjector:
             cursor = min(end + 1, len(clean_text))
 
         coverage = matched_chars / max(total_chars, 1)
+        # V3.2.0+dev.20260205.03: 输出词级标点映射细节，定位弱标点密集来源
+        logger = logging.getLogger(__name__)
+        leading_tokens = sum(1 for leading, _, _, _ in tokens if leading)
+        trailing_tokens = sum(1 for _, _, trailing, _ in tokens if trailing)
+        logger.debug(
+            "词级标点映射统计: clean_len=%d tokens=%d matched_tokens=%d coverage=%.2f leading_tokens=%d trailing_tokens=%d",
+            len(clean_text),
+            len(tokens),
+            matched_tokens,
+            coverage,
+            leading_tokens,
+            trailing_tokens,
+        )
         if coverage < min_mapping_coverage or matched_tokens <= 0:
+            logger.debug(
+                "词级标点映射覆盖不足: coverage=%.2f min_cov=%.2f matched_tokens=%d",
+                coverage,
+                min_mapping_coverage,
+                matched_tokens,
+            )
             return clean_text, [], coverage
 
         positions: List[PuncPosition] = []
@@ -281,14 +296,10 @@ class SemanticInjector:
                         weak_count += 1
                     positions.append(PuncPosition(char_index=end, punctuation=ch, confidence=confidence))
 
-        if max_weak_ratio > 0:
-            weak_ratio = weak_count / max(matched_tokens, 1)
-            if matched_tokens >= 3 and weak_count >= 2 and weak_ratio >= max_weak_ratio:
-                positions = [
-                    position
-                    for position in positions
-                    if position.punctuation not in _WEAK_PUNCTUATION_SET
-                ]
+        # V3.2.0+dev.20260205.06: 移除弱标点过滤逻辑
+        # 原因：密集标点问题已从根源修复（Prompt格式 + condition_on_previous_text禁用）
+        # 弱标点过滤会误伤英文等语言的正常逗号，且 L3 后处理已有规则引擎过滤异常标点
+        # 保留 weak_count 统计用于调试，但不再执行过滤
 
         if not positions:
             return clean_text, [], coverage

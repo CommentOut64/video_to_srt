@@ -336,7 +336,7 @@ class PunctuationConfig:
     min_confidence: float = 0.35
     sentence_end_min_confidence: float = 0.55
     raw_source_min_mapping_coverage: float = 0.6
-    raw_source_max_weak_ratio: float = 0.8
+    raw_source_max_weak_ratio: float = 0.8  # 已废弃 (V3.2.0+dev.20260205.06): 保留用于向后兼容，但不再使用
 
     @classmethod
     def from_runtime(cls, raw: Optional[Dict[str, Any]]) -> "PunctuationConfig":
