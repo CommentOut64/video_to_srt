@@ -32,7 +32,7 @@ import asyncio
 import copy
 import logging
 from dataclasses import replace
-from typing import List, Optional, Any, TYPE_CHECKING, Set, Dict, Tuple
+from typing import List, Optional, Any, TYPE_CHECKING, Set, Dict, Tuple, Sequence
 from pathlib import Path
 
 from app.core.asr.engine import ASREngine
@@ -48,7 +48,10 @@ from app.services.alignment.types import (
     L1Input,
     L2Input,
     L2Output,
+    L3Input,
     NormalizationResult,
+    PunctSource,
+    PunctTrack,
     QualitySignals,
     TextTrack,
     TextTrackBundle,
@@ -60,8 +63,10 @@ from app.services.sse_service import get_sse_manager
 from app.services.segmentation.default_segmenter import DefaultSegmenter
 from app.services.streaming_subtitle import get_streaming_subtitle_manager
 from app.services.punctuation.fast_punctuation_pipeline import FastPunctuationPipeline
+from app.services.punctuation.punctuation_processor import PunctuationProcessor
 from app.services.punctuation.debug_utils import append_debug_whisper_line
 from app.services.punctuation.base import PunctuationResult, PuncPosition, SplitPoint
+from app.services.punctuation.scheduler import get_punctuation_scheduler
 from app.services.bridge.bridge_controller import BridgeBatch, BridgeController
 from app.services.punctuation.semantic_buffer import (
     PunctuationDecision,
@@ -69,7 +74,7 @@ from app.services.punctuation.semantic_buffer import (
     SemanticBufferInput,
     SemanticChunk,
 )
-from app.services.punctuation.semantic_injector import SemanticInjector
+from app.services.text_pipeline_config import TextPipelineConfig
 from app.services.text_normalizer import TextNormalizer
 from app.services.whisper.whisper_text_sanitizer import WhisperTextSanitizer
 from app.pipelines.workers import FastWorker, SlowWorker, SlowWorkerResult
@@ -246,6 +251,11 @@ class AsyncDualPipeline:
         self._l2_processor = TextArbiterProcessor(logger=self.logger)
         self._fast_punctuator = FastPunctuationPipeline(
             job_id=self.job_id,
+            punctuation_service=self.punctuation_service,
+            logger=self.logger,
+        )
+        # V3.2.0+dev.20260204.05: L3 标点处理器
+        self._l3_processor = PunctuationProcessor(
             punctuation_service=self.punctuation_service,
             logger=self.logger,
         )
@@ -991,172 +1001,185 @@ class AsyncDualPipeline:
             gap_ratio=0.0,
         )
 
-    def _resolve_punctuation_source_preference(self) -> str:
-        runtime = get_model_runtime_config_service().get_effective_runtime_global()
-        punct_config = runtime.get("effective", {}).get("punctuation", {})
-        preference = (
-            punct_config.get("source_preference")
-            or punct_config.get("fallback_priority")
-            or "merged"
-        )
-        normalized = str(preference).lower()
-        if normalized not in {"fast", "slow", "merged"}:
-            normalized = "merged"
-        return normalized
-
-    # V3.2.0+dev.20260203.08: 统一规范化映射提取标点，避免数字归一化导致的错位。
-    def _extract_raw_punctuation_positions_with_normalizer(
-        self,
-        raw_text: str,
-        language: str,
-    ) -> Tuple[str, List[PuncPosition]]:
-        """使用统一规范化结果提取标点位置（修复数字归一化导致的错位）。"""
-        if not raw_text:
-            return "", []
-        normalized = self._text_normalizer.normalize(raw_text, language)
-        clean_text = normalized.text_clean or normalized.text_itn_raw
-        if not clean_text:
-            return "", []
-        clean_text, positions = SemanticInjector.extract_raw_punctuation_positions(
-            raw_text,
-            clean_text=clean_text,
-            raw_to_clean=normalized.raw_to_clean,
-        )
-        return clean_text, positions
-
-    def _resolve_whisper_punctuation_positions(
-        self,
-        raw_text: str,
-        clean_text: str,
-        language: str,
-    ) -> Tuple[List[PuncPosition], str, bool]:
-        """优先使用现有清洗口径提取标点，失败时尝试统一规范化回退。"""
-        if not raw_text:
-            return [], "", False
-        wh_clean_text, wh_positions = SemanticInjector.extract_raw_punctuation_positions(raw_text)
-        if wh_clean_text and wh_clean_text == clean_text:
-            return wh_positions, wh_clean_text, True
-        normalized_text, normalized_positions = self._extract_raw_punctuation_positions_with_normalizer(
-            raw_text,
-            language,
-        )
-        if normalized_text and normalized_text == clean_text:
-            return normalized_positions, normalized_text, True
-        return wh_positions, wh_clean_text, False
-
-    def _resolve_punctuation_positions(
+    def _build_punct_source_from_metadata(
         self,
         sv_result: Dict[str, Any],
-        whisper_result: Dict[str, Any],
-        chosen_text_clean: str,
-    ) -> Tuple[Optional[List[PuncPosition]], Optional[str]]:
-        language = (
-            whisper_result.get("language")
-            or sv_result.get("language")
-            or "auto"
-        )
-        punct_source = self._resolve_punctuation_source_preference()
-        clean_text = chosen_text_clean
-        if not clean_text:
-            return None, clean_text
-
-        sv_positions = self._extract_sv_punctuation_positions(sv_result, clean_text)
-        if punct_source == "fast":
-            return (sv_positions or None), clean_text
-
-        if punct_source == "slow":
-            raw_text = str(whisper_result.get("text_itn_raw") or whisper_result.get("text") or "")
-            wh_positions, wh_clean_text, matched = self._resolve_whisper_punctuation_positions(
-                raw_text,
-                clean_text,
-                language,
-            )
-            if not matched:
-                # V3.1.2+dev.20260203.01: 增强诊断日志
-                self.logger.warning(
-                    "标点源清洗文本不一致 - punct_source=slow wh_clean_len=%d clean_len=%d wh_punct_count=%d",
-                    len(wh_clean_text) if wh_clean_text else 0,
-                    len(clean_text),
-                    len(wh_positions),
-                )
-                self.logger.debug("wh_clean_text[:100]='%s'", (wh_clean_text or "")[:100])
-                self.logger.debug("clean_text[:100]='%s'", clean_text[:100])
-                return None, clean_text
-            return (wh_positions or None), wh_clean_text
-
-        raw_text = str(whisper_result.get("text_itn_raw") or whisper_result.get("text") or "")
-        wh_positions, wh_clean_text, matched = self._resolve_whisper_punctuation_positions(
-            raw_text,
-            clean_text,
-            language,
-        )
-        if not matched:
-            # V3.1.2+dev.20260203.01: 增强诊断日志（merged 模式）
-            if wh_clean_text:
-                self.logger.warning(
-                    "标点源清洗文本不一致（merged 模式）- wh_clean_len=%d clean_len=%d",
-                    len(wh_clean_text),
-                    len(clean_text),
-                )
-                self.logger.debug("wh_clean_text[:100]='%s'", wh_clean_text[:100])
-                self.logger.debug("clean_text[:100]='%s'", clean_text[:100])
-            wh_positions = []
-        if sv_positions and wh_positions and clean_text == (sv_result.get("text_clean") or clean_text):
-            merged = self._merge_punctuation_positions(sv_positions, wh_positions)
-            return (merged or None), clean_text
-        return (wh_positions or None), clean_text
-
-    def _extract_sv_punctuation_positions(
-        self,
-        sv_result: Dict[str, Any],
-        clean_text: str,
-    ) -> List[PuncPosition]:
-        if not sv_result:
-            return []
+        track: Optional[TextTrack],
+    ) -> Optional[PunctSource]:
+        if not sv_result or not track:
+            return None
         metadata = sv_result.get("metadata", {}) if isinstance(sv_result, dict) else {}
-        punctuation_meta = metadata.get("punctuation")
-        if not isinstance(punctuation_meta, dict):
-            return []
-        if clean_text and sv_result.get("text_clean") and clean_text != sv_result.get("text_clean"):
-            # V3.1.2+dev.20260203.01: 增强诊断日志
-            sv_clean = sv_result.get("text_clean", "")
-            self.logger.warning(
-                "SV 标点源文本不一致 - sv_clean_len=%d clean_len=%d",
-                len(sv_clean),
-                len(clean_text),
-            )
-            self.logger.debug("sv_clean[:100]='%s'", sv_clean[:100])
-            self.logger.debug("clean_text[:100]='%s'", clean_text[:100])
-            return []
-        result = self._build_punctuation_result(punctuation_meta, clean_text)
-        # V3.1.2+dev.20260203.01: 记录标点位置分布
-        if result and result.punctuation_positions:
-            positions = result.punctuation_positions
-            if clean_text:
-                text_len = len(clean_text)
-                tail_threshold = int(text_len * 0.8)
-                tail_count = sum(1 for p in positions if p.char_index >= tail_threshold)
-                self.logger.debug(
-                    "SV 标点分布：总数=%d 末尾20%%区域=%d 文本长度=%d",
-                    len(positions),
-                    tail_count,
-                    text_len,
+        punct_meta = metadata.get("punctuation")
+        if not isinstance(punct_meta, dict):
+            return None
+        raw_positions = punct_meta.get("punctuation_positions", []) or []
+        positions: List[PuncPosition] = []
+        for item in raw_positions:
+            if not isinstance(item, dict):
+                continue
+            positions.append(
+                PuncPosition(
+                    char_index=int(item.get("char_index", 0)),
+                    punctuation=str(item.get("punctuation", "")),
+                    confidence=float(item.get("confidence", 1.0)),
                 )
-        return result.punctuation_positions if result else []
+            )
+        if not positions:
+            return None
+        return PunctSource(
+            clean_text_ref=track.text_clean or "",
+            positions=positions,
+            source="fast",
+            confidence=float(punct_meta.get("confidence", 0.0) or 0.0),
+            model_id=str(punct_meta.get("model_id", "") or ""),
+        )
+
+    def _build_punct_source_from_whisper(
+        self,
+        whisper_result: Dict[str, Any],
+        track: Optional[TextTrack],
+    ) -> Optional[PunctSource]:
+        if not whisper_result or not track:
+            return None
+        # V3.2.0+dev.20260204.11: slow_raw 来源由 L1 预先抽取并写入 TextTrack.punct_positions。
+        clean_text = str(track.text_clean or "")
+        if not clean_text:
+            return None
+        positions = list(track.punct_positions or [])
+        if not positions:
+            return None
+        avg_conf = sum(float(pos.confidence or 0.0) for pos in positions) / max(len(positions), 1)
+        return PunctSource(
+            clean_text_ref=clean_text,
+            positions=positions,
+            source="slow_raw",
+            confidence=float(avg_conf),
+            model_id="asr_raw_words",
+        )
 
     @staticmethod
-    def _merge_punctuation_positions(
-        base: List[PuncPosition],
-        extra: List[PuncPosition],
-    ) -> List[PuncPosition]:
-        merged: Dict[Tuple[int, str], float] = {}
-        for pos in base + extra:
-            key = (pos.char_index, pos.punctuation)
-            merged[key] = max(merged.get(key, 0.0), pos.confidence)
-        return [
-            PuncPosition(char_index=idx, punctuation=punct, confidence=conf)
-            for (idx, punct), conf in sorted(merged.items(), key=lambda item: item[0][0])
-        ]
+    def _extract_whisper_words(whisper_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+        raw = whisper_result.get("raw_result") if isinstance(whisper_result, dict) else None
+        segments = raw.get("segments", []) if isinstance(raw, dict) else []
+        words: List[Dict[str, Any]] = []
+        edge_punct = set(",.!?;:\"()[]{}，。！？；：、（）【】《》“”‘’「」『』")
+        for seg in segments:
+            for word in seg.get("words", []) or []:
+                token = str(word.get("word", "") or "")
+                token = token.replace("▁", " ").strip()
+                start = 0
+                end = len(token)
+                while start < end and token[start] in edge_punct:
+                    start += 1
+                while end > start and token[end - 1] in edge_punct:
+                    end -= 1
+                token = token[start:end].strip()
+                if not token:
+                    continue
+                words.append(
+                    {
+                        "word": token,
+                        "start": float(word.get("start", 0.0) or 0.0),
+                        "end": float(word.get("end", 0.0) or 0.0),
+                        "confidence": float(word.get("probability", 0.0) or 0.0),
+                    }
+                )
+        return words
+
+    async def _run_punctuation_layer(
+        self,
+        ctx: ProcessingContext,
+        sv_result: Dict[str, Any],
+        whisper_result: Dict[str, Any],
+        chosen_source: str,
+    ) -> Optional[PunctTrack]:
+        tracks = self._ensure_text_tracks(ctx)
+        chosen_track = tracks.chosen_track
+        if not chosen_track:
+            return None
+        word_timestamps: List[Dict[str, Any]] = []
+        if chosen_source == "fast":
+            word_timestamps = list(sv_result.get("words", []) or [])
+        elif whisper_result:
+            word_timestamps = self._extract_whisper_words(whisper_result)
+        sv_source = self._build_punct_source_from_metadata(sv_result, tracks.sv_track)
+        wh_source: Optional[PunctSource] = None
+        # V3.2.0+dev.20260204.11: slow_raw 候选由 L1 预先抽取并透传，仅在文本一致时启用
+        if (
+            chosen_source != "fast"
+            and tracks.whisper_track
+            and tracks.whisper_track.text_clean
+            and tracks.whisper_track.text_clean == chosen_track.text_clean
+        ):
+            wh_source = self._build_punct_source_from_whisper(
+                whisper_result,
+                tracks.whisper_track,
+            )
+        output = await self._l3_processor.process(
+            L3Input(
+                chosen_text_track=chosen_track,
+                sv_punct_source=sv_source,
+                wh_punct_source=wh_source,
+                word_timestamps=word_timestamps,
+            )
+        )
+        return output.punct_track
+
+    def _resolve_gap_ratio_mid(self) -> float:
+        gap_ratio_mid = 0.3
+        if not self.aligner:
+            return gap_ratio_mid
+        gap_resolver = getattr(self.aligner.alignment_service, "gap_resolver", None)
+        value = getattr(gap_resolver, "_gap_ratio_mid", None)
+        if isinstance(value, (int, float)):
+            gap_ratio_mid = float(value)
+        return gap_ratio_mid
+
+    def _resolve_injection_min_mapping_coverage(self) -> float:
+        if not self.aligner:
+            return 0.6
+        config = getattr(self.aligner.final_splitter, "config", None)
+        value = getattr(config, "min_mapping_coverage", None)
+        if isinstance(value, (int, float)):
+            return float(value)
+        return 0.6
+
+    def _record_punct_retry_candidates(self, ctx: ProcessingContext) -> None:
+        """L4/L5 补跑候选仅做埋点，不触发补跑。"""
+        stats = ctx.finalization_metrics
+        if not stats:
+            return
+
+        reasons_l4: List[str] = []
+        coverage = stats.get("coverage")
+        coverage_threshold = get_punctuation_scheduler().policy.alignment_coverage_threshold
+        if coverage is not None and float(coverage) < coverage_threshold:
+            reasons_l4.append("alignment_coverage_low")
+        gap_ratio = stats.get("gap_ratio")
+        gap_ratio_mid = self._resolve_gap_ratio_mid()
+        if gap_ratio is not None and float(gap_ratio) >= gap_ratio_mid:
+            reasons_l4.append("gap_ratio_high")
+        stats["punct_retry_candidate_l4"] = 1.0 if reasons_l4 else 0.0
+        stats["punct_retry_reason_l4"] = "|".join(reasons_l4)
+        stats["punct_retry_alignment_coverage_threshold"] = coverage_threshold
+        stats["punct_retry_gap_ratio_mid"] = gap_ratio_mid
+
+        reasons_l5: List[str] = []
+        min_mapping = self._resolve_injection_min_mapping_coverage()
+        mapping_cov = stats.get("injection_mapping_coverage")
+        if mapping_cov is not None and float(mapping_cov) < min_mapping:
+            reasons_l5.append("injection_coverage_low")
+        miss_ratio = stats.get("injection_miss_ratio")
+        miss_threshold = 0.3
+        if miss_ratio is not None and float(miss_ratio) >= miss_threshold:
+            reasons_l5.append("injection_miss_ratio_high")
+        blocked = stats.get("injection_blocked")
+        if blocked is not None and float(blocked) > 0.0:
+            reasons_l5.append("injection_blocked")
+        stats["punct_retry_candidate_l5"] = 1.0 if reasons_l5 else 0.0
+        stats["punct_retry_reason_l5"] = "|".join(reasons_l5)
+        stats["punct_retry_injection_min_mapping_coverage"] = min_mapping
+        stats["punct_retry_injection_miss_ratio_threshold"] = miss_threshold
 
     async def _apply_fast_punctuation(
         self,
@@ -1172,6 +1195,40 @@ class AsyncDualPipeline:
             ctx=ctx,
             normalization=normalized,
         )
+        punct_track = self._build_punct_track_from_metadata(ctx)
+        if punct_track:
+            ctx.punct_track = punct_track
+
+    def _build_punct_track_from_metadata(self, ctx: ProcessingContext) -> Optional[PunctTrack]:
+        """从快流标点元数据构建 PunctTrack（仅用于草稿路径）。"""
+        if not ctx.sv_result:
+            return None
+        tracks = self._ensure_text_tracks(ctx)
+        sv_track = tracks.sv_track
+        if not sv_track:
+            return None
+        source = self._build_punct_source_from_metadata(ctx.sv_result, sv_track)
+        if not source:
+            return None
+        return PunctTrack(
+            clean_text_ref=source.clean_text_ref,
+            positions=list(source.positions),
+            source="fast",
+            confidence_stats={
+                "count": float(len(source.positions)),
+                "avg_confidence": float(source.confidence or 0.0),
+                "min_confidence": float(source.confidence or 0.0),
+                "max_confidence": float(source.confidence or 0.0),
+                "model_confidence": float(source.confidence or 0.0),
+            },
+        )
+
+    @staticmethod
+    def _is_semantic_clean_text(text: str) -> bool:
+        """判断文本是否包含明显的 ASR 标签/分词符号污染。"""
+        if not text:
+            return False
+        return "<|" not in text and "▁" not in text
 
     def _build_semantic_input(self, ctx: ProcessingContext) -> Optional[SemanticBufferInput]:
         """构建 SemanticBuffer 输入。"""
@@ -1182,7 +1239,11 @@ class AsyncDualPipeline:
         decision_meta = metadata.get("punctuation_decision")
 
         raw_text = sv_result.get("raw_text") or ""
-        text = sv_result.get("text_clean") or raw_text
+        track_text = None
+        tracks = getattr(ctx, "text_tracks", None)
+        if tracks and getattr(tracks, "sv_track", None):
+            track_text = tracks.sv_track.text_clean
+        text = track_text or sv_result.get("text_clean") or raw_text
         words = sv_result.get("words") if isinstance(sv_result, dict) else None
         raw_tokens = sv_result.get("raw_tokens") if isinstance(sv_result, dict) else None
         punctuation_result = None
@@ -1190,7 +1251,11 @@ class AsyncDualPipeline:
         if isinstance(punctuation_meta, dict):
             punctuation_result = self._build_punctuation_result(punctuation_meta, raw_text)
             if punctuation_result and punctuation_result.text:
-                text = punctuation_result.text
+                candidate = punctuation_result.text
+                if self._is_semantic_clean_text(candidate):
+                    text = candidate
+                else:
+                    self.logger.debug("SemanticBuffer 忽略污染标点文本: %s", candidate[:50])
 
         if not text:
             return None
@@ -1431,7 +1496,9 @@ class AsyncDualPipeline:
 
         for idx in ordered_indices:
             segs = assignments.get(idx, [])
-            text = "".join(str(seg.get("text", "")) for seg in segs).strip()
+            # V3.2.0+dev.20260205.01: 分段文本拼接必须保留段间空格，否则会产生 "lamp.Who" 这类错误粘连
+            parts = [str(seg.get("text", "") or "").strip() for seg in segs]
+            text = " ".join(part for part in parts if part).strip()
             confidence = self._estimate_segment_confidence(segs, fallback_conf)
             results[idx] = {
                 "text": text,
@@ -2154,11 +2221,26 @@ class AsyncDualPipeline:
             arbitration_result.chosen_source,
             chosen_text_clean,
         )
-        punctuation_positions, punctuation_clean_text = self._resolve_punctuation_positions(
-            sv_result,
-            whisper_result,
-            chosen_text_clean,
-        )
+        # V3.2.0+dev.20260204.10: 删除慢流补跑分支，定稿标点仅走统一 L3 入口
+        punct_track: Optional[PunctTrack] = None
+        # V3.2.0+dev.20260204.11: 若仲裁选择 fast 且快流已产出同一 clean_text_ref 的 PunctTrack，直接复用避免重复跑模型
+        if (
+            arbitration_result.chosen_source == "fast"
+            and ctx.punct_track is not None
+            and tracks.chosen_track is not None
+            and ctx.punct_track.clean_text_ref == tracks.chosen_track.text_clean
+        ):
+            punct_track = ctx.punct_track
+        else:
+            punct_track = await self._run_punctuation_layer(
+                ctx,
+                sv_result,
+                whisper_result,
+                arbitration_result.chosen_source,
+            )
+        ctx.punct_track = punct_track
+        punctuation_positions = punct_track.positions if punct_track and punct_track.positions else None
+        punctuation_clean_text = punct_track.clean_text_ref if punct_track else None
         if tracks.chosen_track:
             if chosen_text_clean and tracks.chosen_track.text_clean != chosen_text_clean:
                 tracks.chosen_track.text_clean = chosen_text_clean
@@ -2170,7 +2252,7 @@ class AsyncDualPipeline:
                 tracks.chosen_track.punct_positions = list(punctuation_positions)
             else:
                 if punctuation_positions:
-                    self.logger.debug("仲裁标点 clean_text 不一致，清空回写位置")
+                    self.logger.debug("L3 标点 clean_text 不一致，清空回写位置")
                 tracks.chosen_track.punct_positions = []
         if self.bridge_controller:
             self.bridge_controller.record_arbitration_result(arbitration_result)
@@ -2207,6 +2289,8 @@ class AsyncDualPipeline:
                 ctx.finalization_metrics["whisper_itn_fallback"] = (
                     1.0 if tracks.whisper_track.itn_fallback else 0.0
                 )
+            # V3.2.0+dev.20260204.08: L4/L5 补跑候选埋点（仅统计，不触发补跑）
+            self._record_punct_retry_candidates(ctx)
 
         ctx.final_sentences = final_sentences
         if ctx.arbitration_result and self.aligner.last_alignment_stats:
