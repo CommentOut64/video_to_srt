@@ -1,6 +1,6 @@
 """
 语义注入器（词边界标点注入）。
-V3.2.0+dev.20260203.03
+V3.2.0+dev.20260204.10
 """
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import List, Optional, Sequence, Tuple
 
 from app.models.confidence_models import AlignedWord
 from app.models.sensevoice_models import WordTimestamp
-from app.services.punctuation.base import PuncPosition, apply_punctuation
+from app.services.punctuation.base import PuncPosition, WordTimestampLike, apply_punctuation
 from app.services.punctuation.postprocess import build_clean_text
 
 
@@ -18,6 +18,7 @@ _LEFT_QUOTES = set("“‘「『《（【")
 _RIGHT_QUOTES = set("”’」』》）】")
 _AMBIGUOUS_QUOTES = set("\"'")
 _PUNCTUATION_SET = set(",.!?;:\"()[]{}，。！？；：、（）【】《》“”‘’「」『』")
+_WEAK_PUNCTUATION_SET = set(",，、;；:：")
 
 
 @dataclass
@@ -212,6 +213,152 @@ class SemanticInjector:
                 continue
             positions.append(PuncPosition(char_index=prev_clean, punctuation=char, confidence=1.0))
         return clean_text, positions
+
+    # V3.2.0+dev.20260204.10: Whisper 词级标点提取（基于词时间戳对齐 clean_text）。
+    @staticmethod
+    def extract_word_punctuation_positions(
+        word_timestamps: Sequence[WordTimestampLike],
+        *,
+        clean_text: str,
+        min_mapping_coverage: float = 0.6,
+        max_weak_ratio: float = 0.8,
+    ) -> Tuple[str, List[PuncPosition], float]:
+        """基于词级时间戳提取标点位置（以 clean_text 为基准）。"""
+        if not clean_text or not word_timestamps:
+            return clean_text or "", [], 0.0
+
+        tokens: List[Tuple[str, str, str, float]] = []
+        for item in word_timestamps:
+            raw = SemanticInjector._get_word_text(item)
+            token = raw.replace("▁", " ").strip()
+            if not token:
+                tokens.append(("", "", "", 0.0))
+                continue
+            leading, core, trailing = SemanticInjector._split_word_token(token)
+            confidence = SemanticInjector._get_word_confidence(item)
+            tokens.append((leading, core, trailing, confidence))
+
+        spans: List[Optional[Tuple[int, int]]] = [None] * len(tokens)
+        cursor = 0
+        matched_chars = 0
+        matched_tokens = 0
+        total_chars = SemanticInjector._count_nonspace(clean_text)
+        for idx, (_, core, _, _) in enumerate(tokens):
+            if not core:
+                continue
+            cursor = SemanticInjector._skip_whitespace(clean_text, cursor)
+            if cursor >= len(clean_text):
+                break
+            match_idx = clean_text.find(core, cursor)
+            if match_idx == -1:
+                match_idx = SemanticInjector._fallback_match(clean_text, core, cursor)
+            if match_idx == -1:
+                continue
+            start = max(match_idx, 0)
+            end = min(match_idx + len(core) - 1, len(clean_text) - 1)
+            spans[idx] = (start, end)
+            matched_tokens += 1
+            matched_chars += SemanticInjector._count_nonspace(clean_text[start:end + 1])
+            cursor = min(end + 1, len(clean_text))
+
+        coverage = matched_chars / max(total_chars, 1)
+        if coverage < min_mapping_coverage or matched_tokens <= 0:
+            return clean_text, [], coverage
+
+        positions: List[PuncPosition] = []
+        weak_count = 0
+        for idx, (leading, _, trailing, confidence) in enumerate(tokens):
+            span = spans[idx]
+            if span is None:
+                continue
+            start, end = span
+            for ch in leading:
+                if ch in _PUNCTUATION_SET:
+                    positions.append(PuncPosition(char_index=start, punctuation=ch, confidence=confidence))
+            for ch in trailing:
+                if ch in _PUNCTUATION_SET:
+                    if ch in _WEAK_PUNCTUATION_SET:
+                        weak_count += 1
+                    positions.append(PuncPosition(char_index=end, punctuation=ch, confidence=confidence))
+
+        if max_weak_ratio > 0:
+            weak_ratio = weak_count / max(matched_tokens, 1)
+            if matched_tokens >= 3 and weak_count >= 2 and weak_ratio >= max_weak_ratio:
+                positions = [
+                    position
+                    for position in positions
+                    if position.punctuation not in _WEAK_PUNCTUATION_SET
+                ]
+
+        if not positions:
+            return clean_text, [], coverage
+
+        deduped: List[PuncPosition] = []
+        seen: set[tuple[int, str]] = set()
+        for position in sorted(positions, key=lambda item: item.char_index):
+            key = (int(position.char_index), str(position.punctuation))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(position)
+        return clean_text, deduped, coverage
+
+    @staticmethod
+    def _get_word_text(item: WordTimestampLike) -> str:
+        if isinstance(item, dict):
+            return str(item.get("word", "") or "")
+        return str(getattr(item, "word", "") or "")
+
+    @staticmethod
+    def _get_word_confidence(item: WordTimestampLike) -> float:
+        if isinstance(item, dict):
+            value = item.get("confidence")
+            if value is None:
+                value = item.get("probability")
+            return float(value or 0.0)
+        value = getattr(item, "confidence", None)
+        if value is None:
+            value = getattr(item, "probability", None)
+        return float(value or 0.0)
+
+    @staticmethod
+    def _split_word_token(token: str) -> Tuple[str, str, str]:
+        if not token:
+            return "", "", ""
+        start = 0
+        end = len(token)
+        leading: List[str] = []
+        trailing: List[str] = []
+        while start < end and token[start] in _PUNCTUATION_SET:
+            leading.append(token[start])
+            start += 1
+        while end > start and token[end - 1] in _PUNCTUATION_SET:
+            trailing.append(token[end - 1])
+            end -= 1
+        core = token[start:end]
+        trailing.reverse()
+        return "".join(leading), core, "".join(trailing)
+
+    @staticmethod
+    def _count_nonspace(text: str) -> int:
+        return sum(1 for ch in text if not ch.isspace())
+
+    @staticmethod
+    def _skip_whitespace(text: str, cursor: int) -> int:
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        return cursor
+
+    @staticmethod
+    def _fallback_match(text: str, token: str, cursor: int) -> int:
+        if not token:
+            return -1
+        if cursor < len(text) and text[cursor: cursor + len(token)] == token:
+            return cursor
+        for idx in range(cursor, len(text)):
+            if text[idx: idx + len(token)] == token:
+                return idx
+        return -1
 
     # V3.2.0+dev.20260203.09: 语言感知映射（跳过空白 token + 规范化匹配 + 拼接兜底）。
     def _build_char_to_word_map(
