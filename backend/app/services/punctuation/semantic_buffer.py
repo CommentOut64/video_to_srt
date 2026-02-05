@@ -47,6 +47,7 @@ def _is_decimal_point(text: str, index: int) -> bool:
 _WEAK_PUNCTUATION = set("，、；,;:")
 _PUNCTUATION_SET = set(",.!?;:\"()[]{}，。！？；：、（）【】《》""「」『』")
 _TRAILING_PUNCTUATION = set(",，;:；：、。.") 
+_SPECIAL_TAG_PATTERN = re.compile(r"<\|.*?\|>")
 
 
 def _is_removable_punctuation(text: str, index: int) -> bool:
@@ -908,6 +909,11 @@ class SemanticBuffer:
             sentence_confidence = strict_confidence if sentence_words else confidence
             sentence_word_models = self._build_word_models(sentence_words)
             display_text = self._strip_trailing_punctuation(sentence_text).strip()
+            # 统一清洗展示文本，移除标签与 SentencePiece 符号
+            from app.services.text_normalizer import get_text_normalizer
+
+            normalizer = get_text_normalizer()
+            display_text = normalizer.clean(display_text)
             # V3.2.0+dev.20260131.04: 仅修复英文展示文本的缩写撇号，避免影响时间戳与切分。
             if _should_restore_contractions(display_text, language):
                 display_text = _restore_english_contractions(display_text)

@@ -5,11 +5,13 @@ V3.2.0+dev.20260131.03
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 
 _PUNCTUATION_SET = set(",.!?;:\"()[]{}，。！？；：、（）【】《》“”‘’「」『』")
 _LEFT_PUNCT = set("([{“‘（【《「『")
+_SPECIAL_TAG_PATTERN = re.compile(r"<\|.*?\|>")
 
 # V3.2.0+dev.20260131.03: SenseVoice 显示置信度校准参数（仅影响 display 口径）
 _SV_DISPLAY_RAW_MIN = 0.10
@@ -54,6 +56,9 @@ def merge_tokens(
 
 def _normalize_token(token: Dict[str, Any]) -> Dict[str, Any]:
     word = str(token.get("word", "") or "")
+    # 兜底清理标签与 SentencePiece 符号，避免污染后续合并
+    word = _SPECIAL_TAG_PATTERN.sub("", word)
+    word = word.replace("▁", " ")
     start = _safe_float(token.get("start", 0.0))
     end = _safe_float(token.get("end", 0.0))
     confidence = _safe_float(token.get("confidence", 1.0), default=1.0)
