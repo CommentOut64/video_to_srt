@@ -5,10 +5,10 @@ V3.2.0+dev.20260204.03
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Sequence, TYPE_CHECKING
 
 from app.models.confidence_models import AlignedWord as AlignedWord
-from app.services.punctuation.base import PuncPosition
+from app.services.punctuation.base import PuncPosition, WordTimestampLike
 
 if TYPE_CHECKING:
     from app.services.arbitration.arbiter import ArbitrationResult
@@ -54,6 +54,27 @@ class TextTrack:
     clean_to_word: List[Optional[int]] = field(default_factory=list)
     punct_positions: List[PuncPosition] = field(default_factory=list)
     mapping_coverage: float = 0.0
+
+
+@dataclass
+class PunctSource:
+    """标点候选来源（L3 内部使用）。"""
+
+    clean_text_ref: str
+    positions: List[PuncPosition]
+    source: str
+    confidence: float = 0.0
+    model_id: str = ""
+
+
+@dataclass
+class PunctTrack:
+    """标点轨道（L3 输出）。"""
+
+    clean_text_ref: str
+    positions: List[PuncPosition]
+    source: str = ""
+    confidence_stats: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -130,6 +151,23 @@ class L2Output:
 
 
 @dataclass
+class L3Input:
+    """L3 标点层输入。"""
+
+    chosen_text_track: Optional[TextTrack]
+    sv_punct_source: Optional[PunctSource] = None
+    wh_punct_source: Optional[PunctSource] = None
+    word_timestamps: Optional[Sequence[WordTimestampLike]] = None
+
+
+@dataclass
+class L3Output:
+    """L3 标点层输出。"""
+
+    punct_track: PunctTrack
+
+
+@dataclass
 class AnnotatedWord:
     """语义注入后的词信息（预留）。"""
 
@@ -146,7 +184,11 @@ __all__ = [
     "L1Output",
     "L2Input",
     "L2Output",
+    "L3Input",
+    "L3Output",
     "NormalizationResult",
+    "PunctSource",
+    "PunctTrack",
     "QualitySignals",
     "TextTrack",
     "TextTrackBundle",
