@@ -366,6 +366,9 @@ class ModelRuntimeConfigService:
                 "default_language": "zh",
                 "fallback_priority": "fast",
                 "source_preference": "merged",
+                # V3.2.0+dev.20260204.10: Whisper 原始标点抽取门控
+                "raw_source.min_mapping_coverage": 0.6,
+                "raw_source.max_weak_ratio": 0.8,
                 "cache_models": True,
                 "max_cached_models": 3,
                 "device": "cpu",

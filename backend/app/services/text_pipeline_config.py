@@ -1,11 +1,11 @@
 """
 文本处理统一参数入口（TextPipelineConfig）。
-V3.2.0+dev.20260204.04
+V3.2.0+dev.20260204.10
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from app.services.model_runtime_config_service import get_model_runtime_config_service
 
@@ -30,6 +30,166 @@ def _read_runtime_value(raw: Dict[str, Any], key: str, default: Any) -> Any:
     if alt_key in raw:
         return raw[alt_key]
     return default
+
+
+def _read_runtime_optional(raw: Dict[str, Any], key: str) -> Tuple[Any, bool]:
+    """
+    读取运行参数的“显式覆盖值”。
+
+    说明：
+    - 用于“yaml 默认值 + 运行参数覆盖”的场景；
+    - 仅当 key 在 override 中显式出现（dotted/nested/underscore 任一口径）才返回 found=True；
+    - 若显式出现但 value 为 None，视为“清空覆盖”，返回 found=False（让上游回退到默认）。
+    """
+    if key in raw:
+        value = raw[key]
+        return (value, value is not None)
+    if "." in key:
+        current: Any = raw
+        for part in key.split("."):
+            if not isinstance(current, dict) or part not in current:
+                current = None
+                break
+            current = current[part]
+        if current is not None:
+            return (current, True)
+    alt_key = key.replace(".", "_")
+    if alt_key in raw:
+        value = raw[alt_key]
+        return (value, value is not None)
+    return (None, False)
+
+
+@dataclass
+class PunctuationSchedulerOverride:
+    """L3 标点调度覆盖项（仅当运行参数显式设置时生效）。"""
+
+    mode: Optional[str] = None
+    fast_confidence_threshold: Optional[float] = None
+    alignment_coverage_threshold: Optional[float] = None
+    arbiter_conflict_threshold: Optional[float] = None
+    max_slow_retries: Optional[int] = None
+
+
+@dataclass
+class PunctuationPostprocessModeOverride:
+    """后处理模式覆盖项（fast/dual）。"""
+
+    candidate_min_conf: Optional[float] = None
+    add_mid_conf: Optional[float] = None
+    add_end_conf: Optional[float] = None
+    keep_raw_mid_conf: Optional[float] = None
+    keep_raw_end_conf: Optional[float] = None
+    drop_raw_mid_conf: Optional[float] = None
+    drop_raw_end_conf: Optional[float] = None
+    question_gate_min_conf: Optional[float] = None
+    pause_end_min_sec: Optional[float] = None
+
+
+@dataclass
+class PunctuationPostprocessSharedOverride:
+    """后处理 shared 覆盖项。"""
+
+    candidate_window_words: Optional[int] = None
+    conflict_window_chars: Optional[int] = None
+    max_repeat_punct: Optional[int] = None
+    allowed_punct_zh: Optional[str] = None
+    allowed_punct_en: Optional[str] = None
+    comma_guard_enabled: Optional[bool] = None
+    comma_guard_min_conf: Optional[float] = None
+    comma_guard_min_chars: Optional[int] = None
+    comma_guard_min_words: Optional[int] = None
+    comma_guard_pause_min_sec: Optional[float] = None
+
+
+@dataclass
+class PunctuationRuntimeOverrides:
+    """标点运行参数覆盖集合（用于覆盖 punctuation.yaml 的默认值）。"""
+
+    scheduler: PunctuationSchedulerOverride
+    postprocess_fast: PunctuationPostprocessModeOverride
+    postprocess_dual: PunctuationPostprocessModeOverride
+    postprocess_shared: PunctuationPostprocessSharedOverride
+
+    @classmethod
+    def from_runtime(cls, runtime: Optional[Dict[str, Any]] = None) -> "PunctuationRuntimeOverrides":
+        if runtime is None:
+            runtime = get_model_runtime_config_service().get_effective_runtime_global()
+        override = runtime.get("override", {}) if isinstance(runtime, dict) else {}
+        punct = override.get("punctuation", {}) if isinstance(override, dict) else {}
+        punct = punct if isinstance(punct, dict) else {}
+
+        mode_raw, has_mode = _read_runtime_optional(punct, "scheduler.mode")
+        mode = str(mode_raw).lower() if has_mode and mode_raw is not None else None
+        if mode not in {"fast_only", "dual", "smart_review"}:
+            mode = None
+
+        fast_thr, has_fast_thr = _read_runtime_optional(punct, "scheduler.fast_confidence_threshold")
+        cov_thr, has_cov_thr = _read_runtime_optional(punct, "scheduler.alignment_coverage_threshold")
+        conflict_thr, has_conflict_thr = _read_runtime_optional(punct, "scheduler.arbiter_conflict_threshold")
+        max_retry, has_max_retry = _read_runtime_optional(punct, "scheduler.max_slow_retries")
+
+        scheduler = PunctuationSchedulerOverride(
+            mode=mode,
+            fast_confidence_threshold=float(fast_thr) if has_fast_thr else None,
+            alignment_coverage_threshold=float(cov_thr) if has_cov_thr else None,
+            arbiter_conflict_threshold=float(conflict_thr) if has_conflict_thr else None,
+            max_slow_retries=int(max_retry) if has_max_retry else None,
+        )
+
+        def mode_override(prefix: str) -> PunctuationPostprocessModeOverride:
+            def read_float(key: str) -> Optional[float]:
+                value, found = _read_runtime_optional(punct, f"postprocess.{prefix}.{key}")
+                return float(value) if found else None
+
+            return PunctuationPostprocessModeOverride(
+                candidate_min_conf=read_float("candidate_min_conf"),
+                add_mid_conf=read_float("add_mid_conf"),
+                add_end_conf=read_float("add_end_conf"),
+                keep_raw_mid_conf=read_float("keep_raw_mid_conf"),
+                keep_raw_end_conf=read_float("keep_raw_end_conf"),
+                drop_raw_mid_conf=read_float("drop_raw_mid_conf"),
+                drop_raw_end_conf=read_float("drop_raw_end_conf"),
+                question_gate_min_conf=read_float("question_gate_min_conf"),
+                pause_end_min_sec=read_float("pause_end_min_sec"),
+            )
+
+        def shared_override() -> PunctuationPostprocessSharedOverride:
+            def read_int(key: str) -> Optional[int]:
+                value, found = _read_runtime_optional(punct, f"postprocess.shared.{key}")
+                return int(value) if found else None
+
+            def read_float(key: str) -> Optional[float]:
+                value, found = _read_runtime_optional(punct, f"postprocess.shared.{key}")
+                return float(value) if found else None
+
+            def read_str(key: str) -> Optional[str]:
+                value, found = _read_runtime_optional(punct, f"postprocess.shared.{key}")
+                return str(value) if found else None
+
+            def read_bool(key: str) -> Optional[bool]:
+                value, found = _read_runtime_optional(punct, f"postprocess.shared.{key}")
+                return bool(value) if found else None
+
+            return PunctuationPostprocessSharedOverride(
+                candidate_window_words=read_int("candidate_window_words"),
+                conflict_window_chars=read_int("conflict_window_chars"),
+                max_repeat_punct=read_int("max_repeat_punct"),
+                allowed_punct_zh=read_str("allowed_punct_zh"),
+                allowed_punct_en=read_str("allowed_punct_en"),
+                comma_guard_enabled=read_bool("comma_guard_enabled"),
+                comma_guard_min_conf=read_float("comma_guard_min_conf"),
+                comma_guard_min_chars=read_int("comma_guard_min_chars"),
+                comma_guard_min_words=read_int("comma_guard_min_words"),
+                comma_guard_pause_min_sec=read_float("comma_guard_pause_min_sec"),
+            )
+
+        return cls(
+            scheduler=scheduler,
+            postprocess_fast=mode_override("fast"),
+            postprocess_dual=mode_override("dual"),
+            postprocess_shared=shared_override(),
+        )
 
 
 @dataclass
@@ -98,10 +258,11 @@ class NormalizationConfig:
 
 @dataclass
 class TextPipelineConfig:
-    """文本处理流水线参数入口（L1/L2）。"""
+    """文本处理流水线参数入口（L1/L2/L3）。"""
 
     normalization: NormalizationConfig
     arbitration: "ArbitrationConfig"
+    punctuation: "PunctuationConfig"
 
     @classmethod
     def from_runtime(cls, runtime: Optional[Dict[str, Any]] = None) -> "TextPipelineConfig":
@@ -110,9 +271,11 @@ class TextPipelineConfig:
         effective = runtime.get("effective", {}) if isinstance(runtime, dict) else {}
         normalization_raw = effective.get("normalization", {}) if isinstance(effective, dict) else {}
         arbitration_raw = effective.get("arbitration", {}) if isinstance(effective, dict) else {}
+        punctuation_raw = effective.get("punctuation", {}) if isinstance(effective, dict) else {}
         return cls(
             normalization=NormalizationConfig.from_runtime(normalization_raw),
             arbitration=ArbitrationConfig.from_runtime(arbitration_raw),
+            punctuation=PunctuationConfig.from_runtime(punctuation_raw),
         )
 
 
@@ -162,3 +325,52 @@ class ArbitrationConfig:
             "low_confidence_threshold": self.low_confidence_threshold,
             "hallucination_block": self.is_hallucination_block,
         }
+
+
+@dataclass
+class PunctuationConfig:
+    """L3 标点层参数。"""
+
+    is_enabled: bool = True
+    source_preference: str = "merged"
+    min_confidence: float = 0.35
+    sentence_end_min_confidence: float = 0.55
+    raw_source_min_mapping_coverage: float = 0.6
+    raw_source_max_weak_ratio: float = 0.8
+
+    @classmethod
+    def from_runtime(cls, raw: Optional[Dict[str, Any]]) -> "PunctuationConfig":
+        raw = raw or {}
+        enable = _read_runtime_value(raw, "enable", None)
+        if enable is None:
+            enable = _read_runtime_value(raw, "enable_punctuation", cls.is_enabled)
+        preference = (
+            _read_runtime_value(raw, "source_preference", None)
+            or _read_runtime_value(raw, "fallback_priority", None)
+            or cls.source_preference
+        )
+        normalized = str(preference).lower()
+        if normalized not in {"fast", "slow", "merged"}:
+            normalized = cls.source_preference
+        min_conf = _read_runtime_value(raw, "min_confidence", None)
+        if min_conf is None:
+            min_conf = _read_runtime_value(raw, "confidence_threshold", cls.min_confidence)
+        end_min_conf = _read_runtime_value(raw, "sentence_end_min_confidence", cls.sentence_end_min_confidence)
+        raw_min_cov = _read_runtime_value(
+            raw,
+            "raw_source.min_mapping_coverage",
+            cls.raw_source_min_mapping_coverage,
+        )
+        raw_max_weak = _read_runtime_value(
+            raw,
+            "raw_source.max_weak_ratio",
+            cls.raw_source_max_weak_ratio,
+        )
+        return cls(
+            is_enabled=bool(enable),
+            source_preference=normalized,
+            min_confidence=float(min_conf),
+            sentence_end_min_confidence=float(end_min_conf),
+            raw_source_min_mapping_coverage=float(raw_min_cov),
+            raw_source_max_weak_ratio=float(raw_max_weak),
+        )
