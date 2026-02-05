@@ -63,6 +63,7 @@ class PunctuationProcessor:
         raw_text = self._get_raw_text(track, clean_text)
 
         candidates: List[PuncPosition] = []
+        model_candidates: List[PuncPosition] = []
         model_result: Optional[PunctuationResult] = None
         # V3.2.0+dev.20260205.02: 标点模型仅在 fast 模式下调用
         # dual 模式下 Whisper 原始标点质量高（尤其英文），无需模型补充
@@ -74,7 +75,12 @@ class PunctuationProcessor:
             )
             candidates.extend(model_candidates)
 
-        candidates.extend(self._extract_source_positions(data.sv_punct_source, clean_text, allowed={"fast", "merged"}))
+        sv_positions = self._extract_source_positions(
+            data.sv_punct_source,
+            clean_text,
+            allowed={"fast", "merged"},
+        )
+        candidates.extend(sv_positions)
         slow_positions = self._extract_source_positions(
             data.wh_punct_source,
             clean_text,
@@ -88,12 +94,6 @@ class PunctuationProcessor:
                 clean_text=clean_text,
                 max_weak_ratio=config.raw_source_max_weak_ratio,
             )
-            if len(filtered) < len(slow_positions):
-                self._logger.debug(
-                    "L3 slow_raw 弱标点过密，已过滤: before={} after={}",
-                    len(slow_positions),
-                    len(filtered),
-                )
             slow_positions = filtered
         candidates.extend(slow_positions)
 
@@ -120,23 +120,6 @@ class PunctuationProcessor:
             source=self._resolve_source_label(config, candidates, positions),
             confidence_stats=self._build_confidence_stats(positions, model_result),
         )
-        if post_result:
-            self._logger.debug(
-                "L3 标点完成: source={} input_len={} positions={} kept_raw={} add_candidate={} drop_raw={}",
-                punct_track.source,
-                len(clean_text),
-                len(positions),
-                post_result.metrics.get("keep_raw", 0),
-                post_result.metrics.get("add_candidate", 0),
-                post_result.metrics.get("drop_raw", 0),
-            )
-        else:
-            self._logger.debug(
-                "L3 标点完成: source={} input_len={} positions={}",
-                punct_track.source,
-                len(clean_text),
-                len(positions),
-            )
         return L3Output(punct_track=punct_track)
 
     def _resolve_config(self) -> PunctuationConfig:
@@ -202,8 +185,8 @@ class PunctuationProcessor:
             return list(source.positions)
         return list(candidates) if fallback_keep else []
 
-    @staticmethod
     def _filter_dense_weak_positions(
+        self,
         positions: Sequence[PuncPosition],
         words: Sequence[WordTimestampLike],
         language: str,
@@ -224,10 +207,24 @@ class PunctuationProcessor:
         if weak_count <= 0:
             return list(positions)
         weak_ratio = weak_count / max(word_count, 1)
+        # V3.2.0+dev.20260205.03: 输出弱标点密度细节，便于定位密集逗号来源
+        self._logger.debug(
+            "L3 slow_raw 弱标点密度: word_count={} weak_count={} weak_ratio={:.2f} max_weak_ratio={:.2f}",
+            word_count,
+            weak_count,
+            weak_ratio,
+            max_weak_ratio,
+        )
         if (
             (word_count >= 6 and weak_ratio >= max_weak_ratio)
             or (word_count >= 4 and weak_count >= max(2, word_count - 1))
         ):
+            self._logger.debug(
+                "L3 slow_raw 弱标点过滤触发: word_count={} weak_count={} weak_ratio={:.2f}",
+                word_count,
+                weak_count,
+                weak_ratio,
+            )
             return [pos for pos in positions if pos.punctuation not in _WEAK_PUNCTUATION_SET]
         return list(positions)
 
