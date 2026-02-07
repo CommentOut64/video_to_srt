@@ -830,6 +830,50 @@ class PreprocessingPipeline:
                 for chunk in chunks:
                     chunk.speaker_embedding = None
 
+        # Stage 6: Speaker 在线聚类（可选，依赖声纹提取）
+        # V3.2.0+dev.20260207.01: 最小可行版本 - 余弦相似度聚类 + 防抖
+        has_embeddings = any(chunk.speaker_embedding for chunk in chunks)
+        if chunks and self.config.enable_speaker_embedding and has_embeddings:
+            self.logger.info("Stage 6: 说话人在线聚类")
+            try:
+                from app.services.speaker_cluster_service import (
+                    get_speaker_cluster_service,
+                    SpeakerClusterConfig,
+                )
+
+                cluster_config = SpeakerClusterConfig(
+                    similarity_threshold=0.50,  # 折中阈值
+                    debounce_count=2,
+                    min_turn_duration=1.5,
+                    min_turn_chunks=3,
+                    enabled=True,
+                )
+                cluster_service = get_speaker_cluster_service(
+                    config=cluster_config, logger=self.logger
+                )
+                cluster_service.reset()
+
+                speaker_changes = 0
+                for chunk in chunks:
+                    if not chunk.speaker_embedding:
+                        continue
+                    result = cluster_service.cluster(
+                        embedding=chunk.speaker_embedding,
+                        chunk_start=chunk.start,
+                        chunk_end=chunk.end,
+                    )
+                    chunk.primary_speaker_id = result.speaker_id
+                    if result.is_speaker_changed:
+                        speaker_changes += 1
+
+                self.logger.info(
+                    "说话人聚类完成: %d 人, %d 次切换",
+                    cluster_service.speaker_count,
+                    speaker_changes,
+                )
+            except Exception as e:
+                self.logger.warning("说话人聚类失败，已跳过: %s", e)
+
         self.logger.info(f"预处理流程完成: {len(chunks)} 个chunk准备就绪")
 
         return chunks
