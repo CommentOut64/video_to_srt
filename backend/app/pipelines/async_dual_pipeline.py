@@ -30,8 +30,9 @@ V3.2.0+dev.20260123.05 更新：
 """
 import asyncio
 import copy
+import json
 import logging
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import List, Optional, Any, TYPE_CHECKING, Set, Dict, Tuple, Sequence
 from pathlib import Path
 
@@ -39,16 +40,24 @@ from app.core.asr.engine import ASREngine
 from app.core.logging import resolve_loguru_logger
 from app.core.thresholds import ThresholdConfig, needs_whisper_patch
 from app.schemas.pipeline_context import ProcessingContext
-from app.models.sensevoice_models import SentenceSegment
+from app.models.confidence_models import AlignmentStatus
+from app.models.sensevoice_models import SentenceSegment, TextSource, WordTimestamp
 from app.services.audio.chunk_engine import AudioChunk
-from app.services.alignment.default_aligner import DefaultAligner
+from app.services.alignment.alignment_processor import AlignmentProcessor
+from app.services.alignment.default_aligner import DefaultAligner, _strip_trailing_punct_smart
 from app.services.alignment.text_normalizer import get_alignment_text_normalizer
 from app.services.alignment.text_normalizer_processor import TextNormalizerProcessor
 from app.services.alignment.types import (
+    AnnotatedWord,
+    AlignmentResult,
     L1Input,
     L2Input,
     L2Output,
     L3Input,
+    L4Input,
+    L5Input,
+    L6Input,
+    L7Input,
     NormalizationResult,
     PunctSource,
     PunctTrack,
@@ -60,13 +69,24 @@ from app.services.arbitration.arbiter import TextArbiterProcessor
 from app.services.arbitration.hallucination_detector import HallucinationDetector
 from app.services.model_runtime_config_service import get_model_runtime_config_service
 from app.services.sse_service import get_sse_manager
-from app.services.segmentation.default_segmenter import DefaultSegmenter
+from app.services.segmentation.default_segmenter import DefaultSegmenter, DraftSegmenter
+from app.services.segmentation.segmentation_processor import SegmentationProcessor
 from app.services.streaming_subtitle import get_streaming_subtitle_manager
+from app.services.streaming.output_processor import OutputProcessor
 from app.services.punctuation.fast_punctuation_pipeline import FastPunctuationPipeline
 from app.services.punctuation.punctuation_processor import PunctuationProcessor
-from app.services.punctuation.debug_utils import append_debug_whisper_line
+from app.services.punctuation.debug_utils import (
+    append_debug_dual_time_compare_line,
+    append_debug_layer_diag_line,
+    append_debug_layer_trace_line,
+    append_debug_whisper_line,
+    write_debug_json_payload,
+)
 from app.services.punctuation.base import PunctuationResult, PuncPosition, SplitPoint
 from app.services.punctuation.scheduler import get_punctuation_scheduler
+from app.services.punctuation.semantic_injection_processor import SemanticInjectionProcessor
+from app.services.punctuation.final_splitter import FinalSplitter, FinalSplitConfig
+from app.services.semantic_grouper import SemanticGrouper, GroupConfig
 from app.services.bridge.bridge_controller import BridgeBatch, BridgeController
 from app.services.punctuation.semantic_buffer import (
     PunctuationDecision,
@@ -79,6 +99,7 @@ from app.services.text_normalizer import TextNormalizer
 from app.services.whisper.whisper_text_sanitizer import WhisperTextSanitizer
 from app.pipelines.workers import FastWorker, SlowWorker, SlowWorkerResult
 from app.utils.prompt_builder import get_prompt_builder
+from app.utils.text_utils import format_srt_timestamp
 from app.utils.cancellation_token import CancelledException, PausedException  # V3.1.0: 捕获取消/暂停异常
 
 # v3.1.0: 导入取消令牌和异常
@@ -86,6 +107,17 @@ if TYPE_CHECKING:
     from app.utils.cancellation_token import CancellationToken
     from app.services.progress_emitter import ProgressEventEmitter  # V3.1.0
     from app.services.punctuation.service import PunctuationService
+
+
+@dataclass
+class _Layer456RunResult:
+    alignment_result: AlignmentResult
+    words_for_split: List[WordTimestamp]
+    injection_stats: Dict[str, Any]
+    split_stats: Dict[str, Any]
+    final_sentences: List[SentenceSegment]
+    alignment_time_source: str = "sv"
+    alignment_time_word_count: int = 0
 
 
 class AsyncDualPipeline:
@@ -119,7 +151,7 @@ class AsyncDualPipeline:
         alignment_score_threshold: float = 0.3,
         enable_fallback: bool = True,
         transcription_profile: str = "sv_whisper_patch",
-        segmenter: Optional[DefaultSegmenter] = None,
+        segmenter: Optional[DraftSegmenter] = None,
         aligner: Optional[DefaultAligner] = None,
         patching_threshold: Optional[ThresholdConfig] = None,
         enable_cross_chunk_merge: bool = True,
@@ -209,12 +241,15 @@ class AsyncDualPipeline:
 
         # 初始化分句服务与字幕管理器
         if segmenter is None:
-            segmenter = DefaultSegmenter(
+            segmenter = DraftSegmenter(
                 is_enable_semantic_grouping=enable_semantic_grouping,
                 is_enable_cross_chunk_merge=enable_cross_chunk_merge,
                 logger=self.logger,
             )
-        self.segmenter = segmenter
+        # 仅用于草稿链：定稿链严禁通过 DefaultSegmenter 产出结果。
+        self._draft_segmenter = segmenter
+        # 兼容外部历史访问（不建议新代码继续使用）。
+        self.segmenter = self._draft_segmenter
         self.subtitle_manager = get_streaming_subtitle_manager(job_id)
 
         # V3.2.0+dev.20260130.03: SemanticBuffer 语义缓冲（Phase C 接入）
@@ -259,6 +294,79 @@ class AsyncDualPipeline:
             punctuation_service=self.punctuation_service,
             logger=self.logger,
         )
+        # V3.2.0+dev.20260205.09: L4/L5/L6 处理器接入（对齐/注入/切分）
+        self._l4_processor = AlignmentProcessor(logger=self.logger)
+        final_split_config = FinalSplitConfig(
+            min_tokens=5,
+            max_tokens=50,
+            min_duration=0.5,
+            max_duration=10.0,
+            soft_pause=0.35,
+            long_pause=0.8,
+            min_mapping_coverage=0.6,
+        )
+        self._final_splitter = FinalSplitter(final_split_config, logger=self.logger)
+        if enable_semantic_grouping:
+            final_group_config = GroupConfig(
+                max_group_gap=2.0,
+                max_group_duration=10.0,
+                max_group_sentences=5,
+                enable_overlap_detection=True,
+            )
+            self._final_grouper = SemanticGrouper(final_group_config)
+        else:
+            self._final_grouper = None
+        self._l5_processor = SemanticInjectionProcessor(
+            logger=self.logger,
+            min_mapping_coverage=final_split_config.min_mapping_coverage,
+        )
+        self._l6_processor = SegmentationProcessor(
+            final_splitter=self._final_splitter,
+            logger=self.logger,
+            is_keep_sentence_end_punct=self._load_keep_sentence_end_punct(),
+        )
+        self._l7_processor = OutputProcessor(
+            subtitle_manager=self.subtitle_manager,
+            logger=self.logger,
+        )
+        self._keep_sentence_end_punct = self._load_keep_sentence_end_punct()
+        # V3.2.0+dev.20260206.02: 双轨实验配置（shadow/active 仅串行执行 L4-L6，避免并行占用 GPU）。
+        self._alignment_layer_config = TextPipelineConfig.from_runtime().alignment
+        dual_time_mode = str(self._alignment_layer_config.dual_time_mode or "off").lower()
+        if dual_time_mode not in {"off", "shadow", "active"}:
+            dual_time_mode = "off"
+        if dual_time_mode == "off" and self._alignment_layer_config.is_enable_dual_time_experiment:
+            dual_time_mode = "shadow"
+        self._dual_time_mode = dual_time_mode
+        self._is_dual_time_experiment_enabled = dual_time_mode in {"shadow", "active"}
+        self._is_dual_time_write_debug_srt = bool(
+            self._alignment_layer_config.is_dual_time_write_debug_srt
+        )
+        self._dual_time_boundary_tolerance_sec = (
+            max(50, int(self._alignment_layer_config.dual_time_boundary_tolerance_ms)) / 1000.0
+        )
+        self._dual_time_active_min_boundary_f1 = float(
+            self._alignment_layer_config.dual_time_active_min_boundary_f1
+        )
+        self._dual_time_compare_accumulator: Dict[str, Any] = {
+            "chunk_count": 0,
+            "boundary_precision_sum": 0.0,
+            "boundary_recall_sum": 0.0,
+            "boundary_f1_sum": 0.0,
+            "word_start_mae_ms_sum": 0.0,
+            "word_end_mae_ms_sum": 0.0,
+            "sentence_start_mae_ms_sum": 0.0,
+            "sentence_end_mae_ms_sum": 0.0,
+            "selected_experiment_count": 0,
+        }
+        self._dual_time_legacy_sentences_by_chunk: Dict[int, List[SentenceSegment]] = {}
+        self._dual_time_experiment_sentences_by_chunk: Dict[int, List[SentenceSegment]] = {}
+        if self._is_dual_time_experiment_enabled:
+            self.logger.info(
+                "双轨实验开启: mode={} tolerance_ms={} gpu_strategy=serial_postprocess",
+                self._dual_time_mode,
+                int(self._dual_time_boundary_tolerance_sec * 1000),
+            )
 
         # 实例化 FastWorker（仅推理）
         self.fast_worker = FastWorker(
@@ -271,7 +379,6 @@ class AsyncDualPipeline:
         # SlowWorker 仅在非极速模式下创建；对齐阶段由流水线负责
         if self.is_sensevoice_only:
             self.slow_worker = None
-            self.aligner = None
         else:
             # V3.10: 智能复核模式下设置 is_patching_mode=True
             self.slow_worker = SlowWorker(
@@ -280,16 +387,8 @@ class AsyncDualPipeline:
                 punctuation_service=self.punctuation_service,
                 logger=self.logger
             )
-
-            if aligner is None:
-                aligner = DefaultAligner(
-                    alignment_score_threshold=alignment_score_threshold,
-                    is_enable_fallback=enable_fallback,
-                    is_enable_semantic_grouping=enable_semantic_grouping,
-                    logger=self.logger,
-                )
-
-            self.aligner = aligner
+        # Legacy aligner 仅保留为兼容注入入口（默认不启用主路径）。
+        self.aligner = aligner
 
         # 获取 SSE 管理器
         self.sse_manager = get_sse_manager()
@@ -622,6 +721,20 @@ class AsyncDualPipeline:
         # V3.1.0: 清理历史状态，避免重复抛出旧异常
         self.errors.clear()
         self.pause_exception = None
+        if self._is_dual_time_experiment_enabled:
+            self._dual_time_compare_accumulator = {
+                "chunk_count": 0,
+                "boundary_precision_sum": 0.0,
+                "boundary_recall_sum": 0.0,
+                "boundary_f1_sum": 0.0,
+                "word_start_mae_ms_sum": 0.0,
+                "word_end_mae_ms_sum": 0.0,
+                "sentence_start_mae_ms_sum": 0.0,
+                "sentence_end_mae_ms_sum": 0.0,
+                "selected_experiment_count": 0,
+            }
+            self._dual_time_legacy_sentences_by_chunk.clear()
+            self._dual_time_experiment_sentences_by_chunk.clear()
 
         # V3.2.0+dev.20260201.07: 记录完整音频与 Chunk 映射，供 Bridge 批次使用
         self._full_audio_array = full_audio_array
@@ -693,7 +806,7 @@ class AsyncDualPipeline:
             return True
 
         is_draft = not is_final_output
-        sentences = self.segmenter.split_draft(
+        sentences = self._draft_segmenter.split_draft(
             ctx.sv_result,
             ctx.audio_chunk,
             is_draft=is_draft
@@ -834,6 +947,7 @@ class AsyncDualPipeline:
             track,
             source=source,
             clean_to_word=list(track.clean_to_word),
+            word_confidences=list(track.word_confidences),
             punct_positions=list(track.punct_positions),
         )
 
@@ -874,7 +988,7 @@ class AsyncDualPipeline:
         if not ctx.whisper_result or not ctx.audio_chunk:
             return
         whisper_result = ctx.whisper_result
-        raw_text = whisper_result.get("raw_text") or ""
+        raw_text = whisper_result.get("raw_text") or whisper_result.get("text_raw") or ""
         min_clean_text = whisper_result.get("min_clean_text") or ""
         base_text = raw_text or min_clean_text
         if not base_text:
@@ -1123,6 +1237,17 @@ class AsyncDualPipeline:
                 whisper_result,
                 tracks.whisper_track,
             )
+        setattr(
+            ctx,
+            "_trace_l3_input",
+            {
+                "chosen_source": chosen_source,
+                "word_timestamps": list(word_timestamps),
+                "sv_punct_source": sv_source,
+                "wh_punct_source": wh_source,
+                "chosen_text_track": chosen_track,
+            },
+        )
         output = await self._l3_processor.process(
             L3Input(
                 chosen_text_track=chosen_track,
@@ -1131,6 +1256,7 @@ class AsyncDualPipeline:
                 word_timestamps=word_timestamps,
             )
         )
+        setattr(ctx, "_trace_l3_output", output.punct_track)
         return output.punct_track
 
     def _resolve_gap_ratio_mid(self) -> float:
@@ -1444,6 +1570,55 @@ class AsyncDualPipeline:
         return value - end
 
     @staticmethod
+    def _compose_whisper_text_from_words(words: Sequence[Dict[str, Any]]) -> str:
+        """按 Whisper 词序列重建文本，避免跨 Chunk 时整段串入。"""
+        if not words:
+            return ""
+        parts: List[str] = []
+        for item in words:
+            token = str(item.get("word", "") or "")
+            if not token:
+                continue
+            parts.append(token.replace("▁", " "))
+        if not parts:
+            return ""
+        merged = "".join(parts).strip()
+        if not merged:
+            return ""
+        return " ".join(merged.split())
+
+    @staticmethod
+    def _find_target_chunk_by_overlap(
+        start_abs: float,
+        end_abs: float,
+        chunk_ranges: Dict[int, tuple[float, float]],
+        ordered_indices: Sequence[int],
+    ) -> Optional[int]:
+        """按时间重叠优先选择词/片段所属 Chunk。"""
+        if not ordered_indices:
+            return None
+        if end_abs < start_abs:
+            end_abs = start_abs
+
+        best_idx: Optional[int] = None
+        best_overlap = 0.0
+        best_distance = float("inf")
+        mid = (start_abs + end_abs) / 2.0
+
+        for idx in ordered_indices:
+            span_start, span_end = chunk_ranges[idx]
+            overlap = max(0.0, min(end_abs, span_end) - max(start_abs, span_start))
+            distance = AsyncDualPipeline._distance_to_range(mid, (span_start, span_end))
+            if overlap > best_overlap or (overlap == best_overlap and distance < best_distance):
+                best_idx = idx
+                best_overlap = overlap
+                best_distance = distance
+
+        if best_idx is not None:
+            return best_idx
+        return min(ordered_indices, key=lambda idx: AsyncDualPipeline._distance_to_range(mid, chunk_ranges[idx]))
+
+    @staticmethod
     def _estimate_segment_confidence(
         segments: List[Dict[str, Any]],
         fallback: float,
@@ -1478,12 +1653,20 @@ class AsyncDualPipeline:
 
         if not raw_segments:
             first = chunk_indices[0]
+            raw_text = str(whisper_result.get("text_raw") or whisper_result.get("raw_text") or whisper_result.get("text", ""))
+            min_clean_text = str(whisper_result.get("min_clean_text") or "")
+            if not min_clean_text and raw_text:
+                min_clean_text = self._whisper_sanitizer.sanitize_minimal(raw_text, prompt=None)
             return {
                 first: {
                     "text": str(whisper_result.get("text", "")),
+                    "raw_text": raw_text,
+                    "min_clean_text": min_clean_text,
                     "confidence": float(whisper_result.get("confidence", 0.0) or 0.0),
                     "language": str(whisper_result.get("language", "auto")),
                     "raw_result": {"segments": []},
+                    "word_time_base": "batch_local",
+                    "word_time_offset": float(batch_start),
                 }
             }
 
@@ -1493,21 +1676,39 @@ class AsyncDualPipeline:
         for seg in raw_segments:
             seg_start = float(seg.get("start", 0.0) or 0.0) + batch_start
             seg_end = float(seg.get("end", 0.0) or 0.0) + batch_start
-            seg_mid = (seg_start + seg_end) / 2.0
+            seg_words = seg.get("words", []) if isinstance(seg, dict) else []
+            if isinstance(seg_words, list) and seg_words:
+                words_by_chunk: Dict[int, List[Dict[str, Any]]] = {}
+                for word in seg_words:
+                    if not isinstance(word, dict):
+                        continue
+                    word_start_abs = float(word.get("start", 0.0) or 0.0) + batch_start
+                    word_end_abs = float(word.get("end", word.get("start", 0.0)) or word.get("start", 0.0)) + batch_start
+                    target_idx = self._find_target_chunk_by_overlap(
+                        word_start_abs,
+                        word_end_abs,
+                        chunk_ranges,
+                        ordered_indices,
+                    )
+                    if target_idx is None:
+                        continue
+                    words_by_chunk.setdefault(target_idx, []).append(word)
 
-            target_idx = None
-            for idx in ordered_indices:
-                start, end = chunk_ranges[idx]
-                if start <= seg_mid <= end:
-                    target_idx = idx
-                    break
+                for idx, words in words_by_chunk.items():
+                    seg_fragment = dict(seg)
+                    seg_fragment["words"] = list(words)
+                    fragment_text = self._compose_whisper_text_from_words(words)
+                    if fragment_text:
+                        seg_fragment["text"] = fragment_text
+                    assignments[idx].append(seg_fragment)
+                continue
 
-            if target_idx is None and ordered_indices:
-                target_idx = min(
-                    ordered_indices,
-                    key=lambda idx: self._distance_to_range(seg_mid, chunk_ranges[idx]),
-                )
-
+            target_idx = self._find_target_chunk_by_overlap(
+                seg_start,
+                seg_end,
+                chunk_ranges,
+                ordered_indices,
+            )
             if target_idx is not None:
                 assignments[target_idx].append(seg)
 
@@ -1520,12 +1721,17 @@ class AsyncDualPipeline:
             # V3.2.0+dev.20260205.01: 分段文本拼接必须保留段间空格，否则会产生 "lamp.Who" 这类错误粘连
             parts = [str(seg.get("text", "") or "").strip() for seg in segs]
             text = " ".join(part for part in parts if part).strip()
+            raw_text = text
             confidence = self._estimate_segment_confidence(segs, fallback_conf)
             results[idx] = {
                 "text": text,
+                "raw_text": raw_text,
+                "min_clean_text": self._whisper_sanitizer.sanitize_minimal(raw_text, prompt=None) if raw_text else "",
                 "confidence": confidence,
                 "language": language,
                 "raw_result": {"segments": segs},
+                "word_time_base": "batch_local",
+                "word_time_offset": float(batch_start),
             }
         return results
 
@@ -1564,6 +1770,331 @@ class AsyncDualPipeline:
             "language": whisper_result.get("language", "auto"),
         }
         append_debug_whisper_line(job_dir, payload, logger=self.logger)
+
+    def _emit_layer_diagnostics(
+        self,
+        ctx: ProcessingContext,
+        *,
+        tracks: TextTrackBundle,
+        punct_track: Optional[PunctTrack],
+        alignment_result: AlignmentResult,
+        injection_stats: Dict[str, Any],
+        split_stats: Dict[str, Any],
+        final_sentences: List[SentenceSegment],
+    ) -> None:
+        """输出 L3/L4/L5/L6 诊断到独立文件。"""
+        chosen_clean = tracks.chosen_track.text_clean if tracks.chosen_track else ""
+        punct_ref = punct_track.clean_text_ref if punct_track else ""
+        chosen_compact = str(chosen_clean or "").replace("\n", " ").strip()
+        punct_compact = str(punct_ref or "").replace("\n", " ").strip()
+
+        def _clip_head(text: str, limit: int = 40) -> str:
+            if len(text) <= limit:
+                return text
+            return text[:limit]
+
+        def _clip_tail(text: str, limit: int = 40) -> str:
+            if len(text) <= limit:
+                return text
+            return text[-limit:]
+
+        unmatched_prefix_len = 0
+        for aligned_word in alignment_result.aligned_words:
+            status = aligned_word.alignment_status
+            is_prefix_unmatched = bool(aligned_word.is_pseudo) or status in {
+                AlignmentStatus.INSERTED,
+                AlignmentStatus.PSEUDO,
+            }
+            if not is_prefix_unmatched:
+                break
+            unmatched_prefix_len += len(str(aligned_word.word or ""))
+
+        is_ref_mismatch = bool(chosen_compact and punct_compact and chosen_compact != punct_compact)
+        is_slow_chosen = bool(
+            ctx.arbitration_result and ctx.arbitration_result.chosen_source == "slow"
+        )
+        punct_positions_count = len(punct_track.positions) if punct_track and punct_track.positions else 0
+        is_cross_chunk_boundary_suspected = bool(
+            is_slow_chosen
+            and punct_positions_count == 0
+            and (
+                unmatched_prefix_len > 0
+                or float(alignment_result.gap_ratio) >= 0.25
+                or float(alignment_result.coverage) <= 0.70
+            )
+        )
+
+        payload: Dict[str, Any] = {
+            "job_id": ctx.job_id,
+            "chunk_index": int(ctx.chunk_index),
+            "layer": "L3-L6",
+            "chosen_source": ctx.arbitration_result.chosen_source if ctx.arbitration_result else "",
+            "arbitration_reason": ctx.arbitration_result.reason if ctx.arbitration_result else "",
+            "chosen_clean_len": len(chosen_clean or ""),
+            "l2_chosen_text_head": _clip_head(chosen_compact),
+            "l2_chosen_text_tail": _clip_tail(chosen_compact),
+            "l3_positions_total": len(punct_track.positions) if punct_track and punct_track.positions else 0,
+            "l3_source": punct_track.source if punct_track else "",
+            "l3_clean_text_match": bool(chosen_clean and punct_ref and chosen_clean == punct_ref),
+            "l3_clean_ref_head": _clip_head(punct_compact),
+            "l3_clean_ref_tail": _clip_tail(punct_compact),
+            "is_l3_match_blocked_by_ref_mismatch": is_ref_mismatch,
+            "l4_alignment_score": float(alignment_result.alignment_score),
+            "l4_gap_ratio": float(alignment_result.gap_ratio),
+            "l4_coverage": float(alignment_result.coverage),
+            "l4_gap_positions": list(alignment_result.gap_positions),
+            "l4_unmatched_prefix_len": int(unmatched_prefix_len),
+            "is_cross_chunk_boundary_suspected": is_cross_chunk_boundary_suspected,
+            "l5_injection_positions_total": int(injection_stats.get("injection_positions_total", 0) or 0),
+            "l5_injection_unmatched_total": int(injection_stats.get("injection_unmatched_total", 0) or 0),
+            "l5_injection_mapping_coverage": float(injection_stats.get("injection_mapping_coverage", 0.0) or 0.0),
+            "l5_injection_blocked": bool(injection_stats.get("injection_blocked", 0.0)),
+            "l6_sentence_count": len(final_sentences),
+            "l6_split_mapping_coverage": float(split_stats.get("mapping_coverage", 0.0) or 0.0),
+            "l6_split_writeback_ratio": float(split_stats.get("writeback_ratio", 0.0) or 0.0),
+            "l6_split_writeback_used": bool(split_stats.get("writeback_used", 0.0)),
+            "l6_split_writeback_blocked": bool(split_stats.get("writeback_blocked", 0.0)),
+            "l6_sentence_texts": [str(sentence.text or "") for sentence in final_sentences],
+        }
+        append_debug_layer_diag_line(ctx.job_dir, payload, logger=self.logger)
+
+    def _emit_layer_trace_full(
+        self,
+        ctx: ProcessingContext,
+        *,
+        tracks: TextTrackBundle,
+        sv_result: Dict[str, Any],
+        whisper_result: Dict[str, Any],
+        arbitration_output: L2Output,
+        punct_track: Optional[PunctTrack],
+        alignment_result: AlignmentResult,
+        words_for_split: Sequence[WordTimestamp],
+        injection_stats: Dict[str, Any],
+        split_stats: Dict[str, Any],
+        final_sentences: Sequence[SentenceSegment],
+    ) -> None:
+        """输出 L0-L6 全量追踪（逐层 + 逐 token）到独立文件。"""
+
+        def _serialize_punc_positions(positions: Optional[Sequence[PuncPosition]]) -> List[Dict[str, Any]]:
+            if not positions:
+                return []
+            return [
+                {
+                    "char_index": int(pos.char_index),
+                    "punctuation": str(pos.punctuation),
+                    "confidence": float(pos.confidence),
+                }
+                for pos in positions
+            ]
+
+        def _serialize_word_timestamps(words: Optional[Sequence[Any]]) -> List[Dict[str, Any]]:
+            if not words:
+                return []
+            items: List[Dict[str, Any]] = []
+            for word in words:
+                if isinstance(word, dict):
+                    items.append(
+                        {
+                            "word": str(word.get("word", "") or ""),
+                            "start": float(word.get("start", 0.0) or 0.0),
+                            "end": float(word.get("end", 0.0) or 0.0),
+                            "confidence": (
+                                float(word.get("confidence"))
+                                if word.get("confidence") is not None
+                                else (
+                                    float(word.get("probability"))
+                                    if word.get("probability") is not None
+                                    else None
+                                )
+                            ),
+                        }
+                    )
+                    continue
+                items.append(
+                    {
+                        "word": str(getattr(word, "word", "") or ""),
+                        "start": float(getattr(word, "start", 0.0) or 0.0),
+                        "end": float(getattr(word, "end", 0.0) or 0.0),
+                        "confidence": (
+                            float(getattr(word, "confidence"))
+                            if getattr(word, "confidence", None) is not None
+                            else None
+                        ),
+                        "confidence_source": str(getattr(word, "confidence_source", "") or ""),
+                        "is_pseudo": bool(getattr(word, "is_pseudo", False)),
+                    }
+                )
+            return items
+
+        def _serialize_text_track(track: Optional[TextTrack]) -> Dict[str, Any]:
+            if not track:
+                return {}
+            return {
+                "source": str(track.source or ""),
+                "language": str(track.language or ""),
+                "raw_text": str(track.raw_text or ""),
+                "text_itn_raw": str(track.text_itn_raw or ""),
+                "text_clean": str(track.text_clean or ""),
+                "mapping_coverage": float(track.mapping_coverage),
+                "itn_fallback": bool(track.itn_fallback),
+                "itn_fallback_reason": str(track.itn_fallback_reason or ""),
+                "punct_positions": _serialize_punc_positions(track.punct_positions),
+                "clean_to_word": list(track.clean_to_word or []),
+                "word_confidences": list(track.word_confidences or []),
+            }
+
+        def _serialize_aligned_words(words: Sequence[Any]) -> List[Dict[str, Any]]:
+            rows: List[Dict[str, Any]] = []
+            for word in words:
+                rows.append(
+                    {
+                        "word": str(getattr(word, "word", "") or ""),
+                        "start": float(getattr(word, "start", 0.0) or 0.0),
+                        "end": float(getattr(word, "end", 0.0) or 0.0),
+                        "alignment_status": str(getattr(getattr(word, "alignment_status", None), "value", "")),
+                        "is_pseudo": bool(getattr(word, "is_pseudo", False)),
+                        "sv_confidence": (
+                            float(getattr(word, "sv_confidence"))
+                            if getattr(word, "sv_confidence", None) is not None
+                            else None
+                        ),
+                        "whisper_confidence": (
+                            float(getattr(word, "whisper_confidence"))
+                            if getattr(word, "whisper_confidence", None) is not None
+                            else None
+                        ),
+                        "final_confidence": (
+                            float(getattr(word, "final_confidence"))
+                            if getattr(word, "final_confidence", None) is not None
+                            else None
+                        ),
+                        "confidence_source": str(getattr(word, "confidence_source", "") or ""),
+                    }
+                )
+            return rows
+
+        def _serialize_sentences(sentences: Sequence[SentenceSegment]) -> List[Dict[str, Any]]:
+            rows: List[Dict[str, Any]] = []
+            for sentence in sentences:
+                rows.append(
+                    {
+                        "text": str(sentence.text or ""),
+                        "text_clean": str(sentence.text_clean or ""),
+                        "start": float(sentence.start),
+                        "end": float(sentence.end),
+                        "word_count": len(sentence.words or []),
+                        "words": _serialize_word_timestamps(sentence.words),
+                        "alignment_score": (
+                            float(sentence.alignment_score)
+                            if sentence.alignment_score is not None
+                            else None
+                        ),
+                        "matched_ratio": (
+                            float(sentence.matched_ratio)
+                            if sentence.matched_ratio is not None
+                            else None
+                        ),
+                        "confidence_source": str(sentence.confidence_source or ""),
+                    }
+                )
+            return rows
+
+        l3_input = getattr(ctx, "_trace_l3_input", {}) or {}
+        l3_output = getattr(ctx, "_trace_l3_output", None)
+        slow_raw = _serialize_word_timestamps(
+            [
+                word
+                for seg in (whisper_result.get("raw_result", {}) or {}).get("segments", []) or []
+                for word in (seg.get("words", []) or [])
+                if isinstance(word, dict)
+            ]
+        )
+        l0_batch_trace = getattr(ctx, "_trace_l0_batch_whisper", {}) or {}
+        payload: Dict[str, Any] = {
+            "job_id": ctx.job_id,
+            "chunk_index": int(ctx.chunk_index),
+            "layer": "L0-L6-FULL",
+            "arbitration": {
+                "chosen_source": arbitration_output.arbitration_result.chosen_source,
+                "reason": arbitration_output.arbitration_result.reason,
+                "coverage": float(arbitration_output.arbitration_result.coverage),
+                "sv_score": float(arbitration_output.arbitration_result.sv_score),
+                "wh_score": float(arbitration_output.arbitration_result.wh_score),
+                "gap_positions": list(arbitration_output.arbitration_result.gap_positions or []),
+            },
+            "l0": {
+                "bridge_batch": {
+                    "batch_id": str(l0_batch_trace.get("batch_id", "")),
+                    "chunk_indices": list(l0_batch_trace.get("chunk_indices", []) or []),
+                    "prompt": str(l0_batch_trace.get("prompt", "")),
+                    "flush_reason": str(l0_batch_trace.get("flush_reason", "")),
+                    "whisper_text_raw": str(l0_batch_trace.get("whisper_text_raw", "")),
+                    "whisper_text_clean": str(l0_batch_trace.get("whisper_text_clean", "")),
+                    "raw_result": dict(l0_batch_trace.get("raw_result", {}) or {}),
+                },
+                "sv_result": {
+                    "raw_text": str(sv_result.get("raw_text") or ""),
+                    "text_clean": str(sv_result.get("text_clean") or ""),
+                    "words": _serialize_word_timestamps(sv_result.get("words") or []),
+                },
+                "whisper_result": {
+                    "text_raw": str(whisper_result.get("text_raw") or whisper_result.get("raw_text") or ""),
+                    "min_clean_text": str(whisper_result.get("min_clean_text") or ""),
+                    "text_clean": str(whisper_result.get("text_clean") or whisper_result.get("text") or ""),
+                    "prompt": str(whisper_result.get("prompt") or ""),
+                    "segments": list((whisper_result.get("raw_result", {}) or {}).get("segments", []) or []),
+                    "words_from_segments": slow_raw,
+                },
+            },
+            "l1": {
+                "sv_track": _serialize_text_track(tracks.sv_track),
+                "whisper_track": _serialize_text_track(tracks.whisper_track),
+                "chosen_track": _serialize_text_track(tracks.chosen_track),
+            },
+            "l3": {
+                "input": {
+                    "chosen_source": l3_input.get("chosen_source"),
+                    "word_timestamps": _serialize_word_timestamps(l3_input.get("word_timestamps") or []),
+                    "sv_punct_source": {
+                        "source": str(getattr(l3_input.get("sv_punct_source"), "source", "") or ""),
+                        "clean_text_ref": str(getattr(l3_input.get("sv_punct_source"), "clean_text_ref", "") or ""),
+                        "positions": _serialize_punc_positions(getattr(l3_input.get("sv_punct_source"), "positions", []) or []),
+                    },
+                    "wh_punct_source": {
+                        "source": str(getattr(l3_input.get("wh_punct_source"), "source", "") or ""),
+                        "clean_text_ref": str(getattr(l3_input.get("wh_punct_source"), "clean_text_ref", "") or ""),
+                        "positions": _serialize_punc_positions(getattr(l3_input.get("wh_punct_source"), "positions", []) or []),
+                    },
+                },
+                "output": {
+                    "source": str(getattr(l3_output, "source", "") or ""),
+                    "clean_text_ref": str(getattr(l3_output, "clean_text_ref", "") or ""),
+                    "positions": _serialize_punc_positions(getattr(l3_output, "positions", []) or []),
+                    "confidence_stats": dict(getattr(l3_output, "confidence_stats", {}) or {}),
+                },
+            },
+            "l4": {
+                "alignment_score": float(alignment_result.alignment_score),
+                "gap_ratio": float(alignment_result.gap_ratio),
+                "coverage": float(alignment_result.coverage),
+                "gap_positions": list(alignment_result.gap_positions),
+                "aligned_words": _serialize_aligned_words(alignment_result.aligned_words),
+            },
+            "l5": {
+                "injection_stats": dict(injection_stats),
+                "words_for_split": _serialize_word_timestamps(words_for_split),
+            },
+            "l6": {
+                "split_stats": dict(split_stats),
+                "final_sentences": _serialize_sentences(final_sentences),
+            },
+            "current_punct_track": {
+                "source": str(punct_track.source if punct_track else ""),
+                "clean_text_ref": str(punct_track.clean_text_ref if punct_track else ""),
+                "positions": _serialize_punc_positions(punct_track.positions if punct_track else []),
+            },
+        }
+        append_debug_layer_trace_line(ctx.job_dir, payload, logger=self.logger)
 
     async def _process_bridge_batch(
         self,
@@ -1678,6 +2209,19 @@ class AsyncDualPipeline:
         )
 
         for idx, ctx in contexts:
+            setattr(
+                ctx,
+                "_trace_l0_batch_whisper",
+                {
+                    "batch_id": batch.batch_id,
+                    "chunk_indices": list(chunk_indices),
+                    "prompt": str(prompt or ""),
+                    "flush_reason": str(getattr(batch, "flush_reason", "") or ""),
+                    "whisper_text_raw": str(whisper_result.get("text_raw") or ""),
+                    "whisper_text_clean": str(whisper_result.get("text") or ""),
+                    "raw_result": dict(whisper_result.get("raw_result", {}) or {}),
+                },
+            )
             if skip_map.get(idx):
                 ctx.whisper_skipped = True
                 ctx.whisper_result = {}
@@ -1690,12 +2234,17 @@ class AsyncDualPipeline:
                     "confidence": float(whisper_result.get("confidence", 0.0) or 0.0),
                     "language": batch_language,
                     "raw_result": {"segments": []},
+                    "word_time_base": "batch_local",
+                    "word_time_offset": float(batch_start),
                 },
             )
-            chunk_text_raw = str(chunk_result.get("text", "") or "")
+            chunk_text_raw = str(chunk_result.get("raw_text") or chunk_result.get("text", "") or "")
+            chunk_result["raw_text"] = chunk_text_raw
             chunk_result["text_raw"] = chunk_text_raw
-            chunk_result["text"] = self._whisper_sanitizer.sanitize_minimal(chunk_text_raw, prompt=None)
-            raw_text_for_track = str(chunk_result.get("text", "") or "")
+            if not chunk_result.get("min_clean_text"):
+                chunk_result["min_clean_text"] = self._whisper_sanitizer.sanitize_minimal(chunk_text_raw, prompt=None)
+            chunk_result["text"] = str(chunk_result.get("min_clean_text") or "")
+            raw_text_for_track = chunk_text_raw
             normalized_chunk = self._text_normalizer.normalize(chunk_result.get("text", ""), batch_language)
             chunk_result["text_itn_raw"] = normalized_chunk.text_itn_raw
             chunk_result["text_clean"] = normalized_chunk.text_clean
@@ -2184,9 +2733,6 @@ class AsyncDualPipeline:
         2. 推送定稿
         3. 填充 ctx.final_sentences
         """
-        if not self.aligner:
-            raise RuntimeError("对齐阶段未初始化 aligner")
-
         chunk = ctx.audio_chunk
 
         # V3.10: 快速路径 - SlowWorker 跳过时直接使用 SenseVoice
@@ -2194,17 +2740,30 @@ class AsyncDualPipeline:
             if ctx.sv_result is None:
                 raise ValueError("对齐阶段缺少 SenseVoice 推理结果")
             self.logger.debug(f"Chunk {ctx.chunk_index}: Whisper 跳过，直接使用 SenseVoice 定稿")
-            final_sentences = self.aligner.split_sensevoice_only(ctx.sv_result, chunk)
-
-            tracks = self._ensure_text_tracks(ctx)
-            if tracks.sv_track and tracks.chosen_track is None:
-                tracks.chosen_track = self._clone_text_track(tracks.sv_track, source="chosen")
-
+            final_sentences = self._finalize_sensevoice_only(ctx)
             ctx.final_sentences = final_sentences
 
-            # 推送定稿
-            sentences_for_manager = copy.deepcopy(final_sentences)
-            self.subtitle_manager.replace_chunk(ctx.chunk_index, sentences_for_manager)
+            # L7 薄层输出：即便走快路，也统一通过输出层分发。
+            l7_output = self._l7_processor.process(
+                L7Input(
+                    chunk_index=ctx.chunk_index,
+                    sentence_segments=final_sentences,
+                    injection_report={
+                        "mapping_coverage": 0.0,
+                        "mismatch_count": 0.0,
+                        "error_code": "",
+                        "blocked": 0.0,
+                    },
+                    segmentation_report={
+                        "boundary_score_stats": {},
+                        "forced_split_count": 0.0,
+                        "error_code": "",
+                    },
+                )
+            )
+            ctx.finalization_metrics["l7_error_count"] = float(
+                len(l7_output.output_payload.get("errors", []))
+            )
 
             self.logger.debug(
                 f"Chunk {ctx.chunk_index}: SenseVoice 定稿已推送 "
@@ -2212,7 +2771,7 @@ class AsyncDualPipeline:
             )
             return
 
-        # 阶段 1: 双流对齐（三级降级策略）
+        # 阶段 1: 双流对齐（L2/L3/L4/L5/L6）
         self.logger.debug(f"Chunk {ctx.chunk_index}: 双流对齐")
 
         if ctx.whisper_result is None or ctx.sv_result is None:
@@ -2285,39 +2844,132 @@ class AsyncDualPipeline:
             arbitration_result.coverage,
         )
 
-        final_sentences, alignment_level = await self.aligner.align(
-            whisper_result,
-            sv_result,
-            chunk,
-            vad_intervals=self._vad_intervals,
+        # V3.2.0+dev.20260205.09: L4 对齐层（仅对齐与 gap 修复）
+        sv_words = self._build_sv_word_timestamps(sv_result, chunk)
+        legacy_run = self._run_l4_to_l6_once(
+            tracks=tracks,
+            sv_result=sv_result,
+            whisper_result=whisper_result,
+            sv_words=sv_words,
             punctuation_positions=punctuation_positions,
             punctuation_clean_text=punctuation_clean_text,
+            variant="legacy",
         )
-        if self.aligner.last_alignment_stats:
-            ctx.finalization_metrics = dict(self.aligner.last_alignment_stats)
-            if tracks.chosen_track:
-                mapping_cov = self.aligner.last_alignment_stats.get("split_mapping_coverage")
-                if mapping_cov is not None:
-                    tracks.chosen_track.mapping_coverage = float(mapping_cov)
-                ctx.finalization_metrics["itn_fallback"] = (
-                    1.0 if tracks.chosen_track.itn_fallback else 0.0
+
+        experiment_run: Optional[_Layer456RunResult] = None
+        selected_variant = "legacy"
+        selected_reason = "shadow_default" if self._dual_time_mode == "shadow" else "legacy_default"
+        compare_payload: Optional[Dict[str, Any]] = None
+
+        if self._is_dual_time_experiment_enabled:
+            # Shadow/Active 都采用串行后处理：先 legacy，再 experiment，不并行占用 GPU。
+            experiment_run = self._run_l4_to_l6_once(
+                tracks=tracks,
+                sv_result=sv_result,
+                whisper_result=whisper_result,
+                sv_words=sv_words,
+                punctuation_positions=punctuation_positions,
+                punctuation_clean_text=punctuation_clean_text,
+                variant="experiment",
+            )
+            compare_payload = self._build_dual_time_compare_payload(
+                ctx=ctx,
+                legacy_run=legacy_run,
+                experiment_run=experiment_run,
+            )
+            if self._dual_time_mode == "active":
+                selected_variant, selected_reason = self._select_dual_time_variant(
+                    compare_payload=compare_payload,
+                    experiment_run=experiment_run,
                 )
-            if tracks.sv_track:
-                ctx.finalization_metrics["sv_itn_fallback"] = (
-                    1.0 if tracks.sv_track.itn_fallback else 0.0
-                )
-            if tracks.whisper_track:
-                ctx.finalization_metrics["whisper_itn_fallback"] = (
-                    1.0 if tracks.whisper_track.itn_fallback else 0.0
-                )
-            # V3.2.0+dev.20260204.08: L4/L5 补跑候选埋点（仅统计，不触发补跑）
-            self._record_punct_retry_candidates(ctx)
+            else:
+                selected_variant = "legacy"
+                selected_reason = "shadow_force_legacy"
+            compare_payload["selected_variant"] = selected_variant
+            compare_payload["selected_reason"] = selected_reason
+            append_debug_dual_time_compare_line(ctx.job_dir, compare_payload, logger=self.logger)
+            self._update_dual_time_summary(ctx, compare_payload)
+            if self._is_dual_time_write_debug_srt:
+                self._dual_time_legacy_sentences_by_chunk[ctx.chunk_index] = copy.deepcopy(legacy_run.final_sentences)
+                self._dual_time_experiment_sentences_by_chunk[ctx.chunk_index] = copy.deepcopy(experiment_run.final_sentences)
+                self._write_dual_time_debug_srt(ctx.job_dir)
+
+        run_result = legacy_run
+        if selected_variant == "experiment" and experiment_run is not None:
+            run_result = experiment_run
+
+        alignment_result = run_result.alignment_result
+        words_for_split = run_result.words_for_split
+        injection_stats = dict(run_result.injection_stats)
+        split_stats = dict(run_result.split_stats)
+        final_sentences = run_result.final_sentences
+
+
+        ctx.finalization_metrics = {
+            "coverage": alignment_result.coverage,
+            "gap_ratio": alignment_result.gap_ratio,
+            "alignment_score": alignment_result.alignment_score,
+            "gap_positions": list(alignment_result.gap_positions),
+            "gap_resolution": alignment_result.resolution.value if alignment_result.resolution else None,
+            **injection_stats,
+        }
+        for key, value in split_stats.items():
+            ctx.finalization_metrics[f"split_{key}"] = value
+
+        if compare_payload is not None:
+            ctx.finalization_metrics["dual_time_mode"] = self._dual_time_mode
+            ctx.finalization_metrics["dual_time_selected_variant"] = selected_variant
+            ctx.finalization_metrics["dual_time_selected_reason"] = selected_reason
+            ctx.finalization_metrics["dual_time_boundary_f1"] = compare_payload["comparison"]["boundary_f1"]
+            ctx.finalization_metrics["dual_time_word_start_mae_ms"] = compare_payload["comparison"]["word_start_mae_ms"]
+            ctx.finalization_metrics["dual_time_legacy_time_source"] = compare_payload["legacy"]["alignment_time_source"]
+            ctx.finalization_metrics["dual_time_experiment_time_source"] = compare_payload["experiment"]["alignment_time_source"]
+
+        if tracks.chosen_track:
+            mapping_cov = split_stats.get("mapping_coverage")
+            if mapping_cov is not None:
+                tracks.chosen_track.mapping_coverage = float(mapping_cov)
+            ctx.finalization_metrics["itn_fallback"] = (
+                1.0 if tracks.chosen_track.itn_fallback else 0.0
+            )
+        if tracks.sv_track:
+            ctx.finalization_metrics["sv_itn_fallback"] = (
+                1.0 if tracks.sv_track.itn_fallback else 0.0
+            )
+        if tracks.whisper_track:
+            ctx.finalization_metrics["whisper_itn_fallback"] = (
+                1.0 if tracks.whisper_track.itn_fallback else 0.0
+            )
+
+        self._emit_layer_diagnostics(
+            ctx,
+            tracks=tracks,
+            punct_track=punct_track,
+            alignment_result=alignment_result,
+            injection_stats=injection_stats,
+            split_stats=split_stats,
+            final_sentences=final_sentences,
+        )
+        self._emit_layer_trace_full(
+            ctx,
+            tracks=tracks,
+            sv_result=sv_result,
+            whisper_result=whisper_result,
+            arbitration_output=arbitration_output,
+            punct_track=punct_track,
+            alignment_result=alignment_result,
+            words_for_split=words_for_split,
+            injection_stats=injection_stats,
+            split_stats=split_stats,
+            final_sentences=final_sentences,
+        )
+
+        # V3.2.0+dev.20260204.08: L4/L5 补跑候选埋点（仅统计，不触发补跑）
+        self._record_punct_retry_candidates(ctx)
 
         ctx.final_sentences = final_sentences
-        if ctx.arbitration_result and self.aligner.last_alignment_stats:
-            ctx.arbitration_result.gap_positions = list(
-                self.aligner.last_alignment_stats.get("gap_positions", [])
-            )
+        if ctx.arbitration_result:
+            ctx.arbitration_result.gap_positions = list(alignment_result.gap_positions)
             self.logger.debug(
                 "Chunk %s: 仲裁统计 coverage=%.2f gap_positions=%s",
                 ctx.chunk_index,
@@ -2326,52 +2978,648 @@ class AsyncDualPipeline:
             )
 
         # 阶段 2: 推送定稿（使用 Chunk 级别的批量替换）
-        # V3.8 调试日志：记录对齐结果状态
         self.logger.debug(
             f"Chunk {ctx.chunk_index}: 对齐完成 - "
             f"final_sentences={len(final_sentences)}, "
-            f"alignment_level={alignment_level.value}, "
             f"whisper_text_len={len(whisper_result.get('text', ''))}, "
             f"sv_text_clean_len={len(sv_result.get('text_clean', ''))}"
         )
 
-        # V3.8 修复：如果定稿句子为空，尝试从草稿中恢复
+        # 定稿链内兜底：若 L6 仍未产出句子，基于 L6 输入词流构建单句，禁止回读草稿链。
         if not final_sentences:
             self.logger.error(
                 f"Chunk {ctx.chunk_index}: 定稿句子为空！"
                 f"Whisper文本长度={len(whisper_result.get('text', ''))}, "
-                f"SenseVoice文本长度={len(sv_result.get('text_clean', ''))}, "
-                f"对齐级别={alignment_level.value}"
+                f"SenseVoice文本长度={len(sv_result.get('text_clean', ''))}"
             )
+            fallback_sentence = self._build_final_fallback_sentence(words_for_split)
+            if fallback_sentence is not None:
+                final_sentences = [fallback_sentence]
+                ctx.final_sentences = final_sentences
+                split_stats["error_code"] = "E_L6_SPLIT_EMPTY"
+                self.logger.warning(
+                    "Chunk {}: 触发定稿链内单句兜底（禁止草稿回退）",
+                    ctx.chunk_index,
+                )
 
-            # V3.8 修复：尝试从 subtitle_manager 中获取草稿句子作为兜底
-            draft_indices = self.subtitle_manager.chunk_sentences.get(ctx.chunk_index, [])
-            if draft_indices:
-                draft_sentences = []
-                for idx in draft_indices:
-                    if idx in self.subtitle_manager.sentences:
-                        # 深拷贝草稿句子，设置为定稿状态
-                        draft_sentence = copy.deepcopy(self.subtitle_manager.sentences[idx])
-                        draft_sentence.is_finalized = True
-                        draft_sentence.is_draft = False
-                        draft_sentences.append(draft_sentence)
-
-                if draft_sentences:
-                    self.logger.warning(
-                        f"Chunk {ctx.chunk_index}: 使用草稿句子作为兜底 ({len(draft_sentences)} 个句子)"
-                    )
-                    final_sentences = draft_sentences
-                    ctx.final_sentences = final_sentences
-
-        # V3.8 修复竞态条件：深拷贝 final_sentences 再传给 subtitle_manager
-        # 避免 subtitle_manager 修改句子对象影响 ctx.final_sentences
-        sentences_for_manager = copy.deepcopy(final_sentences)
-        self.subtitle_manager.replace_chunk(ctx.chunk_index, sentences_for_manager)
+        l7_output = self._l7_processor.process(
+            L7Input(
+                chunk_index=ctx.chunk_index,
+                sentence_segments=final_sentences,
+                injection_report={
+                    "mapping_coverage": float(injection_stats.get("injection_mapping_coverage", 0.0)),
+                    "mismatch_count": float(injection_stats.get("injection_unmatched_total", 0.0)),
+                    "error_code": str(injection_stats.get("injection_error_code", "") or ""),
+                    "blocked": float(injection_stats.get("injection_blocked", 0.0)),
+                },
+                segmentation_report={
+                    "boundary_score_stats": dict(split_stats),
+                    "forced_split_count": float(split_stats.get("force_split_count", 0.0)),
+                    "error_code": str(split_stats.get("error_code", "") or ""),
+                },
+            )
+        )
+        ctx.finalization_metrics["l7_error_count"] = float(
+            len(l7_output.output_payload.get("errors", []))
+        )
 
         self.logger.debug(
             f"Chunk {ctx.chunk_index}: 定稿已推送 "
-            f"({len(final_sentences)} 个句子, 对齐级别={alignment_level.value})"
+            f"({len(final_sentences)} 个句子)"
         )
+
+    def _run_l4_to_l6_once(
+        self,
+        *,
+        tracks: TextTrackBundle,
+        sv_result: Dict[str, Any],
+        whisper_result: Dict[str, Any],
+        sv_words: List[WordTimestamp],
+        punctuation_positions: Optional[List[PuncPosition]],
+        punctuation_clean_text: Optional[str],
+        variant: str = "legacy",
+    ) -> _Layer456RunResult:
+        """执行一次 L4-L6 主路径（仅 CPU 后处理）。"""
+        time_words, time_source = self._resolve_alignment_time_words(
+            variant=variant,
+            sv_words=sv_words,
+            whisper_result=whisper_result,
+        )
+        l4_output = self._l4_processor.process(
+            L4Input(
+                chosen_text_track=tracks.chosen_track,
+                sv_words=time_words,
+                vad_intervals=self._vad_intervals,
+            )
+        )
+        alignment_result = l4_output.alignment_result
+
+        detected_language = whisper_result.get("language") or (
+            tracks.chosen_track.language if tracks.chosen_track else "auto"
+        )
+        self._final_splitter.set_language(detected_language)
+        injection_stats: Dict[str, Any] = {
+            "injection_positions_total": len(punctuation_positions or []),
+            "injection_unmatched_total": 0,
+            "injection_miss_ratio": 0.0,
+            "injection_mapping_coverage": 0.0,
+            "injection_blocked": 0.0,
+            "injection_error_code": "",
+        }
+        l5_punct_track = PunctTrack(
+            clean_text_ref=punctuation_clean_text or "",
+            positions=list(punctuation_positions or []),
+            source="l3",
+            confidence_stats={},
+        )
+        l5_output = self._l5_processor.process(
+            L5Input(
+                alignment_result=alignment_result,
+                punct_track=l5_punct_track,
+                language=detected_language,
+            )
+        )
+        injection_report = dict(l5_output.injection_report or {})
+        injection_stats["injection_unmatched_total"] = int(injection_report.get("mismatch_count", 0.0))
+        injection_stats["injection_miss_ratio"] = (
+            injection_stats["injection_unmatched_total"] / max(len(punctuation_positions or []), 1)
+        )
+        injection_stats["injection_mapping_coverage"] = float(injection_report.get("mapping_coverage", 0.0))
+        injection_stats["injection_blocked"] = float(injection_report.get("blocked", 0.0))
+        injection_stats["injection_error_code"] = str(injection_report.get("error_code", "") or "")
+
+        l6_output = self._l6_processor.process(
+            L6Input(
+                annotated_words=l5_output.annotated_words,
+                vad_intervals=self._vad_intervals,
+            )
+        )
+        words_for_split = list(l6_output.words_for_split)
+        final_sentences = list(l6_output.sentence_segments)
+        split_stats = dict(self._final_splitter.last_split_stats or {})
+        split_stats.update(dict(l6_output.segmentation_report.get("boundary_score_stats", {})))
+        segmentation_error = str(l6_output.segmentation_report.get("error_code", "") or "")
+        if segmentation_error:
+            split_stats["error_code"] = segmentation_error
+
+        if self._final_grouper:
+            final_sentences = self._final_grouper.group(final_sentences)
+
+        matched_ratio = self._compute_matched_ratio(alignment_result.aligned_words)
+        for sentence in final_sentences:
+            sentence.source = TextSource.WHISPER_PATCH
+            sentence.is_finalized = True
+            sentence.is_draft = False
+            sentence.alignment_score = alignment_result.alignment_score
+            sentence.matched_ratio = matched_ratio
+            sentence.whisper_text = whisper_result.get("text", "")
+            sentence.sv_original_text = sv_result.get("text_clean")
+            sentence.confidence_source = self._resolve_sentence_confidence_source(sentence.words)
+
+        return _Layer456RunResult(
+            alignment_result=alignment_result,
+            words_for_split=words_for_split,
+            injection_stats=injection_stats,
+            split_stats=dict(split_stats),
+            final_sentences=final_sentences,
+            alignment_time_source=time_source,
+            alignment_time_word_count=len(time_words),
+        )
+
+    def _resolve_alignment_time_words(
+        self,
+        *,
+        variant: str,
+        sv_words: List[WordTimestamp],
+        whisper_result: Dict[str, Any],
+    ) -> Tuple[List[WordTimestamp], str]:
+        """根据轨道选择 L4 时间锚点词流。"""
+        if variant != "experiment":
+            return list(sv_words), "sv"
+
+        slow_words = self._build_whisper_word_timestamps(whisper_result)
+        if not slow_words:
+            return list(sv_words), "sv_fallback_no_slow_words"
+
+        resolved_source = "whisper_slow_words"
+        if sv_words:
+            sv_start = float(sv_words[0].start)
+            sv_end = float(sv_words[-1].end)
+            guard_start = sv_start - 0.5
+            guard_end = sv_end + 0.5
+            bounded = [
+                word
+                for word in slow_words
+                if guard_start <= float(word.start) <= guard_end
+                and guard_start <= float(word.end) <= guard_end
+            ]
+            if bounded:
+                slow_words = bounded
+            else:
+                # 兜底：若慢流词仍未落入快流时间窗，按首词差值推断并平移时间基。
+                inferred_offset = sv_start - float(slow_words[0].start)
+                is_large_offset = abs(inferred_offset) >= 1.0
+                if is_large_offset:
+                    shifted = self._shift_word_timestamps(slow_words, inferred_offset)
+                    bounded_shifted = [
+                        word
+                        for word in shifted
+                        if guard_start <= float(word.start) <= guard_end
+                        and guard_start <= float(word.end) <= guard_end
+                    ]
+                    if bounded_shifted:
+                        slow_words = bounded_shifted
+                        resolved_source = "whisper_slow_words_shifted"
+
+        min_required = max(3, int(len(sv_words) * 0.4)) if sv_words else 3
+        if len(slow_words) < min_required:
+            return list(sv_words), "sv_fallback_insufficient_slow_words"
+
+        return slow_words, resolved_source
+
+    @staticmethod
+    def _shift_word_timestamps(words: Sequence[WordTimestamp], offset: float) -> List[WordTimestamp]:
+        """平移词时间戳，用于统一时间基。"""
+        has_effective_offset = abs(offset) >= 1e-6
+        if not has_effective_offset:
+            return list(words)
+        shifted: List[WordTimestamp] = []
+        for item in words:
+            shifted.append(
+                WordTimestamp(
+                    word=item.word,
+                    start=float(item.start) + offset,
+                    end=float(item.end) + offset,
+                    confidence=item.confidence,
+                    confidence_raw=item.confidence_raw,
+                    confidence_display_raw=item.confidence_display_raw,
+                    confidence_source=item.confidence_source,
+                    token_type=item.token_type,
+                    is_pseudo=item.is_pseudo,
+                    warning_type=item.warning_type,
+                    perplexity=item.perplexity,
+                )
+            )
+        return shifted
+
+    @staticmethod
+    def _build_whisper_word_timestamps(whisper_result: Dict[str, Any]) -> List[WordTimestamp]:
+        """将 Whisper 原始词流转换为 WordTimestamp（实验轨时间锚点）。"""
+        words: List[WordTimestamp] = []
+        raw = whisper_result.get("raw_result") if isinstance(whisper_result, dict) else None
+        segments = raw.get("segments", []) if isinstance(raw, dict) else []
+        time_base = str(whisper_result.get("word_time_base", "") or "").strip().lower()
+        time_offset = float(whisper_result.get("word_time_offset", 0.0) or 0.0)
+        has_time_offset = abs(time_offset) >= 1e-6
+        is_relative_base = time_base in {"batch_local", "chunk_local", "relative"}
+        should_apply_offset = has_time_offset and is_relative_base
+
+        for segment in segments or []:
+            for item in segment.get("words", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                token = str(item.get("word", "") or "").replace("▁", " ").strip()
+                if not token:
+                    continue
+                start = float(item.get("start", 0.0) or 0.0)
+                end = float(item.get("end", start) or start)
+                if should_apply_offset:
+                    start += time_offset
+                    end += time_offset
+                if end < start:
+                    start, end = end, start
+                if abs(end - start) < 1e-6:
+                    continue
+                words.append(
+                    WordTimestamp(
+                        word=token,
+                        start=start,
+                        end=end,
+                        confidence=float(item.get("probability", 0.0) or 0.0),
+                        confidence_source="slow",
+                    )
+                )
+        words.sort(key=lambda row: (row.start, row.end))
+        return words
+
+    def _build_dual_time_compare_payload(
+        self,
+        *,
+        ctx: ProcessingContext,
+        legacy_run: _Layer456RunResult,
+        experiment_run: _Layer456RunResult,
+    ) -> Dict[str, Any]:
+        """构建双轨实验 chunk 级对比数据。"""
+        boundary_stats = self._compute_boundary_metrics(
+            legacy_run.final_sentences,
+            experiment_run.final_sentences,
+            tolerance_sec=self._dual_time_boundary_tolerance_sec,
+        )
+        word_mae = self._compute_word_mae_ms(legacy_run.words_for_split, experiment_run.words_for_split)
+        sentence_mae = self._compute_sentence_mae_ms(
+            legacy_run.final_sentences,
+            experiment_run.final_sentences,
+        )
+        return {
+            "job_id": ctx.job_id,
+            "chunk_index": int(ctx.chunk_index),
+            "mode": self._dual_time_mode,
+            "legacy": {
+                "sentence_count": len(legacy_run.final_sentences),
+                "alignment_score": float(legacy_run.alignment_result.alignment_score),
+                "gap_ratio": float(legacy_run.alignment_result.gap_ratio),
+                "sentence_texts": [str(sentence.text or "") for sentence in legacy_run.final_sentences],
+                "alignment_time_source": legacy_run.alignment_time_source,
+                "alignment_time_word_count": int(legacy_run.alignment_time_word_count),
+            },
+            "experiment": {
+                "sentence_count": len(experiment_run.final_sentences),
+                "alignment_score": float(experiment_run.alignment_result.alignment_score),
+                "gap_ratio": float(experiment_run.alignment_result.gap_ratio),
+                "sentence_texts": [str(sentence.text or "") for sentence in experiment_run.final_sentences],
+                "alignment_time_source": experiment_run.alignment_time_source,
+                "alignment_time_word_count": int(experiment_run.alignment_time_word_count),
+            },
+            "comparison": {
+                **boundary_stats,
+                **word_mae,
+                **sentence_mae,
+            },
+        }
+
+    def _select_dual_time_variant(
+        self,
+        *,
+        compare_payload: Dict[str, Any],
+        experiment_run: _Layer456RunResult,
+    ) -> Tuple[str, str]:
+        """Active 模式下选择最终输出轨道，门控失败自动回退 legacy。"""
+        if not experiment_run.final_sentences:
+            return "legacy", "active_gate_empty_experiment"
+        boundary_f1 = float(compare_payload.get("comparison", {}).get("boundary_f1", 0.0) or 0.0)
+        if boundary_f1 < self._dual_time_active_min_boundary_f1:
+            return (
+                "legacy",
+                f"active_gate_boundary_f1<{self._dual_time_active_min_boundary_f1:.2f}",
+            )
+        return "experiment", "active_gate_pass"
+
+    def _update_dual_time_summary(self, ctx: ProcessingContext, payload: Dict[str, Any]) -> None:
+        """更新任务级双轨对比汇总并落盘。"""
+        comparison = payload.get("comparison", {}) if isinstance(payload, dict) else {}
+        acc = self._dual_time_compare_accumulator
+        acc["chunk_count"] += 1
+        acc["boundary_precision_sum"] += float(comparison.get("boundary_precision", 0.0) or 0.0)
+        acc["boundary_recall_sum"] += float(comparison.get("boundary_recall", 0.0) or 0.0)
+        acc["boundary_f1_sum"] += float(comparison.get("boundary_f1", 0.0) or 0.0)
+        acc["word_start_mae_ms_sum"] += float(comparison.get("word_start_mae_ms", 0.0) or 0.0)
+        acc["word_end_mae_ms_sum"] += float(comparison.get("word_end_mae_ms", 0.0) or 0.0)
+        acc["sentence_start_mae_ms_sum"] += float(comparison.get("sentence_start_mae_ms", 0.0) or 0.0)
+        acc["sentence_end_mae_ms_sum"] += float(comparison.get("sentence_end_mae_ms", 0.0) or 0.0)
+        if payload.get("selected_variant") == "experiment":
+            acc["selected_experiment_count"] += 1
+
+        chunk_count = max(int(acc["chunk_count"]), 1)
+        summary = {
+            "job_id": ctx.job_id,
+            "mode": self._dual_time_mode,
+            "chunk_count": int(acc["chunk_count"]),
+            "selected_experiment_count": int(acc["selected_experiment_count"]),
+            "selected_experiment_ratio": float(acc["selected_experiment_count"] / chunk_count),
+            "avg_boundary_precision": float(acc["boundary_precision_sum"] / chunk_count),
+            "avg_boundary_recall": float(acc["boundary_recall_sum"] / chunk_count),
+            "avg_boundary_f1": float(acc["boundary_f1_sum"] / chunk_count),
+            "avg_word_start_mae_ms": float(acc["word_start_mae_ms_sum"] / chunk_count),
+            "avg_word_end_mae_ms": float(acc["word_end_mae_ms_sum"] / chunk_count),
+            "avg_sentence_start_mae_ms": float(acc["sentence_start_mae_ms_sum"] / chunk_count),
+            "avg_sentence_end_mae_ms": float(acc["sentence_end_mae_ms_sum"] / chunk_count),
+        }
+        write_debug_json_payload(
+            ctx.job_dir,
+            "dual_time_eval_summary.json",
+            summary,
+            logger=self.logger,
+        )
+
+    def _write_dual_time_debug_srt(self, job_dir: Optional[Path]) -> None:
+        """输出双轨实验快照 SRT（legacy/experiment）。"""
+        if not job_dir:
+            return
+        try:
+            debug_dir = job_dir / "debug"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            legacy_srt = self._build_srt_from_chunk_map(self._dual_time_legacy_sentences_by_chunk)
+            experiment_srt = self._build_srt_from_chunk_map(self._dual_time_experiment_sentences_by_chunk)
+            (debug_dir / "dual_time_legacy.srt").write_text(legacy_srt, encoding="utf-8")
+            (debug_dir / "dual_time_experiment.srt").write_text(experiment_srt, encoding="utf-8")
+        except Exception as exc:
+            self.logger.debug("写入双轨实验 SRT 失败（忽略）: %s", exc)
+
+    @staticmethod
+    def _build_srt_from_chunk_map(chunk_map: Dict[int, List[SentenceSegment]]) -> str:
+        rows: List[SentenceSegment] = []
+        for chunk_idx in sorted(chunk_map.keys()):
+            rows.extend(sorted(chunk_map[chunk_idx], key=lambda item: (item.start, item.end)))
+        lines: List[str] = []
+        for index, sentence in enumerate(rows, 1):
+            text = str(sentence.text or sentence.text_clean or "").strip()
+            lines.append(str(index))
+            lines.append(
+                f"{format_srt_timestamp(float(sentence.start))} --> {format_srt_timestamp(float(sentence.end))}"
+            )
+            lines.append(text)
+            lines.append("")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _extract_sentence_boundaries(sentences: Sequence[SentenceSegment]) -> List[float]:
+        if len(sentences) <= 1:
+            return []
+        return [float(sentence.end) for sentence in sentences[:-1]]
+
+    @classmethod
+    def _compute_boundary_metrics(
+        cls,
+        legacy_sentences: Sequence[SentenceSegment],
+        experiment_sentences: Sequence[SentenceSegment],
+        *,
+        tolerance_sec: float,
+    ) -> Dict[str, float]:
+        reference = cls._extract_sentence_boundaries(legacy_sentences)
+        candidate = cls._extract_sentence_boundaries(experiment_sentences)
+        matched = 0
+        used = [False] * len(reference)
+        for point in candidate:
+            best_idx = -1
+            best_delta = tolerance_sec + 1.0
+            for idx, target in enumerate(reference):
+                if used[idx]:
+                    continue
+                delta = abs(point - target)
+                if delta <= tolerance_sec and delta < best_delta:
+                    best_idx = idx
+                    best_delta = delta
+            if best_idx >= 0:
+                used[best_idx] = True
+                matched += 1
+
+        if candidate:
+            precision = matched / len(candidate)
+        else:
+            precision = 1.0 if not reference else 0.0
+        if reference:
+            recall = matched / len(reference)
+        else:
+            recall = 1.0 if not candidate else 0.0
+        f1 = 0.0 if (precision + recall) <= 0.0 else (2.0 * precision * recall / (precision + recall))
+        return {
+            "boundary_matched": float(matched),
+            "boundary_reference": float(len(reference)),
+            "boundary_candidate": float(len(candidate)),
+            "boundary_precision": float(precision),
+            "boundary_recall": float(recall),
+            "boundary_f1": float(f1),
+        }
+
+    @staticmethod
+    def _compute_word_mae_ms(
+        legacy_words: Sequence[WordTimestamp],
+        experiment_words: Sequence[WordTimestamp],
+    ) -> Dict[str, float]:
+        overlap = min(len(legacy_words), len(experiment_words))
+        if overlap <= 0:
+            return {
+                "word_overlap": 0.0,
+                "word_start_mae_ms": 0.0,
+                "word_end_mae_ms": 0.0,
+            }
+        start_errors = [
+            abs(float(legacy_words[i].start) - float(experiment_words[i].start)) * 1000.0
+            for i in range(overlap)
+        ]
+        end_errors = [
+            abs(float(legacy_words[i].end) - float(experiment_words[i].end)) * 1000.0
+            for i in range(overlap)
+        ]
+        return {
+            "word_overlap": float(overlap),
+            "word_start_mae_ms": float(sum(start_errors) / overlap),
+            "word_end_mae_ms": float(sum(end_errors) / overlap),
+        }
+
+    @staticmethod
+    def _compute_sentence_mae_ms(
+        legacy_sentences: Sequence[SentenceSegment],
+        experiment_sentences: Sequence[SentenceSegment],
+    ) -> Dict[str, float]:
+        overlap = min(len(legacy_sentences), len(experiment_sentences))
+        if overlap <= 0:
+            return {
+                "sentence_overlap": 0.0,
+                "sentence_start_mae_ms": 0.0,
+                "sentence_end_mae_ms": 0.0,
+            }
+        start_errors = [
+            abs(float(legacy_sentences[i].start) - float(experiment_sentences[i].start)) * 1000.0
+            for i in range(overlap)
+        ]
+        end_errors = [
+            abs(float(legacy_sentences[i].end) - float(experiment_sentences[i].end)) * 1000.0
+            for i in range(overlap)
+        ]
+        return {
+            "sentence_overlap": float(overlap),
+            "sentence_start_mae_ms": float(sum(start_errors) / overlap),
+            "sentence_end_mae_ms": float(sum(end_errors) / overlap),
+        }
+
+    def _finalize_sensevoice_only(self, ctx: ProcessingContext) -> List[SentenceSegment]:
+        """Whisper 跳过时的定稿输出（仅使用 SenseVoice 结果）。"""
+        if not ctx.sv_result or not ctx.audio_chunk:
+            return []
+        sv_words = self._build_sv_word_timestamps(ctx.sv_result, ctx.audio_chunk)
+        annotated_words: List[AnnotatedWord] = [
+            AnnotatedWord(
+                word=word.word,
+                start=word.start,
+                end=word.end,
+                trailing_punct="",
+                confidence=word.confidence,
+                confidence_source=word.confidence_source or "fast",
+                speaker_id=None,
+                track_id="main",
+            )
+            for word in sv_words
+        ]
+        l6_output = self._l6_processor.process(
+            L6Input(
+                annotated_words=annotated_words,
+                vad_intervals=self._vad_intervals,
+            )
+        )
+        sentences = list(l6_output.sentence_segments)
+        if not sentences:
+            fallback = self._build_final_fallback_sentence(l6_output.words_for_split)
+            if fallback is not None:
+                sentences = [fallback]
+                self.logger.warning("Whisper 跳过路径触发 L6 单句兜底")
+        for sentence in sentences:
+            sentence.source = TextSource.SENSEVOICE
+            sentence.is_finalized = True
+            sentence.is_draft = False
+            sentence.confidence_source = "fast"
+        if self._final_grouper and sentences:
+            sentences = self._final_grouper.group(sentences)
+        return sentences
+
+    @staticmethod
+    def _build_sv_word_timestamps(
+        sv_result: Dict[str, Any],
+        chunk: AudioChunk,
+    ) -> List[WordTimestamp]:
+        """将 SenseVoice words 转换为 WordTimestamp（补齐 chunk 偏移）。"""
+        words = sv_result.get("words", []) if isinstance(sv_result, dict) else []
+        timestamps: List[WordTimestamp] = []
+        for item in words or []:
+            if isinstance(item, WordTimestamp):
+                start = item.start + chunk.start
+                end = item.end + chunk.start
+                timestamps.append(
+                    WordTimestamp(
+                        word=item.word,
+                        start=start,
+                        end=end,
+                        confidence=item.confidence,
+                        confidence_raw=item.confidence_raw,
+                        confidence_display_raw=item.confidence_display_raw,
+                        confidence_source=item.confidence_source or "fast",
+                        token_type=item.token_type,
+                        is_pseudo=item.is_pseudo,
+                    )
+                )
+                continue
+            if not isinstance(item, dict):
+                continue
+            timestamps.append(
+                WordTimestamp(
+                    word=str(item.get("word", "")),
+                    start=float(item.get("start", 0.0)) + chunk.start,
+                    end=float(item.get("end", 0.0)) + chunk.start,
+                    confidence=item.get("confidence"),
+                    confidence_raw=item.get("confidence_raw"),
+                    confidence_display_raw=item.get("confidence_display_raw"),
+                    confidence_source=item.get("confidence_source") or "fast",
+                    token_type=item.get("token_type"),
+                    is_pseudo=bool(item.get("is_pseudo", False)),
+                )
+            )
+        return timestamps
+
+    @staticmethod
+    def _compute_matched_ratio(aligned_words: Sequence[Any]) -> float:
+        """计算对齐匹配比例（MATCHED / 总词数）。"""
+        if not aligned_words:
+            return 0.0
+        matched = sum(
+            1 for word in aligned_words
+            if getattr(word, "alignment_status", None) == AlignmentStatus.MATCHED
+        )
+        return matched / len(aligned_words)
+
+    @staticmethod
+    def _build_final_fallback_sentence(words_for_split: Sequence[WordTimestamp]) -> Optional[SentenceSegment]:
+        """基于 L6 输入词流构建定稿单句兜底。"""
+        if not words_for_split:
+            return None
+        text = "".join((word.word or "") for word in words_for_split).strip()
+        if not text:
+            return None
+        confidences = [float(word.confidence) for word in words_for_split if word.confidence is not None]
+        confidence = sum(confidences) / len(confidences) if confidences else None
+        return SentenceSegment(
+            text=text,
+            text_clean=text,
+            start=float(words_for_split[0].start),
+            end=float(words_for_split[-1].end),
+            words=list(words_for_split),
+            confidence=confidence,
+            source=TextSource.WHISPER_PATCH,
+            is_draft=False,
+            is_finalized=True,
+        )
+
+    @staticmethod
+    def _resolve_sentence_confidence_source(words: Sequence[WordTimestamp]) -> str:
+        """根据词级置信度来源汇总句级来源。"""
+        if not words:
+            return "unknown"
+        sources = {
+            word.confidence_source
+            for word in words
+            if word.confidence_source in ("fast", "slow")
+        }
+        if not sources:
+            return "unknown"
+        if len(sources) > 1:
+            return "merged"
+        return sources.pop()
+
+    @staticmethod
+    def _load_keep_sentence_end_punct() -> bool:
+        runtime = get_model_runtime_config_service().get_effective_runtime_global()
+        punct = runtime.get("effective", {}).get("punctuation", {})
+        return bool(punct.get("keep_sentence_end_punct", False))
+
+    @staticmethod
+    def _strip_sentence_end_punct(sentences: List[SentenceSegment]) -> None:
+        """清理句末标点（保留问号/感叹号）。"""
+        for sentence in sentences:
+            sentence.text = _strip_trailing_punct_smart(sentence.text)
+            if sentence.text_clean:
+                sentence.text_clean = _strip_trailing_punct_smart(sentence.text_clean)
+            if sentence.words:
+                last_word = sentence.words[-1]
+                last_word.word = _strip_trailing_punct_smart(last_word.word)
 
     async def _align_loop(
         self,
@@ -2529,3 +3777,15 @@ def get_async_dual_pipeline(
         logger=logger,
         cancellation_token=cancellation_token  # v3.1.0
     )
+
+
+
+
+
+
+
+
+
+
+
+
