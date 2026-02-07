@@ -73,6 +73,7 @@ class StreamingSubtitleManager:
             "start": sentence.start,
             "end": sentence.end,
             "confidence": sentence.confidence,
+            "confidence_display_raw": getattr(sentence, 'confidence_display_raw', None),
             "display_confidence": getattr(sentence, 'display_confidence', None),  # V3.1.2: 映射后准确率
             "confidence_source": getattr(sentence, 'confidence_source', None),    # V3.1.2: 置信度来源
             "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),
@@ -147,6 +148,7 @@ class StreamingSubtitleManager:
             # 无置信度（例如 Whisper 未返回可靠值）时，清空显示，避免沿用旧值
             sentence.confidence = None
             sentence.confidence_source = source.value
+            sentence.confidence_display_raw = None
             sentence.display_confidence = None
 
         if perplexity is not None:
@@ -345,6 +347,7 @@ class StreamingSubtitleManager:
                     "start": sentence_copy.start,
                     "end": sentence_copy.end,
                     "confidence": sentence_copy.confidence,
+                    "confidence_display_raw": getattr(sentence_copy, 'confidence_display_raw', None),
                     "display_confidence": getattr(sentence_copy, 'display_confidence', None),  # V3.1.2: 映射后准确率
                     "confidence_source": getattr(sentence_copy, 'confidence_source', None),    # V3.1.2: 置信度来源
                     "source": sentence_copy.source.value if hasattr(sentence_copy.source, 'value') else str(sentence_copy.source),
@@ -456,6 +459,7 @@ class StreamingSubtitleManager:
                 "start": sentence.start,
                 "end": sentence.end,
                 "confidence": sentence.confidence,
+                "confidence_display_raw": getattr(sentence, 'confidence_display_raw', None),
                 "display_confidence": getattr(sentence, 'display_confidence', None),  # V3.1.2: 映射后准确率
                 "confidence_source": getattr(sentence, 'confidence_source', None),    # V3.1.2: 置信度来源
                 "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),
@@ -533,6 +537,7 @@ class StreamingSubtitleManager:
                     "start": sentence_copy.start,
                     "end": sentence_copy.end,
                     "confidence": sentence_copy.confidence,
+                    "confidence_display_raw": getattr(sentence_copy, 'confidence_display_raw', None),
                     "display_confidence": getattr(sentence_copy, 'display_confidence', None),  # V3.1.2: 映射后准确率
                     "confidence_source": getattr(sentence_copy, 'confidence_source', None),    # V3.1.2: 置信度来源
                     "source": sentence_copy.source.value if hasattr(sentence_copy.source, 'value') else str(sentence_copy.source),
@@ -589,6 +594,7 @@ class StreamingSubtitleManager:
                 "start": sentence.start,
                 "end": sentence.end,
                 "confidence": sentence.confidence,
+                "confidence_display_raw": getattr(sentence, 'confidence_display_raw', None),
                 "display_confidence": getattr(sentence, 'display_confidence', None),  # V3.1.2: 映射后准确率
                 "confidence_source": getattr(sentence, 'confidence_source', None),    # V3.1.2: 置信度来源
                 "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),
@@ -644,6 +650,7 @@ class StreamingSubtitleManager:
                 # V3.1.2: 读取置信度相关字段（兼容旧数据）
                 raw_confidence = sentence_dict.get("confidence", 1.0)
                 display_confidence = sentence_dict.get("display_confidence")  # 可能为 None（旧数据）
+                display_raw = sentence_dict.get("confidence_display_raw")
                 confidence_source = sentence_dict.get("confidence_source")    # 可能为 None（旧数据）
 
                 # 从字典重建 SentenceSegment
@@ -653,6 +660,7 @@ class StreamingSubtitleManager:
                     start=sentence_dict.get("start", 0.0),
                     end=sentence_dict.get("end", 0.0),
                     confidence=raw_confidence,
+                    confidence_display_raw=display_raw,
                     display_confidence=display_confidence,  # V3.1.2: 新增
                     confidence_source=confidence_source,    # V3.1.2: 新增
                 )
@@ -699,6 +707,9 @@ class StreamingSubtitleManager:
                         start=word_dict.get("start", 0.0),
                         end=word_dict.get("end", 0.0),
                         confidence=word_confidence,
+                        confidence_raw=word_dict.get("confidence_raw"),
+                        confidence_display_raw=word_dict.get("confidence_display_raw"),
+                        token_type=word_dict.get("token_type"),
                         is_pseudo=word_dict.get("is_pseudo", False)
                     )
                     sentence.words.append(word)
@@ -875,6 +886,7 @@ class StreamingSubtitleManager:
                         "start": sentence.start,
                         "end": sentence.end,
                         "confidence": sentence.confidence,
+                        "confidence_display_raw": getattr(sentence, 'confidence_display_raw', None),
                         "display_confidence": getattr(sentence, 'display_confidence', None),  # V3.1.2: 映射后准确率
                         "confidence_source": getattr(sentence, 'confidence_source', None),    # V3.1.2: 置信度来源
                     }
@@ -906,6 +918,7 @@ class StreamingSubtitleManager:
                 "start": sentence.start,
                 "end": sentence.end,
                 "confidence": sentence.confidence,
+                "confidence_display_raw": getattr(sentence, 'confidence_display_raw', None),
                 "display_confidence": getattr(sentence, 'display_confidence', None),
                 "confidence_source": getattr(sentence, 'confidence_source', None),
                 "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),

@@ -62,7 +62,7 @@ class PreprocessingConfig:
     langid_confidence_threshold: float = 0.7
     langid_whitelist: List[str] = field(default_factory=lambda: ["zh", "ja", "en"])
     langid_logit_bias_score: float = 2.5
-    enable_speaker_embedding: bool = False
+    enable_speaker_embedding: bool = True  # V3.2.0+dev.20260207.01: 默认开启声纹聚类
 
     # ========== 预处理缓存配置 ==========
     # 是否启用预处理缓存 GC（默认关闭）
@@ -153,6 +153,16 @@ class ComputeConfig:
     temp_file_policy: str = "delete_on_complete"
 
 
+# ========== 调试配置 ==========
+
+@dataclass
+class DebugConfig:
+    """
+    调试配置（按需启用）。
+    """
+    punctuation_output: bool = False  # 标点调试输出（SSE + 文件）
+
+
 # ========== 任务设置 ==========
 
 @dataclass
@@ -171,6 +181,7 @@ class JobSettings:
     transcription: TranscriptionConfig = field(default_factory=TranscriptionConfig)
     refinement: RefinementConfig = field(default_factory=RefinementConfig)
     compute: ComputeConfig = field(default_factory=ComputeConfig)
+    debug: DebugConfig = field(default_factory=DebugConfig)
 
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
@@ -221,11 +232,17 @@ class JobSettings:
                 "output_formats": self.compute.output_formats,
                 "temp_file_policy": self.compute.temp_file_policy,
             },
+            "debug": {
+                "punctuation_output": self.debug.punctuation_output,
+            },
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "JobSettings":
         """从字典创建设置"""
+        if not isinstance(data, dict):
+            raise ValueError("task_config 必须是对象结构。")
+
         raw_data = data
         # 允许直接传入 task_config
         if "task_config" in data and isinstance(data["task_config"], dict):
@@ -250,10 +267,11 @@ class JobSettings:
             raise ValueError("检测到旧版任务配置字段，已停止兼容，请使用 task_config 发送新版配置。")
 
         # 解析新版配置
-        preprocessing_data = data.get("preprocessing", {})
-        transcription_data = data.get("transcription", {})
-        refinement_data = data.get("refinement", {})
-        compute_data = data.get("compute", {})
+        preprocessing_data = data.get("preprocessing") or {}
+        transcription_data = data.get("transcription") or {}
+        refinement_data = data.get("refinement") or {}
+        compute_data = data.get("compute") or {}
+        debug_data = data.get("debug") or {}
 
         raw_whitelist = preprocessing_data.get("langid_whitelist", ["zh", "ja", "en"])
         if isinstance(raw_whitelist, str):
@@ -284,7 +302,7 @@ class JobSettings:
                 langid_confidence_threshold=preprocessing_data.get("langid_confidence_threshold", 0.7),
                 langid_whitelist=langid_whitelist,
                 langid_logit_bias_score=preprocessing_data.get("langid_logit_bias_score", 2.5),
-                enable_speaker_embedding=preprocessing_data.get("enable_speaker_embedding", False),
+                enable_speaker_embedding=preprocessing_data.get("enable_speaker_embedding", True),
                 is_preprocess_cache_gc_enabled=preprocessing_data.get("enable_preprocess_cache_gc", False),
                 cache_budget_gb=preprocessing_data.get("cache_budget_gb", 0.0),
                 ttl_hours=preprocessing_data.get("ttl_hours", 0.0),
@@ -309,6 +327,9 @@ class JobSettings:
                 gpu_id=compute_data.get("gpu_id", 0),
                 output_formats=compute_data.get("output_formats", ["srt"]),
                 temp_file_policy=compute_data.get("temp_file_policy", "delete_on_complete"),
+            ),
+            debug=DebugConfig(
+                punctuation_output=bool(debug_data.get("punctuation_output", False)),
             ),
         )
 
@@ -407,6 +428,8 @@ class JobState:
     title: str = ""  # 用户自定义的任务名称，为空时使用 filename
     createdAt: Optional[int] = None  # 创建时间戳
     updatedAt: Optional[int] = None  # 更新时间戳（毫秒）
+    # V3.2.0+dev.20260130.10: 任务级字幕时间偏移（秒，None 表示使用全局默认）
+    subtitle_time_offset: Optional[float] = None
 
     # 媒体状态（用于编辑器，转录完成后更新）
     media_status: Optional[MediaStatus] = None
@@ -442,6 +465,7 @@ class JobState:
             "canceled": self.canceled,
             "paused": self.paused,
             "settings": self.settings.to_dict(),
+            "subtitle_time_offset": self.subtitle_time_offset,
             "updated_at": time.time()
         }
 
@@ -482,6 +506,7 @@ class JobState:
             canceled=data.get("canceled", False),
             paused=data.get("paused", False),
             updatedAt=updated_at,
+            subtitle_time_offset=data.get("subtitle_time_offset"),
         )
 
     def update_media_status(self, job_dir: str):

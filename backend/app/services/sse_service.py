@@ -385,6 +385,12 @@ SSE_PREPROCESS_TAGS = {
     "preprocessing.speaker.error": "Speaker 声纹提取失败",
 }
 
+# 调试事件 Tag
+SSE_DEBUG_TAGS = {
+    "debug.punctuation": "标点调试输出",
+    "debug.punctuation_scheduler": "标点调度决策调试",
+}
+
 
 # ========== SSE 推送辅助方法 ==========
 

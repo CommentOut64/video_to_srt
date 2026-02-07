@@ -4,9 +4,11 @@
 用于三级流水线架构中的数据传递
 """
 from dataclasses import dataclass, field
-from typing import Optional, List, Any
+from pathlib import Path
+from typing import Optional, List, Any, Dict
 import numpy as np
 
+from app.services.alignment.types import PunctTrack, TextTrackBundle
 
 @dataclass
 class ProcessingContext:
@@ -33,6 +35,8 @@ class ProcessingContext:
     job_id: str
     chunk_index: int
     audio_chunk: Any  # AudioChunk 对象
+    job_dir: Optional[Path] = None
+    debug_punctuation: bool = False
 
     # 音频上下文（用于 Audio Overlap）
     full_audio_array: Optional[np.ndarray] = None  # 完整音频数组（16kHz，单声道）
@@ -42,6 +46,10 @@ class ProcessingContext:
     sv_result: Optional[dict] = None      # FastWorker 产出
     whisper_result: Optional[dict] = None # SlowWorker 产出
     final_sentences: List[Any] = field(default_factory=list)  # 对齐阶段产出
+    arbitration_result: Optional[Any] = None  # V3.2.0+dev.20260202.08: 仲裁结果（Phase G-3）
+    text_tracks: Optional[TextTrackBundle] = None  # V3.2.0+dev.20260203.03: 三轨文本
+    punct_track: Optional[PunctTrack] = None  # V3.2.0+dev.20260204.05: L3 标点轨道
+    finalization_metrics: Dict[str, Any] = field(default_factory=dict)  # V3.2.0+dev.20260203.03
 
     # 控制信号
     is_end: bool = False                  # 结束流标记

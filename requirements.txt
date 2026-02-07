@@ -7,6 +7,7 @@ click
 colorama
 filelock
 psutil
+loguru
 intel-openmp  # fbgemm.dll 需要的 OpenMP 运行时
 
 # --- 数值计算 (严格锁定兼容性) ---
@@ -37,13 +38,11 @@ nvidia-cudnn-cu12==8.9.7.29
 
 # --- ONNX (兼容性配置) ---
 # 强制排除 CPU 版本，只使用 GPU 版本
-# onnxruntime-gpu 完全兼容 CPU 推理，可满足 funasr-onnx 的依赖
+# onnxruntime-gpu 完全兼容 CPU 推理，可用于标点/ASR ONNX 推理
 onnxruntime-gpu==1.18.0
-
-# --- FunASR (语音识别) ---
-# 注意：funasr-onnx 依赖 onnxruntime，但我们用 onnxruntime-gpu 替代
-# 安装后必须执行：pip uninstall onnxruntime -y
-funasr-onnx==0.4.1
+punctuators
+sentencepiece
+tokenizers
 
 # --- 音频处理 ---
 librosa
@@ -72,3 +71,6 @@ pyannote.audio>=3.1.0
 # --- SpeechBrain (语言识别/声纹) ---
 speechbrain==1.0.3
 huggingface-hub==0.24.6
+
+# --- 文本标准化 (ITN/TN) V3.1.2+dev.20260128.01 ---
+wetext>=0.1.2

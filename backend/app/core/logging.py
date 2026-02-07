@@ -12,11 +12,59 @@ import logging
 import sys
 import json
 import time
-from pathlib import Path
 from typing import Optional, Dict, Any
 from contextlib import contextmanager
-from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
+from logging.handlers import RotatingFileHandler
 from app.core.config import config
+try:
+    from loguru import logger as loguru_logger
+except ImportError:  # pragma: no cover - 允许无 Loguru 环境运行
+    loguru_logger = None
+
+
+class _FallbackLoggerAdapter:
+    """Loguru 缺失时的最小兼容层，提供 bind 接口。"""
+
+    def __init__(self, logger: logging.Logger, extra: Optional[Dict[str, Any]] = None) -> None:
+        self._logger = logger
+        self._extra = dict(extra or {})
+
+    def bind(self, **fields: Any) -> "_FallbackLoggerAdapter":
+        merged = dict(self._extra)
+        merged.update(fields)
+        return _FallbackLoggerAdapter(self._logger, merged)
+
+    def _log(self, level: int, message: str, *args: Any, **kwargs: Any) -> None:
+        if self._extra:
+            extra = dict(kwargs.get("extra") or {})
+            extra.update(self._extra)
+            kwargs["extra"] = extra
+        if (args or kwargs) and "{" in message:
+            try:
+                message = message.format(*args, **kwargs)
+                args = ()
+            except (IndexError, KeyError, ValueError):
+                pass
+        self._logger.log(level, message, *args, **kwargs)
+
+    def debug(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._log(logging.DEBUG, message, *args, **kwargs)
+
+    def info(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._log(logging.INFO, message, *args, **kwargs)
+
+    def warning(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._log(logging.WARNING, message, *args, **kwargs)
+
+    def error(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._log(logging.ERROR, message, *args, **kwargs)
+
+    def exception(self, message: str, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("exc_info", True)
+        self._log(logging.ERROR, message, *args, **kwargs)
+
+    def critical(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._log(logging.CRITICAL, message, *args, **kwargs)
 
 
 class MillisecondFormatter(logging.Formatter):
@@ -185,7 +233,109 @@ def setup_logging(
     if enable_structured:
         logger.info(f"结构化日志已启用")
 
-    return logger
+    # V3.2.0+dev.20260203.10: Loguru 迁移准备（分层推进）
+    _configure_loguru_if_available(
+        level=config.LOG_LEVEL,
+        max_bytes=max_bytes,
+        backup_count=backup_count,
+    )
+
+    return get_loguru_logger(__name__)
+
+
+def _configure_loguru_if_available(
+    level: str,
+    max_bytes: int,
+    backup_count: int,
+) -> None:
+    """初始化 Loguru（不影响现有 logging 体系）。"""
+    if loguru_logger is None:
+        return
+    loguru_logger.remove()
+    loguru_logger.configure(extra={"logger": "app"})
+    log_text_dir = config.LOG_DIR / "log"
+    log_json_dir = config.LOG_DIR / "jsonl"
+    log_text_dir.mkdir(parents=True, exist_ok=True)
+    log_json_dir.mkdir(parents=True, exist_ok=True)
+    loguru_logger.add(
+        sys.stdout,
+        level=level,
+        format="<green>{time:HH:mm:ss.SSS}</green> "
+               "[<level>{level}</level>] "
+               "[<cyan>{extra[logger]}</cyan>] "
+               "<level>{message}</level>",
+        colorize=True,
+        enqueue=True,
+        backtrace=False,
+        diagnose=False,
+    )
+    loguru_text_file = log_text_dir / f"loguru_{config.LOG_FILE.stem}.log"
+    loguru_logger.add(
+        loguru_text_file,
+        level="DEBUG",
+        rotation=max_bytes,
+        retention=backup_count,
+        enqueue=True,
+        serialize=False,
+        backtrace=False,
+        diagnose=False,
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} [{level}] [{extra[logger]}] {message}",
+    )
+    loguru_json_file = log_json_dir / f"loguru_{config.LOG_FILE.stem}.jsonl"
+    loguru_logger.add(
+        loguru_json_file,
+        level="DEBUG",
+        rotation=max_bytes,
+        retention=backup_count,
+        enqueue=True,
+        serialize=True,
+        backtrace=False,
+        diagnose=False,
+    )
+
+def _shorten_logger_name(name: str) -> str:
+    """将 logger 名称精简为可识别的最短形式。"""
+    if not name:
+        return "app"
+    normalized = str(name).strip()
+    if not normalized:
+        return "app"
+    if "." in normalized:
+        return normalized.split(".")[-1]
+    if "\\" in normalized or "/" in normalized:
+        normalized = normalized.replace("\\", "/")
+        return normalized.split("/")[-1]
+    return normalized
+
+def get_loguru_logger(name: str, **bind_fields: Any):
+    """获取 Loguru 记录器并绑定上下文字段。"""
+    if loguru_logger is None:
+        base_logger = logging.getLogger(name)
+        return _FallbackLoggerAdapter(base_logger, bind_fields)
+    base_logger = loguru_logger.bind(logger=_shorten_logger_name(name))
+    if bind_fields:
+        base_logger = base_logger.bind(**bind_fields)
+    return base_logger
+
+
+def resolve_loguru_logger(
+    logger: Optional[Any],
+    name: str,
+    **bind_fields: Any,
+):
+    """强制使用 Loguru 记录器，忽略非 Loguru 的入参。"""
+    if loguru_logger is None:
+        if logger is not None and hasattr(logger, "bind"):
+            return logger.bind(**bind_fields) if bind_fields else logger
+        base_logger = logging.getLogger(name)
+        return _FallbackLoggerAdapter(base_logger, bind_fields)
+    if logger is not None and hasattr(logger, "bind"):
+        base_logger = logger.bind(logger=_shorten_logger_name(name))
+    else:
+        base_logger = loguru_logger.bind(logger=_shorten_logger_name(name))
+    if bind_fields:
+        base_logger = base_logger.bind(**bind_fields)
+    return base_logger
 
 
 @contextmanager

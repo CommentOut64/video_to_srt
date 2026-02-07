@@ -1,6 +1,6 @@
 """
-默认分句服务（封装旧分句逻辑）。
-V3.2.0+dev.20260119.06
+默认分句服务（兼容壳，草稿链专用）。
+V3.2.0+dev.20260207.03
 """
 
 from __future__ import annotations
@@ -8,16 +8,24 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from app.models.sensevoice_models import SentenceSegment, TextSource, WordTimestamp
+from app.models.sensevoice_models import SentenceSegment
 from app.services.sentence_splitter import SentenceSplitter, SplitConfig
 from app.services.semantic_grouper import SemanticGrouper, GroupConfig
+from app.services.segmentation.unified_splitter import UnifiedSplitter
 
 if TYPE_CHECKING:
     from app.services.audio.chunk_engine import AudioChunk
 
 
 class DefaultSegmenter:
-    """默认分句服务：封装旧分句/语义分组逻辑。"""
+    """
+    默认分句服务（兼容名）。
+
+    说明：
+    - 该类仅用于草稿链（draft）；
+    - 定稿链已迁移到 L4→L5→L6→L7 主路径；
+    - 推荐新代码优先使用 `DraftSegmenter` 命名。
+    """
 
     def __init__(
         self,
@@ -95,6 +103,7 @@ class DefaultSegmenter:
                 enable_overlap_detection=True,
             )
         self.final_grouper = SemanticGrouper(final_group_config)
+        self.unified_splitter = UnifiedSplitter(logger=self.logger)
 
     def split_draft(
         self,
@@ -102,7 +111,7 @@ class DefaultSegmenter:
         chunk: AudioChunk,
         is_draft: bool = True,
     ) -> List[SentenceSegment]:
-        """快流分句（草稿/定稿）。"""
+        """快流分句（仅草稿链）。"""
         sentences = self._split_draft_core(sv_result, chunk, is_draft=is_draft)
 
         if not self.is_enable_cross_chunk_merge or not sentences:
@@ -125,53 +134,11 @@ class DefaultSegmenter:
         chunk: AudioChunk,
         language: Optional[str] = None,
     ) -> List[SentenceSegment]:
-        """慢流降级：使用 SenseVoice 结果分句。"""
-        text_clean = sv_result.get("text_clean", "")
-        words_data = sv_result.get("words", [])
-        words = self._build_words(words_data)
-
-        if not words:
-            if text_clean and text_clean.strip():
-                self.logger.warning(
-                    "SenseVoice 没有字级时间戳但有文本，创建兜底单句: "
-                    "text='%s...', chunk=[%.2fs, %.2fs]",
-                    text_clean[:50],
-                    chunk.start,
-                    chunk.end,
-                )
-                return [
-                    SentenceSegment(
-                        text=text_clean.strip(),
-                        start=chunk.start,
-                        end=chunk.end,
-                        words=[],
-                        source=TextSource.SENSEVOICE,
-                        confidence=sv_result.get("confidence", 0.5),
-                        is_finalized=True,
-                        is_draft=False,
-                    )
-                ]
-            self.logger.warning("SenseVoice 结果没有字级时间戳且无文本，无法分句")
-            return []
-
-        if language:
-            self.final_splitter.config.language = language
-
-        sentences = self.final_splitter.split(words, text_clean)
-        if self.is_enable_semantic_grouping:
-            sentences = self.final_grouper.group(sentences)
-
-        for sentence in sentences:
-            sentence.start += chunk.start
-            sentence.end += chunk.start
-            sentence.source = TextSource.SENSEVOICE
-            sentence.is_finalized = True
-            sentence.is_draft = False
-            for word in sentence.words:
-                word.start += chunk.start
-                word.end += chunk.start
-
-        return sentences
+        """已禁用：定稿路径必须走 L4→L5→L6→L7，不允许再走 DefaultSegmenter。"""
+        raise RuntimeError(
+            "DefaultSegmenter.split_final_from_sv 已禁用："
+            "定稿请使用 L4->L5->L6->L7 主链。"
+        )
 
     def _split_draft_core(
         self,
@@ -179,72 +146,17 @@ class DefaultSegmenter:
         chunk: AudioChunk,
         is_draft: bool,
     ) -> List[SentenceSegment]:
-        text_clean = sv_result.get("text_clean", "")
-        words_data = sv_result.get("words", [])
-        words = self._build_words(words_data)
-
-        if not words:
-            if text_clean and text_clean.strip():
-                self.logger.warning(
-                    "SenseVoice 没有字级时间戳但有文本，创建兜底单句: "
-                    "text='%s...', chunk=[%.2fs, %.2fs]",
-                    text_clean[:50],
-                    chunk.start,
-                    chunk.end,
-                )
-                return [
-                    SentenceSegment(
-                        text=text_clean.strip(),
-                        start=chunk.start,
-                        end=chunk.end,
-                        words=[],
-                        source=TextSource.SENSEVOICE,
-                        confidence=sv_result.get("confidence", 0.5),
-                        is_finalized=not is_draft,
-                        is_draft=is_draft,
-                    )
-                ]
-            self.logger.warning("SenseVoice 结果没有字级时间戳且无文本，无法分句")
-            return []
-
-        detected_language = sv_result.get("language", "auto")
-        is_chinese = detected_language in {"zh", "yue"}
-
-        if is_chinese:
-            sentences = self.chinese_splitter.split(words, text_clean)
-        else:
-            sentences = self.draft_splitter.split(words, text_clean)
-
-        if self.is_enable_semantic_grouping:
+        sentences = self.unified_splitter.split_draft_from_sv(
+            sv_result,
+            chunk_start=chunk.start,
+            chunk_end=chunk.end,
+            is_final_output=not is_draft,
+        )
+        if self.is_enable_semantic_grouping and sentences:
             sentences = self.draft_grouper.group(sentences)
             self.logger.debug("快流语义分组: %d 个句子（物理约束）", len(sentences))
-
-        for sentence in sentences:
-            sentence.start += chunk.start
-            sentence.end += chunk.start
-            sentence.is_draft = is_draft
-            sentence.is_finalized = not is_draft
-            sentence.source = TextSource.SENSEVOICE
-            for word in sentence.words:
-                word.start += chunk.start
-                word.end += chunk.start
-
         self.logger.debug("快流分句完成: %d 个句子", len(sentences))
         return sentences
-
-    @staticmethod
-    def _build_words(words_data: List[Dict[str, Any]]) -> List[WordTimestamp]:
-        words: List[WordTimestamp] = []
-        for word in words_data:
-            words.append(
-                WordTimestamp(
-                    word=word.get("word", ""),
-                    start=word.get("start", 0.0),
-                    end=word.get("end", 0.0),
-                    confidence=word.get("confidence", 1.0),
-                )
-            )
-        return words
 
     def _is_sentence_incomplete(self, sentence: SentenceSegment) -> bool:
         """判断句子是否语义不完整，用于跨 chunk 合并。"""
@@ -272,17 +184,31 @@ class DefaultSegmenter:
         merged_end = sent2.end
         merged_words = sent1.words + sent2.words
 
-        if sent1.confidence is None or sent2.confidence is None:
-            avg_confidence = sent1.confidence or sent2.confidence or 0.0
-        else:
-            avg_confidence = (sent1.confidence + sent2.confidence) / 2
+        sent1_conf = sent1.confidence or 0.0
+        sent2_conf = sent2.confidence or 0.0
+        strict_confidence = min(sent1_conf, sent2_conf)
+
+        sent1_display = sent1.confidence_display_raw
+        sent2_display = sent2.confidence_display_raw
+        if sent1_display is None:
+            sent1_display = sent1_conf
+        if sent2_display is None:
+            sent2_display = sent2_conf
+        weight1 = max(sent1.end - sent1.start, 0.0)
+        weight2 = max(sent2.end - sent2.start, 0.0)
+        total_weight = (weight1 if weight1 > 0.0 else 1.0) + (weight2 if weight2 > 0.0 else 1.0)
+        display_raw = (
+            ((sent1_display * (weight1 if weight1 > 0.0 else 1.0)) +
+             (sent2_display * (weight2 if weight2 > 0.0 else 1.0))) / total_weight
+        ) if total_weight > 0.0 else None
 
         merged_sentence = SentenceSegment(
             text=merged_text,
             start=merged_start,
             end=merged_end,
             words=merged_words,
-            confidence=avg_confidence,
+            confidence=strict_confidence,
+            confidence_display_raw=display_raw,
             is_draft=sent1.is_draft,
             is_finalized=sent1.is_finalized,
             source=sent1.source,
@@ -290,3 +216,7 @@ class DefaultSegmenter:
         )
 
         return merged_sentence
+
+
+class DraftSegmenter(DefaultSegmenter):
+    """草稿分句服务（推荐名称，等价于 DefaultSegmenter）。"""

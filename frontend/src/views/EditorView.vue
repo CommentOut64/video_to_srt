@@ -172,11 +172,38 @@
           {{ errorCount }} 个问题
         </span>
         <span class="divider">|</span>
-        <button class="settings-btn" @click="showSettings" title="设置">
-          <svg viewBox="0 0 24 24" fill="currentColor">
-            <path d="M19.14,12.94c0.04-0.3,0.06-0.61,0.06-0.94c0-0.32-0.02-0.64-0.07-0.94l2.03-1.58c0.18-0.14,0.23-0.41,0.12-0.61 l-1.92-3.32c-0.12-0.22-0.37-0.29-0.59-0.22l-2.39,0.96c-0.5-0.38-1.03-0.7-1.62-0.94L14.4,2.81c-0.04-0.24-0.24-0.41-0.48-0.41 h-3.84c-0.24,0-0.43,0.17-0.47,0.41L9.25,5.35C8.66,5.59,8.12,5.92,7.63,6.29L5.24,5.33c-0.22-0.08-0.47,0-0.59,0.22L2.74,8.87 C2.62,9.08,2.66,9.34,2.86,9.48l2.03,1.58C4.84,11.36,4.8,11.69,4.8,12s0.02,0.64,0.07,0.94l-2.03,1.58 c-0.18,0.14-0.23,0.41-0.12,0.61l1.92,3.32c0.12,0.22,0.37,0.29,0.59,0.22l2.39-0.96c0.5,0.38,1.03,0.7,1.62,0.94l0.36,2.54 c0.05,0.24,0.24,0.41,0.48,0.41h3.84c0.24,0,0.44-0.17,0.47-0.41l0.36-2.54c0.59-0.24,1.13-0.56,1.62-0.94l2.39,0.96 c0.22,0.08,0.47,0,0.59-0.22l1.92-3.32c0.12-0.22,0.07-0.47-0.12-0.61L19.14,12.94z M12,15.6c-1.98,0-3.6-1.62-3.6-3.6 s1.62-3.6,3.6-3.6s3.6,1.62,3.6,3.6S13.98,15.6,12,15.6z"/>
-          </svg>
-        </button>
+        <el-popover
+          trigger="click"
+          :width="260"
+          popper-class="control-popover-dark"
+          placement="top-end"
+        >
+          <template #reference>
+            <button class="settings-btn" title="设置">
+              <svg viewBox="0 0 24 24" fill="currentColor">
+                <path d="M19.14,12.94c0.04-0.3,0.06-0.61,0.06-0.94c0-0.32-0.02-0.64-0.07-0.94l2.03-1.58c0.18-0.14,0.23-0.41,0.12-0.61 l-1.92-3.32c-0.12-0.22-0.37-0.29-0.59-0.22l-2.39,0.96c-0.5-0.38-1.03-0.7-1.62-0.94L14.4,2.81c-0.04-0.24-0.24-0.41-0.48-0.41 h-3.84c-0.24,0-0.43,0.17-0.47,0.41L9.25,5.35C8.66,5.59,8.12,5.92,7.63,6.29L5.24,5.33c-0.22-0.08-0.47,0-0.59,0.22L2.74,8.87 C2.62,9.08,2.66,9.34,2.86,9.48l2.03,1.58C4.84,11.36,4.8,11.69,4.8,12s0.02,0.64,0.07,0.94l-2.03,1.58 c-0.18,0.14-0.23,0.41-0.12,0.61l1.92,3.32c0.12,0.22,0.37,0.29,0.59,0.22l2.39-0.96c0.5,0.38,1.03,0.7,1.62,0.94l0.36,2.54 c0.05,0.24,0.24,0.41,0.48,0.41h3.84c0.24,0,0.44-0.17,0.47-0.41l0.36-2.54c0.59-0.24,1.13-0.56,1.62-0.94l2.39,0.96 c0.22,0.08,0.47,0,0.59-0.22l1.92-3.32c0.12-0.22,0.07-0.47-0.12-0.61L19.14,12.94z M12,15.6c-1.98,0-3.6-1.62-3.6-3.6 s1.62-3.6,3.6-3.6s3.6,1.62,3.6,3.6S13.98,15.6,12,15.6z"/>
+              </svg>
+            </button>
+          </template>
+          <div class="flex flex-col gap-3 p-2">
+            <div class="text-xs text-[var(--text-secondary)]">字幕时间偏移（秒）</div>
+            <div class="flex items-center gap-2">
+              <el-input-number
+                v-model="localSubtitleOffset"
+                :min="-10"
+                :max="10"
+                :step="0.05"
+                :precision="2"
+                size="small"
+                @change="handleSubtitleOffsetChange"
+              />
+              <el-button size="small" @click="resetSubtitleOffset">恢复</el-button>
+            </div>
+            <div class="text-[11px] text-[var(--text-muted)]">
+              负值提前，正值延后
+            </div>
+          </div>
+        </el-popover>
       </div>
     </footer>
   </div>
@@ -435,6 +462,18 @@ const gridStyle = computed(() => ({
 
 // ========== 数据加载 ==========
 
+// V3.2.0+dev.20260130.10: 读取任务级字幕时间偏移（无则回退全局）
+async function loadSubtitleOffset() {
+  try {
+    const response = await transcriptionApi.getJobSubtitleTimeOffset(props.jobId)
+    const offset = response?.offset ?? 0
+    projectStore.setSubtitleOffset(offset)
+  } catch (error) {
+    console.warn('[EditorView] 读取字幕偏移失败，使用默认值 0:', error)
+    projectStore.setSubtitleOffset(0)
+  }
+}
+
 // 加载项目数据
 async function loadProject() {
   isLoading.value = true
@@ -496,6 +535,9 @@ async function loadProject() {
       }
       // V3.2.0+dev.20260124.02: 后端为唯一真理，后续仍会从 API 刷新覆盖
     }
+
+    // 2.5 读取全局字幕时间偏移（需在恢复后执行，保证差值正确）
+    await loadSubtitleOffset()
 
     // 3. 根据任务状态从后端加载字幕数据
     // V3.1.2+dev.20260111.02: 优先从 segments API 加载（含置信度），fallback 到 SRT
@@ -949,18 +991,19 @@ function handleStreamingSubtitle(data) {
     isModified: sentence.is_modified ?? false,
     originalText: sentence.original_text ?? null
   }
+  const normalized = projectStore.applyOffsetToSentenceData(subtitleData)
 
   if (existingIndex >= 0) {
     // V3.1.2+dev.20260112.01: 修复 - 传入正确的 id 而非索引
     const existingId = projectStore.subtitles[existingIndex].id
-    projectStore.updateSubtitle(existingId, subtitleData)
+    projectStore.updateSubtitle(existingId, normalized)
   } else {
     // 添加新字幕 - 按时间顺序找到插入位置
-    const insertIndex = projectStore.subtitles.findIndex(s => s.start > (start ?? 0))
+    const insertIndex = projectStore.subtitles.findIndex(s => s.start > (normalized.start ?? 0))
     const finalIndex = insertIndex === -1 ? projectStore.subtitles.length : insertIndex
     // V3.1.2: 添加 id 字段给新字幕
-    subtitleData.id = `sv_${sentenceIndex}`
-    projectStore.addSubtitle(finalIndex, subtitleData)
+    normalized.id = `sv_${sentenceIndex}`
+    projectStore.addSubtitle(finalIndex, normalized)
   }
 
   // 恢复历史记录
@@ -1325,7 +1368,8 @@ async function handleExportEvent(event) {
 
 async function handleExport(format) {
   const segments = await fetchLatestSegments()
-  if (!segments || segments.length === 0) {
+  const displaySegments = projectStore.applyOffsetToSegments(segments || [])
+  if (!displaySegments || displaySegments.length === 0) {
     alert('导出失败：后端未返回字幕数据')
     return
   }
@@ -1335,22 +1379,22 @@ async function handleExport(format) {
 
   switch (format) {
     case 'srt':
-      content = segmentsToSRT(segments)
+      content = segmentsToSRT(displaySegments)
       filename += '.srt'
       break
     case 'ass':
-      await handleASSExport(segments)
+      await handleASSExport(displaySegments)
       return
     case 'vtt':
-      content = generateVTTFromSegments(segments)
+      content = generateVTTFromSegments(displaySegments)
       filename += '.vtt'
       break
     case 'txt':
-      content = segments.map(s => s.text).join('\n')
+      content = displaySegments.map(s => s.text).join('\n')
       filename += '.txt'
       break
     case 'json':
-      content = JSON.stringify(segments, null, 2)
+      content = JSON.stringify(displaySegments, null, 2)
       filename += '.json'
       break
   }
@@ -1526,9 +1570,41 @@ function handleSubtitleEdit(id, field, value) {
   console.log('字幕编辑:', id, field, value)
 }
 
-function showSettings() {
-  // TODO: 实现设置面板
-  console.log('打开设置')
+// ========== 字幕全局偏移设置（右下角设置按钮） ==========
+const localSubtitleOffset = ref(projectStore.subtitleOffset)
+const lastStableOffset = ref(projectStore.subtitleOffset)
+let offsetSyncTimer = null
+
+watch(
+  () => projectStore.subtitleOffset,
+  (value) => {
+    localSubtitleOffset.value = value
+    lastStableOffset.value = value
+  }
+)
+
+function scheduleSubtitleOffsetSync(value) {
+  if (offsetSyncTimer) {
+    clearTimeout(offsetSyncTimer)
+  }
+  offsetSyncTimer = setTimeout(async () => {
+    try {
+      await transcriptionApi.setJobSubtitleTimeOffset(projectStore.meta.jobId, value)
+      lastStableOffset.value = value
+    } catch (error) {
+      ElMessage.error('字幕偏移同步失败，已回退到上一次设置')
+      projectStore.setSubtitleOffset(lastStableOffset.value)
+    }
+  }, 300)
+}
+
+function handleSubtitleOffsetChange(value) {
+  projectStore.setSubtitleOffset(value)
+  scheduleSubtitleOffsetSync(projectStore.subtitleOffset)
+}
+
+function resetSubtitleOffset() {
+  handleSubtitleOffsetChange(0)
 }
 
 function formatLastSaved(timestamp) {
@@ -1666,6 +1742,11 @@ onUnmounted(() => {
   // 停止轮询（轮询仅是备用方案）
   stopProgressPolling()
   stopProxyPolling()
+
+  if (offsetSyncTimer) {
+    clearTimeout(offsetSyncTimer)
+    offsetSyncTimer = null
+  }
 })
 
 onBeforeRouteLeave(async (to, from) => {

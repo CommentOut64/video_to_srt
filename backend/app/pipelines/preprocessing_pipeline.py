@@ -17,7 +17,7 @@ v3.1.0 更新：
 
 import logging
 import time
-from typing import Any, Dict, List, Optional, Set, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 from pathlib import Path
 
 from app.services.audio.chunk_engine import ChunkEngine, AudioChunk
@@ -57,7 +57,8 @@ class PreprocessingPipeline:
         vad_config: Optional[VADConfig] = None,  # V3.1.0: 新增 VAD 配置参数
         logger: Optional[logging.Logger] = None,
         cancellation_token: Optional["CancellationToken"] = None,  # v3.1.0: 新增
-        progress_emitter: Optional["ProgressEventEmitter"] = None
+        progress_emitter: Optional["ProgressEventEmitter"] = None,
+        diagnostic_service: Optional[Any] = None  # V3.2.0+dev.20260131: 诊断服务
     ):
         """
         初始化预处理流水线
@@ -69,11 +70,14 @@ class PreprocessingPipeline:
             logger: 日志记录器（可选）
             cancellation_token: 取消令牌（可选，v3.1.0）
             progress_emitter: 进度发射器（可选）
+            diagnostic_service: 诊断服务实例（可选，V3.2.0+dev.20260131）
         """
         self.config = config
         self.logger = logger or logging.getLogger(__name__)
         self.cancellation_token = cancellation_token  # v3.1.0
         self.progress_emitter = progress_emitter
+        self.diagnostic_service = diagnostic_service  # V3.2.0+dev.20260131
+        self._vad_intervals: Optional[List[Tuple[float, float]]] = None
         if vad_config is None:
             from app.services.runtime_param_resolver import build_vad_config
 
@@ -166,6 +170,7 @@ class PreprocessingPipeline:
         self.logger.info(f"开始预处理流程: {video_path}")
         token = self.cancellation_token  # v3.1.0: 简化引用
         job_id = job_state.job_id if job_state else None
+        self._vad_intervals = None
         sse_manager = None
         if job_id:
             from app.services.sse_service import get_sse_manager
@@ -295,6 +300,8 @@ class PreprocessingPipeline:
                     self.logger.warning("[V3.2.0+dev.20260122.03] 保存 VAD 缓存失败: %s", e)
         else:
             self.logger.info("[V3.1.0] 跳过 Stage 1 (音频提取 + VAD)")
+            if self._vad_intervals is None:
+                self.logger.info("VAD 区间缺失（使用缓存/检查点恢复），对齐阶段将跳过 VAD 锚点约束")
 
         # Stage 2: 频谱分诊（如果启用，逐chunk可中断）
         if self.spectral_triage_stage:
@@ -555,6 +562,8 @@ class PreprocessingPipeline:
                         lang_map[chunk_index] = {
                             "language": prediction.language,
                             "confidence": prediction.confidence,
+                            # V3.2.2+dev.20260201.01: 添加 Top-2 语言置信度
+                            "top2_confidence": prediction.top2_confidence,
                             "raw_label": prediction.raw_label,
                             "raw_language": prediction.raw_language,
                             "raw_confidence": prediction.raw_confidence,
@@ -586,11 +595,23 @@ class PreprocessingPipeline:
                     cached = lang_map.get(chunk.index)
                     if not cached:
                         chunk.language = "auto"
-                        chunk.language_confidence = 0.0
+                        chunk.language_confidence = {}
                         continue
+
+                    # V3.2.2+dev.20260201.01: 使用 Top-2 置信度字典
+                    top2_conf = cached.get("top2_confidence")
+                    if top2_conf and isinstance(top2_conf, dict):
+                        chunk.language_confidence = top2_conf
+                    else:
+                        # 回退：使用单一置信度
+                        lang = cached.get("language", "auto")
+                        conf = float(cached.get("confidence", 0.0))
+                        chunk.language_confidence = {lang: conf} if lang != "auto" and conf > 0 else {}
+
                     chunk.language = cached.get("language", "auto")
-                    chunk.language_confidence = float(cached.get("confidence", 0.0))
-                    if chunk.language_confidence < self.config.langid_confidence_threshold:
+                    # 获取 Top-1 置信度用于阈值判断
+                    top1_confidence = max(chunk.language_confidence.values()) if chunk.language_confidence else 0.0
+                    if top1_confidence < self.config.langid_confidence_threshold:
                         chunk.language = "auto"
 
                 languages = [chunk.language for chunk in chunks if chunk.language]
@@ -644,7 +665,7 @@ class PreprocessingPipeline:
                 )
                 for chunk in chunks:
                     chunk.language = "auto"
-                    chunk.language_confidence = 0.0
+                    chunk.language_confidence = {}
 
         # Stage 5: Speaker 声纹提取（可选，失败不阻断）
         if chunks and self.config.enable_speaker_embedding:
@@ -809,6 +830,50 @@ class PreprocessingPipeline:
                 for chunk in chunks:
                     chunk.speaker_embedding = None
 
+        # Stage 6: Speaker 在线聚类（可选，依赖声纹提取）
+        # V3.2.0+dev.20260207.01: 最小可行版本 - 余弦相似度聚类 + 防抖
+        has_embeddings = any(chunk.speaker_embedding for chunk in chunks)
+        if chunks and self.config.enable_speaker_embedding and has_embeddings:
+            self.logger.info("Stage 6: 说话人在线聚类")
+            try:
+                from app.services.speaker_cluster_service import (
+                    get_speaker_cluster_service,
+                    SpeakerClusterConfig,
+                )
+
+                cluster_config = SpeakerClusterConfig(
+                    similarity_threshold=0.50,  # 折中阈值
+                    debounce_count=2,
+                    min_turn_duration=1.5,
+                    min_turn_chunks=3,
+                    enabled=True,
+                )
+                cluster_service = get_speaker_cluster_service(
+                    config=cluster_config, logger=self.logger
+                )
+                cluster_service.reset()
+
+                speaker_changes = 0
+                for chunk in chunks:
+                    if not chunk.speaker_embedding:
+                        continue
+                    result = cluster_service.cluster(
+                        embedding=chunk.speaker_embedding,
+                        chunk_start=chunk.start,
+                        chunk_end=chunk.end,
+                    )
+                    chunk.primary_speaker_id = result.speaker_id
+                    if result.is_speaker_changed:
+                        speaker_changes += 1
+
+                self.logger.info(
+                    "说话人聚类完成: %d 人, %d 次切换",
+                    cluster_service.speaker_count,
+                    speaker_changes,
+                )
+            except Exception as e:
+                self.logger.warning("说话人聚类失败，已跳过: %s", e)
+
         self.logger.info(f"预处理流程完成: {len(chunks)} 个chunk准备就绪")
 
         return chunks
@@ -852,8 +917,14 @@ class PreprocessingPipeline:
             audio_path=video_path,
             enable_demucs=False,  # 关键：不在这里执行Demucs
             vad_config=vad_config,
-            progress_callback=progress_callback
+            progress_callback=progress_callback,
+            diagnostic_service=self.diagnostic_service  # V3.2.0+dev.20260131: 传递诊断服务
         )
+        self._vad_intervals = self._build_vad_intervals_from_segments(
+            self.chunk_engine.get_last_vad_segments()
+        )
+        if not self._vad_intervals:
+            self.logger.info("未获取到真实 VAD 区间，对齐阶段将跳过 VAD 锚点约束")
 
         self.logger.info(
             f"VAD切分完成: {len(chunks)} 个chunk, "
@@ -936,6 +1007,37 @@ class PreprocessingPipeline:
         except Exception as e:
             self.logger.error(f"[V3.1.0] 从 checkpoint 恢复 chunks 失败: {e}")
             return None
+
+    def get_vad_intervals(self) -> Optional[List[Tuple[float, float]]]:
+        """返回最近一次 VAD 语音区间（秒级）。"""
+        if not self._vad_intervals:
+            return None
+        return list(self._vad_intervals)
+
+    @staticmethod
+    def _build_vad_intervals_from_segments(
+        segments: Optional[List[Dict[str, Any]]],
+    ) -> Optional[List[Tuple[float, float]]]:
+        """从 VAD 段列表提取区间，过滤无效边界。"""
+        if not segments:
+            return None
+        intervals: List[Tuple[float, float]] = []
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            start = seg.get("start")
+            end = seg.get("end")
+            if start is None or end is None:
+                continue
+            try:
+                start_val = float(start)
+                end_val = float(end)
+            except (TypeError, ValueError):
+                continue
+            if end_val <= start_val:
+                continue
+            intervals.append((start_val, end_val))
+        return intervals or None
 
     def get_statistics(self, chunks: List[AudioChunk]) -> dict:
         """

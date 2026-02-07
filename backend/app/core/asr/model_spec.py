@@ -3,6 +3,7 @@
 用于统一描述各类模型（ASR/标点/VAD/分离/质量/LangID/声纹等），支持多框架与扩展。
 V3.2.0+dev.20260114.01
 V3.2.0+dev.20260127.01: 增加 speaker 模型类型。
+V3.2.0+dev.20260128.06: 移除 wfst 框架类型。
 """
 
 from __future__ import annotations

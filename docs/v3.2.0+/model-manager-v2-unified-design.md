@@ -21,14 +21,14 @@
 ## 2. 架构设计（模型管理专用）
 
 ### 2.1 ModelSpec 与注册表
-- 新增 `backend/app/core/asr/model_spec.py`：`ModelSpec/ModelSource`（框架 `onnx/torch/ctranslate2/external`，kind 覆盖 asr/vad/separation/quality/langid/punct）。  
+- 新增 `backend/app/core/asr/model_spec.py`：`ModelSpec/ModelSource`（框架 `onnx/torch/ctranslate2/external/wfst`，kind 覆盖 asr/vad/separation/quality/langid/punct）。  
 - 新增注册表 `backend/app/config/models.yaml`（可扩展 `models.d/*.yaml`）：  
   - `sensevoice-small`（ONNX）、`whisper-medium`（ctranslate2）、`brouhaha-quality`（torch，env.pip 锁版本）、`langid-voxlingua`、`silero-vad`、`demucs-htdemucs`。  
-  - 标点模型：`punct-zh`, `punct-en`, `punct-ja` 等，声明语言、框架、资源估算与 fallback 优先级。  
+- 标点模型：`punct-ct-transformer-zh`, `punct-edge-punct-en`, `punct-pcs-47lang`（含 `punct-char-bert-ja` 备用），声明语言、框架、资源估算与 fallback 优先级。  
 
 ### 2.2 Loader 抽象
 - `backend/app/core/asr/loader_base.py`：`ModelLoader.load/unload` 抽象。  
-- 实现文件：`onnx_loader.py`（ort+线程策略）、`torch_loader.py`（torch+autocast+env 校验）、`ct2_loader.py`（faster-whisper）、`external_loader.py`（外部进程/服务句柄）。  
+- 实现文件：`onnx_loader.py`（ort+线程策略）、`torch_loader.py`（torch+autocast+env 校验）、`ct2_loader.py`（faster-whisper）、`external_loader.py`（外部进程/服务句柄）、`wfst_loader.py`（WeTextProcessing）。  
 - Loader 需读取 `spec.env` 设定环境/校验依赖，缺失时返回可安装列表。  
 
 ### 2.3 ModelManager V2 主体

@@ -16,6 +16,7 @@
 import { ref, onUnmounted, unref, watch, toRaw } from 'vue'
 import localforage from 'localforage'
 import transcriptionApi from '@/services/api/transcriptionApi'
+import { useProjectStore } from '@/stores/projectStore'
 
 /**
  * 防抖函数
@@ -91,6 +92,7 @@ async function saveQueue(jobId, queue) {
 }
 
 export function useSubtitleSync(jobIdRef) {
+  const projectStore = useProjectStore()
   // 待同步的编辑队列（Map: index -> update data）
   const pendingUpdates = ref(new Map())
 
@@ -168,8 +170,8 @@ export function useSubtitleSync(jobIdRef) {
     // 构建更新数据（只包含有值的字段）
     const update = {}
     if (text !== undefined) update.text = text
-    if (start !== undefined) update.start = start
-    if (end !== undefined) update.end = end
+    if (start !== undefined) update.start = projectStore.toBaseTime(start)
+    if (end !== undefined) update.end = projectStore.toBaseTime(end)
 
     // 加入同步队列（Map 会自动去重，只保留最后一次修改）
     pendingUpdates.value.set(index, update)
@@ -197,7 +199,14 @@ export function useSubtitleSync(jobIdRef) {
     pendingUpdates.value.forEach((update, index) => {
       const subtitle = projectStore.subtitles.find(s => s.sentenceIndex === index)
       if (!subtitle) return
-      projectStore.updateSubtitle(subtitle.id, update, { isUserEdit: true })
+      const displayUpdate = { ...update }
+      if (update.start !== undefined) {
+        displayUpdate.start = projectStore.toDisplayTime(update.start)
+      }
+      if (update.end !== undefined) {
+        displayUpdate.end = projectStore.toDisplayTime(update.end)
+      }
+      projectStore.updateSubtitle(subtitle.id, displayUpdate, { isUserEdit: true })
       appliedCount += 1
     })
     return appliedCount

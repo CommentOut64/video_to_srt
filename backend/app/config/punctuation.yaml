@@ -1,0 +1,78 @@
+# ================================
+# 标点静态配置（punctuation.yaml）
+# ================================
+# 说明：
+# - 模型/常量类配置建议保留在此处；
+# - 调度与后处理阈值支持通过运行参数覆盖（punctuation.postprocess.* / punctuation.scheduler.*）。
+
+# --------
+# 基础口径
+# --------
+default_language: zh
+fallback_priority: fast
+
+# --------
+# 模型相关（语言策略）
+# --------
+chinese:
+  model_id: punct-ct-transformer-zh
+  itn_first: false
+  fallback_on_oov: true
+
+english:
+  model_id: punct-distilbert-en
+  overlap_words: 10
+
+japanese:
+  model_id: punct-pcs-47lang
+
+# --------
+# 调度相关（可被运行参数覆盖）
+# --------
+scheduler:
+  mode: fast_only
+  fast_confidence_threshold: 0.55
+  alignment_coverage_threshold: 0.7
+  arbiter_conflict_threshold: 0.35
+  max_slow_retries: 1
+
+# --------
+# 后处理相关（可被运行参数覆盖）
+# --------
+postprocess:
+  # 快流（fast）
+  fast:
+    candidate_min_conf: 0.30
+    add_mid_conf: 0.70
+    add_end_conf: 0.75
+    keep_raw_mid_conf: 0.60
+    keep_raw_end_conf: 0.70
+    drop_raw_mid_conf: 0.35
+    drop_raw_end_conf: 0.50
+    question_gate_min_conf: 0.85
+    pause_end_min_sec: 0.35
+
+  # 双流（dual）
+  dual:
+    candidate_min_conf: 0.25
+    add_mid_conf: 0.60
+    add_end_conf: 0.65
+    keep_raw_mid_conf: 0.55
+    keep_raw_end_conf: 0.60
+    drop_raw_mid_conf: 0.30
+    drop_raw_end_conf: 0.40
+    question_gate_min_conf: 0.75
+    pause_end_min_sec: 0.25
+
+  # 常量（shared）
+  shared:
+    candidate_window_words: 1
+    conflict_window_chars: 1
+    max_repeat_punct: 1
+    allowed_punct_zh: "。？！；：，、"
+    allowed_punct_en: ".!?,;:"
+    comma_guard_enabled: false
+    comma_guard_min_conf: 0.85
+    comma_guard_min_chars: 6
+    comma_guard_min_words: 4
+    comma_guard_pause_min_sec: 0.25

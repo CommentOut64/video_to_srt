@@ -16,8 +16,9 @@ V3.2.0+dev.20260125.07: 支持运行时依赖注入（方案 B）
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
-from typing import List, Optional, TYPE_CHECKING
+from typing import List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
 
@@ -56,6 +57,7 @@ class PipelineOrchestrator:
         self.sse_manager = sse_manager
         self.hardware_profile_provider = hardware_profile_provider
         self.logger = logger or logging.getLogger(__name__)
+        self._preprocess_vad_intervals: Optional[List[Tuple[float, float]]] = None
 
     async def run_pipeline(
         self,
@@ -112,6 +114,7 @@ class PipelineOrchestrator:
                 cancellation_token=cancellation_token,
                 progress_emitter=progress_emitter,
             )
+            vad_intervals = self._preprocess_vad_intervals
 
             job.total = len(chunks)
             self.logger.info(f"音频处理完成: {len(chunks)} 个 Chunk")
@@ -163,12 +166,19 @@ class PipelineOrchestrator:
                     self.logger.warning("字幕恢复失败，将从头生成字幕")
 
             # 创建转录流水线
+            from app.services.punctuation.debug_utils import is_debug_punctuation_enabled
+            debug_config = getattr(job.settings, "debug", None)
+            debug_punctuation = is_debug_punctuation_enabled(
+                env_value=os.getenv("DEBUG_PUNCTUATION"),
+                config_value=bool(getattr(debug_config, "punctuation_output", False)),
+            )
             transcription_pipeline = AsyncDualPipeline(
                 job_id=job.job_id,
                 transcription_profile=profile_config.transcription_profile,
                 draft_engine=profile_config.draft_engine,
                 patch_engine=profile_config.patch_engine,
                 patching_threshold=profile_config.patching_threshold,
+                debug_punctuation=debug_punctuation,
                 logger=self.logger,
                 cancellation_token=cancellation_token,
                 progress_emitter=progress_emitter,
@@ -190,6 +200,7 @@ class PipelineOrchestrator:
                 full_audio_array=full_audio_array,
                 full_audio_sr=full_audio_sr,
                 job_dir=_job_dir,
+                vad_intervals=vad_intervals,
                 processed_indices=(
                     resume_context.safe_processed_indices
                     if resume_context.is_resuming
@@ -237,7 +248,15 @@ class PipelineOrchestrator:
             self._update_progress(job, "finalize", 0, "生成字幕文件...")
             srt_path = _job_dir / f"{Path(job.filename).stem}.srt"
             subtitle_output = get_subtitle_output_service()
-            segments = subtitle_output.build_segments(final_sentences)
+            from app.services.user_config_service import get_user_config_service
+            offset = get_user_config_service().resolve_subtitle_time_offset(
+                getattr(job, "subtitle_time_offset", None)
+            )
+            segments = subtitle_output.build_segments(
+                final_sentences,
+                apply_offset=True,
+                offset_override=offset
+            )
             subtitle_output.write_srt(segments, srt_path)
 
             job.srt_path = str(srt_path)
@@ -272,6 +291,7 @@ class PipelineOrchestrator:
 
         V3.2.0+dev.20260125.07: 支持 cancellation_token 和 progress_emitter
         """
+        self._preprocess_vad_intervals = None
         from app.pipelines.preprocessing_pipeline import PreprocessingPipeline
         from app.services.audio.chunk_engine import ChunkEngine
 
@@ -283,6 +303,14 @@ class PipelineOrchestrator:
 
         chunk_engine = ChunkEngine(logger=self.logger)
 
+        # V3.2.0+dev.20260131: 创建诊断服务
+        from app.services.segmentation_diagnostic_service import get_diagnostic_service
+        diagnostic_service = get_diagnostic_service(
+            job_id=job.job_id,
+            job_dir=Path(job.dir) if job.dir else None,
+            enabled=None  # 默认启用，可通过环境变量控制
+        )
+
         preprocessing_pipeline = PreprocessingPipeline(
             config=job.settings.preprocessing,
             chunk_engine=chunk_engine,
@@ -290,6 +318,7 @@ class PipelineOrchestrator:
             logger=self.logger,
             cancellation_token=cancellation_token,
             progress_emitter=progress_emitter,
+            diagnostic_service=diagnostic_service,  # V3.2.0+dev.20260131: 传递诊断服务
         )
 
         checkpoint_data = (
@@ -319,6 +348,16 @@ class PipelineOrchestrator:
             stats["fuse_retry_max"],
         )
 
+        # V3.2.0+dev.20260131: 导出诊断文件
+        if diagnostic_service:
+            try:
+                diagnostic_file = diagnostic_service.export_to_file()
+                if diagnostic_file:
+                    self.logger.info(f"断句诊断文件已保存: {diagnostic_file}")
+            except Exception as e:
+                self.logger.warning(f"导出诊断文件失败: {e}", exc_info=True)
+
+        self._preprocess_vad_intervals = preprocessing_pipeline.get_vad_intervals()
         return chunks
 
     def resolve_profiles(self, job: JobState) -> ProfileConfig:

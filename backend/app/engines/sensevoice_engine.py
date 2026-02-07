@@ -65,6 +65,7 @@ class SenseVoiceEngine(ASREngine):
             raise
 
         words = self._build_words(result.get("words") or [])
+        raw_tokens = result.get("raw_tokens") if isinstance(result, dict) else None
         segments = self._build_segments(result, words)
         event_tag = result.get("event")
 
@@ -77,6 +78,9 @@ class SenseVoiceEngine(ASREngine):
                 "emotion_tag": result.get("emotion"),
                 "event_tag": event_tag,
                 "text_with_tags": result.get("text"),
+                "raw_tokens": raw_tokens,
+                # V3.2.2+dev.20260201.01: SenseVoice 语言标签置信度
+                "sv_language_info": result.get("sv_language_info"),
             },
         )
 
@@ -85,6 +89,7 @@ class SenseVoiceEngine(ASREngine):
             text_clean=result.get("text_clean"),
             segments=segments,
             words=words or None,
+            raw_tokens=raw_tokens,
             confidence=float(result.get("confidence", 0.0)),
             language=result.get("language") or (language or self.language),
             emotion=result.get("emotion"),
@@ -114,7 +119,10 @@ class SenseVoiceEngine(ASREngine):
                     start=float(word.get("start", 0.0)),
                     end=float(word.get("end", 0.0)),
                     confidence=word.get("confidence"),
+                    confidence_display_raw=word.get("confidence_display_raw"),
+                    confidence_raw=word.get("confidence_raw"),
                     is_pseudo=bool(word.get("is_pseudo", False)),
+                    token_type=word.get("token_type"),
                 )
             )
         return words
