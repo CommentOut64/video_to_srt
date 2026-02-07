@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, TYPE_CHECKING, Tuple
 
 from app.models.confidence_models import AlignedWord as AlignedWord
-from app.models.sensevoice_models import WordTimestamp
+from app.models.sensevoice_models import SentenceSegment, WordTimestamp
 from app.services.alignment.gap_resolver import GapResolution
 from app.services.punctuation.base import PuncPosition, WordTimestampLike
 
@@ -207,6 +207,61 @@ class AnnotatedWord:
     start: Optional[float]
     end: Optional[float]
     trailing_punct: str = ""
+    confidence: Optional[float] = None
+    confidence_source: Optional[str] = None
+    speaker_id: Optional[str] = None
+    track_id: Optional[str] = None
+
+
+@dataclass
+class L5Input:
+    """L5 语义注入层输入。"""
+
+    alignment_result: AlignmentResult
+    punct_track: PunctTrack
+    language: str = "auto"
+
+
+@dataclass
+class L5Output:
+    """L5 语义注入层输出。"""
+
+    annotated_words: List[AnnotatedWord]
+    injection_report: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class L6Input:
+    """L6 切分层输入。"""
+
+    annotated_words: List[AnnotatedWord]
+    vad_intervals: Optional[List[Tuple[float, float]]] = None
+
+
+@dataclass
+class L6Output:
+    """L6 切分层输出。"""
+
+    sentence_segments: List[SentenceSegment]
+    words_for_split: List[WordTimestamp]
+    segmentation_report: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class L7Input:
+    """L7 输出层输入。"""
+
+    chunk_index: int
+    sentence_segments: List[SentenceSegment]
+    injection_report: Optional[Dict[str, Any]] = None
+    segmentation_report: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class L7Output:
+    """L7 输出层输出。"""
+
+    output_payload: Dict[str, Any] = field(default_factory=dict)
 
 
 __all__ = [
@@ -220,6 +275,12 @@ __all__ = [
     "L3Output",
     "L4Input",
     "L4Output",
+    "L5Input",
+    "L5Output",
+    "L6Input",
+    "L6Output",
+    "L7Input",
+    "L7Output",
     "NormalizationResult",
     "PunctSource",
     "PunctTrack",
