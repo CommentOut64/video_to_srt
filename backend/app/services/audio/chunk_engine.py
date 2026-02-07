@@ -65,6 +65,10 @@ class AudioChunk:
 
     # V3.2.0+dev.20260127.06: 声纹向量字段（用于后续说话人聚类）
     speaker_embedding: Optional[List[float]] = None  # 192 维声纹向量
+    # V3.2.0+dev.20260204.01: 说话人轨道与主轨标识（L0 透传）
+    speaker_tracks: Optional[List[Dict[str, Any]]] = None
+    speaker_id: Optional[str] = None
+    primary_speaker_id: Optional[str] = None
 
     @property
     def duration(self) -> float:
@@ -92,6 +96,9 @@ class AudioChunk:
             "language_confidence": self.language_confidence,
             # 避免日志/序列化膨胀，仅记录声纹维度
             "speaker_embedding_dim": len(self.speaker_embedding) if self.speaker_embedding else None,
+            "speaker_id": self.speaker_id,
+            "primary_speaker_id": self.primary_speaker_id,
+            "speaker_tracks_count": len(self.speaker_tracks) if self.speaker_tracks else None,
         }
 
 

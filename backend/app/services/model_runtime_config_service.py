@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -76,6 +77,28 @@ class ModelRuntimeConfigService:
             except Exception as exc:
                 logger.error("加载运行参数配置失败: %s", exc)
                 return {"version": _CONFIG_VERSION, "global": {}, "runtime": {}, "per_model": {}}
+
+    @staticmethod
+    def _apply_runtime_aliases(runtime_raw: Dict[str, Any]) -> Dict[str, Any]:
+        """兼容期别名映射（旧 -> 新）。"""
+        runtime = copy.deepcopy(runtime_raw or {})
+        punct = dict(runtime.get("punctuation") or {})
+        arbitration = dict(runtime.get("arbitration") or {})
+        legacy_arbiter = dict(runtime.get("arbiter") or {})
+
+        if "source_preference" not in punct and "fallback_priority" in punct:
+            punct["source_preference"] = punct.get("fallback_priority")
+
+        if "enable" not in arbitration and "enable_arbitration" in punct:
+            arbitration["enable"] = punct.get("enable_arbitration")
+        if "enable" not in arbitration and "enable_arbitration" in legacy_arbiter:
+            arbitration["enable"] = legacy_arbiter.get("enable_arbitration")
+        if "text_source_preference" not in arbitration and "text_source" in arbitration:
+            arbitration["text_source_preference"] = arbitration.get("text_source")
+
+        runtime["punctuation"] = punct
+        runtime["arbitration"] = arbitration
+        return runtime
 
     def _save_raw_config(self, data: Dict[str, Any]) -> None:
         with self._lock:
@@ -342,6 +365,11 @@ class ModelRuntimeConfigService:
                 "enable_punctuation": True,
                 "default_language": "zh",
                 "fallback_priority": "fast",
+                "source_preference": "merged",
+                # V3.2.0+dev.20260204.10: Whisper 原始标点抽取门控
+                "raw_source.min_mapping_coverage": 0.6,
+                "raw_source.max_weak_ratio": 0.8,
+                "sv_fallback_mode": "strict",
                 "cache_models": True,
                 "max_cached_models": 3,
                 "device": "cpu",
@@ -371,6 +399,46 @@ class ModelRuntimeConfigService:
                 "fast_delay_budget_sec": 2.0,
                 "force_split_on_sentence_end_punct": True,
                 "keep_sentence_end_punct": False,
+            },
+            # V3.2.0+dev.20260205.09: L4 对齐层运行参数
+            "alignment": {
+                "enable": True,
+                "score_threshold": 0.30,
+                "gap_ratio_low": 0.10,
+                "gap_ratio_mid": 0.30,
+                "gap_ratio_max": 0.40,
+                "min_valid_neighbors": 1,
+                "min_word_duration_ms": 100,
+                "use_sv_timebase": True,
+                # V3.2.0+dev.20260206.02: 双轨实验仅在 L4-L6 串行执行，不并行占用 GPU。
+                "enable_dual_time_experiment": False,
+                "dual_time_mode": "off",
+                "dual_time_write_debug_srt": False,
+                "dual_time_boundary_tolerance_ms": 250,
+                "dual_time_active_min_boundary_f1": 0.85,
+            },
+            # V3.2.0+dev.20260204.03: L2 文本仲裁层运行参数
+            "arbitration": {
+                "enable": True,
+                "text_source_preference": "auto",
+                "min_length_ratio": 0.65,
+                "max_length_ratio": 3.0,
+                "low_confidence_threshold": 0.5,
+                "hallucination_block": True,
+            },
+            # V3.2.0+dev.20260204.02: L1 规范化层运行参数
+            "normalization": {
+                "itn.enable": True,
+                "itn.quality_min_ratio": 0.30,
+                "itn.quality_max_ratio": 3.00,
+                "decimal_protection.enable": True,
+                "safe_punct.enable": True,
+                "abbrev_dot_protection.enable": True,
+                "hyphen_protection.enable": True,
+                "cjk_single_digit_to_zh": True,
+                "cjk_digit_merge": True,
+                "collapse_spaces": True,
+                "punct_width": "auto",
             },
             "pipeline": {
                 "batch_size": 16,
@@ -479,7 +547,7 @@ class ModelRuntimeConfigService:
 
     def get_effective_runtime_global(self) -> Dict[str, Any]:
         raw = self._load_raw_config()
-        runtime_raw = raw.get("runtime", {})
+        runtime_raw = self._apply_runtime_aliases(raw.get("runtime", {}))
         env_raw = self._read_env_runtime()
         defaults = self._runtime_defaults()
 
@@ -523,7 +591,7 @@ class ModelRuntimeConfigService:
             }
 
         raw = self._load_raw_config()
-        runtime_raw = raw.get("runtime", {})
+        runtime_raw = self._apply_runtime_aliases(raw.get("runtime", {}))
         env_raw = self._read_env_runtime()
         defaults = self._runtime_defaults().get(group, {})
 
@@ -692,3 +760,4 @@ def reset_model_runtime_config_service() -> None:
     """重置运行参数配置服务（用于测试）。"""
     global _runtime_config_service
     _runtime_config_service = None
+

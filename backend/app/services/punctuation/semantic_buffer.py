@@ -47,6 +47,7 @@ def _is_decimal_point(text: str, index: int) -> bool:
 _WEAK_PUNCTUATION = set("，、；,;:")
 _PUNCTUATION_SET = set(",.!?;:\"()[]{}，。！？；：、（）【】《》""「」『』")
 _TRAILING_PUNCTUATION = set(",，;:；：、。.") 
+_SPECIAL_TAG_PATTERN = re.compile(r"<\|.*?\|>")
 
 
 def _is_removable_punctuation(text: str, index: int) -> bool:
@@ -908,6 +909,13 @@ class SemanticBuffer:
             sentence_confidence = strict_confidence if sentence_words else confidence
             sentence_word_models = self._build_word_models(sentence_words)
             display_text = self._strip_trailing_punctuation(sentence_text).strip()
+            # V3.2.0+dev.20260205.08:
+            # SemanticBuffer 不承担清洗职责（由 L1 统一规范化保证 clean 口径）。
+            # 若仍出现 <|...|>/▁，视为上游契约违约：直接跳过该句，避免污染下游展示。
+            if "<|" in display_text or "▁" in display_text:
+                self._logger.debug("SemanticBuffer 检测到污染展示文本，跳过输出: %s", display_text[:50])
+                start_idx = end_idx + 1
+                continue
             # V3.2.0+dev.20260131.04: 仅修复英文展示文本的缩写撇号，避免影响时间戳与切分。
             if _should_restore_contractions(display_text, language):
                 display_text = _restore_english_contractions(display_text)

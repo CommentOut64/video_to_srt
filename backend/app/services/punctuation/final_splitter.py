@@ -1,6 +1,6 @@
 """
 最终切分器（Phase G-4）。
-V3.2.0+dev.20260203.03
+V3.2.0+dev.20260205.10
 """
 from __future__ import annotations
 
@@ -306,10 +306,39 @@ class FinalSplitter:
         token_strength = self._trailing_punct_strength(word)
         return max(token_strength, external_strength.get(idx, 0))
 
+    # V3.2.0+dev.20260206.03: 长句二次切分需要统一边界强度函数。
+    # 这里复用“词尾标点 + 时间停顿”的联合评分，避免 _find_best_boundary 调用缺失。
+    def _get_boundary_strength(self, words: List[WordTimestamp], idx: int) -> int:
+        token_strength = self._trailing_punct_strength(words[idx].word or "")
+        pause_strength = self._pause_strength(words, idx)
+        return max(token_strength, pause_strength)
+
     def _pause_strength(self, words: List[WordTimestamp], idx: int) -> int:
         if idx >= len(words) - 1:
             return 0
-        gap = (words[idx + 1].start or 0.0) - (words[idx].end or 0.0)
+        # V3.2.0+dev.20260205.10: 伪对齐词可能压扁时间戳，跳过连续伪词以恢复真实停顿切分能力。
+        # 伪对齐词可能会“填平”真实停顿，导致 pause_strength 失效。
+        # 这里跳过连续的 is_pseudo 词，使用下一个非伪词作为边界参考。
+        # 关键策略：只在“下一段非伪词的前一个词”处触发边界（即 next_idx - 1），
+        # 这样能把中间的伪词一起归入前一句，避免产生“伪词单独成句”的碎片化结果，
+        # 同时也避免把边界错误地提前到更早的真实词上。
+        next_idx = idx + 1
+        while next_idx < len(words) and getattr(words[next_idx], "is_pseudo", False):
+            next_idx += 1
+        if next_idx >= len(words):
+            return 0
+        boundary_idx = next_idx - 1
+        if idx != boundary_idx:
+            return 0
+
+        current_end = float(words[idx].end or 0.0)
+        if getattr(words[idx], "is_pseudo", False):
+            for prev in range(idx - 1, -1, -1):
+                if not getattr(words[prev], "is_pseudo", False):
+                    current_end = float(words[prev].end or current_end)
+                    break
+
+        gap = float(words[next_idx].start or 0.0) - current_end
         if gap >= self.config.long_pause:
             return 2
         if gap >= self.config.soft_pause:

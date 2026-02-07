@@ -1,6 +1,6 @@
 """
-默认分句服务（封装旧分句逻辑）。
-V3.2.0+dev.20260203.01
+默认分句服务（兼容壳，草稿链专用）。
+V3.2.0+dev.20260207.03
 """
 
 from __future__ import annotations
@@ -18,7 +18,14 @@ if TYPE_CHECKING:
 
 
 class DefaultSegmenter:
-    """默认分句服务：封装旧分句/语义分组逻辑。"""
+    """
+    默认分句服务（兼容名）。
+
+    说明：
+    - 该类仅用于草稿链（draft）；
+    - 定稿链已迁移到 L4→L5→L6→L7 主路径；
+    - 推荐新代码优先使用 `DraftSegmenter` 命名。
+    """
 
     def __init__(
         self,
@@ -104,7 +111,7 @@ class DefaultSegmenter:
         chunk: AudioChunk,
         is_draft: bool = True,
     ) -> List[SentenceSegment]:
-        """快流分句（草稿/定稿）。"""
+        """快流分句（仅草稿链）。"""
         sentences = self._split_draft_core(sv_result, chunk, is_draft=is_draft)
 
         if not self.is_enable_cross_chunk_merge or not sentences:
@@ -127,17 +134,11 @@ class DefaultSegmenter:
         chunk: AudioChunk,
         language: Optional[str] = None,
     ) -> List[SentenceSegment]:
-        """慢流降级：使用 SenseVoice 结果分句。"""
-        sentences = self.unified_splitter.split_draft_from_sv(
-            sv_result,
-            chunk_start=chunk.start,
-            chunk_end=chunk.end,
-            is_final_output=True,
-            language=language,
+        """已禁用：定稿路径必须走 L4→L5→L6→L7，不允许再走 DefaultSegmenter。"""
+        raise RuntimeError(
+            "DefaultSegmenter.split_final_from_sv 已禁用："
+            "定稿请使用 L4->L5->L6->L7 主链。"
         )
-        if self.is_enable_semantic_grouping and sentences:
-            sentences = self.final_grouper.group(sentences)
-        return sentences
 
     def _split_draft_core(
         self,
@@ -215,3 +216,7 @@ class DefaultSegmenter:
         )
 
         return merged_sentence
+
+
+class DraftSegmenter(DefaultSegmenter):
+    """草稿分句服务（推荐名称，等价于 DefaultSegmenter）。"""

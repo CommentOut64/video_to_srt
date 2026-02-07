@@ -1,20 +1,21 @@
 """
 快流标点编排器（Fast Punctuation Pipeline）。
-V3.2.0+dev.20260202.03
+V3.2.0+dev.20260204.06
 """
 from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from app.services.alignment.types import NormalizationResult
-from app.services.punctuation.base import PunctuationResult, build_split_points
+from app.services.alignment.types import NormalizationResult, TextTrack
+from app.services.punctuation.base import PunctuationResult, apply_punctuation, build_split_points
 from app.services.punctuation.debug_utils import append_debug_punctuation_line
 from app.services.punctuation.postprocess import (
     PunctuationPostprocessResult,
     get_postprocess_config,
     postprocess_punctuation,
 )
+from app.services.punctuation.punctuation_processor import PunctuationProcessor
 from app.services.punctuation.scheduler import get_punctuation_scheduler
 from app.services.sse_service import get_sse_manager
 
@@ -37,6 +38,11 @@ class FastPunctuationPipeline:
         self.punctuation_service = punctuation_service
         self.logger = logger or logging.getLogger(__name__)
         self._punctuation_scheduler = get_punctuation_scheduler()
+        # V3.2.0+dev.20260204.06: 统一入口 - 快流标点也通过 L3Processor 产出 PunctTrack
+        self._l3_processor = PunctuationProcessor(
+            punctuation_service=punctuation_service,
+            logger=self.logger,
+        )
 
     async def apply(
         self,
@@ -59,16 +65,18 @@ class FastPunctuationPipeline:
         language = chunk.language or sv_result.get("language") or "auto"
 
         try:
-            result = await self.punctuation_service.restore(
-                text=clean_text,
-                language=language,
-                word_timestamps=words,
+            chosen_track = self._resolve_chosen_track(ctx, sv_result, normalization, language)
+            output = await self._l3_processor.process(
+                data=self._l3_input(chosen_track, words)
             )
         except Exception as exc:
-            self.logger.warning("快流标点恢复失败，继续主流程: %s", exc)
+            self.logger.warning("快流标点处理失败，继续主流程: %s", exc)
             return sv_result
 
+        punct_track = output.punct_track
+        # 兼容：仍写入旧 metadata 结构，供 SemanticBuffer/debug 使用
         metadata = sv_result.setdefault("metadata", {})
+        positions = list(punct_track.positions or [])
         post_config = get_postprocess_config("fast")
         post = postprocess_punctuation(
             raw_text=raw_text,
@@ -78,18 +86,29 @@ class FastPunctuationPipeline:
             words=words,
             language=language,
             mode="fast",
-            candidates=result.punctuation_positions,
+            candidates=positions,
             config=post_config,
         )
+        model_id = punct_track.confidence_stats.get("model_id", "")
+        processing_time_ms = punct_track.confidence_stats.get("processing_time_ms", 0.0)
+        model_confidence = punct_track.confidence_stats.get("model_confidence", 0.0)
+        model_result = PunctuationResult(
+            text=apply_punctuation(clean_text, post.final_positions),
+            split_points=[],
+            punctuation_positions=[],
+            confidence=float(model_confidence or 0.0),
+            model_id=str(model_id or ""),
+            processing_time_ms=float(processing_time_ms or 0.0),
+        )
         metadata["punctuation"] = self._postprocess_result_to_dict(
-            result,
+            model_result,
             post,
             words,
             mode="fast",
         )
 
         decision = self._punctuation_scheduler.evaluate_fast(
-            self._build_postprocess_result(result, post, words),
+            self._build_postprocess_result(model_result, post, words),
             sv_confidence=sv_result.get("confidence"),
         )
         metadata["punctuation_decision"] = {
@@ -97,8 +116,48 @@ class FastPunctuationPipeline:
             "reason": decision.reason,
             "mode": self._punctuation_scheduler.policy.mode.value,
         }
+        if ctx is not None:
+            ctx.punct_track = punct_track
         self._emit_debug_outputs(ctx, raw_text, metadata, sv_result.get("confidence"))
         return sv_result
+
+    @staticmethod
+    def _resolve_chosen_track(
+        ctx: Optional["ProcessingContext"],
+        sv_result: Dict[str, Any],
+        normalization: NormalizationResult,
+        language: str,
+    ) -> TextTrack:
+        if ctx is not None and getattr(ctx, "text_tracks", None) is not None:
+            track = getattr(ctx.text_tracks, "sv_track", None)
+            if track is not None:
+                return track
+        raw_text = str(sv_result.get("raw_text") or normalization.text_itn_raw or "")
+        return TextTrack(
+            raw_text=raw_text,
+            text_itn_raw=normalization.text_itn_raw,
+            text_clean=normalization.text_clean or normalization.text_itn_raw,
+            char_mapping=normalization.char_mapping,
+            raw_to_clean=normalization.raw_to_clean,
+            clean_to_raw=normalization.clean_to_raw,
+            language=language or "auto",
+            source="sv",
+            itn_fallback=normalization.itn_fallback,
+            itn_fallback_reason=normalization.itn_fallback_reason,
+            mapping_coverage=normalization.mapping_coverage,
+        )
+
+    @staticmethod
+    def _l3_input(track: TextTrack, words: List[Dict[str, Any]]):
+        # 延迟导入避免循环依赖
+        from app.services.alignment.types import L3Input
+
+        return L3Input(
+            chosen_text_track=track,
+            sv_punct_source=None,
+            wh_punct_source=None,
+            word_timestamps=words,
+        )
 
     def _emit_debug_outputs(
         self,

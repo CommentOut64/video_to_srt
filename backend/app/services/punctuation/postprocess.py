@@ -1,6 +1,6 @@
 """
 统一标点后处理模块（快流/双流共用）。
-V3.2.0+dev.20260130.01
+V3.2.0+dev.20260205.02
 """
 from __future__ import annotations
 
@@ -9,9 +9,14 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from app.services.punctuation.base import PuncPosition, WordTimestampLike, apply_punctuation
 from app.services.punctuation.config import get_punctuation_config
+from app.services.text_pipeline_config import PunctuationRuntimeOverrides
 
 
 Mode = str
+
+
+_WEAK_PUNCTUATION_SET = set(",，、;；:：")
+_RAW_WEAK_RATIO_THRESHOLD = 0.8
 
 
 @dataclass
@@ -138,7 +143,12 @@ _DEFAULT_POSTPROCESS = {
 }
 
 
-def get_postprocess_config(mode: Mode, config: Optional[Dict[str, Any]] = None) -> PunctuationPostprocessConfig:
+def get_postprocess_config(
+    mode: Mode,
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    runtime: Optional[Dict[str, Any]] = None,
+) -> PunctuationPostprocessConfig:
     """按模式获取后处理配置。"""
     mode_key = "dual" if str(mode).lower() == "dual" else "fast"
     data = config or get_punctuation_config()
@@ -147,6 +157,41 @@ def get_postprocess_config(mode: Mode, config: Optional[Dict[str, Any]] = None) 
     shared.update(post_cfg.get("shared", {}) if isinstance(post_cfg, dict) else {})
     mode_cfg = dict(_DEFAULT_POSTPROCESS[mode_key])
     mode_cfg.update(post_cfg.get(mode_key, {}) if isinstance(post_cfg, dict) else {})
+
+    # V3.2.0+dev.20260204.09: 运行参数显式覆盖（仅覆盖 override 中出现的键）
+    overrides = PunctuationRuntimeOverrides.from_runtime(runtime)
+    mode_override = overrides.postprocess_dual if mode_key == "dual" else overrides.postprocess_fast
+    for key in (
+        "candidate_min_conf",
+        "add_mid_conf",
+        "add_end_conf",
+        "keep_raw_mid_conf",
+        "keep_raw_end_conf",
+        "drop_raw_mid_conf",
+        "drop_raw_end_conf",
+        "question_gate_min_conf",
+        "pause_end_min_sec",
+    ):
+        value = getattr(mode_override, key)
+        if value is not None:
+            mode_cfg[key] = value
+
+    shared_override = overrides.postprocess_shared
+    for key in (
+        "candidate_window_words",
+        "conflict_window_chars",
+        "max_repeat_punct",
+        "allowed_punct_zh",
+        "allowed_punct_en",
+        "comma_guard_enabled",
+        "comma_guard_min_conf",
+        "comma_guard_min_chars",
+        "comma_guard_min_words",
+        "comma_guard_pause_min_sec",
+    ):
+        value = getattr(shared_override, key)
+        if value is not None:
+            shared[key] = value
     return PunctuationPostprocessConfig(
         candidate_min_conf=float(mode_cfg["candidate_min_conf"]),
         add_mid_conf=float(mode_cfg["add_mid_conf"]),
@@ -233,6 +278,16 @@ def postprocess_punctuation(
         clean_to_word,
         words,
     )
+    # V3.2.0+dev.20260204.14: 保护性门控 - 弱标点过密时视为噪声，短句也防止“每词一逗号”。
+    if raw_marks and words:
+        word_count = len(words)
+        weak_count = sum(1 for mark in raw_marks if mark.punctuation in _WEAK_PUNCTUATION_SET)
+        weak_ratio = weak_count / max(word_count, 1)
+        if (
+            (word_count >= 6 and weak_ratio >= _RAW_WEAK_RATIO_THRESHOLD)
+            or (word_count >= 4 and weak_count >= max(2, word_count - 1))
+        ):
+            raw_marks = [mark for mark in raw_marks if mark.punctuation not in _WEAK_PUNCTUATION_SET]
 
     decisions = _rule_engine(
         raw_marks=raw_marks,
@@ -424,6 +479,55 @@ def _rule_engine(
             config=config,
         )
 
+        # V3.2.0+dev.20260204.14 -> V3.2.0+dev.20260205.02:
+        # 英文句末标点过滤仅在 fast 模式生效（SenseVoice 英文标点噪声）。
+        # dual 模式下 raw_marks 来自 Whisper，英文标点质量高，无需过滤。
+        if (
+            mode == "fast"
+            and not _is_cjk_language(language)
+            and mark.punctuation in _SENTENCE_END
+            and mark.punctuation not in _QUESTION_PUNCT
+            and candidate_missing
+            and not _pause_ok(words, mark.word_index, config.pause_end_min_sec)
+        ):
+            decisions.append(
+                Decision(
+                    char_index=mark.char_index,
+                    punctuation=mark.punctuation,
+                    action="drop_raw",
+                    reason="drop_raw_no_candidate_no_pause",
+                    raw_conf=mark.raw_conf,
+                    cand_conf=None,
+                )
+            )
+            continue
+
+        # V3.2.0+dev.20260205.01 -> V3.2.0+dev.20260205.02:
+        # 英文弱标点过滤仅在 fast 模式生效（SenseVoice "It's, still, only, ..." 噪声）。
+        # dual 模式下 raw_marks 来自 Whisper，英文逗号等弱标点质量高，无需过滤。
+        if mode == "fast" and not _is_cjk_language(language) and mark.punctuation in _WEAK_PUNCTUATION_SET:
+            supported_by_candidate = False
+            for maybe in (cand, cand_near):
+                if not maybe:
+                    continue
+                if maybe.punctuation != mark.punctuation:
+                    continue
+                if abs(int(maybe.char_index) - int(mark.char_index)) <= config.conflict_window_chars:
+                    supported_by_candidate = True
+                    break
+            if not supported_by_candidate:
+                decisions.append(
+                    Decision(
+                        char_index=mark.char_index,
+                        punctuation=mark.punctuation,
+                        action="drop_raw",
+                        reason="drop_raw_weak_untrusted",
+                        raw_conf=mark.raw_conf,
+                        cand_conf=cand.confidence if cand else None,
+                    )
+                )
+                continue
+
         if (
             mark.raw_conf < _drop_threshold(mark.punctuation, config)
             and candidate_missing
@@ -595,9 +699,12 @@ def _candidate_is_valid(
             config=config,
         ):
             return False
+    # V3.2.0+dev.20260205.02: 句末停顿门控仅对 CJK 语言生效
+    # 英文 Whisper/模型标点质量高，停顿与句边界弱相关，禁用此门控
     if cand.punctuation in _SENTENCE_END:
-        if not _pause_ok(words, cand.word_index, config.pause_end_min_sec):
-            return False
+        if _is_cjk_language(language):
+            if not _pause_ok(words, cand.word_index, config.pause_end_min_sec):
+                return False
     return True
 
 
@@ -812,3 +919,8 @@ def _get_word_end(word: WordTimestampLike) -> Optional[float]:
     if isinstance(word, dict):
         return word.get("end")
     return getattr(word, "end", None)
+
+
+def _is_cjk_language(language: str) -> bool:
+    lang = (language or "auto").lower()
+    return lang.startswith(("zh", "yue", "ja", "jp", "ko"))

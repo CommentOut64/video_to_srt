@@ -29,6 +29,9 @@ from app.services.runtime_param_resolver import get_runtime_group_for_model
 
 logger = logging.getLogger(__name__)
 
+_SPECIAL_TAG_PATTERN = re.compile(r"<\|.*?\|>")
+_SENTENCEPIECE_SYMBOL = "▁"
+
 
 # V3.2.2+dev.20260201.01: SenseVoice 语言标签置信度结构
 @dataclass
@@ -614,6 +617,84 @@ class SenseVoiceONNXService:
                 self.is_loaded = False
                 self.logger.info("SenseVoice 模型已卸载")
 
+    @staticmethod
+    def _is_tag_only_token(token: str) -> bool:
+        """判断 token 是否完全由特殊标签组成。"""
+        if not token:
+            return False
+        stripped = _SPECIAL_TAG_PATTERN.sub("", token)
+        return stripped.strip() == "" and _SPECIAL_TAG_PATTERN.search(token) is not None
+
+    @staticmethod
+    def _split_sentencepiece_parts(token: str) -> List[str]:
+        """按 SentencePiece 边界拆分 token，返回非空片段。"""
+        if not token:
+            return []
+        normalized = token.replace(_SENTENCEPIECE_SYMBOL, " ")
+        return [part for part in normalized.split() if part]
+
+    def _clean_ctc_word_timestamps(self, word_timestamps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        清洗 CTC token 列表：
+        - 移除纯标签 token，并补偿时间偏移
+        - 剥离嵌入标签与 SentencePiece 符号
+        - 按边界拆分为子 token，保持时间戳连续
+        """
+        if not word_timestamps:
+            return []
+
+        cleaned: List[Dict[str, Any]] = []
+        removed_duration = 0.0
+
+        for item in word_timestamps:
+            raw_word = str(item.get("word", "") or "")
+            start = float(item.get("start", 0.0) or 0.0)
+            end = float(item.get("end", start) or start)
+            duration = max(end - start, 0.0)
+
+            if self._is_tag_only_token(raw_word):
+                removed_duration += duration
+                continue
+
+            start = max(0.0, start - removed_duration)
+            end = max(start, end - removed_duration)
+
+            # 去除嵌入标签后再拆分
+            no_tags = _SPECIAL_TAG_PATTERN.sub("", raw_word)
+            if not no_tags.strip():
+                continue
+
+            had_tag = _SPECIAL_TAG_PATTERN.search(raw_word) is not None
+            boundary_start = had_tag or no_tags.startswith((" ", _SENTENCEPIECE_SYMBOL)) or raw_word.startswith(
+                (" ", _SENTENCEPIECE_SYMBOL)
+            )
+            parts = self._split_sentencepiece_parts(no_tags)
+            if not parts:
+                continue
+
+            total_chars = sum(len(part) for part in parts)
+            if total_chars <= 0:
+                continue
+
+            cursor = start
+            for idx, part in enumerate(parts):
+                ratio = len(part) / total_chars if total_chars > 0 else 0.0
+                part_start = cursor
+                if idx == len(parts) - 1:
+                    part_end = end
+                else:
+                    part_end = cursor + duration * ratio
+                cursor = part_end
+
+                token = dict(item)
+                prefix = _SENTENCEPIECE_SYMBOL if (idx > 0 or boundary_start) else ""
+                token["word"] = f"{prefix}{part}"
+                token["start"] = part_start
+                token["end"] = part_end
+                cleaned.append(token)
+
+        return cleaned
+
     def transcribe_audio_array(
         self,
         audio_array: np.ndarray,
@@ -670,26 +751,9 @@ class SenseVoiceONNXService:
             # V3.2.2+dev.20260201.01: 增加返回 SenseVoice 语言标签置信度
             text, word_timestamps, confidence, sv_language_info = self.decoder.decode(logits, self.time_stride)
 
-            # 【阶段一】过滤特殊标记，并补偿时间偏移
-            # 特殊标记格式：<|xxx|>，如 <|en|>, <|EMO_UNKNOWN|>, <|Speech|>, <|withitn|>
-            # 这些标记占用时间轴（每个约60ms），过滤时需要累计其持续时间并从后续词中扣除
-            clean_word_timestamps = []
-            removed_duration = 0.0  # 累计被删除标记的持续时间
-
-            for w in word_timestamps:
-                word = w.get("word", "")
-                if word.startswith("<|") and word.endswith("|>"):
-                    # 累计被删除标记的持续时间
-                    removed_duration += w.get("end", 0) - w.get("start", 0)
-                    continue
-
-                # 从后续词的时间戳中扣除累计的偏移，补偿标记占用的时间
-                adjusted_w = w.copy()
-                adjusted_w["start"] = max(0.0, w.get("start", 0) - removed_duration)
-                adjusted_w["end"] = max(0.0, w.get("end", 0) - removed_duration)
-                clean_word_timestamps.append(adjusted_w)
-
-            word_timestamps = clean_word_timestamps
+            # 【阶段一】清理特殊标记与 SentencePiece，并补偿时间偏移
+            # 说明：纯标签会从时间轴扣除；嵌入标签仅剥离文本，不扣时间
+            word_timestamps = self._clean_ctc_word_timestamps(word_timestamps)
 
             # 4. 过滤未知情感标签（仅影响原始文本）
             if ban_emo_unk:

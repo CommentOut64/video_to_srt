@@ -9,6 +9,7 @@ import logging
 import time
 from typing import List, Optional, Tuple, Dict, Any
 
+from app.core.logging import resolve_loguru_logger
 from app.models.sensevoice_models import SentenceSegment
 from app.services.bridge.batch_builder import BatchBuilder, BridgeBatch
 from app.services.bridge.config import BridgeConfig
@@ -26,7 +27,7 @@ class BridgeController:
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self._config = config or BridgeConfig()
-        self._logger = logger or logging.getLogger(__name__)
+        self._logger = resolve_loguru_logger(logger, __name__, layer="L0")
         self._queue = SentenceQueue(
             maxsize=self._config.queue_maxsize,
             backpressure_timeout=self._config.backpressure_timeout,
@@ -36,6 +37,7 @@ class BridgeController:
         self._prompt_builder = PromptBuilder()
         self._lock = asyncio.Lock()
         self._last_input_time = time.time()
+        self._last_flush_time = self._last_input_time
         self._last_audio_end = 0.0
         self._last_language = "auto"
         self._last_speaker_id: Optional[str] = None
@@ -50,6 +52,30 @@ class BridgeController:
 
     async def wait_for_capacity(self) -> None:
         await self._queue.wait_for_capacity()
+
+    def get_queue_size(self) -> int:
+        return len(self._queue)
+
+    def should_flush_on_idle(self, queue_inter_size: int, now: Optional[float] = None) -> bool:
+        """GPU 空闲时的保守调度判断：队列水位+等待时长触发强制 flush。"""
+        if not self._config.force_flush_on_gpu_idle:
+            return False
+        if queue_inter_size > 0:
+            return False
+        if len(self._queue) == 0:
+            return False
+        now = now or time.time()
+        waited_ms = max(0.0, (now - self._last_input_time) * 1000.0)
+        if len(self._queue) >= self._config.queue_high_watermark:
+            return True
+        if waited_ms >= self._config.dynamic_batch_max_wait_ms:
+            return True
+        if (
+            len(self._queue) >= self._config.queue_low_watermark
+            and waited_ms >= self._config.dynamic_batch_max_wait_ms / 2
+        ):
+            return True
+        return False
 
     def update_arbiter_feedback(self, decision: Optional[PunctuationDecision]) -> None:
         """更新仲裁反馈，用于标点调度融合。"""
@@ -95,6 +121,12 @@ class BridgeController:
             pre_flush = self._flush_if_speaker_changed(chunk)
             if pre_flush:
                 await self._push_chunk(chunk)
+                # V3.2.0+dev.20260207.03: P0 speaker_change 状态同步补齐
+                self._last_input_time = now
+                self._last_audio_end = max(self._last_audio_end, chunk.audio_range[1])
+                self._last_language = chunk.language or self._last_language
+                if chunk.speaker_id:
+                    self._last_speaker_id = chunk.speaker_id
                 return pre_flush
 
             pre_flush = self._flush_if_long_pause(chunk)
@@ -140,7 +172,7 @@ class BridgeController:
         if self._config.is_enable_frame_drop:
             dropped = self._queue.drop_oldest()
             if dropped:
-                self._logger.warning(
+                self._logger.bind(chunk_id=dropped.chunk_id).warning(
                     "Bridge 触发紧急丢帧：dropped_chunk=%s", dropped.chunk_id
                 )
 
@@ -192,6 +224,19 @@ class BridgeController:
         min_sentences, max_sentences, min_duration, max_duration = (
             self._compute_dynamic_thresholds(total_duration, total_sentences, language)
         )
+        now = time.time()
+        min_sentences, max_sentences, min_duration, max_duration, force_flush = (
+            self._apply_dynamic_batch_adjustments(
+                now,
+                len(chunks),
+                total_duration,
+                total_sentences,
+                min_sentences,
+                max_sentences,
+                min_duration,
+                max_duration,
+            )
+        )
 
         if total_duration >= max_duration:
             return True
@@ -199,7 +244,46 @@ class BridgeController:
             return True
         if total_duration >= min_duration and total_sentences >= min_sentences:
             return True
+        if force_flush and total_sentences > 0:
+            return True
         return False
+
+    def _apply_dynamic_batch_adjustments(
+        self,
+        now: float,
+        queue_len: int,
+        total_duration: float,
+        total_sentences: int,
+        min_sentences: int,
+        max_sentences: int,
+        min_duration: float,
+        max_duration: float,
+    ) -> Tuple[int, int, float, float, bool]:
+        if not self._config.is_enable_dynamic_batch:
+            return min_sentences, max_sentences, min_duration, max_duration, False
+
+        waited_ms = max(0.0, (now - self._last_input_time) * 1000.0)
+        force_flush = waited_ms >= self._config.dynamic_batch_max_wait_ms
+
+        # 水位低且等待不足，避免过小批次
+        if (
+            queue_len <= self._config.queue_low_watermark
+            and waited_ms < self._config.dynamic_batch_max_wait_ms
+        ):
+            return min_sentences, max_sentences, min_duration, max_duration, False
+
+        # 水位高：缩小阈值，加速 flush
+        if queue_len >= self._config.queue_high_watermark:
+            min_sentences = max(1, min_sentences - 1)
+            min_duration = max(0.0, min_duration - self._config.dynamic_duration_step)
+            if total_duration <= 0.0 and total_sentences <= 0:
+                force_flush = False
+
+        if max_sentences < min_sentences:
+            max_sentences = min_sentences
+        if max_duration < min_duration:
+            max_duration = min_duration
+        return min_sentences, max_sentences, min_duration, max_duration, force_flush
 
     def _compute_duration_and_language(self, chunks: List[SemanticChunk]) -> Tuple[float, str]:
         if not chunks:
@@ -290,6 +374,7 @@ class BridgeController:
         if not chunks:
             raise RuntimeError("Bridge 批次构建失败：缓冲区为空")
 
+        self._last_flush_time = time.time()
         sentences = [sentence for chunk in chunks for sentence in chunk.sentences]
         previous_tail = self._last_tail_prompt
         self._last_tail_prompt = self._prompt_builder.build_tail(sentences)
@@ -307,7 +392,7 @@ class BridgeController:
             flush_reason=flush_reason,
         )
 
-        self._logger.debug(
+        self._logger.bind(batch_id=batch.batch_id).debug(
             "Bridge 批次构建: batch_id=%s, sentences=%d, duration=%.2fs, reason=%s",
             batch.batch_id,
             len(batch.sentences),

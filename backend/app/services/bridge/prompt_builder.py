@@ -1,6 +1,9 @@
 """
 Bridge Prompt 构建器。
-V3.2.0+dev.20260201.04
+V3.2.0+dev.20260205.04
+
+更新日志：
+- V3.2.0+dev.20260205.04: 使用空格分隔关键词，避免逗号密集导致 Whisper 标点感染
 """
 from __future__ import annotations
 
@@ -55,7 +58,10 @@ def _extract_keywords(text: str, *, min_word_length: int = 3) -> Counter:
 
 
 class PromptBuilder:
-    """Prompt 构建器（建造者模式）：输出受限的 Glossary，避免正文回显。"""
+    """Prompt 构建器（建造者模式）：输出受限的 Glossary，避免正文回显。
+    
+    V3.2.0+dev.20260205.04: 使用空格分隔关键词，避免逗号密集导致标点感染。
+    """
 
     def build_tail(self, sentences: List[SentenceSegment], max_sentences: int = 2) -> str:
         if not sentences:
@@ -96,7 +102,8 @@ class PromptBuilder:
         for word, _ in sorted_keywords:
             if len(selected) >= max(1, int(max_keywords)):
                 break
-            additional = len(word) + (2 if selected else 0)
+            # V3.2.0+dev.20260205.04: 改为空格分隔，避免逗号感染
+            additional = len(word) + (1 if selected else 0)  # 空格长度
             if current_length + additional > max_prompt_length:
                 break
             selected.append(word)
@@ -104,4 +111,5 @@ class PromptBuilder:
 
         if not selected:
             return ""
-        return f"Glossary: {', '.join(selected)}."
+        # V3.2.0+dev.20260205.04: 使用空格分隔，避免密集逗号
+        return f"Glossary: {' '.join(selected)}."

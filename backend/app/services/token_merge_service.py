@@ -5,11 +5,13 @@ V3.2.0+dev.20260131.03
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 
 _PUNCTUATION_SET = set(",.!?;:\"()[]{}，。！？；：、（）【】《》“”‘’「」『』")
 _LEFT_PUNCT = set("([{“‘（【《「『")
+_SPECIAL_TAG_PATTERN = re.compile(r"<\|.*?\|>")
 
 # V3.2.0+dev.20260131.03: SenseVoice 显示置信度校准参数（仅影响 display 口径）
 _SV_DISPLAY_RAW_MIN = 0.10
@@ -40,12 +42,13 @@ def merge_tokens(
     将 CTC token 合并为词级时间戳。
 
     设计原则：
-    - 保留原始 token 列表（raw_tokens）用于调试与回退
+    - 保留原始 token 列表快照（raw_tokens）用于调试与回退（不做清洗）
     - 统一在合并阶段处理标点 token 的时间戳归并
     - 对无空格语言（中/日/韩等）默认按脚本切分，避免整段合并
     """
-    normalized = [_normalize_token(token) for token in tokens if token]
-    raw_tokens = [token.copy() for token in normalized]
+    input_tokens = [token for token in tokens if isinstance(token, dict)]
+    raw_tokens = [token.copy() for token in input_tokens]
+    normalized = [_normalize_token(token) for token in input_tokens]
     cleaned = _merge_punctuation_tokens(normalized)
     mode = _resolve_merge_mode(cleaned, language)
     words = _merge_by_mode(cleaned, mode)
@@ -54,6 +57,11 @@ def merge_tokens(
 
 def _normalize_token(token: Dict[str, Any]) -> Dict[str, Any]:
     word = str(token.get("word", "") or "")
+    # V3.2.0+dev.20260205.08:
+    # 标准化 token 文本字段：剥离 <|...|> 并将 SentencePiece ▁ 视为空格边界。
+    # 注意：该清理仅影响合并后的 words 输出；raw_tokens 保留输入快照用于调试。
+    word = _SPECIAL_TAG_PATTERN.sub("", word)
+    word = word.replace("▁", " ")
     start = _safe_float(token.get("start", 0.0))
     end = _safe_float(token.get("end", 0.0))
     confidence = _safe_float(token.get("confidence", 1.0), default=1.0)

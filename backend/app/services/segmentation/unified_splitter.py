@@ -565,9 +565,15 @@ def _is_likely_english(text: str) -> bool:
 
 
 def _strip_trailing_sentence_punct(text: Optional[str]) -> str:
+    """
+    句末标点清理（保留问号/感叹号）。
+
+    说明：对齐层与草稿切分保持一致，仅移除句号/逗号/顿号/分号。
+    """
     if not text:
         return ""
+    punct_to_remove = {"。", ".", "，", ",", "、", "；", ";"}
     idx = len(text) - 1
-    while idx >= 0 and text[idx] in _STRONG_END_PUNCT:
+    while idx >= 0 and text[idx] in punct_to_remove:
         idx -= 1
     return text[: idx + 1]

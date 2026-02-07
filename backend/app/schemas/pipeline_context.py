@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional, List, Any, Dict
 import numpy as np
 
-from app.services.alignment.types import TextTrackBundle
+from app.services.alignment.types import PunctTrack, TextTrackBundle
 
 @dataclass
 class ProcessingContext:
@@ -48,6 +48,7 @@ class ProcessingContext:
     final_sentences: List[Any] = field(default_factory=list)  # 对齐阶段产出
     arbitration_result: Optional[Any] = None  # V3.2.0+dev.20260202.08: 仲裁结果（Phase G-3）
     text_tracks: Optional[TextTrackBundle] = None  # V3.2.0+dev.20260203.03: 三轨文本
+    punct_track: Optional[PunctTrack] = None  # V3.2.0+dev.20260204.05: L3 标点轨道
     finalization_metrics: Dict[str, Any] = field(default_factory=dict)  # V3.2.0+dev.20260203.03
 
     # 控制信号

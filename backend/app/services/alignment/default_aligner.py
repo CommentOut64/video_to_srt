@@ -215,6 +215,7 @@ class DefaultAligner:
                     start=word.start,
                     end=word.end,
                     confidence=word.final_confidence,
+                    confidence_source=word.confidence_source,
                     is_pseudo=word.is_pseudo,
                 )
                 for word in aligned_words

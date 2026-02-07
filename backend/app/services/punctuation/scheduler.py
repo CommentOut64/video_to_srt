@@ -11,6 +11,7 @@ from typing import Optional
 
 from app.services.punctuation.base import PunctuationResult
 from app.services.punctuation.config import get_punctuation_config
+from app.services.text_pipeline_config import PunctuationRuntimeOverrides
 
 
 class PunctuationMode(str, Enum):
@@ -119,7 +120,29 @@ _scheduler: Optional[PunctuationScheduler] = None
 def get_punctuation_scheduler() -> PunctuationScheduler:
     """获取调度器单例。"""
     global _scheduler
+    config = get_punctuation_config()
+    policy = PunctuationPolicy.from_config(config)
+
+    # V3.2.0+dev.20260204.09: 运行参数显式覆盖（仅覆盖 override 中出现的键）
+    overrides = PunctuationRuntimeOverrides.from_runtime()
+    sched = overrides.scheduler
+    if sched.mode is not None:
+        try:
+            policy.mode = PunctuationMode(str(sched.mode))
+        except ValueError:
+            pass
+    if sched.fast_confidence_threshold is not None:
+        policy.fast_confidence_threshold = float(sched.fast_confidence_threshold)
+    if sched.alignment_coverage_threshold is not None:
+        policy.alignment_coverage_threshold = float(sched.alignment_coverage_threshold)
+    if sched.arbiter_conflict_threshold is not None:
+        policy.arbiter_conflict_threshold = float(sched.arbiter_conflict_threshold)
+    if sched.max_slow_retries is not None:
+        policy.max_slow_retries = int(sched.max_slow_retries)
+
     if _scheduler is None:
-        config = get_punctuation_config()
-        _scheduler = PunctuationScheduler(policy=PunctuationPolicy.from_config(config))
+        _scheduler = PunctuationScheduler(policy=policy)
+    else:
+        # 动态更新策略，避免热更新时仍使用旧阈值
+        _scheduler._policy = policy  # type: ignore[attr-defined]
     return _scheduler
