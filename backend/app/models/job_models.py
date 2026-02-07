@@ -62,7 +62,7 @@ class PreprocessingConfig:
     langid_confidence_threshold: float = 0.7
     langid_whitelist: List[str] = field(default_factory=lambda: ["zh", "ja", "en"])
     langid_logit_bias_score: float = 2.5
-    enable_speaker_embedding: bool = False
+    enable_speaker_embedding: bool = True  # V3.2.0+dev.20260207.01: 默认开启声纹聚类
 
     # ========== 预处理缓存配置 ==========
     # 是否启用预处理缓存 GC（默认关闭）
@@ -302,7 +302,7 @@ class JobSettings:
                 langid_confidence_threshold=preprocessing_data.get("langid_confidence_threshold", 0.7),
                 langid_whitelist=langid_whitelist,
                 langid_logit_bias_score=preprocessing_data.get("langid_logit_bias_score", 2.5),
-                enable_speaker_embedding=preprocessing_data.get("enable_speaker_embedding", False),
+                enable_speaker_embedding=preprocessing_data.get("enable_speaker_embedding", True),
                 is_preprocess_cache_gc_enabled=preprocessing_data.get("enable_preprocess_cache_gc", False),
                 cache_budget_gb=preprocessing_data.get("cache_budget_gb", 0.0),
                 ttl_hours=preprocessing_data.get("ttl_hours", 0.0),

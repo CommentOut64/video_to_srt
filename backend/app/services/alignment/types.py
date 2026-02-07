@@ -5,9 +5,11 @@ V3.2.0+dev.20260204.03
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Sequence, TYPE_CHECKING, Tuple
 
 from app.models.confidence_models import AlignedWord as AlignedWord
+from app.models.sensevoice_models import WordTimestamp
+from app.services.alignment.gap_resolver import GapResolution
 from app.services.punctuation.base import PuncPosition, WordTimestampLike
 
 if TYPE_CHECKING:
@@ -52,6 +54,8 @@ class TextTrack:
     itn_fallback: bool = False
     itn_fallback_reason: Optional[str] = None
     clean_to_word: List[Optional[int]] = field(default_factory=list)
+    # V3.2.0+dev.20260205.09: L4 对齐支持词级置信度来源透传。
+    word_confidences: List[Optional[float]] = field(default_factory=list)
     punct_positions: List[PuncPosition] = field(default_factory=list)
     mapping_coverage: float = 0.0
 
@@ -168,6 +172,34 @@ class L3Output:
 
 
 @dataclass
+class AlignmentResult:
+    """L4 对齐输出结果。"""
+
+    aligned_words: List[AlignedWord]
+    alignment_score: float
+    gap_ratio: float
+    gap_positions: List[int]
+    resolution: Optional[GapResolution] = None
+    coverage: float = 0.0
+
+
+@dataclass
+class L4Input:
+    """L4 对齐层输入。"""
+
+    chosen_text_track: Optional[TextTrack]
+    sv_words: List[WordTimestamp]
+    vad_intervals: Optional[List[Tuple[float, float]]] = None
+
+
+@dataclass
+class L4Output:
+    """L4 对齐层输出。"""
+
+    alignment_result: AlignmentResult
+
+
+@dataclass
 class AnnotatedWord:
     """语义注入后的词信息（预留）。"""
 
@@ -186,10 +218,13 @@ __all__ = [
     "L2Output",
     "L3Input",
     "L3Output",
+    "L4Input",
+    "L4Output",
     "NormalizationResult",
     "PunctSource",
     "PunctTrack",
     "QualitySignals",
+    "AlignmentResult",
     "TextTrack",
     "TextTrackBundle",
     "AnnotatedWord",

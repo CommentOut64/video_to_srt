@@ -62,6 +62,7 @@ class SenseVoiceONNXConfig:
     optimization_level: int = 99
 
 
+# V3.2.0+dev.20260205.09: 词级置信度来源透传到 WordTimestamp。
 @dataclass
 class WordTimestamp:
     """字级时间戳（扩展版）
@@ -76,6 +77,7 @@ class WordTimestamp:
     confidence: Optional[float] = 1.0  # V3.1.2: 改为 Optional，None 表示无词级置信度
     confidence_raw: Optional[float] = None  # V3.2.0+dev.20260131.02: 词级原始置信度（与 confidence 对齐）
     confidence_display_raw: Optional[float] = None  # V3.2.0+dev.20260131.02: 词级显示口径
+    confidence_source: Optional[str] = None  # V3.2.0+dev.20260205.09: 置信度来源（fast/slow/unknown）
     token_type: Optional[str] = None  # V3.2.0+dev.20260131.02: token 类型（word/token）
     is_pseudo: bool = False              # 是否为伪对齐生成
     # 警告字段
@@ -96,6 +98,7 @@ class WordTimestamp:
             "confidence": self.confidence,  # 可能为 None
             "confidence_raw": self.confidence_raw,
             "confidence_display_raw": self.confidence_display_raw,
+            "confidence_source": self.confidence_source,
             "token_type": self.token_type,
             "is_pseudo": self.is_pseudo,
             "warning_type": self.warning_type.value,
