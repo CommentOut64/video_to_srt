@@ -3,7 +3,7 @@
 ## 文件清单
 
 - [ ] frontend\src\App.vue
-- [ ] frontend\src\components\AboutDialog.vue
+- [x] frontend\src\components\AboutDialog.vue
 - [ ] frontend\src\components\UpdateDialog.vue
 - [ ] frontend\src\components\common\DualAnchorProgress.vue（需重新设计）
 - [ ] frontend\src\components\common\SimpleProgress.vue（需重新设计）
