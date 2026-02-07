@@ -164,6 +164,7 @@ class SemanticInjector:
                     start=source.start,
                     end=source.end,
                     confidence=source.final_confidence,
+                    confidence_source=source.confidence_source,
                     is_pseudo=source.is_pseudo,
                 )
             )
@@ -245,9 +246,7 @@ class SemanticInjector:
             cursor = SemanticInjector._skip_whitespace(clean_text, cursor)
             if cursor >= len(clean_text):
                 break
-            match_idx = clean_text.find(core, cursor)
-            if match_idx == -1:
-                match_idx = SemanticInjector._fallback_match(clean_text, core, cursor)
+            match_idx = SemanticInjector._find_match_index(clean_text, core, cursor)
             if match_idx == -1:
                 continue
             start = max(match_idx, 0)
@@ -360,14 +359,52 @@ class SemanticInjector:
             cursor += 1
         return cursor
 
+    # V3.2.0+dev.20260206.02: 词级标点映射优先选择“最早可匹配位置”，并支持大小写无关匹配，
+    # 防止 p.m. -> PM 这类缩写因大小写差异漂移到后续词（例如误落到 plenty/time）。
     @staticmethod
-    def _fallback_match(text: str, token: str, cursor: int) -> int:
+    def _find_match_index(text: str, token: str, cursor: int) -> int:
         if not token:
             return -1
-        if cursor < len(text) and text[cursor: cursor + len(token)] == token:
+        exact_idx = SemanticInjector._fallback_match(
+            text,
+            token,
+            cursor,
+            ignore_case=False,
+        )
+        ignore_case_idx = SemanticInjector._fallback_match(
+            text,
+            token,
+            cursor,
+            ignore_case=True,
+        )
+        candidates = [idx for idx in (exact_idx, ignore_case_idx) if idx != -1]
+        if not candidates:
+            return -1
+        return min(candidates)
+
+    @staticmethod
+    def _fallback_match(
+        text: str,
+        token: str,
+        cursor: int,
+        *,
+        ignore_case: bool = False,
+    ) -> int:
+        if not token:
+            return -1
+        if cursor >= len(text):
+            return -1
+        if not ignore_case:
+            if text[cursor: cursor + len(token)] == token:
+                return cursor
+            return text.find(token, cursor)
+
+        token_lower = token.lower()
+        if text[cursor: cursor + len(token)].lower() == token_lower:
             return cursor
-        for idx in range(cursor, len(text)):
-            if text[idx: idx + len(token)] == token:
+        upper_bound = len(text) - len(token) + 1
+        for idx in range(cursor, max(cursor, upper_bound)):
+            if text[idx: idx + len(token)].lower() == token_lower:
                 return idx
         return -1
 
