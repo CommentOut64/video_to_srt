@@ -2,6 +2,7 @@
 对齐质量统计计算器。
 V3.2.0+dev.20260202.07
 """
+# V3.2.0+dev.20260205.09: 对齐统计支持词级置信度空值。
 from __future__ import annotations
 
 import logging
@@ -67,7 +68,8 @@ class QualityStatsCalculator:
     def _compute_alignment_score(self, aligned_words: List[AlignedWord]) -> float:
         matched_count = sum(1 for w in aligned_words if w.alignment_status == AlignmentStatus.MATCHED)
         match_ratio = matched_count / max(len(aligned_words), 1)
-        avg_confidence = sum(w.final_confidence for w in aligned_words) / max(len(aligned_words), 1)
+        confidences = [w.final_confidence for w in aligned_words if w.final_confidence is not None]
+        avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
         return 0.6 * match_ratio + 0.4 * avg_confidence
 
     @staticmethod

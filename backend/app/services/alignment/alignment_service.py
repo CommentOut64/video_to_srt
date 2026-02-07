@@ -6,9 +6,10 @@ Phase 3 实现 - 2025-12-10
 实现 Needleman-Wunsch 序列对齐算法，用于将 Whisper 文本对齐到 SenseVoice 时间轴。
 支持静音区硬约束、能量锚点校准、VAD 边界校准和 Gap 填补。
 """
+# V3.2.0+dev.20260205.09: L4 对齐层口径收敛与词级置信度来源修正。
 
 import logging
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Sequence
 from dataclasses import dataclass
 import numpy as np
 
@@ -19,8 +20,9 @@ from app.models.confidence_models import (
     ConfidenceLevel
 )
 from app.models.sensevoice_models import WordTimestamp
-from app.services.alignment.gap_resolver import GapResolver
+from app.services.alignment.gap_resolver import GapResolver, GapResolution, GapResolutionResult
 from app.services.alignment.quality_stats import QualityStatsCalculator
+from app.services.alignment.types import AlignmentResult as LayerAlignmentResult
 from app.utils.text_utils import smart_join_words
 
 
@@ -59,7 +61,9 @@ class AlignmentService:
     def __init__(
         self,
         config: Optional[AlignmentConfig] = None,
-        logger: Optional[logging.Logger] = None
+        logger: Optional[logging.Logger] = None,
+        gap_resolver: Optional[GapResolver] = None,
+        quality_stats_calculator: Optional[QualityStatsCalculator] = None,
     ):
         """
         初始化对齐服务
@@ -70,8 +74,8 @@ class AlignmentService:
         """
         self.config = config or AlignmentConfig()
         self.logger = logger or logging.getLogger(__name__)
-        self.gap_resolver = GapResolver(logger=self.logger)
-        self.quality_stats_calculator = QualityStatsCalculator(logger=self.logger)
+        self.gap_resolver = gap_resolver or GapResolver(logger=self.logger)
+        self.quality_stats_calculator = quality_stats_calculator or QualityStatsCalculator(logger=self.logger)
 
     async def align(
         self,
@@ -97,14 +101,107 @@ class AlignmentService:
         Returns:
             AlignedSubtitle: 对齐后的字幕段
         """
-        self.logger.info(f"开始对齐: Whisper='{whisper_text}', SV tokens={len(sv_tokens)}")
+        self.logger.info(
+            "开始对齐: whisper_len=%d sv_tokens=%d",
+            len(whisper_text or ""),
+            len(sv_tokens),
+        )
 
+        aligned_words, gap_result, quality_stats = self._align_core(
+            clean_text=whisper_text,
+            sv_tokens=sv_tokens,
+            vad_range=vad_range,
+            chunk_offset=chunk_offset,
+            audio_array=audio_array,
+            sample_rate=sample_rate,
+            vad_intervals=vad_intervals,
+            token_confidences=None,
+        )
+
+        # 7. 构建 AlignedSubtitle
+        result = self._build_aligned_subtitle(
+            aligned_words,
+            whisper_text,
+            sv_tokens,
+            vad_range
+        )
+        result.coverage = quality_stats.coverage
+        result.gap_ratio = quality_stats.gap_ratio
+        result.alignment_score = quality_stats.alignment_score
+        result.gap_positions = quality_stats.gap_positions
+        result.gap_resolution = quality_stats.gap_resolution
+
+        self.logger.info(
+            "对齐完成: words=%d matched_ratio=%.2f avg_conf=%.2f",
+            len(aligned_words),
+            result.matched_ratio,
+            result.avg_confidence,
+        )
+
+        return result
+
+    def align_clean_text(
+        self,
+        clean_text: str,
+        sv_tokens: List[WordTimestamp],
+        *,
+        vad_range: Optional[Tuple[float, float]] = None,
+        vad_intervals: Optional[List[Tuple[float, float]]] = None,
+        token_confidences: Optional[Sequence[Optional[float]]] = None,
+    ) -> LayerAlignmentResult:
+        """L4 专用：对齐 clean_text 并输出 AlignmentResult。"""
+        if vad_range is None:
+            vad_range = self._resolve_vad_range(sv_tokens, vad_intervals)
+
+        aligned_words, gap_result, quality_stats = self._align_core(
+            clean_text=clean_text,
+            sv_tokens=sv_tokens,
+            vad_range=vad_range,
+            chunk_offset=0.0,
+            audio_array=None,
+            sample_rate=16000,
+            vad_intervals=vad_intervals,
+            token_confidences=token_confidences,
+        )
+        return LayerAlignmentResult(
+            aligned_words=aligned_words,
+            alignment_score=quality_stats.alignment_score,
+            gap_ratio=quality_stats.gap_ratio,
+            gap_positions=quality_stats.gap_positions,
+            resolution=gap_result.resolution,
+            coverage=quality_stats.coverage,
+        )
+
+    def _align_core(
+        self,
+        *,
+        clean_text: str,
+        sv_tokens: List[WordTimestamp],
+        vad_range: Optional[Tuple[float, float]],
+        chunk_offset: float,
+        audio_array: Optional[np.ndarray],
+        sample_rate: int,
+        vad_intervals: Optional[List[Tuple[float, float]]],
+        token_confidences: Optional[Sequence[Optional[float]]],
+    ) -> Tuple[List[AlignedWord], GapResolutionResult, "QualityStats"]:
         # 1. 文本预处理
-        whisper_words = self._tokenize(whisper_text)
+        whisper_words = self._tokenize(clean_text)
         sv_words = [token.word for token in sv_tokens]
 
-        self.logger.debug(f"Whisper words: {whisper_words}")
-        self.logger.debug(f"SV words: {sv_words}")
+        if not whisper_words or not sv_words:
+            empty_result = GapResolutionResult(
+                words=[],
+                resolution=GapResolution.NONE,
+                gap_ratio=0.0,
+                gap_positions=[],
+            )
+            quality_stats = self.quality_stats_calculator.compute(
+                [],
+                total_tokens=len(sv_tokens),
+                gap_positions=[],
+                gap_resolution=GapResolution.NONE,
+            )
+            return [], empty_result, quality_stats
 
         # 2. Needleman-Wunsch 序列对齐
         alignment_path = self._needleman_wunsch(whisper_words, sv_words)
@@ -115,7 +212,8 @@ class AlignmentService:
             whisper_words,
             sv_tokens,
             vad_range,
-            chunk_offset
+            chunk_offset,
+            token_confidences=token_confidences,
         )
 
         # 4. Gap 处理（插值/合并/降级）
@@ -135,38 +233,19 @@ class AlignmentService:
             )
 
         # 6. VAD 边界校准
-        if self.config.enable_vad_calibration:
+        if self.config.enable_vad_calibration and vad_range is not None:
             aligned_words = self._apply_vad_calibration(
                 aligned_words,
                 vad_range
             )
 
-        # 7. 构建 AlignedSubtitle
-        result = self._build_aligned_subtitle(
-            aligned_words,
-            whisper_text,
-            sv_tokens,
-            vad_range
-        )
         quality_stats = self.quality_stats_calculator.compute(
             aligned_words,
             total_tokens=len(sv_tokens),
             gap_positions=gap_result.gap_positions,
             gap_resolution=gap_result.resolution,
         )
-        result.coverage = quality_stats.coverage
-        result.gap_ratio = quality_stats.gap_ratio
-        result.alignment_score = quality_stats.alignment_score
-        result.gap_positions = quality_stats.gap_positions
-        result.gap_resolution = quality_stats.gap_resolution
-
-        self.logger.info(
-            f"对齐完成: {len(aligned_words)} 个词, "
-            f"匹配率={result.matched_ratio:.2%}, "
-            f"平均置信度={result.avg_confidence:.2f}"
-        )
-
-        return result
+        return aligned_words, gap_result, quality_stats
 
     def _tokenize(self, text: str) -> List[str]:
         """
@@ -198,6 +277,19 @@ class AlignmentService:
             words = [w for w in words if w]
             self.logger.debug(f"空格分词: {len(words)} 个词")
             return words
+
+    @staticmethod
+    def _resolve_vad_range(
+        sv_tokens: List[WordTimestamp],
+        vad_intervals: Optional[List[Tuple[float, float]]],
+    ) -> Optional[Tuple[float, float]]:
+        if sv_tokens:
+            return sv_tokens[0].start, sv_tokens[-1].end
+        if vad_intervals:
+            start = min(interval[0] for interval in vad_intervals)
+            end = max(interval[1] for interval in vad_intervals)
+            return start, end
+        return None
 
     @staticmethod
     def _is_cjk_text(text: str) -> bool:
@@ -373,8 +465,10 @@ class AlignmentService:
         alignment_path: List[Tuple[Optional[int], Optional[int]]],
         whisper_words: List[str],
         sv_tokens: List[WordTimestamp],
-        vad_range: Tuple[float, float],
-        chunk_offset: float
+        vad_range: Optional[Tuple[float, float]],
+        chunk_offset: float,
+        *,
+        token_confidences: Optional[Sequence[Optional[float]]] = None,
     ) -> List[AlignedWord]:
         """
         根据对齐路径生成对齐后的字级时间戳
@@ -395,22 +489,27 @@ class AlignmentService:
             if whisper_idx is not None and sv_idx is not None:
                 whisper_word = whisper_words[whisper_idx]
                 sv_token = sv_tokens[sv_idx]
+                whisper_conf = None
+                if token_confidences and whisper_idx < len(token_confidences):
+                    whisper_conf = token_confidences[whisper_idx]
 
                 if self._is_match(whisper_word, sv_token.word):
                     status = AlignmentStatus.MATCHED
                 else:
                     status = AlignmentStatus.SUBSTITUTED
+                final_conf, conf_source = self._resolve_final_confidence(
+                    sv_token.confidence,
+                    whisper_conf,
+                )
 
                 aligned_word = AlignedWord(
                     word=whisper_word,
                     start=sv_token.start + chunk_offset,
                     end=sv_token.end + chunk_offset,
                     sv_confidence=sv_token.confidence,
-                    whisper_confidence=1.0,
-                    final_confidence=self._compute_final_confidence(
-                        sv_token.confidence,
-                        1.0
-                    ),
+                    whisper_confidence=whisper_conf,
+                    final_confidence=final_conf,
+                    confidence_source=conf_source,
                     alignment_status=status,
                     is_pseudo=False,
                     sv_original=sv_token.word,
@@ -434,9 +533,10 @@ class AlignmentService:
                     word=whisper_word,
                     start=start,
                     end=end,
-                    sv_confidence=0.0,
-                    whisper_confidence=1.0,
-                    final_confidence=self._compute_final_confidence(0.0, 1.0),
+                    sv_confidence=None,
+                    whisper_confidence=None,
+                    final_confidence=None,
+                    confidence_source="unknown",
                     alignment_status=AlignmentStatus.INSERTED,
                     is_pseudo=True,
                     sv_original=None,
@@ -447,34 +547,36 @@ class AlignmentService:
 
         return aligned_words
 
+    def _resolve_final_confidence(
+        self,
+        sv_confidence: Optional[float],
+        whisper_confidence: Optional[float],
+    ) -> Tuple[Optional[float], str]:
+        """根据口径优先级选择最终置信度来源。"""
+        if whisper_confidence is not None:
+            return whisper_confidence, "slow"
+        if sv_confidence is not None:
+            return sv_confidence, "fast"
+        return None, "unknown"
+
     def _compute_final_confidence(
         self,
-        sv_confidence: float,
-        whisper_confidence: float
-    ) -> float:
+        sv_confidence: Optional[float],
+        whisper_confidence: Optional[float],
+    ) -> Optional[float]:
         """
-        计算最终置信度
-
-        融合 SenseVoice 和 Whisper 的置信度。
-
-        Args:
-            sv_confidence: SenseVoice 置信度
-            whisper_confidence: Whisper 置信度
-
-        Returns:
-            float: 最终置信度
+        兼容旧接口：返回最终置信度数值。
+        V3.2.0+dev.20260205.09: 对齐层口径改为 slow 优先，缺失回退 fast。
         """
-        return (
-            self.config.sv_weight * sv_confidence +
-            self.config.whisper_weight * whisper_confidence
-        )
+        value, _ = self._resolve_final_confidence(sv_confidence, whisper_confidence)
+        return value
 
     def _estimate_timestamp_for_insertion(
         self,
         whisper_idx: int,
         aligned_words: List[AlignedWord],
         sv_tokens: List[WordTimestamp],
-        vad_range: Tuple[float, float],
+        vad_range: Optional[Tuple[float, float]],
         chunk_offset: float
     ) -> Tuple[float, float]:
         """
@@ -492,8 +594,12 @@ class AlignmentService:
         Returns:
             Tuple[float, float]: (start, end)
         """
-        prev_end = vad_range[0] + chunk_offset
-        next_start = vad_range[1] + chunk_offset
+        if vad_range:
+            prev_end = vad_range[0] + chunk_offset
+            next_start = vad_range[1] + chunk_offset
+        else:
+            prev_end = chunk_offset
+            next_start = chunk_offset + 0.5
 
         if aligned_words:
             prev_end = aligned_words[-1].end
@@ -554,7 +660,7 @@ class AlignmentService:
     def _apply_vad_calibration(
         self,
         aligned_words: List[AlignedWord],
-        vad_range: Tuple[float, float]
+        vad_range: Optional[Tuple[float, float]]
     ) -> List[AlignedWord]:
         """
         应用 VAD 边界校准
@@ -568,6 +674,9 @@ class AlignmentService:
         Returns:
             List[AlignedWord]: 校准后的词列表
         """
+        if vad_range is None:
+            return aligned_words
+
         vad_start, vad_end = vad_range
 
         for word in aligned_words:
@@ -650,7 +759,8 @@ class AlignmentService:
         )
         match_ratio = matched_count / len(aligned_words)
 
-        avg_confidence = sum(w.final_confidence for w in aligned_words) / len(aligned_words)
+        confidences = [w.final_confidence for w in aligned_words if w.final_confidence is not None]
+        avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
 
         score = 0.6 * match_ratio + 0.4 * avg_confidence
 

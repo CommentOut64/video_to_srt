@@ -120,8 +120,14 @@ class TextNormalizerProcessor:
         words = TextNormalizerProcessor._extract_words_for_clean_map(raw_result, source=source)
         if not words:
             track.clean_to_word = []
+            track.word_confidences = []
             return
         track.clean_to_word = TextNormalizerProcessor._build_clean_to_word_map(clean_text, words)
+        # V3.2.0+dev.20260205.09: 记录词级置信度，用于 L4 慢流优先口径。
+        track.word_confidences = [
+            float(item.get("confidence")) if item.get("confidence") is not None else None
+            for item in words
+        ]
 
     @staticmethod
     def _extract_words_for_punct(raw_result: Dict[str, Any], *, source: str) -> List[Dict[str, Any]]:
