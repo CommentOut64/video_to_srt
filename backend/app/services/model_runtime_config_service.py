@@ -369,6 +369,7 @@ class ModelRuntimeConfigService:
                 # V3.2.0+dev.20260204.10: Whisper 原始标点抽取门控
                 "raw_source.min_mapping_coverage": 0.6,
                 "raw_source.max_weak_ratio": 0.8,
+                "sv_fallback_mode": "strict",
                 "cache_models": True,
                 "max_cached_models": 3,
                 "device": "cpu",
@@ -398,6 +399,23 @@ class ModelRuntimeConfigService:
                 "fast_delay_budget_sec": 2.0,
                 "force_split_on_sentence_end_punct": True,
                 "keep_sentence_end_punct": False,
+            },
+            # V3.2.0+dev.20260205.09: L4 对齐层运行参数
+            "alignment": {
+                "enable": True,
+                "score_threshold": 0.30,
+                "gap_ratio_low": 0.10,
+                "gap_ratio_mid": 0.30,
+                "gap_ratio_max": 0.40,
+                "min_valid_neighbors": 1,
+                "min_word_duration_ms": 100,
+                "use_sv_timebase": True,
+                # V3.2.0+dev.20260206.02: 双轨实验仅在 L4-L6 串行执行，不并行占用 GPU。
+                "enable_dual_time_experiment": False,
+                "dual_time_mode": "off",
+                "dual_time_write_debug_srt": False,
+                "dual_time_boundary_tolerance_ms": 250,
+                "dual_time_active_min_boundary_f1": 0.85,
             },
             # V3.2.0+dev.20260204.03: L2 文本仲裁层运行参数
             "arbitration": {
@@ -742,3 +760,4 @@ def reset_model_runtime_config_service() -> None:
     """重置运行参数配置服务（用于测试）。"""
     global _runtime_config_service
     _runtime_config_service = None
+

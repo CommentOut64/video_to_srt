@@ -2,6 +2,7 @@
 文本处理统一参数入口（TextPipelineConfig）。
 V3.2.0+dev.20260204.10
 """
+# V3.2.0+dev.20260205.09: 接入 L4 对齐层参数。
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -257,12 +258,86 @@ class NormalizationConfig:
 
 
 @dataclass
+class AlignmentLayerConfig:
+    """L4 对齐层参数。"""
+
+    is_enabled: bool = True
+    score_threshold: float = 0.3
+    gap_ratio_low: float = 0.1
+    gap_ratio_mid: float = 0.3
+    gap_ratio_max: float = 0.4
+    min_valid_neighbors: int = 1
+    min_word_duration_ms: int = 100
+    use_sv_timebase: bool = True
+    # V3.2.0+dev.20260206.02: 双轨实验配置（仅影响 L4-L6 CPU 后处理，不并行占用 GPU）。
+    is_enable_dual_time_experiment: bool = False
+    dual_time_mode: str = "off"
+    is_dual_time_write_debug_srt: bool = False
+    dual_time_boundary_tolerance_ms: int = 250
+    dual_time_active_min_boundary_f1: float = 0.85
+
+    @classmethod
+    def from_runtime(cls, raw: Optional[Dict[str, Any]]) -> "AlignmentLayerConfig":
+        raw = raw or {}
+        dual_time_mode = str(
+            _read_runtime_value(raw, "dual_time_mode", cls.dual_time_mode)
+            or cls.dual_time_mode
+        ).lower()
+        if dual_time_mode not in {"off", "shadow", "active"}:
+            dual_time_mode = cls.dual_time_mode
+        tolerance_ms = int(
+            _read_runtime_value(
+                raw,
+                "dual_time_boundary_tolerance_ms",
+                cls.dual_time_boundary_tolerance_ms,
+            )
+        )
+        tolerance_ms = max(50, tolerance_ms)
+        active_min_f1 = float(
+            _read_runtime_value(
+                raw,
+                "dual_time_active_min_boundary_f1",
+                cls.dual_time_active_min_boundary_f1,
+            )
+        )
+        active_min_f1 = min(1.0, max(0.0, active_min_f1))
+        return cls(
+            is_enabled=bool(_read_runtime_value(raw, "enable", cls.is_enabled)),
+            score_threshold=float(_read_runtime_value(raw, "score_threshold", cls.score_threshold)),
+            gap_ratio_low=float(_read_runtime_value(raw, "gap_ratio_low", cls.gap_ratio_low)),
+            gap_ratio_mid=float(_read_runtime_value(raw, "gap_ratio_mid", cls.gap_ratio_mid)),
+            gap_ratio_max=float(_read_runtime_value(raw, "gap_ratio_max", cls.gap_ratio_max)),
+            min_valid_neighbors=int(_read_runtime_value(raw, "min_valid_neighbors", cls.min_valid_neighbors)),
+            min_word_duration_ms=int(_read_runtime_value(raw, "min_word_duration_ms", cls.min_word_duration_ms)),
+            use_sv_timebase=bool(_read_runtime_value(raw, "use_sv_timebase", cls.use_sv_timebase)),
+            is_enable_dual_time_experiment=bool(
+                _read_runtime_value(
+                    raw,
+                    "enable_dual_time_experiment",
+                    cls.is_enable_dual_time_experiment,
+                )
+            ),
+            dual_time_mode=dual_time_mode,
+            is_dual_time_write_debug_srt=bool(
+                _read_runtime_value(
+                    raw,
+                    "dual_time_write_debug_srt",
+                    cls.is_dual_time_write_debug_srt,
+                )
+            ),
+            dual_time_boundary_tolerance_ms=tolerance_ms,
+            dual_time_active_min_boundary_f1=active_min_f1,
+        )
+
+
+@dataclass
 class TextPipelineConfig:
-    """文本处理流水线参数入口（L1/L2/L3）。"""
+    """文本处理流水线参数入口（L1/L2/L3/L4）。"""
 
     normalization: NormalizationConfig
     arbitration: "ArbitrationConfig"
     punctuation: "PunctuationConfig"
+    alignment: AlignmentLayerConfig
 
     @classmethod
     def from_runtime(cls, runtime: Optional[Dict[str, Any]] = None) -> "TextPipelineConfig":
@@ -272,10 +347,12 @@ class TextPipelineConfig:
         normalization_raw = effective.get("normalization", {}) if isinstance(effective, dict) else {}
         arbitration_raw = effective.get("arbitration", {}) if isinstance(effective, dict) else {}
         punctuation_raw = effective.get("punctuation", {}) if isinstance(effective, dict) else {}
+        alignment_raw = effective.get("alignment", {}) if isinstance(effective, dict) else {}
         return cls(
             normalization=NormalizationConfig.from_runtime(normalization_raw),
             arbitration=ArbitrationConfig.from_runtime(arbitration_raw),
             punctuation=PunctuationConfig.from_runtime(punctuation_raw),
+            alignment=AlignmentLayerConfig.from_runtime(alignment_raw),
         )
 
 
@@ -337,6 +414,7 @@ class PunctuationConfig:
     sentence_end_min_confidence: float = 0.55
     raw_source_min_mapping_coverage: float = 0.6
     raw_source_max_weak_ratio: float = 0.8  # 已废弃 (V3.2.0+dev.20260205.06): 保留用于向后兼容，但不再使用
+    sv_fallback_mode: str = "strict"
 
     @classmethod
     def from_runtime(cls, raw: Optional[Dict[str, Any]]) -> "PunctuationConfig":
@@ -366,6 +444,11 @@ class PunctuationConfig:
             "raw_source.max_weak_ratio",
             cls.raw_source_max_weak_ratio,
         )
+        sv_fallback_mode = str(
+            _read_runtime_value(raw, "sv_fallback_mode", cls.sv_fallback_mode)
+        ).lower()
+        if sv_fallback_mode not in {"strict", "tolerant"}:
+            sv_fallback_mode = cls.sv_fallback_mode
         return cls(
             is_enabled=bool(enable),
             source_preference=normalized,
@@ -373,4 +456,6 @@ class PunctuationConfig:
             sentence_end_min_confidence=float(end_min_conf),
             raw_source_min_mapping_coverage=float(raw_min_cov),
             raw_source_max_weak_ratio=float(raw_max_weak),
+            sv_fallback_mode=sv_fallback_mode,
         )
+
