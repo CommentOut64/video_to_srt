@@ -9,7 +9,7 @@ V3.2.0+dev.20260205.03
 - 自动使用 HuggingFace 镜像源（hf-mirror.com）
 
 更新日志：
-- V3.2.0+dev.20260205.03: 语言感知的 condition_on_previous_text 自适应，避免西方语言密集标点感染
+- V3.2.0+dev.20260206.04: 恢复启用 condition_on_previous_text（不再按语言自动禁用）
 """
 # 延迟导入 faster_whisper，避免启动时加载 ctranslate2 导致首次启动卡死
 # from faster_whisper import WhisperModel  # 已移至 load_model() 内部延迟导入
@@ -542,18 +542,8 @@ class WhisperService:
         if language is None or language == 'auto' or language == '':
             language = None
 
-        # V3.2.0+dev.20260205.03: 语言感知的 condition_on_previous_text 自适应
-        # 对于西方语言（英/德/法/西等），禁用前文条件以避免密集标点"感染"
-        # 如果是自动检测(None)，为安全起见也禁用（因为无法提前判断语言）
-        western_languages = ('en', 'de', 'fr', 'es', 'it', 'pt', 'nl', 'sv', 'no', 'da', 'fi')
-        if condition_on_previous_text:
-            if language is None:
-                # 自动检测语言时，为避免首个 segment 标点感染，统一禁用
-                condition_on_previous_text = False
-                logger.debug("自动检测语言，禁用 condition_on_previous_text 以避免标点感染")
-            elif language in western_languages:
-                condition_on_previous_text = False
-                logger.debug("检测到西方语言 '%s'，禁用 condition_on_previous_text 以避免标点感染", language)
+        # V3.2.0+dev.20260206.04: 恢复启用 condition_on_previous_text。
+        # 仅尊重外部显式参数/运行参数，不再按语言自动改写，避免英文场景标点过少。
 
         # 获取幻觉抑制 Token ID（如果未指定）
         if suppress_tokens is None:
