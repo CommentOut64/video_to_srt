@@ -87,7 +87,7 @@ class SemanticInjectionProcessor:
                     trailing_punct=item.trailing_punct,
                     confidence=source.final_confidence,
                     confidence_source=source.confidence_source,
-                    speaker_id=None,
+                    speaker_id=data.speaker_id,  # V3.2.0+dev.20260207.03: P0 speaker 透传
                     track_id="main",
                 )
                 for item, source in zip(injection.annotated_words, aligned_words)
@@ -112,7 +112,7 @@ class SemanticInjectionProcessor:
                 trailing_punct="",
                 confidence=word.final_confidence,
                 confidence_source=word.confidence_source,
-                speaker_id=None,
+                speaker_id=None,  # V3.2.0+dev.20260207.03: 降级路径保持 None
                 track_id="main",
             )
             for word in aligned_words

@@ -2854,6 +2854,7 @@ class AsyncDualPipeline:
             punctuation_positions=punctuation_positions,
             punctuation_clean_text=punctuation_clean_text,
             variant="legacy",
+            speaker_id=ctx.audio_chunk.primary_speaker_id if ctx.audio_chunk else None,
         )
 
         experiment_run: Optional[_Layer456RunResult] = None
@@ -2871,6 +2872,7 @@ class AsyncDualPipeline:
                 punctuation_positions=punctuation_positions,
                 punctuation_clean_text=punctuation_clean_text,
                 variant="experiment",
+                speaker_id=ctx.audio_chunk.primary_speaker_id if ctx.audio_chunk else None,
             )
             compare_payload = self._build_dual_time_compare_payload(
                 ctx=ctx,
@@ -3038,6 +3040,7 @@ class AsyncDualPipeline:
         punctuation_positions: Optional[List[PuncPosition]],
         punctuation_clean_text: Optional[str],
         variant: str = "legacy",
+        speaker_id: Optional[str] = None,
     ) -> _Layer456RunResult:
         """执行一次 L4-L6 主路径（仅 CPU 后处理）。"""
         time_words, time_source = self._resolve_alignment_time_words(
@@ -3077,6 +3080,7 @@ class AsyncDualPipeline:
                 alignment_result=alignment_result,
                 punct_track=l5_punct_track,
                 language=detected_language,
+                speaker_id=speaker_id,  # V3.2.0+dev.20260207.03: P0 speaker 信号链
             )
         )
         injection_report = dict(l5_output.injection_report or {})

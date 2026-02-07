@@ -121,6 +121,12 @@ class BridgeController:
             pre_flush = self._flush_if_speaker_changed(chunk)
             if pre_flush:
                 await self._push_chunk(chunk)
+                # V3.2.0+dev.20260207.03: P0 speaker_change 状态同步补齐
+                self._last_input_time = now
+                self._last_audio_end = max(self._last_audio_end, chunk.audio_range[1])
+                self._last_language = chunk.language or self._last_language
+                if chunk.speaker_id:
+                    self._last_speaker_id = chunk.speaker_id
                 return pre_flush
 
             pre_flush = self._flush_if_long_pause(chunk)

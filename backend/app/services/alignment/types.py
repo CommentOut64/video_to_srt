@@ -220,6 +220,7 @@ class L5Input:
     alignment_result: AlignmentResult
     punct_track: PunctTrack
     language: str = "auto"
+    speaker_id: Optional[str] = None  # V3.2.0+dev.20260207.03: P0 speaker 信号链
 
 
 @dataclass
