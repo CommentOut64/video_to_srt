@@ -290,6 +290,170 @@ html.el-popup-parent--hidden .el-message-box__wrapper {
 }
 
 /* ==============================================
+   AboutDialog 专用全局样式覆盖
+   el-dialog teleport 到 body，scoped 无法穿透
+   ============================================== */
+
+/* 原因：重置 dialog 默认 padding，通过 CSS 变量和直接属性双重覆盖确保生效 */
+/* 注意：class="about-dialog" 通过 $attrs 合并到 .el-dialog 同一元素上 */
+.el-dialog.about-dialog {
+  --el-dialog-padding-primary: 0;
+
+  padding: 0;
+  background: var(--af-bg-secondary);
+  border: 1px solid var(--af-border-default);
+}
+
+/* 原因：EP 用 padding-bottom/padding-right 单独属性，必须逐个覆盖 */
+/* .show-close 变体优先级 (0,3,0) 胜过 EP 的 (0,2,0) */
+.el-dialog.about-dialog .el-dialog__header,
+.el-dialog.about-dialog .el-dialog__header.show-close {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-top: 18px;
+  padding-right: 20px;
+  padding-bottom: 16px;
+  padding-left: 24px;
+  border-bottom: 1px solid var(--af-border-default);
+}
+
+.el-dialog.about-dialog .el-dialog__title {
+  color: var(--af-text-primary);
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+/* 原因：EP headerbtn 默认绝对定位 48x48，需改为 static 与标题对齐 */
+.el-dialog.about-dialog .el-dialog__headerbtn {
+  position: static;
+  width: 24px;
+  height: 24px;
+}
+
+/* 原因：Element Plus 不提供 body padding 的 CSS 变量 */
+.el-dialog.about-dialog .el-dialog__body {
+  padding: 24px 20px;
+}
+
+/* 原因：统一按钮 hover/active 样式 */
+.el-dialog.about-dialog .el-button:hover:not(:disabled) {
+  background: var(--af-bg-elevated);
+  border-color: var(--af-border-default);
+}
+
+.el-dialog.about-dialog .el-button:active:not(:disabled) {
+  background: var(--af-bg-tertiary);
+}
+
+/* ==============================================
+   创建任务 (upload-dialog) 专用全局样式覆盖
+   el-dialog teleport 到 body，scoped 无法穿透
+   ============================================== */
+
+/* 原因：class="upload-dialog" 通过 $attrs 合并到 .el-dialog 同一元素 */
+/* 显式设置 padding: 16px 恢复对话框边框与内容的间距 */
+.el-dialog.upload-dialog {
+  padding: 30px;
+  background: var(--af-bg-secondary);
+  border: 1px solid var(--af-border-default);
+}
+
+/* 原因：EP headerbtn 默认绝对定位 48x48，需改为 flex 内 static 与标题对齐 */
+.el-dialog.upload-dialog .el-dialog__header,
+.el-dialog.upload-dialog .el-dialog__header.show-close {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-top: 0;
+  padding-right: 0;
+  padding-bottom: 16px;
+  padding-left: 0;
+  border-bottom: 1px solid var(--af-border-default);
+}
+
+.el-dialog.upload-dialog .el-dialog__title {
+  color: var(--af-text-primary);
+  font-weight: 600;
+}
+
+.el-dialog.upload-dialog .el-dialog__headerbtn {
+  position: static;
+  width: 24px;
+  height: 24px;
+}
+
+.el-dialog.upload-dialog .el-dialog__headerbtn .el-dialog__close {
+  color: var(--af-text-secondary);
+}
+
+.el-dialog.upload-dialog .el-dialog__headerbtn .el-dialog__close:hover {
+  color: var(--af-text-primary);
+}
+
+.el-dialog.upload-dialog .el-dialog__body {
+  padding: 4px 0 0;
+  color: var(--af-text-primary);
+}
+
+.el-dialog.upload-dialog .el-dialog__footer {
+  padding: 16px 0 0;
+  border-top: 1px solid var(--af-border-default);
+}
+
+.el-dialog.upload-dialog .el-dialog__footer .dialog-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+}
+
+.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .selection-info {
+  color: var(--af-text-secondary);
+  font-size: 14px;
+}
+
+.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .footer-buttons {
+  display: flex;
+  gap: 8px;
+}
+
+/* 原因：统一按钮样式 */
+.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .footer-buttons .el-button {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--af-text-secondary);
+}
+
+.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .footer-buttons .el-button:hover {
+  background: var(--af-bg-tertiary);
+  border-color: var(--af-border-default);
+  color: var(--af-text-primary);
+}
+
+/* 原因：主操作按钮高亮样式 */
+.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .footer-buttons .primary-action-btn {
+  background-color: var(--af-accent-primary);
+  border-color: var(--af-accent-primary);
+  color: var(--af-text-on-dark);
+}
+
+.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .footer-buttons .primary-action-btn:disabled,
+.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .footer-buttons .primary-action-btn.is-disabled {
+  background-color: var(--af-bg-tertiary);
+  border-color: var(--af-border-default);
+  color: var(--af-text-disabled);
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
+.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .footer-buttons .primary-action-btn:hover:not(:disabled) {
+  background-color: var(--af-accent-primary-hover);
+  border-color: var(--af-accent-primary-hover);
+}
+
+/* ==============================================
    EditorHeader 专用全局样式覆盖
    ============================================== */
 
