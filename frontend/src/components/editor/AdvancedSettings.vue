@@ -534,10 +534,10 @@ const props = defineProps({
 
 const emit = defineEmits(['update:modelValue', 'change'])
 
-// 当前激活的 Tab
+/* 当前激活的 Tab */
 const activeTab = ref('general')
 
-// Tab 定义
+/* Tab 定义 */
 const tabs = [
   { id: 'general', label: '常规' },
   { id: 'audio', label: 'Audio' },
@@ -546,206 +546,209 @@ const tabs = [
   { id: 'system', label: 'System' }
 ]
 
-// 本地配置 (深拷贝)
+/* 本地配置 (深拷贝) */
 const localConfig = ref(JSON.parse(JSON.stringify(props.modelValue)))
 
-// 发送变更事件
+/* 发送变更事件 */
 function emitChange() {
-  // 检查是否还匹配某个预设
+  /* 检查是否还匹配某个预设 */
   localConfig.value.preset_id = 'custom'
   emit('update:modelValue', JSON.parse(JSON.stringify(localConfig.value)))
   emit('change', localConfig.value)
 }
 
-// 监听外部值变化
+/* 监听外部值变化 */
 watch(() => props.modelValue, (newVal) => {
   localConfig.value = JSON.parse(JSON.stringify(newVal))
 }, { deep: true })
 </script>
 
-<style lang="scss" scoped>
+<style scoped>
 .advanced-settings {
   display: flex;
   flex-direction: column;
   gap: 12px;
 }
 
-// Tab 页切换
+/* Tab 页切换 */
 .settings-tabs {
   display: flex;
   gap: 4px;
   padding: 4px;
-  background: var(--bg-tertiary);
-  border-radius: var(--radius-md);
-
-  .tab-btn {
-    flex: 1;
-    padding: 6px 12px;
-    font-size: 11px;
-    font-weight: 500;
-    color: var(--text-muted);
-    background: transparent;
-    border-radius: var(--radius-sm);
-    transition: all var(--transition-fast);
-
-    &:hover {
-      color: var(--text-normal);
-      background: var(--bg-quaternary);
-    }
-
-    &.active {
-      color: var(--primary);
-      background: var(--bg-secondary);
-    }
-  }
+  background: var(--af-bg-secondary);
+  border-radius: var(--af-radius-md);
 }
 
-// 设置面板
+.settings-tabs .tab-btn {
+  flex: 1;
+  padding: 6px 12px;
+  background: transparent;
+  border-radius: var(--af-radius-sm);
+  color: var(--af-text-muted);
+  font-size: 11px;
+  font-weight: 500;
+  transition: all var(--af-transition-fast);
+}
+
+.settings-tabs .tab-btn:hover {
+  background: var(--af-bg-tertiary);
+  color: var(--af-text-normal);
+}
+
+.settings-tabs .tab-btn.active {
+  background: var(--af-bg-tertiary);
+  color: var(--af-accent-primary);
+}
+
+/* 设置面板 */
 .settings-panel {
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
   padding: 12px;
-
-  .panel-header {
-    margin-bottom: 12px;
-    padding-bottom: 8px;
-    border-bottom: 1px solid var(--border-default);
-
-    .panel-title {
-      font-size: 12px;
-      font-weight: 500;
-      color: var(--text-normal);
-    }
-  }
+  background: var(--af-bg-secondary);
+  border: 1px solid var(--af-border-default);
+  border-radius: var(--af-radius-md);
 }
 
-// 设置行
+.settings-panel .panel-header {
+  margin-bottom: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--af-border-default);
+}
+
+.settings-panel .panel-header .panel-title {
+  color: var(--af-text-normal);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+/* 设置行 */
 .setting-row {
   display: flex;
-  align-items: center;
   justify-content: space-between;
+  align-items: center;
   padding: 8px 0;
-  border-bottom: 1px solid var(--border-default);
-
-  &:last-child {
-    border-bottom: none;
-  }
-
-  &.disabled {
-    opacity: 0.5;
-    pointer-events: none;
-
-    .setting-control {
-      opacity: 0.6;
-    }
-  }
-
-  .setting-label {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-
-    .label-text {
-      font-size: 12px;
-      color: var(--text-normal);
-    }
-
-    .label-hint {
-      font-size: 10px;
-      color: var(--text-muted);
-      font-family: 'SF Mono', Monaco, monospace;
-    }
-  }
-
-  .setting-control {
-    min-width: 140px;
-
-    select, input[type="text"], input[type="number"] {
-      width: 100%;
-      padding: 6px 10px;
-      font-size: 11px;
-      background: var(--bg-tertiary);
-      border: 1px solid var(--border-default);
-      border-radius: var(--radius-sm);
-      color: var(--text-normal);
-
-      &:focus {
-        outline: none;
-        border-color: var(--primary);
-      }
-
-      &:disabled {
-        opacity: 0.5;
-        cursor: not-allowed;
-      }
-    }
-
-    &.slider-control {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-
-      input[type="range"] {
-        flex: 1;
-        height: 4px;
-        accent-color: var(--primary);
-      }
-
-      .slider-value {
-        min-width: 36px;
-        font-size: 11px;
-        color: var(--text-secondary);
-        text-align: right;
-        font-family: 'SF Mono', Monaco, monospace;
-      }
-    }
-  }
+  border-bottom: 1px solid var(--af-border-default);
 }
 
-// Toggle 开关
+.setting-row:last-child {
+  border-bottom: none;
+}
+
+.setting-row .setting-label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.setting-row .setting-label .label-text {
+  color: var(--af-text-normal);
+  font-size: 12px;
+}
+
+.setting-row .setting-label .label-hint {
+  color: var(--af-text-muted);
+  font-size: 10px;
+  font-family: var(--af-font-mono);
+}
+
+.setting-row .setting-control {
+  min-width: 140px;
+}
+
+.setting-row.disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.setting-row.disabled .setting-control {
+  opacity: 0.6;
+}
+
+.setting-row .setting-control select,
+.setting-row .setting-control input[type="text"],
+.setting-row .setting-control input[type="number"] {
+  width: 100%;
+  padding: 6px 10px;
+  background: var(--af-bg-tertiary);
+  border: 1px solid var(--af-border-default);
+  border-radius: var(--af-radius-sm);
+  color: var(--af-text-normal);
+  font-size: 11px;
+}
+
+.setting-row .setting-control select:focus,
+.setting-row .setting-control input[type="text"]:focus,
+.setting-row .setting-control input[type="number"]:focus {
+  border-color: var(--af-accent-primary);
+  outline: none;
+}
+
+.setting-row .setting-control select:disabled,
+.setting-row .setting-control input[type="text"]:disabled,
+.setting-row .setting-control input[type="number"]:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.setting-row .setting-control.slider-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.setting-row .setting-control.slider-control input[type="range"] {
+  flex: 1;
+  height: 4px;
+  accent-color: var(--af-accent-primary);
+}
+
+.setting-row .setting-control.slider-control .slider-value {
+  min-width: 36px;
+  color: var(--af-text-secondary);
+  font-size: 11px;
+  font-family: var(--af-font-mono);
+  text-align: right;
+}
+
+/* Toggle 开关 */
 .toggle-switch {
   position: relative;
   display: inline-block;
   width: 36px;
   height: 20px;
+}
 
-  input {
-    opacity: 0;
-    width: 0;
-    height: 0;
-  }
+.toggle-switch input {
+  width: 0;
+  height: 0;
+  opacity: 0;
+}
 
-  .toggle-slider {
-    position: absolute;
-    cursor: pointer;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    background-color: var(--bg-quaternary);
-    transition: all var(--transition-fast);
-    border-radius: 10px;
+.toggle-switch .toggle-slider {
+  position: absolute;
+  inset: 0;
+  background-color: var(--af-bg-elevated);
+  border-radius: 10px;
+  transition: all var(--af-transition-fast);
+  cursor: pointer;
+}
 
-    &::before {
-      position: absolute;
-      content: "";
-      height: 16px;
-      width: 16px;
-      left: 2px;
-      bottom: 2px;
-      background-color: white;
-      transition: all var(--transition-fast);
-      border-radius: 50%;
-    }
-  }
+.toggle-switch .toggle-slider::before {
+  position: absolute;
+  bottom: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  background-color: var(--af-text-inverse);
+  border-radius: 50%;
+  transition: all var(--af-transition-fast);
+  content: "";
+}
 
-  input:checked + .toggle-slider {
-    background-color: var(--primary);
-  }
+.toggle-switch input:checked + .toggle-slider {
+  background-color: var(--af-accent-primary);
+}
 
-  input:checked + .toggle-slider::before {
-    transform: translateX(16px);
-  }
+.toggle-switch input:checked + .toggle-slider::before {
+  transform: translateX(16px);
 }
 </style>

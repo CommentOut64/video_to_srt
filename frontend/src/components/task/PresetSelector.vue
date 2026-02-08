@@ -84,12 +84,12 @@
           </label>
         </div>
         <div class="mt-2 flex flex-col gap-2">
-          <div class="text-[11px] text-[var(--text-muted)]">语言检测</div>
+          <div class="text-[11px] text-[var(--af-text-muted)]">语言检测</div>
           <label class="flex items-center gap-2 text-[11px]">
-            <span class="w-16 text-[var(--text-muted)]">模式</span>
+            <span class="w-16 text-[var(--af-text-muted)]">模式</span>
             <select
               v-model="localConfig.preprocessing.language_detection_mode"
-              class="flex-1 rounded border border-[var(--border-default)] bg-[var(--bg-tertiary)] px-2 py-1 text-[11px] text-[var(--text-normal)]"
+              class="flex-1 rounded border border-[var(--af-border-default)] bg-[var(--af-bg-tertiary)] px-2 py-1 text-[11px] text-[var(--af-text-normal)]"
               @change="onModuleChange"
             >
               <option value="fast">极速</option>
@@ -101,12 +101,12 @@
             <input
               type="checkbox"
               v-model="localConfig.preprocessing.enable_speaker_embedding"
-              class="h-3 w-3 accent-[var(--primary)]"
+              class="h-3 w-3 accent-[var(--af-accent-primary)]"
               @change="onModuleChange"
             />
-            <span class="text-[var(--text-normal)]">启用声纹提取</span>
+            <span class="text-[var(--af-text-normal)]">启用声纹提取</span>
           </label>
-          <div class="text-[10px] text-[var(--text-muted)]">
+          <div class="text-[10px] text-[var(--af-text-muted)]">
             声纹数据仅用于后续说话人聚类（默认关闭）
           </div>
         </div>
@@ -225,7 +225,7 @@ const props = defineProps({
       }
     })
   },
-  // 紧凑模式 - 用于对话框等空间有限的场景
+  /* 紧凑模式 - 用于对话框等空间有限的场景 */
   compact: {
     type: Boolean,
     default: false
@@ -234,7 +234,7 @@ const props = defineProps({
 
 const emit = defineEmits(['update:modelValue', 'change', 'openAdvanced'])
 
-// 状态
+/* 状态 */
 const showAdvanced = ref(false)
 const hardwareLoaded = ref(false)
 const vramGB = ref(0)
@@ -242,13 +242,13 @@ const vramMB = ref(0)
 const hasGpu = ref(true)
 const recommendedPresetId = ref(null)
 
-// 本地配置 (深拷贝)
+/* 本地配置 (深拷贝) */
 const localConfig = ref(JSON.parse(JSON.stringify(props.modelValue)))
 
-// 当前预设 ID
+/* 当前预设 ID */
 const currentPresetId = computed(() => localConfig.value.preset_id)
 
-// 快捷场景宏定义
+/* 快捷场景宏定义 */
 const macroPresets = [
   {
     id: 'fast',
@@ -258,7 +258,7 @@ const macroPresets = [
     minVram: 1500,
     requiresGpu: false,
     config: {
-      // 直通模式: 完全跳过频谱分诊和人声分离
+      /* 直通模式: 完全跳过频谱分诊和人声分离 */
       preprocessing: {
         demucs_strategy: 'off',
         separation_mode: 'on_demand',
@@ -278,7 +278,7 @@ const macroPresets = [
     minVram: 4000,
     requiresGpu: true,
     config: {
-      // 智能模式: 启用频谱分诊，按需分离
+      /* 智能模式: 启用频谱分诊，按需分离 */
       preprocessing: {
         demucs_strategy: 'auto',
         separation_mode: 'on_demand',
@@ -298,7 +298,7 @@ const macroPresets = [
     minVram: 8000,
     requiresGpu: true,
     config: {
-      // 极致模式: 强制全局分离，频谱分诊可跳过（因为会强制分离）
+      /* 极致模式: 强制全局分离，频谱分诊可跳过（因为会强制分离） */
       preprocessing: {
         demucs_strategy: 'force_on',
         separation_mode: 'global',
@@ -312,7 +312,7 @@ const macroPresets = [
   }
 ]
 
-// 模块一: 人声分离选项
+/* 模块一: 人声分离选项 */
 const demucsOptions = computed(() => [
   {
     value: 'off',
@@ -334,7 +334,7 @@ const demucsOptions = computed(() => [
   }
 ])
 
-// 模块二: 转录选项
+/* 模块二: 转录选项 */
 const transcriptionOptions = computed(() => [
   {
     value: 'sensevoice_only',
@@ -356,7 +356,7 @@ const transcriptionOptions = computed(() => [
   }
 ])
 
-// 模块三: LLM 增强选项
+/* 模块三: LLM 增强选项 */
 const llmOptions = computed(() => [
   {
     value: 'off',
@@ -384,7 +384,7 @@ const llmOptions = computed(() => [
   }
 ])
 
-// 获取 LLM 选项的组合值
+/* 获取 LLM 选项的组合值 */
 function getLLMOptionValue() {
   const { llm_task, llm_scope } = localConfig.value.refinement
   if (llm_task === 'off') return 'off'
@@ -395,7 +395,7 @@ function getLLMOptionValue() {
   return 'off'
 }
 
-// 设置 LLM 选项
+/* 设置 LLM 选项 */
 function setLLMOption(value) {
   switch (value) {
     case 'off':
@@ -412,13 +412,13 @@ function setLLMOption(value) {
       break
     case 'translate':
       localConfig.value.refinement.llm_task = 'translate'
-      localConfig.value.refinement.llm_scope = 'global'  // 翻译建议全局
+      localConfig.value.refinement.llm_scope = 'global'
       break
   }
   onModuleChange()
 }
 
-// 当前预设信息
+/* 当前预设信息 */
 const currentPresetInfo = computed(() => {
   if (currentPresetId.value === 'custom') {
     return '自定义配置'
@@ -427,23 +427,23 @@ const currentPresetInfo = computed(() => {
   return preset ? `${preset.name} - ${preset.description}` : '自定义配置'
 })
 
-// 显存警告
+/* 显存警告 */
 const vramWarning = computed(() => {
   if (!hardwareLoaded.value) return null
 
   const warnings = []
 
-  // 检查 Demucs mdx_extra
+  /* 检查 Demucs mdx_extra */
   if (localConfig.value.preprocessing.demucs_model === 'mdx_extra' && vramMB.value < 6000) {
     warnings.push('mdx_extra 模型建议 6GB+ 显存')
   }
 
-  // 检查 Whisper large-v3
+  /* 检查 Whisper large-v3 */
   if (localConfig.value.transcription.whisper_model === 'large-v3' && vramMB.value < 8000) {
     warnings.push('Whisper large-v3 模型建议 8GB+ 显存')
   }
 
-  // 检查双流并行
+  /* 检查双流并行 */
   if (localConfig.value.transcription.transcription_profile === 'sv_whisper_dual' && vramMB.value < 8000) {
     warnings.push('双流精校模式建议 8GB+ 显存')
   }
@@ -455,14 +455,14 @@ const vramWarning = computed(() => {
   return null
 })
 
-// 检查预设是否可用
+/* 检查预设是否可用 */
 function isPresetAvailable(preset) {
   if (preset.requiresGpu && !hasGpu.value) return false
   if (vramMB.value < preset.minVram) return false
   return true
 }
 
-// 获取预设 tooltip
+/* 获取预设 tooltip */
 function getPresetTooltip(preset) {
   if (!isPresetAvailable(preset)) {
     if (preset.requiresGpu && !hasGpu.value) {
@@ -473,15 +473,15 @@ function getPresetTooltip(preset) {
   return ''
 }
 
-// 获取预设名称
+/* 获取预设名称 */
 function getPresetName(presetId) {
   const preset = macroPresets.find(p => p.id === presetId)
   return preset?.name || presetId
 }
 
-// 获取预设图标组件
+/* 获取预设图标组件 */
 function getPresetIcon(iconName) {
-  // 返回简单的文本图标
+  /* 返回简单的文本图标 */
   const icons = {
     bolt: 'span',
     scale: 'span',
@@ -490,19 +490,19 @@ function getPresetIcon(iconName) {
   return icons[iconName] || 'span'
 }
 
-// 选择快捷预设
+/* 选择快捷预设 */
 function selectMacroPreset(presetId) {
   const preset = macroPresets.find(p => p.id === presetId)
   if (!preset) return
 
   localConfig.value.preset_id = presetId
 
-  // 应用预设配置
+  /* 应用预设配置 */
   Object.assign(localConfig.value.preprocessing, preset.config.preprocessing)
   Object.assign(localConfig.value.transcription, preset.config.transcription)
   Object.assign(localConfig.value.refinement, preset.config.refinement)
 
-  // 根据预设设置默认的详细参数
+  /* 根据预设设置默认的详细参数 */
   if (presetId === 'fast') {
     localConfig.value.preprocessing.demucs_model = 'htdemucs'
     localConfig.value.preprocessing.demucs_shifts = 1
@@ -520,12 +520,13 @@ function selectMacroPreset(presetId) {
   emitChange()
 }
 
-// 模块选项变更时检查是否匹配预设
+/* 模块选项变更时检查是否匹配预设 */
 function onModuleChange() {
-  // 根据 demucs_strategy 自动推导 enable_spectral_triage 和 separation_mode
-  // - off: 直通模式，跳过频谱分诊，按需分离（实际不会执行）
-  // - auto: 智能模式，启用频谱分诊，按需分离
-  // - force_on: 强制分离，跳过频谱分诊，全局分离
+  /* 根据 demucs_strategy 自动推导 enable_spectral_triage 和 separation_mode
+   * - off: 直通模式，跳过频谱分诊，按需分离（实际不会执行）
+   * - auto: 智能模式，启用频谱分诊，按需分离
+   * - force_on: 强制分离，跳过频谱分诊，全局分离
+   */
   const strategy = localConfig.value.preprocessing.demucs_strategy
   if (strategy === 'off') {
     localConfig.value.preprocessing.enable_spectral_triage = false
@@ -538,7 +539,7 @@ function onModuleChange() {
     localConfig.value.preprocessing.separation_mode = 'global'
   }
 
-  // 检查当前配置是否匹配某个预设
+  /* 检查当前配置是否匹配某个预设 */
   const matchedPreset = macroPresets.find(preset => {
     return (
       localConfig.value.preprocessing.demucs_strategy === preset.config.preprocessing.demucs_strategy &&
@@ -554,35 +555,35 @@ function onModuleChange() {
   emitChange()
 }
 
-// 发送变更事件
+/* 发送变更事件 */
 function emitChange() {
   emit('update:modelValue', JSON.parse(JSON.stringify(localConfig.value)))
   emit('change', localConfig.value)
 }
 
-// 监听外部值变化
+/* 监听外部值变化 */
 watch(() => props.modelValue, (newVal) => {
   localConfig.value = JSON.parse(JSON.stringify(newVal))
 }, { deep: true })
 
-// 监听高级设置开关
+/* 监听高级设置开关 */
 watch(showAdvanced, (val) => {
   if (val) {
     emit('openAdvanced', localConfig.value)
   }
 })
 
-// 加载硬件信息
+/* 加载硬件信息 */
 onMounted(async () => {
   try {
     const response = await getHardwareInfo()
     if (response.success && response.hardware) {
-      // 后端返回的是 gpu 字段，不是 gpu_info
+      /* 后端返回的是 gpu 字段，不是 gpu_info */
       const gpuInfo = response.hardware.gpu
       if (gpuInfo) {
-        // cuda_available 表示是否有可用的 GPU
+        /* cuda_available 表示是否有可用的 GPU */
         hasGpu.value = gpuInfo.cuda_available === true
-        // 显存使用 total_memory_mb 字段
+        /* 显存使用 total_memory_mb 字段 */
         if (gpuInfo.total_memory_mb) {
           vramMB.value = gpuInfo.total_memory_mb
           vramGB.value = Math.floor(gpuInfo.total_memory_mb / 1024)
@@ -591,11 +592,11 @@ onMounted(async () => {
         hasGpu.value = false
       }
 
-      // 计算推荐预设 - 优先推荐智能均衡
+      /* 计算推荐预设 - 优先推荐智能均衡 */
       if (!hasGpu.value) {
         recommendedPresetId.value = 'fast'
       } else if (vramMB.value >= 4000) {
-        // 4GB+ 显存优先推荐智能均衡（最佳平衡点）
+        /* 4GB+ 显存优先推荐智能均衡（最佳平衡点） */
         recommendedPresetId.value = 'balanced'
       } else {
         recommendedPresetId.value = 'fast'
@@ -610,182 +611,180 @@ onMounted(async () => {
 })
 </script>
 
-<style lang="scss" scoped>
+<style scoped>
 .preset-selector {
   display: flex;
   flex-direction: column;
   gap: 16px;
 }
 
-// 顶层: 快捷场景宏
-.macro-presets {
-  .section-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 8px;
-
-    .header-label {
-      font-size: 13px;
-      font-weight: 500;
-      color: var(--text-normal);
-    }
-
-    .toggle-btn {
-      padding: 4px 10px;
-      font-size: 11px;
-      color: var(--text-muted);
-      background: var(--bg-tertiary);
-      border-radius: var(--radius-sm);
-      transition: all var(--transition-fast);
-
-      &:hover {
-        color: var(--text-normal);
-        background: var(--bg-quaternary);
-      }
-    }
-  }
-
-  .hardware-hint {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 6px 10px;
-    margin-bottom: 8px;
-    background: var(--bg-tertiary);
-    border-radius: var(--radius-sm);
-    font-size: 11px;
-
-    .hw-vram {
-      color: var(--text-secondary);
-    }
-
-    .hw-warning {
-      color: var(--warning);
-    }
-
-    .hw-recommend {
-      color: var(--success);
-      margin-left: auto;
-    }
-  }
-
-  .preset-cards {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 8px;
-  }
+/* 顶层: 快捷场景宏 */
+.macro-presets .section-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
 }
 
-// 快捷预设卡片
+.macro-presets .section-header .header-label {
+  color: var(--af-text-normal);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.macro-presets .section-header .toggle-btn {
+  padding: 4px 10px;
+  background: var(--af-bg-tertiary);
+  border-radius: var(--af-radius-sm);
+  color: var(--af-text-muted);
+  font-size: 11px;
+  transition: all var(--af-transition-fast);
+}
+
+.macro-presets .section-header .toggle-btn:hover {
+  background: var(--af-bg-elevated);
+  color: var(--af-text-normal);
+}
+
+.macro-presets .hardware-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  background: var(--af-bg-tertiary);
+  border-radius: var(--af-radius-sm);
+  font-size: 11px;
+}
+
+.macro-presets .hardware-hint .hw-vram {
+  color: var(--af-text-secondary);
+}
+
+.macro-presets .hardware-hint .hw-warning {
+  color: var(--af-accent-warning);
+}
+
+.macro-presets .hardware-hint .hw-recommend {
+  margin-left: auto;
+  color: var(--af-accent-success);
+}
+
+.macro-presets .preset-cards {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+/* 快捷预设卡片 */
 .preset-card {
+  position: relative;
   display: flex;
   flex-direction: column;
   align-items: center;
   padding: 12px 8px;
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
+  background: var(--af-bg-secondary);
+  border: 1px solid var(--af-border-default);
+  border-radius: var(--af-radius-md);
+  transition: all var(--af-transition-fast);
   cursor: pointer;
-  transition: all var(--transition-fast);
-  position: relative;
-
-  &:hover {
-    background: var(--bg-tertiary);
-    border-color: var(--border-hover);
-  }
-
-  &.active {
-    border-color: var(--primary);
-    background: rgba(88, 166, 255, 0.08);
-
-    .preset-icon {
-      background: var(--primary);
-      color: white;
-    }
-  }
-
-  &.disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-
-    &:hover {
-      background: var(--bg-secondary);
-      border-color: var(--border-default);
-    }
-  }
-
-  &.recommended:not(.active) {
-    border-color: var(--success);
-
-    .preset-icon {
-      background: var(--success);
-      color: white;
-    }
-  }
-
-  .preset-icon {
-    width: 32px;
-    height: 32px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: var(--bg-tertiary);
-    border-radius: var(--radius-sm);
-    font-size: 14px;
-    font-weight: 600;
-    color: var(--text-secondary);
-    margin-bottom: 8px;
-
-    &::before {
-      content: attr(data-icon);
-    }
-  }
-
-  .preset-info {
-    text-align: center;
-
-    .preset-name {
-      font-size: 12px;
-      font-weight: 500;
-      color: var(--text-normal);
-      margin-bottom: 2px;
-    }
-
-    .preset-desc {
-      font-size: 10px;
-      color: var(--text-muted);
-      line-height: 1.3;
-    }
-  }
-
-  .check-mark {
-    position: absolute;
-    top: 4px;
-    right: 4px;
-    width: 16px;
-    height: 16px;
-    color: var(--primary);
-
-    svg {
-      width: 100%;
-      height: 100%;
-    }
-  }
-
-  .recommend-badge {
-    position: absolute;
-    top: 2px;
-    left: 2px;
-    padding: 2px 6px;
-    font-size: 9px;
-    background: var(--success);
-    color: white;
-    border-radius: var(--radius-sm);
-  }
 }
 
-// 底层: 三个模块卡片
+.preset-card:hover {
+  background: var(--af-bg-tertiary);
+  border-color: var(--af-accent-primary);
+}
+
+.preset-card.active {
+  background: rgb(var(--af-accent-primary-rgb), 0.08);
+  border-color: var(--af-accent-primary);
+}
+
+.preset-card .preset-icon {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  width: 32px;
+  height: 32px;
+  margin-bottom: 8px;
+  background: var(--af-bg-tertiary);
+  border-radius: var(--af-radius-sm);
+  color: var(--af-text-secondary);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.preset-card.active .preset-icon {
+  background: var(--af-accent-primary);
+  color: var(--af-text-inverse);
+}
+
+.preset-card.disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.preset-card.disabled:hover {
+  background: var(--af-bg-secondary);
+  border-color: var(--af-border-default);
+}
+
+.preset-card.recommended:not(.active) {
+  border-color: var(--af-accent-success);
+}
+
+.preset-card.recommended:not(.active) .preset-icon {
+  background: var(--af-accent-success);
+  color: var(--af-text-inverse);
+}
+
+.preset-card .preset-icon::before {
+  content: attr(data-icon);
+}
+
+.preset-card .preset-info {
+  text-align: center;
+}
+
+.preset-card .preset-info .preset-name {
+  margin-bottom: 2px;
+  color: var(--af-text-normal);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.preset-card .preset-info .preset-desc {
+  color: var(--af-text-muted);
+  font-size: 10px;
+  line-height: 1.3;
+}
+
+.preset-card .check-mark {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 16px;
+  height: 16px;
+  color: var(--af-accent-primary);
+}
+
+.preset-card .check-mark svg {
+  width: 100%;
+  height: 100%;
+}
+
+.preset-card .recommend-badge {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  padding: 2px 6px;
+  background: var(--af-accent-success);
+  border-radius: var(--af-radius-sm);
+  color: var(--af-text-inverse);
+  font-size: 9px;
+}
+
+/* 底层: 三个模块卡片 */
 .module-cards {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -793,222 +792,218 @@ onMounted(async () => {
 }
 
 .module-card {
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
   padding: 10px;
-
-  // 整体禁用状态（LLM 模块暂未集成）
-  &.module-disabled {
-    opacity: 0.5;
-    pointer-events: none;
-    cursor: not-allowed;
-
-    .module-title {
-      color: var(--text-muted);
-    }
-  }
-
-  .module-header {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    margin-bottom: 8px;
-
-    .module-icon {
-      width: 18px;
-      height: 18px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background: var(--bg-tertiary);
-      border-radius: var(--radius-sm);
-      font-size: 10px;
-      font-weight: 600;
-      color: var(--text-muted);
-    }
-
-    .module-title {
-      font-size: 12px;
-      font-weight: 500;
-      color: var(--text-normal);
-    }
-  }
-
-  .module-options {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
+  background: var(--af-bg-secondary);
+  border: 1px solid var(--af-border-default);
+  border-radius: var(--af-radius-md);
 }
 
-// 模块选项
+/* 整体禁用状态（LLM 模块暂未集成） */
+.module-card.module-disabled {
+  opacity: 0.5;
+  pointer-events: none;
+  cursor: not-allowed;
+}
+
+.module-card.module-disabled .module-title {
+  color: var(--af-text-muted);
+}
+
+.module-card .module-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.module-card .module-header .module-icon {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  width: 18px;
+  height: 18px;
+  background: var(--af-bg-tertiary);
+  border-radius: var(--af-radius-sm);
+  color: var(--af-text-muted);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.module-card .module-header .module-title {
+  color: var(--af-text-normal);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.module-card .module-options {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* 模块选项 */
 .option-item {
   display: flex;
   align-items: center;
   gap: 6px;
   padding: 6px 8px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--af-radius-sm);
+  transition: all var(--af-transition-fast);
   cursor: pointer;
-  transition: all var(--transition-fast);
-
-  &:hover {
-    background: var(--bg-tertiary);
-  }
-
-  &.active {
-    background: rgba(88, 166, 255, 0.1);
-
-    .option-label {
-      color: var(--primary);
-      font-weight: 500;
-    }
-  }
-
-  &.disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-
-    &:hover {
-      background: transparent;
-    }
-  }
-
-  input[type="radio"] {
-    width: 12px;
-    height: 12px;
-    accent-color: var(--primary);
-  }
-
-  .option-label {
-    font-size: 11px;
-    color: var(--text-normal);
-    flex: 1;
-  }
-
-  .option-hint {
-    font-size: 9px;
-    color: var(--text-muted);
-  }
 }
 
-// 当前方案信息
+.option-item:hover {
+  background: var(--af-bg-tertiary);
+}
+
+.option-item input[type="radio"] {
+  width: 12px;
+  height: 12px;
+  accent-color: var(--af-accent-primary);
+}
+
+.option-item .option-label {
+  flex: 1;
+  color: var(--af-text-normal);
+  font-size: 11px;
+}
+
+.option-item.active {
+  background: rgb(var(--af-accent-primary-rgb), 0.1);
+}
+
+.option-item.active .option-label {
+  color: var(--af-accent-primary);
+  font-weight: 500;
+}
+
+.option-item.disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.option-item.disabled:hover {
+  background: transparent;
+}
+
+.option-item .option-hint {
+  color: var(--af-text-muted);
+  font-size: 9px;
+}
+
+/* 当前方案信息 */
 .current-preset-info {
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 8px 10px;
-  background: var(--bg-secondary);
-  border-radius: var(--radius-sm);
+  background: var(--af-bg-secondary);
+  border-radius: var(--af-radius-sm);
   font-size: 11px;
-
-  .info-label {
-    color: var(--text-muted);
-  }
-
-  .info-value {
-    color: var(--text-normal);
-    font-weight: 500;
-  }
 }
 
-// 显存警告
+.current-preset-info .info-label {
+  color: var(--af-text-muted);
+}
+
+.current-preset-info .info-value {
+  color: var(--af-text-normal);
+  font-weight: 500;
+}
+
+/* 显存警告 */
 .vram-warning {
   padding: 8px 12px;
-  background: rgba(255, 152, 0, 0.1);
-  border: 1px solid var(--warning);
-  border-radius: var(--radius-sm);
+  background: rgb(var(--af-accent-warning-rgb), 0.1);
+  border: 1px solid var(--af-accent-warning);
+  border-radius: var(--af-radius-sm);
+  color: var(--af-accent-warning);
   font-size: 11px;
-  color: var(--warning);
 }
 
-// 紧凑模式样式
+/* 紧凑模式样式 */
 .preset-selector.compact {
   gap: 12px;
+}
 
-  .macro-presets {
-    .section-header {
-      margin-bottom: 6px;
-    }
+.preset-selector.compact .macro-presets .section-header {
+  margin-bottom: 6px;
+}
 
-    .hardware-hint {
-      padding: 4px 8px;
-      margin-bottom: 6px;
-    }
+.preset-selector.compact .macro-presets .hardware-hint {
+  padding: 4px 8px;
+  margin-bottom: 6px;
+}
 
-    .preset-cards {
-      gap: 6px;
-    }
-  }
+.preset-selector.compact .macro-presets .preset-cards {
+  gap: 6px;
+}
 
-  .preset-card {
-    padding: 10px 6px;
+.preset-selector.compact .preset-card {
+  padding: 10px 6px;
+}
 
-    .preset-icon {
-      width: 28px;
-      height: 28px;
-      margin-bottom: 6px;
-    }
+.preset-selector.compact .preset-card .preset-icon {
+  width: 28px;
+  height: 28px;
+  margin-bottom: 6px;
+}
 
-    .preset-info {
-      .preset-name {
-        font-size: 11px;
-      }
+.preset-selector.compact .preset-card .preset-info .preset-name {
+  font-size: 11px;
+}
 
-      .preset-desc {
-        font-size: 9px;
-      }
-    }
-  }
+.preset-selector.compact .preset-card .preset-info .preset-desc {
+  font-size: 9px;
+}
 
-  .module-cards {
-    gap: 6px;
-  }
+.preset-selector.compact .module-cards {
+  gap: 6px;
+}
 
-  .module-card {
-    padding: 8px;
+.preset-selector.compact .module-card {
+  padding: 8px;
+}
 
-    .module-header {
-      margin-bottom: 6px;
+.preset-selector.compact .module-card .module-header {
+  margin-bottom: 6px;
+}
 
-      .module-icon {
-        width: 16px;
-        height: 16px;
-        font-size: 9px;
-      }
+.preset-selector.compact .module-card .module-header .module-icon {
+  width: 16px;
+  height: 16px;
+  font-size: 9px;
+}
 
-      .module-title {
-        font-size: 11px;
-      }
-    }
-  }
+.preset-selector.compact .module-card .module-header .module-title {
+  font-size: 11px;
+}
 
-  .option-item {
-    padding: 4px 6px;
-    gap: 4px;
+.preset-selector.compact .option-item {
+  gap: 4px;
+  padding: 4px 6px;
+}
 
-    input[type="radio"] {
-      width: 10px;
-      height: 10px;
-    }
+.preset-selector.compact .option-item input[type="radio"] {
+  width: 10px;
+  height: 10px;
+}
 
-    .option-label {
-      font-size: 10px;
-    }
+.preset-selector.compact .option-item .option-label {
+  font-size: 10px;
+}
 
-    .option-hint {
-      font-size: 8px;
-    }
-  }
+.preset-selector.compact .option-item .option-hint {
+  font-size: 8px;
+}
 
-  .current-preset-info {
-    padding: 6px 8px;
-    font-size: 10px;
-  }
+.preset-selector.compact .current-preset-info {
+  padding: 6px 8px;
+  font-size: 10px;
+}
 
-  .vram-warning {
-    padding: 6px 10px;
-    font-size: 10px;
-  }
+.preset-selector.compact .vram-warning {
+  padding: 6px 10px;
+  font-size: 10px;
 }
 </style>
