@@ -5,23 +5,15 @@ module.exports = {
   ],
 
   plugins: [
-    'stylelint-scss',
     'stylelint-order'
   ],
 
   customSyntax: 'postcss-html',
 
   rules: {
-    // ========== 规则 1：禁止 SCSS 特性 ==========
+    // ========== 规则 1：CSS 函数白名单 ==========
 
-    // 禁止 SCSS 变量（$variable）
-    'scss/dollar-variable-pattern': null,
-    'scss/at-rule-no-unknown': null,
-
-    // 禁止 SCSS 嵌套（&）
-    'selector-nested-pattern': null,
-
-    // 禁止 SCSS 函数
+    // 允许的 CSS 函数
     'function-no-unknown': [
       true,
       {
