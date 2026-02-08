@@ -6,20 +6,25 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "lint:style": "stylelint 'src/**/*.{vue,css}'",
+    "lint:style:fix": "stylelint 'src/**/*.{vue,css}' --fix",
+    "lint:style:fix-safe": "stylelint 'src/**/*.{vue,css}' --config .stylelintrc.safe-fix.cjs --fix",
+    "lint:style:fix-safe-dry": "stylelint 'src/**/*.{vue,css}' --config .stylelintrc.safe-fix.cjs --fix-dry-run",
+    "lint:style:report": "stylelint 'src/**/*.{vue,css}' --formatter json --output-file stylelint-report.json"
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.2",
     "@vueuse/components": "^14.0.0",
     "@vueuse/core": "^14.0.0",
     "axios": "^1.13.2",
+    "clsx": "^2.1.1",
     "element-plus": "^2.11.8",
     "eventemitter3": "^5.0.1",
     "localforage": "^1.10.0",
     "lru-cache": "^11.2.2",
     "markdown-it": "^14.1.0",
     "pinia": "^3.0.4",
-    "sass": "^1.94.2",
     "splitpanes": "^4.0.4",
     "vue": "^3.5.24",
     "vue-router": "^4.6.3",
@@ -29,6 +34,14 @@
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^6.0.1",
+    "autoprefixer": "^10.4.23",
+    "postcss": "^8.5.6",
+    "postcss-html": "^1.8.1",
+    "stylelint": "^17.1.0",
+    "stylelint-config-recommended-vue": "^1.6.1",
+    "stylelint-config-standard": "^40.0.0",
+    "stylelint-order": "^7.0.1",
+    "tailwindcss": "^3.4.19",
     "vite": "^7.2.4"
   }
 }

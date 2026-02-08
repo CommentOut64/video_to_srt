@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head>
+<script type="module">
+import { darkTheme } from './src/theme/tokens/dark.js';
+
+function toKebabCase(str) {
+  return str.replace(/([a-z0-9])([A-Z])/g, '$1-$2').toLowerCase();
+}
+
+function flattenObject(obj, prefix = '') {
+  const result = {};
+  for (const [key, value] of Object.entries(obj)) {
+    const kebabKey = toKebabCase(key);
+    const newKey = prefix ? `${prefix}-${kebabKey}` : kebabKey;
+    if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+      Object.assign(result, flattenObject(value, newKey));
+    } else {
+      result[`--af-${newKey}`] = value;
+    }
+  }
+  return result;
+}
+
+console.log('=== Testing functional object flattening ===');
+const vars = flattenObject(darkTheme.functional);
+const processingVars = Object.keys(vars).filter(k => k.includes('processing'));
+console.log('Processing related variables:');
+processingVars.forEach(key => console.log(`${key}: ${vars[key]}`));
+</script>
+</head>
+<body>Check console</body>
+</html>

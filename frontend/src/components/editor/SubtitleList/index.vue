@@ -1,25 +1,25 @@
 <template>
-  <div class="subtitle-list">
+  <div class="subtitle-list tw-flex tw-flex-col tw-h-full tw-bg-bg-primary">
     <!-- 工具栏 -->
-    <div class="list-toolbar">
+    <div class="list-toolbar tw-flex tw-items-center tw-justify-between tw-px-3 tw-py-2.5 tw-bg-bg-secondary tw-border-b tw-border-border tw-gap-3">
       <div class="toolbar-left">
-        <span class="subtitle-count">{{ totalSubtitles }} 条字幕</span>
-        <!-- Phase 5: 草稿/定稿计数 -->
-        <span v-if="draftCount > 0" class="draft-count">({{ draftCount }} 草稿)</span>
+        <span class="subtitle-count tw-text-xs tw-text-text-secondary tw-whitespace-nowrap">{{ totalSubtitles }} 条字幕</span>
+        <!-- 草稿/定稿计数 -->
+        <span v-if="draftCount > 0" class="draft-count tw-text-xs tw-text-accent-warning tw-ml-1">({{ draftCount }} 草稿)</span>
       </div>
 
-      <div class="toolbar-center">
-        <div class="search-box">
-          <svg class="search-icon" viewBox="0 0 24 24" fill="currentColor">
+      <div class="toolbar-center tw-flex-1 tw-max-w-[180px] tw-min-w-[100px]">
+        <div class="search-box tw-flex tw-items-center tw-bg-bg-tertiary tw-rounded-md tw-px-2.5 tw-py-1.5 tw-gap-1.5">
+          <svg class="search-icon tw-w-3.5 tw-h-3.5 tw-text-text-muted tw-flex-shrink-0" viewBox="0 0 24 24" fill="currentColor">
             <path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/>
           </svg>
           <input
             v-model="searchText"
             type="text"
             placeholder="搜索字幕..."
-            class="search-input"
+            class="search-input tw-flex-1 tw-min-w-0 tw-bg-transparent tw-border-none tw-text-text-normal tw-text-xs"
           />
-          <button v-if="searchText" class="search-clear" @click="searchText = ''">
+          <button v-if="searchText" class="search-clear tw-w-4 tw-h-4 tw-text-text-muted tw-flex-shrink-0 hover:tw-text-text-normal" @click="searchText = ''">
             <svg viewBox="0 0 24 24" fill="currentColor">
               <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
             </svg>
@@ -29,8 +29,8 @@
 
       <div class="toolbar-right">
         <el-tooltip content="添加字幕" placement="bottom" :show-after="500">
-          <button class="toolbar-btn" @click="addNewSubtitle">
-            <svg viewBox="0 0 24 24" fill="currentColor">
+          <button class="toolbar-btn tw-w-[30px] tw-h-[30px] tw-flex tw-items-center tw-justify-center tw-rounded-md tw-text-text-secondary tw-transition-all tw-duration-fast tw-flex-shrink-0 hover:tw-bg-bg-tertiary hover:tw-text-accent-primary" @click="addNewSubtitle">
+            <svg viewBox="0 0 24 24" fill="currentColor" class="tw-w-[18px] tw-h-[18px]">
               <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/>
             </svg>
           </button>
@@ -38,17 +38,17 @@
       </div>
     </div>
 
-    <!-- 字幕列表 (Phase 5: 使用 SubtitleItem 组件) -->
-    <div class="list-container" ref="listRef">
-      <div v-if="filteredSubtitles.length === 0" class="empty-state">
-        <svg viewBox="0 0 24 24" fill="currentColor">
-          <path d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zM4 18V6h16v12H4zm2-1h2v-2H6v2zm0-3h8v-2H6v2zm10 3h2v-5h-2v5zm-4 0h2v-2h-2v2zm0-3h4v-2h-4v2z"/>
+    <!-- 字幕列表 (使用 SubtitleItem 组件) -->
+    <div class="list-container tw-flex-1 tw-overflow-y-auto tw-p-1.5 tw-relative" ref="listRef">
+      <div v-if="filteredSubtitles.length === 0" class="empty-state tw-flex tw-flex-col tw-items-center tw-justify-center tw-px-4 tw-py-8 tw-text-text-muted">
+        <svg viewBox="0 0 24 24" fill="currentColor" class="tw-w-12 tw-h-12 tw-mb-3 tw-opacity-50">
+          <path d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H4V6h16v12zM6 10h2v2H6v-2zm0 4h8v2H6v-2zm10 0h2v2h-2v-2zm0-4h2v2h-2v-2zm-4 4h2v2h-2v-2zm0-4h2v2h-2v-2z"/>
         </svg>
-        <p>暂无字幕</p>
+        <p class="tw-text-[13px] tw-mb-3">暂无字幕</p>
         <button class="add-first-btn" @click="addNewSubtitle">添加第一条字幕</button>
       </div>
 
-      <!-- Phase 5: 使用 SubtitleItem 组件替代内联渲染 -->
+      <!-- 使用 SubtitleItem 组件替代内联渲染 -->
       <!-- 添加 TransitionGroup 实现切分动画，批量更新时禁用 -->
       <TransitionGroup :name="animationEnabled ? 'subtitle-list' : ''" tag="div">
         <SubtitleItem
@@ -77,7 +77,7 @@ import { useProjectStore } from '@/stores/projectStore'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { useSubtitleSync } from '@/composables'  // V3.2.0+dev.20260124.01: 导入字幕同步
 import transcriptionApi from '@/services/api/transcriptionApi'
-// Phase 5: 导入 SubtitleItem 组件
+// 导入 SubtitleItem 组件
 import SubtitleItem from './SubtitleItem.vue'
 
 // Props
@@ -112,7 +112,7 @@ const subtitles = computed(() => projectStore.subtitles)
 const totalSubtitles = computed(() => projectStore.totalSubtitles)
 const currentSubtitleId = computed(() => projectStore.currentSubtitle?.id)
 const activeSubtitleId = computed(() => projectStore.view.selectedSubtitleId)
-// Phase 5: 草稿计数
+// 草稿计数
 const draftCount = computed(() => projectStore.draftSubtitleCount)
 
 const filteredSubtitles = computed(() => {
@@ -322,383 +322,425 @@ watch(subtitles, (newList) => {
 }, { flush: 'pre' })  // pre: 在 DOM 更新前触发
 </script>
 
-<style lang="scss" scoped>
+<style scoped>
+/* 主容器 */
 .subtitle-list {
   display: flex;
   flex-direction: column;
   height: 100%;
-  background: var(--bg-primary);
+  background: var(--af-bg-primary);
 }
 
-// 工具栏 - 针对 350px 宽度优化
+/* 工具栏 - 针对 350px 宽度优化 */
 .list-toolbar {
   display: flex;
-  align-items: center;
   justify-content: space-between;
-  padding: 10px 12px;  // 减少内边距
-  background: var(--bg-secondary);
-  border-bottom: 1px solid var(--border-default);
+  align-items: center;
   gap: 12px;
-
-  .toolbar-left {
-    .subtitle-count {
-      font-size: 12px;
-      color: var(--text-secondary);
-      white-space: nowrap;
-    }
-    // Phase 5: 草稿计数样式
-    .draft-count {
-      font-size: 12px;
-      color: var(--warning);
-      margin-left: 4px;
-    }
-  }
-
-  .toolbar-center {
-    flex: 1;
-    max-width: 180px;  // 缩小搜索框
-    min-width: 100px;
-  }
-
-  .search-box {
-    display: flex;
-    align-items: center;
-    background: var(--bg-tertiary);
-    border-radius: var(--radius-md);
-    padding: 5px 10px;
-    gap: 6px;
-
-    .search-icon {
-      width: 14px;
-      height: 14px;
-      color: var(--text-muted);
-      flex-shrink: 0;
-    }
-
-    .search-input {
-      flex: 1;
-      min-width: 0;
-      background: transparent;
-      border: none;
-      color: var(--text-normal);
-      font-size: 12px;
-
-      &::placeholder { color: var(--text-muted); }
-    }
-
-    .search-clear {
-      width: 16px;
-      height: 16px;
-      color: var(--text-muted);
-      flex-shrink: 0;
-      svg { width: 100%; height: 100%; }
-      &:hover { color: var(--text-normal); }
-    }
-  }
-
-  .toolbar-btn {
-    width: 30px;
-    height: 30px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: var(--radius-md);
-    color: var(--text-secondary);
-    transition: all var(--transition-fast);
-    flex-shrink: 0;
-
-    svg { width: 18px; height: 18px; }
-
-    &:hover {
-      background: var(--bg-tertiary);
-      color: var(--primary);
-    }
-  }
+  padding: 10px 12px;
+  background: var(--af-bg-secondary);
+  border-bottom: 1px solid var(--af-border-default);
 }
 
-// 列表容器
-.list-container {
+.list-toolbar .subtitle-count {
+  color: var(--af-text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* 草稿计数样式 */
+.list-toolbar .draft-count {
+  color: var(--af-accent-warning);
+  font-size: 12px;
+  margin-left: 4px;
+}
+
+.list-toolbar .toolbar-center {
   flex: 1;
-  overflow-y: auto;
-  padding: 6px;
-  position: relative;
-
-  &::-webkit-scrollbar {
-    width: 6px;
-  }
-  &::-webkit-scrollbar-track {
-    background: transparent;
-  }
-  &::-webkit-scrollbar-thumb {
-    background: var(--border-default);
-    border-radius: 3px;
-    &:hover { background: var(--text-muted); }
-  }
+  max-width: 180px;
+  min-width: 100px;
 }
 
-// 空状态
-.empty-state {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  padding: 32px 16px;
-  color: var(--text-muted);
-
-  svg {
-    width: 48px;
-    height: 48px;
-    margin-bottom: 12px;
-    opacity: 0.5;
-  }
-
-  p {
-    font-size: 13px;
-    margin-bottom: 12px;
-  }
-
-  .add-first-btn {
-    padding: 6px 16px;
-    background: var(--primary);
-    color: white;
-    border-radius: var(--radius-md);
-    font-size: 13px;
-    transition: background var(--transition-fast);
-    &:hover { background: var(--primary-hover); }
-  }
-}
-
-// 字幕项 - 紧凑布局
-.subtitle-item {
-  display: flex;
-  gap: 10px;
-  padding: 10px;  // 减少内边距
-  margin-bottom: 6px;
-  background: var(--bg-secondary);
-  border: 1px solid transparent;
-  border-radius: var(--radius-md);
-  transition: all var(--transition-fast);
-  cursor: pointer;
-
-  &:hover {
-    background: var(--bg-tertiary);
-
-    .item-actions { opacity: 1; }
-  }
-
-  &.is-active {
-    border-color: var(--primary);
-    background: rgba(88, 166, 255, 0.08);
-  }
-
-  &.is-current {
-    border-color: var(--success);
-    background: rgba(63, 185, 80, 0.08);
-
-    .item-index { background: var(--success); color: white; }
-  }
-
-  // 置信度警告高亮样式
-  &.warning-low-confidence {
-    border-color: var(--warning);
-    background: rgba(210, 153, 34, 0.06);
-
-    .item-index {
-      background: var(--warning);
-      color: white;
-    }
-  }
-
-  &.warning-high-perplexity {
-    border-color: #e67700;
-    background: rgba(230, 119, 0, 0.06);
-
-    .item-index {
-      background: #e67700;
-      color: white;
-    }
-  }
-
-  &.warning-both {
-    border-color: var(--danger);
-    background: rgba(248, 81, 73, 0.08);
-    border-width: 2px;
-
-    .item-index {
-      background: var(--danger);
-      color: white;
-    }
-  }
-}
-
-// 序号 - 缩小尺寸
-.item-index {
-  width: 28px;
-  height: 28px;
+.list-toolbar .search-box {
   display: flex;
   align-items: center;
-  justify-content: center;
-  background: var(--bg-tertiary);
-  border-radius: var(--radius-sm);
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--text-secondary);
+  gap: 6px;
+  padding: 5px 10px;
+  background: var(--af-bg-tertiary);
+  border-radius: var(--af-radius-md);
+}
+
+.list-toolbar .search-box .search-icon {
+  width: 14px;
+  height: 14px;
+  color: var(--af-text-muted);
   flex-shrink: 0;
 }
 
-// 内容区
+.list-toolbar .search-box .search-input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: none;
+  color: var(--af-text-normal);
+  font-size: 12px;
+}
+
+.list-toolbar .search-box .search-input::placeholder {
+  color: var(--af-text-muted);
+}
+
+.list-toolbar .search-box .search-clear {
+  width: 16px;
+  height: 16px;
+  color: var(--af-text-muted);
+  flex-shrink: 0;
+}
+
+.list-toolbar .search-box .search-clear:hover {
+  color: var(--af-text-normal);
+}
+
+.list-toolbar .toolbar-btn {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: var(--af-radius-md);
+  color: var(--af-text-secondary);
+  transition: all var(--af-transition-fast);
+  flex-shrink: 0;
+}
+
+.list-toolbar .toolbar-btn:hover {
+  background: var(--af-bg-tertiary);
+  color: var(--af-accent-primary);
+}
+
+/* SVG 选择器 - 按特异性从低到高排列 */
+svg {
+  width: 14px;
+  height: 14px;
+}
+
+.empty-state svg {
+  width: 48px;
+  height: 48px;
+  margin-bottom: 12px;
+  opacity: 0.5;
+}
+
+.time-row .time-arrow svg {
+  width: 14px;
+  height: 14px;
+}
+
+.item-actions .action-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.list-toolbar .toolbar-btn svg {
+  width: 18px;
+  height: 18px;
+}
+
+.list-toolbar .search-box .search-clear svg {
+  width: 100%;
+  height: 100%;
+}
+
+/* 列表容器 */
+.list-container {
+  position: relative;
+  flex: 1;
+  padding: 6px;
+  overflow-y: auto;
+}
+
+.list-container::-webkit-scrollbar {
+  width: 6px;
+}
+
+.list-container::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.list-container::-webkit-scrollbar-thumb {
+  background: var(--af-border-default);
+  border-radius: 3px;
+}
+
+.list-container::-webkit-scrollbar-thumb:hover {
+  background: var(--af-text-muted);
+}
+
+/* 空状态 */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  padding: 32px 16px;
+  color: var(--af-text-muted);
+}
+
+.empty-state p {
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+
+.empty-state .add-first-btn {
+  padding: 6px 16px;
+  background: var(--af-accent-primary);
+  border: none;
+  border-radius: var(--af-radius-md);
+  color: var(--af-text-inverse);
+  font-size: 13px;
+  cursor: pointer;
+  transition: background var(--af-transition-fast);
+}
+
+.empty-state .add-first-btn:hover {
+  background: var(--af-accent-primary-hover);
+}
+
+/* 字幕项 - 紧凑布局 */
+.subtitle-item {
+  display: flex;
+  gap: 10px;
+  padding: 10px;
+  margin-bottom: 6px;
+  background: var(--af-bg-secondary);
+  border: 1px solid transparent;
+  border-radius: var(--af-radius-md);
+  transition: all var(--af-transition-fast);
+  cursor: pointer;
+}
+
+.subtitle-item:hover {
+  background: var(--af-bg-tertiary);
+}
+
+.subtitle-item.is-active {
+  border-color: var(--af-accent-primary);
+  background: rgb(var(--af-accent-primary-rgb), 0.08);
+}
+
+.subtitle-item.is-current {
+  border-color: var(--af-accent-success);
+  background: rgb(var(--af-accent-success-rgb), 0.08);
+}
+
+/* 置信度警告高亮样式 */
+.subtitle-item.warning-low-confidence {
+  border-color: var(--af-accent-warning);
+  background: rgb(var(--af-accent-warning-rgb), 0.06);
+}
+
+.subtitle-item.warning-high-perplexity {
+  border-color: var(--af-status-warning);
+  background: rgb(var(--af-status-warning-rgb), 0.06);
+}
+
+.subtitle-item.warning-both {
+  border-color: var(--af-accent-danger);
+  background: rgb(var(--af-accent-danger-rgb), 0.08);
+  border-width: 2px;
+}
+
+/* 序号 - 缩小尺寸 */
+.item-index {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  width: 28px;
+  height: 28px;
+  background: var(--af-bg-tertiary);
+  border-radius: var(--af-radius-sm);
+  color: var(--af-text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.subtitle-item.is-current .item-index {
+  background: var(--af-accent-success);
+  color: var(--af-text-inverse);
+}
+
+.subtitle-item.warning-low-confidence .item-index {
+  background: var(--af-accent-warning);
+  color: var(--af-text-inverse);
+}
+
+.subtitle-item.warning-high-perplexity .item-index {
+  background: var(--af-status-warning);
+  color: var(--af-text-inverse);
+}
+
+.subtitle-item.warning-both .item-index {
+  background: var(--af-accent-danger);
+  color: var(--af-text-inverse);
+}
+
+/* 内容区 */
 .item-content {
   flex: 1;
   min-width: 0;
 }
 
-// 时间行 - 优化间距
+/* 时间行 - 优化间距 */
 .time-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
   margin-bottom: 6px;
-  flex-wrap: wrap;
-
-  .time-input {
-    width: 75px;  // 缩小宽度
-    padding: 3px 6px;
-    background: var(--bg-tertiary);
-    border: 1px solid transparent;
-    border-radius: var(--radius-sm);
-    font-size: 11px;
-    font-family: var(--font-mono);
-    color: var(--text-normal);
-    text-align: center;
-
-    &:focus {
-      border-color: var(--primary);
-      outline: none;
-    }
-  }
-
-  .time-arrow {
-    color: var(--text-muted);
-    svg { width: 14px; height: 14px; }
-  }
-
-  .duration-tag {
-    padding: 2px 6px;
-    background: var(--bg-tertiary);
-    border-radius: var(--radius-full);
-    font-size: 10px;
-    font-family: var(--font-mono);
-    color: var(--text-muted);
-  }
 }
 
-// 文本行 - 优化尺寸（支持 Toggle Mode）
+.time-row .time-input {
+  width: 75px;
+  padding: 3px 6px;
+  background: var(--af-bg-tertiary);
+  border: 1px solid transparent;
+  border-radius: var(--af-radius-sm);
+  color: var(--af-text-normal);
+  font-size: 11px;
+  font-family: var(--af-font-mono);
+  text-align: center;
+}
+
+.time-row .time-input:focus {
+  border-color: var(--af-accent-primary);
+  outline: none;
+}
+
+.time-row .time-arrow {
+  color: var(--af-text-muted);
+}
+
+.time-row .duration-tag {
+  padding: 2px 6px;
+  background: var(--af-bg-tertiary);
+  border-radius: var(--af-radius-full);
+  color: var(--af-text-muted);
+  font-size: 10px;
+  font-family: var(--af-font-mono);
+}
+
+/* 文本行 - 优化尺寸（支持 Toggle Mode） */
 .text-row {
   position: relative;
-
-  // 只读高亮视图
-  .text-display {
-    width: 100%;
-    min-height: 45px;
-    padding: 6px 35px 6px 8px;
-    background: var(--bg-tertiary);
-    border: 1px solid transparent;
-    border-radius: var(--radius-sm);
-    font-size: 12px;
-    color: var(--text-normal);
-    line-height: 1.4;
-    white-space: pre-wrap;
-    word-break: break-word;
-    cursor: default;
-
-    &.can-edit {
-      cursor: text;
-      &:hover {
-        border-color: var(--primary);
-        background: var(--bg-secondary);
-      }
-    }
-
-    // 字级警告高亮样式
-    :deep(.word-warning) {
-      background-color: rgba(255, 193, 7, 0.25);
-      border-bottom: 2px solid var(--warning, #ffc107);
-      padding: 0 2px;
-      border-radius: 2px;
-    }
-
-    :deep(.word-critical) {
-      background-color: rgba(244, 67, 54, 0.25);
-      border-bottom: 2px solid var(--error, #f44336);
-      padding: 0 2px;
-      border-radius: 2px;
-      font-weight: 500;
-    }
-  }
-
-  .text-input {
-    width: 100%;
-    padding: 6px 8px;
-    padding-right: 35px;
-    background: var(--bg-tertiary);
-    border: 1px solid transparent;
-    border-radius: var(--radius-sm);
-    font-size: 12px;
-    color: var(--text-normal);
-    resize: none;
-    line-height: 1.4;
-
-    &:focus {
-      border-color: var(--primary);
-      outline: none;
-    }
-
-    &::placeholder { color: var(--text-muted); }
-  }
-
-  .char-count {
-    position: absolute;
-    right: 6px;
-    bottom: 6px;
-    font-size: 10px;
-    font-family: var(--font-mono);
-    color: var(--text-muted);
-
-  }
 }
 
-// 操作按钮 - 始终可见，更小尺寸
+/* 只读高亮视图 */
+.text-row .text-display {
+  width: 100%;
+  padding: 6px 35px 6px 8px;
+  background: var(--af-bg-tertiary);
+  border: 1px solid transparent;
+  border-radius: var(--af-radius-sm);
+  color: var(--af-text-normal);
+  font-size: 12px;
+  min-height: 45px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  cursor: default;
+}
+
+.text-row .text-display.can-edit {
+  cursor: text;
+}
+
+.text-row .text-display.can-edit:hover {
+  border-color: var(--af-accent-primary);
+  background: var(--af-bg-secondary);
+}
+
+/* 字级警告高亮样式 */
+.text-row .text-display :deep(.word-warning) {
+  background-color: rgb(var(--af-accent-warning-rgb), 0.25);
+  border-bottom: 2px solid var(--af-accent-warning);
+  padding: 0 2px;
+  border-radius: 2px;
+}
+
+.text-row .text-display :deep(.word-critical) {
+  background-color: rgb(var(--af-accent-danger-rgb), 0.25);
+  border-bottom: 2px solid var(--af-accent-danger);
+  padding: 0 2px;
+  border-radius: 2px;
+  font-weight: 500;
+}
+
+.text-row .text-input {
+  width: 100%;
+  padding: 6px 8px;
+  background: var(--af-bg-tertiary);
+  border: 1px solid transparent;
+  border-radius: var(--af-radius-sm);
+  color: var(--af-text-normal);
+  font-size: 12px;
+  padding-right: 35px;
+  resize: none;
+  line-height: 1.4;
+}
+
+.text-row .text-input:focus {
+  border-color: var(--af-accent-primary);
+  outline: none;
+}
+
+.text-row .text-input::placeholder {
+  color: var(--af-text-muted);
+}
+
+.text-row .char-count {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  color: var(--af-text-muted);
+  font-size: 10px;
+  font-family: var(--af-font-mono);
+}
+
+/* 操作按钮 - 始终可见，更小尺寸 */
 .item-actions {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  opacity: 1;  // 始终显示
-
-  .action-btn {
-    width: 24px;
-    height: 24px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: var(--radius-sm);
-    color: var(--text-muted);
-    transition: all var(--transition-fast);
-
-    svg { width: 14px; height: 14px; }
-
-    &:hover {
-      background: var(--bg-tertiary);
-      color: var(--text-normal);
-    }
-
-    &--danger:hover {
-      background: rgba(248, 81, 73, 0.15);
-      color: var(--danger);
-    }
-  }
+  opacity: 1;
 }
 
-// 字幕切分动画
+.subtitle-item:hover .item-actions {
+  opacity: 1;
+}
+
+.item-actions .action-btn {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: var(--af-radius-sm);
+  color: var(--af-text-muted);
+  transition: all var(--af-transition-fast);
+}
+
+.item-actions .action-btn:hover {
+  background: var(--af-bg-tertiary);
+  color: var(--af-text-normal);
+}
+
+.item-actions .action-btn-danger:hover {
+  background: rgb(var(--af-accent-danger-rgb), 0.15);
+  color: var(--af-accent-danger);
+}
+
+/* 字幕切分动画 */
 .subtitle-list-move {
   transition: transform 0.3s ease;
 }

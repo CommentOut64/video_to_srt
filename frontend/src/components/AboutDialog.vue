@@ -12,7 +12,7 @@
       <div class="app-icon">
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
   <path
-    fill="#58A6FF"
+    fill="currentColor"
     d="M21 3H3c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H3V5h18v14zM5 10h9v2H5zm0-3h9v2H5zm0 6h6v2H5z"
   />
 </svg>
@@ -162,92 +162,44 @@ onMounted(() => {
 })
 </script>
 
-<style lang="scss">
-/* V3.1.1+dev.20260105.03: 优化对话框样式 - 使用全局样式因为 el-dialog 会 teleport 到 body */
-.about-dialog {
-  .el-dialog {
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-  }
-
-  /* V3.1.1+dev.20260105.03: 减小 header 高度，优化标题和关闭按钮对齐 */
-  .el-dialog__header {
-    border-bottom: 1px solid var(--border-color);
-    padding: 12px 16px !important;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-
-  .el-dialog__title {
-    color: var(--text-bright);
-    font-size: 14px !important;
-    font-weight: 600;
-    line-height: 1;
-  }
-
-  /* V3.1.1+dev.20260105.03: 调整关闭按钮位置 */
-  .el-dialog__headerbtn {
-    position: static !important;
-    width: 24px;
-    height: 24px;
-    top: auto !important;
-    right: auto !important;
-  }
-
-  .el-dialog__body {
-    padding: 24px 20px !important;
-  }
-
-  /* V3.1.1+dev.20260105.03: 统一按钮 hover/click 样式 */
-  .el-button {
-    &:hover:not(:disabled) {
-      background: var(--bg-hover) !important;
-      border-color: var(--border-color) !important;
-    }
-
-    &:active:not(:disabled) {
-      background: var(--bg-tertiary) !important;
-    }
-  }
-}
+<style scoped>
 
 .about-content {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 16px;
+  gap: 14px;
 }
 
 .app-icon {
+  display: flex;
+  justify-content: center;
+  align-items: center;
   width: 80px;
   height: 80px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  color: var(--af-accent-primary);
+}
 
-  .icon-placeholder {
-    width: 100%;
-    height: 100%;
-    background: linear-gradient(135deg, var(--primary) 0%, var(--accent-blue) 100%);
-    border-radius: 16px;
-    opacity: 0.8;
-  }
+.app-icon .icon-placeholder {
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(135deg, var(--af-accent-primary) 0%, var(--af-accent-primary) 100%);
+  border-radius: 16px;
+  opacity: 0.8;
 }
 
 .app-name {
-  font-size: 20px;
-  font-weight: 600;
-  color: var(--text-bright);
   margin: 0;
+  color: var(--af-text-primary);
+  font-size: 22px;
+  font-weight: 600;
 }
 
 .version {
+  color: var(--af-text-secondary);
   font-size: 13px;
-  color: var(--text-secondary);
 }
 
-/* V3.1.1+dev.20260105.01: 检查更新按钮样式 */
 .check-update-btn {
   margin-top: 4px;
 }
@@ -263,42 +215,42 @@ onMounted(() => {
   align-items: center;
   gap: 6px;
   padding: 8px 16px;
-  background: var(--bg-tertiary);
-  border: 1px solid var(--border-color);
+  background: var(--af-bg-tertiary);
+  border: 1px solid var(--af-border-default);
   border-radius: 6px;
-  color: var(--text-normal);
+  color: var(--af-text-normal);
   text-decoration: none;
   transition: all 0.2s;
+}
 
-  svg {
-    width: 18px;
-    height: 18px;
-  }
+.link-item svg {
+  width: 18px;
+  height: 18px;
+}
 
-  span {
-    font-size: 13px;
-  }
+.link-item span {
+  font-size: 13px;
+}
 
-  &:hover {
-    background: var(--bg-hover);
-    border-color: var(--primary);
-    color: var(--primary);
-  }
+.link-item:hover {
+  background: var(--af-bg-elevated);
+  border-color: var(--af-accent-primary);
+  color: var(--af-accent-primary);
 }
 
 .log-level-section {
-  width: 100%;
-  margin-top: 16px;
-  padding-top: 16px;
-  border-top: 1px solid var(--border-color);
   display: flex;
   flex-direction: column;
   gap: 8px;
+  width: 100%;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--af-border-default);
 }
 
 .log-level-label {
+  color: var(--af-text-normal);
   font-size: 13px;
-  color: var(--text-normal);
   font-weight: 500;
 }
 
@@ -307,8 +259,8 @@ onMounted(() => {
 }
 
 .log-level-hint {
+  color: var(--af-text-secondary);
   font-size: 12px;
-  color: var(--text-secondary);
   text-align: center;
 }
 </style>

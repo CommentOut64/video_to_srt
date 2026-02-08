@@ -197,194 +197,120 @@ async function handleImmediateUpdate() {
 }
 </script>
 
-<style lang="scss">
-/* V3.1.1+dev.20260105.07: 与 AboutDialog 完全一致的尺寸和位置 */
+<style scoped>
 
-/* 对话框主体样式 - 与 AboutDialog 一致 */
-.update-dialog .el-dialog {
-  background: var(--bg-secondary) !important;
-  border: 1px solid var(--border-color) !important;
+.update-content {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
 
-/* V3.1.1+dev.20260105.07: header - 与 AboutDialog 完全一致 */
-.update-dialog .el-dialog__header {
-  border-bottom: 1px solid var(--border-color) !important;
-  padding: 8px 8px !important;
-  display: flex !important;
-  align-items: center !important;
-  justify-content: space-between !important;
+.version-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  background: var(--af-bg-tertiary);
+  border-radius: 4px;
 }
 
-/* V3.1.1+dev.20260105.07: 标题 - 与 AboutDialog 一致 */
-.update-dialog .el-dialog__title {
-  color: var(--text-bright) !important;
-  font-size: 14px !important;
-  font-weight: 600 !important;
-  line-height: 1 !important;
+.version-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
 }
 
-/* V3.1.1+dev.20260105.07: 关闭按钮 - 与 AboutDialog 一致 */
-.update-dialog .el-dialog__headerbtn {
-  position: static !important;
-  width: 24px !important;
-  height: 24px !important;
-  top: auto !important;
-  right: auto !important;
+.version-row .label {
+  color: var(--af-text-secondary);
+  font-size: 12px;
 }
 
-/* V3.1.1+dev.20260105.07: body - 与 AboutDialog 一致 */
-.update-dialog .el-dialog__body {
-  padding: 24px 4px !important;
+.version-row .value {
+  color: var(--af-text-normal);
+  font-size: 12px;
+  font-family: monospace;
 }
 
-/* V3.1.1+dev.20260105.07: footer */
-.update-dialog .el-dialog__footer {
-  border-top: 1px solid var(--border-color) !important;
-  padding: 12px 4px !important;
+.version-row .value.highlight {
+  color: var(--af-accent-primary);
 }
 
-/* V3.1.1+dev.20260105.08: 按钮样式 - 仅覆盖 hover/active，与 AboutDialog 一致 */
-.update-dialog .el-button {
-  &:hover:not(:disabled) {
-    background: var(--bg-hover) !important;
-    border-color: var(--border-color) !important;
-  }
-
-  &:active:not(:disabled) {
-    background: var(--bg-tertiary) !important;
-  }
+.changelog-section {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
 }
 
-/* 内容区域样式 */
-.update-dialog .update-content {
-  display: flex !important;
-  flex-direction: column !important;
-  gap: 10px !important;
+.changelog-label {
+  color: var(--af-text-secondary);
+  font-size: 12px;
+  margin-bottom: 6px;
 }
 
-/* V3.1.1+dev.20260105.07: 版本卡片 */
-.update-dialog .version-info {
-  display: flex !important;
-  flex-direction: column !important;
-  gap: 4px !important;
-  padding: 8px 10px !important;
-  background: var(--bg-tertiary) !important;
-  border-radius: 4px !important;
+.changelog-content {
+  padding: 10px;
+  background: var(--af-bg-tertiary);
+  border: 1px solid var(--af-border-default);
+  border-radius: 4px;
+  color: var(--af-text-normal);
+  font-size: 12px;
+  line-height: 1.6;
+  min-height: 175px;
+  max-height: 175px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
 }
 
-.update-dialog .version-row {
-  display: flex !important;
-  justify-content: space-between !important;
-  align-items: center !important;
-}
-
-.update-dialog .version-row .label {
-  color: var(--text-secondary) !important;
-  font-size: 12px !important;
-}
-
-/* V3.1.1+dev.20260105.07: 版本号字体统一 */
-.update-dialog .version-row .value {
-  color: var(--text-normal) !important;
-  font-size: 12px !important;
-  font-family: monospace !important;
-}
-
-.update-dialog .version-row .value.highlight {
-  color: var(--primary) !important;
-  font-weight: 600 !important;
-  font-size: 12px !important;
-}
-
-/* V3.1.1+dev.20260105.09: 更新内容区域 - 适应 320px 宽度 */
-.update-dialog .changelog-section {
-  flex: 1 !important;
-  display: flex !important;
-  flex-direction: column !important;
-}
-
-.update-dialog .changelog-section .changelog-label {
-  color: var(--text-secondary) !important;
-  font-size: 12px !important;
-  margin-bottom: 6px !important;
-}
-
-.update-dialog .changelog-section .changelog-content {
-  padding: 10px !important;
-  background: var(--bg-tertiary) !important;
-  border: 1px solid var(--border-color) !important;
-  border-radius: 4px !important;
-  color: var(--text-normal) !important;
-  font-size: 12px !important;
-  line-height: 1.6 !important;
-  min-height: 136px !important;
-  max-height: 136px !important;
-  overflow-y: auto !important;
-  white-space: pre-wrap !important;
-  word-wrap: break-word !important;
-  overflow-wrap: break-word !important;
-}
-
-/* 暗色滚动条 */
-.update-dialog .changelog-content::-webkit-scrollbar {
+/* 原因：定制滚动条外观适配深色主题 */
+.changelog-content::-webkit-scrollbar {
   width: 6px;
 }
 
-.update-dialog .changelog-content::-webkit-scrollbar-track {
-  background: var(--bg-secondary);
+.changelog-content::-webkit-scrollbar-track {
+  background: var(--af-border-default);
   border-radius: 3px;
 }
 
-.update-dialog .changelog-content::-webkit-scrollbar-thumb {
-  background: var(--border-color);
+.changelog-content::-webkit-scrollbar-thumb {
+  background: var(--af-bg-secondary);
   border-radius: 3px;
 }
 
-.update-dialog .changelog-content::-webkit-scrollbar-thumb:hover {
-  background: var(--text-secondary);
+.changelog-content::-webkit-scrollbar-thumb:hover {
+  background: var(--af-text-secondary);
 }
 
-/* 延迟更新提示 */
-.update-dialog .delayed-notice {
-  display: flex !important;
-  align-items: center !important;
-  gap: 8px !important;
-  padding: 8px 10px !important;
-  background: rgba(var(--primary-rgb), 0.1) !important;
-  border: 1px solid rgba(var(--primary-rgb), 0.3) !important;
-  border-radius: 4px !important;
-  color: var(--primary) !important;
-  font-size: 12px !important;
+.delayed-notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: rgb(var(--af-accent-primary-rgb), 0.1);
+  border: 1px solid rgb(var(--af-accent-primary-rgb), 0.3);
+  border-radius: 4px;
+  color: var(--af-accent-primary);
+  font-size: 12px;
 }
 
-.update-dialog .delayed-notice svg {
-  width: 16px !important;
-  height: 16px !important;
-  flex-shrink: 0 !important;
+.delayed-notice svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
 }
 
-/* V3.1.1+dev.20260105.10: 底部按钮布局 */
-.update-dialog .dialog-footer {
-  display: flex !important;
-  justify-content: space-between !important;
-  align-items: center !important;
+.dialog-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
 }
 
-.update-dialog .dialog-footer .btn-ignore {
-  margin: 0 !important;
+.dialog-footer .btn-ignore {
+  margin: 0;
 }
 
-.update-dialog .dialog-footer .btn-group-right {
-  display: flex !important;
-  gap: 0 !important;
-}
-
-/* V3.1.1+dev.20260105.10: 重置按钮组内按钮的 margin */
-.update-dialog .dialog-footer .btn-group-right .el-button {
-  margin-left: 4px !important;
-}
-
-.update-dialog .dialog-footer .btn-group-right .el-button:first-child {
-  margin-left: 0 !important;
+.dialog-footer .btn-group-right {
+  display: flex;
+  gap: 4px;
 }
 </style>

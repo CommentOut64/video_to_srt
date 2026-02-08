@@ -131,161 +131,161 @@
  * - 拖动排序（仅队列任务）
  * - SSE 心跳检测
  */
-import { computed, ref, onMounted, onUnmounted, watch } from "vue";
-import { useRouter } from "vue-router";
-import { useUnifiedTaskStore } from "@/stores/unifiedTaskStore";
-import Draggable from "vuedraggable";
-import TaskGroup from "./TaskGroup.vue";
-import TaskCard from "./TaskCard.vue";
+import { computed, ref, onMounted, onUnmounted, watch } from 'vue'
+import { useRouter } from 'vue-router'
+import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
+import Draggable from 'vuedraggable'
+import TaskGroup from './TaskGroup.vue'
+import TaskCard from './TaskCard.vue'
 
 const props = defineProps({
-  currentJobId: { type: String, default: "" },
-});
+  currentJobId: { type: String, default: '' },
+})
 
-const router = useRouter();
-const taskStore = useUnifiedTaskStore();
+const router = useRouter()
+const taskStore = useUnifiedTaskStore()
 
 // 从 store 获取数据
-const processingTask = computed(() => taskStore.processingTask);
-const queuedTasks = computed(() => taskStore.queuedTasks);
-const failedTasks = computed(() => taskStore.failedTasks);
-const pausedTasks = computed(() => taskStore.pausedTasks);
-const recentFinishedTasks = computed(() => taskStore.recentFinishedTasks);
-const sseConnected = computed(() => taskStore.sseConnected);
+const processingTask = computed(() => taskStore.processingTask)
+const queuedTasks = computed(() => taskStore.queuedTasks)
+const failedTasks = computed(() => taskStore.failedTasks)
+const pausedTasks = computed(() => taskStore.pausedTasks)
+const recentFinishedTasks = computed(() => taskStore.recentFinishedTasks)
+const sseConnected = computed(() => taskStore.sseConnected)
 
-const hasAnyTasks = computed(() => taskStore.tasks.length > 0);
+const hasAnyTasks = computed(() => taskStore.tasks.length > 0)
 
 // 本地可拖动任务列表
-const queuedTasksLocal = ref([]);
+const queuedTasksLocal = ref([])
 
 // 监听 store 的 queuedTasks 变化，更新本地列表
 watch(
   () => queuedTasks.value,
   (newTasks) => {
-    queuedTasksLocal.value = [...newTasks];
+    queuedTasksLocal.value = [...newTasks]
   },
   { immediate: true, deep: true }
-);
+)
 
 // 拖动结束处理
 async function handleDragEnd(event) {
-  if (event.oldIndex === event.newIndex) return;
+  if (event.oldIndex === event.newIndex) return
 
-  const newOrder = queuedTasksLocal.value.map((t) => t.job_id);
+  const newOrder = queuedTasksLocal.value.map((t) => t.job_id)
   try {
-    await taskStore.reorderQueue(newOrder);
+    await taskStore.reorderQueue(newOrder)
   } catch (error) {
-    console.error("[TaskMonitor] 队列重排失败:", error);
+    console.error('[TaskMonitor] 队列重排失败:', error)
     // 恢复原顺序
-    queuedTasksLocal.value = [...queuedTasks.value];
+    queuedTasksLocal.value = [...queuedTasks.value]
   }
 }
 
 // 打开历史记录页面
 function openHistoryPage() {
   // TODO: 实现历史记录页面
-  console.log("[TaskMonitor] 打开历史记录页面");
+  console.log('[TaskMonitor] 打开历史记录页面')
 }
 
 // SSE 心跳检测
-let heartbeatTimer = null;
+let heartbeatTimer = null
 onMounted(() => {
   heartbeatTimer = setInterval(() => {
-    taskStore.checkSSEConnection();
-  }, 5000);
-});
+    taskStore.checkSSEConnection()
+  }, 5000)
+})
 
 onUnmounted(() => {
   if (heartbeatTimer) {
-    clearInterval(heartbeatTimer);
+    clearInterval(heartbeatTimer)
   }
-});
+})
 </script>
 
-<style lang="scss" scoped>
+<style scoped>
 .task-monitor {
+  position: relative;
   display: flex;
   flex-direction: column;
   height: 100%;
-  background: var(--bg-secondary);
-  position: relative;
-  user-select: none; // 禁止文本选择，避免出现文本光标
-  cursor: default; // 默认光标，不是文本光标
+  background: var(--af-bg-secondary);
+  user-select: none;
+  cursor: default;
 }
 
 .monitor-header {
+  z-index: 10;
+  padding: 5px;
+  background: var(--af-bg-secondary);
   flex-shrink: 0;
-  background: var(--bg-secondary);
   max-height: 300px;
   overflow-y: auto;
-  padding: 5px; // 移除默认 padding，由内部元素控制间距
-  z-index: 10;
+}
 
-  // 当有 processing 任务时，添加底部边距
-  &:has(.task-card) {
-    padding: 12px;
-    padding-bottom: 8px; // 减小与 monitor-body 的间距
-  }
+/* 当有 processing 任务时，添加底部边距 */
+.monitor-header:has(.task-card) {
+  padding: 12px;
+  padding-bottom: 8px;
+}
 
-  // 空状态时的 padding
-  &:has(.empty-state) {
-    padding: 12px;
-  }
+/* 空状态时的 padding */
+.monitor-header:has(.empty-state) {
+  padding: 12px;
 }
 
 .monitor-body {
-  flex: 0 1 auto;  // 自动伸缩，不强制占满所有空间
-  max-height: 500px;  // 设置最大高度，防止过度伸展
+  flex: 0 1 auto;
+  max-height: 500px;
   overflow-y: auto;
   padding: 12px;
-  padding-top: 4px;  // 减小与 monitor-header 的间距
-  padding-bottom: 24px;  // 缩小为渐变遮罩留的空间
-  scrollbar-gutter: stable;  // 为滚动条预留空间，防止滚动条出现时宽度变化
+  padding-top: 4px;
+  padding-bottom: 24px;
+  scrollbar-gutter: stable;
+}
 
-  &::-webkit-scrollbar {
-    width: 8px;
-  }
-  &::-webkit-scrollbar-thumb {
-    background: var(--border-muted);
-    border-radius: 4px;
-  }
+.monitor-body::-webkit-scrollbar {
+  width: 8px;
+}
+
+.monitor-body::-webkit-scrollbar-thumb {
+  background: var(--af-border-muted);
+  border-radius: 4px;
 }
 
 .gradient-mask {
   position: absolute;
+  right: 0;
   bottom: 0;
   left: 0;
-  right: 0;
-  height: 24px; // 缩小渐变高度
-  background: linear-gradient(to top, var(--bg-secondary), transparent);
-  pointer-events: none;
-  // 仅在内容超过最大高度时显示
-  opacity: 0;
+  height: 24px;
+  background: linear-gradient(to top, var(--af-bg-secondary), transparent);
   transition: opacity 0.3s;
+  pointer-events: none;
+  opacity: 0;
 }
 
-// 当 body 有滚动时显示渐变遮罩
-.task-monitor:has(.monitor-body::-webkit-scrollbar-thumb) .gradient-mask,
-.monitor-body[data-has-scroll="true"] + .gradient-mask {
+/* 当 body 有滚动时显示渐变遮罩 */
+.monitor-body[data-has-scroll='true'] + .gradient-mask,
+.task-monitor:has(.monitor-body::-webkit-scrollbar-thumb) .gradient-mask {
   opacity: 1;
 }
 
 .sse-alert {
-  background: rgba(248, 81, 73, 0.1);
-  color: var(--danger);
-  padding: 12px;
-  border-radius: 6px;
-  margin-bottom: 12px;
-  font-size: 13px;
   display: flex;
   align-items: center;
   gap: 8px;
+  padding: 12px;
+  background: rgb(var(--af-accent-danger-rgb), 0.1);
+  border-radius: 6px;
+  color: var(--af-accent-danger);
+  font-size: 13px;
+  margin-bottom: 12px;
+}
 
-  svg {
-    width: 20px;
-    height: 20px;
-    flex-shrink: 0;
-  }
+.sse-alert svg {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
 }
 
 .empty-state {
@@ -293,37 +293,42 @@ onUnmounted(() => {
   flex-direction: column;
   align-items: center;
   padding: 48px 24px;
-  color: var(--text-muted);
+  color: var(--af-text-muted);
+}
 
-  svg {
-    width: 48px;
-    height: 48px;
-    opacity: 0.5;
-    margin-bottom: 12px;
-  }
+.empty-state svg {
+  width: 48px;
+  height: 48px;
+  opacity: 0.5;
+  margin-bottom: 12px;
+}
 
-  p {
-    font-size: 13px;
-    margin: 0;
-  }
+.empty-state p {
+  margin: 0;
+  font-size: 13px;
 }
 
 .view-more {
-  text-align: center;
   padding: 8px;
+  color: var(--af-text-muted);
   font-size: 12px;
-  color: var(--text-muted);
+  text-align: center;
   cursor: pointer;
-
-  &:hover {
-    color: var(--primary);
-  }
 }
 
-// Vue TransitionGroup 动画（改进版，不使用 absolute 定位）
-.list-enter-active,
+.view-more:hover {
+  color: var(--af-accent-primary);
+}
+
+/* Vue TransitionGroup 动画 */
+.list-enter-active {
+  transition: all 0.6s ease;
+}
+
 .list-leave-active {
-  transition: all 0.3s ease;
+  transition:
+    opacity 0.35s ease-out,
+    transform 0.5s ease-out;
 }
 
 .list-enter-from {
@@ -333,19 +338,14 @@ onUnmounted(() => {
 
 .list-leave-to {
   opacity: 0;
-  transform: translateY(-10px);
-  // 移除 position: absolute，让其他元素等待动画结束
-  height: 0;
-  margin: 0;
-  padding: 0;
-  overflow: hidden;
+  transform: translateY(-30px) scale(0.95);
 }
 
 .list-move {
-  transition: transform 0.3s ease;
+  transition: transform 0.5s ease-out;
 }
 
-// 新完成任务高亮
+/* 新完成任务高亮 */
 .newly-finished {
   animation: highlight 2s ease-out;
 }
@@ -355,15 +355,16 @@ onUnmounted(() => {
   100% {
     background: transparent;
   }
+
   50% {
-    background: rgba(63, 185, 80, 0.15);
+    background: rgb(var(--af-accent-success-rgb), 0.15);
   }
 }
 
-// 拖动占位符样式
+/* 拖动占位符样式 */
 .task-ghost {
   opacity: 0.5;
-  background: var(--bg-tertiary);
-  border: 2px dashed var(--border-default);
+  background: var(--af-bg-tertiary);
+  border: 2px dashed var(--af-border-default);
 }
 </style>

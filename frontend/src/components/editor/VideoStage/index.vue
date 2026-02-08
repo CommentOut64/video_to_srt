@@ -51,6 +51,7 @@
       <!-- 字幕覆盖层 - 可拖动版本 -->
       <div
         v-if="showSubtitle && currentSubtitleText"
+        ref="subtitleRef"
         class="subtitle-overlay"
         :class="{ 'is-vertical': isSubtitleVertical, 'is-dragging': isDraggingSubtitle }"
         :style="subtitleStyle"
@@ -182,6 +183,7 @@ const playbackManager = usePlaybackManager()
 // Refs
 const videoRef = ref(null)
 const containerRef = ref(null)
+const subtitleRef = ref(null)
 
 // State
 const isBuffering = ref(false)
@@ -831,7 +833,7 @@ function handleSubtitleMouseDown(e) {
   document.addEventListener('mouseup', handleSubtitleMouseUp)
 }
 
-// 处理字幕鼠标移动事件（拖动中）
+// 处理字幕鼠标移动事件(拖动中)
 function handleSubtitleMouseMove(e) {
   if (!isDraggingSubtitle.value) return
 
@@ -840,9 +842,43 @@ function handleSubtitleMouseMove(e) {
   const deltaX = e.clientX - dragStartPos.value.x
   const deltaY = e.clientY - dragStartPos.value.y
 
+  // 计算新位置
+  let newX = dragStartSubtitlePos.value.x + deltaX
+  let newY = dragStartSubtitlePos.value.y + deltaY
+
+  // 边界限制：确保字幕不超出视频容器
+  if (containerRef.value && subtitleRef.value) {
+    const container = containerRef.value.getBoundingClientRect()
+    const subtitle = subtitleRef.value.getBoundingClientRect()
+
+    // 字幕默认位置是 left: 50%, bottom: 48px
+    // transform: translate(calc(-50% + x), y)
+    // 所以字幕中心点的实际位置是 container.width / 2 + newX
+
+    // 计算字幕的半宽和半高
+    const subtitleHalfWidth = subtitle.width / 2
+    const subtitleHeight = subtitle.height
+
+    // 计算容器的边界(相对于字幕的默认中心位置)
+    const containerCenterX = container.width / 2
+    const maxLeft = -containerCenterX + subtitleHalfWidth  // 左边界(贴边)
+    const maxRight = containerCenterX - subtitleHalfWidth  // 右边界(贴边)
+
+    // Y 轴边界(字幕默认 bottom: 48px)
+    // newY > 0 向下移动，newY < 0 向上移动
+    const maxTop = -(container.height - 48 - subtitleHeight)  // 上边界(贴顶)
+    const maxBottom = 48  // 下边界(允许移动到 bottom: 0,即贴底)
+
+    // 限制 X 轴
+    newX = Math.max(maxLeft, Math.min(maxRight, newX))
+
+    // 限制 Y 轴
+    newY = Math.max(maxTop, Math.min(maxBottom, newY))
+  }
+
   subtitlePosition.value = {
-    x: dragStartSubtitlePos.value.x + deltaX,
-    y: dragStartSubtitlePos.value.y + deltaY
+    x: newX,
+    y: newY
   }
 }
 
@@ -987,338 +1023,344 @@ onUnmounted(() => {
 })
 </script>
 
-<style lang="scss" scoped>
+<style scoped>
 .video-stage {
   width: 100%;
   height: 100%;
-  background: var(--bg-base);
-  border-radius: var(--radius-lg);
+  background: var(--af-bg-primary);
   overflow: hidden;
-
-  // 视频未就绪时的样式（禁用交互提示）
-  &.video-not-ready {
-    .video-container {
-      cursor: not-allowed;
-    }
-  }
 }
 
 .video-container {
   position: relative;
+  display: flex;
+  justify-content: center;
+  align-items: center;
   width: 100%;
   height: 100%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: #000;
-
-  video {
-    max-width: 100%;
-    max-height: 100%;
-    width: auto;
-    height: auto;
-  }
+  background: var(--af-video-bg);
 }
 
-// 字幕覆盖层 - 可拖动版本
+.video-container video {
+  max-width: 100%;
+  max-height: 100%;
+  width: auto;
+  height: auto;
+}
+
+/* 视频未就绪时的样式（禁用交互提示） */
+.video-stage.video-not-ready .video-container {
+  cursor: not-allowed;
+}
+
+/* 字幕覆盖层 - 可拖动版本 */
 .subtitle-overlay {
   position: absolute;
   bottom: 48px;
   left: 50%;
-  // transform 由 subtitleStyle 计算属性控制
+
+  /* transform 由 subtitleStyle 计算属性控制 */
   max-width: 80%;
   z-index: 10;
-  pointer-events: auto;  // 允许交互
-  user-select: none;  // 禁止文本选择
+  pointer-events: auto;
+  user-select: none;
   transition: opacity 0.2s;
-
-  // 控制按钮容器（默认隐藏）
-  .subtitle-control-btn {
-    position: absolute;
-    top: -8px;
-    width: 24px;
-    height: 24px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: rgba(0, 0, 0, 0.85);
-    border: 1px solid rgba(255, 255, 255, 0.2);
-    border-radius: 50%;
-    color: rgba(255, 255, 255, 0.7);
-    cursor: pointer;
-    opacity: 0;
-    transition: all 0.2s;
-    pointer-events: auto;
-
-    svg {
-      width: 14px;
-      height: 14px;
-    }
-
-    &:hover {
-      background: rgba(0, 0, 0, 0.95);
-      color: #fff;
-      border-color: rgba(255, 255, 255, 0.4);
-      transform: scale(1.1);
-    }
-
-    &.direction-btn {
-      left: -8px;
-    }
-
-    &.reset-btn {
-      right: -8px;
-    }
-  }
-
-  // hover 时显示控制按钮
-  &:hover .subtitle-control-btn {
-    opacity: 1;
-  }
-
-  // 拖动时的样式
-  &.is-dragging {
-    opacity: 0.8;
-
-    .subtitle-text {
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
-    }
-  }
-
-  .subtitle-text {
-    display: inline-block;
-    padding: 8px 20px;
-    font-size: 20px;
-    line-height: 1.4;
-    color: #fff;
-    background: rgba(0, 0, 0, 0.75);
-    border-radius: var(--radius-sm);
-    text-align: center;
-    text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.8);
-    transition: box-shadow 0.2s;
-    pointer-events: none;  // 文本本身不响应事件
-  }
-
-  // 竖向显示模式
-  &.is-vertical {
-    .subtitle-text {
-      writing-mode: vertical-rl;
-      text-orientation: upright;
-      padding: 20px 8px;
-      max-height: 60vh;
-      overflow-y: auto;
-
-      // 自定义滚动条
-      &::-webkit-scrollbar {
-        width: 4px;
-      }
-      &::-webkit-scrollbar-thumb {
-        background: rgba(255, 255, 255, 0.3);
-        border-radius: 2px;
-      }
-    }
-  }
 }
 
-// 通用覆盖层
-.video-overlay {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  z-index: 20;
-}
-
-// 加载状态
-.loading-overlay {
-  background: rgba(0, 0, 0, 0.6);
-  color: var(--text-secondary);
-  gap: 12px;
-
-  .loading-spinner {
-    width: 40px;
-    height: 40px;
-    border: 3px solid rgba(255, 255, 255, 0.1);
-    border-top-color: var(--primary);
-    border-radius: 50%;
-    animation: spin 1s linear infinite;
-  }
-}
-
-@keyframes spin {
-  to { transform: rotate(360deg); }
-}
-
-// 错误状态
-.error-overlay {
-  background: rgba(0, 0, 0, 0.85);
-  color: var(--text-secondary);
-  gap: 16px;
-
-  .error-icon {
-    width: 48px;
-    height: 48px;
-    color: var(--danger);
-  }
-
-  .error-message {
-    font-size: 14px;
-  }
-
-  .retry-btn {
-    padding: 8px 24px;
-    background: var(--primary);
-    color: white;
-    border-radius: var(--radius-md);
-    font-size: 14px;
-    transition: background var(--transition-fast);
-
-    &:hover { background: var(--primary-hover); }
-  }
-}
-
-// Proxy 错误状态（新增）
-.proxy-error-overlay {
-  background: rgba(0, 0, 0, 0.9);
-  color: var(--text-secondary);
-  gap: 16px;
-
-  .error-icon {
-    width: 48px;
-    height: 48px;
-    color: var(--warning);
-  }
-
-  h3 {
-    font-size: 18px;
-    font-weight: 600;
-    color: var(--text-normal);
-    margin: 0;
-  }
-
-  .error-message {
-    font-size: 14px;
-    color: var(--text-muted);
-    max-width: 300px;
-    text-align: center;
-  }
-
-  .retry-btn {
-    padding: 8px 24px;
-    background: var(--primary);
-    color: white;
-    border-radius: var(--radius-md);
-    font-size: 14px;
-    transition: background var(--transition-fast);
-
-    &:hover { background: var(--primary-hover); }
-  }
-}
-
-// 转码中状态
-.transcoding-overlay {
-  background: rgba(0, 0, 0, 0.9);
-  color: var(--text-secondary);
-  gap: 16px;
-
-  .transcoding-spinner {
-    width: 48px;
-    height: 48px;
-    border: 4px solid rgba(255, 255, 255, 0.1);
-    border-top-color: var(--primary);
-    border-radius: 50%;
-    animation: spin 1s linear infinite;
-  }
-
-  h3 {
-    font-size: 18px;
-    font-weight: 600;
-    color: var(--text-normal);
-    margin: 0;
-  }
-
-  p {
-    font-size: 14px;
-    color: var(--text-muted);
-    margin: 0;
-  }
-
-  .progress-bar {
-    width: 300px;
-    height: 24px;
-    background: rgba(255, 255, 255, 0.1);
-    border-radius: var(--radius-md);
-    overflow: hidden;
-    position: relative;
-
-    .progress-fill {
-      height: 100%;
-      background: linear-gradient(90deg, var(--primary), var(--primary-hover));
-      transition: width 0.3s ease;
-
-      &.indeterminate {
-        width: 40%;
-        animation: indeterminate 1.5s infinite ease-in-out;
-      }
-    }
-
-    @keyframes indeterminate {
-      0% {
-        transform: translateX(-100%);
-      }
-      50% {
-        transform: translateX(250%);
-      }
-      100% {
-        transform: translateX(-100%);
-      }
-    }
-
-    span {
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      transform: translate(-50%, -50%);
-      font-size: 12px;
-      font-weight: 600;
-      color: white;
-      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
-    }
-  }
-}
-
-// 状态提示（短暂显示播放/暂停图标）
+/* 状态提示（短暂显示播放/暂停图标） */
 .state-hint {
   position: absolute;
   top: 50%;
   left: 50%;
-  transform: translate(-50%, -50%);
+  z-index: 30;
   display: flex;
-  align-items: center;
   justify-content: center;
+  align-items: center;
   gap: 8px;
   padding: 16px 24px;
-  background: rgba(0, 0, 0, 0.7);
-  border-radius: var(--radius-lg);
-  color: white;
-  z-index: 30;
+  background: var(--af-functional-video-overlay-hint);
+  border-radius: var(--af-radius-lg);
+  color: var(--af-text-primary);
+  transform: translate(-50%, -50%);
   pointer-events: none;
+}
 
-  svg {
-    width: 32px;
-    height: 32px;
-  }
+.state-hint svg {
+  width: 32px;
+  height: 32px;
+}
 
-  span {
-    font-size: 16px;
-    font-weight: 500;
+.state-hint span {
+  font-size: 16px;
+  font-weight: 500;
+}
+
+/* 控制按钮容器（默认隐藏） */
+.subtitle-overlay .subtitle-control-btn {
+  position: absolute;
+  top: -8px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  width: 24px;
+  height: 24px;
+  background: var(--af-functional-video-control-bg);
+  border: 1px solid var(--af-functional-video-control-border);
+  border-radius: 50%;
+  color: var(--af-functional-video-control-text);
+  transition: all 0.2s;
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: auto;
+}
+
+.subtitle-overlay .subtitle-control-btn.direction-btn {
+  left: -8px;
+}
+
+.subtitle-overlay .subtitle-control-btn.reset-btn {
+  right: -8px;
+}
+
+.subtitle-overlay .subtitle-control-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.subtitle-overlay .subtitle-control-btn:hover {
+  background: var(--af-functional-video-control-bg-hover);
+  color: var(--af-text-primary);
+  border-color: var(--af-functional-video-control-border-hover);
+  transform: scale(1.1);
+}
+
+/* hover 时显示控制按钮 */
+.subtitle-overlay:hover .subtitle-control-btn {
+  opacity: 1;
+}
+
+.subtitle-overlay .subtitle-text {
+  display: inline-block;
+  padding: 8px 20px;
+  background: var(--af-functional-video-overlay-medium);
+  border-radius: var(--af-radius-sm);
+  color: var(--af-functional-video-text);
+  font-size: 20px;
+  transition: box-shadow 0.2s;
+  line-height: 1.4;
+  text-align: center;
+  text-shadow: var(--af-functional-video-text-shadow);
+  pointer-events: none;
+}
+
+/* 拖动时的样式 */
+.subtitle-overlay.is-dragging {
+  opacity: 0.8;
+}
+
+.subtitle-overlay.is-dragging .subtitle-text {
+  box-shadow: var(--af-functional-video-shadow-lg);
+}
+
+/* 竖向显示模式 */
+.subtitle-overlay.is-vertical .subtitle-text {
+  writing-mode: vertical-rl;
+  text-orientation: upright;
+  padding: 20px 8px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+/* 自定义滚动条 */
+.subtitle-overlay.is-vertical .subtitle-text::-webkit-scrollbar {
+  width: 4px;
+}
+
+.subtitle-overlay.is-vertical .subtitle-text::-webkit-scrollbar-thumb {
+  background: var(--af-functional-video-scrollbar-thumb);
+  border-radius: 2px;
+}
+
+/* 通用覆盖层 */
+.video-overlay {
+  position: absolute;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  inset: 0;
+}
+
+/* 加载状态 */
+.loading-overlay {
+  gap: 12px;
+  background: var(--af-functional-video-overlay);
+  color: var(--af-text-secondary);
+}
+
+.loading-overlay .loading-spinner {
+  width: 40px;
+  height: 40px;
+  border: 3px solid var(--af-border-subtle);
+  border-top-color: var(--af-accent-primary);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
   }
 }
 
-// V3.1.2+dev.20260113.01: 分辨率标志/按钮一体化样式
-// 热区容器：始终存在以接收hover事件
+/* 错误状态 */
+.error-overlay {
+  gap: 16px;
+  background: var(--af-functional-video-overlay-dark);
+  color: var(--af-text-secondary);
+}
+
+.error-overlay .error-icon {
+  width: 48px;
+  height: 48px;
+  color: var(--af-accent-danger);
+}
+
+.error-overlay .error-message {
+  font-size: 14px;
+}
+
+.error-overlay .retry-btn {
+  padding: 8px 24px;
+  background: var(--af-accent-primary);
+  border-radius: var(--af-radius-md);
+  color: var(--af-text-primary);
+  font-size: 14px;
+  transition: background var(--af-transition-fast);
+}
+
+/* Proxy 错误状态 */
+.proxy-error-overlay {
+  gap: 16px;
+  background: var(--af-functional-video-overlay-darker);
+  color: var(--af-text-secondary);
+}
+
+.proxy-error-overlay .error-icon {
+  width: 48px;
+  height: 48px;
+  color: var(--af-accent-warning);
+}
+
+.proxy-error-overlay h3 {
+  margin: 0;
+  color: var(--af-text-normal);
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.proxy-error-overlay .error-message {
+  color: var(--af-text-muted);
+  font-size: 14px;
+  max-width: 300px;
+  text-align: center;
+}
+
+.proxy-error-overlay .retry-btn {
+  padding: 8px 24px;
+  background: var(--af-accent-primary);
+  border-radius: var(--af-radius-md);
+  color: var(--af-text-primary);
+  font-size: 14px;
+  transition: background var(--af-transition-fast);
+}
+
+.proxy-error-overlay .retry-btn:hover {
+  background: var(--af-accent-primary-hover);
+}
+
+.error-overlay .retry-btn:hover {
+  background: var(--af-accent-primary-hover);
+}
+
+/* 转码中状态 */
+.transcoding-overlay {
+  gap: 16px;
+  background: var(--af-functional-video-overlay-darker);
+  color: var(--af-text-secondary);
+}
+
+.transcoding-overlay .transcoding-spinner {
+  width: 48px;
+  height: 48px;
+  border: 4px solid var(--af-border-subtle);
+  border-top-color: var(--af-accent-primary);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+.transcoding-overlay h3 {
+  margin: 0;
+  color: var(--af-text-normal);
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.transcoding-overlay p {
+  margin: 0;
+  color: var(--af-text-muted);
+  font-size: 14px;
+}
+
+.transcoding-overlay .progress-bar {
+  position: relative;
+  width: 300px;
+  height: 24px;
+  background: var(--af-bg-tertiary);
+  border-radius: var(--af-radius-md);
+  overflow: hidden;
+}
+
+.transcoding-overlay .progress-bar .progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--af-accent-primary), var(--af-accent-primary-hover));
+  transition: width 0.3s ease;
+}
+
+.transcoding-overlay .progress-bar .progress-fill.indeterminate {
+  width: 40%;
+  animation: indeterminate 1.5s infinite ease-in-out;
+}
+
+@keyframes indeterminate {
+  0% {
+    transform: translateX(-100%);
+  }
+
+  50% {
+    transform: translateX(250%);
+  }
+
+  100% {
+    transform: translateX(-100%);
+  }
+}
+
+.transcoding-overlay .progress-bar span {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  color: var(--af-text-primary);
+  font-size: 12px;
+  font-weight: 600;
+  transform: translate(-50%, -50%);
+  text-shadow: var(--af-functional-video-text-shadow-sm);
+}
+
+/* V3.1.2+dev.20260113.01: 分辨率标志/按钮一体化样式 */
+
+/* 热区容器：始终存在以接收hover事件 */
 .resolution-hotspot {
   position: absolute;
   top: 16px;
@@ -1335,99 +1377,99 @@ onUnmounted(() => {
   align-items: flex-end;
   gap: 8px;
   pointer-events: auto;
-
-  .resolution-badge {
-    padding: 4px 12px;
-    font-size: 11px;
-    font-weight: 600;
-    border-radius: 4px;
-    letter-spacing: 0.5px;
-    border: none;
-    user-select: none;
-
-    &.preview {
-      background: rgba(255, 193, 7, 0.9);
-      color: #000;
-    }
-
-    &.hd {
-      background: rgba(76, 175, 80, 0.9);
-      color: #fff;
-    }
-
-    &.full-hd {
-      background: rgba(33, 150, 243, 0.9);
-      color: #fff;
-    }
-
-    &.ultra-hd {
-      background: rgba(186, 104, 200, 0.85);
-      color: #fff;
-    }
-
-    &.source {
-      background: rgba(33, 150, 243, 0.9);
-      color: #fff;
-    }
-  }
-
-  .upgrade-progress {
-    padding: 4px 10px;
-    font-size: 11px;
-    font-weight: 500;
-    background: rgba(0, 0, 0, 0.7);
-    color: rgba(76, 175, 80, 1);
-    border-radius: 4px;
-  }
-
-  // V3.1.2+dev.20260113.01: 升级气泡样式
-  .upgrade-bubble {
-    padding: 8px 14px;
-    background: rgba(30, 30, 30, 0.95);
-    border: 1px solid rgba(255, 255, 255, 0.15);
-    border-radius: 6px;
-    font-size: 12px;
-    color: #fff;
-    white-space: nowrap;
-    cursor: pointer;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-
-    &:hover {
-      background: rgba(40, 40, 40, 0.98);
-      // border-color: rgba(255, 193, 7, 0.5);
-    }
-  }
 }
 
-// 全屏模式
-.is-fullscreen {
-  .subtitle-overlay {
-    bottom: 80px;
-
-    .subtitle-text {
-      font-size: 28px;
-      padding: 12px 28px;
-    }
-  }
+.resolution-indicator .resolution-badge {
+  padding: 4px 12px;
+  border: none;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  user-select: none;
 }
 
-// 动画
+.resolution-indicator .resolution-badge.preview {
+  background: var(--af-functional-status-badge-warning-bg);
+  color: var(--af-functional-status-badge-warning-text);
+}
+
+.resolution-indicator .resolution-badge.hd {
+  background: var(--af-functional-status-badge-success-bg);
+  color: var(--af-functional-status-badge-success-text);
+}
+
+.resolution-indicator .resolution-badge.full-hd {
+  background: var(--af-functional-status-badge-info-bg);
+  color: var(--af-functional-status-badge-info-text);
+}
+
+.resolution-indicator .resolution-badge.ultra-hd {
+  background: var(--af-functional-status-badge-premium-bg);
+  color: var(--af-functional-status-badge-premium-text);
+}
+
+.resolution-indicator .resolution-badge.source {
+  background: var(--af-functional-status-badge-info-bg);
+  color: var(--af-functional-status-badge-info-text);
+}
+
+.resolution-indicator .upgrade-progress {
+  padding: 4px 10px;
+  background: var(--af-functional-video-overlay-dark);
+  border-radius: 4px;
+  color: var(--af-accent-success);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+/* V3.1.2+dev.20260113.01: 升级气泡样式 */
+.resolution-indicator .upgrade-bubble {
+  padding: 8px 14px;
+  background: var(--af-functional-video-overlay-dark);
+  border: 1px solid var(--af-border-subtle);
+  border-radius: 6px;
+  color: var(--af-text-primary);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+  box-shadow: var(--af-functional-video-shadow-lg);
+}
+
+.resolution-indicator .upgrade-bubble:hover {
+  background: var(--af-functional-video-overlay-darker);
+}
+
+/* 全屏模式 */
+.is-fullscreen .subtitle-overlay {
+  bottom: 80px;
+}
+
+.is-fullscreen .subtitle-overlay .subtitle-text {
+  padding: 12px 28px;
+  font-size: 28px;
+}
+
+/* 动画 */
 .fade-enter-active,
 .fade-leave-active {
   transition: opacity 0.2s ease;
 }
+
 .fade-enter-from,
 .fade-leave-to {
   opacity: 0;
 }
 
-// V3.1.2+dev.20260113.01: 平滑渐变动画（用于分辨率标志）
+/* V3.1.2+dev.20260113.01: 平滑渐变动画（用于分辨率标志） */
 .fade-smooth-enter-active {
   transition: opacity 0.3s ease;
 }
+
 .fade-smooth-leave-active {
   transition: opacity 0.5s ease;
 }
+
 .fade-smooth-enter-from,
 .fade-smooth-leave-to {
   opacity: 0;
@@ -1436,36 +1478,66 @@ onUnmounted(() => {
 .pop-enter-active {
   animation: pop-in 0.3s ease;
 }
+
 .pop-leave-active {
   animation: pop-out 0.2s ease;
 }
 
-// V3.1.2+dev.20260113.01: 气泡专用过渡（用于升级气泡）
+/* V3.1.2+dev.20260113.01: 气泡专用过渡（用于升级气泡） */
 .resolution-indicator .pop-enter-active {
   animation: bubble-pop-in 0.2s ease;
 }
+
 .resolution-indicator .pop-leave-active {
   animation: bubble-pop-out 0.15s ease;
 }
 
 @keyframes pop-in {
-  0% { transform: translate(-50%, -50%) scale(0.5); opacity: 0; }
-  100% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+  0% {
+    transform: translate(-50%, -50%) scale(0.5);
+    opacity: 0;
+  }
+
+  100% {
+    transform: translate(-50%, -50%) scale(1);
+    opacity: 1;
+  }
 }
 
 @keyframes pop-out {
-  0% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
-  100% { transform: translate(-50%, -50%) scale(1.2); opacity: 0; }
+  0% {
+    transform: translate(-50%, -50%) scale(1);
+    opacity: 1;
+  }
+
+  100% {
+    transform: translate(-50%, -50%) scale(1.2);
+    opacity: 0;
+  }
 }
 
-// V3.1.2+dev.20260113.01: 气泡弹出动画
+/* V3.1.2+dev.20260113.01: 气泡弹出动画 */
 @keyframes bubble-pop-in {
-  0% { transform: scale(0.8) translateY(-4px); opacity: 0; }
-  100% { transform: scale(1) translateY(0); opacity: 1; }
+  0% {
+    transform: scale(0.8) translateY(-4px);
+    opacity: 0;
+  }
+
+  100% {
+    transform: scale(1) translateY(0);
+    opacity: 1;
+  }
 }
 
 @keyframes bubble-pop-out {
-  0% { transform: scale(1) translateY(0); opacity: 1; }
-  100% { transform: scale(0.9) translateY(-4px); opacity: 0; }
+  0% {
+    transform: scale(1) translateY(0);
+    opacity: 1;
+  }
+
+  100% {
+    transform: scale(0.9) translateY(-4px);
+    opacity: 0;
+  }
 }
 </style>
