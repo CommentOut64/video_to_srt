@@ -1623,32 +1623,27 @@ watch(
   }
 )
 
-// 同步高级设置的偏移值到 projectStore
-watch(
-  () => advancedConfig.value.general.global_time_offset,
-  (value) => {
-    if (value !== projectStore.subtitleOffset) {
-      projectStore.setSubtitleOffset(value)
-    }
-  }
-)
-
+// V3.2.0+dev.20260209.03: 移除实时触发，仅在保存时应用
 function handleAdvancedSettingsChange(config) {
-  // 实时响应设置变化
-  console.log('[EditorView] 高级设置变化:', config)
-
-  // 字幕偏移变化时，立即应用到 projectStore
-  if (config.general?.global_time_offset !== undefined) {
-    projectStore.setSubtitleOffset(config.general.global_time_offset)
-  }
+  // 仅用于数据同步，不触发字幕偏移
+  console.log('[EditorView] 高级设置变化（未应用）:', config)
 }
 
 async function handleSaveAdvancedSettings() {
   try {
     console.log('[EditorView] 保存高级设置:', advancedConfig.value)
 
-    // 保存字幕偏移到后端
-    const offset = advancedConfig.value.general.global_time_offset
+    // V3.2.0+dev.20260209.04: 保存时规范化空值为 0
+    let offset = advancedConfig.value.general.global_time_offset
+    if (offset === '' || offset === null || offset === undefined) {
+      offset = 0
+    }
+    offset = Number(offset)
+
+    // 1. 应用到前端 projectStore
+    projectStore.setSubtitleOffset(offset)
+
+    // 2. 保存到后端
     await transcriptionApi.setJobSubtitleTimeOffset(projectStore.meta.jobId, offset)
 
     // TODO: 保存其他高级设置到后端或本地存储
@@ -1807,11 +1802,6 @@ onUnmounted(() => {
   // 停止轮询（轮询仅是备用方案）
   stopProgressPolling()
   stopProxyPolling()
-
-  if (offsetSyncTimer) {
-    clearTimeout(offsetSyncTimer)
-    offsetSyncTimer = null
-  }
 })
 
 onBeforeRouteLeave(async (to, from) => {

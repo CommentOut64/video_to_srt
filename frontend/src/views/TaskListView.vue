@@ -48,7 +48,6 @@
       @update:task-config="(value) => (taskConfig = value)"
       @open-input-folder="handleOpenInputFolder"
       @toggle-advanced-settings="showAdvancedSettings = !showAdvancedSettings"
-      @preset-change="handlePresetChange"
       @close-upload-dialog="closeUploadDialog"
       @upload="handleUpload"
       @batch-create="handleBatchCreate"

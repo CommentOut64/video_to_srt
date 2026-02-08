@@ -34,7 +34,7 @@
             v-model.number="localConfig.general.global_time_offset"
             @change="emitChange"
           />
-          <span class="slider-value">{{ localConfig.general.global_time_offset.toFixed(1) }}s</span>
+          <span class="slider-value">{{ Number(localConfig.general.global_time_offset || 0).toFixed(1) }}s</span>
         </div>
       </div>
 
@@ -48,7 +48,7 @@
           <input
             type="number"
             step="0.01"
-            v-model.number="localConfig.general.global_time_offset"
+            v-model="localConfig.general.global_time_offset"
             @input="emitChange"
             placeholder="0.00"
           />
@@ -549,12 +549,14 @@ const tabs = [
 /* 本地配置 (深拷贝) */
 const localConfig = ref(JSON.parse(JSON.stringify(props.modelValue)))
 
-/* 发送变更事件 */
+/* V3.2.0+dev.20260209.04: 移除自动规范化，允许用户输入空值和负号 */
+/* 发送变更事件（仅用于数据同步，不触发实际应用） */
 function emitChange() {
   /* 检查是否还匹配某个预设 */
   localConfig.value.preset_id = 'custom'
   emit('update:modelValue', JSON.parse(JSON.stringify(localConfig.value)))
-  emit('change', localConfig.value)
+  // V3.2.0+dev.20260209.03: 移除 change 事件，避免实时触发字幕偏移
+  // 只有点击"保存"按钮才真正应用
 }
 
 /* 监听外部值变化 */
