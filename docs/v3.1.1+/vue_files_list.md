@@ -4,7 +4,7 @@
 
 - [ ] frontend\src\App.vue
 - [x] frontend\src\components\AboutDialog.vue
-- [ ] frontend\src\components\UpdateDialog.vue
+- [x] frontend\src\components\UpdateDialog.vue
 - [ ] frontend\src\components\common\DualAnchorProgress.vue（需重新设计）
 - [ ] frontend\src\components\common\SimpleProgress.vue（需重新设计）
 - [ ] frontend\src\components\task\PresetSelector.vue（需重新设计）

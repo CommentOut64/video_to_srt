@@ -168,7 +168,7 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 16px;
+  gap: 14px;
 }
 
 .app-icon {
@@ -191,7 +191,7 @@ onMounted(() => {
 .app-name {
   margin: 0;
   color: var(--af-text-primary);
-  font-size: 20px;
+  font-size: 22px;
   font-weight: 600;
 }
 

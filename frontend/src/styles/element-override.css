@@ -348,6 +348,75 @@ html.el-popup-parent--hidden .el-message-box__wrapper {
 }
 
 /* ==============================================
+   UpdateDialog 专用全局样式覆盖
+   el-dialog teleport 到 body，scoped 无法穿透
+   ============================================== */
+
+/* 原因：重置 dialog 默认 padding，通过 CSS 变量和直接属性双重覆盖确保生效 */
+/* 注意：class="update-dialog" 通过 $attrs 合并到 .el-dialog 同一元素上 */
+.el-dialog.update-dialog {
+  --el-dialog-padding-primary: 0;
+
+  padding: 0;
+  background: var(--af-bg-secondary);
+  border: 1px solid var(--af-border-default);
+}
+
+/* 原因：EP 用 padding-bottom/padding-right 单独属性，必须逐个覆盖 */
+/* .show-close 变体优先级 (0,3,0) 胜过 EP 的 (0,2,0) */
+.el-dialog.update-dialog .el-dialog__header,
+.el-dialog.update-dialog .el-dialog__header.show-close {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-top: 18px;
+  padding-right: 20px;
+  padding-bottom: 16px;
+  padding-left: 24px;
+  border-bottom: 1px solid var(--af-border-default);
+}
+
+.el-dialog.update-dialog .el-dialog__title {
+  color: var(--af-text-primary);
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+/* 原因：EP headerbtn 默认绝对定位 48x48，需改为 static 与标题对齐 */
+.el-dialog.update-dialog .el-dialog__headerbtn {
+  position: static;
+  width: 24px;
+  height: 24px;
+}
+
+/* 原因：Element Plus 不提供 body padding 的 CSS 变量 */
+.el-dialog.update-dialog .el-dialog__body {
+  padding: 24px 20px;
+}
+
+/* 原因：Element Plus 不提供 footer padding/border 的 CSS 变量 */
+.el-dialog.update-dialog .el-dialog__footer {
+  border-top: 1px solid var(--af-border-default);
+  padding: 12px 20px;
+}
+
+/* 原因：统一按钮 hover/active 样式 */
+.el-dialog.update-dialog .el-button:hover:not(:disabled) {
+  background: var(--af-bg-elevated);
+  border-color: var(--af-border-default);
+}
+
+.el-dialog.update-dialog .el-button:active:not(:disabled) {
+  background: var(--af-bg-tertiary);
+}
+
+/* 原因：Element Plus .el-button + .el-button 默认 margin-left: 12px，需重置为由 gap 控制 */
+.el-dialog.update-dialog .btn-group-right .el-button + .el-button {
+  margin-left: 0;
+}
+
+/* ==============================================
    创建任务 (upload-dialog) 专用全局样式覆盖
    el-dialog teleport 到 body，scoped 无法穿透
    ============================================== */
