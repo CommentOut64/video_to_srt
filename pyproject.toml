@@ -1,7 +1,358 @@
+# ============================================================
+# anchor-flux - 项目配置
+# ============================================================
+# 统一依赖管理：生产环境依赖 + 可选开发依赖
+# CUDA 版本: 12.1 统一方案 (PyTorch cu121 内置所有 CUDA 库)
+# 更新时间: 2026-02-09
+# ============================================================
+
 [project]
-name = "video-to-srt-gpu"
-version = "0.1.0"
-description = "Add your description here"
+name = "anchor-flux"
+version = "3.2.2"
+description = "基于 GPU 加速的视频转字幕工具"
 readme = "README.md"
-requires-python = ">=3.10"
-dependencies = []
+requires-python = ">=3.10,<3.13"
+license = { text = "MIT" }
+authors = [
+    { name = "CommentOut64" }
+]
+keywords = ["video", "subtitle", "srt", "asr", "whisper", "gpu", "cuda"]
+
+# ============================================================
+# 核心依赖 (生产环境必需)
+# ============================================================
+dependencies = [
+    # --- 核心工具 ---
+    "python-dateutil",
+    "tqdm",
+    "click",
+    "colorama",
+    "filelock",
+    "psutil",
+    "intel-openmp",  # fbgemm.dll 需要的 OpenMP 运行时
+    "loguru>=0.7.0",  # 增强日志系统
+    "setuptools<78",  # pkg_resources 运行时依赖 (78+ 已移除)
+
+    # --- 数值计算 (严格版本控制) ---
+    "numpy==1.26.4",  # 必须 < 2.0.0 以保证生态兼容性
+    "scipy>=1.11.0,<2.0.0",
+    "sympy>=1.12",
+
+    # --- PyTorch 生态 (CUDA 12.1) ---
+    # cu121 自带完整的 CUDA 12.1 + cuDNN 9.x，无需额外安装 nvidia-* 包
+    "torch==2.4.1",
+    "torchaudio==2.4.1",
+
+    # --- AI 推理引擎 ---
+    "faster-whisper==1.2.1",
+    "ctranslate2>=4.5.0",  # 4.5.0+ 支持 cuDNN 9.x (PyTorch 2.4.1 自带)
+    "onnxruntime-gpu==1.18.0",  # CUDA 12.x + cuDNN 8.x
+
+    # --- 标点恢复/分词 ---
+    "punctuators>=0.0.7",
+    "sentencepiece>=0.2.0",
+    "tokenizers>=0.20.0",
+
+    # --- 文本标准化 (ITN/TN) ---
+    "wetext>=0.1.2",
+
+    # --- 音频处理 ---
+    "librosa>=0.10.0",
+    "soundfile>=0.12.0",
+    "ffmpeg-python>=0.2.0",
+    "av>=10.0.0",
+    "pydub>=0.25.0",
+
+    # --- 人声分离 ---
+    "demucs==4.0.1",
+
+    # --- VAD & 语音分析 ---
+    "silero-vad>=5.0.0",
+    "pyannote.audio>=3.3.0,<4.0.0",
+    "brouhaha",  # 通过 tool.uv.sources 从 GitHub 安装 (使用国内代理加速)
+
+    # --- 声纹识别/语言识别 ---
+    "speechbrain==1.0.3",
+    "huggingface-hub>=0.24.0,<1.0.0",
+
+    # --- Web 服务 ---
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "python-multipart>=0.0.6",
+    "sse-starlette>=1.8.0",
+    "prometheus-client>=0.19.0",
+
+    # --- 数据验证 ---
+    "pydantic>=2.0.0,<3.0.0",
+]
+
+# ============================================================
+# 可选依赖 (开发/测试/文档)
+# ============================================================
+[project.optional-dependencies]
+# 开发环境额外运行时依赖
+dev-runtime = [
+    "pandas>=2.0.0",  # 数据分析
+    "matplotlib>=3.8.0",  # 数据可视化
+    "tabulate>=0.9.0",  # 表格美化输出
+]
+
+# 开发工具
+dev = [
+    # --- 代码质量 ---
+    "ruff>=0.6.0",  # 快速 linter 和 formatter
+    "mypy>=1.8.0",  # 类型检查
+    "black>=24.0.0",  # 代码格式化 (备选)
+
+    # --- 测试 ---
+    "pytest>=8.0.0",  # 测试框架
+    "pytest-asyncio>=0.23.0",  # 异步测试
+    "pytest-cov>=4.1.0",  # 覆盖率
+    "pytest-mock>=3.12.0",  # Mock 工具
+
+    # --- 调试 ---
+    "ipython>=8.20.0",  # 增强的 Python REPL
+    "ipdb>=0.13.0",  # IPython 调试器
+
+    # --- 文档 ---
+    "mkdocs>=1.5.0",  # 文档生成
+    "mkdocs-material>=9.5.0",  # Material 主题
+
+    # --- 性能分析 ---
+    "py-spy>=0.3.0",  # 性能分析工具
+    "memory-profiler>=0.61.0",  # 内存分析
+
+    # --- 打包 ---
+    "pyinstaller>=6.0.0",  # 打包工具
+    "build>=1.0.0",  # 构建工具
+]
+
+# 测试依赖
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "pytest-mock>=3.12.0",
+    "httpx>=0.27.0",  # FastAPI 测试客户端
+]
+
+# 文档依赖
+docs = [
+    "mkdocs>=1.5.0",
+    "mkdocs-material>=9.5.0",
+    "mkdocstrings[python]>=0.24.0",
+]
+
+# ============================================================
+# uv 配置
+# ============================================================
+[tool.uv]
+index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+
+# 强制覆盖依赖版本（解决版本冲突）
+override-dependencies = [
+    # brouhaha 要求 numpy==1.24.4，但我们需要 1.26.4 以兼容其他包
+    "numpy==1.26.4",
+    # 锁定 onnxruntime 到支持 Python 3.10 的版本（安装后会被 onnxruntime-gpu 替换）
+    "onnxruntime==1.18.0",
+]
+
+# 特殊依赖源配置
+[tool.uv.sources]
+# PyTorch 从官方 cu121 源安装
+torch = { index = "pytorch" }
+torchaudio = { index = "pytorch" }
+# Brouhaha 从 GitHub 安装
+brouhaha = { git = "https://github.com/marianne-m/brouhaha-vad" }
+
+# PyTorch 官方 CUDA 12.1 源
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+# ============================================================
+# 工具配置
+# ============================================================
+
+# Ruff 配置 (代码检查和格式化)
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+    "B008",  # do not perform function calls in argument defaults
+    "C901",  # too complex
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  # unused imports
+
+# MyPy 配置 (类型检查)
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+
+# Pytest 配置
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--strict-markers",
+    "--cov=backend",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "gpu: marks tests that require GPU",
+    "integration: marks integration tests",
+]
+
+# Coverage 配置
+[tool.coverage.run]
+source = ["backend"]
+omit = [
+    "*/tests/*",
+    "*/test_*.py",
+    "*/__pycache__/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
+
+# ============================================================
+# 构建系统
+# ============================================================
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Hatch 构建配置（指定项目结构）
+[tool.hatch.build.targets.wheel]
+packages = ["backend"]
+
+# ============================================================
+# 项目元数据
+# ============================================================
+[project.urls]
+Homepage = "https://github.com/CommentOut64/video-to-srt"
+Repository = "https://github.com/CommentOut64/video-to-srt"
+Documentation = "https://github.com/CommentOut64/video-to-srt/blob/main/README.md"
+Issues = "https://github.com/CommentOut64/video-to-srt/issues"
+
+# ============================================================
+# 安装指南
+# ============================================================
+#
+# 生产环境:
+#   uv sync
+#
+# 开发环境 (包含所有开发工具):
+#   uv sync --extra dev-runtime --extra dev --extra test --extra docs
+#   或简写:
+#   uv sync --all-extras
+#
+# 手动安装 (如果 uv sync 失败):
+#   1. 安装 PyTorch (CUDA 12.1):
+#      uv pip install torch==2.4.1+cu121 torchaudio==2.4.1+cu121 \
+#        --index-url https://download.pytorch.org/whl/cu121
+#
+#   2. 安装项目依赖:
+#      uv pip install -e .
+#
+#   3. 卸载冲突的 CPU 版 ONNX Runtime:
+#      uv pip uninstall onnxruntime -y
+#
+# 验证安装:
+#   python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
+#   python -c "import onnxruntime as ort; print(f'GPU providers: {ort.get_available_providers()}')"
+#
+# ============================================================
+
+# ============================================================
+# 国内用户备用方案
+# ============================================================
+#
+# 如果 ghfast.top 代理不可用，可手动安装 brouhaha：
+#   uv pip install brouhaha@https://kkgithub.com/marianne-m/brouhaha-vad/archive/main.zip
+# 或使用其他代理：
+#   uv pip install brouhaha@https://gh-proxy.com/https://github.com/marianne-m/brouhaha-vad/archive/main.zip
+#
+# ============================================================
+
+# ============================================================
+# 开发工作流命令
+# ============================================================
+#
+# 代码检查:
+#   ruff check backend/
+#   mypy backend/
+#
+# 代码格式化:
+#   ruff format backend/
+#
+# 运行测试:
+#   pytest tests/ -v
+#   pytest tests/ -v --cov
+#   pytest tests/ -m "not slow"  # 跳过慢速测试
+#
+# 运行服务器:
+#   uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8000
+#
+# 生成文档:
+#   mkdocs serve
+#   mkdocs build
+#
+# 性能分析:
+#   py-spy record -o profile.svg -- python your_script.py
+#
+# 打包:
+#   pyinstaller AnchorFlux.spec
+#
+# ============================================================
+
+# ============================================================
+# 注意事项
+# ============================================================
+#
+# 1. CUDA 版本要求:
+#    - 驱动版本 >= 525.60.13 (Linux) / 528.33 (Windows)
+#    - 支持 CUDA 12.1 的 NVIDIA GPU
+#
+# 2. 已移除的依赖:
+#    - nvidia-cublas-cu12 (PyTorch cu121 已内置)
+#    - nvidia-cudnn-cu12 (PyTorch cu121 已内置)
+#    - nvidia-cuda-nvrtc-cu12 (PyTorch cu121 已内置)
+#    - funasr-onnx (已被自研 SenseVoice ONNX 替代)
+#    - onnxruntime (被 onnxruntime-gpu 替代，通过 override 强制)
+#
+# 3. 特殊处理:
+#    - brouhaha: 通过 tool.uv.sources 从 GitHub 安装 (ghfast.top 代理)
+#    - torch/torchaudio: 通过 tool.uv.sources 指定 cu121 源
+#
+# ============================================================
