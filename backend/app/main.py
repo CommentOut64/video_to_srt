@@ -6,6 +6,22 @@ import logging
 import asyncio
 import time
 import subprocess
+import warnings
+
+# 抑制 libpng iCCP 警告（必须在导入图像库之前设置）
+os.environ['QT_LOGGING_RULES'] = '*.debug=false;qt.qpa.*=false'
+warnings.filterwarnings('ignore', message='.*iCCP.*')
+warnings.filterwarnings('ignore', message='.*sRGB.*')
+
+# 尝试抑制 C 库级别的 libpng 警告
+try:
+    import ctypes
+    # Windows: 抑制 C 运行时警告
+    if sys.platform == 'win32':
+        ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002 | 0x8000)
+except Exception:
+    pass
+
 from fastapi import FastAPI, Form, HTTPException, UploadFile, File, Request
 from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
