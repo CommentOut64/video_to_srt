@@ -331,13 +331,103 @@ class AlignmentLayerConfig:
 
 
 @dataclass
+class SegmentationLayerConfig:
+    """L6 切分层参数。"""
+
+    is_enabled: bool = True
+    min_chars: int = 6
+    min_duration_sec: float = 0.8
+    max_duration_sec: float = 12.0
+    max_tokens: int = 40
+    long_pause_sec: float = 0.8
+    soft_pause_sec: float = 0.4
+    short_merge_max_chars: int = 22
+    is_keep_sentence_end_punct: bool = False
+
+    final_min_tokens: int = 5
+    final_max_tokens: int = 50
+    final_min_duration: float = 0.5
+    final_max_duration: float = 10.0
+    final_soft_pause: float = 0.35
+    final_long_pause: float = 0.8
+    final_min_mapping_coverage: float = 0.6
+
+    @classmethod
+    def from_runtime(
+        cls,
+        raw: Optional[Dict[str, Any]],
+        punctuation_raw: Optional[Dict[str, Any]] = None,
+    ) -> "SegmentationLayerConfig":
+        raw = raw or {}
+        punctuation_raw = punctuation_raw or {}
+
+        keep_sentence_end_punct = _read_runtime_value(
+            raw,
+            "keep_sentence_end_punct",
+            _read_runtime_value(
+                punctuation_raw,
+                "keep_sentence_end_punct",
+                cls.is_keep_sentence_end_punct,
+            ),
+        )
+
+        return cls(
+            is_enabled=bool(_read_runtime_value(raw, "enable", cls.is_enabled)),
+            min_chars=int(_read_runtime_value(raw, "min_chars", cls.min_chars)),
+            min_duration_sec=float(
+                _read_runtime_value(raw, "min_duration_sec", cls.min_duration_sec)
+            ),
+            max_duration_sec=float(
+                _read_runtime_value(raw, "max_duration_sec", cls.max_duration_sec)
+            ),
+            max_tokens=int(_read_runtime_value(raw, "max_tokens", cls.max_tokens)),
+            long_pause_sec=float(
+                _read_runtime_value(raw, "long_pause_sec", cls.long_pause_sec)
+            ),
+            soft_pause_sec=float(
+                _read_runtime_value(raw, "soft_pause_sec", cls.soft_pause_sec)
+            ),
+            short_merge_max_chars=int(
+                _read_runtime_value(raw, "short_merge_max_chars", cls.short_merge_max_chars)
+            ),
+            is_keep_sentence_end_punct=bool(keep_sentence_end_punct),
+            final_min_tokens=int(
+                _read_runtime_value(raw, "final.min_tokens", cls.final_min_tokens)
+            ),
+            final_max_tokens=int(
+                _read_runtime_value(raw, "final.max_tokens", cls.final_max_tokens)
+            ),
+            final_min_duration=float(
+                _read_runtime_value(raw, "final.min_duration", cls.final_min_duration)
+            ),
+            final_max_duration=float(
+                _read_runtime_value(raw, "final.max_duration", cls.final_max_duration)
+            ),
+            final_soft_pause=float(
+                _read_runtime_value(raw, "final.soft_pause", cls.final_soft_pause)
+            ),
+            final_long_pause=float(
+                _read_runtime_value(raw, "final.long_pause", cls.final_long_pause)
+            ),
+            final_min_mapping_coverage=float(
+                _read_runtime_value(
+                    raw,
+                    "final.min_mapping_coverage",
+                    cls.final_min_mapping_coverage,
+                )
+            ),
+        )
+
+
+@dataclass
 class TextPipelineConfig:
-    """文本处理流水线参数入口（L1/L2/L3/L4）。"""
+    """文本处理流水线参数入口（L1/L2/L3/L4/L6）。"""
 
     normalization: NormalizationConfig
     arbitration: "ArbitrationConfig"
     punctuation: "PunctuationConfig"
     alignment: AlignmentLayerConfig
+    segmentation: SegmentationLayerConfig
 
     @classmethod
     def from_runtime(cls, runtime: Optional[Dict[str, Any]] = None) -> "TextPipelineConfig":
@@ -348,11 +438,16 @@ class TextPipelineConfig:
         arbitration_raw = effective.get("arbitration", {}) if isinstance(effective, dict) else {}
         punctuation_raw = effective.get("punctuation", {}) if isinstance(effective, dict) else {}
         alignment_raw = effective.get("alignment", {}) if isinstance(effective, dict) else {}
+        segmentation_raw = effective.get("segmentation", {}) if isinstance(effective, dict) else {}
         return cls(
             normalization=NormalizationConfig.from_runtime(normalization_raw),
             arbitration=ArbitrationConfig.from_runtime(arbitration_raw),
             punctuation=PunctuationConfig.from_runtime(punctuation_raw),
             alignment=AlignmentLayerConfig.from_runtime(alignment_raw),
+            segmentation=SegmentationLayerConfig.from_runtime(
+                segmentation_raw,
+                punctuation_raw=punctuation_raw,
+            ),
         )
 
 

@@ -296,14 +296,22 @@ class AsyncDualPipeline:
         )
         # V3.2.0+dev.20260205.09: L4/L5/L6 处理器接入（对齐/注入/切分）
         self._l4_processor = AlignmentProcessor(logger=self.logger)
+        self._text_pipeline_config = TextPipelineConfig.from_runtime()
+        self._segmentation_layer_config = self._text_pipeline_config.segmentation
         final_split_config = FinalSplitConfig(
-            min_tokens=5,
-            max_tokens=50,
-            min_duration=0.5,
-            max_duration=10.0,
-            soft_pause=0.35,
-            long_pause=0.8,
-            min_mapping_coverage=0.6,
+            min_tokens=max(1, int(self._segmentation_layer_config.final_min_tokens)),
+            max_tokens=max(1, int(self._segmentation_layer_config.final_max_tokens)),
+            min_duration=max(0.0, float(self._segmentation_layer_config.final_min_duration)),
+            max_duration=max(0.5, float(self._segmentation_layer_config.final_max_duration)),
+            soft_pause=max(0.0, float(self._segmentation_layer_config.final_soft_pause)),
+            long_pause=max(
+                float(self._segmentation_layer_config.final_soft_pause),
+                float(self._segmentation_layer_config.final_long_pause),
+            ),
+            min_mapping_coverage=max(
+                0.0,
+                min(1.0, float(self._segmentation_layer_config.final_min_mapping_coverage)),
+            ),
         )
         self._final_splitter = FinalSplitter(final_split_config, logger=self.logger)
         if enable_semantic_grouping:
@@ -323,15 +331,19 @@ class AsyncDualPipeline:
         self._l6_processor = SegmentationProcessor(
             final_splitter=self._final_splitter,
             logger=self.logger,
-            is_keep_sentence_end_punct=self._load_keep_sentence_end_punct(),
+            is_keep_sentence_end_punct=bool(
+                self._segmentation_layer_config.is_keep_sentence_end_punct
+            ),
         )
         self._l7_processor = OutputProcessor(
             subtitle_manager=self.subtitle_manager,
             logger=self.logger,
         )
-        self._keep_sentence_end_punct = self._load_keep_sentence_end_punct()
+        self._keep_sentence_end_punct = bool(
+            self._segmentation_layer_config.is_keep_sentence_end_punct
+        )
         # V3.2.0+dev.20260206.02: 双轨实验配置（shadow/active 仅串行执行 L4-L6，避免并行占用 GPU）。
-        self._alignment_layer_config = TextPipelineConfig.from_runtime().alignment
+        self._alignment_layer_config = self._text_pipeline_config.alignment
         dual_time_mode = str(self._alignment_layer_config.dual_time_mode or "off").lower()
         if dual_time_mode not in {"off", "shadow", "active"}:
             dual_time_mode = "off"
@@ -742,6 +754,7 @@ class AsyncDualPipeline:
         self._audio_chunks_by_index = {chunk.index: chunk for chunk in audio_chunks}
         self._context_cache = {}
         self._vad_intervals = list(vad_intervals) if vad_intervals else None
+        self._l6_processor.reset_state()
 
         total_chunks = len(audio_chunks)  # V3.1.0: 保存总数用于进度计算
         self.logger.info(f"开始三级流水线: {total_chunks} 个 Chunk")
@@ -3096,7 +3109,10 @@ class AsyncDualPipeline:
             L6Input(
                 annotated_words=l5_output.annotated_words,
                 vad_intervals=self._vad_intervals,
-            )
+            ),
+            stream_id=f"{variant}:{speaker_id or 'main'}",
+            chunk_index=self._resolve_chunk_index_from_words(words=time_words),
+            is_last_chunk=self._is_last_chunk_for_words(words=time_words),
         )
         words_for_split = list(l6_output.words_for_split)
         final_sentences = list(l6_output.sentence_segments)
@@ -3499,7 +3515,10 @@ class AsyncDualPipeline:
             L6Input(
                 annotated_words=annotated_words,
                 vad_intervals=self._vad_intervals,
-            )
+            ),
+            stream_id="sensevoice_only",
+            chunk_index=ctx.chunk_index,
+            is_last_chunk=self._is_last_chunk_index(ctx.chunk_index),
         )
         sentences = list(l6_output.sentence_segments)
         if not sentences:
@@ -3558,6 +3577,26 @@ class AsyncDualPipeline:
                 )
             )
         return timestamps
+
+    def _resolve_chunk_index_from_words(self, *, words: Sequence[WordTimestamp]) -> Optional[int]:
+        if not words or not self._audio_chunks_by_index:
+            return None
+        first_word_start = float(words[0].start)
+        for chunk_index, chunk in self._audio_chunks_by_index.items():
+            if float(chunk.start) <= first_word_start <= float(chunk.end) + 1e-6:
+                return int(chunk_index)
+        return None
+
+    def _is_last_chunk_for_words(self, *, words: Sequence[WordTimestamp]) -> bool:
+        chunk_index = self._resolve_chunk_index_from_words(words=words)
+        if chunk_index is None:
+            return False
+        return self._is_last_chunk_index(chunk_index)
+
+    def _is_last_chunk_index(self, chunk_index: int) -> bool:
+        if not self._audio_chunks_by_index:
+            return False
+        return int(chunk_index) >= max(self._audio_chunks_by_index.keys())
 
     @staticmethod
     def _compute_matched_ratio(aligned_words: Sequence[Any]) -> float:

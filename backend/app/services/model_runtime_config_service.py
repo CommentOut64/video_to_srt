@@ -417,6 +417,25 @@ class ModelRuntimeConfigService:
                 "dual_time_boundary_tolerance_ms": 250,
                 "dual_time_active_min_boundary_f1": 0.85,
             },
+            # V3.2.0+dev.20260210.01: L6 切分层统一参数入口。
+            "segmentation": {
+                "enable": True,
+                "min_chars": 6,
+                "min_duration_sec": 0.8,
+                "max_duration_sec": 12.0,
+                "max_tokens": 40,
+                "long_pause_sec": 0.8,
+                "soft_pause_sec": 0.4,
+                "short_merge_max_chars": 22,
+                "keep_sentence_end_punct": False,
+                "final.min_tokens": 5,
+                "final.max_tokens": 50,
+                "final.min_duration": 0.5,
+                "final.max_duration": 10.0,
+                "final.soft_pause": 0.35,
+                "final.long_pause": 0.8,
+                "final.min_mapping_coverage": 0.6,
+            },
             # V3.2.0+dev.20260204.03: L2 文本仲裁层运行参数
             "arbitration": {
                 "enable": True,
