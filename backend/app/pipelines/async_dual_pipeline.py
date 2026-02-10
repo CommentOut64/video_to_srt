@@ -1276,7 +1276,8 @@ class AsyncDualPipeline:
         gap_ratio_mid = 0.3
         if not self.aligner:
             return gap_ratio_mid
-        gap_resolver = getattr(self.aligner.alignment_service, "gap_resolver", None)
+        alignment_service = getattr(self.aligner, "alignment_service", None)
+        gap_resolver = getattr(alignment_service, "gap_resolver", None)
         value = getattr(gap_resolver, "_gap_ratio_mid", None)
         if isinstance(value, (int, float)):
             gap_ratio_mid = float(value)
@@ -1285,7 +1286,8 @@ class AsyncDualPipeline:
     def _resolve_injection_min_mapping_coverage(self) -> float:
         if not self.aligner:
             return 0.6
-        config = getattr(self.aligner.final_splitter, "config", None)
+        final_splitter = getattr(self.aligner, "final_splitter", None)
+        config = getattr(final_splitter, "config", None)
         value = getattr(config, "min_mapping_coverage", None)
         if isinstance(value, (int, float)):
             return float(value)
