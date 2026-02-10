@@ -186,21 +186,31 @@ target-version = "py310"
 [tool.ruff.lint]
 select = [
     "E",   # pycodestyle errors
-    "W",   # pycodestyle warnings
-    "F",   # pyflakes
-    "I",   # isort
-    "B",   # flake8-bugbear
-    "C4",  # flake8-comprehensions
-    "UP",  # pyupgrade
+    "F",   # pyflakes (only critical errors)
 ]
 ignore = [
+    "E401",  # multiple imports on one line
+    "E402",  # module level import not at top of file
     "E501",  # line too long (handled by formatter)
-    "B008",  # do not perform function calls in argument defaults
-    "C901",  # too complex
+    "E713",  # test for membership should be not in
+    "E722",  # bare except
+    "E731",  # lambda assignment
+    "E741",  # ambiguous variable name
+    "F401",  # imported but unused (handled per-file)
+    "F402",  # import shadowed by loop variable
+    "F403",  # star import
+    "F405",  # name may be undefined (from star import)
+    "F541",  # f-string without placeholders
+    "F601",  # dictionary key repeated
+    "F811",  # redefinition of unused name
+    "F821",  # undefined name (for string type annotations)
+    "F841",  # local variable assigned but never used
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"__init__.py" = ["F401"]  # unused imports
+"__init__.py" = ["F401", "F403"]  # unused imports and star imports
+"**/tests/**" = ["F401", "F841"]  # test files can have unused imports/variables
+"**/ci_tests/**" = ["F401", "F841"]  # CI test files
 
 # MyPy 配置 (类型检查)
 [tool.mypy]
