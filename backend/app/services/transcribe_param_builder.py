@@ -96,19 +96,14 @@ class TranscribeParamBuilder:
             if not sources:
                 if "word_timestamps" not in override_keys:
                     params["word_timestamps"] = False
-                if "condition_on_previous_text" not in override_keys:
-                    params["condition_on_previous_text"] = False
             else:
                 if (
                     "word_timestamps" not in override_keys
                     and sources.get("word_timestamps") == "default"
                 ):
                     params["word_timestamps"] = False
-                if (
-                    "condition_on_previous_text" not in override_keys
-                    and sources.get("condition_on_previous_text") == "default"
-                ):
-                    params["condition_on_previous_text"] = False
+            # V3.2.0+dev.20260206.04: patch 场景不再强制关闭 condition_on_previous_text，
+            # 统一遵循运行参数或显式覆盖，优先保证英文标点连续性。
 
         if params.get("suppress_tokens") is None:
             suppress_tokens = get_whisper_suppress_tokens(model_name)

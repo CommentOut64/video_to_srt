@@ -220,101 +220,112 @@ function formatTime(timestamp) {
 }
 </script>
 
-<style lang="scss" scoped>
+<style scoped>
+/* 任务卡片 */
 .task-card {
   display: flex;
   gap: 12px;
   padding: 12px;
-  background: rgba(255, 255, 255, 0.03);  // 更浅的灰色，能与背景区分
+  background: rgb(var(--af-text-on-dark-rgb), 0.03);
   border: 1px solid transparent;
   border-radius: 6px;
   margin-bottom: 8px;
   transition: border-color 0.2s;
-  user-select: none;  // 禁止文本选择
-
-  // hover 时只改变边框颜色
-  &:hover {
-    border-color: #028AC5;
-  }
-
-  // 正在运行的任务使用浅绿色边框
-  &.variant-processing {
-    border-color: rgba(63, 185, 80, 0.5);
-  }
-
-  &.is-draggable {
-    cursor: move;
-  }
-
-  // 可点击的卡片（已完成任务）
-  &.is-clickable {
-    cursor: pointer;
-
-    .task-info {
-      cursor: pointer;
-    }
-  }
-
-  // 当前正在编辑器打开的任务 - 呼吸灯效果
-  &.is-current {
-    animation: breathing-border 3s ease-in-out infinite;
-  }
+  user-select: none;
 }
 
-// 呼吸灯动画 - 边框颜色从透明到 #028AC5 再到透明
+.task-card:hover {
+  border-color: var(--af-functional-status-processing);
+}
+
+.task-card.is-draggable {
+  cursor: move;
+}
+
+.task-card.is-clickable {
+  cursor: pointer;
+}
+
+.task-card.is-current {
+  animation: breathing-border 3s ease-in-out infinite;
+}
+
+/* 正在运行的任务使用绿色边框,优先级高于 hover */
+.task-card.variant-processing {
+  border-color: rgb(var(--af-accent-success-rgb), 0.5);
+}
+
+.task-card.variant-processing:hover {
+  border-color: rgb(var(--af-accent-success-rgb), 0.5);
+}
+
+/* 正在运行的任务同时是当前任务时,优先显示绿色边框,取消呼吸灯 */
+.task-card.variant-processing.is-current {
+  animation: none;
+  border-color: rgb(var(--af-accent-success-rgb), 0.5);
+}
+
+/* 呼吸灯动画 - 边框颜色从透明到蓝色再到透明 */
 @keyframes breathing-border {
   0%, 100% {
     border-color: transparent;
   }
+
   50% {
-    border-color: #028AC5;
-    box-shadow: 0 0 8px rgba(2, 138, 197, 0.4);
+    border-color: var(--af-functional-status-processing);
+    box-shadow: 0 0 8px rgb(var(--af-functional-status-processing-rgb), 0.40);
   }
 }
 
+/* 拖动手柄 */
 .drag-handle {
-  width: 20px;
   display: flex;
-  align-items: center;
   justify-content: center;
-  color: var(--text-muted);
+  align-items: center;
+  width: 20px;
+  color: var(--af-text-muted);
   cursor: grab;
   opacity: 0.5;
-  user-select: none;  // 禁止文本选择
-
-  &:hover {
-    opacity: 1;
-  }
-
-  &:active {
-    cursor: grabbing;
-  }
-
-  svg {
-    width: 16px;
-    height: 16px;
-    pointer-events: none;  // 防止 SVG 阻止拖拽
-  }
+  user-select: none;
 }
 
+.drag-handle:hover {
+  opacity: 1;
+}
+
+.drag-handle:active {
+  cursor: grabbing;
+}
+
+.drag-handle svg {
+  width: 16px;
+  height: 16px;
+  pointer-events: none;
+}
+
+/* 任务信息 */
 .task-info {
   flex: 1;
   min-width: 0;
 }
 
+.task-card.is-clickable .task-info {
+  cursor: pointer;
+}
+
 .task-header {
   display: flex;
-  align-items: center;
   justify-content: space-between;
-  margin-bottom: 8px;
+  align-items: center;
   gap: 8px;
+  margin-bottom: 8px;
 }
 
 .task-name {
   flex: 1;
+  color: var(--af-text-primary);
   font-size: 13px;
   font-weight: 500;
-  color: var(--text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -328,6 +339,7 @@ function formatTime(timestamp) {
   white-space: nowrap;
 }
 
+/* 进度条 */
 .task-progress {
   display: flex;
   align-items: center;
@@ -337,108 +349,114 @@ function formatTime(timestamp) {
 .progress-bar {
   flex: 1;
   height: 4px;
-  background: var(--border-muted);
+  background: var(--af-border-muted);
   border-radius: 2px;
   overflow: hidden;
 }
 
 .progress-fill {
   height: 100%;
-  background: var(--primary);
+  background: var(--af-accent-primary);
   transition: width 0.3s ease;
 }
 
 .progress-text {
+  color: var(--af-text-muted);
   font-size: 11px;
-  font-family: var(--font-mono);
-  color: var(--text-muted);
+  font-family: var(--af-font-mono);
   min-width: 35px;
   text-align: right;
 }
 
+/* 错误信息 */
 .task-error {
   display: flex;
   align-items: center;
   gap: 6px;
+  color: var(--af-accent-danger);
   font-size: 11px;
-  color: var(--danger);
-
-  svg {
-    width: 14px;
-    height: 14px;
-  }
 }
 
+.task-error svg {
+  width: 14px;
+  height: 14px;
+}
+
+/* 完成时间 */
 .task-meta {
   display: flex;
   align-items: center;
   gap: 6px;
+  color: var(--af-text-muted);
   font-size: 11px;
-  color: var(--text-muted);
-
-  svg {
-    width: 14px;
-    height: 14px;
-    color: var(--success);
-  }
 }
 
+.task-meta svg {
+  width: 14px;
+  height: 14px;
+  color: var(--af-accent-success);
+}
+
+/* 操作按钮容器 */
 .task-actions {
   display: flex;
   flex-direction: column;
   gap: 4px;
 }
 
+/* 操作按钮基础样式 */
 .action-btn {
+  display: flex;
+  justify-content: center;
+  align-items: center;
   width: 28px;
   height: 28px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
   background: transparent;
   border: none;
   border-radius: 4px;
-  color: var(--text-muted);
-  cursor: pointer;
+  color: var(--af-text-muted);
   transition: all 0.2s;
-
-  svg {
-    width: 16px;
-    height: 16px;
-  }
-
-  &:hover {
-    background: var(--bg-tertiary);
-    color: var(--text-secondary);
-  }
-
-  &--primary {
-    color: var(--primary);
-    &:hover {
-      background: rgba(88, 166, 255, 0.15);
-    }
-  }
-
-  &--success {
-    color: var(--success);
-    &:hover {
-      background: rgba(63, 185, 80, 0.15);
-    }
-  }
-
-  &--danger:hover {
-    background: rgba(248, 81, 73, 0.15);
-    color: var(--danger);
-  }
-
-  // V3.1.0: 禁用状态
-  &:disabled {
-    opacity: 0.6;
-    cursor: not-allowed;
-  }
+  cursor: pointer;
 }
 
-// V3.1.0: 旋转动画
+.action-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+.action-btn:hover {
+  background: var(--af-bg-tertiary);
+  color: var(--af-text-secondary);
+}
+
+.action-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* 操作按钮变体 */
+.action-btn-primary {
+  color: var(--af-accent-primary);
+}
+
+.action-btn-primary:hover {
+  background: rgb(var(--af-accent-primary-rgb), 0.15);
+}
+
+.action-btn-success {
+  color: var(--af-accent-success);
+}
+
+.action-btn-success:hover {
+  background: rgb(var(--af-accent-success-rgb), 0.15);
+}
+
+.action-btn-danger:hover {
+  background: rgb(var(--af-accent-danger-rgb), 0.15);
+  color: var(--af-accent-danger);
+}
+
+/* 旋转动画 */
 .spin {
   animation: spin 1s linear infinite;
 }
@@ -447,15 +465,16 @@ function formatTime(timestamp) {
   from {
     transform: rotate(0deg);
   }
+
   to {
     transform: rotate(360deg);
   }
 }
 
-// 拖动占位符样式
+/* 拖动占位符样式 */
 .task-ghost {
   opacity: 0.5;
-  background: var(--bg-tertiary);
-  border: 2px dashed var(--border-default);
+  background: var(--af-bg-tertiary);
+  border: 2px dashed var(--af-border-default);
 }
 </style>

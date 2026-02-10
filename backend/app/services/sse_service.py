@@ -373,6 +373,24 @@ SSE_MODEL_TAGS = {
     "model.download.cache_hit": "模型已在本地",
 }
 
+# 预处理事件 Tag
+SSE_PREPROCESS_TAGS = {
+    "preprocessing.langid.started": "LangID 语言检测开始",
+    "preprocessing.langid.progress": "LangID 语言检测进度",
+    "preprocessing.langid.completed": "LangID 语言检测完成",
+    "preprocessing.langid.error": "LangID 语言检测失败",
+    "preprocessing.speaker.started": "Speaker 声纹提取开始",
+    "preprocessing.speaker.progress": "Speaker 声纹提取进度",
+    "preprocessing.speaker.completed": "Speaker 声纹提取完成",
+    "preprocessing.speaker.error": "Speaker 声纹提取失败",
+}
+
+# 调试事件 Tag
+SSE_DEBUG_TAGS = {
+    "debug.punctuation": "标点调试输出",
+    "debug.punctuation_scheduler": "标点调度决策调试",
+}
+
 
 # ========== SSE 推送辅助方法 ==========
 

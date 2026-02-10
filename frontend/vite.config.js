@@ -18,9 +18,10 @@ export default defineConfig({
   css: {
     preprocessorOptions: {
       scss: {
-        // 使用新版 Sass API，并注入全局 SCSS 变量
+        // 使用新版 Sass API
+        // 注意：已移除全局 SCSS 变量注入，改用 CSS Variables（主题系统）
         api: 'modern-compiler',
-        additionalData: `@use "@/styles/_variables" as *; @use "@/styles/_mixins" as *;`
+        // additionalData: `@use "@/styles/_variables" as *; @use "@/styles/_mixins" as *;`
       }
     }
   },

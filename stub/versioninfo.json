@@ -1,0 +1,43 @@
+{
+    "FixedFileInfo": {
+        "FileVersion": {
+            "Major": 3,
+            "Minor": 2,
+            "Patch": 0,
+            "Build": 0
+        },
+        "ProductVersion": {
+            "Major": 3,
+            "Minor": 2,
+            "Patch": 0,
+            "Build": 0
+        },
+        "FileFlagsMask": "3f",
+        "FileFlags ": "00",
+        "FileOS": "040004",
+        "FileType": "01",
+        "FileSubType": "00"
+    },
+    "StringFileInfo": {
+        "Comments": "",
+        "CompanyName": "AnchorFlux",
+        "FileDescription": "AnchorFlux Launcher",
+        "FileVersion": "v3.2.0",
+        "InternalName": "AnchorFlux",
+        "LegalCopyright": "Copyright (c) 2024-2026 AnchorFlux",
+        "LegalTrademarks": "",
+        "OriginalFilename": "AnchorFlux.exe",
+        "PrivateBuild": "",
+        "ProductName": "AnchorFlux",
+        "ProductVersion": "v3.2.0",
+        "SpecialBuild": ""
+    },
+    "VarFileInfo": {
+        "Translation": {
+            "LangID": "0804",
+            "CharsetID": "04B0"
+        }
+    },
+    "IconPath": "icon.ico",
+    "ManifestPath": ""
+}

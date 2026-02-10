@@ -1,0 +1,84 @@
+name: integration-ci
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - develop
+  pull_request:
+    branches:
+      - main
+      - master
+      - develop
+
+jobs:
+  frontend_build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+  integration_ci:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Set up venv
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -r requirements-ci.txt
+
+      - name: Run ruff (backend minimal)
+        shell: pwsh
+        run: .\.venv\Scripts\python.exe -m ruff check backend
+
+      - name: Run unit tests (quality metrics)
+        shell: pwsh
+        env:
+          INTEGRATION_PROFILE: ci
+          PYTHONUTF8: "1"
+        run: |
+          .\.venv\Scripts\python.exe -m pytest ci_tests\quality\test_quality_evaluation.py::TestMetricsUnit -v --tb=short
+
+      - name: Run dummy integration tests
+        shell: pwsh
+        env:
+          INTEGRATION_PROFILE: ci
+          PYTHONUTF8: "1"
+        run: |
+          .\.venv\Scripts\python.exe -m pytest ci_tests\integration\test_local_pipeline.py -m "not slow and not gpu" --tb=short
+
+      - name: Run integration CI
+        shell: pwsh
+        env:
+          INTEGRATION_PROFILE: ci
+          TEST_LOG_LEVEL: WARNING
+          PYTHONUTF8: "1"
+        run: .\.venv\Scripts\python.exe -m pytest ci_tests\integration -m integration_ci
+
+      - name: Upload artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-ci-artifacts
+          path: artifacts

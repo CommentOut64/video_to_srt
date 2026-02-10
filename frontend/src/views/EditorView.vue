@@ -31,7 +31,9 @@
     <!-- 错误状态 -->
     <div v-else-if="loadError" class="error-overlay">
       <svg viewBox="0 0 24 24" fill="currentColor" class="error-icon">
-        <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/>
+        <path
+          d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"
+        />
       </svg>
       <h3>加载失败</h3>
       <p>{{ loadError }}</p>
@@ -129,7 +131,9 @@
           <div v-show="activeTab === 'validation'" class="tab-pane">
             <div class="placeholder-panel">
               <svg viewBox="0 0 24 24" fill="currentColor">
-                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
+                <path
+                  d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"
+                />
               </svg>
               <h3>问题检查</h3>
               <p>即将实现</p>
@@ -139,7 +143,7 @@
           <div v-show="activeTab === 'assistant'" class="tab-pane">
             <div class="placeholder-panel">
               <svg viewBox="0 0 24 24" fill="currentColor">
-                <path d="M21 10.5h-6.5V4h-5v6.5H3v5h6.5V22h5v-6.5H21v-5z"/>
+                <path d="M21 10.5h-6.5V4h-5v6.5H3v5h6.5V22h5v-6.5H21v-5z" />
               </svg>
               <h3>AI 助手</h3>
               <p>智能字幕优化功能</p>
@@ -161,7 +165,7 @@
       <div class="footer-center">
         <span v-if="lastSaved" class="save-time">
           <svg class="icon" viewBox="0 0 24 24" fill="currentColor">
-            <path d="M9 16.2L4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2z"/>
+            <path d="M9 16.2L4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2z" />
           </svg>
           自动保存于 {{ formatLastSaved(lastSaved) }}
         </span>
@@ -172,13 +176,33 @@
           {{ errorCount }} 个问题
         </span>
         <span class="divider">|</span>
-        <button class="settings-btn" @click="showSettings" title="设置">
+        <button class="settings-btn" @click="showAdvancedSettings = true" title="高级设置">
           <svg viewBox="0 0 24 24" fill="currentColor">
-            <path d="M19.14,12.94c0.04-0.3,0.06-0.61,0.06-0.94c0-0.32-0.02-0.64-0.07-0.94l2.03-1.58c0.18-0.14,0.23-0.41,0.12-0.61 l-1.92-3.32c-0.12-0.22-0.37-0.29-0.59-0.22l-2.39,0.96c-0.5-0.38-1.03-0.7-1.62-0.94L14.4,2.81c-0.04-0.24-0.24-0.41-0.48-0.41 h-3.84c-0.24,0-0.43,0.17-0.47,0.41L9.25,5.35C8.66,5.59,8.12,5.92,7.63,6.29L5.24,5.33c-0.22-0.08-0.47,0-0.59,0.22L2.74,8.87 C2.62,9.08,2.66,9.34,2.86,9.48l2.03,1.58C4.84,11.36,4.8,11.69,4.8,12s0.02,0.64,0.07,0.94l-2.03,1.58 c-0.18,0.14-0.23,0.41-0.12,0.61l1.92,3.32c0.12,0.22,0.37,0.29,0.59,0.22l2.39-0.96c0.5,0.38,1.03,0.7,1.62,0.94l0.36,2.54 c0.05,0.24,0.24,0.41,0.48,0.41h3.84c0.24,0,0.44-0.17,0.47-0.41l0.36-2.54c0.59-0.24,1.13-0.56,1.62-0.94l2.39,0.96 c0.22,0.08,0.47,0,0.59-0.22l1.92-3.32c0.12-0.22,0.07-0.47-0.12-0.61L19.14,12.94z M12,15.6c-1.98,0-3.6-1.62-3.6-3.6 s1.62-3.6,3.6-3.6s3.6,1.62,3.6,3.6S13.98,15.6,12,15.6z"/>
+            <path
+              d="M19.14,12.94c0.04-0.3,0.06-0.61,0.06-0.94c0-0.32-0.02-0.64-0.07-0.94l2.03-1.58c0.18-0.14,0.23-0.41,0.12-0.61 l-1.92-3.32c-0.12-0.22-0.37-0.29-0.59-0.22l-2.39,0.96c-0.5-0.38-1.03-0.7-1.62-0.94L14.4,2.81c-0.04-0.24-0.24-0.41-0.48-0.41 h-3.84c-0.24,0-0.43,0.17-0.47,0.41L9.25,5.35C8.66,5.59,8.12,5.92,7.63,6.29L5.24,5.33c-0.22-0.08-0.47,0-0.59,0.22L2.74,8.87 C2.62,9.08,2.66,9.34,2.86,9.48l2.03,1.58C4.84,11.36,4.8,11.69,4.8,12s0.02,0.64,0.07,0.94l-2.03,1.58 c-0.18,0.14-0.23,0.41-0.12,0.61l1.92,3.32c0.12,0.22,0.37,0.29,0.59,0.22l2.39-0.96c0.5,0.38,1.03,0.7,1.62,0.94l0.36,2.54 c0.05,0.24,0.24,0.41,0.48,0.41h3.84c0.24,0,0.44-0.17,0.47-0.41l0.36-2.54c0.59-0.24,1.13-0.56,1.62-0.94l2.39,0.96 c0.22,0.08,0.47,0,0.59-0.22l1.92-3.32c0.12-0.22,0.07-0.47-0.12-0.61L19.14,12.94z M12,15.6c-1.98,0-3.6-1.62-3.6-3.6 s1.62-3.6,3.6-3.6s3.6,1.62,3.6,3.6S13.98,15.6,12,15.6z"
+            />
           </svg>
         </button>
       </div>
     </footer>
+
+    <!-- 高级设置对话框 -->
+    <el-dialog
+      v-model="showAdvancedSettings"
+      title="高级设置"
+      width="600px"
+      :close-on-click-modal="false"
+      :close-on-press-escape="true"
+      @close="handleCloseAdvancedSettings"
+    >
+      <AdvancedSettings v-model="advancedConfig" @change="handleAdvancedSettingsChange" />
+      <template #footer>
+        <span class="dialog-footer">
+          <el-button @click="handleCancelAdvancedSettings">取消</el-button>
+          <el-button type="primary" @click="handleSaveAdvancedSettings">保存设置</el-button>
+        </span>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -212,10 +236,11 @@ import PlaybackControls from '@/components/editor/PlaybackControls/index.vue'
 import VideoStage from '@/components/editor/VideoStage/index.vue'
 import SubtitleList from '@/components/editor/SubtitleList/index.vue'
 import WaveformTimeline from '@/components/editor/WaveformTimeline/index.vue'
+import AdvancedSettings from '@/components/editor/AdvancedSettings.vue'
 
 // Props
 const props = defineProps({
-  jobId: { type: String, required: true }
+  jobId: { type: String, required: true },
 })
 
 // Stores
@@ -247,6 +272,44 @@ const isResizing = ref(false)
 const isLoading = ref(true)
 const loadError = ref(null)
 
+// 高级设置状态
+const showAdvancedSettings = ref(false)
+const advancedConfig = ref({
+  general: {
+    global_time_offset: projectStore.subtitleOffset, // 从 store 初始化
+    duration_adjust: 0,
+    auto_save_interval: 60,
+    preview_font_size: 24,
+    enable_shortcuts: true,
+  },
+  preprocessing: {
+    demucs_strategy: 'auto',
+    demucs_model: 'htdemucs',
+    demucs_shifts: 1,
+    spectrum_threshold: 0.5,
+    vad_filter: true,
+  },
+  transcription: {
+    transcription_profile: 'sv_whisper_dual',
+    sensevoice_device: 'cuda',
+    whisper_model: 'large-v3',
+    patching_threshold: 0.3,
+  },
+  refinement: {
+    llm_task: 'off',
+    llm_scope: 'sparse',
+    sparse_threshold: 0.5,
+    target_language: 'zh',
+    llm_model_name: 'gpt-4o-mini',
+  },
+  compute: {
+    concurrency_strategy: 'auto',
+    gpu_id: 0,
+    temp_file_policy: 'delete_on_complete',
+  },
+  preset_id: 'default',
+})
+
 // 统一进度状态
 const progressStore = useProgressStore()
 // 修复：直接使用 getRawState 获取响应式状态对象，避免 computed 嵌套导致响应式丢失
@@ -255,9 +318,7 @@ const taskStatus = computed(() => jobProgress.value.status || 'idle')
 const taskPhase = computed(() => jobProgress.value.phase || 'pending')
 const taskProgress = computed(() => jobProgress.value.percent || 0)
 const progressDetail = computed(() => jobProgress.value.detail || null)
-const isTranscribing = computed(() =>
-  ['processing', 'queued'].includes(taskStatus.value)
-)
+const isTranscribing = computed(() => ['processing', 'queued'].includes(taskStatus.value))
 const dualStreamProgress = computed(() => {
   const ds = jobProgress.value.dualStream
   if (ds && ds.mode !== 'unknown') {
@@ -277,31 +338,37 @@ provide('editorContext', {
   jobId: jobIdRef,
   saving,
   // 视频就绪状态（用于播放控制拦截）
-  isVideoReady: computed(() => proxyVideo.isReady.value)
+  isVideoReady: computed(() => proxyVideo.isReady.value),
 })
 
 // 调试：监听 proxyVideo 状态变化
-watch(() => proxyVideo.currentUrl.value, (newUrl, oldUrl) => {
-  console.log('[EditorView] proxyVideo.currentUrl 变化:', {
-    oldUrl,
-    newUrl,
-    state: proxyVideo.state.value,
-    isReady: proxyVideo.isReady.value,
-    urls: {
-      preview360p: proxyVideo.urls.value.preview360p,
-      proxy720p: proxyVideo.urls.value.proxy720p,
-      source: proxyVideo.urls.value.source
-    }
-  })
-})
+watch(
+  () => proxyVideo.currentUrl.value,
+  (newUrl, oldUrl) => {
+    console.log('[EditorView] proxyVideo.currentUrl 变化:', {
+      oldUrl,
+      newUrl,
+      state: proxyVideo.state.value,
+      isReady: proxyVideo.isReady.value,
+      urls: {
+        preview360p: proxyVideo.urls.value.preview360p,
+        proxy720p: proxyVideo.urls.value.proxy720p,
+        source: proxyVideo.urls.value.source,
+      },
+    })
+  }
+)
 
-watch(() => proxyVideo.state.value, (newState, oldState) => {
-  console.log('[EditorView] proxyVideo.state 变化:', {
-    oldState,
-    newState,
-    currentUrl: proxyVideo.currentUrl.value
-  })
-})
+watch(
+  () => proxyVideo.state.value,
+  (newState, oldState) => {
+    console.log('[EditorView] proxyVideo.state 变化:', {
+      oldState,
+      newState,
+      currentUrl: proxyVideo.currentUrl.value,
+    })
+  }
+)
 
 // 将 projectStore 的估算双流进度同步到统一状态，供 UI 兜底展示
 watch(
@@ -376,7 +443,7 @@ const projectName = computed(() => {
   }
 
   // 3. 尝试从 taskStore 获取（优先 title，其次 filename）
-  const task = taskStore.tasks.find(t => t.job_id === props.jobId)
+  const task = taskStore.tasks.find((t) => t.job_id === props.jobId)
   if (task) {
     // 优先使用 task.title
     if (task.title && !isUuidLike(task.title)) {
@@ -404,7 +471,7 @@ const totalSubtitles = computed(() => projectStore.totalSubtitles)
 const currentSubtitle = computed(() => projectStore.currentSubtitle)
 const currentSubtitleIndex = computed(() =>
   currentSubtitle.value
-    ? projectStore.subtitles.findIndex(s => s.id === currentSubtitle.value.id)
+    ? projectStore.subtitles.findIndex((s) => s.id === currentSubtitle.value.id)
     : -1
 )
 
@@ -413,27 +480,35 @@ const canUndo = computed(() => projectStore.canUndo)
 const canRedo = computed(() => projectStore.canRedo)
 
 // 队列进度计算
-const queueCompleted = computed(() =>
-  taskStore.tasks.filter(t => t.status === 'finished').length
-)
-const queueTotal = computed(() =>
-  taskStore.tasks.filter(t => t.status !== 'created').length
-)
-const activeTasks = computed(() =>
-  taskStore.tasks.filter(t => ['processing', 'queued'].includes(t.status)).length
+const queueCompleted = computed(() => taskStore.tasks.filter((t) => t.status === 'finished').length)
+const queueTotal = computed(() => taskStore.tasks.filter((t) => t.status !== 'created').length)
+const activeTasks = computed(
+  () => taskStore.tasks.filter((t) => ['processing', 'queued'].includes(t.status)).length
 )
 
 // 问题检查计数（统计有警告的字幕数量）
-const errorCount = computed(() =>
-  projectStore.subtitles.filter(s => s.warning_type && s.warning_type !== 'none').length
+const errorCount = computed(
+  () => projectStore.subtitles.filter((s) => s.warning_type && s.warning_type !== 'none').length
 )
 
 // Grid 布局样式
 const gridStyle = computed(() => ({
-  gridTemplateColumns: `1fr 4px ${sidebarWidth.value}px`
+  gridTemplateColumns: `1fr 4px ${sidebarWidth.value}px`,
 }))
 
 // ========== 数据加载 ==========
+
+// V3.2.0+dev.20260130.10: 读取任务级字幕时间偏移（无则回退全局）
+async function loadSubtitleOffset() {
+  try {
+    const response = await transcriptionApi.getJobSubtitleTimeOffset(props.jobId)
+    const offset = response?.offset ?? 0
+    projectStore.setSubtitleOffset(offset)
+  } catch (error) {
+    console.warn('[EditorView] 读取字幕偏移失败，使用默认值 0:', error)
+    projectStore.setSubtitleOffset(0)
+  }
+}
 
 // 加载项目数据
 async function loadProject() {
@@ -458,7 +533,7 @@ async function loadProject() {
         phase_percent: jobStatus.phase_percent,
         message: jobStatus.message,
         processed: jobStatus.processed,
-        total: jobStatus.total
+        total: jobStatus.total,
       },
       'http_init'
     )
@@ -488,7 +563,7 @@ async function loadProject() {
 
       // V3.1.2: 检查缓存数据格式完整性
       // 必须有 sentenceIndex 字段才能支持 SSE 匹配
-      const hasValidFormat = projectStore.subtitles.every(s => s.sentenceIndex !== undefined)
+      const hasValidFormat = projectStore.subtitles.every((s) => s.sentenceIndex !== undefined)
       if (!hasValidFormat) {
         // 缓存数据是旧格式，需要重新从 API 加载以获取 sentenceIndex
         console.log('[EditorView] 缓存数据格式过旧（缺少 sentenceIndex），重新从 API 加载')
@@ -496,6 +571,9 @@ async function loadProject() {
       }
       // V3.2.0+dev.20260124.02: 后端为唯一真理，后续仍会从 API 刷新覆盖
     }
+
+    // 2.5 读取全局字幕时间偏移（需在恢复后执行，保证差值正确）
+    await loadSubtitleOffset()
 
     // 3. 根据任务状态从后端加载字幕数据
     // V3.1.2+dev.20260111.02: 优先从 segments API 加载（含置信度），fallback 到 SRT
@@ -564,7 +642,7 @@ async function loadTranscribingSegments() {
         filename: projectStore.meta.filename,
         duration: projectStore.meta.duration,
         videoPath: projectStore.meta.videoPath,
-        audioPath: projectStore.meta.audioPath
+        audioPath: projectStore.meta.audioPath,
       })
       progressStore.applySnapshot(
         props.jobId,
@@ -572,7 +650,7 @@ async function loadTranscribingSegments() {
           percent: textData.progress?.percentage,
           phase: taskPhase.value,
           status: taskStatus.value,
-          phase_percent: textData.progress?.phase_percent
+          phase_percent: textData.progress?.phase_percent,
         },
         'http_segments'
       )
@@ -592,7 +670,7 @@ async function loadFromSRT() {
         filename: srtData.filename || projectStore.meta.filename,
         duration: projectStore.meta.duration,
         videoPath: projectStore.meta.videoPath,
-        audioPath: projectStore.meta.audioPath
+        audioPath: projectStore.meta.audioPath,
       })
       console.log('[EditorView] 从 SRT 文件恢复成功（无置信度数据）')
     }
@@ -604,11 +682,13 @@ async function loadFromSRT() {
 // Segments 转 SRT 格式
 function segmentsToSRT(segments) {
   if (!segments || segments.length === 0) return ''
-  return segments.map((seg, idx) => {
-    const start = formatSRTTime(seg.start)
-    const end = formatSRTTime(seg.end)
-    return `${idx + 1}\n${start} --> ${end}\n${seg.text || ''}\n`
-  }).join('\n')
+  return segments
+    .map((seg, idx) => {
+      const start = formatSRTTime(seg.start)
+      const end = formatSRTTime(seg.end)
+      return `${idx + 1}\n${start} --> ${end}\n${seg.text || ''}\n`
+    })
+    .join('\n')
 }
 
 // SRT 时间格式化
@@ -662,7 +742,7 @@ function subscribeSSE() {
         projectStore.updateDualStreamProgressFromSSE({
           fastStream: Math.round(data.detail.fast || 0),
           slowStream: Math.round(data.detail.slow || 0),
-          totalChunks: data.total || projectStore.dualStreamProgress.totalChunks
+          totalChunks: data.total || projectStore.dualStreamProgress.totalChunks,
         })
       }
     },
@@ -672,10 +752,10 @@ function subscribeSSE() {
       progressStore.markStatus(props.jobId, 'finished', {
         percent: 100,
         phase: 'complete',
-        updated_at: data.updated_at ?? data.timestamp
+        updated_at: data.updated_at ?? data.timestamp,
       })
       taskStore.updateTaskStatus(props.jobId, 'finished', null, {
-        updated_at: data.updated_at ?? data.timestamp
+        updated_at: data.updated_at ?? data.timestamp,
       })
 
       // V3.1.2+dev.20260111.02: 任务完成处理
@@ -691,9 +771,11 @@ function subscribeSSE() {
           await loadFromSRT()
         }
       } else {
-        console.log(`[EditorView] 保留 SSE 推送的 ${projectStore.subtitles.length} 条字幕（含置信度）`)
+        console.log(
+          `[EditorView] 保留 SSE 推送的 ${projectStore.subtitles.length} 条字幕（含置信度）`
+        )
         // 将所有草稿标记为定稿
-        projectStore.subtitles.forEach(sub => {
+        projectStore.subtitles.forEach((sub) => {
           if (sub.isDraft) {
             sub.isDraft = false
           }
@@ -711,10 +793,10 @@ function subscribeSSE() {
       console.log('[EditorView] 任务失败:', data)
       progressStore.markStatus(props.jobId, 'failed', {
         message: data.message,
-        updated_at: data.updated_at ?? data.timestamp
+        updated_at: data.updated_at ?? data.timestamp,
       })
       taskStore.updateTaskStatus(props.jobId, 'failed', null, {
-        updated_at: data.updated_at ?? data.timestamp
+        updated_at: data.updated_at ?? data.timestamp,
       })
       taskStore.updateTaskSSEStatus(props.jobId, true, data.message || '转录失败')
       stopProgressPolling()
@@ -725,10 +807,10 @@ function subscribeSSE() {
     onPaused(data) {
       console.log('[EditorView] 任务已暂停:', data)
       progressStore.markStatus(props.jobId, 'paused', {
-        updated_at: data.updated_at ?? data.timestamp
+        updated_at: data.updated_at ?? data.timestamp,
       })
       taskStore.updateTaskStatus(props.jobId, 'paused', null, {
-        updated_at: data.updated_at ?? data.timestamp
+        updated_at: data.updated_at ?? data.timestamp,
       })
       // 保持SSE连接和进度显示
     },
@@ -736,10 +818,10 @@ function subscribeSSE() {
     onCanceled(data) {
       console.log('[EditorView] 任务已取消:', data)
       progressStore.markStatus(props.jobId, 'canceled', {
-        updated_at: data.updated_at ?? data.timestamp
+        updated_at: data.updated_at ?? data.timestamp,
       })
       taskStore.updateTaskStatus(props.jobId, 'canceled', null, {
-        updated_at: data.updated_at ?? data.timestamp
+        updated_at: data.updated_at ?? data.timestamp,
       })
       stopProgressPolling()
       cleanupSSE()
@@ -749,10 +831,10 @@ function subscribeSSE() {
       // 新增：处理任务恢复信号
       console.log('[EditorView] 任务已恢复:', data)
       progressStore.markStatus(props.jobId, data.status || 'queued', {
-        updated_at: data.updated_at ?? data.timestamp
+        updated_at: data.updated_at ?? data.timestamp,
       })
       taskStore.updateTaskStatus(props.jobId, data.status || 'queued', null, {
-        updated_at: data.updated_at ?? data.timestamp
+        updated_at: data.updated_at ?? data.timestamp,
       })
       startProgressPolling()
     },
@@ -839,6 +921,18 @@ function subscribeSSE() {
       console.log('[EditorView] 熔断触发:', data)
     },
 
+    onLangidEvent(eventType, data) {
+      if (eventType === 'preprocessing.langid.error') {
+        ElMessage.error(data?.message || '语言检测失败')
+      }
+    },
+
+    onSpeakerEvent(eventType, data) {
+      if (eventType === 'preprocessing.speaker.error') {
+        ElMessage.error(data?.message || '声纹提取失败')
+      }
+    },
+
     // === Proxy 视频转码事件（转发到 useProxyVideo）===
     onAnalyzeComplete(data) {
       console.log('[EditorView] 转发 analyze_complete 到 useProxyVideo')
@@ -871,7 +965,7 @@ function subscribeSSE() {
     onProxyError(data) {
       console.log('[EditorView] 转发 proxy_error 到 useProxyVideo')
       proxyVideo.handlers.onProxyError(data)
-    }
+    },
   })
 }
 
@@ -919,9 +1013,7 @@ function handleStreamingSubtitle(data) {
   projectStore.pauseHistory()
 
   // 更新或添加字幕到 store
-  const existingIndex = projectStore.subtitles.findIndex(
-    s => s.sentenceIndex === sentenceIndex
-  )
+  const existingIndex = projectStore.subtitles.findIndex((s) => s.sentenceIndex === sentenceIndex)
 
   // V3.1.2+dev.20260112.01: 包含 display_confidence 和 confidence_source
   const subtitleData = {
@@ -935,20 +1027,21 @@ function handleStreamingSubtitle(data) {
     warning_type: warningType,
     source,
     isModified: sentence.is_modified ?? false,
-    originalText: sentence.original_text ?? null
+    originalText: sentence.original_text ?? null,
   }
+  const normalized = projectStore.applyOffsetToSentenceData(subtitleData)
 
   if (existingIndex >= 0) {
     // V3.1.2+dev.20260112.01: 修复 - 传入正确的 id 而非索引
     const existingId = projectStore.subtitles[existingIndex].id
-    projectStore.updateSubtitle(existingId, subtitleData)
+    projectStore.updateSubtitle(existingId, normalized)
   } else {
     // 添加新字幕 - 按时间顺序找到插入位置
-    const insertIndex = projectStore.subtitles.findIndex(s => s.start > (start ?? 0))
+    const insertIndex = projectStore.subtitles.findIndex((s) => s.start > (normalized.start ?? 0))
     const finalIndex = insertIndex === -1 ? projectStore.subtitles.length : insertIndex
     // V3.1.2: 添加 id 字段给新字幕
-    subtitleData.id = `sv_${sentenceIndex}`
-    projectStore.addSubtitle(finalIndex, subtitleData)
+    normalized.id = `sv_${sentenceIndex}`
+    projectStore.addSubtitle(finalIndex, normalized)
   }
 
   // 恢复历史记录
@@ -978,18 +1071,20 @@ function handleDraftSubtitle(data) {
     start: sentence.start ?? 0,
     end: sentence.end ?? 0,
     confidence: sentence.confidence ?? null,
-    display_confidence: sentence.display_confidence,  // V3.1.2: 映射后准确率
-    confidence_source: sentence.confidence_source,    // V3.1.2: 置信度来源
+    display_confidence: sentence.display_confidence, // V3.1.2: 映射后准确率
+    confidence_source: sentence.confidence_source, // V3.1.2: 置信度来源
     words: sentence.words || [],
     warning_type: sentence.warning_type || 'none',
     is_modified: sentence.is_modified ?? false,
-    original_text: sentence.original_text ?? null
+    original_text: sentence.original_text ?? null,
   }
 
   // 调用 projectStore 的草稿处理方法，传递两个参数
   projectStore.appendOrUpdateDraft(chunkIndex, sentenceData)
 
-  console.log(`[EditorView] 处理草稿字幕，chunk_index: ${chunkIndex}, sentence_index: ${sentenceIndex}`)
+  console.log(
+    `[EditorView] 处理草稿字幕，chunk_index: ${chunkIndex}, sentence_index: ${sentenceIndex}`
+  )
 }
 
 // Phase 5: 处理替换 Chunk（慢流/Whisper）
@@ -1007,13 +1102,13 @@ function handleReplaceChunk(data) {
     start: sentence.start ?? 0,
     end: sentence.end ?? 0,
     confidence: sentence.confidence ?? null,
-    display_confidence: sentence.display_confidence,  // V3.1.2: 映射后准确率
-    confidence_source: sentence.confidence_source,    // V3.1.2: 置信度来源
+    display_confidence: sentence.display_confidence, // V3.1.2: 映射后准确率
+    confidence_source: sentence.confidence_source, // V3.1.2: 置信度来源
     words: sentence.words || [],
     warning_type: sentence.warning_type || 'none',
     source: sentence.source || 'whisper',
     is_modified: sentence.is_modified ?? false,
-    original_text: sentence.original_text ?? null
+    original_text: sentence.original_text ?? null,
   }))
 
   // 调用 projectStore 的替换方法
@@ -1044,15 +1139,15 @@ function handleRestoredChunk(data) {
     start: sentence.start ?? 0,
     end: sentence.end ?? 0,
     confidence: sentence.confidence ?? null,
-    display_confidence: sentence.display_confidence,  // V3.1.2: 映射后准确率
-    confidence_source: sentence.confidence_source,    // V3.1.2: 置信度来源
+    display_confidence: sentence.display_confidence, // V3.1.2: 映射后准确率
+    confidence_source: sentence.confidence_source, // V3.1.2: 置信度来源
     words: sentence.words || [],
     warning_type: sentence.warning_type || 'none',
     source: sentence.source || 'restored',
     is_draft: sentence.is_draft ?? false,
     is_finalized: sentence.is_finalized ?? true,
     is_modified: sentence.is_modified ?? false,
-    original_text: sentence.original_text ?? null
+    original_text: sentence.original_text ?? null,
   }))
 
   // 调用 projectStore 的恢复方法
@@ -1066,7 +1161,7 @@ function handleSubtitleDeleted(data) {
   const sentenceIndex = data.index ?? data.sentence_index
   if (sentenceIndex === undefined || sentenceIndex === null) return
   projectStore.markSentenceDeleted(sentenceIndex)
-  const target = projectStore.subtitles.find(s => s.sentenceIndex === sentenceIndex)
+  const target = projectStore.subtitles.find((s) => s.sentenceIndex === sentenceIndex)
   if (target) {
     projectStore.removeSubtitle(target.id)
   }
@@ -1090,12 +1185,12 @@ function handleFinalizedSubtitle(data) {
     start: sentence.start ?? 0,
     end: sentence.end ?? 0,
     confidence: sentence.confidence ?? null,
-    display_confidence: sentence.display_confidence,  // V3.1.2: 映射后准确率
-    confidence_source: sentence.confidence_source,    // V3.1.2: 置信度来源
+    display_confidence: sentence.display_confidence, // V3.1.2: 映射后准确率
+    confidence_source: sentence.confidence_source, // V3.1.2: 置信度来源
     words: sentence.words || [],
     warning_type: sentence.warning_type || 'none',
     is_modified: sentence.is_modified ?? false,
-    original_text: sentence.original_text ?? null
+    original_text: sentence.original_text ?? null,
   }
 
   // 调用草稿方法，但数据已标记为定稿
@@ -1119,7 +1214,7 @@ async function refreshTaskProgress() {
         phase_percent: jobStatus.phase_percent,
         message: jobStatus.message,
         processed: jobStatus.processed,
-        total: jobStatus.total
+        total: jobStatus.total,
       },
       'http_refresh'
     )
@@ -1152,7 +1247,7 @@ function startProgressPolling() {
           phase_percent: snapshot.phase_percent,
           message: snapshot.message,
           processed: snapshot.processed,
-          total: snapshot.total
+          total: snapshot.total,
         },
         'http_poll'
       )
@@ -1231,7 +1326,7 @@ async function pauseTranscription() {
     if (result?.task) {
       taskStore.applyTaskSnapshot(result.task)
       progressStore.markStatus(props.jobId, result.task.status || 'paused', {
-        updated_at: result.task.updated_at
+        updated_at: result.task.updated_at,
       })
     } else {
       progressStore.markStatus(props.jobId, 'paused')
@@ -1252,7 +1347,7 @@ async function resumeTranscription() {
     if (result?.task) {
       taskStore.applyTaskSnapshot(result.task)
       progressStore.markStatus(props.jobId, result.task.status || 'queued', {
-        updated_at: result.task.updated_at
+        updated_at: result.task.updated_at,
       })
     } else {
       // 根据后端返回值设置状态（应该是 queued，而不是 processing）
@@ -1276,7 +1371,7 @@ async function cancelTranscription() {
     if (result?.task) {
       taskStore.applyTaskSnapshot(result.task)
       progressStore.markStatus(props.jobId, result.task.status || 'canceled', {
-        updated_at: result.task.updated_at
+        updated_at: result.task.updated_at,
       })
     } else {
       progressStore.markStatus(props.jobId, 'canceled')
@@ -1292,8 +1387,12 @@ async function cancelTranscription() {
 
 // ========== 撤销/重做 ==========
 
-function undo() { if (canUndo.value) projectStore.undo() }
-function redo() { if (canRedo.value) projectStore.redo() }
+function undo() {
+  if (canUndo.value) projectStore.undo()
+}
+function redo() {
+  if (canRedo.value) projectStore.redo()
+}
 
 // ========== 导出功能 ==========
 
@@ -1313,7 +1412,8 @@ async function handleExportEvent(event) {
 
 async function handleExport(format) {
   const segments = await fetchLatestSegments()
-  if (!segments || segments.length === 0) {
+  const displaySegments = projectStore.applyOffsetToSegments(segments || [])
+  if (!displaySegments || displaySegments.length === 0) {
     alert('导出失败：后端未返回字幕数据')
     return
   }
@@ -1323,22 +1423,22 @@ async function handleExport(format) {
 
   switch (format) {
     case 'srt':
-      content = segmentsToSRT(segments)
+      content = segmentsToSRT(displaySegments)
       filename += '.srt'
       break
     case 'ass':
-      await handleASSExport(segments)
+      await handleASSExport(displaySegments)
       return
     case 'vtt':
-      content = generateVTTFromSegments(segments)
+      content = generateVTTFromSegments(displaySegments)
       filename += '.vtt'
       break
     case 'txt':
-      content = segments.map(s => s.text).join('\n')
+      content = displaySegments.map((s) => s.text).join('\n')
       filename += '.txt'
       break
     case 'json':
-      content = JSON.stringify(segments, null, 2)
+      content = JSON.stringify(displaySegments, null, 2)
       filename += '.json'
       break
   }
@@ -1369,7 +1469,7 @@ async function handleASSExport(segments) {
       style_preset: 'default',
       title: projectName.value.replace(/\.[^/.]+$/, ''),
       video_width: 1920,
-      video_height: 1080
+      video_height: 1080,
     })
 
     // 获取生成的 ASS 文件内容
@@ -1469,7 +1569,7 @@ function handleUpgradeStarted() {
   console.log('[EditorView] 720p后台转码已启动')
   ElMessage.success({
     message: '后台转码已开始，完成后将自动替换',
-    duration: 5000
+    duration: 5000,
   })
 }
 
@@ -1481,7 +1581,7 @@ async function handleCheckVideoStatus() {
     console.log('[EditorView] Proxy 视频状态已刷新:', {
       state: proxyVideo.state.value,
       isReady: proxyVideo.isReady.value,
-      isTranscoding: proxyVideo.isTranscoding.value
+      isTranscoding: proxyVideo.isTranscoding.value,
     })
   } catch (error) {
     console.error('[EditorView] 刷新 Proxy 视频状态失败:', error)
@@ -1514,9 +1614,57 @@ function handleSubtitleEdit(id, field, value) {
   console.log('字幕编辑:', id, field, value)
 }
 
-function showSettings() {
-  // TODO: 实现设置面板
-  console.log('打开设置')
+// ========== 字幕全局偏移设置 ==========
+// 同步 projectStore.subtitleOffset 到高级设置
+watch(
+  () => projectStore.subtitleOffset,
+  (value) => {
+    advancedConfig.value.general.global_time_offset = value
+  }
+)
+
+// V3.2.0+dev.20260209.03: 移除实时触发，仅在保存时应用
+function handleAdvancedSettingsChange(config) {
+  // 仅用于数据同步，不触发字幕偏移
+  console.log('[EditorView] 高级设置变化（未应用）:', config)
+}
+
+async function handleSaveAdvancedSettings() {
+  try {
+    console.log('[EditorView] 保存高级设置:', advancedConfig.value)
+
+    // V3.2.0+dev.20260209.04: 保存时规范化空值为 0
+    let offset = advancedConfig.value.general.global_time_offset
+    if (offset === '' || offset === null || offset === undefined) {
+      offset = 0
+    }
+    offset = Number(offset)
+
+    // 1. 应用到前端 projectStore
+    projectStore.setSubtitleOffset(offset)
+
+    // 2. 保存到后端
+    await transcriptionApi.setJobSubtitleTimeOffset(projectStore.meta.jobId, offset)
+
+    // TODO: 保存其他高级设置到后端或本地存储
+    // await transcriptionApi.saveAdvancedSettings(jobId, advancedConfig.value)
+
+    ElMessage.success('高级设置已保存')
+    showAdvancedSettings.value = false
+  } catch (error) {
+    console.error('[EditorView] 保存高级设置失败:', error)
+    ElMessage.error('保存高级设置失败: ' + (error.message || '未知错误'))
+  }
+}
+
+function handleCancelAdvancedSettings() {
+  console.log('[EditorView] 取消高级设置')
+  showAdvancedSettings.value = false
+}
+
+function handleCloseAdvancedSettings() {
+  console.log('[EditorView] 关闭高级设置对话框')
+  showAdvancedSettings.value = false
 }
 
 function formatLastSaved(timestamp) {
@@ -1670,326 +1818,379 @@ onBeforeRouteLeave(async (to, from) => {
 })
 </script>
 
-<style lang="scss" scoped>
-@use '@/styles/variables' as *;
-@use '@/styles/mixins' as *;
+<style scoped>
+/* 注意：SCSS 变量和 mixins 已迁移到主题系统 */
+
+/* 旧的 SCSS 文件位于 @/styles/legacy/ 供参考 */
+
+/* 现在使用 CSS Variables（由主题系统注入） */
 
 .editor-view {
   display: flex;
   flex-direction: column;
   height: 100vh;
-  background: var(--bg-base);
-  color: var(--text-normal);
+  background: var(--af-bg-base);
+  color: var(--af-text-normal);
   overflow: hidden;
 }
 
-// 加载状态
+/* 加载状态 */
 .loading-overlay {
-  flex: 1;
   display: flex;
+  flex: 1;
   flex-direction: column;
-  align-items: center;
   justify-content: center;
+  align-items: center;
   gap: 16px;
-  color: var(--text-muted);
-
-  .loading-spinner {
-    width: 48px;
-    height: 48px;
-    border: 3px solid var(--border-default);
-    border-top-color: var(--primary);
-    border-radius: 50%;
-    animation: spin 1s linear infinite;
-  }
+  color: var(--af-text-muted);
 }
 
-// 错误状态
+.loading-overlay .loading-spinner {
+  width: 48px;
+  height: 48px;
+  border: 3px solid var(--af-border-default);
+  border-top-color: var(--af-accent-primary);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+/* 错误状态 */
 .error-overlay {
-  flex: 1;
   display: flex;
+  flex: 1;
   flex-direction: column;
-  align-items: center;
   justify-content: center;
+  align-items: center;
   gap: 16px;
-  color: var(--text-muted);
+  color: var(--af-text-muted);
   text-align: center;
+}
 
-  .error-icon {
-    width: 64px;
-    height: 64px;
-    color: var(--danger);
-  }
+.error-overlay .error-icon {
+  width: 64px;
+  height: 64px;
+  color: var(--af-accent-danger);
+}
 
-  h3 {
-    font-size: 20px;
-    font-weight: 600;
-    color: var(--text-primary);
-    margin: 0;
-  }
+.error-overlay h3 {
+  margin: 0;
+  color: var(--af-text-primary);
+  font-size: 20px;
+  font-weight: 600;
+}
 
-  p {
-    font-size: 14px;
-    max-width: 400px;
-    margin: 0;
-  }
+.error-overlay p {
+  margin: 0;
+  font-size: 14px;
+  max-width: 400px;
+}
 
-  .retry-btn {
-    padding: 10px 24px;
-    background: var(--primary);
-    color: white;
-    border: none;
-    border-radius: var(--radius-md);
-    font-size: 14px;
-    cursor: pointer;
-    transition: background var(--transition-fast);
-    &:hover { background: var(--primary-hover); }
-  }
+.error-overlay .retry-btn {
+  padding: 10px 24px;
+  background: var(--af-accent-primary);
+  border: none;
+  border-radius: var(--af-radius-md);
+  color: var(--af-text-on-dark);
+  font-size: 14px;
+  transition: background var(--af-transition-fast);
+  cursor: pointer;
+}
 
-  .back-link {
-    font-size: 13px;
-    color: var(--text-secondary);
-    text-decoration: underline;
-    &:hover { color: var(--text-primary); }
+.error-overlay .retry-btn:hover {
+  background: var(--af-accent-primary-hover);
+}
+
+.error-overlay .back-link {
+  color: var(--af-text-secondary);
+  font-size: 13px;
+  text-decoration: underline;
+}
+
+.error-overlay .back-link:hover {
+  color: var(--af-text-primary);
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
   }
 }
 
-@keyframes spin { to { transform: rotate(360deg); } }
-
-// 主工作区 Grid 布局
+/* 主工作区 Grid 布局 */
 .workspace-grid {
-  flex: 1;
   display: grid;
-  grid-template-columns: 1fr 4px 350px;
+  flex: 1;
   height: 100%;
+  grid-template-columns: 1fr 4px 350px;
   overflow: hidden;
 }
 
-// 舞台列 (三明治结构: 视频 + 控制 + 波形)
+/* 舞台列 (三明治结构: 视频 + 控制 + 波形) */
 .stage-column {
   display: grid;
-  grid-template-rows: 1fr 48px 200px;  // 波形区域调整为200px（header+刻度+波形+滚动条）
-  background: #000;
+  grid-template-rows: 1fr 48px 180px; /* 波形区域调整为180px（header+波形+滚动条，刻度已嵌入波形） */
+  background: var(--af-video-bg);
   min-width: 0;
   overflow: hidden;
-
-  .video-wrapper {
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    overflow: hidden;
-  }
-
-  .controls-wrapper {
-    background: var(--bg-primary);
-    border-top: 1px solid var(--border-default);
-  }
-
-  .waveform-wrapper {
-    background: var(--bg-secondary);
-    border-top: 1px solid var(--border-default);
-    overflow: hidden;
-  }
 }
 
-// 可拖拽分隔条
+.stage-column .video-wrapper {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  overflow: hidden;
+}
+
+.stage-column .controls-wrapper {
+  background: var(--af-bg-primary);
+  border-top: 1px solid var(--af-border-default);
+}
+
+.stage-column .waveform-wrapper {
+  background: var(--af-bg-secondary);
+  border-top: 1px solid var(--af-border-default);
+  overflow: hidden;
+}
+
+/* 可拖拽分隔条 */
 .resizer {
-  width: 4px;
-  background: var(--border-default);
-  cursor: col-resize;
-  transition: background 0.2s;
   position: relative;
   z-index: 10;
-
-  &:hover, &.active {
-    background: var(--primary);
-  }
+  width: 4px;
+  background: var(--af-border-default);
+  transition: background 0.2s;
+  cursor: col-resize;
 }
 
-// 侧边栏
+.resizer:hover,
+.resizer.active {
+  background: var(--af-accent-primary);
+}
+
+/* 侧边栏 */
 .sidebar-column {
   display: flex;
   flex-direction: column;
-  background: var(--bg-primary);
-  border-left: 1px solid var(--border-default);
+  background: var(--af-bg-primary);
+  border-left: 1px solid var(--af-border-default);
   min-width: 280px;
   max-width: 600px;
   overflow: hidden;
 }
 
-// 标签页导航
+/* 标签页导航 */
 .tab-nav {
   display: flex;
   padding: 0 12px;
-  background: var(--bg-secondary);
-  border-bottom: 1px solid var(--border-default);
-
-  .tab-btn {
-    position: relative;
-    padding: 12px 16px;
-    font-size: 13px;
-    color: var(--text-secondary);
-    background: transparent;
-    border: none;
-    cursor: pointer;
-    transition: color var(--transition-fast);
-
-    &::after {
-      content: '';
-      position: absolute;
-      bottom: 0;
-      left: 0;
-      right: 0;
-      height: 2px;
-      background: transparent;
-      transition: background var(--transition-fast);
-    }
-
-    &:hover { color: var(--text-normal); }
-
-    &.active {
-      color: var(--primary);
-      &::after { background: var(--primary); }
-    }
-
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-width: 18px;
-      height: 18px;
-      margin-left: 6px;
-      padding: 0 5px;
-      background: var(--danger);
-      color: white;
-      font-size: 11px;
-      border-radius: var(--radius-full);
-    }
-  }
+  background: var(--af-bg-secondary);
+  border-bottom: 1px solid var(--af-border-default);
 }
 
-// 标签页内容
-.tab-content { flex: 1; overflow: hidden; }
-.tab-pane { height: 100%; overflow: auto; }
+.tab-nav .tab-btn {
+  position: relative;
+  padding: 12px 16px;
+  background: transparent;
+  border: none;
+  color: var(--af-text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+  transition: color var(--af-transition-fast);
+}
 
-// 占位面板
+.tab-nav .tab-btn::after {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 2px;
+  background: transparent;
+  transition: background var(--af-transition-fast);
+  content: '';
+}
+
+.tab-nav .tab-btn:hover {
+  color: var(--af-text-normal);
+}
+
+.tab-nav .tab-btn.active {
+  color: var(--af-accent-primary);
+}
+
+.tab-nav .tab-btn.active::after {
+  background: var(--af-accent-primary);
+}
+
+.tab-nav .tab-btn .badge {
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  height: 18px;
+  padding: 0 5px;
+  background: var(--af-accent-danger);
+  border-radius: var(--af-radius-full);
+  color: var(--af-text-on-dark);
+  font-size: 11px;
+  min-width: 18px;
+  margin-left: 6px;
+}
+
+/* 标签页内容 */
+.tab-content {
+  flex: 1;
+  overflow: hidden;
+}
+
+.tab-pane {
+  height: 100%;
+  overflow: auto;
+}
+
+/* 占位面板 */
 .placeholder-panel {
-  @include flex-center;
-  @include flex-column;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
   padding: 48px 24px;
+  color: var(--af-text-muted);
   text-align: center;
-  color: var(--text-muted);
-
-  svg {
-    width: 48px;
-    height: 48px;
-    margin-bottom: 16px;
-    opacity: 0.5;
-  }
-
-  h3 {
-    font-size: 16px;
-    font-weight: 600;
-    color: var(--text-normal);
-    margin-bottom: 8px;
-  }
-
-  p { font-size: 13px; margin-bottom: 4px; }
-  .coming-soon { color: var(--primary); font-style: italic; }
-
-  .error-list {
-    width: 100%;
-    max-width: 400px;
-    margin-top: 16px;
-    text-align: left;
-  }
-
-  .error-item {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 8px 12px;
-    margin-bottom: 4px;
-    background: var(--bg-secondary);
-    border-radius: var(--radius-sm);
-    cursor: pointer;
-    transition: background var(--transition-fast);
-
-    &:hover { background: var(--bg-tertiary); }
-    &.error { border-left: 3px solid var(--danger); }
-    &.warning { border-left: 3px solid var(--warning); }
-
-    .error-index {
-      font-family: var(--font-mono);
-      font-size: 12px;
-      color: var(--text-muted);
-    }
-
-    .error-message {
-      font-size: 13px;
-      color: var(--text-normal);
-    }
-  }
 }
 
-// 底部状态栏
-.editor-footer {
+.placeholder-panel svg {
+  width: 48px;
+  height: 48px;
+  margin-bottom: 16px;
+  opacity: 0.5;
+}
+
+.placeholder-panel h3 {
+  margin-bottom: 8px;
+  color: var(--af-text-normal);
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.placeholder-panel p {
+  margin-bottom: 4px;
+  font-size: 13px;
+}
+
+.placeholder-panel .coming-soon {
+  color: var(--af-accent-primary);
+  font-style: italic;
+}
+
+.placeholder-panel .error-list {
+  width: 100%;
+  max-width: 400px;
+  margin-top: 16px;
+  text-align: left;
+}
+
+.placeholder-panel .error-item {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  height: 28px;
-  padding: 0 16px;
-  background: var(--bg-secondary);
-  border-top: 1px solid var(--border-default);
+  gap: 8px;
+  padding: 8px 12px;
+  margin-bottom: 4px;
+  background: var(--af-bg-secondary);
+  border-radius: var(--af-radius-sm);
+  cursor: pointer;
+  transition: background var(--af-transition-fast);
+}
+
+.placeholder-panel .error-item:hover {
+  background: var(--af-bg-tertiary);
+}
+
+.placeholder-panel .error-item.error {
+  border-left: 3px solid var(--af-accent-danger);
+}
+
+.placeholder-panel .error-item.warning {
+  border-left: 3px solid var(--af-accent-warning);
+}
+
+.placeholder-panel .error-item .error-index {
+  color: var(--af-text-muted);
+  font-family: var(--af-font-mono);
   font-size: 12px;
-  color: var(--text-muted);
+}
+
+.placeholder-panel .error-item .error-message {
+  color: var(--af-text-normal);
+  font-size: 13px;
+}
+
+/* 底部状态栏 */
+.editor-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  height: 32px;
+  padding: 0 16px;
+  background: var(--af-bg-secondary);
+  color: var(--af-text-muted);
+  font-size: 12px;
   flex-shrink: 0;
+  border-top: 1px solid var(--af-border-default);
+}
 
-  .footer-left, .footer-center, .footer-right {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
+.editor-footer .footer-left,
+.editor-footer .footer-center,
+.editor-footer .footer-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
 
-  .save-time {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    color: var(--text-secondary);
+.editor-footer .save-time {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--af-text-secondary);
+}
 
-    .icon {
-      width: 14px;
-      height: 14px;
-      color: var(--success);
-    }
-  }
+.editor-footer .save-time .icon {
+  width: 14px;
+  height: 14px;
+  color: var(--af-accent-success);
+}
 
-  .error-indicator {
-    color: var(--danger);
-    cursor: pointer;
-    &:hover { text-decoration: underline; }
-  }
+.editor-footer .error-indicator {
+  color: var(--af-accent-danger);
+  cursor: pointer;
+}
 
-  .settings-btn {
-    width: 24px;
-    height: 24px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: var(--text-muted);
-    background: transparent;
-    border: none;
-    border-radius: 4px;
-    cursor: pointer;
-    transition: all 0.2s;
+.editor-footer .error-indicator:hover {
+  text-decoration: underline;
+}
 
-    svg { width: 16px; height: 16px; }
+.editor-footer .settings-btn {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  width: 24px;
+  height: 24px;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: var(--af-text-muted);
+  transition: all 0.2s;
+  cursor: pointer;
+}
 
-    &:hover {
-      background: var(--bg-tertiary);
-      color: var(--text-normal);
-    }
-  }
+.editor-footer .settings-btn svg {
+  width: 16px;
+  height: 16px;
+}
 
-  .divider { color: var(--border-default); }
+.editor-footer .settings-btn:hover {
+  background: var(--af-bg-tertiary);
+  color: var(--af-text-normal);
+}
+
+.editor-footer .divider {
+  color: var(--af-border-default);
 }
 </style>

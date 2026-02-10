@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Literal
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
@@ -76,6 +76,41 @@ class WhisperRuntimeParams(_RuntimeBase):
             if not isinstance(item, int) or item < 0:
                 raise ValueError("suppress_tokens 仅允许非负整数")
         return value
+
+
+class SanitizePattern(BaseModel):
+    """Whisper 清洗规则模式。"""
+
+    type: Literal["phrase", "regex"] = Field(
+        default="phrase",
+        description="匹配类型：phrase=短语匹配，regex=正则表达式",
+    )
+    value: str = Field(..., min_length=1, description="匹配内容")
+    position: Literal["prefix", "suffix", "any"] = Field(
+        default="any",
+        description="匹配位置：prefix=前缀，suffix=后缀，any=任意位置",
+    )
+    flags: Optional[str] = Field(
+        default="",
+        description="正则标志（如 i 表示忽略大小写）",
+    )
+
+
+class WhisperSanitizeRuntimeParams(_RuntimeBase):
+    is_enabled: Optional[bool] = Field(
+        default=None,
+        alias="enabled",
+        description="是否启用 Whisper 清洗",
+    )
+    min_text_length: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="最小有效文本长度",
+    )
+    patterns: Optional[List[SanitizePattern]] = Field(
+        default=None,
+        description="清洗规则列表",
+    )
 
 
 class SenseVoiceRuntimeParams(_RuntimeBase):
@@ -215,7 +250,8 @@ class YAMNetRuntimeParams(_RuntimeBase):
 class PunctuationRuntimeParams(_RuntimeBase):
     is_enable_punctuation: Optional[bool] = Field(default=None, alias="enable_punctuation")
     default_language: Optional[str] = Field(default=None)
-    is_fallback_to_multilingual: Optional[bool] = Field(default=None, alias="fallback_to_multilingual")
+    fallback_priority: Optional[str] = Field(default=None)
+    source_preference: Optional[str] = Field(default=None)
     is_cache_models: Optional[bool] = Field(default=None, alias="cache_models")
     max_cached_models: Optional[int] = Field(default=None, ge=1)
     device: Optional[str] = Field(default=None)
@@ -239,6 +275,14 @@ class PunctuationRuntimeParams(_RuntimeBase):
     hard_limit_duration: Optional[float] = Field(default=None, ge=0.0)
     min_chunk_duration: Optional[float] = Field(default=None, ge=0.0)
     is_prefer_punctuation_split: Optional[bool] = Field(default=None, alias="prefer_punctuation_split")
+    min_subtitle_chars_zh_ja: Optional[int] = Field(default=None, ge=1)
+    min_subtitle_words_en: Optional[int] = Field(default=None, ge=1)
+    min_subtitle_duration_sec: Optional[float] = Field(default=None, ge=0.0)
+    fast_delay_budget_sec: Optional[float] = Field(default=None, ge=0.0)
+    is_force_split_on_sentence_end_punct: Optional[bool] = Field(
+        default=None,
+        alias="force_split_on_sentence_end_punct",
+    )
 
     @field_validator("device")
     @classmethod
@@ -248,6 +292,26 @@ class PunctuationRuntimeParams(_RuntimeBase):
         value_lower = value.lower()
         if value_lower not in {"cpu", "cuda"}:
             raise ValueError("device 仅支持 cpu 或 cuda")
+        return value_lower
+
+    @field_validator("fallback_priority")
+    @classmethod
+    def _validate_fallback_priority(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        value_lower = value.lower()
+        if value_lower not in {"fast", "slow"}:
+            raise ValueError("fallback_priority 仅支持 fast 或 slow")
+        return value_lower
+
+    @field_validator("source_preference")
+    @classmethod
+    def _validate_source_preference(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        value_lower = value.lower()
+        if value_lower not in {"fast", "slow", "merged"}:
+            raise ValueError("source_preference 仅支持 fast/slow/merged")
         return value_lower
 
     @field_validator("alignment_method")
@@ -266,6 +330,49 @@ class PipelineRuntimeParams(_RuntimeBase):
     is_word_timestamps: Optional[bool] = Field(default=None, alias="word_timestamps")
 
 
+class NormalizationRuntimeParams(_RuntimeBase):
+    is_itn_enable: Optional[bool] = Field(default=None, alias="itn.enable")
+    itn_quality_min_ratio: Optional[float] = Field(default=None, ge=0.0, alias="itn.quality_min_ratio")
+    itn_quality_max_ratio: Optional[float] = Field(default=None, ge=0.0, alias="itn.quality_max_ratio")
+    is_decimal_protection_enable: Optional[bool] = Field(default=None, alias="decimal_protection.enable")
+    is_safe_punct_enable: Optional[bool] = Field(default=None, alias="safe_punct.enable")
+    is_abbrev_dot_protection_enable: Optional[bool] = Field(default=None, alias="abbrev_dot_protection.enable")
+    is_hyphen_protection_enable: Optional[bool] = Field(default=None, alias="hyphen_protection.enable")
+    is_cjk_single_digit_to_zh: Optional[bool] = Field(default=None, alias="cjk_single_digit_to_zh")
+    is_cjk_digit_merge: Optional[bool] = Field(default=None, alias="cjk_digit_merge")
+    is_collapse_spaces: Optional[bool] = Field(default=None, alias="collapse_spaces")
+    punct_width: Optional[str] = Field(default=None, alias="punct_width")
+
+    @field_validator("punct_width")
+    @classmethod
+    def _validate_punct_width(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        value_lower = value.lower()
+        if value_lower not in {"auto", "full", "half"}:
+            raise ValueError("punct_width 仅支持 auto/full/half")
+        return value_lower
+
+
+class ArbitrationRuntimeParams(_RuntimeBase):
+    is_enable: Optional[bool] = Field(default=None, alias="enable")
+    text_source_preference: Optional[str] = Field(default=None)
+    min_length_ratio: Optional[float] = Field(default=None, ge=0.0)
+    max_length_ratio: Optional[float] = Field(default=None, ge=0.0)
+    low_confidence_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    is_hallucination_block: Optional[bool] = Field(default=None, alias="hallucination_block")
+
+    @field_validator("text_source_preference")
+    @classmethod
+    def _validate_text_source_preference(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        value_lower = value.lower()
+        if value_lower not in {"fast", "slow", "auto"}:
+            raise ValueError("text_source_preference 仅支持 fast/slow/auto")
+        return value_lower
+
+
 class RuntimeGroupUpdateRequest(_RuntimeBase):
     whisper: Optional[WhisperRuntimeParams] = None
     sensevoice: Optional[SenseVoiceRuntimeParams] = None
@@ -275,10 +382,13 @@ class RuntimeGroupUpdateRequest(_RuntimeBase):
     yamnet: Optional[YAMNetRuntimeParams] = None
     punctuation: Optional[PunctuationRuntimeParams] = None
     pipeline: Optional[PipelineRuntimeParams] = None
+    normalization: Optional[NormalizationRuntimeParams] = None
+    arbitration: Optional[ArbitrationRuntimeParams] = None
 
 
 _RUNTIME_GROUP_MODELS = {
     "whisper": WhisperRuntimeParams,
+    "whisper_sanitize": WhisperSanitizeRuntimeParams,
     "sensevoice": SenseVoiceRuntimeParams,
     "demucs": DemucsRuntimeParams,
     "vad": VADRuntimeParams,
@@ -286,6 +396,8 @@ _RUNTIME_GROUP_MODELS = {
     "yamnet": YAMNetRuntimeParams,
     "punctuation": PunctuationRuntimeParams,
     "pipeline": PipelineRuntimeParams,
+    "normalization": NormalizationRuntimeParams,
+    "arbitration": ArbitrationRuntimeParams,
 }
 
 
@@ -337,6 +449,11 @@ _PARAM_SCHEMA: Dict[str, Any] = {
             "suppress_tokens": {"type": "int_list", "min": 0, "default": None},
             "repetition_penalty": {"type": "float", "min": 0.0, "default": 1.0},
             "no_repeat_ngram_size": {"type": "int", "min": 0, "default": 0},
+        },
+        "whisper_sanitize": {
+            "enabled": {"type": "bool", "default": True},
+            "min_text_length": {"type": "int", "min": 0, "default": 2},
+            "patterns": {"type": "object", "default": []},
         },
         "sensevoice": {
             "language": {
@@ -402,7 +519,12 @@ _PARAM_SCHEMA: Dict[str, Any] = {
         "punctuation": {
             "enable_punctuation": {"type": "bool", "default": True},
             "default_language": {"type": "string", "default": "zh"},
-            "fallback_to_multilingual": {"type": "bool", "default": True},
+            "fallback_priority": {"type": "enum", "enum": ["fast", "slow"], "default": "fast"},
+            "source_preference": {
+                "type": "enum",
+                "enum": ["fast", "slow", "merged"],
+                "default": "merged",
+            },
             "cache_models": {"type": "bool", "default": True},
             "max_cached_models": {"type": "int", "min": 1, "default": 3},
             "device": {"type": "enum", "enum": ["cpu", "cuda"], "default": "cpu"},
@@ -426,6 +548,36 @@ _PARAM_SCHEMA: Dict[str, Any] = {
             "hard_limit_duration": {"type": "float", "min": 0.0, "default": 20.0},
             "min_chunk_duration": {"type": "float", "min": 0.0, "default": 1.0},
             "prefer_punctuation_split": {"type": "bool", "default": True},
+            "min_subtitle_chars_zh_ja": {"type": "int", "min": 1, "default": 4},
+            "min_subtitle_words_en": {"type": "int", "min": 1, "default": 4},
+            "min_subtitle_duration_sec": {"type": "float", "min": 0.0, "default": 0.8},
+            "fast_delay_budget_sec": {"type": "float", "min": 0.0, "default": 2.0},
+            "force_split_on_sentence_end_punct": {"type": "bool", "default": True},
+        },
+        "arbitration": {
+            "enable": {"type": "bool", "default": True},
+            "text_source_preference": {
+                "type": "enum",
+                "enum": ["fast", "slow", "auto"],
+                "default": "auto",
+            },
+            "min_length_ratio": {"type": "float", "min": 0.0, "default": 0.65},
+            "max_length_ratio": {"type": "float", "min": 0.0, "default": 3.0},
+            "low_confidence_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.5},
+            "hallucination_block": {"type": "bool", "default": True},
+        },
+        "normalization": {
+            "itn.enable": {"type": "bool", "default": True},
+            "itn.quality_min_ratio": {"type": "float", "min": 0.0, "default": 0.30},
+            "itn.quality_max_ratio": {"type": "float", "min": 0.0, "default": 3.00},
+            "decimal_protection.enable": {"type": "bool", "default": True},
+            "safe_punct.enable": {"type": "bool", "default": True},
+            "abbrev_dot_protection.enable": {"type": "bool", "default": True},
+            "hyphen_protection.enable": {"type": "bool", "default": True},
+            "cjk_single_digit_to_zh": {"type": "bool", "default": True},
+            "cjk_digit_merge": {"type": "bool", "default": True},
+            "collapse_spaces": {"type": "bool", "default": True},
+            "punct_width": {"type": "enum", "enum": ["auto", "full", "half"], "default": "auto"},
         },
         "pipeline": {
             "batch_size": {"type": "int", "min": 1, "default": 16},

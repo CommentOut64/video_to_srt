@@ -5,6 +5,21 @@ Workers package for async dual pipeline
 - FastWorker: SenseVoice 快流推理
 - SlowWorker: Whisper 慢流推理
 """
-from .fast_worker import FastWorker
-from .slow_worker import SlowWorker
-__all__ = ['FastWorker', 'SlowWorker']
+__all__ = ["FastWorker", "SlowWorker", "SlowWorkerResult"]
+
+
+def __getattr__(name: str):
+    """延迟导入，避免无关依赖在导入时被强制加载。"""
+    if name == "FastWorker":
+        from .fast_worker import FastWorker
+
+        return FastWorker
+    if name in {"SlowWorker", "SlowWorkerResult"}:
+        from .slow_worker import SlowWorker, SlowWorkerResult
+
+        return {"SlowWorker": SlowWorker, "SlowWorkerResult": SlowWorkerResult}[name]
+    raise AttributeError(f"module 'app.pipelines.workers' has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(__all__)

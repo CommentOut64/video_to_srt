@@ -12,8 +12,11 @@ V3.1.2+dev.20260111.01: 新增 display_confidence 和 confidence_source 字段
 - confidence_source: 置信度来源（sensevoice/whisper）
 """
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 from enum import Enum
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -59,6 +62,7 @@ class SenseVoiceONNXConfig:
     optimization_level: int = 99
 
 
+# V3.2.0+dev.20260205.09: 词级置信度来源透传到 WordTimestamp。
 @dataclass
 class WordTimestamp:
     """字级时间戳（扩展版）
@@ -71,10 +75,19 @@ class WordTimestamp:
     start: float
     end: float
     confidence: Optional[float] = 1.0  # V3.1.2: 改为 Optional，None 表示无词级置信度
+    confidence_raw: Optional[float] = None  # V3.2.0+dev.20260131.02: 词级原始置信度（与 confidence 对齐）
+    confidence_display_raw: Optional[float] = None  # V3.2.0+dev.20260131.02: 词级显示口径
+    confidence_source: Optional[str] = None  # V3.2.0+dev.20260205.09: 置信度来源（fast/slow/unknown）
+    token_type: Optional[str] = None  # V3.2.0+dev.20260131.02: token 类型（word/token）
     is_pseudo: bool = False              # 是否为伪对齐生成
     # 警告字段
     warning_type: WarningType = field(default=WarningType.NONE)
     perplexity: Optional[float] = None   # LLM 校对时的困惑度
+
+    def __post_init__(self):
+        """兼容旧数据：confidence_raw 默认对齐 confidence。"""
+        if self.confidence_raw is None:
+            self.confidence_raw = self.confidence
 
     def to_dict(self) -> Dict:
         """转换为字典格式"""
@@ -83,6 +96,10 @@ class WordTimestamp:
             "start": self.start,
             "end": self.end,
             "confidence": self.confidence,  # 可能为 None
+            "confidence_raw": self.confidence_raw,
+            "confidence_display_raw": self.confidence_display_raw,
+            "confidence_source": self.confidence_source,
+            "token_type": self.token_type,
             "is_pseudo": self.is_pseudo,
             "warning_type": self.warning_type.value,
             "perplexity": self.perplexity
@@ -98,6 +115,7 @@ class SenseVoiceResult:
     words: List[WordTimestamp]
     start: float
     end: float
+    raw_tokens: Optional[List[WordTimestamp]] = None
     language: str = "auto"
     emotion: Optional[str] = None
     event: Optional[str] = None
@@ -110,6 +128,7 @@ class SenseVoiceResult:
             "text_clean": self.text_clean,
             "confidence": self.confidence,
             "words": [w.to_dict() for w in self.words],
+            "raw_tokens": [w.to_dict() for w in self.raw_tokens] if self.raw_tokens else None,
             "start": self.start,
             "end": self.end,
             "language": self.language,
@@ -133,6 +152,7 @@ class SentenceSegment:
     end: float = 0.0
     words: List[WordTimestamp] = field(default_factory=list)
     confidence: float = 1.0  # 原始置信度（内部使用）
+    confidence_display_raw: Optional[float] = None  # V3.2.0+dev.20260131.02: 显示口径的原始置信度
 
     # V3.1.2+dev.20260111.01: 置信度映射相关字段
     display_confidence: Optional[float] = None  # 映射后的准确率（前端显示）
@@ -165,7 +185,9 @@ class SentenceSegment:
 
     def __post_init__(self):
         """初始化后处理：计算 display_confidence"""
-        if self.display_confidence is None and self.confidence is not None:
+        if self.display_confidence is None and (
+            self.confidence is not None or self.confidence_display_raw is not None
+        ):
             self._compute_display_confidence()
 
     def _compute_display_confidence(self):
@@ -173,7 +195,8 @@ class SentenceSegment:
         from app.core.confidence_mapper import ConfidenceMapper
 
         # 无置信度时保持空值，前端不显示徽章
-        if self.confidence is None:
+        base_confidence = self.confidence_display_raw if self.confidence_display_raw is not None else self.confidence
+        if base_confidence is None:
             self.display_confidence = None
             return
 
@@ -182,19 +205,26 @@ class SentenceSegment:
             self.confidence_source = self.source.value if self.source else "sensevoice"
 
         # 计算映射
-        self.display_confidence = ConfidenceMapper.map(self.confidence, self.confidence_source)
+        self.display_confidence = ConfidenceMapper.map(base_confidence, self.confidence_source)
 
-    def update_confidence(self, new_confidence: float, source: str = None):
+    def update_confidence(
+        self,
+        new_confidence: float,
+        source: str = None,
+        display_raw: Optional[float] = None
+    ):
         """
         更新置信度并重新计算 display_confidence
 
         Args:
             new_confidence: 新的原始置信度
             source: 置信度来源（可选，默认保持原来的）
+            display_raw: 显示口径的原始置信度（可选）
         """
         self.confidence = new_confidence
         if source:
             self.confidence_source = source
+        self.confidence_display_raw = display_raw
         # 无置信度时清空显示值，避免误导
         if new_confidence is None:
             self.display_confidence = None
@@ -212,7 +242,7 @@ class SentenceSegment:
 
     def compute_warning_type(self, confidence_threshold: float = 0.6, perplexity_threshold: float = 50.0) -> WarningType:
         """根据置信度和困惑度计算警告类型"""
-        has_low_confidence = self.confidence < confidence_threshold
+        has_low_confidence = self.confidence is not None and self.confidence < confidence_threshold
         has_high_perplexity = self.perplexity is not None and self.perplexity > perplexity_threshold
 
         if has_low_confidence and has_high_perplexity:
@@ -233,14 +263,27 @@ class SentenceSegment:
         V3.1.2+dev.20260111.01: 新增 display_confidence 和 confidence_source 字段
         """
         # 确保 display_confidence 已计算
-        if self.display_confidence is None and self.confidence is not None:
+        if self.display_confidence is None and (
+            self.confidence is not None or self.confidence_display_raw is not None
+        ):
             self._compute_display_confidence()
+
+        words_payload: List[Dict[str, Any]] = []
+        for word in self.words:
+            if hasattr(word, "to_dict"):
+                words_payload.append(word.to_dict())
+            elif isinstance(word, dict):
+                words_payload.append(word)
+            else:
+                logger.warning("SentenceSegment.to_dict 遇到非预期词类型: %s", type(word))
+                words_payload.append({"word": str(word)})
 
         return {
             "text": self.text_clean or self.text,  # 优先使用清洗后的文本
             "start": self.start,
             "end": self.end,
             "confidence": self.confidence,  # 原始置信度（内部逻辑用）
+            "confidence_display_raw": self.confidence_display_raw,
             "display_confidence": self.display_confidence,  # V3.1.2: 映射后准确率（前端显示）
             "confidence_source": self.confidence_source,    # V3.1.2: 置信度来源
             "source": self.source.value,
@@ -251,7 +294,7 @@ class SentenceSegment:
             "perplexity": self.perplexity,
             "translation": self.translation,
             "translation_confidence": self.translation_confidence,
-            "words": [w.to_dict() for w in self.words],
+            "words": words_payload,
             # Layer 2: 语义分组相关字段
             "group_id": self.group_id,
             "is_soft_break": self.is_soft_break,
@@ -278,7 +321,7 @@ class TranscriptionOutput:
         self.total_sentences += 1
         if sentence.is_modified:
             self.modified_sentences += 1
-        if sentence.confidence < 0.6:
+        if sentence.confidence is not None and sentence.confidence < 0.6:
             self.low_confidence_sentences += 1
 
     def to_dict(self) -> Dict:

@@ -19,6 +19,7 @@ import os
 import re
 import logging
 import numpy as np
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Dict, Union, Tuple, Any
 import threading
@@ -27,6 +28,17 @@ import json
 from app.services.runtime_param_resolver import get_runtime_group_for_model
 
 logger = logging.getLogger(__name__)
+
+_SPECIAL_TAG_PATTERN = re.compile(r"<\|.*?\|>")
+_SENTENCEPIECE_SYMBOL = "▁"
+
+
+# V3.2.2+dev.20260201.01: SenseVoice 语言标签置信度结构
+@dataclass
+class SenseVoiceLanguageInfo:
+    """SenseVoice 检测到的语言信息"""
+    language: Optional[str] = None  # 检测到的语言代码（zh/en/ja/ko/yue）
+    confidence: float = 0.0         # 该语言标签的 CTC 置信度
 
 
 class CTCDecoder:
@@ -51,11 +63,14 @@ class CTCDecoder:
         self.blank_id = blank_id
         self.logger = logging.getLogger(__name__)
 
+        # V3.2.2+dev.20260201.01: SenseVoice 语言标签集合
+        self.LANGUAGE_TAGS = {"<|zh|>", "<|en|>", "<|ja|>", "<|ko|>", "<|yue|>", "<|auto|>"}
+
     def decode(
         self,
         logits: np.ndarray,
         time_stride: float = 0.06
-    ) -> Tuple[str, List[Dict], float]:
+    ) -> Tuple[str, List[Dict], float, SenseVoiceLanguageInfo]:
         """
         CTC 解码（贪心算法 + 字级时间戳提取）
 
@@ -64,10 +79,11 @@ class CTCDecoder:
             time_stride: 时间步长（秒），SenseVoice 默认 60ms
 
         Returns:
-            Tuple[str, List[Dict], float]:
+            Tuple[str, List[Dict], float, SenseVoiceLanguageInfo]:
                 - text: 解码后的文本
                 - word_timestamps: 字级时间戳列表
                 - confidence: 平均置信度
+                - language_info: 语言标签信息（V3.2.2+dev.20260201.01）
         """
         # 1. Softmax 转换为概率
         probs = self._softmax(logits)
@@ -81,6 +97,9 @@ class CTCDecoder:
         word_timestamps = []
         prev_token = self.blank_id
         char_start_time = None
+
+        # V3.2.2+dev.20260201.01: 记录语言标签信息
+        language_info = SenseVoiceLanguageInfo()
         char_probs = []
 
         for t, (token_id, prob) in enumerate(zip(token_ids, token_probs)):
@@ -146,13 +165,24 @@ class CTCDecoder:
         # 【新增】CTC 重叠去重：移除前缀重复（如 "W" + "Would" => "Would"）
         word_timestamps = self._remove_overlap_duplicates(word_timestamps)
 
+        # V3.2.2+dev.20260201.01: 提取语言标签置信度
+        for wt in word_timestamps:
+            word = wt.get("word", "")
+            if word in self.LANGUAGE_TAGS:
+                # 提取语言代码（去掉 <| 和 |>）
+                lang_code = word[2:-2].lower()
+                if lang_code != "auto":
+                    language_info.language = lang_code
+                    language_info.confidence = wt.get("confidence", 0.0)
+                break  # 只取第一个语言标签
+
         # 4. 拼接文本
         text = "".join([wt["word"] for wt in word_timestamps])
 
         # 5. 计算平均置信度
         avg_confidence = np.mean([wt["confidence"] for wt in word_timestamps]) if word_timestamps else 0.0
 
-        return text, word_timestamps, float(avg_confidence)
+        return text, word_timestamps, float(avg_confidence), language_info
 
     def _remove_overlap_duplicates(self, word_timestamps: List[Dict]) -> List[Dict]:
         """
@@ -587,6 +617,84 @@ class SenseVoiceONNXService:
                 self.is_loaded = False
                 self.logger.info("SenseVoice 模型已卸载")
 
+    @staticmethod
+    def _is_tag_only_token(token: str) -> bool:
+        """判断 token 是否完全由特殊标签组成。"""
+        if not token:
+            return False
+        stripped = _SPECIAL_TAG_PATTERN.sub("", token)
+        return stripped.strip() == "" and _SPECIAL_TAG_PATTERN.search(token) is not None
+
+    @staticmethod
+    def _split_sentencepiece_parts(token: str) -> List[str]:
+        """按 SentencePiece 边界拆分 token，返回非空片段。"""
+        if not token:
+            return []
+        normalized = token.replace(_SENTENCEPIECE_SYMBOL, " ")
+        return [part for part in normalized.split() if part]
+
+    def _clean_ctc_word_timestamps(self, word_timestamps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        清洗 CTC token 列表：
+        - 移除纯标签 token，并补偿时间偏移
+        - 剥离嵌入标签与 SentencePiece 符号
+        - 按边界拆分为子 token，保持时间戳连续
+        """
+        if not word_timestamps:
+            return []
+
+        cleaned: List[Dict[str, Any]] = []
+        removed_duration = 0.0
+
+        for item in word_timestamps:
+            raw_word = str(item.get("word", "") or "")
+            start = float(item.get("start", 0.0) or 0.0)
+            end = float(item.get("end", start) or start)
+            duration = max(end - start, 0.0)
+
+            if self._is_tag_only_token(raw_word):
+                removed_duration += duration
+                continue
+
+            start = max(0.0, start - removed_duration)
+            end = max(start, end - removed_duration)
+
+            # 去除嵌入标签后再拆分
+            no_tags = _SPECIAL_TAG_PATTERN.sub("", raw_word)
+            if not no_tags.strip():
+                continue
+
+            had_tag = _SPECIAL_TAG_PATTERN.search(raw_word) is not None
+            boundary_start = had_tag or no_tags.startswith((" ", _SENTENCEPIECE_SYMBOL)) or raw_word.startswith(
+                (" ", _SENTENCEPIECE_SYMBOL)
+            )
+            parts = self._split_sentencepiece_parts(no_tags)
+            if not parts:
+                continue
+
+            total_chars = sum(len(part) for part in parts)
+            if total_chars <= 0:
+                continue
+
+            cursor = start
+            for idx, part in enumerate(parts):
+                ratio = len(part) / total_chars if total_chars > 0 else 0.0
+                part_start = cursor
+                if idx == len(parts) - 1:
+                    part_end = end
+                else:
+                    part_end = cursor + duration * ratio
+                cursor = part_end
+
+                token = dict(item)
+                prefix = _SENTENCEPIECE_SYMBOL if (idx > 0 or boundary_start) else ""
+                token["word"] = f"{prefix}{part}"
+                token["start"] = part_start
+                token["end"] = part_end
+                cleaned.append(token)
+
+        return cleaned
+
     def transcribe_audio_array(
         self,
         audio_array: np.ndarray,
@@ -640,32 +748,12 @@ class SenseVoiceONNXService:
             logits = self._run_inference(audio_features, language=language, use_itn=use_itn)
 
             # 3. CTC 解码
-            text, word_timestamps, confidence = self.decoder.decode(logits, self.time_stride)
+            # V3.2.2+dev.20260201.01: 增加返回 SenseVoice 语言标签置信度
+            text, word_timestamps, confidence, sv_language_info = self.decoder.decode(logits, self.time_stride)
 
-            # 【阶段一】过滤特殊标记，并补偿时间偏移
-            # 特殊标记格式：<|xxx|>，如 <|en|>, <|EMO_UNKNOWN|>, <|Speech|>, <|withitn|>
-            # 这些标记占用时间轴（每个约60ms），过滤时需要累计其持续时间并从后续词中扣除
-            clean_word_timestamps = []
-            removed_duration = 0.0  # 累计被删除标记的持续时间
-
-            for w in word_timestamps:
-                word = w.get("word", "")
-                if word.startswith("<|") and word.endswith("|>"):
-                    # 累计被删除标记的持续时间
-                    removed_duration += w.get("end", 0) - w.get("start", 0)
-                    continue
-
-                # 从后续词的时间戳中扣除累计的偏移，补偿标记占用的时间
-                adjusted_w = w.copy()
-                adjusted_w["start"] = max(0.0, w.get("start", 0) - removed_duration)
-                adjusted_w["end"] = max(0.0, w.get("end", 0) - removed_duration)
-                clean_word_timestamps.append(adjusted_w)
-
-            word_timestamps = clean_word_timestamps
-
-            # 【新增】Token 合并：将 BPE/SentencePiece Subword Tokens 合并为完整单词
-            # 修复 "laval" 被拆分为 " la" + "val" 的问题
-            word_timestamps = self._merge_tokens_to_words(word_timestamps)
+            # 【阶段一】清理特殊标记与 SentencePiece，并补偿时间偏移
+            # 说明：纯标签会从时间轴扣除；嵌入标签仅剥离文本，不扣时间
+            word_timestamps = self._clean_ctc_word_timestamps(word_timestamps)
 
             # 4. 过滤未知情感标签（仅影响原始文本）
             if ban_emo_unk:
@@ -682,18 +770,32 @@ class SenseVoiceONNXService:
             # 使用检测到的语言进行文本清洗和标点归一化
             process_result = normalizer.process(text, extract_info=True, language=detected_language)
 
+            # V3.2.0+dev.20260131.02: Token 合并统一入口
+            # 将标点时间戳并入相邻词，并根据语言/脚本策略生成词级时间戳
+            from app.services.token_merge_service import merge_tokens
+
+            merge_result = merge_tokens(word_timestamps, language=detected_language)
+            word_timestamps = merge_result.words
+            raw_tokens = merge_result.raw_tokens
+
             # 6. 构建结果
             result = {
                 "text": text,
                 "text_clean": process_result["text_clean"],
                 "words": word_timestamps,
+                "raw_tokens": raw_tokens,
                 "confidence": confidence,
                 "language": detected_language,
                 "emotion": process_result["tags"]["emotion"] if process_result["tags"] else None,
-                "event": process_result["tags"]["event"] if process_result["tags"] else None
+                "event": process_result["tags"]["event"] if process_result["tags"] else None,
+                # V3.2.2+dev.20260201.01: SenseVoice 语言标签置信度
+                "sv_language_info": {
+                    "language": sv_language_info.language,
+                    "confidence": sv_language_info.confidence,
+                } if sv_language_info.language else None
             }
 
-            self.logger.debug(f"转录完成: {len(word_timestamps)} 个字符, 置信度 {confidence:.3f}")
+            self.logger.debug(f"转录完成: {len(word_timestamps)} 个词/字, 置信度 {confidence:.3f}")
             return result
 
         except Exception as e:
@@ -934,82 +1036,6 @@ class SenseVoiceONNXService:
                 results.append(result)
 
         return results
-
-    def _merge_tokens_to_words(self, tokens: List[Dict]) -> List[Dict]:
-        """
-        将 BPE/SentencePiece Subword Tokens 合并为完整单词
-
-        典型场景：
-        - " la" (0.900) + "val" (0.687) => " laval" (min=0.687)
-        - 原因：SenseVoice 使用 Subword 分词器（BPE/SentencePiece）
-        - 目标：将字符级时间戳聚合为词级时间戳
-
-        合并规则：
-        1. Token 以空格/▁ 开头 => 新词开始
-        2. Token 不以空格开头 且 是字母数字 => 词的延续，合并到前一个词
-        3. 标点符号 => 独立成词（视情况）
-
-        置信度策略：取最小值（木桶效应），利于触发复核
-
-        Args:
-            tokens: 原始字符级时间戳列表
-
-        Returns:
-            List[Dict]: 合并后的词级时间戳列表
-        """
-        if not tokens:
-            return []
-
-        merged_words = []
-        current_word = None
-
-        for token in tokens:
-            text = token["word"]
-
-            # 判断是否是新词的开始
-            # 规则1：以空格开头（如 " la"）或 SentencePiece 符号 ▁ 开头
-            # 规则2：当前没有正在构建的词
-            # 规则3：标点符号通常独立（可选，这里暂不处理）
-            is_new_word = (
-                text.startswith(" ") or
-                text.startswith("▁") or  # SentencePiece 词边界标记 (U+2581)
-                current_word is None
-            )
-
-            if is_new_word:
-                # 归档上一个词
-                if current_word is not None:
-                    # 清理 SentencePiece 符号 ▁ 和前导空格
-                    current_word["word"] = current_word["word"].lstrip("▁ ")
-                    merged_words.append(current_word)
-
-                # 开始新词
-                current_word = token.copy()
-            else:
-                # 合并到当前词
-                # 1. 文本拼接
-                current_word["word"] += text
-
-                # 2. 时间延展（结束时间更新为当前 token 的结束时间）
-                current_word["end"] = token["end"]
-
-                # 3. 置信度：取最小值（木桶效应），反映该词最弱环节的可信度
-                # 这样有利于触发 Whisper 复核
-                current_word["confidence"] = min(
-                    current_word["confidence"],
-                    token["confidence"]
-                )
-
-                # 4. 标记伪对齐状态
-                if token.get("is_pseudo"):
-                    current_word["is_pseudo"] = True
-
-        # 归档最后一个词（同样清理前缀）
-        if current_word is not None:
-            current_word["word"] = current_word["word"].lstrip("▁ ")
-            merged_words.append(current_word)
-
-        return merged_words
 
     def _strip_unknown_emotion_tags(self, text: str) -> str:
         """

@@ -1,0 +1,117 @@
+// ==============================================
+// 临时 SCSS Mixins（Phase 0 修复）
+// 注意：这是临时文件，用于确保构建通过
+// 后续 Phase 3-5 会逐步移除对这些 mixin 的依赖
+// ==============================================
+
+// ==============================================
+// 响应式断点混合宏
+// ==============================================
+
+// 大屏幕 (>= 1200px)
+@mixin desktop {
+  @media (min-width: 1200px) {
+    @content;
+  }
+}
+
+// 笔记本 (992px - 1199px)
+@mixin laptop {
+  @media (min-width: 992px) and (max-width: 1199px) {
+    @content;
+  }
+}
+
+// 平板 (<= 991px)
+@mixin tablet {
+  @media (max-width: 991px) {
+    @content;
+  }
+}
+
+// 手机 (<= 767px)
+@mixin mobile {
+  @media (max-width: 767px) {
+    @content;
+  }
+}
+
+// ==============================================
+// Flexbox 工具
+// ==============================================
+
+@mixin flex-center {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+@mixin flex-between {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+@mixin flex-column {
+  display: flex;
+  flex-direction: column;
+}
+
+// ==============================================
+// 文本工具
+// ==============================================
+
+@mixin text-ellipsis {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@mixin text-clamp($lines: 2) {
+  display: -webkit-box;
+  -webkit-line-clamp: $lines;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+// ==============================================
+// 滚动条样式
+// ==============================================
+
+@mixin custom-scrollbar($width: 8px, $track-color: transparent, $thumb-color: rgba(255, 255, 255, 0.2)) {
+  &::-webkit-scrollbar {
+    width: $width;
+    height: $width;
+  }
+
+  &::-webkit-scrollbar-track {
+    background: $track-color;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    background: $thumb-color;
+    border-radius: $width;
+
+    &:hover {
+      background: rgba(255, 255, 255, 0.3);
+    }
+  }
+}
+
+// ==============================================
+// 交互反馈
+// ==============================================
+
+@mixin hover-bg($color: rgba(255, 255, 255, 0.05)) {
+  transition: background-color var(--transition-fast);
+
+  &:hover {
+    background-color: $color;
+  }
+}
+
+@mixin active-scale($scale: 0.98) {
+  &:active {
+    transform: scale($scale);
+  }
+}

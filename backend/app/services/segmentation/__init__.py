@@ -2,6 +2,6 @@
 分句服务模块。
 """
 
-from .default_segmenter import DefaultSegmenter
+from .default_segmenter import DefaultSegmenter, DraftSegmenter
 
-__all__ = ["DefaultSegmenter"]
+__all__ = ["DefaultSegmenter", "DraftSegmenter"]

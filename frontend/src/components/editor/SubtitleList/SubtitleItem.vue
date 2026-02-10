@@ -130,7 +130,7 @@
       <button
         v-if="!subtitle.isDraft"
         class="delete-btn"
-        :class="{ 'delete-btn--confirming': isDeleteConfirming }"
+        :class="{ 'delete-btn-confirming': isDeleteConfirming }"
         @click.stop="handleDelete"
       >
         <!-- 正常状态：X图标 -->
@@ -426,8 +426,8 @@ async function syncSplitSubtitles(result) {
     if (originalSentenceIndex !== undefined) {
       await transcriptionApi.updateSubtitle(jobId, originalSentenceIndex, {
         text: leftSubtitle.text,
-        start: leftSubtitle.start,
-        end: leftSubtitle.end
+        start: projectStore.toBaseTime(leftSubtitle.start),
+        end: projectStore.toBaseTime(leftSubtitle.end)
       })
       projectStore.updateSubtitle(leftSubtitle.id, {
         sentenceIndex: originalSentenceIndex,
@@ -437,8 +437,8 @@ async function syncSplitSubtitles(result) {
     } else {
       const leftResp = await transcriptionApi.createSubtitle(jobId, {
         text: leftSubtitle.text,
-        start: leftSubtitle.start,
-        end: leftSubtitle.end
+        start: projectStore.toBaseTime(leftSubtitle.start),
+        end: projectStore.toBaseTime(leftSubtitle.end)
       })
       const leftData = leftResp?.data?.data || leftResp?.data
       if (leftData?.index !== undefined) {
@@ -452,8 +452,8 @@ async function syncSplitSubtitles(result) {
 
     const rightResp = await transcriptionApi.createSubtitle(jobId, {
       text: rightSubtitle.text,
-      start: rightSubtitle.start,
-      end: rightSubtitle.end
+      start: projectStore.toBaseTime(rightSubtitle.start),
+      end: projectStore.toBaseTime(rightSubtitle.end)
     })
     const rightData = rightResp?.data?.data || rightResp?.data
     if (rightData?.index !== undefined) {
@@ -519,7 +519,8 @@ function renderTextWithHighlight() {
   let html = ''
   for (let i = 0; i < processedWords.length; i++) {
     const word = processedWords[i]
-    const conf = word.confidence !== undefined ? word.confidence : 1.0
+    const rawConf = word.confidence_display_raw ?? word.confidence
+    const conf = rawConf !== undefined && rawConf !== null ? rawConf : 1.0
     const wordText = escapeHtml(word.word)
 
     if (conf < CRITICAL_THRESHOLD) {
@@ -580,385 +581,415 @@ function formatDuration(seconds) {
 }
 </script>
 
-<style lang="scss" scoped>
-// 字幕项
+<style scoped>
+/* 字幕项 */
 .subtitle-item {
   position: relative;
   display: flex;
   gap: 10px;
   padding: 10px;
   margin-bottom: 6px;
-  background: var(--bg-secondary);
+  background: var(--af-bg-secondary);
   border: 1px solid transparent;
-  border-radius: var(--radius-md);
-  transition: all var(--transition-fast);
+  border-radius: var(--af-radius-md);
+  transition: all var(--af-transition-fast);
   cursor: pointer;
-
-  &:hover {
-    background: var(--bg-tertiary);
-    .item-actions { opacity: 1; }
-  }
-
-  &.is-active {
-    border-color: var(--primary);
-    background: rgba(88, 166, 255, 0.08);
-  }
-
-  &.is-current {
-    border-color: var(--success);
-    background: rgba(63, 185, 80, 0.08);
-    .item-index { background: var(--success); color: white; }
-  }
-
-  // 暂停时显示呼吸灯动画
-  &.is-current-paused {
-    animation: breathing-border-green 3s ease-in-out infinite;
-  }
-
-  // 草稿状态样式
-  &.is-draft {
-    background: rgba(128, 128, 128, 0.05);
-    border-color: rgba(128, 128, 128, 0.2);
-    cursor: wait;
-
-    .item-index {
-      background: #6b7280;
-      color: white;
-    }
-
-    .text-display {
-      color: #9ca3af;
-      font-style: italic;
-    }
-  }
-
-  // 置信度警告高亮样式
-  &.warning-low-confidence {
-    border-color: var(--warning);
-    background: rgba(210, 153, 34, 0.06);
-    .item-index { background: var(--warning); color: white; }
-  }
-
-  &.warning-high-perplexity {
-    border-color: #e67700;
-    background: rgba(230, 119, 0, 0.06);
-    .item-index { background: #e67700; color: white; }
-  }
-
-  &.warning-both {
-    border-color: var(--danger);
-    background: rgba(248, 81, 73, 0.08);
-    border-width: 2px;
-    .item-index { background: var(--danger); color: white; }
-  }
 }
 
-// 序号
+.subtitle-item:hover {
+  background: var(--af-bg-tertiary);
+}
+
+.subtitle-item.is-active {
+  border-color: var(--af-accent-primary);
+  background: rgb(var(--af-accent-primary-rgb), 0.8);
+}
+
+.subtitle-item.is-current {
+  border-color: var(--af-accent-success);
+  background: rgb(var(--af-accent-success-rgb), 0.8);
+}
+
+/* 暂停时显示呼吸灯动画 */
+.subtitle-item.is-current-paused {
+  animation: breathing-border-green 3s ease-in-out infinite;
+}
+
+/* 草稿状态样式 */
+.subtitle-item.is-draft {
+  background: rgb(var(--af-text-muted-rgb), 0.5);
+  border-color: rgb(var(--af-text-muted-rgb), 0.20);
+  cursor: wait;
+}
+
+/* 置信度警告高亮样式 */
+.subtitle-item.warning-low-confidence {
+  border-color: var(--af-accent-warning);
+  background: rgb(var(--af-accent-warning-rgb), 0.6);
+}
+
+.subtitle-item.warning-high-perplexity {
+  border-color: var(--af-status-warning);
+  background: rgb(var(--af-status-warning-rgb), 0.6);
+}
+
+.subtitle-item.warning-both {
+  border-color: var(--af-accent-danger);
+  background: rgb(var(--af-accent-danger-rgb), 0.8);
+  border-width: 2px;
+}
+
+/* 序号 */
 .item-index {
+  display: flex;
+  justify-content: center;
+  align-items: center;
   width: 28px;
   height: 28px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: var(--bg-tertiary);
-  border-radius: var(--radius-sm);
+  background: var(--af-bg-tertiary);
+  border-radius: var(--af-radius-sm);
+  color: var(--af-text-secondary);
   font-size: 11px;
   font-weight: 600;
-  color: var(--text-secondary);
   flex-shrink: 0;
 }
 
-// 内容区
+.subtitle-item.is-current .item-index {
+  background: var(--af-accent-success);
+  color: var(--af-text-on-dark);
+}
+
+.subtitle-item.is-draft .item-index {
+  background: var(--af-text-muted);
+  color: var(--af-text-on-dark);
+}
+
+.subtitle-item.warning-low-confidence .item-index {
+  background: var(--af-accent-warning);
+  color: var(--af-text-on-dark);
+}
+
+.subtitle-item.warning-high-perplexity .item-index {
+  background: var(--af-status-warning);
+  color: var(--af-text-on-dark);
+}
+
+.subtitle-item.warning-both .item-index {
+  background: var(--af-accent-danger);
+  color: var(--af-text-on-dark);
+}
+
+/* 内容区 */
 .item-content {
   flex: 1;
   min-width: 0;
 }
 
-// 时间行
+/* 时间行 */
 .time-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
   margin-bottom: 6px;
-  flex-wrap: wrap;
-
-  .time-input {
-    width: 75px;
-    padding: 3px 6px;
-    background: var(--bg-tertiary);
-    border: 1px solid transparent;
-    border-radius: var(--radius-sm);
-    font-size: 11px;
-    font-family: var(--font-mono);
-    color: var(--text-normal);
-    text-align: center;
-
-    &:focus {
-      border-color: var(--primary);
-      outline: none;
-    }
-
-    &[readonly] {
-      cursor: wait;
-      opacity: 0.6;
-    }
-  }
-
-  .time-arrow {
-    color: var(--text-muted);
-    svg { width: 14px; height: 14px; }
-  }
-
-  .duration-tag {
-    padding: 2px 6px;
-    background: var(--bg-tertiary);
-    border-radius: var(--radius-full);
-    font-size: 10px;
-    font-family: var(--font-mono);
-    color: var(--text-muted);
-  }
 }
 
-// 草稿状态指示器
+.time-row .time-input {
+  width: 75px;
+  padding: 3px 6px;
+  background: var(--af-bg-tertiary);
+  border: 1px solid transparent;
+  border-radius: var(--af-radius-sm);
+  color: var(--af-text-normal);
+  font-size: 11px;
+  font-family: var(--af-font-mono);
+  text-align: center;
+}
+
+.time-row .time-input:focus {
+  border-color: var(--af-accent-primary);
+  outline: none;
+}
+
+.time-row .time-input[readonly] {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+.time-row .time-arrow {
+  color: var(--af-text-muted);
+}
+
+.time-row .time-arrow svg {
+  width: 14px;
+  height: 14px;
+}
+
+.time-row .duration-tag {
+  padding: 2px 6px;
+  background: var(--af-bg-tertiary);
+  border-radius: var(--af-radius-full);
+  color: var(--af-text-muted);
+  font-size: 10px;
+  font-family: var(--af-font-mono);
+}
+
+/* stylelint-disable-next-line no-descending-specificity -- .delete-btn svg 与 .time-row svg 作用于不同元素 */
+.delete-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+/* 草稿状态指示器 */
 .draft-indicator {
   display: flex;
   align-items: center;
   gap: 4px;
   padding: 2px 8px;
-  background: rgba(107, 114, 128, 0.15);
-  border-radius: var(--radius-full);
+  background: rgb(var(--af-draft-bg-rgb), 0.15);
+  border-radius: var(--af-radius-full);
+  color: var(--af-draft-text);
   font-size: 10px;
-  color: #9ca3af;
+}
 
-  .spinner {
-    width: 10px;
-    height: 10px;
-    border: 2px solid rgba(156, 163, 175, 0.3);
-    border-top-color: #9ca3af;
-    border-radius: 50%;
-    animation: spin 1s linear infinite;
-  }
+.draft-indicator .spinner {
+  width: 10px;
+  height: 10px;
+  border: 2px solid rgb(var(--af-text-secondary-rgb), 0.30);
+  border-top-color: var(--af-draft-text);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
 
-  .draft-text {
-    font-style: italic;
-  }
+.draft-indicator .draft-text {
+  font-style: italic;
 }
 
 @keyframes spin {
   to { transform: rotate(360deg); }
 }
 
-// 绿色呼吸灯动画 - 边框颜色从透明到绿色再到透明
+/* 绿色呼吸灯动画 - 边框颜色从透明到绿色再到透明 */
 @keyframes breathing-border-green {
   0%, 100% {
     border-color: transparent;
   }
+
   50% {
-    border-color: #3fb950;
-    box-shadow: 0 0 8px rgba(63, 185, 80, 0.5);
+    border-color: var(--af-accent-success);
+    box-shadow: 0 0 8px rgb(var(--af-accent-success-rgb), 0.50);
   }
 }
 
-// 置信度徽章
+/* 置信度徽章 */
 .confidence-badge {
   padding: 2px 6px;
-  border-radius: var(--radius-full);
+  border-radius: var(--af-radius-full);
   font-size: 10px;
-  font-family: var(--font-mono);
+  font-family: var(--af-font-mono);
   font-weight: 600;
-
-  &.badge-good {
-    background: rgba(63, 185, 80, 0.15);
-    color: var(--success);
-  }
-
-  &.badge-warning {
-    background: rgba(210, 153, 34, 0.15);
-    color: var(--warning);
-  }
-
-  &.badge-danger {
-    background: rgba(248, 81, 73, 0.15);
-    color: var(--danger);
-  }
 }
 
-// 文本行
+.confidence-badge.badge-good {
+  background: rgb(var(--af-accent-success-rgb), 0.15);
+  color: var(--af-accent-success);
+}
+
+.confidence-badge.badge-warning {
+  background: rgb(var(--af-accent-warning-rgb), 0.15);
+  color: var(--af-accent-warning);
+}
+
+.confidence-badge.badge-danger {
+  background: rgb(var(--af-accent-danger-rgb), 0.15);
+  color: var(--af-accent-danger);
+}
+
+/* 文本行 */
 .text-row {
   position: relative;
-
-  .text-display {
-    width: 100%;
-    min-height: 45px;
-    padding: 6px 35px 6px 8px;
-    background: var(--bg-tertiary);
-    border: 1px solid transparent;
-    border-radius: var(--radius-sm);
-    font-size: 12px;
-    color: var(--text-normal);
-    line-height: 1.4;
-    white-space: pre-wrap;
-    word-break: break-word;
-    transition: border-color 0.3s ease, background 0.3s ease;
-  }
-
-  // 草稿文本样式
-  .text-draft {
-    color: #9ca3af;
-    font-style: italic;
-    cursor: wait;
-    background: rgba(107, 114, 128, 0.08);
-  }
-
-  // 预览文本样式
-  .text-preview {
-    cursor: default;
-
-    &.can-edit {
-      cursor: text;
-      &:hover {
-        border-color: rgba(88, 166, 255, 0.8);
-        background: var(--bg-secondary);
-      }
-    }
-
-    // 字级警告高亮样式
-    :deep(.word-warning) {
-      background-color: rgba(255, 193, 7, 0.25);
-      border-bottom: 2px solid var(--warning, #ffc107);
-      padding: 0 2px;
-      border-radius: 2px;
-    }
-
-    :deep(.word-critical) {
-      background-color: rgba(244, 67, 54, 0.25);
-      border-bottom: 2px solid var(--error, #f44336);
-      padding: 0 2px;
-      border-radius: 2px;
-      font-weight: 500;
-    }
-  }
-
-  .text-input {
-    width: 100%;
-    min-height: 45px;
-    padding: 6px 8px;
-    padding-right: 35px;
-    background: var(--bg-tertiary);
-    border: 1px solid var(--primary);
-    border-radius: var(--radius-sm);
-    font-size: 12px;
-    color: var(--text-normal);
-    resize: none;
-    line-height: 1.4;
-    outline: none;
-    overflow: hidden;
-
-    &::placeholder { color: var(--text-muted); }
-
-    // 隐藏滚动条
-    &::-webkit-scrollbar {
-      display: none;
-    }
-    scrollbar-width: none;
-  }
-
-  .char-count {
-    position: absolute;
-    right: 6px;
-    bottom: 6px;
-    font-size: 10px;
-    font-family: var(--font-mono);
-    color: var(--text-muted);
-
-  }
 }
 
-// 警告横幅
+.text-row .text-display {
+  width: 100%;
+  padding: 6px 35px 6px 8px;
+  background: var(--af-bg-tertiary);
+  border: 1px solid transparent;
+  border-radius: var(--af-radius-sm);
+  color: var(--af-text-normal);
+  font-size: 12px;
+  transition: border-color 0.3s ease, background 0.3s ease;
+  min-height: 45px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+
+/* 草稿文本样式 */
+.text-row .text-draft {
+  background: rgb(var(--af-draft-bg-rgb), 0.8);
+  color: var(--af-draft-text);
+  font-style: italic;
+  cursor: wait;
+}
+
+/* 预览文本样式 */
+.text-row .text-preview {
+  cursor: default;
+}
+
+.text-row .text-preview.can-edit {
+  cursor: text;
+}
+
+.text-row .text-preview.can-edit:hover {
+  border-color: var(--af-accent-primary);
+  background: var(--af-bg-secondary);
+}
+
+/* 字级警告高亮样式 */
+.text-row .text-preview :deep(.word-warning) {
+  background-color: rgb(var(--af-confidence-warning-rgb), 0.25);
+  border-bottom: 2px solid var(--af-confidence-warning);
+  padding: 0 2px;
+  border-radius: 2px;
+}
+
+.text-row .text-preview :deep(.word-critical) {
+  background-color: rgb(var(--af-confidence-critical-rgb), 0.25);
+  border-bottom: 2px solid var(--af-confidence-critical);
+  padding: 0 2px;
+  border-radius: 2px;
+  font-weight: 500;
+}
+
+.text-row .text-input {
+  width: 100%;
+  padding: 6px 8px;
+  background: var(--af-bg-tertiary);
+  border: 1px solid var(--af-accent-primary);
+  border-radius: var(--af-radius-sm);
+  color: var(--af-text-normal);
+  font-size: 12px;
+  min-height: 45px;
+  padding-right: 35px;
+  resize: none;
+  line-height: 1.4;
+  outline: none;
+  overflow: hidden;
+  scrollbar-width: none;
+}
+
+.text-row .text-input::placeholder {
+  color: var(--af-text-muted);
+}
+
+/* 隐藏滚动条 */
+.text-row .text-input::-webkit-scrollbar {
+  display: none;
+}
+
+.text-row .char-count {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  color: var(--af-text-muted);
+  font-size: 10px;
+  font-family: var(--af-font-mono);
+}
+
+.subtitle-item.is-draft .text-display {
+  color: var(--af-text-secondary);
+  font-style: italic;
+}
+
+/* 警告横幅 */
 .warning-banner {
   margin-top: 6px;
   padding: 4px 8px;
-  background: rgba(210, 153, 34, 0.1);
-  border-left: 3px solid var(--warning);
-  border-radius: var(--radius-sm);
-
-  .warning-text {
-    font-size: 11px;
-    color: var(--warning);
-  }
+  background: rgb(var(--af-accent-warning-rgb), 0.10);
+  border-left: 3px solid var(--af-accent-warning);
+  border-radius: var(--af-radius-sm);
 }
 
-// 操作按钮
+.warning-banner .warning-text {
+  color: var(--af-accent-warning);
+  font-size: 11px;
+}
+
+/* 操作按钮 */
 .item-actions {
   display: flex;
   flex-direction: column;
   gap: 2px;
   opacity: 0.5;
-  transition: opacity var(--transition-fast);
-
-  .action-btn {
-    width: 24px;
-    height: 24px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: var(--radius-sm);
-    color: var(--text-muted);
-    background: transparent;
-    border: none;
-    cursor: pointer;
-    transition: all var(--transition-fast);
-
-    svg { width: 14px; height: 14px; }
-
-    &:hover {
-      background: var(--bg-tertiary);
-      color: var(--text-normal);
-    }
-
-    &--danger:hover {
-      background: rgba(248, 81, 73, 0.15);
-      color: var(--danger);
-    }
-  }
+  transition: opacity var(--af-transition-fast);
 }
 
-// 删除按钮 - 绝对定位在右下角，与操作按钮垂直对齐
+.item-actions .action-btn {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  width: 24px;
+  height: 24px;
+  background: transparent;
+  border: none;
+  border-radius: var(--af-radius-sm);
+  color: var(--af-text-muted);
+  transition: all var(--af-transition-fast);
+  cursor: pointer;
+}
+
+.item-actions .action-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.item-actions .action-btn:hover {
+  background: var(--af-bg-tertiary);
+  color: var(--af-text-normal);
+}
+
+.item-actions .action-btn-danger:hover {
+  background: rgb(var(--af-accent-danger-rgb), 0.15);
+  color: var(--af-accent-danger);
+}
+
+.subtitle-item:hover .item-actions {
+  opacity: 1;
+}
+
+/* 删除按钮 - 绝对定位在右下角，与操作按钮垂直对齐 */
 .delete-btn {
   position: absolute;
   right: 12px;
   bottom: 6px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
   width: 20px;
   height: 20px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: var(--radius-sm);
-  color: var(--text-muted);
   background: transparent;
   border: none;
+  border-radius: var(--af-radius-sm);
+  color: var(--af-text-muted);
+  transition: all 0.2s ease;
   cursor: pointer;
   opacity: 0.5;
-  transition: all 0.2s ease;
+}
 
-  svg {
-    width: 16px;
-    height: 16px;
-  }
+.delete-btn:hover {
+  opacity: 1;
+  background: var(--af-bg-tertiary);
+}
 
-  &:hover {
-    opacity: 1;
-    background: var(--bg-tertiary);
-  }
+/* 确认状态 - 红色垃圾桶图标 */
+.delete-btn-confirming {
+  color: var(--af-accent-danger);
+  opacity: 1;
+}
 
-  // 确认状态 - 红色垃圾桶图标
-  &--confirming {
-    color: var(--danger);
-    opacity: 1;
-
-    &:hover {
-      background: rgba(248, 81, 73, 0.1);
-    }
-  }
+.delete-btn-confirming:hover {
+  background: rgb(var(--af-accent-danger-rgb), 0.10);
 }
 </style>

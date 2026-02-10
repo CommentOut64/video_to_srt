@@ -6,10 +6,32 @@ SlowWorker - 慢流推理 Worker（GPU）
 2. 返回推理结果（不做 Prompt 构建/幻觉检测/对齐）
 """
 import logging
-from typing import Dict, Optional, Any
+from dataclasses import dataclass
+from typing import Dict, Optional, Any, List, TYPE_CHECKING
 
 from app.core.asr.engine import ASREngine
 from app.core.asr.models import ASRResult
+from app.core.logging import resolve_loguru_logger
+from app.models.sensevoice_models import SentenceSegment
+from app.services.bridge.batch_builder import BridgeBatch
+from app.services.punctuation.base import PunctuationResult
+from app.services.punctuation.semantic_buffer import PunctuationDecision
+from app.services.whisper_buffer_pool import WhisperBufferPool, WhisperBufferConfig
+from app.services.whisper.whisper_text_sanitizer import WhisperTextSanitizer
+
+if TYPE_CHECKING:
+    from app.services.punctuation.service import PunctuationService
+
+
+@dataclass
+class SlowWorkerResult:
+    """SlowWorker 批次处理结果。"""
+
+    batch_id: str
+    whisper_result: Dict[str, Any]
+    source_sentences: List[SentenceSegment]
+    slow_punctuation: Optional[PunctuationResult]
+    punctuation_decision: Optional[PunctuationDecision]
 
 
 class SlowWorker:
@@ -25,6 +47,7 @@ class SlowWorker:
         self,
         patch_engine: ASREngine,
         whisper_language: str = "auto",
+        punctuation_service: Optional["PunctuationService"] = None,
         logger: Optional[logging.Logger] = None
     ):
         """
@@ -39,7 +62,9 @@ class SlowWorker:
             raise ValueError("SlowWorker 需要提供 patch_engine")
         self.patch_engine = patch_engine
         self.whisper_language = whisper_language
-        self.logger = logger or logging.getLogger(__name__)
+        self.punctuation_service = punctuation_service
+        self.logger = resolve_loguru_logger(logger, __name__, layer="L0")
+        self._whisper_sanitizer = WhisperTextSanitizer(logger=self.logger)
 
     async def infer(
         self,
@@ -63,9 +88,117 @@ class SlowWorker:
             repetition_penalty=None,
             no_repeat_ngram_size=None,
         )
-        return self._convert_asr_result(asr_result)
+        return self._convert_asr_result(asr_result, prompt=initial_prompt)
 
-    def _convert_asr_result(self, asr_result: ASRResult) -> Dict[str, Any]:
+    async def process_batch(
+        self,
+        batch: BridgeBatch,
+        *,
+        full_audio_array: Any,
+        full_audio_sr: int = 16000,
+    ) -> SlowWorkerResult:
+        """
+        处理 Bridge 批次（V3.2.0+dev.20260201.07）。
+
+        Args:
+            batch: Bridge 批次
+            full_audio_array: 完整音频数组（16kHz）
+            full_audio_sr: 完整音频采样率
+        """
+        if not batch:
+            raise ValueError("SlowWorker 批次为空")
+        log = self.logger.bind(batch_id=batch.batch_id)
+        log.debug("SlowWorker 批次推理开始")
+        audio = self._concat_batch_audio(batch, full_audio_array, full_audio_sr)
+        whisper_lang = batch.language or self.whisper_language
+        prompt = batch.prompt or None
+
+        asr_result = await self.patch_engine.transcribe(
+            audio,
+            language=whisper_lang,
+            initial_prompt=prompt,
+            word_timestamps=True,
+            vad_filter=False,
+            repetition_penalty=None,
+            no_repeat_ngram_size=None,
+        )
+        whisper_result = self._convert_asr_result(asr_result, prompt=prompt)
+
+        # V3.2.0+dev.20260204.01: L0 不在 Worker 内执行标点恢复
+        slow_punct_result: Optional[PunctuationResult] = None
+        decision = batch.punctuation_decision
+
+        return SlowWorkerResult(
+            batch_id=batch.batch_id,
+            whisper_result=whisper_result,
+            source_sentences=batch.sentences or [],
+            slow_punctuation=slow_punct_result,
+            punctuation_decision=decision,
+        )
+
+    def _concat_batch_audio(
+        self,
+        batch: BridgeBatch,
+        full_audio_array: Any,
+        full_audio_sr: int,
+    ) -> Any:
+        """使用 WhisperBufferPool 拼接批次音频（保留间隔）。"""
+        if full_audio_array is None:
+            raise ValueError("SlowWorker 批次拼接需要完整音频数组")
+        if not batch.audio_segments:
+            raise ValueError("SlowWorker 批次缺少音频片段")
+
+        segments = sorted(batch.audio_segments, key=lambda item: item[0])
+        config = WhisperBufferConfig()
+        pool = WhisperBufferPool(config)
+        # 采样率不匹配会导致间隔长度偏差，强制同步
+        if getattr(pool, "_sample_rate", None) != full_audio_sr:
+            pool._sample_rate = full_audio_sr
+
+        audio_len = len(full_audio_array)
+        for idx, (start, end) in enumerate(segments):
+            start_sample = max(0, int(start * full_audio_sr))
+            end_sample = min(audio_len, int(end * full_audio_sr))
+            if end_sample <= start_sample:
+                continue
+            audio_slice = full_audio_array[start_sample:end_sample]
+            pool.add_chunk(
+                index=idx,
+                start=float(start),
+                end=float(end),
+                audio=audio_slice,
+            )
+
+        if pool.is_empty:
+            raise ValueError("SlowWorker 批次拼接失败：有效音频片段为空")
+
+        concatenated, _, _ = pool.get_concatenated_audio(preserve_gaps=True)
+        return concatenated
+
+    @staticmethod
+    def _extract_word_timestamps(whisper_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """从 Whisper raw_result 中提取词级时间戳。"""
+        raw = whisper_result.get("raw_result") if isinstance(whisper_result, dict) else None
+        segments = raw.get("segments", []) if isinstance(raw, dict) else []
+        words: List[Dict[str, Any]] = []
+        for seg in segments:
+            for word in seg.get("words", []) or []:
+                words.append(
+                    {
+                        "word": str(word.get("word", "")),
+                        "start": float(word.get("start", 0.0) or 0.0),
+                        "end": float(word.get("end", 0.0) or 0.0),
+                        "confidence": float(word.get("probability", 0.0) or 0.0),
+                    }
+                )
+        return words
+
+    def _convert_asr_result(
+        self,
+        asr_result: ASRResult,
+        *,
+        prompt: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """将 ASRResult 转为 Whisper 结果结构。"""
         raw_result = {}
         if asr_result.metadata and asr_result.metadata.raw_tags:
@@ -90,9 +223,19 @@ class SlowWorker:
                 "language": asr_result.language,
             }
 
+        raw_text = asr_result.text if asr_result.text is not None else None
+        # V3.2.0+dev.20260203.10: L0 最小清洗仅产出 min_clean_text，不直接进入下游
+        min_clean_text = None
+        if raw_text:
+            min_clean_text = self._whisper_sanitizer.sanitize_minimal(raw_text, prompt=prompt)
+        segments = raw_result.get("segments") if isinstance(raw_result, dict) else None
         return {
-            "text": asr_result.text,
-            "confidence": float(asr_result.confidence or 0.0),
-            "language": asr_result.language,
+            "raw_text": raw_text,
+            "min_clean_text": min_clean_text,
+            "confidence": float(asr_result.confidence) if asr_result.confidence is not None else None,
+            "confidence_source": "slow",
+            "language": asr_result.language if asr_result.language is not None else None,
             "raw_result": raw_result,
+            "segments": segments,
+            "source": "slow",
         }

@@ -1,0 +1,587 @@
+/**
+ * Element Plus 样式覆盖
+ * 使用 Element Plus 官方 CSS 变量系统与 AnchorFlux 主题系统集成
+ */
+
+/* ==============================================
+   全局 Element Plus 主题变量
+   ============================================== */
+
+/* 修复对话框打开时页面抖动（滚动条消失导致） */
+/* document.scrollingElement 返回 HTML，滚动容器是 <html>
+   方案：禁用 EP 对 body 的操作，改为锁定 html 滚动 */
+
+/* 1. 禁用 Element Plus 对 body 的滚动锁定（防止左移） */
+body.el-popup-parent--hidden {
+  overflow: visible !important;
+  padding-right: 0 !important;
+  width: auto !important;
+  position: static !important;
+}
+
+/* 2. 改为锁定 html 滚动（滚动条保持可见但不可滚动） */
+html.el-popup-parent--hidden {
+  overflow-y: scroll !important;
+  pointer-events: none;
+}
+
+/* 3. 弹窗层保持可交互 */
+html.el-popup-parent--hidden .el-overlay,
+html.el-popup-parent--hidden .el-dialog,
+html.el-popup-parent--hidden .el-message-box__wrapper {
+  pointer-events: auto;
+}
+
+:root {
+  /* 主色系 */
+  --el-color-primary: var(--af-accent-primary);
+  --el-color-success: var(--af-accent-success);
+  --el-color-warning: var(--af-accent-warning);
+  --el-color-danger: var(--af-accent-danger);
+  --el-color-info: var(--af-text-secondary);
+
+  /* 背景色 */
+  --el-bg-color: var(--af-bg-primary);
+  --el-bg-color-page: var(--af-bg-base);
+  --el-bg-color-overlay: var(--af-bg-overlay);
+
+  /* 文本色 */
+  --el-text-color-primary: var(--af-text-normal);
+  --el-text-color-regular: var(--af-text-normal);
+  --el-text-color-secondary: var(--af-text-secondary);
+  --el-text-color-placeholder: var(--af-text-muted);
+  --el-text-color-disabled: var(--af-text-disabled);
+
+  /* 边框 */
+  --el-border-color: var(--af-border-default);
+  --el-border-color-light: var(--af-border-muted);
+  --el-border-color-lighter: var(--af-border-subtle);
+  --el-border-color-extra-light: var(--af-border-subtle);
+  --el-border-color-dark: var(--af-border-default);
+  --el-border-color-darker: var(--af-border-default);
+
+  /* 填充色（用于禁用状态等） */
+  --el-fill-color: var(--af-bg-secondary);
+  --el-fill-color-light: var(--af-bg-tertiary);
+  --el-fill-color-lighter: var(--af-bg-tertiary);
+  --el-fill-color-extra-light: var(--af-bg-secondary);
+  --el-fill-color-dark: var(--af-bg-secondary);
+  --el-fill-color-darker: var(--af-bg-primary);
+  --el-fill-color-blank: transparent;
+
+  /* 圆角 - 使用 Element Plus 默认值 */
+  --el-border-radius-base: 4px;
+  --el-border-radius-small: 2px;
+  --el-border-radius-round: 20px;
+  --el-border-radius-circle: 50%;
+
+  /* 阴影 */
+  --el-box-shadow: var(--af-shadow-md);
+  --el-box-shadow-light: var(--af-shadow-sm);
+  --el-box-shadow-lighter: var(--af-shadow-sm);
+  --el-box-shadow-dark: var(--af-shadow-lg);
+}
+
+/* ==============================================
+   组件专属覆盖
+   ============================================== */
+
+/* 按钮 */
+.el-button {
+  --el-button-bg-color: var(--af-bg-secondary);
+  --el-button-border-color: var(--af-border-default);
+  --el-button-text-color: var(--af-text-normal);
+  --el-button-hover-bg-color: var(--af-bg-tertiary);
+  --el-button-hover-border-color: var(--af-border-default);
+  --el-button-hover-text-color: var(--af-text-primary);
+  --el-button-active-bg-color: var(--af-bg-tertiary);
+  --el-button-active-border-color: var(--af-accent-primary);
+  --el-button-disabled-bg-color: var(--af-bg-tertiary);
+  --el-button-disabled-border-color: var(--af-border-default);
+  --el-button-disabled-text-color: var(--af-text-disabled);
+}
+
+/* 禁用按钮样式 */
+.el-button.is-disabled,
+.el-button:disabled {
+  --el-button-disabled-bg-color: var(--af-bg-tertiary);
+  --el-button-disabled-border-color: var(--af-border-default);
+  --el-button-disabled-text-color: var(--af-text-disabled);
+}
+
+/* danger 类型按钮 */
+.el-button--danger {
+  --el-button-bg-color: var(--af-accent-danger);
+  --el-button-border-color: var(--af-accent-danger);
+  --el-button-text-color: var(--af-text-inverse);
+  --el-button-hover-bg-color: var(--af-accent-danger-dim);
+  --el-button-hover-border-color: var(--af-accent-danger-dim);
+  --el-button-hover-text-color: var(--af-text-inverse);
+  --el-button-active-bg-color: var(--af-accent-danger-dim);
+  --el-button-active-border-color: var(--af-accent-danger-dim);
+}
+
+/* success 类型按钮 */
+.el-button--success {
+  --el-button-bg-color: var(--af-accent-success);
+  --el-button-border-color: var(--af-accent-success);
+  --el-button-text-color: var(--af-text-inverse);
+  --el-button-hover-bg-color: var(--af-accent-success-dim);
+  --el-button-hover-border-color: var(--af-accent-success-dim);
+  --el-button-hover-text-color: var(--af-text-inverse);
+  --el-button-active-bg-color: var(--af-accent-success-dim);
+  --el-button-active-border-color: var(--af-accent-success-dim);
+}
+
+/* 输入框 */
+.el-input {
+  --el-input-bg-color: var(--af-bg-secondary);
+  --el-input-border-color: var(--af-border-default);
+  --el-input-text-color: var(--af-text-normal);
+  --el-input-placeholder-color: var(--af-text-muted);
+  --el-input-hover-border-color: var(--af-accent-primary);
+  --el-input-focus-border-color: var(--af-accent-primary);
+}
+
+.el-textarea {
+  --el-input-bg-color: var(--af-bg-secondary);
+  --el-input-border-color: var(--af-border-default);
+  --el-input-text-color: var(--af-text-normal);
+}
+
+/* 对话框 */
+.el-dialog {
+  --el-dialog-bg-color: var(--af-bg-secondary);
+  --el-dialog-border-radius: var(--af-radius-lg);
+  --el-dialog-box-shadow: var(--af-shadow-xl);
+}
+
+/* 卡片 */
+.el-card {
+  --el-card-bg-color: var(--af-bg-secondary);
+  --el-card-border-color: var(--af-border-default);
+}
+
+/* 下拉菜单 */
+.el-dropdown-menu {
+  --el-dropdown-menuItem-hover-fill: var(--af-bg-tertiary);
+  --el-dropdown-menuItem-hover-color: var(--af-text-primary);
+}
+
+/* 消息提示 - 使用 Element Plus 默认样式 */
+
+/* 通知 */
+.el-notification {
+  --el-notification-bg-color: var(--af-bg-elevated);
+  --el-notification-border-color: var(--af-border-default);
+  --el-notification-text-color: var(--af-text-normal);
+}
+
+/* 弹出框 */
+.el-popover {
+  --el-popover-bg-color: var(--af-bg-elevated);
+  --el-popover-border-color: var(--af-border-default);
+}
+
+/* 提示框 */
+/* 原因：Element Plus 使用 .el-popper.is-dark/.is-light，默认会反转全局 CSS 变量导致颜色错误 */
+/* 解决方案：直接覆盖 .el-popper 主题类，设置背景和文字颜色 */
+.el-popper.is-dark {
+  background-color: var(--af-bg-elevated) !important;
+  color: var(--af-text-primary) !important;
+  border: 1px solid var(--af-border-default) !important;
+}
+
+/* tooltip 箭头 */
+.el-popper.is-dark .el-popper__arrow::before {
+  background: var(--af-bg-elevated) !important;
+  border: 1px solid var(--af-border-default) !important;
+}
+
+/* 浅色主题 tooltip */
+.el-popper.is-light {
+  background-color: var(--af-bg-elevated) !important;
+  color: var(--af-text-primary) !important;
+  border: 1px solid var(--af-border-default) !important;
+}
+
+.el-popper.is-light .el-popper__arrow::before {
+  background: var(--af-bg-elevated) !important;
+  border: 1px solid var(--af-border-default) !important;
+}
+
+/* 表格 */
+.el-table {
+  --el-table-bg-color: var(--af-bg-secondary);
+  --el-table-tr-bg-color: var(--af-bg-secondary);
+  --el-table-header-bg-color: var(--af-bg-tertiary);
+  --el-table-row-hover-bg-color: var(--af-bg-tertiary);
+  --el-table-border-color: var(--af-border-default);
+  --el-table-text-color: var(--af-text-normal);
+  --el-table-header-text-color: var(--af-text-primary);
+}
+
+/* 分页 */
+.el-pagination {
+  --el-pagination-bg-color: var(--af-bg-secondary);
+  --el-pagination-text-color: var(--af-text-normal);
+  --el-pagination-button-bg-color: var(--af-bg-secondary);
+  --el-pagination-hover-color: var(--af-accent-primary);
+}
+
+/* 选择器 */
+.el-select {
+  --el-select-input-bg-color: var(--af-bg-secondary);
+  --el-select-border-color: var(--af-border-default);
+}
+
+.el-select-dropdown {
+  --el-select-dropdown-bg-color: var(--af-bg-elevated);
+  --el-select-dropdown-border: 1px solid var(--af-border-default);
+}
+
+/* 开关 */
+.el-switch {
+  --el-switch-on-color: var(--af-accent-primary);
+  --el-switch-off-color: var(--af-bg-tertiary);
+}
+
+/* 滑块 */
+.el-slider {
+  --el-slider-main-bg-color: var(--af-accent-primary);
+  --el-slider-runway-bg-color: var(--af-bg-tertiary);
+  --el-slider-button-wrapper-bg-color: var(--af-bg-elevated);
+}
+
+/* 进度条 */
+.el-progress {
+  --el-progress-text-color: var(--af-text-normal);
+}
+
+/* 标签页 */
+.el-tabs {
+  --el-tabs-header-bg-color: var(--af-bg-secondary);
+}
+
+/* 折叠面板 */
+.el-collapse {
+  --el-collapse-header-bg-color: var(--af-bg-secondary);
+  --el-collapse-content-bg-color: var(--af-bg-secondary);
+  --el-collapse-border-color: var(--af-border-default);
+}
+
+/* ==============================================
+   特殊覆盖（无官方 CSS 变量支持）
+   ============================================== */
+
+/* 原因：Element Plus 不提供对应的 CSS 变量 */
+.el-loading-mask {
+  background-color: var(--af-bg-overlay);
+}
+
+/* 原因：需要统一深色模式下的图标颜色 */
+.el-icon {
+  color: inherit;
+}
+
+/* 原因：优化对话框在深色模式下的视觉效果 */
+.el-overlay {
+  background-color: var(--af-bg-overlay);
+}
+
+/* ==============================================
+   AboutDialog 专用全局样式覆盖
+   el-dialog teleport 到 body，scoped 无法穿透
+   ============================================== */
+
+/* 原因：重置 dialog 默认 padding，通过 CSS 变量和直接属性双重覆盖确保生效 */
+/* 注意：class="about-dialog" 通过 $attrs 合并到 .el-dialog 同一元素上 */
+.el-dialog.about-dialog {
+  --el-dialog-padding-primary: 0;
+
+  padding: 0;
+  background: var(--af-bg-secondary);
+  border: 1px solid var(--af-border-default);
+}
+
+/* 原因：EP 用 padding-bottom/padding-right 单独属性，必须逐个覆盖 */
+/* .show-close 变体优先级 (0,3,0) 胜过 EP 的 (0,2,0) */
+.el-dialog.about-dialog .el-dialog__header,
+.el-dialog.about-dialog .el-dialog__header.show-close {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-top: 18px;
+  padding-right: 20px;
+  padding-bottom: 16px;
+  padding-left: 24px;
+  border-bottom: 1px solid var(--af-border-default);
+}
+
+.el-dialog.about-dialog .el-dialog__title {
+  color: var(--af-text-primary);
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+/* 原因：EP headerbtn 默认绝对定位 48x48，需改为 static 与标题对齐 */
+.el-dialog.about-dialog .el-dialog__headerbtn {
+  position: static;
+  width: 24px;
+  height: 24px;
+}
+
+/* 原因：Element Plus 不提供 body padding 的 CSS 变量 */
+.el-dialog.about-dialog .el-dialog__body {
+  padding: 24px 20px;
+}
+
+/* 原因：统一按钮 hover/active 样式 */
+.el-dialog.about-dialog .el-button:hover:not(:disabled) {
+  background: var(--af-bg-elevated);
+  border-color: var(--af-border-default);
+}
+
+.el-dialog.about-dialog .el-button:active:not(:disabled) {
+  background: var(--af-bg-tertiary);
+}
+
+/* ==============================================
+   UpdateDialog 专用全局样式覆盖
+   el-dialog teleport 到 body，scoped 无法穿透
+   ============================================== */
+
+/* 原因：重置 dialog 默认 padding，通过 CSS 变量和直接属性双重覆盖确保生效 */
+/* 注意：class="update-dialog" 通过 $attrs 合并到 .el-dialog 同一元素上 */
+.el-dialog.update-dialog {
+  --el-dialog-padding-primary: 0;
+
+  padding: 0;
+  background: var(--af-bg-secondary);
+  border: 1px solid var(--af-border-default);
+}
+
+/* 原因：EP 用 padding-bottom/padding-right 单独属性，必须逐个覆盖 */
+/* .show-close 变体优先级 (0,3,0) 胜过 EP 的 (0,2,0) */
+.el-dialog.update-dialog .el-dialog__header,
+.el-dialog.update-dialog .el-dialog__header.show-close {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-top: 18px;
+  padding-right: 20px;
+  padding-bottom: 16px;
+  padding-left: 24px;
+  border-bottom: 1px solid var(--af-border-default);
+}
+
+.el-dialog.update-dialog .el-dialog__title {
+  color: var(--af-text-primary);
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+/* 原因：EP headerbtn 默认绝对定位 48x48，需改为 static 与标题对齐 */
+.el-dialog.update-dialog .el-dialog__headerbtn {
+  position: static;
+  width: 24px;
+  height: 24px;
+}
+
+/* 原因：Element Plus 不提供 body padding 的 CSS 变量 */
+.el-dialog.update-dialog .el-dialog__body {
+  padding: 24px 20px;
+}
+
+/* 原因：Element Plus 不提供 footer padding/border 的 CSS 变量 */
+.el-dialog.update-dialog .el-dialog__footer {
+  border-top: 1px solid var(--af-border-default);
+  padding: 12px 20px;
+}
+
+/* 原因：统一按钮 hover/active 样式 */
+.el-dialog.update-dialog .el-button:hover:not(:disabled) {
+  background: var(--af-bg-elevated);
+  border-color: var(--af-border-default);
+}
+
+.el-dialog.update-dialog .el-button:active:not(:disabled) {
+  background: var(--af-bg-tertiary);
+}
+
+/* 原因：Element Plus .el-button + .el-button 默认 margin-left: 12px，需重置为由 gap 控制 */
+.el-dialog.update-dialog .btn-group-right .el-button + .el-button {
+  margin-left: 0;
+}
+
+/* ==============================================
+   创建任务 (upload-dialog) 专用全局样式覆盖
+   el-dialog teleport 到 body，scoped 无法穿透
+   ============================================== */
+
+/* 原因：class="upload-dialog" 通过 $attrs 合并到 .el-dialog 同一元素 */
+/* 显式设置 padding: 16px 恢复对话框边框与内容的间距 */
+.el-dialog.upload-dialog {
+  padding: 30px;
+  background: var(--af-bg-secondary);
+  border: 1px solid var(--af-border-default);
+}
+
+/* 原因：EP headerbtn 默认绝对定位 48x48，需改为 flex 内 static 与标题对齐 */
+.el-dialog.upload-dialog .el-dialog__header,
+.el-dialog.upload-dialog .el-dialog__header.show-close {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-top: 0;
+  padding-right: 0;
+  padding-bottom: 16px;
+  padding-left: 0;
+  border-bottom: 1px solid var(--af-border-default);
+}
+
+.el-dialog.upload-dialog .el-dialog__title {
+  color: var(--af-text-primary);
+  font-weight: 600;
+}
+
+.el-dialog.upload-dialog .el-dialog__headerbtn {
+  position: static;
+  width: 24px;
+  height: 24px;
+}
+
+.el-dialog.upload-dialog .el-dialog__headerbtn .el-dialog__close {
+  color: var(--af-text-secondary);
+}
+
+.el-dialog.upload-dialog .el-dialog__headerbtn .el-dialog__close:hover {
+  color: var(--af-text-primary);
+}
+
+.el-dialog.upload-dialog .el-dialog__body {
+  padding: 4px 0 0;
+  color: var(--af-text-primary);
+}
+
+.el-dialog.upload-dialog .el-dialog__footer {
+  padding: 16px 0 0;
+  border-top: 1px solid var(--af-border-default);
+}
+
+.el-dialog.upload-dialog .el-dialog__footer .dialog-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+}
+
+.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .selection-info {
+  color: var(--af-text-secondary);
+  font-size: 14px;
+}
+
+.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .footer-buttons {
+  display: flex;
+  gap: 8px;
+}
+
+/* 原因：统一按钮样式 */
+.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .footer-buttons .el-button {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--af-text-secondary);
+}
+
+.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .footer-buttons .el-button:hover {
+  background: var(--af-bg-tertiary);
+  border-color: var(--af-border-default);
+  color: var(--af-text-primary);
+}
+
+/* 原因：主操作按钮高亮样式 */
+.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .footer-buttons .primary-action-btn {
+  background-color: var(--af-accent-primary);
+  border-color: var(--af-accent-primary);
+  color: var(--af-text-on-dark);
+}
+
+.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .footer-buttons .primary-action-btn:disabled,
+.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .footer-buttons .primary-action-btn.is-disabled {
+  background-color: var(--af-bg-tertiary);
+  border-color: var(--af-border-default);
+  color: var(--af-text-disabled);
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
+.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .footer-buttons .primary-action-btn:hover:not(:disabled) {
+  background-color: var(--af-accent-primary-hover);
+  border-color: var(--af-accent-primary-hover);
+}
+
+/* ==============================================
+   EditorHeader 专用全局样式覆盖
+   ============================================== */
+
+/* 原因：Popover 深色主题需要覆盖 Element Plus 默认样式 */
+.control-popover-dark {
+  background: var(--af-bg-elevated) !important;
+  border-color: var(--af-border-default) !important;
+}
+
+.control-popover-dark .el-popper__arrow::before {
+  background: var(--af-bg-elevated) !important;
+  border-color: var(--af-border-default) !important;
+}
+
+.task-monitor-popover {
+  background: var(--af-bg-secondary) !important;
+  border-color: var(--af-border-default) !important;
+  padding: 0 !important;
+}
+
+.task-monitor-popover .el-popper__arrow::before {
+  background: var(--af-bg-secondary) !important;
+  border-color: var(--af-border-default) !important;
+}
+
+/* 原因：导出下拉菜单需要与任务监控配色一致 */
+.el-dropdown__popper.el-popper {
+  background: var(--af-bg-secondary) !important;
+  border: 1px solid var(--af-border-default) !important;
+  border-radius: 6px !important;
+  box-shadow: var(--af-shadow-lg) !important;
+  padding: 4px 0 !important;
+}
+
+.el-dropdown__popper.el-popper .el-popper__arrow::before {
+  background: var(--af-bg-secondary) !important;
+  border-color: var(--af-border-default) !important;
+}
+
+.el-dropdown__popper.el-popper .el-dropdown-menu {
+  background: transparent !important;
+  border: none !important;
+  padding: 0 !important;
+}
+
+.el-dropdown__popper.el-popper .el-dropdown-menu .el-dropdown-menu__item {
+  padding: 8px 16px !important;
+  font-size: 13px !important;
+  color: var(--af-text-primary) !important;
+  background: transparent !important;
+  transition: all 0.2s !important;
+}
+
+.el-dropdown__popper.el-popper .el-dropdown-menu .el-dropdown-menu__item:hover {
+  background: rgba(255, 255, 255, 0.03) !important;
+  color: var(--af-text-primary) !important;
+}
+
+.el-dropdown__popper.el-popper .el-dropdown-menu .el-dropdown-menu__item:focus {
+  background: rgba(255, 255, 255, 0.03) !important;
+  color: var(--af-text-primary) !important;
+}

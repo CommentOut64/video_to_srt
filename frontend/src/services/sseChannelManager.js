@@ -172,6 +172,16 @@ class SSEChannelManager extends EventEmitter {
       handlers.onAlignProgress?.(data)
     }
 
+    const handleLangidEvent = (eventType, data) => {
+      console.log(`[SSE Job ${jobId}] LangID 事件:`, eventType, data)
+      handlers.onLangidEvent?.(eventType, data)
+    }
+
+    const handleSpeakerEvent = (eventType, data) => {
+      console.log(`[SSE Job ${jobId}] Speaker 事件:`, eventType, data)
+      handlers.onSpeakerEvent?.(eventType, data)
+    }
+
     return this._subscribe(channelId, url, {
       // === 初始状态 ===
       initial_state: (data) => {
@@ -298,6 +308,16 @@ class SSEChannelManager extends EventEmitter {
         handlers.onBatchUpdate?.(data)
         handlers.onSubtitleUpdate?.(data)
       },
+
+      // === 预处理事件 ===
+      'preprocessing.langid.started': (data) => handleLangidEvent('preprocessing.langid.started', data),
+      'preprocessing.langid.progress': (data) => handleLangidEvent('preprocessing.langid.progress', data),
+      'preprocessing.langid.completed': (data) => handleLangidEvent('preprocessing.langid.completed', data),
+      'preprocessing.langid.error': (data) => handleLangidEvent('preprocessing.langid.error', data),
+      'preprocessing.speaker.started': (data) => handleSpeakerEvent('preprocessing.speaker.started', data),
+      'preprocessing.speaker.progress': (data) => handleSpeakerEvent('preprocessing.speaker.progress', data),
+      'preprocessing.speaker.completed': (data) => handleSpeakerEvent('preprocessing.speaker.completed', data),
+      'preprocessing.speaker.error': (data) => handleSpeakerEvent('preprocessing.speaker.error', data),
 
       // === 视频转码相关事件 ===
       // 分析完成事件（新增：智能转码决策）

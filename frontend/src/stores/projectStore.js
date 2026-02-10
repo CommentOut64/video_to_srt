@@ -27,10 +27,15 @@ export const useProjectStore = defineStore("project", () => {
     isDirty: false, // 是否有未保存修改
     // 渐进式加载相关（状态由 useProxyVideo composable 管理）
     currentResolution: null, // 当前视频分辨率 ('360p', '720p', 'source')
+    // V3.2.0+dev.20260130.09: 字幕全局时间偏移（秒）
+    subtitleOffset: 0,
   });
 
   // ========== 2. 字幕数据（Single Source of Truth） ==========
   const subtitles = ref([]);
+
+  // V3.2.0+dev.20260130.09: 字幕全局时间偏移（秒，正值延后，负值提前）
+  const subtitleOffset = ref(0);
 
   // 用户删除的字幕索引集合（用于阻止 SSE 回补）
   const deletedSentenceIndices = ref(new Set());
@@ -102,6 +107,88 @@ export const useProjectStore = defineStore("project", () => {
         player.value.currentTime >= s.start && player.value.currentTime < s.end
     );
   });
+
+  // ========== 6.1 字幕偏移辅助函数 ==========
+  function clampSubtitleOffset(value) {
+    const num = Number(value) || 0;
+    return Math.min(10, Math.max(-10, num));
+  }
+
+  function toDisplayTime(baseTime) {
+    return (Number(baseTime) || 0) + subtitleOffset.value;
+  }
+
+  function toBaseTime(displayTime) {
+    return (Number(displayTime) || 0) - subtitleOffset.value;
+  }
+
+  function shiftWords(words, delta) {
+    if (!Array.isArray(words) || words.length === 0) return [];
+    return words.map((word) => {
+      const start = word?.start;
+      const end = word?.end;
+      const nextStart = typeof start === 'number' ? Math.max(0, start + delta) : start;
+      const nextEnd = typeof end === 'number' ? Math.max(nextStart ?? 0, end + delta) : end;
+      return {
+        ...word,
+        start: nextStart,
+        end: nextEnd,
+      };
+    });
+  }
+
+  function applyOffsetDelta(delta) {
+    if (!delta) return;
+    subtitles.value = subtitles.value.map((subtitle) => {
+      const start = (Number(subtitle.start) || 0) + delta;
+      const end = (Number(subtitle.end) || 0) + delta;
+      const adjustedStart = Math.max(0, start);
+      const adjustedEnd = Math.max(adjustedStart, end);
+      return {
+        ...subtitle,
+        start: adjustedStart,
+        end: adjustedEnd,
+        words: shiftWords(subtitle.words, delta),
+      };
+    });
+  }
+
+  function applyOffsetToSentenceData(sentenceData) {
+    if (!sentenceData) return sentenceData;
+    const delta = subtitleOffset.value;
+    const start = toDisplayTime(sentenceData.start ?? 0);
+    const end = toDisplayTime(sentenceData.end ?? 0);
+    return {
+      ...sentenceData,
+      start: Math.max(0, start),
+      end: Math.max(Math.max(0, start), end),
+      words: shiftWords(sentenceData.words, delta),
+    };
+  }
+
+  function applyOffsetToSegments(segments) {
+    if (!Array.isArray(segments)) return [];
+    return segments.map((segment) => {
+      const start = toDisplayTime(segment.start ?? 0);
+      const end = toDisplayTime(segment.end ?? 0);
+      return {
+        ...segment,
+        start: Math.max(0, start),
+        end: Math.max(Math.max(0, start), end),
+      };
+    });
+  }
+
+  function setSubtitleOffset(value, options = {}) {
+    const { applyDelta = true } = options;
+    const normalized = Math.round(clampSubtitleOffset(value) * 1000) / 1000;
+    const previous = subtitleOffset.value;
+    subtitleOffset.value = normalized;
+    meta.value.subtitleOffset = normalized;
+    if (applyDelta) {
+      applyOffsetDelta(normalized - previous);
+    }
+  }
 
   const isDirty = computed(() => {
     return meta.value.isDirty || subtitles.value.some((s) => s.isDirty);
@@ -185,8 +272,8 @@ export const useProjectStore = defineStore("project", () => {
     subtitles.value = parsed.map((item, idx) => ({
       id: `subtitle-${Date.now()}-${idx}`,
       sentenceIndex: idx,  // V3.1.2: 添加 sentenceIndex 以支持 SSE 匹配
-      start: item.start,
-      end: item.end,
+      start: toDisplayTime(item.start),
+      end: toDisplayTime(item.end),
       text: item.text,
       isDirty: false,
       isModified: false,
@@ -208,6 +295,7 @@ export const useProjectStore = defineStore("project", () => {
       ...metadata,
       lastSaved: Date.now(),
       isDirty: false,
+      subtitleOffset: subtitleOffset.value,
     };
 
     // 清除历史记录，避免撤销到空状态
@@ -230,8 +318,8 @@ export const useProjectStore = defineStore("project", () => {
     subtitles.value = segments.map((seg) => ({
       id: `subtitle-${seg.id}`,
       sentenceIndex: seg.id,  // 关键：保留全局句子索引
-      start: seg.start,
-      end: seg.end,
+      start: toDisplayTime(seg.start),
+      end: toDisplayTime(seg.end),
       text: seg.text,
       isDirty: false,
       isModified: seg.is_modified ?? false,
@@ -251,6 +339,7 @@ export const useProjectStore = defineStore("project", () => {
       ...metadata,
       lastSaved: Date.now(),
       isDirty: false,
+      subtitleOffset: subtitleOffset.value,
     };
 
     // 清除历史记录，避免撤销到空状态
@@ -270,6 +359,9 @@ export const useProjectStore = defineStore("project", () => {
         const cached = memoryCache.get(jobId);
         subtitles.value = cached.subtitles;
         meta.value = cached.meta;
+        if (cached?.meta?.subtitleOffset !== undefined) {
+          setSubtitleOffset(cached.meta.subtitleOffset, { applyDelta: false });
+        }
         // 恢复后清除历史记录，防止撤回到转录期间的状态
         clearHistory();
         console.log("[ProjectStore] 项目已从内存缓存恢复");
@@ -281,6 +373,9 @@ export const useProjectStore = defineStore("project", () => {
       if (saved) {
         subtitles.value = saved.subtitles;
         meta.value = saved.meta;
+        if (saved?.meta?.subtitleOffset !== undefined) {
+          setSubtitleOffset(saved.meta.subtitleOffset, { applyDelta: false });
+        }
         // 恢复后清除历史记录，防止撤回到转录期间的状态
         clearHistory();
         console.log("[ProjectStore] 项目已从存储恢复");
@@ -688,17 +783,18 @@ export const useProjectStore = defineStore("project", () => {
     const existingIndex = subtitles.value.findIndex((s) => s.id === subtitleId);
 
     // V3.1.2+dev.20260111.01: 包含 display_confidence 和 confidence_source
+    const normalized = applyOffsetToSentenceData({ start, end, words });
     const subtitleData = {
       id: subtitleId,
-      start,
-      end,
+      start: normalized.start,
+      end: normalized.end,
       text,
       isDirty: false,
       isModified: sentenceData.is_modified ?? false,
       originalText: sentenceData.original_text ?? null,
       chunk_id,
       isDraft: true, // 标记为草稿
-      words,
+      words: normalized.words,
       confidence,
       display_confidence,  // V3.1.2: 映射后准确率
       confidence_source,   // V3.1.2: 置信度来源
@@ -713,7 +809,7 @@ export const useProjectStore = defineStore("project", () => {
       console.log(`[ProjectStore] 更新草稿字幕: ${subtitleId}`);
     } else {
       // 按时间顺序插入
-      const insertIndex = findInsertIndex(start);
+      const insertIndex = findInsertIndex(normalized.start);
       subtitles.value.splice(insertIndex, 0, subtitleData);
 
       // 更新 Chunk 映射
@@ -770,18 +866,23 @@ export const useProjectStore = defineStore("project", () => {
         return;
       }
       const subtitleId = buildUniqueSubtitleId(`final-${chunk_id}-${idx}`);
+      const normalized = applyOffsetToSentenceData({
+        start: sentence.start,
+        end: sentence.end,
+        words: sentence.words || [],
+      });
       // V3.1.2+dev.20260111.01: 包含 display_confidence 和 confidence_source
       const subtitleData = {
         id: subtitleId,
-        start: sentence.start,
-        end: sentence.end,
+        start: normalized.start,
+        end: normalized.end,
         text: sentence.text,
         isDirty: false,
         isModified: sentence.is_modified ?? false,
         originalText: sentence.original_text ?? null,
         chunk_id,
         isDraft: false, // 定稿
-        words: sentence.words || [],
+        words: normalized.words || [],
         confidence: sentence.confidence ?? null,
         display_confidence: sentence.display_confidence,  // V3.1.2: 映射后准确率
         confidence_source: sentence.confidence_source,    // V3.1.2: 置信度来源
@@ -791,7 +892,7 @@ export const useProjectStore = defineStore("project", () => {
       };
 
       // 按时间顺序插入
-      const insertIndex = findInsertIndex(sentence.start);
+      const insertIndex = findInsertIndex(normalized.start);
       subtitles.value.splice(insertIndex, 0, subtitleData);
       newSubtitleIds.push(subtitleId);
     });
@@ -857,11 +958,16 @@ export const useProjectStore = defineStore("project", () => {
       }
       // 使用 restored 前缀标识恢复的字幕
       const subtitleId = `restored-${chunk_id}-${sentence.index ?? idx}`;
+      const normalized = applyOffsetToSentenceData({
+        start: sentence.start,
+        end: sentence.end,
+        words: sentence.words || [],
+      });
       // V3.1.2+dev.20260111.01: 包含 display_confidence 和 confidence_source
       const subtitleData = {
         id: subtitleId,
-        start: sentence.start,
-        end: sentence.end,
+        start: normalized.start,
+        end: normalized.end,
         text: sentence.text,
         isDirty: false,
         isModified: sentence.is_modified ?? false,
@@ -869,7 +975,7 @@ export const useProjectStore = defineStore("project", () => {
         chunk_id,
         isDraft: sentence.is_draft ?? false,
         isRestored: true, // 标记为恢复的字幕
-        words: sentence.words || [],
+        words: normalized.words || [],
         confidence: sentence.confidence ?? null,
         display_confidence: sentence.display_confidence,  // V3.1.2: 映射后准确率
         confidence_source: sentence.confidence_source,    // V3.1.2: 置信度来源
@@ -879,7 +985,7 @@ export const useProjectStore = defineStore("project", () => {
       };
 
       // 按时间顺序插入
-      const insertIndex = findInsertIndex(sentence.start);
+      const insertIndex = findInsertIndex(normalized.start);
       subtitles.value.splice(insertIndex, 0, subtitleData);
       newSubtitleIds.push(subtitleId);
     });
@@ -1078,6 +1184,8 @@ export const useProjectStore = defineStore("project", () => {
       isDirty: false,
       // 渐进式加载相关（状态由 useProxyVideo composable 管理）
       currentResolution: null,
+      // V3.2.0+dev.20260130.09: 字幕全局时间偏移（秒）
+      subtitleOffset: subtitleOffset.value,
     };
     player.value = {
       currentTime: 0,
@@ -1155,6 +1263,7 @@ export const useProjectStore = defineStore("project", () => {
     subtitles,
     player,
     view,
+    subtitleOffset,
 
     // Phase 5: 双模态架构状态
     chunkSubtitleMap,
@@ -1202,6 +1311,11 @@ export const useProjectStore = defineStore("project", () => {
     updateDualStreamProgressFromSSE,  // V3.1.0: 从 SSE 更新双流进度
 
     // 辅助方法
+    setSubtitleOffset,
+    toBaseTime,
+    toDisplayTime,
+    applyOffsetToSegments,
+    applyOffsetToSentenceData,
     formatTimestamp,
     parseTimestamp,
   };

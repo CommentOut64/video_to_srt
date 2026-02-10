@@ -3,9 +3,14 @@
 
 用于双流对齐架构中的置信度追踪和对齐结果表示
 """
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, TYPE_CHECKING
 from enum import Enum
+
+if TYPE_CHECKING:
+    from app.services.alignment.gap_resolver import GapResolution
 
 
 class AlignmentStatus(Enum):
@@ -37,6 +42,7 @@ class ConfidenceLevel(Enum):
             return cls.VERY_LOW
 
 
+# V3.2.0+dev.20260205.09: 对齐词级置信度支持来源标记与空值口径。
 @dataclass
 class AlignedWord:
     """对齐后的字级时间戳（双流对齐版）"""
@@ -45,9 +51,10 @@ class AlignedWord:
     end: float
 
     # 置信度信息
-    sv_confidence: float = 1.0        # SenseVoice 原始置信度
-    whisper_confidence: float = 1.0   # Whisper 置信度（如有）
-    final_confidence: float = 1.0     # 最终综合置信度
+    sv_confidence: Optional[float] = 1.0        # SenseVoice 原始置信度
+    whisper_confidence: Optional[float] = None  # Whisper 置信度（如有）
+    final_confidence: Optional[float] = 1.0     # 最终综合置信度
+    confidence_source: Optional[str] = None     # 置信度来源（fast/slow/unknown）
 
     # 对齐状态
     alignment_status: AlignmentStatus = field(default=AlignmentStatus.MATCHED)
@@ -66,6 +73,7 @@ class AlignedWord:
             "sv_confidence": self.sv_confidence,
             "whisper_confidence": self.whisper_confidence,
             "final_confidence": self.final_confidence,
+            "confidence_source": self.confidence_source,
             "alignment_status": self.alignment_status.value,
             "is_pseudo": self.is_pseudo,
             "sv_original": self.sv_original,
@@ -75,6 +83,8 @@ class AlignedWord:
     @property
     def confidence_level(self) -> ConfidenceLevel:
         """获取置信度等级"""
+        if self.final_confidence is None:
+            return ConfidenceLevel.VERY_LOW
         return ConfidenceLevel.from_score(self.final_confidence)
 
     @property
@@ -98,6 +108,10 @@ class AlignedSubtitle:
     # 对齐质量
     alignment_score: float = 1.0                 # 对齐质量分数 (0-1)
     matched_ratio: float = 1.0                   # 匹配比例
+    coverage: float = 1.0                        # 对齐覆盖率
+    gap_ratio: float = 0.0                       # Gap 比例
+    gap_resolution: Optional["GapResolution"] = None  # Gap 处理策略
+    gap_positions: List[int] = field(default_factory=list)  # Gap 聚集位置
 
     # 来源信息
     sv_text: Optional[str] = None                # SenseVoice 原始文本
@@ -122,9 +136,13 @@ class AlignedSubtitle:
         if not self.words:
             return
 
-        confidences = [w.final_confidence for w in self.words]
-        self.avg_confidence = sum(confidences) / len(confidences)
-        self.min_confidence = min(confidences)
+        confidences = [w.final_confidence for w in self.words if w.final_confidence is not None]
+        if confidences:
+            self.avg_confidence = sum(confidences) / len(confidences)
+            self.min_confidence = min(confidences)
+        else:
+            self.avg_confidence = 0.0
+            self.min_confidence = 0.0
 
         # 计算匹配比例
         matched_count = sum(1 for w in self.words
@@ -148,6 +166,10 @@ class AlignedSubtitle:
             "min_confidence": self.min_confidence,
             "alignment_score": self.alignment_score,
             "matched_ratio": self.matched_ratio,
+            "coverage": self.coverage,
+            "gap_ratio": self.gap_ratio,
+            "gap_resolution": self.gap_resolution.value if self.gap_resolution else None,
+            "gap_positions": self.gap_positions,
             "sv_text": self.sv_text,
             "whisper_text": self.whisper_text,
             "vad_start": self.vad_start,

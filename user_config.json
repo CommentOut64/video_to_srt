@@ -1,5 +1,5 @@
 {
   "default_preload_model": "medium",
-  "subtitle_time_offset": 0.0,
+  "subtitle_time_offset": -0.3,
   "version": "1.0"
 }

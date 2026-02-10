@@ -138,12 +138,12 @@ defineExpose({ show, hide });
 .context-menu {
   position: fixed;
   z-index: 9999;
-  min-width: 160px;
+  padding: 0;
   background: var(--bg-secondary, #2d2d2d);
   border: 1px solid var(--border-color, #404040);
   border-radius: 6px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-  padding: 0;
+  min-width: 160px;
+  box-shadow: 0 4px 12px rgb(0 0 0 / 30%);
   user-select: none;
   overflow: hidden;
 }
@@ -153,7 +153,7 @@ defineExpose({ show, hide });
   align-items: center;
   width: 100%;
   padding: 8px 12px;
-  margin: 0px;
+  margin: 0;
   cursor: pointer;
   color: var(--text-primary, #e0e0e0);
   font-size: 13px;

@@ -75,6 +75,7 @@ class TranscriptionService:
         from app.services.sse_service import get_sse_manager
         self.sse_manager = get_sse_manager()
         self.logger.info("SSE管理器已集成")
+        self._vad_intervals: Optional[List[Tuple[float, float]]] = None
 
         # 记录CPU信息
         sys_info = self.hardware_profile_provider.get_cpu_system_info()
@@ -221,6 +222,13 @@ class TranscriptionService:
                 whisper_patch_trigger_confidence=patching_threshold_value
             )
 
+            from app.services.punctuation.debug_utils import is_debug_punctuation_enabled
+            debug_config = getattr(job.settings, "debug", None)
+            debug_punctuation = is_debug_punctuation_enabled(
+                env_value=os.getenv("DEBUG_PUNCTUATION"),
+                config_value=bool(getattr(debug_config, "punctuation_output", False)),
+            )
+
             # 动态创建转录流水线
             transcription_pipeline = AsyncDualPipeline(
                 job_id=job.job_id,
@@ -228,12 +236,15 @@ class TranscriptionService:
                 draft_engine=draft_engine,
                 patch_engine=patch_engine,
                 patching_threshold=patching_threshold,
+                debug_punctuation=debug_punctuation,
                 logger=self.logger
             )
 
             # 调用转录流水线
             results = await transcription_pipeline.run(
-                audio_chunks=chunks
+                audio_chunks=chunks,
+                job_dir=job_dir,
+                vad_intervals=self._vad_intervals,
             )
 
             # 从 ProcessingContext 中提取句子
@@ -258,7 +269,15 @@ class TranscriptionService:
 
             srt_path = job_dir / f"{Path(job.filename).stem}.srt"
             subtitle_output = get_subtitle_output_service()
-            segments = subtitle_output.build_segments(final_sentences)
+            from app.services.user_config_service import get_user_config_service
+            offset = get_user_config_service().resolve_subtitle_time_offset(
+                getattr(job, "subtitle_time_offset", None)
+            )
+            segments = subtitle_output.build_segments(
+                final_sentences,
+                apply_offset=True,
+                offset_override=offset
+            )
             subtitle_output.write_srt(segments, srt_path)
 
             job.srt_path = str(srt_path)
@@ -288,6 +307,7 @@ class TranscriptionService:
         Returns:
             List[AudioChunk]: 预处理完成的 Chunk 列表
         """
+        self._vad_intervals = None
         from app.pipelines.preprocessing_pipeline import PreprocessingPipeline
         from app.services.audio.chunk_engine import ChunkEngine
         from app.services.runtime_param_resolver import build_vad_config_for_profile
@@ -318,6 +338,7 @@ class TranscriptionService:
             video_path=str(input_path),
             job_state=job
         )
+        self._vad_intervals = preprocessing_pipeline.get_vad_intervals()
 
         # 记录统计信息
         stats = preprocessing_pipeline.get_statistics(chunks)
@@ -1715,12 +1736,17 @@ class TranscriptionService:
                 WordTimestamp(**w) if isinstance(w, dict) else w
                 for w in result_dict.get('words', [])
             ]
+            raw_tokens = [
+                WordTimestamp(**w) if isinstance(w, dict) else w
+                for w in result_dict.get('raw_tokens', []) or []
+            ]
 
             result = SenseVoiceResult(
                 text=result_dict.get('text', ''),
                 text_clean=result_dict.get('text_clean', ''),
                 confidence=result_dict.get('confidence', 1.0),
                 words=words,
+                raw_tokens=raw_tokens or None,
                 start=0.0,  # Chunk 级别的起始时间，由调用者设置
                 end=len(audio_array) / sample_rate,
                 language=result_dict.get('language'),
@@ -1799,8 +1825,12 @@ class TranscriptionService:
             sentence.start += chunk_start_time
             sentence.end += chunk_start_time
             sentence.source = TextSource.SENSEVOICE
-            # V3.1.2+dev.20260111.01: 使用 update_confidence 确保 display_confidence 同步更新
-            sentence.update_confidence(sv_result.confidence, source="sensevoice")
+            # V3.2.0+dev.20260131.02: 保留分句计算的置信度口径，仅同步映射
+            sentence.update_confidence(
+                sentence.confidence,
+                source="sensevoice",
+                display_raw=sentence.confidence_display_raw
+            )
 
             # 调整字级时间戳的偏移
             for word in sentence.words:
