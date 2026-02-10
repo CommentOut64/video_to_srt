@@ -227,6 +227,9 @@ markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "gpu: marks tests that require GPU",
     "integration: marks integration tests",
+    "integration_ci: marks CI-safe integration tests (no model dependencies)",
+    "quality: marks quality evaluation tests",
+    "local_integration: marks local-only integration tests",
 ]
 
 # Coverage 配置

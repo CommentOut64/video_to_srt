@@ -1,0 +1,31 @@
+# CI 环境最小依赖
+# 不含 torch/onnxruntime/demucs 等重型包
+
+# 测试框架
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+pytest-cov>=4.1.0
+pytest-mock>=3.12.0
+
+# HTTP 客户端
+httpx>=0.27.0
+
+# 代码检查
+ruff>=0.6.0
+
+# 核心依赖
+numpy==1.26.4
+pydantic>=2.0.0,<3.0.0
+
+# Web 框架
+fastapi>=0.104.0
+uvicorn>=0.24.0
+sse-starlette>=1.8.0
+
+# 日志和工具
+loguru>=0.7.0
+colorama
+tqdm
+click
+pyyaml>=6.0
+python-dateutil
