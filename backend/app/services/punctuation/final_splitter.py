@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from app.models.sensevoice_models import SentenceSegment, WordTimestamp
 from app.services.punctuation.base import PuncPosition
@@ -71,18 +71,22 @@ class FinalSplitter:
             words=list(words),
             positions=punctuation_positions or [],
         )
-        self.last_split_stats = stats
-        segments = self._split_words(
+        segments, split_stats = self._split_words(
             list(words),
             min_tokens=self.config.min_tokens,
             external_strength=external_strength,
         )
+        stats.update(split_stats)
         if not self.config.enable_balance:
+            self.last_split_stats = stats
             return segments
 
         segments = self._merge_short_segments(segments)
         segments = self._split_long_segments(segments)
         segments = self._merge_short_segments(segments)
+        segments, continuation_merge_count = self._merge_continuation_segments(segments)
+        stats["continuation_merge_count"] = float(continuation_merge_count)
+        self.last_split_stats = stats
         return segments
 
     def set_language(self, language: str) -> None:
@@ -95,11 +99,12 @@ class FinalSplitter:
         words: List[WordTimestamp],
         min_tokens: int,
         external_strength: Optional[Dict[int, int]] = None,
-    ) -> List[SentenceSegment]:
+    ) -> Tuple[List[SentenceSegment], Dict[str, float]]:
         segments: List[SentenceSegment] = []
         start_idx = 0
         last_candidate_idx: Optional[int] = None
         last_candidate_strength = 0
+        pause_split_blocked_count = 0
         external_strength = external_strength or {}
 
         for idx, word in enumerate(words):
@@ -139,6 +144,9 @@ class FinalSplitter:
                 continue
 
             if pause_strength >= 2 and tokens >= min_tokens and duration >= self.config.min_duration:
+                if self._should_block_pause_split(words, start_idx, idx):
+                    pause_split_blocked_count += 1
+                    continue
                 segments.append(self._build_sentence(words, start_idx, idx))
                 start_idx = idx + 1
                 last_candidate_idx = None
@@ -151,6 +159,9 @@ class FinalSplitter:
                 and duration >= self.config.min_duration
                 and (punct_strength >= 1 or tokens >= self.config.max_tokens)
             ):
+                if self._should_block_pause_split(words, start_idx, idx):
+                    pause_split_blocked_count += 1
+                    continue
                 segments.append(self._build_sentence(words, start_idx, idx))
                 start_idx = idx + 1
                 last_candidate_idx = None
@@ -159,7 +170,44 @@ class FinalSplitter:
         if start_idx < len(words):
             segments.append(self._build_sentence(words, start_idx, len(words) - 1))
 
-        return [seg for seg in segments if seg and seg.words]
+        return [seg for seg in segments if seg and seg.words], {
+            "pause_split_blocked_count": float(pause_split_blocked_count),
+        }
+
+    def _should_block_pause_split(
+        self,
+        words: List[WordTimestamp],
+        start_idx: int,
+        boundary_idx: int,
+    ) -> bool:
+        """停顿切分保护：续接词/不完整结尾时避免句中误切。"""
+        next_idx = self._next_real_word_index(words, boundary_idx)
+        if next_idx is None:
+            return False
+
+        strategy = self._sentence_builder.config.get_strategy()
+        next_probe = self._build_probe_text(words, next_idx)
+        if next_probe and strategy.is_continuation(next_probe):
+            return True
+
+        current_token = self._normalize_boundary_token(words[boundary_idx].word or "")
+        if current_token and strategy.is_incomplete_ending(current_token):
+            return True
+
+        # V3.2.0+dev.20260210.01: 英文兜底规则。
+        # 对无强句末标点且后句小写开头的边界，判定为更可能是句内续写，优先阻断停顿切分。
+        prev_raw = str(words[boundary_idx].word or "").strip()
+        next_first = self._normalize_boundary_token(words[next_idx].word or "")
+        if (
+            next_first
+            and self._is_ascii_word(next_first)
+            and next_first[:1].islower()
+            and not any(prev_raw.endswith(ch) for ch in _STRONG_PUNCT)
+            and boundary_idx >= start_idx
+        ):
+            return True
+
+        return False
 
     def _select_force_split(
         self,
@@ -265,9 +313,79 @@ class FinalSplitter:
 
         return merged
 
+    def _merge_continuation_segments(self, segments: List[SentenceSegment]) -> Tuple[List[SentenceSegment], int]:
+        """切分后回并：处理“续接词开头”导致的误切片段。"""
+        if len(segments) <= 1:
+            return segments, 0
+
+        merged: List[SentenceSegment] = [segments[0]]
+        merge_count = 0
+        for current in segments[1:]:
+            previous = merged[-1]
+            if self._should_merge_continuation_pair(previous, current):
+                candidate = self._merge_two_segments(previous, current)
+                if (
+                    len(candidate.words) <= self.config.max_tokens
+                    and (candidate.end - candidate.start) <= self.config.max_duration * 1.2
+                ):
+                    merged[-1] = candidate
+                    merge_count += 1
+                    continue
+            merged.append(current)
+
+        return merged, merge_count
+
+    def _should_merge_continuation_pair(self, left: SentenceSegment, right: SentenceSegment) -> bool:
+        if not left.words or not right.words:
+            return False
+        strategy = self._sentence_builder.config.get_strategy()
+        left_last = self._normalize_boundary_token(left.words[-1].word or "")
+        right_probe = self._build_probe_text(right.words, 0)
+        if right_probe and strategy.is_continuation(right_probe):
+            return True
+        if left_last and strategy.is_incomplete_ending(left_last):
+            return True
+        return False
+
     def _merge_two_segments(self, left: SentenceSegment, right: SentenceSegment) -> SentenceSegment:
         words = left.words + right.words
         return self._build_sentence(words, 0, len(words) - 1)
+
+    @staticmethod
+    def _next_real_word_index(words: List[WordTimestamp], boundary_idx: int) -> Optional[int]:
+        next_idx = boundary_idx + 1
+        while next_idx < len(words) and getattr(words[next_idx], "is_pseudo", False):
+            next_idx += 1
+        if next_idx >= len(words):
+            return None
+        return next_idx
+
+    def _build_probe_text(
+        self,
+        words: Sequence[WordTimestamp],
+        start_idx: int,
+        window_size: int = 3,
+    ) -> str:
+        tokens: List[str] = []
+        idx = start_idx
+        while idx < len(words) and len(tokens) < window_size:
+            if getattr(words[idx], "is_pseudo", False):
+                idx += 1
+                continue
+            token = self._normalize_boundary_token(words[idx].word or "")
+            if token:
+                tokens.append(token)
+            idx += 1
+        return " ".join(tokens)
+
+    @staticmethod
+    def _normalize_boundary_token(token: str) -> str:
+        trim_chars = "".join(_STRONG_PUNCT | _WEAK_PUNCT) + "\"'”’）)]}】」』"
+        return token.replace("▁", " ").strip().strip(trim_chars)
+
+    @staticmethod
+    def _is_ascii_word(token: str) -> bool:
+        return bool(token) and all(ch.isascii() for ch in token)
 
     def _build_sentence(
         self,

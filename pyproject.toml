@@ -2,7 +2,7 @@
 # anchor-flux - 项目配置
 # ============================================================
 # 统一依赖管理：生产环境依赖 + 可选开发依赖
-# CUDA 版本: 12.1 统一方案 (PyTorch cu121 内置所有 CUDA 库)
+# CUDA 版本: 12.8 统一方案 (PyTorch cu128 内置所有 CUDA 库)
 # 更新时间: 2026-02-09
 # ============================================================
 
@@ -38,14 +38,14 @@ dependencies = [
     "scipy>=1.11.0,<2.0.0",
     "sympy>=1.12",
 
-    # --- PyTorch 生态 (CUDA 12.1) ---
-    # cu121 自带完整的 CUDA 12.1 + cuDNN 9.x，无需额外安装 nvidia-* 包
-    "torch==2.4.1",
-    "torchaudio==2.4.1",
+    # --- PyTorch 生态 (CUDA 12.8) ---
+    # cu128 自带完整的 CUDA 12.8 运行时能力，无需额外安装 nvidia-* 包
+    "torch==2.10.0",
+    "torchaudio==2.10.0",
 
     # --- AI 推理引擎 ---
     "faster-whisper==1.2.1",
-    "ctranslate2>=4.5.0",  # 4.5.0+ 支持 cuDNN 9.x (PyTorch 2.4.1 自带)
+    "ctranslate2>=4.5.0",  # 4.5.0+ 支持新 CUDA/cuDNN 运行时
     "onnxruntime-gpu==1.18.0",  # CUDA 12.x + cuDNN 8.x
 
     # --- 标点恢复/分词 ---
@@ -162,16 +162,16 @@ override-dependencies = [
 
 # 特殊依赖源配置
 [tool.uv.sources]
-# PyTorch 从官方 cu121 源安装
+# PyTorch 从官方 cu128 源安装
 torch = { index = "pytorch" }
 torchaudio = { index = "pytorch" }
 # Brouhaha 从 GitHub 安装
 brouhaha = { git = "https://github.com/marianne-m/brouhaha-vad" }
 
-# PyTorch 官方 CUDA 12.1 源
+# PyTorch 官方 CUDA 12.8 源
 [[tool.uv.index]]
 name = "pytorch"
-url = "https://download.pytorch.org/whl/cu121"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 # ============================================================
@@ -227,6 +227,9 @@ markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "gpu: marks tests that require GPU",
     "integration: marks integration tests",
+    "integration_ci: marks CI-safe integration tests (no model dependencies)",
+    "quality: marks quality evaluation tests",
+    "local_integration: marks local-only integration tests",
 ]
 
 # Coverage 配置
@@ -281,9 +284,9 @@ Issues = "https://github.com/CommentOut64/video-to-srt/issues"
 #   uv sync --all-extras
 #
 # 手动安装 (如果 uv sync 失败):
-#   1. 安装 PyTorch (CUDA 12.1):
-#      uv pip install torch==2.4.1+cu121 torchaudio==2.4.1+cu121 \
-#        --index-url https://download.pytorch.org/whl/cu121
+#   1. 安装 PyTorch (CUDA 12.8):
+#      uv pip install torch==2.10.0+cu128 torchaudio==2.10.0+cu128 \
+#        --index-url https://download.pytorch.org/whl/cu128
 #
 #   2. 安装项目依赖:
 #      uv pip install -e .
@@ -344,18 +347,18 @@ Issues = "https://github.com/CommentOut64/video-to-srt/issues"
 # ============================================================
 #
 # 1. CUDA 版本要求:
-#    - 驱动版本 >= 525.60.13 (Linux) / 528.33 (Windows)
-#    - 支持 CUDA 12.1 的 NVIDIA GPU
+#    - 驱动版本需满足 CUDA 12.8 运行要求（建议使用较新稳定版驱动）
+#    - 支持 CUDA 12.8 的 NVIDIA GPU
 #
 # 2. 已移除的依赖:
-#    - nvidia-cublas-cu12 (PyTorch cu121 已内置)
-#    - nvidia-cudnn-cu12 (PyTorch cu121 已内置)
-#    - nvidia-cuda-nvrtc-cu12 (PyTorch cu121 已内置)
+#    - nvidia-cublas-cu12 (PyTorch cu128 已内置)
+#    - nvidia-cudnn-cu12 (PyTorch cu128 已内置)
+#    - nvidia-cuda-nvrtc-cu12 (PyTorch cu128 已内置)
 #    - funasr-onnx (已被自研 SenseVoice ONNX 替代)
 #    - onnxruntime (被 onnxruntime-gpu 替代，通过 override 强制)
 #
 # 3. 特殊处理:
 #    - brouhaha: 通过 tool.uv.sources 从 GitHub 安装 (ghfast.top 代理)
-#    - torch/torchaudio: 通过 tool.uv.sources 指定 cu121 源
+#    - torch/torchaudio: 通过 tool.uv.sources 指定 cu128 源
 #
 # ============================================================

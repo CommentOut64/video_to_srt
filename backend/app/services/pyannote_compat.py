@@ -1,0 +1,128 @@
+"""
+Pyannote 兼容适配层。
+
+目标：
+1. 统一处理 pyannote 3.x/未来 4.x 的鉴权参数差异；
+2. 在 huggingface_hub 新版本下兼容旧的 use_auth_token 调用；
+3. 为业务模块提供单一加载入口，降低后续升级改造成本。
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Optional
+
+LOGGER = logging.getLogger(__name__)
+_PATCH_FLAG = "_pyannote_hf_hub_patched"
+
+
+def patch_huggingface_hub_for_pyannote(
+    logger: Optional[logging.Logger] = None,
+) -> bool:
+    """对 huggingface_hub 做一次性兼容补丁。"""
+    active_logger = logger or LOGGER
+    try:
+        import huggingface_hub.file_download as hf_download
+    except Exception as exc:
+        active_logger.debug(
+            "huggingface_hub 不可用，跳过 pyannote 兼容补丁: %s",
+            exc,
+        )
+        return False
+
+    if getattr(hf_download, _PATCH_FLAG, False):
+        return True
+
+    original_hf_hub_download = hf_download.hf_hub_download
+
+    def patched_hf_hub_download(*args: Any, **kwargs: Any) -> Any:
+        # 兼容旧调用：use_auth_token -> token
+        if "use_auth_token" in kwargs:
+            if "token" not in kwargs:
+                kwargs["token"] = kwargs["use_auth_token"]
+            kwargs.pop("use_auth_token", None)
+        return original_hf_hub_download(*args, **kwargs)
+
+    hf_download.hf_hub_download = patched_hf_hub_download
+    setattr(hf_download, _PATCH_FLAG, True)
+    active_logger.debug("已应用 pyannote/huggingface_hub 兼容补丁")
+    return True
+
+
+def _load_pyannote_object(
+    object_type: str,
+    checkpoint: str,
+    token: Optional[str] = None,
+    logger: Optional[logging.Logger] = None,
+    **kwargs: Any,
+) -> Any:
+    """统一加载 pyannote Pipeline/Model，并兼容 token 参数差异。"""
+    active_logger = logger or LOGGER
+    patch_huggingface_hub_for_pyannote(active_logger)
+
+    if object_type == "pipeline":
+        from pyannote.audio import Pipeline
+
+        pyannote_cls = Pipeline
+    elif object_type == "model":
+        from pyannote.audio import Model
+
+        pyannote_cls = Model
+    else:
+        raise ValueError(f"不支持的 pyannote 对象类型: {object_type}")
+
+    call_kwargs = dict(kwargs)
+    if token:
+        call_kwargs["token"] = token
+
+    try:
+        return pyannote_cls.from_pretrained(checkpoint, **call_kwargs)
+    except TypeError as exc:
+        # 兼容极端场景：若某版本仍要求 use_auth_token，则自动回退。
+        should_retry_with_legacy_token = (
+            token is not None
+            and "token" in str(exc)
+            and "unexpected keyword" in str(exc)
+        )
+        if not should_retry_with_legacy_token:
+            raise
+
+        legacy_kwargs = dict(kwargs)
+        legacy_kwargs["use_auth_token"] = token
+        active_logger.warning(
+            "pyannote from_pretrained 不接受 token 参数，回退 use_auth_token"
+        )
+        return pyannote_cls.from_pretrained(checkpoint, **legacy_kwargs)
+
+
+def load_pyannote_pipeline(
+    checkpoint: str,
+    token: Optional[str] = None,
+    logger: Optional[logging.Logger] = None,
+    **kwargs: Any,
+) -> Any:
+    """加载 pyannote Pipeline（VAD/分割等）。"""
+    return _load_pyannote_object(
+        object_type="pipeline",
+        checkpoint=checkpoint,
+        token=token,
+        logger=logger,
+        **kwargs,
+    )
+
+
+def load_pyannote_model(
+    checkpoint: str,
+    token: Optional[str] = None,
+    logger: Optional[logging.Logger] = None,
+    **kwargs: Any,
+) -> Any:
+    """加载 pyannote Model（如 Brouhaha 权重）。"""
+    return _load_pyannote_object(
+        object_type="model",
+        checkpoint=checkpoint,
+        token=token,
+        logger=logger,
+        **kwargs,
+    )
+

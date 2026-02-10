@@ -6,7 +6,7 @@
 
 [![Chinese README](https://img.shields.io/badge/README-中文-blue.svg)](README.md)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Version](https://img.shields.io/badge/version-v3.1.1-brightgreen.svg)
+![Version](https://img.shields.io/badge/version-v3.2.2-brightgreen.svg)
 ![Vue](https://img.shields.io/badge/Vue-3.5+-4FC08D?logo=vue.js&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-009688?logo=fastapi&logoColor=white)
@@ -168,146 +168,123 @@ The system supports two runtime modes, switched via the `DEV_MODE` parameter in 
 
 ### AI Models
 
-* **Whisper** - Semantic recognition
-* **SenseVoice** - Time anchoring and draft, CTC word-level timestamps
-* **Silero VAD** - Voice activity detection, implementing intelligent segmentation
+* **Whisper** - Semantic recognition, contextual understanding
+* **SenseVoice** - Time anchoring, CTC word-level timestamps
+* **Silero VAD** - Voice activity detection, smart accumulation segmentation
 * **Demucs** - Vocal separation, eliminating background noise
-* **YAMNet** - Audio classification, identifying non-speech environmental sounds
+* **YAMNet** - Audio event classification, spectral triage decision
+* **SpeechBrain** - Language detection, multilingual recognition
 
 ## Architecture Overview
 
-```
-╔═══════════════════════════════════════════════════════════════════════════╗
-║                 AnchorFlux Dual-Anchor Streaming Transcription Architecture                            ║
-╚═══════════════════════════════════════════════════════════════════════════╝
+```mermaid
+flowchart TB
+    subgraph Preprocessing
+        A[Audio Extract] --> B[VAD Chunking]
+        B --> C[Spectral Triage]
+        C --> D[Vocal Separation]
+        D --> E[Language Detection]
+    end
 
-┌─────────────────────────────────────────────────────────────────────────┐
-│ 1. Preprocessing Stage                                                            │
-│                                                                          │
-│    Video Input                                                              │
-│       ↓                                                                  │
-│    Audio Extraction (FFmpeg 16kHz mono)                                         │
-│       ↓                                                                  │
-│    Spectral Triage (YAMNet Probe Mode)                                           │
-│       ↓                                                                  │
-│    Vocal Separation (Demucs On-Demand/Global)                                          │
-│       ↓                                                                  │
-│    VAD Segmentation (Silero VAD)                                                │
-│       ↓                                                                  │
-│    Smart Accumulation (Average 12s, Max 30s)                                          │
-│       ↓                                                                  │
-│    AudioChunk[] (Contains spectral features, separation level)                                  │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
+    subgraph Dual Stream Processing
+        E --> F[Fast Stream SenseVoice]
+        E --> G[Bridge Semantic Batching]
+        F --> G
+        G --> H[Slow Stream Whisper]
+    end
 
-┌─────────────────────────────────────────────────────────────────────────┐
-│ 2. Fast-Slow Dual Stream Transcription (Async Pipeline)                                            │
-│                                                                          │
-│  ┌──────────────────────┐       ┌──────────────────────┐               │
-│  │  FastWorker (CPU)    │       │  SlowWorker (GPU)    │               │
-│  │  SenseVoice ONNX     │       │  Whisper Large-v3    │               │
-│  └──────────┬───────────┘       └──────────┬───────────┘               │
-│             │                              │                            │
-│             │  Draft Subtitle                    │  Patch Subtitle                  │
-│             │  SSE Push                    │  SSE Push                  │
-│             │    Italic                      │    Regular                   │
-│             │                              │                            │
-│             └──────────┬───────────────────┘                            │
-│                        ↓                                                │
-│              ┌──────────────────┐                                       │
-│              │ AlignmentWorker  │                                       │
-│              │ Text Timestamp Alignment   │                                       │
-│              │ Word-Level Timestamp Calculation   │                                       │
-│              └────────┬─────────┘                                       │
-│                       ↓                                                 │
-│                  Final Subtitles                                               │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
+    H --> L0
+    F --> L0
 
-┌─────────────────────────────────────────────────────────────────────────┐
-│ 3. Frontend Real-time Rendering                                                          │
-│                                                                          │
-│  SSE Event Stream → Dual Stream Progress Bar + Subtitle List + Waveform                            │
-│                                                                          │
-│  Progress Display:                                                            │
-│  ┌────────────────────────────────────────┐                            │
-│  │ ████████░░░░ 60%                       │                            │
-│  │ ├ SenseVoice: ████████░░ 75%          │                            │
-│  │ └ Whisper:    ██████░░░░ 50%          │                            │
-│  └────────────────────────────────────────┘                            │
-│                                                                          │
-│  Real-time Subtitle Update:                                                          │
-│         It's still only 7:28 pm         ← Draft                        │
-│         There's plenty of time          ← Finalized                        │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
+    subgraph Post Processing
+        L0[L0 Raw Output] --> L1[L1 Normalization]
+        L1 --> L2[L2 Arbitration]
+        L2 --> L3[L3 Punctuation]
+        L3 --> L4[L4 Alignment]
+        L4 --> L5[L5 Semantic Injection]
+        L5 --> L6[L6 Segmentation]
+        L6 --> L7[L7 Output]
+    end
 
-┌─────────────────────────────────────────────────────────────────────────┐
-│ 4. Intelligent Patching and Fuse Breaking                                                        │
-│                                                                          │
-│  Trigger Conditions: Low Confidence / Short Segment / Single Character / Word-Level Check                        │
-│      ↓                                                                  │
-│  Whisper Secondary Auscultation                                                       │
-│      ↓                                                                  │
-│  Fuse Breaker (FuseBreakerV2)                                             │
-│      ↓                                                                  │
-│  Upgrade Path: NONE → HTDEMUCS                                              │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
+    subgraph Push
+        K[Draft Push]
+        L[Final Push]
+        M[Export SRT/ASS]
+    end
 
+    L7 --> K
+    L7 --> L
+    L7 --> M
 ```
 
 ## Core Architecture
 
-The system adopts the "spatiotemporal decoupling" philosophy, separating the definition of time boundaries from the generation of semantic content.
+The system adopts the "spatiotemporal decoupling" philosophy, separating the definition of time boundaries from the generation of semantic content, achieving high-quality subtitle output through a seven-layer post-processing pipeline.
 
 ### 1. Dual-Anchor Mechanism
 
-* **Time Anchor (SenseVoice):** Utilizes SenseVoice model (ONNX quantized inference) running on CPU. It uses CTC (Connectionist Temporal Classification) decoding to generate high-precision word-level timestamps, defining the absolute time boundaries of subtitles.
-* **Content Anchor (Whisper):** Utilizes Whisper Large-v3 model running on GPU. It focuses on semantic coherence and contextual understanding. Through the Needleman-Wunsch algorithm, Whisper's semantic text is aligned with SenseVoice's time anchors.
+* **Time Anchor (SenseVoice):** Utilizes SenseVoice model (ONNX quantized inference) running on CPU, using CTC decoding to generate high-precision word-level timestamps, defining the absolute time boundaries of subtitles.
+* **Content Anchor (Whisper):** Utilizes Whisper model running on GPU, focusing on semantic coherence and contextual understanding, mapping semantic text to time anchors through the L4 alignment layer.
 
 ### 2. Asynchronous Dual-Stream Pipeline
 
-The system adopts an "out-of-order execution, in-order submission" architecture to maximize resource utilization:
+The system adopts a three-level pipeline architecture with "out-of-order execution, in-order submission":
 
-* **Fast Stream (CPU Layer):** `FastWorker` executes concurrently on CPU. It handles audio segmentation, SenseVoice inference, and pushes "draft" subtitles via SSE (Server-Sent Events) for instant preview.
-* **Slow Stream (GPU Layer):** `SlowWorker` executes sequentially on GPU. It maintains audio context to ensure Whisper's semantic coherence, performs "patching" on draft subtitles, and generates "finalized" output.
-* **Sequenced Queue (SequencedQueue):** Acts as a rectifier between dual streams, allowing short audio blocks to be processed out-of-order on CPU, while ensuring GPU receives tasks strictly in chronological order to preserve context.
+* **Fast Stream (FastWorker):** Executes SenseVoice inference concurrently on CPU, pushes draft subtitles via SSE for instant preview.
+* **Bridge Semantic Batching:** Aggregates semantic sentences from fast stream into Whisper batches, triggers flush on language switch, speaker switch, pause timeout, etc., improving GPU efficiency and enhancing context consistency.
+* **Slow Stream (SlowWorker):** Executes Whisper inference sequentially on GPU, maintains audio context to ensure semantic coherence.
+
+### 3. Seven-Layer Post-Processing Architecture (L0-L7)
+
+* **L0 Raw Output:** Receives raw recognition results from fast/slow streams
+* **L1 Normalization:** Text cleaning, ITN (Inverse Text Normalization), character mapping
+* **L2 Arbitration:** Selects fast or slow stream text based on quality signals (confidence, repetition detection, hallucination detection)
+* **L3 Punctuation:** Generates punctuation position candidates, supports multi-source punctuation fusion
+* **L4 Alignment:** Uses Needleman-Wunsch algorithm to align slow stream text to fast stream time anchors
+* **L5 Semantic Injection:** Injects punctuation positions into aligned word stream
+* **L6 Segmentation:** Segments into final sentences based on multi-signal boundaries (pause, length, speaker, punctuation)
+* **L7 Output:** Formatting and distribution, pushes finalized subtitles
 
 ## Key Technical Features
 
-### Smart Accumulation VAD (Smart Accumulation VAD)
+### Smart Accumulation VAD
 
-To address the issue of Whisper's attention decay in long audio segments, the system implements a smart accumulation algorithm based on Silero VAD.
+To address Whisper's attention decay in long audio segments, the system implements a smart accumulation algorithm based on Silero VAD.
 
-* **Logic:** Instead of greedy merging, accumulates speech segments based on semantic pauses.
-* **Constraints:** Implements a 12-second "soft limit" (Whisper's optimal processing duration) and a 30-second "hard limit" (physical input window), ensuring optimal segmentation duration.
+* **Backtrack Breakpoint:** Backtracks to find optimal breakpoint when approaching soft limit, selecting position with largest gap and lowest RMS
+* **RMS Validation:** Rejects segmentation at high-energy (speaking) positions, avoiding word truncation
+* **Dual Constraints:** 12-second soft limit (SenseVoice's optimal processing duration) + 30-second hard limit (physical input window)
 
-### Spectral Triage and YAMNet Probe
+### Spectral Triage and Smart Probe
 
-Before processing, audio blocks undergo spectral analysis to determine if vocal separation is needed.
+Before processing, audio blocks undergo multi-layer spectral analysis to determine if vocal separation is needed.
 
-* **YAMNet Probe:** Samples the beginning, middle, and end of audio blocks to classify audio events (speech vs music).
-* **Decision Logic:** Pure speech skips separation; segments with heavy background music (BGM) or high noise levels trigger separation process.
+* **SNR+C50 Three-Layer Decision:** Uses Brouhaha model to calculate signal-to-noise ratio and clarity metrics. Layer 1 for fast screening (pass high-quality/separate low-quality), Layer 2 for spectral feature supplementary judgment, Layer 3 for YAMNet semantic classification fallback.
+* **Smart Probe Mode:** Center-out exponential probe strategy for quickly determining if full detection is needed. Pure videos are directly marked as no separation needed; if interference is detected, falls back to standard triage mode.
+* **On-Demand Separation:** Separates only audio blocks marked by spectral triage, saving GPU resources compared to global track separation.
 
-### On-Demand Separation and Fuse Breaker V2 (FuseBreaker V2)
+### Language Detection and Injection
 
-The system supports dynamic resource allocation for vocal separation (Demucs).
+Multi-mode language detection based on SpeechBrain, with detection results injected into ASR engines to improve recognition accuracy.
 
-* **On-Demand Mode:** Separates only audio blocks marked by spectral triage, saving GPU resources compared to global track separation.
-* **Fuse Breaker (FuseBreaker):** If transcription confidence is below threshold or strong interference is detected, the system triggers "fuse breaking", automatically upgrading separation model (e.g., from no separation to HTDemucs) and retrying transcription.
+* **Three Detection Modes:** fast (quick sampling), balanced (group probing), precise (full detection), automatically selected based on video characteristics.
+* **Center-Out Probe:** Balanced mode groups chunks by time window, using probe strategy to quickly determine language distribution, auto-degrading when consistency is insufficient.
+* **Language Injection to ASR:** Detection results injected into SenseVoice and Whisper, eliminating language guessing overhead and improving accuracy in multilingual scenarios.
 
-### Three-Level Alignment Strategy
+### L2 Text Arbitration
 
-To ensure subtitle stability, `AlignmentWorker` employs a cascade degradation strategy:
+Intelligent text selection mechanism based on multi-dimensional quality signals, preventing low-quality output from entering final subtitles.
 
-1. **Level 1 (Dual-Modal Alignment):** Uses Needleman-Wunsch global sequence alignment algorithm to map Whisper text to SenseVoice timestamps (gold standard).
-2. **Level 2 (Pseudo Alignment):** If sequence alignment fails, uses character/word duration ratio to mathematically map Whisper text to SenseVoice time window.
-3. **Level 3 (Fallback):** If Whisper completely fails, system falls back to original SenseVoice draft.
+* **Quality Signals:** Confidence, length ratio, repetition detection, hallucination detection, ITN fallback flag
+* **Decision Logic:** Automatically falls back to fast stream when slow stream shows repetition/hallucination, ensuring output stability
 
-### Whisper Arbitration
+### L4 Time Alignment
 
-Secondary verification mechanism prevents common hallucination issues in low-confidence segments. If SenseVoice outputs low-confidence results (typically hallucinations like "SRRCT"), Whisper performs targeted re-transcription to decide whether to keep, replace, or discard the segment.
+Core mechanism for precisely mapping slow stream semantic text to fast stream time anchors.
+
+* **Needleman-Wunsch Alignment:** Global sequence alignment algorithm, handling insertions, deletions, substitutions
+* **Gap Repair:** Automatically detects and repairs alignment gaps, supports multiple repair strategies
+* **Coverage Statistics:** Real-time alignment coverage calculation, triggers degradation on low coverage
 
 ## Configuration Options
 

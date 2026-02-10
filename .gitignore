@@ -10,7 +10,6 @@ __pycache__/
 .coverage
 .claude
 .gemini
-.github
 
 # PyInstaller 构建文件
 build/
@@ -59,6 +58,7 @@ ENV/
 # 临时文件
 *.tmp
 *.temp
+tmp
 .cache/
 .env_installed
 .req_hash
@@ -82,14 +82,18 @@ ENV/
 *.srt
 *.csv
 output/
-llmdoc/
 
-# 测试文件
-tests
-test_*
-*_test.py
+# 测试输出（保留测试代码，忽略输出）
 tests_output/
-*.test.*
+artifacts/
+htmlcov/
+.coverage
+
+# 本地测试文件（不上传，ci_tests/ 除外）
+tests/
+backend/tests/
+
+llmdoc/
 
 CLAUDE.md
 backend/models/pretrained/
@@ -100,8 +104,6 @@ patch_tools/apply_patch.py
 scripts
 archive
 openspec
-openspec
 AGENTS.md
 
-artifacts
 uv.lock

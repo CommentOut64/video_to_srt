@@ -18,6 +18,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from app.services.pyannote_compat import load_pyannote_pipeline
+
 
 class VADMethod(Enum):
     """
@@ -494,15 +496,13 @@ class VADService:
         self.logger.info("加载Pyannote VAD模型（需要HF Token）...")
 
         try:
-            from pyannote.audio import Pipeline
+            pipeline = load_pyannote_pipeline(
+                "pyannote/voice-activity-detection",
+                token=vad_config.hf_token,
+                logger=self.logger,
+            )
         except ImportError:
             raise RuntimeError("Pyannote未安装，请使用Silero VAD或安装pyannote-audio")
-
-        # 初始化Pyannote VAD Pipeline
-        pipeline = Pipeline.from_pretrained(
-            "pyannote/voice-activity-detection",
-            use_auth_token=vad_config.hf_token
-        )
 
         # 准备输入（Pyannote需要特定格式）
         # 创建临时文件用于Pyannote处理
