@@ -6,11 +6,12 @@
 - 底层: 4个设置分组 (preprocessing/transcription/refinement/compute)
 """
 import os
+import re
 import uuid
 import shutil
 import time
 import logging
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal, Set
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Request, Body
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -147,6 +148,54 @@ class UploadResponse(BaseModel):
     message: str
 
 
+class HomophoneFindRequest(BaseModel):
+    """同音检索请求模型。"""
+
+    mode: Literal["homophone_strict", "homophone_fuzzy"] = Field(
+        default="homophone_strict",
+        description="同音检索模式",
+    )
+    query_text: str = Field(..., min_length=1, description="待检索文本或读音输入")
+    language: Literal["zh", "ja", "en"] = Field(default="zh", description="语言")
+    is_ignore_punctuation: bool = Field(default=False, description="是否忽略标点")
+    limit: int = Field(default=500, ge=1, le=5000, description="最大返回数量")
+
+
+class BatchReplaceRequest(BaseModel):
+    """批量替换请求模型。"""
+
+    mode: Literal["literal", "regex", "homophone_strict", "homophone_fuzzy"] = Field(
+        default="literal",
+        description="替换模式",
+    )
+    query_text: str = Field(..., min_length=1, description="查找文本")
+    replace_text: str = Field(default="", description="替换文本")
+    language: Literal["zh", "ja", "en"] = Field(default="zh", description="语言")
+    is_ignore_punctuation: bool = Field(default=False, description="是否忽略标点")
+    selected_sentence_indices: List[int] = Field(
+        default_factory=list,
+        description="用户勾选的句子索引列表",
+    )
+
+
+class GlobalTermItem(BaseModel):
+    """全局术语配置项。"""
+
+    language: Literal["auto", "zh", "ja", "en"] = Field(default="auto")
+    source_text: str = Field(..., min_length=1)
+    target_text: str = Field(default="")
+    match_mode: Literal["exact", "regex", "homophone_strict", "homophone_fuzzy"] = Field(default="exact")
+    priority: int = Field(default=100, ge=0, le=10000)
+    is_enabled: bool = Field(default=True)
+    note: str = Field(default="")
+
+
+class GlobalTermSyncRequest(BaseModel):
+    """全量同步全局术语请求。"""
+
+    items: List[GlobalTermItem] = Field(default_factory=list)
+
+
 def create_transcription_router(
     transcription_service: TranscriptionService,
     file_service: FileManagementService,
@@ -159,6 +208,98 @@ def create_transcription_router(
 
     # 获取SSE管理器
     sse_manager = get_sse_manager()
+    logger = logging.getLogger(__name__)
+
+    from app.services.homophone.db import GlobalTermRule
+    from app.services.homophone.runtime import get_homophone_service
+    from app.services.homophone.service import SentenceRecord
+
+    def _detect_language_from_text(text: str) -> str:
+        if re.search(r"[ぁ-んァ-ン]", text):
+            return "ja"
+        if re.search(r"[\u4e00-\u9fff]", text):
+            return "zh"
+        if re.search(r"[A-Za-z]", text):
+            return "en"
+        return "zh"
+
+    def _collect_segments_from_snapshot(job_id: str) -> List[Dict[str, Any]]:
+        from pathlib import Path
+        from app.services.subtitle_edit_store import (
+            apply_deletions_to_segments,
+            apply_edits_to_segments,
+            apply_edits_to_sentences_snapshot,
+            build_manual_segments,
+            load_deleted_indices,
+            load_edits,
+        )
+
+        job = transcription_service.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="任务未找到")
+
+        job_dir = Path(job.dir)
+        checkpoint_path = job_dir / "checkpoint.json"
+        snapshot_path = job_dir / "transcription_text.json"
+
+        data: Optional[Dict[str, Any]] = None
+        transcription_data: Optional[Dict[str, Any]] = None
+
+        if checkpoint_path.exists():
+            with open(checkpoint_path, "r", encoding="utf-8") as file:
+                data = json.load(file)
+                transcription_data = data.get("transcription", {})
+        elif snapshot_path.exists():
+            with open(snapshot_path, "r", encoding="utf-8") as file:
+                transcription_data = json.load(file)
+                data = {"transcription": transcription_data}
+        else:
+            return []
+
+        transcription = transcription_data or {}
+        sentences_snapshot = transcription.get("sentences_snapshot", [])
+        edits = load_edits(job_dir)
+        deleted_indices = load_deleted_indices(job_dir)
+
+        all_segments: List[Dict[str, Any]] = []
+        if sentences_snapshot:
+            if edits:
+                apply_edits_to_sentences_snapshot(sentences_snapshot, edits)
+            for sentence in sentences_snapshot:
+                all_segments.append(
+                    {
+                        "id": int(sentence.get("_index", sentence.get("index", 0))),
+                        "start": float(sentence.get("start", 0.0)),
+                        "end": float(sentence.get("end", 0.0)),
+                        "text": str(sentence.get("text", "")),
+                        "is_modified": bool(sentence.get("is_modified", False)),
+                    }
+                )
+        else:
+            unaligned_results = (data or {}).get("unaligned_results", [])
+            for result in unaligned_results:
+                all_segments.extend(result.get("segments", []))
+            all_segments.sort(key=lambda item: item.get("start", 0))
+            for index, segment in enumerate(all_segments):
+                segment["id"] = int(segment.get("id", index))
+            if edits:
+                apply_edits_to_segments(all_segments, edits)
+
+        if deleted_indices:
+            all_segments = apply_deletions_to_segments(all_segments, deleted_indices)
+
+        manual_segments = build_manual_segments(edits, deleted_indices)
+        if manual_segments:
+            all_segments.extend(manual_segments)
+
+        all_segments.sort(
+            key=lambda item: (
+                float(item.get("start", 0.0)),
+                float(item.get("end", 0.0)),
+                int(item.get("id", 0)),
+            )
+        )
+        return all_segments
 
     def _build_task_snapshot(job: JobState) -> Dict[str, Any]:
         """构建前端任务状态快照（包含时间戳，用于版本校验）。"""
@@ -1300,6 +1441,247 @@ def create_transcription_router(
             raise
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"删除字幕失败: {str(exc)}")
+
+    @router.post("/jobs/{job_id}/homophone/find")
+    async def homophone_find(job_id: str, payload: HomophoneFindRequest):
+        """同音检索接口（Phase 2）。"""
+        job = transcription_service.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="任务未找到")
+
+        homophone_service = get_homophone_service()
+        state = homophone_service.get_index_status(job_id)
+        if state is None:
+            return {
+                "success": True,
+                "data": {
+                    "matches": [],
+                    "index_status": "missing",
+                    "message": "索引尚未构建完成",
+                },
+            }
+
+        matches = homophone_service.search_homophone(
+            job_id=job_id,
+            revision=state.revision,
+            language=payload.language,
+            query_text=payload.query_text,
+            mode=payload.mode,
+            is_ignore_punctuation=payload.is_ignore_punctuation,
+            limit=payload.limit,
+        )
+        return {
+            "success": True,
+            "data": {
+                "index_status": state.status,
+                "revision": state.revision,
+                "query": payload.query_text,
+                "mode": payload.mode,
+                "is_ignore_punctuation": payload.is_ignore_punctuation,
+                "matches": [
+                    {
+                        "sentence_index": item.sentence_index,
+                        "token_index": item.token_index,
+                        "token_text": item.token_text,
+                        "char_start": item.char_start,
+                        "char_end": item.char_end,
+                        "cluster_id": item.cluster_id,
+                        "reading_label": item.reading_label,
+                    }
+                    for item in matches
+                ],
+            },
+        }
+
+    @router.get("/jobs/{job_id}/homophone/index-status")
+    async def homophone_index_status(job_id: str):
+        """同音索引状态查询接口。"""
+        job = transcription_service.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="任务未找到")
+
+        homophone_service = get_homophone_service()
+        state = homophone_service.get_index_status(job_id)
+        if state is None:
+            return {
+                "success": True,
+                "data": {
+                    "status": "missing",
+                    "job_id": job_id,
+                },
+            }
+        return {
+            "success": True,
+            "data": {
+                "job_id": state.job_id,
+                "revision": state.revision,
+                "status": state.status,
+                "last_committed_chunk": state.last_committed_chunk,
+                "heartbeat_at": state.heartbeat_at,
+                "updated_at": state.updated_at,
+            },
+        }
+
+    @router.get("/settings/homophone/global-terms")
+    async def get_homophone_global_terms():
+        """读取全局专有名词表。"""
+        homophone_service = get_homophone_service()
+        terms = homophone_service.list_global_terms()
+        return {
+            "success": True,
+            "data": {
+                "items": [
+                    {
+                        "language": item.language,
+                        "source_text": item.source_text,
+                        "target_text": item.target_text,
+                        "match_mode": item.match_mode,
+                        "priority": item.priority,
+                        "is_enabled": item.is_enabled,
+                        "note": item.note,
+                    }
+                    for item in terms
+                ]
+            },
+        }
+
+    @router.put("/settings/homophone/global-terms")
+    async def put_homophone_global_terms(payload: GlobalTermSyncRequest):
+        """全量覆盖全局专有名词表。"""
+        homophone_service = get_homophone_service()
+        rules = [
+            GlobalTermRule(
+                language=item.language,
+                source_text=item.source_text,
+                target_text=item.target_text,
+                match_mode=item.match_mode,
+                priority=item.priority,
+                is_enabled=item.is_enabled,
+                note=item.note,
+            )
+            for item in payload.items
+        ]
+        homophone_service.replace_global_terms(rules)
+        return {
+            "success": True,
+            "data": {
+                "count": len(rules),
+            },
+        }
+
+    @router.post("/jobs/{job_id}/homophone/batch-replace")
+    async def homophone_batch_replace(job_id: str, payload: BatchReplaceRequest):
+        """同音/正则/精确批量替换接口（初版）。"""
+        from pathlib import Path
+        from app.services.sse_service import push_subtitle_event
+        from app.services.streaming_subtitle import get_streaming_subtitle_manager_if_exists
+        from app.services.subtitle_edit_store import save_edit
+
+        job = transcription_service.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="任务未找到")
+
+        if not payload.selected_sentence_indices:
+            return {
+                "success": True,
+                "data": {
+                    "updated_count": 0,
+                    "updated_indices": [],
+                },
+            }
+
+        selected_indices: Set[int] = {int(item) for item in payload.selected_sentence_indices}
+        all_segments = _collect_segments_from_snapshot(job_id)
+        segment_map: Dict[int, Dict[str, Any]] = {
+            int(segment.get("id", 0)): segment
+            for segment in all_segments
+            if int(segment.get("id", 0)) in selected_indices
+        }
+
+        homophone_service = get_homophone_service()
+        state = homophone_service.get_index_status(job_id)
+        homophone_matches: Dict[int, List[Any]] = {}
+        if payload.mode in {"homophone_strict", "homophone_fuzzy"} and state is not None:
+            query_matches = homophone_service.search_homophone(
+                job_id=job_id,
+                revision=state.revision,
+                language=payload.language,
+                query_text=payload.query_text,
+                mode=payload.mode,
+                is_ignore_punctuation=payload.is_ignore_punctuation,
+                limit=10000,
+            )
+            for match in query_matches:
+                if match.sentence_index in selected_indices:
+                    homophone_matches.setdefault(match.sentence_index, []).append(match)
+
+        subtitle_manager = get_streaming_subtitle_manager_if_exists(job_id)
+        job_dir = Path(job.dir)
+        updated_indices: List[int] = []
+
+        for sentence_index in sorted(selected_indices):
+            source_text = str(segment_map.get(sentence_index, {}).get("text", ""))
+            if not source_text:
+                continue
+
+            replaced_text = source_text
+            if payload.mode == "literal":
+                replaced_text = source_text.replace(payload.query_text, payload.replace_text)
+            elif payload.mode == "regex":
+                try:
+                    replaced_text = re.sub(payload.query_text, payload.replace_text, source_text)
+                except re.error as exc:
+                    raise HTTPException(status_code=400, detail=f"正则表达式无效: {exc}")
+            else:
+                matched_items = homophone_matches.get(sentence_index, [])
+                if not matched_items:
+                    continue
+                chars = list(source_text)
+                for match in sorted(matched_items, key=lambda item: item.char_start, reverse=True):
+                    start = max(0, int(match.char_start))
+                    end = min(len(chars), int(match.char_end))
+                    if start >= end:
+                        continue
+                    chars[start:end] = list(payload.replace_text)
+                replaced_text = "".join(chars)
+
+            if replaced_text == source_text:
+                continue
+
+            save_edit(job_dir, sentence_index, {"text": replaced_text}, original_text=source_text)
+            if subtitle_manager and sentence_index in subtitle_manager.sentences:
+                sentence = subtitle_manager.sentences[sentence_index]
+                if not sentence.is_modified:
+                    sentence.original_text = sentence.text
+                sentence.text = replaced_text
+                sentence.text_clean = replaced_text
+                sentence.is_modified = True
+
+            push_subtitle_event(
+                sse_manager,
+                job_id,
+                "edited",
+                {
+                    "index": sentence_index,
+                    "sentence": {
+                        "index": sentence_index,
+                        "text": replaced_text,
+                        "is_modified": True,
+                        "original_text": source_text,
+                    },
+                    "source": "homophone_batch_replace",
+                    "is_update": True,
+                },
+            )
+            updated_indices.append(sentence_index)
+
+        return {
+            "success": True,
+            "data": {
+                "updated_count": len(updated_indices),
+                "updated_indices": updated_indices,
+            },
+        }
 
     @router.get("/check-resume/{job_id}")
     async def check_resume(job_id: str):
