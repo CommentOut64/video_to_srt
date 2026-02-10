@@ -39,6 +39,7 @@ class AudioChunk:
     end: float                          # 结束时间（秒）
     audio: np.ndarray                   # 音频数组（单声道，16kHz）
     sample_rate: int = 16000            # 采样率
+    chunk_id: str = ""                 # 稳定片段标识（优先使用该字段替代字符串拼接）
 
     # 分离状态字段（原有）
     is_separated: bool = False          # 是否已进行人声分离
@@ -63,12 +64,10 @@ class AudioChunk:
     language: Optional[str] = None      # 语言标签（低置信度可标记为 auto）
     language_confidence: Optional[Dict[str, float]] = None  # 语言置信度字典 {"zh": 0.85, "en": 0.12}
 
-    # V3.2.0+dev.20260127.06: 声纹向量字段（用于后续说话人聚类）
-    speaker_embedding: Optional[List[float]] = None  # 192 维声纹向量
-    # V3.2.0+dev.20260204.01: 说话人轨道与主轨标识（L0 透传）
-    speaker_tracks: Optional[List[Dict[str, Any]]] = None
-    speaker_id: Optional[str] = None
-    primary_speaker_id: Optional[str] = None
+    def __post_init__(self) -> None:
+        """为未显式传入 chunk_id 的调用方补齐稳定标识。"""
+        if not self.chunk_id:
+            self.chunk_id = f"chunk-{self.index}"
 
     @property
     def duration(self) -> float:
@@ -78,6 +77,7 @@ class AudioChunk:
     def to_dict(self) -> dict:
         """转换为字典格式"""
         return {
+            "chunk_id": self.chunk_id,
             "index": self.index,
             "start": self.start,
             "end": self.end,
@@ -94,11 +94,6 @@ class AudioChunk:
             "last_confidence": self.last_confidence,
             "language": self.language,
             "language_confidence": self.language_confidence,
-            # 避免日志/序列化膨胀，仅记录声纹维度
-            "speaker_embedding_dim": len(self.speaker_embedding) if self.speaker_embedding else None,
-            "speaker_id": self.speaker_id,
-            "primary_speaker_id": self.primary_speaker_id,
-            "speaker_tracks_count": len(self.speaker_tracks) if self.speaker_tracks else None,
         }
 
 

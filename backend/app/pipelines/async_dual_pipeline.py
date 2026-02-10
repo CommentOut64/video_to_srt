@@ -2859,6 +2859,8 @@ class AsyncDualPipeline:
 
         # V3.2.0+dev.20260205.09: L4 对齐层（仅对齐与 gap 修复）
         sv_words = self._build_sv_word_timestamps(sv_result, chunk)
+        speaker_id = self._extract_primary_speaker_id(ctx.audio_chunk) if ctx.audio_chunk else None
+
         legacy_run = self._run_l4_to_l6_once(
             tracks=tracks,
             sv_result=sv_result,
@@ -2867,7 +2869,7 @@ class AsyncDualPipeline:
             punctuation_positions=punctuation_positions,
             punctuation_clean_text=punctuation_clean_text,
             variant="legacy",
-            speaker_id=ctx.audio_chunk.primary_speaker_id if ctx.audio_chunk else None,
+            speaker_id=speaker_id,
         )
 
         experiment_run: Optional[_Layer456RunResult] = None
@@ -2885,7 +2887,7 @@ class AsyncDualPipeline:
                 punctuation_positions=punctuation_positions,
                 punctuation_clean_text=punctuation_clean_text,
                 variant="experiment",
-                speaker_id=ctx.audio_chunk.primary_speaker_id if ctx.audio_chunk else None,
+                speaker_id=speaker_id,
             )
             compare_payload = self._build_dual_time_compare_payload(
                 ctx=ctx,

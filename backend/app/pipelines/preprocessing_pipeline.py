@@ -25,6 +25,7 @@ from app.services.audio.vad_service import VADConfig
 from app.pipelines.stages.spectral_triage_stage import SpectralTriageStage
 from app.pipelines.stages.separation_stage import SeparationStage
 from app.models.job_models import PreprocessingConfig, JobState
+from app.models.preprocess_artifacts import PreprocessArtifacts
 from app.services.demucs_service import get_demucs_service
 from app.services.preprocess_cache_service import PreprocessCacheService
 
@@ -78,6 +79,7 @@ class PreprocessingPipeline:
         self.progress_emitter = progress_emitter
         self.diagnostic_service = diagnostic_service  # V3.2.0+dev.20260131
         self._vad_intervals: Optional[List[Tuple[float, float]]] = None
+        self._last_preprocess_artifacts: Optional[PreprocessArtifacts] = None
         if vad_config is None:
             from app.services.runtime_param_resolver import build_vad_config
 
@@ -832,7 +834,7 @@ class PreprocessingPipeline:
 
         # Stage 6: Speaker 在线聚类（可选，依赖声纹提取）
         # V3.2.0+dev.20260207.01: 最小可行版本 - 余弦相似度聚类 + 防抖
-        has_embeddings = any(chunk.speaker_embedding for chunk in chunks)
+        has_embeddings = any(getattr(chunk, "speaker_embedding", None) for chunk in chunks)
         if chunks and self.config.enable_speaker_embedding and has_embeddings:
             self.logger.info("Stage 6: 说话人在线聚类")
             try:
@@ -855,10 +857,11 @@ class PreprocessingPipeline:
 
                 speaker_changes = 0
                 for chunk in chunks:
-                    if not chunk.speaker_embedding:
+                    speaker_embedding = getattr(chunk, "speaker_embedding", None)
+                    if not speaker_embedding:
                         continue
                     result = cluster_service.cluster(
-                        embedding=chunk.speaker_embedding,
+                        embedding=speaker_embedding,
                         chunk_start=chunk.start,
                         chunk_end=chunk.end,
                     )
@@ -875,6 +878,14 @@ class PreprocessingPipeline:
                 self.logger.warning("说话人聚类失败，已跳过: %s", e)
 
         self.logger.info(f"预处理流程完成: {len(chunks)} 个chunk准备就绪")
+
+        self._last_preprocess_artifacts = PreprocessArtifacts(
+            chunks=chunks,
+            vad_intervals=self.get_vad_intervals() or [],
+            full_audio=None,
+            sample_rate=chunks[0].sample_rate if chunks else 16000,
+            language_map={},
+        )
 
         return chunks
 
@@ -1013,6 +1024,10 @@ class PreprocessingPipeline:
         if not self._vad_intervals:
             return None
         return list(self._vad_intervals)
+
+    def get_last_preprocess_artifacts(self) -> Optional[PreprocessArtifacts]:
+        """返回最近一次预处理的结构化产物快照。"""
+        return self._last_preprocess_artifacts
 
     @staticmethod
     def _build_vad_intervals_from_segments(
