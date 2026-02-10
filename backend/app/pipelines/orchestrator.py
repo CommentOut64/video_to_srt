@@ -26,6 +26,7 @@ from app.core.config import config
 from app.models.job_models import JobState
 from app.schemas.profile_config import ProfileConfig
 from app.schemas.resume_context import ResumeContext
+from app.services.checkpoint import RuntimeCheckpointService
 
 if TYPE_CHECKING:
     from app.services.hardware_profile_service import HardwareProfileProvider
@@ -433,6 +434,41 @@ class PipelineOrchestrator:
         from app.services.job.checkpoint_manager import CheckpointManagerV37
 
         _job_dir = job_dir if job_dir else Path(job.dir)
+        runtime_state_service = RuntimeCheckpointService(job_dir=_job_dir)
+
+        # Phase 1: runtime_state.db 优先作为恢复入口。
+        if runtime_state_service.has_runtime_state():
+            snapshot = runtime_state_service.load_snapshot()
+            preprocess_commit = snapshot.last_unit_commits.get("preprocess")
+            runtime_checkpoint = {
+                "runtime_state": {
+                    "source": "runtime_state.db",
+                    "last_unit_commits": snapshot.last_unit_commits,
+                },
+                "preprocessing": {
+                    # 仅当预处理单元已提交，才允许跳过到已完成状态。
+                    "vad_completed": preprocess_commit in {
+                        "vad_chunk",
+                        "triage_chunk",
+                        "separation_chunk",
+                        "langid_chunk",
+                        "speaker_chunk",
+                    },
+                    "spectral_triage_completed": preprocess_commit in {
+                        "triage_chunk",
+                        "separation_chunk",
+                        "langid_chunk",
+                        "speaker_chunk",
+                    },
+                    "separation_completed": preprocess_commit in {
+                        "separation_chunk",
+                        "langid_chunk",
+                        "speaker_chunk",
+                    },
+                },
+            }
+            return ResumeContext.from_checkpoint(runtime_checkpoint)
+
         _checkpoint_manager = checkpoint_manager if checkpoint_manager else CheckpointManagerV37(_job_dir, logger=self.logger)
         checkpoint = _checkpoint_manager.load_checkpoint()
         if not checkpoint:

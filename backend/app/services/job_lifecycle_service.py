@@ -25,6 +25,7 @@ from app.services.sse_service import get_sse_manager
 from app.services.task_event_bus import TaskEventBus
 from app.services.task_heartbeat import TaskHeartbeatService
 from app.services.task_state_repository import TaskStateRepository
+from app.services.checkpoint import RuntimeCheckpointService
 
 
 class JobLifecycleService:
@@ -407,6 +408,11 @@ class JobLifecycleService:
         job.paused = True
         job.status = "paused"
         job.message = "暂停中..."
+        try:
+            runtime_service = RuntimeCheckpointService(job_dir=Path(job.dir))
+            runtime_service.mark_pause_requested()
+        except Exception as exc:
+            self.logger.warning("写入 pause_requested 失败: %s", exc)
         self._persist_job_state(job, from_status=from_status, reason="pause_request")
         self.logger.info(f"⏸️ 任务暂停请求: {job_id}")
         return True
@@ -422,6 +428,11 @@ class JobLifecycleService:
         from_status = job.status
         job.canceled = True
         job.message = "取消中..."
+        try:
+            runtime_service = RuntimeCheckpointService(job_dir=Path(job.dir))
+            runtime_service.mark_cancel_requested()
+        except Exception as exc:
+            self.logger.warning("写入 cancel_requested 失败: %s", exc)
         self._persist_job_state(job, from_status=from_status, reason="cancel_request")
         self.logger.info(f"🛑 任务取消请求: {job_id}, 删除数据: {delete_data}")
 
@@ -515,8 +526,21 @@ class JobLifecycleService:
 
     def _load_checkpoint(self, job_dir: Path) -> Optional[dict]:
         """
-        读取检查点数据
+        读取检查点数据（Phase 1: runtime_state.db 优先）
         """
+        try:
+            runtime_service = RuntimeCheckpointService(job_dir=job_dir)
+            if runtime_service.has_runtime_state():
+                snapshot = runtime_service.load_snapshot()
+                return {
+                    "runtime_state": {
+                        "source": "runtime_state.db",
+                        "last_unit_commits": snapshot.last_unit_commits,
+                    }
+                }
+        except Exception as exc:
+            self.logger.warning("读取 runtime_state 失败，回退 checkpoint.json: %s", exc)
+
         checkpoint_path = job_dir / "checkpoint.json"
         if not checkpoint_path.exists():
             return None

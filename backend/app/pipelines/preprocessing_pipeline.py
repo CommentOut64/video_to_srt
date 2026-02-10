@@ -28,6 +28,7 @@ from app.models.job_models import PreprocessingConfig, JobState
 from app.models.preprocess_artifacts import PreprocessArtifacts
 from app.services.demucs_service import get_demucs_service
 from app.services.preprocess_cache_service import PreprocessCacheService
+from app.services.checkpoint import PauseBarrier, RuntimeCheckpointService
 
 # v3.1.0: 导入取消令牌
 if TYPE_CHECKING:
@@ -173,6 +174,15 @@ class PreprocessingPipeline:
         token = self.cancellation_token  # v3.1.0: 简化引用
         job_id = job_state.job_id if job_state else None
         self._vad_intervals = None
+        runtime_checkpoint_service: Optional[RuntimeCheckpointService] = None
+        pause_barrier: Optional[PauseBarrier] = None
+        if job_dir:
+            runtime_checkpoint_service = RuntimeCheckpointService(job_dir=job_dir)
+            pause_barrier = PauseBarrier(
+                token=token,
+                runtime_checkpoint_service=runtime_checkpoint_service,
+                logger=self.logger,
+            )
         sse_manager = None
         if job_id:
             from app.services.sse_service import get_sse_manager
@@ -272,6 +282,12 @@ class PreprocessingPipeline:
 
             # V3.1.0: Stage 1 检查点（音频提取 + VAD 完成，包含 chunks_metadata）
             if token and job_dir and chunks:
+                if pause_barrier:
+                    pause_barrier.on_unit_start(
+                        stage="preprocess",
+                        unit_id="vad_chunk",
+                        payload={"total_chunks": len(chunks)},
+                    )
                 # 保存 chunks 的元数据（不包含音频数据，用于恢复时重建 chunks）
                 # 注意：AudioChunk 使用 start/end 而非 start_time/end_time
                 chunks_metadata = [
@@ -295,6 +311,17 @@ class PreprocessingPipeline:
                     }
                 }
                 token.check_and_save(checkpoint_data, job_dir)
+                if pause_barrier:
+                    decision = pause_barrier.on_unit_end(
+                        stage="preprocess",
+                        unit_id="vad_chunk",
+                        payload={"total_chunks": len(chunks)},
+                    )
+                    if decision.should_stop:
+                        if decision.stop_reason == "canceled":
+                            token.raise_if_canceled()
+                        if decision.stop_reason == "paused":
+                            token.raise_if_paused()
             if cache_service and chunks and not used_vad_cache and not used_separation_cache:
                 try:
                     cache_service.save_vad_chunks(chunks)
@@ -354,6 +381,12 @@ class PreprocessingPipeline:
 
             # v3.1.0: 频谱分诊完成后检查点
             if token and job_dir:
+                if pause_barrier:
+                    pause_barrier.on_unit_start(
+                        stage="preprocess",
+                        unit_id="triage_chunk",
+                        payload={"need_separation_count": stats['need_separation']},
+                    )
                 checkpoint_data = {
                     "spectral_triage": {
                         "completed": True,
@@ -361,6 +394,17 @@ class PreprocessingPipeline:
                     }
                 }
                 token.check_and_save(checkpoint_data, job_dir)
+                if pause_barrier:
+                    decision = pause_barrier.on_unit_end(
+                        stage="preprocess",
+                        unit_id="triage_chunk",
+                        payload={"need_separation_count": stats['need_separation']},
+                    )
+                    if decision.should_stop:
+                        if decision.stop_reason == "canceled":
+                            token.raise_if_canceled()
+                        if decision.stop_reason == "paused":
+                            token.raise_if_paused()
         else:
             self.logger.info("Stage 2: 频谱分诊已跳过")
             self._report_preprocess_progress("spectrum_analysis", 1.0, "频谱分诊跳过")
@@ -430,6 +474,15 @@ class PreprocessingPipeline:
 
             # v3.1.0: 人声分离完成后检查点
             if token and job_dir:
+                if pause_barrier:
+                    pause_barrier.on_unit_start(
+                        stage="preprocess",
+                        unit_id="separation_chunk",
+                        payload={
+                            "mode": self.config.separation_mode,
+                            "separated_count": stats['separated'],
+                        },
+                    )
                 checkpoint_data = {
                     "separation": {
                         "completed": True,
@@ -438,6 +491,20 @@ class PreprocessingPipeline:
                     }
                 }
                 token.check_and_save(checkpoint_data, job_dir)
+                if pause_barrier:
+                    decision = pause_barrier.on_unit_end(
+                        stage="preprocess",
+                        unit_id="separation_chunk",
+                        payload={
+                            "mode": self.config.separation_mode,
+                            "separated_count": stats['separated'],
+                        },
+                    )
+                    if decision.should_stop:
+                        if decision.stop_reason == "canceled":
+                            token.raise_if_canceled()
+                        if decision.stop_reason == "paused":
+                            token.raise_if_paused()
         else:
             self.logger.info("Stage 3: 人声分离已跳过")
             self._report_preprocess_progress("demucs", 1.0, "人声分离跳过")
@@ -582,6 +649,27 @@ class PreprocessingPipeline:
                             cache_service.save_langid_cache(lang_map, langid_metadata, progress)
                         except Exception as cache_exc:
                             self.logger.warning("[V3.2.0+dev.20260127.05] LangID 缓存写入失败: %s", cache_exc)
+
+                if token and job_dir and pause_barrier:
+                    pause_barrier.on_unit_start(
+                        stage="preprocess",
+                        unit_id="langid_chunk",
+                        payload={"processed": len(lang_map), "total": len(chunks)},
+                    )
+                    token.check_and_save(
+                        {"preprocessing": {"total_chunks": len(chunks)}},
+                        job_dir,
+                    )
+                    decision = pause_barrier.on_unit_end(
+                        stage="preprocess",
+                        unit_id="langid_chunk",
+                        payload={"processed": len(lang_map), "total": len(chunks)},
+                    )
+                    if decision.should_stop:
+                        if decision.stop_reason == "canceled":
+                            token.raise_if_canceled()
+                        if decision.stop_reason == "paused":
+                            token.raise_if_paused()
                 elif cache_service and langid_metadata and lang_map and not cache_complete:
                     try:
                         progress = cache_service.build_langid_progress(
@@ -789,6 +877,27 @@ class PreprocessingPipeline:
                                 "[V3.2.0+dev.20260127.06] Speaker 缓存写入失败: %s",
                                 cache_exc,
                             )
+
+                if token and job_dir and pause_barrier:
+                    pause_barrier.on_unit_start(
+                        stage="preprocess",
+                        unit_id="speaker_chunk",
+                        payload={"processed": len(embedding_map), "total": len(chunks)},
+                    )
+                    token.check_and_save(
+                        {"preprocessing": {"total_chunks": len(chunks)}},
+                        job_dir,
+                    )
+                    decision = pause_barrier.on_unit_end(
+                        stage="preprocess",
+                        unit_id="speaker_chunk",
+                        payload={"processed": len(embedding_map), "total": len(chunks)},
+                    )
+                    if decision.should_stop:
+                        if decision.stop_reason == "canceled":
+                            token.raise_if_canceled()
+                        if decision.stop_reason == "paused":
+                            token.raise_if_paused()
                 elif cache_service and speaker_metadata and embedding_map and not cache_complete:
                     try:
                         progress = cache_service.build_speaker_progress(

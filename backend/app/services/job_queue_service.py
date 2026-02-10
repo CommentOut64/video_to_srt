@@ -22,6 +22,7 @@ import torch
 from app.models.job_models import JobState
 from app.services.sse_service import get_sse_manager
 from app.core.config import config
+from app.services.checkpoint import RuntimeCheckpointService
 from app.services.task_state_repository import QueueState
 from app.utils.cancellation_token import (
     CancellationToken,
@@ -324,6 +325,16 @@ class JobQueueService:
         if job.status not in ("paused", "pausing"):
             logger.warning(f"任务未暂停，无法恢复: {job_id}, status={job.status}")
             return False
+
+        # Phase 1: 恢复请求到达后清理暂停/取消控制信号，
+        # 防止 PauseBarrier 在下一个单元边界误判并再次停机。
+        try:
+            if job.dir:
+                runtime_service = RuntimeCheckpointService(job_dir=Path(job.dir))
+                runtime_service.clear_pause_requested()
+                runtime_service.clear_cancel_requested()
+        except Exception as exc:
+            logger.warning("清理 runtime_state 控制信号失败: %s", exc)
 
         from_status = job.status
         # V3.1.0: 在推送 SSE 之前，先从 checkpoint 恢复进度
@@ -1322,6 +1333,23 @@ class JobQueueService:
             job_dir = Path(job.dir) if job.dir else None
             if not job_dir or not job_dir.exists():
                 return payload
+
+            # Phase 1: 优先读取 runtime_state.db 的单元提交信息。
+            runtime_service = RuntimeCheckpointService(job_dir=job_dir)
+            if runtime_service.has_runtime_state():
+                snapshot = runtime_service.load_snapshot()
+                payload.update(
+                    {
+                        "checkpoint_found": True,
+                        "checkpoint_source": "runtime_state.db",
+                        "unit_commits": snapshot.last_unit_commits,
+                    }
+                )
+                preprocess_unit = snapshot.last_unit_commits.get("preprocess")
+                if preprocess_unit:
+                    payload["phase"] = f"preprocess:{preprocess_unit}"
+                return payload
+
             checkpoint_path = job_dir / "checkpoint.json"
             if not checkpoint_path.exists():
                 return payload
