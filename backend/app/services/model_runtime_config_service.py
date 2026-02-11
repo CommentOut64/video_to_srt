@@ -284,6 +284,9 @@ class ModelRuntimeConfigService:
                 "device": norm_str(os.getenv("SENSEVOICE_DEVICE")),
                 "model_type": norm_str(os.getenv("SENSEVOICE_MODEL_TYPE")),
             },
+            "timeline": {
+                "device": norm_str(os.getenv("TIMELINE_DEVICE")),
+            },
         }
 
     @staticmethod
@@ -346,6 +349,14 @@ class ModelRuntimeConfigService:
                 "sensevoice_merge_max_gap": 0.3,
                 "sensevoice_merge_max_duration": 8.0,
                 "sensevoice_smart_target_duration": 8.0,
+            },
+            "timeline": {
+                "device": "cuda",
+                "segmentation_boundary_threshold": 0.55,
+                "segmentation_min_boundary_interval_sec": 0.2,
+                "min_support_turns": 2,
+                "min_total_duration": 2.0,
+                "merge_similarity_threshold": 0.88,
             },
             "smart_probe": {
                 "snr_threshold": 15.0,
@@ -524,6 +535,8 @@ class ModelRuntimeConfigService:
             return "vad"
         if spec.kind == "punct":
             return "punctuation"
+        if spec.kind == "speaker" and "segmentation" in spec.id:
+            return "timeline"
         return None
 
     def get_effective_global(self) -> Dict[str, Any]:

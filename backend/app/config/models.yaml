@@ -201,6 +201,19 @@
       ]
   resources: {cpu_threads: 4, vram_mb: 100}
 
+- id: pyannote-segmentation-3-0
+  kind: speaker
+  framework: torch
+  format: pth
+  default_device: cuda
+  compute_type: fp32
+  source:
+    local_path: backend/models/pretrained/segmentation-3.0
+    files: [config.yaml, pytorch_model.bin]
+  resources: {vram_mb: 1200, cpu_threads: 4}
+  features:
+    role: segmentation
+
 - id: punct-ct-transformer-zh
   kind: punct
   framework: onnx
