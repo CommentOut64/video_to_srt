@@ -77,16 +77,29 @@ class PyannoteSegmentationService:
             raise RuntimeError("未安装 pyannote.audio，无法执行 segmentation") from exc
 
         waveform = torch.tensor(audio, dtype=torch.float32).unsqueeze(0)
-        inference = Inference(model)
+
+        # 设计说明（Strategy Pattern）：
+        # segmentation-3.0 属于 permutation-invariant 任务，默认推理会返回
+        # 原始 chunk 级三维张量 (chunk, frame, class)，其 sliding_window 表示
+        # chunk 时间轴而非 frame 时间轴。
+        # 这里先把 class 维度压缩为单分数轨（与说话人身份无关），再让
+        # pyannote 执行重叠聚合，得到稳定的一维 frame 时间轴。
+        inference = Inference(
+            model,
+            pre_aggregation_hook=self._collapse_permutation_invariant_scores,
+        )
         sliding_scores = inference({"waveform": waveform, "sample_rate": sample_rate})
 
         data = np.asarray(sliding_scores.data, dtype=np.float32)
         if data.ndim == 1:
             data = data.reshape(-1, 1)
+        if data.ndim != 2:
+            raise RuntimeError(f"segmentation 输出维度不支持: {data.shape}")
 
         frame_scores = np.max(data, axis=1)
         frame_step = float(sliding_scores.sliding_window.step)
         frame_start = float(sliding_scores.sliding_window.start)
+        audio_duration_sec = float(audio.shape[0]) / float(sample_rate)
 
         boundaries: list[float] = []
         frames: list[SegmentationFrame] = []
@@ -95,6 +108,8 @@ class PyannoteSegmentationService:
 
         for idx, score in enumerate(frame_scores.tolist()):
             time_sec = frame_start + idx * frame_step
+            if time_sec > audio_duration_sec:
+                time_sec = audio_duration_sec
             value = float(score)
             frames.append(SegmentationFrame(time=time_sec, score=value))
             if value < threshold:
@@ -105,6 +120,15 @@ class PyannoteSegmentationService:
             last_boundary = time_sec
 
         return SegmentationResult(boundaries=boundaries, frames=frames)
+
+    @staticmethod
+    def _collapse_permutation_invariant_scores(scores: np.ndarray) -> np.ndarray:
+        """将 permutation-invariant 多类输出压缩为单分数轨后再聚合。"""
+        if scores.ndim == 3:
+            return np.max(scores, axis=2, keepdims=True)
+        if scores.ndim == 2:
+            return scores[..., np.newaxis]
+        raise RuntimeError(f"不支持的 segmentation 原始维度: {scores.shape}")
 
     def _acquire_model(self):
         """通过 ModelManagerV2 获取模型目录，并用 pyannote 官方方式加载。"""
