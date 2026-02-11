@@ -357,6 +357,13 @@ class ModelRuntimeConfigService:
                 "min_support_turns": 2,
                 "min_total_duration": 2.0,
                 "merge_similarity_threshold": 0.88,
+                "long_pause_cut_sec": 1.8,
+            },
+            "flush_policy": {
+                "min_audio_sec": 6.0,
+                "min_token_count": 40,
+                "max_wait_sec": 5.0,
+                "tail_idle_sec": 1.0,
             },
             "smart_probe": {
                 "snr_threshold": 15.0,
