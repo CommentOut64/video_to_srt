@@ -210,6 +210,7 @@ class AnnotatedWord:
     confidence: Optional[float] = None
     confidence_source: Optional[str] = None
     speaker_id: Optional[str] = None
+    turn_id: Optional[str] = None
     track_id: Optional[str] = None
 
 
@@ -221,6 +222,7 @@ class L5Input:
     punct_track: PunctTrack
     language: str = "auto"
     speaker_id: Optional[str] = None  # V3.2.0+dev.20260207.03: P0 speaker 信号链
+    turn_id: Optional[str] = None  # V3.2.0+dev.20260210.09: Phase 2 turn 信号链
 
 
 @dataclass

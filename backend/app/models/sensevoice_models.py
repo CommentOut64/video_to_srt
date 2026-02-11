@@ -183,6 +183,10 @@ class SentenceSegment:
     sv_original_text: Optional[str] = None        # SenseVoice 原始文本（用于对比）
     whisper_text: Optional[str] = None            # Whisper 识别文本（用于对比）
 
+    # Phase 2: Timeline 语义绑定字段
+    speaker_id: Optional[str] = None              # 句级说话人标识
+    turn_id: Optional[str] = None                 # 句级 turn 标识
+
     def __post_init__(self):
         """初始化后处理：计算 display_confidence"""
         if self.display_confidence is None and (
@@ -298,7 +302,10 @@ class SentenceSegment:
             # Layer 2: 语义分组相关字段
             "group_id": self.group_id,
             "is_soft_break": self.is_soft_break,
-            "group_position": self.group_position
+            "group_position": self.group_position,
+            # Phase 2: Timeline 语义绑定字段
+            "speaker_id": self.speaker_id,
+            "turn_id": self.turn_id,
         }
 
 
