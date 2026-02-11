@@ -49,7 +49,11 @@ class SemanticInjectionProcessor:
             )
 
         if not clean_text_ref or not positions:
-            base_words = self._build_base_annotated_words(aligned_words)
+            base_words = self._build_base_annotated_words(
+                aligned_words,
+                speaker_id=data.speaker_id,
+                turn_id=data.turn_id,
+            )
             return L5Output(
                 annotated_words=base_words,
                 injection_report={
@@ -77,7 +81,11 @@ class SemanticInjectionProcessor:
 
         annotated_words: List[AnnotatedWord]
         if injection.is_mapping_blocked:
-            annotated_words = self._build_base_annotated_words(aligned_words)
+            annotated_words = self._build_base_annotated_words(
+                aligned_words,
+                speaker_id=data.speaker_id,
+                turn_id=data.turn_id,
+            )
         else:
             annotated_words = [
                 AnnotatedWord(
@@ -88,6 +96,7 @@ class SemanticInjectionProcessor:
                     confidence=source.final_confidence,
                     confidence_source=source.confidence_source,
                     speaker_id=data.speaker_id,  # V3.2.0+dev.20260207.03: P0 speaker 透传
+                    turn_id=data.turn_id,  # V3.2.0+dev.20260210.09: Phase 2 turn 透传
                     track_id="main",
                 )
                 for item, source in zip(injection.annotated_words, aligned_words)
@@ -103,7 +112,12 @@ class SemanticInjectionProcessor:
         return L5Output(annotated_words=annotated_words, injection_report=report)
 
     @staticmethod
-    def _build_base_annotated_words(aligned_words: List[Any]) -> List[AnnotatedWord]:
+    def _build_base_annotated_words(
+        aligned_words: List[Any],
+        *,
+        speaker_id: Optional[str],
+        turn_id: Optional[str],
+    ) -> List[AnnotatedWord]:
         return [
             AnnotatedWord(
                 word=word.word,
@@ -112,7 +126,8 @@ class SemanticInjectionProcessor:
                 trailing_punct="",
                 confidence=word.final_confidence,
                 confidence_source=word.confidence_source,
-                speaker_id=None,  # V3.2.0+dev.20260207.03: 降级路径保持 None
+                speaker_id=speaker_id,
+                turn_id=turn_id,
                 track_id="main",
             )
             for word in aligned_words

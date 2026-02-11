@@ -94,6 +94,14 @@ from app.services.punctuation.semantic_buffer import (
     SemanticBufferInput,
     SemanticChunk,
 )
+from app.services.timeline import (
+    ClusterManagerConfig,
+    PyannoteSegmentationConfig,
+    SpeakerChunkInput,
+    SpeakerTimelineService,
+    SpeakerTimelineServiceConfig,
+    TurnBuilderConfig,
+)
 from app.services.text_pipeline_config import TextPipelineConfig
 from app.services.text_normalizer import TextNormalizer
 from app.services.whisper.whisper_text_sanitizer import WhisperTextSanitizer
@@ -216,6 +224,8 @@ class AsyncDualPipeline:
         self._enable_bridge_batches: bool = False
         self._context_cache: Dict[int, ProcessingContext] = {}
         self._audio_chunks_by_index: Dict[int, AudioChunk] = {}
+        self._timeline_speaker_by_chunk_index: Dict[int, str] = {}
+        self._timeline_turn_by_chunk_index: Dict[int, str] = {}
         self._vad_intervals: Optional[List[Tuple[float, float]]] = None
         self._full_audio_array: Optional[Any] = None
         self._full_audio_sr: int = 16000
@@ -446,6 +456,156 @@ class AsyncDualPipeline:
             if isinstance(first, dict):
                 return first.get("speaker_id")
         return None
+
+    def _resolve_speaker_id_for_chunk(self, chunk: AudioChunk) -> Optional[str]:
+        """优先从 Timeline 域读取 speaker_id，缺失时回退旧字段。"""
+        timeline_speaker = self._timeline_speaker_by_chunk_index.get(chunk.index)
+        if timeline_speaker:
+            return timeline_speaker
+        return self._extract_primary_speaker_id(chunk)
+
+    def _resolve_turn_id_for_chunk(self, chunk: AudioChunk) -> Optional[str]:
+        """获取 chunk 对应 turn_id（Phase 2 内部追踪）。"""
+        return self._timeline_turn_by_chunk_index.get(chunk.index)
+
+    async def _prepare_timeline_domain(
+        self,
+        *,
+        audio_chunks: List[AudioChunk],
+        full_audio_array: Optional[Any],
+        full_audio_sr: int,
+        job_dir: Optional[Path],
+    ) -> None:
+        """S-Epoch：在双流前预构建 SpeakerTimeline 并建立 chunk 映射。"""
+        self._timeline_speaker_by_chunk_index = {}
+        self._timeline_turn_by_chunk_index = {}
+
+        if not audio_chunks:
+            return
+        if full_audio_array is None:
+            self.logger.info("Timeline 域跳过：缺少完整音频数组")
+            return
+
+        has_embeddings = any(
+            bool(getattr(chunk, "speaker_embedding", None)) for chunk in audio_chunks
+        )
+        if not has_embeddings:
+            self.logger.info("Timeline 域跳过：未发现 speaker_embedding")
+            return
+
+        runtime_cfg = get_model_runtime_config_service().get_effective_runtime_global()
+        timeline_cfg = runtime_cfg.get("effective", {}).get("timeline", {})
+        min_support_turns = int(timeline_cfg.get("min_support_turns", 2) or 2)
+        min_total_duration = float(timeline_cfg.get("min_total_duration", 2.0) or 2.0)
+        merge_similarity = float(
+            timeline_cfg.get("merge_similarity_threshold", 0.88) or 0.88
+        )
+        boundary_threshold = float(
+            timeline_cfg.get("segmentation_boundary_threshold", 0.55) or 0.55
+        )
+        min_boundary_interval = float(
+            timeline_cfg.get("segmentation_min_boundary_interval_sec", 0.2) or 0.2
+        )
+
+        runtime_checkpoint_service = None
+        if job_dir:
+            try:
+                from app.services.checkpoint import RuntimeCheckpointService
+
+                runtime_checkpoint_service = RuntimeCheckpointService(job_dir=job_dir)
+            except Exception as exc:
+                self.logger.warning("Timeline 断点服务初始化失败，降级为无断点模式: %s", exc)
+
+        timeline_service = SpeakerTimelineService(
+            config=SpeakerTimelineServiceConfig(
+                cluster=ClusterManagerConfig(
+                    min_support_turns=max(1, min_support_turns),
+                    min_total_duration=max(0.0, min_total_duration),
+                    merge_similarity_threshold=max(0.0, min(1.0, merge_similarity)),
+                ),
+                turn_builder=TurnBuilderConfig(),
+                segmentation=PyannoteSegmentationConfig(
+                    boundary_threshold=max(0.0, min(1.0, boundary_threshold)),
+                    min_boundary_interval_sec=max(0.0, min_boundary_interval),
+                ),
+            ),
+            runtime_checkpoint_service=runtime_checkpoint_service,
+            cancellation_token=self.cancellation_token,
+            logger=self.logger,
+        )
+
+        chunk_inputs = [
+            SpeakerChunkInput(
+                chunk_id=getattr(chunk, "chunk_id", None) or f"chunk-{chunk.index}",
+                start=float(chunk.start),
+                end=float(chunk.end),
+                embedding=list(getattr(chunk, "speaker_embedding", None) or []),
+                quality_score=float(getattr(chunk, "last_confidence", 1.0) or 1.0),
+                is_overlap=False,
+            )
+            for chunk in audio_chunks
+        ]
+
+        try:
+            timeline = await asyncio.to_thread(
+                timeline_service.build_timeline,
+                block_id=f"timeline-{self.job_id}",
+                chunks=chunk_inputs,
+                audio=full_audio_array,
+                sample_rate=full_audio_sr,
+            )
+        except Exception as exc:
+            self.logger.warning("Timeline 域构建失败，回退旧 speaker 透传: %s", exc)
+            return
+
+        if not timeline.turns:
+            self.logger.info("Timeline 域未产生 turn，保持旧 speaker 透传")
+            return
+
+        for chunk in audio_chunks:
+            best_turn = self._select_best_turn_for_chunk(
+                chunk_start=float(chunk.start),
+                chunk_end=float(chunk.end),
+                turns=timeline.turns,
+            )
+            if best_turn is None:
+                continue
+            self._timeline_speaker_by_chunk_index[chunk.index] = best_turn.speaker_id
+            self._timeline_turn_by_chunk_index[chunk.index] = best_turn.turn_id
+
+        self.logger.info(
+            "Timeline 域构建完成: turns=%d speakers=%d chunk_bindings=%d",
+            len(timeline.turns),
+            len(timeline.speakers),
+            len(self._timeline_speaker_by_chunk_index),
+        )
+
+    @staticmethod
+    def _select_best_turn_for_chunk(
+        *,
+        chunk_start: float,
+        chunk_end: float,
+        turns: Sequence[Any],
+    ) -> Optional[Any]:
+        """按时间重叠优先选取 chunk 对应 turn。"""
+        if not turns:
+            return None
+
+        best_turn = None
+        best_overlap = -1.0
+        chunk_mid = (chunk_start + chunk_end) / 2.0
+        best_distance = float("inf")
+
+        for turn in turns:
+            overlap = max(0.0, min(chunk_end, float(turn.end)) - max(chunk_start, float(turn.start)))
+            turn_mid = (float(turn.start) + float(turn.end)) / 2.0
+            distance = abs(turn_mid - chunk_mid)
+            if overlap > best_overlap or (overlap == best_overlap and distance < best_distance):
+                best_turn = turn
+                best_overlap = overlap
+                best_distance = distance
+
+        return best_turn
 
     def _validate_l0_result(
         self,
@@ -755,6 +915,14 @@ class AsyncDualPipeline:
         self._context_cache = {}
         self._vad_intervals = list(vad_intervals) if vad_intervals else None
         self._l6_processor.reset_state()
+
+        # Phase 2: S-Epoch 预构建 Timeline 映射（speaker_id/turn_id）。
+        await self._prepare_timeline_domain(
+            audio_chunks=audio_chunks,
+            full_audio_array=full_audio_array,
+            full_audio_sr=full_audio_sr,
+            job_dir=job_dir,
+        )
 
         total_chunks = len(audio_chunks)  # V3.1.0: 保存总数用于进度计算
         self.logger.info(f"开始三级流水线: {total_chunks} 个 Chunk")
@@ -1424,7 +1592,7 @@ class AsyncDualPipeline:
 
         decision = self._build_punctuation_decision(decision_meta)
         source_chunks = [f"chunk-{chunk.index}"]
-        speaker_id = self._extract_primary_speaker_id(chunk)
+        speaker_id = self._resolve_speaker_id_for_chunk(chunk)
         return SemanticBufferInput(
             chunk_id=f"chunk-{ctx.chunk_index}",
             text=text,
@@ -2861,7 +3029,8 @@ class AsyncDualPipeline:
 
         # V3.2.0+dev.20260205.09: L4 对齐层（仅对齐与 gap 修复）
         sv_words = self._build_sv_word_timestamps(sv_result, chunk)
-        speaker_id = self._extract_primary_speaker_id(ctx.audio_chunk) if ctx.audio_chunk else None
+        speaker_id = self._resolve_speaker_id_for_chunk(ctx.audio_chunk) if ctx.audio_chunk else None
+        turn_id = self._resolve_turn_id_for_chunk(ctx.audio_chunk) if ctx.audio_chunk else None
 
         legacy_run = self._run_l4_to_l6_once(
             tracks=tracks,
@@ -2872,6 +3041,7 @@ class AsyncDualPipeline:
             punctuation_clean_text=punctuation_clean_text,
             variant="legacy",
             speaker_id=speaker_id,
+            turn_id=turn_id,
         )
 
         experiment_run: Optional[_Layer456RunResult] = None
@@ -2890,6 +3060,7 @@ class AsyncDualPipeline:
                 punctuation_clean_text=punctuation_clean_text,
                 variant="experiment",
                 speaker_id=speaker_id,
+                turn_id=turn_id,
             )
             compare_payload = self._build_dual_time_compare_payload(
                 ctx=ctx,
@@ -3013,6 +3184,8 @@ class AsyncDualPipeline:
             )
             fallback_sentence = self._build_final_fallback_sentence(words_for_split)
             if fallback_sentence is not None:
+                fallback_sentence.speaker_id = speaker_id
+                fallback_sentence.turn_id = turn_id
                 final_sentences = [fallback_sentence]
                 ctx.final_sentences = final_sentences
                 split_stats["error_code"] = "E_L6_SPLIT_EMPTY"
@@ -3058,6 +3231,7 @@ class AsyncDualPipeline:
         punctuation_clean_text: Optional[str],
         variant: str = "legacy",
         speaker_id: Optional[str] = None,
+        turn_id: Optional[str] = None,
     ) -> _Layer456RunResult:
         """执行一次 L4-L6 主路径（仅 CPU 后处理）。"""
         time_words, time_source = self._resolve_alignment_time_words(
@@ -3098,6 +3272,7 @@ class AsyncDualPipeline:
                 punct_track=l5_punct_track,
                 language=detected_language,
                 speaker_id=speaker_id,  # V3.2.0+dev.20260207.03: P0 speaker 信号链
+                turn_id=turn_id,
             )
         )
         injection_report = dict(l5_output.injection_report or {})
@@ -3139,6 +3314,10 @@ class AsyncDualPipeline:
             sentence.whisper_text = whisper_result.get("text", "")
             sentence.sv_original_text = sv_result.get("text_clean")
             sentence.confidence_source = self._resolve_sentence_confidence_source(sentence.words)
+            if sentence.speaker_id is None:
+                sentence.speaker_id = speaker_id
+            if sentence.turn_id is None:
+                sentence.turn_id = turn_id
 
         return _Layer456RunResult(
             alignment_result=alignment_result,
@@ -3502,6 +3681,8 @@ class AsyncDualPipeline:
         if not ctx.sv_result or not ctx.audio_chunk:
             return []
         sv_words = self._build_sv_word_timestamps(ctx.sv_result, ctx.audio_chunk)
+        speaker_id = self._resolve_speaker_id_for_chunk(ctx.audio_chunk)
+        turn_id = self._resolve_turn_id_for_chunk(ctx.audio_chunk)
         annotated_words: List[AnnotatedWord] = [
             AnnotatedWord(
                 word=word.word,
@@ -3510,7 +3691,8 @@ class AsyncDualPipeline:
                 trailing_punct="",
                 confidence=word.confidence,
                 confidence_source=word.confidence_source or "fast",
-                speaker_id=None,
+                speaker_id=speaker_id,
+                turn_id=turn_id,
                 track_id="main",
             )
             for word in sv_words
@@ -3528,6 +3710,8 @@ class AsyncDualPipeline:
         if not sentences:
             fallback = self._build_final_fallback_sentence(l6_output.words_for_split)
             if fallback is not None:
+                fallback.speaker_id = speaker_id
+                fallback.turn_id = turn_id
                 sentences = [fallback]
                 self.logger.warning("Whisper 跳过路径触发 L6 单句兜底")
         for sentence in sentences:
@@ -3535,6 +3719,10 @@ class AsyncDualPipeline:
             sentence.is_finalized = True
             sentence.is_draft = False
             sentence.confidence_source = "fast"
+            if sentence.speaker_id is None:
+                sentence.speaker_id = speaker_id
+            if sentence.turn_id is None:
+                sentence.turn_id = turn_id
         if self._final_grouper and sentences:
             sentences = self._final_grouper.group(sentences)
         return sentences

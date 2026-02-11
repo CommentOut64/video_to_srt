@@ -87,6 +87,12 @@ class SegmentationProcessor:
                 continue
             run_segments = self._final_splitter.split(run_words)
             if run_segments:
+                run_speaker_id, run_turn_id = self._extract_run_identity(run_annotated_words)
+                self._apply_identity_to_sentences(
+                    run_segments,
+                    speaker_id=run_speaker_id,
+                    turn_id=run_turn_id,
+                )
                 all_sentence_segments.extend(run_segments)
 
         pending_out_words: List[WordTimestamp] = []
@@ -115,7 +121,12 @@ class SegmentationProcessor:
         # 降级处理：若所有 run 切分后仍为空
         if not all_sentence_segments:
             words_for_split = list(pending_prefix_words) + self._build_words_for_split(annotated_words)
-            fallback_sentence = self._build_single_sentence(words_for_split)
+            fallback_speaker_id, fallback_turn_id = self._extract_run_identity(annotated_words)
+            fallback_sentence = self._build_single_sentence(
+                words_for_split,
+                speaker_id=fallback_speaker_id,
+                turn_id=fallback_turn_id,
+            )
             all_sentence_segments = [fallback_sentence] if fallback_sentence else []
             error_code = "E_L6_SPLIT_EMPTY"
         else:
@@ -267,9 +278,37 @@ class SegmentationProcessor:
         target.sv_original_text = source.sv_original_text
         target.confidence_source = source.confidence_source
         target.warning_type = source.warning_type
+        target.speaker_id = source.speaker_id
+        target.turn_id = source.turn_id
         target.group_id = source.group_id
         target.is_soft_break = source.is_soft_break
         target.group_position = source.group_position
+
+    @staticmethod
+    def _extract_run_identity(annotated_words: List[Any]) -> Tuple[Optional[str], Optional[str]]:
+        """从 run 中提取统一 speaker/turn 标识。"""
+        run_speaker_id: Optional[str] = None
+        run_turn_id: Optional[str] = None
+        for word in annotated_words:
+            if run_speaker_id is None:
+                run_speaker_id = getattr(word, "speaker_id", None)
+            if run_turn_id is None:
+                run_turn_id = getattr(word, "turn_id", None)
+            if run_speaker_id is not None and run_turn_id is not None:
+                break
+        return run_speaker_id, run_turn_id
+
+    @staticmethod
+    def _apply_identity_to_sentences(
+        sentences: List[SentenceSegment],
+        *,
+        speaker_id: Optional[str],
+        turn_id: Optional[str],
+    ) -> None:
+        """将 run 级 speaker/turn 标识写入句子。"""
+        for sentence in sentences:
+            sentence.speaker_id = speaker_id
+            sentence.turn_id = turn_id
 
     @staticmethod
     def _group_by_speaker_runs(annotated_words: List[Any]) -> List[List[Any]]:
@@ -327,7 +366,12 @@ class SegmentationProcessor:
         return words
 
     @staticmethod
-    def _build_single_sentence(words: List[WordTimestamp]) -> Optional[SentenceSegment]:
+    def _build_single_sentence(
+        words: List[WordTimestamp],
+        *,
+        speaker_id: Optional[str] = None,
+        turn_id: Optional[str] = None,
+    ) -> Optional[SentenceSegment]:
         if not words:
             return None
         text = "".join((word.word or "") for word in words).strip()
@@ -345,6 +389,8 @@ class SegmentationProcessor:
             source=TextSource.WHISPER_PATCH,
             is_draft=False,
             is_finalized=True,
+            speaker_id=speaker_id,
+            turn_id=turn_id,
         )
 
     @staticmethod
