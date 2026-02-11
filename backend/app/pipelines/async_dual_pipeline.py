@@ -32,6 +32,7 @@ import asyncio
 import copy
 import json
 import logging
+import time
 from dataclasses import dataclass, replace
 from typing import List, Optional, Any, TYPE_CHECKING, Set, Dict, Tuple, Sequence
 from pathlib import Path
@@ -87,7 +88,10 @@ from app.services.punctuation.scheduler import get_punctuation_scheduler
 from app.services.punctuation.semantic_injection_processor import SemanticInjectionProcessor
 from app.services.punctuation.final_splitter import FinalSplitter, FinalSplitConfig
 from app.services.semantic_grouper import SemanticGrouper, GroupConfig
-from app.services.bridge.bridge_controller import BridgeBatch, BridgeController
+from app.services.bridge.bridge_controller import BridgeController
+from app.services.bridge.flush_policy import FlushPolicyConfig
+from app.services.bridge.turn_group_builder import TurnGroupBuilder, TurnGroupEnvelope
+from app.services.bridge.turn_group_models import TurnGroup
 from app.services.punctuation.semantic_buffer import (
     PunctuationDecision,
     SemanticBuffer,
@@ -105,7 +109,7 @@ from app.services.timeline import (
 from app.services.text_pipeline_config import TextPipelineConfig
 from app.services.text_normalizer import TextNormalizer
 from app.services.whisper.whisper_text_sanitizer import WhisperTextSanitizer
-from app.pipelines.workers import FastWorker, SlowWorker, SlowWorkerResult
+from app.pipelines.workers import FastWorker, SlowWorker
 from app.utils.prompt_builder import get_prompt_builder
 from app.utils.text_utils import format_srt_timestamp
 from app.utils.cancellation_token import CancelledException, PausedException  # V3.1.0: 捕获取消/暂停异常
@@ -163,7 +167,6 @@ class AsyncDualPipeline:
         aligner: Optional[DefaultAligner] = None,
         patching_threshold: Optional[ThresholdConfig] = None,
         enable_cross_chunk_merge: bool = True,
-        enable_bridge_controller: bool = True,
         bridge_controller: Optional[BridgeController] = None,
         debug_punctuation: bool = False,
         logger: Optional[logging.Logger] = None,
@@ -192,7 +195,6 @@ class AsyncDualPipeline:
             aligner: 对齐服务实例（可选）
             patching_threshold: 复核阈值配置（可选）
             enable_cross_chunk_merge: 是否启用跨 chunk 合并
-            enable_bridge_controller: 是否启用 Bridge 控制器
             bridge_controller: Bridge 控制器实例（可选）
             debug_punctuation: 是否启用标点调试输出
             logger: 日志记录器
@@ -220,8 +222,10 @@ class AsyncDualPipeline:
         self.previous_whisper_text: Optional[str] = None
         self._job_dir: Optional[Path] = None
         self._bridge_prompt_hint: Optional[str] = None
-        self._bridge_last_batch: Optional[BridgeBatch] = None
         self._enable_bridge_batches: bool = False
+        self._consume_turn_groups_only: bool = True
+        self._turn_group_builder = TurnGroupBuilder()
+        self._runtime_checkpoint_service = None
         self._context_cache: Dict[int, ProcessingContext] = {}
         self._audio_chunks_by_index: Dict[int, AudioChunk] = {}
         self._timeline_speaker_by_chunk_index: Dict[int, str] = {}
@@ -268,12 +272,12 @@ class AsyncDualPipeline:
         if self.semantic_buffer is None and enable_semantic_buffer:
             self.semantic_buffer = SemanticBuffer(logger=self.logger)
 
-        # V3.2.0+dev.20260201.04: Bridge 控制器（Phase E 完整实现）
-        self.bridge_controller = bridge_controller if enable_bridge_controller else None
-        if self.bridge_controller is None and enable_bridge_controller:
+        # V3.2.0+dev.20260211.04: Bridge 控制器（Phase 3 精简版，仅用于空闲 flush 判定）
+        self.bridge_controller = bridge_controller
+        if self.bridge_controller is None:
             self.bridge_controller = BridgeController(logger=self.logger)
         self._enable_bridge_batches = bool(
-            self.bridge_controller and self.semantic_buffer and not self.is_sensevoice_only
+            self.semantic_buffer and not self.is_sensevoice_only
         )
 
         # V3.2.0+dev.20260129.01: 标点服务注入
@@ -495,6 +499,7 @@ class AsyncDualPipeline:
 
         runtime_cfg = get_model_runtime_config_service().get_effective_runtime_global()
         timeline_cfg = runtime_cfg.get("effective", {}).get("timeline", {})
+        flush_cfg_raw = runtime_cfg.get("effective", {}).get("flush_policy", {})
         min_support_turns = int(timeline_cfg.get("min_support_turns", 2) or 2)
         min_total_duration = float(timeline_cfg.get("min_total_duration", 2.0) or 2.0)
         merge_similarity = float(
@@ -507,12 +512,25 @@ class AsyncDualPipeline:
             timeline_cfg.get("segmentation_min_boundary_interval_sec", 0.2) or 0.2
         )
 
+        self._turn_group_builder = TurnGroupBuilder(
+            flush_config=FlushPolicyConfig(
+                min_audio_sec=float(flush_cfg_raw.get("min_audio_sec", 6.0) or 6.0),
+                min_token_count=int(flush_cfg_raw.get("min_token_count", 40) or 40),
+                max_wait_sec=float(flush_cfg_raw.get("max_wait_sec", 5.0) or 5.0),
+                tail_idle_sec=float(flush_cfg_raw.get("tail_idle_sec", 1.0) or 1.0),
+                long_pause_cut_sec=float(
+                    timeline_cfg.get("long_pause_cut_sec", 1.8) or 1.8
+                ),
+            )
+        )
+
         runtime_checkpoint_service = None
         if job_dir:
             try:
                 from app.services.checkpoint import RuntimeCheckpointService
 
                 runtime_checkpoint_service = RuntimeCheckpointService(job_dir=job_dir)
+                self._runtime_checkpoint_service = runtime_checkpoint_service
             except Exception as exc:
                 self.logger.warning("Timeline 断点服务初始化失败，降级为无断点模式: %s", exc)
 
@@ -1047,40 +1065,336 @@ class AsyncDualPipeline:
 
     async def _ingest_bridge_chunks(self, chunks: List[SemanticChunk]) -> None:
         """将语义 Chunk 送入 Bridge 控制器，更新提示词缓存。"""
-        if not self.bridge_controller:
-            return
         for chunk in chunks:
-            batch = await self.bridge_controller.add_semantic_chunk(chunk)
-            if batch:
-                self._bridge_last_batch = batch
-                self._bridge_prompt_hint = batch.prompt or None
-                self.logger.debug(
-                    "Bridge 批次就绪: batch_id=%s, prompt_len=%d",
-                    batch.batch_id,
-                    len(batch.prompt or ""),
-                )
-                await self._enqueue_bridge_batch(batch)
+            speaker_id = None
+            turn_id = None
+            source_indices = self._parse_source_chunk_indices(list(chunk.source_chunks or []))
+            if source_indices:
+                first_index = source_indices[0]
+                source_chunk = self._audio_chunks_by_index.get(first_index)
+                if source_chunk is not None:
+                    speaker_id = self._resolve_speaker_id_for_chunk(source_chunk)
+                    turn_id = self._resolve_turn_id_for_chunk(source_chunk)
+
+            envelopes = self._turn_group_builder.add_chunk(
+                chunk,
+                speaker_id=speaker_id,
+                turn_id=turn_id,
+                now=time.time(),
+            )
+            for envelope in envelopes:
+                if envelope.group.prompt_text:
+                    self._bridge_prompt_hint = envelope.group.prompt_text
+                await self._enqueue_turn_group(envelope)
 
     async def _flush_bridge_controller(self) -> None:
         """强制刷新 Bridge 控制器缓冲。"""
-        if not self.bridge_controller:
-            return
-        batch = await self.bridge_controller.flush(reason="pipeline_flush")
-        if batch:
-            self._bridge_last_batch = batch
-            self._bridge_prompt_hint = batch.prompt or None
-            self.logger.debug(
-                "Bridge 强制刷新: batch_id=%s, prompt_len=%d",
-                batch.batch_id,
-                len(batch.prompt or ""),
-            )
-            await self._enqueue_bridge_batch(batch)
+        envelope = self._turn_group_builder.flush(reason="eof_flush")
+        if envelope:
+            if envelope.group.prompt_text:
+                self._bridge_prompt_hint = envelope.group.prompt_text
+            await self._enqueue_turn_group(envelope)
 
-    async def _enqueue_bridge_batch(self, batch: BridgeBatch) -> None:
-        """将 Bridge 批次送入 SlowWorker 队列。"""
-        if not self._enable_bridge_batches:
+    async def _enqueue_turn_group(self, envelope: TurnGroupEnvelope) -> None:
+        """将 TurnGroup 送入 SlowWorker 队列。"""
+        if not envelope:
             return
-        await self.queue_inter.put(batch)
+        await self.queue_inter.put(envelope)
+
+    async def _process_turn_group(
+        self,
+        envelope: TurnGroupEnvelope,
+        *,
+        job_dir: Optional[Path],
+        total_chunks: int,
+        slow_processed_indices: Set[int],
+        token: Optional["CancellationToken"],
+    ) -> bool:
+        """处理 TurnGroup 并推送到对齐阶段。"""
+        if not self.slow_worker:
+            return False
+
+        group = envelope.group
+        chunk_indices = self._parse_source_chunk_indices(group.source_chunks)
+        if not chunk_indices:
+            self.logger.warning("TurnGroup 缺少 source_chunks: group_id=%s", group.group_id)
+            self._record_turn_group_unit(
+                group=group,
+                status="committed",
+                payload={
+                    "source_chunks": [],
+                    "speaker_id": group.speaker_id,
+                    "flush_reason": group.flush_reason,
+                    "skipped": True,
+                    "skip_reason": "missing_source_chunks",
+                },
+            )
+            return False
+
+        contexts: List[tuple[int, ProcessingContext]] = []
+        for idx in chunk_indices:
+            ctx = self._context_cache.get(idx)
+            if ctx:
+                contexts.append((idx, ctx))
+
+        if not contexts:
+            self.logger.warning("TurnGroup 缺少上下文缓存: group_id=%s", group.group_id)
+            self._record_turn_group_unit(
+                group=group,
+                status="committed",
+                payload={
+                    "source_chunks": list(group.source_chunks),
+                    "speaker_id": group.speaker_id,
+                    "flush_reason": group.flush_reason,
+                    "skipped": True,
+                    "skip_reason": "missing_context_cache",
+                },
+            )
+            return False
+
+        skip_map: Dict[int, bool] = {}
+        if self.is_patching_mode:
+            for idx, ctx in contexts:
+                if ctx.sv_result and ctx.audio_chunk:
+                    skip_map[idx] = self._should_skip_whisper(ctx.sv_result, ctx.audio_chunk)
+                else:
+                    skip_map[idx] = False
+
+        if self.is_patching_mode and all(skip_map.values()):
+            for _, ctx in contexts:
+                ctx.whisper_skipped = True
+                ctx.whisper_result = {}
+            self._record_turn_group_unit(
+                group=group,
+                status="committed",
+                payload={
+                    "source_chunks": list(group.source_chunks),
+                    "speaker_id": group.speaker_id,
+                    "flush_reason": group.flush_reason,
+                    "skipped": True,
+                    "skip_reason": "all_skip_by_policy",
+                },
+            )
+            return await self._push_batch_contexts(
+                contexts,
+                slow_processed_indices,
+                total_chunks=total_chunks,
+                job_dir=job_dir,
+                token=token,
+            )
+
+        if self._full_audio_array is None:
+            self.logger.warning("TurnGroup 缺少完整音频，跳过慢流: group_id=%s", group.group_id)
+            for _, ctx in contexts:
+                ctx.whisper_skipped = True
+                ctx.whisper_result = {}
+            self._record_turn_group_unit(
+                group=group,
+                status="committed",
+                payload={
+                    "source_chunks": list(group.source_chunks),
+                    "speaker_id": group.speaker_id,
+                    "flush_reason": group.flush_reason,
+                    "skipped": True,
+                    "skip_reason": "missing_full_audio",
+                },
+            )
+            return await self._push_batch_contexts(
+                contexts,
+                slow_processed_indices,
+                total_chunks=total_chunks,
+                job_dir=job_dir,
+                token=token,
+            )
+
+        prompt = self._build_whisper_prompt(group.prompt_text or None)
+        whisper_result = await self.slow_worker.process_turn_group(
+            group,
+            full_audio_array=self._full_audio_array,
+            full_audio_sr=self._full_audio_sr,
+            prompt_text=prompt,
+        )
+
+        self._record_turn_group_unit(
+            group=group,
+            status="committed",
+            payload={
+                "source_chunks": list(group.source_chunks),
+                "target_turn_ids": list(group.target_turn_ids),
+                "speaker_id": group.speaker_id,
+                "flush_reason": group.flush_reason,
+            },
+        )
+
+        self._validate_l0_result(whisper_result, source="slow")
+        whisper_text_raw = str(whisper_result.get("raw_text") or "")
+        whisper_result["text_raw"] = whisper_text_raw
+        whisper_result["prompt"] = prompt
+        base_text = whisper_result.get("min_clean_text") or whisper_text_raw
+        whisper_result["text"] = self._whisper_sanitizer.sanitize_minimal(
+            str(base_text or ""),
+            prompt=prompt,
+        )
+
+        self._emit_whisper_debug(
+            job_dir,
+            group_id=group.group_id,
+            flush_reason=group.flush_reason,
+            whisper_result=whisper_result,
+            chunk_indices=chunk_indices,
+        )
+
+        if whisper_result and self._hallucination_detector.is_hallucination(whisper_result, prompt):
+            self.logger.warning("TurnGroup 检测到 Whisper 幻觉，回退快流: group_id=%s", group.group_id)
+            for _, ctx in contexts:
+                ctx.whisper_skipped = True
+                ctx.whisper_result = {}
+            return await self._push_batch_contexts(
+                contexts,
+                slow_processed_indices,
+                total_chunks=total_chunks,
+                job_dir=job_dir,
+                token=token,
+            )
+
+        group_language = group.language or whisper_result.get("language") or "auto"
+        normalized_whisper = self._text_normalizer.normalize(whisper_result.get("text", ""), group_language)
+        whisper_result["text_itn_raw"] = normalized_whisper.text_itn_raw
+        whisper_result["text_clean"] = normalized_whisper.text_clean
+        whisper_result["text"] = normalized_whisper.text_clean or whisper_result.get("text", "")
+        whisper_result["language"] = group_language
+
+        if whisper_result.get("text"):
+            self._update_prompt_cache(str(whisper_result.get("text", "")))
+
+        batch_start = min((seg[0] for seg in group.audio_segments), default=0.0)
+        chunk_results = self._split_whisper_result_by_chunks(
+            whisper_result,
+            [idx for idx, _ in contexts],
+            batch_start=batch_start,
+            language_override=group_language,
+        )
+
+        for idx, ctx in contexts:
+            setattr(
+                ctx,
+                "_trace_l0_batch_whisper",
+                {
+                    "group_id": group.group_id,
+                    "chunk_indices": list(chunk_indices),
+                    "prompt": str(prompt or ""),
+                    "flush_reason": str(group.flush_reason or ""),
+                    "whisper_text_raw": str(whisper_result.get("text_raw") or ""),
+                    "whisper_text_clean": str(whisper_result.get("text") or ""),
+                    "raw_result": dict(whisper_result.get("raw_result", {}) or {}),
+                },
+            )
+            if skip_map.get(idx):
+                ctx.whisper_skipped = True
+                ctx.whisper_result = {}
+                continue
+
+            ctx.whisper_skipped = False
+            chunk_result = chunk_results.get(
+                idx,
+                {
+                    "text": "",
+                    "confidence": float(whisper_result.get("confidence", 0.0) or 0.0),
+                    "language": group_language,
+                    "raw_result": {"segments": []},
+                    "word_time_base": "batch_local",
+                    "word_time_offset": float(batch_start),
+                },
+            )
+            chunk_text_raw = str(chunk_result.get("raw_text") or chunk_result.get("text", "") or "")
+            chunk_result["raw_text"] = chunk_text_raw
+            chunk_result["text_raw"] = chunk_text_raw
+            if not chunk_result.get("min_clean_text"):
+                chunk_result["min_clean_text"] = self._whisper_sanitizer.sanitize_minimal(
+                    chunk_text_raw,
+                    prompt=None,
+                )
+            chunk_result["text"] = str(chunk_result.get("min_clean_text") or "")
+            raw_text_for_track = chunk_text_raw
+            normalized_chunk = self._text_normalizer.normalize(chunk_result.get("text", ""), group_language)
+            chunk_result["text_itn_raw"] = normalized_chunk.text_itn_raw
+            chunk_result["text_clean"] = normalized_chunk.text_clean
+            chunk_result["text"] = normalized_chunk.text_clean or raw_text_for_track
+            chunk_result["language"] = group_language
+            ctx.whisper_result = chunk_result
+            tracks = self._ensure_text_tracks(ctx)
+            tracks.whisper_track = self._build_text_track(
+                raw_text_for_track,
+                normalized_chunk,
+                source="whisper",
+                language=group_language,
+            )
+
+        return await self._push_batch_contexts(
+            contexts,
+            slow_processed_indices,
+            total_chunks=total_chunks,
+            job_dir=job_dir,
+            token=token,
+        )
+
+    def _record_turn_group_unit(
+        self,
+        *,
+        group: TurnGroup,
+        status: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """W-Epoch 单元状态提交（每个 TurnGroup 一次）。"""
+        service = self._runtime_checkpoint_service
+        if service is None:
+            return
+        stage = "slow_epoch"
+        unit_id = f"turn_group:{group.group_id}"
+        try:
+            if status == "started":
+                service.record_unit_started(stage=stage, unit_id=unit_id, payload=payload)
+            elif status == "committed":
+                service.record_unit_committed(stage=stage, unit_id=unit_id, payload=payload)
+        except Exception as exc:
+            self.logger.warning("TurnGroup 单元写入失败（降级继续）: %s", exc)
+
+    def _is_turn_group_committed(self, group_id: str) -> bool:
+        """判断 TurnGroup 是否已提交（用于恢复跳过重算）。"""
+        service = self._runtime_checkpoint_service
+        if service is None:
+            return False
+        try:
+            snapshot = service.load_snapshot()
+        except Exception:
+            return False
+        commits: Dict[str, str]
+        if isinstance(snapshot, dict):
+            commits = dict(snapshot.get("last_unit_commits", {}))
+        else:
+            commits = dict(getattr(snapshot, "last_unit_commits", {}) or {})
+        committed_unit = commits.get("slow_epoch")
+        if not committed_unit:
+            return False
+        current_unit = f"turn_group:{group_id}"
+        if committed_unit == current_unit:
+            return True
+
+        def _extract_seq(unit: str) -> Optional[int]:
+            if not isinstance(unit, str):
+                return None
+            if not unit.startswith("turn_group:tg-"):
+                return None
+            try:
+                return int(unit.split(":tg-")[-1])
+            except ValueError:
+                return None
+
+        committed_seq = _extract_seq(committed_unit)
+        current_seq = _extract_seq(current_unit)
+        if committed_seq is None or current_seq is None:
+            return False
+        return current_seq <= committed_seq
 
     @staticmethod
     def _ensure_text_tracks(ctx: ProcessingContext) -> TextTrackBundle:
@@ -1921,7 +2235,9 @@ class AsyncDualPipeline:
     def _emit_whisper_debug(
         self,
         job_dir: Optional[Path],
-        batch: BridgeBatch,
+        *,
+        group_id: str,
+        flush_reason: str,
         whisper_result: Dict[str, Any],
         chunk_indices: List[int],
     ) -> None:
@@ -1942,7 +2258,8 @@ class AsyncDualPipeline:
         sanitized_text = str(whisper_result.get("text", "") or "")
         seg_text = "".join(str(seg.get("text", "")) for seg in raw_segments).strip()
         payload = {
-            "batch_id": batch.batch_id,
+            "group_id": group_id,
+            "flush_reason": str(flush_reason or ""),
             "chunk_indices": chunk_indices,
             "text_len": len(sanitized_text),
             "raw_text_len": len(raw_text),
@@ -2279,177 +2596,6 @@ class AsyncDualPipeline:
         }
         append_debug_layer_trace_line(ctx.job_dir, payload, logger=self.logger)
 
-    async def _process_bridge_batch(
-        self,
-        batch: BridgeBatch,
-        *,
-        job_dir: Optional[Path],
-        total_chunks: int,
-        slow_processed_indices: Set[int],
-        token: Optional["CancellationToken"],
-    ) -> bool:
-        """处理 Bridge 批次并推送到对齐阶段。"""
-        if not self.slow_worker:
-            return False
-
-        chunk_indices = self._parse_source_chunk_indices(batch.source_chunks)
-        if not chunk_indices:
-            self.logger.warning("Bridge 批次缺少 source_chunks: batch_id=%s", batch.batch_id)
-            return False
-
-        contexts: List[tuple[int, ProcessingContext]] = []
-        for idx in chunk_indices:
-            ctx = self._context_cache.get(idx)
-            if ctx:
-                contexts.append((idx, ctx))
-
-        if not contexts:
-            self.logger.warning("Bridge 批次缺少上下文缓存: batch_id=%s", batch.batch_id)
-            return False
-
-        skip_map: Dict[int, bool] = {}
-        if self.is_patching_mode:
-            for idx, ctx in contexts:
-                if ctx.sv_result and ctx.audio_chunk:
-                    skip_map[idx] = self._should_skip_whisper(ctx.sv_result, ctx.audio_chunk)
-                else:
-                    skip_map[idx] = False
-
-        if self.is_patching_mode and all(skip_map.values()):
-            for _, ctx in contexts:
-                ctx.whisper_skipped = True
-                ctx.whisper_result = {}
-            return await self._push_batch_contexts(
-                contexts,
-                slow_processed_indices,
-                total_chunks=total_chunks,
-                job_dir=job_dir,
-                token=token,
-            )
-
-        if self._full_audio_array is None:
-            self.logger.warning("Bridge 批次缺少完整音频，跳过慢流: batch_id=%s", batch.batch_id)
-            for _, ctx in contexts:
-                ctx.whisper_skipped = True
-                ctx.whisper_result = {}
-            return await self._push_batch_contexts(
-                contexts,
-                slow_processed_indices,
-                total_chunks=total_chunks,
-                job_dir=job_dir,
-                token=token,
-            )
-
-        slow_result: SlowWorkerResult = await self.slow_worker.process_batch(
-            batch,
-            full_audio_array=self._full_audio_array,
-            full_audio_sr=self._full_audio_sr,
-        )
-        if self.bridge_controller:
-            self.bridge_controller.record_slow_result(batch.batch_id, slow_result)
-
-        whisper_result = slow_result.whisper_result or {}
-        self._validate_l0_result(whisper_result, source="slow")
-        prompt = batch.prompt or None
-        whisper_text_raw = str(whisper_result.get("raw_text") or "")
-        whisper_result["text_raw"] = whisper_text_raw
-        whisper_result["prompt"] = prompt
-        base_text = whisper_result.get("min_clean_text") or whisper_text_raw
-        whisper_result["text"] = self._whisper_sanitizer.sanitize_minimal(
-            str(base_text or ""),
-            prompt=prompt,
-        )
-        self._emit_whisper_debug(job_dir, batch, whisper_result, chunk_indices)
-        if whisper_result and self._hallucination_detector.is_hallucination(whisper_result, prompt):
-            self.logger.warning("Bridge 批次检测到 Whisper 幻觉，回退快流: batch_id=%s", batch.batch_id)
-            for _, ctx in contexts:
-                ctx.whisper_skipped = True
-                ctx.whisper_result = {}
-            return await self._push_batch_contexts(
-                contexts,
-                slow_processed_indices,
-                total_chunks=total_chunks,
-                job_dir=job_dir,
-                token=token,
-            )
-
-        batch_language = batch.language or whisper_result.get("language") or "auto"
-        normalized_whisper = self._text_normalizer.normalize(whisper_result.get("text", ""), batch_language)
-        whisper_result["text_itn_raw"] = normalized_whisper.text_itn_raw
-        whisper_result["text_clean"] = normalized_whisper.text_clean
-        whisper_result["text"] = normalized_whisper.text_clean or whisper_result.get("text", "")
-        whisper_result["language"] = batch_language
-
-        if whisper_result.get("text"):
-            self._update_prompt_cache(str(whisper_result.get("text", "")))
-
-        batch_start = min((seg[0] for seg in batch.audio_segments), default=0.0)
-        chunk_results = self._split_whisper_result_by_chunks(
-            whisper_result,
-            [idx for idx, _ in contexts],
-            batch_start=batch_start,
-            language_override=batch_language,
-        )
-
-        for idx, ctx in contexts:
-            setattr(
-                ctx,
-                "_trace_l0_batch_whisper",
-                {
-                    "batch_id": batch.batch_id,
-                    "chunk_indices": list(chunk_indices),
-                    "prompt": str(prompt or ""),
-                    "flush_reason": str(getattr(batch, "flush_reason", "") or ""),
-                    "whisper_text_raw": str(whisper_result.get("text_raw") or ""),
-                    "whisper_text_clean": str(whisper_result.get("text") or ""),
-                    "raw_result": dict(whisper_result.get("raw_result", {}) or {}),
-                },
-            )
-            if skip_map.get(idx):
-                ctx.whisper_skipped = True
-                ctx.whisper_result = {}
-                continue
-            ctx.whisper_skipped = False
-            chunk_result = chunk_results.get(
-                idx,
-                {
-                    "text": "",
-                    "confidence": float(whisper_result.get("confidence", 0.0) or 0.0),
-                    "language": batch_language,
-                    "raw_result": {"segments": []},
-                    "word_time_base": "batch_local",
-                    "word_time_offset": float(batch_start),
-                },
-            )
-            chunk_text_raw = str(chunk_result.get("raw_text") or chunk_result.get("text", "") or "")
-            chunk_result["raw_text"] = chunk_text_raw
-            chunk_result["text_raw"] = chunk_text_raw
-            if not chunk_result.get("min_clean_text"):
-                chunk_result["min_clean_text"] = self._whisper_sanitizer.sanitize_minimal(chunk_text_raw, prompt=None)
-            chunk_result["text"] = str(chunk_result.get("min_clean_text") or "")
-            raw_text_for_track = chunk_text_raw
-            normalized_chunk = self._text_normalizer.normalize(chunk_result.get("text", ""), batch_language)
-            chunk_result["text_itn_raw"] = normalized_chunk.text_itn_raw
-            chunk_result["text_clean"] = normalized_chunk.text_clean
-            chunk_result["text"] = normalized_chunk.text_clean or raw_text_for_track
-            chunk_result["language"] = batch_language
-            ctx.whisper_result = chunk_result
-            tracks = self._ensure_text_tracks(ctx)
-            tracks.whisper_track = self._build_text_track(
-                raw_text_for_track,
-                normalized_chunk,
-                source="whisper",
-                language=batch_language,
-            )
-
-        return await self._push_batch_contexts(
-            contexts,
-            slow_processed_indices,
-            total_chunks=total_chunks,
-            job_dir=job_dir,
-            token=token,
-        )
-
     async def _push_batch_contexts(
         self,
         contexts: List[tuple[int, ProcessingContext]],
@@ -2607,7 +2753,10 @@ class AsyncDualPipeline:
                     used_semantic = await self._emit_draft_sentences(ctx, is_final_output=False)
 
                     # 放入队列（如果队列满了，会自动阻塞，实现背压）
-                    if not self._enable_bridge_batches or not used_semantic:
+                    if (
+                        not self._enable_bridge_batches
+                        or (not self._consume_turn_groups_only and not used_semantic)
+                    ):
                         await self.queue_inter.put(ctx)
                     fast_processed_count += 1  # V3.1.0
                     last_chunk_index = i
@@ -2736,7 +2885,7 @@ class AsyncDualPipeline:
 
         try:
             while True:
-                # 从队列取输入（ProcessingContext / BridgeBatch）
+                # 从队列取输入（ProcessingContext / TurnGroupEnvelope）
                 try:
                     payload = await asyncio.wait_for(
                         self.queue_inter.get(),
@@ -2747,10 +2896,28 @@ class AsyncDualPipeline:
                         self.queue_inter.qsize()
                     ):
                         await self._flush_bridge_controller()
+                    envelope = self._turn_group_builder.flush_idle(now=time.time())
+                    if envelope:
+                        await self._enqueue_turn_group(envelope)
                     continue
 
-                if isinstance(payload, BridgeBatch):
-                    if await self._process_bridge_batch(
+                if isinstance(payload, TurnGroupEnvelope):
+                    if self._is_turn_group_committed(payload.group.group_id):
+                        self.logger.info(
+                            "W-Epoch 命中已提交 TurnGroup，跳过重算: group_id=%s",
+                            payload.group.group_id,
+                        )
+                        continue
+                    self._record_turn_group_unit(
+                        group=payload.group,
+                        status="started",
+                        payload={
+                            "source_chunks": list(payload.group.source_chunks),
+                            "speaker_id": payload.group.speaker_id,
+                            "flush_reason": payload.group.flush_reason,
+                        },
+                    )
+                    if await self._process_turn_group(
                         payload,
                         job_dir=job_dir,
                         total_chunks=total_chunks,
