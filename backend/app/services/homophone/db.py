@@ -196,6 +196,72 @@ class HomophoneDb:
         with self.connect() as conn:
             return list(conn.execute(sql, (job_id, revision, language, key_value, limit)).fetchall())
 
+    def query_postings_by_prefix(
+        self,
+        *,
+        job_id: str,
+        revision: int,
+        language: str,
+        key_prefix: str,
+        is_fuzzy: bool,
+        is_ignore_punctuation: bool,
+        limit: int,
+    ) -> List[sqlite3.Row]:
+        """按读音前缀召回 postings（用于 fuzzy 场景的近音扩召）。"""
+        if not key_prefix:
+            return []
+        if is_ignore_punctuation:
+            key_column = "reading_key_fuzzy_no_punct" if is_fuzzy else "reading_key_no_punct"
+        else:
+            key_column = "reading_key_fuzzy" if is_fuzzy else "reading_key"
+        sql = f"""
+            SELECT sentence_index, token_index, token_text, char_start, char_end, reading_key
+            FROM homophone_postings
+            WHERE job_id=? AND revision=? AND language=? AND {key_column} LIKE ?
+            ORDER BY sentence_index ASC, token_index ASC
+            LIMIT ?
+        """
+        with self.connect() as conn:
+            return list(
+                conn.execute(
+                    sql,
+                    (job_id, revision, language, f"{key_prefix}%", limit),
+                ).fetchall()
+            )
+
+    def list_sentence_postings(
+        self,
+        *,
+        job_id: str,
+        revision: int,
+        language: str,
+        sentence_indices: List[int],
+    ) -> List[sqlite3.Row]:
+        """批量读取句子级 postings（用于词级序列匹配）。"""
+        if not sentence_indices:
+            return []
+        placeholders = ",".join("?" for _ in sentence_indices)
+        sql = f"""
+            SELECT
+                sentence_index,
+                token_index,
+                token_text,
+                char_start,
+                char_end,
+                reading_key,
+                reading_key_fuzzy,
+                reading_key_no_punct,
+                reading_key_fuzzy_no_punct
+            FROM homophone_postings
+            WHERE job_id=? AND revision=? AND language=?
+              AND sentence_index IN ({placeholders})
+            ORDER BY sentence_index ASC, token_index ASC
+        """
+        params: List[object] = [job_id, revision, language]
+        params.extend(sentence_indices)
+        with self.connect() as conn:
+            return list(conn.execute(sql, tuple(params)).fetchall())
+
     def get_sentence_indices_by_chunk(self, *, job_id: str, revision: int, chunk_index: int) -> List[int]:
         with self.connect() as conn:
             rows = conn.execute(
@@ -256,4 +322,3 @@ class HomophoneDb:
             )
             for row in rows
         ]
-
