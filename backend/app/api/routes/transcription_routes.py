@@ -223,6 +223,48 @@ def create_transcription_router(
             return "en"
         return "zh"
 
+    def _ensure_homophone_index_ready(
+        *,
+        job_id: str,
+        requested_language: str,
+    ) -> Optional[Any]:
+        """确保同音索引可查询。
+
+        设计说明：
+        - 若 L7 侧车尚未写入索引（missing），此处以当前快照同步构建 revision=1，
+          避免前端首次进入同音检索时“永远不可搜”。
+        - 只在 missing 场景触发，避免干扰正常异步侧车流程。
+        """
+        homophone_service = get_homophone_service()
+        state = homophone_service.get_index_status(job_id)
+        if state is not None:
+            return state
+
+        segments = _collect_segments_from_snapshot(job_id)
+        if not segments:
+            return None
+
+        joined_text = "\n".join(str(item.get("text", "")) for item in segments)
+        language = requested_language or _detect_language_from_text(joined_text)
+        if language not in {"zh", "ja", "en"}:
+            language = _detect_language_from_text(joined_text)
+
+        records = [
+            SentenceRecord(
+                index=int(item.get("id", 0)),
+                text=str(item.get("text", "")),
+            )
+            for item in segments
+        ]
+        homophone_service.index_chunk(
+            job_id=job_id,
+            revision=1,
+            chunk_index=0,
+            language=language,
+            sentences=records,
+        )
+        return homophone_service.get_index_status(job_id)
+
     def _collect_segments_from_snapshot(job_id: str) -> List[Dict[str, Any]]:
         from pathlib import Path
         from app.services.subtitle_edit_store import (
@@ -1450,7 +1492,10 @@ def create_transcription_router(
             raise HTTPException(status_code=404, detail="任务未找到")
 
         homophone_service = get_homophone_service()
-        state = homophone_service.get_index_status(job_id)
+        state = _ensure_homophone_index_ready(
+            job_id=job_id,
+            requested_language=payload.language,
+        )
         if state is None:
             return {
                 "success": True,
@@ -1461,15 +1506,75 @@ def create_transcription_router(
                 },
             }
 
+        request_language = payload.language if payload.language in {"zh", "ja", "en"} else "zh"
+        indexed_language = request_language
+
         matches = homophone_service.search_homophone(
             job_id=job_id,
             revision=state.revision,
-            language=payload.language,
+            language=request_language,
             query_text=payload.query_text,
             mode=payload.mode,
             is_ignore_punctuation=payload.is_ignore_punctuation,
             limit=payload.limit,
         )
+
+        if not matches:
+            for fallback_language in ("zh", "ja", "en"):
+                if fallback_language == request_language:
+                    continue
+                fallback_matches = homophone_service.search_homophone(
+                    job_id=job_id,
+                    revision=state.revision,
+                    language=fallback_language,
+                    query_text=payload.query_text,
+                    mode=payload.mode,
+                    is_ignore_punctuation=payload.is_ignore_punctuation,
+                    limit=payload.limit,
+                )
+                if fallback_matches:
+                    matches = fallback_matches
+                    indexed_language = fallback_language
+                    break
+
+        # 设计说明：若首次建索引时语言推断失误（如将中文拼音当英文），
+        # 可能得到 ready 但 postings 为空。此处在“仍未命中”时基于快照主语言自愈重建并重试。
+        if not matches:
+            segments = _collect_segments_from_snapshot(job_id)
+            if segments:
+                joined_text = "\n".join(str(item.get("text", "")) for item in segments)
+                detected_language = _detect_language_from_text(joined_text)
+                if detected_language in {"zh", "ja", "en"} and detected_language != indexed_language:
+                    records = [
+                        SentenceRecord(
+                            index=int(item.get("id", 0)),
+                            text=str(item.get("text", "")),
+                        )
+                        for item in segments
+                    ]
+                    homophone_service.index_chunk(
+                        job_id=job_id,
+                        revision=state.revision,
+                        chunk_index=0,
+                        language=detected_language,
+                        sentences=records,
+                    )
+                    refreshed_state = homophone_service.get_index_status(job_id)
+                    if refreshed_state is not None:
+                        state = refreshed_state
+
+                    fallback_matches = homophone_service.search_homophone(
+                        job_id=job_id,
+                        revision=state.revision,
+                        language=detected_language,
+                        query_text=payload.query_text,
+                        mode=payload.mode,
+                        is_ignore_punctuation=payload.is_ignore_punctuation,
+                        limit=payload.limit,
+                    )
+                    if fallback_matches:
+                        matches = fallback_matches
+                        indexed_language = detected_language
         return {
             "success": True,
             "data": {
@@ -1477,6 +1582,7 @@ def create_transcription_router(
                 "revision": state.revision,
                 "query": payload.query_text,
                 "mode": payload.mode,
+                "language": indexed_language,
                 "is_ignore_punctuation": payload.is_ignore_punctuation,
                 "matches": [
                     {

@@ -279,7 +279,6 @@ class SSEChannelManager extends EventEmitter {
       'subtitle.edited': (data) => {
         console.log(`[SSE Job ${jobId}] 用户编辑字幕:`, data)
         handlers.onSubtitleEdited?.(data)
-        handlers.onSubtitleUpdate?.(data)
       },
 
       // 旧版事件 (兼容)
