@@ -17,6 +17,7 @@ V3.1.1+dev.20260108.01:
 """
 import numpy as np
 import logging
+from importlib import metadata, util
 from typing import List, Tuple, Optional
 
 from app.models.circuit_breaker_models import (
@@ -26,6 +27,30 @@ from app.core.spectrum_thresholds import SpectrumThresholds
 from app.services.runtime_param_resolver import build_spectrum_thresholds
 
 logger = logging.getLogger(__name__)
+
+
+def _is_snr_strategy_runtime_available() -> bool:
+    """
+    判断 SNR+C50 策略运行时是否可用。
+
+    Why:
+    - 临时下线 Brouhaha 后，默认必须走兜底分诊；
+    - 即使外部误传 use_snr_strategy=True，也要自动降级，避免触发导入/推理异常。
+    """
+    if util.find_spec("brouhaha") is None:
+        return False
+
+    try:
+        pyannote_version = metadata.version("pyannote-audio")
+    except metadata.PackageNotFoundError:
+        pyannote_version = ""
+    except Exception:
+        pyannote_version = ""
+
+    if pyannote_version.startswith("4."):
+        return False
+
+    return True
 
 
 # ========== Brouhaha 集成 (V3.1.1+dev.20260108.01) ==========
@@ -74,7 +99,7 @@ class AudioSpectrumClassifier:
         Args:
             thresholds: 频谱阈值配置
             use_yamnet: 是否使用 YAMNet 语义分类器（默认 True）
-            use_snr_strategy: 是否使用 SNR+C50 三层决策策略（默认 True）
+            use_snr_strategy: 是否使用 SNR+C50 三层决策策略（默认 False）
         """
         self.thresholds = thresholds or build_spectrum_thresholds()
         self._librosa = None  # 懒加载
@@ -117,6 +142,8 @@ class AudioSpectrumClassifier:
         每次检查模型是否可用，如果不可用则尝试重新加载
         """
         if not self._use_snr_strategy:
+            return None
+        if not _is_snr_strategy_runtime_available():
             return None
 
         # 如果没有实例或实例不可用，尝试获取/重新加载
@@ -872,17 +899,22 @@ def get_spectrum_classifier(use_snr_strategy: Optional[bool] = None) -> AudioSpe
     """
     获取频谱分诊器单例
 
-    V3.1.1+dev.20260108.02: 默认启用 SNR+C50 三层决策策略
+    V3.2.0+dev.20260212.01: 临时下线 Brouhaha，默认关闭 SNR+C50 三层决策策略
 
     Args:
-        use_snr_strategy: 是否使用 SNR+C50 策略（默认 True）
+        use_snr_strategy: 是否使用 SNR+C50 策略（默认 False）
 
     Returns:
         AudioSpectrumClassifier: 分诊器单例实例
     """
     global _classifier_instance
     thresholds = build_spectrum_thresholds()
-    effective_snr = True if use_snr_strategy is None else use_snr_strategy
+    requested_snr = False if use_snr_strategy is None else bool(use_snr_strategy)
+    if requested_snr and not _is_snr_strategy_runtime_available():
+        logger.warning("SNR+C50 策略运行时不可用（brouhaha 缺失或 pyannote>=4），自动回退兜底分诊")
+        effective_snr = False
+    else:
+        effective_snr = requested_snr
     effective_yamnet = True
     if _classifier_instance is None:
         _classifier_instance = AudioSpectrumClassifier(
