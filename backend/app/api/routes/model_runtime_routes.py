@@ -159,6 +159,7 @@ class DemucsRuntimeParams(_RuntimeBase):
     shifts: Optional[int] = Field(default=None, ge=1, le=5)
     overlap: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     segment_length: Optional[int] = Field(default=None, ge=1)
+    global_group_duration_sec: Optional[float] = Field(default=None, ge=60.0)
     segment_buffer_sec: Optional[float] = Field(default=None, ge=0.0)
     bgm_sample_duration: Optional[float] = Field(default=None, ge=1.0)
     bgm_light_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
@@ -228,6 +229,54 @@ class VADRuntimeParams(_RuntimeBase):
             and self.smart_max_duration < self.sensevoice_smart_target_duration
         ):
             raise ValueError("smart_max_duration 必须 >= sensevoice_smart_target_duration")
+        return self
+
+
+class TimelineRuntimeParams(_RuntimeBase):
+    device: Optional[str] = Field(default=None)
+    is_diarization_enabled: Optional[bool] = Field(default=None, alias="diarization_enabled")
+    diarization_model_id: Optional[str] = Field(default=None)
+    diarization_local_path: Optional[str] = Field(default=None)
+    diarization_hf_token: Optional[str] = Field(default=None)
+    diarization_max_speakers: Optional[int] = Field(default=None, ge=1)
+    diarization_min_speakers: Optional[int] = Field(default=None, ge=1)
+    diarization_num_speakers: Optional[int] = Field(default=None, ge=1)
+    segmentation_boundary_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    segmentation_min_boundary_interval_sec: Optional[float] = Field(default=None, ge=0.0)
+    min_support_turns: Optional[int] = Field(default=None, ge=1)
+    min_total_duration: Optional[float] = Field(default=None, ge=0.0)
+    merge_similarity_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    long_pause_cut_sec: Optional[float] = Field(default=None, ge=0.0)
+
+    @field_validator("device")
+    @classmethod
+    def _validate_device(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        value_lower = value.lower()
+        if value_lower not in _DEVICE_OPTIONS:
+            raise ValueError("device 仅支持 auto/cuda/cpu")
+        return value_lower
+
+    @model_validator(mode="after")
+    def _validate_speaker_constraints(self):
+        if self.diarization_num_speakers is not None:
+            if (
+                self.diarization_min_speakers is not None
+                and self.diarization_num_speakers < self.diarization_min_speakers
+            ):
+                raise ValueError("diarization_num_speakers 必须 >= diarization_min_speakers")
+            if (
+                self.diarization_max_speakers is not None
+                and self.diarization_num_speakers > self.diarization_max_speakers
+            ):
+                raise ValueError("diarization_num_speakers 必须 <= diarization_max_speakers")
+        if (
+            self.diarization_min_speakers is not None
+            and self.diarization_max_speakers is not None
+            and self.diarization_min_speakers > self.diarization_max_speakers
+        ):
+            raise ValueError("diarization_min_speakers 必须 <= diarization_max_speakers")
         return self
 
 
@@ -375,9 +424,11 @@ class ArbitrationRuntimeParams(_RuntimeBase):
 
 class RuntimeGroupUpdateRequest(_RuntimeBase):
     whisper: Optional[WhisperRuntimeParams] = None
+    whisper_sanitize: Optional[WhisperSanitizeRuntimeParams] = None
     sensevoice: Optional[SenseVoiceRuntimeParams] = None
     demucs: Optional[DemucsRuntimeParams] = None
     vad: Optional[VADRuntimeParams] = None
+    timeline: Optional[TimelineRuntimeParams] = None
     smart_probe: Optional[SmartProbeRuntimeParams] = None
     yamnet: Optional[YAMNetRuntimeParams] = None
     punctuation: Optional[PunctuationRuntimeParams] = None
@@ -392,6 +443,7 @@ _RUNTIME_GROUP_MODELS = {
     "sensevoice": SenseVoiceRuntimeParams,
     "demucs": DemucsRuntimeParams,
     "vad": VADRuntimeParams,
+    "timeline": TimelineRuntimeParams,
     "smart_probe": SmartProbeRuntimeParams,
     "yamnet": YAMNetRuntimeParams,
     "punctuation": PunctuationRuntimeParams,
@@ -478,10 +530,27 @@ _PARAM_SCHEMA: Dict[str, Any] = {
             "shifts": {"type": "int", "min": 1, "max": 5, "default": 1},
             "overlap": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.5},
             "segment_length": {"type": "int", "min": 1, "default": 10},
+            "global_group_duration_sec": {"type": "float", "min": 60.0, "default": 1800.0},
             "segment_buffer_sec": {"type": "float", "min": 0.0, "default": 2.0},
             "bgm_sample_duration": {"type": "float", "min": 1.0, "default": 10.0},
             "bgm_light_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.02},
             "bgm_heavy_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.15},
+        },
+        "timeline": {
+            "device": {"type": "enum", "enum": ["auto", "cuda", "cpu"], "default": "cuda"},
+            "diarization_enabled": {"type": "bool", "default": False},
+            "diarization_model_id": {"type": "string", "default": "pyannote-speaker-diarization-community-1"},
+            "diarization_local_path": {"type": "string", "default": ""},
+            "diarization_hf_token": {"type": "string", "default": None},
+            "diarization_max_speakers": {"type": "int", "min": 1, "default": None},
+            "diarization_min_speakers": {"type": "int", "min": 1, "default": None},
+            "diarization_num_speakers": {"type": "int", "min": 1, "default": 3},
+            "segmentation_boundary_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.55},
+            "segmentation_min_boundary_interval_sec": {"type": "float", "min": 0.0, "default": 0.2},
+            "min_support_turns": {"type": "int", "min": 1, "default": 2},
+            "min_total_duration": {"type": "float", "min": 0.0, "default": 2.0},
+            "merge_similarity_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.88},
+            "long_pause_cut_sec": {"type": "float", "min": 0.0, "default": 1.8},
         },
         "vad": {
             "method": {"type": "enum", "enum": ["silero", "pyannote"], "default": "silero"},

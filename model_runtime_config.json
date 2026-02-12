@@ -1,20 +1,24 @@
 {
-    "version": "1.1",
-    "global": {},
-    "runtime": {
-        "punctuation": {
-            "force_split_on_sentence_end_punct": true,
-            "sv_fallback_mode": "tolerant",
-            "source_preference": "merged"
-        },
-        "alignment": {
-            "dual_time_boundary_tolerance_ms": 250,
-            "enable_dual_time_experiment": true,
-            "dual_time_active_min_boundary_f1": 0.85,
-            "dual_time_write_debug_srt": false,
-            "dual_time_mode": "shadow"
-        }
+  "version": "1.1",
+  "global": {},
+  "runtime": {
+    "punctuation": {
+      "force_split_on_sentence_end_punct": true,
+      "sv_fallback_mode": "tolerant",
+      "source_preference": "merged"
     },
-    "per_model": {},
-    "resident_models": []
+    "alignment": {
+      "dual_time_boundary_tolerance_ms": 250,
+      "enable_dual_time_experiment": true,
+      "dual_time_active_min_boundary_f1": 0.85,
+      "dual_time_write_debug_srt": false,
+      "dual_time_mode": "shadow"
+    },
+    "timeline": {
+      "diarization_enabled": true,
+      "diarization_model_id": "pyannote-speaker-diarization-community-1"
+    }
+  },
+  "per_model": {},
+  "resident_models": []
 }

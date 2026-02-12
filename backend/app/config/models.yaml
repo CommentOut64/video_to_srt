@@ -214,6 +214,27 @@
   features:
     role: segmentation
 
+- id: pyannote-speaker-diarization-community-1
+  kind: speaker
+  framework: torch
+  format: pth
+  default_device: cuda
+  compute_type: fp32
+  source:
+    local_path: backend/models/pretrained/speaker-diarization-community-1
+    files:
+      [
+        config.yaml,
+        segmentation/pytorch_model.bin,
+        embedding/pytorch_model.bin,
+        plda/plda.npz,
+        plda/xvec_transform.npz,
+      ]
+  resources: {vram_mb: 2200, cpu_threads: 4}
+  features:
+    role: diarization
+    provider: pyannote-community
+
 - id: punct-ct-transformer-zh
   kind: punct
   framework: onnx

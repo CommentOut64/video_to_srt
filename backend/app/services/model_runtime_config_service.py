@@ -284,8 +284,18 @@ class ModelRuntimeConfigService:
                 "device": norm_str(os.getenv("SENSEVOICE_DEVICE")),
                 "model_type": norm_str(os.getenv("SENSEVOICE_MODEL_TYPE")),
             },
+            "demucs": {
+                "global_group_duration_sec": norm_str(os.getenv("DEMUCS_GLOBAL_GROUP_DURATION_SEC")),
+            },
             "timeline": {
                 "device": norm_str(os.getenv("TIMELINE_DEVICE")),
+                "diarization_enabled": norm_str(os.getenv("TIMELINE_DIARIZATION_ENABLED")),
+                "diarization_model_id": norm_str(os.getenv("TIMELINE_DIARIZATION_MODEL_ID")),
+                "diarization_local_path": norm_str(os.getenv("TIMELINE_DIARIZATION_LOCAL_PATH")),
+                "diarization_hf_token": norm_str(os.getenv("TIMELINE_DIARIZATION_HF_TOKEN")),
+                "diarization_max_speakers": norm_str(os.getenv("TIMELINE_DIARIZATION_MAX_SPEAKERS")),
+                "diarization_min_speakers": norm_str(os.getenv("TIMELINE_DIARIZATION_MIN_SPEAKERS")),
+                "diarization_num_speakers": norm_str(os.getenv("TIMELINE_DIARIZATION_NUM_SPEAKERS")),
             },
         }
 
@@ -326,6 +336,7 @@ class ModelRuntimeConfigService:
                 "shifts": 1,
                 "overlap": 0.5,
                 "segment_length": 10,
+                "global_group_duration_sec": 1800.0,
                 "segment_buffer_sec": 2.0,
                 "bgm_sample_duration": 10.0,
                 "bgm_light_threshold": 0.02,
@@ -358,6 +369,13 @@ class ModelRuntimeConfigService:
                 "min_total_duration": 2.0,
                 "merge_similarity_threshold": 0.88,
                 "long_pause_cut_sec": 1.8,
+                "diarization_enabled": False,
+                "diarization_model_id": "pyannote-speaker-diarization-community-1",
+                "diarization_local_path": "",
+                "diarization_hf_token": None,
+                "diarization_max_speakers": None,
+                "diarization_min_speakers": None,
+                "diarization_num_speakers": 3,
             },
             "flush_policy": {
                 "min_audio_sec": 6.0,
