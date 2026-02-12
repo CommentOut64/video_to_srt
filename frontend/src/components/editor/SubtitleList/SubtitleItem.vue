@@ -4,6 +4,23 @@
     :class="itemClasses"
     @click="handleClick"
   >
+    <!-- 簇颜色条（时间线模式，搜索激活时显示） -->
+    <div
+      v-if="clusterColor"
+      class="cluster-color-bar"
+      :style="{ backgroundColor: clusterColor }"
+    />
+
+    <!-- 复选框（搜索模式显示） -->
+    <el-checkbox
+      v-if="isSelectable"
+      :model-value="isSelected"
+      size="small"
+      class="item-checkbox"
+      @click.stop
+      @change="handleSelectChange"
+    />
+
     <!-- 序号 -->
     <div class="item-index">{{ index + 1 }}</div>
 
@@ -174,6 +191,11 @@ const props = defineProps({
   isActive: { type: Boolean, default: false },
   isCurrent: { type: Boolean, default: false },
   editable: { type: Boolean, default: true },
+  // 同音搜索相关 props
+  matchSpans: { type: Array, default: () => [] },  // 匹配区域 [{start, end, readingKey}]
+  isSelected: { type: Boolean, default: false },   // 是否选中（批量替换）
+  isSelectable: { type: Boolean, default: false }, // 是否显示复选框
+  clusterColor: { type: String, default: null },   // 簇颜色条（时间线模式）
 })
 
 const emit = defineEmits([
@@ -182,7 +204,8 @@ const emit = defineEmits([
   'update-text',
   'delete',
   'insert-before',
-  'insert-after'
+  'insert-after',
+  'select-change',  // 同音搜索：选择变化
 ])
 
 // Store
@@ -212,7 +235,9 @@ const itemClasses = computed(() => ({
   'is-draft': props.subtitle.isDraft,
   'warning-low-confidence': props.subtitle.warning_type === 'low_confidence',
   'warning-high-perplexity': props.subtitle.warning_type === 'high_perplexity',
-  'warning-both': props.subtitle.warning_type === 'both'
+  'warning-both': props.subtitle.warning_type === 'both',
+  'is-match-selected': props.isSelectable && props.isSelected,
+  'has-cluster-color': !!props.clusterColor,
 }))
 
 // 置信度徽章
@@ -264,6 +289,11 @@ function handleClick() {
   // 点击字幕块时重置删除确认状态
   resetDeleteConfirm()
   emit('click', props.subtitle)
+}
+
+// 选择变化处理（同音搜索）
+function handleSelectChange(checked) {
+  emit('select-change', props.index, checked)
 }
 
 // 时间更新
@@ -475,8 +505,14 @@ function handleContextMenuClose() {
 
 // 渲染带置信度高亮的文本
 function renderTextWithHighlight() {
-  const words = props.subtitle.words
   const text = props.subtitle.text
+
+  // 如果有同音搜索匹配区域，优先使用匹配高亮
+  if (props.matchSpans && props.matchSpans.length > 0) {
+    return renderMatchHighlight(text, props.matchSpans)
+  }
+
+  const words = props.subtitle.words
 
   // 如果没有字级数据，直接返回文本
   if (!words || words.length === 0) {
@@ -546,6 +582,49 @@ function renderTextWithHighlight() {
       }
     }
   }
+  return html
+}
+
+/**
+ * 渲染同音搜索匹配高亮
+ * @param {string} text - 原始文本
+ * @param {Array<{start: number, end: number, readingKey?: string}>} spans - 匹配区域
+ * @returns {string} 带高亮标记的 HTML
+ */
+function renderMatchHighlight(text, spans) {
+  if (!text || !spans || spans.length === 0) {
+    return escapeHtml(text)
+  }
+
+  // 按 start 排序并去重
+  const sortedSpans = [...spans].sort((a, b) => a.start - b.start)
+
+  let html = ''
+  let lastEnd = 0
+
+  for (const span of sortedSpans) {
+    const { start, end } = span
+
+    // 跳过无效区域
+    if (start < lastEnd || start >= text.length) continue
+
+    // 添加匹配前的普通文本
+    if (start > lastEnd) {
+      html += escapeHtml(text.slice(lastEnd, start))
+    }
+
+    // 添加高亮匹配文本
+    const matchText = text.slice(start, Math.min(end, text.length))
+    html += `<mark class="match-highlight">${escapeHtml(matchText)}</mark>`
+
+    lastEnd = Math.min(end, text.length)
+  }
+
+  // 添加剩余文本
+  if (lastEnd < text.length) {
+    html += escapeHtml(text.slice(lastEnd))
+  }
+
   return html
 }
 
@@ -991,5 +1070,48 @@ function formatDuration(seconds) {
 
 .delete-btn-confirming:hover {
   background: rgb(var(--af-accent-danger-rgb), 0.10);
+}
+
+/* 同音搜索相关样式 */
+
+/* 簇颜色条 */
+.cluster-color-bar {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  border-radius: var(--af-radius-md) 0 0 var(--af-radius-md);
+}
+
+/* 复选框 */
+.item-checkbox {
+  flex-shrink: 0;
+  margin-right: 4px;
+}
+
+/* 匹配高亮样式 */
+.text-row .text-preview :deep(.match-highlight) {
+  background-color: rgb(var(--af-accent-warning-rgb), 0.35);
+  color: var(--af-text-primary);
+  padding: 1px 2px;
+  border-radius: 2px;
+  font-weight: 500;
+}
+
+/* 选中状态的匹配项 */
+.subtitle-item.is-match-selected {
+  border-color: var(--af-accent-primary);
+  background: rgb(var(--af-accent-primary-rgb), 0.05);
+}
+
+/* 有簇颜色条时增加左侧内边距 */
+.subtitle-item.has-cluster-color {
+  padding-left: 14px;
+}
+
+.subtitle-item.is-match-selected .item-index {
+  background: var(--af-accent-primary);
+  color: var(--af-text-on-dark);
 }
 </style>

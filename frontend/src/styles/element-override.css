@@ -585,3 +585,16 @@ html.el-popup-parent--hidden .el-message-box__wrapper {
   background: rgba(255, 255, 255, 0.03) !important;
   color: var(--af-text-primary) !important;
 }
+
+/* ==============================================
+   SearchToolbar 模式选项 Popover 自定义样式
+   ============================================== */
+
+/* 原因：自定义模式选项 Popover 宽度和内边距，使其更加紧凑 */
+.mode-popover-custom {
+  min-width: 70px !important;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+

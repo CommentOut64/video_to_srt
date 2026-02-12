@@ -1,46 +1,34 @@
 <template>
   <div class="subtitle-list tw-flex tw-flex-col tw-h-full tw-bg-bg-primary">
-    <!-- 工具栏 -->
-    <div class="list-toolbar tw-flex tw-items-center tw-justify-between tw-px-3 tw-py-2.5 tw-bg-bg-secondary tw-border-b tw-border-border tw-gap-3">
-      <div class="toolbar-left">
-        <span class="subtitle-count tw-text-xs tw-text-text-secondary tw-whitespace-nowrap">{{ totalSubtitles }} 条字幕</span>
-        <!-- 草稿/定稿计数 -->
-        <span v-if="draftCount > 0" class="draft-count tw-text-xs tw-text-accent-warning tw-ml-1">({{ draftCount }} 草稿)</span>
-      </div>
-
-      <div class="toolbar-center tw-flex-1 tw-max-w-[180px] tw-min-w-[100px]">
-        <div class="search-box tw-flex tw-items-center tw-bg-bg-tertiary tw-rounded-md tw-px-2.5 tw-py-1.5 tw-gap-1.5">
-          <svg class="search-icon tw-w-3.5 tw-h-3.5 tw-text-text-muted tw-flex-shrink-0" viewBox="0 0 24 24" fill="currentColor">
-            <path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/>
-          </svg>
-          <input
-            v-model="searchText"
-            type="text"
-            placeholder="搜索字幕..."
-            class="search-input tw-flex-1 tw-min-w-0 tw-bg-transparent tw-border-none tw-text-text-normal tw-text-xs"
-          />
-          <button v-if="searchText" class="search-clear tw-w-4 tw-h-4 tw-text-text-muted tw-flex-shrink-0 hover:tw-text-text-normal" @click="searchText = ''">
-            <svg viewBox="0 0 24 24" fill="currentColor">
-              <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
-            </svg>
-          </button>
-        </div>
-      </div>
-
-      <div class="toolbar-right">
-        <el-tooltip content="添加字幕" placement="bottom" :show-after="500">
-          <button class="toolbar-btn tw-w-[30px] tw-h-[30px] tw-flex tw-items-center tw-justify-center tw-rounded-md tw-text-text-secondary tw-transition-all tw-duration-fast tw-flex-shrink-0 hover:tw-bg-bg-tertiary hover:tw-text-accent-primary" @click="addNewSubtitle">
-            <svg viewBox="0 0 24 24" fill="currentColor" class="tw-w-[18px] tw-h-[18px]">
-              <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/>
-            </svg>
-          </button>
-        </el-tooltip>
-      </div>
-    </div>
+    <!-- 搜索工具栏（整合原 list-toolbar） -->
+    <SearchToolbar
+      v-model:search-mode="homophoneSearch.searchMode"
+      v-model:sort-mode="homophoneSearch.sortMode"
+      v-model:search-text="homophoneSearch.searchText"
+      v-model:search-reading="homophoneSearch.searchReading"
+      v-model:is-ignore-punctuation="homophoneSearch.isIgnorePunctuation"
+      v-model:replace-text="homophoneSearch.replaceText"
+      :total-subtitles="totalSubtitles"
+      :draft-count="draftCount"
+      :is-searching="homophoneSearch.isSearching"
+      :can-search="homophoneSearch.canSearch"
+      :is-search-active="homophoneSearch.isSearchActive"
+      :index-status="homophoneSearch.indexStatus"
+      :match-count="homophoneSearch.matchCount"
+      :selected-count="homophoneSearch.selectedCount"
+      :is-all-selected="homophoneSearch.isAllSelected"
+      :is-indeterminate="homophoneSearch.isIndeterminate"
+      @search="handleHomophoneSearch"
+      @reset="handleHomophoneReset"
+      @batch-replace="handleBatchReplace"
+      @toggle-select-all="handleToggleSelectAll"
+      @add-subtitle="addNewSubtitle"
+      @quick-search="handleQuickSearch"
+    />
 
     <!-- 字幕列表 (使用 SubtitleItem 组件) -->
     <div class="list-container tw-flex-1 tw-overflow-y-auto tw-p-1.5 tw-relative" ref="listRef">
-      <div v-if="filteredSubtitles.length === 0" class="empty-state tw-flex tw-flex-col tw-items-center tw-justify-center tw-px-4 tw-py-8 tw-text-text-muted">
+      <div v-if="filteredSubtitles.length === 0 && !homophoneSearch.isSearchActive" class="empty-state tw-flex tw-flex-col tw-items-center tw-justify-center tw-px-4 tw-py-8 tw-text-text-muted">
         <svg viewBox="0 0 24 24" fill="currentColor" class="tw-w-12 tw-h-12 tw-mb-3 tw-opacity-50">
           <path d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H4V6h16v12zM6 10h2v2H6v-2zm0 4h8v2H6v-2zm10 0h2v2h-2v-2zm0-4h2v2h-2v-2zm-4 4h2v2h-2v-2zm0-4h2v2h-2v-2z"/>
         </svg>
@@ -48,9 +36,74 @@
         <button class="add-first-btn" @click="addNewSubtitle">添加第一条字幕</button>
       </div>
 
-      <!-- 使用 SubtitleItem 组件替代内联渲染 -->
-      <!-- 添加 TransitionGroup 实现切分动画，批量更新时禁用 -->
-      <TransitionGroup :name="animationEnabled ? 'subtitle-list' : ''" tag="div">
+      <!-- 搜索无结果提示 -->
+      <div v-else-if="homophoneSearch.isSearchActive && homophoneSearch.matchCount === 0" class="empty-state tw-flex tw-flex-col tw-items-center tw-justify-center tw-px-4 tw-py-8 tw-text-text-muted">
+        <p class="tw-text-[13px]">未找到匹配结果</p>
+      </div>
+
+      <!-- 分组模式渲染 -->
+      <template v-else-if="homophoneSearch.isSearchActive && homophoneSearch.sortMode === SortMode.GROUPED">
+        <template v-for="group in homophoneSearch.groupedViewItems" :key="group.clusterId">
+          <GroupHeader
+            :reading-label="group.readingLabel"
+            :color="group.color"
+            :item-count="group.items.length"
+            :is-collapsed="collapsedGroups.has(group.clusterId)"
+            :is-group-all-selected="isGroupAllSelected(group)"
+            :is-group-indeterminate="isGroupIndeterminate(group)"
+            @toggle-collapse="toggleGroupCollapse(group.clusterId)"
+            @group-select-change="(checked) => handleGroupSelectChange(group, checked)"
+          />
+          <template v-if="!collapsedGroups.has(group.clusterId)">
+            <SubtitleItem
+              v-for="item in group.items"
+              :key="item.subtitle.id"
+              :subtitle="item.subtitle"
+              :index="item.index"
+              :is-active="activeSubtitleId === item.subtitle.id"
+              :is-current="currentSubtitleId === item.subtitle.id"
+              :editable="props.editable"
+              :match-spans="item.matchSpans"
+              :is-selected="item.isSelected"
+              :is-selectable="true"
+              @click="onSubtitleClick"
+              @update-time="updateTime"
+              @update-text="updateText"
+              @delete="deleteSubtitle"
+              @insert-before="insertBefore(item.index)"
+              @insert-after="insertAfter(item.index)"
+              @select-change="handleItemSelectChange"
+            />
+          </template>
+        </template>
+      </template>
+
+      <!-- 时间线模式渲染（搜索激活） -->
+      <template v-else-if="homophoneSearch.isSearchActive && homophoneSearch.sortMode === SortMode.TIMELINE">
+        <SubtitleItem
+          v-for="item in homophoneSearch.timelineViewItems"
+          :key="item.subtitle.id"
+          :subtitle="item.subtitle"
+          :index="item.index"
+          :is-active="activeSubtitleId === item.subtitle.id"
+          :is-current="currentSubtitleId === item.subtitle.id"
+          :editable="props.editable"
+          :match-spans="item.matchSpans"
+          :is-selected="item.isSelected"
+          :is-selectable="true"
+          :cluster-color="item.clusterColor"
+          @click="onSubtitleClick"
+          @update-time="updateTime"
+          @update-text="updateText"
+          @delete="deleteSubtitle"
+          @insert-before="insertBefore(item.index)"
+          @insert-after="insertAfter(item.index)"
+          @select-change="handleItemSelectChange"
+        />
+      </template>
+
+      <!-- 默认模式渲染（无搜索） -->
+      <TransitionGroup v-else :name="animationEnabled ? 'subtitle-list' : ''" tag="div">
         <SubtitleItem
           v-for="(subtitle, index) in filteredSubtitles"
           :key="subtitle.id"
@@ -72,13 +125,16 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, nextTick } from 'vue'
+import { ref, reactive, computed, watch, nextTick } from 'vue'
+import { ElMessage } from 'element-plus'
 import { useProjectStore } from '@/stores/projectStore'
 import { usePlaybackManager } from '@/services/PlaybackManager'
-import { useSubtitleSync } from '@/composables'  // V3.2.0+dev.20260124.01: 导入字幕同步
+import { useSubtitleSync, useHomophoneSearch, SortMode } from '@/composables'
 import transcriptionApi from '@/services/api/transcriptionApi'
-// 导入 SubtitleItem 组件
+// 导入组件
 import SubtitleItem from './SubtitleItem.vue'
+import SearchToolbar from './SearchToolbar.vue'
+import GroupHeader from './GroupHeader.vue'
 
 // Props
 const props = defineProps({
@@ -98,11 +154,20 @@ const jobId = computed(() => projectStore.meta.jobId)
 // V3.2.0+dev.20260124.02: 字幕同步（防止 AI 覆盖用户编辑）
 const { onSubtitleEdit, applyPendingEditsToStore, forceSyncNow, pendingCount } = useSubtitleSync(jobId)
 
+// 同音搜索 composable（用 reactive 包裹，使模板 v-model 能正确写入 ref.value）
+const homophoneSearch = reactive(useHomophoneSearch({
+  jobId,
+  subtitles: computed(() => projectStore.subtitles),
+}))
+
+// 分组折叠状态
+const collapsedGroups = ref(new Set())
+
 // Refs
 const listRef = ref(null)
 
 // State
-const searchText = ref('')
+const quickSearchText = ref('')     // 快速搜索文本（简单过滤）
 const animationEnabled = ref(true)  // 批量更新时禁用动画
 let previousSubtitleCount = 0  // 上一次字幕数量
 const hasAppliedPending = ref(false)
@@ -116,8 +181,8 @@ const activeSubtitleId = computed(() => projectStore.view.selectedSubtitleId)
 const draftCount = computed(() => projectStore.draftSubtitleCount)
 
 const filteredSubtitles = computed(() => {
-  if (!searchText.value) return subtitles.value
-  const search = searchText.value.toLowerCase()
+  if (!quickSearchText.value) return subtitles.value
+  const search = quickSearchText.value.toLowerCase()
   return subtitles.value.filter(sub => sub.text.toLowerCase().includes(search))
 })
 
@@ -320,6 +385,146 @@ watch(subtitles, (newList) => {
 
   previousSubtitleCount = newCount
 }, { flush: 'pre' })  // pre: 在 DOM 更新前触发
+
+// ========================
+// 同音搜索相关方法
+// ========================
+
+// 执行搜索
+async function handleHomophoneSearch() {
+  await homophoneSearch.executeSearch()
+}
+
+// 重置搜索
+function handleHomophoneReset() {
+  homophoneSearch.resetSearch()
+  quickSearchText.value = ''  // 同时清除快速搜索
+}
+
+// 快速搜索（简单文本过滤）
+function handleQuickSearch(text) {
+  quickSearchText.value = text
+}
+
+// 批量替换
+async function handleBatchReplace() {
+  const result = await homophoneSearch.executeBatchReplace()
+  if (result.success) {
+    ElMessage.success(`成功替换 ${result.count} 处`)
+    // 仅增量回填被替换字幕，避免整表 import 覆写快流草稿/切分状态。
+    // 设计说明：此前整量 importSegments 会将 isDraft/chunk_id 等运行态信息重置，
+    // 在 processing 阶段可能让快流表现为“未切分”。
+    if (jobId.value) {
+      try {
+        await forceSyncNow()
+        const textData = await transcriptionApi.getTranscriptionText(jobId.value)
+        if (Array.isArray(textData?.segments)) {
+          const segmentMap = new Map(
+            textData.segments.map((segment) => [Number(segment.id), segment])
+          )
+
+          let patchedCount = 0
+          const updatedIndices = Array.isArray(result?.indices)
+            ? result.indices
+            : []
+
+          for (const sentenceIndex of updatedIndices) {
+            const idx = Number(sentenceIndex)
+            const segment = segmentMap.get(idx)
+            if (!segment) continue
+
+            const subtitle = projectStore.subtitles.find(
+              (item) => Number(item.sentenceIndex) === idx
+            )
+            if (!subtitle) continue
+
+            projectStore.updateSubtitle(subtitle.id, {
+              text: String(segment.text ?? subtitle.text ?? ''),
+              isModified: Boolean(segment.is_modified ?? subtitle.isModified),
+              originalText: segment.original_text ?? subtitle.originalText,
+            })
+            patchedCount += 1
+          }
+
+          // 兜底：若增量回填未命中本地字幕（如刚打开页面本地列表为空），再执行整量导入。
+          if (patchedCount === 0 && projectStore.subtitles.length === 0) {
+            projectStore.importSegments(textData.segments, {
+              jobId: jobId.value,
+              filename: projectStore.meta.filename,
+              duration: projectStore.meta.duration,
+              videoPath: projectStore.meta.videoPath,
+              audioPath: projectStore.meta.audioPath,
+              subtitleOffset: projectStore.subtitleOffset,
+            })
+          }
+        }
+      } catch (error) {
+        console.error('刷新字幕失败:', error)
+        ElMessage.warning('替换成功，但刷新失败，请手动刷新页面')
+      }
+    }
+  } else {
+    ElMessage.error('替换失败')
+  }
+}
+
+// 切换全选
+function handleToggleSelectAll() {
+  homophoneSearch.toggleSelectAll()
+}
+
+// 切换分组折叠
+function toggleGroupCollapse(clusterId) {
+  if (collapsedGroups.value.has(clusterId)) {
+    collapsedGroups.value.delete(clusterId)
+  } else {
+    collapsedGroups.value.add(clusterId)
+  }
+  collapsedGroups.value = new Set(collapsedGroups.value)
+}
+
+// 组内全选变化
+function handleGroupSelectChange(group, checked) {
+  for (const item of group.items) {
+    if (checked) {
+      homophoneSearch.selectedSubtitleIds.add(item.index)
+    } else {
+      homophoneSearch.selectedSubtitleIds.delete(item.index)
+    }
+  }
+  homophoneSearch.selectedSubtitleIds = new Set(homophoneSearch.selectedSubtitleIds)
+}
+
+// 单条选择变化
+function handleItemSelectChange(index, checked) {
+  if (checked) {
+    homophoneSearch.selectedSubtitleIds.add(index)
+  } else {
+    homophoneSearch.selectedSubtitleIds.delete(index)
+  }
+  homophoneSearch.selectedSubtitleIds = new Set(homophoneSearch.selectedSubtitleIds)
+}
+
+// 检查组是否全选
+function isGroupAllSelected(group) {
+  return group.items.every(item => homophoneSearch.selectedSubtitleIds.has(item.index))
+}
+
+// 检查组是否部分选中
+function isGroupIndeterminate(group) {
+  const selectedCount = group.items.filter(item => homophoneSearch.selectedSubtitleIds.has(item.index)).length
+  return selectedCount > 0 && selectedCount < group.items.length
+}
+
+// 暴露给父组件（EditorView tab-nav 视图切换按钮需要）
+defineExpose({
+  sortMode: computed(() => homophoneSearch.sortMode),
+  isSearchActive: computed(() => homophoneSearch.isSearchActive),
+  toggleSortMode() {
+    const current = homophoneSearch.sortMode
+    homophoneSearch.sortMode = current === SortMode.GROUPED ? SortMode.TIMELINE : SortMode.GROUPED
+  },
+})
 </script>
 
 <style scoped>
@@ -329,93 +534,6 @@ watch(subtitles, (newList) => {
   flex-direction: column;
   height: 100%;
   background: var(--af-bg-primary);
-}
-
-/* 工具栏 - 针对 350px 宽度优化 */
-.list-toolbar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 12px;
-  padding: 10px 12px;
-  background: var(--af-bg-secondary);
-  border-bottom: 1px solid var(--af-border-default);
-}
-
-.list-toolbar .subtitle-count {
-  color: var(--af-text-secondary);
-  font-size: 12px;
-  white-space: nowrap;
-}
-
-/* 草稿计数样式 */
-.list-toolbar .draft-count {
-  color: var(--af-accent-warning);
-  font-size: 12px;
-  margin-left: 4px;
-}
-
-.list-toolbar .toolbar-center {
-  flex: 1;
-  max-width: 180px;
-  min-width: 100px;
-}
-
-.list-toolbar .search-box {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 5px 10px;
-  background: var(--af-bg-tertiary);
-  border-radius: var(--af-radius-md);
-}
-
-.list-toolbar .search-box .search-icon {
-  width: 14px;
-  height: 14px;
-  color: var(--af-text-muted);
-  flex-shrink: 0;
-}
-
-.list-toolbar .search-box .search-input {
-  flex: 1;
-  min-width: 0;
-  background: transparent;
-  border: none;
-  color: var(--af-text-normal);
-  font-size: 12px;
-}
-
-.list-toolbar .search-box .search-input::placeholder {
-  color: var(--af-text-muted);
-}
-
-.list-toolbar .search-box .search-clear {
-  width: 16px;
-  height: 16px;
-  color: var(--af-text-muted);
-  flex-shrink: 0;
-}
-
-.list-toolbar .search-box .search-clear:hover {
-  color: var(--af-text-normal);
-}
-
-.list-toolbar .toolbar-btn {
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  width: 30px;
-  height: 30px;
-  border-radius: var(--af-radius-md);
-  color: var(--af-text-secondary);
-  transition: all var(--af-transition-fast);
-  flex-shrink: 0;
-}
-
-.list-toolbar .toolbar-btn:hover {
-  background: var(--af-bg-tertiary);
-  color: var(--af-accent-primary);
 }
 
 /* SVG 选择器 - 按特异性从低到高排列 */
@@ -439,16 +557,6 @@ svg {
 .item-actions .action-btn svg {
   width: 14px;
   height: 14px;
-}
-
-.list-toolbar .toolbar-btn svg {
-  width: 18px;
-  height: 18px;
-}
-
-.list-toolbar .search-box .search-clear svg {
-  width: 100%;
-  height: 100%;
 }
 
 /* 列表容器 */
