@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from app.models.sensevoice_models import SentenceSegment
 from app.services.sentence_splitter import SentenceSplitter, SplitConfig
-from app.services.semantic_grouper import SemanticGrouper, GroupConfig
 from app.services.segmentation.unified_splitter import UnifiedSplitter
 
 if TYPE_CHECKING:
@@ -33,9 +32,9 @@ class DefaultSegmenter:
         is_enable_cross_chunk_merge: bool = False,
         draft_split_config: Optional[SplitConfig] = None,
         chinese_split_config: Optional[SplitConfig] = None,
-        draft_group_config: Optional[GroupConfig] = None,
+        draft_group_config: Optional[Any] = None,
         final_split_config: Optional[SplitConfig] = None,
-        final_group_config: Optional[GroupConfig] = None,
+        final_group_config: Optional[Any] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.logger = logger or logging.getLogger(__name__)
@@ -72,15 +71,6 @@ class DefaultSegmenter:
             )
         self.chinese_splitter = SentenceSplitter(chinese_split_config)
 
-        if draft_group_config is None:
-            draft_group_config = GroupConfig(
-                max_group_gap=2.0,
-                max_group_duration=10.0,
-                max_group_sentences=5,
-                enable_overlap_detection=True,
-            )
-        self.draft_grouper = SemanticGrouper(draft_group_config)
-
         if final_split_config is None:
             final_split_config = SplitConfig(
                 prefer_punctuation_break=True,
@@ -95,14 +85,7 @@ class DefaultSegmenter:
             )
         self.final_splitter = SentenceSplitter(final_split_config)
 
-        if final_group_config is None:
-            final_group_config = GroupConfig(
-                max_group_gap=2.0,
-                max_group_duration=10.0,
-                max_group_sentences=5,
-                enable_overlap_detection=True,
-            )
-        self.final_grouper = SemanticGrouper(final_group_config)
+        # Phase 4: 旧语义分组服务下线，草稿/定稿链均不再执行语义 regroup。
         self.unified_splitter = UnifiedSplitter(logger=self.logger)
 
     def split_draft(
@@ -153,8 +136,7 @@ class DefaultSegmenter:
             is_final_output=not is_draft,
         )
         if self.is_enable_semantic_grouping and sentences:
-            sentences = self.draft_grouper.group(sentences)
-            self.logger.debug("快流语义分组: %d 个句子（物理约束）", len(sentences))
+            self.logger.debug("快流语义分组已下线，保留物理切分结果")
         self.logger.debug("快流分句完成: %d 个句子", len(sentences))
         return sentences
 

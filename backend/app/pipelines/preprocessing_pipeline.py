@@ -757,14 +757,13 @@ class PreprocessingPipeline:
                     chunk.language = "auto"
                     chunk.language_confidence = {}
 
-        # Stage 5: Speaker 声纹提取（可选，失败不阻断）
-        if chunks and self.config.enable_speaker_embedding:
-            self.logger.info("Stage 5: 声纹提取")
+        # Phase 4: 旧 Speaker 声纹提取服务已下线（由 Timeline 域统一接管）。
+        if False and chunks and self.config.enable_speaker_embedding:
+            self.logger.info("Stage 5: 旧 Speaker 声纹提取（已下线）")
             try:
-                from app.services.speaker_embedding_service import get_speaker_embedding_service
                 from app.utils.cancellation_token import CancelledException, PausedException
 
-                speaker_service = get_speaker_embedding_service(logger=self.logger)
+                speaker_service = None
                 speaker_metadata: Optional[Dict[str, Any]] = None
                 embedding_map: Dict[int, List[float]] = {}
                 missing_indices = [chunk.index for chunk in chunks]
@@ -941,16 +940,15 @@ class PreprocessingPipeline:
                 for chunk in chunks:
                     chunk.speaker_embedding = None
 
-        # Stage 6: Speaker 在线聚类（可选，依赖声纹提取）
-        # V3.2.0+dev.20260207.01: 最小可行版本 - 余弦相似度聚类 + 防抖
+        # Phase 4: 旧 Speaker 在线聚类服务已下线（由 Timeline 域统一接管）。
         has_embeddings = any(getattr(chunk, "speaker_embedding", None) for chunk in chunks)
-        if chunks and self.config.enable_speaker_embedding and has_embeddings:
-            self.logger.info("Stage 6: 说话人在线聚类")
+        if False and chunks and self.config.enable_speaker_embedding and has_embeddings:
+            self.logger.info("Stage 6: 旧 Speaker 在线聚类（已下线）")
             try:
-                from app.services.speaker_cluster_service import (
-                    get_speaker_cluster_service,
-                    SpeakerClusterConfig,
-                )
+                _cluster_factory = None
+
+                class SpeakerClusterConfig:  # type: ignore[no-redef]
+                    pass
 
                 cluster_config = SpeakerClusterConfig(
                     similarity_threshold=0.50,  # 折中阈值
@@ -959,9 +957,9 @@ class PreprocessingPipeline:
                     min_turn_chunks=3,
                     enabled=True,
                 )
-                cluster_service = get_speaker_cluster_service(
-                    config=cluster_config, logger=self.logger
-                )
+                cluster_service = None
+                assert _cluster_factory is not None
+                cluster_service = _cluster_factory(config=cluster_config, logger=self.logger)
                 cluster_service.reset()
 
                 speaker_changes = 0

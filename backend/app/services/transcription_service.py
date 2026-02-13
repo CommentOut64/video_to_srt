@@ -1794,11 +1794,9 @@ class TranscriptionService:
         splitter = SentenceSplitter(config)
         sentences = splitter.split(sv_result.words, sv_result.text_clean)
 
-        # Layer 2: 语义分组 (可选，已实现)
+        # Layer 2: 语义分组服务已下线（Phase 4），保留基础分句结果。
         if enable_grouping:
-            from app.services.semantic_grouper import SemanticGrouper, GroupConfig
-            grouper = SemanticGrouper(GroupConfig(language=config.language))
-            sentences = grouper.group(sentences)
+            self.logger.debug("语义分组已下线，跳过 grouping")
 
         # 【阶段三】VAD 边缘吸附 (Head Snap)
         # 逻辑：如果是 Chunk 的第一句话，且 CTC 延迟在合理范围内（<0.6s），
