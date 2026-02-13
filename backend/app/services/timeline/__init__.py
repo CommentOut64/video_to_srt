@@ -5,6 +5,12 @@ from app.services.timeline.cluster_manager import (
     ClusterManager,
     ClusterManagerConfig,
 )
+from app.services.timeline.diarization_service import (
+    DiarizationResult,
+    DiarizationSegment,
+    PyannoteDiarizationConfig,
+    PyannoteDiarizationService,
+)
 from app.services.timeline.segmentation_service import (
     PyannoteSegmentationConfig,
     PyannoteSegmentationService,
@@ -26,7 +32,11 @@ __all__ = [
     "ClusterAssignment",
     "ClusterManager",
     "ClusterManagerConfig",
+    "DiarizationResult",
+    "DiarizationSegment",
     "PyannoteSegmentationConfig",
+    "PyannoteDiarizationConfig",
+    "PyannoteDiarizationService",
     "PyannoteSegmentationService",
     "SegmentationFrame",
     "SegmentationResult",
@@ -37,4 +47,3 @@ __all__ = [
     "TurnBuilder",
     "TurnBuilderConfig",
 ]
-

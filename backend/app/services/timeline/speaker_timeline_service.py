@@ -15,9 +15,15 @@ from typing import Any, Optional, Protocol
 import numpy as np
 
 from app.models.speaker_timeline_models import SpeakerTimeline
+from app.models.speaker_timeline_models import SpeakerProfile, SpeakerTurn
 from app.services.timeline.cluster_manager import (
     ClusterManager,
     ClusterManagerConfig,
+)
+from app.services.timeline.diarization_service import (
+    DiarizationResult,
+    PyannoteDiarizationConfig,
+    PyannoteDiarizationService,
 )
 from app.services.timeline.segmentation_service import (
     PyannoteSegmentationConfig,
@@ -92,8 +98,11 @@ class SpeakerTimelineServiceConfig:
     cluster: ClusterManagerConfig = field(default_factory=ClusterManagerConfig)
     turn_builder: TurnBuilderConfig = field(default_factory=TurnBuilderConfig)
     segmentation: PyannoteSegmentationConfig = field(default_factory=PyannoteSegmentationConfig)
+    diarization: PyannoteDiarizationConfig = field(default_factory=PyannoteDiarizationConfig)
     segmentation_unit_stage: str = "timeline"
     segmentation_unit_id: str = "segmentation_epoch"
+    diarization_unit_stage: str = "timeline"
+    diarization_unit_id: str = "diarization_epoch"
 
 
 class SpeakerTimelineService:
@@ -105,6 +114,7 @@ class SpeakerTimelineService:
         *,
         cluster_manager: Optional[ClusterManager] = None,
         turn_builder: Optional[TurnBuilder] = None,
+        diarization_service: Optional[PyannoteDiarizationService] = None,
         segmentation_service: Optional[PyannoteSegmentationService] = None,
         runtime_checkpoint_service: Optional[RuntimeCheckpointServiceLike] = None,
         cancellation_token: Optional[CancellationToken] = None,
@@ -117,6 +127,10 @@ class SpeakerTimelineService:
             logger=self.logger,
         )
         self.turn_builder = turn_builder or TurnBuilder(config=self.config.turn_builder)
+        self.diarization_service = diarization_service or PyannoteDiarizationService(
+            config=self.config.diarization,
+            logger=self.logger,
+        )
         self.segmentation_service = segmentation_service or PyannoteSegmentationService(
             config=self.config.segmentation,
             logger=self.logger,
@@ -135,6 +149,20 @@ class SpeakerTimelineService:
         """生成块级 `SpeakerTimeline`。"""
         if not chunks:
             return SpeakerTimeline(block_id=block_id, turns=[], speakers=[])
+
+        if self.diarization_service.is_enabled:
+            diarization_result = self._run_diarization_with_checkpoint(
+                block_id=block_id,
+                audio=audio,
+                sample_rate=sample_rate,
+                chunk_count=len(chunks),
+            )
+            if diarization_result.segments:
+                return self._build_timeline_from_diarization(
+                    block_id=block_id,
+                    diarization_result=diarization_result,
+                )
+            self.logger.warning("diarization 启用但未产出说话人分段，回退聚类+segmentation")
 
         self.cluster_manager.reset()
         assignments: list[TimelineChunkAssignment] = []
@@ -178,6 +206,104 @@ class SpeakerTimelineService:
             segmentation_boundaries=segmentation_result.boundaries,
         )
         speakers = self.cluster_manager.build_profiles()
+
+        return SpeakerTimeline(
+            block_id=block_id,
+            turns=turns,
+            speakers=speakers,
+        )
+
+    def _run_diarization_with_checkpoint(
+        self,
+        *,
+        block_id: str,
+        audio: np.ndarray,
+        sample_rate: int,
+        chunk_count: int,
+    ) -> DiarizationResult:
+        stage = self.config.diarization_unit_stage
+        unit_id = f"{self.config.diarization_unit_id}:{block_id}"
+
+        if self.runtime_checkpoint_service and hasattr(self.runtime_checkpoint_service, "load_snapshot"):
+            snapshot = self.runtime_checkpoint_service.load_snapshot()
+            last_unit_commits = self._extract_last_unit_commits(snapshot)
+            last_unit_id = last_unit_commits.get(stage)
+            if last_unit_id == unit_id:
+                self.logger.info(
+                    "diarization_epoch 命中已提交单元，但未缓存中间结果，执行重算: stage=%s unit=%s",
+                    stage,
+                    unit_id,
+                )
+
+        payload = {
+            "block_id": block_id,
+            "chunk_count": chunk_count,
+            "sample_rate": sample_rate,
+        }
+        if self.runtime_checkpoint_service and hasattr(self.runtime_checkpoint_service, "record_unit_started"):
+            self.runtime_checkpoint_service.record_unit_started(
+                stage=stage,
+                unit_id=unit_id,
+                payload=payload,
+            )
+
+        self._raise_if_stopped()
+        result = self.diarization_service.run(audio=audio, sample_rate=sample_rate)
+
+        if self.runtime_checkpoint_service and hasattr(self.runtime_checkpoint_service, "record_unit_committed"):
+            self.runtime_checkpoint_service.record_unit_committed(
+                stage=stage,
+                unit_id=unit_id,
+                payload={
+                    "block_id": block_id,
+                    "segment_count": len(result.segments),
+                    "speaker_count": len(result.speaker_ids),
+                },
+            )
+
+        self._raise_if_stopped()
+        return result
+
+    def _build_timeline_from_diarization(
+        self,
+        *,
+        block_id: str,
+        diarization_result: DiarizationResult,
+    ) -> SpeakerTimeline:
+        turns: list[SpeakerTurn] = []
+        speaker_stats: dict[str, dict[str, float]] = {}
+
+        for idx, item in enumerate(diarization_result.segments):
+            turn_id = f"{block_id}-turn-{idx:04d}"
+            turns.append(
+                SpeakerTurn(
+                    turn_id=turn_id,
+                    block_id=block_id,
+                    speaker_id=item.speaker_id,
+                    start=float(item.start),
+                    end=float(item.end),
+                    boundary_confidence=float(item.confidence),
+                    is_overlap=bool(item.is_overlap),
+                    source="merged",
+                )
+            )
+
+            stats = speaker_stats.setdefault(
+                item.speaker_id,
+                {"count": 0.0, "duration": 0.0},
+            )
+            stats["count"] += 1.0
+            stats["duration"] += float(item.duration)
+
+        speakers = [
+            SpeakerProfile(
+                speaker_id=speaker_id,
+                embedding_centroid=[],
+                sample_count=int(values["count"]),
+                quality_score=max(0.0, min(1.0, values["duration"] / max(values["count"], 1.0))),
+            )
+            for speaker_id, values in sorted(speaker_stats.items(), key=lambda pair: pair[0])
+        ]
 
         return SpeakerTimeline(
             block_id=block_id,
