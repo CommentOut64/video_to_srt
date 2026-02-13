@@ -138,10 +138,16 @@ def _load_pyannote_object(
 
     _ensure_torch_weights_only_compat(active_logger)
 
-    resolved_checkpoint = _resolve_local_checkpoint_path(
-        checkpoint=checkpoint,
-        logger=active_logger,
-    )
+    if object_type == "pipeline":
+        # Why:
+        # - pyannote 4.x 的 community pipeline 入口是目录（含 config.yaml 与子模型目录）；
+        # - 若把目录误解析为单一权重文件，会破坏 pipeline 级加载。
+        resolved_checkpoint = checkpoint
+    else:
+        resolved_checkpoint = _resolve_local_checkpoint_path(
+            checkpoint=checkpoint,
+            logger=active_logger,
+        )
 
     try:
         return pyannote_cls.from_pretrained(resolved_checkpoint, **call_kwargs)
