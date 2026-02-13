@@ -97,18 +97,6 @@
               <option value="precise">精准</option>
             </select>
           </label>
-          <label class="flex items-center gap-2 text-[11px]">
-            <input
-              type="checkbox"
-              v-model="localConfig.preprocessing.enable_speaker_embedding"
-              class="h-3 w-3 accent-[var(--af-accent-primary)]"
-              @change="onModuleChange"
-            />
-            <span class="text-[var(--af-text-normal)]">启用声纹提取</span>
-          </label>
-          <div class="text-[10px] text-[var(--af-text-muted)]">
-            声纹数据仅用于后续说话人聚类（默认关闭）
-          </div>
         </div>
       </div>
 
@@ -198,7 +186,6 @@ const props = defineProps({
         enable_spectral_triage: true,
         language_detection_mode: 'balanced',
         language_detection_device: 'auto',
-        enable_speaker_embedding: false,
         langid_confidence_threshold: 0.7,
         langid_whitelist: ['zh', 'ja', 'en'],
         langid_logit_bias_score: 2.5
@@ -263,8 +250,7 @@ const macroPresets = [
         demucs_strategy: 'off',
         separation_mode: 'on_demand',
         enable_spectral_triage: false,
-        language_detection_mode: 'balanced',
-        enable_speaker_embedding: false
+        language_detection_mode: 'balanced'
       },
       transcription: { transcription_profile: 'sensevoice_only' },
       refinement: { llm_task: 'off', llm_scope: 'sparse' }
@@ -283,8 +269,7 @@ const macroPresets = [
         demucs_strategy: 'auto',
         separation_mode: 'on_demand',
         enable_spectral_triage: true,
-        language_detection_mode: 'balanced',
-        enable_speaker_embedding: false
+        language_detection_mode: 'balanced'
       },
       transcription: { transcription_profile: 'sv_whisper_patch' },
       refinement: { llm_task: 'proofread', llm_scope: 'sparse' }
@@ -303,8 +288,7 @@ const macroPresets = [
         demucs_strategy: 'force_on',
         separation_mode: 'global',
         enable_spectral_triage: false,
-        language_detection_mode: 'balanced',
-        enable_speaker_embedding: false
+        language_detection_mode: 'balanced'
       },
       transcription: { transcription_profile: 'sv_whisper_dual' },
       refinement: { llm_task: 'proofread', llm_scope: 'global' }
@@ -544,7 +528,6 @@ function onModuleChange() {
     return (
       localConfig.value.preprocessing.demucs_strategy === preset.config.preprocessing.demucs_strategy &&
       localConfig.value.preprocessing.language_detection_mode === preset.config.preprocessing.language_detection_mode &&
-      localConfig.value.preprocessing.enable_speaker_embedding === preset.config.preprocessing.enable_speaker_embedding &&
       localConfig.value.transcription.transcription_profile === preset.config.transcription.transcription_profile &&
       localConfig.value.refinement.llm_task === preset.config.refinement.llm_task &&
       localConfig.value.refinement.llm_scope === preset.config.refinement.llm_scope
