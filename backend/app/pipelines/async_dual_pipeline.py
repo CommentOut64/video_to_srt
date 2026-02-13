@@ -116,6 +116,12 @@ from app.utils.prompt_builder import get_prompt_builder
 from app.utils.text_utils import format_srt_timestamp
 from app.utils.cancellation_token import CancelledException, PausedException  # V3.1.0: 捕获取消/暂停异常
 
+try:
+    from app.services.semantic_grouper import SemanticGrouper, GroupConfig
+except ImportError:
+    SemanticGrouper = None
+    GroupConfig = None
+
 # v3.1.0: 导入取消令牌和异常
 if TYPE_CHECKING:
     from app.utils.cancellation_token import CancellationToken
@@ -333,8 +339,16 @@ class AsyncDualPipeline:
             ),
         )
         self._final_splitter = FinalSplitter(final_split_config, logger=self.logger)
-        # Phase 4: 旧语义分组服务已下线，定稿链只保留 turn-aware 切分。
-        self._final_grouper = None
+        if enable_semantic_grouping and SemanticGrouper is not None and GroupConfig is not None:
+            final_group_config = GroupConfig(
+                max_group_gap=2.0,
+                max_group_duration=10.0,
+                max_group_sentences=5,
+                enable_overlap_detection=True,
+            )
+            self._final_grouper = SemanticGrouper(final_group_config)
+        else:
+            self._final_grouper = None
         self._l5_processor = SemanticInjectionProcessor(
             logger=self.logger,
             min_mapping_coverage=final_split_config.min_mapping_coverage,

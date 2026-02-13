@@ -49,7 +49,7 @@ class SegmentationProcessor:
         chunk_index: Optional[int] = None,
         is_last_chunk: bool = False,
     ) -> L6Output:
-        """执行 L6 单路径切分（V3.2.0+dev.20260207.03: speaker run 强制边界）。"""
+        """执行 L6 单路径切分（仅文本边界，不做 speaker/turn 硬切）。"""
         annotated_words = data.annotated_words or []
         pending_prefix_words = self._consume_pending_prefix_words(stream_id)
         has_annotated_words = bool(annotated_words)
@@ -60,8 +60,6 @@ class SegmentationProcessor:
                 segmentation_report={
                     "boundary_score_stats": {},
                     "forced_split_count": 0.0,
-                    "speaker_run_count": 0,
-                    "speaker_forced_split_count": 0,
                     "cross_chunk_pending_in_word_count": 0,
                     "cross_chunk_pending_out_word_count": 0,
                     "cross_chunk_dangling_fix_count": 0,
@@ -70,30 +68,25 @@ class SegmentationProcessor:
                 },
             )
 
-        # V3.2.0+dev.20260207.03: 按 speaker_id 分组为连续 run
-        speaker_runs = self._group_by_speaker_runs(annotated_words)
-        if not speaker_runs and pending_prefix_words:
-            speaker_runs = [[]]
-        all_sentence_segments: List[SentenceSegment] = []
-        speaker_forced_split_count = len(speaker_runs) - 1 if len(speaker_runs) > 1 else 0
+        words_for_split = list(pending_prefix_words) + self._build_words_for_split(annotated_words)
         pending_in_word_count = len(pending_prefix_words)
+        if not words_for_split:
+            return L6Output(
+                sentence_segments=[],
+                words_for_split=[],
+                segmentation_report={
+                    "boundary_score_stats": {},
+                    "forced_split_count": 0.0,
+                    "cross_chunk_pending_in_word_count": pending_in_word_count,
+                    "cross_chunk_pending_out_word_count": 0,
+                    "cross_chunk_dangling_fix_count": 0,
+                    "stream_id": stream_id,
+                    "chunk_index": chunk_index,
+                    "error_code": "E_L6_SPLIT_EMPTY",
+                },
+            )
 
-        # 对每个 speaker run 分别切分
-        for run_index, run_annotated_words in enumerate(speaker_runs):
-            run_words = self._build_words_for_split(run_annotated_words)
-            if run_index == 0 and pending_prefix_words:
-                run_words = list(pending_prefix_words) + run_words
-            if not run_words:
-                continue
-            run_segments = self._final_splitter.split(run_words)
-            if run_segments:
-                run_speaker_id, run_turn_id = self._extract_run_identity(run_annotated_words)
-                self._apply_identity_to_sentences(
-                    run_segments,
-                    speaker_id=run_speaker_id,
-                    turn_id=run_turn_id,
-                )
-                all_sentence_segments.extend(run_segments)
+        all_sentence_segments = self._final_splitter.split(words_for_split)
 
         pending_out_words: List[WordTimestamp] = []
         dangling_fix_count = 0
@@ -120,13 +113,7 @@ class SegmentationProcessor:
 
         # 降级处理：若所有 run 切分后仍为空
         if not all_sentence_segments:
-            words_for_split = list(pending_prefix_words) + self._build_words_for_split(annotated_words)
-            fallback_speaker_id, fallback_turn_id = self._extract_run_identity(annotated_words)
-            fallback_sentence = self._build_single_sentence(
-                words_for_split,
-                speaker_id=fallback_speaker_id,
-                turn_id=fallback_turn_id,
-            )
+            fallback_sentence = self._build_single_sentence(words_for_split)
             all_sentence_segments = [fallback_sentence] if fallback_sentence else []
             error_code = "E_L6_SPLIT_EMPTY"
         else:
@@ -136,8 +123,6 @@ class SegmentationProcessor:
         report: Dict[str, Any] = {
             "boundary_score_stats": split_stats,
             "forced_split_count": float(split_stats.get("force_split_count", 0.0)),
-            "speaker_run_count": len(speaker_runs),
-            "speaker_forced_split_count": speaker_forced_split_count,
             "cross_chunk_pending_in_word_count": pending_in_word_count,
             "cross_chunk_pending_out_word_count": len(pending_out_words),
             "cross_chunk_dangling_fix_count": dangling_fix_count,
@@ -147,23 +132,19 @@ class SegmentationProcessor:
         }
         self._logger.info(
             "L6 切分完成: stream={} chunk={} input_words={} sentences={} "
-            "speaker_runs={} speaker_forced={} pending_in={} pending_out={} error={}",
+            "pending_in={} pending_out={} error={}",
             stream_id,
             chunk_index,
-            len(annotated_words),
+            len(words_for_split),
             len(all_sentence_segments),
-            len(speaker_runs),
-            speaker_forced_split_count,
             pending_in_word_count,
             len(pending_out_words),
             error_code or "none",
         )
 
-        # words_for_split 返回完整输入词流（包含跨 chunk 前缀），用于下游兼容。
-        all_words_for_split = list(pending_prefix_words) + self._build_words_for_split(annotated_words)
         return L6Output(
             sentence_segments=all_sentence_segments,
-            words_for_split=all_words_for_split,
+            words_for_split=words_for_split,
             segmentation_report=report,
         )
 
@@ -285,70 +266,6 @@ class SegmentationProcessor:
         target.group_position = source.group_position
 
     @staticmethod
-    def _extract_run_identity(annotated_words: List[Any]) -> Tuple[Optional[str], Optional[str]]:
-        """从 run 中提取统一 speaker/turn 标识。"""
-        run_speaker_id: Optional[str] = None
-        run_turn_id: Optional[str] = None
-        for word in annotated_words:
-            if run_speaker_id is None:
-                run_speaker_id = getattr(word, "speaker_id", None)
-            if run_turn_id is None:
-                run_turn_id = getattr(word, "turn_id", None)
-            if run_speaker_id is not None and run_turn_id is not None:
-                break
-        return run_speaker_id, run_turn_id
-
-    @staticmethod
-    def _apply_identity_to_sentences(
-        sentences: List[SentenceSegment],
-        *,
-        speaker_id: Optional[str],
-        turn_id: Optional[str],
-    ) -> None:
-        """将 run 级 speaker/turn 标识写入句子。"""
-        for sentence in sentences:
-            sentence.speaker_id = speaker_id
-            sentence.turn_id = turn_id
-
-    @staticmethod
-    def _group_by_speaker_runs(annotated_words: List[Any]) -> List[List[Any]]:
-        """按 speaker_id 分组为连续 run（V3.2.0+dev.20260207.03）。
-
-        降级策略：只有"前后都非空且不同"才触发硬边界。
-        """
-        if not annotated_words:
-            return []
-
-        runs: List[List[Any]] = []
-        current_run: List[Any] = []
-        last_speaker_id: Optional[str] = None
-
-        for word in annotated_words:
-            current_speaker_id = getattr(word, "speaker_id", None)  # 兼容旧测试 mock
-
-            # 判断是否需要切换 run
-            need_split = False
-            if current_run:  # 非首词
-                # 只有"前后都非空且不同"才强制断开
-                if (last_speaker_id is not None
-                    and current_speaker_id is not None
-                    and last_speaker_id != current_speaker_id):
-                    need_split = True
-
-            if need_split:
-                runs.append(current_run)
-                current_run = [word]
-            else:
-                current_run.append(word)
-
-            last_speaker_id = current_speaker_id
-
-        if current_run:
-            runs.append(current_run)
-
-        return runs if runs else [[]]
-
-    @staticmethod
     def _build_words_for_split(annotated_words: List[Any]) -> List[WordTimestamp]:
         words: List[WordTimestamp] = []
         for item in annotated_words:
@@ -368,9 +285,6 @@ class SegmentationProcessor:
     @staticmethod
     def _build_single_sentence(
         words: List[WordTimestamp],
-        *,
-        speaker_id: Optional[str] = None,
-        turn_id: Optional[str] = None,
     ) -> Optional[SentenceSegment]:
         if not words:
             return None
@@ -389,8 +303,6 @@ class SegmentationProcessor:
             source=TextSource.WHISPER_PATCH,
             is_draft=False,
             is_finalized=True,
-            speaker_id=speaker_id,
-            turn_id=turn_id,
         )
 
     @staticmethod
