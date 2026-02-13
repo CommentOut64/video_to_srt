@@ -396,6 +396,63 @@ class TranscriptionAPI {
   async deleteSubtitle(jobId, sentenceIndex) {
     return apiClient.delete(`/api/jobs/${jobId}/subtitles/${sentenceIndex}`);
   }
+
+  // ========================
+  // 同音检索与批量替换 API
+  // ========================
+
+  /**
+   * 同音查找
+   * @param {string} jobId - 任务ID
+   * @param {Object} payload - 查找参数
+   * @param {string} payload.query - 搜索关键词
+   * @param {string} payload.mode - 搜索模式 (literal/regex/homophone_strict/homophone_fuzzy)
+   * @param {string} [payload.reading] - 指定读音（仅同音模式）
+   * @param {boolean} [payload.ignore_punctuation] - 是否忽略标点
+   * @returns {Promise<{matches: Array, clusters: Object}>}
+   */
+  async homophoneFind(jobId, payload) {
+    return apiClient.post(`/api/jobs/${jobId}/homophone/find`, payload);
+  }
+
+  /**
+   * 获取同音索引状态
+   * @param {string} jobId - 任务ID
+   * @returns {Promise<{status: string, progress: number, message: string}>}
+   */
+  async getHomophoneIndexStatus(jobId) {
+    return apiClient.get(`/api/jobs/${jobId}/homophone/index-status`);
+  }
+
+  /**
+   * 批量替换
+   * @param {string} jobId - 任务ID
+   * @param {Object} payload - 替换参数
+   * @param {Array<{sentence_index: number, char_start: number, char_end: number}>} payload.targets - 替换目标
+   * @param {string} payload.replacement - 替换文本
+   * @returns {Promise<{success: boolean, replaced_count: number, updated_subtitles: Array}>}
+   */
+  async homophoneBatchReplace(jobId, payload) {
+    return apiClient.post(`/api/jobs/${jobId}/homophone/batch-replace`, payload);
+  }
+
+  /**
+   * 获取全局术语表
+   * @returns {Promise<{terms: Array<{pattern: string, replacement: string, enabled: boolean}>}>}
+   */
+  async getHomophoneGlobalTerms() {
+    return apiClient.get('/api/settings/homophone/global-terms');
+  }
+
+  /**
+   * 保存全局术语表
+   * @param {Object} payload - 术语表数据
+   * @param {Array<{pattern: string, replacement: string, enabled: boolean}>} payload.terms - 术语列表
+   * @returns {Promise<{success: boolean}>}
+   */
+  async putHomophoneGlobalTerms(payload) {
+    return apiClient.put('/api/settings/homophone/global-terms', payload);
+  }
 }
 
 // 导出单例实例

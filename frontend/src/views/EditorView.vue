@@ -115,12 +115,28 @@
           >
             AI 助手
           </button>
+          <!-- 右侧弹簧 + 视图切换按钮（搜索激活时显示） -->
+          <div class="tw-flex-1" />
+          <button
+            v-if="subtitleListRef?.isSearchActive"
+            class="tab-nav-icon-btn"
+            :title="subtitleListRef?.sortMode === 'grouped' ? '当前：分组模式（点击切换为时间线）' : '当前：时间线模式（点击切换为分组）'"
+            @click="subtitleListRef?.toggleSortMode?.()"
+          >
+            <svg v-if="subtitleListRef?.sortMode === 'grouped'" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M3 15h4v-2H3v2zm0 4h4v-2H3v2zm0-8h4V9H3v2zm4-6v2h14V5H7zm0 10h14v-2H7v2zm0 4h14v-2H7v2z"/>
+            </svg>
+            <svg v-else viewBox="0 0 24 24" fill="currentColor">
+              <path d="M3 14h4v-4H3v4zm0 5h4v-4H3v4zM3 9h4V5H3v4zm5 5h13v-4H8v4zm0 5h13v-4H8v4zM8 5v4h13V5H8z"/>
+            </svg>
+          </button>
         </div>
 
         <!-- 标签页内容 -->
         <div class="tab-content">
           <div v-show="activeTab === 'subtitles'" class="tab-pane">
             <SubtitleList
+              ref="subtitleListRef"
               :auto-scroll="true"
               :editable="true"
               @subtitle-click="handleSubtitleClick"
@@ -260,6 +276,7 @@ const proxyVideo = useProxyVideo(jobIdRef)
 // Refs
 const videoStageRef = ref(null)
 const waveformRef = ref(null)
+const subtitleListRef = ref(null)
 const activeTab = ref('subtitles')
 const saving = ref(false)
 const lastSaved = ref(null)
@@ -901,6 +918,11 @@ function subscribeSSE() {
       handleSubtitleDeleted(data)
     },
 
+    onSubtitleEdited(data) {
+      console.log('[EditorView] 收到编辑字幕:', data)
+      handleSubtitleEdited(data)
+    },
+
     // 新增：BGM 检测事件
     onBgmDetected(data) {
       console.log('[EditorView] BGM 检测结果:', data)
@@ -1165,6 +1187,56 @@ function handleSubtitleDeleted(data) {
   if (target) {
     projectStore.removeSubtitle(target.id)
   }
+}
+
+function handleSubtitleEdited(data) {
+  if (!data) return
+
+  const sentence = data.sentence || {}
+  const sentenceIndex = data.index ?? data.sentence_index ?? sentence.index
+  if (sentenceIndex === undefined || sentenceIndex === null) return
+
+  const target = projectStore.subtitles.find((subtitle) => subtitle.sentenceIndex === sentenceIndex)
+  if (!target) {
+    console.warn('[EditorView] 编辑事件未命中本地字幕:', sentenceIndex)
+    return
+  }
+
+  const patch = {}
+
+  if (sentence.text !== undefined) {
+    patch.text = sentence.text
+  }
+  if (sentence.is_modified !== undefined) {
+    patch.isModified = sentence.is_modified
+  }
+  if (sentence.original_text !== undefined) {
+    patch.originalText = sentence.original_text
+  }
+
+  const hasStart = sentence.start !== undefined && sentence.start !== null
+  const hasEnd = sentence.end !== undefined && sentence.end !== null
+  if (hasStart) {
+    patch.start = projectStore.toDisplayTime(sentence.start)
+  }
+  if (hasEnd) {
+    patch.end = projectStore.toDisplayTime(sentence.end)
+  }
+
+  if (Array.isArray(sentence.words) && sentence.words.length > 0) {
+    const normalized = projectStore.applyOffsetToSentenceData({
+      start: hasStart ? sentence.start : projectStore.toBaseTime(target.start),
+      end: hasEnd ? sentence.end : projectStore.toBaseTime(target.end),
+      words: sentence.words,
+    })
+    patch.words = normalized.words
+  }
+
+  if (Object.keys(patch).length === 0) {
+    return
+  }
+
+  projectStore.updateSubtitle(target.id, patch)
 }
 
 /**
@@ -1981,6 +2053,7 @@ onBeforeRouteLeave(async (to, from) => {
 /* 标签页导航 */
 .tab-nav {
   display: flex;
+  align-items: stretch;
   padding: 0 12px;
   background: var(--af-bg-secondary);
   border-bottom: 1px solid var(--af-border-default);
@@ -2032,6 +2105,33 @@ onBeforeRouteLeave(async (to, from) => {
   font-size: 11px;
   min-width: 18px;
   margin-left: 6px;
+}
+
+/* tab-nav 右侧图标按钮（视图切换） */
+.tab-nav-icon-btn {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  color: var(--af-text-secondary);
+  cursor: pointer;
+  border-radius: var(--af-radius-md);
+  flex-shrink: 0;
+  align-self: center;
+  transition: all var(--af-transition-fast);
+}
+
+.tab-nav-icon-btn:hover {
+  background: var(--af-bg-tertiary);
+  color: var(--af-accent-primary);
+}
+
+.tab-nav-icon-btn svg {
+  width: 18px;
+  height: 18px;
 }
 
 /* 标签页内容 */

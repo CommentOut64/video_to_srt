@@ -55,6 +55,11 @@ dependencies = [
 
     # --- 文本标准化 (ITN/TN) ---
     "wetext>=0.1.2",
+    "pypinyin>=0.53.0",  # 中文同音检索读音编码
+    "sudachipy>=0.6.10",  # 日语同音分词
+    "sudachidict-core>=20241021",  # Sudachi 核心词典
+    "cmudict>=1.0.32",  # 英语读音词典
+    "phonemizer>=3.3.0",  # 英语 OOV 读音回退（需系统 espeak 支持）
 
     # --- 音频处理 ---
     "librosa>=0.10.0",

@@ -447,6 +447,47 @@ class AsyncDualPipeline:
                 return first.get("speaker_id")
         return None
 
+    @staticmethod
+    def _normalize_chunk_language(language: Optional[str]) -> str:
+        """规范化 chunk 语言标签。"""
+        value = str(language or "").strip().lower()
+        return value if value else "auto"
+
+    @classmethod
+    def _resolve_chunk_languages_inplace(cls, audio_chunks: List[AudioChunk]) -> None:
+        """
+        统一修正 Chunk 语言标签。
+
+        规则：
+        1. 若当前 chunk 语言非 auto，直接保留并作为后续基准。
+        2. 若当前 chunk 语言为 auto，则沿用前一个 chunk 的有效语言。
+        3. 第一个 chunk 为 auto 时，回环使用最后一个 chunk 的有效语言。
+        """
+        if not audio_chunks:
+            return
+
+        normalized_languages = [
+            cls._normalize_chunk_language(getattr(chunk, "language", None))
+            for chunk in audio_chunks
+        ]
+        has_effective_language = any(lang != "auto" for lang in normalized_languages)
+        if not has_effective_language:
+            return
+
+        last_effective = "auto"
+        for lang in reversed(normalized_languages):
+            if lang != "auto":
+                last_effective = lang
+                break
+
+        for index, chunk in enumerate(audio_chunks):
+            current = normalized_languages[index]
+            if current == "auto":
+                if getattr(chunk, "language", None) != last_effective:
+                    chunk.language = last_effective
+                continue
+            last_effective = current
+
     def _validate_l0_result(
         self,
         result: Dict[str, Any],
@@ -511,6 +552,9 @@ class AsyncDualPipeline:
         Returns:
             List[ProcessingContext]: 处理结果列表
         """
+        # V3.2.0+dev.20260212.04: 进入 L0 前先收敛语言标签。
+        # 若 chunk.language=auto，则沿用前一个 chunk；第一个 chunk 回环取最后一个有效语言。
+        self._resolve_chunk_languages_inplace(audio_chunks)
         self._job_dir = job_dir
         if self.is_sensevoice_only:
             return await self._run_sensevoice_only(

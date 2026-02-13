@@ -7,6 +7,14 @@ export { useProxyVideo, ProxyState, TranscodeDecision } from './useProxyVideo'
 export { useUpdateChecker } from './useUpdateChecker'
 export { useSubtitleSync } from './useSubtitleSync'
 
+// 同音检索与批量替换
+export {
+  useHomophoneSearch,
+  SearchMode,
+  SortMode,
+  IndexStatus,
+} from './useHomophoneSearch'
+
 // WaveformTimeline 相关 composables
 export {
   useWaveformZoom,
