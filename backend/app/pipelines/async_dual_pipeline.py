@@ -27,6 +27,10 @@ V3.2.0+dev.20260123.05 更新：
 - 修复暂停快照实例变量未同步问题
 - 确保 _fast_processed_indices, _slow_processed_indices, _finalized_indices 实时更新
 - 解决恢复时"无可靠恢复点"导致从头开始的问题
+
+V3.2.0+dev.20260214.10 更新：
+- 新增 L5->L6 soft-cut 计划生成与透传（可配置开关）
+- 维护 stream 级 pending deferred，支持跨 chunk 延迟决策
 """
 import asyncio
 import copy
@@ -73,7 +77,22 @@ from app.services.arbitration.hallucination_detector import HallucinationDetecto
 from app.services.model_runtime_config_service import get_model_runtime_config_service
 from app.services.sse_service import get_sse_manager
 from app.services.segmentation.default_segmenter import DefaultSegmenter, DraftSegmenter
+from app.services.segmentation.boundary_mapper import WordBoundaryMapper
 from app.services.segmentation.segmentation_processor import SegmentationProcessor
+from app.services.segmentation.soft_cut import (
+    AnchorCandidate,
+    AnchorType,
+    DecisionEngineConfig,
+    DeferredCutState,
+    EvidenceBuilder,
+    EvidenceBuilderConfig,
+    EvidenceFusion,
+    EvidenceFusionConfig,
+    SoftCutDecisionEngine,
+    SpeakerChangeFact,
+    SpeakerChangeTag,
+    WindowDecisionContext,
+)
 from app.services.streaming_subtitle import get_streaming_subtitle_manager
 from app.services.streaming.output_processor import OutputProcessor
 from app.services.punctuation.fast_punctuation_pipeline import FastPunctuationPipeline
@@ -155,6 +174,16 @@ class AsyncDualPipeline:
     - 支持 transcription_profile 参数
     - sensevoice_only 模式下跳过 SlowWorker，FastWorker 直接输出定稿
     """
+    # Why: pyannote 边界在快语速下会出现亚词级抖动，直接参与软切会导致单词级碎句。
+    _SOFT_CUT_MIN_TURN_DURATION_SEC = 0.45
+    _SOFT_CUT_SHORT_WORD_DURATION_SEC = 0.09
+    _SOFT_CUT_SHORT_WORD_MIN_PAUSE_SEC = 0.30
+    _SOFT_CUT_CHUNK_EDGE_GUARD_SEC = 0.18
+    _SOFT_CUT_LEADING_WORD_MAX_DURATION_SEC = 0.12
+    _SOFT_CUT_LEADING_WORD_MAX_GAP_SEC = 0.60
+    _SOFT_CUT_LEADING_WORD_MAX_OFFSET_SEC = 0.08
+    _SPEAKER_REPAIR_MIN_TURN_DURATION_SEC = 0.19
+    _SPEAKER_REPAIR_EDGE_GUARD_SEC = 0.15
 
     def __init__(
         self,
@@ -323,6 +352,33 @@ class AsyncDualPipeline:
         self._l4_processor = AlignmentProcessor(logger=self.logger)
         self._text_pipeline_config = TextPipelineConfig.from_runtime()
         self._segmentation_layer_config = self._text_pipeline_config.segmentation
+        self._is_enable_soft_cut = bool(self._segmentation_layer_config.is_enable_soft_cut)
+        self._soft_cut_pending_deferred_by_stream: Dict[str, List[Any]] = {}
+        # Why: 锚点距离惩罚过弱会让“远处大停顿”压过“近处词边界”，表现为尾词前错切。
+        self._soft_cut_evidence_builder = EvidenceBuilder(
+            config=EvidenceBuilderConfig(
+                window_before_sec=0.40,
+                window_after_sec=0.25,
+                anchor_distance_penalty_factor=0.55,
+            )
+        )
+        self._soft_cut_evidence_fusion = EvidenceFusion(
+            config=EvidenceFusionConfig()
+        )
+        self._soft_cut_decision_engine = SoftCutDecisionEngine(
+            config=DecisionEngineConfig()
+        )
+        self._word_boundary_mapper = WordBoundaryMapper()
+        self._soft_cut_semantic_conjunctions = {
+            "但是",
+            "然后",
+            "所以",
+            "不过",
+            "but",
+            "then",
+            "so",
+            "however",
+        }
         final_split_config = FinalSplitConfig(
             min_tokens=max(1, int(self._segmentation_layer_config.final_min_tokens)),
             max_tokens=max(1, int(self._segmentation_layer_config.final_max_tokens)),
@@ -839,6 +895,16 @@ class AsyncDualPipeline:
             return
 
         turns = list(self._timeline_turns or [])
+        if isinstance(sentences, list):
+            repair_count = self._repair_cross_speaker_sentences_once(
+                sentences=sentences,
+                turns=turns,
+            )
+            if repair_count > 0:
+                self.logger.info(
+                    "跨speaker残留修复: repaired_splits={}",
+                    repair_count,
+                )
         fallback_speaker = self._resolve_speaker_id_for_chunk(fallback_chunk) if fallback_chunk else "unknown"
         fallback_turn = self._resolve_turn_id_for_chunk(fallback_chunk) if fallback_chunk else None
 
@@ -863,6 +929,389 @@ class AsyncDualPipeline:
                 sentence.speaker_id = fallback_speaker
             if sentence.turn_id is None:
                 sentence.turn_id = fallback_turn
+
+    def _repair_cross_speaker_sentences_once(
+        self,
+        *,
+        sentences: List[SentenceSegment],
+        turns: Sequence[Any],
+    ) -> int:
+        """
+        单次闭环修复：仅对“句内跨 speaker”句子做一次局部重切。
+
+        Why:
+        - 触发点来自 turn 边界，但落点必须是词边界，禁止切断词。
+        - 不做二次全局复跑，避免重复计算和结果抖动。
+        """
+        if not sentences or len(turns) <= 1:
+            return 0
+
+        repaired_sentences: List[SentenceSegment] = []
+        repaired_split_count = 0
+        ordered_turns = sorted(
+            list(turns),
+            key=lambda item: (
+                float(getattr(item, "start", 0.0)),
+                float(getattr(item, "end", 0.0)),
+            ),
+        )
+        for sentence in sentences:
+            repaired_parts = self._split_sentence_by_turn_boundaries_once(
+                sentence=sentence,
+                ordered_turns=ordered_turns,
+            )
+            repaired_sentences.extend(repaired_parts)
+            if len(repaired_parts) > 1:
+                repaired_split_count += len(repaired_parts) - 1
+
+        if repaired_split_count > 0:
+            sentences[:] = repaired_sentences
+        return repaired_split_count
+
+    def _split_sentence_by_turn_boundaries_once(
+        self,
+        *,
+        sentence: SentenceSegment,
+        ordered_turns: Sequence[Any],
+    ) -> List[SentenceSegment]:
+        words = list(sentence.words or [])
+        if len(words) <= 1:
+            return [sentence]
+
+        sentence_start = float(getattr(sentence, "start", 0.0) or 0.0)
+        sentence_end = float(getattr(sentence, "end", 0.0) or 0.0)
+        if sentence_end <= sentence_start:
+            return [sentence]
+
+        overlap_turns = [
+            turn
+            for turn in ordered_turns
+            if min(sentence_end, float(getattr(turn, "end", 0.0))) > max(sentence_start, float(getattr(turn, "start", 0.0)))
+        ]
+        speaker_set = {
+            str(getattr(turn, "speaker_id", "") or "").strip()
+            for turn in overlap_turns
+            if str(getattr(turn, "speaker_id", "") or "").strip()
+        }
+        if len(speaker_set) <= 1:
+            return [sentence]
+
+        boundary_times = self._collect_sentence_turn_change_times(
+            overlap_turns=overlap_turns,
+            sentence_start=sentence_start,
+            sentence_end=sentence_end,
+        )
+        if not boundary_times:
+            return [sentence]
+
+        boundary_by_split_index: Dict[int, Tuple[float, float]] = {}
+        for boundary_time in boundary_times:
+            split_idx, score = self._select_best_word_boundary_for_turn_change(
+                words=words,
+                boundary_time=boundary_time,
+            )
+            if split_idx is None:
+                continue
+            existing = boundary_by_split_index.get(split_idx)
+            if existing is None or score > existing[1]:
+                boundary_by_split_index[split_idx] = (boundary_time, score)
+
+        if not boundary_by_split_index:
+            return [sentence]
+
+        selected_split_indices = sorted(
+            split_idx
+            for split_idx in boundary_by_split_index.keys()
+            if 0 <= split_idx < len(words) - 1
+        )
+        if not selected_split_indices:
+            return [sentence]
+
+        rebuilt_sentences: List[SentenceSegment] = []
+        start_idx = 0
+        used_split_indices: List[int] = []
+        for split_idx in selected_split_indices:
+            is_has_room = split_idx >= start_idx and split_idx < len(words) - 1
+            if not is_has_room:
+                continue
+            rebuilt_sentences.append(
+                self._final_splitter._build_sentence(words, start_idx, split_idx)
+            )
+            used_split_indices.append(split_idx)
+            start_idx = split_idx + 1
+        if start_idx < len(words):
+            rebuilt_sentences.append(
+                self._final_splitter._build_sentence(words, start_idx, len(words) - 1)
+            )
+
+        if len(rebuilt_sentences) <= 1:
+            return [sentence]
+
+        # 用 turn 边界时间吸附相邻句子的 start/end，减少“跨speaker时间窗”残留。
+        for idx, split_idx in enumerate(used_split_indices):
+            if idx + 1 >= len(rebuilt_sentences):
+                break
+            boundary_time = float(boundary_by_split_index[split_idx][0])
+            left_sentence = rebuilt_sentences[idx]
+            right_sentence = rebuilt_sentences[idx + 1]
+            left_start = float(getattr(left_sentence, "start", 0.0) or 0.0)
+            right_end = float(getattr(right_sentence, "end", 0.0) or 0.0)
+            if right_end <= left_start:
+                continue
+            snapped = max(left_start + 1e-3, min(right_end - 1e-3, boundary_time))
+            left_sentence.end = max(left_start + 1e-3, min(float(left_sentence.end), snapped))
+            right_sentence.start = min(right_end - 1e-3, max(float(right_sentence.start), snapped))
+            if right_sentence.start <= left_sentence.end:
+                right_sentence.start = min(right_end - 1e-3, left_sentence.end + 1e-3)
+            if right_sentence.end <= right_sentence.start:
+                right_sentence.end = right_sentence.start + 1e-3
+
+        for rebuilt in rebuilt_sentences:
+            self._copy_sentence_runtime_metadata(
+                source=sentence,
+                target=rebuilt,
+            )
+            # 交给后续句级 timeline 绑定重新计算最终 speaker/turn。
+            rebuilt.speaker_id = None
+            rebuilt.turn_id = None
+        return rebuilt_sentences
+
+    def _collect_sentence_turn_change_times(
+        self,
+        *,
+        overlap_turns: Sequence[Any],
+        sentence_start: float,
+        sentence_end: float,
+    ) -> List[float]:
+        if len(overlap_turns) <= 1:
+            return []
+
+        ordered = sorted(
+            list(overlap_turns),
+            key=lambda item: (
+                float(getattr(item, "start", 0.0)),
+                float(getattr(item, "end", 0.0)),
+            ),
+        )
+        change_times: List[float] = []
+        for idx in range(1, len(ordered)):
+            left = ordered[idx - 1]
+            right = ordered[idx]
+            left_speaker = str(getattr(left, "speaker_id", "") or "").strip()
+            right_speaker = str(getattr(right, "speaker_id", "") or "").strip()
+            if not left_speaker or not right_speaker or left_speaker == right_speaker:
+                continue
+            left_start_raw = getattr(left, "start", None)
+            left_start = float(left_start_raw) if left_start_raw is not None else 0.0
+            left_end_raw = getattr(left, "end", None)
+            left_end = float(left_end_raw) if left_end_raw is not None else left_start
+            right_start_raw = getattr(right, "start", None)
+            right_start = float(right_start_raw) if right_start_raw is not None else 0.0
+            right_end_raw = getattr(right, "end", None)
+            right_end = float(right_end_raw) if right_end_raw is not None else right_start
+            left_duration = max(0.0, left_end - left_start)
+            right_duration = max(0.0, right_end - right_start)
+            # Why: 极短 turn 常由分割抖动导致，不应直接触发句内重切。
+            if min(left_duration, right_duration) < self._SPEAKER_REPAIR_MIN_TURN_DURATION_SEC:
+                continue
+            boundary_time = right_start
+            # Why: 句首/句尾附近的切点通常由 chunk 边缘时间误差触发，避免把首词单独切出。
+            if (
+                boundary_time <= sentence_start + self._SPEAKER_REPAIR_EDGE_GUARD_SEC
+                or boundary_time >= sentence_end - self._SPEAKER_REPAIR_EDGE_GUARD_SEC
+            ):
+                continue
+            if not (sentence_start < boundary_time < sentence_end):
+                continue
+            change_times.append(boundary_time)
+
+        deduped: List[float] = []
+        for value in sorted(change_times):
+            if not deduped or abs(value - deduped[-1]) > 0.08:
+                deduped.append(value)
+        return deduped
+
+    def _select_best_word_boundary_for_turn_change(
+        self,
+        *,
+        words: Sequence[WordTimestamp],
+        boundary_time: float,
+    ) -> Tuple[Optional[int], float]:
+        if len(words) <= 1:
+            return None, 0.0
+
+        ranked = self._word_boundary_mapper.rank_boundaries(
+            words=words,
+            event_time=boundary_time,
+        )
+        if not ranked:
+            return None, 0.0
+
+        best_idx: Optional[int] = None
+        best_score = float("-inf")
+        for candidate in ranked[:3]:
+            local_score = self._score_word_boundary_candidate(
+                words=words,
+                split_idx=candidate.split_idx,
+                boundary_time=boundary_time,
+            )
+            score = (candidate.score * 1.2) + local_score
+            if score > best_score:
+                best_score = score
+                best_idx = candidate.split_idx
+
+        if best_idx is not None and best_score > -0.8:
+            return best_idx, best_score
+        return ranked[0].split_idx, ranked[0].score
+
+    def _score_word_boundary_candidate(
+        self,
+        *,
+        words: Sequence[WordTimestamp],
+        split_idx: int,
+        boundary_time: float,
+    ) -> float:
+        left_end = float(getattr(words[split_idx], "end", 0.0) or 0.0)
+        right_start = float(getattr(words[split_idx + 1], "start", left_end) or left_end)
+        gap_left = min(left_end, right_start)
+        gap_right = max(left_end, right_start)
+        is_in_gap = gap_left <= boundary_time <= gap_right
+        if is_in_gap:
+            delta = 0.0
+        else:
+            delta = min(
+                abs(left_end - boundary_time),
+                abs(right_start - boundary_time),
+            )
+        distance_score = max(0.0, 1.0 - (delta / 0.8))
+        pause_duration = max(0.0, right_start - left_end)
+        pause_score = min(1.0, pause_duration / 0.35)
+        valley_score = self._score_boundary_vad_valley((left_end + right_start) / 2.0)
+
+        left_ratio, left_speaker = self._resolve_word_speaker_purity(
+            words=words,
+            start_idx=0,
+            end_idx=split_idx,
+        )
+        right_ratio, right_speaker = self._resolve_word_speaker_purity(
+            words=words,
+            start_idx=split_idx + 1,
+            end_idx=len(words) - 1,
+        )
+        speaker_purity_score = (left_ratio + right_ratio) / 2.0
+        is_has_explicit_change = (
+            bool(left_speaker)
+            and bool(right_speaker)
+            and left_speaker != right_speaker
+        )
+        speaker_change_bonus = 1.0 if is_has_explicit_change else 0.0
+
+        short_penalty = 0.0
+        if split_idx + 1 < 2:
+            short_penalty += 0.4
+        if len(words) - (split_idx + 1) < 2:
+            short_penalty += 0.4
+
+        return (
+            distance_score * 1.6
+            + pause_score * 1.0
+            + valley_score * 0.6
+            + speaker_purity_score * 0.8
+            + speaker_change_bonus * 1.2
+            - short_penalty
+        )
+
+    def _score_boundary_vad_valley(self, boundary_time: float) -> float:
+        intervals = list(self._vad_intervals or [])
+        if not intervals:
+            return 0.0
+        for start, end in intervals:
+            if float(start) <= boundary_time <= float(end):
+                return 0.0
+        return 1.0
+
+    @staticmethod
+    def _resolve_word_speaker_purity(
+        *,
+        words: Sequence[WordTimestamp],
+        start_idx: int,
+        end_idx: int,
+    ) -> Tuple[float, str]:
+        if end_idx < start_idx:
+            return 0.0, ""
+        counts: Dict[str, int] = {}
+        total = 0
+        for idx in range(start_idx, end_idx + 1):
+            speaker_id = str(getattr(words[idx], "speaker_id", "") or "").strip()
+            if not speaker_id:
+                continue
+            counts[speaker_id] = counts.get(speaker_id, 0) + 1
+            total += 1
+        if total <= 0 or not counts:
+            return 0.0, ""
+        best_speaker, best_count = max(counts.items(), key=lambda item: item[1])
+        return best_count / total, best_speaker
+
+    @staticmethod
+    def _copy_sentence_runtime_metadata(
+        *,
+        source: SentenceSegment,
+        target: SentenceSegment,
+    ) -> None:
+        target.source = source.source
+        target.is_draft = source.is_draft
+        target.is_finalized = source.is_finalized
+        target.alignment_score = source.alignment_score
+        target.matched_ratio = source.matched_ratio
+        target.whisper_text = source.whisper_text
+        target.sv_original_text = source.sv_original_text
+        target.confidence_source = source.confidence_source
+        target.warning_type = source.warning_type
+        target.group_id = source.group_id
+        target.is_soft_break = source.is_soft_break
+        target.group_position = source.group_position
+
+    def _bind_word_identity_by_timeline_overlap(
+        self,
+        *,
+        annotated_words: Sequence[AnnotatedWord],
+        fallback_speaker_id: Optional[str],
+        fallback_turn_id: Optional[str],
+    ) -> None:
+        """
+        按词级时间窗与 Timeline turn 重叠绑定 speaker/turn。
+
+        Why: 兼容历史测试与诊断入口，保持词级身份绑定行为可直接验证。
+        """
+        if not annotated_words:
+            return
+
+        turns = list(self._timeline_turns or [])
+        fallback_speaker = str(fallback_speaker_id or "unknown")
+        fallback_turn = str(fallback_turn_id or "") or None
+
+        for word in annotated_words:
+            word_start = float(getattr(word, "start", 0.0) or 0.0)
+            word_end_raw = getattr(word, "end", None)
+            word_end = float(word_end_raw if word_end_raw is not None else word_start)
+            if word_end <= word_start:
+                word_end = word_start + 1e-3
+
+            best_turn = self._select_best_turn_for_chunk(
+                chunk_start=word_start,
+                chunk_end=word_end,
+                turns=turns,
+                require_overlap=True,
+            )
+            if best_turn is not None:
+                word.speaker_id = str(getattr(best_turn, "speaker_id", "unknown") or "unknown")
+                word.turn_id = str(getattr(best_turn, "turn_id", "") or "") or None
+                continue
+
+            if word.speaker_id is None:
+                word.speaker_id = fallback_speaker
+            if word.turn_id is None:
+                word.turn_id = fallback_turn
 
     def _validate_l0_result(
         self,
@@ -1172,6 +1621,7 @@ class AsyncDualPipeline:
         self._context_cache = {}
         self._vad_intervals = list(vad_intervals) if vad_intervals else None
         self._l6_processor.reset_state()
+        self._soft_cut_pending_deferred_by_stream.clear()
 
         # Phase 2: S-Epoch 预构建 Timeline 映射（speaker_id/turn_id）。
         await self._prepare_timeline_domain(
@@ -3771,19 +4221,37 @@ class AsyncDualPipeline:
         injection_stats["injection_blocked"] = float(injection_report.get("blocked", 0.0))
         injection_stats["injection_error_code"] = str(injection_report.get("error_code", "") or "")
 
+        # 在进入 soft-cut 前先完成词级身份绑定，避免 chunk 级 speaker 覆盖句内切换。
+        self._bind_word_identity_by_timeline_overlap(
+            annotated_words=l5_output.annotated_words,
+            fallback_speaker_id=speaker_id,
+            fallback_turn_id=turn_id,
+        )
+
+        l6_stream_id = f"{variant}:{speaker_id or 'main'}:{turn_id or 'none'}"
+        l6_chunk_index = self._resolve_chunk_index_from_words(words=time_words)
+        l6_is_last_chunk = self._is_last_chunk_for_words(words=time_words)
+        soft_cut_plan = self._build_soft_cut_plan_for_l6(
+            annotated_words=l5_output.annotated_words,
+            stream_id=l6_stream_id,
+            block_id=f"{self.job_id}:{l6_stream_id}:{l6_chunk_index if l6_chunk_index is not None else -1}",
+            is_last_chunk=l6_is_last_chunk,
+        )
         l6_output = self._l6_processor.process(
             L6Input(
                 annotated_words=l5_output.annotated_words,
                 vad_intervals=self._vad_intervals,
+                cut_plan=soft_cut_plan,
             ),
-            stream_id=f"{variant}:{speaker_id or 'main'}:{turn_id or 'none'}",
-            chunk_index=self._resolve_chunk_index_from_words(words=time_words),
-            is_last_chunk=self._is_last_chunk_for_words(words=time_words),
+            stream_id=l6_stream_id,
+            chunk_index=l6_chunk_index,
+            is_last_chunk=l6_is_last_chunk,
         )
         words_for_split = list(l6_output.words_for_split)
         final_sentences = list(l6_output.sentence_segments)
         split_stats = dict(self._final_splitter.last_split_stats or {})
         split_stats.update(dict(l6_output.segmentation_report.get("boundary_score_stats", {})))
+        split_stats.update(dict(l6_output.segmentation_report.get("soft_cut_stats", {})))
         segmentation_error = str(l6_output.segmentation_report.get("error_code", "") or "")
         if segmentation_error:
             split_stats["error_code"] = segmentation_error
@@ -4184,14 +4652,28 @@ class AsyncDualPipeline:
             )
             for word in sv_words
         ]
+        self._bind_word_identity_by_timeline_overlap(
+            annotated_words=annotated_words,
+            fallback_speaker_id=speaker_id,
+            fallback_turn_id=turn_id,
+        )
+        sensevoice_stream_id = "sensevoice_only"
+        is_last_chunk = self._is_last_chunk_index(ctx.chunk_index)
+        soft_cut_plan = self._build_soft_cut_plan_for_l6(
+            annotated_words=annotated_words,
+            stream_id=sensevoice_stream_id,
+            block_id=f"{self.job_id}:{sensevoice_stream_id}:{ctx.chunk_index}",
+            is_last_chunk=is_last_chunk,
+        )
         l6_output = self._l6_processor.process(
             L6Input(
                 annotated_words=annotated_words,
                 vad_intervals=self._vad_intervals,
+                cut_plan=soft_cut_plan,
             ),
-            stream_id="sensevoice_only",
+            stream_id=sensevoice_stream_id,
             chunk_index=ctx.chunk_index,
-            is_last_chunk=self._is_last_chunk_index(ctx.chunk_index),
+            is_last_chunk=is_last_chunk,
         )
         sentences = list(l6_output.sentence_segments)
         if not sentences:
@@ -4213,6 +4695,420 @@ class AsyncDualPipeline:
         if self._final_grouper and sentences:
             sentences = self._final_grouper.group(sentences)
         return sentences
+
+    def _build_soft_cut_plan_for_l6(
+        self,
+        *,
+        annotated_words: Sequence[AnnotatedWord],
+        stream_id: str,
+        block_id: str,
+        is_last_chunk: bool,
+    ) -> Optional[Any]:
+        """
+        在 L5 -> L6 之间生成 CutPlan。
+
+        说明：
+        - 关闭开关或无有效说话人变化时返回 None，保持旧路径；
+        - 维护 stream 级 pending deferred，满足跨 chunk 延迟决策。
+        """
+        if not self._is_enable_soft_cut:
+            return None
+        words = list(annotated_words or [])
+        if len(words) <= 1:
+            if is_last_chunk:
+                self._soft_cut_pending_deferred_by_stream.pop(stream_id, None)
+            return None
+
+        speaker_change_facts = self._build_soft_cut_speaker_change_facts(words=words)
+        if not speaker_change_facts:
+            if is_last_chunk:
+                self._soft_cut_pending_deferred_by_stream.pop(stream_id, None)
+            return None
+
+        chunk_start = float(words[0].start if words[0].start is not None else 0.0)
+        chunk_end = float(words[-1].end if words[-1].end is not None else chunk_start)
+        if chunk_end <= chunk_start:
+            chunk_end = chunk_start + 1e-3
+
+        anchor_candidates = self._build_soft_cut_anchor_candidates(words=words)
+        pause_anchors = [item for item in anchor_candidates if item.anchor_type == AnchorType.PAUSE_ANCHOR]
+        word_anchors = [item for item in anchor_candidates if item.anchor_type == AnchorType.WORD_BOUNDARY]
+        semantic_anchors = [item for item in anchor_candidates if item.anchor_type == AnchorType.SEMANTIC_ANCHOR]
+        punctuation_anchors = [
+            item for item in anchor_candidates if item.anchor_type == AnchorType.PUNCTUATION_ANCHOR
+        ]
+
+        builder_result = self._soft_cut_evidence_builder.build(
+            chunk_id=f"{stream_id}:{int(chunk_start * 1000)}",
+            chunk_start=chunk_start,
+            chunk_end=chunk_end,
+            speaker_change_facts=speaker_change_facts,
+            anchor_candidates=[],
+        )
+        if not builder_result.cut_windows:
+            return None
+
+        fusion_result = self._soft_cut_evidence_fusion.fuse(
+            cut_windows=builder_result.cut_windows,
+            pause_anchors=pause_anchors,
+            word_anchors=word_anchors,
+            semantic_anchors=semantic_anchors,
+            punctuation_anchors=punctuation_anchors,
+            time_axis_version="m1_legacy",
+        )
+        window_contexts = self._resolve_soft_cut_window_contexts(
+            words=words,
+            cut_windows=fusion_result.fused_windows,
+        )
+        previous_deferred = list(self._soft_cut_pending_deferred_by_stream.get(stream_id, []))
+        plan = self._soft_cut_decision_engine.decide(
+            block_id=block_id,
+            cut_windows=fusion_result.fused_windows,
+            window_contexts=window_contexts,
+            previous_deferred=previous_deferred,
+            current_time=chunk_end,
+        )
+        plan.generation_report.update(
+            {
+                "builder_window_count": int(builder_result.generation_report.get("window_count", 0)),
+                "builder_high_count": int(builder_result.generation_report.get("high_count", 0)),
+                "builder_mid_count": int(builder_result.generation_report.get("mid_count", 0)),
+                "builder_low_count": int(builder_result.generation_report.get("low_count", 0)),
+                "fusion_output_window_count": int(fusion_result.generation_report.get("output_window_count", 0)),
+            }
+        )
+        self._update_soft_cut_pending_deferred_state(
+            stream_id=stream_id,
+            deferred_cuts=plan.deferred_cuts,
+            is_last_chunk=is_last_chunk,
+        )
+        return plan
+
+    def _build_soft_cut_speaker_change_facts(
+        self,
+        *,
+        words: Sequence[AnnotatedWord],
+    ) -> List[SpeakerChangeFact]:
+        chunk_start = float(words[0].start if words and words[0].start is not None else 0.0)
+        turn_duration_by_turn_id = self._build_turn_duration_by_turn_id()
+        facts: List[SpeakerChangeFact] = []
+        for index in range(1, len(words)):
+            left = words[index - 1]
+            right = words[index]
+            left_speaker = str(left.speaker_id or "").strip()
+            right_speaker = str(right.speaker_id or "").strip()
+            is_valid_pair = bool(left_speaker and right_speaker)
+            if not is_valid_pair or left_speaker == right_speaker:
+                continue
+
+            left_end = float(left.end if left.end is not None else 0.0)
+            right_start = float(right.start if right.start is not None else left_end)
+            pause_duration = max(0.0, right_start - left_end)
+            left_duration = max(
+                0.0,
+                float(left.end if left.end is not None else left_end)
+                - float(left.start if left.start is not None else left_end),
+            )
+            right_duration = max(
+                0.0,
+                float(right.end if right.end is not None else right_start)
+                - float(right.start if right.start is not None else right_start),
+            )
+            # Why: 词级 speaker 跳变若仅发生在亚词级短词，通常是时间轴抖动，不应直接入窗。
+            if (
+                min(left_duration, right_duration) <= self._SOFT_CUT_SHORT_WORD_DURATION_SEC
+                and pause_duration < self._SOFT_CUT_SHORT_WORD_MIN_PAUSE_SEC
+            ):
+                continue
+            left_start = float(left.start if left.start is not None else chunk_start)
+            is_leading_boundary = index == 1
+            if is_leading_boundary:
+                is_near_chunk_start = abs(left_start - chunk_start) <= self._SOFT_CUT_LEADING_WORD_MAX_OFFSET_SEC
+                is_short_leading_word = left_duration <= self._SOFT_CUT_LEADING_WORD_MAX_DURATION_SEC
+                is_gap_not_strong = pause_duration <= self._SOFT_CUT_LEADING_WORD_MAX_GAP_SEC
+                # Why: chunk 开头短首词常由跨 chunk 边界的 speaker 变化映射导致，优先避免孤词切分。
+                if is_near_chunk_start and is_short_leading_word and is_gap_not_strong:
+                    continue
+            left_turn_id = str(getattr(left, "turn_id", "") or "").strip()
+            right_turn_id = str(getattr(right, "turn_id", "") or "").strip()
+            known_turn_durations = []
+            if left_turn_id:
+                left_turn_duration = turn_duration_by_turn_id.get(left_turn_id)
+                if left_turn_duration is not None:
+                    known_turn_durations.append(left_turn_duration)
+            if right_turn_id:
+                right_turn_duration = turn_duration_by_turn_id.get(right_turn_id)
+                if right_turn_duration is not None:
+                    known_turn_durations.append(right_turn_duration)
+            # Why: turn 时长过短时，词级 speaker 跳变大概率是 pyannote 回弹抖动，不进入 soft-cut。
+            if known_turn_durations and min(known_turn_durations) < self._SOFT_CUT_MIN_TURN_DURATION_SEC:
+                continue
+            facts.append(
+                SpeakerChangeFact(
+                    time=right_start,
+                    from_speaker=left_speaker,
+                    to_speaker=right_speaker,
+                    pyannote_confidence=0.85,
+                    pause_duration=pause_duration,
+                    embedding_distance=0.65,
+                    embedding_threshold=0.50,
+                    is_abrupt_energy_shift=pause_duration <= 0.05,
+                )
+            )
+        facts.extend(self._build_soft_cut_timeline_change_facts(words=words))
+        return self._dedupe_soft_cut_speaker_change_facts(facts=facts)
+
+    def _build_turn_duration_by_turn_id(self) -> Dict[str, float]:
+        durations: Dict[str, float] = {}
+        for turn in list(self._timeline_turns or []):
+            turn_id = str(getattr(turn, "turn_id", "") or "").strip()
+            if not turn_id:
+                continue
+            turn_start_raw = getattr(turn, "start", None)
+            turn_end_raw = getattr(turn, "end", None)
+            turn_start = float(turn_start_raw) if turn_start_raw is not None else 0.0
+            turn_end = float(turn_end_raw) if turn_end_raw is not None else turn_start
+            durations[turn_id] = max(0.0, turn_end - turn_start)
+        return durations
+
+    def _build_soft_cut_timeline_change_facts(
+        self,
+        *,
+        words: Sequence[AnnotatedWord],
+    ) -> List[SpeakerChangeFact]:
+        turns = sorted(
+            list(self._timeline_turns or []),
+            key=lambda item: (
+                float(getattr(item, "start", 0.0)),
+                float(getattr(item, "end", 0.0)),
+            ),
+        )
+        if len(turns) <= 1 or not words:
+            return []
+
+        chunk_start = float(words[0].start if words[0].start is not None else 0.0)
+        chunk_end = float(words[-1].end if words[-1].end is not None else chunk_start)
+        if chunk_end <= chunk_start:
+            chunk_end = chunk_start + 1e-3
+
+        facts: List[SpeakerChangeFact] = []
+        for index in range(1, len(turns)):
+            left_turn = turns[index - 1]
+            right_turn = turns[index]
+            left_speaker = str(getattr(left_turn, "speaker_id", "") or "").strip()
+            right_speaker = str(getattr(right_turn, "speaker_id", "") or "").strip()
+            if not left_speaker or not right_speaker or left_speaker == right_speaker:
+                continue
+
+            right_start_raw = getattr(right_turn, "start", None)
+            right_start = float(right_start_raw) if right_start_raw is not None else 0.0
+            left_end_raw = getattr(left_turn, "end", None)
+            left_end = float(left_end_raw) if left_end_raw is not None else right_start
+            left_start_raw = getattr(left_turn, "start", None)
+            left_start = float(left_start_raw) if left_start_raw is not None else left_end
+            right_end_raw = getattr(right_turn, "end", None)
+            right_end = float(right_end_raw) if right_end_raw is not None else right_start
+            left_duration = max(0.0, left_end - left_start)
+            right_duration = max(0.0, right_end - right_start)
+            # Why: 短 turn 更可能是 pyannote 抖动回弹，直接触发 soft-cut 会放大为单词碎切。
+            if min(left_duration, right_duration) < self._SOFT_CUT_MIN_TURN_DURATION_SEC:
+                continue
+            # Why: chunk 边缘附近的 turn-change 更容易把首/尾词切成孤词，交给邻近 chunk 处理更稳妥。
+            if (
+                right_start <= chunk_start + self._SOFT_CUT_CHUNK_EDGE_GUARD_SEC
+                or right_start >= chunk_end - self._SOFT_CUT_CHUNK_EDGE_GUARD_SEC
+            ):
+                continue
+            if right_start < chunk_start or right_start > chunk_end:
+                continue
+            if not self._is_timeline_change_inside_word_span(words=words, trigger_time=right_start):
+                continue
+
+            boundary_confidence = float(getattr(right_turn, "boundary_confidence", 0.0) or 0.0)
+            if boundary_confidence <= 0.0:
+                boundary_confidence = float(getattr(left_turn, "boundary_confidence", 0.0) or 0.0)
+            if boundary_confidence <= 0.0:
+                boundary_confidence = 0.75
+
+            pause_duration = max(0.0, right_start - left_end)
+            facts.append(
+                SpeakerChangeFact(
+                    time=right_start,
+                    from_speaker=left_speaker,
+                    to_speaker=right_speaker,
+                    pyannote_confidence=max(0.5, min(0.99, boundary_confidence)),
+                    pause_duration=pause_duration,
+                    embedding_distance=0.60,
+                    embedding_threshold=0.50,
+                    is_abrupt_energy_shift=pause_duration <= 0.05,
+                    tags={SpeakerChangeTag.SUSPECTED_MISSED},
+                )
+            )
+        return facts
+
+    @staticmethod
+    def _is_timeline_change_inside_word_span(
+        *,
+        words: Sequence[AnnotatedWord],
+        trigger_time: float,
+    ) -> bool:
+        is_has_left_word = False
+        is_has_right_word = False
+        for word in words:
+            word_start = float(word.start if word.start is not None else 0.0)
+            word_end = float(word.end if word.end is not None else word_start)
+            if word_end <= trigger_time + 1e-3:
+                is_has_left_word = True
+            if word_start >= trigger_time - 1e-3:
+                is_has_right_word = True
+            if is_has_left_word and is_has_right_word:
+                return True
+        return False
+
+    @staticmethod
+    def _dedupe_soft_cut_speaker_change_facts(
+        *,
+        facts: Sequence[SpeakerChangeFact],
+    ) -> List[SpeakerChangeFact]:
+        if not facts:
+            return []
+
+        ordered = sorted(
+            list(facts),
+            key=lambda item: (
+                float(item.time),
+                str(item.from_speaker),
+                str(item.to_speaker),
+            ),
+        )
+        merged: List[SpeakerChangeFact] = []
+        for fact in ordered:
+            if not merged:
+                merged.append(fact)
+                continue
+
+            last = merged[-1]
+            is_same_pair = (
+                str(last.from_speaker) == str(fact.from_speaker)
+                and str(last.to_speaker) == str(fact.to_speaker)
+            )
+            is_close_time = abs(float(last.time) - float(fact.time)) <= 0.08
+            if not is_same_pair or not is_close_time:
+                merged.append(fact)
+                continue
+
+            merged[-1] = SpeakerChangeFact(
+                time=float(last.time) if float(last.pyannote_confidence) >= float(fact.pyannote_confidence) else float(fact.time),
+                from_speaker=str(last.from_speaker),
+                to_speaker=str(last.to_speaker),
+                pyannote_confidence=max(float(last.pyannote_confidence), float(fact.pyannote_confidence)),
+                pause_duration=max(float(last.pause_duration), float(fact.pause_duration)),
+                embedding_distance=max(float(last.embedding_distance), float(fact.embedding_distance)),
+                embedding_threshold=min(float(last.embedding_threshold), float(fact.embedding_threshold)),
+                is_abrupt_energy_shift=bool(last.is_abrupt_energy_shift or fact.is_abrupt_energy_shift),
+                tags=set(last.tags).union(set(fact.tags)),
+            )
+        return merged
+
+    def _build_soft_cut_anchor_candidates(
+        self,
+        *,
+        words: Sequence[AnnotatedWord],
+    ) -> List[AnchorCandidate]:
+        anchors: List[AnchorCandidate] = []
+        for index in range(1, len(words)):
+            left = words[index - 1]
+            right = words[index]
+            left_end = float(left.end if left.end is not None else 0.0)
+            right_start = float(right.start if right.start is not None else left_end)
+            boundary_time = right_start
+            pause_duration = max(0.0, right_start - left_end)
+
+            anchors.append(
+                AnchorCandidate(
+                    anchor_type=AnchorType.WORD_BOUNDARY,
+                    anchor_time=boundary_time,
+                    source="word_boundary",
+                    confidence=1.0,
+                )
+            )
+            if pause_duration >= 0.30:
+                anchors.append(
+                    AnchorCandidate(
+                        anchor_type=AnchorType.PAUSE_ANCHOR,
+                        anchor_time=boundary_time,
+                        source="pause_gap",
+                        confidence=min(1.0, 0.5 + pause_duration),
+                    )
+                )
+
+            trailing_punct = str(left.trailing_punct or "").strip()
+            if trailing_punct and trailing_punct[-1] in {"。", "！", "？", ".", "!", "?"}:
+                anchors.append(
+                    AnchorCandidate(
+                        anchor_type=AnchorType.PUNCTUATION_ANCHOR,
+                        anchor_time=boundary_time,
+                        source="punct_proxy",
+                        confidence=0.5,
+                    )
+                )
+
+            right_word = str(right.word or "").strip().lower()
+            if right_word in self._soft_cut_semantic_conjunctions:
+                anchors.append(
+                    AnchorCandidate(
+                        anchor_type=AnchorType.SEMANTIC_ANCHOR,
+                        anchor_time=boundary_time,
+                        source="conjunction_rule",
+                        confidence=0.3,
+                    )
+                )
+        return anchors
+
+    def _resolve_soft_cut_window_contexts(
+        self,
+        *,
+        words: Sequence[AnnotatedWord],
+        cut_windows: Sequence[Any],
+    ) -> Dict[str, WindowDecisionContext]:
+        contexts: Dict[str, WindowDecisionContext] = {}
+        for window in cut_windows:
+            trigger_time = float(getattr(window, "trigger_time", 0.0))
+            covered_words = 0
+            for word in words:
+                word_end = float(word.end if word.end is not None else 0.0)
+                if word_end <= trigger_time:
+                    covered_words += 1
+            window_id = str(getattr(window, "window_id", "") or "")
+            if not window_id:
+                continue
+            contexts[window_id] = WindowDecisionContext(
+                current_sentence_word_count=covered_words,
+                waiting_word_count=max(0, len(words) - covered_words),
+                depends_on_fast_draft=False,
+            )
+        return contexts
+
+    def _update_soft_cut_pending_deferred_state(
+        self,
+        *,
+        stream_id: str,
+        deferred_cuts: Sequence[Any],
+        is_last_chunk: bool,
+    ) -> None:
+        if is_last_chunk:
+            self._soft_cut_pending_deferred_by_stream.pop(stream_id, None)
+            return
+
+        pending = []
+        for item in deferred_cuts:
+            state = getattr(item, "state", None)
+            if state == DeferredCutState.PENDING:
+                pending.append(item)
+        if pending:
+            self._soft_cut_pending_deferred_by_stream[stream_id] = pending
+        else:
+            self._soft_cut_pending_deferred_by_stream.pop(stream_id, None)
 
     @staticmethod
     def _build_sv_word_timestamps(
