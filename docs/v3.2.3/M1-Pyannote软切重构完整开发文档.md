@@ -874,4 +874,96 @@ python backend/scripts/export_speaker_marked_srt_to_jsonl.py ^
 
 ---
 
+## 10. 前端说话人编辑与后端唯一真源方案
+
+### 10.1 目标与原则
+
+1. 说话人相关数据（`speaker_id/turn_id/颜色/绑定来源`）以**后端**为唯一真源。
+2. 前端状态仅作为展示缓存，不拥有最终写入权。
+3. 所有前端人工改 speaker 行为必须先写后端，再由后端广播回前端。
+4. 草稿字幕不参与 speaker 最终归属判定，避免把不稳定结果固化到 UI。
+
+### 10.2 数据真源边界
+
+后端真源分层：
+
+1. `subtitle_speaker_links`：句级 speaker 绑定真源（可被人工改绑）。
+2. `speaker_profiles`：说话人展示信息真源（名称、颜色、锁定态）。
+3. `turn_speaker_links`：时轴检测事实真源（系统写入，前端不可直接改）。
+4. `speaker_audit_logs`：人工操作审计真源（可回放与排障）。
+
+前端边界：
+
+1. 不在本地生成或持久化“最终 speaker 归属”。
+2. 不允许绕过后端直接改句子内 `speaker_id` 并视为生效。
+3. 页面刷新后必须以接口回传结果覆盖本地缓存。
+
+### 10.3 草稿与定稿的字段约束（强制）
+
+#### 10.3.1 草稿事件（`subtitle.draft`）
+
+1. **禁止携带**说话人标签字段：
+   - `speaker_id`
+   - `turn_id`
+   - `speaker_color_key`
+   - `binding_source`
+   - `speaker_label`
+2. 草稿仅允许包含文本与时间相关字段（`text/start/end/words/confidence`）。
+3. 前端对草稿字幕不做说话人染色。
+
+#### 10.3.2 定稿/修订事件（`subtitle.replace_chunk` / `subtitle.finalized` / `subtitle.revised`）
+
+1. **必须携带**句级 speaker 字段：
+   - `speaker_id`
+   - `turn_id`（可空）
+   - `speaker_color_key`
+   - `binding_source`（`auto`/`user`）
+   - `speaker_label`（展示别名，缺失时前端回退 `speaker_id`）
+2. 前端仅对定稿与修订字幕启用说话人染色。
+3. 若字段缺失，按数据不完整处理并记录告警，不回退到“猜测 speaker”。
+
+### 10.4 前端人工改 speaker 的同步闭环
+
+1. 用户在前端修改 speaker（改绑/改名/改色）。
+2. 前端调用后端接口：
+   - `PATCH /api/speakers/{job_id}/subtitles/{sentence_index}`（改绑 speaker）
+   - `PATCH /api/speakers/{job_id}/profiles/{speaker_id}`（改名/改色/锁定）
+   - `POST /api/speakers/{job_id}/profiles/merge`（合并 speaker）
+3. 后端在单事务内写入真源表与审计表。
+4. 后端完成写入后立即广播 SSE：
+   - 句子改绑：`subtitle.revised`
+   - profile 变更：`subtitle.speaker_profiles`
+5. 前端仅消费后端广播结果更新 UI，禁止“前端先改后端失败仍保留本地结果”。
+
+### 10.5 一致性与冲突处理
+
+1. 写接口响应必须返回 `updated_at`（毫秒时间戳）用于并发判断。
+2. SSE 事件必须带 `revision_id` 与 `updated_at`，前端按“时间新者覆盖旧者”处理。
+3. 多端并发修改采用“后端最后写入生效（Last Write Wins）+ 审计可追溯”。
+4. 前端若收到 409/422，必须回滚本地临时态并拉取后端最新数据。
+
+### 10.6 与 M1 soft-cut 的联动约束
+
+1. `subtitle.revised` 若由 soft-cut 触发，必须附带：
+   - `affected_window_ids`
+   - `reason/risk`（来自 `CutDecision`）
+2. 修订只允许作用于受影响窗口，不允许全量覆写无关句子。
+3. `window_id/reason/risk` 与 speaker 归属变更必须可联合回放。
+
+### 10.7 接口返回与拉取口径
+
+1. `GET /api/transcription-text/{job_id}` 返回的 `segments` 必须是定稿口径，并包含 speaker 字段。
+2. 恢复场景（checkpoint/snapshot）返回的字幕同样遵守“草稿无 speaker、定稿有 speaker”。
+3. 前端首屏加载时以该接口为准重建状态，SSE 仅做增量更新。
+
+### 10.8 验收标准
+
+1. 草稿事件中 speaker 字段出现率必须为 `0`。
+2. 定稿与修订事件中 speaker 必填字段完整率必须为 `100%`。
+3. 前端改 speaker 后，`<=1s` 内可收到后端回推并更新 UI。
+4. 刷新页面后，speaker 展示与后端查询结果一致。
+5. 多端同时编辑后，不出现前端与后端长期分叉状态。
+
+---
+
 > 文档结束
