@@ -9,8 +9,15 @@ Phase 3 实现 - 2025-12-10
 from .alignment_processor import AlignmentProcessor
 from .alignment_service import AlignmentService
 from .default_aligner import DefaultAligner, AlignmentLevel
+from .fact_builder import FactBuilder, FactBuilderConfig
 from .gap_resolver import GapResolver, GapResolution, GapResolutionResult
 from .keyword_extractor import KeywordExtractor
+from .nw_v2_core import (
+    AlignmentPriorProvider,
+    NeedlemanWunschScoreConfig,
+    NeedlemanWunschV2Core,
+    ZeroPriorProvider,
+)
 from .quality_stats import QualityStatsCalculator, QualityStats
 
 __all__ = [
@@ -18,10 +25,16 @@ __all__ = [
     "AlignmentProcessor",
     "DefaultAligner",
     "AlignmentLevel",
+    "FactBuilder",
+    "FactBuilderConfig",
     "GapResolver",
     "GapResolution",
     "GapResolutionResult",
     "KeywordExtractor",
+    "AlignmentPriorProvider",
+    "NeedlemanWunschScoreConfig",
+    "NeedlemanWunschV2Core",
     "QualityStatsCalculator",
     "QualityStats",
+    "ZeroPriorProvider",
 ]

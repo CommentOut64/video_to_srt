@@ -24,6 +24,13 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any, Tuple
 import numpy as np
 
+from app.services.alignment.nw_v2_core import (
+    NeedlemanWunschScoreConfig,
+    NeedlemanWunschV2Core,
+    ZeroPriorProvider,
+)
+from app.services.model_runtime_config_service import get_model_runtime_config_service
+
 logger = logging.getLogger(__name__)
 
 
@@ -58,6 +65,13 @@ class WhisperBufferConfig:
     # 对齐参数
     min_word_duration: float = 0.05     # 最小词时长（秒）
     alignment_tolerance: float = 0.3    # 对齐容差（秒）
+    # V3.2.0+dev.20260215.11: NW 统一内核参数
+    nw_v2_enable: Optional[bool] = None
+    nw_match_score: float = 2.0
+    nw_mismatch_penalty: float = -1.0
+    nw_gap_penalty: float = -2.0
+    nw_v2_confidence_alpha: float = 0.6
+    nw_v2_prior_beta: float = 0.4
 
 
 class WhisperBufferPool:
@@ -281,6 +295,31 @@ class WhisperBufferAligner:
             config: 配置
         """
         self.config = config or WhisperBufferConfig()
+        self._is_nw_v2_enabled = self._resolve_nw_v2_enabled(self.config)
+        self._nw_core = NeedlemanWunschV2Core(
+            NeedlemanWunschScoreConfig(
+                base_match_score=float(self.config.nw_match_score),
+                base_mismatch_penalty=float(self.config.nw_mismatch_penalty),
+                base_gap_penalty=float(self.config.nw_gap_penalty),
+                confidence_alpha=float(self.config.nw_v2_confidence_alpha),
+                prior_beta=float(self.config.nw_v2_prior_beta),
+                is_enable_weighted_scoring=self._is_nw_v2_enabled,
+            )
+        )
+        self._prior_provider = ZeroPriorProvider()
+        logger.info("WhisperBufferAligner NW 内核配置: nw_v2_enable=%s", self._is_nw_v2_enabled)
+
+    @staticmethod
+    def _resolve_nw_v2_enabled(config: WhisperBufferConfig) -> bool:
+        if config.nw_v2_enable is not None:
+            return bool(config.nw_v2_enable)
+        try:
+            runtime = get_model_runtime_config_service().get_effective_runtime_global()
+            effective = runtime.get("effective", {}) if isinstance(runtime, dict) else {}
+            m2 = effective.get("m2", {}) if isinstance(effective, dict) else {}
+            return bool(m2.get("nw_v2.enable", False))
+        except Exception:
+            return False
 
     def align_text_to_chunks(
         self,
@@ -330,7 +369,9 @@ class WhisperBufferAligner:
         # Needleman-Wunsch 序列对齐
         alignment_path = self._needleman_wunsch(
             [w["word"] for w in whisper_words],
-            [w["word"] for w in all_sv_words]
+            [w["word"] for w in all_sv_words],
+            seq1_confidences=[w.get("probability") for w in whisper_words],
+            seq2_confidences=[w.get("confidence") for w in all_sv_words],
         )
 
         # 根据对齐路径分配 Whisper 词到 Chunk
@@ -378,6 +419,7 @@ class WhisperBufferAligner:
             chunk_start = chunk["start"]
             chunk_end = chunk["end"]
             chunk_duration = chunk_end - chunk_start
+            chunk_confidence = float(chunk.get("sensevoice_confidence", 0.0) or 0.0)
 
             # 简单分词
             words = sv_text.strip().split()
@@ -391,7 +433,8 @@ class WhisperBufferAligner:
                         "word": word,
                         "start": chunk_start + i * word_duration,
                         "end": chunk_start + (i + 1) * word_duration,
-                        "chunk_index": chunk["index"]
+                        "chunk_index": chunk["index"],
+                        "confidence": chunk_confidence,
                     })
 
             result.append(chunk_words)
@@ -400,10 +443,13 @@ class WhisperBufferAligner:
     def _needleman_wunsch(
         self,
         seq1: List[str],
-        seq2: List[str]
+        seq2: List[str],
+        *,
+        seq1_confidences: Optional[List[Optional[float]]] = None,
+        seq2_confidences: Optional[List[Optional[float]]] = None,
     ) -> List[Tuple[Optional[int], Optional[int]]]:
         """
-        Needleman-Wunsch 全局序列对齐算法
+        Needleman-Wunsch 全局序列对齐算法（统一 V1/V2 内核）。
 
         Args:
             seq1: Whisper 词列表
@@ -415,69 +461,14 @@ class WhisperBufferAligner:
             - (i, None): Whisper 词在 SenseVoice 中没有对应（插入）
             - (None, j): SenseVoice 词在 Whisper 中没有对应（删除）
         """
-        # 评分参数
-        match_score = 2
-        mismatch_penalty = -1
-        gap_penalty = -2
-
-        m, n = len(seq1), len(seq2)
-
-        # 初始化得分矩阵
-        score = np.zeros((m + 1, n + 1), dtype=int)
-        traceback = np.zeros((m + 1, n + 1), dtype=int)
-
-        for i in range(1, m + 1):
-            score[i][0] = score[i-1][0] + gap_penalty
-            traceback[i][0] = 1  # 上
-        for j in range(1, n + 1):
-            score[0][j] = score[0][j-1] + gap_penalty
-            traceback[0][j] = 2  # 左
-
-        # 填充得分矩阵
-        for i in range(1, m + 1):
-            for j in range(1, n + 1):
-                is_match = self._is_word_match(seq1[i-1], seq2[j-1])
-
-                match = score[i-1][j-1] + (match_score if is_match else mismatch_penalty)
-                delete = score[i-1][j] + gap_penalty
-                insert = score[i][j-1] + gap_penalty
-
-                max_score = max(match, delete, insert)
-                score[i][j] = max_score
-
-                if max_score == match:
-                    traceback[i][j] = 0  # 对角
-                elif max_score == delete:
-                    traceback[i][j] = 1  # 上
-                else:
-                    traceback[i][j] = 2  # 左
-
-        # 回溯生成对齐路径
-        alignment_path = []
-        i, j = m, n
-
-        while i > 0 or j > 0:
-            if i == 0:
-                alignment_path.append((None, j - 1))
-                j -= 1
-            elif j == 0:
-                alignment_path.append((i - 1, None))
-                i -= 1
-            else:
-                direction = traceback[i][j]
-                if direction == 0:
-                    alignment_path.append((i - 1, j - 1))
-                    i -= 1
-                    j -= 1
-                elif direction == 1:
-                    alignment_path.append((i - 1, None))
-                    i -= 1
-                else:
-                    alignment_path.append((None, j - 1))
-                    j -= 1
-
-        alignment_path.reverse()
-        return alignment_path
+        return self._nw_core.align(
+            seq1,
+            seq2,
+            seq1_confidences=seq1_confidences,
+            seq2_confidences=seq2_confidences,
+            prior_provider=self._prior_provider,
+            match_fn=self._is_word_match,
+        )
 
     def _is_word_match(self, word1: str, word2: str) -> bool:
         """判断两个词是否匹配（大小写不敏感 + 编辑距离容错）"""

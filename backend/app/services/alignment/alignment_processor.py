@@ -33,6 +33,7 @@ class AlignmentProcessor:
             processor_name="alignment_processor",
         )
         self._config = self._load_alignment_config(config_override)
+        self._is_m2_nw_v2_enabled = bool(TextPipelineConfig.from_runtime().m2.is_nw_v2_enabled)
         self._gap_resolver = GapResolver(
             gap_ratio_low=self._config.gap_ratio_low,
             gap_ratio_mid=self._config.gap_ratio_mid,
@@ -42,10 +43,16 @@ class AlignmentProcessor:
         )
         self._quality_stats = QualityStatsCalculator(logger=self._logger)
         self._alignment_service = AlignmentService(
-            config=AlignmentConfig(),
+            config=AlignmentConfig(
+                is_enable_nw_v2=self._is_m2_nw_v2_enabled,
+            ),
             logger=self._logger,
             gap_resolver=self._gap_resolver,
             quality_stats_calculator=self._quality_stats,
+        )
+        self._logger.info(
+            "L4 NW 内核配置: nw_v2_enable={}",
+            self._is_m2_nw_v2_enabled,
         )
 
     def process(self, data: L4Input) -> L4Output:
