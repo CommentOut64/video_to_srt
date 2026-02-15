@@ -83,6 +83,7 @@ class SoftCutDecisionEngine:
             "length_pressure_cut_count": 0,
             "deferred_forced_count": 0,
             "overflow_forced_count": 0,
+            "deferred_pending_count": 0,
         }
 
         pending_deferred = self._resolve_existing_deferred(
@@ -124,7 +125,7 @@ class SoftCutDecisionEngine:
                 continue
 
             # LOW: 进入 evidence_queue（当前通过 pending deferred 建模）。
-            pending_deferred.append(self._create_deferred(window))
+            pending_deferred.append(self._create_deferred(window, context=context))
             deferred_records.append(pending_deferred[-1])
             report["low_queued_count"] += 1
 
@@ -167,16 +168,20 @@ class SoftCutDecisionEngine:
                 continue
 
             context = contexts.get(deferred.window_id, WindowDecisionContext())
+            depends_on_fast_draft = bool(
+                context.depends_on_fast_draft or getattr(deferred, "depends_on_fast_draft", False)
+            )
             is_timed_out = decision_time >= deferred.expected_resolve_by
             is_word_overflow = context.waiting_word_count >= self.config.deferred_max_words
             if is_timed_out or is_word_overflow:
+                time_range = self._resolve_deferred_time_range(deferred)
                 forced_decision = self._build_forced_decision(
                     window_id=deferred.window_id,
-                    time_range=(deferred.created_at, deferred.expected_resolve_by),
+                    time_range=time_range,
                     decision_time=decision_time,
                     reason="deferred_forced",
                     risk="deferred",
-                    depends_on_fast_draft=context.depends_on_fast_draft,
+                    depends_on_fast_draft=depends_on_fast_draft,
                 )
                 deferred.state = DeferredCutState.FORCED
                 deferred.resolution_decision = forced_decision
@@ -228,7 +233,7 @@ class SoftCutDecisionEngine:
             report["high_forced_count"] += 1
             return
 
-        pending = self._create_deferred(window)
+        pending = self._create_deferred(window, context=context)
         pending_deferred.append(pending)
         deferred_records.append(pending)
 
@@ -248,14 +253,14 @@ class SoftCutDecisionEngine:
             current_sentence_word_count=context.current_sentence_word_count,
         )
         if action == "defer":
-            pending = self._create_deferred(window)
+            pending = self._create_deferred(window, context=context)
             pending_deferred.append(pending)
             deferred_records.append(pending)
             report["mid_deferred_count"] += 1
             return
 
         if best_anchor is None:
-            pending = self._create_deferred(window)
+            pending = self._create_deferred(window, context=context)
             pending_deferred.append(pending)
             deferred_records.append(pending)
             report["mid_deferred_count"] += 1
@@ -292,13 +297,16 @@ class SoftCutDecisionEngine:
         while len(pending_deferred) > self.config.max_deferred_windows:
             oldest = pending_deferred.pop(0)
             context = contexts.get(oldest.window_id, WindowDecisionContext())
+            depends_on_fast_draft = bool(
+                context.depends_on_fast_draft or getattr(oldest, "depends_on_fast_draft", False)
+            )
             forced_decision = self._build_forced_decision(
                 window_id=oldest.window_id,
-                time_range=(oldest.created_at, oldest.expected_resolve_by),
+                time_range=self._resolve_deferred_time_range(oldest),
                 decision_time=decision_time,
                 reason="deferred_forced",
                 risk="overflow_forced",
-                depends_on_fast_draft=context.depends_on_fast_draft,
+                depends_on_fast_draft=depends_on_fast_draft,
             )
             oldest.state = DeferredCutState.FORCED
             oldest.resolution_decision = forced_decision
@@ -352,14 +360,40 @@ class SoftCutDecisionEngine:
             time_range=(float(start), float(end)),
         )
 
-    def _create_deferred(self, window: CutWindow) -> DeferredCut:
+    def _create_deferred(
+        self,
+        window: CutWindow,
+        *,
+        context: Optional[WindowDecisionContext] = None,
+    ) -> DeferredCut:
+        active_context = context or WindowDecisionContext()
         return DeferredCut(
             deferred_id=f"{window.window_id}-deferred",
             window_id=window.window_id,
             created_at=float(window.trigger_time),
             expected_resolve_by=float(window.trigger_time + self.config.deferred_max_wait_sec),
             state=DeferredCutState.PENDING,
+            window_start=float(window.start_time),
+            window_end=float(window.end_time),
+            trigger_level=str(getattr(window.trigger_level, "value", window.trigger_level)),
+            depends_on_fast_draft=bool(active_context.depends_on_fast_draft),
         )
+
+    @staticmethod
+    def _resolve_deferred_time_range(deferred: DeferredCut) -> tuple[float, float]:
+        start = (
+            float(deferred.window_start)
+            if getattr(deferred, "window_start", None) is not None
+            else float(deferred.created_at)
+        )
+        end = (
+            float(deferred.window_end)
+            if getattr(deferred, "window_end", None) is not None
+            else float(deferred.expected_resolve_by)
+        )
+        if end <= start:
+            end = max(float(deferred.expected_resolve_by), start + 1e-3)
+        return start, end
 
     def _decide_mid_action(self, *, anchor_score: float, current_sentence_word_count: int) -> str:
         if anchor_score >= self.config.mid_high_quality_threshold:

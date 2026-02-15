@@ -8,7 +8,7 @@ import importlib
 import logging
 from typing import Any, Optional, Protocol, Sequence, runtime_checkable
 
-from app.services.alignment.types import AnnotatedWord
+from app.services.alignment.types import AlignedFacts, AnnotatedWord, FusedEvidence
 
 
 @runtime_checkable
@@ -22,6 +22,8 @@ class SoftCutPlanProvider(Protocol):
         stream_id: str,
         block_id: str,
         is_last_chunk: bool,
+        aligned_facts: Optional[AlignedFacts] = None,
+        fused_evidence: Optional[FusedEvidence] = None,
     ) -> Optional[Any]:
         """为 L6 生成 CutPlan。"""
 
@@ -45,12 +47,16 @@ class M1InternalSoftCutPlanProvider:
         stream_id: str,
         block_id: str,
         is_last_chunk: bool,
+        aligned_facts: Optional[AlignedFacts] = None,
+        fused_evidence: Optional[FusedEvidence] = None,
     ) -> Optional[Any]:
         return self._pipeline._build_soft_cut_plan_for_l6_m1(
             annotated_words=annotated_words,
             stream_id=stream_id,
             block_id=block_id,
             is_last_chunk=is_last_chunk,
+            aligned_facts=aligned_facts,
+            fused_evidence=fused_evidence,
         )
 
 

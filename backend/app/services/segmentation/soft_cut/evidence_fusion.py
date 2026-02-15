@@ -7,8 +7,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from statistics import fmean
-from typing import Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
+from app.services.alignment.types import FusedEvidence
 from .evidence_builder import AnchorCandidate
 from .types import AnchorScore, AnchorType, CutWindow, EvidenceLevel
 
@@ -258,6 +259,24 @@ class EvidenceFusion:
             )
             for item in scores
         ]
+
+    def to_fused_evidence(
+        self,
+        *,
+        speaker_changes: Sequence[Dict[str, Any]],
+        pause_anchors: Sequence[Dict[str, Any]],
+        semantic_anchors: Sequence[Dict[str, Any]],
+        punctuation_anchors: Sequence[Dict[str, Any]],
+        generation_report: Optional[Dict[str, Any]] = None,
+    ) -> FusedEvidence:
+        """将融合结果封装为阶段4统一契约。"""
+        return FusedEvidence(
+            speaker_changes=list(speaker_changes or []),
+            pause_anchors=list(pause_anchors or []),
+            semantic_anchors=list(semantic_anchors or []),
+            punctuation_anchors=list(punctuation_anchors or []),
+            evidence_report=dict(generation_report or {}),
+        )
 
 
 __all__ = [
