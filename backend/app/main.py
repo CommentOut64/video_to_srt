@@ -48,6 +48,7 @@ from app.api.routes import model_routes
 from app.api.routes import model_runtime_routes
 from app.api.routes import media_routes  # 新增：媒体资源路由
 from app.api.routes.transcription_routes import create_transcription_router
+from app.api.routes.speaker_routes import create_speaker_router
 from app.api.routes.demucs_routes import create_demucs_router  # 新增：Demucs配置路由
 from app.api.routes.file_routes import create_file_router  # 新增：文件管理路由
 from app.api.routes import system_routes  # 新增：系统管理路由
@@ -350,6 +351,10 @@ app.include_router(file_router)
 # 注意：model_routes已在第59行注册，这里不再重复注册
 transcription_router = create_transcription_router(transcription_service, file_service, OUTPUT_DIR)
 app.include_router(transcription_router)
+
+# 注册 speaker 路由（说话人 profile/改绑/合并）
+speaker_router = create_speaker_router(transcription_service)
+app.include_router(speaker_router)
 
 ModelPreloadConfig.print_config()
 

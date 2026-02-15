@@ -1422,6 +1422,13 @@ def create_transcription_router(
         transcription_data = None
         using_snapshot = False
         logger = logging.getLogger(__name__)
+        speaker_store_service = None
+        try:
+            from app.services.speaker_store import SpeakerStoreService
+
+            speaker_store_service = SpeakerStoreService(job_dir=job_dir)
+        except Exception as speaker_exc:
+            logger.warning("[%s] SpeakerStoreService 初始化失败，跳过 speaker 合并: %s", job_id, speaker_exc)
 
         if checkpoint_path.exists():
             try:
@@ -1479,6 +1486,10 @@ def create_transcription_router(
                     # 注意：旧数据可能完全没有 confidence 字段，此时不应显示虚假的准确率
                     raw_conf = sentence.get("confidence")  # 可能为 None
                     source = sentence.get("source", "sensevoice")
+                    is_draft = bool(sentence.get("_is_draft", False))
+                    is_finalized = sentence.get("_is_finalized")
+                    if is_finalized is None:
+                        is_finalized = not is_draft
 
                     # V3.1.2: 检查是否有 display_confidence，没有则计算并标记需要更新
                     display_conf = sentence.get("display_confidence")
@@ -1504,7 +1515,9 @@ def create_transcription_router(
                         "confidence_source": confidence_source,  # 可能为 None
                         "source": source,
                         "is_modified": sentence.get("is_modified", False),
-                        "original_text": sentence.get("original_text")
+                        "original_text": sentence.get("original_text"),
+                        "is_draft": is_draft,
+                        "is_finalized": bool(is_finalized),
                     })
 
                 # 按 _index 排序（已经是正确顺序，但保险起见）
@@ -1571,6 +1584,68 @@ def create_transcription_router(
                     x.get("id", 0),
                 )
             )
+
+            # 统一补齐草稿/定稿标记，避免前后端语义漂移
+            for seg in all_segments:
+                is_draft = bool(seg.get("is_draft", False))
+                is_finalized = seg.get("is_finalized")
+                if is_finalized is None:
+                    is_finalized = not is_draft
+                seg["is_draft"] = is_draft
+                seg["is_finalized"] = bool(is_finalized)
+
+            # 定稿段合并 speaker 信息；草稿段强制不携带 speaker 标签
+            finalized_sentence_indices: List[int] = []
+            for seg in all_segments:
+                if seg.get("id") is None or not bool(seg.get("is_finalized")):
+                    continue
+                try:
+                    finalized_sentence_indices.append(int(seg["id"]))
+                except (TypeError, ValueError):
+                    continue
+            speaker_links_map: Dict[int, Dict[str, Any]] = {}
+            if speaker_store_service and finalized_sentence_indices:
+                try:
+                    speaker_links_map = speaker_store_service.get_subtitle_speaker_map(
+                        sentence_indices=finalized_sentence_indices
+                    )
+                except Exception as speaker_query_exc:
+                    logger.warning(
+                        "[%s] 查询 speaker 链接失败，返回默认 speaker 字段: %s",
+                        job_id,
+                        speaker_query_exc,
+                    )
+
+            for seg in all_segments:
+                if bool(seg.get("is_draft")):
+                    seg.pop("speaker_id", None)
+                    seg.pop("turn_id", None)
+                    seg.pop("speaker_label", None)
+                    seg.pop("speaker_color_key", None)
+                    seg.pop("binding_source", None)
+                    continue
+
+                if not bool(seg.get("is_finalized")):
+                    continue
+
+                sentence_index = seg.get("id")
+                resolved_sentence_index = None
+                if sentence_index is not None:
+                    try:
+                        resolved_sentence_index = int(sentence_index)
+                    except (TypeError, ValueError):
+                        resolved_sentence_index = None
+                link_row = (
+                    speaker_links_map.get(resolved_sentence_index)
+                    if resolved_sentence_index is not None
+                    else None
+                )
+                speaker_id = str((link_row or {}).get("speaker_id") or "unknown")
+                seg["speaker_id"] = speaker_id
+                seg["turn_id"] = (link_row or {}).get("turn_id")
+                seg["speaker_label"] = str((link_row or {}).get("speaker_label") or speaker_id)
+                seg["speaker_color_key"] = str((link_row or {}).get("speaker_color_key") or "speaker-01")
+                seg["binding_source"] = str((link_row or {}).get("binding_source") or "auto")
 
             # 快照模式下补充进度信息，避免 percentage 为 0
             if using_snapshot:
