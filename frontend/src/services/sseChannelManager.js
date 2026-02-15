@@ -266,6 +266,16 @@ class SSEChannelManager extends EventEmitter {
         handlers.onFinalized?.(data)
         handlers.onSubtitleUpdate?.(data)
       },
+      // 说话人改绑/修订事件（后端唯一真源回推）
+      'subtitle.revised': (data) => {
+        console.log(`[SSE Job ${jobId}] 字幕修订:`, data)
+        handlers.onRevised?.(data)
+      },
+      // 说话人 profile 更新事件（名称/颜色/锁定/合并）
+      'subtitle.speaker_profiles': (data) => {
+        console.log(`[SSE Job ${jobId}] 说话人资料更新:`, data)
+        handlers.onSpeakerProfiles?.(data)
+      },
       'subtitle.added': (data) => {
         console.log(`[SSE Job ${jobId}] 新增字幕:`, data)
         handlers.onSubtitleAdded?.(data)

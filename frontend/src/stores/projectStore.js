@@ -53,6 +53,9 @@ export const useProjectStore = defineStore("project", () => {
     finalizedChunks: 0, // 定稿 Chunk 数
   });
 
+  // 说话人 profile 缓存（后端真源的前端镜像）
+  const speakerProfiles = ref(new Map());
+
   // ========== 3. Undo/Redo 历史记录 ==========
   // 【重要】撤销/重做策略：
   // - 历史记录只追踪用户编辑操作
@@ -179,6 +182,27 @@ export const useProjectStore = defineStore("project", () => {
     });
   }
 
+  function normalizeSpeakerFields(source = {}, options = {}) {
+    const { stripSpeaker = false } = options;
+    if (stripSpeaker) {
+      return {
+        speaker_id: null,
+        turn_id: null,
+        speaker_label: null,
+        speaker_color_key: null,
+        binding_source: null,
+      };
+    }
+    const speakerId = source.speaker_id ?? source.speakerId ?? null;
+    return {
+      speaker_id: speakerId,
+      turn_id: source.turn_id ?? source.turnId ?? null,
+      speaker_label: source.speaker_label ?? source.speakerLabel ?? speakerId,
+      speaker_color_key: source.speaker_color_key ?? source.speakerColorKey ?? null,
+      binding_source: source.binding_source ?? source.bindingSource ?? null,
+    };
+  }
+
   function setSubtitleOffset(value, options = {}) {
     const { applyDelta = true } = options;
     const normalized = Math.round(clampSubtitleOffset(value) * 1000) / 1000;
@@ -281,6 +305,7 @@ export const useProjectStore = defineStore("project", () => {
       // Phase 5: 双模态架构新增字段
       chunk_id: null, // 物理切片ID
       isDraft: false, // 已导入的SRT都是定稿
+      isFinalized: true,
       words: [], // 字级置信度数据
       // V3.1.2+dev.20260112.01: SRT 无置信度数据，置空避免显示误导性的 100%
       confidence: null,
@@ -288,6 +313,7 @@ export const useProjectStore = defineStore("project", () => {
       confidence_source: 'srt_fallback',  // 标记来源用于 UI 判断
       warning_type: "none", // 警告类型: none/low_confidence/high_perplexity/both
       source: "imported", // 来源: sensevoice/whisper/imported
+      ...normalizeSpeakerFields({}, { stripSpeaker: true }),
     }));
 
     meta.value = {
@@ -302,6 +328,7 @@ export const useProjectStore = defineStore("project", () => {
     clearHistory();
     // 清除 Chunk 映射
     chunkSubtitleMap.value.clear();
+    speakerProfiles.value = new Map();
     deletedSentenceIndices.value.clear();
   }
 
@@ -325,13 +352,15 @@ export const useProjectStore = defineStore("project", () => {
       isModified: seg.is_modified ?? false,
       originalText: seg.original_text ?? null,
       chunk_id: null,
-      isDraft: false,
       words: [],
       confidence: seg.confidence ?? null,
       display_confidence: seg.display_confidence,  // V3.1.2: 映射后准确率
       confidence_source: seg.confidence_source,    // V3.1.2: 置信度来源
       warning_type: "none",
       source: seg.source || "imported",
+      isDraft: seg.is_draft ?? false,
+      isFinalized: seg.is_finalized ?? !(seg.is_draft ?? false),
+      ...normalizeSpeakerFields(seg, { stripSpeaker: Boolean(seg.is_draft) }),
     }));
 
     meta.value = {
@@ -346,6 +375,7 @@ export const useProjectStore = defineStore("project", () => {
     clearHistory();
     // 清除 Chunk 映射
     chunkSubtitleMap.value.clear();
+    speakerProfiles.value = new Map();
     deletedSentenceIndices.value.clear();
   }
 
@@ -768,7 +798,11 @@ export const useProjectStore = defineStore("project", () => {
       confidence_source,   // V3.1.2: 置信度来源
       words = [],
       warning_type = "none",
+      is_draft,
+      is_finalized,
     } = sentenceData;
+    const isDraftSentence = is_draft ?? !Boolean(is_finalized);
+    const isFinalizedSentence = is_finalized ?? !isDraftSentence;
 
     if (deletedSentenceIndices.value.has(sentenceIndex)) {
       console.log(`[ProjectStore] 草稿字幕已被用户删除，跳过: ${sentenceIndex}`);
@@ -793,14 +827,16 @@ export const useProjectStore = defineStore("project", () => {
       isModified: sentenceData.is_modified ?? false,
       originalText: sentenceData.original_text ?? null,
       chunk_id,
-      isDraft: true, // 标记为草稿
+      isDraft: isDraftSentence,
+      isFinalized: isFinalizedSentence,
       words: normalized.words,
       confidence,
       display_confidence,  // V3.1.2: 映射后准确率
       confidence_source,   // V3.1.2: 置信度来源
       warning_type,
-      source: "sensevoice",
+      source: sentenceData.source || (isDraftSentence ? "sensevoice" : "finalized"),
       sentenceIndex, // 保留原始句子索引
+      ...normalizeSpeakerFields(sentenceData, { stripSpeaker: Boolean(isDraftSentence) }),
     };
 
     if (existingIndex >= 0) {
@@ -882,6 +918,7 @@ export const useProjectStore = defineStore("project", () => {
         originalText: sentence.original_text ?? null,
         chunk_id,
         isDraft: false, // 定稿
+        isFinalized: true,
         words: normalized.words || [],
         confidence: sentence.confidence ?? null,
         display_confidence: sentence.display_confidence,  // V3.1.2: 映射后准确率
@@ -889,6 +926,7 @@ export const useProjectStore = defineStore("project", () => {
         warning_type: sentence.warning_type || "none",
         source: sentence.source || "whisper",
         sentenceIndex: sentence.index,
+        ...normalizeSpeakerFields(sentence, { stripSpeaker: false }),
       };
 
       // 按时间顺序插入
@@ -974,6 +1012,7 @@ export const useProjectStore = defineStore("project", () => {
         originalText: sentence.original_text ?? null,
         chunk_id,
         isDraft: sentence.is_draft ?? false,
+        isFinalized: sentence.is_finalized ?? !(sentence.is_draft ?? false),
         isRestored: true, // 标记为恢复的字幕
         words: normalized.words || [],
         confidence: sentence.confidence ?? null,
@@ -982,6 +1021,7 @@ export const useProjectStore = defineStore("project", () => {
         warning_type: sentence.warning_type || "none",
         source: sentence.source || "restored",
         sentenceIndex: sentence.index,
+        ...normalizeSpeakerFields(sentence, { stripSpeaker: Boolean(sentence.is_draft ?? false) }),
       };
 
       // 按时间顺序插入
@@ -1003,6 +1043,142 @@ export const useProjectStore = defineStore("project", () => {
     updateDualStreamProgress();
 
     // 恢复历史记录
+    resumeHistory();
+  }
+
+  /**
+   * 应用后端推送的修订事件（包含说话人改绑）。
+   *
+   * 支持两种格式：
+   * - 单条：{ index, sentence }
+   * - 批量：{ sentences: [...] }
+   */
+  function applyRevisedSubtitle(data) {
+    if (!data) return;
+
+    const revisions = Array.isArray(data.sentences)
+      ? data.sentences
+      : [data.sentence ? { ...data.sentence, index: data.index ?? data.sentence.index } : data];
+
+    if (revisions.length === 0) return;
+    pauseHistory();
+
+    let revisedCount = 0;
+    revisions.forEach((revision) => {
+      const sentenceIndex = revision.index ?? revision.sentenceIndex;
+      if (sentenceIndex === undefined || sentenceIndex === null) {
+        return;
+      }
+
+      const existingIndex = subtitles.value.findIndex((item) => item.sentenceIndex === sentenceIndex);
+      const isDraft = revision.is_draft ?? (existingIndex >= 0 ? subtitles.value[existingIndex].isDraft : false);
+      const isFinalized = revision.is_finalized ?? !isDraft;
+      const speakerFields = normalizeSpeakerFields(revision, { stripSpeaker: Boolean(isDraft) });
+
+      const hasTiming =
+        revision.start !== undefined
+        || revision.end !== undefined
+        || revision.words !== undefined;
+      let normalizedTiming = {};
+      if (hasTiming) {
+        const normalized = applyOffsetToSentenceData({
+          start: revision.start ?? 0,
+          end: revision.end ?? (revision.start ?? 0),
+          words: revision.words || [],
+        });
+        normalizedTiming = {
+          ...(revision.start !== undefined ? { start: normalized.start } : {}),
+          ...(revision.end !== undefined ? { end: normalized.end } : {}),
+          ...(revision.words !== undefined ? { words: normalized.words } : {}),
+        };
+      }
+
+      if (existingIndex >= 0) {
+        const current = subtitles.value[existingIndex];
+        subtitles.value[existingIndex] = {
+          ...current,
+          ...(revision.text !== undefined ? { text: revision.text } : {}),
+          ...normalizedTiming,
+          ...(revision.warning_type !== undefined ? { warning_type: revision.warning_type } : {}),
+          ...(revision.source !== undefined ? { source: revision.source } : {}),
+          isDraft,
+          isFinalized,
+          sentenceIndex,
+          ...speakerFields,
+        };
+      } else {
+        const normalized = applyOffsetToSentenceData({
+          start: revision.start ?? 0,
+          end: revision.end ?? 0,
+          words: revision.words || [],
+        });
+        const newSubtitle = {
+          id: buildUniqueSubtitleId(`revised-${sentenceIndex}`),
+          sentenceIndex,
+          start: normalized.start,
+          end: normalized.end,
+          text: revision.text || "",
+          isDirty: false,
+          isModified: revision.is_modified ?? false,
+          originalText: revision.original_text ?? null,
+          chunk_id: null,
+          isDraft,
+          isFinalized,
+          words: normalized.words || [],
+          confidence: revision.confidence ?? null,
+          display_confidence: revision.display_confidence,
+          confidence_source: revision.confidence_source,
+          warning_type: revision.warning_type || "none",
+          source: revision.source || "revised",
+          ...speakerFields,
+        };
+        const insertIndex = findInsertIndex(normalized.start);
+        subtitles.value.splice(insertIndex, 0, newSubtitle);
+      }
+      revisedCount += 1;
+    });
+
+    if (revisedCount > 0) {
+      subtitles.value.sort((left, right) => {
+        const byStart = (left.start ?? 0) - (right.start ?? 0);
+        if (byStart !== 0) return byStart;
+        return (left.end ?? 0) - (right.end ?? 0);
+      });
+      updateDualStreamProgress();
+    }
+    resumeHistory();
+  }
+
+  /**
+   * 应用后端推送的说话人 profile 更新。
+   */
+  function applySpeakerProfiles(data) {
+    if (!data || !Array.isArray(data.profiles) || data.profiles.length === 0) {
+      return;
+    }
+
+    pauseHistory();
+    const nextProfiles = new Map(speakerProfiles.value);
+    data.profiles.forEach((profile) => {
+      if (!profile?.speaker_id) return;
+      nextProfiles.set(profile.speaker_id, profile);
+    });
+    speakerProfiles.value = nextProfiles;
+
+    subtitles.value = subtitles.value.map((subtitle) => {
+      if (subtitle.isDraft || !subtitle.speaker_id) {
+        return subtitle;
+      }
+      const profile = speakerProfiles.value.get(subtitle.speaker_id);
+      if (!profile) {
+        return subtitle;
+      }
+      return {
+        ...subtitle,
+        speaker_label: profile.display_name || subtitle.speaker_label || subtitle.speaker_id,
+        speaker_color_key: profile.color_key || subtitle.speaker_color_key,
+      };
+    });
     resumeHistory();
   }
 
@@ -1205,6 +1381,7 @@ export const useProjectStore = defineStore("project", () => {
       finalizedChunks: 0,
     };
     deletedSentenceIndices.value.clear();
+    speakerProfiles.value = new Map();
     console.log("[ProjectStore] 项目已重置");
   }
 
@@ -1268,6 +1445,7 @@ export const useProjectStore = defineStore("project", () => {
     // Phase 5: 双模态架构状态
     chunkSubtitleMap,
     dualStreamProgress,
+    speakerProfiles,
 
     // 计算属性
     totalSubtitles,
@@ -1307,6 +1485,8 @@ export const useProjectStore = defineStore("project", () => {
     appendOrUpdateDraft,
     replaceChunk,
     restoreChunk, // V3.1.0: 断点续传字幕恢复
+    applyRevisedSubtitle,
+    applySpeakerProfiles,
     updateDualStreamProgress,
     updateDualStreamProgressFromSSE,  // V3.1.0: 从 SSE 更新双流进度
 

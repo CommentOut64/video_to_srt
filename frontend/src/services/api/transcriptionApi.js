@@ -396,6 +396,63 @@ class TranscriptionAPI {
   async deleteSubtitle(jobId, sentenceIndex) {
     return apiClient.delete(`/api/jobs/${jobId}/subtitles/${sentenceIndex}`);
   }
+
+  /**
+   * 获取说话人资料列表
+   * @param {string} jobId - 任务ID
+   * @returns {Promise<{job_id: string, profiles: Array}>}
+   */
+  async listSpeakerProfiles(jobId) {
+    return apiClient.get(`/api/speakers/${jobId}/profiles`);
+  }
+
+  /**
+   * 获取指定说话人的字幕绑定列表
+   * @param {string} jobId - 任务ID
+   * @param {string} speakerId - 说话人ID
+   * @returns {Promise<{job_id: string, speaker_id: string, subtitles: Array}>}
+   */
+  async listSpeakerSubtitles(jobId, speakerId) {
+    return apiClient.get(`/api/speakers/${jobId}/profiles/${speakerId}/subtitles`);
+  }
+
+  /**
+   * 更新说话人资料（名称/颜色/锁定/状态）
+   * @param {string} jobId - 任务ID
+   * @param {string} speakerId - 说话人ID
+   * @param {Object} payload - 更新字段
+   * @returns {Promise<{success: boolean, data: Object, revision_id: string, updated_at: number}>}
+   */
+  async updateSpeakerProfile(jobId, speakerId, payload) {
+    return apiClient.patch(`/api/speakers/${jobId}/profiles/${speakerId}`, payload);
+  }
+
+  /**
+   * 改绑句级 speaker
+   * @param {string} jobId - 任务ID
+   * @param {number} sentenceIndex - 句子索引
+   * @param {string} speakerId - 目标说话人ID
+   * @returns {Promise<{success: boolean, data: Object, revision_id: string, updated_at: number}>}
+   */
+  async rebindSubtitleSpeaker(jobId, sentenceIndex, speakerId) {
+    return apiClient.patch(`/api/speakers/${jobId}/subtitles/${sentenceIndex}`, {
+      speaker_id: speakerId,
+    });
+  }
+
+  /**
+   * 合并说话人
+   * @param {string} jobId - 任务ID
+   * @param {string} sourceSpeakerId - 源说话人ID
+   * @param {string} targetSpeakerId - 目标说话人ID
+   * @returns {Promise<{success: boolean, data: Object, revision_id: string, updated_at: number}>}
+   */
+  async mergeSpeakerProfiles(jobId, sourceSpeakerId, targetSpeakerId) {
+    return apiClient.post(`/api/speakers/${jobId}/profiles/merge`, {
+      source_speaker_id: sourceSpeakerId,
+      target_speaker_id: targetSpeakerId,
+    });
+  }
 }
 
 // 导出单例实例
