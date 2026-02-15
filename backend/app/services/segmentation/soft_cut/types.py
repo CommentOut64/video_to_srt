@@ -107,10 +107,25 @@ class CutDecision:
     anchor_score: float
     depends_on_fast_draft: bool
     time_range: tuple[float, float]
+    # V3.2.0+dev.20260215.10: 时间映射契约（Phase 1 预埋）。
+    pyannote_frame_time: Optional[float] = None
+    mapped_cut_time: Optional[float] = None
+    mapping_quality: str = ""
+    mapping_reason: str = ""
 
     def __post_init__(self) -> None:
         if not self.window_id:
             raise ValueError("CutDecision.window_id 不能为空")
+
+    @property
+    def split_reason(self) -> str:
+        """兼容口径：split_reason。"""
+        return self.reason
+
+    @property
+    def split_risk(self) -> str:
+        """兼容口径：split_risk。"""
+        return str(self.risk or "")
 
 
 @dataclass
@@ -123,6 +138,10 @@ class DeferredCut:
     expected_resolve_by: float
     state: DeferredCutState = DeferredCutState.PENDING
     resolution_decision: Optional[CutDecision] = None
+    window_start: Optional[float] = None
+    window_end: Optional[float] = None
+    trigger_level: str = ""
+    depends_on_fast_draft: bool = False
 
 
 @dataclass

@@ -235,12 +235,55 @@ class L5Output:
 
 
 @dataclass
+class AlignedFacts:
+    """集合层事实契约（M2 预埋）。"""
+
+    annotated_words: List[AnnotatedWord] = field(default_factory=list)
+    alignment_score: float = 0.0
+    gap_ratio: float = 0.0
+    gap_positions: List[int] = field(default_factory=list)
+    speaker_turns: List[Dict[str, Any]] = field(default_factory=list)
+    fast_draft_cuts: List[float] = field(default_factory=list)
+    time_axis_version: str = "m1_legacy"
+    time_mappings: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class FusedEvidence:
+    """评分层统一证据契约（M2 预埋）。"""
+
+    speaker_changes: List[Dict[str, Any]] = field(default_factory=list)
+    pause_anchors: List[Dict[str, Any]] = field(default_factory=list)
+    semantic_anchors: List[Dict[str, Any]] = field(default_factory=list)
+    punctuation_anchors: List[Dict[str, Any]] = field(default_factory=list)
+    evidence_report: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class OutputTrace:
+    """输出层追踪契约（句级切分原因 + 时间映射）。"""
+
+    sentence_index: int
+    split_reason: str = ""
+    split_risk: str = ""
+    window_id: str = ""
+    pyannote_frame_time: Optional[float] = None
+    mapped_cut_time: Optional[float] = None
+    mapping_quality: str = ""
+    mapping_reason: str = ""
+    sentence_start: Optional[float] = None
+    sentence_end: Optional[float] = None
+
+
+@dataclass
 class L6Input:
     """L6 切分层输入。"""
 
     annotated_words: List[AnnotatedWord]
     vad_intervals: Optional[List[Tuple[float, float]]] = None
     cut_plan: Optional["CutPlan"] = None
+    aligned_facts: Optional[AlignedFacts] = None
+    fused_evidence: Optional[FusedEvidence] = None
 
 
 @dataclass
@@ -251,6 +294,7 @@ class L6Output:
     words_for_split: List[WordTimestamp]
     segmentation_report: Dict[str, Any] = field(default_factory=dict)
     applied_cut_plan: Optional["CutPlan"] = None
+    output_traces: List[OutputTrace] = field(default_factory=list)
 
 
 @dataclass
@@ -261,6 +305,7 @@ class L7Input:
     sentence_segments: List[SentenceSegment]
     injection_report: Optional[Dict[str, Any]] = None
     segmentation_report: Optional[Dict[str, Any]] = None
+    output_traces: Optional[List[OutputTrace]] = None
 
 
 @dataclass
@@ -268,6 +313,7 @@ class L7Output:
     """L7 输出层输出。"""
 
     output_payload: Dict[str, Any] = field(default_factory=dict)
+    output_traces: List[OutputTrace] = field(default_factory=list)
 
 
 __all__ = [
@@ -295,4 +341,7 @@ __all__ = [
     "TextTrack",
     "TextTrackBundle",
     "AnnotatedWord",
+    "AlignedFacts",
+    "FusedEvidence",
+    "OutputTrace",
 ]
