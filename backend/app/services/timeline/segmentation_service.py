@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -43,6 +43,79 @@ class PyannoteSegmentationConfig:
     boundary_threshold: float = 0.55
     min_boundary_interval_sec: float = 0.20
     prefer_device: str = "auto"
+
+
+def map_frame_times_to_word_boundaries(
+    *,
+    frame_times: Sequence[float],
+    word_boundaries: Sequence[float],
+    tolerance_sec: float = 0.22,
+    is_enable_mapping: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    将 pyannote 帧时间映射到词边界（阶段3契约）。
+
+    Why:
+    - 统一 `raw_time/snapped_time/delta_ms/mapping_reason/mapping_quality` 字段口径，
+      供 FactBuilder 在不改主链裁决的前提下产出可观测事实。
+    """
+    normalized_frames = sorted({float(item) for item in frame_times or []})
+    normalized_boundaries = sorted({float(item) for item in word_boundaries or []})
+    mappings: List[Dict[str, Any]] = []
+    if not normalized_frames:
+        return mappings
+
+    if not is_enable_mapping:
+        for raw_time in normalized_frames:
+            mappings.append(
+                {
+                    "raw_time": raw_time,
+                    "snapped_time": raw_time,
+                    "delta_ms": 0.0,
+                    "mapping_reason": "time_mapping_disabled",
+                    "mapping_quality": "disabled",
+                }
+            )
+        return mappings
+
+    if not normalized_boundaries:
+        for raw_time in normalized_frames:
+            mappings.append(
+                {
+                    "raw_time": raw_time,
+                    "snapped_time": raw_time,
+                    "delta_ms": 0.0,
+                    "mapping_reason": "no_word_boundaries",
+                    "mapping_quality": "deferred",
+                }
+            )
+        return mappings
+
+    tolerance = max(0.0, float(tolerance_sec))
+    for raw_time in normalized_frames:
+        snapped_time = min(normalized_boundaries, key=lambda item: abs(item - raw_time))
+        delta_ms = (float(snapped_time) - float(raw_time)) * 1000.0
+        if abs(float(snapped_time) - float(raw_time)) <= tolerance:
+            mappings.append(
+                {
+                    "raw_time": float(raw_time),
+                    "snapped_time": float(snapped_time),
+                    "delta_ms": float(delta_ms),
+                    "mapping_reason": "word_boundary_mapper",
+                    "mapping_quality": "snapped",
+                }
+            )
+        else:
+            mappings.append(
+                {
+                    "raw_time": float(raw_time),
+                    "snapped_time": float(raw_time),
+                    "delta_ms": 0.0,
+                    "mapping_reason": "no_anchor_within_tolerance",
+                    "mapping_quality": "deferred",
+                }
+            )
+    return mappings
 
 
 class PyannoteSegmentationService:

@@ -12,6 +12,7 @@ from app.services.timeline.diarization_service import (
     PyannoteDiarizationService,
 )
 from app.services.timeline.segmentation_service import (
+    map_frame_times_to_word_boundaries,
     PyannoteSegmentationConfig,
     PyannoteSegmentationService,
     SegmentationFrame,
@@ -34,6 +35,7 @@ __all__ = [
     "ClusterManagerConfig",
     "DiarizationResult",
     "DiarizationSegment",
+    "map_frame_times_to_word_boundaries",
     "PyannoteSegmentationConfig",
     "PyannoteDiarizationConfig",
     "PyannoteDiarizationService",
