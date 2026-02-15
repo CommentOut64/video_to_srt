@@ -476,6 +476,14 @@ class ModelRuntimeConfigService:
                 "soft_cut.plan_provider": "m1_internal",
                 "soft_cut.plan_provider_class": "",
             },
+            # V3.2.0+dev.20260215.09: M2 阶段0开关与观测配置（仅观测，不改主链结果）。
+            "m2": {
+                "enable": False,
+                "nw_v2.enable": False,
+                "time_mapping.enable": False,
+                "shadow.sample_rate": 0.1,
+                "shadow.provider_class": "",
+            },
             # V3.2.0+dev.20260204.03: L2 文本仲裁层运行参数
             "arbitration": {
                 "enable": True,

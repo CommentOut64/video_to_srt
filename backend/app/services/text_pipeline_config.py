@@ -454,6 +454,47 @@ class SegmentationLayerConfig:
 
 
 @dataclass
+class M2StageConfig:
+    """M2 阶段开关与观测参数。"""
+
+    is_enabled: bool = False
+    is_nw_v2_enabled: bool = False
+    is_time_mapping_enabled: bool = False
+    shadow_sample_rate: float = 0.1
+    shadow_provider_class: str = ""
+
+    @classmethod
+    def from_runtime(cls, raw: Optional[Dict[str, Any]]) -> "M2StageConfig":
+        raw = raw or {}
+        sample_rate = float(
+            _read_runtime_value(raw, "shadow.sample_rate", cls.shadow_sample_rate)
+        )
+        sample_rate = min(1.0, max(0.0, sample_rate))
+        return cls(
+            is_enabled=bool(_read_runtime_value(raw, "enable", cls.is_enabled)),
+            is_nw_v2_enabled=bool(
+                _read_runtime_value(raw, "nw_v2.enable", cls.is_nw_v2_enabled)
+            ),
+            is_time_mapping_enabled=bool(
+                _read_runtime_value(
+                    raw,
+                    "time_mapping.enable",
+                    cls.is_time_mapping_enabled,
+                )
+            ),
+            shadow_sample_rate=sample_rate,
+            shadow_provider_class=str(
+                _read_runtime_value(
+                    raw,
+                    "shadow.provider_class",
+                    cls.shadow_provider_class,
+                )
+                or cls.shadow_provider_class
+            ).strip(),
+        )
+
+
+@dataclass
 class TextPipelineConfig:
     """文本处理流水线参数入口（L1/L2/L3/L4/L6）。"""
 
@@ -462,6 +503,7 @@ class TextPipelineConfig:
     punctuation: "PunctuationConfig"
     alignment: AlignmentLayerConfig
     segmentation: SegmentationLayerConfig
+    m2: M2StageConfig
 
     @classmethod
     def from_runtime(cls, runtime: Optional[Dict[str, Any]] = None) -> "TextPipelineConfig":
@@ -473,6 +515,7 @@ class TextPipelineConfig:
         punctuation_raw = effective.get("punctuation", {}) if isinstance(effective, dict) else {}
         alignment_raw = effective.get("alignment", {}) if isinstance(effective, dict) else {}
         segmentation_raw = effective.get("segmentation", {}) if isinstance(effective, dict) else {}
+        m2_raw = effective.get("m2", {}) if isinstance(effective, dict) else {}
         return cls(
             normalization=NormalizationConfig.from_runtime(normalization_raw),
             arbitration=ArbitrationConfig.from_runtime(arbitration_raw),
@@ -482,6 +525,7 @@ class TextPipelineConfig:
                 segmentation_raw,
                 punctuation_raw=punctuation_raw,
             ),
+            m2=M2StageConfig.from_runtime(m2_raw),
         )
 
 
