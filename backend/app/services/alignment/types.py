@@ -1,6 +1,6 @@
 """
 对齐/规范化共享类型定义。
-V3.2.0+dev.20260204.03
+V3.2.0+dev.20260214.07
 """
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from app.services.punctuation.base import PuncPosition, WordTimestampLike
 
 if TYPE_CHECKING:
     from app.services.arbitration.arbiter import ArbitrationResult
+    from app.services.segmentation.soft_cut.types import CutPlan
 
 
 @dataclass
@@ -239,6 +240,7 @@ class L6Input:
 
     annotated_words: List[AnnotatedWord]
     vad_intervals: Optional[List[Tuple[float, float]]] = None
+    cut_plan: Optional["CutPlan"] = None
 
 
 @dataclass
@@ -248,6 +250,7 @@ class L6Output:
     sentence_segments: List[SentenceSegment]
     words_for_split: List[WordTimestamp]
     segmentation_report: Dict[str, Any] = field(default_factory=dict)
+    applied_cut_plan: Optional["CutPlan"] = None
 
 
 @dataclass
