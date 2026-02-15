@@ -186,6 +186,9 @@ class SentenceSegment:
     # Phase 2: Timeline 语义绑定字段
     speaker_id: Optional[str] = None              # 句级说话人标识
     turn_id: Optional[str] = None                 # 句级 turn 标识
+    speaker_label: Optional[str] = None           # 句级说话人展示名
+    speaker_color_key: Optional[str] = None       # 句级说话人颜色键
+    binding_source: Optional[str] = None          # 句级绑定来源（auto/user）
 
     def __post_init__(self):
         """初始化后处理：计算 display_confidence"""
@@ -306,6 +309,9 @@ class SentenceSegment:
             # Phase 2: Timeline 语义绑定字段
             "speaker_id": self.speaker_id,
             "turn_id": self.turn_id,
+            "speaker_label": self.speaker_label,
+            "speaker_color_key": self.speaker_color_key,
+            "binding_source": self.binding_source,
         }
 
 
