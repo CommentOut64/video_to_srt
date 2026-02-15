@@ -1,6 +1,6 @@
 """
 L6 切分层处理器（SegmentationProcessor）。
-V3.2.0+dev.20260214.10
+V3.2.0+dev.20260215.07
 """
 from __future__ import annotations
 
@@ -23,6 +23,14 @@ class SegmentationProcessor:
     _SENTENCE_END_PUNCT = {"。", "！", "？", ".", "!", "?"}
     _CUT_PLAN_SINGLETON_TAIL_MAX_GAP_SEC = 0.65
     _CUT_PLAN_SINGLETON_TAIL_MAX_DURATION_SEC = 0.95
+    _CUT_PLAN_SINGLETON_MID_MAX_GAP_SEC = 0.60
+    _CUT_PLAN_SINGLETON_MID_MAX_DURATION_SEC = 0.95
+    _CUT_PLAN_SINGLETON_MID_GUARD_REASONS = {
+        "speaker_change",
+        "high_forced",
+        "deferred_forced",
+        "overflow_forced",
+    }
     def __init__(
         self,
         *,
@@ -196,6 +204,13 @@ class SegmentationProcessor:
             words_for_split=words_for_split,
             decisions=decisions,
         )
+        decision_by_window = self._build_cut_plan_decision_map(decisions=decisions)
+        split_points = self._filter_cut_plan_singleton_split_points(
+            words_for_split=words_for_split,
+            split_points=split_points,
+            split_to_window=split_to_window,
+            decision_by_window=decision_by_window,
+        )
         if not split_points:
             return self._final_splitter.split(words_for_split), []
 
@@ -215,8 +230,103 @@ class SegmentationProcessor:
                 )
             )
         sentence_segments = self._merge_cut_plan_singleton_tail_sentence(sentence_segments)
-        applied_window_ids = sorted(set(split_to_window.values()))
+        applied_window_ids = sorted(
+            {
+                str(split_to_window.get(split_idx, "") or "")
+                for split_idx in split_points
+                if str(split_to_window.get(split_idx, "") or "")
+            }
+        )
         return sentence_segments, applied_window_ids
+
+    @staticmethod
+    def _build_cut_plan_decision_map(
+        *,
+        decisions: Sequence[Any],
+    ) -> Dict[str, Any]:
+        decision_by_window: Dict[str, Any] = {}
+        for decision in decisions:
+            window_id = str(getattr(decision, "window_id", "") or "")
+            if not window_id:
+                continue
+            decision_by_window[window_id] = decision
+        return decision_by_window
+
+    def _filter_cut_plan_singleton_split_points(
+        self,
+        *,
+        words_for_split: Sequence[WordTimestamp],
+        split_points: Sequence[int],
+        split_to_window: Dict[int, str],
+        decision_by_window: Dict[str, Any],
+    ) -> List[int]:
+        if len(words_for_split) <= 1 or not split_points:
+            return list(split_points)
+
+        kept_split_points: List[int] = []
+        for idx, split_idx in enumerate(split_points):
+            next_split = split_points[idx + 1] if idx + 1 < len(split_points) else None
+            window_id = str(split_to_window.get(split_idx, "") or "")
+            decision = decision_by_window.get(window_id)
+            is_drop = self._should_drop_split_for_singleton_guard(
+                words_for_split=words_for_split,
+                split_idx=split_idx,
+                next_split=next_split,
+                decision=decision,
+            )
+            if not is_drop:
+                kept_split_points.append(int(split_idx))
+        return kept_split_points
+
+    def _should_drop_split_for_singleton_guard(
+        self,
+        *,
+        words_for_split: Sequence[WordTimestamp],
+        split_idx: int,
+        next_split: Optional[int],
+        decision: Optional[Any],
+    ) -> bool:
+        if split_idx < 0 or split_idx >= len(words_for_split) - 1:
+            return False
+
+        singleton_word_count = (
+            (len(words_for_split) - split_idx - 1)
+            if next_split is None
+            else (next_split - split_idx)
+        )
+        if singleton_word_count != 1:
+            return False
+
+        left_word = words_for_split[split_idx]
+        singleton_word = words_for_split[split_idx + 1]
+        left_end = float(getattr(left_word, "end", 0.0) or 0.0)
+        right_start = float(getattr(singleton_word, "start", left_end) or left_end)
+        gap_sec = max(0.0, right_start - left_end)
+        singleton_start = float(getattr(singleton_word, "start", right_start) or right_start)
+        singleton_end = float(getattr(singleton_word, "end", singleton_start) or singleton_start)
+        singleton_duration = max(0.0, singleton_end - singleton_start)
+
+        prev_tail = str(getattr(left_word, "word", "") or "").strip()
+        if prev_tail.endswith(tuple(self._SENTENCE_END_PUNCT)):
+            return False
+
+        singleton_token = str(getattr(singleton_word, "word", "") or "").strip()
+        if not self._is_lowercase_continuation_token(singleton_token):
+            return False
+
+        if next_split is None:
+            return (
+                gap_sec <= self._CUT_PLAN_SINGLETON_TAIL_MAX_GAP_SEC
+                and singleton_duration <= self._CUT_PLAN_SINGLETON_TAIL_MAX_DURATION_SEC
+            )
+
+        reason = str(getattr(decision, "reason", "") or "")
+        if reason not in self._CUT_PLAN_SINGLETON_MID_GUARD_REASONS:
+            return False
+        return (
+            gap_sec <= self._CUT_PLAN_SINGLETON_MID_MAX_GAP_SEC
+            and singleton_duration <= self._CUT_PLAN_SINGLETON_MID_MAX_DURATION_SEC
+        )
 
     def _resolve_cut_plan_split_points(
         self,

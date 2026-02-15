@@ -28,9 +28,11 @@ V3.2.0+dev.20260123.05 更新：
 - 确保 _fast_processed_indices, _slow_processed_indices, _finalized_indices 实时更新
 - 解决恢复时"无可靠恢复点"导致从头开始的问题
 
-V3.2.0+dev.20260214.10 更新：
+V3.2.0+dev.20260215.08 更新：
 - 新增 L5->L6 soft-cut 计划生成与透传（可配置开关）
 - 维护 stream 级 pending deferred，支持跨 chunk 延迟决策
+- 新增短 turn 续段与词内触发守门，抑制“尾词前错切”
+- 收紧句级跨speaker修复门限，避免误切连续文本
 """
 import asyncio
 import copy
@@ -182,7 +184,12 @@ class AsyncDualPipeline:
     _SOFT_CUT_LEADING_WORD_MAX_DURATION_SEC = 0.12
     _SOFT_CUT_LEADING_WORD_MAX_GAP_SEC = 0.60
     _SOFT_CUT_LEADING_WORD_MAX_OFFSET_SEC = 0.08
-    _SPEAKER_REPAIR_MIN_TURN_DURATION_SEC = 0.19
+    _SOFT_CUT_SHORT_TURN_CONTINUATION_SEC = 0.75
+    _SOFT_CUT_SHORT_TURN_CONTINUATION_GAP_SEC = 0.80
+    _SOFT_CUT_IN_WORD_BODY_MARGIN_SEC = 0.02
+    _SPEAKER_REPAIR_MIN_TURN_DURATION_SEC = 0.45
+    _SPEAKER_REPAIR_STRONG_BREAK_MIN_PAUSE_SEC = 0.30
+    _SPEAKER_REPAIR_SENTENCE_END_PUNCT = {"。", "！", "？", ".", "!", "?"}
     _SPEAKER_REPAIR_EDGE_GUARD_SEC = 0.15
 
     def __init__(
@@ -353,6 +360,9 @@ class AsyncDualPipeline:
         self._text_pipeline_config = TextPipelineConfig.from_runtime()
         self._segmentation_layer_config = self._text_pipeline_config.segmentation
         self._is_enable_soft_cut = bool(self._segmentation_layer_config.is_enable_soft_cut)
+        self._is_enable_soft_cut_overlap_degrade = bool(
+            self._segmentation_layer_config.is_enable_soft_cut_overlap_degrade
+        )
         self._soft_cut_pending_deferred_by_stream: Dict[str, List[Any]] = {}
         # Why: 锚点距离惩罚过弱会让“远处大停顿”压过“近处词边界”，表现为尾词前错切。
         self._soft_cut_evidence_builder = EvidenceBuilder(
@@ -995,8 +1005,15 @@ class AsyncDualPipeline:
         }
         if len(speaker_set) <= 1:
             return [sentence]
+        if (
+            self._is_enable_soft_cut_overlap_degrade
+            and self._is_overlap_turn_window(turns=overlap_turns)
+        ):
+            # Why: 重叠抢话场景的 diarization 边界噪声高，降级为“不做句级硬切”更稳妥。
+            return [sentence]
 
         boundary_times = self._collect_sentence_turn_change_times(
+            words=words,
             overlap_turns=overlap_turns,
             sentence_start=sentence_start,
             sentence_end=sentence_end,
@@ -1079,6 +1096,7 @@ class AsyncDualPipeline:
     def _collect_sentence_turn_change_times(
         self,
         *,
+        words: Sequence[WordTimestamp],
         overlap_turns: Sequence[Any],
         sentence_start: float,
         sentence_end: float,
@@ -1114,6 +1132,19 @@ class AsyncDualPipeline:
             # Why: 极短 turn 常由分割抖动导致，不应直接触发句内重切。
             if min(left_duration, right_duration) < self._SPEAKER_REPAIR_MIN_TURN_DURATION_SEC:
                 continue
+            if self._is_short_turn_followed_by_same_speaker_continuation(
+                turns=ordered,
+                index=idx,
+                right_speaker=right_speaker,
+                right_end=right_end,
+                right_duration=right_duration,
+            ):
+                # Why: 短 turn 若被同 speaker 续段承接，多为 pyannote 抖动；仅在强断句证据时放行。
+                if not self._is_repair_boundary_strong_break(
+                    words=words,
+                    boundary_time=right_start,
+                ):
+                    continue
             boundary_time = right_start
             # Why: 句首/句尾附近的切点通常由 chunk 边缘时间误差触发，避免把首词单独切出。
             if (
@@ -1130,6 +1161,57 @@ class AsyncDualPipeline:
             if not deduped or abs(value - deduped[-1]) > 0.08:
                 deduped.append(value)
         return deduped
+
+    def _is_short_turn_followed_by_same_speaker_continuation(
+        self,
+        *,
+        turns: Sequence[Any],
+        index: int,
+        right_speaker: str,
+        right_end: float,
+        right_duration: float,
+    ) -> bool:
+        if right_duration >= self._SOFT_CUT_SHORT_TURN_CONTINUATION_SEC:
+            return False
+        if index + 1 >= len(turns):
+            return False
+
+        next_turn = turns[index + 1]
+        next_speaker = str(getattr(next_turn, "speaker_id", "") or "").strip()
+        if not next_speaker or next_speaker != right_speaker:
+            return False
+        next_start_raw = getattr(next_turn, "start", None)
+        next_start = float(next_start_raw) if next_start_raw is not None else right_end
+        continuation_gap = max(0.0, next_start - right_end)
+        return continuation_gap <= self._SOFT_CUT_SHORT_TURN_CONTINUATION_GAP_SEC
+
+    def _is_repair_boundary_strong_break(
+        self,
+        *,
+        words: Sequence[WordTimestamp],
+        boundary_time: float,
+    ) -> bool:
+        selection = self._word_boundary_mapper.select_best_boundary(
+            words=words,
+            event_time=boundary_time,
+        )
+        if selection is None:
+            return False
+
+        split_idx = int(selection.split_idx)
+        if split_idx < 0 or split_idx >= len(words) - 1:
+            return False
+
+        left_word = words[split_idx]
+        right_word = words[split_idx + 1]
+        left_text = str(getattr(left_word, "word", "") or "").strip()
+        if left_text.endswith(tuple(self._SPEAKER_REPAIR_SENTENCE_END_PUNCT)):
+            return True
+
+        left_end = float(getattr(left_word, "end", 0.0) or 0.0)
+        right_start = float(getattr(right_word, "start", left_end) or left_end)
+        pause_duration = max(0.0, right_start - left_end)
+        return pause_duration >= self._SPEAKER_REPAIR_STRONG_BREAK_MIN_PAUSE_SEC
 
     def _select_best_word_boundary_for_turn_change(
         self,
@@ -4836,10 +4918,18 @@ class AsyncDualPipeline:
                 left_turn_duration = turn_duration_by_turn_id.get(left_turn_id)
                 if left_turn_duration is not None:
                     known_turn_durations.append(left_turn_duration)
+            else:
+                inferred_left_turn_duration = self._infer_turn_duration_for_word(word=left)
+                if inferred_left_turn_duration is not None:
+                    known_turn_durations.append(inferred_left_turn_duration)
             if right_turn_id:
                 right_turn_duration = turn_duration_by_turn_id.get(right_turn_id)
                 if right_turn_duration is not None:
                     known_turn_durations.append(right_turn_duration)
+            else:
+                inferred_right_turn_duration = self._infer_turn_duration_for_word(word=right)
+                if inferred_right_turn_duration is not None:
+                    known_turn_durations.append(inferred_right_turn_duration)
             # Why: turn 时长过短时，词级 speaker 跳变大概率是 pyannote 回弹抖动，不进入 soft-cut。
             if known_turn_durations and min(known_turn_durations) < self._SOFT_CUT_MIN_TURN_DURATION_SEC:
                 continue
@@ -4913,6 +5003,16 @@ class AsyncDualPipeline:
             # Why: 短 turn 更可能是 pyannote 抖动回弹，直接触发 soft-cut 会放大为单词碎切。
             if min(left_duration, right_duration) < self._SOFT_CUT_MIN_TURN_DURATION_SEC:
                 continue
+            if self._is_short_turn_continuation_inside_word_body(
+                words=words,
+                turns=turns,
+                index=index,
+                right_speaker=right_speaker,
+                right_start=right_start,
+                right_end=right_end,
+                right_duration=right_duration,
+            ):
+                continue
             # Why: chunk 边缘附近的 turn-change 更容易把首/尾词切成孤词，交给邻近 chunk 处理更稳妥。
             if (
                 right_start <= chunk_start + self._SOFT_CUT_CHUNK_EDGE_GUARD_SEC
@@ -4945,6 +5045,111 @@ class AsyncDualPipeline:
                 )
             )
         return facts
+
+    def _infer_turn_duration_for_word(
+        self,
+        *,
+        word: AnnotatedWord,
+    ) -> Optional[float]:
+        """
+        在 turn_id 缺失时按重叠回推词所属 turn 时长。
+
+        Why:
+        - 少数词级绑定会出现 turn_id 缺失，若直接放过会绕开短 turn 过滤并误触发切分。
+        """
+        word_start = float(word.start if word.start is not None else 0.0)
+        word_end = float(word.end if word.end is not None else word_start)
+        if word_end <= word_start:
+            word_end = word_start + 1e-3
+
+        best_overlap = 0.0
+        best_duration: Optional[float] = None
+        for turn in list(self._timeline_turns or []):
+            turn_start_raw = getattr(turn, "start", None)
+            turn_end_raw = getattr(turn, "end", None)
+            turn_start = float(turn_start_raw) if turn_start_raw is not None else 0.0
+            turn_end = float(turn_end_raw) if turn_end_raw is not None else turn_start
+            overlap = max(0.0, min(word_end, turn_end) - max(word_start, turn_start))
+            if overlap <= best_overlap:
+                continue
+            best_overlap = overlap
+            best_duration = max(0.0, turn_end - turn_start)
+        return best_duration
+
+    def _is_short_turn_continuation_inside_word_body(
+        self,
+        *,
+        words: Sequence[AnnotatedWord],
+        turns: Sequence[Any],
+        index: int,
+        right_speaker: str,
+        right_start: float,
+        right_end: float,
+        right_duration: float,
+    ) -> bool:
+        """
+        过滤“短 turn + 同 speaker 续段 + 词内触发”的高风险切点。
+
+        Why:
+        - 该形态常见于笑声/呼吸触发的 pyannote 假边界
+        - 若直接入窗，最终会稳定落在前一词末，形成“延后一词切”
+        """
+        if right_duration >= self._SOFT_CUT_SHORT_TURN_CONTINUATION_SEC:
+            return False
+        if index + 1 >= len(turns):
+            return False
+
+        next_turn = turns[index + 1]
+        next_speaker = str(getattr(next_turn, "speaker_id", "") or "").strip()
+        if not next_speaker or next_speaker != right_speaker:
+            return False
+        next_start_raw = getattr(next_turn, "start", None)
+        next_start = float(next_start_raw) if next_start_raw is not None else right_end
+        continuation_gap = max(0.0, next_start - right_end)
+        if continuation_gap > self._SOFT_CUT_SHORT_TURN_CONTINUATION_GAP_SEC:
+            return False
+        return self._is_time_inside_word_body(words=words, trigger_time=right_start)
+
+    def _is_time_inside_word_body(
+        self,
+        *,
+        words: Sequence[AnnotatedWord],
+        trigger_time: float,
+    ) -> bool:
+        for word in words:
+            word_start = float(word.start if word.start is not None else 0.0)
+            word_end = float(word.end if word.end is not None else word_start)
+            if word_end <= word_start:
+                continue
+            if trigger_time <= word_start + self._SOFT_CUT_IN_WORD_BODY_MARGIN_SEC:
+                continue
+            if trigger_time >= word_end - self._SOFT_CUT_IN_WORD_BODY_MARGIN_SEC:
+                continue
+            return True
+        return False
+
+    @staticmethod
+    def _is_overlap_turn_window(
+        *,
+        turns: Sequence[Any],
+    ) -> bool:
+        if len(turns) <= 1:
+            return False
+        ordered = sorted(
+            list(turns),
+            key=lambda item: (
+                float(getattr(item, "start", 0.0)),
+                float(getattr(item, "end", 0.0)),
+            ),
+        )
+        for idx in range(1, len(ordered)):
+            left = ordered[idx - 1]
+            right = ordered[idx]
+            left_end = float(getattr(left, "end", 0.0))
+            right_start = float(getattr(right, "start", 0.0))
+            if right_start < left_end - 1e-3:
+                return True
+        return False
 
     @staticmethod
     def _is_timeline_change_inside_word_span(
