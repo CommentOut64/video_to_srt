@@ -353,6 +353,8 @@ class SegmentationLayerConfig:
     final_min_mapping_coverage: float = 0.6
     is_enable_soft_cut: bool = True
     is_enable_soft_cut_overlap_degrade: bool = False
+    soft_cut_plan_provider: str = "m1_internal"
+    soft_cut_plan_provider_class: str = ""
 
     @classmethod
     def from_runtime(
@@ -432,6 +434,22 @@ class SegmentationLayerConfig:
                     cls.is_enable_soft_cut_overlap_degrade,
                 )
             ),
+            soft_cut_plan_provider=str(
+                _read_runtime_value(
+                    raw,
+                    "soft_cut.plan_provider",
+                    cls.soft_cut_plan_provider,
+                )
+                or cls.soft_cut_plan_provider
+            ).strip(),
+            soft_cut_plan_provider_class=str(
+                _read_runtime_value(
+                    raw,
+                    "soft_cut.plan_provider_class",
+                    cls.soft_cut_plan_provider_class,
+                )
+                or cls.soft_cut_plan_provider_class
+            ).strip(),
         )
 
 

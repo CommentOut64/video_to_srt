@@ -11,6 +11,11 @@ from .evidence_builder import (
 )
 from .evidence_fusion import EvidenceFusion, EvidenceFusionConfig, EvidenceFusionResult
 from .decision_engine import DecisionEngineConfig, SoftCutDecisionEngine, WindowDecisionContext
+from .plan_provider import (
+    M1InternalSoftCutPlanProvider,
+    SoftCutPlanProvider,
+    resolve_soft_cut_plan_provider,
+)
 from .types import (
     AnchorScore,
     AnchorType,
@@ -42,7 +47,10 @@ __all__ = [
     "EvidenceFusion",
     "EvidenceFusionConfig",
     "EvidenceFusionResult",
+    "M1InternalSoftCutPlanProvider",
+    "SoftCutPlanProvider",
     "EvidenceLevel",
+    "resolve_soft_cut_plan_provider",
     "SoftCutDecisionEngine",
     "SpeakerChangeFact",
     "SpeakerChangeEvidence",

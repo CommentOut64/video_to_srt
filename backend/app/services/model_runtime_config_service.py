@@ -473,6 +473,8 @@ class ModelRuntimeConfigService:
                 "final.min_mapping_coverage": 0.6,
                 "soft_cut.enable": True,
                 "soft_cut.overlap_degrade_enable": False,
+                "soft_cut.plan_provider": "m1_internal",
+                "soft_cut.plan_provider_class": "",
             },
             # V3.2.0+dev.20260204.03: L2 文本仲裁层运行参数
             "arbitration": {

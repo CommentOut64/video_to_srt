@@ -90,10 +90,12 @@ from app.services.segmentation.soft_cut import (
     EvidenceBuilderConfig,
     EvidenceFusion,
     EvidenceFusionConfig,
+    SoftCutPlanProvider,
     SoftCutDecisionEngine,
     SpeakerChangeFact,
     SpeakerChangeTag,
     WindowDecisionContext,
+    resolve_soft_cut_plan_provider,
 )
 from app.services.streaming_subtitle import get_streaming_subtitle_manager
 from app.services.streaming.output_processor import OutputProcessor
@@ -363,6 +365,14 @@ class AsyncDualPipeline:
         self._is_enable_soft_cut_overlap_degrade = bool(
             self._segmentation_layer_config.is_enable_soft_cut_overlap_degrade
         )
+        self._soft_cut_plan_provider_name = str(
+            self._segmentation_layer_config.soft_cut_plan_provider
+            or "m1_internal"
+        ).strip()
+        self._soft_cut_plan_provider_class = str(
+            self._segmentation_layer_config.soft_cut_plan_provider_class
+            or ""
+        ).strip()
         self._soft_cut_pending_deferred_by_stream: Dict[str, List[Any]] = {}
         # Why: 锚点距离惩罚过弱会让“远处大停顿”压过“近处词边界”，表现为尾词前错切。
         self._soft_cut_evidence_builder = EvidenceBuilder(
@@ -377,6 +387,12 @@ class AsyncDualPipeline:
         )
         self._soft_cut_decision_engine = SoftCutDecisionEngine(
             config=DecisionEngineConfig()
+        )
+        self._soft_cut_plan_provider: SoftCutPlanProvider = resolve_soft_cut_plan_provider(
+            pipeline=self,
+            provider_name=self._soft_cut_plan_provider_name,
+            provider_class_path=self._soft_cut_plan_provider_class,
+            logger=self.logger,
         )
         self._word_boundary_mapper = WordBoundaryMapper()
         self._soft_cut_semantic_conjunctions = {
@@ -4779,6 +4795,41 @@ class AsyncDualPipeline:
         return sentences
 
     def _build_soft_cut_plan_for_l6(
+        self,
+        *,
+        annotated_words: Sequence[AnnotatedWord],
+        stream_id: str,
+        block_id: str,
+        is_last_chunk: bool,
+    ) -> Optional[Any]:
+        """
+        统一 CutPlan 生产入口。
+
+        Why:
+        - 主链只依赖 provider 协议，后续 M2 切换只需新增 provider 与配置
+        - provider 异常时回退 M1，避免影响主流程可用性
+        """
+        try:
+            return self._soft_cut_plan_provider.build_plan(
+                annotated_words=annotated_words,
+                stream_id=stream_id,
+                block_id=block_id,
+                is_last_chunk=is_last_chunk,
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "soft-cut provider 执行失败，回退 M1: provider={} error={}",
+                self._soft_cut_plan_provider.__class__.__name__,
+                exc,
+            )
+            return self._build_soft_cut_plan_for_l6_m1(
+                annotated_words=annotated_words,
+                stream_id=stream_id,
+                block_id=block_id,
+                is_last_chunk=is_last_chunk,
+            )
+
+    def _build_soft_cut_plan_for_l6_m1(
         self,
         *,
         annotated_words: Sequence[AnnotatedWord],
