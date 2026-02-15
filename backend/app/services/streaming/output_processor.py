@@ -80,7 +80,7 @@ class OutputProcessor:
                     "start": float(getattr(sentence, "start", 0.0) or 0.0),
                     "end": float(getattr(sentence, "end", 0.0) or 0.0),
                     "text_hash": self._compute_sentence_text_hash(text),
-                    "binding_source": "l7_output_processor",
+                    "binding_source": "auto",
                 }
             )
 

@@ -51,6 +51,58 @@ class StreamingSubtitleManager:
         # V3.8: 标记是否允许删除句子
         self._deletion_enabled = False
 
+    @staticmethod
+    def _remove_speaker_fields_for_draft(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """草稿事件强制移除 speaker 相关字段。"""
+        for key in (
+            "speaker_id",
+            "turn_id",
+            "speaker_label",
+            "speaker_color_key",
+            "binding_source",
+        ):
+            payload.pop(key, None)
+        return payload
+
+    def _build_sentence_payload(
+        self,
+        sentence: SentenceSegment,
+        *,
+        index: Optional[int] = None,
+        is_draft: Optional[bool] = None,
+        is_finalized: Optional[bool] = None,
+        sanitize_draft_speaker: bool = False,
+    ) -> Dict[str, Any]:
+        """统一序列化句子 payload，避免多处字段漂移。"""
+        payload = sentence.to_dict() if hasattr(sentence, "to_dict") else {
+            "text": sentence.text_clean or sentence.text,
+            "start": sentence.start,
+            "end": sentence.end,
+            "confidence": sentence.confidence,
+            "confidence_display_raw": getattr(sentence, "confidence_display_raw", None),
+            "display_confidence": getattr(sentence, "display_confidence", None),
+            "confidence_source": getattr(sentence, "confidence_source", None),
+            "source": sentence.source.value if hasattr(sentence.source, "value") else str(sentence.source),
+            "is_modified": getattr(sentence, "is_modified", False),
+            "original_text": getattr(sentence, "original_text", None),
+            "warning_type": getattr(getattr(sentence, "warning_type", None), "value", "none"),
+            "words": [w.to_dict() if hasattr(w, "to_dict") else w for w in getattr(sentence, "words", [])],
+            "speaker_id": getattr(sentence, "speaker_id", None),
+            "turn_id": getattr(sentence, "turn_id", None),
+            "speaker_label": getattr(sentence, "speaker_label", None),
+            "speaker_color_key": getattr(sentence, "speaker_color_key", None),
+            "binding_source": getattr(sentence, "binding_source", None),
+        }
+        if index is not None:
+            payload["index"] = index
+        if is_draft is not None:
+            payload["is_draft"] = bool(is_draft)
+        if is_finalized is not None:
+            payload["is_finalized"] = bool(is_finalized)
+        if sanitize_draft_speaker:
+            self._remove_speaker_fields_for_draft(payload)
+        return payload
+
     def add_sentence(self, sentence: SentenceSegment) -> int:
         """
         添加新句子（SenseVoice 阶段）
@@ -333,27 +385,22 @@ class StreamingSubtitleManager:
             for sentence in sentences:
                 # V3.8 修复：深拷贝句子对象，避免共享引用
                 sentence_copy = copy.deepcopy(sentence)
+                sentence_copy.is_draft = True
+                sentence_copy.is_finalized = False
 
                 index = self.sentence_count
                 self.sentences[index] = sentence_copy
                 self.sentence_count += 1
                 sentence_indices.append(index)
 
-                # V3.8: 收集待推送的句子数据（在锁内准备，锁外推送）
-                # V3.1.2+dev.20260113.01: fallback 字典补充 display_confidence 和 confidence_source
-                sentence_dict = sentence_copy.to_dict() if hasattr(sentence_copy, 'to_dict') else {
-                    "index": index,
-                    "text": sentence_copy.text_clean or sentence_copy.text,
-                    "start": sentence_copy.start,
-                    "end": sentence_copy.end,
-                    "confidence": sentence_copy.confidence,
-                    "confidence_display_raw": getattr(sentence_copy, 'confidence_display_raw', None),
-                    "display_confidence": getattr(sentence_copy, 'display_confidence', None),  # V3.1.2: 映射后准确率
-                    "confidence_source": getattr(sentence_copy, 'confidence_source', None),    # V3.1.2: 置信度来源
-                    "source": sentence_copy.source.value if hasattr(sentence_copy.source, 'value') else str(sentence_copy.source),
-                    "is_draft": True,
-                    "words": [w.to_dict() if hasattr(w, 'to_dict') else w for w in getattr(sentence_copy, 'words', [])]
-                }
+                # 草稿事件口径：仅文本/时间字段，不透传 speaker 标签
+                sentence_dict = self._build_sentence_payload(
+                    sentence_copy,
+                    index=index,
+                    is_draft=True,
+                    is_finalized=False,
+                    sanitize_draft_speaker=True,
+                )
                 sentences_to_push.append((index, sentence_dict))
 
             # 记录 Chunk 级别的索引映射
@@ -437,6 +484,8 @@ class StreamingSubtitleManager:
             # 添加新的定稿句子
             new_indices = []
             for sentence in sentences:
+                sentence.is_draft = False
+                sentence.is_finalized = True
                 index = self.sentence_count
                 self.sentences[index] = sentence
                 self.sentence_count += 1
@@ -451,24 +500,18 @@ class StreamingSubtitleManager:
             self.chunk_sentences[chunk_index] = sorted(new_indices)
 
         # 推送 SSE 事件（批量替换）- 在锁外推送，避免死锁
-        # V3.1.2+dev.20260113.01: fallback 字典补充 display_confidence 和 confidence_source
-        sentences_data = [
-            sentence.to_dict() if hasattr(sentence, 'to_dict') else {
-                "index": new_indices[i],
-                "text": sentence.text_clean or sentence.text,
-                "start": sentence.start,
-                "end": sentence.end,
-                "confidence": sentence.confidence,
-                "confidence_display_raw": getattr(sentence, 'confidence_display_raw', None),
-                "display_confidence": getattr(sentence, 'display_confidence', None),  # V3.1.2: 映射后准确率
-                "confidence_source": getattr(sentence, 'confidence_source', None),    # V3.1.2: 置信度来源
-                "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),
-                "is_draft": False,
-                "is_finalized": True,
-                "words": [w.to_dict() if hasattr(w, 'to_dict') else w for w in getattr(sentence, 'words', [])]
-            }
-            for i, sentence in enumerate(sentences)
-        ]
+        sentences_data: List[Dict[str, Any]] = []
+        for i, sentence in enumerate(sentences):
+            sentence_index = new_indices[i] if i < len(new_indices) else None
+            sentences_data.append(
+                self._build_sentence_payload(
+                    sentence,
+                    index=sentence_index,
+                    is_draft=False,
+                    is_finalized=True,
+                    sanitize_draft_speaker=False,
+                )
+            )
 
         push_subtitle_event(
             self.sse_manager,
@@ -529,22 +572,14 @@ class StreamingSubtitleManager:
                 self.sentence_count += 1
                 sentence_indices.append(index)
 
-                # V3.8: 收集待推送的句子数据（在锁内准备，锁外推送）
-                # V3.1.2+dev.20260113.01: fallback 字典补充 display_confidence 和 confidence_source
-                sentence_dict = sentence_copy.to_dict() if hasattr(sentence_copy, 'to_dict') else {
-                    "index": index,
-                    "text": sentence_copy.text_clean or sentence_copy.text,
-                    "start": sentence_copy.start,
-                    "end": sentence_copy.end,
-                    "confidence": sentence_copy.confidence,
-                    "confidence_display_raw": getattr(sentence_copy, 'confidence_display_raw', None),
-                    "display_confidence": getattr(sentence_copy, 'display_confidence', None),  # V3.1.2: 映射后准确率
-                    "confidence_source": getattr(sentence_copy, 'confidence_source', None),    # V3.1.2: 置信度来源
-                    "source": sentence_copy.source.value if hasattr(sentence_copy.source, 'value') else str(sentence_copy.source),
-                    "is_draft": False,
-                    "is_finalized": True,
-                    "words": [w.to_dict() if hasattr(w, 'to_dict') else w for w in getattr(sentence_copy, 'words', [])]
-                }
+                # 定稿事件允许透传 speaker 字段
+                sentence_dict = self._build_sentence_payload(
+                    sentence_copy,
+                    index=index,
+                    is_draft=False,
+                    is_finalized=True,
+                    sanitize_draft_speaker=False,
+                )
                 sentences_to_push.append((index, sentence_dict))
 
             # 记录 Chunk 级别的索引映射
@@ -587,18 +622,8 @@ class StreamingSubtitleManager:
         """
         sentences_snapshot = []
         for idx, sentence in self.sentences.items():
-            # 使用 SentenceSegment.to_dict() 序列化
-            # V3.1.2+dev.20260113.01: fallback 字典补充 display_confidence 和 confidence_source
-            sentence_dict = sentence.to_dict() if hasattr(sentence, 'to_dict') else {
-                "text": sentence.text_clean or sentence.text,
-                "start": sentence.start,
-                "end": sentence.end,
-                "confidence": sentence.confidence,
-                "confidence_display_raw": getattr(sentence, 'confidence_display_raw', None),
-                "display_confidence": getattr(sentence, 'display_confidence', None),  # V3.1.2: 映射后准确率
-                "confidence_source": getattr(sentence, 'confidence_source', None),    # V3.1.2: 置信度来源
-                "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),
-            }
+            # Checkpoint 持久化保留全量字段（包括 speaker），供恢复与最终导出使用
+            sentence_dict = self._build_sentence_payload(sentence)
             # 添加索引信息
             sentence_dict["_index"] = idx
             sentence_dict["_is_draft"] = getattr(sentence, 'is_draft', False)
@@ -693,8 +718,17 @@ class StreamingSubtitleManager:
                 sentence.perplexity = sentence_dict.get("perplexity")
                 sentence.translation = sentence_dict.get("translation")
                 sentence.translation_confidence = sentence_dict.get("translation_confidence")
-                sentence.is_draft = sentence_dict.get("_is_draft", False)
-                sentence.is_finalized = sentence_dict.get("_is_finalized", False)
+                restored_is_draft = bool(sentence_dict.get("_is_draft", False))
+                restored_is_finalized = sentence_dict.get("_is_finalized")
+                if restored_is_finalized is None:
+                    restored_is_finalized = not restored_is_draft
+                sentence.is_draft = restored_is_draft
+                sentence.is_finalized = bool(restored_is_finalized)
+                sentence.speaker_id = sentence_dict.get("speaker_id")
+                sentence.turn_id = sentence_dict.get("turn_id")
+                sentence.speaker_label = sentence_dict.get("speaker_label")
+                sentence.speaker_color_key = sentence_dict.get("speaker_color_key")
+                sentence.binding_source = sentence_dict.get("binding_source")
 
                 # 恢复字级时间戳
                 words_data = sentence_dict.get("words", [])
@@ -880,19 +914,14 @@ class StreamingSubtitleManager:
             for idx in sentence_indices:
                 if idx in self.sentences:
                     sentence = self.sentences[idx]
-                    # V3.1.2+dev.20260113.01: fallback 字典补充 display_confidence 和 confidence_source
-                    sentence_dict = sentence.to_dict() if hasattr(sentence, 'to_dict') else {
-                        "text": sentence.text_clean or sentence.text,
-                        "start": sentence.start,
-                        "end": sentence.end,
-                        "confidence": sentence.confidence,
-                        "confidence_display_raw": getattr(sentence, 'confidence_display_raw', None),
-                        "display_confidence": getattr(sentence, 'display_confidence', None),  # V3.1.2: 映射后准确率
-                        "confidence_source": getattr(sentence, 'confidence_source', None),    # V3.1.2: 置信度来源
-                    }
-                    sentence_dict["index"] = idx
-                    sentence_dict["is_draft"] = getattr(sentence, 'is_draft', False)
-                    sentence_dict["is_finalized"] = getattr(sentence, 'is_finalized', True)
+                    is_draft = bool(getattr(sentence, "is_draft", False))
+                    sentence_dict = self._build_sentence_payload(
+                        sentence,
+                        index=idx,
+                        is_draft=is_draft,
+                        is_finalized=bool(getattr(sentence, "is_finalized", True)),
+                        sanitize_draft_speaker=is_draft,
+                    )
                     sentences_data.append(sentence_dict)
 
             if sentences_data:
@@ -913,19 +942,14 @@ class StreamingSubtitleManager:
         for idx, sentence in self.sentences.items():
             if idx >= 0:
                 continue
-            sentence_dict = sentence.to_dict() if hasattr(sentence, 'to_dict') else {
-                "text": sentence.text_clean or sentence.text,
-                "start": sentence.start,
-                "end": sentence.end,
-                "confidence": sentence.confidence,
-                "confidence_display_raw": getattr(sentence, 'confidence_display_raw', None),
-                "display_confidence": getattr(sentence, 'display_confidence', None),
-                "confidence_source": getattr(sentence, 'confidence_source', None),
-                "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),
-            }
-            sentence_dict["index"] = idx
-            sentence_dict["is_draft"] = getattr(sentence, 'is_draft', False)
-            sentence_dict["is_finalized"] = getattr(sentence, 'is_finalized', True)
+            is_draft = bool(getattr(sentence, "is_draft", False))
+            sentence_dict = self._build_sentence_payload(
+                sentence,
+                index=idx,
+                is_draft=is_draft,
+                is_finalized=bool(getattr(sentence, "is_finalized", True)),
+                sanitize_draft_speaker=is_draft,
+            )
             manual_sentences.append(sentence_dict)
 
         if manual_sentences:

@@ -1,7 +1,8 @@
 """
 Speaker Store 服务层。
 
-Phase 0 只提供仓储初始化封装，后续 phase 再扩展读写业务。
+设计模式：Facade Pattern（门面模式）
+原因：为 API/流水线提供稳定调用面，避免上层直接依赖 SQL 细节。
 """
 
 from __future__ import annotations
@@ -71,3 +72,99 @@ class SpeakerStoreService:
     def upsert_subtitle_speaker_links(self, items: Sequence[dict[str, object]]) -> None:
         """批量写入字幕-说话人绑定。"""
         self.repository.upsert_subtitle_speaker_links(items)
+
+    def list_speaker_profiles(self) -> list[dict[str, object]]:
+        """查询所有说话人 profile。"""
+        return self.repository.list_speaker_profiles()
+
+    def get_speaker_profile(self, *, speaker_id: str) -> dict[str, object] | None:
+        """查询单个说话人 profile。"""
+        return self.repository.get_speaker_profile(speaker_id=speaker_id)
+
+    def update_speaker_profile(
+        self,
+        *,
+        speaker_id: str,
+        display_name: str | None = None,
+        color_key: str | None = None,
+        is_locked: bool | None = None,
+        status: str | None = None,
+    ) -> dict[str, object] | None:
+        """更新说话人 profile。"""
+        return self.repository.update_speaker_profile(
+            speaker_id=speaker_id,
+            display_name=display_name,
+            color_key=color_key,
+            is_locked=is_locked,
+            status=status,
+        )
+
+    def list_subtitle_speaker_links(
+        self,
+        *,
+        speaker_id: str | None = None,
+        sentence_indices: Sequence[int] | None = None,
+    ) -> list[dict[str, object]]:
+        """查询字幕-说话人绑定。"""
+        return self.repository.list_subtitle_speaker_links(
+            speaker_id=speaker_id,
+            sentence_indices=sentence_indices,
+        )
+
+    def get_subtitle_speaker_link(self, *, sentence_index: int) -> dict[str, object] | None:
+        """查询单条字幕-说话人绑定。"""
+        return self.repository.get_subtitle_speaker_link(sentence_index=sentence_index)
+
+    def get_subtitle_speaker_map(
+        self,
+        *,
+        sentence_indices: Sequence[int],
+    ) -> dict[int, dict[str, object]]:
+        """按句子索引批量查询 speaker 绑定，返回映射。"""
+        links = self.list_subtitle_speaker_links(sentence_indices=sentence_indices)
+        mapping: dict[int, dict[str, object]] = {}
+        for row in links:
+            mapping[int(row["sentence_index"])] = row
+        return mapping
+
+    def rebind_subtitle_speaker(
+        self,
+        *,
+        sentence_index: int,
+        speaker_id: str,
+        binding_source: str = "user",
+    ) -> dict[str, object] | None:
+        """改绑句级 speaker。"""
+        return self.repository.rebind_subtitle_speaker(
+            sentence_index=sentence_index,
+            speaker_id=speaker_id,
+            binding_source=binding_source,
+        )
+
+    def merge_speakers(
+        self,
+        *,
+        source_speaker_id: str,
+        target_speaker_id: str,
+    ) -> dict[str, object] | None:
+        """合并说话人。"""
+        return self.repository.merge_speakers(
+            source_speaker_id=source_speaker_id,
+            target_speaker_id=target_speaker_id,
+        )
+
+    def append_audit_log(
+        self,
+        *,
+        action: str,
+        speaker_id: str | None = None,
+        sentence_index: int | None = None,
+        payload: dict[str, object] | str | None = None,
+    ) -> int:
+        """写入审计日志。"""
+        return self.repository.append_audit_log(
+            action=action,
+            speaker_id=speaker_id,
+            sentence_index=sentence_index,
+            payload=payload,
+        )
