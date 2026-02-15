@@ -471,6 +471,7 @@ class ModelRuntimeConfigService:
                 "final.soft_pause": 0.35,
                 "final.long_pause": 0.8,
                 "final.min_mapping_coverage": 0.6,
+                "soft_cut.enable": True,
             },
             # V3.2.0+dev.20260204.03: L2 文本仲裁层运行参数
             "arbitration": {

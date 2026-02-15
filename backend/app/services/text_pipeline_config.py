@@ -1,6 +1,6 @@
 """
 文本处理统一参数入口（TextPipelineConfig）。
-V3.2.0+dev.20260204.10
+V3.2.0+dev.20260214.10
 """
 # V3.2.0+dev.20260205.09: 接入 L4 对齐层参数。
 from __future__ import annotations
@@ -351,6 +351,7 @@ class SegmentationLayerConfig:
     final_soft_pause: float = 0.35
     final_long_pause: float = 0.8
     final_min_mapping_coverage: float = 0.6
+    is_enable_soft_cut: bool = True
 
     @classmethod
     def from_runtime(
@@ -414,6 +415,13 @@ class SegmentationLayerConfig:
                     raw,
                     "final.min_mapping_coverage",
                     cls.final_min_mapping_coverage,
+                )
+            ),
+            is_enable_soft_cut=bool(
+                _read_runtime_value(
+                    raw,
+                    "soft_cut.enable",
+                    cls.is_enable_soft_cut,
                 )
             ),
         )
