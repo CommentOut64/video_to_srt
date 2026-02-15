@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from app.engines.dummy_engine import DummyEngine
+from app.engines.factory import ASREngineFactory
 from app.models.sensevoice_models import SentenceSegment
 from app.pipelines.async_dual_pipeline import AsyncDualPipeline
 from app.services.audio.chunk_engine import AudioChunk
@@ -162,7 +163,18 @@ class IntegrationTestRunner:
     def _build_engines(self):
         """构建 ASR 引擎。"""
         if self.config.use_real_engines:
-            raise NotImplementedError("真实引擎模式需要 GPU + 模型，暂未集成到 TestRunner")
+            # Why: 真实集成测试需要验证生产级引擎装配路径，直接复用工厂注册避免测试侧分叉实现。
+            draft_engine = ASREngineFactory.create(
+                "sensevoice",
+                language=self.config.language,
+            )
+            patch_engine = None
+            if self.config.transcription_profile != "sensevoice_only":
+                patch_engine = ASREngineFactory.create(
+                    "whisper",
+                    device="cuda",
+                )
+            return draft_engine, patch_engine
 
         # Dummy 模式
         draft_engine = MockEngineFactory.create_dummy_draft(
@@ -187,15 +199,17 @@ class IntegrationTestRunner:
         # Bridge 配置
         bridge_controller = None
         if self.config.enable_bridge and self.config.transcription_profile == "sv_whisper_dual":
+            max_wait_ms = max(50, int(self.config.chunk_duration * 1000))
+            high_watermark = max(2, int(self.config.chunk_count))
+            low_watermark = max(1, min(high_watermark - 1, 2))
             bridge_controller = BridgeController(
                 config=BridgeConfig(
-                    min_batch_duration=0.1,
-                    max_batch_duration=self.config.chunk_duration * self.config.chunk_count,
-                    min_batch_sentences=1,
-                    max_batch_sentences=self.config.chunk_count,
-                    starvation_timeout=100.0,
-                    long_pause_threshold=100.0,
-                    is_enable_dynamic_thresholds=False,
+                    # Why: BridgeConfig 已收敛为 Phase 3 精简字段，这里按等价语义映射旧测试参数。
+                    is_enable_dynamic_batch=False,
+                    dynamic_batch_max_wait_ms=max_wait_ms,
+                    queue_low_watermark=low_watermark,
+                    queue_high_watermark=high_watermark,
+                    force_flush_on_gpu_idle=True,
                 )
             )
 
@@ -205,7 +219,8 @@ class IntegrationTestRunner:
             draft_engine=draft_engine,
             patch_engine=patch_engine,
             punctuation_service=punctuation_service,
-            enable_semantic_buffer=True,
+            # Why: 真实引擎集成测试需要覆盖 L4-L7 后处理链路，关闭语义缓冲以强制进入队列与对齐阶段。
+            enable_semantic_buffer=not self.config.use_real_engines,
             bridge_controller=bridge_controller,
         )
         # 注入 stub 对齐器
