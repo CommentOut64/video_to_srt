@@ -36,6 +36,7 @@ V3.2.0+dev.20260215.08 更新：
 """
 import asyncio
 import copy
+import hashlib
 import json
 import logging
 import time
@@ -54,11 +55,14 @@ from app.models.sensevoice_models import SentenceSegment, TextSource, WordTimest
 from app.services.audio.chunk_engine import AudioChunk
 from app.services.alignment.alignment_processor import AlignmentProcessor
 from app.services.alignment.default_aligner import DefaultAligner, _strip_trailing_punct_smart
+from app.services.alignment.fact_builder import FactBuilder, FactBuilderConfig
 from app.services.alignment.text_normalizer import get_alignment_text_normalizer
 from app.services.alignment.text_normalizer_processor import TextNormalizerProcessor
 from app.services.alignment.types import (
+    AlignedFacts,
     AnnotatedWord,
     AlignmentResult,
+    FusedEvidence,
     L1Input,
     L2Input,
     L2Output,
@@ -68,6 +72,7 @@ from app.services.alignment.types import (
     L6Input,
     L7Input,
     NormalizationResult,
+    OutputTrace,
     PunctSource,
     PunctTrack,
     QualitySignals,
@@ -84,8 +89,12 @@ from app.services.segmentation.segmentation_processor import SegmentationProcess
 from app.services.segmentation.soft_cut import (
     AnchorCandidate,
     AnchorType,
+    CutPlan,
+    CutWindow,
     DecisionEngineConfig,
+    DeferredCut,
     DeferredCutState,
+    EvidenceLevel,
     EvidenceBuilder,
     EvidenceBuilderConfig,
     EvidenceFusion,
@@ -105,6 +114,7 @@ from app.services.punctuation.debug_utils import (
     append_debug_dual_time_compare_line,
     append_debug_layer_diag_line,
     append_debug_layer_trace_line,
+    append_debug_m2_stage0_line,
     append_debug_whisper_line,
     write_debug_json_payload,
 )
@@ -156,10 +166,13 @@ if TYPE_CHECKING:
 @dataclass
 class _Layer456RunResult:
     alignment_result: AlignmentResult
+    aligned_facts: AlignedFacts
+    fused_evidence: FusedEvidence
     words_for_split: List[WordTimestamp]
     injection_stats: Dict[str, Any]
     split_stats: Dict[str, Any]
     final_sentences: List[SentenceSegment]
+    output_traces: List[OutputTrace]
     alignment_time_source: str = "sv"
     alignment_time_word_count: int = 0
 
@@ -360,6 +373,21 @@ class AsyncDualPipeline:
         # V3.2.0+dev.20260205.09: L4/L5/L6 处理器接入（对齐/注入/切分）
         self._l4_processor = AlignmentProcessor(logger=self.logger)
         self._text_pipeline_config = TextPipelineConfig.from_runtime()
+        self._m2_stage_config = self._text_pipeline_config.m2
+        self._is_m2_enabled = bool(self._m2_stage_config.is_enabled)
+        self._is_m2_nw_v2_enabled = bool(self._m2_stage_config.is_nw_v2_enabled)
+        self._is_m2_time_mapping_enabled = bool(self._m2_stage_config.is_time_mapping_enabled)
+        self._m2_shadow_sample_rate = float(self._m2_stage_config.shadow_sample_rate)
+        self._m2_shadow_provider_class = str(
+            self._m2_stage_config.shadow_provider_class or ""
+        ).strip()
+        self._fact_builder = FactBuilder(
+            FactBuilderConfig(
+                anchor_snap_tolerance_sec=0.22,
+                is_enable_time_mapping=self._is_m2_time_mapping_enabled,
+                time_axis_version="m2_nw_v2",
+            )
+        )
         self._segmentation_layer_config = self._text_pipeline_config.segmentation
         self._is_enable_soft_cut = bool(self._segmentation_layer_config.is_enable_soft_cut)
         self._is_enable_soft_cut_overlap_degrade = bool(
@@ -441,6 +469,9 @@ class AsyncDualPipeline:
             is_keep_sentence_end_punct=bool(
                 self._segmentation_layer_config.is_keep_sentence_end_punct
             ),
+            is_enable_soft_cut_overlap_degrade=bool(
+                self._segmentation_layer_config.is_enable_soft_cut_overlap_degrade
+            ),
         )
         self._l7_processor = OutputProcessor(
             subtitle_manager=self.subtitle_manager,
@@ -486,6 +517,13 @@ class AsyncDualPipeline:
                 "双轨实验开启: mode={} tolerance_ms={} gpu_strategy=serial_postprocess",
                 self._dual_time_mode,
                 int(self._dual_time_boundary_tolerance_sec * 1000),
+            )
+        if self._is_m2_enabled:
+            self.logger.info(
+                "M2阶段0观测开启: nw_v2_enable={} time_mapping_enable={} sample_rate={:.2f}",
+                self._is_m2_nw_v2_enabled,
+                self._is_m2_time_mapping_enabled,
+                self._m2_shadow_sample_rate,
             )
 
         # 实例化 FastWorker（仅推理）
@@ -916,21 +954,12 @@ class AsyncDualPipeline:
         按句级时间窗与 Timeline turn 重叠绑定 speaker/turn。
 
         Why: Chunk 级绑定在多人交替发言时会误绑定整段，句级重叠可显著提升切换准确率。
+        说明：跨 speaker 残留修复已迁移到 L6（SegmentationProcessor）内完成。
         """
         if not sentences:
             return
 
         turns = list(self._timeline_turns or [])
-        if isinstance(sentences, list):
-            repair_count = self._repair_cross_speaker_sentences_once(
-                sentences=sentences,
-                turns=turns,
-            )
-            if repair_count > 0:
-                self.logger.info(
-                    "跨speaker残留修复: repaired_splits={}",
-                    repair_count,
-                )
         fallback_speaker = self._resolve_speaker_id_for_chunk(fallback_chunk) if fallback_chunk else "unknown"
         fallback_turn = self._resolve_turn_id_for_chunk(fallback_chunk) if fallback_chunk else None
 
@@ -1541,7 +1570,7 @@ class AsyncDualPipeline:
         """
         极速模式: 仅运行 FastWorker
 
-        FastWorker 输出直接作为定稿推送，跳过 Whisper 和对齐。
+        FastWorker 输出经 L6/L7 定稿链路输出，跳过 Whisper 和对齐。
 
         v3.1.0: 支持逐 Chunk 中断和检查点保存
         V3.1.0: 集成进度发射器，实时推送 SSE 进度
@@ -1555,6 +1584,9 @@ class AsyncDualPipeline:
         self._finalized_indices = processed_indices
         total_chunks = len(audio_chunks)
         last_chunk_index: Optional[int] = None
+        self._audio_chunks_by_index = {chunk.index: chunk for chunk in audio_chunks}
+        self._l6_processor.reset_state()
+        self._soft_cut_pending_deferred_by_stream.clear()
 
         for i, chunk in enumerate(audio_chunks):
             # v3.1.0: 跳过已处理的 chunk（用于恢复）
@@ -1583,7 +1615,32 @@ class AsyncDualPipeline:
                     self._validate_l0_result(ctx.sv_result, source="fast", chunk_index=i)
                 normalized = self._normalize_sensevoice_result(ctx)
                 await self._apply_fast_punctuation(ctx, normalized)
-                await self._emit_draft_sentences(ctx, is_final_output=True)
+                final_sentences = self._finalize_sensevoice_only(ctx)
+                self._assign_sentence_identity_by_timeline_overlap(
+                    final_sentences,
+                    fallback_chunk=ctx.audio_chunk,
+                )
+                ctx.final_sentences = final_sentences
+                l7_output = self._emit_l7_output(
+                    chunk_index=ctx.chunk_index,
+                    sentence_segments=final_sentences,
+                    injection_report={
+                        "mapping_coverage": 0.0,
+                        "mismatch_count": 0.0,
+                        "error_code": "",
+                        "blocked": 0.0,
+                    },
+                    segmentation_report={
+                        "boundary_score_stats": {},
+                        "forced_split_count": 0.0,
+                        "error_code": "",
+                    },
+                    output_traces=None,
+                    default_trace_reason="sensevoice_only",
+                )
+                ctx.finalization_metrics["l7_error_count"] = float(
+                    len(l7_output.output_payload.get("errors", []))
+                )
                 results.append(ctx)
                 last_chunk_index = i
 
@@ -1799,7 +1856,26 @@ class AsyncDualPipeline:
         )
 
         if is_final_output:
-            self.subtitle_manager.add_finalized_sentences(ctx.chunk_index, sentences)
+            for sentence in sentences:
+                sentence.is_finalized = True
+                sentence.is_draft = False
+            self._emit_l7_output(
+                chunk_index=ctx.chunk_index,
+                sentence_segments=sentences,
+                injection_report={
+                    "mapping_coverage": 0.0,
+                    "mismatch_count": 0.0,
+                    "error_code": "",
+                    "blocked": 0.0,
+                },
+                segmentation_report={
+                    "boundary_score_stats": {},
+                    "forced_split_count": 0.0,
+                    "error_code": "",
+                },
+                output_traces=None,
+                default_trace_reason="draft_segmenter_final",
+            )
             self.logger.debug(
                 f"Chunk {ctx.chunk_index}: 定稿已推送 ({len(sentences)} 个句子)"
             )
@@ -1837,16 +1913,36 @@ class AsyncDualPipeline:
             )
 
         total_sentences = 0
+        finalized_sentences: List[SentenceSegment] = []
         for chunk in chunks:
             sentences = chunk.sentences
             if is_final_output:
                 for sentence in sentences:
                     sentence.is_finalized = True
                     sentence.is_draft = False
-                self.subtitle_manager.add_finalized_sentences(ctx.chunk_index, sentences)
+                finalized_sentences.extend(sentences)
             else:
                 self.subtitle_manager.add_draft_sentences(ctx.chunk_index, sentences)
             total_sentences += len(sentences)
+
+        if is_final_output and finalized_sentences:
+            self._emit_l7_output(
+                chunk_index=ctx.chunk_index,
+                sentence_segments=finalized_sentences,
+                injection_report={
+                    "mapping_coverage": 0.0,
+                    "mismatch_count": 0.0,
+                    "error_code": "",
+                    "blocked": 0.0,
+                },
+                segmentation_report={
+                    "boundary_score_stats": {},
+                    "forced_split_count": 0.0,
+                    "error_code": "",
+                },
+                output_traces=None,
+                default_trace_reason="semantic_buffer_final",
+            )
 
         phase = "定稿" if is_final_output else "草稿"
         self.logger.debug(
@@ -2834,16 +2930,35 @@ class AsyncDualPipeline:
         if self._enable_bridge_batches:
             await self._ingest_bridge_chunks(chunks)
         total_sentences = 0
+        finalized_sentences: List[SentenceSegment] = []
         for chunk in chunks:
             sentences = chunk.sentences
             if is_final_output:
                 for sentence in sentences:
                     sentence.is_finalized = True
                     sentence.is_draft = False
-                self.subtitle_manager.add_finalized_sentences(chunk_index, sentences)
+                finalized_sentences.extend(sentences)
             else:
                 self.subtitle_manager.add_draft_sentences(chunk_index, sentences)
             total_sentences += len(sentences)
+        if is_final_output and finalized_sentences:
+            self._emit_l7_output(
+                chunk_index=chunk_index,
+                sentence_segments=finalized_sentences,
+                injection_report={
+                    "mapping_coverage": 0.0,
+                    "mismatch_count": 0.0,
+                    "error_code": "",
+                    "blocked": 0.0,
+                },
+                segmentation_report={
+                    "boundary_score_stats": {},
+                    "forced_split_count": 0.0,
+                    "error_code": "",
+                },
+                output_traces=None,
+                default_trace_reason="semantic_buffer_flush_final",
+            )
         phase = "定稿" if is_final_output else "草稿"
         self.logger.debug(
             "SemanticBuffer 尾部刷新完成: %s %d 个句子",
@@ -3179,6 +3294,15 @@ class AsyncDualPipeline:
                 or float(alignment_result.coverage) <= 0.70
             )
         )
+        split_reason_stats: Dict[str, int] = {}
+        split_risk_stats: Dict[str, int] = {}
+        for sentence in final_sentences:
+            reason = str(getattr(sentence, "split_reason", "") or "")
+            risk = str(getattr(sentence, "split_risk", "") or "")
+            if reason:
+                split_reason_stats[reason] = int(split_reason_stats.get(reason, 0) + 1)
+            if risk:
+                split_risk_stats[risk] = int(split_risk_stats.get(risk, 0) + 1)
 
         payload: Dict[str, Any] = {
             "job_id": ctx.job_id,
@@ -3210,6 +3334,8 @@ class AsyncDualPipeline:
             "l6_split_writeback_ratio": float(split_stats.get("writeback_ratio", 0.0) or 0.0),
             "l6_split_writeback_used": bool(split_stats.get("writeback_used", 0.0)),
             "l6_split_writeback_blocked": bool(split_stats.get("writeback_blocked", 0.0)),
+            "l6_split_reason_stats": split_reason_stats,
+            "l6_split_risk_stats": split_risk_stats,
             "l6_sentence_texts": [str(sentence.text or "") for sentence in final_sentences],
         }
         append_debug_layer_diag_line(ctx.job_dir, payload, logger=self.logger)
@@ -3224,10 +3350,13 @@ class AsyncDualPipeline:
         arbitration_output: L2Output,
         punct_track: Optional[PunctTrack],
         alignment_result: AlignmentResult,
+        aligned_facts: AlignedFacts,
+        fused_evidence: FusedEvidence,
         words_for_split: Sequence[WordTimestamp],
         injection_stats: Dict[str, Any],
         split_stats: Dict[str, Any],
         final_sentences: Sequence[SentenceSegment],
+        output_traces: Sequence[OutputTrace],
     ) -> None:
         """输出 L0-L6 全量追踪（逐层 + 逐 token）到独立文件。"""
 
@@ -3351,9 +3480,65 @@ class AsyncDualPipeline:
                             else None
                         ),
                         "confidence_source": str(sentence.confidence_source or ""),
+                        "split_reason": str(getattr(sentence, "split_reason", "") or ""),
+                        "split_risk": str(getattr(sentence, "split_risk", "") or ""),
+                        "window_id": str(getattr(sentence, "window_id", "") or ""),
+                        "pyannote_frame_time": getattr(sentence, "pyannote_frame_time", None),
+                        "mapped_cut_time": getattr(sentence, "mapped_cut_time", None),
+                        "mapping_quality": str(getattr(sentence, "mapping_quality", "") or ""),
+                        "mapping_reason": str(getattr(sentence, "mapping_reason", "") or ""),
                     }
                 )
             return rows
+
+        def _serialize_output_traces(traces: Sequence[OutputTrace]) -> List[Dict[str, Any]]:
+            rows: List[Dict[str, Any]] = []
+            for trace in traces:
+                rows.append(
+                    {
+                        "sentence_index": int(trace.sentence_index),
+                        "split_reason": str(trace.split_reason or ""),
+                        "split_risk": str(trace.split_risk or ""),
+                        "window_id": str(trace.window_id or ""),
+                        "pyannote_frame_time": trace.pyannote_frame_time,
+                        "mapped_cut_time": trace.mapped_cut_time,
+                        "mapping_quality": str(trace.mapping_quality or ""),
+                        "mapping_reason": str(trace.mapping_reason or ""),
+                        "sentence_start": trace.sentence_start,
+                        "sentence_end": trace.sentence_end,
+                    }
+                )
+            return rows
+
+        def _serialize_aligned_facts(facts: AlignedFacts) -> Dict[str, Any]:
+            mapping_quality_stats: Dict[str, int] = {}
+            for item in list(facts.time_mappings or []):
+                quality = str(item.get("mapping_quality", "") or "unknown")
+                mapping_quality_stats[quality] = mapping_quality_stats.get(quality, 0) + 1
+            return {
+                "alignment_score": float(facts.alignment_score),
+                "gap_ratio": float(facts.gap_ratio),
+                "gap_positions": list(facts.gap_positions or []),
+                "annotated_word_count": int(len(facts.annotated_words or [])),
+                "speaker_turn_count": int(len(facts.speaker_turns or [])),
+                "fast_draft_cut_count": int(len(facts.fast_draft_cuts or [])),
+                "time_axis_version": str(facts.time_axis_version or ""),
+                "time_mappings": list(facts.time_mappings or []),
+                "mapping_quality_stats": mapping_quality_stats,
+            }
+
+        def _serialize_fused_evidence(evidence: FusedEvidence) -> Dict[str, Any]:
+            return {
+                "speaker_change_count": int(len(evidence.speaker_changes or [])),
+                "pause_anchor_count": int(len(evidence.pause_anchors or [])),
+                "semantic_anchor_count": int(len(evidence.semantic_anchors or [])),
+                "punctuation_anchor_count": int(len(evidence.punctuation_anchors or [])),
+                "evidence_report": dict(evidence.evidence_report or {}),
+                "speaker_changes": list(evidence.speaker_changes or []),
+                "pause_anchors": list(evidence.pause_anchors or []),
+                "semantic_anchors": list(evidence.semantic_anchors or []),
+                "punctuation_anchors": list(evidence.punctuation_anchors or []),
+            }
 
         l3_input = getattr(ctx, "_trace_l3_input", {}) or {}
         l3_output = getattr(ctx, "_trace_l3_output", None)
@@ -3439,10 +3624,13 @@ class AsyncDualPipeline:
             "l5": {
                 "injection_stats": dict(injection_stats),
                 "words_for_split": _serialize_word_timestamps(words_for_split),
+                "aligned_facts": _serialize_aligned_facts(aligned_facts),
+                "fused_evidence": _serialize_fused_evidence(fused_evidence),
             },
             "l6": {
                 "split_stats": dict(split_stats),
                 "final_sentences": _serialize_sentences(final_sentences),
+                "output_trace": _serialize_output_traces(output_traces),
             },
             "current_punct_track": {
                 "source": str(punct_track.source if punct_track else ""),
@@ -3954,22 +4142,22 @@ class AsyncDualPipeline:
             ctx.final_sentences = final_sentences
 
             # L7 薄层输出：即便走快路，也统一通过输出层分发。
-            l7_output = self._l7_processor.process(
-                L7Input(
-                    chunk_index=ctx.chunk_index,
-                    sentence_segments=final_sentences,
-                    injection_report={
-                        "mapping_coverage": 0.0,
-                        "mismatch_count": 0.0,
-                        "error_code": "",
-                        "blocked": 0.0,
-                    },
-                    segmentation_report={
-                        "boundary_score_stats": {},
-                        "forced_split_count": 0.0,
-                        "error_code": "",
-                    },
-                )
+            l7_output = self._emit_l7_output(
+                chunk_index=ctx.chunk_index,
+                sentence_segments=final_sentences,
+                injection_report={
+                    "mapping_coverage": 0.0,
+                    "mismatch_count": 0.0,
+                    "error_code": "",
+                    "blocked": 0.0,
+                },
+                segmentation_report={
+                    "boundary_score_stats": {},
+                    "forced_split_count": 0.0,
+                    "error_code": "",
+                },
+                output_traces=None,
+                default_trace_reason="sensevoice_only",
             )
             ctx.finalization_metrics["l7_error_count"] = float(
                 len(l7_output.output_payload.get("errors", []))
@@ -4115,14 +4303,32 @@ class AsyncDualPipeline:
         if selected_variant == "experiment" and experiment_run is not None:
             run_result = experiment_run
 
+        self._maybe_record_m2_stage0_sample(
+            ctx=ctx,
+            selected_variant=selected_variant,
+            selected_reason=selected_reason,
+            legacy_run=legacy_run,
+            experiment_run=experiment_run,
+            active_run=run_result,
+            compare_payload=compare_payload,
+        )
+
         alignment_result = run_result.alignment_result
+        aligned_facts = run_result.aligned_facts
+        fused_evidence = run_result.fused_evidence
         words_for_split = run_result.words_for_split
         injection_stats = dict(run_result.injection_stats)
         split_stats = dict(run_result.split_stats)
         final_sentences = run_result.final_sentences
+        output_traces = list(run_result.output_traces or [])
         self._assign_sentence_identity_by_timeline_overlap(
             final_sentences,
             fallback_chunk=ctx.audio_chunk,
+        )
+        output_traces = self._normalize_output_traces_for_sentences(
+            final_sentences=final_sentences,
+            output_traces=output_traces,
+            default_reason="post_identity_binding",
         )
 
 
@@ -4136,6 +4342,24 @@ class AsyncDualPipeline:
         }
         for key, value in split_stats.items():
             ctx.finalization_metrics[f"split_{key}"] = value
+        ctx.finalization_metrics["fact_word_count"] = float(len(aligned_facts.annotated_words))
+        ctx.finalization_metrics["fact_turn_count"] = float(len(aligned_facts.speaker_turns))
+        ctx.finalization_metrics["fact_mapping_count"] = float(len(aligned_facts.time_mappings))
+        ctx.finalization_metrics["fact_time_mapping_enabled"] = (
+            1.0 if self._is_m2_time_mapping_enabled else 0.0
+        )
+        ctx.finalization_metrics["evidence_speaker_change_count"] = float(
+            len(fused_evidence.speaker_changes)
+        )
+        ctx.finalization_metrics["evidence_pause_anchor_count"] = float(
+            len(fused_evidence.pause_anchors)
+        )
+        ctx.finalization_metrics["evidence_semantic_anchor_count"] = float(
+            len(fused_evidence.semantic_anchors)
+        )
+        ctx.finalization_metrics["evidence_punctuation_anchor_count"] = float(
+            len(fused_evidence.punctuation_anchors)
+        )
 
         if compare_payload is not None:
             ctx.finalization_metrics["dual_time_mode"] = self._dual_time_mode
@@ -4179,10 +4403,13 @@ class AsyncDualPipeline:
             arbitration_output=arbitration_output,
             punct_track=punct_track,
             alignment_result=alignment_result,
+            aligned_facts=aligned_facts,
+            fused_evidence=fused_evidence,
             words_for_split=words_for_split,
             injection_stats=injection_stats,
             split_stats=split_stats,
             final_sentences=final_sentences,
+            output_traces=output_traces,
         )
 
         # V3.2.0+dev.20260204.08: L4/L5 补跑候选埋点（仅统计，不触发补跑）
@@ -4229,22 +4456,22 @@ class AsyncDualPipeline:
                     ctx.chunk_index,
                 )
 
-        l7_output = self._l7_processor.process(
-            L7Input(
-                chunk_index=ctx.chunk_index,
-                sentence_segments=final_sentences,
-                injection_report={
-                    "mapping_coverage": float(injection_stats.get("injection_mapping_coverage", 0.0)),
-                    "mismatch_count": float(injection_stats.get("injection_unmatched_total", 0.0)),
-                    "error_code": str(injection_stats.get("injection_error_code", "") or ""),
-                    "blocked": float(injection_stats.get("injection_blocked", 0.0)),
-                },
-                segmentation_report={
-                    "boundary_score_stats": dict(split_stats),
-                    "forced_split_count": float(split_stats.get("force_split_count", 0.0)),
-                    "error_code": str(split_stats.get("error_code", "") or ""),
-                },
-            )
+        l7_output = self._emit_l7_output(
+            chunk_index=ctx.chunk_index,
+            sentence_segments=final_sentences,
+            injection_report={
+                "mapping_coverage": float(injection_stats.get("injection_mapping_coverage", 0.0)),
+                "mismatch_count": float(injection_stats.get("injection_unmatched_total", 0.0)),
+                "error_code": str(injection_stats.get("injection_error_code", "") or ""),
+                "blocked": float(injection_stats.get("injection_blocked", 0.0)),
+            },
+            segmentation_report={
+                "boundary_score_stats": dict(split_stats),
+                "forced_split_count": float(split_stats.get("force_split_count", 0.0)),
+                "error_code": str(split_stats.get("error_code", "") or ""),
+            },
+            output_traces=output_traces,
+            default_trace_reason="default_splitter",
         )
         ctx.finalization_metrics["l7_error_count"] = float(
             len(l7_output.output_payload.get("errors", []))
@@ -4325,8 +4552,23 @@ class AsyncDualPipeline:
             fallback_speaker_id=speaker_id,
             fallback_turn_id=turn_id,
         )
-
+        speaker_turn_facts = self._collect_speaker_turn_facts_for_words(time_words)
+        fast_draft_cuts = self._collect_fast_draft_cuts(sv_result, sv_words=time_words)
+        pyannote_frame_times = self._collect_pyannote_frame_times_for_words(time_words)
+        aligned_facts = self._fact_builder.build(
+            annotated_words=l5_output.annotated_words,
+            alignment_result=alignment_result,
+            speaker_turns=speaker_turn_facts,
+            fast_draft_cuts=fast_draft_cuts,
+            pyannote_frame_times=pyannote_frame_times,
+        )
         l6_stream_id = f"{variant}:{speaker_id or 'main'}:{turn_id or 'none'}"
+        fused_evidence = self._build_fused_evidence_for_l6(
+            words=l5_output.annotated_words,
+            stream_id=l6_stream_id,
+            aligned_facts=aligned_facts,
+        )
+
         l6_chunk_index = self._resolve_chunk_index_from_words(words=time_words)
         l6_is_last_chunk = self._is_last_chunk_for_words(words=time_words)
         soft_cut_plan = self._build_soft_cut_plan_for_l6(
@@ -4334,12 +4576,16 @@ class AsyncDualPipeline:
             stream_id=l6_stream_id,
             block_id=f"{self.job_id}:{l6_stream_id}:{l6_chunk_index if l6_chunk_index is not None else -1}",
             is_last_chunk=l6_is_last_chunk,
+            aligned_facts=aligned_facts,
+            fused_evidence=fused_evidence,
         )
         l6_output = self._l6_processor.process(
             L6Input(
                 annotated_words=l5_output.annotated_words,
                 vad_intervals=self._vad_intervals,
                 cut_plan=soft_cut_plan,
+                aligned_facts=aligned_facts,
+                fused_evidence=fused_evidence,
             ),
             stream_id=l6_stream_id,
             chunk_index=l6_chunk_index,
@@ -4347,9 +4593,11 @@ class AsyncDualPipeline:
         )
         words_for_split = list(l6_output.words_for_split)
         final_sentences = list(l6_output.sentence_segments)
+        output_traces = list(l6_output.output_traces or [])
         split_stats = dict(self._final_splitter.last_split_stats or {})
         split_stats.update(dict(l6_output.segmentation_report.get("boundary_score_stats", {})))
         split_stats.update(dict(l6_output.segmentation_report.get("soft_cut_stats", {})))
+        split_stats["output_trace_count"] = int(len(output_traces))
         segmentation_error = str(l6_output.segmentation_report.get("error_code", "") or "")
         if segmentation_error:
             split_stats["error_code"] = segmentation_error
@@ -4374,10 +4622,13 @@ class AsyncDualPipeline:
 
         return _Layer456RunResult(
             alignment_result=alignment_result,
+            aligned_facts=aligned_facts,
+            fused_evidence=fused_evidence,
             words_for_split=words_for_split,
             injection_stats=injection_stats,
             split_stats=dict(split_stats),
             final_sentences=final_sentences,
+            output_traces=output_traces,
             alignment_time_source=time_source,
             alignment_time_word_count=len(time_words),
         )
@@ -4432,6 +4683,88 @@ class AsyncDualPipeline:
             return list(sv_words), "sv_fallback_insufficient_slow_words"
 
         return slow_words, resolved_source
+
+    def _collect_speaker_turn_facts_for_words(
+        self,
+        words: Sequence[WordTimestamp],
+    ) -> List[Dict[str, Any]]:
+        """收集与当前词时间窗重叠的 turn 事实。"""
+        if not words:
+            return []
+        window_start = float(words[0].start)
+        window_end = float(words[-1].end)
+        if window_end <= window_start:
+            return []
+        rows: List[Dict[str, Any]] = []
+        for turn in list(self._timeline_turns or []):
+            turn_start = float(getattr(turn, "start", 0.0) or 0.0)
+            turn_end = float(getattr(turn, "end", 0.0) or 0.0)
+            if turn_end <= turn_start:
+                continue
+            overlap_start = max(window_start, turn_start)
+            overlap_end = min(window_end, turn_end)
+            if overlap_end <= overlap_start:
+                continue
+            rows.append(
+                {
+                    "turn_id": str(getattr(turn, "turn_id", "") or ""),
+                    "speaker_id": str(getattr(turn, "speaker_id", "unknown") or "unknown"),
+                    "start": turn_start,
+                    "end": turn_end,
+                    "source": str(getattr(turn, "source", "") or ""),
+                    "boundary_confidence": float(
+                        getattr(turn, "boundary_confidence", 0.0) or 0.0
+                    ),
+                }
+            )
+        return rows
+
+    def _collect_pyannote_frame_times_for_words(
+        self,
+        words: Sequence[WordTimestamp],
+    ) -> List[float]:
+        """收集当前词窗内的 pyannote 边界时间（使用 turn end 作为帧候选）。"""
+        if not words:
+            return []
+        window_start = float(words[0].start)
+        window_end = float(words[-1].end)
+        if window_end <= window_start:
+            return []
+        candidates: List[float] = []
+        for turn in list(self._timeline_turns or []):
+            turn_end = float(getattr(turn, "end", 0.0) or 0.0)
+            if window_start <= turn_end <= window_end:
+                candidates.append(turn_end)
+        return sorted(set(candidates))
+
+    @staticmethod
+    def _collect_fast_draft_cuts(
+        sv_result: Dict[str, Any],
+        *,
+        sv_words: Sequence[WordTimestamp],
+    ) -> List[float]:
+        """从快流结果提取句级边界时间。"""
+        raw_sentences = sv_result.get("sentences")
+        if raw_sentences is None:
+            raw_sentences = sv_result.get("sentence_segments")
+        cuts: List[float] = []
+        if isinstance(raw_sentences, Sequence):
+            for item in raw_sentences:
+                if isinstance(item, dict):
+                    end_value = item.get("end")
+                else:
+                    end_value = getattr(item, "end", None)
+                if end_value is None:
+                    continue
+                try:
+                    cuts.append(float(end_value))
+                except (TypeError, ValueError):
+                    continue
+        if cuts:
+            return sorted(set(cuts))
+        if sv_words:
+            return [float(sv_words[-1].end)]
+        return []
 
     @staticmethod
     def _shift_word_timestamps(words: Sequence[WordTimestamp], offset: float) -> List[WordTimestamp]:
@@ -4497,6 +4830,68 @@ class AsyncDualPipeline:
                 )
         words.sort(key=lambda row: (row.start, row.end))
         return words
+
+    def _should_record_m2_stage0_sample(self, *, chunk_index: int) -> bool:
+        """按稳定哈希做采样，避免随机波动影响基线复现。"""
+        if not self._is_m2_enabled:
+            return False
+        sample_rate = max(0.0, min(1.0, float(self._m2_shadow_sample_rate)))
+        if sample_rate <= 0.0:
+            return False
+        if sample_rate >= 1.0:
+            return True
+        digest = hashlib.md5(f"{self.job_id}:{int(chunk_index)}".encode("utf-8")).digest()
+        bucket = int.from_bytes(digest[:4], byteorder="big", signed=False) % 10000
+        threshold = int(sample_rate * 10000)
+        return bucket < threshold
+
+    def _build_stage0_run_snapshot(self, run: _Layer456RunResult) -> Dict[str, Any]:
+        return {
+            "sentence_count": int(len(run.final_sentences)),
+            "alignment_score": float(run.alignment_result.alignment_score),
+            "gap_ratio": float(run.alignment_result.gap_ratio),
+            "alignment_time_source": str(run.alignment_time_source),
+            "alignment_time_word_count": int(run.alignment_time_word_count),
+        }
+
+    def _maybe_record_m2_stage0_sample(
+        self,
+        *,
+        ctx: ProcessingContext,
+        selected_variant: str,
+        selected_reason: str,
+        legacy_run: _Layer456RunResult,
+        experiment_run: Optional[_Layer456RunResult],
+        active_run: _Layer456RunResult,
+        compare_payload: Optional[Dict[str, Any]],
+    ) -> None:
+        # V3.2.0+dev.20260215.09: 阶段0仅做观测落盘，不改主链路径和结果。
+        if not self._should_record_m2_stage0_sample(chunk_index=ctx.chunk_index):
+            return
+
+        payload: Dict[str, Any] = {
+            "job_id": ctx.job_id,
+            "chunk_index": int(ctx.chunk_index),
+            "dual_time_mode": str(self._dual_time_mode),
+            "selected_variant": str(selected_variant),
+            "selected_reason": str(selected_reason),
+            "m2_flags": {
+                "enable": bool(self._is_m2_enabled),
+                "nw_v2_enable": bool(self._is_m2_nw_v2_enabled),
+                "time_mapping_enable": bool(self._is_m2_time_mapping_enabled),
+                "shadow_sample_rate": float(self._m2_shadow_sample_rate),
+                "shadow_provider_class": str(self._m2_shadow_provider_class),
+            },
+            "active_run": self._build_stage0_run_snapshot(active_run),
+            "legacy_run": self._build_stage0_run_snapshot(legacy_run),
+        }
+
+        if experiment_run is not None:
+            payload["shadow_run"] = self._build_stage0_run_snapshot(experiment_run)
+        if compare_payload is not None and isinstance(compare_payload, dict):
+            payload["comparison"] = dict(compare_payload.get("comparison") or {})
+
+        append_debug_m2_stage0_line(ctx.job_dir, payload, logger=self.logger)
 
     def _build_dual_time_compare_payload(
         self,
@@ -4755,19 +5150,53 @@ class AsyncDualPipeline:
             fallback_speaker_id=speaker_id,
             fallback_turn_id=turn_id,
         )
+        speaker_turn_facts = self._collect_speaker_turn_facts_for_words(sv_words)
+        fast_draft_cuts = self._collect_fast_draft_cuts(ctx.sv_result, sv_words=sv_words)
+        pyannote_frame_times = self._collect_pyannote_frame_times_for_words(sv_words)
+        aligned_facts = self._fact_builder.build(
+            annotated_words=annotated_words,
+            alignment_result=None,
+            speaker_turns=speaker_turn_facts,
+            fast_draft_cuts=fast_draft_cuts,
+            pyannote_frame_times=pyannote_frame_times,
+        )
         sensevoice_stream_id = "sensevoice_only"
+        fused_evidence = self._build_fused_evidence_for_l6(
+            words=annotated_words,
+            stream_id=sensevoice_stream_id,
+            aligned_facts=aligned_facts,
+        )
+        ctx.finalization_metrics["fact_word_count"] = float(len(aligned_facts.annotated_words))
+        ctx.finalization_metrics["fact_turn_count"] = float(len(aligned_facts.speaker_turns))
+        ctx.finalization_metrics["fact_mapping_count"] = float(len(aligned_facts.time_mappings))
+        ctx.finalization_metrics["evidence_speaker_change_count"] = float(
+            len(fused_evidence.speaker_changes)
+        )
+        ctx.finalization_metrics["evidence_pause_anchor_count"] = float(
+            len(fused_evidence.pause_anchors)
+        )
+        ctx.finalization_metrics["evidence_semantic_anchor_count"] = float(
+            len(fused_evidence.semantic_anchors)
+        )
+        ctx.finalization_metrics["evidence_punctuation_anchor_count"] = float(
+            len(fused_evidence.punctuation_anchors)
+        )
         is_last_chunk = self._is_last_chunk_index(ctx.chunk_index)
         soft_cut_plan = self._build_soft_cut_plan_for_l6(
             annotated_words=annotated_words,
             stream_id=sensevoice_stream_id,
             block_id=f"{self.job_id}:{sensevoice_stream_id}:{ctx.chunk_index}",
             is_last_chunk=is_last_chunk,
+            aligned_facts=aligned_facts,
+            fused_evidence=fused_evidence,
         )
         l6_output = self._l6_processor.process(
             L6Input(
                 annotated_words=annotated_words,
                 vad_intervals=self._vad_intervals,
                 cut_plan=soft_cut_plan,
+                aligned_facts=aligned_facts,
+                fused_evidence=fused_evidence,
             ),
             stream_id=sensevoice_stream_id,
             chunk_index=ctx.chunk_index,
@@ -4801,6 +5230,8 @@ class AsyncDualPipeline:
         stream_id: str,
         block_id: str,
         is_last_chunk: bool,
+        aligned_facts: Optional[AlignedFacts] = None,
+        fused_evidence: Optional[FusedEvidence] = None,
     ) -> Optional[Any]:
         """
         统一 CutPlan 生产入口。
@@ -4810,11 +5241,19 @@ class AsyncDualPipeline:
         - provider 异常时回退 M1，避免影响主流程可用性
         """
         try:
-            return self._soft_cut_plan_provider.build_plan(
+            plan = self._soft_cut_plan_provider.build_plan(
                 annotated_words=annotated_words,
                 stream_id=stream_id,
                 block_id=block_id,
                 is_last_chunk=is_last_chunk,
+                aligned_facts=aligned_facts,
+                fused_evidence=fused_evidence,
+            )
+            return self._normalize_soft_cut_plan(
+                plan=plan,
+                stream_id=stream_id,
+                block_id=block_id,
+                reason="provider_empty_plan",
             )
         except Exception as exc:
             self.logger.warning(
@@ -4822,12 +5261,207 @@ class AsyncDualPipeline:
                 self._soft_cut_plan_provider.__class__.__name__,
                 exc,
             )
-            return self._build_soft_cut_plan_for_l6_m1(
+            plan = self._build_soft_cut_plan_for_l6_m1(
                 annotated_words=annotated_words,
                 stream_id=stream_id,
                 block_id=block_id,
                 is_last_chunk=is_last_chunk,
+                aligned_facts=aligned_facts,
+                fused_evidence=fused_evidence,
             )
+            return self._normalize_soft_cut_plan(
+                plan=plan,
+                stream_id=stream_id,
+                block_id=block_id,
+                reason="provider_exception_fallback",
+            )
+
+    def _build_fused_evidence_for_l6(
+        self,
+        *,
+        words: Sequence[AnnotatedWord],
+        stream_id: str,
+        aligned_facts: Optional[AlignedFacts],
+    ) -> FusedEvidence:
+        """
+        构建评分层契约（FusedEvidence）。
+
+        Why:
+        - 将 pipeline 内散落的 speaker-change/anchor 拼装逻辑收口为单入口。
+        - 该层仅产出证据，不触发裁决，保持与 CutPlan 解耦。
+        """
+        anchor_candidates = self._build_soft_cut_anchor_candidates(words=words)
+        pause_anchors = [item for item in anchor_candidates if item.anchor_type == AnchorType.PAUSE_ANCHOR]
+        word_anchors = [item for item in anchor_candidates if item.anchor_type == AnchorType.WORD_BOUNDARY]
+        semantic_anchors = [item for item in anchor_candidates if item.anchor_type == AnchorType.SEMANTIC_ANCHOR]
+        punctuation_anchors = [
+            item for item in anchor_candidates if item.anchor_type == AnchorType.PUNCTUATION_ANCHOR
+        ]
+        base_report: Dict[str, Any] = {
+            "enabled": bool(self._is_enable_soft_cut),
+            "stream_id": str(stream_id),
+            "word_count": int(len(words)),
+            "anchor_candidate_count": int(len(anchor_candidates)),
+            "time_axis_version": str(
+                getattr(aligned_facts, "time_axis_version", "m1_legacy") or "m1_legacy"
+            ),
+        }
+        if not self._is_enable_soft_cut or len(words) <= 1:
+            base_report["reason"] = "soft_cut_disabled_or_insufficient_words"
+            return self._soft_cut_evidence_fusion.to_fused_evidence(
+                speaker_changes=[],
+                pause_anchors=self._serialize_soft_cut_anchor_candidates(pause_anchors),
+                semantic_anchors=self._serialize_soft_cut_anchor_candidates(semantic_anchors),
+                punctuation_anchors=self._serialize_soft_cut_anchor_candidates(punctuation_anchors),
+                generation_report=base_report,
+            )
+
+        speaker_change_facts = self._build_soft_cut_speaker_change_facts(words=words)
+        if not speaker_change_facts:
+            base_report["reason"] = "no_speaker_change_facts"
+            return self._soft_cut_evidence_fusion.to_fused_evidence(
+                speaker_changes=[],
+                pause_anchors=self._serialize_soft_cut_anchor_candidates(pause_anchors),
+                semantic_anchors=self._serialize_soft_cut_anchor_candidates(semantic_anchors),
+                punctuation_anchors=self._serialize_soft_cut_anchor_candidates(punctuation_anchors),
+                generation_report=base_report,
+            )
+
+        chunk_start = float(words[0].start if words[0].start is not None else 0.0)
+        chunk_end = float(words[-1].end if words[-1].end is not None else chunk_start)
+        if chunk_end <= chunk_start:
+            chunk_end = chunk_start + 1e-3
+        chunk_id = f"{stream_id}:{int(chunk_start * 1000)}"
+        builder_result = self._soft_cut_evidence_builder.build(
+            chunk_id=chunk_id,
+            chunk_start=chunk_start,
+            chunk_end=chunk_end,
+            speaker_change_facts=speaker_change_facts,
+            anchor_candidates=[],
+        )
+        time_axis_version = str(
+            getattr(aligned_facts, "time_axis_version", "m1_legacy") or "m1_legacy"
+        )
+        word_time_confidence = self._collect_word_time_confidence_for_fusion(words=words)
+        fusion_result = self._soft_cut_evidence_fusion.fuse(
+            cut_windows=builder_result.cut_windows,
+            pause_anchors=pause_anchors,
+            word_anchors=word_anchors,
+            semantic_anchors=semantic_anchors,
+            punctuation_anchors=punctuation_anchors,
+            time_axis_version=time_axis_version,
+            word_time_confidence=word_time_confidence,
+        )
+        report = {
+            **base_report,
+            "speaker_change_fact_count": int(len(speaker_change_facts)),
+            "word_time_confidence_count": int(len(word_time_confidence or [])),
+            "builder": dict(builder_result.generation_report or {}),
+            "fusion": dict(fusion_result.generation_report or {}),
+            "fused_windows": self._serialize_soft_cut_windows(fusion_result.fused_windows),
+        }
+        return self._soft_cut_evidence_fusion.to_fused_evidence(
+            speaker_changes=self._serialize_soft_cut_speaker_changes(builder_result.speaker_changes),
+            pause_anchors=self._serialize_soft_cut_anchor_candidates(pause_anchors),
+            semantic_anchors=self._serialize_soft_cut_anchor_candidates(semantic_anchors),
+            punctuation_anchors=self._serialize_soft_cut_anchor_candidates(punctuation_anchors),
+            generation_report=report,
+        )
+
+    @staticmethod
+    def _serialize_soft_cut_speaker_changes(items: Sequence[Any]) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for item in items or []:
+            rows.append(
+                {
+                    "time": float(getattr(item, "time", 0.0) or 0.0),
+                    "from_speaker": str(getattr(item, "from_speaker", "") or ""),
+                    "to_speaker": str(getattr(item, "to_speaker", "") or ""),
+                    "pyannote_confidence": float(getattr(item, "pyannote_confidence", 0.0) or 0.0),
+                    "pause_duration": float(getattr(item, "pause_duration", 0.0) or 0.0),
+                    "embedding_distance": float(getattr(item, "embedding_distance", 0.0) or 0.0),
+                    "embedding_threshold": float(getattr(item, "embedding_threshold", 0.0) or 0.0),
+                    "is_abrupt_energy_shift": bool(getattr(item, "is_abrupt_energy_shift", False)),
+                    "level": str(getattr(getattr(item, "level", None), "value", "") or ""),
+                    "tags": sorted(
+                        [
+                            str(getattr(tag, "value", str(tag)))
+                            for tag in list(getattr(item, "tags", set()) or set())
+                        ]
+                    ),
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _serialize_soft_cut_anchor_candidates(items: Sequence[AnchorCandidate]) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for item in items or []:
+            rows.append(
+                {
+                    "anchor_type": str(getattr(item.anchor_type, "value", item.anchor_type)),
+                    "anchor_time": float(item.anchor_time),
+                    "source": str(item.source),
+                    "confidence": (
+                        float(item.confidence) if item.confidence is not None else None
+                    ),
+                    "base_score_override": (
+                        float(item.base_score_override)
+                        if item.base_score_override is not None
+                        else None
+                    ),
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _serialize_soft_cut_windows(windows: Sequence[Any]) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for window in windows or []:
+            candidate_anchors = list(getattr(window, "candidate_anchors", []) or [])
+            top_anchor = candidate_anchors[0] if candidate_anchors else None
+            rows.append(
+                {
+                    "window_id": str(getattr(window, "window_id", "") or ""),
+                    "trigger_time": float(getattr(window, "trigger_time", 0.0) or 0.0),
+                    "trigger_level": str(getattr(getattr(window, "trigger_level", None), "value", "") or ""),
+                    "start_time": float(getattr(window, "start_time", 0.0) or 0.0),
+                    "end_time": float(getattr(window, "end_time", 0.0) or 0.0),
+                    "candidate_anchor_count": int(len(candidate_anchors)),
+                    "top_anchor_type": (
+                        str(getattr(getattr(top_anchor, "anchor_type", None), "value", "") or "")
+                        if top_anchor is not None
+                        else ""
+                    ),
+                    "top_anchor_time": (
+                        float(getattr(top_anchor, "anchor_time", 0.0) or 0.0)
+                        if top_anchor is not None
+                        else None
+                    ),
+                    "top_anchor_score": (
+                        float(getattr(top_anchor, "final_score", 0.0) or 0.0)
+                        if top_anchor is not None
+                        else None
+                    ),
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _collect_word_time_confidence_for_fusion(
+        *,
+        words: Sequence[AnnotatedWord],
+    ) -> Optional[List[float]]:
+        values: List[float] = []
+        for item in words or []:
+            confidence = getattr(item, "confidence", None)
+            if confidence is None:
+                continue
+            try:
+                values.append(max(0.0, min(1.0, float(confidence))))
+            except (TypeError, ValueError):
+                continue
+        return values or None
 
     def _build_soft_cut_plan_for_l6_m1(
         self,
@@ -4836,6 +5470,8 @@ class AsyncDualPipeline:
         stream_id: str,
         block_id: str,
         is_last_chunk: bool,
+        aligned_facts: Optional[AlignedFacts] = None,
+        fused_evidence: Optional[FusedEvidence] = None,
     ) -> Optional[Any]:
         """
         在 L5 -> L6 之间生成 CutPlan。
@@ -4845,24 +5481,29 @@ class AsyncDualPipeline:
         - 维护 stream 级 pending deferred，满足跨 chunk 延迟决策。
         """
         if not self._is_enable_soft_cut:
-            return None
+            return self._build_empty_soft_cut_plan(
+                stream_id=stream_id,
+                block_id=block_id,
+                reason="soft_cut_disabled",
+            )
         words = list(annotated_words or [])
+        previous_deferred = list(self._soft_cut_pending_deferred_by_stream.get(stream_id, []))
         if len(words) <= 1:
             if is_last_chunk:
+                self._expire_pending_deferred(previous_deferred)
                 self._soft_cut_pending_deferred_by_stream.pop(stream_id, None)
-            return None
-
-        speaker_change_facts = self._build_soft_cut_speaker_change_facts(words=words)
-        if not speaker_change_facts:
-            if is_last_chunk:
-                self._soft_cut_pending_deferred_by_stream.pop(stream_id, None)
-            return None
+            return self._build_empty_soft_cut_plan(
+                stream_id=stream_id,
+                block_id=block_id,
+                reason="insufficient_words",
+            )
 
         chunk_start = float(words[0].start if words[0].start is not None else 0.0)
         chunk_end = float(words[-1].end if words[-1].end is not None else chunk_start)
         if chunk_end <= chunk_start:
             chunk_end = chunk_start + 1e-3
 
+        speaker_change_facts = self._build_soft_cut_speaker_change_facts(words=words)
         anchor_candidates = self._build_soft_cut_anchor_candidates(words=words)
         pause_anchors = [item for item in anchor_candidates if item.anchor_type == AnchorType.PAUSE_ANCHOR]
         word_anchors = [item for item in anchor_candidates if item.anchor_type == AnchorType.WORD_BOUNDARY]
@@ -4871,43 +5512,114 @@ class AsyncDualPipeline:
             item for item in anchor_candidates if item.anchor_type == AnchorType.PUNCTUATION_ANCHOR
         ]
 
-        builder_result = self._soft_cut_evidence_builder.build(
-            chunk_id=f"{stream_id}:{int(chunk_start * 1000)}",
-            chunk_start=chunk_start,
-            chunk_end=chunk_end,
-            speaker_change_facts=speaker_change_facts,
-            anchor_candidates=[],
-        )
-        if not builder_result.cut_windows:
-            return None
+        builder_window_count = 0
+        builder_high_count = 0
+        builder_mid_count = 0
+        builder_low_count = 0
+        cut_windows: List[CutWindow] = []
+        if speaker_change_facts:
+            builder_result = self._soft_cut_evidence_builder.build(
+                chunk_id=f"{stream_id}:{int(chunk_start * 1000)}",
+                chunk_start=chunk_start,
+                chunk_end=chunk_end,
+                speaker_change_facts=speaker_change_facts,
+                anchor_candidates=[],
+            )
+            cut_windows = list(builder_result.cut_windows or [])
+            builder_window_count = int(builder_result.generation_report.get("window_count", 0))
+            builder_high_count = int(builder_result.generation_report.get("high_count", 0))
+            builder_mid_count = int(builder_result.generation_report.get("mid_count", 0))
+            builder_low_count = int(builder_result.generation_report.get("low_count", 0))
 
+        time_axis_version = str(getattr(aligned_facts, "time_axis_version", "m1_legacy") or "m1_legacy")
         fusion_result = self._soft_cut_evidence_fusion.fuse(
-            cut_windows=builder_result.cut_windows,
+            cut_windows=cut_windows,
             pause_anchors=pause_anchors,
             word_anchors=word_anchors,
             semantic_anchors=semantic_anchors,
             punctuation_anchors=punctuation_anchors,
-            time_axis_version="m1_legacy",
+            time_axis_version=time_axis_version,
         )
         window_contexts = self._resolve_soft_cut_window_contexts(
             words=words,
             cut_windows=fusion_result.fused_windows,
         )
-        previous_deferred = list(self._soft_cut_pending_deferred_by_stream.get(stream_id, []))
+        (
+            recompute_windows,
+            carried_previous_deferred,
+            affected_deferred_by_window,
+            affected_reason_by_window,
+        ) = self._resolve_soft_cut_affected_deferred_windows(
+            stream_id=stream_id,
+            previous_deferred=previous_deferred,
+            anchor_candidates=anchor_candidates,
+            aligned_facts=aligned_facts,
+            fused_evidence=fused_evidence,
+            chunk_start=chunk_start,
+            chunk_end=chunk_end,
+        )
+        recompute_window_count = len(recompute_windows)
+        all_windows = list(fusion_result.fused_windows)
+        if recompute_windows:
+            recompute_fusion = self._soft_cut_evidence_fusion.fuse(
+                cut_windows=recompute_windows,
+                pause_anchors=pause_anchors,
+                word_anchors=word_anchors,
+                semantic_anchors=semantic_anchors,
+                punctuation_anchors=punctuation_anchors,
+                time_axis_version=time_axis_version,
+            )
+            all_windows.extend(list(recompute_fusion.fused_windows))
+            recompute_contexts = self._resolve_soft_cut_window_contexts(
+                words=words,
+                cut_windows=recompute_fusion.fused_windows,
+            )
+            for window_id, deferred in affected_deferred_by_window.items():
+                context = recompute_contexts.get(window_id, WindowDecisionContext())
+                context.depends_on_fast_draft = bool(getattr(deferred, "depends_on_fast_draft", False))
+                recompute_contexts[window_id] = context
+            window_contexts.update(recompute_contexts)
+
+        if not all_windows and not carried_previous_deferred:
+            if is_last_chunk:
+                self._expire_pending_deferred(previous_deferred)
+                self._soft_cut_pending_deferred_by_stream.pop(stream_id, None)
+            return self._build_empty_soft_cut_plan(
+                stream_id=stream_id,
+                block_id=block_id,
+                reason="no_cut_windows",
+            )
+
         plan = self._soft_cut_decision_engine.decide(
             block_id=block_id,
-            cut_windows=fusion_result.fused_windows,
+            cut_windows=all_windows,
             window_contexts=window_contexts,
-            previous_deferred=previous_deferred,
+            previous_deferred=carried_previous_deferred,
             current_time=chunk_end,
         )
+        affected_lifecycle = self._apply_affected_deferred_resolution(
+            plan=plan,
+            affected_deferred_by_window=affected_deferred_by_window,
+            is_last_chunk=is_last_chunk,
+        )
+        expired_on_last_chunk_count = 0
+        if is_last_chunk:
+            expired_on_last_chunk_count = self._expire_pending_deferred(plan.deferred_cuts)
         plan.generation_report.update(
             {
-                "builder_window_count": int(builder_result.generation_report.get("window_count", 0)),
-                "builder_high_count": int(builder_result.generation_report.get("high_count", 0)),
-                "builder_mid_count": int(builder_result.generation_report.get("mid_count", 0)),
-                "builder_low_count": int(builder_result.generation_report.get("low_count", 0)),
+                "builder_window_count": builder_window_count,
+                "builder_high_count": builder_high_count,
+                "builder_mid_count": builder_mid_count,
+                "builder_low_count": builder_low_count,
                 "fusion_output_window_count": int(fusion_result.generation_report.get("output_window_count", 0)),
+                "recompute_window_count": int(recompute_window_count),
+                "affected_window_count": int(len(affected_deferred_by_window)),
+                "affected_window_ids": sorted(list(affected_deferred_by_window.keys())),
+                "affected_reason_by_window": affected_reason_by_window,
+                "affected_resolved_count": int(affected_lifecycle.get("resolved_count", 0)),
+                "affected_expired_count": int(affected_lifecycle.get("expired_count", 0)),
+                "expired_on_last_chunk_count": int(expired_on_last_chunk_count),
+                "deferred_state_stats": self._build_deferred_state_stats(plan.deferred_cuts),
             }
         )
         self._update_soft_cut_pending_deferred_state(
@@ -4916,6 +5628,316 @@ class AsyncDualPipeline:
             is_last_chunk=is_last_chunk,
         )
         return plan
+
+    def _normalize_soft_cut_plan(
+        self,
+        *,
+        plan: Optional[CutPlan],
+        stream_id: str,
+        block_id: str,
+        reason: str,
+    ) -> CutPlan:
+        if plan is not None:
+            return plan
+        return self._build_empty_soft_cut_plan(
+            stream_id=stream_id,
+            block_id=block_id,
+            reason=reason,
+        )
+
+    @staticmethod
+    def _build_empty_soft_cut_plan(
+        *,
+        stream_id: str,
+        block_id: str,
+        reason: str,
+    ) -> CutPlan:
+        return CutPlan(
+            plan_id=f"{block_id}-empty-plan",
+            block_id=block_id,
+            decisions=[],
+            deferred_cuts=[],
+            generation_report={
+                "fallback_reason": str(reason or "unknown"),
+                "stream_id": str(stream_id),
+            },
+        )
+
+    def _resolve_soft_cut_affected_deferred_windows(
+        self,
+        *,
+        stream_id: str,
+        previous_deferred: Sequence[DeferredCut],
+        anchor_candidates: Sequence[AnchorCandidate],
+        aligned_facts: Optional[AlignedFacts],
+        fused_evidence: Optional[FusedEvidence],
+        chunk_start: float,
+        chunk_end: float,
+    ) -> Tuple[List[CutWindow], List[DeferredCut], Dict[str, DeferredCut], Dict[str, List[str]]]:
+        """
+        识别受当前 chunk 影响的 deferred 窗口，并转换为重算窗口。
+
+        Why:
+        - deferred 若长期只靠超时强制，会放大“快流草稿先切、慢流后到”的误切风险。
+        - 把受影响 deferred 转成当前轮窗口重算，可在不旁路 L6 的前提下完成闭环裁决。
+        """
+        if not previous_deferred:
+            return [], [], {}, {}
+
+        anchor_times = self._collect_soft_cut_anchor_times(
+            anchor_candidates=anchor_candidates,
+            fused_evidence=fused_evidence,
+        )
+        recompute_windows: List[CutWindow] = []
+        carried_previous_deferred: List[DeferredCut] = []
+        affected_deferred_by_window: Dict[str, DeferredCut] = {}
+        affected_reason_by_window: Dict[str, List[str]] = {}
+        for deferred in previous_deferred:
+            state = getattr(deferred, "state", None)
+            if state != DeferredCutState.PENDING:
+                carried_previous_deferred.append(deferred)
+                continue
+            window_id = str(getattr(deferred, "window_id", "") or "")
+            if not window_id:
+                carried_previous_deferred.append(deferred)
+                continue
+            start_time, end_time = self._resolve_deferred_time_range(deferred)
+            if end_time < chunk_start - 1e-6 or start_time > chunk_end + 1e-6:
+                carried_previous_deferred.append(deferred)
+                continue
+
+            has_new_anchor = any(
+                start_time <= anchor_time <= end_time and anchor_time >= chunk_start - 1e-6
+                for anchor_time in anchor_times
+            )
+            is_slow_covered = bool(getattr(deferred, "depends_on_fast_draft", False)) and (
+                self._is_slow_signal_covering_range(
+                    aligned_facts=aligned_facts,
+                    range_start=start_time,
+                    range_end=end_time,
+                )
+            )
+            is_level_upgraded = self._is_deferred_level_upgraded(
+                deferred=deferred,
+                fused_evidence=fused_evidence,
+                range_start=start_time,
+                range_end=end_time,
+                chunk_start=chunk_start,
+            )
+            reason_flags: List[str] = []
+            if has_new_anchor:
+                reason_flags.append("new_anchor")
+            if is_slow_covered:
+                reason_flags.append("slow_covered")
+            if is_level_upgraded:
+                reason_flags.append("level_upgraded")
+            if not reason_flags:
+                carried_previous_deferred.append(deferred)
+                continue
+
+            trigger_time = float(getattr(deferred, "created_at", start_time) or start_time)
+            if trigger_time < start_time:
+                trigger_time = start_time
+            if trigger_time > end_time:
+                trigger_time = end_time
+            recompute_windows.append(
+                CutWindow(
+                    window_id=window_id,
+                    trigger_time=trigger_time,
+                    trigger_level=self._parse_evidence_level(getattr(deferred, "trigger_level", "")),
+                    start_time=start_time,
+                    end_time=end_time,
+                    chunk_id=f"{stream_id}:deferred_recompute",
+                    candidate_anchors=[],
+                )
+            )
+            affected_deferred_by_window[window_id] = deferred
+            affected_reason_by_window[window_id] = sorted(reason_flags)
+        return (
+            recompute_windows,
+            carried_previous_deferred,
+            affected_deferred_by_window,
+            affected_reason_by_window,
+        )
+
+    @staticmethod
+    def _resolve_deferred_time_range(deferred: DeferredCut) -> Tuple[float, float]:
+        start_time = (
+            float(getattr(deferred, "window_start", deferred.created_at))
+            if getattr(deferred, "window_start", None) is not None
+            else float(deferred.created_at)
+        )
+        end_time = (
+            float(getattr(deferred, "window_end", deferred.expected_resolve_by))
+            if getattr(deferred, "window_end", None) is not None
+            else float(deferred.expected_resolve_by)
+        )
+        if end_time <= start_time:
+            end_time = max(float(deferred.expected_resolve_by), start_time + 1e-3)
+        return start_time, end_time
+
+    def _collect_soft_cut_anchor_times(
+        self,
+        *,
+        anchor_candidates: Sequence[AnchorCandidate],
+        fused_evidence: Optional[FusedEvidence],
+    ) -> List[float]:
+        anchor_times: List[float] = []
+        for item in anchor_candidates or []:
+            anchor_times.append(float(item.anchor_time))
+        if fused_evidence is None:
+            return anchor_times
+        for field_name in ("pause_anchors", "semantic_anchors", "punctuation_anchors"):
+            for item in list(getattr(fused_evidence, field_name, []) or []):
+                if not isinstance(item, dict):
+                    continue
+                raw_time = item.get("anchor_time", item.get("time"))
+                try:
+                    anchor_times.append(float(raw_time))
+                except (TypeError, ValueError):
+                    continue
+        return anchor_times
+
+    def _is_slow_signal_covering_range(
+        self,
+        *,
+        aligned_facts: Optional[AlignedFacts],
+        range_start: float,
+        range_end: float,
+    ) -> bool:
+        if aligned_facts is None:
+            return False
+        for word in list(getattr(aligned_facts, "annotated_words", []) or []):
+            word_start = float(getattr(word, "start", range_start) or range_start)
+            word_end = float(getattr(word, "end", word_start) or word_start)
+            if word_end <= word_start:
+                word_end = word_start + 1e-3
+            if word_end < range_start - 1e-6 or word_start > range_end + 1e-6:
+                continue
+            source = str(getattr(word, "confidence_source", "") or "").strip().lower()
+            if not source:
+                continue
+            if not self._is_fast_confidence_source(source):
+                return True
+        return False
+
+    def _is_deferred_level_upgraded(
+        self,
+        *,
+        deferred: DeferredCut,
+        fused_evidence: Optional[FusedEvidence],
+        range_start: float,
+        range_end: float,
+        chunk_start: float,
+    ) -> bool:
+        if fused_evidence is None:
+            return False
+        current_priority = self._evidence_level_priority(str(getattr(deferred, "trigger_level", "") or ""))
+        upgraded_priority = current_priority
+        for item in list(getattr(fused_evidence, "speaker_changes", []) or []):
+            if not isinstance(item, dict):
+                continue
+            try:
+                trigger_time = float(item.get("time"))
+            except (TypeError, ValueError):
+                continue
+            if trigger_time < chunk_start - 1e-6:
+                continue
+            if trigger_time < range_start - 1e-6 or trigger_time > range_end + 1e-6:
+                continue
+            level = str(item.get("level", "") or "")
+            upgraded_priority = max(upgraded_priority, self._evidence_level_priority(level))
+        return upgraded_priority > current_priority
+
+    @staticmethod
+    def _evidence_level_priority(level: str) -> int:
+        normalized = str(level or "").strip().lower()
+        if normalized == "high":
+            return 3
+        if normalized == "mid":
+            return 2
+        return 1
+
+    def _parse_evidence_level(self, level: str) -> EvidenceLevel:
+        normalized = str(level or "").strip().lower()
+        if normalized == "high":
+            return EvidenceLevel.HIGH
+        if normalized == "mid":
+            return EvidenceLevel.MID
+        return EvidenceLevel.LOW
+
+    def _apply_affected_deferred_resolution(
+        self,
+        *,
+        plan: Any,
+        affected_deferred_by_window: Dict[str, DeferredCut],
+        is_last_chunk: bool,
+    ) -> Dict[str, int]:
+        if not affected_deferred_by_window:
+            return {"resolved_count": 0, "expired_count": 0}
+        decisions = list(getattr(plan, "decisions", []) or [])
+        decision_by_window = {}
+        for decision in decisions:
+            window_id = str(getattr(decision, "window_id", "") or "")
+            if not window_id:
+                continue
+            decision_by_window[window_id] = decision
+
+        deferred_cuts = list(getattr(plan, "deferred_cuts", []) or [])
+        deferred_by_window = {}
+        for deferred in deferred_cuts:
+            window_id = str(getattr(deferred, "window_id", "") or "")
+            if not window_id:
+                continue
+            deferred_by_window[window_id] = deferred
+
+        resolved_count = 0
+        expired_count = 0
+        for window_id, original_deferred in affected_deferred_by_window.items():
+            target = deferred_by_window.get(window_id, original_deferred)
+            decision = decision_by_window.get(window_id)
+            if decision is not None:
+                target.state = DeferredCutState.RESOLVED
+                target.resolution_decision = decision
+                resolved_count += 1
+            elif is_last_chunk:
+                target.state = DeferredCutState.EXPIRED
+                target.resolution_decision = None
+                expired_count += 1
+            else:
+                target.state = DeferredCutState.PENDING
+                target.resolution_decision = None
+            if target not in deferred_cuts:
+                deferred_cuts.append(target)
+        setattr(plan, "deferred_cuts", deferred_cuts)
+        return {
+            "resolved_count": int(resolved_count),
+            "expired_count": int(expired_count),
+        }
+
+    def _expire_pending_deferred(self, deferred_cuts: Sequence[DeferredCut]) -> int:
+        expired_count = 0
+        for deferred in deferred_cuts:
+            if getattr(deferred, "state", None) != DeferredCutState.PENDING:
+                continue
+            deferred.state = DeferredCutState.EXPIRED
+            deferred.resolution_decision = None
+            expired_count += 1
+        return expired_count
+
+    @staticmethod
+    def _build_deferred_state_stats(deferred_cuts: Sequence[DeferredCut]) -> Dict[str, int]:
+        stats = {
+            "pending": 0,
+            "resolved": 0,
+            "forced": 0,
+            "expired": 0,
+        }
+        for deferred in deferred_cuts:
+            state_value = str(getattr(getattr(deferred, "state", None), "value", "") or "").lower()
+            if state_value in stats:
+                stats[state_value] += 1
+        return stats
 
     def _build_soft_cut_speaker_change_facts(
         self,
@@ -5330,20 +6352,41 @@ class AsyncDualPipeline:
         contexts: Dict[str, WindowDecisionContext] = {}
         for window in cut_windows:
             trigger_time = float(getattr(window, "trigger_time", 0.0))
+            window_start = float(getattr(window, "start_time", trigger_time))
+            window_end = float(getattr(window, "end_time", trigger_time))
             covered_words = 0
+            has_fast_source = False
+            has_non_fast_source = False
             for word in words:
+                source = str(getattr(word, "confidence_source", "") or "").strip().lower()
                 word_end = float(word.end if word.end is not None else 0.0)
                 if word_end <= trigger_time:
                     covered_words += 1
+                word_start = float(word.start if word.start is not None else word_end)
+                if word_end <= word_start:
+                    word_end = word_start + 1e-3
+                if word_end < window_start - 1e-6 or word_start > window_end + 1e-6:
+                    continue
+                if not source:
+                    continue
+                if self._is_fast_confidence_source(source):
+                    has_fast_source = True
+                else:
+                    has_non_fast_source = True
             window_id = str(getattr(window, "window_id", "") or "")
             if not window_id:
                 continue
             contexts[window_id] = WindowDecisionContext(
                 current_sentence_word_count=covered_words,
                 waiting_word_count=max(0, len(words) - covered_words),
-                depends_on_fast_draft=False,
+                depends_on_fast_draft=bool(has_fast_source and not has_non_fast_source),
             )
         return contexts
+
+    @staticmethod
+    def _is_fast_confidence_source(source: str) -> bool:
+        normalized = str(source or "").strip().lower()
+        return normalized in {"fast", "sensevoice", "sv", "draft", "fast_draft", "m1_fast"}
 
     def _update_soft_cut_pending_deferred_state(
         self,
@@ -5439,6 +6482,65 @@ class AsyncDualPipeline:
             if getattr(word, "alignment_status", None) == AlignmentStatus.MATCHED
         )
         return matched / len(aligned_words)
+
+    def _emit_l7_output(
+        self,
+        *,
+        chunk_index: int,
+        sentence_segments: Sequence[SentenceSegment],
+        injection_report: Dict[str, Any],
+        segmentation_report: Dict[str, Any],
+        output_traces: Optional[Sequence[OutputTrace]],
+        default_trace_reason: str,
+    ) -> Any:
+        """
+        统一 L7 出口，避免快路/主路各自拼装输出导致分支漂移。
+
+        Why:
+        - 阶段6要求输出层单入口，所有路径统一经过 OutputProcessor。
+        - trace 在入口先对齐句段数量，保障 transport payload 稳定可追溯。
+        """
+        normalized_traces = self._normalize_output_traces_for_sentences(
+            final_sentences=sentence_segments,
+            output_traces=output_traces or [],
+            default_reason=default_trace_reason,
+        )
+        return self._l7_processor.process(
+            L7Input(
+                chunk_index=chunk_index,
+                sentence_segments=list(sentence_segments),
+                injection_report=dict(injection_report),
+                segmentation_report=dict(segmentation_report),
+                output_traces=normalized_traces,
+            )
+        )
+
+    @staticmethod
+    def _normalize_output_traces_for_sentences(
+        *,
+        final_sentences: Sequence[SentenceSegment],
+        output_traces: Sequence[OutputTrace],
+        default_reason: str,
+    ) -> List[OutputTrace]:
+        if len(final_sentences) == len(output_traces):
+            return list(output_traces)
+        normalized: List[OutputTrace] = []
+        for sentence_index, sentence in enumerate(final_sentences):
+            normalized.append(
+                OutputTrace(
+                    sentence_index=sentence_index,
+                    split_reason=str(getattr(sentence, "split_reason", "") or default_reason),
+                    split_risk=str(getattr(sentence, "split_risk", "") or ""),
+                    window_id=str(getattr(sentence, "window_id", "") or ""),
+                    pyannote_frame_time=getattr(sentence, "pyannote_frame_time", None),
+                    mapped_cut_time=getattr(sentence, "mapped_cut_time", None),
+                    mapping_quality=str(getattr(sentence, "mapping_quality", "") or "default"),
+                    mapping_reason=str(getattr(sentence, "mapping_reason", "") or default_reason),
+                    sentence_start=float(sentence.start),
+                    sentence_end=float(sentence.end),
+                )
+            )
+        return normalized
 
     @staticmethod
     def _build_final_fallback_sentence(words_for_split: Sequence[WordTimestamp]) -> Optional[SentenceSegment]:
