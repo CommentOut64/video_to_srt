@@ -53,9 +53,7 @@ from app.schemas.pipeline_context import ProcessingContext
 from app.models.confidence_models import AlignmentStatus
 from app.models.sensevoice_models import SentenceSegment, TextSource, WordTimestamp
 from app.services.audio.chunk_engine import AudioChunk
-from app.services.alignment.alignment_processor import AlignmentProcessor
 from app.services.alignment.default_aligner import DefaultAligner, _strip_trailing_punct_smart
-from app.services.alignment.fact_builder import FactBuilder, FactBuilderConfig
 from app.services.alignment.text_normalizer import get_alignment_text_normalizer
 from app.services.alignment.text_normalizer_processor import TextNormalizerProcessor
 from app.services.alignment.types import (
@@ -85,7 +83,6 @@ from app.services.model_runtime_config_service import get_model_runtime_config_s
 from app.services.sse_service import get_sse_manager
 from app.services.segmentation.default_segmenter import DefaultSegmenter, DraftSegmenter
 from app.services.segmentation.boundary_mapper import WordBoundaryMapper
-from app.services.segmentation.segmentation_processor import SegmentationProcessor
 from app.services.segmentation.soft_cut import (
     AnchorCandidate,
     AnchorType,
@@ -97,8 +94,6 @@ from app.services.segmentation.soft_cut import (
     EvidenceLevel,
     EvidenceBuilder,
     EvidenceBuilderConfig,
-    EvidenceFusion,
-    EvidenceFusionConfig,
     SoftCutPlanProvider,
     SoftCutDecisionEngine,
     SpeakerChangeFact,
@@ -107,7 +102,6 @@ from app.services.segmentation.soft_cut import (
     resolve_soft_cut_plan_provider,
 )
 from app.services.streaming_subtitle import get_streaming_subtitle_manager
-from app.services.streaming.output_processor import OutputProcessor
 from app.services.punctuation.fast_punctuation_pipeline import FastPunctuationPipeline
 from app.services.punctuation.punctuation_processor import PunctuationProcessor
 from app.services.punctuation.debug_utils import (
@@ -120,7 +114,6 @@ from app.services.punctuation.debug_utils import (
 )
 from app.services.punctuation.base import PunctuationResult, PuncPosition, SplitPoint
 from app.services.punctuation.scheduler import get_punctuation_scheduler
-from app.services.punctuation.semantic_injection_processor import SemanticInjectionProcessor
 from app.services.punctuation.final_splitter import FinalSplitter, FinalSplitConfig
 from app.services.bridge.bridge_controller import BridgeController
 from app.services.bridge.flush_policy import FlushPolicyConfig
@@ -143,6 +136,16 @@ from app.services.timeline import (
 )
 from app.services.text_pipeline_config import TextPipelineConfig
 from app.services.text_normalizer import TextNormalizer
+from app.services.textflow import (
+    CollectionAlignmentProcessor,
+    CollectionFactBuilder,
+    CollectionFactBuilderConfig,
+    ScoringEvidenceFusion,
+    ScoringEvidenceFusionConfig,
+    ScoringSemanticInjectionProcessor,
+    DecisionSegmentationProcessor,
+    OutputLayerProcessor,
+)
 from app.services.whisper.whisper_text_sanitizer import WhisperTextSanitizer
 from app.pipelines.workers import FastWorker, SlowWorker
 from app.utils.prompt_builder import get_prompt_builder
@@ -175,6 +178,7 @@ class _Layer456RunResult:
     output_traces: List[OutputTrace]
     alignment_time_source: str = "sv"
     alignment_time_word_count: int = 0
+    detected_language: str = "auto"
 
 
 class AsyncDualPipeline:
@@ -266,7 +270,7 @@ class AsyncDualPipeline:
             logger,
             __name__,
             job_id=job_id,
-            layer="L0",
+            layer="编排层",
         )
         self.transcription_profile = transcription_profile
         self.cancellation_token = cancellation_token  # v3.1.0
@@ -370,8 +374,8 @@ class AsyncDualPipeline:
             punctuation_service=self.punctuation_service,
             logger=self.logger,
         )
-        # V3.2.0+dev.20260205.09: L4/L5/L6 处理器接入（对齐/注入/切分）
-        self._l4_processor = AlignmentProcessor(logger=self.logger)
+        # V3.2.0+dev.20260215.23: 阶段C接入四层统一目录入口（集合/评分/裁决/输出）。
+        self._l4_processor = CollectionAlignmentProcessor(logger=self.logger)
         self._text_pipeline_config = TextPipelineConfig.from_runtime()
         self._m2_stage_config = self._text_pipeline_config.m2
         self._is_m2_enabled = bool(self._m2_stage_config.is_enabled)
@@ -381,8 +385,8 @@ class AsyncDualPipeline:
         self._m2_shadow_provider_class = str(
             self._m2_stage_config.shadow_provider_class or ""
         ).strip()
-        self._fact_builder = FactBuilder(
-            FactBuilderConfig(
+        self._fact_builder = CollectionFactBuilder(
+            CollectionFactBuilderConfig(
                 anchor_snap_tolerance_sec=0.22,
                 is_enable_time_mapping=self._is_m2_time_mapping_enabled,
                 time_axis_version="m2_nw_v2",
@@ -410,8 +414,8 @@ class AsyncDualPipeline:
                 anchor_distance_penalty_factor=0.55,
             )
         )
-        self._soft_cut_evidence_fusion = EvidenceFusion(
-            config=EvidenceFusionConfig()
+        self._soft_cut_evidence_fusion = ScoringEvidenceFusion(
+            config=ScoringEvidenceFusionConfig()
         )
         self._soft_cut_decision_engine = SoftCutDecisionEngine(
             config=DecisionEngineConfig()
@@ -459,11 +463,11 @@ class AsyncDualPipeline:
             self._final_grouper = SemanticGrouper(final_group_config)
         else:
             self._final_grouper = None
-        self._l5_processor = SemanticInjectionProcessor(
+        self._l5_processor = ScoringSemanticInjectionProcessor(
             logger=self.logger,
             min_mapping_coverage=final_split_config.min_mapping_coverage,
         )
-        self._l6_processor = SegmentationProcessor(
+        self._l6_processor = DecisionSegmentationProcessor(
             final_splitter=self._final_splitter,
             logger=self.logger,
             is_keep_sentence_end_punct=bool(
@@ -473,7 +477,7 @@ class AsyncDualPipeline:
                 self._segmentation_layer_config.is_enable_soft_cut_overlap_degrade
             ),
         )
-        self._l7_processor = OutputProcessor(
+        self._l7_processor = OutputLayerProcessor(
             subtitle_manager=self.subtitle_manager,
             speaker_store_service_getter=self._get_speaker_store_service,
             logger=self.logger,
@@ -954,7 +958,7 @@ class AsyncDualPipeline:
         按句级时间窗与 Timeline turn 重叠绑定 speaker/turn。
 
         Why: Chunk 级绑定在多人交替发言时会误绑定整段，句级重叠可显著提升切换准确率。
-        说明：跨 speaker 残留修复已迁移到 L6（SegmentationProcessor）内完成。
+        说明：跨 speaker 残留修复已迁移到裁决层（DecisionSegmentationProcessor）内完成。
         """
         if not sentences:
             return
@@ -1624,6 +1628,7 @@ class AsyncDualPipeline:
                 l7_output = self._emit_l7_output(
                     chunk_index=ctx.chunk_index,
                     sentence_segments=final_sentences,
+                    language=str(ctx.audio_chunk.language or (ctx.sv_result or {}).get("language") or "auto"),
                     injection_report={
                         "mapping_coverage": 0.0,
                         "mismatch_count": 0.0,
@@ -1862,6 +1867,7 @@ class AsyncDualPipeline:
             self._emit_l7_output(
                 chunk_index=ctx.chunk_index,
                 sentence_segments=sentences,
+                language=str(ctx.audio_chunk.language or (ctx.sv_result or {}).get("language") or "auto"),
                 injection_report={
                     "mapping_coverage": 0.0,
                     "mismatch_count": 0.0,
@@ -1929,6 +1935,7 @@ class AsyncDualPipeline:
             self._emit_l7_output(
                 chunk_index=ctx.chunk_index,
                 sentence_segments=finalized_sentences,
+                language=str(ctx.audio_chunk.language or (ctx.sv_result or {}).get("language") or "auto"),
                 injection_report={
                     "mapping_coverage": 0.0,
                     "mismatch_count": 0.0,
@@ -2407,7 +2414,7 @@ class AsyncDualPipeline:
         # V3.2.0+dev.20260203.10: L0 使用 raw_text 作为规范化入口
         raw_text = sv_result.get("raw_text")
         if raw_text is None or str(raw_text).strip() == "":
-            self.logger.warning("L1 规范化缺失 raw_text，跳过规范化")
+            self.logger.warning("规范层缺失 raw_text，跳过规范化")
             return None
         if not sv_result.get("confidence_source"):
             sv_result["confidence_source"] = "fast"
@@ -2535,7 +2542,7 @@ class AsyncDualPipeline:
         if wh_text:
             is_repetition, reason = TextNormalizer.detect_intra_block_repetition(wh_text)
             if is_repetition:
-                self.logger.debug("L2 仲裁检测到重复: reason=%s", reason)
+                self.logger.debug("选文层检测到重复: reason={}", reason)
 
         is_itn_fallback = bool(
             (tracks.whisper_track and tracks.whisper_track.itn_fallback)
@@ -2610,7 +2617,7 @@ class AsyncDualPipeline:
         avg_conf = sum(float(pos.confidence or 0.0) for pos in positions) / max(len(positions), 1)
         # V3.2.0+dev.20260205.03: 记录 slow_raw 来源细节，定位词级逗号密集问题
         self.logger.debug(
-            "L1 slow_raw 标点候选: clean_len=%d positions=%d avg_conf=%.2f sample=%s",
+            "规范层 slow_raw 标点候选: clean_len={} positions={} avg_conf={:.2f} sample={}",
             len(clean_text),
             len(positions),
             avg_conf,
@@ -2945,6 +2952,7 @@ class AsyncDualPipeline:
             self._emit_l7_output(
                 chunk_index=chunk_index,
                 sentence_segments=finalized_sentences,
+                language="auto",
                 injection_report={
                     "mapping_coverage": 0.0,
                     "mismatch_count": 0.0,
@@ -3307,7 +3315,7 @@ class AsyncDualPipeline:
         payload: Dict[str, Any] = {
             "job_id": ctx.job_id,
             "chunk_index": int(ctx.chunk_index),
-            "layer": "L3-L6",
+            "layer": "选文到裁决",
             "chosen_source": ctx.arbitration_result.chosen_source if ctx.arbitration_result else "",
             "arbitration_reason": ctx.arbitration_result.reason if ctx.arbitration_result else "",
             "chosen_clean_len": len(chosen_clean or ""),
@@ -3554,7 +3562,7 @@ class AsyncDualPipeline:
         payload: Dict[str, Any] = {
             "job_id": ctx.job_id,
             "chunk_index": int(ctx.chunk_index),
-            "layer": "L0-L6-FULL",
+            "layer": "全链路追踪",
             "arbitration": {
                 "chosen_source": arbitration_output.arbitration_result.chosen_source,
                 "reason": arbitration_output.arbitration_result.reason,
@@ -4145,6 +4153,7 @@ class AsyncDualPipeline:
             l7_output = self._emit_l7_output(
                 chunk_index=ctx.chunk_index,
                 sentence_segments=final_sentences,
+                language=str(ctx.audio_chunk.language or (ctx.sv_result or {}).get("language") or "auto"),
                 injection_report={
                     "mapping_coverage": 0.0,
                     "mismatch_count": 0.0,
@@ -4230,12 +4239,12 @@ class AsyncDualPipeline:
                 tracks.chosen_track.punct_positions = list(punctuation_positions)
             else:
                 if punctuation_positions:
-                    self.logger.debug("L3 标点 clean_text 不一致，清空回写位置")
+                    self.logger.debug("评分层标点 clean_text 不一致，清空回写位置")
                 tracks.chosen_track.punct_positions = []
         if self.bridge_controller:
             self.bridge_controller.record_arbitration_result(arbitration_result)
         self.logger.debug(
-            "Chunk %s: 仲裁完成 chosen_source=%s reason=%s coverage=%.2f",
+            "Chunk {}: 选文完成 chosen_source={} reason={} coverage={:.2f}",
             ctx.chunk_index,
             arbitration_result.chosen_source,
             arbitration_result.reason,
@@ -4419,7 +4428,7 @@ class AsyncDualPipeline:
         if ctx.arbitration_result:
             ctx.arbitration_result.gap_positions = list(alignment_result.gap_positions)
             self.logger.debug(
-                "Chunk %s: 仲裁统计 coverage=%.2f gap_positions=%s",
+                "Chunk {}: 选文统计 coverage={:.2f} gap_positions={}",
                 ctx.chunk_index,
                 ctx.arbitration_result.coverage,
                 ctx.arbitration_result.gap_positions,
@@ -4459,6 +4468,7 @@ class AsyncDualPipeline:
         l7_output = self._emit_l7_output(
             chunk_index=ctx.chunk_index,
             sentence_segments=final_sentences,
+            language=str(run_result.detected_language or "auto"),
             injection_report={
                 "mapping_coverage": float(injection_stats.get("injection_mapping_coverage", 0.0)),
                 "mismatch_count": float(injection_stats.get("injection_unmatched_total", 0.0)),
@@ -4631,6 +4641,7 @@ class AsyncDualPipeline:
             output_traces=output_traces,
             alignment_time_source=time_source,
             alignment_time_word_count=len(time_words),
+            detected_language=str(detected_language or "auto"),
         )
 
     def _resolve_alignment_time_words(
@@ -5209,7 +5220,7 @@ class AsyncDualPipeline:
                 fallback.speaker_id = speaker_id
                 fallback.turn_id = turn_id
                 sentences = [fallback]
-                self.logger.warning("Whisper 跳过路径触发 L6 单句兜底")
+                self.logger.warning("Whisper 跳过路径触发裁决层单句兜底")
         for sentence in sentences:
             sentence.source = TextSource.SENSEVOICE
             sentence.is_finalized = True
@@ -6488,6 +6499,7 @@ class AsyncDualPipeline:
         *,
         chunk_index: int,
         sentence_segments: Sequence[SentenceSegment],
+        language: str,
         injection_report: Dict[str, Any],
         segmentation_report: Dict[str, Any],
         output_traces: Optional[Sequence[OutputTrace]],
@@ -6497,7 +6509,7 @@ class AsyncDualPipeline:
         统一 L7 出口，避免快路/主路各自拼装输出导致分支漂移。
 
         Why:
-        - 阶段6要求输出层单入口，所有路径统一经过 OutputProcessor。
+        - 阶段6要求输出层单入口，所有路径统一经过 OutputLayerProcessor。
         - trace 在入口先对齐句段数量，保障 transport payload 稳定可追溯。
         """
         normalized_traces = self._normalize_output_traces_for_sentences(
@@ -6509,6 +6521,7 @@ class AsyncDualPipeline:
             L7Input(
                 chunk_index=chunk_index,
                 sentence_segments=list(sentence_segments),
+                language=str(language or "auto"),
                 injection_report=dict(injection_report),
                 segmentation_report=dict(segmentation_report),
                 output_traces=normalized_traces,

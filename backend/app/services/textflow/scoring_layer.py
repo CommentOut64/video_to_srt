@@ -1,7 +1,8 @@
 """
-L5 语义注入层处理器（SemanticInjectionProcessor）。
-V3.2.0+dev.20260207.02
+评分层统一入口（真实实现 + 合证适配）。
+V3.2.0+dev.20260215.24
 """
+
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
@@ -9,10 +10,14 @@ from typing import Any, Dict, List, Optional
 from app.core.logging import resolve_loguru_logger
 from app.services.alignment.types import AnnotatedWord, L5Input, L5Output
 from app.services.punctuation.semantic_injector import SemanticInjector
+from app.services.segmentation.soft_cut.evidence_fusion import (
+    EvidenceFusion as ScoringEvidenceFusion,
+    EvidenceFusionConfig as ScoringEvidenceFusionConfig,
+)
 
 
-class SemanticInjectionProcessor:
-    """L5 处理器：仅负责标点注入与覆盖率门控。"""
+class ScoringSemanticInjectionProcessor:
+    """评分层处理器：仅负责标点注入与覆盖率门控。"""
 
     def __init__(
         self,
@@ -23,7 +28,7 @@ class SemanticInjectionProcessor:
         self._logger = resolve_loguru_logger(
             logger,
             __name__,
-            layer="L5",
+            layer="评分层",
             processor_name="semantic_injection_processor",
         )
         self._injector = SemanticInjector(
@@ -32,7 +37,7 @@ class SemanticInjectionProcessor:
         )
 
     def process(self, data: L5Input) -> L5Output:
-        """执行 L5 注入主路径。"""
+        """执行评分层注入主路径。"""
         aligned_words = data.alignment_result.aligned_words or []
         clean_text_ref = str(data.punct_track.clean_text_ref or "")
         positions = list(data.punct_track.positions or [])
@@ -95,15 +100,15 @@ class SemanticInjectionProcessor:
                     trailing_punct=item.trailing_punct,
                     confidence=source.final_confidence,
                     confidence_source=source.confidence_source,
-                    speaker_id=data.speaker_id,  # V3.2.0+dev.20260207.03: P0 speaker 透传
-                    turn_id=data.turn_id,  # V3.2.0+dev.20260210.09: Phase 2 turn 透传
+                    speaker_id=data.speaker_id,
+                    turn_id=data.turn_id,
                     track_id="main",
                 )
                 for item, source in zip(injection.annotated_words, aligned_words)
             ]
 
         self._logger.info(
-            "L5 注入完成: words={} blocked={} coverage={:.2f} mismatch={}",
+            "评分层注入完成: words={} blocked={} coverage={:.2f} mismatch={}",
             len(annotated_words),
             int(report["blocked"]),
             report["mapping_coverage"],
@@ -133,3 +138,13 @@ class SemanticInjectionProcessor:
             for word in aligned_words
         ]
 
+
+# 兼容旧命名（用于过渡期）。
+SemanticInjectionProcessor = ScoringSemanticInjectionProcessor
+
+__all__ = [
+    "ScoringSemanticInjectionProcessor",
+    "ScoringEvidenceFusion",
+    "ScoringEvidenceFusionConfig",
+    "SemanticInjectionProcessor",
+]

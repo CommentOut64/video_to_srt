@@ -1,19 +1,51 @@
 """
-L7 输出层处理器（OutputProcessor）。
-V3.2.0+dev.20260207.02
+输出层统一入口（真实实现）。
+V3.2.0+dev.20260215.24
 """
+
 from __future__ import annotations
 
 import copy
 import hashlib
+import re
 from typing import Any, Callable, Dict, Optional, Sequence
 
 from app.core.logging import resolve_loguru_logger
 from app.services.alignment.types import L7Input, L7Output, OutputTrace
 
 
-class OutputProcessor:
-    """L7 处理器：仅负责格式化与分发，不改文本逻辑。"""
+class OutputLayerProcessor:
+    """输出层处理器：负责最终分发，并在定稿出口做标点风格标准化。"""
+
+    _HALF_TO_FULL_PUNCT = {
+        ",": "，",
+        ".": "。",
+        "!": "！",
+        "?": "？",
+        ";": "；",
+        ":": "：",
+        "(": "（",
+        ")": "）",
+        "[": "【",
+        "]": "】",
+        "{": "｛",
+        "}": "｝",
+    }
+    _FULL_TO_HALF_PUNCT = {
+        value: key for key, value in _HALF_TO_FULL_PUNCT.items()
+    }
+    _FULL_TO_HALF_PUNCT.update(
+        {
+            "．": ".",
+            "、": ",",
+            "“": "\"",
+            "”": "\"",
+            "‘": "'",
+            "’": "'",
+        }
+    )
+    _EN_RIGHT_PUNCT = {",", ".", "!", "?", ";", ":", ")", "]", "}"}
+    _EN_LEFT_PUNCT = {"(", "[", "{"}
 
     def __init__(
         self,
@@ -27,7 +59,7 @@ class OutputProcessor:
         self._logger = resolve_loguru_logger(
             logger,
             __name__,
-            layer="L7",
+            layer="输出层",
             processor_name="output_processor",
         )
 
@@ -43,7 +75,7 @@ class OutputProcessor:
         try:
             return self._speaker_store_service_getter()
         except Exception:
-            self._logger.exception("L7 获取 speaker_store_service 失败")
+            self._logger.exception("输出层获取 speaker_store_service 失败")
             return None
 
     def _write_speaker_links(
@@ -61,7 +93,7 @@ class OutputProcessor:
 
         if len(sentence_indices) < len(sentence_segments):
             self._logger.warning(
-                "L7 speaker_store 写入索引不足: indices={} sentences={}",
+                "输出层 speaker_store 写入索引不足: indices={} sentences={}",
                 len(sentence_indices),
                 len(sentence_segments),
             )
@@ -90,8 +122,12 @@ class OutputProcessor:
         return "skipped_empty", 0
 
     def process(self, data: L7Input) -> L7Output:
-        """执行 L7 输出分发。"""
+        """执行输出层分发。"""
         sentence_segments = list(data.sentence_segments or [])
+        self._apply_language_punctuation_standardization(
+            sentence_segments=sentence_segments,
+            language=data.language,
+        )
         output_traces = self._resolve_output_traces(
             sentence_segments=sentence_segments,
             output_traces=data.output_traces,
@@ -117,7 +153,7 @@ class OutputProcessor:
             subtitle_channel_status = "failed"
             speaker_store_channel_status = "skipped_upstream_failed"
             self._logger.exception(
-                "L7 输出失败: chunk_index={} sentences={}",
+                "输出层分发失败: chunk_index={} sentences={}",
                 data.chunk_index,
                 len(sentence_segments),
             )
@@ -132,7 +168,7 @@ class OutputProcessor:
                 output_errors.append("E_L7_SPEAKER_STORE_FAIL")
                 speaker_store_channel_status = "failed"
                 self._logger.exception(
-                    "L7 speaker_store 写入失败: chunk_index={} sentences={}",
+                    "输出层 speaker_store 写入失败: chunk_index={} sentences={}",
                     data.chunk_index,
                     len(sentence_segments),
                 )
@@ -163,7 +199,7 @@ class OutputProcessor:
             "errors": output_errors,
         }
         self._logger.info(
-            "L7 输出完成: chunk_index={} sentences={} errors={}",
+            "输出层完成: chunk_index={} sentences={} errors={}",
             data.chunk_index,
             len(sentence_segments),
             len(output_errors),
@@ -172,6 +208,132 @@ class OutputProcessor:
             output_payload=payload,
             output_traces=output_traces,
         )
+
+    def _apply_language_punctuation_standardization(
+        self,
+        *,
+        sentence_segments: Sequence[Any],
+        language: str,
+    ) -> None:
+        """
+        在最终出稿前按语言标准化标点样式。
+
+        约束:
+        - 仅处理定稿（草稿跳过）。
+        - 在最终标点决策之后执行，避免影响上游评分/裁决。
+        """
+        for sentence in sentence_segments:
+            if bool(getattr(sentence, "is_draft", False)):
+                continue
+            source_language = str(getattr(sentence, "language", "") or language or "auto")
+            normalized_text = self._standardize_text_by_language(
+                text=str(getattr(sentence, "text", "") or ""),
+                language=source_language,
+            )
+            if normalized_text:
+                setattr(sentence, "text", normalized_text)
+
+            text_clean = str(getattr(sentence, "text_clean", "") or "")
+            if text_clean:
+                normalized_clean = self._standardize_text_by_language(
+                    text=text_clean,
+                    language=source_language,
+                )
+                if normalized_clean:
+                    setattr(sentence, "text_clean", normalized_clean)
+
+    def _standardize_text_by_language(self, *, text: str, language: str) -> str:
+        if not text:
+            return text
+        lang = self._resolve_language_tag(language=language, text=text)
+        if lang == "en":
+            return self._standardize_english_punctuation(text)
+        if lang in {"zh", "ja"}:
+            return self._standardize_cjk_punctuation(text)
+        return text
+
+    @staticmethod
+    def _resolve_language_tag(*, language: str, text: str) -> str:
+        tag = str(language or "auto").lower()
+        if tag.startswith("en"):
+            return "en"
+        if tag.startswith("zh") or tag.startswith("yue"):
+            return "zh"
+        if tag.startswith("ja") or tag.startswith("jp"):
+            return "ja"
+
+        has_cjk = bool(re.search(r"[\u4e00-\u9fff\u3040-\u30ff]", text))
+        has_latin = bool(re.search(r"[A-Za-z]", text))
+        if has_cjk and not has_latin:
+            return "zh"
+        if has_latin and not has_cjk:
+            return "en"
+        return "auto"
+
+    def _standardize_english_punctuation(self, text: str) -> str:
+        normalized = self._to_halfwidth_punctuation(text)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        normalized = re.sub(r"\s+([,.;:!?\)\]\}])", r"\1", normalized)
+        normalized = re.sub(r"([\(\[\{])\s+", r"\1", normalized)
+
+        chars = list(normalized)
+        out: list[str] = []
+        length = len(chars)
+        for index, char in enumerate(chars):
+            out.append(char)
+            if index >= length - 1:
+                continue
+            next_char = chars[index + 1]
+            if next_char.isspace():
+                continue
+            if char in {",", ";", ":", "!", "?"} and next_char not in self._EN_RIGHT_PUNCT:
+                out.append(" ")
+            elif (
+                char == "."
+                and self._should_insert_space_after_dot(
+                    prev_char=chars[index - 1] if index > 0 else "",
+                    next_char=next_char,
+                )
+            ):
+                out.append(" ")
+
+        normalized = "".join(out)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        normalized = re.sub(r"\s+([,.;:!?\)\]\}])", r"\1", normalized)
+        normalized = re.sub(r"([\(\[\{])\s+", r"\1", normalized)
+        return normalized
+
+    @staticmethod
+    def _should_insert_space_after_dot(*, prev_char: str, next_char: str) -> bool:
+        if not prev_char or not next_char:
+            return False
+        if prev_char.isdigit() and next_char.isdigit():
+            return False
+        if prev_char.isalpha() and next_char.isalpha():
+            # 缩写/省略场景保守处理，不强插空格。
+            if prev_char.isupper() and next_char.isupper():
+                return False
+            return prev_char.islower() and next_char.isupper()
+        return next_char.isalnum()
+
+    def _standardize_cjk_punctuation(self, text: str) -> str:
+        normalized = self._to_fullwidth_punctuation(text)
+        normalized = re.sub(r"\s*([，。！？；：、）】》」』｝])\s*", r"\1", normalized)
+        normalized = re.sub(r"\s*([（【《「『｛])\s*", r"\1", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        return normalized
+
+    def _to_halfwidth_punctuation(self, text: str) -> str:
+        normalized = text
+        for source, target in self._FULL_TO_HALF_PUNCT.items():
+            normalized = normalized.replace(source, target)
+        return normalized
+
+    def _to_fullwidth_punctuation(self, text: str) -> str:
+        normalized = text
+        for source, target in self._HALF_TO_FULL_PUNCT.items():
+            normalized = normalized.replace(source, target)
+        return normalized
 
     @staticmethod
     def _resolve_output_traces(
@@ -251,3 +413,8 @@ class OutputProcessor:
             "mapping_reason": str(getattr(sentence, "mapping_reason", "") or ""),
         }
 
+
+# 兼容旧命名（用于过渡期）。
+OutputProcessor = OutputLayerProcessor
+
+__all__ = ["OutputLayerProcessor", "OutputProcessor"]

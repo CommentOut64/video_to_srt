@@ -303,6 +303,7 @@ class L7Input:
 
     chunk_index: int
     sentence_segments: List[SentenceSegment]
+    language: str = "auto"
     injection_report: Optional[Dict[str, Any]] = None
     segmentation_report: Optional[Dict[str, Any]] = None
     output_traces: Optional[List[OutputTrace]] = None

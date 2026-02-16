@@ -1,6 +1,6 @@
 """
-L6 切分层处理器（SegmentationProcessor）。
-V3.2.0+dev.20260215.07
+裁决层切分处理器（SegmentationProcessor）。
+V3.2.0+dev.20260215.24
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from app.services.punctuation.final_splitter import FinalSplitter
 
 
 class SegmentationProcessor:
-    """L6 处理器：仅负责边界决策与句子切分。"""
+    """裁决层处理器：仅负责边界决策与句子切分。"""
 
     # V3.2.0+dev.20260210.03: L6 内建跨 chunk 连续性处理（仅处理高风险残词）。
     _CROSS_CHUNK_CARRY_WORDS = {"a", "an", "the"}
@@ -49,7 +49,7 @@ class SegmentationProcessor:
         self._logger = resolve_loguru_logger(
             logger,
             __name__,
-            layer="L6",
+            layer="裁决层",
             processor_name="segmentation_processor",
         )
         self._final_splitter = final_splitter
@@ -60,7 +60,7 @@ class SegmentationProcessor:
         self._active_vad_intervals: List[Tuple[float, float]] = []
 
     def reset_state(self) -> None:
-        """重置 L6 跨 chunk 状态（新任务开始时调用）。"""
+        """重置裁决层跨 chunk 状态（新任务开始时调用）。"""
         self._pending_prefix_words_by_stream.clear()
 
     def process(
@@ -71,7 +71,7 @@ class SegmentationProcessor:
         chunk_index: Optional[int] = None,
         is_last_chunk: bool = False,
     ) -> L6Output:
-        """执行 L6 单路径切分，并在层内执行一次跨 speaker 残留修复。"""
+        """执行裁决层单路径切分，并在层内执行一次跨 speaker 残留修复。"""
         annotated_words = data.annotated_words or []
         pending_prefix_words = self._consume_pending_prefix_words(stream_id)
         cut_plan = self._normalize_cut_plan(
@@ -222,7 +222,7 @@ class SegmentationProcessor:
             "output_trace": [self._serialize_output_trace(item) for item in output_traces],
         }
         self._logger.info(
-            "L6 切分完成: stream={} chunk={} input_words={} sentences={} "
+            "裁决层切分完成: stream={} chunk={} input_words={} sentences={} "
             "pending_in={} pending_out={} error={}",
             stream_id,
             chunk_index,
@@ -1516,3 +1516,9 @@ class SegmentationProcessor:
             sentence.source = TextSource.WHISPER_PATCH
             sentence.is_draft = False
             sentence.is_finalized = True
+
+
+# 兼容新旧命名。
+DecisionSegmentationProcessor = SegmentationProcessor
+
+__all__ = ["SegmentationProcessor", "DecisionSegmentationProcessor"]
