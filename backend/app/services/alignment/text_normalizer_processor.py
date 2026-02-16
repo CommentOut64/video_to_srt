@@ -34,7 +34,7 @@ class TextNormalizerProcessor:
         self._logger = resolve_loguru_logger(
             logger,
             __name__,
-            layer="L1",
+            layer="规范层",
             processor_name="text_normalizer_processor",
         )
         self._normalizer = normalizer or get_alignment_text_normalizer(logger=logger)
@@ -64,7 +64,7 @@ class TextNormalizerProcessor:
         if not input_text and source == "whisper":
             input_text = str(raw_result.get("min_clean_text") or "")
         if not input_text:
-            self._logger.warning("L1 规范化缺失 raw_text/min_clean_text source={}", source)
+            self._logger.warning("规范层缺失 raw_text/min_clean_text source={}", source)
             return None
         if not raw_text:
             raw_text = input_text

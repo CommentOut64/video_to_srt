@@ -37,7 +37,7 @@ class PunctuationProcessor:
         self._logger = resolve_loguru_logger(
             logger,
             __name__,
-            layer="L3",
+            layer="评分层",
             processor_name="punctuation_processor",
         )
         self._punctuation_service = punctuation_service
@@ -166,7 +166,7 @@ class PunctuationProcessor:
             )
             return list(result.punctuation_positions or []), result
         except Exception as exc:
-            self._logger.warning("L3 标点模型恢复失败: {}", exc)
+            self._logger.warning("评分层标点模型恢复失败: {}", exc)
             return [], None
 
     @staticmethod
@@ -368,7 +368,7 @@ class PunctuationProcessor:
         weak_ratio = weak_count / max(word_count, 1)
         # V3.2.0+dev.20260205.03: 输出弱标点密度细节，便于定位密集逗号来源
         self._logger.debug(
-            "L3 slow_raw 弱标点密度: word_count={} weak_count={} weak_ratio={:.2f} max_weak_ratio={:.2f}",
+            "评分层 slow_raw 弱标点密度: word_count={} weak_count={} weak_ratio={:.2f} max_weak_ratio={:.2f}",
             word_count,
             weak_count,
             weak_ratio,
@@ -379,7 +379,7 @@ class PunctuationProcessor:
             or (word_count >= 4 and weak_count >= max(2, word_count - 1))
         ):
             self._logger.debug(
-                "L3 slow_raw 弱标点过滤触发: word_count={} weak_count={} weak_ratio={:.2f}",
+                "评分层 slow_raw 弱标点过滤触发: word_count={} weak_count={} weak_ratio={:.2f}",
                 word_count,
                 weak_count,
                 weak_ratio,

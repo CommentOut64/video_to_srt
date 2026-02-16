@@ -484,7 +484,7 @@ class ModelRuntimeConfigService:
                 "shadow.sample_rate": 0.1,
                 "shadow.provider_class": "",
             },
-            # V3.2.0+dev.20260204.03: L2 文本仲裁层运行参数
+            # V3.2.0+dev.20260204.03: L2 文本选文层运行参数
             "arbitration": {
                 "enable": True,
                 "text_source_preference": "auto",

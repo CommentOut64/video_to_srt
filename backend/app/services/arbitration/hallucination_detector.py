@@ -19,7 +19,7 @@ class HallucinationDetector:
         self._logger = resolve_loguru_logger(
             logger,
             __name__,
-            layer="L2",
+            layer="选文层",
             processor_name="hallucination_detector",
         )
 
@@ -45,7 +45,7 @@ class HallucinationDetector:
             return True
 
         if TextNormalizer.is_whisper_hallucination(candidate_text):
-            self._logger.warning("检测到 Whisper 规则幻觉: text='%s...'", candidate_text[:50])
+            self._logger.warning("检测到 Whisper 规则幻觉: text='{}...'", candidate_text[:50])
             return True
 
         return False

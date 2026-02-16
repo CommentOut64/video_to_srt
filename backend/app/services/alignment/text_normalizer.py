@@ -60,7 +60,7 @@ class TextNormalizer:
         self._logger = resolve_loguru_logger(
             logger,
             __name__,
-            layer="L1",
+            layer="规范层",
             processor_name="text_normalizer",
         )
         self._itn_cache: Dict[str, object] = {}
@@ -120,7 +120,7 @@ class TextNormalizer:
         )
         mapping_coverage = _calc_mapping_coverage(raw_to_clean)
         self._logger.info(
-            "L1 规范化完成 input_len={} clean_len={} itn_fallback={} mapping_cov={:.2f} lang={}",
+            "规范层完成 input_len={} clean_len={} itn_fallback={} mapping_cov={:.2f} lang={}",
             len(base_text),
             len(text_clean),
             1 if itn_fallback else 0,

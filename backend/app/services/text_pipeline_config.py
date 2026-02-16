@@ -531,7 +531,7 @@ class TextPipelineConfig:
 
 @dataclass
 class ArbitrationConfig:
-    """L2 文本仲裁层参数。"""
+    """L2 文本选文层参数。"""
 
     is_enabled: bool = True
     text_source_preference: str = "auto"
