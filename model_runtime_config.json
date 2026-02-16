@@ -15,6 +15,7 @@
       "dual_time_mode": "shadow"
     },
     "timeline": {
+      "enabled": true,
       "diarization_enabled": true,
       "diarization_model_id": "pyannote-speaker-diarization-community-1"
     }

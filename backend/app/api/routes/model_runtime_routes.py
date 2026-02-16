@@ -233,6 +233,7 @@ class VADRuntimeParams(_RuntimeBase):
 
 
 class TimelineRuntimeParams(_RuntimeBase):
+    is_enabled: Optional[bool] = Field(default=None, alias="enabled")
     device: Optional[str] = Field(default=None)
     is_diarization_enabled: Optional[bool] = Field(default=None, alias="diarization_enabled")
     diarization_model_id: Optional[str] = Field(default=None)
@@ -537,6 +538,7 @@ _PARAM_SCHEMA: Dict[str, Any] = {
             "bgm_heavy_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.15},
         },
         "timeline": {
+            "enabled": {"type": "bool", "default": True},
             "device": {"type": "enum", "enum": ["auto", "cuda", "cpu"], "default": "cuda"},
             "diarization_enabled": {"type": "bool", "default": False},
             "diarization_model_id": {"type": "string", "default": "pyannote-speaker-diarization-community-1"},

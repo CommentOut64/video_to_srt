@@ -288,6 +288,7 @@ class ModelRuntimeConfigService:
                 "global_group_duration_sec": norm_str(os.getenv("DEMUCS_GLOBAL_GROUP_DURATION_SEC")),
             },
             "timeline": {
+                "enabled": norm_str(os.getenv("TIMELINE_ENABLED")),
                 "device": norm_str(os.getenv("TIMELINE_DEVICE")),
                 "diarization_enabled": norm_str(os.getenv("TIMELINE_DIARIZATION_ENABLED")),
                 "diarization_model_id": norm_str(os.getenv("TIMELINE_DIARIZATION_MODEL_ID")),
@@ -362,6 +363,7 @@ class ModelRuntimeConfigService:
                 "sensevoice_smart_target_duration": 8.0,
             },
             "timeline": {
+                "enabled": True,
                 "device": "cuda",
                 "segmentation_boundary_threshold": 0.55,
                 "segmentation_min_boundary_interval_sec": 0.2,
@@ -375,7 +377,7 @@ class ModelRuntimeConfigService:
                 "diarization_hf_token": None,
                 "diarization_max_speakers": None,
                 "diarization_min_speakers": None,
-                "diarization_num_speakers": 3,
+                "diarization_num_speakers": None,
             },
             "flush_policy": {
                 "min_audio_sec": 6.0,
