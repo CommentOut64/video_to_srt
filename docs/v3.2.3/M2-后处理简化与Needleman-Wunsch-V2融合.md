@@ -1,7 +1,7 @@
 # M2 后处理简化与 Needleman-Wunsch V2 融合
 
 > Type: Architecture | Status: Active
-> Version: V3.2.0+dev.20260215.18
+> Version: V3.2.0+dev.20260215.28
 > Scope: 后处理主链简化、NW V2 改造、时间轴映射契约补齐
 
 ## 1. Summary
@@ -20,9 +20,9 @@
 
 ## 3. Key Components
 
-* `backend/app/services/alignment/alignment_service.py`: NW 主实现（需升级为 V2）。
-* `backend/app/services/whisper_buffer_pool.py`: 第二套 NW 实现（需收敛到同一内核）。
-* `backend/app/services/segmentation/segmentation_processor.py`: 软切决策执行器。
+* `backend/app/services/alignment/alignment_service.py`: NW 主实现（已接入 V2 内核开关）。
+* `backend/app/services/whisper_buffer_pool.py`: 第二入口 NW 调用方（已收敛到同一内核）。
+* `backend/app/services/textflow/decision_layer.py`: 裁决层执行器（四层统一入口）。
 * `backend/app/services/timeline/segmentation_service.py`: pyannote 帧时间源。
 * `backend/app/services/alignment/types.py`: 四模块契约对象定义。
 
@@ -492,4 +492,133 @@ time_sec = frame_start + idx * frame_step
   - `$env:PYTHONPATH='.'; .\\.venv\\Scripts\\python.exe -m pytest -o addopts= ci_tests/integration/test_local_pipeline.py::TestRealVideoIntegration::test_real_full_pipeline --test-video \"F:/video_to_srt_gpu/input/test_video_H265.mp4\" --real-engines -q -rs`
 4. 验证结果：
   - `1 passed`（真实 GPU 用例已执行，不再 skip）。
-  - 日志可见 `L4 对齐完成`、`L5 注入完成`、`L6 切分完成`、`L7 输出完成`，与新四层口径一致。
+  - 日志可见 `集合层对齐完成`、`评分层注入完成`、`裁决层切分完成`、`输出层完成`，与新四层口径一致。
+
+### 10.12 阶段 C：四层目录统一入口（已完成）
+
+1. 目标：在不破坏现有调用链的前提下，把主流水线依赖收口到四层目录，减少“同职跨目录导入”扩散。
+2. 主要改动：
+  - 新增四层统一入口目录：`backend/app/services/textflow/`
+    - `collection_layer.py`
+    - `scoring_layer.py`
+    - `decision_layer.py`
+    - `output_layer.py`
+  - `AsyncDualPipeline` 主链导入已切换到四层入口：
+    - `CollectionAlignmentProcessor/CollectionFactBuilder`
+    - `ScoringSemanticInjectionProcessor/ScoringEvidenceFusion`
+    - `DecisionSegmentationProcessor`
+    - `OutputLayerProcessor`
+  - 旧模块保留为兼容实现，不做破坏性删除。
+3. 质量守卫升级：
+  - `ci_tests/quality/check_textflow_layer_guards.py` 新增“旧入口导入冻结”规则；
+  - 禁止新增以下旧入口直连导入：
+    - `alignment.alignment_processor`
+    - `alignment.fact_builder`
+    - `punctuation.semantic_injection_processor`
+    - `segmentation.segmentation_processor`
+    - `streaming.output_processor`
+4. 当前结论：
+  - 四层目录入口已成为主编排路径；
+  - 通过“兼容保留 + 新增冻结”实现平滑迁移，可继续推进后续物理合并与旧文件清理。
+
+### 10.13 阶段 D：物理合并第一批（已完成）
+
+1. 目标：将四层中体量可控的实现迁移到 `textflow` 目录，旧路径降级为兼容桥接文件。
+2. 主要改动：
+  - `backend/app/services/textflow/collection_layer.py`
+    - 内置 `CollectionAlignmentProcessor` 与 `CollectionFactBuilder` 真实实现。
+  - `backend/app/services/textflow/scoring_layer.py`
+    - 内置 `ScoringSemanticInjectionProcessor` 真实实现；
+    - 保留 `ScoringEvidenceFusion` 合证入口。
+  - `backend/app/services/textflow/output_layer.py`
+    - 内置 `OutputLayerProcessor` 真实实现。
+  - 旧路径改为兼容桥接：
+    - `backend/app/services/alignment/alignment_processor.py`
+    - `backend/app/services/alignment/fact_builder.py`
+    - `backend/app/services/punctuation/semantic_injection_processor.py`
+    - `backend/app/services/streaming/output_processor.py`
+3. 冻结守卫与基线：
+  - `frozen_legacy_postprocess_imports.txt` 已收敛为 1 条（仅保留 `decision_layer` 对 `SegmentationProcessor` 的过渡导入）。
+4. 当前结论：
+  - 主编排、真实实现、兼容桥接三者已闭环；
+  - 后续仅剩 `DecisionSegmentationProcessor` 的大文件（`segmentation_processor.py`）物理迁移与拆分。
+
+### 10.14 阶段 D：物理合并第二批（已完成）
+
+1. 目标：完成裁决层实现迁移，清零旧后处理入口导入。
+2. 主要改动：
+  - `backend/app/services/textflow/decision_layer.py`
+    - 迁入 `SegmentationProcessor` 真实实现；
+    - 新增别名 `DecisionSegmentationProcessor = SegmentationProcessor`。
+  - `backend/app/services/segmentation/segmentation_processor.py`
+    - 改为兼容桥接，转发到 `textflow.decision_layer`。
+3. 冻结守卫补强：
+  - `ci_tests/quality/check_textflow_layer_guards.py` 允许“空基线文件”（用于收敛到 0 条违规）。
+  - `frozen_legacy_postprocess_imports.txt` 已收敛为 0 条。
+4. 当前结论：
+  - 四层真实实现已全部迁入 `textflow` 目录；
+  - 旧路径仅保留兼容桥接文件，不再有旧入口直连导入。
+
+### 10.15 阶段 E：稳定 API 固化与防回流（已完成）
+
+1. 目标：固定 `textflow` 包级 API，避免调用方直接依赖层文件路径。
+2. 主要改动：
+  - `backend/app/services/textflow/__init__.py`
+    - 新增稳定短名导出：
+      - `AlignmentProcessor`
+      - `FactBuilder` / `FactBuilderConfig`
+      - `SemanticInjectionProcessor`
+      - `SegmentationProcessor`
+      - `OutputProcessor`
+  - 调用方统一改为包级导入：
+    - `backend/app/pipelines/async_dual_pipeline.py`
+    - 旧桥接文件（alignment/punctuation/segmentation/streaming）全部改为 `from app.services.textflow import ...`
+3. 质量守卫升级：
+  - `ci_tests/quality/check_textflow_layer_guards.py` 新增规则：
+    - 冻结新增 `from app.services.textflow.<layer_module> import ...` 直连导入
+    - 统一要求调用方改用 `from app.services.textflow import ...`
+4. 风险修复：
+  - 修复 `textflow` 与 `alignment.__init__` 的循环依赖；
+  - `alignment.__init__.py` 改为对 `AlignmentProcessor/FactBuilder` 使用延迟导出（`__getattr__`）。
+5. 当前结论：
+  - 包级 API 已稳定；
+  - 旧入口导入为 0，层文件直连导入仅保留 `textflow/__init__.py` 内部聚合行为。
+
+### 10.16 阶段 F：兼容桥接文件删除（已完成）
+
+1. 目标：删除过渡期兼容桥接文件，消除“名义迁移但保留旧壳”的维护成本。
+2. 删除文件：
+  - `backend/app/services/alignment/alignment_processor.py`
+  - `backend/app/services/alignment/fact_builder.py`
+  - `backend/app/services/punctuation/semantic_injection_processor.py`
+  - `backend/app/services/segmentation/segmentation_processor.py`
+  - `backend/app/services/streaming/output_processor.py`
+3. 同步改造：
+  - 测试导入统一改为 `from app.services.textflow import ...`：
+    - `backend/tests/test_l1_l4_flow_edges.py`
+    - `backend/tests/test_async_pipeline_sensevoice_normalize.py`
+    - `backend/tests/test_layer_processors_l5_l6_l7.py`
+    - `backend/tests/test_soft_cut_phase_d_integration.py`
+    - `backend/tests/unit/services/alignment/test_alignment_processor.py`
+4. 兼容策略：
+  - `backend/app/services/alignment/__init__.py` 保留延迟导出（`__getattr__`），继续支持包级兼容访问。
+  - 推荐入口仍为 `app.services.textflow` 包级 API。
+5. 验证结果：
+  - 运行时引用扫描：`NO_RUNTIME_REFERENCES`。
+  - 质量守卫：通过。
+  - 回归测试：`44 passed`。
+
+### 10.17 阶段 G：历史别名导出清理（已完成）
+
+1. 目标：移除 `alignment` 包级历史别名导出，彻底收敛到 `textflow` 单入口。
+2. 主要改动：
+  - `backend/app/services/alignment/__init__.py`
+    - 移除 `AlignmentProcessor/FactBuilder/FactBuilderConfig` 导出；
+    - 删除对应 `__getattr__` 延迟兼容逻辑。
+3. 守卫升级：
+  - `ci_tests/quality/check_textflow_layer_guards.py` 新增规则：
+    - 冻结新增 `from app.services.alignment import AlignmentProcessor/FactBuilder/FactBuilderConfig`。
+  - 新增基线：`frozen_alignment_legacy_exports_imports.txt`（当前为 0 条）。
+4. 当前结论：
+  - 后处理入口已完整收敛到 `app.services.textflow`；
+  - `alignment` 包仅保留算法与工具服务导出，不再承载后处理编排入口职责。
