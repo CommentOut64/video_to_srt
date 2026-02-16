@@ -1,0 +1,9 @@
+backend/app/pipelines/async_dual_pipeline.py|layer="L0",
+backend/app/pipelines/workers/fast_worker.py|layer="L0",
+backend/app/pipelines/workers/slow_worker.py|self.logger = resolve_loguru_logger(logger, __name__, layer="L0")
+backend/app/services/alignment/text_normalizer.py|layer="L1",
+backend/app/services/alignment/text_normalizer_processor.py|layer="L1",
+backend/app/services/arbitration/arbiter.py|layer="L2",
+backend/app/services/arbitration/hallucination_detector.py|layer="L2",
+backend/app/services/bridge/bridge_controller.py|self._logger = resolve_loguru_logger(logger, __name__, layer="L0")
+backend/app/services/punctuation/punctuation_processor.py|layer="L3",
