@@ -9,9 +9,10 @@ Pyannote 完整说话人分离服务。
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, ClassVar, Optional
 
 import numpy as np
 
@@ -59,6 +60,10 @@ class PyannoteDiarizationConfig:
 
 class PyannoteDiarizationService:
     """使用 pyannote 完整 Pipeline 产出说话人区间。"""
+
+    # V3.2.0+dev.20260216.03: 进程内缓存 Pipeline，避免每个 block 重复加载模型。
+    _PIPELINE_CACHE: ClassVar[dict[tuple[str, str, str], Any]] = {}
+    _PIPELINE_CACHE_LOCK: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(
         self,
@@ -169,13 +174,24 @@ class PyannoteDiarizationService:
             self.logger.warning("diarization 未配置模型路径或 model_id，跳过")
             return None
 
+        device = str(self.config.prefer_device or "auto")
+        cache_key = (
+            str(checkpoint),
+            str(self.config.hf_token or ""),
+            device,
+        )
+
+        with self._PIPELINE_CACHE_LOCK:
+            cached_pipeline = self._PIPELINE_CACHE.get(cache_key)
+        if cached_pipeline is not None:
+            return cached_pipeline
+
         pipeline = load_pyannote_pipeline(
             checkpoint=checkpoint,
             token=self.config.hf_token,
             logger=self.logger,
         )
 
-        device = str(self.config.prefer_device or "auto")
         try:
             if device.startswith("cuda"):
                 import torch
@@ -185,6 +201,8 @@ class PyannoteDiarizationService:
         except Exception as exc:
             self.logger.warning("diarization pipeline 切换设备失败，回退默认设备: %s", exc)
 
+        with self._PIPELINE_CACHE_LOCK:
+            self._PIPELINE_CACHE[cache_key] = pipeline
         return pipeline
 
     def _resolve_checkpoint(self) -> str:
