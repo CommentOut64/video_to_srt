@@ -453,14 +453,44 @@ class StreamingSubtitleManager:
         Returns:
             List[int]: 新的句子索引列表
         """
-        # 防御性检查：如果新句子列表为空，保留原有草稿，不要删除
+        # 防御性处理：空定稿也要完成 chunk 收口，避免前端草稿永久停留“生成中”。
         if not sentences:
-            existing_indices = self.chunk_sentences.get(chunk_index, [])
+            with self._lock:
+                old_indices = self.chunk_sentences.get(chunk_index, [])
+                protected_sentences = {}
+                for old_index in old_indices:
+                    if old_index not in self.sentences:
+                        continue
+                    old_sentence = self.sentences[old_index]
+                    if getattr(old_sentence, 'is_modified', False):
+                        protected_sentences[old_index] = old_sentence
+                        logger.info(
+                            f"[V3.2.0+dev.20260216.11] 空定稿保留用户编辑: "
+                            f"chunk={chunk_index}, index={old_index}"
+                        )
+                    else:
+                        del self.sentences[old_index]
+
+                new_indices = sorted(protected_sentences.keys())
+                self.chunk_sentences[chunk_index] = new_indices
+
+            push_subtitle_event(
+                self.sse_manager,
+                self.job_id,
+                "replace_chunk",
+                {
+                    "chunk_index": chunk_index,
+                    "old_indices": old_indices,
+                    "new_indices": new_indices,
+                    "sentences": []
+                }
+            )
             logger.warning(
                 f"replace_chunk: Chunk {chunk_index} 的定稿句子为空，"
-                f"保留原有 {len(existing_indices)} 个草稿句子以避免字幕丢失"
+                f"已清理 {max(len(old_indices) - len(new_indices), 0)} 个草稿并推送空替换事件，"
+                f"保留用户编辑 {len(new_indices)} 条"
             )
-            return existing_indices
+            return new_indices
 
         # V3.8: 使用锁保护整个替换过程
         with self._lock:
