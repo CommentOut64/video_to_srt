@@ -622,3 +622,11 @@ time_sec = frame_start + idx * frame_step
 4. 当前结论：
   - 后处理入口已完整收敛到 `app.services.textflow`；
   - `alignment` 包仅保留算法与工具服务导出，不再承载后处理编排入口职责。
+
+### 10.18 阶段A补充：统一切分优先级引擎（新增实施文档）
+
+1. 目标：为 `speaker/pause/punctuation/semantic/llm` 提供统一优先级协议与 profile 化调权能力，支持“提权标点 -> LLM 提权 -> 标点可移除”的平滑迁移。
+2. 详细实施方案：`docs/v3.2.3/M2-阶段A-统一切分优先级引擎实施文档.md`。
+3. 落地约束：
+  - `speaker` 保持软边界（高权重，不做硬切）；
+  - 任何来源的优先级调整必须通过配置完成，不允许新增分支硬编码。

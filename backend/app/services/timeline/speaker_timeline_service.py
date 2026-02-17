@@ -8,8 +8,10 @@ SpeakerTimelineService（Phase 2）。
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional, Protocol
 
 import numpy as np
@@ -21,6 +23,7 @@ from app.services.timeline.cluster_manager import (
     ClusterManagerConfig,
 )
 from app.services.timeline.diarization_service import (
+    DiarizationSegment,
     DiarizationResult,
     PyannoteDiarizationConfig,
     PyannoteDiarizationService,
@@ -28,6 +31,7 @@ from app.services.timeline.diarization_service import (
 from app.services.timeline.segmentation_service import (
     PyannoteSegmentationConfig,
     PyannoteSegmentationService,
+    SegmentationFrame,
     SegmentationResult,
 )
 from app.services.timeline.turn_builder import (
@@ -165,9 +169,14 @@ class SpeakerTimelineService:
             self.logger.warning("diarization 启用但未产出说话人分段，回退聚类+segmentation")
 
         self.cluster_manager.reset()
-        assignments: list[TimelineChunkAssignment] = []
+        ordered_chunks = sorted(chunks, key=lambda item: (item.start, item.end))
+        assignments, start_index = self._load_cluster_progress(
+            block_id=block_id,
+            chunks=ordered_chunks,
+        )
 
-        for chunk in sorted(chunks, key=lambda item: (item.start, item.end)):
+        for index in range(start_index, len(ordered_chunks)):
+            chunk = ordered_chunks[index]
             if self.cancellation_token:
                 self.cancellation_token.raise_if_canceled()
                 self.cancellation_token.raise_if_paused()
@@ -191,6 +200,12 @@ class SpeakerTimelineService:
                     speaker_status=status,
                     is_overlap=chunk.is_overlap,
                 )
+            )
+            self._save_cluster_progress(
+                block_id=block_id,
+                chunks=ordered_chunks,
+                assignments=assignments,
+                processed_count=index + 1,
             )
 
         segmentation_result = self._run_segmentation_with_checkpoint(
@@ -229,8 +244,16 @@ class SpeakerTimelineService:
             last_unit_commits = self._extract_last_unit_commits(snapshot)
             last_unit_id = last_unit_commits.get(stage)
             if last_unit_id == unit_id:
+                cached_result = self._load_cached_diarization(block_id=block_id)
+                if cached_result is not None:
+                    self.logger.info(
+                        "diarization_epoch 命中已提交单元，命中缓存并跳过重算: stage=%s unit=%s",
+                        stage,
+                        unit_id,
+                    )
+                    return cached_result
                 self.logger.info(
-                    "diarization_epoch 命中已提交单元，但未缓存中间结果，执行重算: stage=%s unit=%s",
+                    "diarization_epoch 命中已提交单元但缓存缺失，执行重算: stage=%s unit=%s",
                     stage,
                     unit_id,
                 )
@@ -249,6 +272,7 @@ class SpeakerTimelineService:
 
         self._raise_if_stopped()
         result = self.diarization_service.run(audio=audio, sample_rate=sample_rate)
+        is_cache_saved = self._save_cached_diarization(block_id=block_id, result=result)
 
         if self.runtime_checkpoint_service and hasattr(self.runtime_checkpoint_service, "record_unit_committed"):
             self.runtime_checkpoint_service.record_unit_committed(
@@ -258,6 +282,7 @@ class SpeakerTimelineService:
                     "block_id": block_id,
                     "segment_count": len(result.segments),
                     "speaker_count": len(result.speaker_ids),
+                    "cache_saved": is_cache_saved,
                 },
             )
 
@@ -327,14 +352,21 @@ class SpeakerTimelineService:
             last_unit_commits = self._extract_last_unit_commits(snapshot)
             last_unit_id = last_unit_commits.get(stage)
             if last_unit_id == unit_id:
-                # Why: 崩溃恢复后如果该块 S-Epoch 已提交，则不重复执行，
-                # 将重算范围限制在最后未提交单元。
+                cached_result = self._load_cached_segmentation(block_id=block_id)
+                if cached_result is not None:
+                    self.logger.info(
+                        "segmentation_epoch 命中已提交单元，命中缓存并跳过重算: stage=%s unit=%s",
+                        stage,
+                        unit_id,
+                    )
+                    return cached_result
+                # Why: 已提交但缓存缺失时若直接返回空边界，会破坏后续 turn 构建与切分质量；
+                # 这里回退为重算并回填缓存，保证恢复行为与首次执行一致。
                 self.logger.info(
-                    "segmentation_epoch 命中已提交单元，跳过重算: stage=%s unit=%s",
+                    "segmentation_epoch 命中已提交单元但缓存缺失，执行重算: stage=%s unit=%s",
                     stage,
                     unit_id,
                 )
-                return SegmentationResult(boundaries=[], frames=[])
 
         payload = {
             "block_id": block_id,
@@ -350,6 +382,7 @@ class SpeakerTimelineService:
 
         self._raise_if_stopped()
         result = self.segmentation_service.run(audio=audio, sample_rate=sample_rate)
+        is_cache_saved = self._save_cached_segmentation(block_id=block_id, result=result)
 
         if self.runtime_checkpoint_service and hasattr(self.runtime_checkpoint_service, "record_unit_committed"):
             self.runtime_checkpoint_service.record_unit_committed(
@@ -358,6 +391,7 @@ class SpeakerTimelineService:
                 payload={
                     "block_id": block_id,
                     "boundary_count": len(result.boundaries),
+                    "cache_saved": is_cache_saved,
                 },
             )
 
@@ -380,6 +414,302 @@ class SpeakerTimelineService:
             raise CancelledException(job_id="timeline", message="segmentation_epoch 已取消")
         if hasattr(service, "is_pause_requested") and service.is_pause_requested():
             raise PausedException(job_id="timeline", message="segmentation_epoch 已暂停")
+
+    def _load_cached_diarization(self, *, block_id: str) -> DiarizationResult | None:
+        cache_path = self._build_cache_file_path(cache_prefix="diarization", block_id=block_id)
+        if cache_path is None:
+            return None
+
+        payload = self._read_json_file(cache_path)
+        if not isinstance(payload, dict):
+            return None
+        return self._deserialize_diarization_result(payload)
+
+    def _save_cached_diarization(self, *, block_id: str, result: DiarizationResult) -> bool:
+        cache_path = self._build_cache_file_path(cache_prefix="diarization", block_id=block_id)
+        if cache_path is None:
+            return False
+        payload = self._serialize_diarization_result(result=result)
+        return self._write_json_file(path=cache_path, payload=payload)
+
+    def _load_cached_segmentation(self, *, block_id: str) -> SegmentationResult | None:
+        cache_path = self._build_cache_file_path(cache_prefix="segmentation", block_id=block_id)
+        if cache_path is None:
+            return None
+        payload = self._read_json_file(cache_path)
+        if not isinstance(payload, dict):
+            return None
+        return self._deserialize_segmentation_result(payload)
+
+    def _save_cached_segmentation(self, *, block_id: str, result: SegmentationResult) -> bool:
+        cache_path = self._build_cache_file_path(cache_prefix="segmentation", block_id=block_id)
+        if cache_path is None:
+            return False
+        payload = self._serialize_segmentation_result(result=result)
+        return self._write_json_file(path=cache_path, payload=payload)
+
+    def _load_cluster_progress(
+        self,
+        *,
+        block_id: str,
+        chunks: list[SpeakerChunkInput],
+    ) -> tuple[list[TimelineChunkAssignment], int]:
+        cache_path = self._build_cache_file_path(cache_prefix="cluster_progress", block_id=block_id)
+        if cache_path is None:
+            return [], 0
+
+        payload = self._read_json_file(cache_path)
+        if not isinstance(payload, dict):
+            return [], 0
+
+        expected_signature = self._build_chunk_signature(chunks=chunks)
+        cached_signature = payload.get("chunk_signature", [])
+        if cached_signature != expected_signature:
+            return [], 0
+
+        cluster_state_payload = payload.get("cluster_state", {})
+        if not isinstance(cluster_state_payload, dict):
+            return [], 0
+        is_cluster_restored = self.cluster_manager.load_from_dict(cluster_state_payload)
+        if not is_cluster_restored:
+            self.cluster_manager.reset()
+            return [], 0
+
+        raw_assignments = payload.get("assignments", [])
+        if not isinstance(raw_assignments, list):
+            self.cluster_manager.reset()
+            return [], 0
+
+        processed_count = max(0, int(payload.get("processed_count", 0)))
+        processed_count = min(processed_count, len(raw_assignments))
+        assignments: list[TimelineChunkAssignment] = []
+        for raw_item in raw_assignments[:processed_count]:
+            parsed = self._deserialize_timeline_assignment(raw_item)
+            if parsed is None:
+                self.cluster_manager.reset()
+                return [], 0
+            assignments.append(parsed)
+
+        if processed_count > 0:
+            self.logger.info(
+                "cluster_progress 命中缓存并恢复: block=%s processed=%s/%s",
+                block_id,
+                processed_count,
+                len(chunks),
+            )
+
+        return assignments, processed_count
+
+    def _save_cluster_progress(
+        self,
+        *,
+        block_id: str,
+        chunks: list[SpeakerChunkInput],
+        assignments: list[TimelineChunkAssignment],
+        processed_count: int,
+    ) -> bool:
+        cache_path = self._build_cache_file_path(cache_prefix="cluster_progress", block_id=block_id)
+        if cache_path is None:
+            return False
+
+        payload = {
+            "version": "3.2.0+dev.20260216.03",
+            "block_id": block_id,
+            "chunk_signature": self._build_chunk_signature(chunks=chunks),
+            "processed_count": int(processed_count),
+            "cluster_state": self.cluster_manager.to_dict(),
+            "assignments": [
+                self._serialize_timeline_assignment(item=item)
+                for item in assignments[:processed_count]
+            ],
+        }
+        return self._write_json_file(path=cache_path, payload=payload)
+
+    @staticmethod
+    def _serialize_diarization_result(*, result: DiarizationResult) -> dict[str, Any]:
+        return {
+            "version": "3.2.0+dev.20260216.03",
+            "segments": [
+                {
+                    "speaker_id": str(item.speaker_id),
+                    "start": float(item.start),
+                    "end": float(item.end),
+                    "confidence": float(item.confidence),
+                    "is_overlap": bool(item.is_overlap),
+                }
+                for item in result.segments
+            ],
+            "speaker_ids": [str(item) for item in result.speaker_ids],
+        }
+
+    @staticmethod
+    def _deserialize_diarization_result(payload: dict[str, Any]) -> DiarizationResult | None:
+        try:
+            raw_segments = payload.get("segments", [])
+            raw_speaker_ids = payload.get("speaker_ids", [])
+            if not isinstance(raw_segments, list) or not isinstance(raw_speaker_ids, list):
+                return None
+
+            segments: list[DiarizationSegment] = []
+            for item in raw_segments:
+                if not isinstance(item, dict):
+                    return None
+                segments.append(
+                    DiarizationSegment(
+                        speaker_id=str(item.get("speaker_id") or "unknown"),
+                        start=float(item.get("start", 0.0)),
+                        end=float(item.get("end", 0.0)),
+                        confidence=float(item.get("confidence", 0.85)),
+                        is_overlap=bool(item.get("is_overlap", False)),
+                    )
+                )
+
+            return DiarizationResult(
+                segments=segments,
+                speaker_ids=[str(item) for item in raw_speaker_ids],
+            )
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _serialize_segmentation_result(*, result: SegmentationResult) -> dict[str, Any]:
+        return {
+            "version": "3.2.0+dev.20260216.03",
+            "boundaries": [float(item) for item in result.boundaries],
+            "frames": [
+                {"time": float(item.time), "score": float(item.score)}
+                for item in result.frames
+            ],
+        }
+
+    @staticmethod
+    def _deserialize_segmentation_result(payload: dict[str, Any]) -> SegmentationResult | None:
+        try:
+            raw_boundaries = payload.get("boundaries", [])
+            raw_frames = payload.get("frames", [])
+            if not isinstance(raw_boundaries, list) or not isinstance(raw_frames, list):
+                return None
+
+            boundaries = [float(item) for item in raw_boundaries]
+            frames: list[SegmentationFrame] = []
+            for item in raw_frames:
+                if not isinstance(item, dict):
+                    return None
+                frames.append(
+                    SegmentationFrame(
+                        time=float(item.get("time", 0.0)),
+                        score=float(item.get("score", 0.0)),
+                    )
+                )
+            return SegmentationResult(boundaries=boundaries, frames=frames)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _serialize_timeline_assignment(item: TimelineChunkAssignment) -> dict[str, Any]:
+        return {
+            "chunk_id": str(item.chunk_id),
+            "start": float(item.start),
+            "end": float(item.end),
+            "speaker_id": str(item.speaker_id),
+            "speaker_status": str(item.speaker_status),
+            "is_overlap": bool(item.is_overlap),
+        }
+
+    @staticmethod
+    def _deserialize_timeline_assignment(payload: object) -> TimelineChunkAssignment | None:
+        if not isinstance(payload, dict):
+            return None
+        try:
+            return TimelineChunkAssignment(
+                chunk_id=str(payload.get("chunk_id") or ""),
+                start=float(payload.get("start", 0.0)),
+                end=float(payload.get("end", 0.0)),
+                speaker_id=str(payload.get("speaker_id") or "unknown"),
+                speaker_status=str(payload.get("speaker_status") or "unknown"),
+                is_overlap=bool(payload.get("is_overlap", False)),
+            )
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _build_chunk_signature(*, chunks: list[SpeakerChunkInput]) -> list[dict[str, Any]]:
+        signature: list[dict[str, Any]] = []
+        for chunk in chunks:
+            embedding = chunk.embedding or []
+            embedding_array = np.asarray(embedding, dtype=np.float32) if embedding else np.array([], dtype=np.float32)
+            signature.append(
+                {
+                    "chunk_id": str(chunk.chunk_id),
+                    "start": round(float(chunk.start), 6),
+                    "end": round(float(chunk.end), 6),
+                    "quality_score": round(float(chunk.quality_score), 6),
+                    "is_overlap": bool(chunk.is_overlap),
+                    "embedding_dim": int(len(embedding)),
+                    "embedding_checksum": round(float(np.sum(embedding_array)), 6),
+                }
+            )
+        return signature
+
+    def _build_cache_file_path(self, *, cache_prefix: str, block_id: str) -> Path | None:
+        cache_dir = self._resolve_timeline_cache_dir()
+        if cache_dir is None:
+            return None
+        safe_block_id = "".join(
+            item if item.isalnum() or item in {"-", "_"} else "_"
+            for item in str(block_id)
+        )
+        if not safe_block_id:
+            safe_block_id = "unknown"
+        return cache_dir / f"{cache_prefix}_{safe_block_id}.json"
+
+    def _resolve_timeline_cache_dir(self) -> Path | None:
+        service = self.runtime_checkpoint_service
+        if service is None:
+            return None
+
+        job_dir = getattr(service, "job_dir", None)
+        if job_dir is None:
+            return None
+
+        cache_dir = Path(job_dir) / "timeline_cache"
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.logger.warning("创建 timeline_cache 目录失败: %s", exc)
+            return None
+        return cache_dir
+
+    def _write_json_file(self, *, path: Path, payload: dict[str, Any]) -> bool:
+        try:
+            temp_path = path.with_suffix(path.suffix + ".tmp")
+            temp_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temp_path.replace(path)
+            return True
+        except OSError as exc:
+            self.logger.warning("写入 timeline 缓存失败: path=%s error=%s", path, exc)
+            return False
+
+    def _read_json_file(self, path: Path) -> dict[str, Any] | None:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            self.logger.warning("读取 timeline 缓存失败: path=%s error=%s", path, exc)
+            return None
+
+        try:
+            payload = json.loads(text)
+            if not isinstance(payload, dict):
+                return None
+            return payload
+        except json.JSONDecodeError as exc:
+            self.logger.warning("解析 timeline 缓存失败: path=%s error=%s", path, exc)
+            return None
 
     @staticmethod
     def _extract_last_unit_commits(snapshot: RuntimeCheckpointSnapshotLike | dict[str, Any]) -> dict[str, str]:

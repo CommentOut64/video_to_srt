@@ -24,6 +24,10 @@ from app.services.sse_service import get_sse_manager
 from app.services.job_queue_service import get_queue_service
 from app.services.media_prep_service import get_media_prep_service
 from app.api.routes.media_routes import _find_video_file
+from app.services.transcription_recovery_utils import (
+    force_finalize_segments_when_finished,
+    force_finalize_snapshot_when_finished,
+)
 
 
 # ========== v3.5 新版 API 模型 ==========
@@ -1520,6 +1524,19 @@ def create_transcription_router(
                         "is_finalized": bool(is_finalized),
                     })
 
+                # finished 态强制收口 snapshot，避免恢复后残留 draft。
+                forced_snapshot_updates = force_finalize_snapshot_when_finished(
+                    job_status=job.status,
+                    sentences_snapshot=sentences_snapshot,
+                )
+                if forced_snapshot_updates > 0:
+                    need_update_checkpoint = True
+                    logger.warning(
+                        "[%s] finished 态修正快照草稿标记: count=%s",
+                        job_id,
+                        forced_snapshot_updates,
+                    )
+
                 # 按 _index 排序（已经是正确顺序，但保险起见）
                 all_segments.sort(key=lambda x: x.get('id', 0))
 
@@ -1529,18 +1546,6 @@ def create_transcription_router(
                 # 进度信息从 transcription 获取
                 processed_count = transcription.get("processed_count", 0)
                 total_chunks = transcription.get("total_chunks", 0)
-
-                # V3.1.2: 如果有旧数据需要迁移，写回 checkpoint
-                if need_update_checkpoint:
-                    try:
-                        # 使用原始文件路径写回：checkpoint 优先，其次快照文件
-                        target_path = checkpoint_path if checkpoint_path.exists() else snapshot_path
-                        dump_obj = data if not using_snapshot else transcription
-                        with open(target_path, 'w', encoding='utf-8') as f:
-                            json.dump(dump_obj, f, ensure_ascii=False, indent=2)
-                        logger.info(f"[{job_id}] 已迁移字幕数据: 添加 display_confidence 字段")
-                    except Exception as e:
-                        logger.warning(f"[{job_id}] 迁移 checkpoint 失败: {e}")
 
             else:
                 # 回退到旧格式（unaligned_results）
@@ -1593,6 +1598,17 @@ def create_transcription_router(
                     is_finalized = not is_draft
                 seg["is_draft"] = is_draft
                 seg["is_finalized"] = bool(is_finalized)
+
+            forced_segments = force_finalize_segments_when_finished(
+                job_status=job.status,
+                segments=all_segments,
+            )
+            if forced_segments > 0:
+                logger.warning(
+                    "[%s] finished 态收口返回段落草稿标记: count=%s",
+                    job_id,
+                    forced_segments,
+                )
 
             # 定稿段合并 speaker 信息；草稿段强制不携带 speaker 标签
             finalized_sentence_indices: List[int] = []
@@ -1653,6 +1669,17 @@ def create_transcription_router(
                     processed_count = len(sentences_snapshot)
                 if not total_chunks:
                     total_chunks = job.total or len(sentences_snapshot)
+
+            # V3.1.2: 统一在返回前回写迁移字段（display_confidence/finished收口等）
+            if need_update_checkpoint:
+                try:
+                    target_path = checkpoint_path if checkpoint_path.exists() else snapshot_path
+                    dump_obj = data if not using_snapshot else transcription
+                    with open(target_path, 'w', encoding='utf-8') as f:
+                        json.dump(dump_obj, f, ensure_ascii=False, indent=2)
+                    logger.info(f"[{job_id}] 已迁移字幕数据并完成 finished 态收口")
+                except Exception as e:
+                    logger.warning(f"[{job_id}] 迁移 checkpoint 失败: {e}")
 
             return {
                 "job_id": job_id,

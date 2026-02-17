@@ -180,6 +180,95 @@ class ClusterManager:
         profiles.sort(key=lambda item: item.speaker_id)
         return profiles
 
+    def to_dict(self) -> dict[str, object]:
+        """导出聚类状态快照（用于断点恢复）。"""
+        states_payload: list[dict[str, object]] = []
+        for state in sorted(self._speaker_states.values(), key=lambda item: item.speaker_id):
+            states_payload.append(
+                {
+                    "speaker_id": state.speaker_id,
+                    "centroid": state.centroid.astype(np.float32).tolist(),
+                    "sample_count": int(state.sample_count),
+                    "support_turns": int(state.support_turns),
+                    "total_duration": float(state.total_duration),
+                    "status": str(state.status),
+                    "merged_into": state.merged_into,
+                }
+            )
+
+        return {
+            "speaker_states": states_payload,
+            "speaker_remap": dict(self._speaker_remap),
+            "speaker_counter": int(self._speaker_counter),
+            "assignment_count": int(self._assignment_count),
+        }
+
+    def load_from_dict(self, payload: dict[str, object]) -> bool:
+        """从聚类状态快照恢复。"""
+        try:
+            if not isinstance(payload, dict):
+                return False
+
+            raw_states = payload.get("speaker_states", [])
+            if not isinstance(raw_states, list):
+                return False
+
+            restored_states: dict[str, _SpeakerState] = {}
+            for raw_state in raw_states:
+                if not isinstance(raw_state, dict):
+                    return False
+
+                speaker_id = str(raw_state.get("speaker_id") or "").strip()
+                if not speaker_id:
+                    return False
+
+                centroid_values = raw_state.get("centroid", [])
+                if not isinstance(centroid_values, list) or not centroid_values:
+                    return False
+
+                centroid = self._normalize(np.asarray(centroid_values, dtype=np.float32))
+                status_value = str(raw_state.get("status") or "candidate")
+                if status_value not in {"candidate", "confirmed", "merged", "unknown"}:
+                    status_value = "candidate"
+
+                restored_states[speaker_id] = _SpeakerState(
+                    speaker_id=speaker_id,
+                    centroid=centroid,
+                    sample_count=max(1, int(raw_state.get("sample_count", 1))),
+                    support_turns=max(1, int(raw_state.get("support_turns", 1))),
+                    total_duration=max(0.0, float(raw_state.get("total_duration", 0.0))),
+                    status=status_value,  # type: ignore[arg-type]
+                    merged_into=(
+                        str(raw_state.get("merged_into"))
+                        if raw_state.get("merged_into") is not None
+                        else None
+                    ),
+                )
+
+            raw_remap = payload.get("speaker_remap", {})
+            if not isinstance(raw_remap, dict):
+                return False
+            restored_remap = {str(key): str(value) for key, value in raw_remap.items()}
+
+            self._speaker_states = restored_states
+            self._speaker_remap = restored_remap
+
+            max_counter = 0
+            for speaker_id in restored_states:
+                if speaker_id.startswith("spk_"):
+                    suffix = speaker_id.replace("spk_", "", 1)
+                    if suffix.isdigit():
+                        max_counter = max(max_counter, int(suffix) + 1)
+
+            payload_counter = int(payload.get("speaker_counter", 0))
+            self._speaker_counter = max(max_counter, payload_counter)
+            self._assignment_count = max(0, int(payload.get("assignment_count", 0)))
+            return True
+        except (TypeError, ValueError) as exc:
+            # Why: 断点恢复使用外部持久化数据，必须显式记录反序列化失败原因。
+            self.logger.warning("ClusterManager 状态恢复失败: %s", exc)
+            return False
+
     def _create_candidate_speaker(self, embedding: np.ndarray, duration: float) -> str:
         speaker_id = f"spk_{self._speaker_counter:03d}"
         self._speaker_counter += 1

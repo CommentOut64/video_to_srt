@@ -26,8 +26,14 @@ from .types import (
     DeferredCut,
     DeferredCutState,
     EvidenceLevel,
+    SoftCutPriorityProfile,
+    SourcePriorityRule,
+    SplitEvidence,
+    SplitEvidenceSource,
     SpeakerChangeEvidence,
     SpeakerChangeTag,
+    default_priority_profiles,
+    resolve_priority_profile,
 )
 
 __all__ = [
@@ -50,10 +56,16 @@ __all__ = [
     "M1InternalSoftCutPlanProvider",
     "SoftCutPlanProvider",
     "EvidenceLevel",
+    "SoftCutPriorityProfile",
+    "SourcePriorityRule",
+    "SplitEvidence",
+    "SplitEvidenceSource",
     "resolve_soft_cut_plan_provider",
     "SoftCutDecisionEngine",
     "SpeakerChangeFact",
     "SpeakerChangeEvidence",
     "SpeakerChangeTag",
     "WindowDecisionContext",
+    "default_priority_profiles",
+    "resolve_priority_profile",
 ]

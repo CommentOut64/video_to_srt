@@ -24,13 +24,18 @@ class SegmentationProcessor:
     _SENTENCE_END_PUNCT = {"。", "！", "？", ".", "!", "?"}
     _CUT_PLAN_SINGLETON_TAIL_MAX_GAP_SEC = 0.65
     _CUT_PLAN_SINGLETON_TAIL_MAX_DURATION_SEC = 0.95
+    _CUT_PLAN_SHORT_TAIL_MAX_WORDS = 2
+    _CUT_PLAN_SHORT_TAIL_MAX_GAP_SEC = 0.45
+    _CUT_PLAN_SHORT_TAIL_MAX_DURATION_SEC = 2.20
+    _CUT_PLAN_SHORT_TAIL_GUARD_REASONS = {
+        "speaker_change",
+        "pause",
+    }
     _CUT_PLAN_SINGLETON_MID_MAX_GAP_SEC = 0.60
     _CUT_PLAN_SINGLETON_MID_MAX_DURATION_SEC = 0.95
     _CUT_PLAN_SINGLETON_MID_GUARD_REASONS = {
         "speaker_change",
-        "high_forced",
-        "deferred_forced",
-        "overflow_forced",
+        "hard_limit_forced",
     }
     _SOFT_CUT_SHORT_TURN_CONTINUATION_SEC = 0.75
     _SOFT_CUT_SHORT_TURN_CONTINUATION_GAP_SEC = 0.80
@@ -136,6 +141,10 @@ class SegmentationProcessor:
         all_sentence_segments, applied_window_ids, output_traces = self._split_by_cut_plan(
             words_for_split=words_for_split,
             cut_plan=cut_plan,
+            fallback_clean_text_ref=str(getattr(data, "fallback_clean_text_ref", "") or ""),
+            fallback_punctuation_positions=list(
+                getattr(data, "fallback_punctuation_positions", []) or []
+            ),
         )
         self._apply_output_traces_to_sentences(
             sentence_segments=all_sentence_segments,
@@ -314,6 +323,8 @@ class SegmentationProcessor:
         *,
         words_for_split: List[WordTimestamp],
         cut_plan: Any,
+        fallback_clean_text_ref: str = "",
+        fallback_punctuation_positions: Optional[Sequence[Any]] = None,
     ) -> Tuple[List[SentenceSegment], List[str], List[OutputTrace]]:
         """
         按 CutPlan 执行词流切分。
@@ -324,7 +335,11 @@ class SegmentationProcessor:
         """
         decisions = list(getattr(cut_plan, "decisions", []) or [])
         if len(words_for_split) <= 1 or not decisions:
-            sentence_segments = self._final_splitter.split(words_for_split)
+            sentence_segments = self._final_splitter.split(
+                words_for_split,
+                clean_text=fallback_clean_text_ref or None,
+                punctuation_positions=list(fallback_punctuation_positions or []),
+            )
             output_traces = self._build_default_output_traces(sentence_segments)
             return sentence_segments, [], output_traces
 
@@ -340,7 +355,11 @@ class SegmentationProcessor:
             decision_by_window=decision_by_window,
         )
         if not split_points:
-            sentence_segments = self._final_splitter.split(words_for_split)
+            sentence_segments = self._final_splitter.split(
+                words_for_split,
+                clean_text=fallback_clean_text_ref or None,
+                punctuation_positions=list(fallback_punctuation_positions or []),
+            )
             output_traces = self._build_default_output_traces(sentence_segments)
             return sentence_segments, [], output_traces
 
@@ -452,38 +471,61 @@ class SegmentationProcessor:
             if next_split is None
             else (next_split - split_idx)
         )
-        if singleton_word_count != 1:
+        if singleton_word_count <= 0:
             return False
 
         left_word = words_for_split[split_idx]
-        singleton_word = words_for_split[split_idx + 1]
         left_end = float(getattr(left_word, "end", 0.0) or 0.0)
-        right_start = float(getattr(singleton_word, "start", left_end) or left_end)
+        first_tail_word = words_for_split[split_idx + 1]
+        right_start = float(getattr(first_tail_word, "start", left_end) or left_end)
         gap_sec = max(0.0, right_start - left_end)
-        singleton_start = float(getattr(singleton_word, "start", right_start) or right_start)
-        singleton_end = float(getattr(singleton_word, "end", singleton_start) or singleton_start)
-        singleton_duration = max(0.0, singleton_end - singleton_start)
 
         prev_tail = str(getattr(left_word, "word", "") or "").strip()
         if prev_tail.endswith(tuple(self._SENTENCE_END_PUNCT)):
             return False
 
-        singleton_token = str(getattr(singleton_word, "word", "") or "").strip()
-        if not self._is_lowercase_continuation_token(singleton_token):
-            return False
+        if singleton_word_count == 1:
+            singleton_start = float(getattr(first_tail_word, "start", right_start) or right_start)
+            singleton_end = float(getattr(first_tail_word, "end", singleton_start) or singleton_start)
+            singleton_duration = max(0.0, singleton_end - singleton_start)
+            singleton_token = str(getattr(first_tail_word, "word", "") or "").strip()
+            if not self._is_lowercase_continuation_token(singleton_token):
+                return False
 
-        if next_split is None:
+            if next_split is None:
+                return (
+                    gap_sec <= self._CUT_PLAN_SINGLETON_TAIL_MAX_GAP_SEC
+                    and singleton_duration <= self._CUT_PLAN_SINGLETON_TAIL_MAX_DURATION_SEC
+                )
+
+            reason = str(getattr(decision, "reason", "") or "")
+            if reason not in self._CUT_PLAN_SINGLETON_MID_GUARD_REASONS:
+                return False
             return (
-                gap_sec <= self._CUT_PLAN_SINGLETON_TAIL_MAX_GAP_SEC
-                and singleton_duration <= self._CUT_PLAN_SINGLETON_TAIL_MAX_DURATION_SEC
+                gap_sec <= self._CUT_PLAN_SINGLETON_MID_MAX_GAP_SEC
+                and singleton_duration <= self._CUT_PLAN_SINGLETON_MID_MAX_DURATION_SEC
             )
 
-        reason = str(getattr(decision, "reason", "") or "")
-        if reason not in self._CUT_PLAN_SINGLETON_MID_GUARD_REASONS:
+        # Why: 末尾仅剩 acronym+noun（如 `DDLC character?`）时，pause/speaker 触发切分常是不自然误切。
+        if next_split is not None:
             return False
+        if singleton_word_count > self._CUT_PLAN_SHORT_TAIL_MAX_WORDS:
+            return False
+        reason = str(getattr(decision, "reason", "") or "")
+        if reason not in self._CUT_PLAN_SHORT_TAIL_GUARD_REASONS:
+            return False
+        tail_words = list(words_for_split[split_idx + 1 :])
+        if len(tail_words) != singleton_word_count:
+            return False
+        head_tail_token = str(getattr(tail_words[0], "word", "") or "").strip()
+        if not self._is_uppercase_acronym_token(head_tail_token):
+            return False
+        tail_start = float(getattr(tail_words[0], "start", right_start) or right_start)
+        tail_end = float(getattr(tail_words[-1], "end", tail_start) or tail_start)
+        tail_duration = max(0.0, tail_end - tail_start)
         return (
-            gap_sec <= self._CUT_PLAN_SINGLETON_MID_MAX_GAP_SEC
-            and singleton_duration <= self._CUT_PLAN_SINGLETON_MID_MAX_DURATION_SEC
+            gap_sec <= self._CUT_PLAN_SHORT_TAIL_MAX_GAP_SEC
+            and tail_duration <= self._CUT_PLAN_SHORT_TAIL_MAX_DURATION_SEC
         )
 
     def _resolve_cut_plan_split_points(
@@ -813,6 +855,16 @@ class SegmentationProcessor:
                 return ch.islower()
         return False
 
+    @staticmethod
+    def _is_uppercase_acronym_token(token: str) -> bool:
+        text = str(token or "").strip().lstrip("\"'“”‘’([{")
+        if not text:
+            return False
+        letters = [ch for ch in text if ch.isalpha()]
+        if len(letters) < 2:
+            return False
+        return all(ch.isupper() for ch in letters)
+
     def _build_soft_cut_stats(
         self,
         *,
@@ -836,6 +888,7 @@ class SegmentationProcessor:
                 "unapplied_window_ids": [],
                 "reason_stats": {},
                 "risk_stats": {},
+                "source_stats": {},
             }
 
         decisions = list(getattr(cut_plan, "decisions", []) or [])
@@ -863,6 +916,13 @@ class SegmentationProcessor:
                 if str(getattr(item, "risk", "") or "")
             )
         )
+        source_stats = dict(
+            Counter(
+                str(getattr(item, "source", "") or "")
+                for item in decisions
+                if str(getattr(item, "source", "") or "")
+            )
+        )
         deferred_state_stats = {
             "pending": 0,
             "resolved": 0,
@@ -884,6 +944,7 @@ class SegmentationProcessor:
             "unapplied_window_ids": unapplied_window_ids,
             "reason_stats": reason_stats,
             "risk_stats": risk_stats,
+            "source_stats": source_stats,
         }
 
     def _consume_pending_prefix_words(self, stream_id: str) -> List[WordTimestamp]:

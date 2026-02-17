@@ -233,6 +233,7 @@ class VADRuntimeParams(_RuntimeBase):
 
 
 class TimelineRuntimeParams(_RuntimeBase):
+    is_enabled: Optional[bool] = Field(default=None, alias="enabled")
     device: Optional[str] = Field(default=None)
     is_diarization_enabled: Optional[bool] = Field(default=None, alias="diarization_enabled")
     diarization_model_id: Optional[str] = Field(default=None)
@@ -422,6 +423,62 @@ class ArbitrationRuntimeParams(_RuntimeBase):
         return value_lower
 
 
+class SegmentationRuntimeParams(_RuntimeBase):
+    is_enable: Optional[bool] = Field(default=None, alias="enable")
+    min_chars: Optional[int] = Field(default=None, ge=1)
+    min_duration_sec: Optional[float] = Field(default=None, ge=0.0)
+    max_duration_sec: Optional[float] = Field(default=None, ge=0.0)
+    max_tokens: Optional[int] = Field(default=None, ge=1)
+    long_pause_sec: Optional[float] = Field(default=None, ge=0.0)
+    soft_pause_sec: Optional[float] = Field(default=None, ge=0.0)
+    short_merge_max_chars: Optional[int] = Field(default=None, ge=1)
+    is_keep_sentence_end_punct: Optional[bool] = Field(default=None, alias="keep_sentence_end_punct")
+    is_enable_soft_cut: Optional[bool] = Field(default=None, alias="soft_cut.enable")
+    is_enable_soft_cut_overlap_degrade: Optional[bool] = Field(
+        default=None,
+        alias="soft_cut.overlap_degrade_enable",
+    )
+    soft_cut_plan_provider: Optional[str] = Field(default=None, alias="soft_cut.plan_provider")
+    soft_cut_plan_provider_class: Optional[str] = Field(default=None, alias="soft_cut.plan_provider_class")
+    soft_cut_priority_active_profile: Optional[str] = Field(
+        default=None,
+        alias="soft_cut.priority.active_profile",
+    )
+    soft_cut_priority_profiles: Optional[Dict[str, Any]] = Field(
+        default=None,
+        alias="soft_cut.priority.profiles",
+    )
+
+    @model_validator(mode="after")
+    def _validate_duration_limits(self):
+        if (
+            self.max_duration_sec is not None
+            and self.min_duration_sec is not None
+            and self.max_duration_sec < self.min_duration_sec
+        ):
+            raise ValueError("max_duration_sec 必须 >= min_duration_sec")
+        return self
+
+    @field_validator("soft_cut_priority_active_profile")
+    @classmethod
+    def _validate_soft_cut_priority_active_profile(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("soft_cut.priority.active_profile 不能为空字符串")
+        return normalized
+
+    @field_validator("soft_cut_priority_profiles")
+    @classmethod
+    def _validate_soft_cut_priority_profiles(cls, value: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if value is None:
+            return value
+        if not isinstance(value, dict):
+            raise ValueError("soft_cut.priority.profiles 必须为对象")
+        return value
+
+
 class RuntimeGroupUpdateRequest(_RuntimeBase):
     whisper: Optional[WhisperRuntimeParams] = None
     whisper_sanitize: Optional[WhisperSanitizeRuntimeParams] = None
@@ -435,6 +492,7 @@ class RuntimeGroupUpdateRequest(_RuntimeBase):
     pipeline: Optional[PipelineRuntimeParams] = None
     normalization: Optional[NormalizationRuntimeParams] = None
     arbitration: Optional[ArbitrationRuntimeParams] = None
+    segmentation: Optional[SegmentationRuntimeParams] = None
 
 
 _RUNTIME_GROUP_MODELS = {
@@ -450,6 +508,7 @@ _RUNTIME_GROUP_MODELS = {
     "pipeline": PipelineRuntimeParams,
     "normalization": NormalizationRuntimeParams,
     "arbitration": ArbitrationRuntimeParams,
+    "segmentation": SegmentationRuntimeParams,
 }
 
 
@@ -537,6 +596,7 @@ _PARAM_SCHEMA: Dict[str, Any] = {
             "bgm_heavy_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.15},
         },
         "timeline": {
+            "enabled": {"type": "bool", "default": True},
             "device": {"type": "enum", "enum": ["auto", "cuda", "cpu"], "default": "cuda"},
             "diarization_enabled": {"type": "bool", "default": False},
             "diarization_model_id": {"type": "string", "default": "pyannote-speaker-diarization-community-1"},
@@ -634,6 +694,27 @@ _PARAM_SCHEMA: Dict[str, Any] = {
             "max_length_ratio": {"type": "float", "min": 0.0, "default": 3.0},
             "low_confidence_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.5},
             "hallucination_block": {"type": "bool", "default": True},
+        },
+        "segmentation": {
+            "enable": {"type": "bool", "default": True},
+            "min_chars": {"type": "int", "min": 1, "default": 6},
+            "min_duration_sec": {"type": "float", "min": 0.0, "default": 0.8},
+            "max_duration_sec": {"type": "float", "min": 0.0, "default": 12.0},
+            "max_tokens": {"type": "int", "min": 1, "default": 40},
+            "long_pause_sec": {"type": "float", "min": 0.0, "default": 0.8},
+            "soft_pause_sec": {"type": "float", "min": 0.0, "default": 0.4},
+            "short_merge_max_chars": {"type": "int", "min": 1, "default": 22},
+            "keep_sentence_end_punct": {"type": "bool", "default": False},
+            "soft_cut.enable": {"type": "bool", "default": True},
+            "soft_cut.overlap_degrade_enable": {"type": "bool", "default": False},
+            "soft_cut.plan_provider": {"type": "string", "default": "m1_internal"},
+            "soft_cut.plan_provider_class": {"type": "string", "default": ""},
+            "soft_cut.priority.active_profile": {
+                "type": "enum",
+                "enum": ["punct_boost_transition", "llm_ramp_up", "llm_primary_no_punct"],
+                "default": "punct_boost_transition",
+            },
+            "soft_cut.priority.profiles": {"type": "object", "default": {}},
         },
         "normalization": {
             "itn.enable": {"type": "bool", "default": True},
