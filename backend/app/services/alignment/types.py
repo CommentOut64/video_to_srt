@@ -284,6 +284,8 @@ class L6Input:
     cut_plan: Optional["CutPlan"] = None
     aligned_facts: Optional[AlignedFacts] = None
     fused_evidence: Optional[FusedEvidence] = None
+    fallback_clean_text_ref: str = ""
+    fallback_punctuation_positions: List[PuncPosition] = field(default_factory=list)
 
 
 @dataclass
