@@ -18,6 +18,7 @@ from .types import (
     DeferredCut,
     DeferredCutState,
     EvidenceLevel,
+    SplitEvidenceSource,
 )
 
 
@@ -34,14 +35,27 @@ class WindowDecisionContext:
 class DecisionEngineConfig:
     """决策引擎参数。"""
 
-    mid_high_quality_threshold: float = 0.60
-    mid_medium_quality_threshold: float = 0.40
-    length_pressure_soft: int = 15
-    length_pressure_hard: int = 25
+    cut_threshold_base: float = 0.62
+    cut_threshold_relax_start_words: int = 12
+    cut_threshold_relax_span_words: int = 18
+    cut_threshold_relax_max: float = 0.10
+    score_bonus_high_level: float = 0.08
+    score_bonus_mid_level: float = 0.03
+    score_bonus_punctuation_source: float = 0.12
+    score_bonus_pause_source: float = 0.04
+    score_bonus_speaker_source: float = 0.02
+    score_bonus_semantic_source: float = 0.02
+    score_bonus_llm_source: float = 0.10
+    score_bonus_punctuation_presence: float = 0.08
     deferred_max_wait_sec: float = 2.5
-    deferred_max_words: int = 18
+    deferred_max_wait_cap_sec: float = 4.2
+    deferred_dynamic_relax_min_words: int = 14
+    deferred_dynamic_relax_long_sentence_sec: float = 0.6
+    deferred_dynamic_relax_punctuation_sec: float = 0.5
     deferred_force_min_word_boundary_gap: float = 0.08
-    max_deferred_windows: int = 3
+    hard_limit_trigger_score_weight: float = 0.20
+    speaker_left_anchor_prefer_max_gap_sec: float = 0.30
+    speaker_right_anchor_tolerance_sec: float = 0.06
 
 
 class SoftCutDecisionEngine:
@@ -76,35 +90,37 @@ class SoftCutDecisionEngine:
         report = {
             "window_count": int(len(ordered_windows)),
             "decision_count": 0,
-            "high_forced_count": 0,
-            "mid_immediate_count": 0,
-            "mid_deferred_count": 0,
+            "immediate_cut_count": 0,
+            "deferred_queued_count": 0,
             "low_queued_count": 0,
-            "length_pressure_cut_count": 0,
-            "deferred_forced_count": 0,
-            "overflow_forced_count": 0,
+            "hard_limit_forced_count": 0,
             "deferred_pending_count": 0,
         }
 
         pending_deferred = self._resolve_existing_deferred(
             previous_deferred=existing_deferred,
-            contexts=contexts,
-            decision_time=decision_time,
-            decisions=decisions,
-            report=report,
             deferred_records=deferred_records,
         )
+        candidate_map: dict[
+            str,
+            tuple[CutWindow, Optional[AnchorScore], Optional[AnchorScore], WindowDecisionContext],
+        ] = {}
 
         for window in ordered_windows:
             context = contexts.get(window.window_id, WindowDecisionContext())
-            best_anchor = window.candidate_anchors[0] if window.candidate_anchors else None
+            scored_anchor = window.candidate_anchors[0] if window.candidate_anchors else None
+            selected_anchor = self._select_cut_anchor(
+                window=window,
+                scored_anchor=scored_anchor,
+            )
+            candidate_map[str(window.window_id)] = (window, scored_anchor, selected_anchor, context)
 
             if window.trigger_level == EvidenceLevel.HIGH:
-                self._handle_high_window(
+                self._handle_scored_window(
                     window=window,
-                    best_anchor=best_anchor,
+                    scored_anchor=scored_anchor,
+                    selected_anchor=selected_anchor,
                     context=context,
-                    decision_time=decision_time,
                     decisions=decisions,
                     pending_deferred=pending_deferred,
                     deferred_records=deferred_records,
@@ -113,9 +129,10 @@ class SoftCutDecisionEngine:
                 continue
 
             if window.trigger_level == EvidenceLevel.MID:
-                self._handle_mid_window(
+                self._handle_scored_window(
                     window=window,
-                    best_anchor=best_anchor,
+                    scored_anchor=scored_anchor,
+                    selected_anchor=selected_anchor,
                     context=context,
                     decisions=decisions,
                     pending_deferred=pending_deferred,
@@ -127,10 +144,12 @@ class SoftCutDecisionEngine:
             # LOW: 进入 evidence_queue（当前通过 pending deferred 建模）。
             pending_deferred.append(self._create_deferred(window, context=context))
             deferred_records.append(pending_deferred[-1])
+            report["deferred_queued_count"] += 1
             report["low_queued_count"] += 1
 
-        self._enforce_deferred_capacity(
+        self._apply_hard_limit_force(
             pending_deferred=pending_deferred,
+            candidate_map=candidate_map,
             contexts=contexts,
             decisions=decisions,
             report=report,
@@ -155,10 +174,6 @@ class SoftCutDecisionEngine:
         self,
         *,
         previous_deferred: Sequence[DeferredCut],
-        contexts: dict[str, WindowDecisionContext],
-        decision_time: float,
-        decisions: list[CutDecision],
-        report: dict[str, int],
         deferred_records: list[DeferredCut],
     ) -> list[DeferredCut]:
         pending: list[DeferredCut] = []
@@ -166,153 +181,221 @@ class SoftCutDecisionEngine:
             if deferred.state != DeferredCutState.PENDING:
                 deferred_records.append(deferred)
                 continue
-
-            context = contexts.get(deferred.window_id, WindowDecisionContext())
-            depends_on_fast_draft = bool(
-                context.depends_on_fast_draft or getattr(deferred, "depends_on_fast_draft", False)
-            )
-            is_timed_out = decision_time >= deferred.expected_resolve_by
-            is_word_overflow = context.waiting_word_count >= self.config.deferred_max_words
-            if is_timed_out or is_word_overflow:
-                time_range = self._resolve_deferred_time_range(deferred)
-                forced_decision = self._build_forced_decision(
-                    window_id=deferred.window_id,
-                    time_range=time_range,
-                    decision_time=decision_time,
-                    reason="deferred_forced",
-                    risk="deferred",
-                    depends_on_fast_draft=depends_on_fast_draft,
-                )
-                deferred.state = DeferredCutState.FORCED
-                deferred.resolution_decision = forced_decision
-                decisions.append(forced_decision)
-                report["deferred_forced_count"] += 1
-            else:
-                pending.append(deferred)
+            pending.append(deferred)
             deferred_records.append(deferred)
         return pending
 
-    def _handle_high_window(
+    def _handle_scored_window(
         self,
         *,
         window: CutWindow,
-        best_anchor: Optional[AnchorScore],
+        scored_anchor: Optional[AnchorScore],
+        selected_anchor: Optional[AnchorScore],
         context: WindowDecisionContext,
-        decision_time: float,
         decisions: list[CutDecision],
         pending_deferred: list[DeferredCut],
         deferred_records: list[DeferredCut],
         report: dict[str, int],
     ) -> None:
-        if best_anchor is not None:
+        if scored_anchor is None:
+            pending = self._create_deferred(window, context=context)
+            pending_deferred.append(pending)
+            deferred_records.append(pending)
+            report["deferred_queued_count"] += 1
+            return
+
+        if self._should_cut_window(
+            window=window,
+            anchor=scored_anchor,
+            context=context,
+        ):
+            cut_anchor = selected_anchor or scored_anchor
             decisions.append(
                 self._build_anchor_decision(
                     window=window,
-                    anchor=best_anchor,
-                    reason=self._resolve_anchor_reason(best_anchor),
+                    anchor=cut_anchor,
+                    reason=self._resolve_anchor_reason(cut_anchor),
                     risk=None,
                     depends_on_fast_draft=context.depends_on_fast_draft,
                 )
             )
             window.state = CutWindowState.RESOLVED
-            return
-
-        expected_resolve_by = window.trigger_time + self.config.deferred_max_wait_sec
-        if decision_time >= expected_resolve_by:
-            decisions.append(
-                self._build_forced_decision(
-                    window_id=window.window_id,
-                    time_range=(window.start_time, window.end_time),
-                    decision_time=decision_time,
-                    reason="high_forced",
-                    risk="deferred",
-                    depends_on_fast_draft=context.depends_on_fast_draft,
-                )
-            )
-            window.state = CutWindowState.FORCED
-            report["high_forced_count"] += 1
+            report["immediate_cut_count"] += 1
             return
 
         pending = self._create_deferred(window, context=context)
         pending_deferred.append(pending)
         deferred_records.append(pending)
+        report["deferred_queued_count"] += 1
 
-    def _handle_mid_window(
-        self,
-        *,
-        window: CutWindow,
-        best_anchor: Optional[AnchorScore],
-        context: WindowDecisionContext,
-        decisions: list[CutDecision],
-        pending_deferred: list[DeferredCut],
-        deferred_records: list[DeferredCut],
-        report: dict[str, int],
-    ) -> None:
-        action = self._decide_mid_action(
-            anchor_score=best_anchor.final_score if best_anchor is not None else 0.0,
-            current_sentence_word_count=context.current_sentence_word_count,
-        )
-        if action == "defer":
-            pending = self._create_deferred(window, context=context)
-            pending_deferred.append(pending)
-            deferred_records.append(pending)
-            report["mid_deferred_count"] += 1
-            return
-
-        if best_anchor is None:
-            pending = self._create_deferred(window, context=context)
-            pending_deferred.append(pending)
-            deferred_records.append(pending)
-            report["mid_deferred_count"] += 1
-            return
-
-        reason = "length_pressure" if action == "length_pressure_cut" else self._resolve_anchor_reason(best_anchor)
-        decisions.append(
-            self._build_anchor_decision(
-                window=window,
-                anchor=best_anchor,
-                reason=reason,
-                risk=None,
-                depends_on_fast_draft=context.depends_on_fast_draft,
-            )
-        )
-        window.state = CutWindowState.RESOLVED
-        report["mid_immediate_count"] += 1
-        if reason == "length_pressure":
-            report["length_pressure_cut_count"] += 1
-
-    def _enforce_deferred_capacity(
+    def _apply_hard_limit_force(
         self,
         *,
         pending_deferred: list[DeferredCut],
+        candidate_map: dict[
+            str,
+            tuple[CutWindow, Optional[AnchorScore], Optional[AnchorScore], WindowDecisionContext],
+        ],
         contexts: dict[str, WindowDecisionContext],
         decisions: list[CutDecision],
         report: dict[str, int],
         decision_time: float,
     ) -> None:
-        if self.config.max_deferred_windows <= 0:
+        if not pending_deferred:
+            return
+        # Why: 同轮已有稳定切点时，不再叠加硬上限强切，避免“一段文本被多刀”。
+        if decisions:
+            return
+        timeout_indices = [
+            index
+            for index, item in enumerate(pending_deferred)
+            if decision_time >= float(getattr(item, "expected_resolve_by", item.created_at))
+        ]
+        if not timeout_indices:
             return
 
-        pending_deferred.sort(key=lambda item: (item.created_at, item.window_id))
-        while len(pending_deferred) > self.config.max_deferred_windows:
-            oldest = pending_deferred.pop(0)
-            context = contexts.get(oldest.window_id, WindowDecisionContext())
-            depends_on_fast_draft = bool(
-                context.depends_on_fast_draft or getattr(oldest, "depends_on_fast_draft", False)
-            )
-            forced_decision = self._build_forced_decision(
-                window_id=oldest.window_id,
-                time_range=self._resolve_deferred_time_range(oldest),
-                decision_time=decision_time,
-                reason="deferred_forced",
-                risk="overflow_forced",
+        force_index = self._select_hard_limit_target_index(
+            pending_deferred=pending_deferred,
+            candidate_map=candidate_map,
+            candidate_indices=timeout_indices,
+        )
+        target = pending_deferred.pop(force_index)
+        context = contexts.get(target.window_id, WindowDecisionContext())
+        depends_on_fast_draft = bool(
+            context.depends_on_fast_draft or getattr(target, "depends_on_fast_draft", False)
+        )
+        candidate = candidate_map.get(str(target.window_id))
+        forced_decision: CutDecision
+        if candidate is not None and candidate[2] is not None:
+            window, _, anchor, _ = candidate
+            forced_decision = self._build_anchor_decision(
+                window=window,
+                anchor=anchor,
+                reason="hard_limit_forced",
+                risk="hard_limit",
                 depends_on_fast_draft=depends_on_fast_draft,
             )
-            oldest.state = DeferredCutState.FORCED
-            oldest.resolution_decision = forced_decision
-            decisions.append(forced_decision)
-            report["deferred_forced_count"] += 1
-            report["overflow_forced_count"] += 1
+        else:
+            forced_decision = self._build_forced_decision(
+                window_id=target.window_id,
+                time_range=self._resolve_deferred_time_range(target),
+                decision_time=decision_time,
+                reason="hard_limit_forced",
+                risk="hard_limit",
+                depends_on_fast_draft=depends_on_fast_draft,
+            )
+        target.state = DeferredCutState.FORCED
+        target.resolution_decision = forced_decision
+        decisions.append(forced_decision)
+        report["hard_limit_forced_count"] += 1
+
+    def _select_hard_limit_target_index(
+        self,
+        *,
+        pending_deferred: Sequence[DeferredCut],
+        candidate_map: dict[
+            str,
+            tuple[CutWindow, Optional[AnchorScore], Optional[AnchorScore], WindowDecisionContext],
+        ],
+        candidate_indices: Sequence[int],
+    ) -> int:
+        candidate_index: Optional[int] = None
+        candidate_key: Optional[tuple[float, float]] = None
+        for index in candidate_indices:
+            if index < 0 or index >= len(pending_deferred):
+                continue
+            item = pending_deferred[index]
+            candidate = candidate_map.get(str(item.window_id))
+            if candidate is None or candidate[1] is None:
+                score_key = (-1.0, float(item.created_at))
+            else:
+                window, anchor, _, _ = candidate
+                score_key = (
+                    self._resolve_hard_limit_priority(window=window, anchor=anchor),
+                    float(item.created_at),
+                )
+            if candidate_key is None or score_key > candidate_key:
+                candidate_key = score_key
+                candidate_index = index
+
+        if candidate_index is None:
+            return 0
+        return int(candidate_index)
+
+    def _resolve_hard_limit_priority(
+        self,
+        *,
+        window: CutWindow,
+        anchor: AnchorScore,
+    ) -> float:
+        base_score = self._score_window(window=window, anchor=anchor)
+        trigger_score = max(0.0, float(getattr(window, "trigger_score", 0.0)))
+        return base_score + (trigger_score * float(self.config.hard_limit_trigger_score_weight))
+
+    def _select_cut_anchor(
+        self,
+        *,
+        window: CutWindow,
+        scored_anchor: Optional[AnchorScore],
+    ) -> Optional[AnchorScore]:
+        if scored_anchor is None:
+            return None
+        trigger_source = getattr(window, "trigger_source", SplitEvidenceSource.SPEAKER)
+        trigger_source_text = str(getattr(trigger_source, "value", trigger_source))
+        if trigger_source_text != SplitEvidenceSource.SPEAKER.value:
+            return scored_anchor
+        return self._select_speaker_anchor(window=window, default_anchor=scored_anchor)
+
+    def _select_speaker_anchor(
+        self,
+        *,
+        window: CutWindow,
+        default_anchor: AnchorScore,
+    ) -> AnchorScore:
+        candidates = list(window.candidate_anchors or [])
+        if not candidates:
+            return default_anchor
+
+        trigger_time = float(window.trigger_time)
+        epsilon = 1e-6
+        left_candidates = [
+            item for item in candidates if float(item.anchor_time) <= trigger_time + epsilon
+        ]
+        if left_candidates:
+            prefer_gap_sec = max(0.0, float(self.config.speaker_left_anchor_prefer_max_gap_sec))
+            near_left_candidates = [
+                item
+                for item in left_candidates
+                if (trigger_time - float(item.anchor_time)) <= prefer_gap_sec
+            ]
+            target_pool = near_left_candidates or left_candidates
+            return min(
+                target_pool,
+                key=lambda item: (
+                    trigger_time - float(item.anchor_time),
+                    -float(item.final_score),
+                    -float(item.anchor_time),
+                ),
+            )
+
+        right_tolerance_sec = max(0.0, float(self.config.speaker_right_anchor_tolerance_sec))
+        if right_tolerance_sec > 0.0:
+            right_candidates = [
+                item
+                for item in candidates
+                if 0.0 < (float(item.anchor_time) - trigger_time) <= (right_tolerance_sec + epsilon)
+            ]
+            if right_candidates:
+                return min(
+                    right_candidates,
+                    key=lambda item: (
+                        float(item.anchor_time) - trigger_time,
+                        -float(item.final_score),
+                        float(item.anchor_time),
+                    ),
+                )
+
+        return default_anchor
 
     def _build_anchor_decision(
         self,
@@ -332,6 +415,7 @@ class SoftCutDecisionEngine:
             anchor_score=float(anchor.final_score),
             depends_on_fast_draft=depends_on_fast_draft,
             time_range=(float(window.start_time), float(window.end_time)),
+            source=str(getattr(anchor.evidence_source, "value", "") or ""),
         )
 
     def _build_forced_decision(
@@ -358,6 +442,7 @@ class SoftCutDecisionEngine:
             anchor_score=0.0,
             depends_on_fast_draft=depends_on_fast_draft,
             time_range=(float(start), float(end)),
+            source=SplitEvidenceSource.FORCE.value,
         )
 
     def _create_deferred(
@@ -367,17 +452,42 @@ class SoftCutDecisionEngine:
         context: Optional[WindowDecisionContext] = None,
     ) -> DeferredCut:
         active_context = context or WindowDecisionContext()
+        max_wait_sec = self._resolve_deferred_max_wait_sec(
+            window=window,
+            context=active_context,
+        )
         return DeferredCut(
             deferred_id=f"{window.window_id}-deferred",
             window_id=window.window_id,
             created_at=float(window.trigger_time),
-            expected_resolve_by=float(window.trigger_time + self.config.deferred_max_wait_sec),
+            expected_resolve_by=float(window.trigger_time + max_wait_sec),
             state=DeferredCutState.PENDING,
             window_start=float(window.start_time),
             window_end=float(window.end_time),
             trigger_level=str(getattr(window.trigger_level, "value", window.trigger_level)),
             depends_on_fast_draft=bool(active_context.depends_on_fast_draft),
         )
+
+    def _resolve_deferred_max_wait_sec(
+        self,
+        *,
+        window: CutWindow,
+        context: WindowDecisionContext,
+    ) -> float:
+        wait_sec = max(0.1, float(self.config.deferred_max_wait_sec))
+        long_sentence_words = max(0, int(self.config.deferred_dynamic_relax_min_words))
+        if int(context.current_sentence_word_count) >= long_sentence_words:
+            wait_sec += max(0.0, float(self.config.deferred_dynamic_relax_long_sentence_sec))
+            has_punctuation_anchor = any(
+                item.evidence_source == SplitEvidenceSource.PUNCTUATION
+                or item.anchor_type == AnchorType.PUNCTUATION_ANCHOR
+                for item in list(window.candidate_anchors or [])
+            )
+            if has_punctuation_anchor:
+                wait_sec += max(0.0, float(self.config.deferred_dynamic_relax_punctuation_sec))
+
+        wait_cap = max(0.1, float(self.config.deferred_max_wait_cap_sec))
+        return min(wait_sec, wait_cap)
 
     @staticmethod
     def _resolve_deferred_time_range(deferred: DeferredCut) -> tuple[float, float]:
@@ -395,21 +505,84 @@ class SoftCutDecisionEngine:
             end = max(float(deferred.expected_resolve_by), start + 1e-3)
         return start, end
 
-    def _decide_mid_action(self, *, anchor_score: float, current_sentence_word_count: int) -> str:
-        if anchor_score >= self.config.mid_high_quality_threshold:
-            return "cut"
-        if anchor_score >= self.config.mid_medium_quality_threshold:
-            if current_sentence_word_count > self.config.length_pressure_soft:
-                return "cut"
-            return "defer"
-        if current_sentence_word_count > self.config.length_pressure_hard:
-            return "length_pressure_cut"
-        return "defer"
+    def _resolve_cut_threshold(self, *, current_sentence_word_count: int) -> float:
+        start_words = max(0, int(self.config.cut_threshold_relax_start_words))
+        span_words = max(1, int(self.config.cut_threshold_relax_span_words))
+        relax_max = max(0.0, float(self.config.cut_threshold_relax_max))
+        overflow_words = max(0, int(current_sentence_word_count) - start_words)
+        relax_ratio = min(1.0, float(overflow_words) / float(span_words))
+        return float(self.config.cut_threshold_base) - (relax_ratio * relax_max)
+
+    def _should_cut_window(
+        self,
+        *,
+        window: CutWindow,
+        anchor: AnchorScore,
+        context: WindowDecisionContext,
+    ) -> bool:
+        score = self._score_window(window=window, anchor=anchor)
+        threshold = self._resolve_cut_threshold(
+            current_sentence_word_count=context.current_sentence_word_count,
+        )
+        return score >= threshold
+
+    def _score_window(
+        self,
+        *,
+        window: CutWindow,
+        anchor: AnchorScore,
+    ) -> float:
+        score = float(anchor.final_score)
+        score += self._resolve_level_bonus(window.trigger_level)
+        score += self._resolve_source_bonus(anchor)
+        has_punctuation_anchor = any(
+            item.evidence_source == SplitEvidenceSource.PUNCTUATION
+            for item in list(window.candidate_anchors or [])
+        )
+        if has_punctuation_anchor:
+            score += max(0.0, float(self.config.score_bonus_punctuation_presence))
+        return max(0.0, score)
+
+    def _resolve_level_bonus(self, level: EvidenceLevel) -> float:
+        if level == EvidenceLevel.HIGH:
+            return max(0.0, float(self.config.score_bonus_high_level))
+        if level == EvidenceLevel.MID:
+            return max(0.0, float(self.config.score_bonus_mid_level))
+        return 0.0
+
+    def _resolve_source_bonus(self, anchor: AnchorScore) -> float:
+        source = getattr(anchor, "evidence_source", None)
+        if source == SplitEvidenceSource.PUNCTUATION:
+            return max(0.0, float(self.config.score_bonus_punctuation_source))
+        if source == SplitEvidenceSource.PAUSE:
+            return max(0.0, float(self.config.score_bonus_pause_source))
+        if source == SplitEvidenceSource.SEMANTIC:
+            return max(0.0, float(self.config.score_bonus_semantic_source))
+        if source == SplitEvidenceSource.LLM:
+            return max(0.0, float(self.config.score_bonus_llm_source))
+        if source == SplitEvidenceSource.SPEAKER:
+            return max(0.0, float(self.config.score_bonus_speaker_source))
+        return 0.0
 
     @staticmethod
     def _resolve_anchor_reason(anchor: AnchorScore) -> str:
+        source = getattr(anchor, "evidence_source", None)
+        if source == SplitEvidenceSource.PAUSE:
+            return "pause"
+        if source == SplitEvidenceSource.PUNCTUATION:
+            return "punctuation"
+        if source == SplitEvidenceSource.SEMANTIC:
+            return "semantic"
+        if source == SplitEvidenceSource.LLM:
+            return "llm_semantic"
+        if source == SplitEvidenceSource.FORCE:
+            return "forced_guard"
         if anchor.anchor_type == AnchorType.PAUSE_ANCHOR:
             return "pause"
+        if anchor.anchor_type == AnchorType.PUNCTUATION_ANCHOR:
+            return "punctuation"
+        if anchor.anchor_type == AnchorType.SEMANTIC_ANCHOR:
+            return "semantic"
         return "speaker_change"
 
     @staticmethod

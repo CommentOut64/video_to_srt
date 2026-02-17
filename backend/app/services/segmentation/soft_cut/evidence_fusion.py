@@ -1,17 +1,26 @@
 """
 软切证据融合服务（Phase C）。
-V3.2.0+dev.20260214.09
+V3.2.0+dev.20260217.01
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from statistics import fmean
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 from app.services.alignment.types import FusedEvidence
 from .evidence_builder import AnchorCandidate
-from .types import AnchorScore, AnchorType, CutWindow, EvidenceLevel
+from .types import (
+    AnchorScore,
+    AnchorType,
+    CutWindow,
+    EvidenceLevel,
+    SoftCutPriorityProfile,
+    SourcePriorityRule,
+    SplitEvidenceSource,
+    resolve_priority_profile,
+)
 
 
 @dataclass
@@ -21,6 +30,8 @@ class EvidenceFusionConfig:
     anchor_distance_penalty_factor_m1: float = 0.10
     anchor_distance_penalty_factor_m2: float = 0.06
     word_time_confidence_weight: float = 0.35
+    priority_active_profile: str = "punct_boost_transition"
+    priority_profiles: dict[str, dict[str, object]] = field(default_factory=dict)
     anchor_base_scores: dict[AnchorType, float] = field(
         default_factory=lambda: {
             AnchorType.PAUSE_ANCHOR: 0.8,
@@ -36,7 +47,7 @@ class EvidenceFusionResult:
     """融合输出。"""
 
     fused_windows: list[CutWindow]
-    generation_report: dict[str, float | int | str] = field(default_factory=dict)
+    generation_report: dict[str, float | int | str | dict[str, Any]] = field(default_factory=dict)
 
 
 class EvidenceFusion:
@@ -45,11 +56,15 @@ class EvidenceFusion:
 
     Why:
     - 把多来源锚点融合与重评分收口在单点，避免决策层依赖各来源细节。
-    - 对 M2 NW V2 仅暴露时基参数，不改决策引擎调用边界。
+    - Phase A 扩展：统一来源优先级配置，实现“调权不改代码”。
     """
 
     def __init__(self, config: Optional[EvidenceFusionConfig] = None) -> None:
         self.config = config or EvidenceFusionConfig()
+        self._priority_profile: SoftCutPriorityProfile = resolve_priority_profile(
+            active_profile=self.config.priority_active_profile,
+            profile_overrides=self.config.priority_profiles,
+        )
 
     def fuse(
         self,
@@ -74,6 +89,7 @@ class EvidenceFusion:
         ]
 
         total_output_anchors = 0
+        source_score_report: dict[str, dict[str, float | int]] = {}
         for window in merged_windows:
             existing_candidates = self._convert_existing_scores_to_candidates(window.candidate_anchors)
             combined_candidates = [*existing_candidates, *all_new_candidates]
@@ -82,8 +98,10 @@ class EvidenceFusion:
                 start_time=window.start_time,
                 end_time=window.end_time,
                 candidates=combined_candidates,
+                fallback_source=window.trigger_source,
                 time_axis_version=time_axis_version,
                 word_time_confidence=word_time_confidence,
+                source_score_report=source_score_report,
             )
             total_output_anchors += len(window.candidate_anchors)
 
@@ -97,6 +115,8 @@ class EvidenceFusion:
             "output_anchor_count": int(total_output_anchors),
             "time_axis_version": time_axis_version,
             "has_word_time_confidence": int(bool(word_time_confidence)),
+            "priority_profile": self._priority_profile.profile_name,
+            "source_score_report": source_score_report,
         }
         return EvidenceFusionResult(
             fused_windows=merged_windows,
@@ -110,17 +130,34 @@ class EvidenceFusion:
         start_time: float,
         end_time: float,
         candidates: Sequence[AnchorCandidate],
+        fallback_source: SplitEvidenceSource,
         time_axis_version: str,
         word_time_confidence: Optional[Sequence[float]],
+        source_score_report: dict[str, dict[str, float | int]],
     ) -> list[AnchorScore]:
         scores: list[AnchorScore] = []
         seen: set[tuple[str, int, str]] = set()
         for candidate in candidates:
             if candidate.anchor_time < start_time or candidate.anchor_time > end_time:
                 continue
+            source = self._resolve_candidate_source(
+                candidate,
+                fallback_source=fallback_source,
+            )
+            rule = self._priority_profile.source_rule(source)
+            confidence = self._resolve_candidate_confidence(candidate)
+            if not rule.enabled:
+                self._append_source_report(source_score_report, source=source, skipped_disabled=1)
+                continue
+            if confidence < rule.min_confidence:
+                self._append_source_report(source_score_report, source=source, skipped_low_conf=1)
+                continue
+
             score = self._score_anchor_candidate(
                 trigger_time=trigger_time,
                 candidate=candidate,
+                source=source,
+                source_rule=rule,
                 time_axis_version=time_axis_version,
                 word_time_confidence=word_time_confidence,
             )
@@ -133,11 +170,18 @@ class EvidenceFusion:
                 continue
             seen.add(dedupe_key)
             scores.append(score)
+            self._append_source_report(
+                source_score_report,
+                source=source,
+                accepted=1,
+                total_score=score.final_score,
+            )
 
         return sorted(
             scores,
             key=lambda item: (
                 -item.final_score,
+                self._priority_profile.source_rank(item.evidence_source),
                 abs(item.anchor_time - trigger_time),
                 item.anchor_time,
             ),
@@ -148,6 +192,8 @@ class EvidenceFusion:
         *,
         trigger_time: float,
         candidate: AnchorCandidate,
+        source: SplitEvidenceSource,
+        source_rule: SourcePriorityRule,
         time_axis_version: str,
         word_time_confidence: Optional[Sequence[float]],
     ) -> AnchorScore:
@@ -157,8 +203,9 @@ class EvidenceFusion:
             else self.config.anchor_base_scores.get(candidate.anchor_type, 0.0)
         )
 
-        if candidate.confidence is not None:
-            base_score *= max(0.0, min(1.0, float(candidate.confidence)))
+        confidence = self._resolve_candidate_confidence(candidate)
+        base_score *= confidence
+        base_score *= max(0.0, min(1.0, float(source_rule.weight)))
 
         if word_time_confidence:
             clamped = [max(0.0, min(1.0, float(value))) for value in word_time_confidence]
@@ -180,6 +227,7 @@ class EvidenceFusion:
             distance_penalty=float(distance_penalty),
             final_score=float(final_score),
             source=candidate.source,
+            evidence_source=source,
         )
 
     def _resolve_window_conflicts(
@@ -207,9 +255,13 @@ class EvidenceFusion:
             preferred = self._pick_preferred_window(previous, current)
             if preferred is current:
                 current.candidate_anchors.extend(previous.candidate_anchors)
+                current.start_time = min(current.start_time, previous.start_time)
+                current.end_time = max(current.end_time, previous.end_time)
                 resolved[-1] = current
             else:
                 previous.candidate_anchors.extend(current.candidate_anchors)
+                previous.start_time = min(previous.start_time, current.start_time)
+                previous.end_time = max(previous.end_time, current.end_time)
                 resolved[-1] = previous
         return resolved, merged_count
 
@@ -218,6 +270,14 @@ class EvidenceFusion:
         right_priority = self._level_priority(right.trigger_level)
         if left_priority != right_priority:
             return left if left_priority > right_priority else right
+
+        if abs(float(left.trigger_score) - float(right.trigger_score)) > 1e-9:
+            return left if left.trigger_score > right.trigger_score else right
+
+        left_rank = self._priority_profile.source_rank(left.trigger_source)
+        right_rank = self._priority_profile.source_rank(right.trigger_source)
+        if left_rank != right_rank:
+            return left if left_rank < right_rank else right
 
         left_best = left.candidate_anchors[0].final_score if left.candidate_anchors else 0.0
         right_best = right.candidate_anchors[0].final_score if right.candidate_anchors else 0.0
@@ -242,6 +302,8 @@ class EvidenceFusion:
             start_time=window.start_time,
             end_time=window.end_time,
             chunk_id=window.chunk_id,
+            trigger_source=window.trigger_source,
+            trigger_score=window.trigger_score,
             candidate_anchors=list(window.candidate_anchors),
             state=window.state,
         )
@@ -259,6 +321,65 @@ class EvidenceFusion:
             )
             for item in scores
         ]
+
+    @staticmethod
+    def _resolve_candidate_confidence(candidate: AnchorCandidate) -> float:
+        if candidate.confidence is None:
+            return 1.0
+        return max(0.0, min(1.0, float(candidate.confidence)))
+
+    @staticmethod
+    def _resolve_candidate_source(
+        candidate: AnchorCandidate,
+        *,
+        fallback_source: Optional[SplitEvidenceSource] = None,
+    ) -> SplitEvidenceSource:
+        source_text = str(candidate.source or "").strip().lower()
+        if "llm" in source_text:
+            return SplitEvidenceSource.LLM
+        if "punct" in source_text:
+            return SplitEvidenceSource.PUNCTUATION
+        if "semantic" in source_text:
+            return SplitEvidenceSource.SEMANTIC
+        if "pause" in source_text:
+            return SplitEvidenceSource.PAUSE
+        if "speaker" in source_text:
+            return SplitEvidenceSource.SPEAKER
+        if candidate.anchor_type == AnchorType.PAUSE_ANCHOR:
+            return SplitEvidenceSource.PAUSE
+        if candidate.anchor_type == AnchorType.PUNCTUATION_ANCHOR:
+            return SplitEvidenceSource.PUNCTUATION
+        if candidate.anchor_type == AnchorType.SEMANTIC_ANCHOR:
+            return SplitEvidenceSource.SEMANTIC
+        # Why: WORD_BOUNDARY 是落点类型而非来源，优先继承触发窗口来源，避免 split_reason 漂移。
+        if candidate.anchor_type == AnchorType.WORD_BOUNDARY and fallback_source is not None:
+            return fallback_source
+        return SplitEvidenceSource.SPEAKER
+
+    @staticmethod
+    def _append_source_report(
+        report: dict[str, dict[str, float | int]],
+        *,
+        source: SplitEvidenceSource,
+        accepted: int = 0,
+        skipped_disabled: int = 0,
+        skipped_low_conf: int = 0,
+        total_score: float = 0.0,
+    ) -> None:
+        key = source.value
+        item = report.setdefault(
+            key,
+            {
+                "accepted": 0,
+                "skipped_disabled": 0,
+                "skipped_low_conf": 0,
+                "total_score": 0.0,
+            },
+        )
+        item["accepted"] = int(item.get("accepted", 0)) + int(accepted)
+        item["skipped_disabled"] = int(item.get("skipped_disabled", 0)) + int(skipped_disabled)
+        item["skipped_low_conf"] = int(item.get("skipped_low_conf", 0)) + int(skipped_low_conf)
+        item["total_score"] = float(item.get("total_score", 0.0)) + float(total_score)
 
     def to_fused_evidence(
         self,

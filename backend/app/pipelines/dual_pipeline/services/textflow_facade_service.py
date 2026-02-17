@@ -255,6 +255,8 @@ class TextflowFacadeService:
                 cut_plan=soft_cut_plan,
                 aligned_facts=aligned_facts,
                 fused_evidence=fused_evidence,
+                fallback_clean_text_ref=str(punctuation_clean_text or ""),
+                fallback_punctuation_positions=list(punctuation_positions or []),
             ),
             stream_id=l6_stream_id,
             chunk_index=l6_chunk_index,

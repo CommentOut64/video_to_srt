@@ -200,6 +200,10 @@ class AsyncDualPipelineKernel:
     _SOFT_CUT_SHORT_TURN_CONTINUATION_SEC = 0.75
     _SOFT_CUT_SHORT_TURN_CONTINUATION_GAP_SEC = 0.80
     _SOFT_CUT_IN_WORD_BODY_MARGIN_SEC = 0.02
+    _SOFT_CUT_PAUSE_ANCHOR_TRIGGER_SEC = 0.40
+    _SOFT_CUT_PAUSE_ANCHOR_MIN_GAP_SEC = 1.00
+    _SOFT_CUT_PUNCT_ANCHOR_CONFIDENCE_WEAK = 0.62
+    _SOFT_CUT_PUNCT_ANCHOR_CONFIDENCE_STRONG = 0.82
     _SPEAKER_REPAIR_MIN_TURN_DURATION_SEC = 0.45
     _SPEAKER_REPAIR_STRONG_BREAK_MIN_PAUSE_SEC = 0.30
     _SPEAKER_REPAIR_SENTENCE_END_PUNCT = {"。", "！", "？", ".", "!", "?"}
@@ -399,6 +403,13 @@ class AsyncDualPipelineKernel:
             self._segmentation_layer_config.soft_cut_plan_provider_class
             or ""
         ).strip()
+        self._soft_cut_priority_active_profile = str(
+            self._segmentation_layer_config.soft_cut_priority_active_profile
+            or "punct_boost_transition"
+        ).strip()
+        self._soft_cut_priority_profiles = dict(
+            self._segmentation_layer_config.soft_cut_priority_profiles or {}
+        )
         self._soft_cut_pending_deferred_by_stream: Dict[str, List[Any]] = {}
         # Why: 锚点距离惩罚过弱会让“远处大停顿”压过“近处词边界”，表现为尾词前错切。
         self._soft_cut_evidence_builder = EvidenceBuilder(
@@ -406,10 +417,15 @@ class AsyncDualPipelineKernel:
                 window_before_sec=0.40,
                 window_after_sec=0.25,
                 anchor_distance_penalty_factor=0.55,
+                priority_active_profile=self._soft_cut_priority_active_profile,
+                priority_profiles=self._soft_cut_priority_profiles,
             )
         )
         self._soft_cut_evidence_fusion = ScoringEvidenceFusion(
-            config=ScoringEvidenceFusionConfig()
+            config=ScoringEvidenceFusionConfig(
+                priority_active_profile=self._soft_cut_priority_active_profile,
+                priority_profiles=self._soft_cut_priority_profiles,
+            )
         )
         self._soft_cut_decision_engine = SoftCutDecisionEngine(
             config=DecisionEngineConfig()
@@ -3887,6 +3903,7 @@ class AsyncDualPipelineKernel:
             "stream_id": str(stream_id),
             "word_count": int(len(words)),
             "anchor_candidate_count": int(len(anchor_candidates)),
+            "priority_profile": str(self._soft_cut_priority_active_profile),
             "time_axis_version": str(
                 getattr(aligned_facts, "time_axis_version", "m1_legacy") or "m1_legacy"
             ),
@@ -3902,15 +3919,6 @@ class AsyncDualPipelineKernel:
             )
 
         speaker_change_facts = self._build_soft_cut_speaker_change_facts(words=words)
-        if not speaker_change_facts:
-            base_report["reason"] = "no_speaker_change_facts"
-            return self._soft_cut_evidence_fusion.to_fused_evidence(
-                speaker_changes=[],
-                pause_anchors=self._serialize_soft_cut_anchor_candidates(pause_anchors),
-                semantic_anchors=self._serialize_soft_cut_anchor_candidates(semantic_anchors),
-                punctuation_anchors=self._serialize_soft_cut_anchor_candidates(punctuation_anchors),
-                generation_report=base_report,
-            )
 
         chunk_start = float(words[0].start if words[0].start is not None else 0.0)
         chunk_end = float(words[-1].end if words[-1].end is not None else chunk_start)
@@ -3922,7 +3930,7 @@ class AsyncDualPipelineKernel:
             chunk_start=chunk_start,
             chunk_end=chunk_end,
             speaker_change_facts=speaker_change_facts,
-            anchor_candidates=[],
+            anchor_candidates=anchor_candidates,
         )
         time_axis_version = str(
             getattr(aligned_facts, "time_axis_version", "m1_legacy") or "m1_legacy"
@@ -4010,6 +4018,10 @@ class AsyncDualPipelineKernel:
                     "window_id": str(getattr(window, "window_id", "") or ""),
                     "trigger_time": float(getattr(window, "trigger_time", 0.0) or 0.0),
                     "trigger_level": str(getattr(getattr(window, "trigger_level", None), "value", "") or ""),
+                    "trigger_source": str(
+                        getattr(getattr(window, "trigger_source", None), "value", "") or ""
+                    ),
+                    "trigger_score": float(getattr(window, "trigger_score", 0.0) or 0.0),
                     "start_time": float(getattr(window, "start_time", 0.0) or 0.0),
                     "end_time": float(getattr(window, "end_time", 0.0) or 0.0),
                     "candidate_anchor_count": int(len(candidate_anchors)),
@@ -4027,6 +4039,11 @@ class AsyncDualPipelineKernel:
                         float(getattr(top_anchor, "final_score", 0.0) or 0.0)
                         if top_anchor is not None
                         else None
+                    ),
+                    "top_anchor_source": (
+                        str(getattr(getattr(top_anchor, "evidence_source", None), "value", "") or "")
+                        if top_anchor is not None
+                        else ""
                     ),
                 }
             )
@@ -4101,20 +4118,18 @@ class AsyncDualPipelineKernel:
         builder_high_count = 0
         builder_mid_count = 0
         builder_low_count = 0
-        cut_windows: List[CutWindow] = []
-        if speaker_change_facts:
-            builder_result = self._soft_cut_evidence_builder.build(
-                chunk_id=f"{stream_id}:{int(chunk_start * 1000)}",
-                chunk_start=chunk_start,
-                chunk_end=chunk_end,
-                speaker_change_facts=speaker_change_facts,
-                anchor_candidates=[],
-            )
-            cut_windows = list(builder_result.cut_windows or [])
-            builder_window_count = int(builder_result.generation_report.get("window_count", 0))
-            builder_high_count = int(builder_result.generation_report.get("high_count", 0))
-            builder_mid_count = int(builder_result.generation_report.get("mid_count", 0))
-            builder_low_count = int(builder_result.generation_report.get("low_count", 0))
+        builder_result = self._soft_cut_evidence_builder.build(
+            chunk_id=f"{stream_id}:{int(chunk_start * 1000)}",
+            chunk_start=chunk_start,
+            chunk_end=chunk_end,
+            speaker_change_facts=speaker_change_facts,
+            anchor_candidates=anchor_candidates,
+        )
+        cut_windows: List[CutWindow] = list(builder_result.cut_windows or [])
+        builder_window_count = int(builder_result.generation_report.get("window_count", 0))
+        builder_high_count = int(builder_result.generation_report.get("high_count", 0))
+        builder_mid_count = int(builder_result.generation_report.get("mid_count", 0))
+        builder_low_count = int(builder_result.generation_report.get("low_count", 0))
 
         time_axis_version = str(getattr(aligned_facts, "time_axis_version", "m1_legacy") or "m1_legacy")
         fusion_result = self._soft_cut_evidence_fusion.fuse(
@@ -4196,6 +4211,7 @@ class AsyncDualPipelineKernel:
                 "builder_high_count": builder_high_count,
                 "builder_mid_count": builder_mid_count,
                 "builder_low_count": builder_low_count,
+                "priority_profile": str(self._soft_cut_priority_active_profile),
                 "fusion_output_window_count": int(fusion_result.generation_report.get("output_window_count", 0)),
                 "recompute_window_count": int(recompute_window_count),
                 "affected_window_count": int(len(affected_deferred_by_window)),
@@ -4879,6 +4895,7 @@ class AsyncDualPipelineKernel:
         words: Sequence[AnnotatedWord],
     ) -> List[AnchorCandidate]:
         anchors: List[AnchorCandidate] = []
+        last_pause_anchor_index: Optional[int] = None
         for index in range(1, len(words)):
             left = words[index - 1]
             right = words[index]
@@ -4895,24 +4912,40 @@ class AsyncDualPipelineKernel:
                     confidence=1.0,
                 )
             )
-            if pause_duration >= 0.30:
-                anchors.append(
-                    AnchorCandidate(
-                        anchor_type=AnchorType.PAUSE_ANCHOR,
-                        anchor_time=boundary_time,
-                        source="pause_gap",
-                        confidence=min(1.0, 0.5 + pause_duration),
-                    )
+            if pause_duration >= self._SOFT_CUT_PAUSE_ANCHOR_TRIGGER_SEC:
+                pause_anchor = AnchorCandidate(
+                    anchor_type=AnchorType.PAUSE_ANCHOR,
+                    anchor_time=boundary_time,
+                    source="pause_gap",
+                    confidence=min(1.0, 0.5 + pause_duration),
                 )
+                # Why: 相邻短间隔 pause 会在同一语义片段内生成过密窗口，易触发 deferred overflow 强切。
+                if last_pause_anchor_index is not None:
+                    previous_pause = anchors[last_pause_anchor_index]
+                    anchor_gap = max(0.0, float(pause_anchor.anchor_time) - float(previous_pause.anchor_time))
+                    if anchor_gap < self._SOFT_CUT_PAUSE_ANCHOR_MIN_GAP_SEC:
+                        previous_confidence = float(previous_pause.confidence or 0.0)
+                        current_confidence = float(pause_anchor.confidence or 0.0)
+                        if current_confidence >= previous_confidence:
+                            anchors[last_pause_anchor_index] = pause_anchor
+                        continue
+                anchors.append(pause_anchor)
+                last_pause_anchor_index = len(anchors) - 1
 
             trailing_punct = str(left.trailing_punct or "").strip()
             if trailing_punct and trailing_punct[-1] in {"。", "！", "？", ".", "!", "?"}:
+                punct_char = trailing_punct[-1]
+                punct_confidence = (
+                    self._SOFT_CUT_PUNCT_ANCHOR_CONFIDENCE_STRONG
+                    if punct_char in {"！", "？", "!", "?"}
+                    else self._SOFT_CUT_PUNCT_ANCHOR_CONFIDENCE_WEAK
+                )
                 anchors.append(
                     AnchorCandidate(
                         anchor_type=AnchorType.PUNCTUATION_ANCHOR,
                         anchor_time=boundary_time,
-                        source="punct_proxy",
-                        confidence=0.5,
+                        source=f"punct_proxy:{punct_char}",
+                        confidence=punct_confidence,
                     )
                 )
 
