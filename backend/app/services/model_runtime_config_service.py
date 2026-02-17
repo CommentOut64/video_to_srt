@@ -477,6 +477,117 @@ class ModelRuntimeConfigService:
                 "soft_cut.overlap_degrade_enable": False,
                 "soft_cut.plan_provider": "m1_internal",
                 "soft_cut.plan_provider_class": "",
+                "soft_cut.priority.active_profile": "punct_boost_transition",
+                "soft_cut.priority.profiles": {
+                    "punct_boost_transition": {
+                        "tiebreak_order": ["speaker", "punctuation", "pause", "semantic", "llm"],
+                        "merge_window_ms": 120,
+                        "source_rules": {
+                            "speaker": {
+                                "enabled": True,
+                                "weight": 0.85,
+                                "min_confidence": 0.45,
+                                "trigger_threshold": 0.42,
+                            },
+                            "pause": {
+                                "enabled": True,
+                                "weight": 0.55,
+                                "min_confidence": 0.35,
+                                "trigger_threshold": 0.30,
+                            },
+                            "punctuation": {
+                                "enabled": True,
+                                "weight": 0.75,
+                                "min_confidence": 0.35,
+                                "trigger_threshold": 0.28,
+                            },
+                            "semantic": {
+                                "enabled": True,
+                                "weight": 0.45,
+                                "min_confidence": 0.30,
+                                "trigger_threshold": 0.24,
+                            },
+                            "llm": {
+                                "enabled": False,
+                                "weight": 0.0,
+                                "min_confidence": 0.0,
+                                "trigger_threshold": 1.0,
+                            },
+                        },
+                    },
+                    "llm_ramp_up": {
+                        "tiebreak_order": ["speaker", "llm", "punctuation", "pause", "semantic"],
+                        "merge_window_ms": 120,
+                        "source_rules": {
+                            "speaker": {
+                                "enabled": True,
+                                "weight": 0.85,
+                                "min_confidence": 0.45,
+                                "trigger_threshold": 0.42,
+                            },
+                            "pause": {
+                                "enabled": True,
+                                "weight": 0.55,
+                                "min_confidence": 0.35,
+                                "trigger_threshold": 0.30,
+                            },
+                            "punctuation": {
+                                "enabled": True,
+                                "weight": 0.35,
+                                "min_confidence": 0.35,
+                                "trigger_threshold": 0.28,
+                            },
+                            "semantic": {
+                                "enabled": True,
+                                "weight": 0.45,
+                                "min_confidence": 0.30,
+                                "trigger_threshold": 0.24,
+                            },
+                            "llm": {
+                                "enabled": True,
+                                "weight": 0.78,
+                                "min_confidence": 0.50,
+                                "trigger_threshold": 0.36,
+                            },
+                        },
+                    },
+                    "llm_primary_no_punct": {
+                        "tiebreak_order": ["speaker", "llm", "pause", "semantic", "punctuation"],
+                        "merge_window_ms": 120,
+                        "source_rules": {
+                            "speaker": {
+                                "enabled": True,
+                                "weight": 0.85,
+                                "min_confidence": 0.45,
+                                "trigger_threshold": 0.42,
+                            },
+                            "pause": {
+                                "enabled": True,
+                                "weight": 0.50,
+                                "min_confidence": 0.35,
+                                "trigger_threshold": 0.28,
+                            },
+                            "punctuation": {
+                                "enabled": False,
+                                "weight": 0.0,
+                                "min_confidence": 1.0,
+                                "trigger_threshold": 1.0,
+                            },
+                            "semantic": {
+                                "enabled": True,
+                                "weight": 0.45,
+                                "min_confidence": 0.30,
+                                "trigger_threshold": 0.24,
+                            },
+                            "llm": {
+                                "enabled": True,
+                                "weight": 0.92,
+                                "min_confidence": 0.55,
+                                "trigger_threshold": 0.40,
+                            },
+                        },
+                    },
+                },
             },
             # V3.2.0+dev.20260215.09: M2 阶段0开关与观测配置（仅观测，不改主链结果）。
             "m2": {

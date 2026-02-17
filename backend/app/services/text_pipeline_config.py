@@ -5,7 +5,7 @@ V3.2.0+dev.20260214.10
 # V3.2.0+dev.20260205.09: 接入 L4 对齐层参数。
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
 from app.services.model_runtime_config_service import get_model_runtime_config_service
@@ -355,6 +355,212 @@ class SegmentationLayerConfig:
     is_enable_soft_cut_overlap_degrade: bool = False
     soft_cut_plan_provider: str = "m1_internal"
     soft_cut_plan_provider_class: str = ""
+    soft_cut_priority_active_profile: str = "punct_boost_transition"
+    soft_cut_priority_profiles: Dict[str, Dict[str, Any]] = field(
+        default_factory=lambda: {
+            "punct_boost_transition": {
+                "tiebreak_order": ["speaker", "punctuation", "pause", "semantic", "llm"],
+                "merge_window_ms": 120,
+                "source_rules": {
+                    "speaker": {
+                        "enabled": True,
+                        "weight": 0.85,
+                        "min_confidence": 0.45,
+                        "trigger_threshold": 0.42,
+                    },
+                    "pause": {
+                        "enabled": True,
+                        "weight": 0.55,
+                        "min_confidence": 0.35,
+                        "trigger_threshold": 0.30,
+                    },
+                    "punctuation": {
+                        "enabled": True,
+                        "weight": 0.75,
+                        "min_confidence": 0.35,
+                        "trigger_threshold": 0.28,
+                    },
+                    "semantic": {
+                        "enabled": True,
+                        "weight": 0.45,
+                        "min_confidence": 0.30,
+                        "trigger_threshold": 0.24,
+                    },
+                    "llm": {
+                        "enabled": False,
+                        "weight": 0.0,
+                        "min_confidence": 0.0,
+                        "trigger_threshold": 1.0,
+                    },
+                },
+            },
+            "llm_ramp_up": {
+                "tiebreak_order": ["speaker", "llm", "punctuation", "pause", "semantic"],
+                "merge_window_ms": 120,
+                "source_rules": {
+                    "speaker": {
+                        "enabled": True,
+                        "weight": 0.85,
+                        "min_confidence": 0.45,
+                        "trigger_threshold": 0.42,
+                    },
+                    "pause": {
+                        "enabled": True,
+                        "weight": 0.55,
+                        "min_confidence": 0.35,
+                        "trigger_threshold": 0.30,
+                    },
+                    "punctuation": {
+                        "enabled": True,
+                        "weight": 0.35,
+                        "min_confidence": 0.35,
+                        "trigger_threshold": 0.28,
+                    },
+                    "semantic": {
+                        "enabled": True,
+                        "weight": 0.45,
+                        "min_confidence": 0.30,
+                        "trigger_threshold": 0.24,
+                    },
+                    "llm": {
+                        "enabled": True,
+                        "weight": 0.78,
+                        "min_confidence": 0.50,
+                        "trigger_threshold": 0.36,
+                    },
+                },
+            },
+            "llm_primary_no_punct": {
+                "tiebreak_order": ["speaker", "llm", "pause", "semantic", "punctuation"],
+                "merge_window_ms": 120,
+                "source_rules": {
+                    "speaker": {
+                        "enabled": True,
+                        "weight": 0.85,
+                        "min_confidence": 0.45,
+                        "trigger_threshold": 0.42,
+                    },
+                    "pause": {
+                        "enabled": True,
+                        "weight": 0.50,
+                        "min_confidence": 0.35,
+                        "trigger_threshold": 0.28,
+                    },
+                    "punctuation": {
+                        "enabled": False,
+                        "weight": 0.0,
+                        "min_confidence": 1.0,
+                        "trigger_threshold": 1.0,
+                    },
+                    "semantic": {
+                        "enabled": True,
+                        "weight": 0.45,
+                        "min_confidence": 0.30,
+                        "trigger_threshold": 0.24,
+                    },
+                    "llm": {
+                        "enabled": True,
+                        "weight": 0.92,
+                        "min_confidence": 0.55,
+                        "trigger_threshold": 0.40,
+                    },
+                },
+            },
+        }
+    )
+
+    @classmethod
+    def _merge_priority_profiles_from_runtime(
+        cls,
+        *,
+        raw: Dict[str, Any],
+        base_profiles: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        merged_profiles: Dict[str, Dict[str, Any]] = {
+            name: {
+                "tiebreak_order": list((payload or {}).get("tiebreak_order") or []),
+                "merge_window_ms": int((payload or {}).get("merge_window_ms", 120) or 120),
+                "source_rules": dict((payload or {}).get("source_rules") or {}),
+            }
+            for name, payload in base_profiles.items()
+        }
+
+        runtime_profiles = _read_runtime_value(raw, "soft_cut.priority.profiles", None)
+        if runtime_profiles is None:
+            runtime_profiles = _read_runtime_value(raw, "soft_cut.priority.profile", None)
+        if isinstance(runtime_profiles, dict):
+            for name, payload in runtime_profiles.items():
+                profile_name = str(name or "").strip()
+                if not profile_name:
+                    continue
+                existing = merged_profiles.get(
+                    profile_name,
+                    {
+                        "tiebreak_order": [],
+                        "merge_window_ms": 120,
+                        "source_rules": {},
+                    },
+                )
+                if isinstance(payload, dict):
+                    if "tiebreak_order" in payload:
+                        existing["tiebreak_order"] = list(payload.get("tiebreak_order") or [])
+                    if "merge_window_ms" in payload:
+                        existing["merge_window_ms"] = int(payload.get("merge_window_ms") or 120)
+                    if isinstance(payload.get("source_rules"), dict):
+                        merged_source_rules = dict(existing.get("source_rules") or {})
+                        merged_source_rules.update(dict(payload.get("source_rules") or {}))
+                        existing["source_rules"] = merged_source_rules
+                    if isinstance(payload.get("source"), dict):
+                        merged_source_rules = dict(existing.get("source_rules") or {})
+                        merged_source_rules.update(dict(payload.get("source") or {}))
+                        existing["source_rules"] = merged_source_rules
+                    merged_profiles[profile_name] = existing
+
+        for key, value in raw.items():
+            if not isinstance(key, str):
+                continue
+            active_prefix = "soft_cut.priority.profile."
+            if key.startswith(active_prefix):
+                path = key[len(active_prefix):]
+            elif key.startswith("soft_cut.priority.profiles."):
+                path = key[len("soft_cut.priority.profiles."):]
+            else:
+                continue
+            parts = path.split(".")
+            if len(parts) < 2:
+                continue
+            profile_name = str(parts[0] or "").strip()
+            if not profile_name:
+                continue
+            profile_payload = merged_profiles.setdefault(
+                profile_name,
+                {
+                    "tiebreak_order": [],
+                    "merge_window_ms": 120,
+                    "source_rules": {},
+                },
+            )
+            if parts[1] == "tiebreak_order":
+                if isinstance(value, list):
+                    profile_payload["tiebreak_order"] = list(value)
+                continue
+            if parts[1] == "merge_window_ms":
+                try:
+                    profile_payload["merge_window_ms"] = int(value)
+                except (TypeError, ValueError):
+                    pass
+                continue
+            if len(parts) >= 4 and parts[1] == "source":
+                source_name = str(parts[2] or "").strip().lower()
+                field_name = str(parts[3] or "").strip()
+                if not source_name or not field_name:
+                    continue
+                source_rules = dict(profile_payload.get("source_rules") or {})
+                source_rule_payload = dict(source_rules.get(source_name) or {})
+                source_rule_payload[field_name] = value
+                source_rules[source_name] = source_rule_payload
+                profile_payload["source_rules"] = source_rules
+        return merged_profiles
 
     @classmethod
     def from_runtime(
@@ -374,6 +580,21 @@ class SegmentationLayerConfig:
                 cls.is_keep_sentence_end_punct,
             ),
         )
+        priority_active_profile = str(
+            _read_runtime_value(
+                raw,
+                "soft_cut.priority.active_profile",
+                cls.soft_cut_priority_active_profile,
+            )
+            or cls.soft_cut_priority_active_profile
+        ).strip() or cls.soft_cut_priority_active_profile
+        base_priority_profiles = cls().soft_cut_priority_profiles
+        merged_priority_profiles = cls._merge_priority_profiles_from_runtime(
+            raw=raw,
+            base_profiles=base_priority_profiles,
+        )
+        if priority_active_profile not in merged_priority_profiles:
+            priority_active_profile = cls.soft_cut_priority_active_profile
 
         return cls(
             is_enabled=bool(_read_runtime_value(raw, "enable", cls.is_enabled)),
@@ -450,6 +671,8 @@ class SegmentationLayerConfig:
                 )
                 or cls.soft_cut_plan_provider_class
             ).strip(),
+            soft_cut_priority_active_profile=priority_active_profile,
+            soft_cut_priority_profiles=merged_priority_profiles,
         )
 
 
