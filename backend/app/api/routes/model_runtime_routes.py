@@ -432,6 +432,10 @@ class SegmentationRuntimeParams(_RuntimeBase):
     long_pause_sec: Optional[float] = Field(default=None, ge=0.0)
     soft_pause_sec: Optional[float] = Field(default=None, ge=0.0)
     short_merge_max_chars: Optional[int] = Field(default=None, ge=1)
+    is_force_split_on_sentence_end_punct: Optional[bool] = Field(
+        default=None,
+        alias="force_split_on_sentence_end_punct",
+    )
     is_keep_sentence_end_punct: Optional[bool] = Field(default=None, alias="keep_sentence_end_punct")
     is_enable_soft_cut: Optional[bool] = Field(default=None, alias="soft_cut.enable")
     is_enable_soft_cut_overlap_degrade: Optional[bool] = Field(
@@ -704,6 +708,7 @@ _PARAM_SCHEMA: Dict[str, Any] = {
             "long_pause_sec": {"type": "float", "min": 0.0, "default": 0.8},
             "soft_pause_sec": {"type": "float", "min": 0.0, "default": 0.4},
             "short_merge_max_chars": {"type": "int", "min": 1, "default": 22},
+            "force_split_on_sentence_end_punct": {"type": "bool", "default": True},
             "keep_sentence_end_punct": {"type": "bool", "default": False},
             "soft_cut.enable": {"type": "bool", "default": True},
             "soft_cut.overlap_degrade_enable": {"type": "bool", "default": False},
