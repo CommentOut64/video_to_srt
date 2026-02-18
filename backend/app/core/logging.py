@@ -133,6 +133,11 @@ class ThirdPartyFilter(logging.Filter):
         # Windows asyncio ProactorEventLoop 已知问题，无害
         "_ProactorBasePipeTransport._call_connection_lost",
         "Exception in callback _ProactorBasePipeTransport",
+        # V3.2.0+dev.20260218.01: SpeechBrain 模型加载时的冗余日志
+        "Using file found at",       # speechbrain.utils.fetching
+        "Using symlink found at",    # speechbrain.utils.fetching (Windows)
+        "Loading pretrained files for:",  # speechbrain.utils.parameter_transfer
+        "CategoricalEncoder.expect_len was never called",  # speechbrain.dataio.encoder
     ]
 
     def filter(self, record):
@@ -215,7 +220,16 @@ def setup_logging(
         'urllib3', 'multipart', 'transformers',
         'faster_whisper', 'ctranslate2',  # Faster-Whisper 及其底层库
         'silero', 'torch', 'pytorch_lightning', 'pyannote',
-        'speechbrain', 'whisper', 'onnxruntime'
+        'speechbrain', 'whisper', 'onnxruntime',
+        # V3.2.0+dev.20260218.01: SpeechBrain 子模块（from_hparams 可能重置父级别）
+        'speechbrain.utils.fetching',
+        'speechbrain.utils.parameter_transfer',
+        'speechbrain.dataio.encoder',
+        # pyannote 子模块
+        'pyannote.audio.core.io',
+        'pyannote.audio.utils.reproducibility',
+        # lightning 子模块
+        'lightning', 'lightning.fabric',
     ]
 
     for logger_name in third_party_loggers:

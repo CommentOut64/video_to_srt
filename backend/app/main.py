@@ -13,6 +13,19 @@ os.environ['QT_LOGGING_RULES'] = '*.debug=false;qt.qpa.*=false'
 warnings.filterwarnings('ignore', message='.*iCCP.*')
 warnings.filterwarnings('ignore', message='.*sRGB.*')
 
+# V3.2.0+dev.20260218.01: 抑制第三方库的弃用/未来警告（来自依赖库内部，不影响功能）
+# --- SpeechBrain 相关 ---
+warnings.filterwarnings('ignore', message=r'.*torchaudio\._backend\.list_audio_backends has been deprecated.*')
+warnings.filterwarnings('ignore', message=r'.*torch\.cuda\.amp\.custom_fwd.*is deprecated.*')
+warnings.filterwarnings('ignore', message=r".*Module 'speechbrain\.pretrained' was deprecated.*")
+warnings.filterwarnings('ignore', message=r'.*Requested Pretrainer collection using symlinks on Windows.*')
+# --- pyannote / lightning 相关 ---
+# torchcodec 警告消息以 \n 开头，需要 (?s) 使 . 匹配换行符
+warnings.filterwarnings('ignore', message=r'(?s).*torchcodec is not installed correctly.*')
+warnings.filterwarnings('ignore', message=r'(?s).*TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD.*')
+warnings.filterwarnings('ignore', message=r'.*TensorFloat-32 \(TF32\) has been disabled.*')
+warnings.filterwarnings('ignore', message=r'.*std\(\): degrees of freedom is <= 0.*')
+
 # 尝试抑制 C 库级别的 libpng 警告
 try:
     import ctypes

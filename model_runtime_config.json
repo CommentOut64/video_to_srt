@@ -9,10 +9,10 @@
     },
     "alignment": {
       "dual_time_boundary_tolerance_ms": 250,
-      "enable_dual_time_experiment": true,
+      "enable_dual_time_experiment": false,
       "dual_time_active_min_boundary_f1": 0.85,
       "dual_time_write_debug_srt": false,
-      "dual_time_mode": "shadow"
+      "dual_time_mode": "off"
     },
     "timeline": {
       "enabled": true,

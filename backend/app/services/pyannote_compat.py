@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import warnings
 from pathlib import Path
 from typing import Any, Optional
 
@@ -71,7 +72,7 @@ def _ensure_torch_weights_only_compat(
     os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 
     if not getattr(_ensure_torch_weights_only_compat, _TORCH_WEIGHTS_ONLY_FLAG, False):
-        active_logger.info(
+        active_logger.debug(
             "已启用 TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1，兼容 pyannote 旧 checkpoint 加载"
         )
         setattr(_ensure_torch_weights_only_compat, _TORCH_WEIGHTS_ONLY_FLAG, True)
@@ -121,52 +122,57 @@ def _load_pyannote_object(
     active_logger = logger or LOGGER
     patch_huggingface_hub_for_pyannote(active_logger)
 
-    if object_type == "pipeline":
-        from pyannote.audio import Pipeline
+    # V3.2.0+dev.20260218.01: 抑制 pyannote/lightning/torch 加载时的第三方库警告
+    # 必须包裹 import 语句，因为 torchcodec 警告在 pyannote 模块导入时就触发
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
 
-        pyannote_cls = Pipeline
-    elif object_type == "model":
-        from pyannote.audio import Model
+        if object_type == "pipeline":
+            from pyannote.audio import Pipeline
 
-        pyannote_cls = Model
-    else:
-        raise ValueError(f"不支持的 pyannote 对象类型: {object_type}")
+            pyannote_cls = Pipeline
+        elif object_type == "model":
+            from pyannote.audio import Model
 
-    call_kwargs = dict(kwargs)
-    if token:
-        call_kwargs["token"] = token
+            pyannote_cls = Model
+        else:
+            raise ValueError(f"不支持的 pyannote 对象类型: {object_type}")
 
-    _ensure_torch_weights_only_compat(active_logger)
+        call_kwargs = dict(kwargs)
+        if token:
+            call_kwargs["token"] = token
 
-    if object_type == "pipeline":
-        # Why:
-        # - pyannote 4.x 的 community pipeline 入口是目录（含 config.yaml 与子模型目录）；
-        # - 若把目录误解析为单一权重文件，会破坏 pipeline 级加载。
-        resolved_checkpoint = checkpoint
-    else:
-        resolved_checkpoint = _resolve_local_checkpoint_path(
-            checkpoint=checkpoint,
-            logger=active_logger,
-        )
+        _ensure_torch_weights_only_compat(active_logger)
 
-    try:
-        return pyannote_cls.from_pretrained(resolved_checkpoint, **call_kwargs)
-    except TypeError as exc:
-        # 兼容极端场景：若某版本仍要求 use_auth_token，则自动回退。
-        should_retry_with_legacy_token = (
-            token is not None
-            and "token" in str(exc)
-            and "unexpected keyword" in str(exc)
-        )
-        if not should_retry_with_legacy_token:
-            raise
+        if object_type == "pipeline":
+            # Why:
+            # - pyannote 4.x 的 community pipeline 入口是目录（含 config.yaml 与子模型目录）；
+            # - 若把目录误解析为单一权重文件，会破坏 pipeline 级加载。
+            resolved_checkpoint = checkpoint
+        else:
+            resolved_checkpoint = _resolve_local_checkpoint_path(
+                checkpoint=checkpoint,
+                logger=active_logger,
+            )
 
-        legacy_kwargs = dict(kwargs)
-        legacy_kwargs["use_auth_token"] = token
-        active_logger.warning(
-            "pyannote from_pretrained 不接受 token 参数，回退 use_auth_token"
-        )
-        return pyannote_cls.from_pretrained(resolved_checkpoint, **legacy_kwargs)
+        try:
+            return pyannote_cls.from_pretrained(resolved_checkpoint, **call_kwargs)
+        except TypeError as exc:
+            # 兼容极端场景：若某版本仍要求 use_auth_token，则自动回退。
+            should_retry_with_legacy_token = (
+                token is not None
+                and "token" in str(exc)
+                and "unexpected keyword" in str(exc)
+            )
+            if not should_retry_with_legacy_token:
+                raise
+
+            legacy_kwargs = dict(kwargs)
+            legacy_kwargs["use_auth_token"] = token
+            active_logger.warning(
+                "pyannote from_pretrained 不接受 token 参数，回退 use_auth_token"
+            )
+            return pyannote_cls.from_pretrained(resolved_checkpoint, **legacy_kwargs)
 
 
 def load_pyannote_pipeline(

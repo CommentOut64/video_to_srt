@@ -181,26 +181,6 @@
       ]
   resources: {cpu_threads: 4, vram_mb: 200}
 
-- id: speaker-ecapa-voxceleb
-  kind: speaker
-  framework: torch
-  format: pth
-  default_device: cpu
-  compute_type: fp32
-  source:
-    local_path: backend/models/pretrained/spkrec-ecapa-voxceleb
-    repo_id: speechbrain/spkrec-ecapa-voxceleb
-    files:
-      [
-        classifier.ckpt,
-        embedding_model.ckpt,
-        mean_var_norm_emb.ckpt,
-        hyperparams.yaml,
-        label_encoder.txt,
-        config.json,
-      ]
-  resources: {cpu_threads: 4, vram_mb: 100}
-
 - id: pyannote-segmentation-3-0
   kind: speaker
   framework: torch
