@@ -189,8 +189,8 @@ class SentenceSegment:
     speaker_label: Optional[str] = None           # 句级说话人展示名
     speaker_color_key: Optional[str] = None       # 句级说话人颜色键
     binding_source: Optional[str] = None          # 句级绑定来源（auto/user）
-    split_reason: Optional[str] = None            # 句级切分原因（L6/L7 透传）
-    split_risk: Optional[str] = None              # 句级切分风险（L6/L7 透传）
+    split_reason: Optional[str] = None            # 句级切分原因（裁决层/输出层透传）
+    split_risk: Optional[str] = None              # 句级切分风险（裁决层/输出层透传）
     window_id: Optional[str] = None               # 触发窗口 ID（soft-cut）
     pyannote_frame_time: Optional[float] = None   # 原始 pyannote 帧时间
     mapped_cut_time: Optional[float] = None       # 吸附后的切分时间

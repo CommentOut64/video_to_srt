@@ -55,7 +55,7 @@ class TextTrack:
     itn_fallback: bool = False
     itn_fallback_reason: Optional[str] = None
     clean_to_word: List[Optional[int]] = field(default_factory=list)
-    # V3.2.0+dev.20260205.09: L4 对齐支持词级置信度来源透传。
+    # V3.2.0+dev.20260205.09: 集合层对齐支持词级置信度来源透传。
     word_confidences: List[Optional[float]] = field(default_factory=list)
     punct_positions: List[PuncPosition] = field(default_factory=list)
     mapping_coverage: float = 0.0
@@ -63,7 +63,7 @@ class TextTrack:
 
 @dataclass
 class PunctSource:
-    """标点候选来源（L3 内部使用）。"""
+    """标点候选来源（标点前置域内部使用）。"""
 
     clean_text_ref: str
     positions: List[PuncPosition]
@@ -74,7 +74,7 @@ class PunctSource:
 
 @dataclass
 class PunctTrack:
-    """标点轨道（L3 输出）。"""
+    """标点轨道（标点前置域输出）。"""
 
     clean_text_ref: str
     positions: List[PuncPosition]
@@ -156,8 +156,8 @@ class L2Output:
 
 
 @dataclass
-class L3Input:
-    """L3 标点层输入。"""
+class PunctuationPreInput:
+    """标点前置域输入。"""
 
     chosen_text_track: Optional[TextTrack]
     sv_punct_source: Optional[PunctSource] = None
@@ -166,15 +166,15 @@ class L3Input:
 
 
 @dataclass
-class L3Output:
-    """L3 标点层输出。"""
+class PunctuationPreOutput:
+    """标点前置域输出。"""
 
     punct_track: PunctTrack
 
 
 @dataclass
 class AlignmentResult:
-    """L4 对齐输出结果。"""
+    """集合层对齐输出结果。"""
 
     aligned_words: List[AlignedWord]
     alignment_score: float
@@ -185,8 +185,8 @@ class AlignmentResult:
 
 
 @dataclass
-class L4Input:
-    """L4 对齐层输入。"""
+class CollectionLayerInput:
+    """集合层输入。"""
 
     chosen_text_track: Optional[TextTrack]
     sv_words: List[WordTimestamp]
@@ -194,8 +194,8 @@ class L4Input:
 
 
 @dataclass
-class L4Output:
-    """L4 对齐层输出。"""
+class CollectionLayerOutput:
+    """集合层输出。"""
 
     alignment_result: AlignmentResult
 
@@ -216,8 +216,8 @@ class AnnotatedWord:
 
 
 @dataclass
-class L5Input:
-    """L5 语义注入层输入。"""
+class ScoringLayerInput:
+    """评分层输入。"""
 
     alignment_result: AlignmentResult
     punct_track: PunctTrack
@@ -227,8 +227,8 @@ class L5Input:
 
 
 @dataclass
-class L5Output:
-    """L5 语义注入层输出。"""
+class ScoringLayerOutput:
+    """评分层输出。"""
 
     annotated_words: List[AnnotatedWord]
     injection_report: Dict[str, Any] = field(default_factory=dict)
@@ -276,8 +276,8 @@ class OutputTrace:
 
 
 @dataclass
-class L6Input:
-    """L6 切分层输入。"""
+class DecisionLayerInput:
+    """裁决层输入。"""
 
     annotated_words: List[AnnotatedWord]
     vad_intervals: Optional[List[Tuple[float, float]]] = None
@@ -289,8 +289,8 @@ class L6Input:
 
 
 @dataclass
-class L6Output:
-    """L6 切分层输出。"""
+class DecisionLayerOutput:
+    """裁决层输出。"""
 
     sentence_segments: List[SentenceSegment]
     words_for_split: List[WordTimestamp]
@@ -300,8 +300,8 @@ class L6Output:
 
 
 @dataclass
-class L7Input:
-    """L7 输出层输入。"""
+class OutputLayerInput:
+    """输出层输入。"""
 
     chunk_index: int
     sentence_segments: List[SentenceSegment]
@@ -312,8 +312,8 @@ class L7Input:
 
 
 @dataclass
-class L7Output:
-    """L7 输出层输出。"""
+class OutputLayerOutput:
+    """输出层输出。"""
 
     output_payload: Dict[str, Any] = field(default_factory=dict)
     output_traces: List[OutputTrace] = field(default_factory=list)
@@ -326,16 +326,16 @@ __all__ = [
     "L1Output",
     "L2Input",
     "L2Output",
-    "L3Input",
-    "L3Output",
-    "L4Input",
-    "L4Output",
-    "L5Input",
-    "L5Output",
-    "L6Input",
-    "L6Output",
-    "L7Input",
-    "L7Output",
+    "PunctuationPreInput",
+    "PunctuationPreOutput",
+    "CollectionLayerInput",
+    "CollectionLayerOutput",
+    "ScoringLayerInput",
+    "ScoringLayerOutput",
+    "DecisionLayerInput",
+    "DecisionLayerOutput",
+    "OutputLayerInput",
+    "OutputLayerOutput",
     "NormalizationResult",
     "PunctSource",
     "PunctTrack",
@@ -348,3 +348,4 @@ __all__ = [
     "FusedEvidence",
     "OutputTrace",
 ]
+
