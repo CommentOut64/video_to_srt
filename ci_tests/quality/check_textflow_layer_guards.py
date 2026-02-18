@@ -8,6 +8,7 @@
 3. 冻结新增后处理旧入口导入：禁止新增 L4-L7 旧目录直连导入。
 4. 冻结新增 textflow 分层子模块直连导入：调用方统一使用 `app.services.textflow` 包级 API。
 5. 冻结新增 alignment 包级旧别名导入：禁止新增 `from app.services.alignment import AlignmentProcessor/FactBuilder`。
+6. 冻结新增后处理旧层级术语字面量：禁止新增 `L3/L4/L5/L6/L7`（仅冻结新增，历史遗留走基线）。
 
 说明：
 - 脚本默认采用“基线对比”模式：只阻止新增，不阻止历史遗留。
@@ -43,6 +44,7 @@ RULES: dict[str, re.Pattern[str]] = {
     "frozen_alignment_legacy_exports_imports.txt": re.compile(
         r"from\s+app\.services\.alignment\s+import\s+.*\b(AlignmentProcessor|FactBuilder|FactBuilderConfig)\b"
     ),
+    "frozen_legacy_layer_terms.txt": re.compile(r"(?<![A-Za-z0-9_])L[3-7](?:\.[0-9]+)?(?![A-Za-z0-9_])"),
 }
 
 
@@ -148,6 +150,8 @@ def main() -> int:
                 title = "检测到新增后处理旧入口导入（应改用 textflow 包级 API）"
             elif baseline_name == "frozen_textflow_direct_layer_imports.txt":
                 title = "检测到新增 textflow 分层子模块直连导入（应改用 app.services.textflow）"
+            elif baseline_name == "frozen_legacy_layer_terms.txt":
+                title = "检测到新增后处理旧层级术语字面量（L3-L7）"
             else:
                 title = "检测到新增 alignment 包级旧别名导入（应改用 app.services.textflow）"
             _print_new_violations(title, baseline_file, new_records)
