@@ -11,6 +11,10 @@ V3.1.1+dev.20260108.02 更新：
 - 支持 use_snr_triage 配置参数
 - 默认启用 SNR+C50 三层决策策略
 
+V3.2.0+dev.20260212.01 更新：
+- 临时下线 Brouhaha 依赖，默认关闭 SNR+C50 策略与智能探针
+- 分诊默认走 YAMNet/规则兜底路径
+
 V3.1.1+dev.20260108.06 更新：
 - 新增分诊详细日志导出功能
 - 保存每个 Chunk 的 SNR/C50/决策层级等信息到任务目录
@@ -22,6 +26,7 @@ V3.1.2+dev.20260109.01 更新：
 
 import logging
 import json
+from importlib import util
 from datetime import datetime
 from typing import List, Optional, TYPE_CHECKING, Dict, Any
 from pathlib import Path
@@ -62,8 +67,8 @@ class SpectralTriageStage:
         threshold: float = 0.35,
         logger: Optional[logging.Logger] = None,
         cancellation_token: Optional["CancellationToken"] = None,  # v3.1.0: 新增
-        use_snr_triage: bool = True,  # V3.1.1+dev.20260108.02: 新增，默认启用
-        use_smart_probe: bool = True,  # V3.1.2+dev.20260109.01: 新增，智能探针模式（默认启用）
+        use_snr_triage: bool = False,  # V3.2.0+dev.20260212.01: 默认关闭，走兜底分诊
+        use_smart_probe: bool = False,  # V3.2.0+dev.20260212.01: 默认关闭，避免依赖 Brouhaha
         show_progress: bool = True  # V3.1.2+dev.20260109.01: 新增，显示命令行进度条
     ):
         """
@@ -74,8 +79,8 @@ class SpectralTriageStage:
             threshold: 分诊阈值，默认0.35
             logger: 日志记录器，如果为None则创建新的
             cancellation_token: 取消令牌（可选，v3.1.0）
-            use_snr_triage: 是否启用 SNR+C50 三层决策策略（默认 True，V3.1.1+dev.20260108.02）
-            use_smart_probe: 是否启用智能探针模式（默认 True，V3.1.2+dev.20260109.01）
+            use_snr_triage: 是否启用 SNR+C50 三层决策策略（默认 False）
+            use_smart_probe: 是否启用智能探针模式（默认 False）
             show_progress: 是否显示命令行进度条（默认 True，V3.1.2+dev.20260109.01）
         """
         # V3.1.1+dev.20260108.02: 根据配置决定是否启用 SNR 策略
@@ -84,7 +89,12 @@ class SpectralTriageStage:
         self.logger = logger or logging.getLogger(__name__)
         self.cancellation_token = cancellation_token  # v3.1.0
         self.use_snr_triage = use_snr_triage  # V3.1.1+dev.20260108.02
-        self.use_smart_probe = use_smart_probe  # V3.1.2+dev.20260109.01
+        # Why: 智能探针依赖 Brouhaha；临时下线阶段若依赖缺失则强制回退标准分诊。
+        if use_smart_probe and util.find_spec("brouhaha") is None:
+            self.logger.warning("检测到 Brouhaha 不可用，已自动关闭智能探针并回退标准分诊")
+            self.use_smart_probe = False
+        else:
+            self.use_smart_probe = use_smart_probe
         self.show_progress = show_progress  # V3.1.2+dev.20260109.01
         self._smart_probe = None  # 懒加载
         self._last_triage_log: List[Dict[str, Any]] = []

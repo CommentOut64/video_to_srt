@@ -26,6 +26,7 @@ from app.core.config import config
 from app.models.job_models import JobState
 from app.schemas.profile_config import ProfileConfig
 from app.schemas.resume_context import ResumeContext
+from app.services.checkpoint import RuntimeCheckpointService
 
 if TYPE_CHECKING:
     from app.services.hardware_profile_service import HardwareProfileProvider
@@ -172,6 +173,22 @@ class PipelineOrchestrator:
                 env_value=os.getenv("DEBUG_PUNCTUATION"),
                 config_value=bool(getattr(debug_config, "punctuation_output", False)),
             )
+            preprocessing = getattr(job.settings, "preprocessing", None)
+            is_enable_speaker_detection = bool(
+                getattr(preprocessing, "is_enable_speaker_detection", True)
+            )
+            is_enable_speaker_guided_split = bool(
+                getattr(preprocessing, "is_enable_speaker_guided_split", True)
+            )
+            speaker_count = max(0, int(getattr(preprocessing, "speaker_count", 0) or 0))
+            speaker_min_count = max(
+                0,
+                int(getattr(preprocessing, "speaker_min_count", 0) or 0),
+            )
+            speaker_max_count = max(
+                0,
+                int(getattr(preprocessing, "speaker_max_count", 0) or 0),
+            )
             transcription_pipeline = AsyncDualPipeline(
                 job_id=job.job_id,
                 transcription_profile=profile_config.transcription_profile,
@@ -179,6 +196,11 @@ class PipelineOrchestrator:
                 patch_engine=profile_config.patch_engine,
                 patching_threshold=profile_config.patching_threshold,
                 debug_punctuation=debug_punctuation,
+                is_enable_speaker_detection=is_enable_speaker_detection,
+                is_enable_speaker_guided_split=is_enable_speaker_guided_split,
+                speaker_count=speaker_count,
+                speaker_min_count=speaker_min_count,
+                speaker_max_count=speaker_max_count,
                 logger=self.logger,
                 cancellation_token=cancellation_token,
                 progress_emitter=progress_emitter,
@@ -433,6 +455,41 @@ class PipelineOrchestrator:
         from app.services.job.checkpoint_manager import CheckpointManagerV37
 
         _job_dir = job_dir if job_dir else Path(job.dir)
+        runtime_state_service = RuntimeCheckpointService(job_dir=_job_dir)
+
+        # Phase 1: runtime_state.db 优先作为恢复入口。
+        if runtime_state_service.has_runtime_state():
+            snapshot = runtime_state_service.load_snapshot()
+            preprocess_commit = snapshot.last_unit_commits.get("preprocess")
+            runtime_checkpoint = {
+                "runtime_state": {
+                    "source": "runtime_state.db",
+                    "last_unit_commits": snapshot.last_unit_commits,
+                },
+                "preprocessing": {
+                    # 仅当预处理单元已提交，才允许跳过到已完成状态。
+                    "vad_completed": preprocess_commit in {
+                        "vad_chunk",
+                        "triage_chunk",
+                        "separation_chunk",
+                        "langid_chunk",
+                        "speaker_chunk",
+                    },
+                    "spectral_triage_completed": preprocess_commit in {
+                        "triage_chunk",
+                        "separation_chunk",
+                        "langid_chunk",
+                        "speaker_chunk",
+                    },
+                    "separation_completed": preprocess_commit in {
+                        "separation_chunk",
+                        "langid_chunk",
+                        "speaker_chunk",
+                    },
+                },
+            }
+            return ResumeContext.from_checkpoint(runtime_checkpoint)
+
         _checkpoint_manager = checkpoint_manager if checkpoint_manager else CheckpointManagerV37(_job_dir, logger=self.logger)
         checkpoint = _checkpoint_manager.load_checkpoint()
         if not checkpoint:

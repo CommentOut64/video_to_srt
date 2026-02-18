@@ -181,25 +181,39 @@
       ]
   resources: {cpu_threads: 4, vram_mb: 200}
 
-- id: speaker-ecapa-voxceleb
+- id: pyannote-segmentation-3-0
   kind: speaker
   framework: torch
   format: pth
-  default_device: cpu
+  default_device: cuda
   compute_type: fp32
   source:
-    local_path: backend/models/pretrained/spkrec-ecapa-voxceleb
-    repo_id: speechbrain/spkrec-ecapa-voxceleb
+    local_path: backend/models/pretrained/segmentation-3.0
+    files: [config.yaml, pytorch_model.bin]
+  resources: {vram_mb: 1200, cpu_threads: 4}
+  features:
+    role: segmentation
+
+- id: pyannote-speaker-diarization-community-1
+  kind: speaker
+  framework: torch
+  format: pth
+  default_device: cuda
+  compute_type: fp32
+  source:
+    local_path: backend/models/pretrained/speaker-diarization-community-1
     files:
       [
-        classifier.ckpt,
-        embedding_model.ckpt,
-        mean_var_norm_emb.ckpt,
-        hyperparams.yaml,
-        label_encoder.txt,
-        config.json,
+        config.yaml,
+        segmentation/pytorch_model.bin,
+        embedding/pytorch_model.bin,
+        plda/plda.npz,
+        plda/xvec_transform.npz,
       ]
-  resources: {cpu_threads: 4, vram_mb: 100}
+  resources: {vram_mb: 2200, cpu_threads: 4}
+  features:
+    role: diarization
+    provider: pyannote-community
 
 - id: punct-ct-transformer-zh
   kind: punct

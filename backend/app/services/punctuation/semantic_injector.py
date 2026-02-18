@@ -297,7 +297,7 @@ class SemanticInjector:
 
         # V3.2.0+dev.20260205.06: 移除弱标点过滤逻辑
         # 原因：密集标点问题已从根源修复（Prompt格式 + condition_on_previous_text禁用）
-        # 弱标点过滤会误伤英文等语言的正常逗号，且 L3 后处理已有规则引擎过滤异常标点
+        # 弱标点过滤会误伤英文等语言的正常逗号，且标点前置域后处理已有规则引擎过滤异常标点
         # 保留 weak_count 统计用于调试，但不再执行过滤
 
         if not positions:

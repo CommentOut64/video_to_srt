@@ -344,6 +344,12 @@ SSE_PROGRESS_TAGS = {
 SSE_SUBTITLE_TAGS = {
     "subtitle.sv_segment": "SenseVoice 完成一个 VAD 段",
     "subtitle.sv_sentence": "SenseVoice 完成一个句子",
+    "subtitle.draft": "草稿字幕（快流）",
+    "subtitle.replace_chunk": "Chunk 替换（慢流定稿）",
+    "subtitle.restored": "断点恢复字幕",
+    "subtitle.finalized": "极速模式定稿字幕",
+    "subtitle.revised": "句级修订（含说话人改绑）",
+    "subtitle.speaker_profiles": "说话人资料变更",
     "subtitle.whisper_patch": "Whisper 复核覆盖一个句子",
     "subtitle.llm_proof": "LLM 校对覆盖一个句子",
     "subtitle.llm_trans": "LLM 翻译完成一个句子",

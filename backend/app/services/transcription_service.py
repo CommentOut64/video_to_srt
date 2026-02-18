@@ -228,6 +228,16 @@ class TranscriptionService:
                 env_value=os.getenv("DEBUG_PUNCTUATION"),
                 config_value=bool(getattr(debug_config, "punctuation_output", False)),
             )
+            preprocessing = getattr(job.settings, "preprocessing", None)
+            is_enable_speaker_detection = bool(
+                getattr(preprocessing, "is_enable_speaker_detection", True)
+            )
+            is_enable_speaker_guided_split = bool(
+                getattr(preprocessing, "is_enable_speaker_guided_split", True)
+            )
+            speaker_count = max(0, int(getattr(preprocessing, "speaker_count", 0) or 0))
+            speaker_min_count = max(0, int(getattr(preprocessing, "speaker_min_count", 0) or 0))
+            speaker_max_count = max(0, int(getattr(preprocessing, "speaker_max_count", 0) or 0))
 
             # 动态创建转录流水线
             transcription_pipeline = AsyncDualPipeline(
@@ -237,6 +247,11 @@ class TranscriptionService:
                 patch_engine=patch_engine,
                 patching_threshold=patching_threshold,
                 debug_punctuation=debug_punctuation,
+                is_enable_speaker_detection=is_enable_speaker_detection,
+                is_enable_speaker_guided_split=is_enable_speaker_guided_split,
+                speaker_count=speaker_count,
+                speaker_min_count=speaker_min_count,
+                speaker_max_count=speaker_max_count,
                 logger=self.logger
             )
 
@@ -1794,11 +1809,9 @@ class TranscriptionService:
         splitter = SentenceSplitter(config)
         sentences = splitter.split(sv_result.words, sv_result.text_clean)
 
-        # Layer 2: 语义分组 (可选，已实现)
+        # Layer 2: 语义分组服务已下线（Phase 4），保留基础分句结果。
         if enable_grouping:
-            from app.services.semantic_grouper import SemanticGrouper, GroupConfig
-            grouper = SemanticGrouper(GroupConfig(language=config.language))
-            sentences = grouper.group(sentences)
+            self.logger.debug("语义分组已下线，跳过 grouping")
 
         # 【阶段三】VAD 边缘吸附 (Head Snap)
         # 逻辑：如果是 Chunk 的第一句话，且 CTC 延迟在合理范围内（<0.6s），

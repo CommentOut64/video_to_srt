@@ -1,5 +1,5 @@
 """
-L3 标点处理器（PunctuationProcessor）。
+标点前置域处理器（PunctuationProcessor）。
 V3.2.0+dev.20260205.02
 """
 from __future__ import annotations
@@ -9,7 +9,13 @@ import difflib
 from typing import Any, Dict, List, Optional, Sequence, TYPE_CHECKING
 
 from app.core.logging import resolve_loguru_logger
-from app.services.alignment.types import L3Input, L3Output, PunctSource, PunctTrack, TextTrack
+from app.services.alignment.types import (
+    PunctuationPreInput,
+    PunctuationPreOutput,
+    PunctSource,
+    PunctTrack,
+    TextTrack,
+)
 from app.services.punctuation.base import PuncPosition, PunctuationResult, WordTimestampLike, apply_punctuation
 from app.services.punctuation.postprocess import (
     PunctuationPostprocessResult,
@@ -25,7 +31,7 @@ _WEAK_PUNCTUATION_SET = set(",，、;；:：")
 
 
 class PunctuationProcessor:
-    """处理器模式：L3 标点恢复与候选合并。"""
+    """处理器模式：标点前置域恢复与候选合并。"""
 
     def __init__(
         self,
@@ -37,7 +43,7 @@ class PunctuationProcessor:
         self._logger = resolve_loguru_logger(
             logger,
             __name__,
-            layer="L3",
+            layer="评分层",
             processor_name="punctuation_processor",
         )
         self._punctuation_service = punctuation_service
@@ -47,16 +53,18 @@ class PunctuationProcessor:
 
             self._punctuation_service = get_punctuation_service()
 
-    async def process(self, data: L3Input) -> L3Output:
-        """执行 L3 标点恢复并输出 PunctTrack。"""
+    async def process(self, data: PunctuationPreInput) -> PunctuationPreOutput:
+        """执行标点前置域恢复并输出 PunctTrack。"""
         track = data.chosen_text_track
         clean_text = self._get_clean_text(track)
         if not clean_text:
-            return L3Output(punct_track=PunctTrack(clean_text_ref=clean_text or "", positions=[], source="empty"))
+            return PunctuationPreOutput(
+                punct_track=PunctTrack(clean_text_ref=clean_text or "", positions=[], source="empty")
+            )
 
         config = self._resolve_config()
         if not config.is_enabled:
-            return L3Output(
+            return PunctuationPreOutput(
                 punct_track=PunctTrack(clean_text_ref=clean_text, positions=[], source="disabled")
             )
 
@@ -130,7 +138,7 @@ class PunctuationProcessor:
             source=self._resolve_source_label(config, candidates, positions),
             confidence_stats=self._build_confidence_stats(positions, model_result),
         )
-        return L3Output(punct_track=punct_track)
+        return PunctuationPreOutput(punct_track=punct_track)
 
     def _resolve_config(self) -> PunctuationConfig:
         if self._config_override is not None:
@@ -166,7 +174,7 @@ class PunctuationProcessor:
             )
             return list(result.punctuation_positions or []), result
         except Exception as exc:
-            self._logger.warning("L3 标点模型恢复失败: {}", exc)
+            self._logger.warning("评分层标点模型恢复失败: {}", exc)
             return [], None
 
     @staticmethod
@@ -368,7 +376,7 @@ class PunctuationProcessor:
         weak_ratio = weak_count / max(word_count, 1)
         # V3.2.0+dev.20260205.03: 输出弱标点密度细节，便于定位密集逗号来源
         self._logger.debug(
-            "L3 slow_raw 弱标点密度: word_count={} weak_count={} weak_ratio={:.2f} max_weak_ratio={:.2f}",
+            "评分层 slow_raw 弱标点密度: word_count={} weak_count={} weak_ratio={:.2f} max_weak_ratio={:.2f}",
             word_count,
             weak_count,
             weak_ratio,
@@ -379,7 +387,7 @@ class PunctuationProcessor:
             or (word_count >= 4 and weak_count >= max(2, word_count - 1))
         ):
             self._logger.debug(
-                "L3 slow_raw 弱标点过滤触发: word_count={} weak_count={} weak_ratio={:.2f}",
+                "评分层 slow_raw 弱标点过滤触发: word_count={} weak_count={} weak_ratio={:.2f}",
                 word_count,
                 weak_count,
                 weak_ratio,

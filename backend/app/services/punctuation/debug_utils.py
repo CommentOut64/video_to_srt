@@ -135,6 +135,28 @@ def append_debug_dual_time_compare_line(
         log.debug("写入双轨实验对比输出失败（忽略）: %s", exc)
 
 
+def append_debug_m2_stage0_line(
+    job_dir: Optional[Path],
+    payload: Dict[str, Any],
+    *,
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """追加 M2 阶段0观测输出到 debug/m2_stage0_shadow_samples.jsonl。"""
+    if not job_dir:
+        return
+    log = logger or logging.getLogger(__name__)
+    try:
+        debug_dir = job_dir / "debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        file_path = debug_dir / "m2_stage0_shadow_samples.jsonl"
+        line = dict(payload)
+        line.setdefault("timestamp", datetime.utcnow().isoformat() + "Z")
+        with file_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(line, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        log.debug("写入 M2 阶段0观测输出失败（忽略）: %s", exc)
+
+
 def write_debug_json_payload(
     job_dir: Optional[Path],
     filename: str,

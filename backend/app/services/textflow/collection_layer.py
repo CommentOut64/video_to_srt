@@ -1,9 +1,11 @@
 """
-L4 对齐层处理器（AlignmentProcessor）。
-V3.2.0+dev.20260205.09
+集合层统一入口（真实实现）。
+V3.2.0+dev.20260215.24
 """
+
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from app.core.logging import resolve_loguru_logger
@@ -12,13 +14,21 @@ from app.models.sensevoice_models import WordTimestamp
 from app.services.alignment.alignment_service import AlignmentService, AlignmentConfig
 from app.services.alignment.gap_resolver import GapResolver, GapResolution
 from app.services.alignment.quality_stats import QualityStatsCalculator
-from app.services.alignment.types import AlignmentResult, L4Input, L4Output, TextTrack
+from app.services.alignment.types import (
+    AlignedFacts,
+    AlignmentResult,
+    AnnotatedWord,
+    CollectionLayerInput,
+    CollectionLayerOutput,
+    TextTrack,
+)
 from app.services.pseudo_alignment import PseudoAlignment
 from app.services.text_pipeline_config import TextPipelineConfig, AlignmentLayerConfig
+from app.services.timeline.segmentation_service import map_frame_times_to_word_boundaries
 
 
-class AlignmentProcessor:
-    """L4 对齐层处理器：对齐 + Gap 修复 + 质量统计。"""
+class CollectionAlignmentProcessor:
+    """集合层处理器：对齐 + Gap 修复 + 质量统计。"""
 
     def __init__(
         self,
@@ -29,10 +39,11 @@ class AlignmentProcessor:
         self._logger = resolve_loguru_logger(
             logger,
             __name__,
-            layer="L4",
+            layer="集合层",
             processor_name="alignment_processor",
         )
         self._config = self._load_alignment_config(config_override)
+        self._is_m2_nw_v2_enabled = bool(TextPipelineConfig.from_runtime().m2.is_nw_v2_enabled)
         self._gap_resolver = GapResolver(
             gap_ratio_low=self._config.gap_ratio_low,
             gap_ratio_mid=self._config.gap_ratio_mid,
@@ -42,14 +53,20 @@ class AlignmentProcessor:
         )
         self._quality_stats = QualityStatsCalculator(logger=self._logger)
         self._alignment_service = AlignmentService(
-            config=AlignmentConfig(),
+            config=AlignmentConfig(
+                is_enable_nw_v2=self._is_m2_nw_v2_enabled,
+            ),
             logger=self._logger,
             gap_resolver=self._gap_resolver,
             quality_stats_calculator=self._quality_stats,
         )
+        self._logger.info(
+            "集合层 NW 内核配置: nw_v2_enable={}",
+            self._is_m2_nw_v2_enabled,
+        )
 
-    def process(self, data: L4Input) -> L4Output:
-        """执行 L4 对齐并返回 AlignmentResult。"""
+    def process(self, data: CollectionLayerInput) -> CollectionLayerOutput:
+        """执行集合层对齐并返回 AlignmentResult。"""
         track = data.chosen_text_track
         if not track or not track.text_clean:
             empty = AlignmentResult(
@@ -60,7 +77,7 @@ class AlignmentProcessor:
                 resolution=None,
                 coverage=0.0,
             )
-            return L4Output(alignment_result=empty)
+            return CollectionLayerOutput(alignment_result=empty)
 
         clean_text = track.text_clean
         sv_words = data.sv_words or []
@@ -68,16 +85,16 @@ class AlignmentProcessor:
 
         if not self._config.is_enabled:
             fallback = self._build_pseudo_result(clean_text, vad_range)
-            return L4Output(alignment_result=fallback)
+            return CollectionLayerOutput(alignment_result=fallback)
 
         if not self._config.use_sv_timebase:
-            self._logger.warning("L4 对齐关闭 SV 时间基准，改用伪对齐")
+            self._logger.warning("集合层对齐关闭 SV 时间基准，改用伪对齐")
             fallback = self._build_pseudo_result(clean_text, vad_range)
-            return L4Output(alignment_result=fallback)
+            return CollectionLayerOutput(alignment_result=fallback)
 
         if not sv_words:
             fallback = self._build_pseudo_result(clean_text, vad_range)
-            return L4Output(alignment_result=fallback)
+            return CollectionLayerOutput(alignment_result=fallback)
 
         tokens = self._alignment_service._tokenize(clean_text)
         token_confidences = self._build_token_confidences(track, clean_text, tokens)
@@ -94,13 +111,13 @@ class AlignmentProcessor:
             result = self._build_pseudo_result(clean_text, vad_range)
 
         self._logger.info(
-            "L4 对齐完成: words={} score={:.2f} gap_ratio={:.2f} coverage={:.2f}",
+            "集合层对齐完成: words={} score={:.2f} gap_ratio={:.2f} coverage={:.2f}",
             len(result.aligned_words),
             result.alignment_score,
             result.gap_ratio,
             result.coverage,
         )
-        return L4Output(alignment_result=result)
+        return CollectionLayerOutput(alignment_result=result)
 
     @staticmethod
     def _resolve_vad_range(
@@ -214,3 +231,147 @@ class AlignmentProcessor:
         if config_override is None:
             return TextPipelineConfig.from_runtime().alignment
         return AlignmentLayerConfig.from_runtime(config_override)
+
+
+@dataclass
+class CollectionFactBuilderConfig:
+    """集合层配置。"""
+
+    anchor_snap_tolerance_sec: float = 0.22
+    is_enable_time_mapping: bool = False
+    time_axis_version: str = "m2_nw_v2"
+
+
+class CollectionFactBuilder:
+    """
+    集合层事实构建器（Builder Pattern）。
+
+    Why:
+    - 将快慢词、turn、时间映射拼装收敛到单入口，避免编排层散落组装。
+    - 只生产事实对象，不参与切分与裁决，便于后续阶段复用。
+    """
+
+    def __init__(self, config: Optional[CollectionFactBuilderConfig] = None) -> None:
+        self.config = config or CollectionFactBuilderConfig()
+
+    def build(
+        self,
+        *,
+        annotated_words: Sequence[AnnotatedWord],
+        alignment_result: Optional[AlignmentResult],
+        speaker_turns: Sequence[Dict[str, Any]],
+        fast_draft_cuts: Sequence[float],
+        pyannote_frame_times: Sequence[float],
+    ) -> AlignedFacts:
+        normalized_words = list(annotated_words or [])
+        normalized_turns = self._normalize_speaker_turns(speaker_turns)
+        normalized_cuts = self._normalize_cut_times(fast_draft_cuts)
+        normalized_frames = self._normalize_cut_times(pyannote_frame_times)
+        if not normalized_frames:
+            # Why: 阶段3仅要求契约可观测；无 pyannote 帧时使用快流边界作为最小候选。
+            normalized_frames = list(normalized_cuts)
+        boundaries = self._collect_word_boundaries(normalized_words)
+        time_mappings = map_frame_times_to_word_boundaries(
+            frame_times=normalized_frames,
+            word_boundaries=boundaries,
+            tolerance_sec=float(self.config.anchor_snap_tolerance_sec),
+            is_enable_mapping=bool(self.config.is_enable_time_mapping),
+        )
+
+        alignment_score = (
+            float(alignment_result.alignment_score)
+            if alignment_result is not None
+            else 0.0
+        )
+        gap_ratio = (
+            float(alignment_result.gap_ratio)
+            if alignment_result is not None
+            else 0.0
+        )
+        gap_positions = (
+            list(alignment_result.gap_positions)
+            if alignment_result is not None
+            else []
+        )
+
+        return AlignedFacts(
+            annotated_words=normalized_words,
+            alignment_score=alignment_score,
+            gap_ratio=gap_ratio,
+            gap_positions=gap_positions,
+            speaker_turns=normalized_turns,
+            fast_draft_cuts=normalized_cuts,
+            time_axis_version=str(self.config.time_axis_version),
+            time_mappings=time_mappings,
+        )
+
+    @staticmethod
+    def _normalize_speaker_turns(
+        turns: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        for item in turns or []:
+            if not isinstance(item, dict):
+                continue
+            turn_id = str(item.get("turn_id", "") or "").strip()
+            speaker_id = str(item.get("speaker_id", "") or "unknown").strip() or "unknown"
+            start_raw = item.get("start")
+            end_raw = item.get("end")
+            if start_raw is None or end_raw is None:
+                continue
+            start = float(start_raw)
+            end = float(end_raw)
+            if end <= start:
+                continue
+            normalized.append(
+                {
+                    "turn_id": turn_id,
+                    "speaker_id": speaker_id,
+                    "start": start,
+                    "end": end,
+                    "source": str(item.get("source", "") or ""),
+                    "boundary_confidence": (
+                        float(item.get("boundary_confidence"))
+                        if item.get("boundary_confidence") is not None
+                        else 0.0
+                    ),
+                }
+            )
+        return normalized
+
+    @staticmethod
+    def _collect_word_boundaries(
+        words: Sequence[AnnotatedWord],
+    ) -> List[float]:
+        boundaries: List[float] = []
+        for word in words:
+            if word.start is not None:
+                boundaries.append(float(word.start))
+            if word.end is not None:
+                boundaries.append(float(word.end))
+        return sorted(set(boundaries))
+
+    @staticmethod
+    def _normalize_cut_times(values: Sequence[float]) -> List[float]:
+        normalized: List[float] = []
+        for value in values or []:
+            try:
+                normalized.append(float(value))
+            except (TypeError, ValueError):
+                continue
+        return sorted(set(normalized))
+
+
+# 兼容旧命名（用于过渡期）。
+AlignmentProcessor = CollectionAlignmentProcessor
+FactBuilder = CollectionFactBuilder
+FactBuilderConfig = CollectionFactBuilderConfig
+
+__all__ = [
+    "CollectionAlignmentProcessor",
+    "CollectionFactBuilder",
+    "CollectionFactBuilderConfig",
+    "AlignmentProcessor",
+    "FactBuilder",
+    "FactBuilderConfig",
+]

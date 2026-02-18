@@ -18,7 +18,6 @@ from app.services.punctuation.postprocess import (
 from app.services.punctuation.punctuation_processor import PunctuationProcessor
 from app.services.punctuation.scheduler import get_punctuation_scheduler
 from app.services.sse_service import get_sse_manager
-from app.services.text_pipeline_config import TextPipelineConfig
 
 if TYPE_CHECKING:
     from app.services.audio.chunk_engine import AudioChunk
@@ -39,13 +38,10 @@ class FastPunctuationPipeline:
         self.punctuation_service = punctuation_service
         self.logger = logger or logging.getLogger(__name__)
         self._punctuation_scheduler = get_punctuation_scheduler()
-        l3_config_override = self._build_l3_fast_config_override()
         # V3.2.0+dev.20260204.06: 统一入口 - 快流标点也通过 L3Processor 产出 PunctTrack
-        # V3.2.0+dev.20260212.02: 快流入口强制 source_preference=fast，避免无慢流模型时 merged 导致空候选。
-        self._l3_processor = PunctuationProcessor(
+        self._punctuation_pre_processor = PunctuationProcessor(
             punctuation_service=punctuation_service,
             logger=self.logger,
-            config_override=l3_config_override,
         )
 
     async def apply(
@@ -70,9 +66,8 @@ class FastPunctuationPipeline:
 
         try:
             chosen_track = self._resolve_chosen_track(ctx, sv_result, normalization, language)
-            language = str(getattr(chosen_track, "language", "") or language or "auto")
-            output = await self._l3_processor.process(
-                data=self._l3_input(chosen_track, words)
+            output = await self._punctuation_pre_processor.process(
+                data=self._build_punctuation_pre_input(chosen_track, words)
             )
         except Exception as exc:
             self.logger.warning("快流标点处理失败，继续主流程: %s", exc)
@@ -110,7 +105,6 @@ class FastPunctuationPipeline:
             post,
             words,
             mode="fast",
-            language=language,
         )
 
         decision = self._punctuation_scheduler.evaluate_fast(
@@ -154,43 +148,16 @@ class FastPunctuationPipeline:
         )
 
     @staticmethod
-    def _l3_input(
-        track: TextTrack,
-        words: List[Dict[str, Any]],
-    ):
+    def _build_punctuation_pre_input(track: TextTrack, words: List[Dict[str, Any]]):
         # 延迟导入避免循环依赖
-        from app.services.alignment.types import L3Input
+        from app.services.alignment.types import PunctuationPreInput
 
-        # 快流强制 fast 模式时不注入 sv_punct_source，避免覆盖模型候选。
-        return L3Input(
+        return PunctuationPreInput(
             chosen_text_track=track,
             sv_punct_source=None,
             wh_punct_source=None,
             word_timestamps=words,
         )
-
-    def _build_l3_fast_config_override(self) -> Dict[str, Any]:
-        """
-        构建快流 L3 覆盖配置。
-
-        原则：
-        1. 继承当前运行时标点参数，避免误覆盖其它阈值；
-        2. 仅强制 source_preference=fast，确保快流路径不依赖慢流来源。
-        """
-        try:
-            punctuation = TextPipelineConfig.from_runtime().punctuation
-            return {
-                "enable": bool(punctuation.is_enabled),
-                "source_preference": "fast",
-                "min_confidence": float(punctuation.min_confidence),
-                "sentence_end_min_confidence": float(punctuation.sentence_end_min_confidence),
-                "raw_source.min_mapping_coverage": float(punctuation.raw_source_min_mapping_coverage),
-                "raw_source.max_weak_ratio": float(punctuation.raw_source_max_weak_ratio),
-                "sv_fallback_mode": str(punctuation.sv_fallback_mode),
-            }
-        except Exception as exc:
-            self.logger.warning("加载快流标点配置失败，回退默认 fast: %s", exc)
-            return {"source_preference": "fast"}
 
     def _emit_debug_outputs(
         self,
@@ -212,12 +179,9 @@ class FastPunctuationPipeline:
             "original_text": raw_text,
             "punctuated_text": punctuation.get("text", ""),
             "split_points": punctuation.get("split_points", []),
-            "language": punctuation.get("language", ""),
-            "positions_count": len(punctuation.get("punctuation_positions", []) or []),
             "model_id": punctuation.get("model_id", ""),
             "processing_time_ms": punctuation.get("processing_time_ms", 0.0),
             "confidence": punctuation.get("confidence", 0.0),
-            "postprocess_metrics": (punctuation.get("postprocess", {}) or {}).get("metrics", {}),
         }
 
         sse_manager = get_sse_manager()
@@ -247,7 +211,6 @@ class FastPunctuationPipeline:
         words: List[Dict[str, Any]],
         *,
         mode: str,
-        language: str,
     ) -> Dict[str, Any]:
         """将后处理结果转换为可序列化结构。"""
         positions = post_result.final_positions
@@ -278,7 +241,6 @@ class FastPunctuationPipeline:
             "confidence": self._estimate_positions_confidence(positions, model_result.confidence),
             "model_id": model_result.model_id,
             "processing_time_ms": model_result.processing_time_ms,
-            "language": str(language or ""),
             "postprocess": {
                 "mode": mode,
                 "decision_log": [
@@ -327,3 +289,4 @@ class FastPunctuationPipeline:
             model_id=model_result.model_id,
             processing_time_ms=model_result.processing_time_ms,
         )
+

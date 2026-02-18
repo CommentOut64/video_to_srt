@@ -97,18 +97,40 @@
               <option value="precise">精准</option>
             </select>
           </label>
-          <label class="flex items-center gap-2 text-[11px]">
+        </div>
+        <div class="mt-3 flex flex-col gap-2">
+          <div class="text-[11px] text-[var(--af-text-muted)]">说话人策略</div>
+          <label class="flex items-center justify-between gap-2 text-[11px] text-[var(--af-text-normal)]">
+            <span>启用说话人检测</span>
             <input
               type="checkbox"
-              v-model="localConfig.preprocessing.enable_speaker_embedding"
-              class="h-3 w-3 accent-[var(--af-accent-primary)]"
+              v-model="localConfig.preprocessing.enable_speaker_detection"
               @change="onModuleChange"
             />
-            <span class="text-[var(--af-text-normal)]">启用声纹提取</span>
           </label>
-          <div class="text-[10px] text-[var(--af-text-muted)]">
-            声纹数据仅用于后续说话人聚类（默认关闭）
-          </div>
+          <label class="flex items-center justify-between gap-2 text-[11px] text-[var(--af-text-normal)]">
+            <span>speaker 介入切分</span>
+            <input
+              type="checkbox"
+              v-model="localConfig.preprocessing.enable_speaker_guided_split"
+              :disabled="!localConfig.preprocessing.enable_speaker_detection"
+              @change="onModuleChange"
+            />
+          </label>
+          <label class="flex items-center gap-2 text-[11px]">
+            <span class="w-24 text-[var(--af-text-muted)]">说话人数</span>
+            <input
+              type="number"
+              min="0"
+              max="20"
+              step="1"
+              v-model.number="localConfig.preprocessing.speaker_count"
+              :disabled="!localConfig.preprocessing.enable_speaker_detection"
+              class="flex-1 rounded border border-[var(--af-border-default)] bg-[var(--af-bg-tertiary)] px-2 py-1 text-[11px] text-[var(--af-text-normal)]"
+              @change="onModuleChange"
+            />
+            <span class="text-[10px] text-[var(--af-text-muted)]">0=自动</span>
+          </label>
         </div>
       </div>
 
@@ -198,7 +220,11 @@ const props = defineProps({
         enable_spectral_triage: true,
         language_detection_mode: 'balanced',
         language_detection_device: 'auto',
-        enable_speaker_embedding: false,
+        enable_speaker_detection: true,
+        enable_speaker_guided_split: true,
+        speaker_count: 0,
+        speaker_min_count: 0,
+        speaker_max_count: 0,
         langid_confidence_threshold: 0.7,
         langid_whitelist: ['zh', 'ja', 'en'],
         langid_logit_bias_score: 2.5
@@ -263,8 +289,7 @@ const macroPresets = [
         demucs_strategy: 'off',
         separation_mode: 'on_demand',
         enable_spectral_triage: false,
-        language_detection_mode: 'balanced',
-        enable_speaker_embedding: false
+        language_detection_mode: 'balanced'
       },
       transcription: { transcription_profile: 'sensevoice_only' },
       refinement: { llm_task: 'off', llm_scope: 'sparse' }
@@ -283,8 +308,7 @@ const macroPresets = [
         demucs_strategy: 'auto',
         separation_mode: 'on_demand',
         enable_spectral_triage: true,
-        language_detection_mode: 'balanced',
-        enable_speaker_embedding: false
+        language_detection_mode: 'balanced'
       },
       transcription: { transcription_profile: 'sv_whisper_patch' },
       refinement: { llm_task: 'proofread', llm_scope: 'sparse' }
@@ -303,8 +327,7 @@ const macroPresets = [
         demucs_strategy: 'force_on',
         separation_mode: 'global',
         enable_spectral_triage: false,
-        language_detection_mode: 'balanced',
-        enable_speaker_embedding: false
+        language_detection_mode: 'balanced'
       },
       transcription: { transcription_profile: 'sv_whisper_dual' },
       refinement: { llm_task: 'proofread', llm_scope: 'global' }
@@ -539,12 +562,24 @@ function onModuleChange() {
     localConfig.value.preprocessing.separation_mode = 'global'
   }
 
+  if (!localConfig.value.preprocessing.enable_speaker_detection) {
+    localConfig.value.preprocessing.enable_speaker_guided_split = false
+    localConfig.value.preprocessing.speaker_count = 0
+  }
+  const speakerCount = Number(localConfig.value.preprocessing.speaker_count || 0)
+  if (Number.isNaN(speakerCount) || speakerCount < 0) {
+    localConfig.value.preprocessing.speaker_count = 0
+  } else {
+    localConfig.value.preprocessing.speaker_count = Math.min(20, Math.floor(speakerCount))
+  }
+  localConfig.value.preprocessing.speaker_min_count = 0
+  localConfig.value.preprocessing.speaker_max_count = 0
+
   /* 检查当前配置是否匹配某个预设 */
   const matchedPreset = macroPresets.find(preset => {
     return (
       localConfig.value.preprocessing.demucs_strategy === preset.config.preprocessing.demucs_strategy &&
       localConfig.value.preprocessing.language_detection_mode === preset.config.preprocessing.language_detection_mode &&
-      localConfig.value.preprocessing.enable_speaker_embedding === preset.config.preprocessing.enable_speaker_embedding &&
       localConfig.value.transcription.transcription_profile === preset.config.transcription.transcription_profile &&
       localConfig.value.refinement.llm_task === preset.config.refinement.llm_task &&
       localConfig.value.refinement.llm_scope === preset.config.refinement.llm_scope

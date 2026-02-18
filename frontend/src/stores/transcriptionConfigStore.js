@@ -27,6 +27,11 @@ function buildDefaultTaskConfig() {
       language_detection_mode: 'balanced',
       language_detection_device: 'auto',
       enable_speaker_embedding: false,
+      enable_speaker_detection: true,
+      enable_speaker_guided_split: true,
+      speaker_count: 0,
+      speaker_min_count: 0,
+      speaker_max_count: 0,
       langid_confidence_threshold: 0.7,
       langid_whitelist: ['zh', 'ja', 'en'],
       langid_logit_bias_score: 2.5

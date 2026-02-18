@@ -16,7 +16,6 @@ from app.services.punctuation.base import PuncPosition
 from app.services.model_runtime_config_service import get_model_runtime_config_service
 from app.services.punctuation.semantic_injector import SemanticInjector
 from app.services.punctuation.final_splitter import FinalSplitter, FinalSplitConfig
-from app.services.semantic_grouper import SemanticGrouper, GroupConfig
 from app.services.segmentation.unified_splitter import UnifiedSplitter
 
 if TYPE_CHECKING:
@@ -38,7 +37,7 @@ class DefaultAligner:
         self,
         alignment_config: Optional[AlignmentConfig] = None,
         final_split_config: Optional[FinalSplitConfig] = None,
-        final_group_config: Optional[GroupConfig] = None,
+        final_group_config: Optional[Any] = None,
         is_enable_semantic_grouping: bool = True,
         alignment_score_threshold: float = 0.3,
         is_enable_fallback: bool = True,
@@ -68,14 +67,7 @@ class DefaultAligner:
             )
         self.final_splitter = FinalSplitter(final_split_config, logger=self.logger)
 
-        if final_group_config is None:
-            final_group_config = GroupConfig(
-                max_group_gap=2.0,
-                max_group_duration=10.0,
-                max_group_sentences=5,
-                enable_overlap_detection=True,
-            )
-        self.final_grouper = SemanticGrouper(final_group_config)
+        # Phase 4: 旧语义分组服务下线，定稿链不再执行语义 regroup。
         # V3.2.0+dev.20260202.08: 语义注入器（对齐后标点注入）
         self._semantic_injector = SemanticInjector(
             logger=self.logger,
@@ -366,8 +358,6 @@ class DefaultAligner:
             clean_text=punctuation_clean_text,
             punctuation_positions=punctuation_positions,
         )
-        if self.is_enable_semantic_grouping:
-            sentences = self.final_grouper.group(sentences)
         return sentences
 
     @staticmethod

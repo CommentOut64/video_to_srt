@@ -6,33 +6,17 @@ SlowWorker - 慢流推理 Worker（GPU）
 2. 返回推理结果（不做 Prompt 构建/幻觉检测/对齐）
 """
 import logging
-from dataclasses import dataclass
 from typing import Dict, Optional, Any, List, TYPE_CHECKING
 
 from app.core.asr.engine import ASREngine
 from app.core.asr.models import ASRResult
 from app.core.logging import resolve_loguru_logger
-from app.models.sensevoice_models import SentenceSegment
-from app.services.bridge.batch_builder import BridgeBatch
-from app.services.punctuation.base import PunctuationResult
-from app.services.punctuation.semantic_buffer import PunctuationDecision
+from app.services.bridge.turn_group_models import TurnGroup
 from app.services.whisper_buffer_pool import WhisperBufferPool, WhisperBufferConfig
 from app.services.whisper.whisper_text_sanitizer import WhisperTextSanitizer
 
 if TYPE_CHECKING:
     from app.services.punctuation.service import PunctuationService
-
-
-@dataclass
-class SlowWorkerResult:
-    """SlowWorker 批次处理结果。"""
-
-    batch_id: str
-    whisper_result: Dict[str, Any]
-    source_sentences: List[SentenceSegment]
-    slow_punctuation: Optional[PunctuationResult]
-    punctuation_decision: Optional[PunctuationDecision]
-
 
 class SlowWorker:
     """
@@ -90,32 +74,31 @@ class SlowWorker:
         )
         return self._convert_asr_result(asr_result, prompt=initial_prompt)
 
-    async def process_batch(
+    async def process_turn_group(
         self,
-        batch: BridgeBatch,
+        group: TurnGroup,
         *,
         full_audio_array: Any,
         full_audio_sr: int = 16000,
-    ) -> SlowWorkerResult:
-        """
-        处理 Bridge 批次（V3.2.0+dev.20260201.07）。
+        prompt_text: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """处理 TurnGroup（Phase 3 W-Epoch）。"""
+        if not group:
+            raise ValueError("SlowWorker TurnGroup 为空")
+        if not group.audio_segments:
+            raise ValueError("SlowWorker TurnGroup 缺少音频片段")
 
-        Args:
-            batch: Bridge 批次
-            full_audio_array: 完整音频数组（16kHz）
-            full_audio_sr: 完整音频采样率
-        """
-        if not batch:
-            raise ValueError("SlowWorker 批次为空")
-        log = self.logger.bind(batch_id=batch.batch_id)
-        log.debug("SlowWorker 批次推理开始")
-        audio = self._concat_batch_audio(batch, full_audio_array, full_audio_sr)
-        whisper_lang = batch.language or self.whisper_language
-        prompt = batch.prompt or None
-
+        log = self.logger.bind(group_id=group.group_id, speaker_id=group.speaker_id)
+        log.debug("SlowWorker TurnGroup 推理开始")
+        audio = self._concat_segments_audio(
+            segments=group.audio_segments,
+            full_audio_array=full_audio_array,
+            full_audio_sr=full_audio_sr,
+        )
+        prompt = prompt_text or group.prompt_text or None
         asr_result = await self.patch_engine.transcribe(
             audio,
-            language=whisper_lang,
+            language=group.language or self.whisper_language,
             initial_prompt=prompt,
             word_timestamps=True,
             vad_filter=False,
@@ -123,42 +106,39 @@ class SlowWorker:
             no_repeat_ngram_size=None,
         )
         whisper_result = self._convert_asr_result(asr_result, prompt=prompt)
+        whisper_result["source"] = "slow"
+        whisper_result["speaker_id"] = group.speaker_id
+        whisper_result["group_id"] = group.group_id
+        whisper_result["turn_group_id"] = group.group_id
+        whisper_result["target_turn_ids"] = list(group.target_turn_ids)
+        whisper_result["context_turn_ids"] = list(group.context_turn_ids)
+        whisper_result["flush_reason"] = group.flush_reason
+        whisper_result["language"] = group.language or whisper_result.get("language")
+        return whisper_result
 
-        # V3.2.0+dev.20260204.01: L0 不在 Worker 内执行标点恢复
-        slow_punct_result: Optional[PunctuationResult] = None
-        decision = batch.punctuation_decision
-
-        return SlowWorkerResult(
-            batch_id=batch.batch_id,
-            whisper_result=whisper_result,
-            source_sentences=batch.sentences or [],
-            slow_punctuation=slow_punct_result,
-            punctuation_decision=decision,
-        )
-
-    def _concat_batch_audio(
+    def _concat_segments_audio(
         self,
-        batch: BridgeBatch,
+        *,
+        segments: List[tuple[float, float]],
         full_audio_array: Any,
         full_audio_sr: int,
     ) -> Any:
-        """使用 WhisperBufferPool 拼接批次音频（保留间隔）。"""
+        """按给定时间片拼接音频（保留间隔）。"""
         if full_audio_array is None:
-            raise ValueError("SlowWorker 批次拼接需要完整音频数组")
-        if not batch.audio_segments:
-            raise ValueError("SlowWorker 批次缺少音频片段")
+            raise ValueError("SlowWorker 音频拼接需要完整音频数组")
+        if not segments:
+            raise ValueError("SlowWorker 音频拼接缺少时间片")
 
-        segments = sorted(batch.audio_segments, key=lambda item: item[0])
+        sorted_segments = sorted(segments, key=lambda item: item[0])
         config = WhisperBufferConfig()
         pool = WhisperBufferPool(config)
-        # 采样率不匹配会导致间隔长度偏差，强制同步
         if getattr(pool, "_sample_rate", None) != full_audio_sr:
             pool._sample_rate = full_audio_sr
 
         audio_len = len(full_audio_array)
-        for idx, (start, end) in enumerate(segments):
-            start_sample = max(0, int(start * full_audio_sr))
-            end_sample = min(audio_len, int(end * full_audio_sr))
+        for idx, (start, end) in enumerate(sorted_segments):
+            start_sample = max(0, int(float(start) * full_audio_sr))
+            end_sample = min(audio_len, int(float(end) * full_audio_sr))
             if end_sample <= start_sample:
                 continue
             audio_slice = full_audio_array[start_sample:end_sample]
@@ -170,7 +150,7 @@ class SlowWorker:
             )
 
         if pool.is_empty:
-            raise ValueError("SlowWorker 批次拼接失败：有效音频片段为空")
+            raise ValueError("SlowWorker 音频拼接失败：有效片段为空")
 
         concatenated, _, _ = pool.get_concatenated_audio(preserve_gaps=True)
         return concatenated

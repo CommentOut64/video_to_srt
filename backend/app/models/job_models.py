@@ -4,7 +4,7 @@
 与 preset_models.py 中的 1+3 预设模式保持一致
 """
 from dataclasses import dataclass, field, asdict
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 
 
 # ========== 分组一: 预处理与音频设置 ==========
@@ -35,8 +35,8 @@ class PreprocessingConfig:
     # 分诊灵敏度: 0.0-1.0 (默认从 spectrum_thresholds.py: 0.35)
     spectrum_threshold: float = 0.35
 
-    # V3.1.1+dev.20260108.02: 是否启用 SNR+C50 三层决策策略（默认启用）
-    use_snr_triage: bool = True
+    # V3.2.0+dev.20260212.01: 临时下线 Brouhaha，默认关闭 SNR+C50 三层决策策略
+    use_snr_triage: bool = False
 
     # ========== 熔断回溯配置 (新增) ==========
     # 是否启用熔断回溯
@@ -63,6 +63,12 @@ class PreprocessingConfig:
     langid_whitelist: List[str] = field(default_factory=lambda: ["zh", "ja", "en"])
     langid_logit_bias_score: float = 2.5
     enable_speaker_embedding: bool = True  # V3.2.0+dev.20260207.01: 默认开启声纹聚类
+    # V3.2.0+dev.20260217.06: 任务级 speaker 行为配置（阶段B/C）
+    is_enable_speaker_detection: bool = True
+    is_enable_speaker_guided_split: bool = True
+    speaker_count: int = 0  # 0=auto
+    speaker_min_count: int = 0  # 0=auto
+    speaker_max_count: int = 0  # 0=auto
 
     # ========== 预处理缓存配置 ==========
     # 是否启用预处理缓存 GC（默认关闭）
@@ -76,6 +82,33 @@ class PreprocessingConfig:
 
     # 缓存任务数上限，0 表示不限制
     max_tasks: int = 0
+
+    def resolve_speaker_count(self) -> Optional[int]:
+        """
+        解析任务级固定说话人数。
+
+        约定：
+        - 0 表示自动推断，返回 None；
+        - >0 表示固定人数，直接返回。
+        """
+        normalized_count = max(0, int(self.speaker_count or 0))
+        if normalized_count <= 0:
+            return None
+        return normalized_count
+
+    def resolve_speaker_min_max(self) -> Tuple[Optional[int], Optional[int]]:
+        """
+        解析任务级人数范围（仅在 speaker_count=0 时生效）。
+        """
+        if self.resolve_speaker_count() is not None:
+            return None, None
+        normalized_min = max(0, int(self.speaker_min_count or 0))
+        normalized_max = max(0, int(self.speaker_max_count or 0))
+        min_value = normalized_min if normalized_min > 0 else None
+        max_value = normalized_max if normalized_max > 0 else None
+        if min_value is not None and max_value is not None and max_value < min_value:
+            max_value = min_value
+        return min_value, max_value
 
 
 # ========== 分组二: 转录核心设置 ==========
@@ -207,6 +240,11 @@ class JobSettings:
                 "langid_whitelist": self.preprocessing.langid_whitelist,
                 "langid_logit_bias_score": self.preprocessing.langid_logit_bias_score,
                 "enable_speaker_embedding": self.preprocessing.enable_speaker_embedding,
+                "enable_speaker_detection": self.preprocessing.is_enable_speaker_detection,
+                "enable_speaker_guided_split": self.preprocessing.is_enable_speaker_guided_split,
+                "speaker_count": int(self.preprocessing.speaker_count),
+                "speaker_min_count": int(self.preprocessing.speaker_min_count),
+                "speaker_max_count": int(self.preprocessing.speaker_max_count),
                 "enable_preprocess_cache_gc": self.preprocessing.is_preprocess_cache_gc_enabled,
                 "cache_budget_gb": self.preprocessing.cache_budget_gb,
                 "ttl_hours": self.preprocessing.ttl_hours,
@@ -280,6 +318,34 @@ class JobSettings:
             langid_whitelist = raw_whitelist
         else:
             langid_whitelist = ["zh", "ja", "en"]
+        def _to_non_negative_int(value: Any, default: int = 0) -> int:
+            try:
+                return max(0, int(value))
+            except (TypeError, ValueError):
+                return default
+
+        speaker_count = _to_non_negative_int(preprocessing_data.get("speaker_count", 0))
+        speaker_min_count = _to_non_negative_int(preprocessing_data.get("speaker_min_count", 0))
+        speaker_max_count = _to_non_negative_int(preprocessing_data.get("speaker_max_count", 0))
+        if speaker_count > 0:
+            speaker_min_count = 0
+            speaker_max_count = 0
+        elif speaker_min_count > 0 and speaker_max_count > 0 and speaker_max_count < speaker_min_count:
+            speaker_max_count = speaker_min_count
+        is_enable_speaker_detection = bool(
+            preprocessing_data.get(
+                "enable_speaker_detection",
+                preprocessing_data.get("is_enable_speaker_detection", True),
+            )
+        )
+        is_enable_speaker_guided_split = bool(
+            preprocessing_data.get(
+                "enable_speaker_guided_split",
+                preprocessing_data.get("is_enable_speaker_guided_split", True),
+            )
+        )
+        if not is_enable_speaker_detection:
+            is_enable_speaker_guided_split = False
 
         return cls(
             # 新版配置
@@ -291,7 +357,7 @@ class JobSettings:
                 separation_mode=preprocessing_data.get("separation_mode", "on_demand"),
                 enable_spectral_triage=preprocessing_data.get("enable_spectral_triage", True),
                 spectrum_threshold=preprocessing_data.get("spectrum_threshold", 0.35),
-                use_snr_triage=preprocessing_data.get("use_snr_triage", True),
+                use_snr_triage=preprocessing_data.get("use_snr_triage", False),
                 enable_fuse_breaker=preprocessing_data.get("enable_fuse_breaker", True),
                 fuse_max_retry=preprocessing_data.get("fuse_max_retry", 2),
                 fuse_confidence_threshold=preprocessing_data.get("fuse_confidence_threshold", 0.5),
@@ -303,6 +369,11 @@ class JobSettings:
                 langid_whitelist=langid_whitelist,
                 langid_logit_bias_score=preprocessing_data.get("langid_logit_bias_score", 2.5),
                 enable_speaker_embedding=preprocessing_data.get("enable_speaker_embedding", True),
+                is_enable_speaker_detection=is_enable_speaker_detection,
+                is_enable_speaker_guided_split=is_enable_speaker_guided_split,
+                speaker_count=speaker_count,
+                speaker_min_count=speaker_min_count,
+                speaker_max_count=speaker_max_count,
                 is_preprocess_cache_gc_enabled=preprocessing_data.get("enable_preprocess_cache_gc", False),
                 cache_budget_gb=preprocessing_data.get("cache_budget_gb", 0.0),
                 ttl_hours=preprocessing_data.get("ttl_hours", 0.0),
@@ -352,7 +423,7 @@ class JobSettings:
                 separation_mode=preset.preprocessing.separation_mode,
                 enable_spectral_triage=preset.preprocessing.enable_spectral_triage,
                 spectrum_threshold=preset.preprocessing.spectrum_threshold,
-                use_snr_triage=True,  # V3.1.1+dev.20260108.02: 默认启用 SNR+C50 策略
+                use_snr_triage=False,  # V3.2.0+dev.20260212.01: 临时下线 Brouhaha，默认走兜底分诊
                 vad_filter=preset.preprocessing.vad_filter,
                 enable_fuse_breaker=True,
                 fuse_max_retry=1,
@@ -363,6 +434,11 @@ class JobSettings:
                 langid_confidence_threshold=0.7,
                 langid_whitelist=["zh", "ja", "en"],
                 langid_logit_bias_score=2.5,
+                is_enable_speaker_detection=True,
+                is_enable_speaker_guided_split=True,
+                speaker_count=0,
+                speaker_min_count=0,
+                speaker_max_count=0,
                 is_preprocess_cache_gc_enabled=False,
                 cache_budget_gb=0.0,
                 ttl_hours=0.0,

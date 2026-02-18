@@ -3,7 +3,7 @@
 # ============================================================
 # 统一依赖管理：生产环境依赖 + 可选开发依赖
 # CUDA 版本: 12.8 统一方案 (PyTorch cu128 内置所有 CUDA 库)
-# 更新时间: 2026-02-09
+# 更新时间: 2026-02-11
 # ============================================================
 
 [project]
@@ -40,8 +40,8 @@ dependencies = [
 
     # --- PyTorch 生态 (CUDA 12.8) ---
     # cu128 自带完整的 CUDA 12.8 运行时能力，无需额外安装 nvidia-* 包
-    "torch==2.10.0",
-    "torchaudio==2.10.0",
+    "torch==2.8.0",
+    "torchaudio==2.8.0",
 
     # --- AI 推理引擎 ---
     "faster-whisper==1.2.1",
@@ -73,8 +73,7 @@ dependencies = [
 
     # --- VAD & 语音分析 ---
     "silero-vad>=5.0.0",
-    "pyannote.audio>=3.3.0,<4.0.0",
-    "brouhaha",  # 通过 tool.uv.sources 从 GitHub 安装 (使用国内代理加速)
+    "pyannote.audio==4.0.0",
 
     # --- 声纹识别/语言识别 ---
     "speechbrain==1.0.3",
@@ -159,7 +158,7 @@ index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 
 # 强制覆盖依赖版本（解决版本冲突）
 override-dependencies = [
-    # brouhaha 要求 numpy==1.24.4，但我们需要 1.26.4 以兼容其他包
+    # 与现有生态保持一致，统一 numpy 主版本
     "numpy==1.26.4",
     # 锁定 onnxruntime 到支持 Python 3.10 的版本（安装后会被 onnxruntime-gpu 替换）
     "onnxruntime==1.18.0",
@@ -170,8 +169,6 @@ override-dependencies = [
 # PyTorch 从官方 cu128 源安装
 torch = { index = "pytorch" }
 torchaudio = { index = "pytorch" }
-# Brouhaha 从 GitHub 安装
-brouhaha = { git = "https://github.com/marianne-m/brouhaha-vad" }
 
 # PyTorch 官方 CUDA 12.8 源
 [[tool.uv.index]]
@@ -300,7 +297,7 @@ Issues = "https://github.com/CommentOut64/video-to-srt/issues"
 #
 # 手动安装 (如果 uv sync 失败):
 #   1. 安装 PyTorch (CUDA 12.8):
-#      uv pip install torch==2.10.0+cu128 torchaudio==2.10.0+cu128 \
+#      uv pip install torch==2.8.0+cu128 torchaudio==2.8.0+cu128 \
 #        --index-url https://download.pytorch.org/whl/cu128
 #
 #   2. 安装项目依赖:
@@ -312,17 +309,6 @@ Issues = "https://github.com/CommentOut64/video-to-srt/issues"
 # 验证安装:
 #   python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
 #   python -c "import onnxruntime as ort; print(f'GPU providers: {ort.get_available_providers()}')"
-#
-# ============================================================
-
-# ============================================================
-# 国内用户备用方案
-# ============================================================
-#
-# 如果 ghfast.top 代理不可用，可手动安装 brouhaha：
-#   uv pip install brouhaha@https://kkgithub.com/marianne-m/brouhaha-vad/archive/main.zip
-# 或使用其他代理：
-#   uv pip install brouhaha@https://gh-proxy.com/https://github.com/marianne-m/brouhaha-vad/archive/main.zip
 #
 # ============================================================
 
@@ -373,7 +359,6 @@ Issues = "https://github.com/CommentOut64/video-to-srt/issues"
 #    - onnxruntime (被 onnxruntime-gpu 替代，通过 override 强制)
 #
 # 3. 特殊处理:
-#    - brouhaha: 通过 tool.uv.sources 从 GitHub 安装 (ghfast.top 代理)
 #    - torch/torchaudio: 通过 tool.uv.sources 指定 cu128 源
 #
 # ============================================================

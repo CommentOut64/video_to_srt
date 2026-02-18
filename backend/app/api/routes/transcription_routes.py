@@ -25,6 +25,10 @@ from app.services.sse_service import get_sse_manager
 from app.services.job_queue_service import get_queue_service
 from app.services.media_prep_service import get_media_prep_service
 from app.api.routes.media_routes import _find_video_file
+from app.services.transcription_recovery_utils import (
+    force_finalize_segments_when_finished,
+    force_finalize_snapshot_when_finished,
+)
 
 
 # ========== v3.5 新版 API 模型 ==========
@@ -47,6 +51,15 @@ class PreprocessingSettingsAPI(BaseModel):
     spectrum_threshold: float = Field(default=0.35, ge=0.0, le=1.0, description="分诊灵敏度")
     # VAD 静音过滤
     vad_filter: bool = Field(default=True, description="VAD 静音过滤")
+    # 是否启用说话人检测（任务级）
+    enable_speaker_detection: bool = Field(default=True, description="是否启用说话人检测")
+    # 是否启用 speaker 介入切分（任务级）
+    enable_speaker_guided_split: bool = Field(default=True, description="是否启用 speaker 介入切分")
+    # 手动指定说话人数：0=auto
+    speaker_count: int = Field(default=0, ge=0, le=20, description="说话人数，0 表示自动推断")
+    # 可选人数范围：0=auto，仅在 speaker_count=0 时生效
+    speaker_min_count: int = Field(default=0, ge=0, le=20, description="最小说话人数，0 表示自动")
+    speaker_max_count: int = Field(default=0, ge=0, le=20, description="最大说话人数，0 表示自动")
 
 
 class TranscriptionSettingsAPI(BaseModel):
@@ -196,6 +209,13 @@ class GlobalTermSyncRequest(BaseModel):
     items: List[GlobalTermItem] = Field(default_factory=list)
 
 
+class CreateJobsBatchRequest(BaseModel):
+    """批量创建任务请求。"""
+
+    filenames: List[str] = Field(default_factory=list, description="文件名列表")
+    task_config: Optional[TaskConfigAPI] = Field(default=None, description="任务级配置（可选）")
+
+
 def create_transcription_router(
     transcription_service: TranscriptionService,
     file_service: FileManagementService,
@@ -208,8 +228,6 @@ def create_transcription_router(
 
     # 获取SSE管理器
     sse_manager = get_sse_manager()
-    logger = logging.getLogger(__name__)
-
     from app.services.homophone.db import GlobalTermRule
     from app.services.homophone.runtime import get_homophone_service
     from app.services.homophone.service import SentenceRecord
@@ -228,13 +246,7 @@ def create_transcription_router(
         job_id: str,
         requested_language: str,
     ) -> Optional[Any]:
-        """确保同音索引可查询。
-
-        设计说明：
-        - 若 L7 侧车尚未写入索引（missing），此处以当前快照同步构建 revision=1，
-          避免前端首次进入同音检索时“永远不可搜”。
-        - 只在 missing 场景触发，避免干扰正常异步侧车流程。
-        """
+        """确保同音索引可查询。"""
         homophone_service = get_homophone_service()
         state = homophone_service.get_index_status(job_id)
         if state is not None:
@@ -342,6 +354,74 @@ def create_transcription_router(
             )
         )
         return all_segments
+
+    def _parse_task_config_form(task_config_raw: Optional[str]) -> Dict[str, Any]:
+        """解析 Form 中的 task_config JSON。"""
+        if not task_config_raw:
+            return {}
+        try:
+            payload = json.loads(task_config_raw)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail=f"task_config 不是合法 JSON: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="task_config 必须是对象结构")
+        if "task_config" in payload and isinstance(payload["task_config"], dict):
+            return dict(payload["task_config"])
+        return payload
+
+    def _build_job_settings_from_task_config(task_config: Optional[Dict[str, Any]]) -> JobSettings:
+        """根据 task_config 生成 JobSettings。"""
+        if not task_config:
+            return JobSettings()
+        preset_id = str(task_config.get("preset_id", "balanced") or "balanced")
+        has_custom_groups = any(
+            task_config.get(key)
+            for key in ("preprocessing", "transcription", "refinement", "compute", "debug")
+        )
+        if preset_id != "custom" and not has_custom_groups:
+            return JobSettings.from_preset(preset_id)
+        try:
+            return JobSettings.from_dict(task_config)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    def _normalize_checkpoint_speaker_settings(
+        original_settings: Optional[Dict[str, Any]],
+        task_config: Optional[Dict[str, Any]],
+        existing_job_settings: Optional[JobSettings],
+    ) -> Dict[str, Any]:
+        """
+        规范化 checkpoint 中的 speaker 相关设置。
+
+        Why:
+        - 历史 checkpoint 可能缺少任务级 speaker 字段；
+        - /start 收到显式 task_config 时，用户期望 speaker 策略按本次请求生效。
+        """
+        merged = dict(original_settings or {})
+        preprocessing_payload = dict(merged.get("preprocessing") or {})
+        request_preprocessing = dict((task_config or {}).get("preprocessing") or {})
+        fallback_preprocessing: Dict[str, Any] = {}
+        if isinstance(existing_job_settings, JobSettings):
+            fallback_preprocessing = (
+                existing_job_settings.to_dict().get("preprocessing") or {}
+            )
+
+        speaker_keys = (
+            "enable_speaker_detection",
+            "enable_speaker_guided_split",
+            "speaker_count",
+            "speaker_min_count",
+            "speaker_max_count",
+        )
+        for key in speaker_keys:
+            if key in request_preprocessing:
+                preprocessing_payload[key] = request_preprocessing[key]
+                continue
+            if key not in preprocessing_payload and key in fallback_preprocessing:
+                preprocessing_payload[key] = fallback_preprocessing[key]
+
+        merged["preprocessing"] = preprocessing_payload
+        return merged
 
     def _build_task_snapshot(job: JobState) -> Dict[str, Any]:
         """构建前端任务状态快照（包含时间戳，用于版本校验）。"""
@@ -460,7 +540,10 @@ def create_transcription_router(
         )
 
     @router.post("/upload")
-    async def upload_file(file: UploadFile = File(...)):
+    async def upload_file(
+        file: UploadFile = File(...),
+        task_config: Optional[str] = Form(None),
+    ):
         """上传文件并自动创建转录任务（V2.2: 加入队列）"""
         try:
             # 验证文件类型
@@ -489,7 +572,8 @@ def create_transcription_router(
 
             # 创建任务
             job_id = uuid.uuid4().hex
-            settings = JobSettings()
+            parsed_task_config = _parse_task_config_form(task_config)
+            settings = _build_job_settings_from_task_config(parsed_task_config)
             job = transcription_service.create_job(original_filename, input_path, settings, job_id=job_id)
 
             # 🔥 新增: 加入队列（而非直接启动）
@@ -509,7 +593,10 @@ def create_transcription_router(
             raise HTTPException(status_code=500, detail=f"上传文件失败: {str(e)}")
 
     @router.post("/create-job")
-    async def create_job(filename: str = Form(...)):
+    async def create_job(
+        filename: str = Form(...),
+        task_config: Optional[str] = Form(None),
+    ):
         """为指定文件创建转录任务（本地input模式）"""
         try:
             input_path = file_service.get_input_file_path(filename)
@@ -520,7 +607,8 @@ def create_transcription_router(
                 raise HTTPException(status_code=400, detail="不支持的文件格式")
 
             job_id = uuid.uuid4().hex
-            settings = JobSettings()
+            parsed_task_config = _parse_task_config_form(task_config)
+            settings = _build_job_settings_from_task_config(parsed_task_config)
             transcription_service.create_job(filename, input_path, settings, job_id=job_id)
 
             return {"job_id": job_id, "filename": filename}
@@ -530,7 +618,7 @@ def create_transcription_router(
             raise HTTPException(status_code=500, detail=f"创建任务失败: {str(e)}")
 
     @router.post("/create-jobs-batch")
-    async def create_jobs_batch(filenames: list = Body(..., embed=True)):
+    async def create_jobs_batch(req: CreateJobsBatchRequest):
         """
         批量创建转录任务（从 input 目录选择多个文件）
 
@@ -551,6 +639,12 @@ def create_transcription_router(
             queue_service = get_queue_service(transcription_service)
             jobs = []
             failed = []
+            filenames = list(req.filenames or [])
+            task_config_payload = (
+                req.task_config.model_dump()
+                if req.task_config is not None
+                else {}
+            )
 
             for filename in filenames:
                 try:
@@ -567,7 +661,7 @@ def create_transcription_router(
 
                     # 创建任务
                     job_id = uuid.uuid4().hex
-                    settings = JobSettings()
+                    settings = _build_job_settings_from_task_config(task_config_payload)
                     job = transcription_service.create_job(filename, input_path, settings, job_id=job_id)
 
                     # 加入队列
@@ -635,24 +729,19 @@ def create_transcription_router(
 
             if original_settings:
                 try:
-                    job.settings = JobSettings.from_dict(original_settings)
+                    normalized_original_settings = _normalize_checkpoint_speaker_settings(
+                        original_settings=original_settings,
+                        task_config=task_config,
+                        existing_job_settings=job.settings,
+                    )
+                    job.settings = JobSettings.from_dict(normalized_original_settings)
                 except ValueError as exc:
                     raise HTTPException(status_code=400, detail=str(exc))
             elif task_config:
-                preset_id = task_config.get("preset_id", "balanced")
-                has_custom_groups = any(
-                    task_config.get(key)
-                    for key in ("preprocessing", "transcription", "refinement", "compute")
-                )
-                if preset_id != "custom" and not has_custom_groups:
-                    job.settings = JobSettings.from_preset(preset_id)
-                else:
-                    try:
-                        job.settings = JobSettings.from_dict(task_config)
-                    except ValueError as exc:
-                        raise HTTPException(status_code=400, detail=str(exc))
+                job.settings = _build_job_settings_from_task_config(task_config)
             else:
-                job.settings = JobSettings()
+                if not isinstance(job.settings, JobSettings):
+                    job.settings = JobSettings()
 
             # 🔥 关键改动: 如果任务不在队列中，加入队列
             with queue_service.lock:
@@ -1537,8 +1626,6 @@ def create_transcription_router(
                     indexed_language = fallback_language
                     break
 
-        # 设计说明：若首次建索引时语言推断失误（如将中文拼音当英文），
-        # 可能得到 ready 但 postings 为空。此处在“仍未命中”时基于快照主语言自愈重建并重试。
         if not matches:
             segments = _collect_segments_from_snapshot(job_id)
             if segments:
@@ -1910,6 +1997,13 @@ def create_transcription_router(
         transcription_data = None
         using_snapshot = False
         logger = logging.getLogger(__name__)
+        speaker_store_service = None
+        try:
+            from app.services.speaker_store import SpeakerStoreService
+
+            speaker_store_service = SpeakerStoreService(job_dir=job_dir)
+        except Exception as speaker_exc:
+            logger.warning("[%s] SpeakerStoreService 初始化失败，跳过 speaker 合并: %s", job_id, speaker_exc)
 
         if checkpoint_path.exists():
             try:
@@ -1967,6 +2061,10 @@ def create_transcription_router(
                     # 注意：旧数据可能完全没有 confidence 字段，此时不应显示虚假的准确率
                     raw_conf = sentence.get("confidence")  # 可能为 None
                     source = sentence.get("source", "sensevoice")
+                    is_draft = bool(sentence.get("_is_draft", False))
+                    is_finalized = sentence.get("_is_finalized")
+                    if is_finalized is None:
+                        is_finalized = not is_draft
 
                     # V3.1.2: 检查是否有 display_confidence，没有则计算并标记需要更新
                     display_conf = sentence.get("display_confidence")
@@ -1992,8 +2090,23 @@ def create_transcription_router(
                         "confidence_source": confidence_source,  # 可能为 None
                         "source": source,
                         "is_modified": sentence.get("is_modified", False),
-                        "original_text": sentence.get("original_text")
+                        "original_text": sentence.get("original_text"),
+                        "is_draft": is_draft,
+                        "is_finalized": bool(is_finalized),
                     })
+
+                # finished 态强制收口 snapshot，避免恢复后残留 draft。
+                forced_snapshot_updates = force_finalize_snapshot_when_finished(
+                    job_status=job.status,
+                    sentences_snapshot=sentences_snapshot,
+                )
+                if forced_snapshot_updates > 0:
+                    need_update_checkpoint = True
+                    logger.warning(
+                        "[%s] finished 态修正快照草稿标记: count=%s",
+                        job_id,
+                        forced_snapshot_updates,
+                    )
 
                 # 按 _index 排序（已经是正确顺序，但保险起见）
                 all_segments.sort(key=lambda x: x.get('id', 0))
@@ -2004,18 +2117,6 @@ def create_transcription_router(
                 # 进度信息从 transcription 获取
                 processed_count = transcription.get("processed_count", 0)
                 total_chunks = transcription.get("total_chunks", 0)
-
-                # V3.1.2: 如果有旧数据需要迁移，写回 checkpoint
-                if need_update_checkpoint:
-                    try:
-                        # 使用原始文件路径写回：checkpoint 优先，其次快照文件
-                        target_path = checkpoint_path if checkpoint_path.exists() else snapshot_path
-                        dump_obj = data if not using_snapshot else transcription
-                        with open(target_path, 'w', encoding='utf-8') as f:
-                            json.dump(dump_obj, f, ensure_ascii=False, indent=2)
-                        logger.info(f"[{job_id}] 已迁移字幕数据: 添加 display_confidence 字段")
-                    except Exception as e:
-                        logger.warning(f"[{job_id}] 迁移 checkpoint 失败: {e}")
 
             else:
                 # 回退到旧格式（unaligned_results）
@@ -2060,12 +2161,96 @@ def create_transcription_router(
                 )
             )
 
+            # 统一补齐草稿/定稿标记，避免前后端语义漂移
+            for seg in all_segments:
+                is_draft = bool(seg.get("is_draft", False))
+                is_finalized = seg.get("is_finalized")
+                if is_finalized is None:
+                    is_finalized = not is_draft
+                seg["is_draft"] = is_draft
+                seg["is_finalized"] = bool(is_finalized)
+
+            forced_segments = force_finalize_segments_when_finished(
+                job_status=job.status,
+                segments=all_segments,
+            )
+            if forced_segments > 0:
+                logger.warning(
+                    "[%s] finished 态收口返回段落草稿标记: count=%s",
+                    job_id,
+                    forced_segments,
+                )
+
+            # 定稿段合并 speaker 信息；草稿段强制不携带 speaker 标签
+            finalized_sentence_indices: List[int] = []
+            for seg in all_segments:
+                if seg.get("id") is None or not bool(seg.get("is_finalized")):
+                    continue
+                try:
+                    finalized_sentence_indices.append(int(seg["id"]))
+                except (TypeError, ValueError):
+                    continue
+            speaker_links_map: Dict[int, Dict[str, Any]] = {}
+            if speaker_store_service and finalized_sentence_indices:
+                try:
+                    speaker_links_map = speaker_store_service.get_subtitle_speaker_map(
+                        sentence_indices=finalized_sentence_indices
+                    )
+                except Exception as speaker_query_exc:
+                    logger.warning(
+                        "[%s] 查询 speaker 链接失败，返回默认 speaker 字段: %s",
+                        job_id,
+                        speaker_query_exc,
+                    )
+
+            for seg in all_segments:
+                if bool(seg.get("is_draft")):
+                    seg.pop("speaker_id", None)
+                    seg.pop("turn_id", None)
+                    seg.pop("speaker_label", None)
+                    seg.pop("speaker_color_key", None)
+                    seg.pop("binding_source", None)
+                    continue
+
+                if not bool(seg.get("is_finalized")):
+                    continue
+
+                sentence_index = seg.get("id")
+                resolved_sentence_index = None
+                if sentence_index is not None:
+                    try:
+                        resolved_sentence_index = int(sentence_index)
+                    except (TypeError, ValueError):
+                        resolved_sentence_index = None
+                link_row = (
+                    speaker_links_map.get(resolved_sentence_index)
+                    if resolved_sentence_index is not None
+                    else None
+                )
+                speaker_id = str((link_row or {}).get("speaker_id") or "unknown")
+                seg["speaker_id"] = speaker_id
+                seg["turn_id"] = (link_row or {}).get("turn_id")
+                seg["speaker_label"] = str((link_row or {}).get("speaker_label") or speaker_id)
+                seg["speaker_color_key"] = str((link_row or {}).get("speaker_color_key") or "speaker-01")
+                seg["binding_source"] = str((link_row or {}).get("binding_source") or "auto")
+
             # 快照模式下补充进度信息，避免 percentage 为 0
             if using_snapshot:
                 if not processed_count:
                     processed_count = len(sentences_snapshot)
                 if not total_chunks:
                     total_chunks = job.total or len(sentences_snapshot)
+
+            # V3.1.2: 统一在返回前回写迁移字段（display_confidence/finished收口等）
+            if need_update_checkpoint:
+                try:
+                    target_path = checkpoint_path if checkpoint_path.exists() else snapshot_path
+                    dump_obj = data if not using_snapshot else transcription
+                    with open(target_path, 'w', encoding='utf-8') as f:
+                        json.dump(dump_obj, f, ensure_ascii=False, indent=2)
+                    logger.info(f"[{job_id}] 已迁移字幕数据并完成 finished 态收口")
+                except Exception as e:
+                    logger.warning(f"[{job_id}] 迁移 checkpoint 失败: {e}")
 
             return {
                 "job_id": job_id,

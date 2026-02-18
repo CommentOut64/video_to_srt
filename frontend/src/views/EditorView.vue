@@ -908,6 +908,16 @@ function subscribeSSE() {
       handleFinalizedSubtitle(data)
     },
 
+    onRevised(data) {
+      console.log('[EditorView] 收到字幕修订:', data)
+      handleRevisedSubtitle(data)
+    },
+
+    onSpeakerProfiles(data) {
+      console.log('[EditorView] 收到说话人资料更新:', data)
+      handleSpeakerProfiles(data)
+    },
+
     onSubtitleAdded(data) {
       console.log('[EditorView] 收到新增字幕:', data)
       handleStreamingSubtitle(data)
@@ -1131,6 +1141,13 @@ function handleReplaceChunk(data) {
     source: sentence.source || 'whisper',
     is_modified: sentence.is_modified ?? false,
     original_text: sentence.original_text ?? null,
+    speaker_id: sentence.speaker_id ?? null,
+    turn_id: sentence.turn_id ?? null,
+    speaker_label: sentence.speaker_label ?? null,
+    speaker_color_key: sentence.speaker_color_key ?? null,
+    binding_source: sentence.binding_source ?? null,
+    is_draft: false,
+    is_finalized: true,
   }))
 
   // 调用 projectStore 的替换方法
@@ -1170,6 +1187,11 @@ function handleRestoredChunk(data) {
     is_finalized: sentence.is_finalized ?? true,
     is_modified: sentence.is_modified ?? false,
     original_text: sentence.original_text ?? null,
+    speaker_id: sentence.speaker_id ?? null,
+    turn_id: sentence.turn_id ?? null,
+    speaker_label: sentence.speaker_label ?? null,
+    speaker_color_key: sentence.speaker_color_key ?? null,
+    binding_source: sentence.binding_source ?? null,
   }))
 
   // 调用 projectStore 的恢复方法
@@ -1246,7 +1268,7 @@ function handleSubtitleEdited(data) {
 function handleFinalizedSubtitle(data) {
   if (!data) return
 
-  // 极速模式的定稿字幕处理方式与草稿类似，但标记为定稿
+  // 极速模式：按 chunk 维持映射，但句子标记为定稿
   const sentence = data.sentence || {}
   const chunkIndex = data.chunk_index
 
@@ -1263,12 +1285,43 @@ function handleFinalizedSubtitle(data) {
     warning_type: sentence.warning_type || 'none',
     is_modified: sentence.is_modified ?? false,
     original_text: sentence.original_text ?? null,
+    speaker_id: sentence.speaker_id ?? null,
+    turn_id: sentence.turn_id ?? null,
+    speaker_label: sentence.speaker_label ?? null,
+    speaker_color_key: sentence.speaker_color_key ?? null,
+    binding_source: sentence.binding_source ?? null,
+    is_draft: false,
+    is_finalized: true,
+    source: sentence.source || 'sensevoice_only',
   }
 
-  // 调用草稿方法，但数据已标记为定稿
   projectStore.appendOrUpdateDraft(chunkIndex, sentenceData)
 
   console.log(`[EditorView] 极速模式定稿 Chunk ${chunkIndex}，句子索引 ${data.index}`)
+}
+
+function handleRevisedSubtitle(data) {
+  if (!data) return
+
+  const revisedPayload = { ...data }
+  if (data.sentence) {
+    revisedPayload.sentence = {
+      ...data.sentence,
+      index: data.index ?? data.sentence.index ?? data.sentence.sentenceIndex,
+    }
+  }
+  if (Array.isArray(data.sentences)) {
+    revisedPayload.sentences = data.sentences.map((item) => ({
+      ...item,
+      index: item.index ?? item.sentenceIndex,
+    }))
+  }
+  projectStore.applyRevisedSubtitle(revisedPayload)
+}
+
+function handleSpeakerProfiles(data) {
+  if (!data) return
+  projectStore.applySpeakerProfiles(data)
 }
 
 // 刷新任务进度（用于SSE重连后的状态同步）

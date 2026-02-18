@@ -52,6 +52,10 @@ jobs:
         shell: pwsh
         run: .\.venv\Scripts\python.exe -m ruff check backend
 
+      - name: Run textflow layer guards (Phase A freeze)
+        shell: pwsh
+        run: .\.venv\Scripts\python.exe ci_tests\quality\check_textflow_layer_guards.py
+
       - name: Run unit tests (quality metrics)
         shell: pwsh
         env:

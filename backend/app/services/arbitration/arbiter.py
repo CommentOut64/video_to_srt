@@ -1,6 +1,6 @@
 """
-L2 文本仲裁处理器（单路径）。
-V3.2.0+dev.20260204.04
+L2 文本选文处理器（单路径）。
+V3.2.0+dev.20260216.01
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ class ArbitrationResult:
 
 
 class TextArbiterProcessor:
-    """处理器模式：单路径仲裁，输出明确来源与原因。"""
+    """处理器模式：单路径选文，输出明确来源与原因。"""
 
     _DEFAULT_CONFIG: Dict[str, Any] = {
         "enable": True,
@@ -47,7 +47,7 @@ class TextArbiterProcessor:
         self._logger = resolve_loguru_logger(
             logger,
             __name__,
-            layer="L2",
+            layer="选文层",
             processor_name="text_arbiter_processor",
         )
         self._config_override = dict(config) if config else None
@@ -74,7 +74,7 @@ class TextArbiterProcessor:
                 coverage=coverage,
                 error_code=error_code,
             )
-            self._logger.warning("L2 仲裁缺失输入，回退 fast")
+            self._logger.warning("选文层缺失输入，回退 fast")
             return L2Output(chosen_text_track=None, arbitration_result=result)
 
         chosen_source, reason = self._decide_source(
@@ -138,27 +138,27 @@ class TextArbiterProcessor:
             return chosen_source, "disabled_preference"
 
         if quality.is_hallucination and bool(config.get("hallucination_block", True)):
-            self._logger.debug("L2 仲裁门控: hallucination_flag=true")
+            self._logger.debug("选文层门控: hallucination_flag=true")
             return "fast", "hallucination"
 
         if quality.is_repetition:
-            self._logger.debug("L2 仲裁门控: repetition_flag=true")
+            self._logger.debug("选文层门控: repetition_flag=true")
             return "fast", "repetition"
 
         length_ratio = self._resolve_length_ratio(quality.length_ratio, sv_text, wh_text)
         min_ratio = float(config.get("min_length_ratio", 0.65))
         max_ratio = float(config.get("max_length_ratio", 3.0))
         if length_ratio < min_ratio:
-            self._logger.debug("L2 仲裁门控: length_ratio=%.2f < %.2f", length_ratio, min_ratio)
+            self._logger.debug("选文层门控: length_ratio={:.2f} < {:.2f}", length_ratio, min_ratio)
             return "slow", "length_ratio_low"
         if length_ratio > max_ratio:
-            self._logger.debug("L2 仲裁门控: length_ratio=%.2f > %.2f", length_ratio, max_ratio)
+            self._logger.debug("选文层门控: length_ratio={:.2f} > {:.2f}", length_ratio, max_ratio)
             return "fast", "length_ratio_high"
 
         slow_conf = float(quality.confidence_slow or 0.0)
         low_conf = float(config.get("low_confidence_threshold", 0.5))
         if slow_conf < low_conf:
-            self._logger.debug("L2 仲裁门控: slow_conf=%.2f < %.2f", slow_conf, low_conf)
+            self._logger.debug("选文层门控: slow_conf={:.2f} < {:.2f}", slow_conf, low_conf)
             return "fast", "low_confidence_slow"
 
         if preference == "fast":
@@ -260,7 +260,7 @@ class TextArbiterProcessor:
         result: ArbitrationResult,
     ) -> None:
         message = (
-            "L2 仲裁完成 chosen_source={} reason={} coverage={:.2f} sv_score={:.2f} "
+            "选文层完成 chosen_source={} reason={} coverage={:.2f} sv_score={:.2f} "
             "wh_score={:.2f} input_len=({}, {}) output_len={}"
         )
         if result.error_code:

@@ -210,6 +210,25 @@ class TestRealVideoIntegration:
             pytest.skip("需要 --test-video 参数")
         if not use_real_engines:
             pytest.skip("需要 --real-engines 参数")
+        config = PipelineTestConfig(
+            transcription_profile="sv_whisper_dual",
+            use_real_engines=True,
+            video_path=test_video_path,
+            chunk_count=1,
+            chunk_duration=2.0,
+            enable_bridge=True,
+            language="zh",
+        )
+        runner = IntegrationTestRunner(config)
+        result = await runner.run_full_pipeline()
 
-        # 此测试需要真实引擎实现
-        pytest.skip("真实引擎模式尚未集成到 TestRunner")
+        assert result.success, f"真实流水线失败: {result.error}"
+        assert len(result.contexts) == config.chunk_count
+        assert result.srt_content, "真实流水线应输出非空 SRT"
+        ctx = result.contexts[0]
+        finalization_metrics = getattr(ctx, "finalization_metrics", {}) or {}
+        # 新四层执行证据：集合层/评分层/裁决层/输出层
+        assert "fact_word_count" in finalization_metrics
+        assert "evidence_pause_anchor_count" in finalization_metrics
+        assert "split_decision_count" in finalization_metrics
+        assert "l7_error_count" in finalization_metrics

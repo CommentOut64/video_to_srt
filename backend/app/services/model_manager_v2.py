@@ -227,6 +227,11 @@ class ModelManagerV2:
                 continue
         return result
 
+    @property
+    def runtime_config_service(self):
+        """暴露运行参数服务只读访问入口。"""
+        return self._runtime_service
+
     def _select_loader(self, framework: str) -> ModelLoader:
         if framework not in self.loaders:
             raise KeyError(f"未注册框架对应的 Loader: {framework}")

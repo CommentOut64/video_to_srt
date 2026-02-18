@@ -22,6 +22,7 @@ import torch
 from app.models.job_models import JobState
 from app.services.sse_service import get_sse_manager
 from app.core.config import config
+from app.services.checkpoint import RuntimeCheckpointService
 from app.services.task_state_repository import QueueState
 from app.utils.cancellation_token import (
     CancellationToken,
@@ -325,6 +326,16 @@ class JobQueueService:
             logger.warning(f"任务未暂停，无法恢复: {job_id}, status={job.status}")
             return False
 
+        # Phase 1: 恢复请求到达后清理暂停/取消控制信号，
+        # 防止 PauseBarrier 在下一个单元边界误判并再次停机。
+        try:
+            if job.dir:
+                runtime_service = RuntimeCheckpointService(job_dir=Path(job.dir))
+                runtime_service.clear_pause_requested()
+                runtime_service.clear_cancel_requested()
+        except Exception as exc:
+            logger.warning("清理 runtime_state 控制信号失败: %s", exc)
+
         from_status = job.status
         # V3.1.0: 在推送 SSE 之前，先从 checkpoint 恢复进度
         # 这样 _notify_job_status 推送的进度就是正确的，而非 0
@@ -613,6 +624,9 @@ class JobQueueService:
                         job.status = "paused"
                         job.message = "已暂停"
                     else:
+                        is_finish_valid, finish_error = self._validate_finish_integrity(job)
+                        if not is_finish_valid:
+                            raise RuntimeError(finish_error)
                         job.status = "finished"
                         job.message = "完成"
                         logger.info(f"任务完成: {self.running_job_id}")
@@ -1308,6 +1322,88 @@ class JobQueueService:
         self.sse_manager.broadcast_sync(f"job:{job_id}", f"signal.{signal}", data)
         logger.debug(f"[单任务SSE] 推送信号: {job_id[:8]}... -> signal.{signal}")
 
+    def _validate_finish_integrity(self, job: "JobState") -> tuple[bool, str]:
+        """
+        完成态校验（finished 前最后闸门）。
+
+        约束：
+        1. finalized 覆盖数必须达到 total_chunks。
+        2. sentences_snapshot 不得残留草稿标记。
+        """
+        try:
+            job_dir = Path(job.dir) if job.dir else None
+            if not job_dir or not job_dir.exists():
+                return True, ""
+
+            checkpoint_path = job_dir / "checkpoint.json"
+            snapshot_path = job_dir / "transcription_text.json"
+            source = "none"
+            transcription: Dict[str, Any] = {}
+            total_chunks = int(job.total or 0)
+
+            if checkpoint_path.exists():
+                with open(checkpoint_path, "r", encoding="utf-8") as f:
+                    checkpoint_data = json.load(f)
+                if isinstance(checkpoint_data, dict):
+                    transcription = checkpoint_data.get("transcription", {}) or {}
+                    total_chunks = int(
+                        checkpoint_data.get("preprocessing", {}).get("total_chunks", 0)
+                        or transcription.get("total_chunks", 0)
+                        or total_chunks
+                    )
+                source = "checkpoint"
+            elif snapshot_path.exists():
+                with open(snapshot_path, "r", encoding="utf-8") as f:
+                    snapshot_data = json.load(f)
+                if isinstance(snapshot_data, dict):
+                    transcription = snapshot_data
+                    total_chunks = int(transcription.get("total_chunks", 0) or total_chunks)
+                source = "snapshot"
+            else:
+                return True, ""
+
+            finalized_indices = transcription.get("finalized_indices")
+            if finalized_indices is None:
+                alignment = transcription.get("alignment", {})
+                if isinstance(alignment, dict):
+                    finalized_indices = alignment.get("finalized_indices", [])
+            finalized_set = set()
+            for raw_idx in finalized_indices or []:
+                try:
+                    finalized_set.add(int(raw_idx))
+                except (TypeError, ValueError):
+                    continue
+
+            if total_chunks > 0 and len(finalized_set) < total_chunks:
+                missing = sorted(set(range(total_chunks)) - finalized_set)
+                return (
+                    False,
+                    "完成态校验失败: "
+                    f"{source} 定稿覆盖不足 {len(finalized_set)}/{total_chunks}, "
+                    f"missing={missing[:20]}",
+                )
+
+            sentences_snapshot = transcription.get("sentences_snapshot", [])
+            draft_count = 0
+            for item in sentences_snapshot if isinstance(sentences_snapshot, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                is_draft = bool(item.get("_is_draft", False))
+                is_finalized = item.get("_is_finalized")
+                if is_finalized is None:
+                    is_finalized = not is_draft
+                if is_draft or not bool(is_finalized):
+                    draft_count += 1
+            if draft_count > 0:
+                return (
+                    False,
+                    f"完成态校验失败: {source} 存在草稿残留 draft_count={draft_count}",
+                )
+
+            return True, ""
+        except Exception as exc:
+            return False, f"完成态校验异常: {exc}"
+
     def _build_pause_ack_payload(self, job: "JobState") -> Dict[str, Any]:
         """构建暂停握手确认的载荷信息（包含检查点摘要）"""
         payload: Dict[str, Any] = {
@@ -1322,6 +1418,23 @@ class JobQueueService:
             job_dir = Path(job.dir) if job.dir else None
             if not job_dir or not job_dir.exists():
                 return payload
+
+            # Phase 1: 优先读取 runtime_state.db 的单元提交信息。
+            runtime_service = RuntimeCheckpointService(job_dir=job_dir)
+            if runtime_service.has_runtime_state():
+                snapshot = runtime_service.load_snapshot()
+                payload.update(
+                    {
+                        "checkpoint_found": True,
+                        "checkpoint_source": "runtime_state.db",
+                        "unit_commits": snapshot.last_unit_commits,
+                    }
+                )
+                preprocess_unit = snapshot.last_unit_commits.get("preprocess")
+                if preprocess_unit:
+                    payload["phase"] = f"preprocess:{preprocess_unit}"
+                return payload
+
             checkpoint_path = job_dir / "checkpoint.json"
             if not checkpoint_path.exists():
                 return payload

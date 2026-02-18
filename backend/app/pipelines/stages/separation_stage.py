@@ -15,7 +15,7 @@ V3.1.2+dev.20260109.01 更新：
 
 import asyncio
 import logging
-from typing import List, Optional, TYPE_CHECKING
+from typing import List, Optional, TYPE_CHECKING, Tuple
 from pathlib import Path
 
 import numpy as np
@@ -123,7 +123,7 @@ class SeparationStage:
         """
         全局分离模式
 
-        对整个音频文件进行分离，然后更新所有chunk的音频数据
+        将 Chunk 音频按组拼接后分离，再切片回填到各 Chunk。
 
         v3.1.0: 整轨分离为原子操作，不可中断
 
@@ -147,25 +147,54 @@ class SeparationStage:
             token.enter_atomic_region("demucs_global_separation")
 
         try:
-            # 整轨分离（转移到线程，避免阻塞事件循环）
-            separated_path = await asyncio.to_thread(
-                self.demucs_service.separate_vocals,
-                audio_path
-            )
+            runtime_model = self.demucs_service.config.model_name
+            try:
+                from app.services.runtime_param_resolver import get_demucs_runtime_params
 
-            self.logger.info(f"全局分离完成，分离后文件: {separated_path}")
+                runtime_demucs = get_demucs_runtime_params()
+                runtime_model = str(runtime_demucs.get("model_name") or runtime_model)
+            except Exception:
+                runtime_model = self.demucs_service.config.model_name
 
-            # V3.1.1+dev.20260107.06: 加载分离后的音频并更新所有chunk
-            await self._load_separated_audio_to_chunks(
+            group_duration_sec = self._resolve_global_group_duration_sec()
+            groups = self._build_global_groups(
                 chunks=chunks,
-                separated_path=separated_path
+                max_group_duration_sec=group_duration_sec,
             )
+            self.logger.info(
+                "全局分离分组执行: groups=%s group_duration_sec=%.1f",
+                len(groups),
+                group_duration_sec,
+            )
+
+            for group_index, group_chunks in enumerate(groups):
+                concatenated_audio, chunk_spans = self._concat_group_audio(group_chunks)
+                if concatenated_audio.size == 0 or not chunk_spans:
+                    continue
+                sample_rate = int(group_chunks[0].sample_rate) if group_chunks else 16000
+                separated_audio = await asyncio.to_thread(
+                    self.demucs_service.separate_chunk,
+                    concatenated_audio,
+                    runtime_model,
+                    sample_rate,
+                )
+                self._apply_group_separation_result(
+                    chunk_spans=chunk_spans,
+                    separated_audio=separated_audio,
+                    separation_model=runtime_model,
+                )
+                self.logger.debug(
+                    "全局分离分组完成: group_index=%s chunk_count=%s audio_sec=%.2f",
+                    group_index,
+                    len(group_chunks),
+                    float(len(concatenated_audio)) / float(max(sample_rate, 1)),
+                )
             if cache_service:
                 model_name = self.demucs_service.get_loaded_model_name() or self.demucs_service.config.model_name
                 try:
                     cache_service.save_global_separation(
                         chunks=chunks,
-                        separated_path=separated_path,
+                        separated_path="",
                         separation_model=model_name
                     )
                 except Exception as e:
@@ -197,6 +226,118 @@ class SeparationStage:
             token.check_and_save(checkpoint_data, job_dir)
 
         return chunks
+
+    def _resolve_global_group_duration_sec(self) -> float:
+        """读取全局分组时长配置。"""
+        default_duration = 1800.0
+        try:
+            from app.services.runtime_param_resolver import get_demucs_runtime_params
+
+            runtime_demucs = get_demucs_runtime_params()
+            raw_value = runtime_demucs.get("global_group_duration_sec", default_duration)
+            duration = float(raw_value)
+            return max(60.0, duration)
+        except Exception:
+            return default_duration
+
+    @staticmethod
+    def _build_global_groups(
+        chunks: List[AudioChunk],
+        max_group_duration_sec: float,
+    ) -> List[List[AudioChunk]]:
+        """按累计语音时长分组，避免整轨一次性分离导致显存峰值过高。"""
+        if not chunks:
+            return []
+
+        groups: List[List[AudioChunk]] = []
+        current_group: List[AudioChunk] = []
+        current_duration = 0.0
+
+        for chunk in sorted(chunks, key=lambda item: item.index):
+            chunk_duration = max(0.0, float(chunk.end - chunk.start))
+            chunk_sample_rate = int(getattr(chunk, "sample_rate", 16000) or 16000)
+            if (
+                current_group
+                and (
+                    current_duration + chunk_duration > max_group_duration_sec
+                    or int(current_group[-1].sample_rate) != chunk_sample_rate
+                )
+            ):
+                groups.append(current_group)
+                current_group = []
+                current_duration = 0.0
+
+            current_group.append(chunk)
+            current_duration += chunk_duration
+
+        if current_group:
+            groups.append(current_group)
+
+        return groups
+
+    @staticmethod
+    def _concat_group_audio(
+        chunks: List[AudioChunk],
+    ) -> Tuple[np.ndarray, List[Tuple[AudioChunk, int, int]]]:
+        """将分组内 Chunk 音频拼接，并返回每个 Chunk 的切片范围。"""
+        parts: List[np.ndarray] = []
+        spans: List[Tuple[AudioChunk, int, int]] = []
+        offset = 0
+        for chunk in chunks:
+            chunk_audio = np.asarray(chunk.audio, dtype=np.float32).reshape(-1)
+            if chunk_audio.size == 0:
+                continue
+            start = offset
+            end = start + int(chunk_audio.size)
+            spans.append((chunk, start, end))
+            parts.append(chunk_audio)
+            offset = end
+        if not parts:
+            return np.zeros(0, dtype=np.float32), []
+        return np.concatenate(parts), spans
+
+    def _apply_group_separation_result(
+        self,
+        *,
+        chunk_spans: List[Tuple[AudioChunk, int, int]],
+        separated_audio: np.ndarray,
+        separation_model: str,
+    ) -> None:
+        """将分组分离结果回填到 Chunk，并执行能量回退保护。"""
+        if not chunk_spans:
+            return
+
+        expected_size = chunk_spans[-1][2]
+        merged_audio = np.asarray(separated_audio, dtype=np.float32).reshape(-1)
+        if merged_audio.size < expected_size:
+            merged_audio = np.pad(merged_audio, (0, expected_size - merged_audio.size))
+        elif merged_audio.size > expected_size:
+            merged_audio = merged_audio[:expected_size]
+
+        for chunk, start, end in chunk_spans:
+            if chunk.original_audio is None:
+                chunk.original_audio = np.asarray(chunk.audio, dtype=np.float32).copy()
+
+            separated_chunk_audio = merged_audio[start:end]
+            original_chunk_audio = np.asarray(chunk.original_audio, dtype=np.float32)
+            sep_rms = float(np.sqrt(np.mean(separated_chunk_audio ** 2))) if separated_chunk_audio.size else 0.0
+            orig_rms = float(np.sqrt(np.mean(original_chunk_audio ** 2))) if original_chunk_audio.size else 0.0
+
+            if sep_rms < orig_rms * 0.2 and orig_rms > 1e-3:
+                chunk.audio = original_chunk_audio
+                chunk.is_separated = False
+                chunk.separation_level = SeparationLevel.NONE
+                chunk.separation_model = None
+                continue
+
+            chunk.audio = separated_chunk_audio
+            chunk.is_separated = True
+            chunk.separation_level = (
+                SeparationLevel.MDX_EXTRA
+                if separation_model == SeparationLevel.MDX_EXTRA.value
+                else SeparationLevel.HTDEMUCS
+            )
+            chunk.separation_model = separation_model
 
     async def _process_on_demand(
         self,

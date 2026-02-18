@@ -1,0 +1,63 @@
+backend/app/pipelines/dual_pipeline/implementation.py|"""L4/L5 补跑候选仅做埋点，不触发补跑。"""
+backend/app/pipelines/dual_pipeline/implementation.py|"""基于 L6 输入词流构建定稿单句兜底。"""
+backend/app/pipelines/dual_pipeline/implementation.py|"""输出 L0-L6 全量追踪（逐层 + 逐 token）到独立文件。"""
+backend/app/pipelines/dual_pipeline/implementation.py|"""输出 L3/L4/L5/L6 诊断到独立文件。"""
+backend/app/pipelines/dual_pipeline/implementation.py|# V3.2.0+dev.20260204.05: L3 标点处理器
+backend/app/pipelines/dual_pipeline/implementation.py|# V3.2.0+dev.20260206.02: 双轨实验配置（shadow/active 仅串行执行 L4-L6，避免并行占用 GPU）。
+backend/app/pipelines/dual_pipeline/implementation.py|- 新增 L5->L6 soft-cut 计划生成与透传（可配置开关）
+backend/app/pipelines/dual_pipeline/implementation.py|FastWorker 输出经 L6/L7 定稿链路输出，跳过 Whisper 和对齐。
+backend/app/pipelines/dual_pipeline/implementation.py|在 L5 -> L6 之间生成 CutPlan。
+backend/app/pipelines/dual_pipeline/implementation.py|统一 L7 出口，避免快路/主路各自拼装输出导致分支漂移。
+backend/app/pipelines/dual_pipeline/services/alignment_stage_service.py|# L7 薄层输出：即便走快路，也统一通过输出层分发。
+backend/app/pipelines/dual_pipeline/services/alignment_stage_service.py|# V3.2.0+dev.20260204.08: L4/L5 补跑候选埋点（仅统计，不触发补跑）
+backend/app/pipelines/dual_pipeline/services/alignment_stage_service.py|# V3.2.0+dev.20260204.10: 删除慢流补跑分支，定稿标点仅走统一 L3 入口
+backend/app/pipelines/dual_pipeline/services/alignment_stage_service.py|# V3.2.0+dev.20260205.09: L4 对齐层（仅对齐与 gap 修复）
+backend/app/pipelines/dual_pipeline/services/alignment_stage_service.py|# 定稿链内兜底：若 L6 仍未产出句子，基于 L6 输入词流构建单句，禁止回读草稿链。
+backend/app/pipelines/dual_pipeline/services/alignment_stage_service.py|# 阶段 1: 双流对齐（L2/L3/L4/L5/L6）
+backend/app/pipelines/dual_pipeline/services/diagnostic_trace_service.py|输出分层诊断到独立文件（兼容双写：旧 L3/L4/L5/L6 + 新四层键）。
+backend/app/pipelines/dual_pipeline/services/textflow_facade_service.py|"""根据轨道选择 L4 时间锚点词流。"""
+backend/app/services/alignment/alignment_service.py|"""L4 专用：对齐 clean_text 并输出 AlignmentResult。"""
+backend/app/services/alignment/alignment_service.py|# V3.2.0+dev.20260205.09: L4 对齐层口径收敛与词级置信度来源修正。
+backend/app/services/alignment/text_normalizer_processor.py|# L1 负责把“原始词级标点”提取为 clean_text 坐标（避免 L3 再反推）。
+backend/app/services/alignment/text_normalizer_processor.py|# V3.2.0+dev.20260205.09: 记录词级置信度，用于 L4 慢流优先口径。
+backend/app/services/alignment/text_normalizer_processor.py|# 弱标点过滤会误伤英文等语言的正常逗号，且 L3 后处理已有规则引擎过滤异常标点
+backend/app/services/alignment/text_normalizer_processor.py|# 词级时间戳缺失时，允许使用字符映射兜底（仅在 L1 内部做，L3 禁止回看）。
+backend/app/services/alignment/types.py|"""L3 标点层输入。"""
+backend/app/services/alignment/types.py|"""L3 标点层输出。"""
+backend/app/services/alignment/types.py|"""L4 对齐层输入。"""
+backend/app/services/alignment/types.py|"""L4 对齐层输出。"""
+backend/app/services/alignment/types.py|"""L4 对齐输出结果。"""
+backend/app/services/alignment/types.py|"""L5 语义注入层输入。"""
+backend/app/services/alignment/types.py|"""L5 语义注入层输出。"""
+backend/app/services/alignment/types.py|"""L6 切分层输入。"""
+backend/app/services/alignment/types.py|"""L6 切分层输出。"""
+backend/app/services/alignment/types.py|"""L7 输出层输入。"""
+backend/app/services/alignment/types.py|"""L7 输出层输出。"""
+backend/app/services/alignment/types.py|"""标点候选来源（L3 内部使用）。"""
+backend/app/services/alignment/types.py|"""标点轨道（L3 输出）。"""
+backend/app/services/alignment/types.py|# V3.2.0+dev.20260205.09: L4 对齐支持词级置信度来源透传。
+backend/app/services/audio_spectrum_classifier.py|reason = f"[L3] SNR 偏低({snr:.1f}dB) + YAMNet 置信度不足(speech={yamnet_result.speech_score:.2f})，保守分离"
+backend/app/services/audio_spectrum_classifier.py|reason = f"[L3] SNR 偏低({snr:.1f}dB) 但 YAMNet 高置信度(speech={yamnet_result.speech_score:.2f})，放行"
+backend/app/services/audio_spectrum_classifier.py|reason = f"[L3] YAMNet 判定为人声 (speech={yamnet_result.speech_score:.2f})"
+backend/app/services/audio_spectrum_classifier.py|reason = f"[L3] YAMNet 检测到音乐 (music={yamnet_result.music_score:.2f})"
+backend/app/services/audio_spectrum_classifier.py|reason = f"[L3] 规则判断 (music={music_score:.2f}, noise={noise_score:.2f})"
+backend/app/services/model_runtime_config_service.py|# V3.2.0+dev.20260205.09: L4 对齐层运行参数
+backend/app/services/model_runtime_config_service.py|# V3.2.0+dev.20260206.02: 双轨实验仅在 L4-L6 串行执行，不并行占用 GPU。
+backend/app/services/model_runtime_config_service.py|# V3.2.0+dev.20260210.01: L6 切分层统一参数入口。
+backend/app/services/punctuation/punctuation_processor.py|"""处理器模式：L3 标点恢复与候选合并。"""
+backend/app/services/punctuation/punctuation_processor.py|"""执行 L3 标点恢复并输出 PunctTrack。"""
+backend/app/services/punctuation/punctuation_processor.py|L3 标点处理器（PunctuationProcessor）。
+backend/app/services/punctuation/semantic_injector.py|# 弱标点过滤会误伤英文等语言的正常逗号，且 L3 后处理已有规则引擎过滤异常标点
+backend/app/services/segmentation/boundary_mapper.py|- 统一 L6 cut plan 与句级修复两条链路的“时间点 -> 词边界”逻辑，避免策略漂移。
+backend/app/services/segmentation/default_segmenter.py|"""已禁用：定稿路径必须走 L4→L5→L6→L7，不允许再走 DefaultSegmenter。"""
+backend/app/services/segmentation/default_segmenter.py|"定稿请使用 L4->L5->L6->L7 主链。"
+backend/app/services/segmentation/default_segmenter.py|- 定稿链已迁移到 L4→L5→L6→L7 主路径；
+backend/app/services/segmentation/soft_cut/plan_provider.py|"""为 L6 生成 CutPlan。"""
+backend/app/services/text_pipeline_config.py|"""L3 标点层参数。"""
+backend/app/services/text_pipeline_config.py|"""L3 标点调度覆盖项（仅当运行参数显式设置时生效）。"""
+backend/app/services/text_pipeline_config.py|"""L4 对齐层参数。"""
+backend/app/services/text_pipeline_config.py|"""L6 切分层参数。"""
+backend/app/services/text_pipeline_config.py|"""文本处理流水线参数入口（L1/L2/L3/L4/L6）。"""
+backend/app/services/text_pipeline_config.py|# V3.2.0+dev.20260205.09: 接入 L4 对齐层参数。
+backend/app/services/text_pipeline_config.py|# V3.2.0+dev.20260206.02: 双轨实验配置（仅影响 L4-L6 CPU 后处理，不并行占用 GPU）。
+backend/app/services/textflow/decision_layer.py|# V3.2.0+dev.20260210.03: L6 内建跨 chunk 连续性处理（仅处理高风险残词）。

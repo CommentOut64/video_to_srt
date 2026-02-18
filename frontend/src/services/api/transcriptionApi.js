@@ -15,11 +15,15 @@ class TranscriptionAPI {
    * 上传文件并创建转录任务
    * @param {File} file - 视频文件对象
    * @param {Function} onProgress - 上传进度回调 (percent) => void
+   * @param {Object|null} taskConfig - 任务级配置（可选）
    * @returns {Promise<{job_id: string, filename: string, message: string, queue_position: number}>}
    */
-  async uploadFile(file, onProgress = null) {
+  async uploadFile(file, onProgress = null, taskConfig = null) {
     const formData = new FormData();
     formData.append("file", file);
+    if (taskConfig && typeof taskConfig === "object") {
+      formData.append("task_config", JSON.stringify(taskConfig));
+    }
 
     const config = {
       headers: {
@@ -43,11 +47,15 @@ class TranscriptionAPI {
   /**
    * 为本地 input 文件创建转录任务
    * @param {string} filename - 文件名
+   * @param {Object|null} taskConfig - 任务级配置（可选）
    * @returns {Promise<{job_id: string, filename: string}>}
    */
-  async createJob(filename) {
+  async createJob(filename, taskConfig = null) {
     const formData = new FormData();
     formData.append("filename", filename);
+    if (taskConfig && typeof taskConfig === "object") {
+      formData.append("task_config", JSON.stringify(taskConfig));
+    }
 
     return apiClient.post("/api/create-job", formData);
   }
@@ -452,6 +460,63 @@ class TranscriptionAPI {
    */
   async putHomophoneGlobalTerms(payload) {
     return apiClient.put('/api/settings/homophone/global-terms', payload);
+  }
+
+  /**
+   * 获取说话人资料列表
+   * @param {string} jobId - 任务ID
+   * @returns {Promise<{job_id: string, profiles: Array}>}
+   */
+  async listSpeakerProfiles(jobId) {
+    return apiClient.get(`/api/speakers/${jobId}/profiles`);
+  }
+
+  /**
+   * 获取指定说话人的字幕绑定列表
+   * @param {string} jobId - 任务ID
+   * @param {string} speakerId - 说话人ID
+   * @returns {Promise<{job_id: string, speaker_id: string, subtitles: Array}>}
+   */
+  async listSpeakerSubtitles(jobId, speakerId) {
+    return apiClient.get(`/api/speakers/${jobId}/profiles/${speakerId}/subtitles`);
+  }
+
+  /**
+   * 更新说话人资料（名称/颜色/锁定/状态）
+   * @param {string} jobId - 任务ID
+   * @param {string} speakerId - 说话人ID
+   * @param {Object} payload - 更新字段
+   * @returns {Promise<{success: boolean, data: Object, revision_id: string, updated_at: number}>}
+   */
+  async updateSpeakerProfile(jobId, speakerId, payload) {
+    return apiClient.patch(`/api/speakers/${jobId}/profiles/${speakerId}`, payload);
+  }
+
+  /**
+   * 改绑句级 speaker
+   * @param {string} jobId - 任务ID
+   * @param {number} sentenceIndex - 句子索引
+   * @param {string} speakerId - 目标说话人ID
+   * @returns {Promise<{success: boolean, data: Object, revision_id: string, updated_at: number}>}
+   */
+  async rebindSubtitleSpeaker(jobId, sentenceIndex, speakerId) {
+    return apiClient.patch(`/api/speakers/${jobId}/subtitles/${sentenceIndex}`, {
+      speaker_id: speakerId,
+    });
+  }
+
+  /**
+   * 合并说话人
+   * @param {string} jobId - 任务ID
+   * @param {string} sourceSpeakerId - 源说话人ID
+   * @param {string} targetSpeakerId - 目标说话人ID
+   * @returns {Promise<{success: boolean, data: Object, revision_id: string, updated_at: number}>}
+   */
+  async mergeSpeakerProfiles(jobId, sourceSpeakerId, targetSpeakerId) {
+    return apiClient.post(`/api/speakers/${jobId}/profiles/merge`, {
+      source_speaker_id: sourceSpeakerId,
+      target_speaker_id: targetSpeakerId,
+    });
   }
 }
 
