@@ -29,7 +29,7 @@ V3.2.0+dev.20260123.05 更新：
 - 解决恢复时"无可靠恢复点"导致从头开始的问题
 
 V3.2.0+dev.20260215.08 更新：
-- 新增 L5->L6 soft-cut 计划生成与透传（可配置开关）
+- 新增评分层->裁决层 soft-cut 计划生成与透传（可配置开关）
 - soft-cut 改为即时裁决路径，不再维护 deferred 跨 chunk 状态
 - 新增短 turn 续段与词内触发守门，抑制“尾词前错切”
 - 收紧句级跨speaker修复门限，避免误切连续文本
@@ -63,13 +63,10 @@ from app.services.alignment.types import (
     L1Input,
     L2Input,
     L2Output,
-    L3Input,
-    L4Input,
-    L5Input,
-    L6Input,
-    L7Input,
     NormalizationResult,
+    OutputLayerInput,
     OutputTrace,
+    PunctuationPreInput,
     PunctSource,
     PunctTrack,
     QualitySignals,
@@ -390,13 +387,13 @@ class AsyncDualPipelineKernel:
             punctuation_service=self.punctuation_service,
             logger=self.logger,
         )
-        # V3.2.0+dev.20260204.05: L3 标点处理器
-        self._l3_processor = PunctuationProcessor(
+        # V3.2.0+dev.20260204.05: 标点前置域处理器
+        self._punctuation_pre_processor = PunctuationProcessor(
             punctuation_service=self.punctuation_service,
             logger=self.logger,
         )
         # V3.2.0+dev.20260215.23: 阶段C接入四层统一目录入口（集合/评分/裁决/输出）。
-        self._l4_processor = CollectionAlignmentProcessor(logger=self.logger)
+        self._collection_processor = CollectionAlignmentProcessor(logger=self.logger)
         self._text_pipeline_config = TextPipelineConfig.from_runtime()
         self._m2_stage_config = self._text_pipeline_config.m2
         self._is_m2_enabled = bool(self._m2_stage_config.is_enabled)
@@ -481,6 +478,9 @@ class AsyncDualPipelineKernel:
                 float(self._segmentation_layer_config.final_soft_pause),
                 float(self._segmentation_layer_config.final_long_pause),
             ),
+            is_force_split_on_sentence_end_punct=bool(
+                self._segmentation_layer_config.is_force_split_on_sentence_end_punct
+            ),
             min_mapping_coverage=max(
                 0.0,
                 min(1.0, float(self._segmentation_layer_config.final_min_mapping_coverage)),
@@ -497,11 +497,11 @@ class AsyncDualPipelineKernel:
             self._final_grouper = SemanticGrouper(final_group_config)
         else:
             self._final_grouper = None
-        self._l5_processor = ScoringSemanticInjectionProcessor(
+        self._scoring_processor = ScoringSemanticInjectionProcessor(
             logger=self.logger,
             min_mapping_coverage=final_split_config.min_mapping_coverage,
         )
-        self._l6_processor = DecisionSegmentationProcessor(
+        self._decision_processor = DecisionSegmentationProcessor(
             final_splitter=self._final_splitter,
             logger=self.logger,
             is_keep_sentence_end_punct=bool(
@@ -512,7 +512,7 @@ class AsyncDualPipelineKernel:
             ),
             is_enable_speaker_guided_split=self._is_enable_speaker_guided_split,
         )
-        self._l7_processor = OutputLayerProcessor(
+        self._output_processor = OutputLayerProcessor(
             subtitle_manager=self.subtitle_manager,
             speaker_store_service_getter=self._get_speaker_store_service,
             logger=self.logger,
@@ -529,7 +529,7 @@ class AsyncDualPipelineKernel:
         self._keep_sentence_end_punct = bool(
             self._segmentation_layer_config.is_keep_sentence_end_punct
         )
-        # V3.2.0+dev.20260206.02: 双轨实验配置（shadow/active 仅串行执行 L4-L6，避免并行占用 GPU）。
+        # V3.2.0+dev.20260206.02: 双轨实验配置（shadow/active 仅串行执行四层主链，避免并行占用 GPU）。
         self._alignment_layer_config = self._text_pipeline_config.alignment
         dual_time_mode = str(self._alignment_layer_config.dual_time_mode or "off").lower()
         if dual_time_mode not in {"off", "shadow", "active"}:
@@ -1669,7 +1669,7 @@ class AsyncDualPipelineKernel:
         """
         极速模式: 仅运行 FastWorker
 
-        FastWorker 输出经 L6/L7 定稿链路输出，跳过 Whisper 和对齐。
+        FastWorker 输出经四层主链定稿并由输出层分发，跳过 Whisper 和对齐。
 
         v3.1.0: 支持逐 Chunk 中断和检查点保存
         V3.1.0: 集成进度发射器，实时推送 SSE 进度
@@ -1763,7 +1763,7 @@ class AsyncDualPipelineKernel:
             for sentence in sentences:
                 sentence.is_finalized = True
                 sentence.is_draft = False
-            self._emit_l7_output(
+            self._emit_output_layer(
                 chunk_index=ctx.chunk_index,
                 sentence_segments=sentences,
                 language=str(ctx.audio_chunk.language or (ctx.sv_result or {}).get("language") or "auto"),
@@ -1831,7 +1831,7 @@ class AsyncDualPipelineKernel:
             total_sentences += len(sentences)
 
         if is_final_output and finalized_sentences:
-            self._emit_l7_output(
+            self._emit_output_layer(
                 chunk_index=ctx.chunk_index,
                 sentence_segments=finalized_sentences,
                 language=str(ctx.audio_chunk.language or (ctx.sv_result or {}).get("language") or "auto"),
@@ -2590,7 +2590,7 @@ class AsyncDualPipelineKernel:
             )
         setattr(
             ctx,
-            "_trace_l3_input",
+            "_trace_punctuation_pre_input",
             {
                 "chosen_source": chosen_source,
                 "word_timestamps": list(word_timestamps),
@@ -2599,15 +2599,15 @@ class AsyncDualPipelineKernel:
                 "chosen_text_track": chosen_track,
             },
         )
-        output = await self._l3_processor.process(
-            L3Input(
+        output = await self._punctuation_pre_processor.process(
+            PunctuationPreInput(
                 chosen_text_track=chosen_track,
                 sv_punct_source=sv_source,
                 wh_punct_source=wh_source,
                 word_timestamps=word_timestamps,
             )
         )
-        setattr(ctx, "_trace_l3_output", output.punct_track)
+        setattr(ctx, "_trace_punctuation_pre_output", output.punct_track)
         return output.punct_track
 
     def _resolve_gap_ratio_mid(self) -> float:
@@ -2632,7 +2632,7 @@ class AsyncDualPipelineKernel:
         return 0.6
 
     def _record_punct_retry_candidates(self, ctx: ProcessingContext) -> None:
-        """L4/L5 补跑候选仅做埋点，不触发补跑。"""
+        """集合层/评分层补跑候选仅做埋点，不触发补跑。"""
         stats = ctx.finalization_metrics
         if not stats:
             return
@@ -2854,7 +2854,7 @@ class AsyncDualPipelineKernel:
                 self.subtitle_manager.add_draft_sentences(chunk_index, sentences)
             total_sentences += len(sentences)
         if is_final_output and finalized_sentences:
-            self._emit_l7_output(
+            self._emit_output_layer(
                 chunk_index=chunk_index,
                 sentence_segments=finalized_sentences,
                 language="auto",
@@ -3164,7 +3164,7 @@ class AsyncDualPipelineKernel:
         split_stats: Dict[str, Any],
         final_sentences: List[SentenceSegment],
     ) -> None:
-        """输出 L3/L4/L5/L6 诊断到独立文件。"""
+        """输出前置标点域与四层主链诊断到独立文件。"""
         chosen_clean = tracks.chosen_track.text_clean if tracks.chosen_track else ""
         punct_ref = punct_track.clean_text_ref if punct_track else ""
         chosen_compact = str(chosen_clean or "").replace("\n", " ").strip()
@@ -3224,30 +3224,30 @@ class AsyncDualPipelineKernel:
             "chosen_clean_len": len(chosen_clean or ""),
             "l2_chosen_text_head": _clip_head(chosen_compact),
             "l2_chosen_text_tail": _clip_tail(chosen_compact),
-            "l3_positions_total": len(punct_track.positions) if punct_track and punct_track.positions else 0,
-            "l3_source": punct_track.source if punct_track else "",
-            "l3_clean_text_match": bool(chosen_clean and punct_ref and chosen_clean == punct_ref),
-            "l3_clean_ref_head": _clip_head(punct_compact),
-            "l3_clean_ref_tail": _clip_tail(punct_compact),
-            "is_l3_match_blocked_by_ref_mismatch": is_ref_mismatch,
-            "l4_alignment_score": float(alignment_result.alignment_score),
-            "l4_gap_ratio": float(alignment_result.gap_ratio),
-            "l4_coverage": float(alignment_result.coverage),
-            "l4_gap_positions": list(alignment_result.gap_positions),
-            "l4_unmatched_prefix_len": int(unmatched_prefix_len),
+            "punctuation_pre_positions_total": len(punct_track.positions) if punct_track and punct_track.positions else 0,
+            "punctuation_pre_source": punct_track.source if punct_track else "",
+            "punctuation_pre_clean_text_match": bool(chosen_clean and punct_ref and chosen_clean == punct_ref),
+            "punctuation_pre_clean_ref_head": _clip_head(punct_compact),
+            "punctuation_pre_clean_ref_tail": _clip_tail(punct_compact),
+            "is_punctuation_pre_match_blocked_by_ref_mismatch": is_ref_mismatch,
+            "collection_alignment_score": float(alignment_result.alignment_score),
+            "collection_gap_ratio": float(alignment_result.gap_ratio),
+            "collection_coverage": float(alignment_result.coverage),
+            "collection_gap_positions": list(alignment_result.gap_positions),
+            "collection_unmatched_prefix_len": int(unmatched_prefix_len),
             "is_cross_chunk_boundary_suspected": is_cross_chunk_boundary_suspected,
-            "l5_injection_positions_total": int(injection_stats.get("injection_positions_total", 0) or 0),
-            "l5_injection_unmatched_total": int(injection_stats.get("injection_unmatched_total", 0) or 0),
-            "l5_injection_mapping_coverage": float(injection_stats.get("injection_mapping_coverage", 0.0) or 0.0),
-            "l5_injection_blocked": bool(injection_stats.get("injection_blocked", 0.0)),
-            "l6_sentence_count": len(final_sentences),
-            "l6_split_mapping_coverage": float(split_stats.get("mapping_coverage", 0.0) or 0.0),
-            "l6_split_writeback_ratio": float(split_stats.get("writeback_ratio", 0.0) or 0.0),
-            "l6_split_writeback_used": bool(split_stats.get("writeback_used", 0.0)),
-            "l6_split_writeback_blocked": bool(split_stats.get("writeback_blocked", 0.0)),
-            "l6_split_reason_stats": split_reason_stats,
-            "l6_split_risk_stats": split_risk_stats,
-            "l6_sentence_texts": [str(sentence.text or "") for sentence in final_sentences],
+            "scoring_injection_positions_total": int(injection_stats.get("injection_positions_total", 0) or 0),
+            "scoring_injection_unmatched_total": int(injection_stats.get("injection_unmatched_total", 0) or 0),
+            "scoring_injection_mapping_coverage": float(injection_stats.get("injection_mapping_coverage", 0.0) or 0.0),
+            "scoring_injection_blocked": bool(injection_stats.get("injection_blocked", 0.0)),
+            "decision_sentence_count": len(final_sentences),
+            "decision_split_mapping_coverage": float(split_stats.get("mapping_coverage", 0.0) or 0.0),
+            "decision_split_writeback_ratio": float(split_stats.get("writeback_ratio", 0.0) or 0.0),
+            "decision_split_writeback_used": bool(split_stats.get("writeback_used", 0.0)),
+            "decision_split_writeback_blocked": bool(split_stats.get("writeback_blocked", 0.0)),
+            "decision_split_reason_stats": split_reason_stats,
+            "decision_split_risk_stats": split_risk_stats,
+            "decision_sentence_texts": [str(sentence.text or "") for sentence in final_sentences],
         }
         append_debug_layer_diag_line(ctx.job_dir, payload, logger=self.logger)
 
@@ -3269,7 +3269,7 @@ class AsyncDualPipelineKernel:
         final_sentences: Sequence[SentenceSegment],
         output_traces: Sequence[OutputTrace],
     ) -> None:
-        """输出 L0-L6 全量追踪（逐层 + 逐 token）到独立文件。"""
+        """输出前置域与四层主链全量追踪（逐层 + 逐 token）到独立文件。"""
 
         def _serialize_punc_positions(positions: Optional[Sequence[PuncPosition]]) -> List[Dict[str, Any]]:
             if not positions:
@@ -3451,8 +3451,8 @@ class AsyncDualPipelineKernel:
                 "punctuation_anchors": list(evidence.punctuation_anchors or []),
             }
 
-        l3_input = getattr(ctx, "_trace_l3_input", {}) or {}
-        l3_output = getattr(ctx, "_trace_l3_output", None)
+        punctuation_pre_input = getattr(ctx, "_trace_punctuation_pre_input", {}) or {}
+        punctuation_pre_output = getattr(ctx, "_trace_punctuation_pre_output", None)
         slow_raw = _serialize_word_timestamps(
             [
                 word
@@ -3503,42 +3503,42 @@ class AsyncDualPipelineKernel:
                 "whisper_track": _serialize_text_track(tracks.whisper_track),
                 "chosen_track": _serialize_text_track(tracks.chosen_track),
             },
-            "l3": {
+            "punctuation_pre": {
                 "input": {
-                    "chosen_source": l3_input.get("chosen_source"),
-                    "word_timestamps": _serialize_word_timestamps(l3_input.get("word_timestamps") or []),
+                    "chosen_source": punctuation_pre_input.get("chosen_source"),
+                    "word_timestamps": _serialize_word_timestamps(punctuation_pre_input.get("word_timestamps") or []),
                     "sv_punct_source": {
-                        "source": str(getattr(l3_input.get("sv_punct_source"), "source", "") or ""),
-                        "clean_text_ref": str(getattr(l3_input.get("sv_punct_source"), "clean_text_ref", "") or ""),
-                        "positions": _serialize_punc_positions(getattr(l3_input.get("sv_punct_source"), "positions", []) or []),
+                        "source": str(getattr(punctuation_pre_input.get("sv_punct_source"), "source", "") or ""),
+                        "clean_text_ref": str(getattr(punctuation_pre_input.get("sv_punct_source"), "clean_text_ref", "") or ""),
+                        "positions": _serialize_punc_positions(getattr(punctuation_pre_input.get("sv_punct_source"), "positions", []) or []),
                     },
                     "wh_punct_source": {
-                        "source": str(getattr(l3_input.get("wh_punct_source"), "source", "") or ""),
-                        "clean_text_ref": str(getattr(l3_input.get("wh_punct_source"), "clean_text_ref", "") or ""),
-                        "positions": _serialize_punc_positions(getattr(l3_input.get("wh_punct_source"), "positions", []) or []),
+                        "source": str(getattr(punctuation_pre_input.get("wh_punct_source"), "source", "") or ""),
+                        "clean_text_ref": str(getattr(punctuation_pre_input.get("wh_punct_source"), "clean_text_ref", "") or ""),
+                        "positions": _serialize_punc_positions(getattr(punctuation_pre_input.get("wh_punct_source"), "positions", []) or []),
                     },
                 },
                 "output": {
-                    "source": str(getattr(l3_output, "source", "") or ""),
-                    "clean_text_ref": str(getattr(l3_output, "clean_text_ref", "") or ""),
-                    "positions": _serialize_punc_positions(getattr(l3_output, "positions", []) or []),
-                    "confidence_stats": dict(getattr(l3_output, "confidence_stats", {}) or {}),
+                    "source": str(getattr(punctuation_pre_output, "source", "") or ""),
+                    "clean_text_ref": str(getattr(punctuation_pre_output, "clean_text_ref", "") or ""),
+                    "positions": _serialize_punc_positions(getattr(punctuation_pre_output, "positions", []) or []),
+                    "confidence_stats": dict(getattr(punctuation_pre_output, "confidence_stats", {}) or {}),
                 },
             },
-            "l4": {
+            "collection": {
                 "alignment_score": float(alignment_result.alignment_score),
                 "gap_ratio": float(alignment_result.gap_ratio),
                 "coverage": float(alignment_result.coverage),
                 "gap_positions": list(alignment_result.gap_positions),
                 "aligned_words": _serialize_aligned_words(alignment_result.aligned_words),
             },
-            "l5": {
+            "scoring": {
                 "injection_stats": dict(injection_stats),
                 "words_for_split": _serialize_word_timestamps(words_for_split),
                 "aligned_facts": _serialize_aligned_facts(aligned_facts),
                 "fused_evidence": _serialize_fused_evidence(fused_evidence),
             },
-            "l6": {
+            "decision": {
                 "split_stats": dict(split_stats),
                 "final_sentences": _serialize_sentences(final_sentences),
                 "output_trace": _serialize_output_traces(output_traces),
@@ -3740,7 +3740,7 @@ class AsyncDualPipelineKernel:
             logger=self.logger,
         )
 
-    def _run_l4_to_l6_once(
+    def _run_collection_scoring_decision_once(
         self,
         *,
         tracks: TextTrackBundle,
@@ -3754,11 +3754,11 @@ class AsyncDualPipelineKernel:
         turn_id: Optional[str] = None,
     ) -> Layer456RunResult:
         """
-        执行一次四层主路径（collection/scoring/decision）。
+        四层术语主入口：集合层→评分层→裁决层。
 
-        Why: 通过门面服务收口四层串联，降低实现类体积并稳定阶段边界。
+        Why: 编排层统一通过该入口委派门面服务，避免多处分叉调用。
         """
-        return self._textflow_facade_service.run_l4_to_l6_once(
+        return self._textflow_facade_service.run_collection_scoring_decision_once(
             tracks=tracks,
             sv_result=sv_result,
             whisper_result=whisper_result,
@@ -3891,7 +3891,7 @@ class AsyncDualPipelineKernel:
         """
         return self._textflow_facade_service.finalize_sensevoice_only(ctx)
 
-    def _build_soft_cut_plan_for_l6(
+    def _build_soft_cut_plan_for_decision(
         self,
         *,
         annotated_words: Sequence[AnnotatedWord],
@@ -3929,7 +3929,7 @@ class AsyncDualPipelineKernel:
                 self._soft_cut_plan_provider.__class__.__name__,
                 exc,
             )
-            plan = self._build_soft_cut_plan_for_l6_m1(
+            plan = self._build_soft_cut_plan_for_decision_m1(
                 annotated_words=annotated_words,
                 stream_id=stream_id,
                 block_id=block_id,
@@ -3944,7 +3944,7 @@ class AsyncDualPipelineKernel:
                 reason="provider_exception_fallback",
             )
 
-    def _build_fused_evidence_for_l6(
+    def _build_fused_evidence_for_decision(
         self,
         *,
         words: Sequence[AnnotatedWord],
@@ -4132,7 +4132,7 @@ class AsyncDualPipelineKernel:
                 continue
         return values or None
 
-    def _build_soft_cut_plan_for_l6_m1(
+    def _build_soft_cut_plan_for_decision_m1(
         self,
         *,
         annotated_words: Sequence[AnnotatedWord],
@@ -4143,7 +4143,7 @@ class AsyncDualPipelineKernel:
         fused_evidence: Optional[FusedEvidence] = None,
     ) -> Optional[Any]:
         """
-        在 L5 -> L6 之间生成 CutPlan。
+        在评分层 -> 裁决层之间生成 CutPlan。
 
         说明：
         - 关闭开关或无有效说话人变化时返回 None，保持旧路径；
@@ -4823,7 +4823,7 @@ class AsyncDualPipelineKernel:
         )
         return matched / len(aligned_words)
 
-    def _emit_l7_output(
+    def _emit_output_layer(
         self,
         *,
         chunk_index: int,
@@ -4835,10 +4835,10 @@ class AsyncDualPipelineKernel:
         default_trace_reason: str,
     ) -> Any:
         """
-        统一 L7 出口，避免快路/主路各自拼装输出导致分支漂移。
+        输出层唯一分发方法（内部主入口）。
 
         Why:
-        - 阶段6要求输出层单入口，所有路径统一经过 OutputLayerProcessor。
+        - 输出层要求单入口，所有路径统一经过 OutputLayerProcessor；
         - trace 在入口先对齐句段数量，保障 transport payload 稳定可追溯。
         """
         normalized_traces = self._normalize_output_traces_for_sentences(
@@ -4846,8 +4846,8 @@ class AsyncDualPipelineKernel:
             output_traces=output_traces or [],
             default_reason=default_trace_reason,
         )
-        return self._l7_processor.process(
-            L7Input(
+        return self._output_processor.process(
+            OutputLayerInput(
                 chunk_index=chunk_index,
                 sentence_segments=list(sentence_segments),
                 language=str(language or "auto"),
@@ -4886,7 +4886,7 @@ class AsyncDualPipelineKernel:
 
     @staticmethod
     def _build_final_fallback_sentence(words_for_split: Sequence[WordTimestamp]) -> Optional[SentenceSegment]:
-        """基于 L6 输入词流构建定稿单句兜底。"""
+        """基于裁决层输入词流构建定稿单句兜底。"""
         if not words_for_split:
             return None
         text = "".join((word.word or "") for word in words_for_split).strip()
@@ -5014,6 +5014,9 @@ def get_async_dual_pipeline_kernel(
         logger=logger,
         cancellation_token=cancellation_token  # v3.1.0
     )
+
+
+
 
 
 

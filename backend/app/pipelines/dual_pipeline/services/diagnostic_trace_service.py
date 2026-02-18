@@ -88,9 +88,7 @@ class DiagnosticTraceService:
         final_sentences: List[SentenceSegment],
         append_debug_layer_diag_line: Any,
     ) -> None:
-        """
-        输出 L3/L4/L5/L6 诊断到独立文件。
-        """
+        """输出分层诊断到独立文件（四层口径）。"""
         chosen_clean = tracks.chosen_track.text_clean if tracks.chosen_track else ""
         punct_ref = punct_track.clean_text_ref if punct_track else ""
         chosen_compact = str(chosen_clean or "").replace("\n", " ").strip()
@@ -140,30 +138,64 @@ class DiagnosticTraceService:
             "chosen_clean_len": len(chosen_clean or ""),
             "l2_chosen_text_head": self._clip_head(chosen_compact),
             "l2_chosen_text_tail": self._clip_tail(chosen_compact),
-            "l3_positions_total": len(punct_track.positions) if punct_track and punct_track.positions else 0,
-            "l3_source": punct_track.source if punct_track else "",
-            "l3_clean_text_match": bool(chosen_clean and punct_ref and chosen_clean == punct_ref),
-            "l3_clean_ref_head": self._clip_head(punct_compact),
-            "l3_clean_ref_tail": self._clip_tail(punct_compact),
-            "is_l3_match_blocked_by_ref_mismatch": is_ref_mismatch,
-            "l4_alignment_score": float(alignment_result.alignment_score),
-            "l4_gap_ratio": float(alignment_result.gap_ratio),
-            "l4_coverage": float(alignment_result.coverage),
-            "l4_gap_positions": list(alignment_result.gap_positions),
-            "l4_unmatched_prefix_len": int(unmatched_prefix_len),
+            "punctuation_pre_positions_total": len(punct_track.positions) if punct_track and punct_track.positions else 0,
+            "punctuation_pre_source": punct_track.source if punct_track else "",
+            "punctuation_pre_clean_text_match": bool(chosen_clean and punct_ref and chosen_clean == punct_ref),
+            "punctuation_pre_clean_ref_head": self._clip_head(punct_compact),
+            "punctuation_pre_clean_ref_tail": self._clip_tail(punct_compact),
+            "is_punctuation_pre_match_blocked_by_ref_mismatch": is_ref_mismatch,
+            "collection_alignment_score": float(alignment_result.alignment_score),
+            "collection_gap_ratio": float(alignment_result.gap_ratio),
+            "collection_coverage": float(alignment_result.coverage),
+            "collection_gap_positions": list(alignment_result.gap_positions),
+            "collection_unmatched_prefix_len": int(unmatched_prefix_len),
             "is_cross_chunk_boundary_suspected": is_cross_chunk_boundary_suspected,
-            "l5_injection_positions_total": int(injection_stats.get("injection_positions_total", 0) or 0),
-            "l5_injection_unmatched_total": int(injection_stats.get("injection_unmatched_total", 0) or 0),
-            "l5_injection_mapping_coverage": float(injection_stats.get("injection_mapping_coverage", 0.0) or 0.0),
-            "l5_injection_blocked": bool(injection_stats.get("injection_blocked", 0.0)),
-            "l6_sentence_count": len(final_sentences),
-            "l6_split_mapping_coverage": float(split_stats.get("mapping_coverage", 0.0) or 0.0),
-            "l6_split_writeback_ratio": float(split_stats.get("writeback_ratio", 0.0) or 0.0),
-            "l6_split_writeback_used": bool(split_stats.get("writeback_used", 0.0)),
-            "l6_split_writeback_blocked": bool(split_stats.get("writeback_blocked", 0.0)),
-            "l6_split_reason_stats": split_reason_stats,
-            "l6_split_risk_stats": split_risk_stats,
-            "l6_sentence_texts": [str(sentence.text or "") for sentence in final_sentences],
+            "scoring_injection_positions_total": int(injection_stats.get("injection_positions_total", 0) or 0),
+            "scoring_injection_unmatched_total": int(injection_stats.get("injection_unmatched_total", 0) or 0),
+            "scoring_injection_mapping_coverage": float(injection_stats.get("injection_mapping_coverage", 0.0) or 0.0),
+            "scoring_injection_blocked": bool(injection_stats.get("injection_blocked", 0.0)),
+            "decision_sentence_count": len(final_sentences),
+            "decision_split_mapping_coverage": float(split_stats.get("mapping_coverage", 0.0) or 0.0),
+            "decision_split_writeback_ratio": float(split_stats.get("writeback_ratio", 0.0) or 0.0),
+            "decision_split_writeback_used": bool(split_stats.get("writeback_used", 0.0)),
+            "decision_split_writeback_blocked": bool(split_stats.get("writeback_blocked", 0.0)),
+            "decision_split_reason_stats": split_reason_stats,
+            "decision_split_risk_stats": split_risk_stats,
+            "decision_sentence_texts": [str(sentence.text or "") for sentence in final_sentences],
+            "punctuation_pre": {
+                "positions_total": len(punct_track.positions) if punct_track and punct_track.positions else 0,
+                "source": punct_track.source if punct_track else "",
+                "clean_text_match": bool(chosen_clean and punct_ref and chosen_clean == punct_ref),
+                "clean_ref_head": self._clip_head(punct_compact),
+                "clean_ref_tail": self._clip_tail(punct_compact),
+                "is_match_blocked_by_ref_mismatch": is_ref_mismatch,
+            },
+            "collection": {
+                "alignment_score": float(alignment_result.alignment_score),
+                "gap_ratio": float(alignment_result.gap_ratio),
+                "coverage": float(alignment_result.coverage),
+                "gap_positions": list(alignment_result.gap_positions),
+                "unmatched_prefix_len": int(unmatched_prefix_len),
+                "is_cross_chunk_boundary_suspected": is_cross_chunk_boundary_suspected,
+            },
+            "scoring": {
+                "injection_positions_total": int(injection_stats.get("injection_positions_total", 0) or 0),
+                "injection_unmatched_total": int(injection_stats.get("injection_unmatched_total", 0) or 0),
+                "injection_mapping_coverage": float(
+                    injection_stats.get("injection_mapping_coverage", 0.0) or 0.0
+                ),
+                "injection_blocked": bool(injection_stats.get("injection_blocked", 0.0)),
+            },
+            "decision": {
+                "sentence_count": len(final_sentences),
+                "split_mapping_coverage": float(split_stats.get("mapping_coverage", 0.0) or 0.0),
+                "split_writeback_ratio": float(split_stats.get("writeback_ratio", 0.0) or 0.0),
+                "split_writeback_used": bool(split_stats.get("writeback_used", 0.0)),
+                "split_writeback_blocked": bool(split_stats.get("writeback_blocked", 0.0)),
+                "split_reason_stats": split_reason_stats,
+                "split_risk_stats": split_risk_stats,
+                "sentence_texts": [str(sentence.text or "") for sentence in final_sentences],
+            },
         }
         append_debug_layer_diag_line(ctx.job_dir, payload, logger=self.logger)
 
@@ -186,11 +218,9 @@ class DiagnosticTraceService:
         output_traces: Sequence[OutputTrace],
         append_debug_layer_trace_line: Any,
     ) -> None:
-        """
-        输出 L0-L6 全量追踪（逐层 + 逐 token）到独立文件。
-        """
-        l3_input = getattr(ctx, "_trace_l3_input", {}) or {}
-        l3_output = getattr(ctx, "_trace_l3_output", None)
+        """输出全量分层追踪（逐层 + 逐 token）到独立文件。"""
+        punctuation_pre_input = getattr(ctx, "_trace_punctuation_pre_input", {}) or {}
+        punctuation_pre_output = getattr(ctx, "_trace_punctuation_pre_output", None)
         slow_raw = self._serialize_word_timestamps(
             [
                 word
@@ -241,42 +271,42 @@ class DiagnosticTraceService:
                 "whisper_track": self._serialize_text_track(tracks.whisper_track),
                 "chosen_track": self._serialize_text_track(tracks.chosen_track),
             },
-            "l3": {
+            "punctuation_pre": {
                 "input": {
-                    "chosen_source": l3_input.get("chosen_source"),
-                    "word_timestamps": self._serialize_word_timestamps(l3_input.get("word_timestamps") or []),
+                    "chosen_source": punctuation_pre_input.get("chosen_source"),
+                    "word_timestamps": self._serialize_word_timestamps(punctuation_pre_input.get("word_timestamps") or []),
                     "sv_punct_source": {
-                        "source": str(getattr(l3_input.get("sv_punct_source"), "source", "") or ""),
-                        "clean_text_ref": str(getattr(l3_input.get("sv_punct_source"), "clean_text_ref", "") or ""),
-                        "positions": self._serialize_punc_positions(getattr(l3_input.get("sv_punct_source"), "positions", []) or []),
+                        "source": str(getattr(punctuation_pre_input.get("sv_punct_source"), "source", "") or ""),
+                        "clean_text_ref": str(getattr(punctuation_pre_input.get("sv_punct_source"), "clean_text_ref", "") or ""),
+                        "positions": self._serialize_punc_positions(getattr(punctuation_pre_input.get("sv_punct_source"), "positions", []) or []),
                     },
                     "wh_punct_source": {
-                        "source": str(getattr(l3_input.get("wh_punct_source"), "source", "") or ""),
-                        "clean_text_ref": str(getattr(l3_input.get("wh_punct_source"), "clean_text_ref", "") or ""),
-                        "positions": self._serialize_punc_positions(getattr(l3_input.get("wh_punct_source"), "positions", []) or []),
+                        "source": str(getattr(punctuation_pre_input.get("wh_punct_source"), "source", "") or ""),
+                        "clean_text_ref": str(getattr(punctuation_pre_input.get("wh_punct_source"), "clean_text_ref", "") or ""),
+                        "positions": self._serialize_punc_positions(getattr(punctuation_pre_input.get("wh_punct_source"), "positions", []) or []),
                     },
                 },
                 "output": {
-                    "source": str(getattr(l3_output, "source", "") or ""),
-                    "clean_text_ref": str(getattr(l3_output, "clean_text_ref", "") or ""),
-                    "positions": self._serialize_punc_positions(getattr(l3_output, "positions", []) or []),
-                    "confidence_stats": dict(getattr(l3_output, "confidence_stats", {}) or {}),
+                    "source": str(getattr(punctuation_pre_output, "source", "") or ""),
+                    "clean_text_ref": str(getattr(punctuation_pre_output, "clean_text_ref", "") or ""),
+                    "positions": self._serialize_punc_positions(getattr(punctuation_pre_output, "positions", []) or []),
+                    "confidence_stats": dict(getattr(punctuation_pre_output, "confidence_stats", {}) or {}),
                 },
             },
-            "l4": {
+            "collection": {
                 "alignment_score": float(alignment_result.alignment_score),
                 "gap_ratio": float(alignment_result.gap_ratio),
                 "coverage": float(alignment_result.coverage),
                 "gap_positions": list(alignment_result.gap_positions),
                 "aligned_words": self._serialize_aligned_words(alignment_result.aligned_words),
             },
-            "l5": {
+            "scoring": {
                 "injection_stats": dict(injection_stats),
                 "words_for_split": self._serialize_word_timestamps(words_for_split),
                 "aligned_facts": self._serialize_aligned_facts(aligned_facts),
                 "fused_evidence": self._serialize_fused_evidence(fused_evidence),
             },
-            "l6": {
+            "decision": {
                 "split_stats": dict(split_stats),
                 "final_sentences": self._serialize_sentences(final_sentences),
                 "output_trace": self._serialize_output_traces(output_traces),
@@ -488,4 +518,5 @@ class DiagnosticTraceService:
             "semantic_anchors": list(evidence.semantic_anchors or []),
             "punctuation_anchors": list(evidence.punctuation_anchors or []),
         }
+
 

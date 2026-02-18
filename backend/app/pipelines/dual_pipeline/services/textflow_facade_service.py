@@ -17,12 +17,12 @@ from app.services.alignment.types import (
     AlignedFacts,
     AnnotatedWord,
     AlignmentResult,
+    CollectionLayerInput,
+    DecisionLayerInput,
     CharMapping,
     FusedEvidence,
-    L4Input,
-    L5Input,
-    L6Input,
     OutputTrace,
+    ScoringLayerInput,
     PuncPosition,
     PunctTrack,
     TextTrack,
@@ -51,9 +51,9 @@ class _TextflowFacadeHost(Protocol):
     job_id: str
     logger: Any
     _vad_intervals: Optional[List[Tuple[float, float]]]
-    _l4_processor: Any
-    _l5_processor: Any
-    _l6_processor: Any
+    _collection_processor: Any
+    _scoring_processor: Any
+    _decision_processor: Any
     _fact_builder: Any
     _final_splitter: Any
     _final_grouper: Any
@@ -68,7 +68,7 @@ class _TextflowFacadeHost(Protocol):
     ) -> None:
         ...
 
-    def _build_fused_evidence_for_l6(
+    def _build_fused_evidence_for_decision(
         self,
         *,
         words: Sequence[AnnotatedWord],
@@ -91,7 +91,7 @@ class _TextflowFacadeHost(Protocol):
     ) -> bool:
         ...
 
-    def _build_soft_cut_plan_for_l6(
+    def _build_soft_cut_plan_for_decision(
         self,
         *,
         annotated_words: Sequence[AnnotatedWord],
@@ -141,7 +141,7 @@ class TextflowFacadeService:
     def __init__(self, *, host: _TextflowFacadeHost) -> None:
         self._host = host
 
-    def run_l4_to_l6_once(
+    def run_collection_scoring_decision_once(
         self,
         *,
         tracks: TextTrackBundle,
@@ -154,20 +154,20 @@ class TextflowFacadeService:
         speaker_id: Optional[str] = None,
         turn_id: Optional[str] = None,
     ) -> Layer456RunResult:
-        """执行一次 collection/scoring/decision 主路径。"""
+        """执行一次集合层→评分层→裁决层主路径（内部主入口）。"""
         time_words, time_source = self._resolve_alignment_time_words(
             variant=variant,
             sv_words=sv_words,
             whisper_result=whisper_result,
         )
-        l4_output = self._host._l4_processor.process(
-            L4Input(
+        collection_output = self._host._collection_processor.process(
+            CollectionLayerInput(
                 chosen_text_track=tracks.chosen_track,
                 sv_words=time_words,
                 vad_intervals=self._host._vad_intervals,
             )
         )
-        alignment_result = l4_output.alignment_result
+        alignment_result = collection_output.alignment_result
 
         detected_language = whisper_result.get("language") or (
             tracks.chosen_track.language if tracks.chosen_track else "auto"
@@ -184,11 +184,11 @@ class TextflowFacadeService:
         l5_punct_track = PunctTrack(
             clean_text_ref=punctuation_clean_text or "",
             positions=list(punctuation_positions or []),
-            source="l3",
+            source="punctuation_pre",
             confidence_stats={},
         )
-        l5_output = self._host._l5_processor.process(
-            L5Input(
+        scoring_output = self._host._scoring_processor.process(
+            ScoringLayerInput(
                 alignment_result=alignment_result,
                 punct_track=l5_punct_track,
                 language=detected_language,
@@ -196,7 +196,7 @@ class TextflowFacadeService:
                 turn_id=turn_id,
             )
         )
-        injection_report = dict(l5_output.injection_report or {})
+        injection_report = dict(scoring_output.injection_report or {})
         injection_stats["injection_unmatched_total"] = int(
             injection_report.get("mismatch_count", 0.0)
         )
@@ -213,7 +213,7 @@ class TextflowFacadeService:
         )
 
         self._host._bind_word_identity_by_timeline_overlap(
-            annotated_words=l5_output.annotated_words,
+            annotated_words=scoring_output.annotated_words,
             fallback_speaker_id=speaker_id,
             fallback_turn_id=turn_id,
         )
@@ -224,35 +224,35 @@ class TextflowFacadeService:
         )
         pyannote_frame_times = self._collect_pyannote_frame_times_for_words(time_words)
         aligned_facts = self._host._fact_builder.build(
-            annotated_words=l5_output.annotated_words,
+            annotated_words=scoring_output.annotated_words,
             alignment_result=alignment_result,
             speaker_turns=speaker_turn_facts,
             fast_draft_cuts=fast_draft_cuts,
             pyannote_frame_times=pyannote_frame_times,
         )
-        l6_stream_id = f"{variant}:{speaker_id or 'main'}:{turn_id or 'none'}"
-        fused_evidence = self._host._build_fused_evidence_for_l6(
-            words=l5_output.annotated_words,
-            stream_id=l6_stream_id,
+        decision_stream_id = f"{variant}:{speaker_id or 'main'}:{turn_id or 'none'}"
+        fused_evidence = self._host._build_fused_evidence_for_decision(
+            words=scoring_output.annotated_words,
+            stream_id=decision_stream_id,
             aligned_facts=aligned_facts,
         )
 
-        l6_chunk_index = self._host._resolve_chunk_index_from_words(words=time_words)
-        l6_is_last_chunk = self._host._is_last_chunk_for_words(words=time_words)
-        soft_cut_plan = self._host._build_soft_cut_plan_for_l6(
-            annotated_words=l5_output.annotated_words,
-            stream_id=l6_stream_id,
+        decision_chunk_index = self._host._resolve_chunk_index_from_words(words=time_words)
+        decision_is_last_chunk = self._host._is_last_chunk_for_words(words=time_words)
+        soft_cut_plan = self._host._build_soft_cut_plan_for_decision(
+            annotated_words=scoring_output.annotated_words,
+            stream_id=decision_stream_id,
             block_id=(
-                f"{self._host.job_id}:{l6_stream_id}:"
-                f"{l6_chunk_index if l6_chunk_index is not None else -1}"
+                f"{self._host.job_id}:{decision_stream_id}:"
+                f"{decision_chunk_index if decision_chunk_index is not None else -1}"
             ),
-            is_last_chunk=l6_is_last_chunk,
+            is_last_chunk=decision_is_last_chunk,
             aligned_facts=aligned_facts,
             fused_evidence=fused_evidence,
         )
-        l6_output = self._host._l6_processor.process(
-            L6Input(
-                annotated_words=l5_output.annotated_words,
+        decision_output = self._host._decision_processor.process(
+            DecisionLayerInput(
+                annotated_words=scoring_output.annotated_words,
                 vad_intervals=self._host._vad_intervals,
                 cut_plan=soft_cut_plan,
                 aligned_facts=aligned_facts,
@@ -260,18 +260,18 @@ class TextflowFacadeService:
                 fallback_clean_text_ref=str(punctuation_clean_text or ""),
                 fallback_punctuation_positions=list(punctuation_positions or []),
             ),
-            stream_id=l6_stream_id,
-            chunk_index=l6_chunk_index,
-            is_last_chunk=l6_is_last_chunk,
+            stream_id=decision_stream_id,
+            chunk_index=decision_chunk_index,
+            is_last_chunk=decision_is_last_chunk,
         )
-        words_for_split = list(l6_output.words_for_split)
-        final_sentences = list(l6_output.sentence_segments)
-        output_traces = list(l6_output.output_traces or [])
+        words_for_split = list(decision_output.words_for_split)
+        final_sentences = list(decision_output.sentence_segments)
+        output_traces = list(decision_output.output_traces or [])
         split_stats = dict(self._host._final_splitter.last_split_stats or {})
-        split_stats.update(dict(l6_output.segmentation_report.get("boundary_score_stats", {})))
-        split_stats.update(dict(l6_output.segmentation_report.get("soft_cut_stats", {})))
+        split_stats.update(dict(decision_output.segmentation_report.get("boundary_score_stats", {})))
+        split_stats.update(dict(decision_output.segmentation_report.get("soft_cut_stats", {})))
         split_stats["output_trace_count"] = int(len(output_traces))
-        segmentation_error = str(l6_output.segmentation_report.get("error_code", "") or "")
+        segmentation_error = str(decision_output.segmentation_report.get("error_code", "") or "")
         if segmentation_error:
             split_stats["error_code"] = segmentation_error
 
@@ -362,7 +362,7 @@ class TextflowFacadeService:
         punct_track = ctx.punct_track
         punctuation_positions = list(punct_track.positions) if punct_track and punct_track.positions else None
         punctuation_clean_text = punct_track.clean_text_ref if punct_track else None
-        run_result = self.run_l4_to_l6_once(
+        run_result = self.run_collection_scoring_decision_once(
             tracks=tracks,
             sv_result=ctx.sv_result,
             whisper_result=ctx.whisper_result or {},
@@ -382,7 +382,7 @@ class TextflowFacadeService:
                 fallback.speaker_id = speaker_id
                 fallback.turn_id = turn_id
                 final_sentences = [fallback]
-                split_stats["error_code"] = "E_L6_SPLIT_EMPTY"
+                split_stats["error_code"] = "E_DECISION_SPLIT_EMPTY"
                 self._host.logger.warning("Whisper 跳过路径触发裁决层单句兜底")
 
         for sentence in final_sentences:
@@ -417,7 +417,7 @@ class TextflowFacadeService:
         sv_words: List[WordTimestamp],
         whisper_result: Dict[str, Any],
     ) -> Tuple[List[WordTimestamp], str]:
-        """根据轨道选择 L4 时间锚点词流。"""
+        """根据轨道选择集合层时间锚点词流。"""
         if variant != "experiment":
             return list(sv_words), "sv"
 
@@ -572,8 +572,17 @@ class TextflowFacadeService:
         """从 Whisper 结果解析词级时间戳。"""
         words: List[WordTimestamp] = []
         segments = whisper_result.get("segments", [])
+        if not segments and isinstance(whisper_result.get("raw_result"), dict):
+            segments = whisper_result.get("raw_result", {}).get("segments", [])
         if not isinstance(segments, Sequence):
             return words
+        time_base = str(whisper_result.get("word_time_base", "") or "").strip().lower()
+        time_offset = 0.0
+        if time_base == "batch_local":
+            try:
+                time_offset = float(whisper_result.get("word_time_offset", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                time_offset = 0.0
 
         for segment in segments:
             if not isinstance(segment, dict):
@@ -588,8 +597,8 @@ class TextflowFacadeService:
                 if not text:
                     continue
                 try:
-                    start = float(item.get("start", 0.0))
-                    end = float(item.get("end", start))
+                    start = float(item.get("start", 0.0)) + time_offset
+                    end = float(item.get("end", item.get("start", 0.0))) + time_offset
                 except (TypeError, ValueError):
                     continue
                 confidence = float(item.get("probability", item.get("confidence", 0.0)) or 0.0)
@@ -605,3 +614,7 @@ class TextflowFacadeService:
 
         words.sort(key=lambda item: (item.start, item.end))
         return words
+
+
+
+

@@ -79,8 +79,8 @@ class AlignmentStageService:
                 len(fused_evidence.punctuation_anchors)
             )
 
-            # L7 薄层输出：即便走快路，也统一通过输出层分发。
-            l7_output = host._emit_l7_output(
+            # 输出层薄层分发：即便走快路，也统一通过输出层入口。
+            output_layer_result = host._emit_output_layer(
                 chunk_index=ctx.chunk_index,
                 sentence_segments=final_sentences,
                 language=str(run_result.detected_language or "auto"),
@@ -103,7 +103,7 @@ class AlignmentStageService:
                 default_trace_reason="sensevoice_only",
             )
             ctx.finalization_metrics["l7_error_count"] = float(
-                len(l7_output.output_payload.get("errors", []))
+                len(output_layer_result.output_payload.get("errors", []))
             )
 
             host.logger.debug(
@@ -112,7 +112,7 @@ class AlignmentStageService:
             )
             return
 
-        # 阶段 1: 双流对齐（L2/L3/L4/L5/L6）
+        # 阶段 1: 双流定稿主链（前置仲裁/标点域 + 四层主链）
         host.logger.debug(f"Chunk {ctx.chunk_index}: 双流对齐")
 
         if ctx.whisper_result is None or ctx.sv_result is None:
@@ -145,7 +145,7 @@ class AlignmentStageService:
             arbitration_result.chosen_source,
             chosen_text_clean,
         )
-        # V3.2.0+dev.20260204.10: 删除慢流补跑分支，定稿标点仅走统一 L3 入口
+        # V3.2.0+dev.20260204.10: 删除慢流补跑分支，定稿标点仅走统一前置入口
         punct_track: Optional[PunctTrack] = None
         # V3.2.0+dev.20260204.11: 若仲裁选择 fast 且快流已产出同一 clean_text_ref 的 PunctTrack，直接复用避免重复跑模型
         if (
@@ -188,12 +188,12 @@ class AlignmentStageService:
             arbitration_result.coverage,
         )
 
-        # V3.2.0+dev.20260205.09: L4 对齐层（仅对齐与 gap 修复）
+        # V3.2.0+dev.20260205.09: 集合层（仅对齐与 gap 修复）
         sv_words = host._build_sv_word_timestamps(sv_result, chunk)
         speaker_id = host._resolve_speaker_id_for_chunk(ctx.audio_chunk) if ctx.audio_chunk else None
         turn_id = host._resolve_turn_id_for_chunk(ctx.audio_chunk) if ctx.audio_chunk else None
 
-        legacy_run = host._run_l4_to_l6_once(
+        legacy_run = host._run_collection_scoring_decision_once(
             tracks=tracks,
             sv_result=sv_result,
             whisper_result=whisper_result,
@@ -214,7 +214,7 @@ class AlignmentStageService:
 
         if host._is_dual_time_experiment_enabled:
             # Shadow/Active 都采用串行后处理：先 legacy，再 experiment，不并行占用 GPU。
-            experiment_run = host._run_l4_to_l6_once(
+            experiment_run = host._run_collection_scoring_decision_once(
                 tracks=tracks,
                 sv_result=sv_result,
                 whisper_result=whisper_result,
@@ -373,7 +373,7 @@ class AlignmentStageService:
             output_traces=output_traces,
         )
 
-        # V3.2.0+dev.20260204.08: L4/L5 补跑候选埋点（仅统计，不触发补跑）
+        # V3.2.0+dev.20260204.08: 集合/评分域补跑候选埋点（仅统计，不触发补跑）
         host._record_punct_retry_candidates(ctx)
 
         ctx.final_sentences = final_sentences
@@ -394,7 +394,7 @@ class AlignmentStageService:
             f"sv_text_clean_len={len(sv_result.get('text_clean', ''))}"
         )
 
-        # 定稿链内兜底：若 L6 仍未产出句子，基于 L6 输入词流构建单句，禁止回读草稿链。
+        # 定稿链内兜底：若裁决层仍未产出句子，基于裁决层输入词流构建单句，禁止回读草稿链。
         if not final_sentences:
             host.logger.error(
                 f"Chunk {ctx.chunk_index}: 定稿句子为空！"
@@ -404,7 +404,7 @@ class AlignmentStageService:
                 f"chosen_text_len={len(chosen_text_clean)}"
             )
             fallback_sentence = host._build_final_fallback_sentence(words_for_split)
-            fallback_error_code = "E_L6_SPLIT_EMPTY"
+            fallback_error_code = "E_DECISION_SPLIT_EMPTY"
             if fallback_sentence is None:
                 fallback_text = self._resolve_text_fallback_content(
                     chosen_text_clean=chosen_text_clean,
@@ -422,7 +422,7 @@ class AlignmentStageService:
                     chunk=ctx.audio_chunk,
                     confidence=fallback_confidence,
                 )
-                fallback_error_code = "E_L6_SPLIT_EMPTY_TEXT_FALLBACK"
+                fallback_error_code = "E_DECISION_SPLIT_EMPTY_TEXT_FALLBACK"
             if fallback_sentence is not None:
                 fallback_sentence.speaker_id = speaker_id
                 fallback_sentence.turn_id = turn_id
@@ -442,7 +442,7 @@ class AlignmentStageService:
                     fallback_error_code,
                 )
 
-        l7_output = host._emit_l7_output(
+        output_layer_result = host._emit_output_layer(
             chunk_index=ctx.chunk_index,
             sentence_segments=final_sentences,
             language=str(run_result.detected_language or "auto"),
@@ -465,7 +465,7 @@ class AlignmentStageService:
             default_trace_reason="default_splitter",
         )
         ctx.finalization_metrics["l7_error_count"] = float(
-            len(l7_output.output_payload.get("errors", []))
+            len(output_layer_result.output_payload.get("errors", []))
         )
 
         host.logger.debug(
@@ -546,3 +546,4 @@ class AlignmentStageService:
             is_draft=False,
             is_finalized=True,
         )
+

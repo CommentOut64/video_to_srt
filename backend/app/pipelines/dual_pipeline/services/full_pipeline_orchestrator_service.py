@@ -62,7 +62,7 @@ class FullPipelineOrchestratorService:
         host._audio_chunks_by_index = {chunk.index: chunk for chunk in audio_chunks}
         host._context_cache = {}
         host._vad_intervals = list(vad_intervals) if vad_intervals else None
-        host._l6_processor.reset_state()
+        host._decision_processor.reset_state()
         host._soft_cut_pending_deferred_by_stream.clear()
 
         # Phase 2: S-Epoch 预构建 Timeline 映射（speaker_id/turn_id）。
@@ -190,3 +190,4 @@ class FullPipelineOrchestratorService:
 
         host.logger.info(f"三级流水线完成: {len(results)} 个 Chunk 已处理")
         return results
+

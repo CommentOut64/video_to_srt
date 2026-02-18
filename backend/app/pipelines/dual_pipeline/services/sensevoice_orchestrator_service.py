@@ -42,7 +42,7 @@ class SensevoiceOrchestratorService:
         total_chunks = len(audio_chunks)
         last_chunk_index: Optional[int] = None
         host._audio_chunks_by_index = {chunk.index: chunk for chunk in audio_chunks}
-        host._l6_processor.reset_state()
+        host._decision_processor.reset_state()
         host._soft_cut_pending_deferred_by_stream.clear()
 
         for i, chunk in enumerate(audio_chunks):
@@ -113,7 +113,7 @@ class SensevoiceOrchestratorService:
                 ctx.finalization_metrics["evidence_punctuation_anchor_count"] = float(
                     len(fused_evidence.punctuation_anchors)
                 )
-                l7_output = host._emit_l7_output(
+                output_layer_result = host._emit_output_layer(
                     chunk_index=ctx.chunk_index,
                     sentence_segments=final_sentences,
                     language=str(run_result.detected_language or "auto"),
@@ -136,7 +136,7 @@ class SensevoiceOrchestratorService:
                     default_trace_reason="sensevoice_only",
                 )
                 ctx.finalization_metrics["l7_error_count"] = float(
-                    len(l7_output.output_payload.get("errors", []))
+                    len(output_layer_result.output_payload.get("errors", []))
                 )
                 results.append(ctx)
                 last_chunk_index = i
@@ -198,3 +198,4 @@ class SensevoiceOrchestratorService:
 
         host.logger.info(f"极速模式完成: {len(results)} 个 Chunk 已处理")
         return results
+
