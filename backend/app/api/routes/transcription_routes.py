@@ -50,6 +50,15 @@ class PreprocessingSettingsAPI(BaseModel):
     spectrum_threshold: float = Field(default=0.35, ge=0.0, le=1.0, description="分诊灵敏度")
     # VAD 静音过滤
     vad_filter: bool = Field(default=True, description="VAD 静音过滤")
+    # 是否启用说话人检测（任务级）
+    enable_speaker_detection: bool = Field(default=True, description="是否启用说话人检测")
+    # 是否启用 speaker 介入切分（任务级）
+    enable_speaker_guided_split: bool = Field(default=True, description="是否启用 speaker 介入切分")
+    # 手动指定说话人数：0=auto
+    speaker_count: int = Field(default=0, ge=0, le=20, description="说话人数，0 表示自动推断")
+    # 可选人数范围：0=auto，仅在 speaker_count=0 时生效
+    speaker_min_count: int = Field(default=0, ge=0, le=20, description="最小说话人数，0 表示自动")
+    speaker_max_count: int = Field(default=0, ge=0, le=20, description="最大说话人数，0 表示自动")
 
 
 class TranscriptionSettingsAPI(BaseModel):
@@ -151,6 +160,13 @@ class UploadResponse(BaseModel):
     message: str
 
 
+class CreateJobsBatchRequest(BaseModel):
+    """批量创建任务请求。"""
+
+    filenames: List[str] = Field(default_factory=list, description="文件名列表")
+    task_config: Optional[TaskConfigAPI] = Field(default=None, description="任务级配置（可选）")
+
+
 def create_transcription_router(
     transcription_service: TranscriptionService,
     file_service: FileManagementService,
@@ -163,6 +179,74 @@ def create_transcription_router(
 
     # 获取SSE管理器
     sse_manager = get_sse_manager()
+
+    def _parse_task_config_form(task_config_raw: Optional[str]) -> Dict[str, Any]:
+        """解析 Form 中的 task_config JSON。"""
+        if not task_config_raw:
+            return {}
+        try:
+            payload = json.loads(task_config_raw)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail=f"task_config 不是合法 JSON: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="task_config 必须是对象结构")
+        if "task_config" in payload and isinstance(payload["task_config"], dict):
+            return dict(payload["task_config"])
+        return payload
+
+    def _build_job_settings_from_task_config(task_config: Optional[Dict[str, Any]]) -> JobSettings:
+        """根据 task_config 生成 JobSettings。"""
+        if not task_config:
+            return JobSettings()
+        preset_id = str(task_config.get("preset_id", "balanced") or "balanced")
+        has_custom_groups = any(
+            task_config.get(key)
+            for key in ("preprocessing", "transcription", "refinement", "compute", "debug")
+        )
+        if preset_id != "custom" and not has_custom_groups:
+            return JobSettings.from_preset(preset_id)
+        try:
+            return JobSettings.from_dict(task_config)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    def _normalize_checkpoint_speaker_settings(
+        original_settings: Optional[Dict[str, Any]],
+        task_config: Optional[Dict[str, Any]],
+        existing_job_settings: Optional[JobSettings],
+    ) -> Dict[str, Any]:
+        """
+        规范化 checkpoint 中的 speaker 相关设置。
+
+        Why:
+        - 历史 checkpoint 可能缺少任务级 speaker 字段；
+        - /start 收到显式 task_config 时，用户期望 speaker 策略按本次请求生效。
+        """
+        merged = dict(original_settings or {})
+        preprocessing_payload = dict(merged.get("preprocessing") or {})
+        request_preprocessing = dict((task_config or {}).get("preprocessing") or {})
+        fallback_preprocessing: Dict[str, Any] = {}
+        if isinstance(existing_job_settings, JobSettings):
+            fallback_preprocessing = (
+                existing_job_settings.to_dict().get("preprocessing") or {}
+            )
+
+        speaker_keys = (
+            "enable_speaker_detection",
+            "enable_speaker_guided_split",
+            "speaker_count",
+            "speaker_min_count",
+            "speaker_max_count",
+        )
+        for key in speaker_keys:
+            if key in request_preprocessing:
+                preprocessing_payload[key] = request_preprocessing[key]
+                continue
+            if key not in preprocessing_payload and key in fallback_preprocessing:
+                preprocessing_payload[key] = fallback_preprocessing[key]
+
+        merged["preprocessing"] = preprocessing_payload
+        return merged
 
     def _build_task_snapshot(job: JobState) -> Dict[str, Any]:
         """构建前端任务状态快照（包含时间戳，用于版本校验）。"""
@@ -281,7 +365,10 @@ def create_transcription_router(
         )
 
     @router.post("/upload")
-    async def upload_file(file: UploadFile = File(...)):
+    async def upload_file(
+        file: UploadFile = File(...),
+        task_config: Optional[str] = Form(None),
+    ):
         """上传文件并自动创建转录任务（V2.2: 加入队列）"""
         try:
             # 验证文件类型
@@ -310,7 +397,8 @@ def create_transcription_router(
 
             # 创建任务
             job_id = uuid.uuid4().hex
-            settings = JobSettings()
+            parsed_task_config = _parse_task_config_form(task_config)
+            settings = _build_job_settings_from_task_config(parsed_task_config)
             job = transcription_service.create_job(original_filename, input_path, settings, job_id=job_id)
 
             # 🔥 新增: 加入队列（而非直接启动）
@@ -330,7 +418,10 @@ def create_transcription_router(
             raise HTTPException(status_code=500, detail=f"上传文件失败: {str(e)}")
 
     @router.post("/create-job")
-    async def create_job(filename: str = Form(...)):
+    async def create_job(
+        filename: str = Form(...),
+        task_config: Optional[str] = Form(None),
+    ):
         """为指定文件创建转录任务（本地input模式）"""
         try:
             input_path = file_service.get_input_file_path(filename)
@@ -341,7 +432,8 @@ def create_transcription_router(
                 raise HTTPException(status_code=400, detail="不支持的文件格式")
 
             job_id = uuid.uuid4().hex
-            settings = JobSettings()
+            parsed_task_config = _parse_task_config_form(task_config)
+            settings = _build_job_settings_from_task_config(parsed_task_config)
             transcription_service.create_job(filename, input_path, settings, job_id=job_id)
 
             return {"job_id": job_id, "filename": filename}
@@ -351,7 +443,7 @@ def create_transcription_router(
             raise HTTPException(status_code=500, detail=f"创建任务失败: {str(e)}")
 
     @router.post("/create-jobs-batch")
-    async def create_jobs_batch(filenames: list = Body(..., embed=True)):
+    async def create_jobs_batch(req: CreateJobsBatchRequest):
         """
         批量创建转录任务（从 input 目录选择多个文件）
 
@@ -372,6 +464,12 @@ def create_transcription_router(
             queue_service = get_queue_service(transcription_service)
             jobs = []
             failed = []
+            filenames = list(req.filenames or [])
+            task_config_payload = (
+                req.task_config.model_dump()
+                if req.task_config is not None
+                else {}
+            )
 
             for filename in filenames:
                 try:
@@ -388,7 +486,7 @@ def create_transcription_router(
 
                     # 创建任务
                     job_id = uuid.uuid4().hex
-                    settings = JobSettings()
+                    settings = _build_job_settings_from_task_config(task_config_payload)
                     job = transcription_service.create_job(filename, input_path, settings, job_id=job_id)
 
                     # 加入队列
@@ -456,24 +554,19 @@ def create_transcription_router(
 
             if original_settings:
                 try:
-                    job.settings = JobSettings.from_dict(original_settings)
+                    normalized_original_settings = _normalize_checkpoint_speaker_settings(
+                        original_settings=original_settings,
+                        task_config=task_config,
+                        existing_job_settings=job.settings,
+                    )
+                    job.settings = JobSettings.from_dict(normalized_original_settings)
                 except ValueError as exc:
                     raise HTTPException(status_code=400, detail=str(exc))
             elif task_config:
-                preset_id = task_config.get("preset_id", "balanced")
-                has_custom_groups = any(
-                    task_config.get(key)
-                    for key in ("preprocessing", "transcription", "refinement", "compute")
-                )
-                if preset_id != "custom" and not has_custom_groups:
-                    job.settings = JobSettings.from_preset(preset_id)
-                else:
-                    try:
-                        job.settings = JobSettings.from_dict(task_config)
-                    except ValueError as exc:
-                        raise HTTPException(status_code=400, detail=str(exc))
+                job.settings = _build_job_settings_from_task_config(task_config)
             else:
-                job.settings = JobSettings()
+                if not isinstance(job.settings, JobSettings):
+                    job.settings = JobSettings()
 
             # 🔥 关键改动: 如果任务不在队列中，加入队列
             with queue_service.lock:
