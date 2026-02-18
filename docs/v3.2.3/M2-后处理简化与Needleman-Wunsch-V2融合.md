@@ -374,46 +374,39 @@ time_sec = frame_start + idx * frame_step
 
 ### 10.7 阶段 5：裁决层落地（1 周）
 
-1. 目标：实现唯一裁决层，统一 deferred 生命周期。
+1. 目标：实现唯一裁决层，统一即时打分裁决（cut/skip）。
 2. 主要改动：
   - `SoftCutDecisionEngine` 作为唯一落刀决策器输出 `CutPlan`。
-  - 实现“受影响窗口重算”与跨 chunk deferred 状态维护。
+  - 移除跨 chunk deferred 状态维护与超时硬切分支。
   - 禁止旁路落刀，`SegmentationProcessor` 仅消费 `CutPlan`。
 3. 代码落点：
   - `backend/app/services/segmentation/soft_cut/decision_engine.py`
   - `backend/app/services/segmentation/segmentation_processor.py`
   - `backend/app/pipelines/async_dual_pipeline.py`
 4. 退出门槛：
-  - `deferred` 终态闭环（pending/resolved/forced/expired）完整。
+  - 无 deferred 状态机与 hard-limit 触发路径残留。
   - 句中误切率不升高，漏切率下降。
 5. 回滚策略：`cut_plan=None` 退回 `FinalSplitter` 默认路径。
 
 #### 10.7.1 阶段 5 当前实现状态（代码已落地）
 
-1. 已在 `AsyncDualPipeline._build_soft_cut_plan_for_l6_m1(...)` 接入“受影响窗口重算”：
-  - 基于 `aligned_facts/fused_evidence` 与 pending deferred，识别受影响窗口（`new_anchor/slow_covered/level_upgraded`）。
-  - 将受影响 deferred 转换为重算窗口并并入当前轮 `SoftCutDecisionEngine` 统一裁决。
-2. 已完成 deferred 生命周期闭环：
-  - 新增 deferred 元数据（`window_start/window_end/trigger_level/depends_on_fast_draft`）。
-  - 当前链路可形成完整终态：`pending/resolved/forced/expired`。
-  - `is_last_chunk=true` 时，剩余 `pending` 自动转 `expired`，避免悬挂状态。
-3. 已补齐观测字段与统计：
-  - `CutPlan.generation_report` 新增 `affected_window_count/affected_window_ids/affected_reason_by_window`。
-  - 新增 `deferred_state_stats` 与阶段5统计（重算窗口数、受影响 resolved/expired 数）。
-  - `SegmentationProcessor.soft_cut_stats` 增加 `deferred_state_stats` 透传。
-4. 行为边界保持不变：
+1. 已将 `SoftCutDecisionEngine` 收口为即时裁决：
+  - 仅基于当前 `cut_windows` 做 `score >= threshold` 判定；
+  - 不再创建/解析 deferred，不再产出 `hard_limit_forced`。
+2. 已将 `AsyncDualPipeline._build_soft_cut_plan_for_l6_m1(...)` 收口为单轮计划构建：
+  - 删除跨 chunk deferred 缓存、受影响窗口重算、last_chunk 过期处理；
+  - `deferred_state_stats` 保留兼容键并固定为 0。
+3. 行为边界保持不变：
   - `SegmentationProcessor` 仍仅消费 `CutPlan`，无旁路落刀。
   - 保留旧回退路径（`cut_plan=None` -> `FinalSplitter` 默认切分）。
-5. 阶段5本地回归结果：
+4. 阶段5本地回归结果：
   - `test_soft_cut_decision_engine.py`
-  - `test_soft_cut_plan_provider.py`
   - `test_soft_cut_phase_d_pipeline_integration.py`
   - `test_soft_cut_phase_d_integration.py`
   - `test_layer_processors_l5_l6_l7.py`
-  - `test_async_dual_pipeline_alignment_stage.py`
-  - `unit/services/alignment/test_alignment_service_tokenize.py`
-  - `unit/services/alignment/test_alignment_processor.py`
-  - 以上共 `62 passed`。
+  - `test_text_pipeline_config_segmentation.py`
+  - `test_async_dual_pipeline_timeline_priority.py`
+  - 以上共 `49 passed`。
 
 ### 10.8 阶段 6：输出层收口（0.5 周）
 
@@ -630,3 +623,25 @@ time_sec = frame_start + idx * frame_step
 3. 落地约束：
   - `speaker` 保持软边界（高权重，不做硬切）；
   - 任何来源的优先级调整必须通过配置完成，不允许新增分支硬编码。
+
+### 10.19 阶段 B/C：任务级 Speaker API 与参数分层（已完成）
+
+1. 目标：
+  - 在任务创建阶段即可下发并持久化 speaker 行为配置；
+  - 将“全局模型/资源参数”与“任务业务行为参数”分层，避免任务被全局硬覆盖。
+2. 任务级新增参数（创建任务与启动任务统一支持）：
+  - `enable_speaker_detection`
+  - `enable_speaker_guided_split`
+  - `speaker_count`（`0=auto`）
+  - 预留：`speaker_min_count/speaker_max_count`（`0=auto`）。
+3. 分层口径：
+  - 全局保留：`timeline` 模型/设备/阈值默认值（如 `diarization_model_id/device/boundary_threshold`）。
+  - 任务级保留：是否检测、是否介入切分、人数策略。
+4. 运行时合并策略：
+  - 任务关闭检测：跳过 Timeline 构建；
+  - 任务固定人数（`speaker_count>0`）：强制启用 diarization 并下发 `num_speakers`；
+  - `speaker_count=0`：保持自动推断，按任务范围或全局默认范围运行。
+5. 验收结论：
+  - 同一全局配置下，任务可独立启停 speaker 检测与介入切分；
+  - `speaker_count=0 -> auto` 语义已落地到运行时；
+  - 创建任务路径与启动任务路径均支持同口径参数。
