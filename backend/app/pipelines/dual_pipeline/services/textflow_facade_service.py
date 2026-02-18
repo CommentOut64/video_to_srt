@@ -17,6 +17,7 @@ from app.services.alignment.types import (
     AlignedFacts,
     AnnotatedWord,
     AlignmentResult,
+    CharMapping,
     FusedEvidence,
     L4Input,
     L5Input,
@@ -24,6 +25,7 @@ from app.services.alignment.types import (
     OutputTrace,
     PuncPosition,
     PunctTrack,
+    TextTrack,
     TextTrackBundle,
 )
 
@@ -307,105 +309,106 @@ class TextflowFacadeService:
             detected_language=str(detected_language or "auto"),
         )
 
-    def finalize_sensevoice_only(self, ctx: ProcessingContext) -> List[SentenceSegment]:
-        """Whisper 跳过时的定稿输出（仅使用 SenseVoice 结果）。"""
+    def finalize_sensevoice_only(self, ctx: ProcessingContext) -> Layer456RunResult:
+        """Whisper 跳过时的定稿输出（仅使用 SenseVoice 结果，统一走四层主链）。"""
         if not ctx.sv_result or not ctx.audio_chunk:
-            return []
+            raise ValueError("Whisper 跳过路径缺少 SenseVoice 结果或音频块")
+
+        tracks = ctx.text_tracks or TextTrackBundle()
+        ctx.text_tracks = tracks
+
+        normalize_sensevoice_result = getattr(self._host, "_normalize_sensevoice_result", None)
+        if tracks.sv_track is None and callable(normalize_sensevoice_result):
+            normalize_sensevoice_result(ctx)
+            tracks = ctx.text_tracks or tracks
+
+        if tracks.sv_track is None:
+            fallback_text = str(
+                ctx.sv_result.get("text_clean")
+                or ctx.sv_result.get("text_itn_raw")
+                or ctx.sv_result.get("text")
+                or ctx.sv_result.get("raw_text")
+                or ""
+            ).strip()
+            if not fallback_text:
+                raise ValueError("Whisper 跳过路径缺少 SenseVoice 文本轨道")
+            text_length = len(fallback_text)
+            mapping = list(range(text_length))
+            tracks.sv_track = TextTrack(
+                raw_text=fallback_text,
+                text_itn_raw=fallback_text,
+                text_clean=fallback_text,
+                char_mapping=[
+                    CharMapping(raw_idx=index, clean_idx=index, punct=None)
+                    for index in range(text_length)
+                ],
+                raw_to_clean=list(mapping),
+                clean_to_raw=list(mapping),
+                language=str(ctx.audio_chunk.language or ctx.sv_result.get("language") or "auto"),
+                source="sensevoice",
+                mapping_coverage=1.0 if text_length > 0 else 0.0,
+            )
+
+        if tracks.chosen_track is None:
+            clone_text_track = getattr(self._host, "_clone_text_track", None)
+            if callable(clone_text_track):
+                tracks.chosen_track = clone_text_track(tracks.sv_track, source="chosen")
+            else:
+                tracks.chosen_track = tracks.sv_track
 
         sv_words = self._host._build_sv_word_timestamps(ctx.sv_result, ctx.audio_chunk)
         speaker_id = self._host._resolve_speaker_id_for_chunk(ctx.audio_chunk)
         turn_id = self._host._resolve_turn_id_for_chunk(ctx.audio_chunk)
-        annotated_words: List[AnnotatedWord] = [
-            AnnotatedWord(
-                word=word.word,
-                start=word.start,
-                end=word.end,
-                trailing_punct="",
-                confidence=word.confidence,
-                confidence_source=word.confidence_source or "fast",
-                speaker_id=speaker_id,
-                turn_id=turn_id,
-                track_id="main",
-            )
-            for word in sv_words
-        ]
-        self._host._bind_word_identity_by_timeline_overlap(
-            annotated_words=annotated_words,
-            fallback_speaker_id=speaker_id,
-            fallback_turn_id=turn_id,
+        punct_track = ctx.punct_track
+        punctuation_positions = list(punct_track.positions) if punct_track and punct_track.positions else None
+        punctuation_clean_text = punct_track.clean_text_ref if punct_track else None
+        run_result = self.run_l4_to_l6_once(
+            tracks=tracks,
+            sv_result=ctx.sv_result,
+            whisper_result=ctx.whisper_result or {},
+            sv_words=sv_words,
+            punctuation_positions=punctuation_positions,
+            punctuation_clean_text=punctuation_clean_text,
+            variant="legacy",
+            speaker_id=speaker_id,
+            turn_id=turn_id,
         )
-        speaker_turn_facts = self._collect_speaker_turn_facts_for_words(sv_words)
-        fast_draft_cuts = self._collect_fast_draft_cuts(ctx.sv_result, sv_words=sv_words)
-        pyannote_frame_times = self._collect_pyannote_frame_times_for_words(sv_words)
-        aligned_facts = self._host._fact_builder.build(
-            annotated_words=annotated_words,
-            alignment_result=None,
-            speaker_turns=speaker_turn_facts,
-            fast_draft_cuts=fast_draft_cuts,
-            pyannote_frame_times=pyannote_frame_times,
-        )
-        sensevoice_stream_id = "sensevoice_only"
-        fused_evidence = self._host._build_fused_evidence_for_l6(
-            words=annotated_words,
-            stream_id=sensevoice_stream_id,
-            aligned_facts=aligned_facts,
-        )
-        ctx.finalization_metrics["fact_word_count"] = float(len(aligned_facts.annotated_words))
-        ctx.finalization_metrics["fact_turn_count"] = float(len(aligned_facts.speaker_turns))
-        ctx.finalization_metrics["fact_mapping_count"] = float(len(aligned_facts.time_mappings))
-        ctx.finalization_metrics["evidence_speaker_change_count"] = float(
-            len(fused_evidence.speaker_changes)
-        )
-        ctx.finalization_metrics["evidence_pause_anchor_count"] = float(
-            len(fused_evidence.pause_anchors)
-        )
-        ctx.finalization_metrics["evidence_semantic_anchor_count"] = float(
-            len(fused_evidence.semantic_anchors)
-        )
-        ctx.finalization_metrics["evidence_punctuation_anchor_count"] = float(
-            len(fused_evidence.punctuation_anchors)
-        )
-        is_last_chunk = self._host._is_last_chunk_index(ctx.chunk_index)
-        soft_cut_plan = self._host._build_soft_cut_plan_for_l6(
-            annotated_words=annotated_words,
-            stream_id=sensevoice_stream_id,
-            block_id=f"{self._host.job_id}:{sensevoice_stream_id}:{ctx.chunk_index}",
-            is_last_chunk=is_last_chunk,
-            aligned_facts=aligned_facts,
-            fused_evidence=fused_evidence,
-        )
-        l6_output = self._host._l6_processor.process(
-            L6Input(
-                annotated_words=annotated_words,
-                vad_intervals=self._host._vad_intervals,
-                cut_plan=soft_cut_plan,
-                aligned_facts=aligned_facts,
-                fused_evidence=fused_evidence,
-            ),
-            stream_id=sensevoice_stream_id,
-            chunk_index=ctx.chunk_index,
-            is_last_chunk=is_last_chunk,
-        )
-        sentences = list(l6_output.sentence_segments)
-        if not sentences:
-            fallback = self._host._build_final_fallback_sentence(l6_output.words_for_split)
+
+        final_sentences = list(run_result.final_sentences)
+        split_stats = dict(run_result.split_stats)
+        if not final_sentences:
+            fallback = self._host._build_final_fallback_sentence(run_result.words_for_split)
             if fallback is not None:
                 fallback.speaker_id = speaker_id
                 fallback.turn_id = turn_id
-                sentences = [fallback]
+                final_sentences = [fallback]
+                split_stats["error_code"] = "E_L6_SPLIT_EMPTY"
                 self._host.logger.warning("Whisper 跳过路径触发裁决层单句兜底")
-        for sentence in sentences:
+
+        for sentence in final_sentences:
             sentence.source = TextSource.SENSEVOICE
             sentence.is_finalized = True
             sentence.is_draft = False
-            sentence.confidence_source = "fast"
+            if not sentence.confidence_source:
+                sentence.confidence_source = "fast"
             if sentence.speaker_id is None:
                 sentence.speaker_id = speaker_id
             if sentence.turn_id is None:
                 sentence.turn_id = turn_id
-        if self._host._final_grouper and sentences:
-            sentences = self._host._final_grouper.group(sentences)
-        return sentences
+
+        return Layer456RunResult(
+            alignment_result=run_result.alignment_result,
+            aligned_facts=run_result.aligned_facts,
+            fused_evidence=run_result.fused_evidence,
+            words_for_split=run_result.words_for_split,
+            injection_stats=dict(run_result.injection_stats),
+            split_stats=split_stats,
+            final_sentences=final_sentences,
+            output_traces=list(run_result.output_traces),
+            alignment_time_source=run_result.alignment_time_source,
+            alignment_time_word_count=run_result.alignment_time_word_count,
+            detected_language=run_result.detected_language,
+        )
 
     def _resolve_alignment_time_words(
         self,

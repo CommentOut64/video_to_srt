@@ -50,6 +50,7 @@ class SegmentationProcessor:
         logger: Optional[Any] = None,
         is_keep_sentence_end_punct: bool = False,
         is_enable_soft_cut_overlap_degrade: bool = False,
+        is_enable_speaker_guided_split: bool = True,
     ) -> None:
         self._logger = resolve_loguru_logger(
             logger,
@@ -60,6 +61,7 @@ class SegmentationProcessor:
         self._final_splitter = final_splitter
         self._is_keep_sentence_end_punct = is_keep_sentence_end_punct
         self._is_enable_soft_cut_overlap_degrade = is_enable_soft_cut_overlap_degrade
+        self._is_enable_speaker_guided_split = is_enable_speaker_guided_split
         self._pending_prefix_words_by_stream: Dict[str, List[WordTimestamp]] = {}
         self._boundary_mapper = WordBoundaryMapper()
         self._active_vad_intervals: List[Tuple[float, float]] = []
@@ -152,7 +154,7 @@ class SegmentationProcessor:
         )
         self._active_vad_intervals = list(data.vad_intervals or [])
         speaker_repair_split_count = 0
-        if isinstance(all_sentence_segments, list):
+        if self._is_enable_speaker_guided_split and isinstance(all_sentence_segments, list):
             speaker_repair_split_count = self._repair_cross_speaker_sentences_once(
                 sentences=all_sentence_segments,
                 turns=self._collect_speaker_turns_for_repair(aligned_facts),

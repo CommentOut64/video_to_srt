@@ -30,7 +30,7 @@ V3.2.0+dev.20260123.05 更新：
 
 V3.2.0+dev.20260215.08 更新：
 - 新增 L5->L6 soft-cut 计划生成与透传（可配置开关）
-- 维护 stream 级 pending deferred，支持跨 chunk 延迟决策
+- soft-cut 改为即时裁决路径，不再维护 deferred 跨 chunk 状态
 - 新增短 turn 续段与词内触发守门，抑制“尾词前错切”
 - 收紧句级跨speaker修复门限，避免误切连续文本
 """
@@ -88,8 +88,6 @@ from app.services.segmentation.soft_cut import (
     CutPlan,
     CutWindow,
     DecisionEngineConfig,
-    DeferredCut,
-    DeferredCutState,
     EvidenceLevel,
     EvidenceBuilder,
     EvidenceBuilderConfig,
@@ -231,6 +229,11 @@ class AsyncDualPipelineKernel:
         enable_cross_chunk_merge: bool = True,
         bridge_controller: Optional[BridgeController] = None,
         debug_punctuation: bool = False,
+        is_enable_speaker_detection: bool = True,
+        is_enable_speaker_guided_split: bool = True,
+        speaker_count: int = 0,
+        speaker_min_count: int = 0,
+        speaker_max_count: int = 0,
         logger: Optional[logging.Logger] = None,
         cancellation_token: Optional["CancellationToken"] = None,  # v3.1.0: 新增
         progress_emitter: Optional["ProgressEventEmitter"] = None  # V3.1.0: 新增
@@ -297,6 +300,26 @@ class AsyncDualPipelineKernel:
         self._vad_intervals: Optional[List[Tuple[float, float]]] = None
         self._full_audio_array: Optional[Any] = None
         self._full_audio_sr: int = 16000
+        self._is_enable_speaker_detection = bool(is_enable_speaker_detection)
+        self._is_enable_speaker_guided_split = bool(
+            is_enable_speaker_detection and is_enable_speaker_guided_split
+        )
+        self._speaker_count = max(0, int(speaker_count or 0))
+        self._speaker_min_count = max(0, int(speaker_min_count or 0))
+        self._speaker_max_count = max(0, int(speaker_max_count or 0))
+        if self._speaker_count > 0:
+            self._speaker_min_count = 0
+            self._speaker_max_count = 0
+        elif self._speaker_min_count > 0 and self._speaker_max_count > 0:
+            self._speaker_max_count = max(self._speaker_min_count, self._speaker_max_count)
+        self.logger.info(
+            "任务级 speaker 策略: detect={} guided_split={} speaker_count={} speaker_min={} speaker_max={}",
+            self._is_enable_speaker_detection,
+            self._is_enable_speaker_guided_split,
+            self._speaker_count,
+            self._speaker_min_count,
+            self._speaker_max_count,
+        )
 
         # 判断是否为纯 SenseVoice 模式
         self.is_sensevoice_only = (transcription_profile == "sensevoice_only")
@@ -410,6 +433,7 @@ class AsyncDualPipelineKernel:
         self._soft_cut_priority_profiles = dict(
             self._segmentation_layer_config.soft_cut_priority_profiles or {}
         )
+        # 兼容旧 orchestrator 清理调用，实际已不再承载 deferred 状态。
         self._soft_cut_pending_deferred_by_stream: Dict[str, List[Any]] = {}
         # Why: 锚点距离惩罚过弱会让“远处大停顿”压过“近处词边界”，表现为尾词前错切。
         self._soft_cut_evidence_builder = EvidenceBuilder(
@@ -486,6 +510,7 @@ class AsyncDualPipelineKernel:
             is_enable_soft_cut_overlap_degrade=bool(
                 self._segmentation_layer_config.is_enable_soft_cut_overlap_degrade
             ),
+            is_enable_speaker_guided_split=self._is_enable_speaker_guided_split,
         )
         self._l7_processor = OutputLayerProcessor(
             subtitle_manager=self.subtitle_manager,
@@ -699,6 +724,10 @@ class AsyncDualPipelineKernel:
             self.logger.info("Timeline 域跳过：无可用音频输入")
             return
 
+        if not self._is_enable_speaker_detection:
+            self.logger.info("Timeline 域跳过：任务级已关闭说话人检测")
+            return
+
         runtime_cfg = get_model_runtime_config_service().get_effective_runtime_global()
         timeline_cfg = runtime_cfg.get("effective", {}).get("timeline", {})
         raw_timeline_enabled = timeline_cfg.get("enabled", True)
@@ -707,8 +736,7 @@ class AsyncDualPipelineKernel:
         else:
             timeline_enabled = bool(raw_timeline_enabled)
         if not timeline_enabled:
-            self.logger.info("Timeline 域已禁用：跳过 SpeakerTimeline 构建与 chunk 绑定")
-            return
+            self.logger.info("Timeline 域全局开关为关闭，按任务级策略继续执行说话人检测")
 
         flush_cfg_raw = runtime_cfg.get("effective", {}).get("flush_policy", {})
         min_support_turns = int(timeline_cfg.get("min_support_turns", 2) or 2)
@@ -718,15 +746,15 @@ class AsyncDualPipelineKernel:
         )
         raw_diarization_enabled = timeline_cfg.get("diarization_enabled", False)
         if isinstance(raw_diarization_enabled, str):
-            diarization_enabled = raw_diarization_enabled.strip().lower() in {"1", "true", "yes", "on"}
+            global_diarization_enabled = raw_diarization_enabled.strip().lower() in {"1", "true", "yes", "on"}
         else:
-            diarization_enabled = bool(raw_diarization_enabled)
+            global_diarization_enabled = bool(raw_diarization_enabled)
         diarization_model_id = str(timeline_cfg.get("diarization_model_id", "") or "")
         diarization_local_path = str(timeline_cfg.get("diarization_local_path", "") or "")
         diarization_hf_token = timeline_cfg.get("diarization_hf_token")
-        diarization_max_speakers = timeline_cfg.get("diarization_max_speakers")
-        diarization_min_speakers = timeline_cfg.get("diarization_min_speakers")
-        diarization_num_speakers = timeline_cfg.get("diarization_num_speakers")
+        diarization_max_speakers_raw = timeline_cfg.get("diarization_max_speakers")
+        diarization_min_speakers_raw = timeline_cfg.get("diarization_min_speakers")
+        diarization_num_speakers_raw = timeline_cfg.get("diarization_num_speakers")
 
         def _to_optional_int(value: Any) -> Optional[int]:
             if value is None or value == "":
@@ -736,6 +764,14 @@ class AsyncDualPipelineKernel:
             except (TypeError, ValueError):
                 self.logger.warning("timeline diarization 配置非整数，已忽略: {}", value)
                 return None
+        diarization_num_speakers, diarization_min_speakers, diarization_max_speakers, diarization_enabled = (
+            self._resolve_task_diarization_config(
+                global_diarization_enabled=global_diarization_enabled,
+                global_num_speakers=_to_optional_int(diarization_num_speakers_raw),
+                global_min_speakers=_to_optional_int(diarization_min_speakers_raw),
+                global_max_speakers=_to_optional_int(diarization_max_speakers_raw),
+            )
+        )
         boundary_threshold = float(
             timeline_cfg.get("segmentation_boundary_threshold", 0.55) or 0.55
         )
@@ -778,9 +814,9 @@ class AsyncDualPipelineKernel:
                     local_path=diarization_local_path,
                     hf_token=diarization_hf_token,
                     prefer_device=str(timeline_cfg.get("device", "auto") or "auto"),
-                    max_speakers=_to_optional_int(diarization_max_speakers),
-                    min_speakers=_to_optional_int(diarization_min_speakers),
-                    num_speakers=_to_optional_int(diarization_num_speakers),
+                    max_speakers=diarization_max_speakers,
+                    min_speakers=diarization_min_speakers,
+                    num_speakers=diarization_num_speakers,
                 ),
                 turn_builder=TurnBuilderConfig(),
                 segmentation=PyannoteSegmentationConfig(
@@ -845,6 +881,37 @@ class AsyncDualPipelineKernel:
             len(self._timeline_speaker_by_chunk_index),
             timeline_audio_source,
         )
+
+    def _resolve_task_diarization_config(
+        self,
+        *,
+        global_diarization_enabled: bool,
+        global_num_speakers: Optional[int],
+        global_min_speakers: Optional[int],
+        global_max_speakers: Optional[int],
+    ) -> Tuple[Optional[int], Optional[int], Optional[int], bool]:
+        """
+        合并全局与任务级说话人数配置。
+
+        分层约定：
+        - 全局：模型/设备/阈值默认值；
+        - 任务级：是否检测、是否 speaker 介入切分、人数策略（固定人数/自动）。
+        """
+        task_speaker_count = max(0, int(self._speaker_count or 0))
+        task_speaker_min = max(0, int(self._speaker_min_count or 0))
+        task_speaker_max = max(0, int(self._speaker_max_count or 0))
+        if task_speaker_count > 0:
+            return task_speaker_count, None, None, True
+
+        min_speakers = task_speaker_min if task_speaker_min > 0 else global_min_speakers
+        max_speakers = task_speaker_max if task_speaker_max > 0 else global_max_speakers
+        num_speakers = global_num_speakers
+        if min_speakers is not None and max_speakers is not None and max_speakers < min_speakers:
+            max_speakers = min_speakers
+
+        is_has_task_range = task_speaker_min > 0 or task_speaker_max > 0
+        diarization_enabled = bool(global_diarization_enabled or is_has_task_range)
+        return num_speakers, min_speakers, max_speakers, diarization_enabled
 
     def _resolve_timeline_audio_input(
         self,
@@ -3816,7 +3883,7 @@ class AsyncDualPipelineKernel:
             experiment_sentences,
         )
 
-    def _finalize_sensevoice_only(self, ctx: ProcessingContext) -> List[SentenceSegment]:
+    def _finalize_sensevoice_only(self, ctx: ProcessingContext) -> Layer456RunResult:
         """
         Whisper 跳过时的定稿输出（仅使用 SenseVoice 结果）。
 
@@ -4080,7 +4147,7 @@ class AsyncDualPipelineKernel:
 
         说明：
         - 关闭开关或无有效说话人变化时返回 None，保持旧路径；
-        - 维护 stream 级 pending deferred，满足跨 chunk 延迟决策。
+        - 仅执行当前 chunk 的即时裁决，不维护 deferred 跨 chunk 状态。
         """
         if not self._is_enable_soft_cut:
             return self._build_empty_soft_cut_plan(
@@ -4089,11 +4156,7 @@ class AsyncDualPipelineKernel:
                 reason="soft_cut_disabled",
             )
         words = list(annotated_words or [])
-        previous_deferred = list(self._soft_cut_pending_deferred_by_stream.get(stream_id, []))
         if len(words) <= 1:
-            if is_last_chunk:
-                self._expire_pending_deferred(previous_deferred)
-                self._soft_cut_pending_deferred_by_stream.pop(stream_id, None)
             return self._build_empty_soft_cut_plan(
                 stream_id=stream_id,
                 block_id=block_id,
@@ -4140,71 +4203,25 @@ class AsyncDualPipelineKernel:
             punctuation_anchors=punctuation_anchors,
             time_axis_version=time_axis_version,
         )
-        window_contexts = self._resolve_soft_cut_window_contexts(
-            words=words,
-            cut_windows=fusion_result.fused_windows,
-        )
-        (
-            recompute_windows,
-            carried_previous_deferred,
-            affected_deferred_by_window,
-            affected_reason_by_window,
-        ) = self._resolve_soft_cut_affected_deferred_windows(
-            stream_id=stream_id,
-            previous_deferred=previous_deferred,
-            anchor_candidates=anchor_candidates,
-            aligned_facts=aligned_facts,
-            fused_evidence=fused_evidence,
-            chunk_start=chunk_start,
-            chunk_end=chunk_end,
-        )
-        recompute_window_count = len(recompute_windows)
-        all_windows = list(fusion_result.fused_windows)
-        if recompute_windows:
-            recompute_fusion = self._soft_cut_evidence_fusion.fuse(
-                cut_windows=recompute_windows,
-                pause_anchors=pause_anchors,
-                word_anchors=word_anchors,
-                semantic_anchors=semantic_anchors,
-                punctuation_anchors=punctuation_anchors,
-                time_axis_version=time_axis_version,
-            )
-            all_windows.extend(list(recompute_fusion.fused_windows))
-            recompute_contexts = self._resolve_soft_cut_window_contexts(
-                words=words,
-                cut_windows=recompute_fusion.fused_windows,
-            )
-            for window_id, deferred in affected_deferred_by_window.items():
-                context = recompute_contexts.get(window_id, WindowDecisionContext())
-                context.depends_on_fast_draft = bool(getattr(deferred, "depends_on_fast_draft", False))
-                recompute_contexts[window_id] = context
-            window_contexts.update(recompute_contexts)
-
-        if not all_windows and not carried_previous_deferred:
-            if is_last_chunk:
-                self._expire_pending_deferred(previous_deferred)
-                self._soft_cut_pending_deferred_by_stream.pop(stream_id, None)
+        all_windows = list(fusion_result.fused_windows or [])
+        if not all_windows:
             return self._build_empty_soft_cut_plan(
                 stream_id=stream_id,
                 block_id=block_id,
                 reason="no_cut_windows",
             )
 
+        window_contexts = self._resolve_soft_cut_window_contexts(
+            words=words,
+            cut_windows=all_windows,
+        )
+
         plan = self._soft_cut_decision_engine.decide(
             block_id=block_id,
             cut_windows=all_windows,
             window_contexts=window_contexts,
-            previous_deferred=carried_previous_deferred,
             current_time=chunk_end,
         )
-        affected_lifecycle = self._apply_affected_deferred_resolution(
-            plan=plan,
-            affected_deferred_by_window=affected_deferred_by_window,
-            is_last_chunk=is_last_chunk,
-        )
-        expired_on_last_chunk_count = 0
-        if is_last_chunk:
-            expired_on_last_chunk_count = self._expire_pending_deferred(plan.deferred_cuts)
         plan.generation_report.update(
             {
                 "builder_window_count": builder_window_count,
@@ -4213,20 +4230,20 @@ class AsyncDualPipelineKernel:
                 "builder_low_count": builder_low_count,
                 "priority_profile": str(self._soft_cut_priority_active_profile),
                 "fusion_output_window_count": int(fusion_result.generation_report.get("output_window_count", 0)),
-                "recompute_window_count": int(recompute_window_count),
-                "affected_window_count": int(len(affected_deferred_by_window)),
-                "affected_window_ids": sorted(list(affected_deferred_by_window.keys())),
-                "affected_reason_by_window": affected_reason_by_window,
-                "affected_resolved_count": int(affected_lifecycle.get("resolved_count", 0)),
-                "affected_expired_count": int(affected_lifecycle.get("expired_count", 0)),
-                "expired_on_last_chunk_count": int(expired_on_last_chunk_count),
-                "deferred_state_stats": self._build_deferred_state_stats(plan.deferred_cuts),
+                "recompute_window_count": 0,
+                "affected_window_count": 0,
+                "affected_window_ids": [],
+                "affected_reason_by_window": {},
+                "affected_resolved_count": 0,
+                "affected_expired_count": 0,
+                "expired_on_last_chunk_count": 0,
+                "deferred_state_stats": {
+                    "pending": 0,
+                    "resolved": 0,
+                    "forced": 0,
+                    "expired": 0,
+                },
             }
-        )
-        self._update_soft_cut_pending_deferred_state(
-            stream_id=stream_id,
-            deferred_cuts=plan.deferred_cuts,
-            is_last_chunk=is_last_chunk,
         )
         return plan
 
@@ -4264,287 +4281,13 @@ class AsyncDualPipelineKernel:
             },
         )
 
-    def _resolve_soft_cut_affected_deferred_windows(
-        self,
-        *,
-        stream_id: str,
-        previous_deferred: Sequence[DeferredCut],
-        anchor_candidates: Sequence[AnchorCandidate],
-        aligned_facts: Optional[AlignedFacts],
-        fused_evidence: Optional[FusedEvidence],
-        chunk_start: float,
-        chunk_end: float,
-    ) -> Tuple[List[CutWindow], List[DeferredCut], Dict[str, DeferredCut], Dict[str, List[str]]]:
-        """
-        识别受当前 chunk 影响的 deferred 窗口，并转换为重算窗口。
-
-        Why:
-        - deferred 若长期只靠超时强制，会放大“快流草稿先切、慢流后到”的误切风险。
-        - 把受影响 deferred 转成当前轮窗口重算，可在不旁路 L6 的前提下完成闭环裁决。
-        """
-        if not previous_deferred:
-            return [], [], {}, {}
-
-        anchor_times = self._collect_soft_cut_anchor_times(
-            anchor_candidates=anchor_candidates,
-            fused_evidence=fused_evidence,
-        )
-        recompute_windows: List[CutWindow] = []
-        carried_previous_deferred: List[DeferredCut] = []
-        affected_deferred_by_window: Dict[str, DeferredCut] = {}
-        affected_reason_by_window: Dict[str, List[str]] = {}
-        for deferred in previous_deferred:
-            state = getattr(deferred, "state", None)
-            if state != DeferredCutState.PENDING:
-                carried_previous_deferred.append(deferred)
-                continue
-            window_id = str(getattr(deferred, "window_id", "") or "")
-            if not window_id:
-                carried_previous_deferred.append(deferred)
-                continue
-            start_time, end_time = self._resolve_deferred_time_range(deferred)
-            if end_time < chunk_start - 1e-6 or start_time > chunk_end + 1e-6:
-                carried_previous_deferred.append(deferred)
-                continue
-
-            has_new_anchor = any(
-                start_time <= anchor_time <= end_time and anchor_time >= chunk_start - 1e-6
-                for anchor_time in anchor_times
-            )
-            is_slow_covered = bool(getattr(deferred, "depends_on_fast_draft", False)) and (
-                self._is_slow_signal_covering_range(
-                    aligned_facts=aligned_facts,
-                    range_start=start_time,
-                    range_end=end_time,
-                )
-            )
-            is_level_upgraded = self._is_deferred_level_upgraded(
-                deferred=deferred,
-                fused_evidence=fused_evidence,
-                range_start=start_time,
-                range_end=end_time,
-                chunk_start=chunk_start,
-            )
-            reason_flags: List[str] = []
-            if has_new_anchor:
-                reason_flags.append("new_anchor")
-            if is_slow_covered:
-                reason_flags.append("slow_covered")
-            if is_level_upgraded:
-                reason_flags.append("level_upgraded")
-            if not reason_flags:
-                carried_previous_deferred.append(deferred)
-                continue
-
-            trigger_time = float(getattr(deferred, "created_at", start_time) or start_time)
-            if trigger_time < start_time:
-                trigger_time = start_time
-            if trigger_time > end_time:
-                trigger_time = end_time
-            recompute_windows.append(
-                CutWindow(
-                    window_id=window_id,
-                    trigger_time=trigger_time,
-                    trigger_level=self._parse_evidence_level(getattr(deferred, "trigger_level", "")),
-                    start_time=start_time,
-                    end_time=end_time,
-                    chunk_id=f"{stream_id}:deferred_recompute",
-                    candidate_anchors=[],
-                )
-            )
-            affected_deferred_by_window[window_id] = deferred
-            affected_reason_by_window[window_id] = sorted(reason_flags)
-        return (
-            recompute_windows,
-            carried_previous_deferred,
-            affected_deferred_by_window,
-            affected_reason_by_window,
-        )
-
-    @staticmethod
-    def _resolve_deferred_time_range(deferred: DeferredCut) -> Tuple[float, float]:
-        start_time = (
-            float(getattr(deferred, "window_start", deferred.created_at))
-            if getattr(deferred, "window_start", None) is not None
-            else float(deferred.created_at)
-        )
-        end_time = (
-            float(getattr(deferred, "window_end", deferred.expected_resolve_by))
-            if getattr(deferred, "window_end", None) is not None
-            else float(deferred.expected_resolve_by)
-        )
-        if end_time <= start_time:
-            end_time = max(float(deferred.expected_resolve_by), start_time + 1e-3)
-        return start_time, end_time
-
-    def _collect_soft_cut_anchor_times(
-        self,
-        *,
-        anchor_candidates: Sequence[AnchorCandidate],
-        fused_evidence: Optional[FusedEvidence],
-    ) -> List[float]:
-        anchor_times: List[float] = []
-        for item in anchor_candidates or []:
-            anchor_times.append(float(item.anchor_time))
-        if fused_evidence is None:
-            return anchor_times
-        for field_name in ("pause_anchors", "semantic_anchors", "punctuation_anchors"):
-            for item in list(getattr(fused_evidence, field_name, []) or []):
-                if not isinstance(item, dict):
-                    continue
-                raw_time = item.get("anchor_time", item.get("time"))
-                try:
-                    anchor_times.append(float(raw_time))
-                except (TypeError, ValueError):
-                    continue
-        return anchor_times
-
-    def _is_slow_signal_covering_range(
-        self,
-        *,
-        aligned_facts: Optional[AlignedFacts],
-        range_start: float,
-        range_end: float,
-    ) -> bool:
-        if aligned_facts is None:
-            return False
-        for word in list(getattr(aligned_facts, "annotated_words", []) or []):
-            word_start = float(getattr(word, "start", range_start) or range_start)
-            word_end = float(getattr(word, "end", word_start) or word_start)
-            if word_end <= word_start:
-                word_end = word_start + 1e-3
-            if word_end < range_start - 1e-6 or word_start > range_end + 1e-6:
-                continue
-            source = str(getattr(word, "confidence_source", "") or "").strip().lower()
-            if not source:
-                continue
-            if not self._is_fast_confidence_source(source):
-                return True
-        return False
-
-    def _is_deferred_level_upgraded(
-        self,
-        *,
-        deferred: DeferredCut,
-        fused_evidence: Optional[FusedEvidence],
-        range_start: float,
-        range_end: float,
-        chunk_start: float,
-    ) -> bool:
-        if fused_evidence is None:
-            return False
-        current_priority = self._evidence_level_priority(str(getattr(deferred, "trigger_level", "") or ""))
-        upgraded_priority = current_priority
-        for item in list(getattr(fused_evidence, "speaker_changes", []) or []):
-            if not isinstance(item, dict):
-                continue
-            try:
-                trigger_time = float(item.get("time"))
-            except (TypeError, ValueError):
-                continue
-            if trigger_time < chunk_start - 1e-6:
-                continue
-            if trigger_time < range_start - 1e-6 or trigger_time > range_end + 1e-6:
-                continue
-            level = str(item.get("level", "") or "")
-            upgraded_priority = max(upgraded_priority, self._evidence_level_priority(level))
-        return upgraded_priority > current_priority
-
-    @staticmethod
-    def _evidence_level_priority(level: str) -> int:
-        normalized = str(level or "").strip().lower()
-        if normalized == "high":
-            return 3
-        if normalized == "mid":
-            return 2
-        return 1
-
-    def _parse_evidence_level(self, level: str) -> EvidenceLevel:
-        normalized = str(level or "").strip().lower()
-        if normalized == "high":
-            return EvidenceLevel.HIGH
-        if normalized == "mid":
-            return EvidenceLevel.MID
-        return EvidenceLevel.LOW
-
-    def _apply_affected_deferred_resolution(
-        self,
-        *,
-        plan: Any,
-        affected_deferred_by_window: Dict[str, DeferredCut],
-        is_last_chunk: bool,
-    ) -> Dict[str, int]:
-        if not affected_deferred_by_window:
-            return {"resolved_count": 0, "expired_count": 0}
-        decisions = list(getattr(plan, "decisions", []) or [])
-        decision_by_window = {}
-        for decision in decisions:
-            window_id = str(getattr(decision, "window_id", "") or "")
-            if not window_id:
-                continue
-            decision_by_window[window_id] = decision
-
-        deferred_cuts = list(getattr(plan, "deferred_cuts", []) or [])
-        deferred_by_window = {}
-        for deferred in deferred_cuts:
-            window_id = str(getattr(deferred, "window_id", "") or "")
-            if not window_id:
-                continue
-            deferred_by_window[window_id] = deferred
-
-        resolved_count = 0
-        expired_count = 0
-        for window_id, original_deferred in affected_deferred_by_window.items():
-            target = deferred_by_window.get(window_id, original_deferred)
-            decision = decision_by_window.get(window_id)
-            if decision is not None:
-                target.state = DeferredCutState.RESOLVED
-                target.resolution_decision = decision
-                resolved_count += 1
-            elif is_last_chunk:
-                target.state = DeferredCutState.EXPIRED
-                target.resolution_decision = None
-                expired_count += 1
-            else:
-                target.state = DeferredCutState.PENDING
-                target.resolution_decision = None
-            if target not in deferred_cuts:
-                deferred_cuts.append(target)
-        setattr(plan, "deferred_cuts", deferred_cuts)
-        return {
-            "resolved_count": int(resolved_count),
-            "expired_count": int(expired_count),
-        }
-
-    def _expire_pending_deferred(self, deferred_cuts: Sequence[DeferredCut]) -> int:
-        expired_count = 0
-        for deferred in deferred_cuts:
-            if getattr(deferred, "state", None) != DeferredCutState.PENDING:
-                continue
-            deferred.state = DeferredCutState.EXPIRED
-            deferred.resolution_decision = None
-            expired_count += 1
-        return expired_count
-
-    @staticmethod
-    def _build_deferred_state_stats(deferred_cuts: Sequence[DeferredCut]) -> Dict[str, int]:
-        stats = {
-            "pending": 0,
-            "resolved": 0,
-            "forced": 0,
-            "expired": 0,
-        }
-        for deferred in deferred_cuts:
-            state_value = str(getattr(getattr(deferred, "state", None), "value", "") or "").lower()
-            if state_value in stats:
-                stats[state_value] += 1
-        return stats
-
     def _build_soft_cut_speaker_change_facts(
         self,
         *,
         words: Sequence[AnnotatedWord],
     ) -> List[SpeakerChangeFact]:
+        if not self._is_enable_speaker_guided_split:
+            return []
         chunk_start = float(words[0].start if words and words[0].start is not None else 0.0)
         turn_duration_by_turn_id = self._build_turn_duration_by_turn_id()
         facts: List[SpeakerChangeFact] = []
@@ -4919,7 +4662,7 @@ class AsyncDualPipelineKernel:
                     source="pause_gap",
                     confidence=min(1.0, 0.5 + pause_duration),
                 )
-                # Why: 相邻短间隔 pause 会在同一语义片段内生成过密窗口，易触发 deferred overflow 强切。
+                # Why: 相邻短间隔 pause 会在同一语义片段内生成过密窗口，需抑制重复弱锚点。
                 if last_pause_anchor_index is not None:
                     previous_pause = anchors[last_pause_anchor_index]
                     anchor_gap = max(0.0, float(pause_anchor.anchor_time) - float(previous_pause.anchor_time))
@@ -5005,27 +4748,6 @@ class AsyncDualPipelineKernel:
     def _is_fast_confidence_source(source: str) -> bool:
         normalized = str(source or "").strip().lower()
         return normalized in {"fast", "sensevoice", "sv", "draft", "fast_draft", "m1_fast"}
-
-    def _update_soft_cut_pending_deferred_state(
-        self,
-        *,
-        stream_id: str,
-        deferred_cuts: Sequence[Any],
-        is_last_chunk: bool,
-    ) -> None:
-        if is_last_chunk:
-            self._soft_cut_pending_deferred_by_stream.pop(stream_id, None)
-            return
-
-        pending = []
-        for item in deferred_cuts:
-            state = getattr(item, "state", None)
-            if state == DeferredCutState.PENDING:
-                pending.append(item)
-        if pending:
-            self._soft_cut_pending_deferred_by_stream[stream_id] = pending
-        else:
-            self._soft_cut_pending_deferred_by_stream.pop(stream_id, None)
 
     @staticmethod
     def _build_sv_word_timestamps(
