@@ -11,7 +11,7 @@ import re
 from typing import Any, Callable, Dict, Optional, Sequence
 
 from app.core.logging import resolve_loguru_logger
-from app.services.alignment.types import L7Input, L7Output, OutputTrace
+from app.services.alignment.types import OutputLayerInput, OutputLayerOutput, OutputTrace
 
 
 class OutputLayerProcessor:
@@ -121,7 +121,7 @@ class OutputLayerProcessor:
             return "ok", int(len(payload_items))
         return "skipped_empty", 0
 
-    def process(self, data: L7Input) -> L7Output:
+    def process(self, data: OutputLayerInput) -> OutputLayerOutput:
         """执行输出层分发。"""
         sentence_segments = list(data.sentence_segments or [])
         self._apply_language_punctuation_standardization(
@@ -149,7 +149,7 @@ class OutputLayerProcessor:
                 or []
             )
         except Exception:
-            output_errors.append("E_L7_OUTPUT_CHANNEL_FAIL")
+            output_errors.append("E_OUTPUT_CHANNEL_FAIL")
             subtitle_channel_status = "failed"
             speaker_store_channel_status = "skipped_upstream_failed"
             self._logger.exception(
@@ -158,14 +158,14 @@ class OutputLayerProcessor:
                 len(sentence_segments),
             )
 
-        if "E_L7_OUTPUT_CHANNEL_FAIL" not in output_errors:
+        if "E_OUTPUT_CHANNEL_FAIL" not in output_errors:
             try:
                 speaker_store_channel_status, speaker_link_count = self._write_speaker_links(
                     sentence_segments=sentence_segments,
                     sentence_indices=replaced_sentence_indices,
                 )
             except Exception:
-                output_errors.append("E_L7_SPEAKER_STORE_FAIL")
+                output_errors.append("E_OUTPUT_SPEAKER_STORE_FAIL")
                 speaker_store_channel_status = "failed"
                 self._logger.exception(
                     "输出层 speaker_store 写入失败: chunk_index={} sentences={}",
@@ -204,7 +204,7 @@ class OutputLayerProcessor:
             len(sentence_segments),
             len(output_errors),
         )
-        return L7Output(
+        return OutputLayerOutput(
             output_payload=payload,
             output_traces=output_traces,
         )
@@ -418,3 +418,4 @@ class OutputLayerProcessor:
 OutputProcessor = OutputLayerProcessor
 
 __all__ = ["OutputLayerProcessor", "OutputProcessor"]
+

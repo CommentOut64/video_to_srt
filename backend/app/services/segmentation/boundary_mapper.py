@@ -25,7 +25,7 @@ class WordBoundaryMapper:
     词边界映射器（Strategy Pattern）。
 
     Why:
-    - 统一 L6 cut plan 与句级修复两条链路的“时间点 -> 词边界”逻辑，避免策略漂移。
+    - 统一裁决层 cut plan 与句级修复两条链路的“时间点 -> 词边界”逻辑，避免策略漂移。
     - 事件落在词内时按“前后半词”定向，避免默认偏向词尾导致“延后一词切”。
     """
 
@@ -174,4 +174,3 @@ class WordBoundaryMapper:
         if value is None:
             return default
         return float(value)
-

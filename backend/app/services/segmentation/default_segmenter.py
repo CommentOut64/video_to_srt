@@ -22,7 +22,7 @@ class DefaultSegmenter:
 
     说明：
     - 该类仅用于草稿链（draft）；
-    - 定稿链已迁移到 L4→L5→L6→L7 主路径；
+    - 定稿链已迁移到 集合→评分→裁决→输出 主路径；
     - 推荐新代码优先使用 `DraftSegmenter` 命名。
     """
 
@@ -117,10 +117,10 @@ class DefaultSegmenter:
         chunk: AudioChunk,
         language: Optional[str] = None,
     ) -> List[SentenceSegment]:
-        """已禁用：定稿路径必须走 L4→L5→L6→L7，不允许再走 DefaultSegmenter。"""
+        """已禁用：定稿路径必须走 集合→评分→裁决→输出，不允许再走 DefaultSegmenter。"""
         raise RuntimeError(
             "DefaultSegmenter.split_final_from_sv 已禁用："
-            "定稿请使用 L4->L5->L6->L7 主链。"
+            "定稿请使用 collection->scoring->decision->output 主链。"
         )
 
     def _split_draft_core(

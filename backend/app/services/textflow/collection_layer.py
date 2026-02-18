@@ -18,8 +18,8 @@ from app.services.alignment.types import (
     AlignedFacts,
     AlignmentResult,
     AnnotatedWord,
-    L4Input,
-    L4Output,
+    CollectionLayerInput,
+    CollectionLayerOutput,
     TextTrack,
 )
 from app.services.pseudo_alignment import PseudoAlignment
@@ -65,7 +65,7 @@ class CollectionAlignmentProcessor:
             self._is_m2_nw_v2_enabled,
         )
 
-    def process(self, data: L4Input) -> L4Output:
+    def process(self, data: CollectionLayerInput) -> CollectionLayerOutput:
         """执行集合层对齐并返回 AlignmentResult。"""
         track = data.chosen_text_track
         if not track or not track.text_clean:
@@ -77,7 +77,7 @@ class CollectionAlignmentProcessor:
                 resolution=None,
                 coverage=0.0,
             )
-            return L4Output(alignment_result=empty)
+            return CollectionLayerOutput(alignment_result=empty)
 
         clean_text = track.text_clean
         sv_words = data.sv_words or []
@@ -85,16 +85,16 @@ class CollectionAlignmentProcessor:
 
         if not self._config.is_enabled:
             fallback = self._build_pseudo_result(clean_text, vad_range)
-            return L4Output(alignment_result=fallback)
+            return CollectionLayerOutput(alignment_result=fallback)
 
         if not self._config.use_sv_timebase:
             self._logger.warning("集合层对齐关闭 SV 时间基准，改用伪对齐")
             fallback = self._build_pseudo_result(clean_text, vad_range)
-            return L4Output(alignment_result=fallback)
+            return CollectionLayerOutput(alignment_result=fallback)
 
         if not sv_words:
             fallback = self._build_pseudo_result(clean_text, vad_range)
-            return L4Output(alignment_result=fallback)
+            return CollectionLayerOutput(alignment_result=fallback)
 
         tokens = self._alignment_service._tokenize(clean_text)
         token_confidences = self._build_token_confidences(track, clean_text, tokens)
@@ -117,7 +117,7 @@ class CollectionAlignmentProcessor:
             result.gap_ratio,
             result.coverage,
         )
-        return L4Output(alignment_result=result)
+        return CollectionLayerOutput(alignment_result=result)
 
     @staticmethod
     def _resolve_vad_range(

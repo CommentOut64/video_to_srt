@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from app.core.logging import resolve_loguru_logger
-from app.services.alignment.types import AnnotatedWord, L5Input, L5Output
+from app.services.alignment.types import AnnotatedWord, ScoringLayerInput, ScoringLayerOutput
 from app.services.punctuation.semantic_injector import SemanticInjector
 from app.services.segmentation.soft_cut.evidence_fusion import (
     EvidenceFusion as ScoringEvidenceFusion,
@@ -36,19 +36,19 @@ class ScoringSemanticInjectionProcessor:
             min_mapping_coverage=min_mapping_coverage,
         )
 
-    def process(self, data: L5Input) -> L5Output:
+    def process(self, data: ScoringLayerInput) -> ScoringLayerOutput:
         """执行评分层注入主路径。"""
         aligned_words = data.alignment_result.aligned_words or []
         clean_text_ref = str(data.punct_track.clean_text_ref or "")
         positions = list(data.punct_track.positions or [])
 
         if not aligned_words:
-            return L5Output(
+            return ScoringLayerOutput(
                 annotated_words=[],
                 injection_report={
                     "mapping_coverage": 0.0,
                     "mismatch_count": 0.0,
-                    "error_code": "E_L5_EMPTY_ALIGNMENT",
+                    "error_code": "E_SCORING_EMPTY_ALIGNMENT",
                     "blocked": 1.0,
                 },
             )
@@ -59,7 +59,7 @@ class ScoringSemanticInjectionProcessor:
                 speaker_id=data.speaker_id,
                 turn_id=data.turn_id,
             )
-            return L5Output(
+            return ScoringLayerOutput(
                 annotated_words=base_words,
                 injection_report={
                     "mapping_coverage": 1.0,
@@ -76,7 +76,7 @@ class ScoringSemanticInjectionProcessor:
             language=data.language,
         )
         mismatch_count = float(len(injection.unmatched_positions or []))
-        error_code = "E_L5_INJECTION_BLOCKED" if injection.is_mapping_blocked else ""
+        error_code = "E_SCORING_INJECTION_BLOCKED" if injection.is_mapping_blocked else ""
         report: Dict[str, Any] = {
             "mapping_coverage": float(injection.mapping_coverage),
             "mismatch_count": mismatch_count,
@@ -114,7 +114,7 @@ class ScoringSemanticInjectionProcessor:
             report["mapping_coverage"],
             int(report["mismatch_count"]),
         )
-        return L5Output(annotated_words=annotated_words, injection_report=report)
+        return ScoringLayerOutput(annotated_words=annotated_words, injection_report=report)
 
     @staticmethod
     def _build_base_annotated_words(
@@ -148,3 +148,4 @@ __all__ = [
     "ScoringEvidenceFusionConfig",
     "SemanticInjectionProcessor",
 ]
+

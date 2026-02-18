@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from app.core.logging import resolve_loguru_logger
 from app.models.sensevoice_models import SentenceSegment, TextSource, WordTimestamp
 from app.services.alignment.default_aligner import _strip_trailing_punct_smart
-from app.services.alignment.types import L6Input, L6Output, OutputTrace
+from app.services.alignment.types import DecisionLayerInput, DecisionLayerOutput, OutputTrace
 from app.services.segmentation.boundary_mapper import WordBoundaryMapper
 from app.services.punctuation.final_splitter import FinalSplitter
 
@@ -19,7 +19,7 @@ from app.services.punctuation.final_splitter import FinalSplitter
 class SegmentationProcessor:
     """裁决层处理器：仅负责边界决策与句子切分。"""
 
-    # V3.2.0+dev.20260210.03: L6 内建跨 chunk 连续性处理（仅处理高风险残词）。
+    # V3.2.0+dev.20260210.03: 裁决层内建跨 chunk 连续性处理（仅处理高风险残词）。
     _CROSS_CHUNK_CARRY_WORDS = {"a", "an", "the"}
     _SENTENCE_END_PUNCT = {"。", "！", "？", ".", "!", "?"}
     _CUT_PLAN_SINGLETON_TAIL_MAX_GAP_SEC = 0.65
@@ -72,12 +72,12 @@ class SegmentationProcessor:
 
     def process(
         self,
-        data: L6Input,
+        data: DecisionLayerInput,
         *,
         stream_id: str = "main",
         chunk_index: Optional[int] = None,
         is_last_chunk: bool = False,
-    ) -> L6Output:
+    ) -> DecisionLayerOutput:
         """执行裁决层单路径切分，并在层内执行一次跨 speaker 残留修复。"""
         annotated_words = data.annotated_words or []
         pending_prefix_words = self._consume_pending_prefix_words(stream_id)
@@ -90,7 +90,7 @@ class SegmentationProcessor:
         fused_evidence = data.fused_evidence
         has_annotated_words = bool(annotated_words)
         if not has_annotated_words and not pending_prefix_words:
-            return L6Output(
+            return DecisionLayerOutput(
                 sentence_segments=[],
                 words_for_split=[],
                 segmentation_report={
@@ -106,7 +106,7 @@ class SegmentationProcessor:
                     "aligned_facts_stats": self._build_aligned_facts_stats(aligned_facts),
                     "fused_evidence_stats": self._build_fused_evidence_stats(fused_evidence),
                     "stream_id": stream_id,
-                    "error_code": "E_L6_SPLIT_EMPTY",
+                    "error_code": "E_DECISION_SPLIT_EMPTY",
                 },
                 applied_cut_plan=cut_plan,
                 output_traces=[],
@@ -115,7 +115,7 @@ class SegmentationProcessor:
         words_for_split = list(pending_prefix_words) + self._build_words_for_split(annotated_words)
         pending_in_word_count = len(pending_prefix_words)
         if not words_for_split:
-            return L6Output(
+            return DecisionLayerOutput(
                 sentence_segments=[],
                 words_for_split=[],
                 segmentation_report={
@@ -132,7 +132,7 @@ class SegmentationProcessor:
                     "fused_evidence_stats": self._build_fused_evidence_stats(fused_evidence),
                     "stream_id": stream_id,
                     "chunk_index": chunk_index,
-                    "error_code": "E_L6_SPLIT_EMPTY",
+                    "error_code": "E_DECISION_SPLIT_EMPTY",
                 },
                 applied_cut_plan=cut_plan,
                 output_traces=[],
@@ -209,7 +209,7 @@ class SegmentationProcessor:
                 sentence_segments=all_sentence_segments,
                 output_traces=output_traces,
             )
-            error_code = "E_L6_SPLIT_EMPTY"
+            error_code = "E_DECISION_SPLIT_EMPTY"
         else:
             error_code = ""
 
@@ -245,7 +245,7 @@ class SegmentationProcessor:
         )
         self._active_vad_intervals = []
 
-        return L6Output(
+        return DecisionLayerOutput(
             sentence_segments=all_sentence_segments,
             words_for_split=words_for_split,
             segmentation_report=report,
@@ -355,6 +355,11 @@ class SegmentationProcessor:
             split_points=split_points,
             split_to_window=split_to_window,
             decision_by_window=decision_by_window,
+        )
+        split_points = self._augment_split_points_with_sentence_end_punct(
+            words_for_split=words_for_split,
+            split_points=split_points,
+            split_to_mapping=split_to_mapping,
         )
         if not split_points:
             sentence_segments = self._final_splitter.split(
@@ -574,6 +579,52 @@ class SegmentationProcessor:
         split_points = sorted(split_to_window.keys())
         return split_points, split_to_window, split_to_mapping
 
+    def _augment_split_points_with_sentence_end_punct(
+        self,
+        *,
+        words_for_split: Sequence[WordTimestamp],
+        split_points: Sequence[int],
+        split_to_mapping: Dict[int, Dict[str, Any]],
+    ) -> List[int]:
+        """
+        在 CutPlan 路径补齐句末标点边界，确保与 FinalSplitter 强切口径一致。
+        """
+        max_split_idx = len(words_for_split) - 2
+        if max_split_idx < 0:
+            return []
+        merged_split_points = {
+            int(split_idx)
+            for split_idx in split_points
+            if 0 <= int(split_idx) <= max_split_idx
+        }
+        if not self._is_force_split_on_sentence_end_punct_enabled():
+            return sorted(merged_split_points)
+
+        sentence_end_punct = tuple(self._SENTENCE_END_PUNCT)
+        for split_idx in range(0, max_split_idx + 1):
+            word_text = str(getattr(words_for_split[split_idx], "word", "") or "").strip()
+            if not word_text.endswith(sentence_end_punct):
+                continue
+            if split_idx in merged_split_points:
+                continue
+            merged_split_points.add(split_idx)
+            split_to_mapping[split_idx] = {
+                "mapped_cut_time": self._resolve_split_boundary_time(
+                    words_for_split=words_for_split,
+                    split_idx=split_idx,
+                ),
+                "mapping_quality": "boundary",
+                "mapping_reason": "sentence_end_punct_forced",
+                "selection_score": 0.0,
+            }
+        return sorted(merged_split_points)
+
+    def _is_force_split_on_sentence_end_punct_enabled(self) -> bool:
+        splitter_config = getattr(self._final_splitter, "config", None)
+        return bool(
+            getattr(splitter_config, "is_force_split_on_sentence_end_punct", False)
+        )
+
     def _build_cut_plan_output_trace(
         self,
         *,
@@ -622,6 +673,8 @@ class SegmentationProcessor:
             mapping_quality = "boundary"
         if not mapping_reason:
             mapping_reason = "word_boundary_mapper"
+        if decision is None and mapping_reason == "sentence_end_punct_forced":
+            split_reason = "punctuation"
 
         return OutputTrace(
             sentence_index=sentence_index,
@@ -1585,3 +1638,4 @@ class SegmentationProcessor:
 DecisionSegmentationProcessor = SegmentationProcessor
 
 __all__ = ["SegmentationProcessor", "DecisionSegmentationProcessor"]
+

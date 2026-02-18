@@ -25,7 +25,7 @@ class SoftCutPlanProvider(Protocol):
         aligned_facts: Optional[AlignedFacts] = None,
         fused_evidence: Optional[FusedEvidence] = None,
     ) -> Optional[Any]:
-        """为 L6 生成 CutPlan。"""
+        """为裁决层生成 CutPlan。"""
 
 
 class M1InternalSoftCutPlanProvider:
@@ -50,7 +50,7 @@ class M1InternalSoftCutPlanProvider:
         aligned_facts: Optional[AlignedFacts] = None,
         fused_evidence: Optional[FusedEvidence] = None,
     ) -> Optional[Any]:
-        return self._pipeline._build_soft_cut_plan_for_l6_m1(
+        return self._pipeline._build_soft_cut_plan_for_decision_m1(
             annotated_words=annotated_words,
             stream_id=stream_id,
             block_id=block_id,

@@ -27,6 +27,7 @@ class FinalSplitConfig:
     max_duration: float = 10.0
     soft_pause: float = 0.35
     long_pause: float = 0.8
+    is_force_split_on_sentence_end_punct: bool = True
     language: str = "auto"
     enable_balance: bool = True
     min_mapping_coverage: float = 0.6
@@ -131,6 +132,13 @@ class FinalSplitter:
                 )
                 segments.append(self._build_sentence(words, start_idx, split_idx))
                 start_idx = split_idx + 1
+                last_candidate_idx = None
+                last_candidate_strength = 0
+                continue
+
+            if punct_strength >= 3 and self.config.is_force_split_on_sentence_end_punct:
+                segments.append(self._build_sentence(words, start_idx, idx))
+                start_idx = idx + 1
                 last_candidate_idx = None
                 last_candidate_strength = 0
                 continue
