@@ -14,6 +14,7 @@ from app.models.sensevoice_models import SentenceSegment, TextSource, WordTimest
 from app.services.model_runtime_config_service import get_model_runtime_config_service
 from app.services.punctuation.base import PuncPosition
 from app.services.punctuation.final_splitter import FinalSplitter, FinalSplitConfig
+from app.services.text_protection import should_preserve_trailing_punct
 
 
 _STRONG_END_PUNCT = set("。？！.!?")
@@ -575,5 +576,8 @@ def _strip_trailing_sentence_punct(text: Optional[str]) -> str:
     punct_to_remove = {"。", ".", "，", ",", "、", "；", ";"}
     idx = len(text) - 1
     while idx >= 0 and text[idx] in punct_to_remove:
+        # V3.2.0+dev.20260218.03: 保护规则 - 数字结构尾部点号不删除（避免 0. 被截断成 0）。
+        if should_preserve_trailing_punct(text, idx):
+            break
         idx -= 1
     return text[: idx + 1]

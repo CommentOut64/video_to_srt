@@ -12,6 +12,10 @@ from app.models.confidence_models import AlignedWord
 from app.models.sensevoice_models import WordTimestamp
 from app.services.punctuation.base import PuncPosition, WordTimestampLike, apply_punctuation
 from app.services.punctuation.postprocess import build_clean_text
+from app.services.text_protection import (
+    can_merge_word_tokens,
+    should_skip_raw_punctuation,
+)
 
 
 _LEFT_QUOTES = set("“‘「『《（【")
@@ -189,6 +193,8 @@ class SemanticInjector:
         for raw_idx, char in enumerate(raw_text):
             if char not in _PUNCTUATION_SET:
                 continue
+            if should_skip_raw_punctuation(raw_text, raw_idx, char):
+                continue
             if raw_idx >= len(raw_to_clean):
                 continue
             if raw_to_clean[raw_idx] is not None:
@@ -286,11 +292,20 @@ class SemanticInjector:
             if span is None:
                 continue
             start, end = span
+            core = tokens[idx][1]
+            prev_core = tokens[idx - 1][1] if idx > 0 else ""
+            next_core = tokens[idx + 1][1] if idx + 1 < len(tokens) else ""
             for ch in leading:
                 if ch in _PUNCTUATION_SET:
+                    # V3.2.0+dev.20260218.03: 保护规则 - 跳过跨 token 小数点前缀注入（如 1 | .4）。
+                    if can_merge_word_tokens(prev_core, f"{ch}{core}"):
+                        continue
                     positions.append(PuncPosition(char_index=start, punctuation=ch, confidence=confidence))
             for ch in trailing:
                 if ch in _PUNCTUATION_SET:
+                    # V3.2.0+dev.20260218.03: 保护规则 - 跳过跨 token 小数点后缀注入（如 0. | 15）。
+                    if can_merge_word_tokens(f"{core}{ch}", next_core):
+                        continue
                     if ch in _WEAK_PUNCTUATION_SET:
                         weak_count += 1
                     positions.append(PuncPosition(char_index=end, punctuation=ch, confidence=confidence))

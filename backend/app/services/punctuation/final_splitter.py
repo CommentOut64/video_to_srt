@@ -11,6 +11,10 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from app.models.sensevoice_models import SentenceSegment, WordTimestamp
 from app.services.punctuation.base import PuncPosition
 from app.services.sentence_splitter import SentenceSplitter, SplitConfig
+from app.services.text_protection import (
+    is_sentence_end_punct,
+    merge_protected_word_tokens,
+)
 
 
 _STRONG_PUNCT = set("。？！.!?")
@@ -66,14 +70,17 @@ class FinalSplitter:
         """执行最终切分并返回 SentenceSegment 列表。"""
         if not words:
             return []
+        protected_words = merge_protected_word_tokens(list(words))
+        if not protected_words:
+            return []
 
         external_strength, stats = self._build_external_strength(
             clean_text=clean_text,
-            words=list(words),
+            words=list(protected_words),
             positions=punctuation_positions or [],
         )
         segments, split_stats = self._split_words(
-            list(words),
+            list(protected_words),
             min_tokens=self.config.min_tokens,
             external_strength=external_strength,
         )
@@ -210,7 +217,7 @@ class FinalSplitter:
             next_first
             and self._is_ascii_word(next_first)
             and next_first[:1].islower()
-            and not any(prev_raw.endswith(ch) for ch in _STRONG_PUNCT)
+            and not is_sentence_end_punct(prev_raw, words[next_idx].word or "")
             and boundary_idx >= start_idx
         ):
             return True
@@ -429,13 +436,15 @@ class FinalSplitter:
         external_strength: Dict[int, int],
     ) -> int:
         word = words[idx].word or ""
-        token_strength = self._trailing_punct_strength(word)
+        next_word = words[idx + 1].word if idx + 1 < len(words) else None
+        token_strength = self._trailing_punct_strength(word, next_word)
         return max(token_strength, external_strength.get(idx, 0))
 
     # V3.2.0+dev.20260206.03: 长句二次切分需要统一边界强度函数。
     # 这里复用“词尾标点 + 时间停顿”的联合评分，避免 _find_best_boundary 调用缺失。
     def _get_boundary_strength(self, words: List[WordTimestamp], idx: int) -> int:
-        token_strength = self._trailing_punct_strength(words[idx].word or "")
+        next_word = words[idx + 1].word if idx + 1 < len(words) else None
+        token_strength = self._trailing_punct_strength(words[idx].word or "", next_word)
         pause_strength = self._pause_strength(words, idx)
         return max(token_strength, pause_strength)
 
@@ -471,9 +480,11 @@ class FinalSplitter:
             return 1
         return 0
 
-    def _trailing_punct_strength(self, token: str) -> int:
+    def _trailing_punct_strength(self, token: str, next_token: Optional[str] = None) -> int:
         if not token:
             return 0
+        if is_sentence_end_punct(token, next_token):
+            return 3
         trailing = self._extract_trailing_punct(token)
         if not trailing:
             return 0

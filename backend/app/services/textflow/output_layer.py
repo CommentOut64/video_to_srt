@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, Optional, Sequence
 
 from app.core.logging import resolve_loguru_logger
 from app.services.alignment.types import OutputLayerInput, OutputLayerOutput, OutputTrace
+from app.services.text_protection import is_decimal_dot_in_text
 
 
 class OutputLayerProcessor:
@@ -330,10 +331,14 @@ class OutputLayerProcessor:
         return normalized
 
     def _to_fullwidth_punctuation(self, text: str) -> str:
-        normalized = text
-        for source, target in self._HALF_TO_FULL_PUNCT.items():
-            normalized = normalized.replace(source, target)
-        return normalized
+        chars: list[str] = []
+        for index, char in enumerate(text):
+            # V3.2.0+dev.20260218.03: 保护规则 - 数字结构中的点号不做全角化，避免 1.4 -> 1。4。
+            if char == "." and is_decimal_dot_in_text(text, index):
+                chars.append(char)
+                continue
+            chars.append(self._HALF_TO_FULL_PUNCT.get(char, char))
+        return "".join(chars)
 
     @staticmethod
     def _resolve_output_traces(

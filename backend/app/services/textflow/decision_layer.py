@@ -14,6 +14,10 @@ from app.services.alignment.default_aligner import _strip_trailing_punct_smart
 from app.services.alignment.types import DecisionLayerInput, DecisionLayerOutput, OutputTrace
 from app.services.segmentation.boundary_mapper import WordBoundaryMapper
 from app.services.punctuation.final_splitter import FinalSplitter
+from app.services.text_protection import (
+    is_sentence_end_punct,
+    merge_protected_word_tokens,
+)
 
 
 class SegmentationProcessor:
@@ -113,6 +117,7 @@ class SegmentationProcessor:
             )
 
         words_for_split = list(pending_prefix_words) + self._build_words_for_split(annotated_words)
+        words_for_split = merge_protected_word_tokens(words_for_split)
         pending_in_word_count = len(pending_prefix_words)
         if not words_for_split:
             return DecisionLayerOutput(
@@ -488,7 +493,8 @@ class SegmentationProcessor:
         gap_sec = max(0.0, right_start - left_end)
 
         prev_tail = str(getattr(left_word, "word", "") or "").strip()
-        if prev_tail.endswith(tuple(self._SENTENCE_END_PUNCT)):
+        next_token = str(getattr(first_tail_word, "word", "") or "").strip()
+        if is_sentence_end_punct(prev_tail, next_token, sentence_end_chars=tuple(self._SENTENCE_END_PUNCT)):
             return False
 
         if singleton_word_count == 1:
@@ -603,7 +609,12 @@ class SegmentationProcessor:
         sentence_end_punct = tuple(self._SENTENCE_END_PUNCT)
         for split_idx in range(0, max_split_idx + 1):
             word_text = str(getattr(words_for_split[split_idx], "word", "") or "").strip()
-            if not word_text.endswith(sentence_end_punct):
+            next_token = str(getattr(words_for_split[split_idx + 1], "word", "") or "").strip()
+            if not is_sentence_end_punct(
+                word_text,
+                next_token,
+                sentence_end_chars=sentence_end_punct,
+            ):
                 continue
             if split_idx in merged_split_points:
                 continue
@@ -867,10 +878,14 @@ class SegmentationProcessor:
             return sentence_segments, output_traces
 
         prev_tail = str(getattr(prev_words[-1], "word", "") or "").strip()
-        if prev_tail.endswith(tuple(self._SENTENCE_END_PUNCT)):
+        tail_token = str(getattr(last_words[0], "word", "") or "").strip()
+        if is_sentence_end_punct(
+            prev_tail,
+            tail_token,
+            sentence_end_chars=tuple(self._SENTENCE_END_PUNCT),
+        ):
             return sentence_segments, output_traces
 
-        tail_token = str(getattr(last_words[0], "word", "") or "").strip()
         if not self._is_lowercase_continuation_token(tail_token):
             return sentence_segments, output_traces
 
@@ -1041,8 +1056,10 @@ class SegmentationProcessor:
             return []
 
         anchor_token_raw = str(words[-2].word or "").strip()
-        has_sentence_end_anchor = any(
-            anchor_token_raw.endswith(ch) for ch in self._SENTENCE_END_PUNCT
+        has_sentence_end_anchor = is_sentence_end_punct(
+            anchor_token_raw,
+            str(words[-1].word or "").strip(),
+            sentence_end_chars=tuple(self._SENTENCE_END_PUNCT),
         )
         if not has_sentence_end_anchor:
             return []
@@ -1426,7 +1443,11 @@ class SegmentationProcessor:
         left_word = words[split_idx]
         right_word = words[split_idx + 1]
         left_text = str(getattr(left_word, "word", "") or "").strip()
-        if left_text.endswith(tuple(self._SPEAKER_REPAIR_SENTENCE_END_PUNCT)):
+        if is_sentence_end_punct(
+            left_text,
+            str(getattr(right_word, "word", "") or "").strip(),
+            sentence_end_chars=tuple(self._SPEAKER_REPAIR_SENTENCE_END_PUNCT),
+        ):
             return True
 
         left_end = float(getattr(left_word, "end", 0.0) or 0.0)

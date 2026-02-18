@@ -119,6 +119,7 @@ from app.services.punctuation.semantic_buffer import (
     SemanticBufferInput,
     SemanticChunk,
 )
+from app.services.text_protection import is_sentence_end_punct
 from app.pipelines.dual_pipeline.services import (
     AlignLoopService,
     AlignmentStageService,
@@ -1349,7 +1350,11 @@ class AsyncDualPipelineKernel:
         left_word = words[split_idx]
         right_word = words[split_idx + 1]
         left_text = str(getattr(left_word, "word", "") or "").strip()
-        if left_text.endswith(tuple(self._SPEAKER_REPAIR_SENTENCE_END_PUNCT)):
+        if is_sentence_end_punct(
+            left_text,
+            str(getattr(right_word, "word", "") or "").strip(),
+            sentence_end_chars=tuple(self._SPEAKER_REPAIR_SENTENCE_END_PUNCT),
+        ):
             return True
 
         left_end = float(getattr(left_word, "end", 0.0) or 0.0)

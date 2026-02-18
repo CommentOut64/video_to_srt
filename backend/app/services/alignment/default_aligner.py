@@ -17,6 +17,7 @@ from app.services.model_runtime_config_service import get_model_runtime_config_s
 from app.services.punctuation.semantic_injector import SemanticInjector
 from app.services.punctuation.final_splitter import FinalSplitter, FinalSplitConfig
 from app.services.segmentation.unified_splitter import UnifiedSplitter
+from app.services.text_protection import should_preserve_trailing_punct
 
 if TYPE_CHECKING:
     from app.services.audio.chunk_engine import AudioChunk
@@ -464,6 +465,9 @@ def _strip_trailing_punct_smart(text: Optional[str]) -> str:
 
     idx = len(text) - 1
     while idx >= 0 and text[idx] in punct_to_remove:
+        # V3.2.0+dev.20260218.03: 保护规则 - 数字结构尾部点号不删除（避免 0. 被截断成 0）。
+        if should_preserve_trailing_punct(text, idx):
+            break
         idx -= 1
 
     return text[: idx + 1]
