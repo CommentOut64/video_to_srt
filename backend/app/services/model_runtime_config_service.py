@@ -438,7 +438,7 @@ class ModelRuntimeConfigService:
                 "force_split_on_sentence_end_punct": True,
                 "keep_sentence_end_punct": False,
             },
-            # V3.2.0+dev.20260205.09: L4 对齐层运行参数
+            # V3.2.0+dev.20260205.09: 集合层（collection）对齐运行参数
             "alignment": {
                 "enable": True,
                 "score_threshold": 0.30,
@@ -448,14 +448,14 @@ class ModelRuntimeConfigService:
                 "min_valid_neighbors": 1,
                 "min_word_duration_ms": 100,
                 "use_sv_timebase": True,
-                # V3.2.0+dev.20260206.02: 双轨实验仅在 L4-L6 串行执行，不并行占用 GPU。
+                # V3.2.0+dev.20260206.02: 双轨实验仅在 collection/scoring/decision 串行执行，不并行占用 GPU。
                 "enable_dual_time_experiment": False,
                 "dual_time_mode": "off",
                 "dual_time_write_debug_srt": False,
                 "dual_time_boundary_tolerance_ms": 250,
                 "dual_time_active_min_boundary_f1": 0.85,
             },
-            # V3.2.0+dev.20260210.01: L6 切分层统一参数入口。
+            # V3.2.0+dev.20260210.01: 裁决层（decision）统一参数入口。
             "segmentation": {
                 "enable": True,
                 "min_chars": 6,
@@ -465,6 +465,7 @@ class ModelRuntimeConfigService:
                 "long_pause_sec": 0.8,
                 "soft_pause_sec": 0.4,
                 "short_merge_max_chars": 22,
+                "force_split_on_sentence_end_punct": True,
                 "keep_sentence_end_punct": False,
                 "final.min_tokens": 5,
                 "final.max_tokens": 50,

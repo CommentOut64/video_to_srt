@@ -2,7 +2,7 @@
 文本处理统一参数入口（TextPipelineConfig）。
 V3.2.0+dev.20260214.10
 """
-# V3.2.0+dev.20260205.09: 接入 L4 对齐层参数。
+# V3.2.0+dev.20260205.09: 接入 collection 对齐层参数。
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -63,7 +63,7 @@ def _read_runtime_optional(raw: Dict[str, Any], key: str) -> Tuple[Any, bool]:
 
 @dataclass
 class PunctuationSchedulerOverride:
-    """L3 标点调度覆盖项（仅当运行参数显式设置时生效）。"""
+    """标点前置域调度覆盖项（仅当运行参数显式设置时生效）。"""
 
     mode: Optional[str] = None
     fast_confidence_threshold: Optional[float] = None
@@ -259,7 +259,7 @@ class NormalizationConfig:
 
 @dataclass
 class AlignmentLayerConfig:
-    """L4 对齐层参数。"""
+    """集合层（collection）对齐参数。"""
 
     is_enabled: bool = True
     score_threshold: float = 0.3
@@ -269,7 +269,7 @@ class AlignmentLayerConfig:
     min_valid_neighbors: int = 1
     min_word_duration_ms: int = 100
     use_sv_timebase: bool = True
-    # V3.2.0+dev.20260206.02: 双轨实验配置（仅影响 L4-L6 CPU 后处理，不并行占用 GPU）。
+    # V3.2.0+dev.20260206.02: 双轨实验配置（仅影响 collection/scoring/decision CPU 后处理，不并行占用 GPU）。
     is_enable_dual_time_experiment: bool = False
     dual_time_mode: str = "off"
     is_dual_time_write_debug_srt: bool = False
@@ -332,7 +332,7 @@ class AlignmentLayerConfig:
 
 @dataclass
 class SegmentationLayerConfig:
-    """L6 切分层参数。"""
+    """裁决层（decision）切分参数。"""
 
     is_enabled: bool = True
     min_chars: int = 6
@@ -342,6 +342,7 @@ class SegmentationLayerConfig:
     long_pause_sec: float = 0.8
     soft_pause_sec: float = 0.4
     short_merge_max_chars: int = 22
+    is_force_split_on_sentence_end_punct: bool = True
     is_keep_sentence_end_punct: bool = False
 
     final_min_tokens: int = 5
@@ -580,6 +581,15 @@ class SegmentationLayerConfig:
                 cls.is_keep_sentence_end_punct,
             ),
         )
+        force_split_on_sentence_end_punct = _read_runtime_value(
+            raw,
+            "force_split_on_sentence_end_punct",
+            _read_runtime_value(
+                punctuation_raw,
+                "force_split_on_sentence_end_punct",
+                cls.is_force_split_on_sentence_end_punct,
+            ),
+        )
         priority_active_profile = str(
             _read_runtime_value(
                 raw,
@@ -615,6 +625,7 @@ class SegmentationLayerConfig:
             short_merge_max_chars=int(
                 _read_runtime_value(raw, "short_merge_max_chars", cls.short_merge_max_chars)
             ),
+            is_force_split_on_sentence_end_punct=bool(force_split_on_sentence_end_punct),
             is_keep_sentence_end_punct=bool(keep_sentence_end_punct),
             final_min_tokens=int(
                 _read_runtime_value(raw, "final.min_tokens", cls.final_min_tokens)
@@ -719,7 +730,7 @@ class M2StageConfig:
 
 @dataclass
 class TextPipelineConfig:
-    """文本处理流水线参数入口（L1/L2/L3/L4/L6）。"""
+    """文本处理流水线参数入口（规范化/仲裁/标点前置/集合/裁决）。"""
 
     normalization: NormalizationConfig
     arbitration: "ArbitrationConfig"
@@ -802,7 +813,7 @@ class ArbitrationConfig:
 
 @dataclass
 class PunctuationConfig:
-    """L3 标点层参数。"""
+    """标点前置域参数。"""
 
     is_enabled: bool = True
     source_preference: str = "merged"

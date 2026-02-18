@@ -6,7 +6,7 @@ Phase 3 实现 - 2025-12-10
 实现 Needleman-Wunsch 序列对齐算法，用于将 Whisper 文本对齐到 SenseVoice 时间轴。
 支持静音区硬约束、能量锚点校准、VAD 边界校准和 Gap 填补。
 """
-# V3.2.0+dev.20260205.09: L4 对齐层口径收敛与词级置信度来源修正。
+# V3.2.0+dev.20260205.09: 集合层对齐口径收敛与词级置信度来源修正。
 
 import logging
 from typing import List, Optional, Tuple, Dict, Sequence
@@ -170,7 +170,7 @@ class AlignmentService:
         vad_intervals: Optional[List[Tuple[float, float]]] = None,
         token_confidences: Optional[Sequence[Optional[float]]] = None,
     ) -> LayerAlignmentResult:
-        """L4 专用：对齐 clean_text 并输出 AlignmentResult。"""
+        """集合层专用：对齐 clean_text 并输出 AlignmentResult。"""
         if vad_range is None:
             vad_range = self._resolve_vad_range(sv_tokens, vad_intervals)
 

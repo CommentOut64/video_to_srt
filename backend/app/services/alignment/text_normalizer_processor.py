@@ -71,7 +71,7 @@ class TextNormalizerProcessor:
         language = str(raw_result.get("language") or language_hint or "auto")
         normalized = self._normalizer.normalize(input_text, language)
         track = self._build_text_track(raw_text, normalized, source=source, language=language)
-        # L1 负责把“原始词级标点”提取为 clean_text 坐标（避免 L3 再反推）。
+        # L1 负责把“原始词级标点”提取为 clean_text 坐标（避免标点前置域再反推）。
         self._attach_word_level_punctuation(track, raw_result, source=source)
         # L1 可选生成 clean_to_word 映射（供后续模块埋点/对齐参考）。
         self._attach_clean_to_word(track, raw_result, source=source)
@@ -96,7 +96,7 @@ class TextNormalizerProcessor:
                 track.punct_positions = list(positions or [])
                 return
 
-        # 词级时间戳缺失时，允许使用字符映射兜底（仅在 L1 内部做，L3 禁止回看）。
+        # 词级时间戳缺失时，允许使用字符映射兜底（仅在 L1 内部做，标点前置域禁止回看）。
         raw_text = str(track.text_itn_raw or track.raw_text or "")
         if not raw_text or not track.raw_to_clean:
             return
@@ -109,7 +109,7 @@ class TextNormalizerProcessor:
             return
         # V3.2.0+dev.20260205.06: 移除弱标点过滤逻辑
         # 原因：密集标点问题已从根源修复（Prompt格式 + condition_on_previous_text禁用）
-        # 弱标点过滤会误伤英文等语言的正常逗号，且 L3 后处理已有规则引擎过滤异常标点
+        # 弱标点过滤会误伤英文等语言的正常逗号，且标点前置域后处理已有规则引擎过滤异常标点
         track.punct_positions = list(positions)
 
     @staticmethod
@@ -123,7 +123,7 @@ class TextNormalizerProcessor:
             track.word_confidences = []
             return
         track.clean_to_word = TextNormalizerProcessor._build_clean_to_word_map(clean_text, words)
-        # V3.2.0+dev.20260205.09: 记录词级置信度，用于 L4 慢流优先口径。
+        # V3.2.0+dev.20260205.09: 记录词级置信度，用于集合层慢流优先口径。
         track.word_confidences = [
             float(item.get("confidence")) if item.get("confidence") is not None else None
             for item in words
