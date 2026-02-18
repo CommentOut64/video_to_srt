@@ -15,11 +15,15 @@ class TranscriptionAPI {
    * 上传文件并创建转录任务
    * @param {File} file - 视频文件对象
    * @param {Function} onProgress - 上传进度回调 (percent) => void
+   * @param {Object|null} taskConfig - 任务级配置（可选）
    * @returns {Promise<{job_id: string, filename: string, message: string, queue_position: number}>}
    */
-  async uploadFile(file, onProgress = null) {
+  async uploadFile(file, onProgress = null, taskConfig = null) {
     const formData = new FormData();
     formData.append("file", file);
+    if (taskConfig && typeof taskConfig === "object") {
+      formData.append("task_config", JSON.stringify(taskConfig));
+    }
 
     const config = {
       headers: {
@@ -43,11 +47,15 @@ class TranscriptionAPI {
   /**
    * 为本地 input 文件创建转录任务
    * @param {string} filename - 文件名
+   * @param {Object|null} taskConfig - 任务级配置（可选）
    * @returns {Promise<{job_id: string, filename: string}>}
    */
-  async createJob(filename) {
+  async createJob(filename, taskConfig = null) {
     const formData = new FormData();
     formData.append("filename", filename);
+    if (taskConfig && typeof taskConfig === "object") {
+      formData.append("task_config", JSON.stringify(taskConfig));
+    }
 
     return apiClient.post("/api/create-job", formData);
   }

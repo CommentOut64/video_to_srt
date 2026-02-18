@@ -81,21 +81,16 @@ export function useTaskUpload({ taskStore, taskConfig, getThumbnailUrl }) {
 
     creatingBatch.value = true;
     try {
+      const transcriptionSettings = buildTranscriptionSettings();
       const filenames = selectedFiles.value.map((file) => file.name);
-      const result = await fileApi.createJobsBatch(filenames);
+      const result = await fileApi.createJobsBatch(
+        filenames,
+        transcriptionSettings.task_config,
+      );
 
       if (result.succeeded > 0) {
-        const transcriptionSettings = buildTranscriptionSettings();
-        for (const job of result.jobs) {
-          try {
-            await transcriptionApi.startJob(job.job_id, transcriptionSettings);
-          } catch (startError) {
-            console.warn(`启动任务 ${job.job_id} 失败:`, startError);
-          }
-        }
-
         await taskStore.syncTasksFromBackend();
-        ElMessage.success(`成功创建并启动 ${result.succeeded} 个任务`);
+        ElMessage.success(`成功创建并入队 ${result.succeeded} 个任务`);
       }
 
       if (result.failed_count > 0) {
@@ -187,9 +182,13 @@ export function useTaskUpload({ taskStore, taskConfig, getThumbnailUrl }) {
 
       for (const file of uploadFiles.value) {
         try {
-          const { job_id, filename, queue_position } = await transcriptionApi.uploadFile(file, (percent) => {
-            console.log(`上传进度 [${file.name}]: ${percent}%`);
-          });
+          const { job_id, filename, queue_position } = await transcriptionApi.uploadFile(
+            file,
+            (percent) => {
+              console.log(`上传进度 [${file.name}]: ${percent}%`);
+            },
+            transcriptionSettings.task_config,
+          );
 
           taskStore.addTask({
             job_id,
@@ -200,14 +199,6 @@ export function useTaskUpload({ taskStore, taskConfig, getThumbnailUrl }) {
             progress: 0,
             message: `已加入队列 (位置: ${queue_position})`,
             settings: transcriptionSettings,
-          });
-
-          await transcriptionApi.startJob(job_id, transcriptionSettings);
-
-          taskStore.updateTask(job_id, {
-            status: "queued",
-            phase: "transcribing",
-            message: "等待转录...",
           });
 
           setTimeout(() => {

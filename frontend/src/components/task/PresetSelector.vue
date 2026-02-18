@@ -98,6 +98,40 @@
             </select>
           </label>
         </div>
+        <div class="mt-3 flex flex-col gap-2">
+          <div class="text-[11px] text-[var(--af-text-muted)]">说话人策略</div>
+          <label class="flex items-center justify-between gap-2 text-[11px] text-[var(--af-text-normal)]">
+            <span>启用说话人检测</span>
+            <input
+              type="checkbox"
+              v-model="localConfig.preprocessing.enable_speaker_detection"
+              @change="onModuleChange"
+            />
+          </label>
+          <label class="flex items-center justify-between gap-2 text-[11px] text-[var(--af-text-normal)]">
+            <span>speaker 介入切分</span>
+            <input
+              type="checkbox"
+              v-model="localConfig.preprocessing.enable_speaker_guided_split"
+              :disabled="!localConfig.preprocessing.enable_speaker_detection"
+              @change="onModuleChange"
+            />
+          </label>
+          <label class="flex items-center gap-2 text-[11px]">
+            <span class="w-24 text-[var(--af-text-muted)]">说话人数</span>
+            <input
+              type="number"
+              min="0"
+              max="20"
+              step="1"
+              v-model.number="localConfig.preprocessing.speaker_count"
+              :disabled="!localConfig.preprocessing.enable_speaker_detection"
+              class="flex-1 rounded border border-[var(--af-border-default)] bg-[var(--af-bg-tertiary)] px-2 py-1 text-[11px] text-[var(--af-text-normal)]"
+              @change="onModuleChange"
+            />
+            <span class="text-[10px] text-[var(--af-text-muted)]">0=自动</span>
+          </label>
+        </div>
       </div>
 
       <!-- 模块二: 转录核心 -->
@@ -186,6 +220,11 @@ const props = defineProps({
         enable_spectral_triage: true,
         language_detection_mode: 'balanced',
         language_detection_device: 'auto',
+        enable_speaker_detection: true,
+        enable_speaker_guided_split: true,
+        speaker_count: 0,
+        speaker_min_count: 0,
+        speaker_max_count: 0,
         langid_confidence_threshold: 0.7,
         langid_whitelist: ['zh', 'ja', 'en'],
         langid_logit_bias_score: 2.5
@@ -522,6 +561,19 @@ function onModuleChange() {
     localConfig.value.preprocessing.enable_spectral_triage = false
     localConfig.value.preprocessing.separation_mode = 'global'
   }
+
+  if (!localConfig.value.preprocessing.enable_speaker_detection) {
+    localConfig.value.preprocessing.enable_speaker_guided_split = false
+    localConfig.value.preprocessing.speaker_count = 0
+  }
+  const speakerCount = Number(localConfig.value.preprocessing.speaker_count || 0)
+  if (Number.isNaN(speakerCount) || speakerCount < 0) {
+    localConfig.value.preprocessing.speaker_count = 0
+  } else {
+    localConfig.value.preprocessing.speaker_count = Math.min(20, Math.floor(speakerCount))
+  }
+  localConfig.value.preprocessing.speaker_min_count = 0
+  localConfig.value.preprocessing.speaker_max_count = 0
 
   /* 检查当前配置是否匹配某个预设 */
   const matchedPreset = macroPresets.find(preset => {
