@@ -594,12 +594,22 @@ class WhisperService:
             """清理 Whisper 输出中泄漏的 prompt 内容"""
             if not text:
                 return text
-            # 移除 "Glossary: xxx." 开头的内容
-            # 匹配 "Glossary:" 开头，到第一个句号或换行结束
-            cleaned = re.sub(r'^Glossary:\s*[^.]*\.\s*', '', text, flags=re.IGNORECASE)
-            # 如果整个文本就是 Glossary 格式，返回空
-            if cleaned == text and text.lower().startswith('glossary:'):
-                return ''
+            cleaned = text.strip()
+            glossary_pattern = re.compile(
+                r"(?i)g[\s\|·•]*l[\s\|·•]*o[\s\|·•]*s[\s\|·•]*s[\s\|·•]*a[\s\|·•]*r[\s\|·•]*y(?:\s*[:：])?"
+            )
+
+            # Why: 保留正文优先。前缀泄漏剥离标记，中后段泄漏截断尾部。
+            while True:
+                match = glossary_pattern.search(cleaned)
+                if match is None:
+                    break
+                start, end = match.span()
+                if start <= max(6, int(len(cleaned) * 0.25)):
+                    cleaned = (cleaned[:start] + cleaned[end:]).lstrip(" ：:|.-\t")
+                    continue
+                cleaned = cleaned[:start].rstrip()
+                break
             return cleaned.strip()
 
         # 清理每个 segment 的文本

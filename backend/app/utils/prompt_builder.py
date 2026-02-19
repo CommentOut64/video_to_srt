@@ -1,6 +1,6 @@
 """
 Prompt Builder - 安全的 Whisper Prompt 构建器
-V3.2.0+dev.20260205.04
+V3.2.0+dev.20260218.01
 
 Phase 4 实现 - 2025-12-10
 Phase 4 优化 - 2025-12-11
@@ -15,6 +15,7 @@ Phase 4 优化 - 2025-12-11
 
 更新日志：
 - V3.2.0+dev.20260205.04: 使用空格分隔关键词，避免逗号密集导致 Whisper 标点感染
+- V3.2.0+dev.20260218.01: 禁用 `Glossary:` 模板，避免提示词回显污染正文
 """
 
 import re
@@ -30,7 +31,7 @@ class PromptBuilder:
     核心策略：
     1. 从前文中提取专有名词（大写开头的词）
     2. 过滤停用词
-    3. 构建 "Glossary: word1 word2 ..." 格式的 prompt（空格分隔）
+    3. 构建纯关键词 prompt（空格分隔，不携带标签模板）
     4. 避免使用完整句子，防止 Whisper 误判
     5. 避免密集逗号，防止标点感染
     """
@@ -112,7 +113,7 @@ class PromptBuilder:
         """
         构建安全的 Whisper Prompt（优化版）
 
-        格式："Glossary: word1 word2 word3."（空格分隔，避免逗号感染）
+        格式："word1 word2 word3"（纯关键词，避免模板回显污染）
 
         优化策略：
         1. 提取关键词并统计词频
@@ -148,11 +149,11 @@ class PromptBuilder:
 
         # 4. 动态调整关键词数量以满足长度限制
         selected_keywords = []
-        current_length = len("Glossary: .")  # 基础长度
+        current_length = 0
 
         for keyword in sorted_keywords[:self.max_keywords]:
             # 计算添加这个关键词后的长度（空格分隔）
-            additional_length = len(keyword) + 1  # " " 的长度
+            additional_length = len(keyword) + (1 if selected_keywords else 0)
             if current_length + additional_length > self.max_prompt_length:
                 break
 
@@ -163,9 +164,8 @@ class PromptBuilder:
         if not selected_keywords:
             return ""
 
-        # V3.2.0+dev.20260205.04: 使用空格分隔关键词，避免密集逗号导致标点感染
-        prompt = "Glossary: " + " ".join(selected_keywords) + "."
-        return prompt
+        # V3.2.0+dev.20260218.01: 禁用 Glossary 标签模板，改为纯关键词提示。
+        return " ".join(selected_keywords)
 
     def get_keyword_statistics(self) -> Dict[str, int]:
         """
