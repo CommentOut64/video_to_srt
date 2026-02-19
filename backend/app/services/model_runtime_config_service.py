@@ -280,6 +280,16 @@ class ModelRuntimeConfigService:
             return value or None
 
         return {
+            "whisper_prompt": {
+                "enabled": norm_str(os.getenv("WHISPER_PROMPT_ENABLED")),
+                "max_prompt_chars": norm_str(os.getenv("WHISPER_PROMPT_MAX_CHARS")),
+                "max_keyword_count": norm_str(os.getenv("WHISPER_PROMPT_MAX_KEYWORDS")),
+                "max_context_chars": norm_str(os.getenv("WHISPER_PROMPT_MAX_CONTEXT_CHARS")),
+                "max_history_chars": norm_str(os.getenv("WHISPER_PROMPT_MAX_HISTORY_CHARS")),
+                "reset_pause_sec": norm_str(os.getenv("WHISPER_PROMPT_RESET_PAUSE_SEC")),
+                "reset_no_speech_prob": norm_str(os.getenv("WHISPER_PROMPT_RESET_NO_SPEECH")),
+                "reset_low_confidence": norm_str(os.getenv("WHISPER_PROMPT_RESET_LOW_CONF")),
+            },
             "sensevoice": {
                 "device": norm_str(os.getenv("SENSEVOICE_DEVICE")),
                 "model_type": norm_str(os.getenv("SENSEVOICE_MODEL_TYPE")),
@@ -320,6 +330,16 @@ class ModelRuntimeConfigService:
                 "enabled": True,
                 "min_text_length": 2,
                 "patterns": [],
+            },
+            "whisper_prompt": {
+                "enabled": False,
+                "max_prompt_chars": 180,
+                "max_keyword_count": 16,
+                "max_context_chars": 80,
+                "max_history_chars": 160,
+                "reset_pause_sec": 1.8,
+                "reset_no_speech_prob": 0.65,
+                "reset_low_confidence": 0.35,
             },
             "sensevoice": {
                 "language": "auto",

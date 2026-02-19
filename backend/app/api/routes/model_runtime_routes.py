@@ -113,6 +113,17 @@ class WhisperSanitizeRuntimeParams(_RuntimeBase):
     )
 
 
+class WhisperPromptRuntimeParams(_RuntimeBase):
+    is_enabled: Optional[bool] = Field(default=None, alias="enabled")
+    max_prompt_chars: Optional[int] = Field(default=None, ge=32, le=1024)
+    max_keyword_count: Optional[int] = Field(default=None, ge=1, le=128)
+    max_context_chars: Optional[int] = Field(default=None, ge=16, le=512)
+    max_history_chars: Optional[int] = Field(default=None, ge=32, le=2048)
+    reset_pause_sec: Optional[float] = Field(default=None, ge=0.0, le=30.0)
+    reset_no_speech_prob: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    reset_low_confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
+
 class SenseVoiceRuntimeParams(_RuntimeBase):
     language: Optional[str] = Field(default=None)
     is_use_itn: Optional[bool] = Field(default=None, alias="use_itn")
@@ -486,6 +497,7 @@ class SegmentationRuntimeParams(_RuntimeBase):
 class RuntimeGroupUpdateRequest(_RuntimeBase):
     whisper: Optional[WhisperRuntimeParams] = None
     whisper_sanitize: Optional[WhisperSanitizeRuntimeParams] = None
+    whisper_prompt: Optional[WhisperPromptRuntimeParams] = None
     sensevoice: Optional[SenseVoiceRuntimeParams] = None
     demucs: Optional[DemucsRuntimeParams] = None
     vad: Optional[VADRuntimeParams] = None
@@ -502,6 +514,7 @@ class RuntimeGroupUpdateRequest(_RuntimeBase):
 _RUNTIME_GROUP_MODELS = {
     "whisper": WhisperRuntimeParams,
     "whisper_sanitize": WhisperSanitizeRuntimeParams,
+    "whisper_prompt": WhisperPromptRuntimeParams,
     "sensevoice": SenseVoiceRuntimeParams,
     "demucs": DemucsRuntimeParams,
     "vad": VADRuntimeParams,
@@ -569,6 +582,16 @@ _PARAM_SCHEMA: Dict[str, Any] = {
             "enabled": {"type": "bool", "default": True},
             "min_text_length": {"type": "int", "min": 0, "default": 2},
             "patterns": {"type": "object", "default": []},
+        },
+        "whisper_prompt": {
+            "enabled": {"type": "bool", "default": False},
+            "max_prompt_chars": {"type": "int", "min": 32, "max": 1024, "default": 180},
+            "max_keyword_count": {"type": "int", "min": 1, "max": 128, "default": 16},
+            "max_context_chars": {"type": "int", "min": 16, "max": 512, "default": 80},
+            "max_history_chars": {"type": "int", "min": 32, "max": 2048, "default": 160},
+            "reset_pause_sec": {"type": "float", "min": 0.0, "max": 30.0, "default": 1.8},
+            "reset_no_speech_prob": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.65},
+            "reset_low_confidence": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.35},
         },
         "sensevoice": {
             "language": {

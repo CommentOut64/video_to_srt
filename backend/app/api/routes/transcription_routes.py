@@ -70,8 +70,8 @@ class TranscriptionSettingsAPI(BaseModel):
     transcription_profile: str = Field(default="sensevoice_only", description="转录流水线模式")
     # 主引擎运行设备: auto/cpu
     sensevoice_device: str = Field(default="auto", description="SenseVoice 运行设备")
-    # 辅助/复核模型: tiny/small/medium/large-v3
-    whisper_model: str = Field(default="medium", description="Whisper 模型")
+    # 辅助/复核模型（临时停用任务级覆盖，当前统一读取 .env）
+    whisper_model: Optional[str] = Field(default=None, description="Whisper 模型（临时停用任务级覆盖）")
     # 复核触发阈值: 0.0-1.0
     patching_threshold: float = Field(default=0.60, ge=0.0, le=1.0, description="复核触发阈值")
 
@@ -373,15 +373,22 @@ def create_transcription_router(
         """根据 task_config 生成 JobSettings。"""
         if not task_config:
             return JobSettings()
-        preset_id = str(task_config.get("preset_id", "balanced") or "balanced")
+        # 临时策略：任务级 whisper_model 覆盖停用，统一回退 .env。
+        normalized_task_config = dict(task_config)
+        transcription_payload = dict(normalized_task_config.get("transcription") or {})
+        if "whisper_model" in transcription_payload:
+            transcription_payload.pop("whisper_model", None)
+            normalized_task_config["transcription"] = transcription_payload
+
+        preset_id = str(normalized_task_config.get("preset_id", "balanced") or "balanced")
         has_custom_groups = any(
-            task_config.get(key)
+            normalized_task_config.get(key)
             for key in ("preprocessing", "transcription", "refinement", "compute", "debug")
         )
         if preset_id != "custom" and not has_custom_groups:
             return JobSettings.from_preset(preset_id)
         try:
-            return JobSettings.from_dict(task_config)
+            return JobSettings.from_dict(normalized_task_config)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -641,7 +648,7 @@ def create_transcription_router(
             failed = []
             filenames = list(req.filenames or [])
             task_config_payload = (
-                req.task_config.model_dump()
+                req.task_config.model_dump(exclude_none=True)
                 if req.task_config is not None
                 else {}
             )
@@ -723,7 +730,7 @@ def create_transcription_router(
                     print(f"读取checkpoint设置失败: {e}")
 
             task_config = (
-                settings_obj.task_config.model_dump()
+                settings_obj.task_config.model_dump(exclude_none=True)
                 if settings_obj.task_config else {}
             )
 
