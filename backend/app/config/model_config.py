@@ -3,7 +3,7 @@
 """
 
 import os
-from typing import List
+from typing import Dict, List
 
 
 class ModelPreloadConfig:
@@ -64,44 +64,79 @@ def recommend_models_by_memory(total_memory_gb: float) -> List[str]:
 # - 封杀 YouTube 风格幻觉词的首 Token
 # - 不封杀常见标点和单字母 (如 '.', '[', 'C')
 
-WHISPER_SUPPRESS_TOKENS = {
-    # Whisper Medium 模型
-    # 运行 `python scripts/extract_hallucination_tokens.py --model medium` 获取
-    "medium": [
-        # 下划线类 (最常见的幻觉来源)
-        62,      # '_' 单个下划线
-        10852,   # '__' 双下划线
-        23757,   # '____' 四下划线
+DEFAULT_WHISPER_SUPPRESS_TOKENS: List[int] = [
+    # 下划线类（最常见幻觉来源）
+    62,      # '_' 单个下划线
+    10852,   # '__' 双下划线
+    23757,   # '____' 四下划线
 
-        # 省略号类
-        485,     # '...' 省略号
-        353,     # '..' 双点
+    # 省略号类
+    485,     # '...'
+    353,     # '..'
 
-        # YouTube 风格幻觉 (带空格版本更安全)
-        27738,   # ' Questions' 带空格的 Questions
-        8511,    # ' Subtitles' 带空格的 Subtitles (首 token)
-        25653,   # ' Copyright' 带空格的 Copyright (首 token)
-        27917,   # 'Thanks for watching' 首 token
-        16216,   # 'Please subscribe' 首 token
-        2012,    # ' Amara' 带空格的 Amara (首 token)
+    # YouTube 风格幻觉（带空格版本更安全）
+    27738,   # ' Questions'
+    8511,    # ' Subtitles'
+    25653,   # ' Copyright'
+    27917,   # 'Thanks for watching'
+    16216,   # 'Please subscribe'
+    2012,    # ' Amara'
 
-        # 音乐符号
-        3961,    # 音符符号
+    # 音乐符号
+    3961,
+]
 
-        # 注意: 以下 Token 被排除，因为可能误杀正常文本
-        # 13,    # '.' 单点 - 太常见，不能封杀
-        # 34,    # 'C' (Copyright首字母) - 单字母，不能封杀
-        # 58,    # '[' 方括号 - 太常见，不能封杀
-        # 8547,  # 'Questions' 无空格版本 - 可能误杀正常问句
-        # 39582, # 'Subtitles' 无空格版本 - 首 token 是 'Sub'，可能误杀
-    ],
-
-    # Whisper Large-v3 模型 (未来扩展)
-    # 运行 `python scripts/extract_hallucination_tokens.py --model large-v3` 获取
-    "large-v3": [
-        # TODO: 运行脚本后填入实际 Token ID
-    ],
+# Token Profile（可按模型独立扩展，当前所有模型先复用保守默认列表）
+WHISPER_SUPPRESS_TOKENS: Dict[str, List[int]] = {
+    "default": list(DEFAULT_WHISPER_SUPPRESS_TOKENS),
+    "medium": list(DEFAULT_WHISPER_SUPPRESS_TOKENS),
+    "large-v3": list(DEFAULT_WHISPER_SUPPRESS_TOKENS),
 }
+
+# 所有 Whisper 模型统一接入 suppress_tokens。
+# Why: 先保证全量模型有基础抑制，再逐模型精调 Token Profile。
+WHISPER_MODEL_TOKEN_PROFILE: Dict[str, str] = {
+    "tiny": "default",
+    "tiny.en": "default",
+    "base": "default",
+    "base.en": "default",
+    "small": "default",
+    "small.en": "default",
+    "medium": "medium",
+    "medium.en": "default",
+    "large": "default",
+    "large-v1": "default",
+    "large-v2": "default",
+    "large-v3": "large-v3",
+    "turbo": "default",
+    "large-v3-turbo": "default",
+    "distil-large-v2": "default",
+    "distil-large-v3": "default",
+}
+
+
+def _normalize_whisper_model_name(model_name: str) -> str:
+    """
+    归一化 Whisper 模型名，兼容 repo_id / 注册表 id / 别名。
+    """
+    raw = str(model_name or "").strip().lower()
+    if not raw:
+        return ""
+
+    tail = raw.split("/")[-1]
+    if tail.startswith("faster-whisper-"):
+        tail = tail[len("faster-whisper-"):]
+    elif tail.startswith("faster-distil-whisper-"):
+        tail = f"distil-{tail[len('faster-distil-whisper-'):]}"
+    elif tail.startswith("whisper-"):
+        tail = tail[len("whisper-"):]
+
+    tail = tail.replace("_", "-")
+
+    # 兼容 whisper-medium-en / tiny-en 这类命名
+    if tail.endswith("-en") and not tail.startswith("distil-"):
+        tail = f"{tail[:-3]}.en"
+    return tail
 
 
 def get_whisper_suppress_tokens(model_name: str) -> List[int]:
@@ -114,8 +149,19 @@ def get_whisper_suppress_tokens(model_name: str) -> List[int]:
     Returns:
         list: Token ID 列表，用于 suppress_tokens 参数
     """
-    model_name_lower = model_name.lower()
-    for key, tokens in WHISPER_SUPPRESS_TOKENS.items():
-        if key in model_name_lower:
-            return tokens
-    return []
+    normalized = _normalize_whisper_model_name(model_name)
+    if not normalized:
+        return list(WHISPER_SUPPRESS_TOKENS.get("default", []))
+
+    profile = WHISPER_MODEL_TOKEN_PROFILE.get(normalized)
+    if profile is None:
+        # 向后兼容：允许按片段匹配既有 profile（如自定义变体名称）
+        for key in WHISPER_MODEL_TOKEN_PROFILE:
+            if key in normalized:
+                profile = WHISPER_MODEL_TOKEN_PROFILE[key]
+                break
+
+    if profile is None:
+        profile = "default"
+
+    return list(WHISPER_SUPPRESS_TOKENS.get(profile, WHISPER_SUPPRESS_TOKENS["default"]))
