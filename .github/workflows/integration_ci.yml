@@ -54,6 +54,8 @@ jobs:
 
       - name: Run textflow layer guards (Phase A freeze)
         shell: pwsh
+        env:
+          PYTHONUTF8: "1"
         run: .\.venv\Scripts\python.exe ci_tests\quality\check_textflow_layer_guards.py
 
       - name: Run unit tests (quality metrics)

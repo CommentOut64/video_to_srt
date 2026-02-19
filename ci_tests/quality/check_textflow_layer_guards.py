@@ -98,6 +98,12 @@ def _print_new_violations(title: str, baseline_file: Path, new_items: set[str]) 
 
 
 def main() -> int:
+    # V3.2.0+dev.20260219.01: 兼容 Windows CI (cp1252) 环境，强制 stdout/stderr 使用 UTF-8
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name)
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(description="文本后处理四层架构阶段A/C/E/G冻结守卫")
     parser.add_argument(
         "--project-root",
