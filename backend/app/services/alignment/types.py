@@ -210,6 +210,7 @@ class AnnotatedWord:
     trailing_punct: str = ""
     confidence: Optional[float] = None
     confidence_source: Optional[str] = None
+    is_pseudo: bool = False
     speaker_id: Optional[str] = None
     turn_id: Optional[str] = None
     track_id: Optional[str] = None

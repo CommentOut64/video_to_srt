@@ -8,6 +8,7 @@ TurnGroup 构建器。
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -61,6 +62,12 @@ class TurnGroupEnvelope:
 
 class TurnGroupBuilder:
     """基于 Timeline speaker 信号构建 TurnGroup。"""
+
+    _PROMPT_SEED_MAX_CHARS = 160
+    _PROMPT_SEED_MAX_SENTENCES = 3
+    _PROMPT_SEED_MAX_KEYWORDS = 20
+    _LATIN_WORD_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9'_-]{1,31}")
+    _CJK_WORD_PATTERN = re.compile(r"[\u4e00-\u9fff]{2,6}")
 
     def __init__(
         self,
@@ -171,11 +178,7 @@ class TurnGroupBuilder:
     def _flush(self, reason: str) -> TurnGroupEnvelope:
         self._group_counter += 1
         group_id = f"tg-{self._group_counter:06d}"
-        prompt_text = " ".join(
-            sentence.text_clean or sentence.text or ""
-            for sentence in self._pending.sentences
-            if sentence
-        ).strip()
+        prompt_text = self._build_prompt_seed()
         decision = self._merge_decisions(self._pending.punctuation_decisions)
         group = TurnGroup(
             group_id=group_id,
@@ -205,6 +208,53 @@ class TurnGroupBuilder:
         start = min(segment[0] for segment in self._pending.audio_segments)
         end = max(segment[1] for segment in self._pending.audio_segments)
         return max(0.0, float(end) - float(start))
+
+    def _build_prompt_seed(self) -> str:
+        """
+        构建 TurnGroup 的提示词种子（关键词化 + 长度预算）。
+
+        Why:
+        - 避免把整段历史正文塞入 prompt_text，降低跨批次拼接污染与回显概率。
+        - 保留实体词与短上下文线索，满足 Whisper 风格/术语引导。
+        """
+        recent_sentences = self._pending.sentences[-self._PROMPT_SEED_MAX_SENTENCES :]
+        raw_texts = [
+            str(sentence.text_clean or sentence.text or "").strip()
+            for sentence in recent_sentences
+            if sentence
+        ]
+        merged_text = " ".join(item for item in raw_texts if item).strip()
+        if not merged_text:
+            return ""
+
+        keywords: list[str] = []
+        seen = set()
+        for candidate in self._LATIN_WORD_PATTERN.findall(merged_text):
+            normalized = candidate.strip()
+            lowered = normalized.lower()
+            if not normalized or lowered in seen:
+                continue
+            seen.add(lowered)
+            keywords.append(normalized)
+            if len(keywords) >= self._PROMPT_SEED_MAX_KEYWORDS:
+                break
+
+        if len(keywords) < self._PROMPT_SEED_MAX_KEYWORDS:
+            for candidate in self._CJK_WORD_PATTERN.findall(merged_text):
+                normalized = candidate.strip()
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                keywords.append(normalized)
+                if len(keywords) >= self._PROMPT_SEED_MAX_KEYWORDS:
+                    break
+
+        seed = " ".join(keywords).strip()
+        if not seed:
+            seed = merged_text
+        if len(seed) > self._PROMPT_SEED_MAX_CHARS:
+            seed = seed[-self._PROMPT_SEED_MAX_CHARS :].lstrip()
+        return seed
 
     @staticmethod
     def _count_tokens(text: str, language: str) -> int:

@@ -1,10 +1,11 @@
 """
 裁决层切分处理器（SegmentationProcessor）。
-V3.2.0+dev.20260215.24
+V3.2.0+dev.20260219.01
 """
 from __future__ import annotations
 
 from collections import Counter
+import re
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -25,6 +26,10 @@ class SegmentationProcessor:
 
     # V3.2.0+dev.20260210.03: 裁决层内建跨 chunk 连续性处理（仅处理高风险残词）。
     _CROSS_CHUNK_CARRY_WORDS = {"a", "an", "the"}
+    _CROSS_CHUNK_CJK_CARRY_SINGLE_CHARS = {"经", "直", "才", "因", "检", "警"}
+    _CROSS_CHUNK_CJK_CARRY_WORDS = {"因为", "以及", "直到", "经过", "检测"}
+    _CROSS_CHUNK_CJK_MAX_GAP_SEC = 0.10
+    _CROSS_CHUNK_CJK_MAX_DURATION_SEC = 0.80
     _SENTENCE_END_PUNCT = {"。", "！", "？", ".", "!", "?"}
     _CUT_PLAN_SINGLETON_TAIL_MAX_GAP_SEC = 0.65
     _CUT_PLAN_SINGLETON_TAIL_MAX_DURATION_SEC = 0.95
@@ -47,6 +52,9 @@ class SegmentationProcessor:
     _SPEAKER_REPAIR_STRONG_BREAK_MIN_PAUSE_SEC = 0.30
     _SPEAKER_REPAIR_SENTENCE_END_PUNCT = {"。", "！", "？", ".", "!", "?"}
     _SPEAKER_REPAIR_EDGE_GUARD_SEC = 0.15
+    _UNKNOWN_PSEUDO_JUNK_PATTERN = re.compile(
+        r"^[\s\|·•`~!@#$%^&*()_+\-=\[\]{};:'\",.<>/?\\，。！？：；、（）《》【】…—]+$"
+    )
     def __init__(
         self,
         *,
@@ -116,7 +124,13 @@ class SegmentationProcessor:
                 output_traces=[],
             )
 
-        words_for_split = list(pending_prefix_words) + self._build_words_for_split(annotated_words)
+        raw_words_for_split = list(pending_prefix_words) + self._build_words_for_split(annotated_words)
+        (
+            words_for_split,
+            dropped_unknown_pseudo_count,
+            is_unknown_pseudo_filter_fallback,
+            degraded_unknown_pseudo_count,
+        ) = self._filter_unknown_pseudo_words(raw_words_for_split)
         words_for_split = merge_protected_word_tokens(words_for_split)
         pending_in_word_count = len(pending_prefix_words)
         if not words_for_split:
@@ -129,6 +143,9 @@ class SegmentationProcessor:
                     "cross_chunk_pending_in_word_count": pending_in_word_count,
                     "cross_chunk_pending_out_word_count": 0,
                     "cross_chunk_dangling_fix_count": 0,
+                    "unknown_pseudo_drop_count": int(dropped_unknown_pseudo_count),
+                    "unknown_pseudo_degrade_count": int(degraded_unknown_pseudo_count),
+                    "unknown_pseudo_filter_fallback": bool(is_unknown_pseudo_filter_fallback),
                     "soft_cut_stats": self._build_soft_cut_stats(
                         cut_plan=cut_plan,
                         applied_window_ids=[],
@@ -225,6 +242,9 @@ class SegmentationProcessor:
             "cross_chunk_pending_in_word_count": pending_in_word_count,
             "cross_chunk_pending_out_word_count": len(pending_out_words),
             "cross_chunk_dangling_fix_count": dangling_fix_count,
+            "unknown_pseudo_drop_count": int(dropped_unknown_pseudo_count),
+            "unknown_pseudo_degrade_count": int(degraded_unknown_pseudo_count),
+            "unknown_pseudo_filter_fallback": bool(is_unknown_pseudo_filter_fallback),
             "speaker_repair_split_count": int(speaker_repair_split_count),
             "soft_cut_stats": self._build_soft_cut_stats(
                 cut_plan=cut_plan,
@@ -238,14 +258,19 @@ class SegmentationProcessor:
             "output_trace": [self._serialize_output_trace(item) for item in output_traces],
         }
         self._logger.info(
-            "裁决层切分完成: stream={} chunk={} input_words={} sentences={} "
-            "pending_in={} pending_out={} error={}",
+            "裁决层切分完成: stream={} chunk={} input_words={} raw_words={} "
+            "sentences={} pending_in={} pending_out={} dropped_unknown_pseudo={} "
+            "degraded_unknown_pseudo={} filter_fallback={} error={}",
             stream_id,
             chunk_index,
             len(words_for_split),
+            len(raw_words_for_split),
             len(all_sentence_segments),
             pending_in_word_count,
             len(pending_out_words),
+            int(dropped_unknown_pseudo_count),
+            int(degraded_unknown_pseudo_count),
+            int(is_unknown_pseudo_filter_fallback),
             error_code or "none",
         )
         self._active_vad_intervals = []
@@ -1052,7 +1077,9 @@ class SegmentationProcessor:
             return []
 
         last_token = self._normalize_boundary_token(words[-1].word)
-        if last_token not in self._CROSS_CHUNK_CARRY_WORDS:
+        is_english_carry = last_token in self._CROSS_CHUNK_CARRY_WORDS
+        is_cjk_carry = self._is_cjk_carry_token(last_token)
+        if not is_english_carry and not is_cjk_carry:
             return []
 
         anchor_token_raw = str(words[-2].word or "").strip()
@@ -1061,10 +1088,61 @@ class SegmentationProcessor:
             str(words[-1].word or "").strip(),
             sentence_end_chars=tuple(self._SENTENCE_END_PUNCT),
         )
-        if not has_sentence_end_anchor:
+        if is_english_carry:
+            if has_sentence_end_anchor:
+                return [words[-1]]
             return []
 
-        return [words[-1]]
+        if has_sentence_end_anchor:
+            return []
+        cjk_tail_words = self._detect_cjk_dangling_tail_words(words)
+        if cjk_tail_words:
+            return cjk_tail_words
+        return []
+
+    def _detect_cjk_dangling_tail_words(
+        self,
+        words: Sequence[WordTimestamp],
+    ) -> List[WordTimestamp]:
+        if len(words) <= 1:
+            return []
+
+        last_word = words[-1]
+        last_token = self._normalize_boundary_token(last_word.word)
+        if not self._is_cjk_carry_token(last_token):
+            return []
+
+        prev_word = words[-2]
+        prev_raw = str(prev_word.word or "").strip()
+        last_raw = str(last_word.word or "").strip()
+        if is_sentence_end_punct(
+            prev_raw,
+            last_raw,
+            sentence_end_chars=tuple(self._SENTENCE_END_PUNCT),
+        ):
+            return []
+
+        prev_end = float(getattr(prev_word, "end", 0.0) or 0.0)
+        last_start = float(getattr(last_word, "start", prev_end) or prev_end)
+        last_end = float(getattr(last_word, "end", last_start) or last_start)
+        if last_end < last_start:
+            last_end = last_start
+
+        # Why: 仅兜底“紧贴 chunk 边界的短残词”，避免把真实句尾误判为跨 chunk 续接。
+        if max(0.0, last_start - prev_end) > self._CROSS_CHUNK_CJK_MAX_GAP_SEC:
+            return []
+        if (last_end - last_start) > self._CROSS_CHUNK_CJK_MAX_DURATION_SEC:
+            return []
+        return [last_word]
+
+    @classmethod
+    def _is_cjk_carry_token(cls, token: str) -> bool:
+        text = str(token or "").strip()
+        if not text:
+            return False
+        if text in cls._CROSS_CHUNK_CJK_CARRY_WORDS:
+            return True
+        return len(text) == 1 and text in cls._CROSS_CHUNK_CJK_CARRY_SINGLE_CHARS
 
     def _normalize_carried_article_sentence_case(
         self,
@@ -1598,6 +1676,81 @@ class SegmentationProcessor:
                 return True
         return False
 
+    @classmethod
+    def _filter_unknown_pseudo_words(
+        cls,
+        words_for_split: Sequence[WordTimestamp],
+    ) -> Tuple[List[WordTimestamp], int, bool, int]:
+        """
+        在切分前处理低质量伪词：confidence_source=unknown 且 is_pseudo=True。
+
+        处理策略：
+        1. 仅剔除“明显噪声”伪词（纯分隔符/模型残留符号），避免边界污染；
+        2. 对非噪声伪词不删词，仅降权保留，避免数字或句首句尾文本被吞；
+        3. 若全部被剔除，触发降权回退，避免整句误判为空。
+        """
+        normalized_words = list(words_for_split or [])
+        if not normalized_words:
+            return [], 0, False, 0
+
+        filtered_words: List[WordTimestamp] = []
+        dropped_count = 0
+        degraded_count = 0
+        for word in normalized_words:
+            if not cls._is_unknown_pseudo_word(word):
+                filtered_words.append(word)
+                continue
+            if cls._is_unknown_pseudo_junk(word):
+                dropped_count += 1
+                continue
+            filtered_words.append(cls._degrade_unknown_pseudo_word(word))
+            degraded_count += 1
+        if filtered_words:
+            return filtered_words, dropped_count, False, degraded_count
+
+        fallback_words = [
+            cls._degrade_unknown_pseudo_word(word)
+            if cls._is_unknown_pseudo_word(word)
+            else word
+            for word in normalized_words
+        ]
+        fallback_degraded_count = sum(1 for word in normalized_words if cls._is_unknown_pseudo_word(word))
+        return fallback_words, dropped_count, dropped_count > 0, fallback_degraded_count
+
+    @staticmethod
+    def _is_unknown_pseudo_word(word: WordTimestamp) -> bool:
+        confidence_source = str(getattr(word, "confidence_source", "") or "").strip().lower()
+        return bool(getattr(word, "is_pseudo", False)) and confidence_source == "unknown"
+
+    @classmethod
+    def _is_unknown_pseudo_junk(cls, word: WordTimestamp) -> bool:
+        token = str(getattr(word, "word", "") or "")
+        token_stripped = token.strip()
+        if not token_stripped:
+            return True
+        if "▁" in token_stripped:
+            return True
+        if "<|" in token_stripped or "|>" in token_stripped:
+            return True
+        return bool(cls._UNKNOWN_PSEUDO_JUNK_PATTERN.fullmatch(token_stripped))
+
+    @staticmethod
+    def _degrade_unknown_pseudo_word(word: WordTimestamp) -> WordTimestamp:
+        degraded = WordTimestamp(
+            word=word.word,
+            start=word.start,
+            end=word.end,
+            confidence=0.0,
+            confidence_raw=word.confidence_raw,
+            confidence_display_raw=word.confidence_display_raw,
+            confidence_source=word.confidence_source,
+            token_type=word.token_type,
+            is_pseudo=word.is_pseudo,
+        )
+        setattr(degraded, "speaker_id", getattr(word, "speaker_id", None))
+        setattr(degraded, "turn_id", getattr(word, "turn_id", None))
+        return degraded
+
     @staticmethod
     def _build_words_for_split(annotated_words: List[Any]) -> List[WordTimestamp]:
         words: List[WordTimestamp] = []
@@ -1609,7 +1762,7 @@ class SegmentationProcessor:
                 end=float(item.end) if item.end is not None else 0.0,
                 confidence=item.confidence,
                 confidence_source=item.confidence_source,
-                is_pseudo=False,
+                is_pseudo=bool(getattr(item, "is_pseudo", False)),
             )
             # Why: 后续“单次闭环”修复需要词级 speaker/turn 信息判断跨 speaker 残留。
             setattr(word, "speaker_id", getattr(item, "speaker_id", None))
