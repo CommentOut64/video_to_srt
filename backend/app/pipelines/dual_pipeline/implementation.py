@@ -152,9 +152,9 @@ from app.services.textflow import (
     DecisionSegmentationProcessor,
     OutputLayerProcessor,
 )
+from app.services.whisper.whisper_prompt_policy import WhisperPromptPolicy
 from app.services.whisper.whisper_text_sanitizer import WhisperTextSanitizer
 from app.pipelines.workers import FastWorker, SlowWorker
-from app.utils.prompt_builder import get_prompt_builder
 from app.utils.cancellation_token import CancelledException, PausedException  # V3.1.0: 捕获取消/暂停异常
 
 try:
@@ -204,6 +204,31 @@ class AsyncDualPipelineKernel:
     _SPEAKER_REPAIR_STRONG_BREAK_MIN_PAUSE_SEC = 0.30
     _SPEAKER_REPAIR_SENTENCE_END_PUNCT = {"。", "！", "？", ".", "!", "?"}
     _SPEAKER_REPAIR_EDGE_GUARD_SEC = 0.15
+    _WHISPER_REBALANCE_MAX_TAIL_WORDS = 2
+    _WHISPER_REBALANCE_MAX_TAIL_GAP_SEC = 0.08
+    _WHISPER_REBALANCE_MAX_TAIL_DURATION_SEC = 0.85
+    _WHISPER_REBALANCE_SINGLE_CHAR_CARRY = {
+        "是",
+        "才",
+        "经",
+        "过",
+        "直",
+        "因",
+        "检",
+        "警",
+        "一",
+    }
+    _WHISPER_REBALANCE_MULTI_CHAR_CARRY = {
+        "因为",
+        "以及",
+        "直到",
+        "经过",
+        "检测",
+        "都有",
+        "然而",
+        "但是",
+        "不过",
+    }
 
     def __init__(
         self,
@@ -284,7 +309,11 @@ class AsyncDualPipelineKernel:
         self.user_glossary = user_glossary
         self.previous_whisper_text: Optional[str] = None
         self._job_dir: Optional[Path] = None
-        self._bridge_prompt_hint: Optional[str] = None
+        self._last_prompt_audio_end: Optional[float] = None
+        self._whisper_prompt_policy = WhisperPromptPolicy(
+            logger=self.logger,
+            user_glossary=self.user_glossary,
+        )
         self._enable_bridge_batches: bool = False
         self._consume_turn_groups_only: bool = True
         self._turn_group_builder = TurnGroupBuilder()
@@ -317,6 +346,10 @@ class AsyncDualPipelineKernel:
             self._speaker_count,
             self._speaker_min_count,
             self._speaker_max_count,
+        )
+        self.logger.info(
+            "Whisper 提示词策略: {}",
+            self._whisper_prompt_policy.describe_config(),
         )
 
         # 判断是否为纯 SenseVoice 模式
@@ -1884,16 +1917,12 @@ class AsyncDualPipelineKernel:
                 now=time.time(),
             )
             for envelope in envelopes:
-                if envelope.group.prompt_text:
-                    self._bridge_prompt_hint = envelope.group.prompt_text
                 await self._enqueue_turn_group(envelope)
 
     async def _flush_bridge_controller(self) -> None:
         """强制刷新 Bridge 控制器缓冲。"""
         envelope = self._turn_group_builder.flush(reason="eof_flush")
         if envelope:
-            if envelope.group.prompt_text:
-                self._bridge_prompt_hint = envelope.group.prompt_text
             await self._enqueue_turn_group(envelope)
 
     async def _enqueue_turn_group(self, envelope: TurnGroupEnvelope) -> None:
@@ -2008,7 +2037,16 @@ class AsyncDualPipelineKernel:
                 token=token,
             )
 
-        prompt = self._build_whisper_prompt(group.prompt_text or None)
+        group_start = min((seg[0] for seg in group.audio_segments), default=0.0)
+        group_end = max((seg[1] for seg in group.audio_segments), default=group_start)
+        pause_gap_sec: Optional[float] = None
+        if self._last_prompt_audio_end is not None:
+            pause_gap_sec = max(0.0, float(group_start) - float(self._last_prompt_audio_end))
+
+        prompt = self._build_whisper_prompt(
+            group.prompt_text or None,
+            pause_gap_sec=pause_gap_sec,
+        )
         whisper_result = await self.slow_worker.process_turn_group(
             group,
             full_audio_array=self._full_audio_array,
@@ -2047,6 +2085,8 @@ class AsyncDualPipelineKernel:
 
         if whisper_result and self._hallucination_detector.is_hallucination(whisper_result, prompt):
             self.logger.warning("TurnGroup 检测到 Whisper 幻觉，回退快流: group_id=%s", group.group_id)
+            self._reset_prompt_cache(reason="hallucination")
+            self._last_prompt_audio_end = float(group_end)
             for _, ctx in contexts:
                 ctx.whisper_skipped = True
                 ctx.whisper_result = {}
@@ -2065,8 +2105,12 @@ class AsyncDualPipelineKernel:
         whisper_result["text"] = normalized_whisper.text_clean or whisper_result.get("text", "")
         whisper_result["language"] = group_language
 
-        if whisper_result.get("text"):
-            self._update_prompt_cache(str(whisper_result.get("text", "")))
+        self._update_prompt_cache(
+            str(whisper_result.get("text", "")),
+            confidence=whisper_result.get("confidence"),
+            whisper_result=whisper_result,
+        )
+        self._last_prompt_audio_end = float(group_end)
 
         batch_start = min((seg[0] for seg in group.audio_segments), default=0.0)
         chunk_results = self._split_whisper_result_by_chunks(
@@ -2900,31 +2944,18 @@ class AsyncDualPipelineKernel:
             config=self.patching_threshold or ThresholdConfig()
         )
 
-    def _build_whisper_prompt(self, sv_context: Optional[str]) -> str:
-        """
-        构建 Whisper Prompt（关键词 + 语义线索）。
-        """
-        prompt_builder = get_prompt_builder()
-        base_prompt = prompt_builder.build_prompt(
+    def _build_whisper_prompt(
+        self,
+        sv_context: Optional[str],
+        *,
+        pause_gap_sec: Optional[float] = None,
+    ) -> Optional[str]:
+        """构建 Whisper Prompt（统一策略入口）。"""
+        return self._whisper_prompt_policy.build_prompt(
             previous_text=self.previous_whisper_text,
-            user_glossary=self.user_glossary
+            semantic_text=sv_context,
+            pause_gap_sec=pause_gap_sec,
         )
-
-        context_segments: List[str] = []
-        if self._bridge_prompt_hint:
-            context_segments.append(self._bridge_prompt_hint.strip())
-        if sv_context:
-            semantic_hint = sv_context[-50:] if len(sv_context) > 50 else sv_context
-            semantic_hint = semantic_hint.lstrip()
-            if semantic_hint:
-                context_segments.append(semantic_hint)
-
-        if context_segments:
-            context_text = " ".join(segment for segment in context_segments if segment)
-            if base_prompt:
-                return f"Context: {context_text}. {base_prompt}"
-            return f"Context: {context_text}."
-        return base_prompt
 
     @staticmethod
     def _parse_source_chunk_indices(source_chunks: List[str]) -> List[int]:
@@ -2970,6 +3001,137 @@ class AsyncDualPipelineKernel:
         if not merged:
             return ""
         return " ".join(merged.split())
+
+    @staticmethod
+    def _normalize_whisper_boundary_token(token: Any) -> str:
+        token_str = str(token or "").replace("▁", " ").strip()
+        if not token_str:
+            return ""
+        return token_str.strip("\"'“”‘’()[]{}<>《》【】「」『』，。、！？：；,.!?;:")
+
+    @classmethod
+    def _is_cjk_token(cls, token: str) -> bool:
+        text = str(token or "")
+        return any("\u4e00" <= ch <= "\u9fff" for ch in text)
+
+    @classmethod
+    def _is_sentence_end_token(cls, token: str) -> bool:
+        text = str(token or "").strip()
+        if not text:
+            return False
+        return is_sentence_end_punct(
+            text,
+            "",
+            sentence_end_chars=tuple(cls._SPEAKER_REPAIR_SENTENCE_END_PUNCT),
+        )
+
+    @staticmethod
+    def _resolve_word_start_end_local(word: Dict[str, Any]) -> Tuple[float, float]:
+        start = float(word.get("start", 0.0) or 0.0)
+        end = float(word.get("end", word.get("start", 0.0)) or word.get("start", 0.0))
+        if end < start:
+            end = start
+        return start, end
+
+    @classmethod
+    def _resolve_whisper_tail_move_count(
+        cls,
+        left_words: Sequence[Dict[str, Any]],
+        right_words: Sequence[Dict[str, Any]],
+    ) -> int:
+        if not left_words or not right_words:
+            return 0
+
+        right_head = cls._normalize_whisper_boundary_token(right_words[0].get("word", ""))
+        if not right_head or not cls._is_cjk_token(right_head):
+            return 0
+
+        right_start, _ = cls._resolve_word_start_end_local(right_words[0])
+        max_tail = min(cls._WHISPER_REBALANCE_MAX_TAIL_WORDS, len(left_words))
+
+        for move_count in range(max_tail, 0, -1):
+            tail_words = list(left_words[-move_count:])
+            if move_count < len(left_words):
+                anchor_word = left_words[-move_count - 1]
+                anchor_token = cls._normalize_whisper_boundary_token(anchor_word.get("word", ""))
+                if cls._is_sentence_end_token(anchor_token):
+                    continue
+
+            normalized_tail_tokens = [
+                cls._normalize_whisper_boundary_token(item.get("word", ""))
+                for item in tail_words
+            ]
+            if any(not token for token in normalized_tail_tokens):
+                continue
+            if any(cls._is_sentence_end_token(token) for token in normalized_tail_tokens):
+                continue
+
+            merged_tail = "".join(normalized_tail_tokens)
+            if move_count == 1:
+                token = normalized_tail_tokens[0]
+                is_single_char_carry = len(token) == 1 and token in cls._WHISPER_REBALANCE_SINGLE_CHAR_CARRY
+                is_multi_char_carry = token in cls._WHISPER_REBALANCE_MULTI_CHAR_CARRY
+                if not (is_single_char_carry or is_multi_char_carry):
+                    continue
+            else:
+                if merged_tail not in cls._WHISPER_REBALANCE_MULTI_CHAR_CARRY:
+                    continue
+                if any(len(token) != 1 for token in normalized_tail_tokens):
+                    continue
+
+            tail_start, tail_end = cls._resolve_word_start_end_local(tail_words[0])
+            _, last_tail_end = cls._resolve_word_start_end_local(tail_words[-1])
+            tail_end = max(tail_end, last_tail_end)
+            if tail_end < tail_start:
+                tail_end = tail_start
+            if max(0.0, right_start - tail_end) > cls._WHISPER_REBALANCE_MAX_TAIL_GAP_SEC:
+                continue
+            if (tail_end - tail_start) > cls._WHISPER_REBALANCE_MAX_TAIL_DURATION_SEC:
+                continue
+            return move_count
+        return 0
+
+    @classmethod
+    def _rebalance_whisper_words_by_chunk(
+        cls,
+        words_by_chunk: Dict[int, List[Dict[str, Any]]],
+        ordered_indices: Sequence[int],
+    ) -> int:
+        if len(ordered_indices) <= 1:
+            return 0
+
+        moved_word_count = 0
+        for left_idx, right_idx in zip(ordered_indices[:-1], ordered_indices[1:]):
+            left_words = list(words_by_chunk.get(left_idx) or [])
+            right_words = list(words_by_chunk.get(right_idx) or [])
+            if not left_words or not right_words:
+                continue
+
+            move_count = cls._resolve_whisper_tail_move_count(left_words, right_words)
+            if move_count <= 0 or move_count > len(left_words):
+                continue
+
+            moved_words = left_words[-move_count:]
+            words_by_chunk[left_idx] = left_words[:-move_count]
+            words_by_chunk[right_idx] = moved_words + right_words
+            moved_word_count += move_count
+        return moved_word_count
+
+    @classmethod
+    def _resolve_fragment_local_time_range(
+        cls,
+        words: Sequence[Dict[str, Any]],
+        *,
+        fallback_start: float,
+        fallback_end: float,
+    ) -> Tuple[float, float]:
+        if not words:
+            return fallback_start, max(fallback_end, fallback_start)
+        start, _ = cls._resolve_word_start_end_local(words[0])
+        _, end = cls._resolve_word_start_end_local(words[-1])
+        if end < start:
+            end = start
+        return start, end
 
     @staticmethod
     def _find_target_chunk_by_overlap(
@@ -3056,6 +3218,7 @@ class AsyncDualPipelineKernel:
 
         assignments: Dict[int, List[Dict[str, Any]]] = {idx: [] for idx in chunk_ranges}
         ordered_indices = sorted(chunk_ranges.keys())
+        moved_words_total = 0
 
         for seg in raw_segments:
             seg_start = float(seg.get("start", 0.0) or 0.0) + batch_start
@@ -3078,12 +3241,27 @@ class AsyncDualPipelineKernel:
                         continue
                     words_by_chunk.setdefault(target_idx, []).append(word)
 
-                for idx, words in words_by_chunk.items():
+                moved_words_total += self._rebalance_whisper_words_by_chunk(
+                    words_by_chunk=words_by_chunk,
+                    ordered_indices=ordered_indices,
+                )
+
+                for idx in ordered_indices:
+                    words = list(words_by_chunk.get(idx) or [])
+                    if not words:
+                        continue
                     seg_fragment = dict(seg)
                     seg_fragment["words"] = list(words)
                     fragment_text = self._compose_whisper_text_from_words(words)
                     if fragment_text:
                         seg_fragment["text"] = fragment_text
+                    fragment_start, fragment_end = self._resolve_fragment_local_time_range(
+                        words,
+                        fallback_start=float(seg.get("start", 0.0) or 0.0),
+                        fallback_end=float(seg.get("end", 0.0) or 0.0),
+                    )
+                    seg_fragment["start"] = fragment_start
+                    seg_fragment["end"] = fragment_end
                     assignments[idx].append(seg_fragment)
                 continue
 
@@ -3095,6 +3273,13 @@ class AsyncDualPipelineKernel:
             )
             if target_idx is not None:
                 assignments[target_idx].append(seg)
+
+        if moved_words_total > 0:
+            self.logger.debug(
+                "Whisper批次回写跨chunk重平衡: moved_words={} chunk_count={}",
+                moved_words_total,
+                len(ordered_indices),
+            )
 
         results: Dict[int, Dict[str, Any]] = {}
         language = str(language_override or whisper_result.get("language", "auto"))
@@ -3250,6 +3435,13 @@ class AsyncDualPipelineKernel:
             "decision_split_writeback_ratio": float(split_stats.get("writeback_ratio", 0.0) or 0.0),
             "decision_split_writeback_used": bool(split_stats.get("writeback_used", 0.0)),
             "decision_split_writeback_blocked": bool(split_stats.get("writeback_blocked", 0.0)),
+            "decision_unknown_pseudo_drop_count": int(split_stats.get("unknown_pseudo_drop_count", 0) or 0),
+            "decision_unknown_pseudo_degrade_count": int(
+                split_stats.get("unknown_pseudo_degrade_count", 0) or 0
+            ),
+            "decision_unknown_pseudo_filter_fallback": bool(
+                split_stats.get("unknown_pseudo_filter_fallback", False)
+            ),
             "decision_split_reason_stats": split_reason_stats,
             "decision_split_risk_stats": split_risk_stats,
             "decision_sentence_texts": [str(sentence.text or "") for sentence in final_sentences],
@@ -3625,15 +3817,56 @@ class AsyncDualPipelineKernel:
             )
         return full_audio[start_sample:end_sample]
 
-    def _update_prompt_cache(self, whisper_text: str) -> None:
-        """更新 Whisper 上下文缓存。"""
-        self.previous_whisper_text = whisper_text
+    @staticmethod
+    def _estimate_avg_no_speech_prob(whisper_result: Optional[Dict[str, Any]]) -> Optional[float]:
+        """估算当前结果的平均 no_speech_prob。"""
+        if not isinstance(whisper_result, dict):
+            return None
+        raw_result = whisper_result.get("raw_result")
+        if not isinstance(raw_result, dict):
+            return None
+        segments = raw_result.get("segments")
+        if not isinstance(segments, list) or not segments:
+            return None
+        values: List[float] = []
+        for segment in segments:
+            if not isinstance(segment, dict):
+                continue
+            value = segment.get("no_speech_prob")
+            if isinstance(value, (float, int)):
+                values.append(float(value))
+        if not values:
+            return None
+        return float(sum(values) / len(values))
+
+    def _update_prompt_cache(
+        self,
+        whisper_text: str,
+        *,
+        confidence: Optional[float] = None,
+        whisper_result: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """更新 Whisper 上下文缓存（策略层统一裁剪与重置）。"""
+        avg_no_speech_prob = self._estimate_avg_no_speech_prob(whisper_result)
+        self.previous_whisper_text = self._whisper_prompt_policy.update_history(
+            previous_text=self.previous_whisper_text,
+            decoded_text=whisper_text,
+            confidence=float(confidence) if isinstance(confidence, (float, int)) else None,
+            avg_no_speech_prob=avg_no_speech_prob,
+            is_hallucination=False,
+        )
+
+    def _reset_prompt_cache(self, reason: str) -> None:
+        """重置 Whisper 上下文缓存。"""
+        self.previous_whisper_text = ""
+        self.logger.debug("Whisper 上下文已重置: reason=%s", reason)
 
     def restore_prompt_cache(self, previous_text: Optional[str]) -> None:
         """恢复 Whisper 上下文缓存（断点续传使用）。"""
-        self.previous_whisper_text = previous_text
-        if previous_text:
-            self.logger.debug(f"[v3.1.0] 已恢复 Whisper 上下文: {len(previous_text)} 字符")
+        restored = self._whisper_prompt_policy.restore_history(previous_text)
+        self.previous_whisper_text = restored
+        if restored:
+            self.logger.debug(f"[v3.1.0] 已恢复 Whisper 上下文: {len(restored)} 字符")
         else:
             self.logger.debug("[v3.1.0] Whisper 上下文为空")
 

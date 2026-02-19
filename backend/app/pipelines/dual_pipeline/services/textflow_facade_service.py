@@ -270,6 +270,15 @@ class TextflowFacadeService:
         split_stats = dict(self._host._final_splitter.last_split_stats or {})
         split_stats.update(dict(decision_output.segmentation_report.get("boundary_score_stats", {})))
         split_stats.update(dict(decision_output.segmentation_report.get("soft_cut_stats", {})))
+        split_stats["unknown_pseudo_drop_count"] = int(
+            decision_output.segmentation_report.get("unknown_pseudo_drop_count", 0) or 0
+        )
+        split_stats["unknown_pseudo_degrade_count"] = int(
+            decision_output.segmentation_report.get("unknown_pseudo_degrade_count", 0) or 0
+        )
+        split_stats["unknown_pseudo_filter_fallback"] = bool(
+            decision_output.segmentation_report.get("unknown_pseudo_filter_fallback", False)
+        )
         split_stats["output_trace_count"] = int(len(output_traces))
         segmentation_error = str(decision_output.segmentation_report.get("error_code", "") or "")
         if segmentation_error:
