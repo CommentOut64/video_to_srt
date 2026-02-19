@@ -494,6 +494,70 @@ class SegmentationRuntimeParams(_RuntimeBase):
         return value
 
 
+class LanguagePolicyRuntimeParams(_RuntimeBase):
+    is_enabled: Optional[bool] = Field(default=None, alias="enabled")
+    default_language: Optional[str] = Field(default=None)
+    policy_version: Optional[str] = Field(default=None)
+    thresholds: Optional[Dict[str, float]] = Field(default=None)
+    carry_rules: Optional[Dict[str, List[float]]] = Field(default=None)
+    cross_chunk: Optional[Dict[str, Any]] = Field(default=None)
+
+    @field_validator("default_language")
+    @classmethod
+    def _validate_default_language(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        normalized = value.strip().lower()
+        if not normalized:
+            raise ValueError("default_language 不能为空字符串")
+        if not (2 <= len(normalized) <= 10 and normalized.replace("-", "").isalnum()):
+            raise ValueError("default_language 必须是 2-10 位语言码")
+        return normalized
+
+    @field_validator("thresholds")
+    @classmethod
+    def _validate_thresholds(cls, value: Optional[Dict[str, float]]) -> Optional[Dict[str, float]]:
+        if value is None:
+            return value
+        normalized: Dict[str, float] = {}
+        for key, item in value.items():
+            try:
+                normalized[str(key)] = float(item)
+            except (TypeError, ValueError):
+                raise ValueError(f"thresholds.{key} 必须为数值")
+        return normalized
+
+    @field_validator("carry_rules")
+    @classmethod
+    def _validate_carry_rules(
+        cls,
+        value: Optional[Dict[str, List[float]]],
+    ) -> Optional[Dict[str, List[float]]]:
+        if value is None:
+            return value
+        normalized: Dict[str, List[float]] = {}
+        for key, item in value.items():
+            if not isinstance(item, list) or len(item) < 2:
+                raise ValueError(f"carry_rules.{key} 必须为至少两个元素的数值数组")
+            pair = []
+            for num in item[:2]:
+                try:
+                    pair.append(float(num))
+                except (TypeError, ValueError):
+                    raise ValueError(f"carry_rules.{key} 必须为数值数组")
+            normalized[str(key)] = pair
+        return normalized
+
+    @field_validator("cross_chunk")
+    @classmethod
+    def _validate_cross_chunk(cls, value: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if value is None:
+            return value
+        if not isinstance(value, dict):
+            raise ValueError("cross_chunk 必须为对象")
+        return value
+
+
 class RuntimeGroupUpdateRequest(_RuntimeBase):
     whisper: Optional[WhisperRuntimeParams] = None
     whisper_sanitize: Optional[WhisperSanitizeRuntimeParams] = None
@@ -509,6 +573,7 @@ class RuntimeGroupUpdateRequest(_RuntimeBase):
     normalization: Optional[NormalizationRuntimeParams] = None
     arbitration: Optional[ArbitrationRuntimeParams] = None
     segmentation: Optional[SegmentationRuntimeParams] = None
+    language_policy: Optional[LanguagePolicyRuntimeParams] = None
 
 
 _RUNTIME_GROUP_MODELS = {
@@ -526,6 +591,7 @@ _RUNTIME_GROUP_MODELS = {
     "normalization": NormalizationRuntimeParams,
     "arbitration": ArbitrationRuntimeParams,
     "segmentation": SegmentationRuntimeParams,
+    "language_policy": LanguagePolicyRuntimeParams,
 }
 
 
@@ -760,6 +826,14 @@ _PARAM_SCHEMA: Dict[str, Any] = {
         "pipeline": {
             "batch_size": {"type": "int", "min": 1, "default": 16},
             "word_timestamps": {"type": "bool", "default": False},
+        },
+        "language_policy": {
+            "enabled": {"type": "bool", "default": True},
+            "default_language": {"type": "string", "default": "zh"},
+            "policy_version": {"type": "string", "default": "V3.2.0+dev.20260219.08"},
+            "thresholds": {"type": "object", "default": {}},
+            "carry_rules": {"type": "object", "default": {}},
+            "cross_chunk": {"type": "object", "default": {}},
         },
     },
 }

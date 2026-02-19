@@ -14,6 +14,7 @@ from app.models.sensevoice_models import SentenceSegment, TextSource
 from app.pipelines.dual_pipeline.services.textflow_facade_service import Layer456RunResult
 from app.schemas.pipeline_context import ProcessingContext
 from app.services.alignment.types import PunctTrack
+from app.services.language_policy import build_language_policy_snapshot
 
 
 class AlignmentStageService:
@@ -192,6 +193,27 @@ class AlignmentStageService:
         sv_words = host._build_sv_word_timestamps(sv_result, chunk)
         speaker_id = host._resolve_speaker_id_for_chunk(ctx.audio_chunk) if ctx.audio_chunk else None
         turn_id = host._resolve_turn_id_for_chunk(ctx.audio_chunk) if ctx.audio_chunk else None
+        policy_snapshot = None
+        language_hint = str(
+            (tracks.chosen_track.language if tracks.chosen_track else "")
+            or whisper_result.get("language")
+            or getattr(chunk, "language", "")
+            or "auto"
+        )
+        try:
+            policy_snapshot = build_language_policy_snapshot(language_hint=language_hint)
+            host.logger.debug(
+                "语言策略快照注入: chunk={} language_tag={} policy_version={}",
+                ctx.chunk_index,
+                policy_snapshot.language_tag,
+                policy_snapshot.policy_version,
+            )
+        except Exception:
+            host.logger.exception(
+                "语言策略快照编译失败，回退空快照注入: chunk={} language_hint={}",
+                ctx.chunk_index,
+                language_hint,
+            )
 
         legacy_run = host._run_collection_scoring_decision_once(
             tracks=tracks,
@@ -203,6 +225,7 @@ class AlignmentStageService:
             variant="legacy",
             speaker_id=speaker_id,
             turn_id=turn_id,
+            policy_snapshot=policy_snapshot,
         )
 
         experiment_run: Optional[Layer456RunResult] = None
@@ -224,6 +247,7 @@ class AlignmentStageService:
                 variant="experiment",
                 speaker_id=speaker_id,
                 turn_id=turn_id,
+                policy_snapshot=policy_snapshot,
             )
             compare_payload = host._build_dual_time_compare_payload(
                 ctx=ctx,

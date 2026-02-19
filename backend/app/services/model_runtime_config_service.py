@@ -641,6 +641,12 @@ class ModelRuntimeConfigService:
                 "collapse_spaces": True,
                 "punct_width": "auto",
             },
+            # V3.2.0+dev.20260219.08: 语言适配层（准备层编译快照）运行参数。
+            "language_policy": {
+                "enabled": True,
+                "default_language": "zh",
+                "policy_version": "V3.2.0+dev.20260219.08",
+            },
             "pipeline": {
                 "batch_size": 16,
                 "word_timestamps": False,

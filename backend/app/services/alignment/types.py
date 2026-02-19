@@ -14,6 +14,7 @@ from app.services.punctuation.base import PuncPosition, WordTimestampLike
 
 if TYPE_CHECKING:
     from app.services.arbitration.arbiter import ArbitrationResult
+    from app.services.language_policy.types import LanguagePolicySnapshot
     from app.services.segmentation.soft_cut.types import CutPlan
 
 
@@ -191,6 +192,7 @@ class CollectionLayerInput:
     chosen_text_track: Optional[TextTrack]
     sv_words: List[WordTimestamp]
     vad_intervals: Optional[List[Tuple[float, float]]] = None
+    policy_snapshot: Optional["LanguagePolicySnapshot"] = None
 
 
 @dataclass
@@ -225,6 +227,7 @@ class ScoringLayerInput:
     language: str = "auto"
     speaker_id: Optional[str] = None  # V3.2.0+dev.20260207.03: P0 speaker 信号链
     turn_id: Optional[str] = None  # V3.2.0+dev.20260210.09: Phase 2 turn 信号链
+    policy_snapshot: Optional["LanguagePolicySnapshot"] = None
 
 
 @dataclass
@@ -287,6 +290,7 @@ class DecisionLayerInput:
     fused_evidence: Optional[FusedEvidence] = None
     fallback_clean_text_ref: str = ""
     fallback_punctuation_positions: List[PuncPosition] = field(default_factory=list)
+    policy_snapshot: Optional["LanguagePolicySnapshot"] = None
 
 
 @dataclass

@@ -1,13 +1,13 @@
 """
 裁决层切分处理器（SegmentationProcessor）。
-V3.2.0+dev.20260219.01
+V3.2.0+dev.20260219.08
 """
 from __future__ import annotations
 
 from collections import Counter
 import re
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from app.core.logging import resolve_loguru_logger
 from app.models.sensevoice_models import SentenceSegment, TextSource, WordTimestamp
@@ -19,6 +19,9 @@ from app.services.text_protection import (
     is_sentence_end_punct,
     merge_protected_word_tokens,
 )
+
+if TYPE_CHECKING:
+    from app.services.language_policy.types import LanguagePolicySnapshot
 
 
 class SegmentationProcessor:
@@ -199,7 +202,10 @@ class SegmentationProcessor:
                 all_sentence_segments,
                 pending_out_words,
                 dangling_fix_count,
-            ) = self._extract_cross_chunk_pending_tail(all_sentence_segments)
+            ) = self._extract_cross_chunk_pending_tail(
+                all_sentence_segments,
+                policy_snapshot=data.policy_snapshot,
+            )
             if pending_out_words:
                 self._pending_prefix_words_by_stream[stream_id] = self._clone_words(pending_out_words)
         elif pending_prefix_words:
@@ -212,6 +218,7 @@ class SegmentationProcessor:
         self._normalize_carried_article_sentence_case(
             sentence_segments=all_sentence_segments,
             pending_in_word_count=pending_in_word_count,
+            policy_snapshot=data.policy_snapshot,
         )
         self._finalize_sentence_metadata(all_sentence_segments)
         self._apply_output_traces_to_sentences(
@@ -1053,11 +1060,16 @@ class SegmentationProcessor:
     def _extract_cross_chunk_pending_tail(
         self,
         sentence_segments: List[SentenceSegment],
+        *,
+        policy_snapshot: Optional["LanguagePolicySnapshot"] = None,
     ) -> Tuple[List[SentenceSegment], List[WordTimestamp], int]:
         if not sentence_segments:
             return sentence_segments, [], 0
 
-        tail_words = self._detect_dangling_tail_words(sentence_segments[-1])
+        tail_words = self._detect_dangling_tail_words(
+            sentence_segments[-1],
+            policy_snapshot=policy_snapshot,
+        )
         if not tail_words:
             return sentence_segments, [], 0
 
@@ -1071,14 +1083,19 @@ class SegmentationProcessor:
         sentence_segments[-1] = rebuilt_last
         return sentence_segments, self._clone_words(tail_words), 1
 
-    def _detect_dangling_tail_words(self, sentence: SentenceSegment) -> List[WordTimestamp]:
+    def _detect_dangling_tail_words(
+        self,
+        sentence: SentenceSegment,
+        *,
+        policy_snapshot: Optional["LanguagePolicySnapshot"] = None,
+    ) -> List[WordTimestamp]:
         words = list(sentence.words or [])
         if len(words) <= 1:
             return []
 
         last_token = self._normalize_boundary_token(words[-1].word)
-        is_english_carry = last_token in self._CROSS_CHUNK_CARRY_WORDS
-        is_cjk_carry = self._is_cjk_carry_token(last_token)
+        is_english_carry = last_token in self._resolve_english_carry_words(policy_snapshot)
+        is_cjk_carry = self._is_cjk_carry_token(last_token, policy_snapshot=policy_snapshot)
         if not is_english_carry and not is_cjk_carry:
             return []
 
@@ -1086,7 +1103,7 @@ class SegmentationProcessor:
         has_sentence_end_anchor = is_sentence_end_punct(
             anchor_token_raw,
             str(words[-1].word or "").strip(),
-            sentence_end_chars=tuple(self._SENTENCE_END_PUNCT),
+            sentence_end_chars=self._resolve_sentence_end_chars(policy_snapshot),
         )
         if is_english_carry:
             if has_sentence_end_anchor:
@@ -1095,7 +1112,10 @@ class SegmentationProcessor:
 
         if has_sentence_end_anchor:
             return []
-        cjk_tail_words = self._detect_cjk_dangling_tail_words(words)
+        cjk_tail_words = self._detect_cjk_dangling_tail_words(
+            words,
+            policy_snapshot=policy_snapshot,
+        )
         if cjk_tail_words:
             return cjk_tail_words
         return []
@@ -1103,13 +1123,15 @@ class SegmentationProcessor:
     def _detect_cjk_dangling_tail_words(
         self,
         words: Sequence[WordTimestamp],
+        *,
+        policy_snapshot: Optional["LanguagePolicySnapshot"] = None,
     ) -> List[WordTimestamp]:
         if len(words) <= 1:
             return []
 
         last_word = words[-1]
         last_token = self._normalize_boundary_token(last_word.word)
-        if not self._is_cjk_carry_token(last_token):
+        if not self._is_cjk_carry_token(last_token, policy_snapshot=policy_snapshot):
             return []
 
         prev_word = words[-2]
@@ -1118,7 +1140,7 @@ class SegmentationProcessor:
         if is_sentence_end_punct(
             prev_raw,
             last_raw,
-            sentence_end_chars=tuple(self._SENTENCE_END_PUNCT),
+            sentence_end_chars=self._resolve_sentence_end_chars(policy_snapshot),
         ):
             return []
 
@@ -1128,27 +1150,32 @@ class SegmentationProcessor:
         if last_end < last_start:
             last_end = last_start
 
+        max_gap_sec, max_duration_sec = self._resolve_cjk_carry_limits(policy_snapshot)
         # Why: 仅兜底“紧贴 chunk 边界的短残词”，避免把真实句尾误判为跨 chunk 续接。
-        if max(0.0, last_start - prev_end) > self._CROSS_CHUNK_CJK_MAX_GAP_SEC:
+        if max(0.0, last_start - prev_end) > max_gap_sec:
             return []
-        if (last_end - last_start) > self._CROSS_CHUNK_CJK_MAX_DURATION_SEC:
+        if (last_end - last_start) > max_duration_sec:
             return []
         return [last_word]
 
     @classmethod
-    def _is_cjk_carry_token(cls, token: str) -> bool:
+    def _is_cjk_carry_token(
+        cls,
+        token: str,
+        *,
+        policy_snapshot: Optional["LanguagePolicySnapshot"] = None,
+    ) -> bool:
         text = str(token or "").strip()
         if not text:
             return False
-        if text in cls._CROSS_CHUNK_CJK_CARRY_WORDS:
-            return True
-        return len(text) == 1 and text in cls._CROSS_CHUNK_CJK_CARRY_SINGLE_CHARS
+        return text in cls._resolve_cjk_carry_words(policy_snapshot)
 
     def _normalize_carried_article_sentence_case(
         self,
         *,
         sentence_segments: List[SentenceSegment],
         pending_in_word_count: int,
+        policy_snapshot: Optional["LanguagePolicySnapshot"] = None,
     ) -> None:
         """当跨 chunk 回放冠词时，规范句首为英文句式大小写。"""
         if pending_in_word_count <= 0 or not sentence_segments:
@@ -1159,7 +1186,7 @@ class SegmentationProcessor:
             return
 
         carry_token = self._normalize_boundary_token(words[0].word)
-        if carry_token not in self._CROSS_CHUNK_CARRY_WORDS:
+        if carry_token not in self._resolve_english_carry_words(policy_snapshot):
             return
 
         words[0].word = words[0].word.capitalize()
@@ -1172,6 +1199,111 @@ class SegmentationProcessor:
         rebuilt = self._final_splitter._build_sentence(words, 0, len(words) - 1)
         self._copy_sentence_metadata(first_sentence, rebuilt)
         sentence_segments[0] = rebuilt
+
+    @staticmethod
+    def _resolve_sentence_end_chars(
+        policy_snapshot: Optional["LanguagePolicySnapshot"],
+    ) -> Tuple[str, ...]:
+        if policy_snapshot and policy_snapshot.sentence_end_chars:
+            ordered_chars = sorted(
+                {
+                    str(char).strip()
+                    for char in policy_snapshot.sentence_end_chars
+                    if str(char).strip()
+                }
+            )
+            if ordered_chars:
+                return tuple(ordered_chars)
+        return tuple(SegmentationProcessor._SENTENCE_END_PUNCT)
+
+    @classmethod
+    def _resolve_english_carry_words(
+        cls,
+        policy_snapshot: Optional["LanguagePolicySnapshot"],
+    ) -> Set[str]:
+        words = cls._resolve_cross_chunk_word_set(
+            policy_snapshot=policy_snapshot,
+            key="english_carry_words",
+        )
+        if words is not None:
+            return words
+        return set(cls._CROSS_CHUNK_CARRY_WORDS)
+
+    @classmethod
+    def _resolve_cjk_carry_words(
+        cls,
+        policy_snapshot: Optional["LanguagePolicySnapshot"],
+    ) -> Set[str]:
+        words = cls._resolve_cross_chunk_word_set(
+            policy_snapshot=policy_snapshot,
+            key="cjk_carry_words",
+        )
+        if words is not None:
+            return words
+        return set(cls._CROSS_CHUNK_CJK_CARRY_WORDS).union(
+            set(cls._CROSS_CHUNK_CJK_CARRY_SINGLE_CHARS)
+        )
+
+    @classmethod
+    def _resolve_cjk_carry_limits(
+        cls,
+        policy_snapshot: Optional["LanguagePolicySnapshot"],
+    ) -> Tuple[float, float]:
+        cross_chunk_config = cls._resolve_cross_chunk_config(policy_snapshot)
+        max_gap_sec = cls._parse_float_with_default(
+            cross_chunk_config.get("cjk_max_gap_sec"),
+            cls._CROSS_CHUNK_CJK_MAX_GAP_SEC,
+        )
+        max_duration_sec = cls._parse_float_with_default(
+            cross_chunk_config.get("cjk_max_duration_sec"),
+            cls._CROSS_CHUNK_CJK_MAX_DURATION_SEC,
+        )
+        return max_gap_sec, max_duration_sec
+
+    @staticmethod
+    def _parse_float_with_default(value: Any, default: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    @staticmethod
+    def _resolve_cross_chunk_config(
+        policy_snapshot: Optional["LanguagePolicySnapshot"],
+    ) -> Dict[str, Any]:
+        if not policy_snapshot:
+            return {}
+        metadata = getattr(policy_snapshot, "metadata", {})
+        if not isinstance(metadata, dict):
+            return {}
+        cross_chunk = metadata.get("cross_chunk")
+        if isinstance(cross_chunk, dict):
+            return cross_chunk
+        return {}
+
+    @classmethod
+    def _resolve_cross_chunk_word_set(
+        cls,
+        *,
+        policy_snapshot: Optional["LanguagePolicySnapshot"],
+        key: str,
+    ) -> Optional[Set[str]]:
+        cross_chunk_config = cls._resolve_cross_chunk_config(policy_snapshot)
+        if key not in cross_chunk_config:
+            return None
+        raw_value = cross_chunk_config.get(key)
+        if isinstance(raw_value, str):
+            values = [raw_value]
+        elif isinstance(raw_value, (list, tuple, set, frozenset)):
+            values = list(raw_value)
+        else:
+            return set()
+        normalized: Set[str] = set()
+        for item in values:
+            token = cls._normalize_boundary_token(str(item or ""))
+            if token:
+                normalized.add(token)
+        return normalized
 
     @staticmethod
     def _normalize_boundary_token(token: Optional[str]) -> str:

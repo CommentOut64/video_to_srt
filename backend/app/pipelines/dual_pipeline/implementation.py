@@ -3990,6 +3990,7 @@ class AsyncDualPipelineKernel:
         variant: str = "legacy",
         speaker_id: Optional[str] = None,
         turn_id: Optional[str] = None,
+        policy_snapshot: Optional[Any] = None,
     ) -> Layer456RunResult:
         """
         四层术语主入口：集合层→评分层→裁决层。
@@ -4006,6 +4007,7 @@ class AsyncDualPipelineKernel:
             variant=variant,
             speaker_id=speaker_id,
             turn_id=turn_id,
+            policy_snapshot=policy_snapshot,
         )
 
     def _should_record_m2_stage0_sample(self, *, chunk_index: int) -> bool:
@@ -4138,6 +4140,7 @@ class AsyncDualPipelineKernel:
         is_last_chunk: bool,
         aligned_facts: Optional[AlignedFacts] = None,
         fused_evidence: Optional[FusedEvidence] = None,
+        policy_snapshot: Optional[Any] = None,
     ) -> Optional[Any]:
         """
         统一 CutPlan 生产入口。
@@ -4174,6 +4177,7 @@ class AsyncDualPipelineKernel:
                 is_last_chunk=is_last_chunk,
                 aligned_facts=aligned_facts,
                 fused_evidence=fused_evidence,
+                policy_snapshot=policy_snapshot,
             )
             return self._normalize_soft_cut_plan(
                 plan=plan,
@@ -4188,6 +4192,7 @@ class AsyncDualPipelineKernel:
         words: Sequence[AnnotatedWord],
         stream_id: str,
         aligned_facts: Optional[AlignedFacts],
+        policy_snapshot: Optional[Any] = None,
     ) -> FusedEvidence:
         """
         构建评分层契约（FusedEvidence）。
@@ -4196,7 +4201,10 @@ class AsyncDualPipelineKernel:
         - 将 pipeline 内散落的 speaker-change/anchor 拼装逻辑收口为单入口。
         - 该层仅产出证据，不触发裁决，保持与 CutPlan 解耦。
         """
-        anchor_candidates = self._build_soft_cut_anchor_candidates(words=words)
+        anchor_candidates = self._build_soft_cut_anchor_candidates(
+            words=words,
+            policy_snapshot=policy_snapshot,
+        )
         pause_anchors = [item for item in anchor_candidates if item.anchor_type == AnchorType.PAUSE_ANCHOR]
         word_anchors = [item for item in anchor_candidates if item.anchor_type == AnchorType.WORD_BOUNDARY]
         semantic_anchors = [item for item in anchor_candidates if item.anchor_type == AnchorType.SEMANTIC_ANCHOR]
@@ -4379,6 +4387,7 @@ class AsyncDualPipelineKernel:
         is_last_chunk: bool,
         aligned_facts: Optional[AlignedFacts] = None,
         fused_evidence: Optional[FusedEvidence] = None,
+        policy_snapshot: Optional[Any] = None,
     ) -> Optional[Any]:
         """
         在评分层 -> 裁决层之间生成 CutPlan。
@@ -4407,7 +4416,10 @@ class AsyncDualPipelineKernel:
             chunk_end = chunk_start + 1e-3
 
         speaker_change_facts = self._build_soft_cut_speaker_change_facts(words=words)
-        anchor_candidates = self._build_soft_cut_anchor_candidates(words=words)
+        anchor_candidates = self._build_soft_cut_anchor_candidates(
+            words=words,
+            policy_snapshot=policy_snapshot,
+        )
         pause_anchors = [item for item in anchor_candidates if item.anchor_type == AnchorType.PAUSE_ANCHOR]
         word_anchors = [item for item in anchor_candidates if item.anchor_type == AnchorType.WORD_BOUNDARY]
         semantic_anchors = [item for item in anchor_candidates if item.anchor_type == AnchorType.SEMANTIC_ANCHOR]
@@ -4874,9 +4886,11 @@ class AsyncDualPipelineKernel:
         self,
         *,
         words: Sequence[AnnotatedWord],
+        policy_snapshot: Optional[Any] = None,
     ) -> List[AnchorCandidate]:
         anchors: List[AnchorCandidate] = []
         last_pause_anchor_index: Optional[int] = None
+        semantic_anchor_words = self._resolve_soft_cut_semantic_anchor_words(policy_snapshot)
         for index in range(1, len(words)):
             left = words[index - 1]
             right = words[index]
@@ -4931,7 +4945,7 @@ class AsyncDualPipelineKernel:
                 )
 
             right_word = str(right.word or "").strip().lower()
-            if right_word in self._soft_cut_semantic_conjunctions:
+            if right_word in semantic_anchor_words:
                 anchors.append(
                     AnchorCandidate(
                         anchor_type=AnchorType.SEMANTIC_ANCHOR,
@@ -4941,6 +4955,22 @@ class AsyncDualPipelineKernel:
                     )
                 )
         return anchors
+
+    def _resolve_soft_cut_semantic_anchor_words(
+        self,
+        policy_snapshot: Optional[Any],
+    ) -> set[str]:
+        if policy_snapshot is not None:
+            snapshot_words = getattr(policy_snapshot, "semantic_anchor_words", None)
+            if snapshot_words:
+                normalized = {
+                    str(item or "").strip().lower()
+                    for item in snapshot_words
+                    if str(item or "").strip()
+                }
+                if normalized:
+                    return normalized
+        return set(self._soft_cut_semantic_conjunctions)
 
     def _resolve_soft_cut_window_contexts(
         self,

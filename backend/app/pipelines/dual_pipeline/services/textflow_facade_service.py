@@ -9,10 +9,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
 from app.models.sensevoice_models import SentenceSegment, TextSource, WordTimestamp
 from app.schemas.pipeline_context import ProcessingContext
+from app.services.language_policy import build_language_policy_snapshot
 from app.services.alignment.types import (
     AlignedFacts,
     AnnotatedWord,
@@ -28,6 +29,9 @@ from app.services.alignment.types import (
     TextTrack,
     TextTrackBundle,
 )
+
+if TYPE_CHECKING:
+    from app.services.language_policy.types import LanguagePolicySnapshot
 
 
 @dataclass
@@ -74,6 +78,7 @@ class _TextflowFacadeHost(Protocol):
         words: Sequence[AnnotatedWord],
         stream_id: str,
         aligned_facts: Optional[AlignedFacts],
+        policy_snapshot: Optional["LanguagePolicySnapshot"] = None,
     ) -> FusedEvidence:
         ...
 
@@ -100,6 +105,7 @@ class _TextflowFacadeHost(Protocol):
         is_last_chunk: bool,
         aligned_facts: Optional[AlignedFacts] = None,
         fused_evidence: Optional[FusedEvidence] = None,
+        policy_snapshot: Optional["LanguagePolicySnapshot"] = None,
     ) -> Optional[Any]:
         ...
 
@@ -153,6 +159,7 @@ class TextflowFacadeService:
         variant: str = "legacy",
         speaker_id: Optional[str] = None,
         turn_id: Optional[str] = None,
+        policy_snapshot: Optional["LanguagePolicySnapshot"] = None,
     ) -> Layer456RunResult:
         """执行一次集合层→评分层→裁决层主路径（内部主入口）。"""
         time_words, time_source = self._resolve_alignment_time_words(
@@ -165,6 +172,7 @@ class TextflowFacadeService:
                 chosen_text_track=tracks.chosen_track,
                 sv_words=time_words,
                 vad_intervals=self._host._vad_intervals,
+                policy_snapshot=policy_snapshot,
             )
         )
         alignment_result = collection_output.alignment_result
@@ -194,6 +202,7 @@ class TextflowFacadeService:
                 language=detected_language,
                 speaker_id=speaker_id,
                 turn_id=turn_id,
+                policy_snapshot=policy_snapshot,
             )
         )
         injection_report = dict(scoring_output.injection_report or {})
@@ -235,6 +244,7 @@ class TextflowFacadeService:
             words=scoring_output.annotated_words,
             stream_id=decision_stream_id,
             aligned_facts=aligned_facts,
+            policy_snapshot=policy_snapshot,
         )
 
         decision_chunk_index = self._host._resolve_chunk_index_from_words(words=time_words)
@@ -249,6 +259,7 @@ class TextflowFacadeService:
             is_last_chunk=decision_is_last_chunk,
             aligned_facts=aligned_facts,
             fused_evidence=fused_evidence,
+            policy_snapshot=policy_snapshot,
         )
         decision_output = self._host._decision_processor.process(
             DecisionLayerInput(
@@ -259,6 +270,7 @@ class TextflowFacadeService:
                 fused_evidence=fused_evidence,
                 fallback_clean_text_ref=str(punctuation_clean_text or ""),
                 fallback_punctuation_positions=list(punctuation_positions or []),
+                policy_snapshot=policy_snapshot,
             ),
             stream_id=decision_stream_id,
             chunk_index=decision_chunk_index,
@@ -371,6 +383,20 @@ class TextflowFacadeService:
         punct_track = ctx.punct_track
         punctuation_positions = list(punct_track.positions) if punct_track and punct_track.positions else None
         punctuation_clean_text = punct_track.clean_text_ref if punct_track else None
+        policy_snapshot: Optional["LanguagePolicySnapshot"] = None
+        language_hint = str(
+            (tracks.chosen_track.language if tracks.chosen_track else "")
+            or getattr(ctx.audio_chunk, "language", "")
+            or ctx.sv_result.get("language")
+            or "auto"
+        )
+        try:
+            policy_snapshot = build_language_policy_snapshot(language_hint=language_hint)
+        except Exception:
+            self._host.logger.exception(
+                "Whisper 跳过路径语言策略快照编译失败: language_hint={}",
+                language_hint,
+            )
         run_result = self.run_collection_scoring_decision_once(
             tracks=tracks,
             sv_result=ctx.sv_result,
@@ -381,6 +407,7 @@ class TextflowFacadeService:
             variant="legacy",
             speaker_id=speaker_id,
             turn_id=turn_id,
+            policy_snapshot=policy_snapshot,
         )
 
         final_sentences = list(run_result.final_sentences)
