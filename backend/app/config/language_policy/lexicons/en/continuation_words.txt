@@ -1,0 +1,10 @@
+# English continuation words
+and
+but
+so
+because
+if
+then
+however
+therefore
+meanwhile
