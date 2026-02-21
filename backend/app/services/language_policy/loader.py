@@ -1,6 +1,6 @@
 """
 语言策略配置与词表加载器。
-V3.2.0+dev.20260219.08
+V3.2.0+dev.20260221.01
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ _LEXICON_CACHE: Dict[str, FrozenSet[str]] = {}
 
 def _default_policy_config() -> Dict[str, Any]:
     return {
-        "policy_version": "V3.2.0+dev.20260219.08",
+        "policy_version": "V3.2.0+dev.20260221.01",
         "default_language": "zh",
         "language_aliases": {
             "auto": "zh",
@@ -49,6 +49,15 @@ def _default_policy_config() -> Dict[str, Any]:
                 "thresholds": {
                     "final_min_mapping_coverage": 0.60,
                     "soft_cut_min_score": 0.35,
+                    "soft_cut_min_score_pause": 0.34,
+                    "soft_cut_min_score_punctuation": 0.40,
+                    "soft_cut_min_score_semantic": 0.35,
+                    "soft_cut_min_score_llm": 0.35,
+                    "soft_cut_min_score_fast_draft": 0.30,
+                    "soft_cut_pause_anchor_trigger_sec": 0.30,
+                    "soft_cut_pause_anchor_min_gap_sec": 0.70,
+                    "soft_cut_semantic_anchor_confidence": 0.70,
+                    "soft_cut_weak_punct_anchor_confidence": 0.60,
                 },
                 "carry_rules": {
                     "short_tail": [0.45, 2.20],
@@ -71,6 +80,15 @@ def _default_policy_config() -> Dict[str, Any]:
                 "thresholds": {
                     "final_min_mapping_coverage": 0.60,
                     "soft_cut_min_score": 0.35,
+                    "soft_cut_min_score_pause": 0.35,
+                    "soft_cut_min_score_punctuation": 0.35,
+                    "soft_cut_min_score_semantic": 0.35,
+                    "soft_cut_min_score_llm": 0.35,
+                    "soft_cut_min_score_fast_draft": 0.35,
+                    "soft_cut_pause_anchor_trigger_sec": 0.40,
+                    "soft_cut_pause_anchor_min_gap_sec": 1.00,
+                    "soft_cut_semantic_anchor_confidence": 0.30,
+                    "soft_cut_weak_punct_anchor_confidence": 0.00,
                 },
                 "carry_rules": {
                     "short_tail": [0.45, 2.20],
@@ -93,6 +111,15 @@ def _default_policy_config() -> Dict[str, Any]:
                 "thresholds": {
                     "final_min_mapping_coverage": 0.60,
                     "soft_cut_min_score": 0.35,
+                    "soft_cut_min_score_pause": 0.34,
+                    "soft_cut_min_score_punctuation": 0.40,
+                    "soft_cut_min_score_semantic": 0.35,
+                    "soft_cut_min_score_llm": 0.35,
+                    "soft_cut_min_score_fast_draft": 0.30,
+                    "soft_cut_pause_anchor_trigger_sec": 0.30,
+                    "soft_cut_pause_anchor_min_gap_sec": 0.70,
+                    "soft_cut_semantic_anchor_confidence": 0.70,
+                    "soft_cut_weak_punct_anchor_confidence": 0.60,
                 },
                 "carry_rules": {
                     "short_tail": [0.45, 2.20],
