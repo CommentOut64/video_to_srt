@@ -1,6 +1,6 @@
 """
 裁决层切分处理器（SegmentationProcessor）。
-V3.2.0+dev.20260219.08
+V3.2.0+dev.20260220.01
 """
 from __future__ import annotations
 
@@ -49,6 +49,16 @@ class SegmentationProcessor:
         "speaker_change",
         "hard_limit_forced",
     }
+    _CUT_PLAN_CJK_FAST_DRAFT_SINGLETON_MIN_LEFT_WORDS = 3
+    _CUT_PLAN_CJK_FAST_DRAFT_SHORT_PREFIX_MAX_WORDS = 3
+    _CUT_PLAN_CJK_PUNCT_FRAGMENT_MAX_GAP_SEC = 0.65
+    _CUT_PLAN_CJK_PUNCT_FRAGMENT_SINGLETON_MAX_DURATION_SEC = 1.20
+    _CUT_PLAN_CJK_PUNCT_FRAGMENT_SHORT_MAX_DURATION_SEC = 0.95
+    _CUT_PLAN_CJK_PUNCT_FRAGMENT_CONTINUATION_MAX_WORDS = 4
+    _CUT_PLAN_CJK_PUNCT_FRAGMENT_CONTINUATION_MAX_DURATION_SEC = 2.40
+    _CUT_PLAN_CJK_SHORT_PREFIX_MAX_WORDS = 3
+    _CUT_PLAN_CJK_SHORT_PREFIX_MAX_DURATION_SEC = 1.10
+    _CUT_PLAN_CJK_SHORT_PREFIX_MAX_GAP_SEC = 0.55
     _SOFT_CUT_SHORT_TURN_CONTINUATION_SEC = 0.75
     _SOFT_CUT_SHORT_TURN_CONTINUATION_GAP_SEC = 0.80
     _SPEAKER_REPAIR_MIN_TURN_DURATION_SEC = 0.45
@@ -168,6 +178,8 @@ class SegmentationProcessor:
         all_sentence_segments, applied_window_ids, output_traces = self._split_by_cut_plan(
             words_for_split=words_for_split,
             cut_plan=cut_plan,
+            aligned_facts=aligned_facts,
+            policy_snapshot=data.policy_snapshot,
             fallback_clean_text_ref=str(getattr(data, "fallback_clean_text_ref", "") or ""),
             fallback_punctuation_positions=list(
                 getattr(data, "fallback_punctuation_positions", []) or []
@@ -362,6 +374,8 @@ class SegmentationProcessor:
         *,
         words_for_split: List[WordTimestamp],
         cut_plan: Any,
+        aligned_facts: Optional[Any] = None,
+        policy_snapshot: Optional["LanguagePolicySnapshot"] = None,
         fallback_clean_text_ref: str = "",
         fallback_punctuation_positions: Optional[Sequence[Any]] = None,
     ) -> Tuple[List[SentenceSegment], List[str], List[OutputTrace]]:
@@ -374,6 +388,13 @@ class SegmentationProcessor:
         """
         decisions = list(getattr(cut_plan, "decisions", []) or [])
         if len(words_for_split) <= 1 or not decisions:
+            fast_draft_fallback = self._try_split_by_fast_draft_cuts(
+                words_for_split=words_for_split,
+                aligned_facts=aligned_facts,
+                policy_snapshot=policy_snapshot,
+            )
+            if fast_draft_fallback is not None:
+                return fast_draft_fallback
             sentence_segments = self._final_splitter.split(
                 words_for_split,
                 clean_text=fallback_clean_text_ref or None,
@@ -392,6 +413,7 @@ class SegmentationProcessor:
             split_points=split_points,
             split_to_window=split_to_window,
             decision_by_window=decision_by_window,
+            policy_snapshot=policy_snapshot,
         )
         split_points = self._augment_split_points_with_sentence_end_punct(
             words_for_split=words_for_split,
@@ -399,6 +421,20 @@ class SegmentationProcessor:
             split_to_mapping=split_to_mapping,
         )
         if not split_points:
+            fast_draft_decision_fallback = self._try_split_by_fast_draft_decisions(
+                words_for_split=words_for_split,
+                decisions=decisions,
+                policy_snapshot=policy_snapshot,
+            )
+            if fast_draft_decision_fallback is not None:
+                return fast_draft_decision_fallback
+            fast_draft_fallback = self._try_split_by_fast_draft_cuts(
+                words_for_split=words_for_split,
+                aligned_facts=aligned_facts,
+                policy_snapshot=policy_snapshot,
+            )
+            if fast_draft_fallback is not None:
+                return fast_draft_fallback
             sentence_segments = self._final_splitter.split(
                 words_for_split,
                 clean_text=fallback_clean_text_ref or None,
@@ -451,6 +487,11 @@ class SegmentationProcessor:
             sentence_segments=sentence_segments,
             output_traces=output_traces,
         )
+        sentence_segments, output_traces = self._merge_cjk_punctuation_fragments(
+            sentence_segments=sentence_segments,
+            output_traces=output_traces,
+            policy_snapshot=policy_snapshot,
+        )
         applied_window_ids = sorted(
             {
                 str(split_to_window.get(split_idx, "") or "")
@@ -480,12 +521,14 @@ class SegmentationProcessor:
         split_points: Sequence[int],
         split_to_window: Dict[int, str],
         decision_by_window: Dict[str, Any],
+        policy_snapshot: Optional["LanguagePolicySnapshot"] = None,
     ) -> List[int]:
         if len(words_for_split) <= 1 or not split_points:
             return list(split_points)
 
         kept_split_points: List[int] = []
         for idx, split_idx in enumerate(split_points):
+            previous_split = split_points[idx - 1] if idx > 0 else None
             next_split = split_points[idx + 1] if idx + 1 < len(split_points) else None
             window_id = str(split_to_window.get(split_idx, "") or "")
             decision = decision_by_window.get(window_id)
@@ -495,6 +538,14 @@ class SegmentationProcessor:
                 next_split=next_split,
                 decision=decision,
             )
+            if not is_drop:
+                is_drop = self._should_drop_split_for_short_prefix_guard(
+                    words_for_split=words_for_split,
+                    split_idx=split_idx,
+                    previous_split=previous_split,
+                    decision=decision,
+                    policy_snapshot=policy_snapshot,
+                )
             if not is_drop:
                 kept_split_points.append(int(split_idx))
         return kept_split_points
@@ -526,15 +577,29 @@ class SegmentationProcessor:
 
         prev_tail = str(getattr(left_word, "word", "") or "").strip()
         next_token = str(getattr(first_tail_word, "word", "") or "").strip()
-        if is_sentence_end_punct(prev_tail, next_token, sentence_end_chars=tuple(self._SENTENCE_END_PUNCT)):
-            return False
 
         if singleton_word_count == 1:
             singleton_start = float(getattr(first_tail_word, "start", right_start) or right_start)
             singleton_end = float(getattr(first_tail_word, "end", singleton_start) or singleton_start)
             singleton_duration = max(0.0, singleton_end - singleton_start)
             singleton_token = str(getattr(first_tail_word, "word", "") or "").strip()
-            if not self._is_lowercase_continuation_token(singleton_token):
+            is_lowercase_continuation = self._is_lowercase_continuation_token(singleton_token)
+            is_cjk_fast_draft_tail = self._is_cjk_fast_draft_singleton_tail(
+                words_for_split=words_for_split,
+                split_idx=split_idx,
+                singleton_token=singleton_token,
+                decision=decision,
+                next_split=next_split,
+            )
+            if is_cjk_fast_draft_tail:
+                return True
+            if is_sentence_end_punct(
+                prev_tail,
+                next_token,
+                sentence_end_chars=tuple(self._SENTENCE_END_PUNCT),
+            ):
+                return False
+            if not is_lowercase_continuation and not is_cjk_fast_draft_tail:
                 return False
 
             if next_split is None:
@@ -554,6 +619,12 @@ class SegmentationProcessor:
         # Why: 末尾仅剩 acronym+noun（如 `DDLC character?`）时，pause/speaker 触发切分常是不自然误切。
         if next_split is not None:
             return False
+        if is_sentence_end_punct(
+            prev_tail,
+            next_token,
+            sentence_end_chars=tuple(self._SENTENCE_END_PUNCT),
+        ):
+            return False
         if singleton_word_count > self._CUT_PLAN_SHORT_TAIL_MAX_WORDS:
             return False
         reason = str(getattr(decision, "reason", "") or "")
@@ -572,6 +643,129 @@ class SegmentationProcessor:
             gap_sec <= self._CUT_PLAN_SHORT_TAIL_MAX_GAP_SEC
             and tail_duration <= self._CUT_PLAN_SHORT_TAIL_MAX_DURATION_SEC
         )
+
+    def _should_drop_split_for_short_prefix_guard(
+        self,
+        *,
+        words_for_split: Sequence[WordTimestamp],
+        split_idx: int,
+        previous_split: Optional[int],
+        decision: Optional[Any],
+        policy_snapshot: Optional["LanguagePolicySnapshot"],
+    ) -> bool:
+        """
+        CJK 前缀短句守门：抑制 chunk 开头被 pause/speaker 误切成“短前缀句”。
+
+        Why:
+        - 双流 CJK 下，常见首句被错误切成 `如` / `其实` / `这起案件`；
+        - 这些切点多由弱 pause 触发，且边界处并无句末强标点。
+        """
+        if not self._is_cjk_policy_language(policy_snapshot):
+            return False
+        if previous_split is not None:
+            return False
+        if split_idx < 0 or split_idx >= len(words_for_split) - 1:
+            return False
+
+        reason = str(getattr(decision, "reason", "") or "")
+        if reason not in {"pause", "speaker_change", "fast_draft"}:
+            return False
+
+        left_word_count = split_idx + 1
+        if left_word_count <= 0 or left_word_count > self._CUT_PLAN_CJK_SHORT_PREFIX_MAX_WORDS:
+            return False
+
+        left_words = list(words_for_split[:left_word_count])
+        if not left_words:
+            return False
+        left_start = float(getattr(left_words[0], "start", 0.0) or 0.0)
+        left_end = float(getattr(left_words[-1], "end", left_start) or left_start)
+        prefix_duration = max(0.0, left_end - left_start)
+        if prefix_duration > self._CUT_PLAN_CJK_SHORT_PREFIX_MAX_DURATION_SEC:
+            return False
+
+        right_word = words_for_split[split_idx + 1]
+        right_start = float(getattr(right_word, "start", left_end) or left_end)
+        boundary_gap_sec = max(0.0, right_start - left_end)
+        if boundary_gap_sec > self._CUT_PLAN_CJK_SHORT_PREFIX_MAX_GAP_SEC:
+            return False
+
+        left_tail_token = str(getattr(left_words[-1], "word", "") or "").strip()
+        right_head_token = str(getattr(right_word, "word", "") or "").strip()
+        if is_sentence_end_punct(
+            left_tail_token,
+            right_head_token,
+            sentence_end_chars=tuple(self._SENTENCE_END_PUNCT),
+        ):
+            return False
+
+        normalized_prefix_tokens = [
+            self._normalize_boundary_token(str(getattr(item, "word", "") or ""))
+            for item in left_words
+        ]
+        normalized_prefix_tokens = [item for item in normalized_prefix_tokens if item]
+        if not normalized_prefix_tokens:
+            return False
+        if any(any(char.isalpha() and char.isascii() for char in token) for token in normalized_prefix_tokens):
+            return False
+        single_cjk_count = sum(
+            1 for token in normalized_prefix_tokens if self._is_single_cjk_token(token)
+        )
+        total_char_count = sum(len(token) for token in normalized_prefix_tokens)
+        if left_word_count == 1:
+            return True
+        if left_word_count == 2:
+            return bool(single_cjk_count >= 2 or total_char_count <= 3)
+        if left_word_count >= 3 and single_cjk_count < 2:
+            return False
+        return True
+
+    def _is_cjk_fast_draft_singleton_tail(
+        self,
+        *,
+        words_for_split: Sequence[WordTimestamp],
+        split_idx: int,
+        singleton_token: str,
+        decision: Optional[Any],
+        next_split: Optional[int],
+    ) -> bool:
+        """
+        CJK + fast_draft 特殊守门：避免“最后一字被切出去”。
+
+        Why:
+        - 中文/日文在字级时间轴下，fast_draft 切点若落在词尾前，常形成 `XX...男 | 子`。
+        - 该场景在业务上几乎总是误切，应在切点阶段直接丢弃。
+        """
+        if next_split is not None:
+            return False
+        reason = str(getattr(decision, "reason", "") or "")
+        source = str(getattr(decision, "source", "") or "")
+        if reason != "fast_draft" and source != "fast_draft":
+            return False
+        if split_idx + 1 < self._CUT_PLAN_CJK_FAST_DRAFT_SINGLETON_MIN_LEFT_WORDS:
+            return False
+        if not self._is_single_cjk_token(singleton_token):
+            return False
+        return True
+
+    @staticmethod
+    def _is_single_cjk_token(token: str) -> bool:
+        # V3.2.0+dev.20260221.01: 先归一化去尾标点，避免 `件。/人。` 误判为“非单字”。
+        text = SegmentationProcessor._normalize_boundary_token(token)
+        if len(text) != 1:
+            return False
+        return SegmentationProcessor._is_cjk_text(text)
+
+    @staticmethod
+    def _is_cjk_text(text: str) -> bool:
+        for char in str(text or ""):
+            if "\u4e00" <= char <= "\u9fff":
+                return True
+            if "\u3040" <= char <= "\u30ff":
+                return True
+            if "\uac00" <= char <= "\ud7af":
+                return True
+        return False
 
     def _resolve_cut_plan_split_points(
         self,
@@ -616,6 +810,340 @@ class SegmentationProcessor:
 
         split_points = sorted(split_to_window.keys())
         return split_points, split_to_window, split_to_mapping
+
+    def _try_split_by_fast_draft_decisions(
+        self,
+        *,
+        words_for_split: Sequence[WordTimestamp],
+        decisions: Sequence[Any],
+        policy_snapshot: Optional["LanguagePolicySnapshot"],
+    ) -> Optional[Tuple[List[SentenceSegment], List[str], List[OutputTrace]]]:
+        """
+        CutPlan 已有决策但切点全部失效时，优先回写 fast_draft 决策本身。
+
+        Why:
+        - 线上出现 `decision_count>0` 且 `split_points=0` 后直接走 default splitter；
+        - fast_draft 决策仍然携带可用的事件时间，不应在这一步被完全丢弃。
+        """
+        if len(words_for_split) <= 1 or not decisions:
+            return None
+        if not self._is_cjk_policy_language(policy_snapshot):
+            return None
+
+        split_payload_by_idx: Dict[int, Dict[str, Any]] = {}
+        for decision in sorted(
+            decisions,
+            key=lambda item: (
+                float(getattr(item, "time", 0.0) or 0.0),
+                str(getattr(item, "window_id", "") or ""),
+            ),
+        ):
+            reason = str(getattr(decision, "reason", "") or "")
+            source = str(getattr(decision, "source", "") or "")
+            depends_on_fast_draft = bool(getattr(decision, "depends_on_fast_draft", False))
+            if reason != "fast_draft" and source != "fast_draft" and not depends_on_fast_draft:
+                continue
+
+            decision_time = self._optional_float(getattr(decision, "time", None))
+            if decision_time is None:
+                continue
+            selection = self._boundary_mapper.select_best_boundary(
+                words=words_for_split,
+                event_time=decision_time,
+            )
+            if selection is None:
+                continue
+            split_idx = int(selection.split_idx)
+            if split_idx < 0 or split_idx >= len(words_for_split) - 1:
+                continue
+            if self._is_fast_draft_fallback_short_prefix_boundary(
+                words_for_split=words_for_split,
+                split_idx=split_idx,
+            ):
+                continue
+            if self._is_fast_draft_fallback_singleton_tail_boundary(
+                words_for_split=words_for_split,
+                split_idx=split_idx,
+            ):
+                continue
+
+            payload = {
+                "window_id": str(getattr(decision, "window_id", "") or ""),
+                "split_reason": reason or "fast_draft",
+                "split_risk": str(getattr(decision, "risk", "") or ""),
+                "pyannote_frame_time": self._optional_float(
+                    getattr(decision, "pyannote_frame_time", None),
+                ),
+                "decision_time": float(decision_time),
+                "mapped_cut_time": self._resolve_split_boundary_time(
+                    words_for_split=words_for_split,
+                    split_idx=split_idx,
+                ),
+                "mapping_quality": "gap" if selection.is_in_gap else "boundary",
+                "mapping_reason": "fast_draft_decision_fallback",
+                "selection_score": float(selection.score),
+                "anchor_score": float(getattr(decision, "anchor_score", 0.0) or 0.0),
+            }
+            existing_payload = split_payload_by_idx.get(split_idx)
+            if existing_payload is None:
+                split_payload_by_idx[split_idx] = payload
+                continue
+            if float(payload["anchor_score"]) >= float(existing_payload.get("anchor_score", 0.0) or 0.0):
+                split_payload_by_idx[split_idx] = payload
+
+        split_points = sorted(split_payload_by_idx.keys())
+        if not split_points:
+            return None
+
+        sentence_segments: List[SentenceSegment] = []
+        output_traces: List[OutputTrace] = []
+        start_idx = 0
+        sentence_index = 0
+        for split_idx in split_points:
+            sentence = self._final_splitter._build_sentence(words_for_split, start_idx, split_idx)
+            sentence_segments.append(sentence)
+            payload = split_payload_by_idx.get(split_idx, {})
+            pyannote_frame_time = self._optional_float(payload.get("pyannote_frame_time"))
+            if pyannote_frame_time is None:
+                pyannote_frame_time = self._optional_float(payload.get("decision_time"))
+            output_traces.append(
+                OutputTrace(
+                    sentence_index=sentence_index,
+                    split_reason=str(payload.get("split_reason", "fast_draft")),
+                    split_risk=str(payload.get("split_risk", "")),
+                    window_id=str(payload.get("window_id", "")),
+                    pyannote_frame_time=pyannote_frame_time,
+                    mapped_cut_time=float(payload.get("mapped_cut_time", sentence.end)),
+                    mapping_quality=str(payload.get("mapping_quality", "boundary")),
+                    mapping_reason=str(
+                        payload.get("mapping_reason", "fast_draft_decision_fallback")
+                    ),
+                    sentence_start=float(sentence.start),
+                    sentence_end=float(sentence.end),
+                )
+            )
+            start_idx = split_idx + 1
+            sentence_index += 1
+
+        if start_idx < len(words_for_split):
+            tail_sentence = self._final_splitter._build_sentence(
+                words_for_split,
+                start_idx,
+                len(words_for_split) - 1,
+            )
+            sentence_segments.append(tail_sentence)
+            output_traces.append(
+                OutputTrace(
+                    sentence_index=sentence_index,
+                    split_reason="tail_flush",
+                    split_risk="",
+                    window_id="",
+                    pyannote_frame_time=None,
+                    mapped_cut_time=float(tail_sentence.end),
+                    mapping_quality="tail",
+                    mapping_reason="tail_flush",
+                    sentence_start=float(tail_sentence.start),
+                    sentence_end=float(tail_sentence.end),
+                )
+            )
+        applied_window_ids = sorted(
+            {
+                str(payload.get("window_id", "") or "")
+                for payload in split_payload_by_idx.values()
+                if str(payload.get("window_id", "") or "")
+            }
+        )
+        return sentence_segments, applied_window_ids, output_traces
+
+    def _try_split_by_fast_draft_cuts(
+        self,
+        *,
+        words_for_split: Sequence[WordTimestamp],
+        aligned_facts: Optional[Any],
+        policy_snapshot: Optional["LanguagePolicySnapshot"],
+    ) -> Optional[Tuple[List[SentenceSegment], List[str], List[OutputTrace]]]:
+        """
+        CutPlan 无法产出有效切点时，优先尝试快流切点回写。
+
+        Why:
+        - CJK 双流在慢流弱标点场景常出现“有窗口无决策”，直接回退 default_splitter 会漏切。
+        - fast_draft 切点时间更稳定，作为 fallback 可显著降低错切/漏切。
+        """
+        if len(words_for_split) <= 1:
+            return None
+        if not self._is_cjk_policy_language(policy_snapshot):
+            return None
+        fast_draft_cuts = list(getattr(aligned_facts, "fast_draft_cuts", []) or [])
+        if not fast_draft_cuts:
+            return None
+
+        split_to_mapping: Dict[int, Dict[str, Any]] = {}
+        for raw_cut in fast_draft_cuts:
+            try:
+                cut_time = float(raw_cut)
+            except (TypeError, ValueError):
+                continue
+            selection = self._boundary_mapper.select_best_boundary(
+                words=words_for_split,
+                event_time=cut_time,
+            )
+            if selection is None:
+                continue
+            split_idx = int(selection.split_idx)
+            if split_idx < 0 or split_idx >= len(words_for_split) - 1:
+                continue
+            if self._is_fast_draft_fallback_short_prefix_boundary(
+                words_for_split=words_for_split,
+                split_idx=split_idx,
+            ):
+                continue
+            if self._is_fast_draft_fallback_singleton_tail_boundary(
+                words_for_split=words_for_split,
+                split_idx=split_idx,
+            ):
+                continue
+            split_to_mapping[split_idx] = {
+                "mapped_cut_time": self._resolve_split_boundary_time(
+                    words_for_split=words_for_split,
+                    split_idx=split_idx,
+                ),
+                "mapping_quality": "gap" if selection.is_in_gap else "boundary",
+                "mapping_reason": "fast_draft_boundary_fallback",
+                "selection_score": float(selection.score),
+            }
+        split_points = sorted(split_to_mapping.keys())
+        if not split_points:
+            return None
+
+        sentence_segments: List[SentenceSegment] = []
+        output_traces: List[OutputTrace] = []
+        start_idx = 0
+        sentence_index = 0
+        for split_idx in split_points:
+            sentence = self._final_splitter._build_sentence(words_for_split, start_idx, split_idx)
+            sentence_segments.append(sentence)
+            mapped_cut_time = self._optional_float(
+                split_to_mapping.get(split_idx, {}).get("mapped_cut_time")
+            )
+            output_traces.append(
+                OutputTrace(
+                    sentence_index=sentence_index,
+                    split_reason="fast_draft",
+                    split_risk="fallback",
+                    window_id="",
+                    pyannote_frame_time=None,
+                    mapped_cut_time=float(mapped_cut_time if mapped_cut_time is not None else sentence.end),
+                    mapping_quality=str(
+                        split_to_mapping.get(split_idx, {}).get("mapping_quality", "boundary")
+                    ),
+                    mapping_reason="fast_draft_boundary_fallback",
+                    sentence_start=float(sentence.start),
+                    sentence_end=float(sentence.end),
+                )
+            )
+            start_idx = split_idx + 1
+            sentence_index += 1
+
+        if start_idx < len(words_for_split):
+            tail_sentence = self._final_splitter._build_sentence(
+                words_for_split,
+                start_idx,
+                len(words_for_split) - 1,
+            )
+            sentence_segments.append(tail_sentence)
+            output_traces.append(
+                OutputTrace(
+                    sentence_index=sentence_index,
+                    split_reason="tail_flush",
+                    split_risk="",
+                    window_id="",
+                    pyannote_frame_time=None,
+                    mapped_cut_time=float(tail_sentence.end),
+                    mapping_quality="tail",
+                    mapping_reason="tail_flush",
+                    sentence_start=float(tail_sentence.start),
+                    sentence_end=float(tail_sentence.end),
+                )
+            )
+        return sentence_segments, [], output_traces
+
+    def _is_fast_draft_fallback_singleton_tail_boundary(
+        self,
+        *,
+        words_for_split: Sequence[WordTimestamp],
+        split_idx: int,
+    ) -> bool:
+        if split_idx < 0 or split_idx >= len(words_for_split) - 1:
+            return False
+        tail_count = len(words_for_split) - split_idx - 1
+        if tail_count != 1:
+            return False
+        if split_idx + 1 < self._CUT_PLAN_CJK_FAST_DRAFT_SINGLETON_MIN_LEFT_WORDS:
+            return False
+
+        left_word = words_for_split[split_idx]
+        tail_word = words_for_split[split_idx + 1]
+
+        left_token = str(getattr(left_word, "word", "") or "").strip()
+        tail_token = str(getattr(tail_word, "word", "") or "").strip()
+        return self._is_single_cjk_token(tail_token)
+
+    def _is_fast_draft_fallback_short_prefix_boundary(
+        self,
+        *,
+        words_for_split: Sequence[WordTimestamp],
+        split_idx: int,
+    ) -> bool:
+        if split_idx < 0 or split_idx >= len(words_for_split) - 1:
+            return False
+        left_word_count = split_idx + 1
+        if left_word_count <= 0 or left_word_count > self._CUT_PLAN_CJK_FAST_DRAFT_SHORT_PREFIX_MAX_WORDS:
+            return False
+        left_start = float(getattr(words_for_split[0], "start", 0.0) or 0.0)
+        left_end = float(getattr(words_for_split[split_idx], "end", left_start) or left_start)
+        prefix_duration_sec = max(0.0, left_end - left_start)
+        if prefix_duration_sec > self._CUT_PLAN_CJK_SHORT_PREFIX_MAX_DURATION_SEC:
+            return False
+        right_word = words_for_split[split_idx + 1]
+        right_start = float(getattr(right_word, "start", left_end) or left_end)
+        boundary_gap_sec = max(0.0, right_start - left_end)
+        if boundary_gap_sec > self._CUT_PLAN_CJK_SHORT_PREFIX_MAX_GAP_SEC:
+            return False
+        left_tail = str(getattr(words_for_split[split_idx], "word", "") or "").strip()
+        right_head = str(getattr(right_word, "word", "") or "").strip()
+        if is_sentence_end_punct(
+            left_tail,
+            right_head,
+            sentence_end_chars=tuple(self._SENTENCE_END_PUNCT),
+        ):
+            return False
+        normalized_prefix_tokens = [
+            self._normalize_boundary_token(str(getattr(item, "word", "") or ""))
+            for item in list(words_for_split[:left_word_count])
+        ]
+        normalized_prefix_tokens = [item for item in normalized_prefix_tokens if item]
+        if not normalized_prefix_tokens:
+            return False
+        single_cjk_count = sum(
+            1 for token in normalized_prefix_tokens if self._is_single_cjk_token(token)
+        )
+        total_char_count = sum(len(token) for token in normalized_prefix_tokens)
+        if left_word_count == 1:
+            return True
+        if left_word_count == 2:
+            return bool(single_cjk_count >= 2 or total_char_count <= 3)
+        if left_word_count >= 3 and single_cjk_count < 2:
+            return False
+        return True
+
+    @staticmethod
+    def _is_cjk_policy_language(
+        policy_snapshot: Optional["LanguagePolicySnapshot"],
+    ) -> bool:
+        language_tag = str(getattr(policy_snapshot, "language_tag", "") or "").strip().lower()
+        if not language_tag:
+            return False
+        return language_tag.startswith(("zh", "yue", "ja", "jp", "ko"))
 
     def _augment_split_points_with_sentence_end_punct(
         self,
@@ -947,6 +1475,166 @@ class SegmentationProcessor:
             output_traces = self._renumber_output_traces(output_traces)
         return sentence_segments, output_traces
 
+    def _merge_cjk_punctuation_fragments(
+        self,
+        *,
+        sentence_segments: List[SentenceSegment],
+        output_traces: List[OutputTrace],
+        policy_snapshot: Optional["LanguagePolicySnapshot"] = None,
+    ) -> Tuple[List[SentenceSegment], List[OutputTrace]]:
+        """
+        CJK + CutPlan 标点守门：回并逗号等弱断句导致的短碎片句。
+
+        Why:
+        - 双流 CJK 在慢流弱标点密集场景下，常出现 `punctuation` 连续落切导致的“短右句碎片”。
+        - 该守门仅在 CJK 生效，且仅处理非强句末边界，避免影响英文与正常句末切分。
+        """
+        if len(sentence_segments) < 2 or not self._is_cjk_policy_language(policy_snapshot):
+            return sentence_segments, output_traces
+
+        sentence_end_chars = self._resolve_sentence_end_chars(policy_snapshot)
+        continuation_words = {
+            self._normalize_boundary_token(str(item or ""))
+            for item in list(getattr(policy_snapshot, "continuation_words", frozenset()) or [])
+            if self._normalize_boundary_token(str(item or ""))
+        }
+        traces = list(output_traces or [])
+        merged_sentences: List[SentenceSegment] = []
+        merged_traces: List[OutputTrace] = []
+        index = 0
+        while index < len(sentence_segments):
+            if index >= len(sentence_segments) - 1:
+                merged_sentences.append(sentence_segments[index])
+                if index < len(traces):
+                    merged_traces.append(traces[index])
+                index += 1
+                continue
+
+            left_sentence = sentence_segments[index]
+            right_sentence = sentence_segments[index + 1]
+            left_trace = traces[index] if index < len(traces) else None
+            if not self._should_merge_cjk_punctuation_boundary(
+                left_sentence=left_sentence,
+                right_sentence=right_sentence,
+                left_trace=left_trace,
+                continuation_words=continuation_words,
+                sentence_end_chars=sentence_end_chars,
+            ):
+                merged_sentences.append(left_sentence)
+                if left_trace is not None:
+                    merged_traces.append(left_trace)
+                index += 1
+                continue
+
+            left_words = list(left_sentence.words or [])
+            right_words = list(right_sentence.words or [])
+            if not left_words or not right_words:
+                merged_sentences.append(left_sentence)
+                if left_trace is not None:
+                    merged_traces.append(left_trace)
+                index += 1
+                continue
+
+            merged_words = left_words + right_words
+            rebuilt_sentence = self._final_splitter._build_sentence(
+                merged_words,
+                0,
+                len(merged_words) - 1,
+            )
+            self._copy_sentence_metadata(left_sentence, rebuilt_sentence)
+            merged_sentences.append(rebuilt_sentence)
+
+            next_trace = traces[index + 1] if (index + 1) < len(traces) else None
+            if next_trace is None:
+                next_trace = OutputTrace(
+                    sentence_index=len(merged_sentences) - 1,
+                    split_reason="tail_flush",
+                    split_risk="",
+                    window_id="",
+                    pyannote_frame_time=None,
+                    mapped_cut_time=float(rebuilt_sentence.end),
+                    mapping_quality="merged",
+                    mapping_reason="cjk_punctuation_guard",
+                    sentence_start=float(rebuilt_sentence.start),
+                    sentence_end=float(rebuilt_sentence.end),
+                )
+            else:
+                next_trace = OutputTrace(
+                    sentence_index=len(merged_sentences) - 1,
+                    split_reason=str(next_trace.split_reason or ""),
+                    split_risk=str(next_trace.split_risk or ""),
+                    window_id=str(next_trace.window_id or ""),
+                    pyannote_frame_time=next_trace.pyannote_frame_time,
+                    mapped_cut_time=next_trace.mapped_cut_time,
+                    mapping_quality=str(next_trace.mapping_quality or ""),
+                    mapping_reason=str(next_trace.mapping_reason or ""),
+                    sentence_start=float(rebuilt_sentence.start),
+                    sentence_end=float(rebuilt_sentence.end),
+                )
+            merged_traces.append(next_trace)
+            index += 2
+
+        merged_traces = self._renumber_output_traces(merged_traces)
+        return merged_sentences, merged_traces
+
+    def _should_merge_cjk_punctuation_boundary(
+        self,
+        *,
+        left_sentence: SentenceSegment,
+        right_sentence: SentenceSegment,
+        left_trace: Optional[OutputTrace],
+        continuation_words: Set[str],
+        sentence_end_chars: Tuple[str, ...],
+    ) -> bool:
+        if left_trace is None:
+            return False
+        if str(left_trace.split_reason or "") != "punctuation":
+            return False
+
+        left_words = list(left_sentence.words or [])
+        right_words = list(right_sentence.words or [])
+        if not left_words or not right_words:
+            return False
+
+        left_tail_raw = str(getattr(left_words[-1], "word", "") or "").strip()
+        right_head_raw = str(getattr(right_words[0], "word", "") or "").strip()
+        if is_sentence_end_punct(
+            left_tail_raw,
+            right_head_raw,
+            sentence_end_chars=sentence_end_chars,
+        ):
+            return False
+
+        left_end = float(getattr(left_words[-1], "end", 0.0) or 0.0)
+        right_start = float(getattr(right_words[0], "start", left_end) or left_end)
+        gap_sec = max(0.0, right_start - left_end)
+        if gap_sec > self._CUT_PLAN_CJK_PUNCT_FRAGMENT_MAX_GAP_SEC:
+            return False
+
+        right_sentence_start = float(getattr(right_sentence, "start", right_start) or right_start)
+        right_sentence_end = float(getattr(right_sentence, "end", right_sentence_start) or right_sentence_start)
+        right_duration_sec = max(0.0, right_sentence_end - right_sentence_start)
+        right_word_count = len(right_words)
+        right_head_norm = self._normalize_boundary_token(right_head_raw)
+
+        # Why: 单字/单词右句在 CJK 标点切分下高概率是碎片，优先回并。
+        if right_word_count == 1:
+            return right_duration_sec <= self._CUT_PLAN_CJK_PUNCT_FRAGMENT_SINGLETON_MAX_DURATION_SEC
+
+        # Why: 连接词起句通常是句内延续，不应被弱标点直接截断。
+        if right_head_norm in continuation_words:
+            return (
+                right_word_count <= self._CUT_PLAN_CJK_PUNCT_FRAGMENT_CONTINUATION_MAX_WORDS
+                and right_duration_sec
+                <= self._CUT_PLAN_CJK_PUNCT_FRAGMENT_CONTINUATION_MAX_DURATION_SEC
+            )
+
+        # Why: 短右句且首词为单个 CJK 字，常见于“字级词流 + 逗号切分”误切。
+        if self._is_single_cjk_token(right_head_norm):
+            return right_duration_sec <= self._CUT_PLAN_CJK_PUNCT_FRAGMENT_SHORT_MAX_DURATION_SEC
+
+        return False
+
     @staticmethod
     def _is_lowercase_continuation_token(token: str) -> bool:
         text = str(token or "").strip().lstrip("\"'“”‘’([{")
@@ -995,6 +1683,15 @@ class SegmentationProcessor:
 
         decisions = list(getattr(cut_plan, "decisions", []) or [])
         deferred_cuts = list(getattr(cut_plan, "deferred_cuts", []) or [])
+        generation_report = dict(getattr(cut_plan, "generation_report", {}) or {})
+        fusion_output_window_count = int(
+            generation_report.get(
+                "fusion_output_window_count",
+                generation_report.get("output_window_count", 0),
+            )
+            or 0
+        )
+        fallback_reason = str(generation_report.get("fallback_reason", "") or "")
         decision_window_ids = [
             str(getattr(item, "window_id", "") or "")
             for item in decisions
@@ -1035,6 +1732,9 @@ class SegmentationProcessor:
             state_value = str(getattr(getattr(item, "state", None), "value", "") or "").lower()
             if state_value in deferred_state_stats:
                 deferred_state_stats[state_value] += 1
+        diagnostic_code = ""
+        if fusion_output_window_count > 0 and len(decisions) <= 0:
+            diagnostic_code = "E_SOFT_CUT_WINDOWS_WITHOUT_DECISIONS"
         return {
             "enabled": True,
             "plan_id": str(getattr(cut_plan, "plan_id", "") or ""),
@@ -1047,6 +1747,9 @@ class SegmentationProcessor:
             "reason_stats": reason_stats,
             "risk_stats": risk_stats,
             "source_stats": source_stats,
+            "fusion_output_window_count": fusion_output_window_count,
+            "fallback_reason": fallback_reason,
+            "diagnostic_code": diagnostic_code,
         }
 
     def _consume_pending_prefix_words(self, stream_id: str) -> List[WordTimestamp]:
