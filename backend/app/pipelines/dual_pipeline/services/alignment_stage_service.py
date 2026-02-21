@@ -52,6 +52,11 @@ class AlignmentStageService:
             fused_evidence = run_result.fused_evidence
             injection_stats = dict(run_result.injection_stats)
             split_stats = dict(run_result.split_stats)
+            soft_cut_observe_snapshot = host._update_soft_cut_observability(
+                split_stats=split_stats,
+                chunk_index=ctx.chunk_index,
+                stage="sensevoice_only_alignment_stage",
+            )
             ctx.finalization_metrics = {
                 "coverage": alignment_result.coverage,
                 "gap_ratio": alignment_result.gap_ratio,
@@ -64,6 +69,8 @@ class AlignmentStageService:
             }
             for key, value in split_stats.items():
                 ctx.finalization_metrics[f"split_{key}"] = value
+            for key, value in soft_cut_observe_snapshot.items():
+                ctx.finalization_metrics[f"soft_cut_obs_{key}"] = value
             ctx.finalization_metrics["fact_word_count"] = float(len(aligned_facts.annotated_words))
             ctx.finalization_metrics["fact_turn_count"] = float(len(aligned_facts.speaker_turns))
             ctx.finalization_metrics["fact_mapping_count"] = float(len(aligned_facts.time_mappings))
@@ -295,6 +302,11 @@ class AlignmentStageService:
         words_for_split = run_result.words_for_split
         injection_stats = dict(run_result.injection_stats)
         split_stats = dict(run_result.split_stats)
+        soft_cut_observe_snapshot = host._update_soft_cut_observability(
+            split_stats=split_stats,
+            chunk_index=ctx.chunk_index,
+            stage="dual_or_patch_alignment_stage",
+        )
         final_sentences = run_result.final_sentences
         output_traces = list(run_result.output_traces or [])
         host._assign_sentence_identity_by_timeline_overlap(
@@ -319,6 +331,8 @@ class AlignmentStageService:
         }
         for key, value in split_stats.items():
             ctx.finalization_metrics[f"split_{key}"] = value
+        for key, value in soft_cut_observe_snapshot.items():
+            ctx.finalization_metrics[f"soft_cut_obs_{key}"] = value
         ctx.finalization_metrics["fact_word_count"] = float(len(aligned_facts.annotated_words))
         ctx.finalization_metrics["fact_turn_count"] = float(len(aligned_facts.speaker_turns))
         ctx.finalization_metrics["fact_mapping_count"] = float(len(aligned_facts.time_mappings))

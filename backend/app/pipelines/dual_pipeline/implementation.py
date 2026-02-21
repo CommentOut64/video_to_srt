@@ -90,6 +90,7 @@ from app.services.segmentation.soft_cut import (
     EvidenceBuilderConfig,
     SoftCutPlanProvider,
     SoftCutDecisionEngine,
+    SplitEvidenceSource,
     SpeakerChangeFact,
     SpeakerChangeTag,
     WindowDecisionContext,
@@ -200,6 +201,10 @@ class AsyncDualPipelineKernel:
     _SOFT_CUT_PAUSE_ANCHOR_MIN_GAP_SEC = 1.00
     _SOFT_CUT_PUNCT_ANCHOR_CONFIDENCE_WEAK = 0.62
     _SOFT_CUT_PUNCT_ANCHOR_CONFIDENCE_STRONG = 0.82
+    _SOFT_CUT_FAST_DRAFT_ANCHOR_CONFIDENCE = 0.92
+    _SOFT_CUT_FAST_DRAFT_MAX_DRIFT_SEC = 0.65
+    _SOFT_CUT_CJK_PAUSE_MIN_SCORE_FLOOR = 0.50
+    _SOFT_CUT_NO_FUSED_WINDOW_WARN_STREAK = 6
     _SPEAKER_REPAIR_MIN_TURN_DURATION_SEC = 0.45
     _SPEAKER_REPAIR_STRONG_BREAK_MIN_PAUSE_SEC = 0.30
     _SPEAKER_REPAIR_SENTENCE_END_PUNCT = {"。", "！", "？", ".", "!", "?"}
@@ -594,6 +599,12 @@ class AsyncDualPipelineKernel:
         }
         self._dual_time_legacy_sentences_by_chunk: Dict[int, List[SentenceSegment]] = {}
         self._dual_time_experiment_sentences_by_chunk: Dict[int, List[SentenceSegment]] = {}
+        self._soft_cut_observe_total_chunks = 0
+        self._soft_cut_observe_decision_chunks = 0
+        self._soft_cut_observe_default_splitter_chunks = 0
+        self._soft_cut_observe_punctuation_anchor_chunks = 0
+        self._soft_cut_observe_punctuation_anchor_hits = 0
+        self._soft_cut_no_fused_window_streak = 0
         if self._is_dual_time_experiment_enabled:
             self.logger.info(
                 "双轨实验开启: mode={} tolerance_ms={} gpu_strategy=serial_postprocess",
@@ -3991,6 +4002,7 @@ class AsyncDualPipelineKernel:
         speaker_id: Optional[str] = None,
         turn_id: Optional[str] = None,
         policy_snapshot: Optional[Any] = None,
+        is_fast_only_mode: bool = False,
     ) -> Layer456RunResult:
         """
         四层术语主入口：集合层→评分层→裁决层。
@@ -4008,6 +4020,7 @@ class AsyncDualPipelineKernel:
             speaker_id=speaker_id,
             turn_id=turn_id,
             policy_snapshot=policy_snapshot,
+            is_fast_only_mode=is_fast_only_mode,
         )
 
     def _should_record_m2_stage0_sample(self, *, chunk_index: int) -> bool:
@@ -4131,6 +4144,64 @@ class AsyncDualPipelineKernel:
         """
         return self._textflow_facade_service.finalize_sensevoice_only(ctx)
 
+    def _update_soft_cut_observability(
+        self,
+        *,
+        split_stats: Dict[str, Any],
+        chunk_index: Optional[int],
+        stage: str,
+    ) -> Dict[str, Any]:
+        """记录 soft-cut 观测统计；连续无窗仅告警，不主动跳过计划。"""
+        self._soft_cut_observe_total_chunks += 1
+
+        applied_decision_count = int(split_stats.get("applied_decision_count", 0) or 0)
+        is_has_decision = 1 if applied_decision_count > 0 else 0
+        self._soft_cut_observe_decision_chunks += is_has_decision
+
+        is_default_splitter = int(split_stats.get("soft_cut_used_default_splitter", 0) or 0)
+        self._soft_cut_observe_default_splitter_chunks += is_default_splitter
+
+        punctuation_anchor_count = int(split_stats.get("fused_punctuation_anchor_count", 0) or 0)
+        is_punctuation_hit = int(split_stats.get("soft_cut_punctuation_anchor_hit", 0) or 0)
+        if punctuation_anchor_count > 0:
+            self._soft_cut_observe_punctuation_anchor_chunks += 1
+            self._soft_cut_observe_punctuation_anchor_hits += is_punctuation_hit
+
+        is_no_fused_window = int(split_stats.get("soft_cut_no_fused_window", 0) or 0) > 0
+        if is_no_fused_window:
+            self._soft_cut_no_fused_window_streak += 1
+        else:
+            self._soft_cut_no_fused_window_streak = 0
+
+        threshold = int(self._SOFT_CUT_NO_FUSED_WINDOW_WARN_STREAK)
+        diagnostic_code = str(split_stats.get("soft_cut_diagnostic_code", "") or "")
+        if self._soft_cut_no_fused_window_streak >= threshold:
+            diagnostic_code = "E_SOFT_CUT_NO_FUSED_WINDOW_STREAK"
+            if self._soft_cut_no_fused_window_streak == threshold:
+                # Why: 仅保留观测告警，避免“下一块直接空计划”造成可切分 chunk 被连锁跳过。
+                self.logger.warning(
+                    "soft-cut 连续无融合窗口: chunk={} stage={} streak={} threshold={}",
+                    chunk_index,
+                    stage,
+                    self._soft_cut_no_fused_window_streak,
+                    threshold,
+                )
+
+        total = max(1, self._soft_cut_observe_total_chunks)
+        punctuation_total = max(1, self._soft_cut_observe_punctuation_anchor_chunks)
+        snapshot = {
+            "total_chunks": int(self._soft_cut_observe_total_chunks),
+            "decision_chunk_ratio": float(self._soft_cut_observe_decision_chunks / total),
+            "default_splitter_ratio": float(self._soft_cut_observe_default_splitter_chunks / total),
+            "punctuation_anchor_hit_ratio": float(
+                self._soft_cut_observe_punctuation_anchor_hits / punctuation_total
+            ),
+            "no_fused_window_streak": int(self._soft_cut_no_fused_window_streak),
+            "skip_next_chunk_plan": 0,
+            "diagnostic_code": diagnostic_code,
+        }
+        return snapshot
+
     def _build_soft_cut_plan_for_decision(
         self,
         *,
@@ -4141,6 +4212,7 @@ class AsyncDualPipelineKernel:
         aligned_facts: Optional[AlignedFacts] = None,
         fused_evidence: Optional[FusedEvidence] = None,
         policy_snapshot: Optional[Any] = None,
+        is_fast_only_mode: bool = False,
     ) -> Optional[Any]:
         """
         统一 CutPlan 生产入口。
@@ -4150,14 +4222,26 @@ class AsyncDualPipelineKernel:
         - provider 异常时回退 M1，避免影响主流程可用性
         """
         try:
-            plan = self._soft_cut_plan_provider.build_plan(
-                annotated_words=annotated_words,
-                stream_id=stream_id,
-                block_id=block_id,
-                is_last_chunk=is_last_chunk,
-                aligned_facts=aligned_facts,
-                fused_evidence=fused_evidence,
-            )
+            try:
+                plan = self._soft_cut_plan_provider.build_plan(
+                    annotated_words=annotated_words,
+                    stream_id=stream_id,
+                    block_id=block_id,
+                    is_last_chunk=is_last_chunk,
+                    aligned_facts=aligned_facts,
+                    fused_evidence=fused_evidence,
+                    is_fast_only_mode=is_fast_only_mode,
+                )
+            except TypeError:
+                # 兼容第三方 provider 尚未接入新参数的场景。
+                plan = self._soft_cut_plan_provider.build_plan(
+                    annotated_words=annotated_words,
+                    stream_id=stream_id,
+                    block_id=block_id,
+                    is_last_chunk=is_last_chunk,
+                    aligned_facts=aligned_facts,
+                    fused_evidence=fused_evidence,
+                )
             return self._normalize_soft_cut_plan(
                 plan=plan,
                 stream_id=stream_id,
@@ -4178,6 +4262,7 @@ class AsyncDualPipelineKernel:
                 aligned_facts=aligned_facts,
                 fused_evidence=fused_evidence,
                 policy_snapshot=policy_snapshot,
+                is_fast_only_mode=is_fast_only_mode,
             )
             return self._normalize_soft_cut_plan(
                 plan=plan,
@@ -4193,6 +4278,7 @@ class AsyncDualPipelineKernel:
         stream_id: str,
         aligned_facts: Optional[AlignedFacts],
         policy_snapshot: Optional[Any] = None,
+        is_fast_only_mode: bool = False,
     ) -> FusedEvidence:
         """
         构建评分层契约（FusedEvidence）。
@@ -4204,6 +4290,8 @@ class AsyncDualPipelineKernel:
         anchor_candidates = self._build_soft_cut_anchor_candidates(
             words=words,
             policy_snapshot=policy_snapshot,
+            is_fast_only_mode=is_fast_only_mode,
+            fast_draft_cuts=list(getattr(aligned_facts, "fast_draft_cuts", []) or []),
         )
         pause_anchors = [item for item in anchor_candidates if item.anchor_type == AnchorType.PAUSE_ANCHOR]
         word_anchors = [item for item in anchor_candidates if item.anchor_type == AnchorType.WORD_BOUNDARY]
@@ -4216,6 +4304,7 @@ class AsyncDualPipelineKernel:
             "stream_id": str(stream_id),
             "word_count": int(len(words)),
             "anchor_candidate_count": int(len(anchor_candidates)),
+            "fast_draft_cut_count": int(len(getattr(aligned_facts, "fast_draft_cuts", []) or [])),
             "priority_profile": str(self._soft_cut_priority_active_profile),
             "time_axis_version": str(
                 getattr(aligned_facts, "time_axis_version", "m1_legacy") or "m1_legacy"
@@ -4388,6 +4477,7 @@ class AsyncDualPipelineKernel:
         aligned_facts: Optional[AlignedFacts] = None,
         fused_evidence: Optional[FusedEvidence] = None,
         policy_snapshot: Optional[Any] = None,
+        is_fast_only_mode: bool = False,
     ) -> Optional[Any]:
         """
         在评分层 -> 裁决层之间生成 CutPlan。
@@ -4419,6 +4509,8 @@ class AsyncDualPipelineKernel:
         anchor_candidates = self._build_soft_cut_anchor_candidates(
             words=words,
             policy_snapshot=policy_snapshot,
+            is_fast_only_mode=is_fast_only_mode,
+            fast_draft_cuts=list(getattr(aligned_facts, "fast_draft_cuts", []) or []),
         )
         pause_anchors = [item for item in anchor_candidates if item.anchor_type == AnchorType.PAUSE_ANCHOR]
         word_anchors = [item for item in anchor_candidates if item.anchor_type == AnchorType.WORD_BOUNDARY]
@@ -4464,6 +4556,8 @@ class AsyncDualPipelineKernel:
         window_contexts = self._resolve_soft_cut_window_contexts(
             words=words,
             cut_windows=all_windows,
+            policy_snapshot=policy_snapshot,
+            is_fast_only_mode=is_fast_only_mode,
         )
 
         plan = self._soft_cut_decision_engine.decide(
@@ -4887,10 +4981,33 @@ class AsyncDualPipelineKernel:
         *,
         words: Sequence[AnnotatedWord],
         policy_snapshot: Optional[Any] = None,
+        is_fast_only_mode: bool = False,
+        fast_draft_cuts: Optional[Sequence[float]] = None,
     ) -> List[AnchorCandidate]:
         anchors: List[AnchorCandidate] = []
         last_pause_anchor_index: Optional[int] = None
+        language_tag = self._resolve_soft_cut_language_tag(policy_snapshot)
+        is_cjk_language = self._is_soft_cut_cjk_language(language_tag)
+        pause_anchor_trigger_sec = self._resolve_soft_cut_pause_anchor_trigger_sec(
+            policy_snapshot=policy_snapshot,
+            is_cjk_language=is_cjk_language,
+        )
+        pause_anchor_min_gap_sec = self._resolve_soft_cut_pause_anchor_min_gap_sec(
+            policy_snapshot=policy_snapshot,
+            is_cjk_language=is_cjk_language,
+        )
+        semantic_anchor_confidence = self._resolve_soft_cut_semantic_anchor_confidence(
+            policy_snapshot=policy_snapshot,
+            is_cjk_language=is_cjk_language,
+        )
         semantic_anchor_words = self._resolve_soft_cut_semantic_anchor_words(policy_snapshot)
+        is_cjk_dual_mode = bool(is_cjk_language and not is_fast_only_mode)
+        if is_fast_only_mode:
+            # Why: fast-only 以快流稳定基线优先，soft-cut 仅保留保守锚点策略，避免中文短停顿/弱标点过切。
+            pause_anchor_trigger_sec = float(self._SOFT_CUT_PAUSE_ANCHOR_TRIGGER_SEC)
+            pause_anchor_min_gap_sec = float(self._SOFT_CUT_PAUSE_ANCHOR_MIN_GAP_SEC)
+            semantic_anchor_confidence = 0.0
+            semantic_anchor_words = set()
         for index in range(1, len(words)):
             left = words[index - 1]
             right = words[index]
@@ -4907,7 +5024,7 @@ class AsyncDualPipelineKernel:
                     confidence=1.0,
                 )
             )
-            if pause_duration >= self._SOFT_CUT_PAUSE_ANCHOR_TRIGGER_SEC:
+            if pause_duration >= pause_anchor_trigger_sec:
                 pause_anchor = AnchorCandidate(
                     anchor_type=AnchorType.PAUSE_ANCHOR,
                     anchor_time=boundary_time,
@@ -4918,7 +5035,7 @@ class AsyncDualPipelineKernel:
                 if last_pause_anchor_index is not None:
                     previous_pause = anchors[last_pause_anchor_index]
                     anchor_gap = max(0.0, float(pause_anchor.anchor_time) - float(previous_pause.anchor_time))
-                    if anchor_gap < self._SOFT_CUT_PAUSE_ANCHOR_MIN_GAP_SEC:
+                    if anchor_gap < pause_anchor_min_gap_sec:
                         previous_confidence = float(previous_pause.confidence or 0.0)
                         current_confidence = float(pause_anchor.confidence or 0.0)
                         if current_confidence >= previous_confidence:
@@ -4930,31 +5047,106 @@ class AsyncDualPipelineKernel:
             trailing_punct = str(left.trailing_punct or "").strip()
             if trailing_punct and trailing_punct[-1] in {"。", "！", "？", ".", "!", "?"}:
                 punct_char = trailing_punct[-1]
-                punct_confidence = (
-                    self._SOFT_CUT_PUNCT_ANCHOR_CONFIDENCE_STRONG
-                    if punct_char in {"！", "？", "!", "?"}
-                    else self._SOFT_CUT_PUNCT_ANCHOR_CONFIDENCE_WEAK
-                )
+                if punct_char in {"！", "？", "!", "?"}:
+                    punct_confidence = self._SOFT_CUT_PUNCT_ANCHOR_CONFIDENCE_STRONG
+                else:
+                    punct_confidence = self._SOFT_CUT_PUNCT_ANCHOR_CONFIDENCE_WEAK
+                punct_source = f"punct_proxy:{punct_char}"
                 anchors.append(
                     AnchorCandidate(
                         anchor_type=AnchorType.PUNCTUATION_ANCHOR,
                         anchor_time=boundary_time,
-                        source=f"punct_proxy:{punct_char}",
+                        source=punct_source,
                         confidence=punct_confidence,
                     )
                 )
 
-            right_word = str(right.word or "").strip().lower()
-            if right_word in semantic_anchor_words:
+            if self._is_soft_cut_semantic_anchor_hit(
+                words=words,
+                start_index=index,
+                semantic_anchor_words=semantic_anchor_words,
+            ):
+                semantic_source = "conjunction_rule"
                 anchors.append(
                     AnchorCandidate(
                         anchor_type=AnchorType.SEMANTIC_ANCHOR,
                         anchor_time=boundary_time,
-                        source="conjunction_rule",
-                        confidence=0.3,
+                        source=semantic_source,
+                        confidence=semantic_anchor_confidence,
                     )
                 )
+        if is_cjk_language and not is_fast_only_mode:
+            anchors.extend(
+                self._build_soft_cut_fast_draft_anchor_candidates(
+                    words=words,
+                    fast_draft_cuts=fast_draft_cuts or [],
+                )
+            )
         return anchors
+
+    def _build_soft_cut_fast_draft_anchor_candidates(
+        self,
+        *,
+        words: Sequence[AnnotatedWord],
+        fast_draft_cuts: Sequence[float],
+    ) -> List[AnchorCandidate]:
+        """
+        将快流切点映射为 soft-cut 候选锚点。
+
+        Why:
+        - 双流中文/日文在慢流文本弱标点场景下，fast-draft 的时间边界更稳定。
+        - 只注入“已映射到词边界”的锚点，避免把词内时间直接当切分位置。
+        """
+        if len(words) <= 1 or not fast_draft_cuts:
+            return []
+        anchors: List[AnchorCandidate] = []
+        seen_anchor_ms: set[int] = set()
+        max_drift_sec = max(0.05, float(self._SOFT_CUT_FAST_DRAFT_MAX_DRIFT_SEC))
+        for raw_cut_time in fast_draft_cuts:
+            try:
+                cut_time = float(raw_cut_time)
+            except (TypeError, ValueError):
+                continue
+            selection = self._word_boundary_mapper.select_best_boundary(
+                words=words,
+                event_time=cut_time,
+            )
+            if selection is None:
+                continue
+            split_idx = int(selection.split_idx)
+            if split_idx < 0 or split_idx >= len(words) - 1:
+                continue
+            anchor_time = self._resolve_soft_cut_boundary_time(
+                words=words,
+                split_idx=split_idx,
+            )
+            if abs(anchor_time - cut_time) > max_drift_sec:
+                continue
+            anchor_ms = int(round(anchor_time * 1000.0))
+            if anchor_ms in seen_anchor_ms:
+                continue
+            seen_anchor_ms.add(anchor_ms)
+            anchors.append(
+                AnchorCandidate(
+                    anchor_type=AnchorType.WORD_BOUNDARY,
+                    anchor_time=anchor_time,
+                    source="fast_draft_cut",
+                    confidence=float(self._SOFT_CUT_FAST_DRAFT_ANCHOR_CONFIDENCE),
+                )
+            )
+        return anchors
+
+    @staticmethod
+    def _resolve_soft_cut_boundary_time(
+        *,
+        words: Sequence[AnnotatedWord],
+        split_idx: int,
+    ) -> float:
+        if split_idx < 0 or split_idx >= len(words) - 1:
+            return 0.0
+        left_end = float(getattr(words[split_idx], "end", 0.0) or 0.0)
+        right_start = float(getattr(words[split_idx + 1], "start", left_end) or left_end)
+        return (left_end + right_start) / 2.0
 
     def _resolve_soft_cut_semantic_anchor_words(
         self,
@@ -4972,14 +5164,238 @@ class AsyncDualPipelineKernel:
                     return normalized
         return set(self._soft_cut_semantic_conjunctions)
 
+    def _resolve_soft_cut_language_tag(self, policy_snapshot: Optional[Any]) -> str:
+        if policy_snapshot is not None:
+            snapshot_tag = str(getattr(policy_snapshot, "language_tag", "") or "").strip().lower()
+            if snapshot_tag:
+                return snapshot_tag
+        return str(getattr(self._final_splitter.config, "language", "auto") or "auto").strip().lower()
+
+    @staticmethod
+    def _is_soft_cut_cjk_language(language_tag: str) -> bool:
+        tag = str(language_tag or "").strip().lower()
+        return tag.startswith(("zh", "yue", "ja", "jp", "ko"))
+
+    @staticmethod
+    def _resolve_soft_cut_threshold(
+        *,
+        policy_snapshot: Optional[Any],
+        key: str,
+        default: float,
+    ) -> float:
+        if policy_snapshot is not None:
+            thresholds = getattr(policy_snapshot, "thresholds", None)
+            if isinstance(thresholds, dict):
+                value = thresholds.get(key)
+                if value is not None:
+                    try:
+                        return float(value)
+                    except (TypeError, ValueError):
+                        pass
+        return float(default)
+
+    def _resolve_soft_cut_source_min_score(
+        self,
+        *,
+        policy_snapshot: Optional[Any],
+        key: str,
+        default: float,
+    ) -> float:
+        resolved = self._resolve_soft_cut_threshold(
+            policy_snapshot=policy_snapshot,
+            key=key,
+            default=default,
+        )
+        return max(0.0, min(1.0, float(resolved)))
+
+    def _resolve_soft_cut_pause_anchor_trigger_sec(
+        self,
+        *,
+        policy_snapshot: Optional[Any],
+        is_cjk_language: bool,
+    ) -> float:
+        default_value = 0.30 if is_cjk_language else self._SOFT_CUT_PAUSE_ANCHOR_TRIGGER_SEC
+        return max(
+            0.05,
+            self._resolve_soft_cut_threshold(
+                policy_snapshot=policy_snapshot,
+                key="soft_cut_pause_anchor_trigger_sec",
+                default=default_value,
+            ),
+        )
+
+    def _resolve_soft_cut_pause_anchor_min_gap_sec(
+        self,
+        *,
+        policy_snapshot: Optional[Any],
+        is_cjk_language: bool,
+    ) -> float:
+        default_value = 0.70 if is_cjk_language else self._SOFT_CUT_PAUSE_ANCHOR_MIN_GAP_SEC
+        return max(
+            0.05,
+            self._resolve_soft_cut_threshold(
+                policy_snapshot=policy_snapshot,
+                key="soft_cut_pause_anchor_min_gap_sec",
+                default=default_value,
+            ),
+        )
+
+    def _resolve_soft_cut_semantic_anchor_confidence(
+        self,
+        *,
+        policy_snapshot: Optional[Any],
+        is_cjk_language: bool,
+    ) -> float:
+        default_value = 0.62 if is_cjk_language else 0.30
+        resolved = self._resolve_soft_cut_threshold(
+            policy_snapshot=policy_snapshot,
+            key="soft_cut_semantic_anchor_confidence",
+            default=default_value,
+        )
+        return max(0.0, min(1.0, resolved))
+
+    def _resolve_soft_cut_weak_punct_anchor_confidence(
+        self,
+        *,
+        policy_snapshot: Optional[Any],
+        is_cjk_language: bool,
+    ) -> float:
+        default_value = 0.60 if is_cjk_language else 0.0
+        resolved = self._resolve_soft_cut_threshold(
+            policy_snapshot=policy_snapshot,
+            key="soft_cut_weak_punct_anchor_confidence",
+            default=default_value,
+        )
+        return max(0.0, min(1.0, resolved))
+
+    def _is_soft_cut_semantic_anchor_hit(
+        self,
+        *,
+        words: Sequence[AnnotatedWord],
+        start_index: int,
+        semantic_anchor_words: set[str],
+    ) -> bool:
+        if not semantic_anchor_words:
+            return False
+        semantic_tokens: List[str] = []
+        for item in semantic_anchor_words:
+            normalized = self._normalize_soft_cut_semantic_token(item)
+            if normalized:
+                semantic_tokens.append(normalized)
+        if not semantic_tokens:
+            return False
+
+        right_tokens: List[str] = []
+        for index in range(start_index, len(words)):
+            token = self._normalize_soft_cut_semantic_token(getattr(words[index], "word", ""))
+            if not token:
+                continue
+            right_tokens.append(token)
+            if len(right_tokens) >= 8:
+                break
+        if not right_tokens:
+            return False
+
+        first_token = right_tokens[0]
+        if first_token in semantic_tokens:
+            return True
+
+        right_compact = "".join(right_tokens)
+        right_spaced = " ".join(right_tokens)
+        for token in semantic_tokens:
+            if " " in token:
+                if right_spaced.startswith(token):
+                    return True
+                continue
+            if self._is_soft_cut_cjk_text(token):
+                if right_compact.startswith(token):
+                    return True
+        return False
+
+    @staticmethod
+    def _normalize_soft_cut_semantic_token(token: Any) -> str:
+        if token is None:
+            return ""
+        trim_chars = " \t\r\n，。、！？；：,.!?;:\"'“”‘’()[]{}（）【】<>《》"
+        return str(token).replace("▁", " ").strip().strip(trim_chars).lower()
+
+    @staticmethod
+    def _is_soft_cut_cjk_text(text: str) -> bool:
+        for char in str(text or ""):
+            if "\u4e00" <= char <= "\u9fff":
+                return True
+            if "\u3040" <= char <= "\u30ff":
+                return True
+            if "\uac00" <= char <= "\ud7af":
+                return True
+        return False
+
     def _resolve_soft_cut_window_contexts(
         self,
         *,
         words: Sequence[AnnotatedWord],
         cut_windows: Sequence[Any],
+        policy_snapshot: Optional[Any] = None,
+        is_fast_only_mode: bool = False,
     ) -> Dict[str, WindowDecisionContext]:
         contexts: Dict[str, WindowDecisionContext] = {}
+        language_tag = self._resolve_soft_cut_language_tag(policy_snapshot)
+        is_cjk_language = self._is_soft_cut_cjk_language(language_tag)
+        source_threshold_overrides: Dict[SplitEvidenceSource, float] = {}
+        allow_low_level_sources: frozenset[SplitEvidenceSource] = frozenset()
+        if is_cjk_language and not is_fast_only_mode:
+            # Why: CJK 双流低级窗口在“慢流弱标点”场景容易全部被挡掉，来源化阈值用于放宽但可控。
+            legacy_default = self._resolve_soft_cut_source_min_score(
+                policy_snapshot=policy_snapshot,
+                key="soft_cut_min_score",
+                default=0.35,
+            )
+            pause_min_score = self._resolve_soft_cut_source_min_score(
+                policy_snapshot=policy_snapshot,
+                key="soft_cut_min_score_pause",
+                default=legacy_default,
+            )
+            pause_min_score = max(
+                float(pause_min_score),
+                float(self._SOFT_CUT_CJK_PAUSE_MIN_SCORE_FLOOR),
+            )
+            source_threshold_overrides = {
+                SplitEvidenceSource.SEMANTIC: self._resolve_soft_cut_source_min_score(
+                    policy_snapshot=policy_snapshot,
+                    key="soft_cut_min_score_semantic",
+                    default=legacy_default,
+                ),
+                SplitEvidenceSource.LLM: self._resolve_soft_cut_source_min_score(
+                    policy_snapshot=policy_snapshot,
+                    key="soft_cut_min_score_llm",
+                    default=legacy_default,
+                ),
+                SplitEvidenceSource.PAUSE: pause_min_score,
+                SplitEvidenceSource.PUNCTUATION: self._resolve_soft_cut_source_min_score(
+                    policy_snapshot=policy_snapshot,
+                    key="soft_cut_min_score_punctuation",
+                    default=legacy_default,
+                ),
+                SplitEvidenceSource.FAST_DRAFT: self._resolve_soft_cut_source_min_score(
+                    policy_snapshot=policy_snapshot,
+                    key="soft_cut_min_score_fast_draft",
+                    default=legacy_default,
+                ),
+            }
+            # Why: CJK 双流中 low-level pause 误触发概率高，改为仅允许语义/标点/fast_draft 低级窗口放行。
+            allow_low_level_sources = frozenset(
+                source
+                for source in source_threshold_overrides.keys()
+                if source != SplitEvidenceSource.PAUSE
+            )
         for window in cut_windows:
+            trigger_source = getattr(window, "trigger_source", None)
+            if not isinstance(trigger_source, SplitEvidenceSource):
+                source_text = str(getattr(trigger_source, "value", trigger_source) or "").strip().lower()
+                try:
+                    trigger_source = SplitEvidenceSource(source_text)
+                except ValueError:
+                    trigger_source = SplitEvidenceSource.SPEAKER
             trigger_time = float(getattr(window, "trigger_time", 0.0))
             window_start = float(getattr(window, "start_time", trigger_time))
             window_end = float(getattr(window, "end_time", trigger_time))
@@ -5008,7 +5424,16 @@ class AsyncDualPipelineKernel:
             contexts[window_id] = WindowDecisionContext(
                 current_sentence_word_count=covered_words,
                 waiting_word_count=max(0, len(words) - covered_words),
-                depends_on_fast_draft=bool(has_fast_source and not has_non_fast_source),
+                depends_on_fast_draft=bool(
+                    trigger_source == SplitEvidenceSource.FAST_DRAFT
+                    or (has_fast_source and not has_non_fast_source)
+                ),
+                cut_threshold_override=source_threshold_overrides.get(trigger_source),
+                is_allow_low_level_semantic=bool(
+                    trigger_source in {SplitEvidenceSource.SEMANTIC, SplitEvidenceSource.LLM}
+                    and allow_low_level_sources
+                ),
+                allow_low_level_sources=allow_low_level_sources,
             )
         return contexts
 

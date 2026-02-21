@@ -29,6 +29,7 @@ from app.services.alignment.types import (
     TextTrack,
     TextTrackBundle,
 )
+from app.services.text_protection import is_sentence_end_punct
 
 if TYPE_CHECKING:
     from app.services.language_policy.types import LanguagePolicySnapshot
@@ -79,6 +80,7 @@ class _TextflowFacadeHost(Protocol):
         stream_id: str,
         aligned_facts: Optional[AlignedFacts],
         policy_snapshot: Optional["LanguagePolicySnapshot"] = None,
+        is_fast_only_mode: bool = False,
     ) -> FusedEvidence:
         ...
 
@@ -106,6 +108,7 @@ class _TextflowFacadeHost(Protocol):
         aligned_facts: Optional[AlignedFacts] = None,
         fused_evidence: Optional[FusedEvidence] = None,
         policy_snapshot: Optional["LanguagePolicySnapshot"] = None,
+        is_fast_only_mode: bool = False,
     ) -> Optional[Any]:
         ...
 
@@ -160,6 +163,7 @@ class TextflowFacadeService:
         speaker_id: Optional[str] = None,
         turn_id: Optional[str] = None,
         policy_snapshot: Optional["LanguagePolicySnapshot"] = None,
+        is_fast_only_mode: bool = False,
     ) -> Layer456RunResult:
         """执行一次集合层→评分层→裁决层主路径（内部主入口）。"""
         time_words, time_source = self._resolve_alignment_time_words(
@@ -173,6 +177,7 @@ class TextflowFacadeService:
                 sv_words=time_words,
                 vad_intervals=self._host._vad_intervals,
                 policy_snapshot=policy_snapshot,
+                is_fast_only_mode=is_fast_only_mode,
             )
         )
         alignment_result = collection_output.alignment_result
@@ -181,6 +186,21 @@ class TextflowFacadeService:
             tracks.chosen_track.language if tracks.chosen_track else "auto"
         )
         self._host._final_splitter.set_language(detected_language)
+        is_cjk_language = self._is_cjk_language_tag(detected_language)
+        # Why: 纯快流是当前稳定基线，双流 CJK 仅保留语义断点，不启用弱标点扩展切分。
+        is_enable_cjk_weak_punct = (not is_fast_only_mode) and (not is_cjk_language)
+        is_enable_cjk_semantic = (not is_fast_only_mode)
+        self._host._final_splitter.set_cjk_split_mode(
+            is_enable_weak_punct=is_enable_cjk_weak_punct,
+            is_enable_semantic=is_enable_cjk_semantic,
+        )
+        if is_fast_only_mode:
+            # Why: fast-only 以“稳定快流基线”为优先，避免 CJK 语义词表触发额外碎切。
+            self._host._final_splitter.set_semantic_anchor_words([])
+        else:
+            self._host._final_splitter.set_semantic_anchor_words(
+                list(getattr(policy_snapshot, "semantic_anchor_words", []) or [])
+            )
         injection_stats: Dict[str, Any] = {
             "injection_positions_total": len(punctuation_positions or []),
             "injection_unmatched_total": 0,
@@ -245,6 +265,7 @@ class TextflowFacadeService:
             stream_id=decision_stream_id,
             aligned_facts=aligned_facts,
             policy_snapshot=policy_snapshot,
+            is_fast_only_mode=is_fast_only_mode,
         )
 
         decision_chunk_index = self._host._resolve_chunk_index_from_words(words=time_words)
@@ -260,6 +281,7 @@ class TextflowFacadeService:
             aligned_facts=aligned_facts,
             fused_evidence=fused_evidence,
             policy_snapshot=policy_snapshot,
+            is_fast_only_mode=is_fast_only_mode,
         )
         decision_output = self._host._decision_processor.process(
             DecisionLayerInput(
@@ -282,6 +304,7 @@ class TextflowFacadeService:
         split_stats = dict(self._host._final_splitter.last_split_stats or {})
         split_stats.update(dict(decision_output.segmentation_report.get("boundary_score_stats", {})))
         split_stats.update(dict(decision_output.segmentation_report.get("soft_cut_stats", {})))
+        fused_evidence_stats = dict(decision_output.segmentation_report.get("fused_evidence_stats", {}))
         split_stats["unknown_pseudo_drop_count"] = int(
             decision_output.segmentation_report.get("unknown_pseudo_drop_count", 0) or 0
         )
@@ -292,9 +315,39 @@ class TextflowFacadeService:
             decision_output.segmentation_report.get("unknown_pseudo_filter_fallback", False)
         )
         split_stats["output_trace_count"] = int(len(output_traces))
+        split_stats["fused_punctuation_anchor_count"] = int(
+            fused_evidence_stats.get("punctuation_anchor_count", 0) or 0
+        )
+        split_stats["fused_semantic_anchor_count"] = int(
+            fused_evidence_stats.get("semantic_anchor_count", 0) or 0
+        )
+        source_stats = split_stats.get("source_stats", {})
+        source_keys = [
+            str(key).lower()
+            for key in (source_stats.keys() if isinstance(source_stats, dict) else [])
+        ]
+        split_stats["soft_cut_punctuation_anchor_hit"] = (
+            1 if any("punct" in key for key in source_keys) else 0
+        )
+        split_stats["soft_cut_no_fused_window"] = (
+            1 if int(split_stats.get("fusion_output_window_count", 0) or 0) <= 0 else 0
+        )
+        default_splitter_trace_count = sum(
+            1
+            for item in output_traces
+            if str(getattr(item, "split_reason", "") or "") == "default_splitter"
+        )
+        split_stats["soft_cut_used_default_splitter"] = (
+            1
+            if output_traces and default_splitter_trace_count == len(output_traces)
+            else 0
+        )
         segmentation_error = str(decision_output.segmentation_report.get("error_code", "") or "")
         if segmentation_error:
             split_stats["error_code"] = segmentation_error
+        soft_cut_diagnostic_code = str(split_stats.get("diagnostic_code", "") or "")
+        if soft_cut_diagnostic_code:
+            split_stats["soft_cut_diagnostic_code"] = soft_cut_diagnostic_code
 
         if self._host._final_grouper:
             final_sentences = self._host._final_grouper.group(final_sentences)
@@ -408,6 +461,7 @@ class TextflowFacadeService:
             speaker_id=speaker_id,
             turn_id=turn_id,
             policy_snapshot=policy_snapshot,
+            is_fast_only_mode=True,
         )
 
         final_sentences = list(run_result.final_sentences)
@@ -551,33 +605,227 @@ class TextflowFacadeService:
         return sorted(set(candidates))
 
     @staticmethod
+    def _is_cjk_language_tag(language: Optional[str]) -> bool:
+        tag = str(language or "").strip().lower()
+        if not tag:
+            return False
+        return tag.startswith(("zh", "yue", "ja", "jp", "ko"))
+
+    @staticmethod
     def _collect_fast_draft_cuts(
         sv_result: Dict[str, Any],
         *,
         sv_words: Sequence[WordTimestamp],
     ) -> List[float]:
-        """从快流结果提取句级边界时间。"""
+        """
+        从快流结果提取句级边界时间。
+
+        Why:
+        - 双流 CJK 任务中，`sv_result` 常缺少 `sentences/sentence_segments`，旧逻辑会退化成“仅尾部一个 cut”；
+        - 单尾部 cut 会让 fast_draft 证据高度尾部化，最终在 Decision 守门后大量失效。
+        """
         raw_sentences = sv_result.get("sentences")
         if raw_sentences is None:
             raw_sentences = sv_result.get("sentence_segments")
         cuts: List[float] = []
-        if isinstance(raw_sentences, Sequence):
+        if isinstance(raw_sentences, Sequence) and not isinstance(raw_sentences, (str, bytes)):
             for item in raw_sentences:
                 if isinstance(item, dict):
                     end_value = item.get("end")
                 else:
                     end_value = getattr(item, "end", None)
-                if end_value is None:
-                    continue
-                try:
-                    cuts.append(float(end_value))
-                except (TypeError, ValueError):
-                    continue
+                normalized_cut_time = TextflowFacadeService._normalize_fast_draft_cut_time(end_value)
+                if normalized_cut_time is not None:
+                    cuts.append(normalized_cut_time)
+        cuts.extend(
+            TextflowFacadeService._collect_fast_draft_word_boundary_cuts(
+                sv_words=sv_words,
+            )
+        )
         if cuts:
-            return sorted(set(cuts))
+            return TextflowFacadeService._dedupe_sorted_fast_draft_cut_times(cuts)
         if sv_words:
             return [float(sv_words[-1].end)]
         return []
+
+    @staticmethod
+    def _normalize_fast_draft_cut_time(raw_value: Any) -> Optional[float]:
+        if raw_value is None:
+            return None
+        try:
+            cut_time = float(raw_value)
+        except (TypeError, ValueError):
+            return None
+        if cut_time < 0.0:
+            return None
+        return cut_time
+
+    @staticmethod
+    def _dedupe_sorted_fast_draft_cut_times(cuts: Sequence[float]) -> List[float]:
+        unique_by_ms: Dict[int, float] = {}
+        for item in cuts:
+            try:
+                value = float(item)
+            except (TypeError, ValueError):
+                continue
+            unique_by_ms[int(round(value * 1000.0))] = value
+        return [unique_by_ms[key] for key in sorted(unique_by_ms.keys())]
+
+    @staticmethod
+    def _collect_fast_draft_word_boundary_cuts(
+        *,
+        sv_words: Sequence[WordTimestamp],
+    ) -> List[float]:
+        """
+        从快流词边界提取补充 cut。
+
+        Why:
+        - 当快流缺失句级结构时，仍需要若干“句中候选边界”支撑 soft-cut；
+        - 仅依赖尾部 cut 会导致 fast_draft 触发位置长期靠近 chunk 末端。
+        """
+        if len(sv_words) <= 3:
+            return []
+        if TextflowFacadeService._is_dense_cjk_char_stream(sv_words):
+            return []
+        boundary_rows: List[Tuple[int, float, float, float]] = []
+        for index in range(1, len(sv_words)):
+            left = sv_words[index - 1]
+            right = sv_words[index]
+            left_end = float(getattr(left, "end", 0.0) or 0.0)
+            right_start = float(getattr(right, "start", left_end) or left_end)
+            gap_sec = max(0.0, right_start - left_end)
+            boundary_time = (left_end + right_start) / 2.0
+
+            left_token = str(getattr(left, "word", "") or "").strip()
+            right_token = str(getattr(right, "word", "") or "").strip()
+            punct_score = 0.0
+            if TextflowFacadeService._has_fast_draft_sentence_end_punct(
+                left_token=left_token,
+                right_token=right_token,
+            ):
+                punct_score = 1.35
+            elif TextflowFacadeService._has_fast_draft_weak_punct(left_token):
+                punct_score = 0.70
+            boundary_rows.append((index, boundary_time, gap_sec, punct_score))
+
+        if not boundary_rows:
+            return []
+        positive_gaps = sorted(item[2] for item in boundary_rows if item[2] > 1e-6)
+        if positive_gaps:
+            pivot_index = min(
+                len(positive_gaps) - 1,
+                max(0, int(round((len(positive_gaps) - 1) * 0.75))),
+            )
+            pause_trigger_sec = max(0.18, min(0.52, float(positive_gaps[pivot_index])))
+        else:
+            pause_trigger_sec = 0.32
+
+        max_candidate_count = 1
+        if len(sv_words) >= 6:
+            max_candidate_count = 2
+        max_candidate_count = min(4, max(max_candidate_count, len(sv_words) // 14))
+        scored_rows: List[Tuple[float, float, int, float]] = []
+        for index, boundary_time, gap_sec, punct_score in boundary_rows:
+            # Why: 两端边界通常对应 chunk 前后沿，噪声较大，不作为句中候选。
+            if index <= 1 or index >= len(sv_words) - 1:
+                continue
+            is_pause_hit = gap_sec >= pause_trigger_sec
+            if not is_pause_hit and punct_score <= 0.0:
+                continue
+            score = punct_score + min(1.2, gap_sec * 1.8)
+            scored_rows.append((score, gap_sec, index, boundary_time))
+        if not scored_rows:
+            return []
+
+        scored_rows.sort(
+            key=lambda item: (
+                float(item[0]),
+                float(item[1]),
+            ),
+            reverse=True,
+        )
+        selected_times: List[float] = []
+        selected_indices: List[int] = []
+        for _score, _gap_sec, index, boundary_time in scored_rows:
+            # Why: 防止在相邻字边界上重复入选，造成过密切点。
+            if any(abs(index - picked_index) < 2 for picked_index in selected_indices):
+                continue
+            selected_indices.append(index)
+            selected_times.append(boundary_time)
+            if len(selected_times) >= max_candidate_count:
+                break
+        return selected_times
+
+    @staticmethod
+    def _is_dense_cjk_char_stream(
+        sv_words: Sequence[WordTimestamp],
+    ) -> bool:
+        normalized_tokens: List[str] = []
+        for item in sv_words:
+            token = TextflowFacadeService._normalize_fast_draft_token(
+                str(getattr(item, "word", "") or ""),
+            )
+            if token:
+                normalized_tokens.append(token)
+        if len(normalized_tokens) < 8:
+            return False
+        single_cjk_count = sum(
+            1
+            for token in normalized_tokens
+            if len(token) == 1 and TextflowFacadeService._is_all_cjk_text(token)
+        )
+        if single_cjk_count <= 0:
+            return False
+        return (single_cjk_count / float(len(normalized_tokens))) >= 0.72
+
+    @staticmethod
+    def _normalize_fast_draft_token(token: str) -> str:
+        text = str(token or "").strip()
+        if not text:
+            return ""
+        normalized_chars = [
+            char
+            for char in text
+            if char.isalnum() or TextflowFacadeService._is_cjk_char(char)
+        ]
+        return "".join(normalized_chars)
+
+    @staticmethod
+    def _is_all_cjk_text(text: str) -> bool:
+        normalized = str(text or "")
+        if not normalized:
+            return False
+        return all(TextflowFacadeService._is_cjk_char(char) for char in normalized)
+
+    @staticmethod
+    def _is_cjk_char(char: str) -> bool:
+        code_point = ord(char)
+        if 0x4E00 <= code_point <= 0x9FFF:
+            return True
+        if 0x3400 <= code_point <= 0x4DBF:
+            return True
+        if 0x3040 <= code_point <= 0x30FF:
+            return True
+        if 0xAC00 <= code_point <= 0xD7AF:
+            return True
+        return False
+
+    @staticmethod
+    def _has_fast_draft_sentence_end_punct(
+        *,
+        left_token: str,
+        right_token: str,
+    ) -> bool:
+        return is_sentence_end_punct(
+            left_token,
+            right_token,
+            sentence_end_chars=("。", "！", "？", ".", "!", "?"),
+        )
+
+    @staticmethod
+    def _has_fast_draft_weak_punct(token: str) -> bool:
+        weak_chars = ("，", "、", ",", ";", "；", ":", "：")
+        return any(char in token for char in weak_chars)
 
     @staticmethod
     def _shift_word_timestamps(

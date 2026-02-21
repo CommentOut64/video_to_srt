@@ -83,6 +83,17 @@ class CollectionAlignmentProcessor:
         sv_words = data.sv_words or []
         vad_range = self._resolve_vad_range(sv_words, data.vad_intervals)
 
+        if data.is_fast_only_mode:
+            fast_only_result = self._build_fast_only_identity_result(sv_words=sv_words)
+            if fast_only_result is not None:
+                self._logger.info(
+                    "集合层轻量模式命中: words={} score={:.2f} coverage={:.2f}",
+                    len(fast_only_result.aligned_words),
+                    fast_only_result.alignment_score,
+                    fast_only_result.coverage,
+                )
+                return CollectionLayerOutput(alignment_result=fast_only_result)
+
         if not self._config.is_enabled:
             fallback = self._build_pseudo_result(clean_text, vad_range)
             return CollectionLayerOutput(alignment_result=fallback)
@@ -118,6 +129,62 @@ class CollectionAlignmentProcessor:
             result.coverage,
         )
         return CollectionLayerOutput(alignment_result=result)
+
+    def _build_fast_only_identity_result(
+        self,
+        *,
+        sv_words: Sequence[WordTimestamp],
+    ) -> Optional[AlignmentResult]:
+        """Fast-Only 轻量对齐：直接复用快流词时间，避免重复 NW 对齐开销。"""
+        aligned_words: List[AlignedWord] = []
+        for word in sv_words or []:
+            text = str(getattr(word, "word", "") or "").strip()
+            if not text:
+                continue
+            start = float(getattr(word, "start", 0.0) or 0.0)
+            end = float(getattr(word, "end", start) or start)
+            if end <= start:
+                end = start + 1e-3
+
+            confidence_raw = getattr(word, "confidence", None)
+            confidence = (
+                float(confidence_raw)
+                if isinstance(confidence_raw, (int, float))
+                else None
+            )
+            aligned_words.append(
+                AlignedWord(
+                    word=text,
+                    start=start,
+                    end=end,
+                    sv_confidence=confidence,
+                    whisper_confidence=None,
+                    final_confidence=confidence if confidence is not None else 1.0,
+                    confidence_source=str(getattr(word, "confidence_source", "") or "fast"),
+                    alignment_status=AlignmentStatus.MATCHED,
+                    is_pseudo=False,
+                    sv_original=text,
+                    whisper_original=text,
+                )
+            )
+
+        if not aligned_words:
+            return None
+
+        quality = self._quality_stats.compute(
+            aligned_words,
+            total_tokens=len(aligned_words),
+            gap_positions=[],
+            gap_resolution=None,
+        )
+        return AlignmentResult(
+            aligned_words=aligned_words,
+            alignment_score=quality.alignment_score,
+            gap_ratio=quality.gap_ratio,
+            gap_positions=quality.gap_positions,
+            resolution=quality.gap_resolution,
+            coverage=quality.coverage,
+        )
 
     @staticmethod
     def _resolve_vad_range(
