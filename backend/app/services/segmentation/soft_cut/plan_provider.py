@@ -24,6 +24,7 @@ class SoftCutPlanProvider(Protocol):
         is_last_chunk: bool,
         aligned_facts: Optional[AlignedFacts] = None,
         fused_evidence: Optional[FusedEvidence] = None,
+        is_fast_only_mode: bool = False,
     ) -> Optional[Any]:
         """为裁决层生成 CutPlan。"""
 
@@ -49,6 +50,7 @@ class M1InternalSoftCutPlanProvider:
         is_last_chunk: bool,
         aligned_facts: Optional[AlignedFacts] = None,
         fused_evidence: Optional[FusedEvidence] = None,
+        is_fast_only_mode: bool = False,
     ) -> Optional[Any]:
         return self._pipeline._build_soft_cut_plan_for_decision_m1(
             annotated_words=annotated_words,
@@ -57,6 +59,7 @@ class M1InternalSoftCutPlanProvider:
             is_last_chunk=is_last_chunk,
             aligned_facts=aligned_facts,
             fused_evidence=fused_evidence,
+            is_fast_only_mode=is_fast_only_mode,
         )
 
 

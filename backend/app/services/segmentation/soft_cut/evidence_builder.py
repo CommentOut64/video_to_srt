@@ -1,6 +1,6 @@
 """
 软切证据构建器（Phase B）。
-V3.2.0+dev.20260217.01
+V3.2.0+dev.20260220.01
 """
 
 from __future__ import annotations
@@ -290,10 +290,13 @@ class EvidenceBuilder:
         windows: list[CutWindow] = []
         index = 0
         for candidate in sorted(anchor_candidates, key=lambda item: item.anchor_time):
-            # Why: 词边界是落点候选，不是触发事件。直接触发会造成“每词都开窗”。
-            if candidate.anchor_type == AnchorType.WORD_BOUNDARY:
-                continue
             source = self._resolve_candidate_source(candidate)
+            # Why: 词边界默认仅作落点候选；fast_draft 词边界是显式切点，可作为触发窗口。
+            if (
+                candidate.anchor_type == AnchorType.WORD_BOUNDARY
+                and source != SplitEvidenceSource.FAST_DRAFT
+            ):
+                continue
             rule = self._priority_profile.source_rule(source)
             if not rule.enabled:
                 continue
@@ -514,6 +517,8 @@ class EvidenceBuilder:
             return SplitEvidenceSource.PUNCTUATION
         if "semantic" in source_text:
             return SplitEvidenceSource.SEMANTIC
+        if "fast_draft" in source_text or "fastdraft" in source_text:
+            return SplitEvidenceSource.FAST_DRAFT
         if "pause" in source_text:
             return SplitEvidenceSource.PAUSE
         if "speaker" in source_text:

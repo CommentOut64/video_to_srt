@@ -193,6 +193,7 @@ class CollectionLayerInput:
     sv_words: List[WordTimestamp]
     vad_intervals: Optional[List[Tuple[float, float]]] = None
     policy_snapshot: Optional["LanguagePolicySnapshot"] = None
+    is_fast_only_mode: bool = False
 
 
 @dataclass
