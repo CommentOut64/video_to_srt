@@ -282,7 +282,7 @@ class PipelineOrchestrator:
             subtitle_output.write_srt(segments, srt_path)
 
             job.srt_path = str(srt_path)
-            job.status = "completed"
+            job.status = "finished"
             job.message = "转录完成"
             job.progress = 100
 

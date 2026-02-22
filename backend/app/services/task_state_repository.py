@@ -69,6 +69,7 @@ class TaskStateRepository:
                     dir TEXT,
                     input_path TEXT,
                     status TEXT,
+                    state_seq INTEGER DEFAULT 0,
                     phase TEXT,
                     progress REAL,
                     phase_percent REAL,
@@ -96,6 +97,7 @@ class TaskStateRepository:
                     from_status TEXT,
                     to_status TEXT,
                     reason TEXT,
+                    state_seq INTEGER DEFAULT 0,
                     payload_json TEXT,
                     created_at REAL
                 )
@@ -143,6 +145,8 @@ class TaskStateRepository:
                 """
             )
             self._ensure_tasks_column(conn, "subtitle_time_offset", "REAL")
+            self._ensure_tasks_column(conn, "state_seq", "INTEGER DEFAULT 0")
+            self._ensure_task_events_column(conn, "state_seq", "INTEGER DEFAULT 0")
 
     def _ensure_tasks_column(self, conn: sqlite3.Connection, name: str, column_type: str) -> None:
         cursor = conn.execute("PRAGMA table_info(tasks)")
@@ -151,6 +155,13 @@ class TaskStateRepository:
             return
         conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {column_type}")
 
+    def _ensure_task_events_column(self, conn: sqlite3.Connection, name: str, column_type: str) -> None:
+        cursor = conn.execute("PRAGMA table_info(task_events)")
+        columns = {row["name"] for row in cursor.fetchall()}
+        if name in columns:
+            return
+        conn.execute(f"ALTER TABLE task_events ADD COLUMN {name} {column_type}")
+
     def upsert_task(self, job: JobState, conn: Optional[sqlite3.Connection] = None) -> None:
         payload = self._job_to_row(job)
         target_conn = conn or self._connect()
@@ -158,11 +169,11 @@ class TaskStateRepository:
             target_conn.execute(
                 """
                 INSERT INTO tasks (
-                    job_id, filename, title, dir, input_path, status, phase, progress,
+                    job_id, filename, title, dir, input_path, status, state_seq, phase, progress,
                     phase_percent, message, error, processed, total, language, srt_path,
                     canceled, paused, subtitle_time_offset, settings_json, updated_at, created_at
                 ) VALUES (
-                    :job_id, :filename, :title, :dir, :input_path, :status, :phase, :progress,
+                    :job_id, :filename, :title, :dir, :input_path, :status, :state_seq, :phase, :progress,
                     :phase_percent, :message, :error, :processed, :total, :language, :srt_path,
                     :canceled, :paused, :subtitle_time_offset, :settings_json, :updated_at, :created_at
                 )
@@ -172,6 +183,7 @@ class TaskStateRepository:
                     dir=excluded.dir,
                     input_path=excluded.input_path,
                     status=excluded.status,
+                    state_seq=excluded.state_seq,
                     phase=excluded.phase,
                     progress=excluded.progress,
                     phase_percent=excluded.phase_percent,
@@ -332,7 +344,8 @@ class TaskStateRepository:
         from_status: Optional[str],
         to_status: Optional[str],
         reason: Optional[str],
-        payload: Optional[Dict[str, Any]],
+        state_seq: int = 0,
+        payload: Optional[Dict[str, Any]] = None,
         conn: Optional[sqlite3.Connection] = None
     ) -> None:
         payload_json = json.dumps(payload or {})
@@ -341,8 +354,8 @@ class TaskStateRepository:
             target_conn.execute(
                 """
                 INSERT INTO task_events (
-                    job_id, event_type, from_status, to_status, reason, payload_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    job_id, event_type, from_status, to_status, reason, state_seq, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -350,6 +363,7 @@ class TaskStateRepository:
                     from_status,
                     to_status,
                     reason,
+                    max(0, int(state_seq or 0)),
                     payload_json,
                     time.time(),
                 ),
@@ -364,7 +378,7 @@ class TaskStateRepository:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT event_type, from_status, to_status, reason, payload_json, created_at
+                SELECT event_type, from_status, to_status, reason, state_seq, payload_json, created_at
                 FROM task_events
                 WHERE job_id = ?
                 ORDER BY id ASC
@@ -380,6 +394,7 @@ class TaskStateRepository:
                     "from_status": row["from_status"],
                     "to_status": row["to_status"],
                     "reason": row["reason"],
+                    "state_seq": row["state_seq"] or 0,
                     "payload": payload,
                     "created_at": row["created_at"],
                 }
@@ -540,6 +555,7 @@ class TaskStateRepository:
             "dir": job.dir,
             "input_path": job.input_path,
             "status": job.status,
+            "state_seq": max(0, int(job.state_seq or 0)),
             "phase": job.phase,
             "progress": job.progress,
             "phase_percent": job.phase_percent,
@@ -572,6 +588,7 @@ class TaskStateRepository:
             input_path=row["input_path"] or "",
             settings=settings,
             status=row["status"] or "queued",
+            state_seq=max(0, int((row["state_seq"] or 0))),
             phase=row["phase"] or "pending",
             progress=row["progress"] or 0.0,
             phase_percent=row["phase_percent"] or 0.0,

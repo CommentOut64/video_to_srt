@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, Optional
 
 from app.services.task_state_repository import TaskStateRepository
@@ -39,16 +40,19 @@ class TaskEventBus:
         from_status: Optional[str],
         to_status: Optional[str],
         reason: Optional[str] = None,
+        state_seq: int = 0,
         payload: Optional[Dict[str, Any]] = None,
         conn: Optional[Any] = None
     ) -> None:
         event_payload = payload or {}
+        updated_at = int(time.time() * 1000)
         self.state_repo.record_event(
             job_id=job_id,
             event_type="status_transition",
             from_status=from_status,
             to_status=to_status,
             reason=reason,
+            state_seq=state_seq,
             payload=event_payload,
             conn=conn,
         )
@@ -62,6 +66,8 @@ class TaskEventBus:
                         "from_status": from_status,
                         "to_status": to_status,
                         "reason": reason,
+                        "state_seq": max(0, int(state_seq or 0)),
+                        "updated_at": updated_at,
                         "payload": event_payload,
                     },
                 )

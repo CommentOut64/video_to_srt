@@ -20,6 +20,8 @@ from pathlib import Path
 import torch
 
 from app.models.job_models import JobState
+from app.models.task_state_machine import get_state_guard
+from app.config.lifecycle_config import STATE_MACHINE_GUARD_ENABLED
 from app.services.sse_service import get_sse_manager
 from app.core.config import config
 from app.services.checkpoint import RuntimeCheckpointService
@@ -141,6 +143,7 @@ class JobQueueService:
         # 依赖服务
         self.transcription_service = transcription_service
         self.sse_manager = get_sse_manager()
+        self.state_guard = get_state_guard()
         # V3.2.0+dev.20260120.05: 队列状态改为仓库驱动 + 心跳租约
         self.state_repo = transcription_service.job_lifecycle.state_repo
         self.event_bus = transcription_service.job_lifecycle.event_bus
@@ -215,10 +218,13 @@ class JobQueueService:
             job: 任务状态对象
         """
         with self.lock:
+            from_status = job.status
+            is_transitioned = self._transition_job_status(job, "queued", "queue_add")
+            if not is_transitioned:
+                logger.error("加入队列失败，状态迁移被拒绝: job=%s", job.job_id)
+                return
             self.jobs[job.job_id] = job
             self.queue.append(job.job_id)
-            from_status = job.status
-            job.status = "queued"
             job.message = f"排队中 (位置: {len(self.queue)})"
 
         logger.info(f"任务已加入队列: {job.job_id} (队列长度: {len(self.queue)})")
@@ -233,6 +239,43 @@ class JobQueueService:
     def get_job(self, job_id: str) -> Optional[JobState]:
         """获取任务状态"""
         return self.jobs.get(job_id)
+
+    def _transition_job_status(self, job: JobState, target_status: str, reason: str) -> bool:
+        """
+        通过状态守卫执行状态迁移。
+
+        守卫关闭时直接赋值，便于灰度回滚。
+        """
+        normalized_target = self.state_guard.normalize_status(target_status)
+        if not STATE_MACHINE_GUARD_ENABLED:
+            job.status = normalized_target
+            return True
+
+        self.state_guard.sync_seq(job.job_id, job.state_seq)
+        normalized_current = self.state_guard.normalize_status(job.status)
+        if normalized_current == normalized_target:
+            job.status = normalized_target
+            return True
+
+        result = self.state_guard.transition(
+            job_id=job.job_id,
+            current_status=normalized_current,
+            target_status=normalized_target,
+            reason=reason,
+        )
+        if not result.success:
+            logger.error(
+                "状态迁移被拒绝: job=%s, %s -> %s, reason=%s",
+                job.job_id,
+                normalized_current,
+                normalized_target,
+                reason,
+            )
+            return False
+
+        job.status = result.to_status
+        job.state_seq = result.state_seq
+        return True
 
     def pause_job(self, job_id: str) -> bool:
         """
@@ -262,7 +305,10 @@ class JobQueueService:
                 is_running = True
                 job.paused = True
                 # V3.1.0: 状态改为 pausing，表示正在等待流水线响应
-                job.status = "pausing"
+                if not self._transition_job_status(job, "pausing", "pause_request_running"):
+                    logger.error("暂停失败，状态迁移被拒绝: job=%s", job_id)
+                    job.paused = False
+                    return False
                 job.message = "正在暂停，等待当前操作完成..."
 
                 # [v3.1.0] 触发取消令牌的暂停
@@ -274,8 +320,10 @@ class JobQueueService:
                     logger.info(f"设置暂停标志: {job_id}")
             elif job_id in self.queue:
                 # 还在排队的任务：直接从队列移除
+                if not self._transition_job_status(job, "paused", "pause_request_queued"):
+                    logger.error("暂停失败，状态迁移被拒绝: job=%s", job_id)
+                    return False
                 self.queue.remove(job_id)
-                job.status = "paused"
                 job.message = "已暂停（未开始）"
                 logger.info(f"从队列移除: {job_id}")
 
@@ -352,20 +400,27 @@ class JobQueueService:
                 # 任务会在原子区域结束后继续正常执行（不会抛出 PausedException）
                 token.resume()
                 job.paused = False
-                job.status = "processing"
+                if not self._transition_job_status(job, "processing", "resume_running"):
+                    logger.error("恢复失败，状态迁移被拒绝: job=%s", job_id)
+                    return False
                 job.message = "已恢复，继续执行中..."
                 logger.info(f"[v3.1.0] 任务仍在运行，清除暂停标志: {job_id}")
             else:
                 # 任务已完全停止：优先保留既有队列顺序
                 if job_id in self.queue:
                     queue_position = list(self.queue).index(job_id) + 1
-                    job.status = "queued"
+                    if not self._transition_job_status(job, "queued", "resume_queued"):
+                        logger.error("恢复失败，状态迁移被拒绝: job=%s", job_id)
+                        return False
                     job.paused = False
                     job.message = f"已恢复，等待执行 (位置: {queue_position})"
                     logger.info(f"[V3.2.0+dev.20260124.01] 任务已在恢复队列中: {job_id}")
                 else:
                     self.queue.append(job_id)
-                    job.status = "queued"
+                    if not self._transition_job_status(job, "queued", "resume_queued"):
+                        logger.error("恢复失败，状态迁移被拒绝: job=%s", job_id)
+                        self.queue.remove(job_id)
+                        return False
                     job.paused = False
                     job.message = f"已恢复，排队中 (位置: {len(self.queue)})"
 
@@ -433,6 +488,14 @@ class JobQueueService:
 
         from_status = job.status
         is_running = False  # [V3.1.0] 标记是否为正在运行的任务
+        cancel_request_time = time.time()
+        logger.info(
+            "[Lifecycle] 取消请求: job=%s, current_status=%s, delete_data=%s, request_time=%s",
+            job_id,
+            job.status,
+            delete_data,
+            cancel_request_time,
+        )
 
         with self.lock:
             # 设置取消标志
@@ -446,22 +509,37 @@ class JobQueueService:
 
             # 如果在队列中，直接移除并标记为已取消
             if job_id in self.queue:
+                if not self._transition_job_status(job, "canceled", "cancel_queued"):
+                    logger.error("取消失败，状态迁移被拒绝: job=%s", job_id)
+                    return False, "状态迁移被拒绝", False
                 self.queue.remove(job_id)
-                job.status = "canceled"
                 job.message = "已取消（未开始）"
+                logger.info(
+                    "[Lifecycle] 取消终态达成: job=%s, status=%s, total_cancel_duration=%.1fs",
+                    job_id,
+                    job.status,
+                    time.time() - cancel_request_time,
+                )
 
             # [V3.1.0] 如果是正在运行的任务，进入"取消中"状态
             # 不再立即清除 running_job_id，让 Worker 的 finally 块处理
             elif self.running_job_id == job_id:
                 is_running = True
-                job.status = "canceling"  # 新状态：取消中
+                if not self._transition_job_status(job, "canceling", "cancel_running"):
+                    logger.error("取消失败，状态迁移被拒绝: job=%s", job_id)
+                    return False, "状态迁移被拒绝", False
                 # 运行中删除：提示将延迟自动删除
                 job.message = "当前有进程占用，将延迟自动删除"
                 # 记录取消请求时间，用于超时保障
-                self._pending_cancel_requests[job_id] = time.time()
+                self._pending_cancel_requests[job_id] = cancel_request_time
                 if delete_data:
                     self._pending_delete_after_cancel.add(job_id)
                 logger.info(f"[V3.1.0] 任务进入取消中状态: {job_id}")
+                logger.info(
+                    "[Lifecycle] 进入 canceling: job=%s, enter_time=%s",
+                    job_id,
+                    cancel_request_time,
+                )
 
         self._persist_queue_and_jobs([job], {job.job_id: from_status}, reason="cancel_request")
 
@@ -544,7 +622,7 @@ class JobQueueService:
                         if job.status == "paused":
                             # V3.2.0+dev.20260124.01: 重启后保留队列顺序，等待用户恢复
                             logger.info(f"[V3.2.0+dev.20260124.01] 队列头任务已暂停，等待恢复: {job_id}")
-                        elif job.status in ["canceled", "canceling", "force_canceled", "failed"]:
+                        elif job.status in ["canceled", "canceling", "force_canceled", "failed", "removed"]:
                             logger.info(f"⏭️ 跳过已取消/失败的任务: {job_id}")
                             self.queue.popleft()
                             continue
@@ -553,7 +631,11 @@ class JobQueueService:
                             self.queue.popleft()
                             self.running_job_id = job_id
                             self._current_executing_job_id = job_id  # [V3.1.0] 记录实际执行的任务ID
-                            job.status = "processing"
+                            if not self._transition_job_status(job, "processing", "worker_start"):
+                                logger.error("任务启动失败，状态迁移被拒绝: job=%s", job_id)
+                                self.running_job_id = None
+                                self._current_executing_job_id = None
+                                continue
                             job.message = "开始处理"
 
                             # V3.1.0: 在推送 SSE 之前，先从 checkpoint 恢复进度
@@ -618,34 +700,34 @@ class JobQueueService:
 
                     # 检查最终状态
                     if job.canceled:
-                        job.status = "canceled"
+                        self._transition_job_status(job, "canceled", "pipeline_canceled")
                         job.message = "已取消"
                     elif job.paused:
-                        job.status = "paused"
+                        self._transition_job_status(job, "paused", "pipeline_paused")
                         job.message = "已暂停"
                     else:
                         is_finish_valid, finish_error = self._validate_finish_integrity(job)
                         if not is_finish_valid:
                             raise RuntimeError(finish_error)
-                        job.status = "finished"
+                        self._transition_job_status(job, "finished", "pipeline_complete")
                         job.message = "完成"
                         logger.info(f"任务完成: {self.running_job_id}")
 
                 except CancelledException as e:
                     # [v3.1.0] 捕获取消异常
-                    job.status = "canceled"
+                    self._transition_job_status(job, "canceled", "pipeline_canceled")
                     job.message = "已取消"
                     logger.info(f"[v3.1.0] 任务被取消: {e.job_id}")
 
                 except PausedException as e:
                     # [v3.1.0] 捕获暂停异常
-                    job.status = "paused"
+                    self._transition_job_status(job, "paused", "pipeline_paused")
                     job.message = "已暂停"
                     self._notify_pause_ack(job)
                     logger.info(f"[v3.1.0] 任务已暂停: {e.job_id}")
 
                 except Exception as e:
-                    job.status = "failed"
+                    self._transition_job_status(job, "failed", "pipeline_error")
                     job.message = f"失败: {e}"
                     job.error = str(e)
                     logger.error(f"任务执行失败: {self.running_job_id} - {e}", exc_info=True)
@@ -655,11 +737,23 @@ class JobQueueService:
                     # [V3.1.0] 使用 _current_executing_job_id 而非 running_job_id
                     # 因为 running_job_id 可能被超时监控清除
                     finished_job_id = self._current_executing_job_id
+                    cancel_request_time = None
                     with self.lock:
                         self.running_job_id = None
                         self._current_executing_job_id = None
                         # [V3.1.0] 从待取消列表移除
-                        self._pending_cancel_requests.pop(finished_job_id, None)
+                        cancel_request_time = self._pending_cancel_requests.pop(finished_job_id, None)
+
+                    if (
+                        cancel_request_time is not None
+                        and job.status in ("canceled", "force_canceled")
+                    ):
+                        logger.info(
+                            "[Lifecycle] 取消终态达成: job=%s, status=%s, total_cancel_duration=%.1fs",
+                            finished_job_id,
+                            job.status,
+                            time.time() - cancel_request_time,
+                        )
 
                     # [v3.1.0] 清理取消令牌
                     self._remove_cancellation_token(finished_job_id)
@@ -685,7 +779,6 @@ class JobQueueService:
                                 self._save_state()
                                 continue
                             # 删除失败（如外部占用），保留任务并提示稍后重试
-                            job.status = "paused"
                             job.message = err or "当前有进程占用，请稍后再试"
                             self.transcription_service.save_job_meta(job)
                             self._notify_job_status(job.job_id, job.status)
@@ -797,7 +890,7 @@ class JobQueueService:
             job = self.jobs.get(job_id)
             if job:
                 from_status = job.status
-                job.status = "force_canceled"
+                self._transition_job_status(job, "force_canceled", "cancel_timeout")
                 job.message = f"已强制取消（响应超时 {elapsed:.0f}s）"
                 logger.info(f"[V3.1.0] 任务状态更新为 force_canceled: {job_id}")
 
@@ -946,7 +1039,7 @@ class JobQueueService:
 
         except Exception as e:
             logger.error(f"[双流对齐] 任务失败: {e}", exc_info=True)
-            job.status = 'failed'
+            self._transition_job_status(job, "failed", "pipeline_error")
             job.error = str(e)
             push_signal_event(sse_manager, job.job_id, "job_failed", str(e))
             raise
@@ -1202,7 +1295,7 @@ class JobQueueService:
                 # 将被中断的任务重新加入队列头部
                 if self.interrupted_job_id not in self.queue:
                     self.queue.appendleft(self.interrupted_job_id)
-                    interrupted_job.status = "queued"
+                    self._transition_job_status(interrupted_job, "queued", "interrupted_resume")
                     interrupted_job.paused = False
                     interrupted_job.message = "插队任务已完成，自动恢复执行"
                     logger.info(f"[自动恢复] 被中断的任务已恢复到队头: {self.interrupted_job_id}")
@@ -1241,6 +1334,7 @@ class JobQueueService:
         data = {
             "id": job_id,
             "status": status,
+            "state_seq": int(job.state_seq or 0),
             "percent": round(job.progress, 1),  # 统一字段名为 percent，保留1位小数
             "message": job.message,
             "filename": job.filename,
@@ -1314,6 +1408,7 @@ class JobQueueService:
             "signal": signal,
             "job_id": job_id,
             "status": job.status,
+            "state_seq": int(job.state_seq or 0),
             "message": job.message,
             "percent": round(job.progress, 1),
             "updated_at": int(time.time() * 1000)
@@ -1730,16 +1825,23 @@ class JobQueueService:
                     conn=conn,
                 )
                 for job in jobs:
+                    self.state_guard.sync_seq(job.job_id, job.state_seq)
+                    job.status = self.state_guard.normalize_status(job.status)
                     self.state_repo.upsert_task(job, conn=conn)
 
                 for job in jobs:
                     from_status = from_status_map.get(job.job_id)
-                    if from_status != job.status or reason:
+                    normalized_from_status = (
+                        self.state_guard.normalize_status(from_status)
+                        if from_status else from_status
+                    )
+                    if normalized_from_status != job.status or reason:
                         self.event_bus.emit_status_event(
                             job_id=job.job_id,
-                            from_status=from_status,
+                            from_status=normalized_from_status,
                             to_status=job.status,
                             reason=reason,
+                            state_seq=job.state_seq,
                             conn=conn,
                         )
         except Exception as exc:
@@ -1806,9 +1908,12 @@ class JobQueueService:
         timeout_jobs: set[str],
     ) -> None:
         """重启纠偏：统一标记暂停并设置原因提示。"""
-        if job.status in ("finished", "failed", "canceled"):
+        if job.status in ("finished", "failed", "canceled", "force_canceled", "removed"):
             return
-        job.status = "paused"
+        is_transitioned = self._transition_job_status(job, "paused", "restart_correction")
+        if not is_transitioned:
+            logger.warning("重启纠偏状态迁移被拒绝: job=%s", job.job_id)
+            return
         job.paused = True
         if job.job_id in expired_jobs:
             job.message = "租约过期，任务已暂停"
@@ -1852,7 +1957,13 @@ class JobQueueService:
             job_ids = set(recovery_queue)
             # V3.2.0+dev.20260120.06: 加载仓库中的暂停任务，避免重启后无法恢复
             for job in self.state_repo.list_tasks():
-                is_non_terminal = job.status not in ("finished", "failed", "canceled")
+                is_non_terminal = job.status not in (
+                    "finished",
+                    "failed",
+                    "canceled",
+                    "force_canceled",
+                    "removed",
+                )
                 if is_non_terminal:
                     job_ids.add(job.job_id)
 
@@ -1870,8 +1981,9 @@ class JobQueueService:
                 job = self._load_job_for_recovery(job_id)
                 if not job:
                     continue
+                self.state_guard.sync_seq(job.job_id, job.state_seq)
 
-                if job.status in ("finished", "failed", "canceled"):
+                if job.status in ("finished", "failed", "canceled", "force_canceled", "removed"):
                     logger.info(f"[V3.2.0+dev.20260124.01] 过滤终态任务: {job_id}")
                     continue
 
@@ -1887,7 +1999,8 @@ class JobQueueService:
                 job = self._load_job_for_recovery(job_id)
                 if not job:
                     continue
-                if job.status in ("finished", "failed", "canceled"):
+                self.state_guard.sync_seq(job.job_id, job.state_seq)
+                if job.status in ("finished", "failed", "canceled", "force_canceled", "removed"):
                     continue
                 from_status_map[job_id] = job.status
                 self._apply_restart_pause(job, expired_jobs, timeout_jobs)
@@ -1951,7 +2064,10 @@ class JobQueueService:
 
             # 3. 插到队头
             self.queue.appendleft(job_id)
-            job.status = "queued"
+            if not self._transition_job_status(job, "queued", "prioritize"):
+                logger.error("插队失败，状态迁移被拒绝: job=%s", job_id)
+                self.queue.remove(job_id)
+                return {"success": False, "error": "状态迁移被拒绝"}
 
             result = {
                 "success": True,

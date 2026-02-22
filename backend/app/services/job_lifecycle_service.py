@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Dict, Optional, List, Any, Tuple
 
 from app.models.job_models import JobState, JobSettings
+from app.models.task_state_machine import get_state_guard
+from app.config.lifecycle_config import STATE_MACHINE_GUARD_ENABLED
 from app.services.job_index_service import JobIndexService, get_job_index_service
 from app.services.sse_service import get_sse_manager
 from app.services.task_event_bus import TaskEventBus
@@ -35,7 +37,7 @@ class JobLifecycleService:
     统一管理任务元信息、断点与重启恢复。
     """
 
-    _TERMINAL_STATUSES = {"finished", "failed", "canceled"}
+    _TERMINAL_STATUSES = {"finished", "failed", "canceled", "force_canceled", "removed"}
     _NON_TERMINAL_STATUSES = {
         "created",
         "uploaded",
@@ -56,6 +58,7 @@ class JobLifecycleService:
         self.jobs_root = Path(jobs_root)
         self.jobs_root.mkdir(parents=True, exist_ok=True)
         self.logger = logger or logging.getLogger(__name__)
+        self.state_guard = get_state_guard()
 
         self.jobs: Dict[str, JobState] = {}
         self.lock = threading.Lock()
@@ -88,6 +91,7 @@ class JobLifecycleService:
             loaded_count = 0
             for job in jobs:
                 from_status = job.status
+                self.state_guard.sync_seq(job.job_id, job.state_seq)
                 if self._apply_restart_pause(job):
                     self._persist_job_state(job, from_status=from_status, reason="system_restart")
 
@@ -406,7 +410,8 @@ class JobLifecycleService:
 
         from_status = job.status
         job.paused = True
-        job.status = "paused"
+        if not self._transition_job_status(job, "paused", "pause_request"):
+            return False
         job.message = "暂停中..."
         try:
             runtime_service = RuntimeCheckpointService(job_dir=Path(job.dir))
@@ -591,6 +596,43 @@ class JobLifecycleService:
 
     # ====== internal helpers ======
 
+    def _transition_job_status(self, job: JobState, target_status: str, reason: str) -> bool:
+        """
+        通过状态守卫执行任务状态迁移。
+
+        关闭守卫开关时回退为直接赋值，保证灰度可回滚。
+        """
+        normalized_target = self.state_guard.normalize_status(target_status)
+        if not STATE_MACHINE_GUARD_ENABLED:
+            job.status = normalized_target
+            return True
+
+        self.state_guard.sync_seq(job.job_id, job.state_seq)
+        normalized_current = self.state_guard.normalize_status(job.status)
+        if normalized_current == normalized_target:
+            job.status = normalized_target
+            return True
+
+        result = self.state_guard.transition(
+            job_id=job.job_id,
+            current_status=normalized_current,
+            target_status=normalized_target,
+            reason=reason,
+        )
+        if not result.success:
+            self.logger.error(
+                "状态迁移被拒绝: job=%s, %s -> %s, reason=%s",
+                job.job_id,
+                normalized_current,
+                normalized_target,
+                reason,
+            )
+            return False
+
+        job.status = result.to_status
+        job.state_seq = result.state_seq
+        return True
+
     def _apply_restart_pause(self, job: JobState) -> bool:
         """
         系统重启纠偏：将非终态任务统一标记为暂停。
@@ -603,7 +645,9 @@ class JobLifecycleService:
             or not job.paused
             or job.message != "系统重启，任务已暂停"
         )
-        job.status = "paused"
+        is_transitioned = self._transition_job_status(job, "paused", "restart_correction")
+        if not is_transitioned:
+            return False
         job.paused = True
         job.message = "系统重启，任务已暂停"
         return changed
@@ -614,22 +658,26 @@ class JobLifecycleService:
         from_status: Optional[str],
         reason: Optional[str]
     ) -> None:
+        normalized_from_status = self.state_guard.normalize_status(from_status) if from_status else from_status
+        job.status = self.state_guard.normalize_status(job.status)
         with self.state_repo.transaction() as conn:
             self.state_repo.upsert_task(job, conn=conn)
-            if from_status and from_status != job.status:
+            if normalized_from_status and normalized_from_status != job.status:
                 self.event_bus.emit_status_event(
                     job_id=job.job_id,
-                    from_status=from_status,
+                    from_status=normalized_from_status,
                     to_status=job.status,
                     reason=reason,
+                    state_seq=job.state_seq,
                     conn=conn,
                 )
             elif reason:
                 self.event_bus.emit_status_event(
                     job_id=job.job_id,
-                    from_status=from_status,
+                    from_status=normalized_from_status,
                     to_status=job.status,
                     reason=reason,
+                    state_seq=job.state_seq,
                     conn=conn,
                 )
 
@@ -658,6 +706,7 @@ class JobLifecycleService:
                     from_status=None,
                     to_status=job.status,
                     reason="legacy_import",
+                    state_seq=job.state_seq,
                     payload={"source": "job_meta_or_checkpoint"},
                 )
                 if job.input_path:
