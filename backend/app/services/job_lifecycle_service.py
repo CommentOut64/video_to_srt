@@ -262,6 +262,8 @@ class JobLifecycleService:
         """
         summaries: List[Dict[str, Any]] = []
         for job in self.state_repo.list_tasks():
+            if job.status == "removed":
+                continue
             summaries.append({
                 "id": job.job_id,
                 "filename": job.filename,

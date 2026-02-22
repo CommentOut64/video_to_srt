@@ -5,6 +5,7 @@ V3.2.0+dev.20260119.03
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -67,7 +68,11 @@ class WhisperEngine(ASREngine):
         no_repeat_ngram_size = kwargs.get("no_repeat_ngram_size")
 
         try:
-            result = self.service.transcribe(
+            # 设计模式：Async Adapter（线程卸载同步推理）
+            # 原因：WhisperService.transcribe 是同步重计算，直接调用会阻塞事件循环，
+            # 导致取消/删除信号无法及时被流水线消费。
+            result = await asyncio.to_thread(
+                self.service.transcribe,
                 audio,
                 language=language,
                 initial_prompt=initial_prompt,

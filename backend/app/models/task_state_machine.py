@@ -98,6 +98,9 @@ STATUS_ALIASES: Dict[str, str] = {
     "uploaded": TaskStatus.CREATED.value,
     "running": TaskStatus.PROCESSING.value,
     "transcribing": TaskStatus.PROCESSING.value,
+    # 兼容旧冻结语义事件：统一映射到 canceled
+    "freezing": TaskStatus.CANCELED.value,
+    "frozen": TaskStatus.CANCELED.value,
 }
 
 
@@ -227,4 +230,3 @@ def get_state_guard() -> TaskStateGuard:
     if _guard is None:
         _guard = TaskStateGuard()
     return _guard
-

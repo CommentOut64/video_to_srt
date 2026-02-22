@@ -2106,7 +2106,7 @@ def create_transcription_router(
                         "is_finalized": bool(is_finalized),
                     })
 
-                # finished 态强制收口 snapshot，避免恢复后残留 draft。
+                # 终态强制收口 snapshot，避免取消/完成后残留 draft。
                 forced_snapshot_updates = force_finalize_snapshot_when_finished(
                     job_status=job.status,
                     sentences_snapshot=sentences_snapshot,
@@ -2114,8 +2114,9 @@ def create_transcription_router(
                 if forced_snapshot_updates > 0:
                     need_update_checkpoint = True
                     logger.warning(
-                        "[%s] finished 态修正快照草稿标记: count=%s",
+                        "[%s] 终态修正快照草稿标记: status=%s, count=%s",
                         job_id,
+                        job.status,
                         forced_snapshot_updates,
                     )
 
@@ -2187,8 +2188,9 @@ def create_transcription_router(
             )
             if forced_segments > 0:
                 logger.warning(
-                    "[%s] finished 态收口返回段落草稿标记: count=%s",
+                    "[%s] 终态收口返回段落草稿标记: status=%s, count=%s",
                     job_id,
+                    job.status,
                     forced_segments,
                 )
 

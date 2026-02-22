@@ -5,8 +5,10 @@ SlowWorker - 慢流推理 Worker（GPU）
 1. 执行 Whisper 推理
 2. 返回推理结果（不做 Prompt 构建/幻觉检测/对齐）
 """
+import asyncio
 import logging
-from typing import Dict, Optional, Any, List, TYPE_CHECKING
+from contextlib import suppress
+from typing import Callable, Dict, Optional, Any, List, TYPE_CHECKING
 
 from app.core.asr.engine import ASREngine
 from app.core.asr.models import ASRResult
@@ -50,10 +52,52 @@ class SlowWorker:
         self.logger = resolve_loguru_logger(logger, __name__, layer="L0")
         self._whisper_sanitizer = WhisperTextSanitizer(logger=self.logger)
 
+    async def _transcribe_with_cancel_guard(
+        self,
+        *,
+        audio: Any,
+        language: Optional[str],
+        cancel_checker: Optional[Callable[[], None]] = None,
+        poll_interval_sec: float = 0.2,
+        **kwargs: Any,
+    ) -> ASRResult:
+        """
+        带取消轮询守卫的转录执行。
+
+        Why:
+        - patch_engine.transcribe 可能是重计算路径，取消请求到来时必须尽快让当前协程退出，
+          避免 SlowLoop 长时间停留在 canceling。
+        """
+        transcribe_task = asyncio.create_task(
+            self.patch_engine.transcribe(
+                audio,
+                language=language,
+                **kwargs,
+            )
+        )
+
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    {transcribe_task},
+                    timeout=poll_interval_sec,
+                )
+                if done:
+                    return transcribe_task.result()
+                if cancel_checker:
+                    cancel_checker()
+        except Exception:
+            if not transcribe_task.done():
+                transcribe_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await asyncio.wait_for(transcribe_task, timeout=0.05)
+            raise
+
     async def infer(
         self,
         audio: Any,
-        initial_prompt: Optional[str] = None
+        initial_prompt: Optional[str] = None,
+        cancel_checker: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
         """
         执行 Whisper 推理
@@ -65,9 +109,10 @@ class SlowWorker:
         Returns:
             Dict: Whisper 推理结果
         """
-        asr_result = await self.patch_engine.transcribe(
-            audio,
+        asr_result = await self._transcribe_with_cancel_guard(
+            audio=audio,
             language=self.whisper_language,
+            cancel_checker=cancel_checker,
             initial_prompt=initial_prompt,
             repetition_penalty=None,
             no_repeat_ngram_size=None,
@@ -81,6 +126,7 @@ class SlowWorker:
         full_audio_array: Any,
         full_audio_sr: int = 16000,
         prompt_text: Optional[str] = None,
+        cancel_checker: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
         """处理 TurnGroup（Phase 3 W-Epoch）。"""
         if not group:
@@ -97,9 +143,10 @@ class SlowWorker:
         )
         # Why: 禁止隐式回退到 group.prompt_text，避免关闭注入后仍发生上下文拼接污染。
         prompt = prompt_text if prompt_text else None
-        asr_result = await self.patch_engine.transcribe(
-            audio,
+        asr_result = await self._transcribe_with_cancel_guard(
+            audio=audio,
             language=group.language or self.whisper_language,
+            cancel_checker=cancel_checker,
             initial_prompt=prompt,
             word_timestamps=True,
             vad_filter=False,

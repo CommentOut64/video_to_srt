@@ -7,6 +7,7 @@ FastWorker 循环门面服务。
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any, List, Optional, Set
 
@@ -20,6 +21,48 @@ class FastLoopService:
 
     def __init__(self, *, host: Any) -> None:
         self._host = host
+
+    async def _put_queue_inter_with_guard(
+        self,
+        *,
+        payload: ProcessingContext,
+        token: Any,
+        timeout_seconds: float = 0.5,
+        max_retry: int = 6,
+        allow_drop: bool = False,
+        reason: str = "",
+    ) -> bool:
+        """
+        带取消守卫的 queue_inter 投递。
+
+        Why:
+        - 下游提前退出时，`await queue.put(...)` 可能因背压永久阻塞
+        - 取消链路必须优先退出，不能被队列写入卡死
+        """
+        host = self._host
+        retries = 0
+        while True:
+            try:
+                await asyncio.wait_for(
+                    host.queue_inter.put(payload),
+                    timeout=timeout_seconds,
+                )
+                return True
+            except asyncio.TimeoutError:
+                retries += 1
+                if token:
+                    token.raise_if_canceled()
+                if retries >= max_retry:
+                    if allow_drop:
+                        host.logger.warning(
+                            "FastWorker 投递 queue_inter 超时，丢弃载荷: reason=%s, retries=%s",
+                            reason,
+                            retries,
+                        )
+                        return False
+                    raise RuntimeError(
+                        f"FastWorker 投递 queue_inter 超时: reason={reason}, retries={retries}"
+                    )
 
     async def run(
         self,
@@ -78,7 +121,11 @@ class FastLoopService:
                         not host._enable_bridge_batches
                         or (not host._consume_turn_groups_only and not used_semantic)
                     ):
-                        await host.queue_inter.put(ctx)
+                        await self._put_queue_inter_with_guard(
+                            payload=ctx,
+                            token=token,
+                            reason=f"chunk_{i}",
+                        )
                     fast_processed_count += 1
                     last_chunk_index = i
 
@@ -119,7 +166,7 @@ class FastLoopService:
                         break
 
         except CancelledException as exc:
-            host.logger.error(f"FastWorker 循环取消: {exc}", exc_info=True)
+            host.logger.info(f"FastWorker 循环取消: {exc}")
             host.errors.append(exc)
             should_send_end_signal = False
 
@@ -132,7 +179,12 @@ class FastLoopService:
                 is_end=True,
                 error=exc,
             )
-            await host.queue_inter.put(error_ctx)
+            await self._put_queue_inter_with_guard(
+                payload=error_ctx,
+                token=token,
+                allow_drop=True,
+                reason="cancel_error_ctx",
+            )
             return
 
         except Exception as exc:
@@ -148,7 +200,12 @@ class FastLoopService:
                 is_end=True,
                 error=exc,
             )
-            await host.queue_inter.put(error_ctx)
+            await self._put_queue_inter_with_guard(
+                payload=error_ctx,
+                token=token,
+                allow_drop=True,
+                reason="exception_error_ctx",
+            )
             should_send_end_signal = False
             return
         finally:
@@ -166,7 +223,12 @@ class FastLoopService:
                     debug_punctuation=host.debug_punctuation,
                     is_end=True,
                 )
-                await host.queue_inter.put(end_ctx)
+                await self._put_queue_inter_with_guard(
+                    payload=end_ctx,
+                    token=token,
+                    allow_drop=True,
+                    reason="end_ctx",
+                )
                 if pause_requested:
                     host.logger.debug("[V3.1.0] FastWorker 已发送暂停结束信号，等待下游排空")
                 else:
