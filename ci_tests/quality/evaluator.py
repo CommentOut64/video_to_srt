@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from ci_tests.integration.harness import SRTEntry, SRTParser
+from ci_tests.integration.harness.srt_parser import SRTEntry, SRTParser
 
 from .metrics import (
     CERCalculator,
