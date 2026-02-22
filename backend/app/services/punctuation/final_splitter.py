@@ -38,8 +38,8 @@ class FinalSplitConfig:
     is_enable_cjk_weak_punct_split: bool = True
     is_enable_cjk_semantic_split: bool = True
     cjk_weak_punct_min_tokens: int = 8
-    cjk_weak_punct_fallback_min_tokens: int = 16
-    cjk_weak_punct_fallback_min_duration: float = 2.4
+    cjk_weak_punct_fallback_min_tokens: int = 12
+    cjk_weak_punct_fallback_min_duration: float = 1.8
     cjk_semantic_split_min_tokens: int = 10
     cjk_semantic_split_min_duration: float = 1.2
 
@@ -204,17 +204,13 @@ class FinalSplitter:
                     last_candidate_strength = 0
                 continue
 
-            if (
-                punct_strength >= 1
-                and self._is_enable_cjk_weak_punct_split()
-                and tokens >= max(min_tokens, self.config.cjk_weak_punct_min_tokens)
-                and duration >= self.config.min_duration
-                and (
-                    pause_strength >= 1
-                    or is_semantic_boundary
-                    or tokens >= self.config.cjk_weak_punct_fallback_min_tokens
-                    or duration >= self.config.cjk_weak_punct_fallback_min_duration
-                )
+            if self._can_split_by_cjk_weak_punct(
+                tokens=tokens,
+                duration=duration,
+                punct_strength=punct_strength,
+                pause_strength=pause_strength,
+                is_semantic_boundary=is_semantic_boundary,
+                min_tokens=min_tokens,
             ):
                 if not is_semantic_boundary and self._should_block_pause_split(words, start_idx, idx):
                     pause_split_blocked_count += 1
@@ -332,6 +328,31 @@ class FinalSplitter:
             if first_token == normalized:
                 return True
         return False
+
+    def _can_split_by_cjk_weak_punct(
+        self,
+        *,
+        tokens: int,
+        duration: float,
+        punct_strength: int,
+        pause_strength: int,
+        is_semantic_boundary: bool,
+        min_tokens: int,
+    ) -> bool:
+        if punct_strength < 1:
+            return False
+        if not self._is_enable_cjk_weak_punct_split():
+            return False
+        if tokens < max(min_tokens, self.config.cjk_weak_punct_min_tokens):
+            return False
+        if duration < self.config.min_duration:
+            return False
+        if pause_strength >= 1 or is_semantic_boundary:
+            return True
+        return (
+            tokens >= self.config.cjk_weak_punct_fallback_min_tokens
+            or duration >= self.config.cjk_weak_punct_fallback_min_duration
+        )
 
     def _should_block_pause_split(
         self,
