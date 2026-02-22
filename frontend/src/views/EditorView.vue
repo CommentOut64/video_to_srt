@@ -348,7 +348,7 @@ let progressPollTimer = null
 let proxyPollTimer = null
 const isCancelPending = ref(false)
 const CANCEL_TIMEOUT_MS = 30000
-const CANCEL_TERMINAL_STATUSES = new Set(['canceled', 'force_canceled', 'failed', 'finished', 'removed'])
+const CANCEL_TERMINAL_STATUSES = new Set(['canceled', 'failed', 'finished', 'removed', 'force_canceled'])
 let cancelTimeoutTimer = null
 
 // Provide 编辑器上下文
@@ -592,6 +592,13 @@ async function loadProject() {
         console.log('[EditorView] 缓存数据格式过旧（缺少 sentenceIndex），重新从 API 加载')
         await loadTranscribingSegments()
       }
+      // 取消终态下兜底收口本地草稿，避免旧缓存刷新后回到草稿态
+      if (['canceled', 'force_canceled'].includes(jobStatus.status)) {
+        const hasDraft = projectStore.subtitles.some((s) => s.isDraft)
+        if (hasDraft) {
+          await projectStore.finalizeDraftSubtitlesOnCancel()
+        }
+      }
       // V3.2.0+dev.20260124.02: 后端为唯一真理，后续仍会从 API 刷新覆盖
     }
 
@@ -630,6 +637,14 @@ async function loadProject() {
       // 任务刚创建，订阅SSE等待开始
       subscribeSSE()
       startProxyPolling()
+    } else if (['canceled', 'force_canceled'].includes(jobStatus.status)) {
+      // 取消终态：优先保留本地恢复结果，若无本地数据则回退后端字幕
+      if (!hasLocalRestore) {
+        await loadTranscribingSegments()
+        if (projectStore.subtitles.length === 0) {
+          await loadFromSRT()
+        }
+      }
     } else if (jobStatus.status === 'failed') {
       await loadTranscribingSegments()
     }
@@ -882,14 +897,14 @@ function subscribeSSE() {
       })
     },
 
-    onCanceled(data) {
+    async onCanceled(data) {
       console.log('[EditorView] 任务已取消:', data)
-      handleCancelTerminal(data, 'canceled')
+      await handleCancelTerminal(data, 'canceled')
     },
 
-    onForceCanceled(data) {
+    async onForceCanceled(data) {
       console.log('[EditorView] 任务已强制取消:', data)
-      handleCancelTerminal(data, 'force_canceled')
+      await handleCancelTerminal(data, 'force_canceled')
     },
 
     onResumed(data) {
@@ -1072,10 +1087,14 @@ function isCancelTerminalStatus(status) {
   return CANCEL_TERMINAL_STATUSES.has(status)
 }
 
-function handleCancelTerminal(data, fallbackStatus = 'canceled') {
+async function handleCancelTerminal(data, fallbackStatus = 'canceled') {
   const terminalStatus = data?.status || fallbackStatus
   isCancelPending.value = false
   stopCancelTimeoutPolling()
+  // 取消收敛后，将已推送草稿就地转为定稿，保持已有定稿不变
+  if (terminalStatus === 'canceled') {
+    await projectStore.finalizeDraftSubtitlesOnCancel()
+  }
   progressStore.markStatus(props.jobId, terminalStatus, {
     updated_at: data?.updated_at ?? data?.timestamp,
     state_seq: data?.state_seq,
@@ -1098,7 +1117,7 @@ function startCancelTimeoutPolling() {
       const snapshot = await transcriptionApi.getJobStatus(props.jobId, true)
       const status = snapshot?.status || ''
       if (isCancelTerminalStatus(status)) {
-        handleCancelTerminal(
+        await handleCancelTerminal(
           {
             status,
             updated_at: snapshot?.updated_at,
@@ -1599,7 +1618,7 @@ async function cancelTranscription() {
   if (!confirm('确定要取消当前转录任务吗?')) return
   try {
     const result = await transcriptionApi.cancelJob(props.jobId, false)
-    const apiStatus = result?.task?.status || result?.status || 'canceling'
+    const apiStatus = result?.task?.status || result?.status || 'canceled'
     if (result?.task) {
       taskStore.applyTaskSnapshot(result.task)
       progressStore.markStatus(props.jobId, apiStatus, {
@@ -1609,9 +1628,21 @@ async function cancelTranscription() {
       progressStore.markStatus(props.jobId, apiStatus)
       taskStore.updateTaskStatus(props.jobId, apiStatus, null, { isServer: false })
     }
-    // Phase1: 取消后保留 SSE，等待终态信号后再断连
-    isCancelPending.value = true
-    startCancelTimeoutPolling()
+    if (isCancelTerminalStatus(apiStatus)) {
+      await handleCancelTerminal(
+        {
+          status: apiStatus,
+          updated_at: result?.task?.updated_at,
+          timestamp: Date.now(),
+          state_seq: result?.state_seq,
+        },
+        apiStatus
+      )
+    } else {
+      // 兼容旧后端 canceling 语义
+      isCancelPending.value = true
+      startCancelTimeoutPolling()
+    }
     console.log('[EditorView] 取消请求已发送，等待终态信号:', {
       status: apiStatus,
       reason_code: result?.reason_code,

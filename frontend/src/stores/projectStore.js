@@ -951,6 +951,101 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   /**
+   * 取消收敛时将已推送草稿转为定稿。
+   *
+   * 约束：
+   * 1. 已有定稿保持不变
+   * 2. 草稿转定稿时沿用“同句索引优先去重”策略，避免与既有定稿重复
+   * 3. 未推送数据不处理
+   */
+  async function finalizeDraftSubtitlesOnCancel() {
+    pauseHistory();
+
+    const finalizedSentenceKeys = new Set();
+    const finalizedChunkKeys = new Set();
+    subtitles.value.forEach((subtitle) => {
+      if (subtitle.isDraft) return;
+      if (subtitle.sentenceIndex !== undefined && subtitle.sentenceIndex !== null) {
+        finalizedSentenceKeys.add(String(subtitle.sentenceIndex));
+      }
+      if (subtitle.chunk_id !== undefined && subtitle.chunk_id !== null) {
+        finalizedChunkKeys.add(
+          `${subtitle.chunk_id}::${(subtitle.text || "").trim()}::${Number(subtitle.start || 0).toFixed(3)}::${Number(subtitle.end || 0).toFixed(3)}`
+        );
+      }
+    });
+
+    const removedIds = new Set();
+    subtitles.value = subtitles.value
+      .map((subtitle) => {
+        if (!subtitle.isDraft) {
+          return subtitle;
+        }
+
+        const hasSentenceIndex = subtitle.sentenceIndex !== undefined && subtitle.sentenceIndex !== null;
+        const sentenceKey = hasSentenceIndex ? String(subtitle.sentenceIndex) : null;
+        const chunkKey = subtitle.chunk_id !== undefined && subtitle.chunk_id !== null
+          ? `${subtitle.chunk_id}::${(subtitle.text || "").trim()}::${Number(subtitle.start || 0).toFixed(3)}::${Number(subtitle.end || 0).toFixed(3)}`
+          : null;
+        const isDuplicated = Boolean(
+          (sentenceKey && finalizedSentenceKeys.has(sentenceKey))
+          || (chunkKey && finalizedChunkKeys.has(chunkKey))
+        );
+        if (isDuplicated) {
+          removedIds.add(subtitle.id);
+          return null;
+        }
+
+        if (sentenceKey) {
+          finalizedSentenceKeys.add(sentenceKey);
+        }
+        if (chunkKey) {
+          finalizedChunkKeys.add(chunkKey);
+        }
+
+        return {
+          ...subtitle,
+          isDraft: false,
+          isFinalized: true,
+          source: subtitle.source || "cancel_finalized",
+        };
+      })
+      .filter(Boolean);
+
+    if (removedIds.size > 0) {
+      chunkSubtitleMap.value.forEach((subtitleIds, chunkId) => {
+        const filtered = (subtitleIds || []).filter((id) => !removedIds.has(id));
+        chunkSubtitleMap.value.set(chunkId, filtered);
+      });
+    }
+
+    subtitles.value.sort((left, right) => {
+      const byStart = (left.start || 0) - (right.start || 0);
+      if (byStart !== 0) return byStart;
+      return (left.end || 0) - (right.end || 0);
+    });
+
+    updateDualStreamProgress();
+    console.log(
+      `[ProjectStore] 取消收敛完成，草稿转定稿并去重: removed=${removedIds.size}`
+    );
+
+    // 关键路径使用同步备份 + 立即持久化，避免取消后用户立刻刷新导致数据丢失
+    if (meta.value.jobId) {
+      try {
+        await smartSaver.forceSaveCritical({
+          jobId: meta.value.jobId,
+          subtitles: subtitles.value,
+          meta: meta.value,
+        });
+      } catch (error) {
+        console.error("[ProjectStore] 取消收敛后关键保存失败:", error);
+      }
+    }
+    resumeHistory();
+  }
+
+  /**
    * V3.1.0: 恢复字幕（断点续传后恢复）
    *
    * 当收到 subtitle.restored 事件时调用
@@ -1484,6 +1579,7 @@ export const useProjectStore = defineStore("project", () => {
     // Phase 5: 双模态架构方法
     appendOrUpdateDraft,
     replaceChunk,
+    finalizeDraftSubtitlesOnCancel,
     restoreChunk, // V3.1.0: 断点续传字幕恢复
     applyRevisedSubtitle,
     applySpeakerProfiles,

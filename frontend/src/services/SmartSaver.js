@@ -473,6 +473,19 @@ class SmartSaver {
   }
 
   /**
+   * 强制关键保存（先同步备份，再立即持久化）
+   *
+   * Why:
+   * - 用于取消/删除等关键收敛场景，避免用户立即刷新导致异步保存尚未完成而丢失
+   */
+  async forceSaveCritical(data) {
+    if (!data?.jobId) return;
+    this._pendingData = data;
+    this._emergencySave(data);
+    await this._immediateSave(data);
+  }
+
+  /**
    * 清理资源
    */
   destroy() {
