@@ -8,16 +8,14 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
+from app.core.logging import resolve_loguru_logger
 from app.services.checkpoint.runtime_checkpoint_models import RuntimeCheckpointSnapshot
 from app.services.checkpoint.runtime_checkpoint_service import RuntimeCheckpointService
 from app.services.job.checkpoint_manager import CheckpointManagerV37
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -90,7 +88,13 @@ class ResumeStateMerger:
 
     def __init__(self, job_dir: Path):
         self._job_dir = Path(job_dir)
-        self._logger = logging.getLogger(f"{__name__}.{self._job_dir.name}")
+        self._logger = resolve_loguru_logger(
+            None,
+            __name__,
+            job_id=self._job_dir.name,
+            layer="检查点层",
+            processor_name="resume_state_merger",
+        )
 
     def merge(self) -> MergedResumeState:
         """执行双源合并。"""
@@ -118,10 +122,9 @@ class ResumeStateMerger:
         )
 
         self._logger.info(
-            "恢复合并完成: runtime=%s checkpoint=%s decisions=%s",
-            result.runtime_state_available,
-            result.checkpoint_json_available,
-            len(result.merge_decisions),
+            f"恢复合并完成: runtime={result.runtime_state_available} "
+            f"checkpoint={result.checkpoint_json_available} "
+            f"decisions={len(result.merge_decisions)}"
         )
         return result
 
@@ -132,7 +135,7 @@ class ResumeStateMerger:
             if service.has_runtime_state():
                 return service.load_snapshot()
         except Exception as exc:
-            self._logger.warning("读取 runtime_state 失败: %s", exc)
+            self._logger.warning(f"读取 runtime_state 失败: {exc}")
         return None
 
     def _load_checkpoint(self) -> Optional[Dict[str, Any]]:
@@ -149,7 +152,7 @@ class ResumeStateMerger:
                 return checkpoint_dict if isinstance(checkpoint_dict, dict) else None
             return None
         except Exception as exc:
-            self._logger.warning("读取 checkpoint 失败: %s", exc)
+            self._logger.warning(f"读取 checkpoint 失败: {exc}")
             return None
 
     def _merge_preprocessing(
