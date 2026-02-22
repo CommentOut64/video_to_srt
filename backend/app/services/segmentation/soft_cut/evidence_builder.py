@@ -13,6 +13,7 @@ from .types import (
     AnchorType,
     CutWindow,
     EvidenceLevel,
+    SourcePriorityRule,
     SoftCutPriorityProfile,
     SpeakerChangeEvidence,
     SpeakerChangeTag,
@@ -291,10 +292,9 @@ class EvidenceBuilder:
         index = 0
         for candidate in sorted(anchor_candidates, key=lambda item: item.anchor_time):
             source = self._resolve_candidate_source(candidate)
-            # Why: 词边界默认仅作落点候选；fast_draft 词边界是显式切点，可作为触发窗口。
-            if (
-                candidate.anchor_type == AnchorType.WORD_BOUNDARY
-                and source != SplitEvidenceSource.FAST_DRAFT
+            if not self._is_anchor_candidate_trigger_enabled(
+                candidate=candidate,
+                source=source,
             ):
                 continue
             rule = self._priority_profile.source_rule(source)
@@ -305,8 +305,13 @@ class EvidenceBuilder:
             if confidence < rule.min_confidence:
                 continue
 
-            trigger_score = confidence * rule.weight
-            if trigger_score < rule.trigger_threshold:
+            trigger_score = self._resolve_anchor_trigger_score(
+                candidate=candidate,
+                source=source,
+                confidence=confidence,
+                rule=rule,
+            )
+            if trigger_score is None:
                 continue
 
             trigger_time = float(candidate.anchor_time)
@@ -497,6 +502,45 @@ class EvidenceBuilder:
         if trigger_score >= self.config.anchor_trigger_mid_threshold:
             return EvidenceLevel.MID
         return EvidenceLevel.LOW
+
+    @staticmethod
+    def _is_anchor_candidate_trigger_enabled(
+        *,
+        candidate: AnchorCandidate,
+        source: SplitEvidenceSource,
+    ) -> bool:
+        # Why: 词边界默认只作为落点候选；只有 fast_draft 显式切点允许触发窗口。
+        if candidate.anchor_type != AnchorType.WORD_BOUNDARY:
+            return True
+        return source == SplitEvidenceSource.FAST_DRAFT
+
+    @staticmethod
+    def _is_fast_draft_word_boundary_candidate(
+        *,
+        candidate: AnchorCandidate,
+        source: SplitEvidenceSource,
+    ) -> bool:
+        return (
+            candidate.anchor_type == AnchorType.WORD_BOUNDARY
+            and source == SplitEvidenceSource.FAST_DRAFT
+        )
+
+    def _resolve_anchor_trigger_score(
+        self,
+        *,
+        candidate: AnchorCandidate,
+        source: SplitEvidenceSource,
+        confidence: float,
+        rule: SourcePriorityRule,
+    ) -> Optional[float]:
+        raw_trigger_score = confidence * rule.weight
+        if self._is_fast_draft_word_boundary_candidate(candidate=candidate, source=source):
+            # Why: fast_draft 是“同源时间边界”证据，必须至少进入 MID 触发层，
+            # 避免在 CJK 双流里因统一阈值过高而出现“窗口为零”。
+            return max(raw_trigger_score, self.config.anchor_trigger_mid_threshold)
+        if raw_trigger_score < rule.trigger_threshold:
+            return None
+        return raw_trigger_score
 
     @staticmethod
     def _resolve_candidate_confidence(candidate: AnchorCandidate) -> float:
