@@ -27,10 +27,13 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
     CREATED: 'created',
     QUEUED: 'queued',
     PROCESSING: 'processing',
+    CANCELING: 'canceling',
     PAUSED: 'paused',
     FINISHED: 'finished',
     FAILED: 'failed',
-    CANCELED: 'canceled'
+    CANCELED: 'canceled',
+    FORCE_CANCELED: 'force_canceled',
+    REMOVED: 'removed'
   }
 
   // ========== 核心数据 ==========
@@ -112,6 +115,26 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
     const num = Number(value)
     if (Number.isNaN(num)) return null
     return Math.round(Math.max(0, Math.min(100, num)) * 10) / 10
+  }
+
+  function normalizeStateSeq(value) {
+    const numericValue = Number(value)
+    if (!Number.isFinite(numericValue) || numericValue <= 0) return 0
+    return Math.floor(numericValue)
+  }
+
+  function applyStateSeqGuard(task, incomingSeq, { allowEqual = false } = {}) {
+    if (incomingSeq <= 0) return true
+    const currentSeq = normalizeStateSeq(task.state_seq)
+    const isRejected = allowEqual ? incomingSeq < currentSeq : incomingSeq <= currentSeq
+    if (isRejected) {
+      console.warn(
+        `[UnifiedTaskStore] 拒绝旧序号事件: job=${task.job_id}, incoming_seq=${incomingSeq}, current_seq=${currentSeq}`
+      )
+      return false
+    }
+    task.state_seq = incomingSeq
+    return true
   }
 
   function shouldApplyServerUpdate(task, incomingAt) {
@@ -204,6 +227,8 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
       completed_at: taskData.completed_at || null,  // 完成时间
       paused_at: taskData.paused_at || null,        // 暂停时间
       failed_at: taskData.failed_at || null,        // 失败时间
+      canceled_at: taskData.canceled_at || null,    // 取消时间
+      state_seq: normalizeStateSeq(taskData.state_seq),
       isDirty: false,
       sseConnected: false,
       lastError: null,
@@ -229,6 +254,10 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
   function updateTaskStatus(jobId, status, message = null, meta = {}) {
     const task = tasksMap.value.get(jobId)
     if (task) {
+      const incomingSeq = normalizeStateSeq(meta.state_seq)
+      if (!applyStateSeqGuard(task, incomingSeq, { allowEqual: false })) {
+        return
+      }
       const incomingAt = normalizeTimestamp(
         meta.updated_at ?? meta.updatedAt ?? meta.timestamp
       )
@@ -239,6 +268,16 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
       task.status = status
       if (message !== null) {
         task.message = message
+      }
+      if (
+        [TaskStatus.CANCELED, TaskStatus.FORCE_CANCELED].includes(status) &&
+        !task.canceled_at
+      ) {
+        task.canceled_at = Date.now()
+      }
+      if (status === TaskStatus.REMOVED) {
+        deleteTask(jobId)
+        return
       }
       saveTasks()
       console.log(`[UnifiedTaskStore] 任务状态已更新: ${jobId} -> ${status}`)
@@ -251,6 +290,18 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
   function updateTaskProgress(jobId, percent, status, extraData = {}, meta = {}) {
     const task = tasksMap.value.get(jobId)
     if (!task) return
+
+    const incomingSeq = normalizeStateSeq(meta.state_seq)
+    const currentSeq = normalizeStateSeq(task.state_seq)
+    if (incomingSeq > 0 && incomingSeq < currentSeq) {
+      console.warn(
+        `[UnifiedTaskStore] 忽略旧序号进度更新: job=${jobId}, incoming_seq=${incomingSeq}, current_seq=${currentSeq}`
+      )
+      return
+    }
+    if (incomingSeq > currentSeq) {
+      task.state_seq = incomingSeq
+    }
 
     const incomingAt = normalizeTimestamp(
       meta.updated_at ?? meta.updatedAt ?? meta.timestamp
@@ -339,6 +390,23 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
   function updateTask(jobId, updates, meta = {}) {
     const task = tasksMap.value.get(jobId)
     if (!task) return
+    const incomingSeq = normalizeStateSeq(meta.state_seq ?? updates.state_seq)
+    if (updates.status !== undefined) {
+      if (!applyStateSeqGuard(task, incomingSeq, { allowEqual: false })) {
+        return
+      }
+    } else {
+      const currentSeq = normalizeStateSeq(task.state_seq)
+      if (incomingSeq > 0 && incomingSeq < currentSeq) {
+        console.warn(
+          `[UnifiedTaskStore] 忽略旧序号任务更新: job=${jobId}, incoming_seq=${incomingSeq}, current_seq=${currentSeq}`
+        )
+        return
+      }
+      if (incomingSeq > currentSeq) {
+        task.state_seq = incomingSeq
+      }
+    }
     const incomingAt = normalizeTimestamp(
       meta.updated_at ?? meta.updatedAt ?? meta.timestamp
     )
@@ -370,6 +438,16 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
     if (updates.status === 'failed' && task.status !== 'failed') {
       updates.failed_at = Date.now()
     }
+    if (
+      ['canceled', 'force_canceled'].includes(updates.status) &&
+      !['canceled', 'force_canceled'].includes(task.status)
+    ) {
+      updates.canceled_at = Date.now()
+    }
+    if (updates.status === 'removed') {
+      deleteTask(jobId)
+      return
+    }
 
     if (updates.progress !== undefined) {
       applyProgressField(task, updates.progress, updates.status)
@@ -385,12 +463,20 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
     if (!snapshot) return false
     const jobId = snapshot.id || snapshot.job_id
     if (!jobId) return false
+    const incomingSeq = normalizeStateSeq(snapshot.state_seq ?? meta.state_seq)
+    if (snapshot.status === 'removed') {
+      deleteTask(jobId)
+      return true
+    }
 
     const incomingAt = normalizeTimestamp(
       snapshot.updated_at ?? snapshot.updatedAt ?? snapshot.timestamp ?? meta.timestamp
     )
     const task = tasksMap.value.get(jobId)
     if (task) {
+      if (!applyStateSeqGuard(task, incomingSeq, { allowEqual: true })) {
+        return false
+      }
       if (!shouldApplyServerUpdate(task, incomingAt)) {
         return false
       }
@@ -399,6 +485,7 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
         return false
       }
 
+      const previousStatus = task.status
       if (snapshot.status) task.status = snapshot.status
       if (snapshot.message !== undefined) task.message = snapshot.message
       if (snapshot.filename) task.filename = snapshot.filename
@@ -413,6 +500,21 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
       if (snapshot.created_time) task.createdAt = snapshot.created_time
       if (snapshot.progress !== undefined) {
         applyProgressField(task, snapshot.progress, snapshot.status)
+      }
+      if (task.status === 'finished' && previousStatus !== 'finished') {
+        task.completed_at = task.completed_at || Date.now()
+      }
+      if (task.status === 'paused' && previousStatus !== 'paused') {
+        task.paused_at = task.paused_at || Date.now()
+      }
+      if (task.status === 'failed' && previousStatus !== 'failed') {
+        task.failed_at = task.failed_at || Date.now()
+      }
+      if (
+        ['canceled', 'force_canceled'].includes(task.status) &&
+        !['canceled', 'force_canceled'].includes(previousStatus)
+      ) {
+        task.canceled_at = task.canceled_at || Date.now()
       }
       saveTasks()
       return true
@@ -430,7 +532,9 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
       processed: snapshot.processed || 0,
       total: snapshot.total || 0,
       createdAt: snapshot.created_time || Date.now(),
-      updated_at: incomingAt
+      updated_at: incomingAt,
+      canceled_at: snapshot.canceled_at,
+      state_seq: incomingSeq
     })
     return true
   }
@@ -502,6 +606,16 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
     queueOrder.value = queueOrder.value.filter(id => id !== jobId)
     saveTasks()
     console.log(`[UnifiedTaskStore] 任务已删除: ${jobId}`)
+  }
+
+  function hasStaleState(statuses, staleMs = 30000) {
+    const statusList = Array.isArray(statuses) ? statuses : [statuses]
+    const now = Date.now()
+    return tasks.value.some(task => {
+      if (!statusList.includes(task.status)) return false
+      const lastKnownAt = normalizeTimestamp(task.serverUpdatedAt ?? task.updatedAt) || 0
+      return now - lastKnownAt > staleMs
+    })
   }
 
   /**
@@ -667,7 +781,17 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
       const saved = localStorage.getItem('task-list')
       if (saved) {
         const tasksArray = JSON.parse(saved)
-        tasksMap.value = new Map(tasksArray.map(t => [t.job_id, t]))
+        tasksMap.value = new Map(
+          tasksArray.map(t => [
+            t.job_id,
+            {
+              ...t,
+              canceled_at: t.canceled_at || null,
+              state_seq: normalizeStateSeq(t.state_seq),
+              serverUpdatedAt: normalizeTimestamp(t.serverUpdatedAt) || 0
+            }
+          ])
+        )
         console.log(`[UnifiedTaskStore] 已恢复 ${tasksArray.length} 个任务`)
       }
 
@@ -760,6 +884,7 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
     loadTask,
     saveCurrentTask,
     deleteTask,
+    hasStaleState,
     applyQueueOrder,
     reorderQueue,
     syncTasksFromBackend,

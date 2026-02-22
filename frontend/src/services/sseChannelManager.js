@@ -752,6 +752,20 @@ class SSEChannelManager extends EventEmitter {
   }
 
   /**
+   * 全局频道健康检查
+   * OPEN/CONNECTING 均视为健康，CLOSED 视为异常
+   * @returns {boolean}
+   */
+  isGlobalHealthy() {
+    const eventSource = this.channels.get('global')
+    if (!eventSource) return false
+    return (
+      eventSource.readyState === EventSource.OPEN ||
+      eventSource.readyState === EventSource.CONNECTING
+    )
+  }
+
+  /**
    * 销毁管理器
    */
   destroy() {
