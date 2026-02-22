@@ -5132,6 +5132,9 @@ class AsyncDualPipelineKernel:
                     anchor_time=anchor_time,
                     source="fast_draft_cut",
                     confidence=float(self._SOFT_CUT_FAST_DRAFT_ANCHOR_CONFIDENCE),
+                    # Why: fast_draft 词边界是 CJK 双流同源时间证据，
+                    # 在窗口内排序时应优先于通用词边界候选。
+                    base_score_override=0.85,
                 )
             )
         return anchors
