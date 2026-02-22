@@ -33,6 +33,7 @@ class GapResolutionResult:
 
 class GapResolver:
     """GapResolver：根据 Gap 比例选择策略处理。"""
+    _MIN_TIMELINE_EPSILON = 1e-3
 
     def __init__(
         self,
@@ -125,6 +126,7 @@ class GapResolver:
                 next_start = prev_end + self._min_word_duration * (len(segment) + 1)
 
             gap_step = (next_start - prev_end) / (len(segment) + 1)
+            segment_prev_end = prev_end
 
             for i, idx in enumerate(segment, start=1):
                 start = prev_end + gap_step * i
@@ -132,9 +134,16 @@ class GapResolver:
                 if end <= start:
                     end = start + self._min_word_duration
                 start, end = self._apply_vad_anchor(start, end, vad_intervals)
+                start, end = self._enforce_monotonic_bounds(
+                    start=start,
+                    end=end,
+                    min_start=segment_prev_end,
+                    max_end=next_start if next_idx is not None else None,
+                )
                 resolved[idx].start = start
                 resolved[idx].end = end
                 resolved[idx].is_pseudo = True
+                segment_prev_end = end
         return resolved
 
     def _merge_gaps(
@@ -148,6 +157,8 @@ class GapResolver:
         for idx in gap_indices:
             prev_idx = self._find_prev_valid_index(resolved, idx)
             next_idx = self._find_next_valid_index(resolved, idx)
+            prev_end = resolved[prev_idx].end if prev_idx is not None else None
+            next_start = resolved[next_idx].start if next_idx is not None else None
 
             if prev_idx is not None:
                 start = resolved[prev_idx].end
@@ -160,6 +171,12 @@ class GapResolver:
                 end = start + self._min_word_duration
 
             start, end = self._apply_vad_anchor(start, end, vad_intervals)
+            start, end = self._enforce_monotonic_bounds(
+                start=start,
+                end=end,
+                min_start=prev_end if prev_end is not None else start,
+                max_end=next_start,
+            )
             resolved[idx].start = start
             resolved[idx].end = end
             resolved[idx].is_pseudo = True
@@ -236,6 +253,34 @@ class GapResolver:
             anchored_start = interval_start
             anchored_end = min(interval_end, interval_start + duration)
         return anchored_start, anchored_end
+
+    def _enforce_monotonic_bounds(
+        self,
+        *,
+        start: float,
+        end: float,
+        min_start: float,
+        max_end: Optional[float],
+    ) -> Tuple[float, float]:
+        """
+        兜底时间单调修正：避免伪词被 VAD 回锚后回退到前词之前。
+        """
+        safe_start = max(float(start), float(min_start))
+        min_duration = max(self._MIN_TIMELINE_EPSILON, min(self._min_word_duration, 0.05))
+        safe_end = max(float(end), safe_start + min_duration)
+
+        if max_end is None:
+            return safe_start, safe_end
+
+        max_allowed_end = float(max_end) - self._MIN_TIMELINE_EPSILON
+        if max_allowed_end <= safe_start:
+            # Why: 邻接词时间窗过窄时，优先保证不回退，允许极短伪词占位。
+            return safe_start, safe_start + self._MIN_TIMELINE_EPSILON
+
+        safe_end = min(safe_end, max_allowed_end)
+        if safe_end <= safe_start:
+            safe_end = min(max_allowed_end, safe_start + self._MIN_TIMELINE_EPSILON)
+        return safe_start, safe_end
 
     @staticmethod
     def _is_in_speech(time_point: float, intervals: List[Tuple[float, float]]) -> bool:
