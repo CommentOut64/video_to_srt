@@ -10,10 +10,12 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 from app.services.storage import MigrationStep, SQLiteEngine, SQLiteMigrator
+from app.services.storage.sqlite_tx import immediate_transaction
 
 
 class RuntimeCheckpointRepository:
@@ -84,21 +86,37 @@ class RuntimeCheckpointRepository:
         unit_id: str,
         status: str,
         payload_json: Optional[str] = None,
+        conn: sqlite3.Connection | None = None,
     ) -> None:
         """写入单元状态日志。"""
-        with self.engine.connect() as conn:
-            conn.execute(
+        is_external_conn = conn is not None
+        active_conn = conn if is_external_conn else self.engine.connect()
+        try:
+            active_conn.execute(
                 """
                 INSERT INTO unit_journal (stage, unit_id, status, payload_json, created_at)
                 VALUES (?, ?, ?, ?, ?)
                 """,
                 (stage, unit_id, status, payload_json, time.time()),
             )
+            if not is_external_conn:
+                active_conn.commit()
+        finally:
+            if not is_external_conn:
+                active_conn.close()
 
-    def upsert_unit_commit(self, *, stage: str, last_unit_id: str) -> None:
+    def upsert_unit_commit(
+        self,
+        *,
+        stage: str,
+        last_unit_id: str,
+        conn: sqlite3.Connection | None = None,
+    ) -> None:
         """更新阶段最近已提交单元。"""
-        with self.engine.connect() as conn:
-            conn.execute(
+        is_external_conn = conn is not None
+        active_conn = conn if is_external_conn else self.engine.connect()
+        try:
+            active_conn.execute(
                 """
                 INSERT INTO unit_commits (stage, last_unit_id, committed_at)
                 VALUES (?, ?, ?)
@@ -108,6 +126,11 @@ class RuntimeCheckpointRepository:
                 """,
                 (stage, last_unit_id, time.time()),
             )
+            if not is_external_conn:
+                active_conn.commit()
+        finally:
+            if not is_external_conn:
+                active_conn.close()
 
     def get_last_unit_commit(self, stage: str) -> Optional[str]:
         """读取某阶段最后已提交单元。"""
@@ -165,3 +188,9 @@ class RuntimeCheckpointRepository:
         if not row:
             return False
         return bool(row["journal_count"] or row["commit_count"])
+
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """开启 IMMEDIATE 事务，保证多步写入原子性。"""
+        with immediate_transaction(self.engine) as conn:
+            yield conn

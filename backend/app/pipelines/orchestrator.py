@@ -23,6 +23,7 @@ from typing import List, Optional, Tuple, TYPE_CHECKING
 import numpy as np
 
 from app.core.config import config
+from app.config.lifecycle_config import RESUME_MERGER_ENABLED
 from app.models.job_models import JobState
 from app.schemas.profile_config import ProfileConfig
 from app.schemas.resume_context import ResumeContext
@@ -461,6 +462,86 @@ class PipelineOrchestrator:
 
         V3.2.0+dev.20260125.07: 支持外部传入 checkpoint_manager
         """
+        if not RESUME_MERGER_ENABLED:
+            return self._build_resume_context_legacy(job, checkpoint_manager, job_dir)
+
+        from app.services.checkpoint.resume_state_merger import ResumeStateMerger
+
+        _job_dir = job_dir if job_dir else Path(job.dir)
+        merged_state = ResumeStateMerger(job_dir=_job_dir).merge()
+        is_has_resume_data = bool(
+            merged_state.runtime_state_available or merged_state.checkpoint_json_available
+        )
+        if not is_has_resume_data:
+            return ResumeContext(checkpoint=None)
+
+        safe_indices = set()
+        if merged_state.finalized_indices:
+            max_finalized = max(merged_state.finalized_indices)
+            safe_indices = set(range(max_finalized + 1))
+        elif merged_state.fast_processed_indices and merged_state.slow_processed_indices:
+            safe_indices = merged_state.fast_processed_indices & merged_state.slow_processed_indices
+
+        merge_decisions = [
+            {
+                "field_name": decision.field_name,
+                "source": decision.source,
+                "reason": decision.reason,
+                "value_summary": decision.value_summary,
+            }
+            for decision in merged_state.merge_decisions
+        ]
+        for decision in merge_decisions:
+            self.logger.info(
+                "恢复合并决策: field=%s source=%s reason=%s summary=%s",
+                decision["field_name"],
+                decision["source"],
+                decision["reason"],
+                decision["value_summary"],
+            )
+
+        checkpoint_payload = {
+            "runtime_state": {
+                "source": "resume_merger",
+                "runtime_state_available": merged_state.runtime_state_available,
+                "checkpoint_json_available": merged_state.checkpoint_json_available,
+            },
+            "preprocessing": {
+                "vad_completed": merged_state.vad_completed,
+                "spectral_triage_completed": merged_state.spectral_triage_completed,
+                "separation_completed": merged_state.separation_completed,
+                "langid_completed": merged_state.langid_completed,
+            },
+            "transcription": {
+                "fast_processed_indices": sorted(merged_state.fast_processed_indices),
+                "slow_processed_indices": sorted(merged_state.slow_processed_indices),
+                "finalized_indices": sorted(merged_state.finalized_indices),
+                "previous_whisper_text": merged_state.previous_whisper_text,
+                "sentences_snapshot": merged_state.sentences_snapshot,
+                "sentence_count": merged_state.sentence_count,
+                "chunk_sentences_map": merged_state.chunk_sentences_map,
+            },
+        }
+        return ResumeContext(
+            checkpoint=checkpoint_payload,
+            safe_processed_indices=safe_indices,
+            fast_processed_indices=set(merged_state.fast_processed_indices),
+            slow_processed_indices=set(merged_state.slow_processed_indices),
+            finalized_indices=set(merged_state.finalized_indices),
+            previous_whisper_text=merged_state.previous_whisper_text,
+            sentences_snapshot=list(merged_state.sentences_snapshot),
+            sentence_count=int(merged_state.sentence_count),
+            chunk_sentences_map=dict(merged_state.chunk_sentences_map),
+            merge_decisions=merge_decisions,
+        )
+
+    def _build_resume_context_legacy(
+        self,
+        job: JobState,
+        checkpoint_manager: Optional["CheckpointManagerV37"] = None,
+        job_dir: Optional[Path] = None,
+    ) -> ResumeContext:
+        """构建恢复上下文（灰度回退旧逻辑）。"""
         from app.services.job.checkpoint_manager import CheckpointManagerV37
 
         _job_dir = job_dir if job_dir else Path(job.dir)
@@ -499,14 +580,15 @@ class PipelineOrchestrator:
             }
             return ResumeContext.from_checkpoint(runtime_checkpoint)
 
-        _checkpoint_manager = checkpoint_manager if checkpoint_manager else CheckpointManagerV37(_job_dir, logger=self.logger)
+        _checkpoint_manager = checkpoint_manager if checkpoint_manager else CheckpointManagerV37(
+            _job_dir,
+            logger=self.logger,
+        )
         checkpoint = _checkpoint_manager.load_checkpoint()
         if not checkpoint:
             return ResumeContext(checkpoint=None)
 
-        checkpoint_dict = (
-            checkpoint.to_dict() if hasattr(checkpoint, "to_dict") else checkpoint
-        )
+        checkpoint_dict = checkpoint.to_dict() if hasattr(checkpoint, "to_dict") else checkpoint
         return ResumeContext.from_checkpoint(checkpoint_dict)
 
     def _update_progress(
