@@ -1,6 +1,6 @@
 """
 语言策略配置与词表加载器。
-V3.2.0+dev.20260221.01
+V3.2.0+dev.20260221.07
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ _LEXICON_CACHE: Dict[str, FrozenSet[str]] = {}
 
 def _default_policy_config() -> Dict[str, Any]:
     return {
-        "policy_version": "V3.2.0+dev.20260221.01",
+        "policy_version": "V3.2.0+dev.20260221.07",
         "default_language": "zh",
         "language_aliases": {
             "auto": "zh",
@@ -53,7 +53,7 @@ def _default_policy_config() -> Dict[str, Any]:
                     "soft_cut_min_score_punctuation": 0.40,
                     "soft_cut_min_score_semantic": 0.35,
                     "soft_cut_min_score_llm": 0.35,
-                    "soft_cut_min_score_fast_draft": 0.30,
+                    "soft_cut_min_score_fast_draft": 0.20,
                     "soft_cut_pause_anchor_trigger_sec": 0.30,
                     "soft_cut_pause_anchor_min_gap_sec": 0.70,
                     "soft_cut_semantic_anchor_confidence": 0.70,

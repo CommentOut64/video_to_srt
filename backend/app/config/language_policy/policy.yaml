@@ -6,7 +6,7 @@
 # - 高频词表放在 lexicons/*.txt；
 # - 运行时临时覆盖通过 model_runtime_config.json 的 runtime.language_policy 写入。
 
-policy_version: V3.2.0+dev.20260221.01
+policy_version: V3.2.0+dev.20260221.07
 default_language: zh
 
 language_aliases:
@@ -33,7 +33,7 @@ languages:
       soft_cut_min_score_punctuation: 0.40
       soft_cut_min_score_semantic: 0.35
       soft_cut_min_score_llm: 0.35
-      soft_cut_min_score_fast_draft: 0.30
+      soft_cut_min_score_fast_draft: 0.20
       soft_cut_pause_anchor_trigger_sec: 0.30
       soft_cut_pause_anchor_min_gap_sec: 0.70
       soft_cut_semantic_anchor_confidence: 0.70
