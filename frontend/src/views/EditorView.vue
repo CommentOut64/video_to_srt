@@ -780,9 +780,11 @@ function subscribeSSE() {
         percent: 100,
         phase: 'complete',
         updated_at: data.updated_at ?? data.timestamp,
+        state_seq: data.state_seq,
       })
       taskStore.updateTaskStatus(props.jobId, 'finished', null, {
         updated_at: data.updated_at ?? data.timestamp,
+        state_seq: data.state_seq,
       })
 
       // V3.1.2+dev.20260111.02: 任务完成处理
@@ -825,9 +827,11 @@ function subscribeSSE() {
       progressStore.markStatus(props.jobId, 'failed', {
         message: data.message,
         updated_at: data.updated_at ?? data.timestamp,
+        state_seq: data.state_seq,
       })
       taskStore.updateTaskStatus(props.jobId, 'failed', null, {
         updated_at: data.updated_at ?? data.timestamp,
+        state_seq: data.state_seq,
       })
       taskStore.updateTaskSSEStatus(props.jobId, true, data.message || '转录失败')
       stopProgressPolling()
@@ -839,9 +843,11 @@ function subscribeSSE() {
       console.log('[EditorView] 任务已暂停:', data)
       progressStore.markStatus(props.jobId, 'paused', {
         updated_at: data.updated_at ?? data.timestamp,
+        state_seq: data.state_seq,
       })
       taskStore.updateTaskStatus(props.jobId, 'paused', null, {
         updated_at: data.updated_at ?? data.timestamp,
+        state_seq: data.state_seq,
       })
       // 保持SSE连接和进度显示
     },
@@ -850,9 +856,11 @@ function subscribeSSE() {
       console.log('[EditorView] 任务暂停中:', data)
       progressStore.markStatus(props.jobId, 'pausing', {
         updated_at: data.updated_at ?? data.timestamp,
+        state_seq: data.state_seq,
       })
       taskStore.updateTaskStatus(props.jobId, 'pausing', null, {
         updated_at: data.updated_at ?? data.timestamp,
+        state_seq: data.state_seq,
       })
     },
 
@@ -866,9 +874,11 @@ function subscribeSSE() {
       startCancelTimeoutPolling()
       progressStore.markStatus(props.jobId, 'canceling', {
         updated_at: data.updated_at ?? data.timestamp,
+        state_seq: data.state_seq,
       })
       taskStore.updateTaskStatus(props.jobId, 'canceling', null, {
         updated_at: data.updated_at ?? data.timestamp,
+        state_seq: data.state_seq,
       })
     },
 
@@ -887,9 +897,11 @@ function subscribeSSE() {
       console.log('[EditorView] 任务已恢复:', data)
       progressStore.markStatus(props.jobId, data.status || 'queued', {
         updated_at: data.updated_at ?? data.timestamp,
+        state_seq: data.state_seq,
       })
       taskStore.updateTaskStatus(props.jobId, data.status || 'queued', null, {
         updated_at: data.updated_at ?? data.timestamp,
+        state_seq: data.state_seq,
       })
       startProgressPolling()
     },
@@ -1066,9 +1078,11 @@ function handleCancelTerminal(data, fallbackStatus = 'canceled') {
   stopCancelTimeoutPolling()
   progressStore.markStatus(props.jobId, terminalStatus, {
     updated_at: data?.updated_at ?? data?.timestamp,
+    state_seq: data?.state_seq,
   })
   taskStore.updateTaskStatus(props.jobId, terminalStatus, null, {
     updated_at: data?.updated_at ?? data?.timestamp,
+    state_seq: data?.state_seq,
   })
   stopProgressPolling()
   cleanupSSE()
