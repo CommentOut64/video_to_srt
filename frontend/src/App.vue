@@ -12,12 +12,14 @@
  */
 import { ref, onMounted, onUnmounted } from 'vue'
 import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
+import { useProgressStore } from '@/stores/progressStore'
 import { useUpdateChecker } from '@/composables'
 import sseChannelManager from '@/services/sseChannelManager'
 import { heartbeatService } from '@/services/heartbeat'
 import UpdateDialog from '@/components/UpdateDialog.vue'
 
 const taskStore = useUnifiedTaskStore()
+const progressStore = useProgressStore()
 
 // V3.1.1+dev.20260105.01: 更新相关状态
 const showUpdateDialog = ref(false)
@@ -25,6 +27,7 @@ const pendingUpdateInfo = ref(null)
 const { checkForUpdate } = useUpdateChecker()
 
 let unsubscribeGlobal = null
+let syncTimer = null
 
 // V3.1.1+dev.20260106.01: sessionStorage key，用于防止会话内重复检查更新
 const UPDATE_CHECK_SESSION_KEY = 'anchorflux_update_checked_this_session'
@@ -71,6 +74,25 @@ async function checkUpdateOnStartup() {
   }
 }
 
+function startPeriodicSync() {
+  if (syncTimer) {
+    clearInterval(syncTimer)
+  }
+  syncTimer = setInterval(async () => {
+    const needsSync =
+      taskStore.hasStaleState('canceling', 30000) ||
+      !sseChannelManager.isGlobalHealthy()
+    if (!needsSync) return
+
+    console.log('[App] 检测到异常状态，触发兜底同步')
+    try {
+      await taskStore.syncTasksFromBackend()
+    } catch (error) {
+      console.warn('[App] 兜底同步失败:', error)
+    }
+  }, 60000)
+}
+
 onMounted(async () => {
   console.log('[App] 应用已挂载，执行初始化')
 
@@ -86,21 +108,8 @@ onMounted(async () => {
   // V3.1.1+dev.20260106.01: 启动时检查更新（每个会话只检查一次，不阻塞其他初始化）
   checkUpdateOnStartup()
 
-  // 第一步：从后端同步任务列表（第一阶段修复：数据同步）
-  console.log('[App] 步骤 1: 从后端同步任务列表...')
-  try {
-    const syncSuccess = await taskStore.syncTasksFromBackend()
-    if (syncSuccess) {
-      console.log('[App] 任务列表同步成功')
-    } else {
-      console.warn('[App] 任务列表同步失败，将使用本地 localStorage 数据')
-    }
-  } catch (error) {
-    console.error('[App] 任务列表同步异常:', error)
-  }
-
-  // 第二步：订阅全局 SSE 事件流（用于实时更新）
-  console.log('[App] 步骤 2: 订阅全局 SSE 事件流...')
+  // 第一步：订阅全局 SSE 事件流（先订阅避免和 HTTP 同步竞态）
+  console.log('[App] 步骤 1: 订阅全局 SSE 事件流...')
   unsubscribeGlobal = sseChannelManager.subscribeGlobal({
     onInitialState(state) {
       console.log('[App] 全局初始状态:', state)
@@ -156,7 +165,15 @@ onMounted(async () => {
         // 避免后端推送的低进度（如恢复时的 0）覆盖前端已有的高进度
         // progress 的更新由 onJobProgress 专门负责
         taskStore.updateTaskStatus(jobId, status, data.message || '', {
-          updated_at: data.updated_at ?? data.timestamp
+          updated_at: data.updated_at ?? data.timestamp,
+          state_seq: data.state_seq
+        })
+        progressStore.markStatus(jobId, status, {
+          updated_at: data.updated_at ?? data.timestamp,
+          state_seq: data.state_seq,
+          message: data.message,
+          phase: data.phase,
+          phase_percent: data.phase_percent
         })
 
       }
@@ -177,7 +194,8 @@ onMounted(async () => {
         total: data.total,
         language: data.language
       }, {
-        updated_at: data.updated_at ?? data.timestamp
+        updated_at: data.updated_at ?? data.timestamp,
+        state_seq: data.state_seq
       })
     },
     onJobRenamed(data) {
@@ -201,6 +219,7 @@ onMounted(async () => {
 
       // 从 store 中彻底移除任务
       taskStore.deleteTask(jobId)
+      progressStore.clearJobState(jobId)
 
     },
 
@@ -223,6 +242,22 @@ onMounted(async () => {
       taskStore.updateSSEHeartbeat()
     }
   })
+
+  // 第二步：HTTP 同步任务列表（兜底，避免漏事件）
+  console.log('[App] 步骤 2: 从后端同步任务列表...')
+  try {
+    const syncSuccess = await taskStore.syncTasksFromBackend()
+    if (syncSuccess) {
+      console.log('[App] 任务列表同步成功')
+    } else {
+      console.warn('[App] 任务列表同步失败，将使用本地 localStorage 数据')
+    }
+  } catch (error) {
+    console.error('[App] 任务列表同步异常:', error)
+  }
+
+  // 第三步：启动低频兜底同步
+  startPeriodicSync()
 })
 
 onUnmounted(() => {
@@ -231,6 +266,10 @@ onUnmounted(() => {
   // 取消全局订阅
   if (unsubscribeGlobal) {
     unsubscribeGlobal()
+  }
+  if (syncTimer) {
+    clearInterval(syncTimer)
+    syncTimer = null
   }
 
   // 停止心跳服务

@@ -14,12 +14,20 @@ import json
 import os
 import sys
 import asyncio
+import shutil
 from collections import deque
+from dataclasses import dataclass
 from typing import Dict, Optional, Literal, Any
 from pathlib import Path
 import torch
 
 from app.models.job_models import JobState
+from app.models.task_state_machine import get_state_guard
+from app.config.lifecycle_config import (
+    STATE_MACHINE_GUARD_ENABLED,
+    RUNNER_GATE_ENABLED,
+    RUNNER_DETACH_ON_FORCE_CANCEL_ENABLED,
+)
 from app.services.sse_service import get_sse_manager
 from app.core.config import config
 from app.services.checkpoint import RuntimeCheckpointService
@@ -35,6 +43,29 @@ logger = logging.getLogger(__name__)
 
 # 插队模式类型
 PrioritizeMode = Literal["gentle", "force"]
+
+
+@dataclass
+class CancelResult:
+    """取消/删除操作结果。"""
+
+    success: bool
+    status: str
+    reason_code: str
+    message: str
+    pending_delete: bool
+    state_seq: int = 0
+
+
+CANCEL_REASON_CODES: Dict[str, str] = {
+    "cancel_queued": "排队中任务直接取消",
+    "cancel_running": "运行中任务已取消并释放调度",
+    "cancel_already": "任务已取消或已完成",
+    "cancel_not_found": "任务不存在",
+    "delete_immediate": "任务已删除",
+    "delete_blocked": "当前有进程占用，请稍后再试",
+    "delete_failed": "删除失败",
+}
 
 
 def _run_async_safely(coro):
@@ -134,13 +165,24 @@ class JobQueueService:
         # [V3.1.0] 取消超时保障机制
         # 用于确保取消操作最终生效，防止任务卡死导致队列阻塞
         self._pending_cancel_requests: Dict[str, float] = {}  # {job_id: cancel_request_time}
-        self._pending_delete_after_cancel: set = set()  # 取消后需要删除数据的任务
+        self._pending_physical_delete: Dict[str, Dict[str, Any]] = {}
+        self._logically_removed_jobs: set[str] = set()
         self._force_cancel_timeout: float = 60.0  # 超时时间（秒）
         self._current_executing_job_id: Optional[str] = None  # Worker 当前实际执行的任务ID（不受 cancel 影响）
+        # V3.2.4+dev.20260222.01: RunnerGate 风险闸门（孤儿执行观测）
+        self._orphan_executions: Dict[str, float] = {}  # {job_id: force_cancel_timestamp}
+        self._is_gpu_busy_override: bool = False
+        self._runner_gate_orphan_timeout_seconds: float = 120.0
+        self._runner_gate_warn_interval_seconds: float = 10.0
+        self._runner_gate_last_warn_at: float = 0.0
+        # V3.2.4+dev.20260222.07: 调度线程与执行线程解耦
+        self._runner_threads: Dict[str, threading.Thread] = {}
+        self._dispatch_interval_seconds: float = 0.2
 
         # 依赖服务
         self.transcription_service = transcription_service
         self.sse_manager = get_sse_manager()
+        self.state_guard = get_state_guard()
         # V3.2.0+dev.20260120.05: 队列状态改为仓库驱动 + 心跳租约
         self.state_repo = transcription_service.job_lifecycle.state_repo
         self.event_bus = transcription_service.job_lifecycle.event_bus
@@ -215,10 +257,13 @@ class JobQueueService:
             job: 任务状态对象
         """
         with self.lock:
+            from_status = job.status
+            is_transitioned = self._transition_job_status(job, "queued", "queue_add")
+            if not is_transitioned:
+                logger.error("加入队列失败，状态迁移被拒绝: job=%s", job.job_id)
+                return
             self.jobs[job.job_id] = job
             self.queue.append(job.job_id)
-            from_status = job.status
-            job.status = "queued"
             job.message = f"排队中 (位置: {len(self.queue)})"
 
         logger.info(f"任务已加入队列: {job.job_id} (队列长度: {len(self.queue)})")
@@ -233,6 +278,43 @@ class JobQueueService:
     def get_job(self, job_id: str) -> Optional[JobState]:
         """获取任务状态"""
         return self.jobs.get(job_id)
+
+    def _transition_job_status(self, job: JobState, target_status: str, reason: str) -> bool:
+        """
+        通过状态守卫执行状态迁移。
+
+        守卫关闭时直接赋值，便于灰度回滚。
+        """
+        normalized_target = self.state_guard.normalize_status(target_status)
+        if not STATE_MACHINE_GUARD_ENABLED:
+            job.status = normalized_target
+            return True
+
+        self.state_guard.sync_seq(job.job_id, job.state_seq)
+        normalized_current = self.state_guard.normalize_status(job.status)
+        if normalized_current == normalized_target:
+            job.status = normalized_target
+            return True
+
+        result = self.state_guard.transition(
+            job_id=job.job_id,
+            current_status=normalized_current,
+            target_status=normalized_target,
+            reason=reason,
+        )
+        if not result.success:
+            logger.error(
+                "状态迁移被拒绝: job=%s, %s -> %s, reason=%s",
+                job.job_id,
+                normalized_current,
+                normalized_target,
+                reason,
+            )
+            return False
+
+        job.status = result.to_status
+        job.state_seq = result.state_seq
+        return True
 
     def pause_job(self, job_id: str) -> bool:
         """
@@ -262,7 +344,10 @@ class JobQueueService:
                 is_running = True
                 job.paused = True
                 # V3.1.0: 状态改为 pausing，表示正在等待流水线响应
-                job.status = "pausing"
+                if not self._transition_job_status(job, "pausing", "pause_request_running"):
+                    logger.error("暂停失败，状态迁移被拒绝: job=%s", job_id)
+                    job.paused = False
+                    return False
                 job.message = "正在暂停，等待当前操作完成..."
 
                 # [v3.1.0] 触发取消令牌的暂停
@@ -274,8 +359,10 @@ class JobQueueService:
                     logger.info(f"设置暂停标志: {job_id}")
             elif job_id in self.queue:
                 # 还在排队的任务：直接从队列移除
+                if not self._transition_job_status(job, "paused", "pause_request_queued"):
+                    logger.error("暂停失败，状态迁移被拒绝: job=%s", job_id)
+                    return False
                 self.queue.remove(job_id)
-                job.status = "paused"
                 job.message = "已暂停（未开始）"
                 logger.info(f"从队列移除: {job_id}")
 
@@ -352,20 +439,27 @@ class JobQueueService:
                 # 任务会在原子区域结束后继续正常执行（不会抛出 PausedException）
                 token.resume()
                 job.paused = False
-                job.status = "processing"
+                if not self._transition_job_status(job, "processing", "resume_running"):
+                    logger.error("恢复失败，状态迁移被拒绝: job=%s", job_id)
+                    return False
                 job.message = "已恢复，继续执行中..."
                 logger.info(f"[v3.1.0] 任务仍在运行，清除暂停标志: {job_id}")
             else:
                 # 任务已完全停止：优先保留既有队列顺序
                 if job_id in self.queue:
                     queue_position = list(self.queue).index(job_id) + 1
-                    job.status = "queued"
+                    if not self._transition_job_status(job, "queued", "resume_queued"):
+                        logger.error("恢复失败，状态迁移被拒绝: job=%s", job_id)
+                        return False
                     job.paused = False
                     job.message = f"已恢复，等待执行 (位置: {queue_position})"
                     logger.info(f"[V3.2.0+dev.20260124.01] 任务已在恢复队列中: {job_id}")
                 else:
                     self.queue.append(job_id)
-                    job.status = "queued"
+                    if not self._transition_job_status(job, "queued", "resume_queued"):
+                        logger.error("恢复失败，状态迁移被拒绝: job=%s", job_id)
+                        self.queue.remove(job_id)
+                        return False
                     job.paused = False
                     job.message = f"已恢复，排队中 (位置: {len(self.queue)})"
 
@@ -388,128 +482,272 @@ class JobQueueService:
 
         return True
 
-    def cancel_job(self, job_id: str, delete_data: bool = False):
+    def cancel_job(self, job_id: str, delete_data: bool = False) -> CancelResult:
         """
-        取消任务（支持删除已完成的任务）
-
-        V3.1.0 修复：
-        - 删除数据时同步清理内存中的 self.jobs[job_id]
-        - 广播 job_removed 事件，解决幽灵任务问题
-
-        v3.1.0 更新:
-        - 集成 CancellationToken，触发协作式取消
-
-        V3.1.0 更新:
-        - 正在运行的任务进入"canceling"状态，不再立即清除 running_job_id
-        - 增加超时保障机制，确保任务最终被清除
+        取消任务（delete_data=True 时执行立即逻辑删除）。
 
         Args:
             job_id: 任务ID
             delete_data: 是否删除任务数据
 
         Returns:
-            Tuple[bool, Optional[str], bool]: (是否成功, 失败原因, 是否处于延迟删除状态)
+            CancelResult: 结构化取消结果
         """
         job = self.jobs.get(job_id)
 
-        # 如果任务不在队列服务中（可能是已完成的任务），直接调用transcription_service删除
         if not job:
             if delete_data:
-                # 尝试通过transcription_service删除已完成的任务
+                repo_job = None
+                state_seq = 0
+                input_path = ""
+                job_dir = str(Path(config.JOBS_DIR) / job_id)
                 try:
-                    result = self.transcription_service.cancel_job(job_id, delete_data=True)
-                    success, err = result if isinstance(result, tuple) else (bool(result), None)
-                    if success:
-                        # [V3.1.0] 推送任务删除事件（而非仅状态变更）
-                        self._notify_job_removed(job_id)
-                        # [v3.1.0] 清理取消令牌
-                        self._remove_cancellation_token(job_id)
-                        return True, None, False
-                    return False, err or "删除失败", False
-                except Exception as e:
-                    logger.warning(f"删除任务 {job_id} 失败: {e}")
-                    return False, str(e), False
-            return False, "任务未找到", False
+                    repo_job = self.state_repo.get_task(job_id)
+                    if repo_job:
+                        state_seq = int(repo_job.state_seq or 0)
+                        input_path = str(repo_job.input_path or "")
+                        if repo_job.dir:
+                            job_dir = str(repo_job.dir)
+                except Exception as exc:
+                    logger.warning(
+                        "读取仓库任务快照失败，按幂等删除继续: %s, %s",
+                        job_id,
+                        exc,
+                    )
+
+                if not input_path:
+                    try:
+                        job_index = getattr(self.transcription_service.job_lifecycle, "job_index", None)
+                        if job_index and hasattr(job_index, "get_file_path"):
+                            input_path = str(job_index.get_file_path(job_id) or "")
+                    except Exception:
+                        input_path = ""
+
+                blocked, blocked_message = self._check_delete_blocked(job_id)
+                if blocked:
+                    return CancelResult(
+                        success=False,
+                        status=str(getattr(repo_job, "status", "") or "not_found"),
+                        reason_code="delete_blocked",
+                        message=blocked_message or CANCEL_REASON_CODES["delete_blocked"],
+                        pending_delete=False,
+                        state_seq=state_seq,
+                    )
+
+                with self.lock:
+                    if job_id in self.queue:
+                        self.queue.remove(job_id)
+                    if self.running_job_id == job_id:
+                        self.running_job_id = None
+                    if self.interrupted_job_id == job_id:
+                        self.interrupted_job_id = None
+                    self._pending_cancel_requests.pop(job_id, None)
+                    runner_thread = self._runner_threads.get(job_id)
+                    is_runner_alive = bool(runner_thread and runner_thread.is_alive())
+                    if is_runner_alive or self._current_executing_job_id == job_id:
+                        self._logically_removed_jobs.add(job_id)
+                    self._enqueue_physical_delete_locked(
+                        job_id=job_id,
+                        job_dir=job_dir,
+                        input_path=input_path,
+                    )
+
+                try:
+                    self.state_repo.delete_task(job_id)
+                except Exception as exc:
+                    logger.warning("逻辑删除任务状态失败(任务可能已不存在): %s, %s", job_id, exc)
+                self.heartbeat_service.release(job_id, self._lease_owner)
+                self._save_state()
+                self._notify_job_removed(job_id)
+                self._try_process_pending_physical_deletes(limit=1)
+                return CancelResult(
+                    success=True,
+                    status="removed",
+                    reason_code="delete_immediate",
+                    message=CANCEL_REASON_CODES["delete_immediate"],
+                    pending_delete=False,
+                    state_seq=state_seq,
+                )
+            return CancelResult(
+                success=False,
+                status="not_found",
+                reason_code="cancel_not_found",
+                message=CANCEL_REASON_CODES["cancel_not_found"],
+                pending_delete=False,
+                state_seq=0,
+            )
+
+        cancel_request_time = time.time()
+        logger.info(
+            "[Lifecycle] 取消请求: job=%s, current_status=%s, delete_data=%s, request_time=%s",
+            job_id,
+            job.status,
+            delete_data,
+            cancel_request_time,
+        )
+
+        if job.status in ("finished", "failed", "canceled", "force_canceled", "removed") and not delete_data:
+            return CancelResult(
+                success=True,
+                status=job.status,
+                reason_code="cancel_already",
+                message=CANCEL_REASON_CODES["cancel_already"],
+                pending_delete=False,
+                state_seq=int(job.state_seq or 0),
+            )
+
+        if delete_data:
+            blocked, blocked_message = self._check_delete_blocked(job_id)
+            if blocked:
+                return CancelResult(
+                    success=False,
+                    status=job.status,
+                    reason_code="delete_blocked",
+                    message=blocked_message or CANCEL_REASON_CODES["delete_blocked"],
+                    pending_delete=False,
+                    state_seq=int(job.state_seq or 0),
+                )
 
         from_status = job.status
-        is_running = False  # [V3.1.0] 标记是否为正在运行的任务
+        is_running = False
 
         with self.lock:
-            # 设置取消标志
-            job.canceled = True
+            is_running = (self.running_job_id == job_id)
+            if job_id in self.queue:
+                self.queue.remove(job_id)
 
-            # [v3.1.0] 触发取消令牌的取消
+            # 取消令牌优先触发，确保后台执行尽快退出
             token = self.cancellation_tokens.get(job_id)
             if token:
                 token.cancel()
-                logger.info(f"[v3.1.0] 已触发取消令牌取消: {job_id}")
+                logger.info("[Lifecycle] 已触发取消令牌: %s", job_id)
 
-            # 如果在队列中，直接移除并标记为已取消
-            if job_id in self.queue:
-                self.queue.remove(job_id)
-                job.status = "canceled"
-                job.message = "已取消（未开始）"
+            job.canceled = True
+            self._pending_cancel_requests.pop(job_id, None)
 
-            # [V3.1.0] 如果是正在运行的任务，进入"取消中"状态
-            # 不再立即清除 running_job_id，让 Worker 的 finally 块处理
-            elif self.running_job_id == job_id:
-                is_running = True
-                job.status = "canceling"  # 新状态：取消中
-                # 运行中删除：提示将延迟自动删除
-                job.message = "当前有进程占用，将延迟自动删除"
-                # 记录取消请求时间，用于超时保障
-                self._pending_cancel_requests[job_id] = time.time()
-                if delete_data:
-                    self._pending_delete_after_cancel.add(job_id)
-                logger.info(f"[V3.1.0] 任务进入取消中状态: {job_id}")
+            if is_running:
+                self.running_job_id = None
+                logger.info("[Lifecycle] 取消请求释放运行槽位: %s", job_id)
+
+            if delete_data:
+                if job.status not in ("canceled", "removed"):
+                    if not self._transition_job_status(job, "canceled", "delete_request_cancel"):
+                        return CancelResult(
+                            success=False,
+                            status=job.status,
+                            reason_code="delete_failed",
+                            message="状态迁移被拒绝",
+                            pending_delete=False,
+                            state_seq=int(job.state_seq or 0),
+                        )
+                if job.status != "removed":
+                    if not self._transition_job_status(job, "removed", "delete_request_remove"):
+                        return CancelResult(
+                            success=False,
+                            status=job.status,
+                            reason_code="delete_failed",
+                            message="状态迁移被拒绝",
+                            pending_delete=False,
+                            state_seq=int(job.state_seq or 0),
+                        )
+                job.message = "任务已删除（后台清理中）"
+                self._logically_removed_jobs.add(job_id)
+                self._enqueue_physical_delete_locked(job)
+                self.jobs.pop(job_id, None)
+            else:
+                if job.status != "canceled":
+                    if not self._transition_job_status(job, "canceled", "cancel_request"):
+                        return CancelResult(
+                            success=False,
+                            status=job.status,
+                            reason_code="delete_failed",
+                            message="状态迁移被拒绝",
+                            pending_delete=False,
+                            state_seq=int(job.state_seq or 0),
+                        )
+                job.message = "已取消"
+
+        if delete_data:
+            try:
+                self.state_repo.delete_task(job_id)
+            except Exception as exc:
+                logger.warning("逻辑删除任务状态失败(稍后重试物理清理): %s, %s", job_id, exc)
+            self.heartbeat_service.release(job_id, self._lease_owner)
+            self._notify_job_removed(job_id)
+            self._save_state()
+            self._try_process_pending_physical_deletes(limit=1)
+            return CancelResult(
+                success=True,
+                status="removed",
+                reason_code="delete_immediate",
+                message=CANCEL_REASON_CODES["delete_immediate"],
+                pending_delete=False,
+                state_seq=int(job.state_seq or 0),
+            )
 
         self._persist_queue_and_jobs([job], {job.job_id: from_status}, reason="cancel_request")
+        self._notify_queue_change()
+        self._notify_job_status(job_id, job.status)
+        self._notify_job_signal(job_id, "job_canceled")
+        logger.info(
+            "[Lifecycle] 取消终态达成: job=%s, status=%s, total_cancel_duration=%.1fs",
+            job_id,
+            job.status,
+            time.time() - cancel_request_time,
+        )
+        return CancelResult(
+            success=True,
+            status=job.status,
+            reason_code="cancel_running" if is_running else "cancel_queued",
+            message=(
+                CANCEL_REASON_CODES["cancel_running"]
+                if is_running else CANCEL_REASON_CODES["cancel_queued"]
+            ),
+            pending_delete=False,
+            state_seq=int(job.state_seq or 0),
+        )
 
-        # [V3.1.0] 正在运行的任务：延迟处理删除，由 Worker 或超时监控完成
-        if is_running:
-            # 不在这里删除数据，等待任务真正结束
-            # 推送状态变更
-            self._notify_queue_change()
-            self._notify_job_status(job_id, job.status)
-            self._notify_job_signal(job_id, "job_canceling")  # 新信号
-            # 如果需要删除数据，标记完成后再删
-            if delete_data:
-                with self.lock:
-                    self._pending_delete_after_cancel.add(job_id)
-                return True, "任务正在执行，已请求取消并将在结束后删除", True
-            return True, None, False
+    def _check_delete_blocked(self, job_id: str) -> tuple[bool, Optional[str]]:
+        """删除前占用检测：命中占用时返回阻塞原因，禁止逻辑删除。"""
+        try:
+            from app.services.media_stream_tracker import get_active_streams
 
-        # 非运行中的任务：立即处理
-        if delete_data:
-            result = self.transcription_service.cancel_job(job_id, delete_data=True)
-            success, err = result if isinstance(result, tuple) else (bool(result), None)
-            if not success:
-                # 删除失败时不广播删除事件，保留任务文件供用户重试
-                return False, err or "删除失败", False
+            active_streams = int(get_active_streams(job_id) or 0)
+        except Exception:
+            active_streams = 0
 
-            # [V3.1.0] 从内存中彻底移除任务，防止幽灵任务
-            with self.lock:
-                if job_id in self.jobs:
-                    del self.jobs[job_id]
-                    logger.info(f"[幽灵任务修复] 已从内存移除任务: {job_id}")
+        if active_streams > 0:
+            return True, f"当前有进程占用，请稍后再试 (active_streams={active_streams})"
 
-            # [v3.1.0] 清理取消令牌
-            self._remove_cancellation_token(job_id)
-        else:
-            success, err = True, None
+        try:
+            from app.services.media_prep_service import get_media_prep_service
 
-        # [V3.1.0] 根据是否删除数据，推送不同事件
-        if delete_data:
-            # 推送 job_removed 事件（任务被彻底删除）
-            self._notify_job_removed(job_id)
-        else:
-            # 推送状态变更事件（任务仍存在）
-            self._notify_queue_change()
-            self._notify_job_status(job_id, job.status)
-            # 同时推送到单任务频道，确保 EditorView 能收到
-            self._notify_job_signal(job_id, "job_canceled")
+            media_prep_service = get_media_prep_service()
+        except Exception:
+            media_prep_service = None
 
-        return success, err, False
+        if media_prep_service is None:
+            return False, None
+
+        status_getters = (
+            ("preview_360p", getattr(media_prep_service, "get_preview_status", None)),
+            ("proxy_720p", getattr(media_prep_service, "get_proxy_status", None)),
+            ("remux", getattr(media_prep_service, "get_remux_status", None)),
+        )
+        for stage_name, status_getter in status_getters:
+            if not callable(status_getter):
+                continue
+            try:
+                stage_status = status_getter(job_id)
+            except Exception:
+                continue
+            status_value = ""
+            if isinstance(stage_status, dict):
+                status_value = str(stage_status.get("status") or "").strip().lower()
+            if status_value in {"queued", "processing"}:
+                return True, f"当前有进程占用，请稍后再试 ({stage_name}={status_value})"
+
+        return False, None
 
     def _worker_loop(self):
         """
@@ -517,213 +755,19 @@ class JobQueueService:
 
         核心逻辑:
         1. 从队列取任务
-        2. 执行任务（阻塞）
-        3. 清理资源
+        2. 仅负责调度，执行委托给独立 Runner 线程
+        3. Runner 线程自行收尾清理
         4. 循环
         """
         logger.info("Worker循环已启动")
 
         while not self.stop_event.is_set():
             try:
-                # 1. 检查队列是否为空
                 with self.lock:
-                    if not self.queue:
-                        # 队列为空，休眠1秒
-                        pass
-                    else:
-                        # 取队头任务（不移除，防止出错丢失）
-                        job_id = self.queue[0]
-                        job = self.jobs.get(job_id)
+                    self._cleanup_finished_runner_threads_locked()
+                    self._dispatch_next_job_locked()
 
-                        # 验证任务有效性
-                        if not job:
-                            logger.warning(f"⚠️ 任务不存在，跳过: {job_id}")
-                            self.queue.popleft()
-                            continue
-
-                        if job.status == "paused":
-                            # V3.2.0+dev.20260124.01: 重启后保留队列顺序，等待用户恢复
-                            logger.info(f"[V3.2.0+dev.20260124.01] 队列头任务已暂停，等待恢复: {job_id}")
-                        elif job.status in ["canceled", "canceling", "force_canceled", "failed"]:
-                            logger.info(f"⏭️ 跳过已取消/失败的任务: {job_id}")
-                            self.queue.popleft()
-                            continue
-                        else:
-                            # 正式从队列移除
-                            self.queue.popleft()
-                            self.running_job_id = job_id
-                            self._current_executing_job_id = job_id  # [V3.1.0] 记录实际执行的任务ID
-                            job.status = "processing"
-                            job.message = "开始处理"
-
-                            # V3.1.0: 在推送 SSE 之前，先从 checkpoint 恢复进度
-                            # 这样断点续传时前端收到的进度是正确的，而非 0
-                            self._restore_progress_from_checkpoint(job)
-
-                            # 推送队列变化和任务状态通知（在lock内，避免数据不一致）
-                            self._notify_queue_change()
-                            self._notify_job_status(job_id, "processing")
-                            # 推送初始进度（让前端立即知道任务的初始状态）
-                            self._notify_job_progress(job_id)
-
-                    # 任务开始执行前保存状态（确保断电后能恢复 running 任务）
-                    if self.running_job_id:
-                        self._save_state()
-                        # 同时保存任务元信息（记录 processing 状态）
-                        job = self.jobs.get(self.running_job_id)
-                        if job:
-                            self.transcription_service.save_job_meta(job)
-                            self.heartbeat_service.acquire_lease(
-                                job.job_id,
-                                self._lease_owner,
-                                self._heartbeat_ttl_seconds,
-                            )
-
-                        # [v3.1.0] 创建取消令牌
-                        token = self._create_cancellation_token(self.running_job_id)
-                        logger.debug(f"[v3.1.0] 已创建取消令牌: {self.running_job_id}")
-
-                        # V3.1.2+dev.20260114.11: 新任务开始前，智能处理正在运行的 720p 转码
-                        self._maybe_throttle_or_pause_proxy()
-
-                # 2. 如果没有任务，休眠后继续
-                if self.running_job_id is None:
-                    time.sleep(1)
-                    continue
-
-                # 3. 执行任务（阻塞，直到完成/失败/暂停/取消）
-                job = self.jobs[self.running_job_id]
-                logger.info(f" 开始执行任务: {self.running_job_id}")
-
-                try:
-                    transcription = getattr(job.settings, "transcription", None)
-                    transcription_profile = (
-                        transcription.transcription_profile
-                        if transcription else "sensevoice_only"
-                    )
-                    preset_id = getattr(job.settings, "preset_id", "balanced")
-
-                    logger.info(
-                        "路由决策: profile=%s, preset=%s",
-                        transcription_profile,
-                        preset_id,
-                    )
-
-                    logger.info(
-                        "使用双流对齐流水线 (profile=%s, preset=%s)",
-                        transcription_profile,
-                        preset_id,
-                    )
-                    _run_async_safely(self._run_dual_alignment_pipeline(job, preset_id))
-
-                    # 检查最终状态
-                    if job.canceled:
-                        job.status = "canceled"
-                        job.message = "已取消"
-                    elif job.paused:
-                        job.status = "paused"
-                        job.message = "已暂停"
-                    else:
-                        is_finish_valid, finish_error = self._validate_finish_integrity(job)
-                        if not is_finish_valid:
-                            raise RuntimeError(finish_error)
-                        job.status = "finished"
-                        job.message = "完成"
-                        logger.info(f"任务完成: {self.running_job_id}")
-
-                except CancelledException as e:
-                    # [v3.1.0] 捕获取消异常
-                    job.status = "canceled"
-                    job.message = "已取消"
-                    logger.info(f"[v3.1.0] 任务被取消: {e.job_id}")
-
-                except PausedException as e:
-                    # [v3.1.0] 捕获暂停异常
-                    job.status = "paused"
-                    job.message = "已暂停"
-                    self._notify_pause_ack(job)
-                    logger.info(f"[v3.1.0] 任务已暂停: {e.job_id}")
-
-                except Exception as e:
-                    job.status = "failed"
-                    job.message = f"失败: {e}"
-                    job.error = str(e)
-                    logger.error(f"任务执行失败: {self.running_job_id} - {e}", exc_info=True)
-
-                finally:
-                    # 4. 清理资源（关键！）
-                    # [V3.1.0] 使用 _current_executing_job_id 而非 running_job_id
-                    # 因为 running_job_id 可能被超时监控清除
-                    finished_job_id = self._current_executing_job_id
-                    with self.lock:
-                        self.running_job_id = None
-                        self._current_executing_job_id = None
-                        # [V3.1.0] 从待取消列表移除
-                        self._pending_cancel_requests.pop(finished_job_id, None)
-
-                    # [v3.1.0] 清理取消令牌
-                    self._remove_cancellation_token(finished_job_id)
-                    self.heartbeat_service.release(finished_job_id, self._lease_owner)
-
-                    # 资源大清洗
-                    self._cleanup_resources()
-
-                    # [V3.1.0] 处理取消后的延迟删除
-                    need_delete_data = finished_job_id in self._pending_delete_after_cancel
-                    if need_delete_data:
-                        self._pending_delete_after_cancel.discard(finished_job_id)
-                        logger.info(f"[V3.1.0] 执行取消后的延迟删除: {finished_job_id}")
-                        try:
-                            result = self.transcription_service.cancel_job(finished_job_id, delete_data=True)
-                            success, err = result if isinstance(result, tuple) else (bool(result), None)
-                            if success:
-                                with self.lock:
-                                    if finished_job_id in self.jobs:
-                                        del self.jobs[finished_job_id]
-                                self._notify_job_removed(finished_job_id)
-                                # 跳过后续的状态保存和通知
-                                self._save_state()
-                                continue
-                            # 删除失败（如外部占用），保留任务并提示稍后重试
-                            job.status = "paused"
-                            job.message = err or "当前有进程占用，请稍后再试"
-                            self.transcription_service.save_job_meta(job)
-                            self._notify_job_status(job.job_id, job.status)
-                            logger.error(f"[V3.1.0] 延迟删除失败: {finished_job_id}, {err}")
-                        except Exception as e:
-                            logger.error(f"[V3.1.0] 延迟删除失败: {finished_job_id}, {e}")
-
-                    # 保存任务最终状态到状态仓库
-                    self.transcription_service.save_job_meta(job)
-
-                    # 推送任务结束信号（单任务频道）
-                    # 使用统一的命名空间前缀格式：signal.{signal_type}
-                    signal_type = "job_complete" if job.status == "finished" else f"job_{job.status}"
-                    self.sse_manager.broadcast_sync(
-                        f"job:{job.job_id}",
-                        f"signal.{signal_type}",
-                        {
-                            "signal": signal_type,
-                            "job_id": job.job_id,
-                            "message": job.message,
-                            "status": job.status,
-                            "percent": round(job.progress, 1)
-                        }
-                    )
-
-                    # 推送全局SSE通知
-                    self._notify_job_status(job.job_id, job.status)
-                    self._notify_queue_change()
-
-                    # 5. 检查是否需要恢复被中断的任务（强制插队后的自动恢复）
-                    self._try_restore_interrupted_job(finished_job_id, job.status)
-
-                    # 保存队列状态
-                    self._save_state()
-
-                    # V3.1.2+dev.20260114.04: 队列变空/任务完成时通知720p调度器
-                    if job.status == "finished":
-                        self._trigger_720p_check_after_job_complete(job.job_id)
+                time.sleep(self._dispatch_interval_seconds)
 
             except Exception as e:
                 logger.error(f"Worker循环异常: {e}", exc_info=True)
@@ -731,19 +775,442 @@ class JobQueueService:
 
         logger.info("Worker循环已停止")
 
+    def _cleanup_finished_runner_threads_locked(self) -> None:
+        """清理已结束但未被回收的 Runner 线程（需持有 self.lock）。"""
+        stale_job_ids = [
+            job_id
+            for job_id, thread in self._runner_threads.items()
+            if not thread.is_alive() and job_id != self.running_job_id
+        ]
+        for stale_job_id in stale_job_ids:
+            self._runner_threads.pop(stale_job_id, None)
+
+    def _dispatch_next_job_locked(self) -> bool:
+        """
+        调度队列头任务（需持有 self.lock）。
+
+        Returns:
+            bool: 是否成功派发任务
+        """
+        if self.running_job_id is not None:
+            return False
+
+        while self.queue:
+            job_id = self.queue[0]
+            job = self.jobs.get(job_id)
+            if not job:
+                logger.warning("⚠️ 任务不存在，跳过: %s", job_id)
+                self.queue.popleft()
+                continue
+
+            if job.status == "paused":
+                logger.info("[V3.2.0+dev.20260124.01] 队列头任务已暂停，等待恢复: %s", job_id)
+                return False
+
+            if job.status in ["canceled", "canceling", "force_canceled", "failed", "removed"]:
+                logger.info("⏭️ 跳过已取消/失败的任务: %s", job_id)
+                self.queue.popleft()
+                continue
+
+            is_runner_gate_blocking = self._is_runner_gate_blocking_locked()
+            if is_runner_gate_blocking and not RUNNER_DETACH_ON_FORCE_CANCEL_ENABLED:
+                now = time.time()
+                if now - self._runner_gate_last_warn_at >= self._runner_gate_warn_interval_seconds:
+                    logger.warning(
+                        "[RunnerGate] GPU 忙碌覆盖生效，等待孤儿任务退出后再调度: orphan_jobs=%s",
+                        list(self._orphan_executions.keys()),
+                    )
+                    self._runner_gate_last_warn_at = now
+                return False
+
+            if is_runner_gate_blocking and RUNNER_DETACH_ON_FORCE_CANCEL_ENABLED:
+                now = time.time()
+                if now - self._runner_gate_last_warn_at >= self._runner_gate_warn_interval_seconds:
+                    logger.warning(
+                        "[RunnerDetach] 检测到孤儿执行，继续派发新任务: orphan_jobs=%s",
+                        list(self._orphan_executions.keys()),
+                    )
+                    self._runner_gate_last_warn_at = now
+
+            self.queue.popleft()
+            self.running_job_id = job_id
+            self._current_executing_job_id = job_id
+            if not self._transition_job_status(job, "processing", "worker_start"):
+                logger.error("任务启动失败，状态迁移被拒绝: job=%s", job_id)
+                self.running_job_id = None
+                if self._current_executing_job_id == job_id:
+                    self._current_executing_job_id = None
+                return False
+
+            job.message = "开始处理"
+            self._restore_progress_from_checkpoint(job)
+            self._notify_queue_change()
+            self._notify_job_status(job_id, "processing")
+            self._notify_job_progress(job_id)
+
+            self._save_state()
+            self.transcription_service.save_job_meta(job)
+            self.heartbeat_service.acquire_lease(
+                job.job_id,
+                self._lease_owner,
+                self._heartbeat_ttl_seconds,
+            )
+            self._create_cancellation_token(job_id)
+            logger.debug("[v3.1.0] 已创建取消令牌: %s", job_id)
+
+            self._maybe_throttle_or_pause_proxy()
+
+            runner_thread = threading.Thread(
+                target=self._execute_job_runner,
+                args=(job_id,),
+                daemon=True,
+                name=f"JobRunner-{job_id[:8]}",
+            )
+            self._runner_threads[job_id] = runner_thread
+            runner_thread.start()
+            return True
+
+        return False
+
+    def _execute_job_runner(self, job_id: str) -> None:
+        """Runner线程：执行单任务并独立完成收尾。"""
+        with self.lock:
+            job = self.jobs.get(job_id)
+        if not job:
+            with self.lock:
+                self._runner_threads.pop(job_id, None)
+            return
+
+        logger.info("开始执行任务: %s", job_id)
+
+        try:
+            transcription = getattr(job.settings, "transcription", None)
+            transcription_profile = (
+                transcription.transcription_profile
+                if transcription else "sensevoice_only"
+            )
+            preset_id = getattr(job.settings, "preset_id", "balanced")
+
+            logger.info(
+                "路由决策: profile=%s, preset=%s",
+                transcription_profile,
+                preset_id,
+            )
+            logger.info(
+                "使用双流对齐流水线 (profile=%s, preset=%s)",
+                transcription_profile,
+                preset_id,
+            )
+            _run_async_safely(self._run_dual_alignment_pipeline(job, preset_id))
+
+            if job_id in self._logically_removed_jobs or job.status == "removed":
+                logger.info("[Lifecycle] 任务已逻辑删除，Runner 直接收尾: %s", job_id)
+            elif job.status == "force_canceled":
+                logger.info("[RunnerDetach] 任务已 force_canceled，按孤儿收尾: %s", job_id)
+            elif job.canceled or job.status == "canceled":
+                self._transition_job_status(job, "canceled", "pipeline_canceled")
+                job.message = "已取消"
+            elif job.paused:
+                self._transition_job_status(job, "paused", "pipeline_paused")
+                job.message = "已暂停"
+            else:
+                is_finish_valid, finish_error = self._validate_finish_integrity(job)
+                if not is_finish_valid:
+                    raise RuntimeError(finish_error)
+                self._transition_job_status(job, "finished", "pipeline_complete")
+                job.message = "完成"
+                logger.info("任务完成: %s", job_id)
+
+        except CancelledException as e:
+            if job_id in self._logically_removed_jobs or job.status == "removed":
+                logger.info("[Lifecycle] 逻辑删除任务收到取消异常，保持 removed: %s", e.job_id)
+            elif job.status == "force_canceled":
+                logger.info("[RunnerDetach] force_canceled 任务收到取消异常，保持终态: %s", e.job_id)
+            else:
+                self._transition_job_status(job, "canceled", "pipeline_canceled")
+                job.message = "已取消"
+                logger.info("[v3.1.0] 任务被取消: %s", e.job_id)
+
+        except PausedException as e:
+            if job_id in self._logically_removed_jobs or job.status == "removed":
+                logger.info("[Lifecycle] 逻辑删除任务收到暂停异常，保持 removed: %s", e.job_id)
+            elif job.canceled or job.status == "canceled":
+                self._transition_job_status(job, "canceled", "pipeline_pause_after_cancel")
+                job.message = "已取消"
+                logger.info("[Lifecycle] 已取消任务收到暂停异常，保持 canceled: %s", e.job_id)
+            else:
+                self._transition_job_status(job, "paused", "pipeline_paused")
+                job.message = "已暂停"
+                self._notify_pause_ack(job)
+                logger.info("[v3.1.0] 任务已暂停: %s", e.job_id)
+
+        except Exception as e:
+            if job_id in self._logically_removed_jobs or job.status == "removed":
+                logger.warning("[Lifecycle] 逻辑删除任务执行异常，保持 removed: %s", job_id)
+            elif job.status == "force_canceled":
+                logger.warning("[RunnerDetach] force_canceled 任务执行异常，保持终态: %s", job_id)
+            elif job.canceled or job.status == "canceled":
+                self._transition_job_status(job, "canceled", "pipeline_error_after_cancel")
+                job.message = "已取消"
+                logger.info("[Lifecycle] 已取消任务执行异常，保持 canceled: %s", job_id)
+            else:
+                self._transition_job_status(job, "failed", "pipeline_error")
+                job.message = f"失败: {e}"
+                job.error = str(e)
+                logger.error("任务执行失败: %s - %s", job_id, e, exc_info=True)
+
+        finally:
+            self._finalize_job_runner(job)
+
+    def _finalize_job_runner(self, job: JobState) -> None:
+        """Runner线程收尾：释放执行槽、落盘状态、推送事件。"""
+        finished_job_id = job.job_id
+        cancel_request_time = None
+        is_logically_removed = False
+        with self.lock:
+            if self.running_job_id == finished_job_id:
+                self.running_job_id = None
+            if self._current_executing_job_id == finished_job_id:
+                self._current_executing_job_id = None
+            cancel_request_time = self._pending_cancel_requests.pop(finished_job_id, None)
+            self._clear_orphan_execution_locked(finished_job_id)
+            self._runner_threads.pop(finished_job_id, None)
+            is_logically_removed = finished_job_id in self._logically_removed_jobs
+
+        if (
+            cancel_request_time is not None
+            and job.status in ("canceled", "force_canceled")
+        ):
+            logger.info(
+                "[Lifecycle] 取消终态达成: job=%s, status=%s, total_cancel_duration=%.1fs",
+                finished_job_id,
+                job.status,
+                time.time() - cancel_request_time,
+            )
+
+        self._remove_cancellation_token(finished_job_id)
+        self.heartbeat_service.release(finished_job_id, self._lease_owner)
+        self._cleanup_resources()
+
+        if is_logically_removed:
+            with self.lock:
+                self._logically_removed_jobs.discard(finished_job_id)
+            self._try_process_pending_physical_deletes(limit=1)
+            self._save_state()
+            return
+
+        self.transcription_service.save_job_meta(job)
+        signal_type = "job_complete" if job.status == "finished" else f"job_{job.status}"
+        self.sse_manager.broadcast_sync(
+            f"job:{job.job_id}",
+            f"signal.{signal_type}",
+            {
+                "signal": signal_type,
+                "job_id": job.job_id,
+                "message": job.message,
+                "status": job.status,
+                "percent": round(job.progress, 1),
+            },
+        )
+
+        self._notify_job_status(job.job_id, job.status)
+        self._notify_queue_change()
+        self._try_restore_interrupted_job(finished_job_id, job.status)
+        self._save_state()
+        if job.status == "finished":
+            self._trigger_720p_check_after_job_complete(job.job_id)
+
+    def _enqueue_physical_delete_locked(
+        self,
+        job: Optional[JobState] = None,
+        *,
+        job_id: Optional[str] = None,
+        job_dir: Optional[str] = None,
+        input_path: Optional[str] = None,
+    ) -> None:
+        """登记待后台重试的物理删除任务（需持有 self.lock）。"""
+        target_job_id = job.job_id if job else str(job_id or "")
+        if not target_job_id:
+            logger.warning("[Lifecycle] 跳过空 job_id 的物理删除登记")
+            return
+
+        target_job_dir = str(job.dir or "") if job else str(job_dir or "")
+        if not target_job_dir:
+            target_job_dir = str(Path(config.JOBS_DIR) / target_job_id)
+        target_input_path = str(job.input_path or "") if job else str(input_path or "")
+
+        self._pending_physical_delete[target_job_id] = {
+            "job_id": target_job_id,
+            "job_dir": target_job_dir,
+            "input_path": target_input_path,
+            "retries": 0,
+            "last_error": "",
+            "last_attempt_at": 0.0,
+        }
+
+    def _perform_physical_delete(self, job_id: str, payload: Dict[str, Any]) -> tuple[bool, Optional[str]]:
+        """执行物理删除（无仓库状态副作用）。"""
+        job_dir_value = str(payload.get("job_dir") or "")
+        job_dir = Path(job_dir_value) if job_dir_value else (Path(config.JOBS_DIR) / job_id)
+
+        try:
+            from app.services.media_stream_tracker import get_active_streams
+
+            active_streams = int(get_active_streams(job_id) or 0)
+        except Exception:
+            active_streams = 0
+
+        if active_streams > 0:
+            return False, f"当前有进程占用，请稍后再试 (active_streams={active_streams})"
+
+        try:
+            from app.services.media_prep_service import get_media_prep_service
+
+            killed = get_media_prep_service().cancel_tasks(job_id)
+            if killed > 0:
+                logger.info("[Lifecycle] 物理删除前终止 %s 个 MediaPrep 进程: %s", killed, job_id)
+                time.sleep(0.1)
+        except Exception as exc:
+            logger.warning("[Lifecycle] 物理删除前取消 MediaPrep 任务失败: job=%s, err=%s", job_id, exc)
+
+        if not job_dir.exists():
+            return True, None
+
+        lifecycle_service = getattr(self.transcription_service, "job_lifecycle", None)
+        force_remove = getattr(lifecycle_service, "_force_remove_directory", None)
+        if callable(force_remove):
+            success = bool(force_remove(job_dir, job_id, max_retries=1, fast_fail=True))
+            if success:
+                return True, None
+            return False, "当前有进程占用，请稍后再试"
+
+        try:
+            shutil.rmtree(job_dir)
+            return True, None
+        except FileNotFoundError:
+            return True, None
+        except PermissionError:
+            return False, "当前有进程占用，请稍后再试"
+        except Exception as exc:
+            return False, str(exc)
+
+    def _try_process_pending_physical_deletes(self, limit: int = 3) -> None:
+        """尝试处理待删除任务（不阻塞前台语义）。"""
+        with self.lock:
+            pending_items = list(self._pending_physical_delete.items())[: max(1, int(limit or 1))]
+
+        for job_id, payload in pending_items:
+            try:
+                success, err = self._perform_physical_delete(job_id, payload)
+                if success:
+                    is_runner_alive = False
+                    with self.lock:
+                        runner_thread = self._runner_threads.get(job_id)
+                        if runner_thread and runner_thread.is_alive():
+                            is_runner_alive = True
+                    with self.lock:
+                        self._pending_physical_delete.pop(job_id, None)
+                        if not is_runner_alive:
+                            self._logically_removed_jobs.discard(job_id)
+                    try:
+                        self.state_repo.delete_task(job_id)
+                    except Exception:
+                        pass
+                    self.heartbeat_service.release(job_id, self._lease_owner)
+                    self._remove_cancellation_token(job_id)
+                    if payload.get("input_path"):
+                        try:
+                            self.transcription_service.job_lifecycle.job_index.remove_mapping(
+                                payload["input_path"]
+                            )
+                        except Exception:
+                            pass
+                    if is_runner_alive:
+                        logger.info("[Lifecycle] 后台物理删除完成，等待 Runner 收尾: %s", job_id)
+                    else:
+                        logger.info("[Lifecycle] 后台物理删除完成: %s", job_id)
+                    continue
+
+                with self.lock:
+                    current_payload = self._pending_physical_delete.get(job_id)
+                    if current_payload is None:
+                        continue
+                    current_payload["retries"] = int(current_payload.get("retries", 0)) + 1
+                    current_payload["last_error"] = str(err or "unknown")
+                    current_payload["last_attempt_at"] = time.time()
+                logger.warning(
+                    "[Lifecycle] 后台物理删除未完成，稍后重试: job=%s, err=%s",
+                    job_id,
+                    err,
+                )
+            except Exception as exc:
+                with self.lock:
+                    current_payload = self._pending_physical_delete.get(job_id)
+                    if current_payload is None:
+                        continue
+                    current_payload["retries"] = int(current_payload.get("retries", 0)) + 1
+                    current_payload["last_error"] = str(exc)
+                    current_payload["last_attempt_at"] = time.time()
+                logger.warning("[Lifecycle] 后台物理删除异常，稍后重试: job=%s, err=%s", job_id, exc)
+
+    def _clear_orphan_execution_locked(self, job_id: Optional[str]) -> None:
+        """清理已退出执行对应的孤儿标记（需持有 self.lock）。"""
+        if not job_id:
+            return
+
+        if self._orphan_executions.pop(job_id, None) is not None:
+            logger.info("[RunnerGate] 孤儿任务已实际退出并清理: %s", job_id)
+
+        if not self._orphan_executions and self._is_gpu_busy_override:
+            self._is_gpu_busy_override = False
+            logger.info("[RunnerGate] 孤儿任务全部清理，解除 GPU 忙碌覆盖")
+
+    def _check_orphan_cleanup_locked(self, now: Optional[float] = None) -> bool:
+        """检查并清理超时孤儿任务（需持有 self.lock）。"""
+        if not self._orphan_executions:
+            return True
+
+        checkpoint_time = now if now is not None else time.time()
+        expired_job_ids = [
+            orphan_job_id
+            for orphan_job_id, marked_at in self._orphan_executions.items()
+            if checkpoint_time - marked_at >= self._runner_gate_orphan_timeout_seconds
+        ]
+        for orphan_job_id in expired_job_ids:
+            self._orphan_executions.pop(orphan_job_id, None)
+            logger.warning("[RunnerGate] 孤儿任务超过保护窗口，按超时清理: %s", orphan_job_id)
+
+        return not self._orphan_executions
+
+    def _is_runner_gate_blocking_locked(self) -> bool:
+        """判断 RunnerGate 是否阻断新任务调度（需持有 self.lock）。"""
+        if not RUNNER_GATE_ENABLED:
+            return False
+        if not self._is_gpu_busy_override:
+            return False
+
+        if self._check_orphan_cleanup_locked():
+            self._is_gpu_busy_override = False
+            logger.info("[RunnerGate] 孤儿任务保护窗口结束，恢复队列调度")
+            return False
+        return True
+
+    def is_runner_gate_blocking(self) -> bool:
+        """提供给外部模块的 RunnerGate 状态只读接口。"""
+        with self.lock:
+            return self._is_runner_gate_blocking_locked()
+
     def _cancel_timeout_monitor(self):
         """
-        [V3.1.0] 取消超时监控线程
+        [V3.1.0] 取消超时与后台删除重试监控线程
 
         职责：
-        1. 定期检查待取消任务是否超时
-        2. 超时后强制清除 running_job_id，允许队列继续
-        3. 确保任务最终被清除，防止队列阻塞
+        1. 兼容历史 canceling 任务的超时收敛
+        2. 定期重试逻辑删除任务的物理清理
 
         设计原则：
-        - 最小侵入：不干扰正常的协作式取消流程
-        - 超时保障：只在任务卡死时介入
-        - 资源安全：等待流水线自然退出后再清理资源
+        - 不阻塞前台：删除成功/失败都不影响前端可见语义
+        - 兜底收敛：历史 canceling 任务仍可自动收敛
         """
         logger.info("[V3.1.0] 取消超时监控线程已启动")
 
@@ -764,6 +1231,9 @@ class JobQueueService:
                 for job_id, elapsed in force_cancel_list:
                     self._force_cancel_timeout_job(job_id, elapsed)
 
+                # 后台物理删除重试
+                self._try_process_pending_physical_deletes(limit=2)
+
             except Exception as e:
                 logger.error(f"[V3.1.0] 超时监控异常: {e}", exc_info=True)
 
@@ -771,15 +1241,9 @@ class JobQueueService:
 
     def _force_cancel_timeout_job(self, job_id: str, elapsed: float):
         """
-        [V3.1.0] 强制取消超时的任务
+        [V3.1.0] 兼容历史 canceling 超时任务的兜底收敛。
 
-        当任务取消请求超时（流水线未响应）时调用此方法。
-        强制清除 running_job_id，允许队列继续处理其他任务。
-
-        注意：
-        - 流水线可能仍在后台运行，但队列不再等待它
-        - 当流水线最终退出时，Worker 的 finally 块会完成清理
-        - 这是一种"放弃等待"策略，而非"强制终止"
+        新语义下统一收敛到 canceled，不再对外暴露 force_canceled。
 
         Args:
             job_id: 超时的任务ID
@@ -797,15 +1261,20 @@ class JobQueueService:
             job = self.jobs.get(job_id)
             if job:
                 from_status = job.status
-                job.status = "force_canceled"
-                job.message = f"已强制取消（响应超时 {elapsed:.0f}s）"
-                logger.info(f"[V3.1.0] 任务状态更新为 force_canceled: {job_id}")
+                self._transition_job_status(job, "canceled", "cancel_timeout")
+                job.message = f"已取消（超时兜底 {elapsed:.0f}s）"
+                logger.info("[V3.1.0] 历史 canceling 任务已收敛为 canceled: %s", job_id)
 
-            # 关键：强制清除 running_job_id，允许下一个任务开始
-            # 注意：_current_executing_job_id 保持不变，让 Worker finally 块知道要清理谁
             if self.running_job_id == job_id:
                 self.running_job_id = None
-                logger.warning(f"[V3.1.0] 强制清除 running_job_id: {job_id}")
+                logger.warning("[V3.1.0] 取消超时兜底清除 running_job_id: %s", job_id)
+                self._orphan_executions[job_id] = time.time()
+                if RUNNER_GATE_ENABLED:
+                    self._is_gpu_busy_override = True
+                    logger.warning(
+                        "[RunnerGate] 记录孤儿执行并启用 GPU 忙碌覆盖: %s",
+                        job_id,
+                    )
 
         # 保存状态
         if job:
@@ -815,13 +1284,8 @@ class JobQueueService:
 
         # 推送通知
         self._notify_queue_change()
-        self._notify_job_status(job_id, "force_canceled")
-        self._notify_job_signal(job_id, "job_force_canceled")
-
-        # 如果需要删除数据，保留在 _pending_delete_after_cancel 中
-        # 等 Worker 的 finally 块执行时处理
-        if job_id in self._pending_delete_after_cancel:
-            logger.info(f"[V3.1.0] 任务 {job_id} 的数据将在流水线退出后删除")
+        self._notify_job_status(job_id, "canceled")
+        self._notify_job_signal(job_id, "job_canceled")
 
     async def _run_dual_alignment_pipeline(self, job: 'JobState', preset_id: str):
         """
@@ -944,9 +1408,17 @@ class JobQueueService:
 
             logger.info(f"[双流对齐] 任务完成: {job.job_id}")
 
+        except CancelledException as e:
+            logger.info("[双流对齐] 任务取消: %s", e.job_id)
+            raise
+
+        except PausedException as e:
+            logger.info("[双流对齐] 任务暂停: %s", e.job_id)
+            raise
+
         except Exception as e:
             logger.error(f"[双流对齐] 任务失败: {e}", exc_info=True)
-            job.status = 'failed'
+            self._transition_job_status(job, "failed", "pipeline_error")
             job.error = str(e)
             push_signal_event(sse_manager, job.job_id, "job_failed", str(e))
             raise
@@ -1202,7 +1674,7 @@ class JobQueueService:
                 # 将被中断的任务重新加入队列头部
                 if self.interrupted_job_id not in self.queue:
                     self.queue.appendleft(self.interrupted_job_id)
-                    interrupted_job.status = "queued"
+                    self._transition_job_status(interrupted_job, "queued", "interrupted_resume")
                     interrupted_job.paused = False
                     interrupted_job.message = "插队任务已完成，自动恢复执行"
                     logger.info(f"[自动恢复] 被中断的任务已恢复到队头: {self.interrupted_job_id}")
@@ -1241,6 +1713,7 @@ class JobQueueService:
         data = {
             "id": job_id,
             "status": status,
+            "state_seq": int(job.state_seq or 0),
             "percent": round(job.progress, 1),  # 统一字段名为 percent，保留1位小数
             "message": job.message,
             "filename": job.filename,
@@ -1314,6 +1787,7 @@ class JobQueueService:
             "signal": signal,
             "job_id": job_id,
             "status": job.status,
+            "state_seq": int(job.state_seq or 0),
             "message": job.message,
             "percent": round(job.progress, 1),
             "updated_at": int(time.time() * 1000)
@@ -1730,16 +2204,23 @@ class JobQueueService:
                     conn=conn,
                 )
                 for job in jobs:
+                    self.state_guard.sync_seq(job.job_id, job.state_seq)
+                    job.status = self.state_guard.normalize_status(job.status)
                     self.state_repo.upsert_task(job, conn=conn)
 
                 for job in jobs:
                     from_status = from_status_map.get(job.job_id)
-                    if from_status != job.status or reason:
+                    normalized_from_status = (
+                        self.state_guard.normalize_status(from_status)
+                        if from_status else from_status
+                    )
+                    if normalized_from_status != job.status or reason:
                         self.event_bus.emit_status_event(
                             job_id=job.job_id,
-                            from_status=from_status,
+                            from_status=normalized_from_status,
                             to_status=job.status,
                             reason=reason,
+                            state_seq=job.state_seq,
                             conn=conn,
                         )
         except Exception as exc:
@@ -1806,9 +2287,12 @@ class JobQueueService:
         timeout_jobs: set[str],
     ) -> None:
         """重启纠偏：统一标记暂停并设置原因提示。"""
-        if job.status in ("finished", "failed", "canceled"):
+        if job.status in ("finished", "failed", "canceled", "force_canceled", "removed"):
             return
-        job.status = "paused"
+        is_transitioned = self._transition_job_status(job, "paused", "restart_correction")
+        if not is_transitioned:
+            logger.warning("重启纠偏状态迁移被拒绝: job=%s", job.job_id)
+            return
         job.paused = True
         if job.job_id in expired_jobs:
             job.message = "租约过期，任务已暂停"
@@ -1852,7 +2336,13 @@ class JobQueueService:
             job_ids = set(recovery_queue)
             # V3.2.0+dev.20260120.06: 加载仓库中的暂停任务，避免重启后无法恢复
             for job in self.state_repo.list_tasks():
-                is_non_terminal = job.status not in ("finished", "failed", "canceled")
+                is_non_terminal = job.status not in (
+                    "finished",
+                    "failed",
+                    "canceled",
+                    "force_canceled",
+                    "removed",
+                )
                 if is_non_terminal:
                     job_ids.add(job.job_id)
 
@@ -1870,8 +2360,9 @@ class JobQueueService:
                 job = self._load_job_for_recovery(job_id)
                 if not job:
                     continue
+                self.state_guard.sync_seq(job.job_id, job.state_seq)
 
-                if job.status in ("finished", "failed", "canceled"):
+                if job.status in ("finished", "failed", "canceled", "force_canceled", "removed"):
                     logger.info(f"[V3.2.0+dev.20260124.01] 过滤终态任务: {job_id}")
                     continue
 
@@ -1887,7 +2378,8 @@ class JobQueueService:
                 job = self._load_job_for_recovery(job_id)
                 if not job:
                     continue
-                if job.status in ("finished", "failed", "canceled"):
+                self.state_guard.sync_seq(job.job_id, job.state_seq)
+                if job.status in ("finished", "failed", "canceled", "force_canceled", "removed"):
                     continue
                 from_status_map[job_id] = job.status
                 self._apply_restart_pause(job, expired_jobs, timeout_jobs)
@@ -1951,7 +2443,10 @@ class JobQueueService:
 
             # 3. 插到队头
             self.queue.appendleft(job_id)
-            job.status = "queued"
+            if not self._transition_job_status(job, "queued", "prioritize"):
+                logger.error("插队失败，状态迁移被拒绝: job=%s", job_id)
+                self.queue.remove(job_id)
+                return {"success": False, "error": "状态迁移被拒绝"}
 
             result = {
                 "success": True,
@@ -2102,6 +2597,12 @@ class JobQueueService:
         # 4. 等待Worker线程结束
         if hasattr(self, "worker_thread"):
             self.worker_thread.join(timeout=5)
+
+        # V3.2.4+dev.20260222.07: 等待所有 Runner 线程收尾，避免测试进程残留后台线程
+        with self.lock:
+            runner_threads = list(self._runner_threads.values())
+        for runner_thread in runner_threads:
+            runner_thread.join(timeout=5)
         logger.info("队列服务已停止")
 
 

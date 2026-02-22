@@ -7,11 +7,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any, List, Optional
 
 from app.schemas.pipeline_context import ProcessingContext
-from app.utils.cancellation_token import PausedException
+from app.utils.cancellation_token import CancelledException, PausedException
 
 
 class AlignLoopService:
@@ -45,14 +46,26 @@ class AlignLoopService:
         if finalized_indices:
             host._last_align_chunk_index = max(finalized_indices)
         pause_requested = False
+        idle_poll_interval = 0.5
 
         try:
             while True:
-                ctx = await host.queue_final.get()
+                try:
+                    ctx = await asyncio.wait_for(
+                        host.queue_final.get(),
+                        timeout=idle_poll_interval,
+                    )
+                except asyncio.TimeoutError:
+                    if token:
+                        token.raise_if_canceled()
+                    continue
 
                 if ctx.is_end:
                     if ctx.error:
-                        host.logger.error(f"上游错误: {ctx.error}")
+                        if isinstance(ctx.error, CancelledException):
+                            host.logger.info(f"上游取消信号: {ctx.error}")
+                        else:
+                            host.logger.error(f"上游错误: {ctx.error}")
                         raise ctx.error
                     break
 
@@ -142,6 +155,10 @@ class AlignLoopService:
                             host.pause_exception = exc
 
             host.logger.info("对齐阶段循环完成")
+
+        except CancelledException as exc:
+            host.logger.info(f"对齐阶段循环取消: {exc}")
+            host.errors.append(exc)
 
         except Exception as exc:
             host.logger.error(f"对齐阶段循环异常: {exc}", exc_info=True)

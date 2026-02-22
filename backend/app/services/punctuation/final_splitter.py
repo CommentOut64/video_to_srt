@@ -49,6 +49,7 @@ class FinalSplitter:
     _CONTINUATION_MERGE_MAX_GAP_SEC = 0.55
     _CJK_CONTINUATION_MERGE_MAX_WORDS = 4
     _CJK_CONTINUATION_MERGE_MAX_DURATION_SEC = 2.20
+    _TIMELINE_BACKTRACK_TOLERANCE_SEC = 0.02
     _CJK_DISCOURSE_BREAK_MARKERS = (
         "然而",
         "但是",
@@ -154,6 +155,7 @@ class FinalSplitter:
         pause_split_blocked_count = 0
         cjk_weak_punct_split_count = 0
         semantic_anchor_split_count = 0
+        backtrack_split_blocked_count = 0
         external_strength = external_strength or {}
 
         for idx, word in enumerate(words):
@@ -167,6 +169,7 @@ class FinalSplitter:
                 boundary_idx=idx,
             )
             strategy = self._sentence_builder.config.get_strategy()
+            is_backtrack_boundary = self._is_temporal_backtrack_boundary(words, idx)
 
             if boundary_strength > 0:
                 if boundary_strength > last_candidate_strength:
@@ -190,6 +193,9 @@ class FinalSplitter:
                 continue
 
             if punct_strength >= 3 and self.config.is_force_split_on_sentence_end_punct:
+                if is_backtrack_boundary:
+                    backtrack_split_blocked_count += 1
+                    continue
                 segments.append(self._build_sentence(words, start_idx, idx))
                 start_idx = idx + 1
                 last_candidate_idx = None
@@ -198,6 +204,9 @@ class FinalSplitter:
 
             if punct_strength >= 3:
                 if tokens >= min_tokens or duration >= self.config.min_duration or idx == len(words) - 1:
+                    if is_backtrack_boundary:
+                        backtrack_split_blocked_count += 1
+                        continue
                     segments.append(self._build_sentence(words, start_idx, idx))
                     start_idx = idx + 1
                     last_candidate_idx = None
@@ -212,6 +221,9 @@ class FinalSplitter:
                 is_semantic_boundary=is_semantic_boundary,
                 min_tokens=min_tokens,
             ):
+                if is_backtrack_boundary:
+                    backtrack_split_blocked_count += 1
+                    continue
                 if not is_semantic_boundary and self._should_block_pause_split(words, start_idx, idx):
                     pause_split_blocked_count += 1
                     continue
@@ -228,6 +240,9 @@ class FinalSplitter:
                 and tokens >= max(min_tokens, self.config.cjk_semantic_split_min_tokens)
                 and duration >= max(self.config.min_duration, self.config.cjk_semantic_split_min_duration)
             ):
+                if is_backtrack_boundary:
+                    backtrack_split_blocked_count += 1
+                    continue
                 current_token = self._normalize_boundary_token(words[idx].word or "")
                 if current_token and strategy.is_incomplete_ending(current_token):
                     continue
@@ -239,6 +254,9 @@ class FinalSplitter:
                 continue
 
             if pause_strength >= 2 and tokens >= min_tokens and duration >= self.config.min_duration:
+                if is_backtrack_boundary:
+                    backtrack_split_blocked_count += 1
+                    continue
                 if not is_semantic_boundary and self._should_block_pause_split(words, start_idx, idx):
                     pause_split_blocked_count += 1
                     continue
@@ -254,6 +272,9 @@ class FinalSplitter:
                 and duration >= self.config.min_duration
                 and (punct_strength >= 1 or tokens >= self.config.max_tokens)
             ):
+                if is_backtrack_boundary:
+                    backtrack_split_blocked_count += 1
+                    continue
                 if not is_semantic_boundary and self._should_block_pause_split(words, start_idx, idx):
                     pause_split_blocked_count += 1
                     continue
@@ -269,6 +290,7 @@ class FinalSplitter:
             "pause_split_blocked_count": float(pause_split_blocked_count),
             "cjk_weak_punct_split_count": float(cjk_weak_punct_split_count),
             "semantic_anchor_split_count": float(semantic_anchor_split_count),
+            "backtrack_split_blocked_count": float(backtrack_split_blocked_count),
         }
 
     def _is_enable_cjk_weak_punct_split(self) -> bool:
@@ -693,6 +715,30 @@ class FinalSplitter:
         if gap >= self.config.soft_pause:
             return 1
         return 0
+
+    def _is_temporal_backtrack_boundary(self, words: List[WordTimestamp], idx: int) -> bool:
+        """时间回退守门：右词起点明显早于左侧边界时，阻断该切点。"""
+        if idx < 0 or idx >= len(words) - 1:
+            return False
+
+        left_end = float(getattr(words[idx], "end", 0.0) or 0.0)
+        if getattr(words[idx], "is_pseudo", False):
+            for prev in range(idx - 1, -1, -1):
+                if not getattr(words[prev], "is_pseudo", False):
+                    left_end = float(getattr(words[prev], "end", left_end) or left_end)
+                    break
+
+        immediate_right_start = float(getattr(words[idx + 1], "start", left_end) or left_end)
+        if immediate_right_start < (left_end - self._TIMELINE_BACKTRACK_TOLERANCE_SEC):
+            return True
+
+        next_idx = idx + 1
+        while next_idx < len(words) and getattr(words[next_idx], "is_pseudo", False):
+            next_idx += 1
+        if next_idx >= len(words):
+            return False
+        right_start = float(getattr(words[next_idx], "start", left_end) or left_end)
+        return right_start < (left_end - self._TIMELINE_BACKTRACK_TOLERANCE_SEC)
 
     def _trailing_punct_strength(self, token: str, next_token: Optional[str] = None) -> int:
         if not token:

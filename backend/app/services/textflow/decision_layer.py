@@ -65,6 +65,8 @@ class SegmentationProcessor:
     _SPEAKER_REPAIR_STRONG_BREAK_MIN_PAUSE_SEC = 0.30
     _SPEAKER_REPAIR_SENTENCE_END_PUNCT = {"。", "！", "？", ".", "!", "?"}
     _SPEAKER_REPAIR_EDGE_GUARD_SEC = 0.15
+    _TIMELINE_BACKTRACK_DROP_TOLERANCE_SEC = 0.02
+    _TIMELINE_NORMALIZE_MIN_DURATION_SEC = 0.01
     _UNKNOWN_PSEUDO_JUNK_PATTERN = re.compile(
         r"^[\s\|·•`~!@#$%^&*()_+\-=\[\]{};:'\",.<>/?\\，。！？：；、（）《》【】…—]+$"
     )
@@ -145,6 +147,9 @@ class SegmentationProcessor:
             degraded_unknown_pseudo_count,
         ) = self._filter_unknown_pseudo_words(raw_words_for_split)
         words_for_split = merge_protected_word_tokens(words_for_split)
+        words_for_split, timestamp_backtrack_fix_count = self._normalize_words_for_split_timestamps(
+            words_for_split
+        )
         pending_in_word_count = len(pending_prefix_words)
         if not words_for_split:
             return DecisionLayerOutput(
@@ -159,6 +164,7 @@ class SegmentationProcessor:
                     "unknown_pseudo_drop_count": int(dropped_unknown_pseudo_count),
                     "unknown_pseudo_degrade_count": int(degraded_unknown_pseudo_count),
                     "unknown_pseudo_filter_fallback": bool(is_unknown_pseudo_filter_fallback),
+                    "timestamp_backtrack_fix_count": int(timestamp_backtrack_fix_count),
                     "soft_cut_stats": self._build_soft_cut_stats(
                         cut_plan=cut_plan,
                         applied_window_ids=[],
@@ -264,6 +270,7 @@ class SegmentationProcessor:
             "unknown_pseudo_drop_count": int(dropped_unknown_pseudo_count),
             "unknown_pseudo_degrade_count": int(degraded_unknown_pseudo_count),
             "unknown_pseudo_filter_fallback": bool(is_unknown_pseudo_filter_fallback),
+            "timestamp_backtrack_fix_count": int(timestamp_backtrack_fix_count),
             "speaker_repair_split_count": int(speaker_repair_split_count),
             "soft_cut_stats": self._build_soft_cut_stats(
                 cut_plan=cut_plan,
@@ -279,7 +286,7 @@ class SegmentationProcessor:
         self._logger.info(
             "裁决层切分完成: stream={} chunk={} input_words={} raw_words={} "
             "sentences={} pending_in={} pending_out={} dropped_unknown_pseudo={} "
-            "degraded_unknown_pseudo={} filter_fallback={} error={}",
+            "degraded_unknown_pseudo={} filter_fallback={} backtrack_fix={} error={}",
             stream_id,
             chunk_index,
             len(words_for_split),
@@ -290,6 +297,7 @@ class SegmentationProcessor:
             int(dropped_unknown_pseudo_count),
             int(degraded_unknown_pseudo_count),
             int(is_unknown_pseudo_filter_fallback),
+            int(timestamp_backtrack_fix_count),
             error_code or "none",
         )
         self._active_vad_intervals = []
@@ -532,12 +540,17 @@ class SegmentationProcessor:
             next_split = split_points[idx + 1] if idx + 1 < len(split_points) else None
             window_id = str(split_to_window.get(split_idx, "") or "")
             decision = decision_by_window.get(window_id)
-            is_drop = self._should_drop_split_for_singleton_guard(
+            is_drop = self._is_temporal_backtrack_boundary(
                 words_for_split=words_for_split,
                 split_idx=split_idx,
-                next_split=next_split,
-                decision=decision,
             )
+            if not is_drop:
+                is_drop = self._should_drop_split_for_singleton_guard(
+                    words_for_split=words_for_split,
+                    split_idx=split_idx,
+                    next_split=next_split,
+                    decision=decision,
+                )
             if not is_drop:
                 is_drop = self._should_drop_split_for_short_prefix_guard(
                     words_for_split=words_for_split,
@@ -549,6 +562,18 @@ class SegmentationProcessor:
             if not is_drop:
                 kept_split_points.append(int(split_idx))
         return kept_split_points
+
+    def _is_temporal_backtrack_boundary(
+        self,
+        *,
+        words_for_split: Sequence[WordTimestamp],
+        split_idx: int,
+    ) -> bool:
+        if split_idx < 0 or split_idx >= len(words_for_split) - 1:
+            return False
+        left_end = float(getattr(words_for_split[split_idx], "end", 0.0) or 0.0)
+        right_start = float(getattr(words_for_split[split_idx + 1], "start", left_end) or left_end)
+        return right_start < (left_end - self._TIMELINE_BACKTRACK_DROP_TOLERANCE_SEC)
 
     def _should_drop_split_for_singleton_guard(
         self,
@@ -2585,6 +2610,52 @@ class SegmentationProcessor:
         setattr(degraded, "speaker_id", getattr(word, "speaker_id", None))
         setattr(degraded, "turn_id", getattr(word, "turn_id", None))
         return degraded
+
+    @classmethod
+    def _normalize_words_for_split_timestamps(
+        cls,
+        words_for_split: Sequence[WordTimestamp],
+    ) -> Tuple[List[WordTimestamp], int]:
+        """
+        词流时间单调修正：避免时间回退词触发错误边界映射与拆句。
+        """
+        normalized_words: List[WordTimestamp] = []
+        fix_count = 0
+        previous_end: Optional[float] = None
+
+        for source_word in list(words_for_split or []):
+            start = float(getattr(source_word, "start", 0.0) or 0.0)
+            end = float(getattr(source_word, "end", start) or start)
+
+            if end < start:
+                end = start
+                fix_count += 1
+
+            if previous_end is not None and start < previous_end:
+                start = previous_end
+                end = max(end, start + cls._TIMELINE_NORMALIZE_MIN_DURATION_SEC)
+                fix_count += 1
+            elif end <= start:
+                end = start + cls._TIMELINE_NORMALIZE_MIN_DURATION_SEC
+                fix_count += 1
+
+            normalized = WordTimestamp(
+                word=source_word.word,
+                start=start,
+                end=end,
+                confidence=source_word.confidence,
+                confidence_raw=source_word.confidence_raw,
+                confidence_display_raw=source_word.confidence_display_raw,
+                confidence_source=source_word.confidence_source,
+                token_type=source_word.token_type,
+                is_pseudo=source_word.is_pseudo,
+            )
+            setattr(normalized, "speaker_id", getattr(source_word, "speaker_id", None))
+            setattr(normalized, "turn_id", getattr(source_word, "turn_id", None))
+            normalized_words.append(normalized)
+            previous_end = float(normalized.end)
+
+        return normalized_words, fix_count
 
     @staticmethod
     def _build_words_for_split(annotated_words: List[Any]) -> List[WordTimestamp]:

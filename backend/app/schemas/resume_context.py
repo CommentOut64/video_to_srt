@@ -21,11 +21,17 @@ class ResumeContext:
     sentences_snapshot: List[Dict[str, Any]] = field(default_factory=list)
     sentence_count: int = 0
     chunk_sentences_map: Dict[int, List[int]] = field(default_factory=dict)
+    merge_decisions: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def is_resuming(self) -> bool:
         """是否处于恢复模式"""
         return self.checkpoint is not None
+
+    @property
+    def is_merged_resume(self) -> bool:
+        """是否经过双源合并恢复。"""
+        return len(self.merge_decisions) > 0
 
     @classmethod
     def from_checkpoint(cls, checkpoint: Optional[Dict[str, Any]]) -> "ResumeContext":

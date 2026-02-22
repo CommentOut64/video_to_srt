@@ -10,18 +10,21 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 
+_FORCE_FINALIZE_STATUSES = {"finished", "canceled", "force_canceled"}
+
+
 def force_finalize_snapshot_when_finished(
     *,
     job_status: str,
     sentences_snapshot: List[Dict[str, Any]],
 ) -> int:
     """
-    finished 态强制收口快照草稿标记。
+    终态强制收口快照草稿标记。
 
     返回值:
         int: 被修正的句子数量
     """
-    if str(job_status).lower() != "finished":
+    if str(job_status).lower() not in _FORCE_FINALIZE_STATUSES:
         return 0
 
     changed_count = 0
@@ -43,12 +46,12 @@ def force_finalize_segments_when_finished(
     segments: List[Dict[str, Any]],
 ) -> int:
     """
-    finished 态下统一收口返回段落，避免前端长期停留“生成中”。
+    终态下统一收口返回段落，避免前端长期停留草稿态。
 
     返回值:
         int: 被修正的段落数量
     """
-    if str(job_status).lower() != "finished":
+    if str(job_status).lower() not in _FORCE_FINALIZE_STATUSES:
         return 0
 
     changed_count = 0

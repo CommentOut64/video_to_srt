@@ -167,25 +167,9 @@ async function deleteTask(jobId) {
     // 调用后端 API 删除任务数据
     try {
       const res = await transcriptionApi.cancelJob(jobId, true)
-      // 后端现在区分“正在执行，等待取消后删除”与“已立即删除”
-      if (res.pending_delete) {
-        if (res.task) {
-          taskStore.applyTaskSnapshot(res.task)
-        } else {
-          taskStore.updateTaskStatus(
-            jobId,
-            'canceling',
-            res.message || '已请求取消并将在结束后删除',
-            { isServer: false }
-          )
-        }
-        ElMessage.info(res.message || '任务正在执行，已请求取消，结束后将删除')
-        // 任务会在原子段结束后自动删除，此处不删卡片
-      } else {
-        // 非运行中，已立即删除
-        taskStore.deleteTask(jobId)
-        ElMessage.success('任务已删除')
-      }
+      // 新语义：删除请求成功后立即逻辑删除，不等待后台物理清理
+      taskStore.deleteTask(jobId)
+      ElMessage.success(res?.message || '任务已删除')
       // 无论哪种情况，刷新 input 列表以反映文件变化
       await loadInputFiles()
       setTimeout(() => {
@@ -243,6 +227,7 @@ function getStatusText(status) {
     finished: '已完成',
     failed: '失败',
     canceled: '已取消',
+    removed: '已删除',
   }
   return statusMap[status] || status
 }

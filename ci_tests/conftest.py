@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
 import types
@@ -52,14 +53,19 @@ _CI_STUB_MODULES = [
 _INTEGRATION_PROFILE = os.environ.get("INTEGRATION_PROFILE", "").lower()
 
 
+def _is_module_available(module_name: str) -> bool:
+    """检测模块是否可导入（不触发真实导入）。"""
+    return importlib.util.find_spec(module_name) is not None
+
+
 def _install_ci_stubs() -> None:
     """在 CI 环境中，为不可用的重型模块安装空 stub。"""
     for mod_name in _CI_STUB_MODULES:
         if mod_name not in sys.modules:
             sys.modules[mod_name] = types.ModuleType(mod_name)
 
-    # fastapi 需要特殊处理：提供 DummyRequest
-    if "fastapi" not in sys.modules:
+    # fastapi 特殊处理：仅在环境未安装 fastapi 时注入最小 stub，避免覆盖真实 FastAPI
+    if "fastapi" not in sys.modules and not _is_module_available("fastapi"):
         fastapi_stub = types.ModuleType("fastapi")
 
         class DummyRequest:

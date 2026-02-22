@@ -287,6 +287,10 @@ def create_transcription_router(
             load_deleted_indices,
             load_edits,
         )
+        from app.services.subtitle_visibility import (
+            filter_hidden_unknown_sentences,
+            is_hidden_unknown_sentence,
+        )
 
         job = transcription_service.get_job(job_id)
         if not job:
@@ -320,6 +324,8 @@ def create_transcription_router(
             if edits:
                 apply_edits_to_sentences_snapshot(sentences_snapshot, edits)
             for sentence in sentences_snapshot:
+                if is_hidden_unknown_sentence(sentence):
+                    continue
                 all_segments.append(
                     {
                         "id": int(sentence.get("_index", sentence.get("index", 0))),
@@ -345,6 +351,7 @@ def create_transcription_router(
         manual_segments = build_manual_segments(edits, deleted_indices)
         if manual_segments:
             all_segments.extend(manual_segments)
+        all_segments = filter_hidden_unknown_sentences(all_segments)
 
         all_segments.sort(
             key=lambda item: (
@@ -793,28 +800,32 @@ def create_transcription_router(
     async def cancel_job(job_id: str, delete_data: bool = False):
         """取消转录任务（V2.2: 使用队列服务）"""
         queue_service = get_queue_service(transcription_service)
-        ok, err, pending_delete = queue_service.cancel_job(job_id, delete_data=delete_data)
-        if not ok:
+        result = queue_service.cancel_job(job_id, delete_data=delete_data)
+        if not result.success:
             # 占用场景用 423 方便前端弹全局提示；运行中删除用 409 告知稍后再试
-            if "占用" in (err or ""):
+            if result.reason_code == "delete_blocked" or "占用" in (result.message or ""):
                 status = 423
-            elif "正在执行" in (err or "") or "取消中" in (err or ""):
+            elif result.reason_code == "cancel_running" or "取消中" in (result.message or ""):
                 status = 409
-            elif "未找到" in (err or ""):
+            elif result.reason_code == "cancel_not_found":
                 status = 404
             else:
                 status = 400
-            raise HTTPException(status_code=status, detail=err or "任务未找到")
+            raise HTTPException(status_code=status, detail=result.message or "任务未找到")
         job_snapshot = None
         job = transcription_service.job_lifecycle.state_repo.get_task(job_id)
         if job:
             job_snapshot = _build_task_snapshot(job)
         return {
             "job_id": job_id,
-            "canceled": ok,
+            "canceled": result.success,
             "data_deleted": delete_data,
-            "message": err,
-            "pending_delete": pending_delete,
+            "success": result.success,
+            "status": result.status,
+            "reason_code": result.reason_code,
+            "message": result.message,
+            "pending_delete": result.pending_delete,
+            "state_seq": result.state_seq,
             "task": job_snapshot,
         }
 
@@ -2048,6 +2059,10 @@ def create_transcription_router(
                 load_deleted_indices,
                 load_edits
             )
+            from app.services.subtitle_visibility import (
+                filter_hidden_unknown_sentences,
+                is_hidden_unknown_sentence,
+            )
             edits = load_edits(job_dir)
             deleted_indices = load_deleted_indices(job_dir)
 
@@ -2064,6 +2079,8 @@ def create_transcription_router(
                 from app.core.confidence_mapper import ConfidenceMapper
 
                 for sentence in sentences_snapshot:
+                    if is_hidden_unknown_sentence(sentence):
+                        continue
                     # V3.1.2: 处理置信度字段
                     # 注意：旧数据可能完全没有 confidence 字段，此时不应显示虚假的准确率
                     raw_conf = sentence.get("confidence")  # 可能为 None
@@ -2102,7 +2119,7 @@ def create_transcription_router(
                         "is_finalized": bool(is_finalized),
                     })
 
-                # finished 态强制收口 snapshot，避免恢复后残留 draft。
+                # 终态强制收口 snapshot，避免取消/完成后残留 draft。
                 forced_snapshot_updates = force_finalize_snapshot_when_finished(
                     job_status=job.status,
                     sentences_snapshot=sentences_snapshot,
@@ -2110,8 +2127,9 @@ def create_transcription_router(
                 if forced_snapshot_updates > 0:
                     need_update_checkpoint = True
                     logger.warning(
-                        "[%s] finished 态修正快照草稿标记: count=%s",
+                        "[%s] 终态修正快照草稿标记: status=%s, count=%s",
                         job_id,
+                        job.status,
                         forced_snapshot_updates,
                     )
 
@@ -2158,6 +2176,7 @@ def create_transcription_router(
             if manual_segments:
                 all_segments.extend(manual_segments)
                 all_segments.sort(key=lambda x: x.get('start', 0))
+            all_segments = filter_hidden_unknown_sentences(all_segments)
 
             # V3.2.0+dev.20260202.06: 统一按时间排序，避免前端展示/导出乱序
             all_segments.sort(
@@ -2183,8 +2202,9 @@ def create_transcription_router(
             )
             if forced_segments > 0:
                 logger.warning(
-                    "[%s] finished 态收口返回段落草稿标记: count=%s",
+                    "[%s] 终态收口返回段落草稿标记: status=%s, count=%s",
                     job_id,
+                    job.status,
                     forced_segments,
                 )
 

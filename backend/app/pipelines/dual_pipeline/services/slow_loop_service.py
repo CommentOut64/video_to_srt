@@ -15,7 +15,7 @@ from typing import Any, Optional
 
 from app.schemas.pipeline_context import ProcessingContext
 from app.services.bridge.turn_group_builder import TurnGroupEnvelope
-from app.utils.cancellation_token import PausedException
+from app.utils.cancellation_token import CancelledException, PausedException
 
 
 class SlowLoopService:
@@ -23,6 +23,48 @@ class SlowLoopService:
 
     def __init__(self, *, host: Any) -> None:
         self._host = host
+
+    async def _put_queue_final_with_guard(
+        self,
+        *,
+        payload: ProcessingContext,
+        token: Any,
+        timeout_seconds: float = 0.5,
+        max_retry: int = 6,
+        allow_drop: bool = False,
+        reason: str = "",
+    ) -> bool:
+        """
+        带取消守卫的 queue_final 投递。
+
+        Why:
+        - 对齐阶段提前退出时，SlowWorker 的 put 会被背压阻塞
+        - 取消/删除链路必须保证可收敛退出
+        """
+        host = self._host
+        retries = 0
+        while True:
+            try:
+                await asyncio.wait_for(
+                    host.queue_final.put(payload),
+                    timeout=timeout_seconds,
+                )
+                return True
+            except asyncio.TimeoutError:
+                retries += 1
+                if token:
+                    token.raise_if_canceled()
+                if retries >= max_retry:
+                    if allow_drop:
+                        host.logger.warning(
+                            "SlowWorker 投递 queue_final 超时，丢弃载荷: reason=%s, retries=%s",
+                            reason,
+                            retries,
+                        )
+                        return False
+                    raise RuntimeError(
+                        f"SlowWorker 投递 queue_final 超时: reason={reason}, retries={retries}"
+                    )
 
     async def run(
         self,
@@ -53,6 +95,8 @@ class SlowLoopService:
                         timeout=idle_poll_interval,
                     )
                 except asyncio.TimeoutError:
+                    if token:
+                        token.raise_if_canceled()
                     if host.bridge_controller and host.bridge_controller.should_flush_on_idle(
                         host.queue_inter.qsize()
                     ):
@@ -91,7 +135,12 @@ class SlowLoopService:
                 ctx = payload
 
                 if ctx.is_end or ctx.error:
-                    await host.queue_final.put(ctx)
+                    await self._put_queue_final_with_guard(
+                        payload=ctx,
+                        token=token,
+                        allow_drop=True,
+                        reason="upstream_end_or_error",
+                    )
                     break
 
                 chunk_index = ctx.chunk_index
@@ -134,6 +183,7 @@ class SlowLoopService:
                         whisper_result = await host.slow_worker.infer(
                             audio_with_overlap,
                             initial_prompt=prompt,
+                            cancel_checker=token.raise_if_canceled if token else None,
                         )
                         host._validate_l0_result(
                             whisper_result,
@@ -190,7 +240,11 @@ class SlowLoopService:
                             f"(text_length={len(whisper_result.get('text', ''))})"
                         )
 
-                    await host.queue_final.put(ctx)
+                    await self._put_queue_final_with_guard(
+                        payload=ctx,
+                        token=token,
+                        reason=f"chunk_{chunk_index}",
+                    )
                     host._context_cache.pop(chunk_index, None)
                     slow_processed_count += 1
                     slow_processed_indices.add(chunk_index)
@@ -233,6 +287,25 @@ class SlowLoopService:
 
             host.logger.info("SlowWorker 循环完成")
 
+        except CancelledException as exc:
+            host.logger.info(f"SlowWorker 循环取消: {exc}")
+            host.errors.append(exc)
+            error_ctx = ProcessingContext(
+                job_id=host.job_id,
+                chunk_index=-1,
+                audio_chunk=None,
+                job_dir=job_dir,
+                debug_punctuation=host.debug_punctuation,
+                is_end=True,
+                error=exc,
+            )
+            await self._put_queue_final_with_guard(
+                payload=error_ctx,
+                token=token,
+                allow_drop=True,
+                reason="cancel_error_ctx",
+            )
+
         except Exception as exc:
             host.logger.error(f"SlowWorker 循环异常: {exc}", exc_info=True)
             host.errors.append(exc)
@@ -246,7 +319,12 @@ class SlowLoopService:
                 is_end=True,
                 error=exc,
             )
-            await host.queue_final.put(error_ctx)
+            await self._put_queue_final_with_guard(
+                payload=error_ctx,
+                token=token,
+                allow_drop=True,
+                reason="exception_error_ctx",
+            )
         finally:
             if pause_requested:
                 host.logger.debug("[V3.1.0] SlowWorker 已完成排空，等待对齐阶段同步完成")

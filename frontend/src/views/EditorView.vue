@@ -346,6 +346,14 @@ const dualStreamProgress = computed(() => {
 let sseUnsubscribe = null
 let progressPollTimer = null
 let proxyPollTimer = null
+const isCancelPending = ref(false)
+const CANCEL_TIMEOUT_MS = 30000
+const CANCEL_TERMINAL_STATUSES = new Set(['canceled', 'failed', 'finished', 'removed', 'force_canceled'])
+let cancelTimeoutTimer = null
+// V3.2.4+dev.20260222.15: 定稿事件实时回拉后端真源（单飞+补偿，避免请求风暴）
+let isRealtimeFinalSyncInFlight = false
+let hasRealtimeFinalSyncPending = false
+let realtimeFinalSyncReason = null
 
 // Provide 编辑器上下文
 // ========== Provide 上下文 ==========
@@ -405,6 +413,8 @@ watch(jobIdRef, async (newJobId, oldJobId) => {
 
   // 取消旧的 SSE 订阅
   cleanupSSE()
+  stopCancelTimeoutPolling()
+  isCancelPending.value = false
 
   // 重置项目状态
   projectStore.resetProject()
@@ -586,6 +596,13 @@ async function loadProject() {
         console.log('[EditorView] 缓存数据格式过旧（缺少 sentenceIndex），重新从 API 加载')
         await loadTranscribingSegments()
       }
+      // 取消终态下兜底收口本地草稿，避免旧缓存刷新后回到草稿态
+      if (['canceled', 'force_canceled'].includes(jobStatus.status)) {
+        const hasDraft = projectStore.subtitles.some((s) => s.isDraft)
+        if (hasDraft) {
+          await projectStore.finalizeDraftSubtitlesOnCancel()
+        }
+      }
       // V3.2.0+dev.20260124.02: 后端为唯一真理，后续仍会从 API 刷新覆盖
     }
 
@@ -624,6 +641,12 @@ async function loadProject() {
       // 任务刚创建，订阅SSE等待开始
       subscribeSSE()
       startProxyPolling()
+    } else if (['canceled', 'force_canceled'].includes(jobStatus.status)) {
+      // V3.2.4+dev.20260222.14: 终态统一以后端为准，强制同步最终字幕口径
+      await syncSegmentsFromBackendAsSource({
+        reason: 'load_project_canceled_terminal',
+        allowSrtFallback: true,
+      })
     } else if (jobStatus.status === 'failed') {
       await loadTranscribingSegments()
     }
@@ -672,8 +695,49 @@ async function loadTranscribingSegments() {
         'http_segments'
       )
     }
+    return (textData.segments && textData.segments.length) || 0
   } catch (error) {
     console.warn('[EditorView] 加载转录文字失败:', error)
+    return 0
+  }
+}
+
+// V3.2.4+dev.20260222.14: 终态同步必须以后端为唯一数据源
+async function syncSegmentsFromBackendAsSource({ reason = 'unknown', allowSrtFallback = true } = {}) {
+  console.log(`[EditorView] 开始后端字幕强制同步: reason=${reason}`)
+  const count = await loadTranscribingSegments()
+  if (count === 0 && allowSrtFallback) {
+    console.log('[EditorView] 后端 segments 为空，回退加载 SRT')
+    await loadFromSRT()
+  }
+  console.log(`[EditorView] 后端字幕强制同步完成: count=${projectStore.subtitles.length}`)
+}
+
+// V3.2.4+dev.20260222.15: 每次定稿事件都立即触发后端回拉，且高频事件合并为“当前1次+补1次”
+async function scheduleRealtimeFinalSync(reason = 'subtitle_final_event') {
+  realtimeFinalSyncReason = reason
+  if (isRealtimeFinalSyncInFlight) {
+    hasRealtimeFinalSyncPending = true
+    return
+  }
+
+  isRealtimeFinalSyncInFlight = true
+  try {
+    do {
+      const currentReason = realtimeFinalSyncReason || reason
+      hasRealtimeFinalSyncPending = false
+      realtimeFinalSyncReason = null
+      try {
+        await syncSegmentsFromBackendAsSource({
+          reason: currentReason,
+          allowSrtFallback: false,
+        })
+      } catch (error) {
+        console.warn('[EditorView] 实时定稿后端回拉失败:', error)
+      }
+    } while (hasRealtimeFinalSyncPending)
+  } finally {
+    isRealtimeFinalSyncInFlight = false
   }
 }
 
@@ -766,38 +830,26 @@ function subscribeSSE() {
 
     async onComplete(data) {
       console.log('[EditorView] 任务完成:', data)
+      if (isCancelPending.value) {
+        isCancelPending.value = false
+        stopCancelTimeoutPolling()
+      }
       progressStore.markStatus(props.jobId, 'finished', {
         percent: 100,
         phase: 'complete',
         updated_at: data.updated_at ?? data.timestamp,
+        state_seq: data.state_seq,
       })
       taskStore.updateTaskStatus(props.jobId, 'finished', null, {
         updated_at: data.updated_at ?? data.timestamp,
+        state_seq: data.state_seq,
       })
 
-      // V3.1.2+dev.20260111.02: 任务完成处理
-      // 优先保留 SSE 推送的字幕（含置信度），无数据时从 API 加载
-      if (projectStore.subtitles.length === 0) {
-        console.log('[EditorView] 无字幕数据（可能断线），尝试恢复...')
-        // 先尝试从 segments API 加载（含置信度）
-        await loadTranscribingSegments()
-
-        // 如果还是没有数据，从 SRT 文件加载（无置信度，但至少有字幕）
-        if (projectStore.subtitles.length === 0) {
-          console.log('[EditorView] segments API 无数据，尝试从 SRT 恢复')
-          await loadFromSRT()
-        }
-      } else {
-        console.log(
-          `[EditorView] 保留 SSE 推送的 ${projectStore.subtitles.length} 条字幕（含置信度）`
-        )
-        // 将所有草稿标记为定稿
-        projectStore.subtitles.forEach((sub) => {
-          if (sub.isDraft) {
-            sub.isDraft = false
-          }
-        })
-      }
+      // V3.2.4+dev.20260222.14: 完成态不再本地“草稿改定稿”，必须立即以后端最终口径覆盖
+      await syncSegmentsFromBackendAsSource({
+        reason: 'signal_job_complete',
+        allowSrtFallback: true,
+      })
 
       stopProgressPolling()
       startProxyPolling()
@@ -808,12 +860,18 @@ function subscribeSSE() {
 
     onFailed(data) {
       console.log('[EditorView] 任务失败:', data)
+      if (isCancelPending.value) {
+        isCancelPending.value = false
+        stopCancelTimeoutPolling()
+      }
       progressStore.markStatus(props.jobId, 'failed', {
         message: data.message,
         updated_at: data.updated_at ?? data.timestamp,
+        state_seq: data.state_seq,
       })
       taskStore.updateTaskStatus(props.jobId, 'failed', null, {
         updated_at: data.updated_at ?? data.timestamp,
+        state_seq: data.state_seq,
       })
       taskStore.updateTaskSSEStatus(props.jobId, true, data.message || '转录失败')
       stopProgressPolling()
@@ -825,23 +883,53 @@ function subscribeSSE() {
       console.log('[EditorView] 任务已暂停:', data)
       progressStore.markStatus(props.jobId, 'paused', {
         updated_at: data.updated_at ?? data.timestamp,
+        state_seq: data.state_seq,
       })
       taskStore.updateTaskStatus(props.jobId, 'paused', null, {
         updated_at: data.updated_at ?? data.timestamp,
+        state_seq: data.state_seq,
       })
       // 保持SSE连接和进度显示
     },
 
-    onCanceled(data) {
+    onPausePending(data) {
+      console.log('[EditorView] 任务暂停中:', data)
+      progressStore.markStatus(props.jobId, 'pausing', {
+        updated_at: data.updated_at ?? data.timestamp,
+        state_seq: data.state_seq,
+      })
+      taskStore.updateTaskStatus(props.jobId, 'pausing', null, {
+        updated_at: data.updated_at ?? data.timestamp,
+        state_seq: data.state_seq,
+      })
+    },
+
+    onPauseAck(data) {
+      console.log('[EditorView] 收到暂停确认:', data)
+    },
+
+    onCanceling(data) {
+      console.log('[EditorView] 收到 canceling 信号，等待终态:', data)
+      isCancelPending.value = true
+      startCancelTimeoutPolling()
+      progressStore.markStatus(props.jobId, 'canceling', {
+        updated_at: data.updated_at ?? data.timestamp,
+        state_seq: data.state_seq,
+      })
+      taskStore.updateTaskStatus(props.jobId, 'canceling', null, {
+        updated_at: data.updated_at ?? data.timestamp,
+        state_seq: data.state_seq,
+      })
+    },
+
+    async onCanceled(data) {
       console.log('[EditorView] 任务已取消:', data)
-      progressStore.markStatus(props.jobId, 'canceled', {
-        updated_at: data.updated_at ?? data.timestamp,
-      })
-      taskStore.updateTaskStatus(props.jobId, 'canceled', null, {
-        updated_at: data.updated_at ?? data.timestamp,
-      })
-      stopProgressPolling()
-      cleanupSSE()
+      await handleCancelTerminal(data, 'canceled')
+    },
+
+    async onForceCanceled(data) {
+      console.log('[EditorView] 任务已强制取消:', data)
+      await handleCancelTerminal(data, 'force_canceled')
     },
 
     onResumed(data) {
@@ -849,9 +937,11 @@ function subscribeSSE() {
       console.log('[EditorView] 任务已恢复:', data)
       progressStore.markStatus(props.jobId, data.status || 'queued', {
         updated_at: data.updated_at ?? data.timestamp,
+        state_seq: data.state_seq,
       })
       taskStore.updateTaskStatus(props.jobId, data.status || 'queued', null, {
         updated_at: data.updated_at ?? data.timestamp,
+        state_seq: data.state_seq,
       })
       startProgressPolling()
     },
@@ -872,12 +962,13 @@ function subscribeSSE() {
       taskStore.updateSSEHeartbeat()
     },
 
-    // V3.1.2+dev.20260113.01: 恢复 onSubtitleUpdate 回调
-    // 原因：专用处理器（onDraft等）处理新架构事件，onSubtitleUpdate 处理旧架构事件
-    // 两者互补，不会冲突
+    // V3.2.4+dev.20260222.14: onSubtitleUpdate 仅用于旧事件，避免新事件双路径改写导致状态漂移
     onSubtitleUpdate(data) {
-      // 只处理旧架构的字幕事件（sv_sentence, whisper_patch, llm_proof 等）
-      // 新架构事件（draft, replace_chunk）由专用处理器处理
+      // 新架构事件（draft/replace_chunk/finalized/restored）统一走专用处理器
+      if (data?.chunk_index !== undefined && data?.chunk_index !== null) {
+        return
+      }
+      // 仅处理旧架构字幕事件（sv_sentence/whisper_patch/llm_proof 等）
       if (data.sentence || data.sentence_index !== undefined) {
         console.log('[EditorView] 收到旧架构字幕更新:', data)
         handleStreamingSubtitle(data)
@@ -1003,11 +1094,74 @@ function subscribeSSE() {
 
 // 清理SSE连接
 function cleanupSSE() {
+  stopCancelTimeoutPolling()
   if (sseUnsubscribe) {
     console.log('[EditorView] 清理SSE连接:', props.jobId)
     sseUnsubscribe()
     sseUnsubscribe = null
   }
+}
+
+function stopCancelTimeoutPolling() {
+  if (cancelTimeoutTimer) {
+    clearTimeout(cancelTimeoutTimer)
+    cancelTimeoutTimer = null
+  }
+}
+
+function isCancelTerminalStatus(status) {
+  return CANCEL_TERMINAL_STATUSES.has(status)
+}
+
+async function handleCancelTerminal(data, fallbackStatus = 'canceled') {
+  const terminalStatus = data?.status || fallbackStatus
+  isCancelPending.value = false
+  stopCancelTimeoutPolling()
+  // V3.2.4+dev.20260222.14: 取消终态同样以后端返回为准，不做本地草稿转定稿
+  if (['canceled', 'force_canceled'].includes(terminalStatus)) {
+    await syncSegmentsFromBackendAsSource({
+      reason: `signal_${terminalStatus}`,
+      allowSrtFallback: true,
+    })
+  }
+  progressStore.markStatus(props.jobId, terminalStatus, {
+    updated_at: data?.updated_at ?? data?.timestamp,
+    state_seq: data?.state_seq,
+  })
+  taskStore.updateTaskStatus(props.jobId, terminalStatus, null, {
+    updated_at: data?.updated_at ?? data?.timestamp,
+    state_seq: data?.state_seq,
+  })
+  stopProgressPolling()
+  cleanupSSE()
+}
+
+function startCancelTimeoutPolling() {
+  if (!isCancelPending.value) return
+  stopCancelTimeoutPolling()
+  cancelTimeoutTimer = setTimeout(async () => {
+    if (!isCancelPending.value) return
+    console.warn('[EditorView] canceling 超时，主动拉取状态:', props.jobId)
+    try {
+      const snapshot = await transcriptionApi.getJobStatus(props.jobId, true)
+      const status = snapshot?.status || ''
+      if (isCancelTerminalStatus(status)) {
+        await handleCancelTerminal(
+          {
+            status,
+            updated_at: snapshot?.updated_at,
+            timestamp: snapshot?.timestamp,
+          },
+          status
+        )
+        return
+      }
+      startCancelTimeoutPolling()
+    } catch (error) {
+      console.warn('[EditorView] canceling 兜底查询失败，下一轮重试:', error)
+      startCancelTimeoutPolling()
+    }
+  }, CANCEL_TIMEOUT_MS)
 }
 
 // 处理流式字幕更新（旧版兼容，已弃用）
@@ -1123,37 +1277,10 @@ function handleDraftSubtitle(data) {
 function handleReplaceChunk(data) {
   if (!data) return
 
-  // 后端数据格式: { chunk_index, old_indices, new_indices, sentences: [...] }
   const chunkIndex = data.chunk_index
-  const sentences = Array.isArray(data.sentences) ? data.sentences : []
-
-  // V3.1.2+dev.20260111.01: 转换为 projectStore 需要的格式，包含 display_confidence
-  const formattedSentences = sentences.map((sentence, idx) => ({
-    index: data.new_indices?.[idx] ?? idx,
-    text: sentence.text || '',
-    start: sentence.start ?? 0,
-    end: sentence.end ?? 0,
-    confidence: sentence.confidence ?? null,
-    display_confidence: sentence.display_confidence, // V3.1.2: 映射后准确率
-    confidence_source: sentence.confidence_source, // V3.1.2: 置信度来源
-    words: sentence.words || [],
-    warning_type: sentence.warning_type || 'none',
-    source: sentence.source || 'whisper',
-    is_modified: sentence.is_modified ?? false,
-    original_text: sentence.original_text ?? null,
-    speaker_id: sentence.speaker_id ?? null,
-    turn_id: sentence.turn_id ?? null,
-    speaker_label: sentence.speaker_label ?? null,
-    speaker_color_key: sentence.speaker_color_key ?? null,
-    binding_source: sentence.binding_source ?? null,
-    is_draft: false,
-    is_finalized: true,
-  }))
-
-  // 调用 projectStore 的替换方法
-  projectStore.replaceChunk(chunkIndex, formattedSentences)
-
-  console.log(`[EditorView] 替换 Chunk ${chunkIndex}，共 ${formattedSentences.length} 条定稿字幕`)
+  const finalizedCount = Array.isArray(data.sentences) ? data.sentences.length : 0
+  console.log(`[EditorView] 替换 Chunk ${chunkIndex}（定稿事件 ${finalizedCount} 条），立即以后端真源覆盖`)
+  void scheduleRealtimeFinalSync(`subtitle_replace_chunk_${chunkIndex ?? 'unknown'}`)
 }
 
 /**
@@ -1268,36 +1395,12 @@ function handleSubtitleEdited(data) {
 function handleFinalizedSubtitle(data) {
   if (!data) return
 
-  // 极速模式：按 chunk 维持映射，但句子标记为定稿
-  const sentence = data.sentence || {}
   const chunkIndex = data.chunk_index
-
-  // V3.1.2+dev.20260111.01: 构建 sentenceData，包含 display_confidence
-  const sentenceData = {
-    index: data.index ?? 0,
-    text: sentence.text || '',
-    start: sentence.start ?? 0,
-    end: sentence.end ?? 0,
-    confidence: sentence.confidence ?? null,
-    display_confidence: sentence.display_confidence, // V3.1.2: 映射后准确率
-    confidence_source: sentence.confidence_source, // V3.1.2: 置信度来源
-    words: sentence.words || [],
-    warning_type: sentence.warning_type || 'none',
-    is_modified: sentence.is_modified ?? false,
-    original_text: sentence.original_text ?? null,
-    speaker_id: sentence.speaker_id ?? null,
-    turn_id: sentence.turn_id ?? null,
-    speaker_label: sentence.speaker_label ?? null,
-    speaker_color_key: sentence.speaker_color_key ?? null,
-    binding_source: sentence.binding_source ?? null,
-    is_draft: false,
-    is_finalized: true,
-    source: sentence.source || 'sensevoice_only',
-  }
-
-  projectStore.appendOrUpdateDraft(chunkIndex, sentenceData)
-
-  console.log(`[EditorView] 极速模式定稿 Chunk ${chunkIndex}，句子索引 ${data.index}`)
+  const sentenceIndex = data.index
+  console.log(
+    `[EditorView] 极速模式定稿 Chunk ${chunkIndex}，句子索引 ${sentenceIndex}，立即以后端真源覆盖`
+  )
+  void scheduleRealtimeFinalSync(`subtitle_finalized_${chunkIndex ?? sentenceIndex ?? 'unknown'}`)
 }
 
 function handleRevisedSubtitle(data) {
@@ -1493,19 +1596,39 @@ async function cancelTranscription() {
   if (!confirm('确定要取消当前转录任务吗?')) return
   try {
     const result = await transcriptionApi.cancelJob(props.jobId, false)
+    const apiStatus = result?.task?.status || result?.status || 'canceled'
     if (result?.task) {
       taskStore.applyTaskSnapshot(result.task)
-      progressStore.markStatus(props.jobId, result.task.status || 'canceled', {
+      progressStore.markStatus(props.jobId, apiStatus, {
         updated_at: result.task.updated_at,
       })
     } else {
-      progressStore.markStatus(props.jobId, 'canceled')
-      taskStore.updateTaskStatus(props.jobId, 'canceled', null, { isServer: false })
+      progressStore.markStatus(props.jobId, apiStatus)
+      taskStore.updateTaskStatus(props.jobId, apiStatus, null, { isServer: false })
     }
-    // 取消后关闭SSE连接
-    cleanupSSE()
-    stopProgressPolling()
+    if (isCancelTerminalStatus(apiStatus)) {
+      await handleCancelTerminal(
+        {
+          status: apiStatus,
+          updated_at: result?.task?.updated_at,
+          timestamp: Date.now(),
+          state_seq: result?.state_seq,
+        },
+        apiStatus
+      )
+    } else {
+      // 兼容旧后端 canceling 语义
+      isCancelPending.value = true
+      startCancelTimeoutPolling()
+    }
+    console.log('[EditorView] 取消请求已发送，等待终态信号:', {
+      status: apiStatus,
+      reason_code: result?.reason_code,
+      pending_delete: result?.pending_delete,
+    })
   } catch (error) {
+    isCancelPending.value = false
+    stopCancelTimeoutPolling()
     console.error('取消任务失败:', error)
   }
 }
@@ -1925,6 +2048,8 @@ onUnmounted(() => {
   console.log('[EditorView] 组件卸载，保留SSE连接以支持后台任务')
 
   // 停止轮询（轮询仅是备用方案）
+  isCancelPending.value = false
+  stopCancelTimeoutPolling()
   stopProgressPolling()
   stopProxyPolling()
 })

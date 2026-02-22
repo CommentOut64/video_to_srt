@@ -2063,6 +2063,7 @@ class AsyncDualPipelineKernel:
             full_audio_array=self._full_audio_array,
             full_audio_sr=self._full_audio_sr,
             prompt_text=prompt,
+            cancel_checker=token.raise_if_canceled if token else None,
         )
 
         self._record_turn_group_unit(

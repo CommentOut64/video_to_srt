@@ -11,6 +11,7 @@ import threading
 from typing import Any, Dict, List, Optional
 from app.models.sensevoice_models import SentenceSegment, TextSource
 from app.services.sse_service import get_sse_manager
+from app.services.subtitle_visibility import is_hidden_unknown_sentence
 import logging
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,20 @@ class StreamingSubtitleManager:
             payload.pop(key, None)
         return payload
 
+    @staticmethod
+    def _is_hidden_unknown_sentence(sentence: SentenceSegment) -> bool:
+        """统一 unknown 字幕可见性判断。"""
+        return is_hidden_unknown_sentence(sentence)
+
+    def _filter_unknown_sentences(
+        self,
+        sentences: List[SentenceSegment],
+    ) -> List[SentenceSegment]:
+        return [
+            sentence for sentence in list(sentences or [])
+            if not self._is_hidden_unknown_sentence(sentence)
+        ]
+
     def _build_sentence_payload(
         self,
         sentence: SentenceSegment,
@@ -113,6 +128,10 @@ class StreamingSubtitleManager:
         Returns:
             int: 句子索引
         """
+        if self._is_hidden_unknown_sentence(sentence):
+            logger.info("跳过 unknown 字幕写入: job_id=%s", self.job_id)
+            return -1
+
         index = self.sentence_count
         self.sentences[index] = sentence
         self.sentence_count += 1
@@ -206,6 +225,11 @@ class StreamingSubtitleManager:
         if perplexity is not None:
             sentence.perplexity = perplexity
             sentence.warning_type = sentence.compute_warning_type()
+
+        if self._is_hidden_unknown_sentence(sentence):
+            self.remove_sentence_by_index(index)
+            logger.info("移除更新后变为 unknown 的字幕: job_id=%s index=%s", self.job_id, index)
+            return
 
         # 推送 SSE 事件
         event_type = {
@@ -326,6 +350,7 @@ class StreamingSubtitleManager:
         sentences = [
             s for s in self.sentences.values()
             if not getattr(s, 'marked_for_deletion', False)
+            and not self._is_hidden_unknown_sentence(s)
         ]
         sentences.sort(key=lambda s: s.start)
         # V3.8 调试日志：导出时记录句子数量
@@ -378,11 +403,21 @@ class StreamingSubtitleManager:
         Returns:
             List[int]: 句子索引列表
         """
+        visible_sentences = self._filter_unknown_sentences(sentences)
+        dropped_unknown_count = max(0, len(list(sentences or [])) - len(visible_sentences))
+        if dropped_unknown_count > 0:
+            logger.info(
+                "草稿链路过滤 unknown 字幕: job_id=%s chunk=%s count=%s",
+                self.job_id,
+                chunk_index,
+                dropped_unknown_count,
+            )
+
         sentence_indices = []
         sentences_to_push = []  # V3.8: 收集待推送的句子数据
 
         with self._lock:
-            for sentence in sentences:
+            for sentence in visible_sentences:
                 # V3.8 修复：深拷贝句子对象，避免共享引用
                 sentence_copy = copy.deepcopy(sentence)
                 sentence_copy.is_draft = True
@@ -421,7 +456,7 @@ class StreamingSubtitleManager:
 
         # V3.8 调试日志：确认草稿已添加到管理器
         logger.debug(
-            f"add_draft_sentences: Chunk {chunk_index} 添加 {len(sentences)} 个草稿, "
+            f"add_draft_sentences: Chunk {chunk_index} 添加 {len(visible_sentences)} 个草稿, "
             f"索引 {sentence_indices}, 当前总句子数={len(self.sentences)}"
         )
 
@@ -453,8 +488,18 @@ class StreamingSubtitleManager:
         Returns:
             List[int]: 新的句子索引列表
         """
+        visible_sentences = self._filter_unknown_sentences(sentences)
+        dropped_unknown_count = max(0, len(list(sentences or [])) - len(visible_sentences))
+        if dropped_unknown_count > 0:
+            logger.info(
+                "定稿替换过滤 unknown 字幕: job_id=%s chunk=%s count=%s",
+                self.job_id,
+                chunk_index,
+                dropped_unknown_count,
+            )
+
         # 防御性处理：空定稿也要完成 chunk 收口，避免前端草稿永久停留“生成中”。
-        if not sentences:
+        if not visible_sentences:
             with self._lock:
                 old_indices = self.chunk_sentences.get(chunk_index, [])
                 protected_sentences = {}
@@ -513,7 +558,7 @@ class StreamingSubtitleManager:
 
             # 添加新的定稿句子
             new_indices = []
-            for sentence in sentences:
+            for sentence in visible_sentences:
                 sentence.is_draft = False
                 sentence.is_finalized = True
                 index = self.sentence_count
@@ -531,7 +576,7 @@ class StreamingSubtitleManager:
 
         # 推送 SSE 事件（批量替换）- 在锁外推送，避免死锁
         sentences_data: List[Dict[str, Any]] = []
-        for i, sentence in enumerate(sentences):
+        for i, sentence in enumerate(visible_sentences):
             sentence_index = new_indices[i] if i < len(new_indices) else None
             sentences_data.append(
                 self._build_sentence_payload(
@@ -559,7 +604,7 @@ class StreamingSubtitleManager:
         logger.debug(
             f"replace_chunk: Chunk {chunk_index} 替换完成 - "
             f"删除 {len(old_indices)} 个草稿 {old_indices}, "
-            f"添加 {len(new_indices)} 个定稿 {new_indices}, "
+            f"添加 {len(visible_sentences)} 个定稿 {new_indices}, "
             f"当前总句子数={len(self.sentences)}"
         )
 
@@ -585,11 +630,21 @@ class StreamingSubtitleManager:
         Returns:
             List[int]: 句子索引列表
         """
+        visible_sentences = self._filter_unknown_sentences(sentences)
+        dropped_unknown_count = max(0, len(list(sentences or [])) - len(visible_sentences))
+        if dropped_unknown_count > 0:
+            logger.info(
+                "极速定稿过滤 unknown 字幕: job_id=%s chunk=%s count=%s",
+                self.job_id,
+                chunk_index,
+                dropped_unknown_count,
+            )
+
         sentence_indices = []
         sentences_to_push = []  # V3.8: 收集待推送的句子数据
 
         with self._lock:
-            for sentence in sentences:
+            for sentence in visible_sentences:
                 # V3.8 修复：深拷贝句子对象，避免共享引用
                 sentence_copy = copy.deepcopy(sentence)
 
@@ -631,7 +686,7 @@ class StreamingSubtitleManager:
 
         logger.debug(
             f"添加定稿句子 [极速模式]: Chunk {chunk_index}, "
-            f"{len(sentences)} 个句子, 索引 {sentence_indices}"
+            f"{len(visible_sentences)} 个句子, 索引 {sentence_indices}"
         )
 
         return sentence_indices
@@ -651,7 +706,10 @@ class StreamingSubtitleManager:
             dict: 可直接保存到 Checkpoint 的字幕数据
         """
         sentences_snapshot = []
+        visible_indices = set()
         for idx, sentence in self.sentences.items():
+            if self._is_hidden_unknown_sentence(sentence):
+                continue
             # Checkpoint 持久化保留全量字段（包括 speaker），供恢复与最终导出使用
             sentence_dict = self._build_sentence_payload(sentence)
             # 添加索引信息
@@ -659,11 +717,17 @@ class StreamingSubtitleManager:
             sentence_dict["_is_draft"] = getattr(sentence, 'is_draft', False)
             sentence_dict["_is_finalized"] = getattr(sentence, 'is_finalized', False)
             sentences_snapshot.append(sentence_dict)
+            visible_indices.add(idx)
+
+        chunk_sentences_map = {
+            int(chunk_index): [idx for idx in indices if idx in visible_indices]
+            for chunk_index, indices in self.chunk_sentences.items()
+        }
 
         return {
             "sentences_snapshot": sentences_snapshot,
             "sentence_count": self.sentence_count,
-            "chunk_sentences_map": self.chunk_sentences
+            "chunk_sentences_map": chunk_sentences_map,
         }
 
     def restore_from_checkpoint(self, checkpoint_data: dict) -> bool:
@@ -778,6 +842,8 @@ class StreamingSubtitleManager:
                     )
                     sentence.words.append(word)
 
+                if self._is_hidden_unknown_sentence(sentence):
+                    continue
                 self.sentences[idx] = sentence
                 restored_count += 1
 
@@ -789,6 +855,13 @@ class StreamingSubtitleManager:
             if chunk_sentences_map:
                 self.chunk_sentences = {
                     int(k): v for k, v in chunk_sentences_map.items()
+                }
+                self.chunk_sentences = {
+                    chunk_index: [
+                        idx for idx in indices
+                        if idx in self.sentences and not self._is_hidden_unknown_sentence(self.sentences[idx])
+                    ]
+                    for chunk_index, indices in self.chunk_sentences.items()
                 }
 
             logger.info(
@@ -944,6 +1017,8 @@ class StreamingSubtitleManager:
             for idx in sentence_indices:
                 if idx in self.sentences:
                     sentence = self.sentences[idx]
+                    if self._is_hidden_unknown_sentence(sentence):
+                        continue
                     is_draft = bool(getattr(sentence, "is_draft", False))
                     sentence_dict = self._build_sentence_payload(
                         sentence,
@@ -971,6 +1046,8 @@ class StreamingSubtitleManager:
         manual_sentences = []
         for idx, sentence in self.sentences.items():
             if idx >= 0:
+                continue
+            if self._is_hidden_unknown_sentence(sentence):
                 continue
             is_draft = bool(getattr(sentence, "is_draft", False))
             sentence_dict = self._build_sentence_payload(

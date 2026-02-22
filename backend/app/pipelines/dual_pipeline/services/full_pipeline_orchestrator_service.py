@@ -13,6 +13,7 @@ from typing import Any, List, Optional, Set, Tuple
 
 from app.schemas.pipeline_context import ProcessingContext
 from app.services.audio.chunk_engine import AudioChunk
+from app.utils.cancellation_token import CancelledException, PausedException
 
 
 class FullPipelineOrchestratorService:
@@ -116,11 +117,32 @@ class FullPipelineOrchestratorService:
         )
 
         for res in await_results:
+            if isinstance(res, CancelledException):
+                host.logger.info(f"流水线任务取消: {res}")
+                raise res
+            if isinstance(res, PausedException):
+                host.logger.info(f"流水线任务暂停: {res}")
+                raise res
             if isinstance(res, Exception):
                 host.logger.error(f"任务异常: {res}", exc_info=res)
                 raise res
 
+        if host.cancellation_token and host.cancellation_token.is_canceled:
+            raise CancelledException(host.job_id)
+
         if host.errors:
+            canceled_error = next(
+                (err for err in host.errors if isinstance(err, CancelledException)),
+                None,
+            )
+            if canceled_error is not None:
+                raise canceled_error
+            paused_error = next(
+                (err for err in host.errors if isinstance(err, PausedException)),
+                None,
+            )
+            if paused_error is not None:
+                raise paused_error
             host.logger.error(f"流水线执行中发生 {len(host.errors)} 个错误")
             raise host.errors[0]
 

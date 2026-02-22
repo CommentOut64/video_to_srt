@@ -5,6 +5,7 @@ Runtime checkpoint 数据模型。
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -22,4 +23,6 @@ class RuntimeCheckpointSnapshot:
     """运行时状态快照（Phase 1 仅包含最小提交信息）。"""
 
     last_unit_commits: dict[str, str] = field(default_factory=dict)
+    # Phase 2: 仅保存转录摘要提示，不复制 checkpoint 全量数据
+    transcription_hint: dict[str, Any] | None = None
 

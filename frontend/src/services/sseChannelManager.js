@@ -135,7 +135,7 @@ class SSEChannelManager extends EventEmitter {
 
     // 统一的信号处理函数
     const handleSignal = (data) => {
-      const signal = data.signal || data.code
+      const signal = data.signal || data.code || data.type || ''
       console.log(`[SSE Job ${jobId}] 信号:`, signal)
 
       // 分发特定信号事件
@@ -149,6 +149,14 @@ class SSEChannelManager extends EventEmitter {
         handlers.onCanceled?.(data)
       } else if (signal === 'job_resumed') {
         handlers.onResumed?.(data)
+      } else if (signal === 'job_canceling') {
+        handlers.onCanceling?.(data)
+      } else if (signal === 'job_force_canceled') {
+        handlers.onForceCanceled?.(data)
+      } else if (signal === 'pause_pending') {
+        handlers.onPausePending?.(data)
+      } else if (signal === 'pause_ack') {
+        handlers.onPauseAck?.(data)
       }
 
       handlers.onSignal?.(signal, data)
@@ -214,6 +222,10 @@ class SSEChannelManager extends EventEmitter {
       'signal.job_paused': handleSignal,
       'signal.job_canceled': handleSignal,
       'signal.job_resumed': handleSignal,
+      'signal.job_canceling': handleSignal,
+      'signal.job_force_canceled': handleSignal,
+      'signal.pause_pending': handleSignal,
+      'signal.pause_ack': handleSignal,
       'signal.phase_start': handleSignal,
       'signal.phase_complete': handleSignal,
       'signal.circuit_breaker': (data) => {
@@ -243,28 +255,24 @@ class SSEChannelManager extends EventEmitter {
       'subtitle.draft': (data) => {
         console.log(`[SSE Job ${jobId}] 草稿字幕:`, data)
         handlers.onDraft?.(data)
-        handlers.onSubtitleUpdate?.(data)
       },
 
       // Phase 5: 双模态架构 - 替换 Chunk 事件（慢流/Whisper）
       'subtitle.replace_chunk': (data) => {
         console.log(`[SSE Job ${jobId}] 替换 Chunk:`, data)
         handlers.onReplaceChunk?.(data)
-        handlers.onSubtitleUpdate?.(data)
       },
 
       // V3.1.0: 字幕恢复事件（断点续传后恢复字幕）
       'subtitle.restored': (data) => {
         console.log(`[SSE Job ${jobId}] 恢复字幕:`, data)
         handlers.onRestored?.(data)
-        handlers.onSubtitleUpdate?.(data)
       },
 
       // V3.5: 极速模式定稿事件
       'subtitle.finalized': (data) => {
         console.log(`[SSE Job ${jobId}] 定稿字幕:`, data)
         handlers.onFinalized?.(data)
-        handlers.onSubtitleUpdate?.(data)
       },
       // 说话人改绑/修订事件（后端唯一真源回推）
       'subtitle.revised': (data) => {
@@ -737,6 +745,20 @@ class SSEChannelManager extends EventEmitter {
   isChannelActive(channelId) {
     const eventSource = this.channels.get(channelId)
     return eventSource && eventSource.readyState === EventSource.OPEN
+  }
+
+  /**
+   * 全局频道健康检查
+   * OPEN/CONNECTING 均视为健康，CLOSED 视为异常
+   * @returns {boolean}
+   */
+  isGlobalHealthy() {
+    const eventSource = this.channels.get('global')
+    if (!eventSource) return false
+    return (
+      eventSource.readyState === EventSource.OPEN ||
+      eventSource.readyState === EventSource.CONNECTING
+    )
   }
 
   /**

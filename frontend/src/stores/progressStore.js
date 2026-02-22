@@ -111,12 +111,19 @@ export const useProgressStore = defineStore('progress', () => {
     if (normalized >= state.percent) {
       return { accept: true, value: normalized }
     }
-    if (state.percent - normalized <= 3) {
+    const diff = state.percent - normalized
+    if (diff <= 3) {
+      if (source === 'sse') {
+        return { accept: true, value: normalized }
+      }
       return { accept: true, value: state.percent }
     }
     if (source !== 'sse' && now - state.lastSseAt < 10000) {
       return { accept: false, value: state.percent }
     }
+    console.warn(
+      `[ProgressStore] 进度大幅倒退: job=${state.jobId}, ${state.percent} -> ${normalized}, source=${source}`
+    )
     return { accept: false, value: state.percent }
   }
 
@@ -184,8 +191,7 @@ export const useProgressStore = defineStore('progress', () => {
     if (percentPayload !== undefined) {
       const decision = shouldAcceptPercent(state, percentPayload, source, nextStatus)
       if (decision.accept) {
-        const nextValue = decision.value
-        state.percent = Math.max(state.percent, nextValue)
+        state.percent = decision.value
         dirty = true
       } else {
         state.lastRejected = {
@@ -236,23 +242,21 @@ export const useProgressStore = defineStore('progress', () => {
   function markStatus(jobId, status, extra = {}) {
     const state = ensureState(jobId)
 
-    // 特殊处理：任务完成时强制设为 100%
-    if (status === 'finished') {
-      const result = apply(jobId, { status, ...extra, percent: 100 }, 'signal')
-      // [V3.1.0] 注册延迟清理
-      scheduleCleanup(jobId)
-      return result
-    }
-
-    // [V3.1.0] 任务取消或失败时也注册清理
-    if (status === 'canceled' || status === 'failed') {
-      scheduleCleanup(jobId)
-    }
-
     // 其他状态变更时，移除 extra 中的 percent 字段，避免归零
     // 只保留 status 和其他非进度字段
     const { percent, progress, ...safeExtra } = extra
-    return apply(jobId, { status, ...safeExtra }, 'signal')
+    const terminalStatuses = ['finished', 'failed', 'canceled', 'force_canceled', 'removed']
+    const payload = { status, ...safeExtra }
+
+    if (status === 'finished') {
+      payload.percent = 100
+    }
+
+    const result = apply(jobId, payload, 'signal')
+    if (terminalStatuses.includes(status)) {
+      scheduleCleanup(jobId)
+    }
+    return result
   }
 
   /**

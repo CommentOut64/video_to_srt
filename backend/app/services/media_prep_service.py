@@ -906,6 +906,12 @@ class MediaPrepService:
                 logger.debug(f"[MediaPrep] 队列繁忙: 正在执行任务 {queue_service.running_job_id}")
                 return True
 
+            # V3.2.4+dev.20260222.01: RunnerGate 生效时，队列虽然无 running_job_id
+            # 但孤儿执行可能仍占用 GPU，需继续判定为繁忙
+            if hasattr(queue_service, "is_runner_gate_blocking") and queue_service.is_runner_gate_blocking():
+                logger.debug("[MediaPrep] 队列繁忙: RunnerGate 正在阻断新任务")
+                return True
+
             # 检查3: 有活跃的进度追踪器（双重保险，防止边界情况）
             from app.services.progress_tracker import get_all_trackers
             active_trackers = get_all_trackers()

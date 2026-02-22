@@ -519,6 +519,7 @@ class JobState:
     title: str = ""  # 用户自定义的任务名称，为空时使用 filename
     createdAt: Optional[int] = None  # 创建时间戳
     updatedAt: Optional[int] = None  # 更新时间戳（毫秒）
+    state_seq: int = 0  # 状态迁移序号，单调递增
     # V3.2.0+dev.20260130.10: 任务级字幕时间偏移（秒，None 表示使用全局默认）
     subtitle_time_offset: Optional[float] = None
 
@@ -557,7 +558,8 @@ class JobState:
             "paused": self.paused,
             "settings": self.settings.to_dict(),
             "subtitle_time_offset": self.subtitle_time_offset,
-            "updated_at": time.time()
+            "updated_at": time.time(),
+            "state_seq": int(self.state_seq or 0),
         }
 
     @classmethod
@@ -597,6 +599,7 @@ class JobState:
             canceled=data.get("canceled", False),
             paused=data.get("paused", False),
             updatedAt=updated_at,
+            state_seq=max(0, int(data.get("state_seq", 0) or 0)),
             subtitle_time_offset=data.get("subtitle_time_offset"),
         )
 
