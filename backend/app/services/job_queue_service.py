@@ -22,7 +22,7 @@ import torch
 
 from app.models.job_models import JobState
 from app.models.task_state_machine import get_state_guard
-from app.config.lifecycle_config import STATE_MACHINE_GUARD_ENABLED
+from app.config.lifecycle_config import STATE_MACHINE_GUARD_ENABLED, RUNNER_GATE_ENABLED
 from app.services.sse_service import get_sse_manager
 from app.core.config import config
 from app.services.checkpoint import RuntimeCheckpointService
@@ -162,6 +162,12 @@ class JobQueueService:
         self._pending_delete_after_cancel: set = set()  # 取消后需要删除数据的任务
         self._force_cancel_timeout: float = 60.0  # 超时时间（秒）
         self._current_executing_job_id: Optional[str] = None  # Worker 当前实际执行的任务ID（不受 cancel 影响）
+        # V3.2.4+dev.20260222.01: RunnerGate 风险闸门（孤儿执行观测）
+        self._orphan_executions: Dict[str, float] = {}  # {job_id: force_cancel_timestamp}
+        self._is_gpu_busy_override: bool = False
+        self._runner_gate_orphan_timeout_seconds: float = 120.0
+        self._runner_gate_warn_interval_seconds: float = 10.0
+        self._runner_gate_last_warn_at: float = 0.0
 
         # 依赖服务
         self.transcription_service = transcription_service
@@ -781,26 +787,35 @@ class JobQueueService:
                             self.queue.popleft()
                             continue
                         else:
-                            # 正式从队列移除
-                            self.queue.popleft()
-                            self.running_job_id = job_id
-                            self._current_executing_job_id = job_id  # [V3.1.0] 记录实际执行的任务ID
-                            if not self._transition_job_status(job, "processing", "worker_start"):
-                                logger.error("任务启动失败，状态迁移被拒绝: job=%s", job_id)
-                                self.running_job_id = None
-                                self._current_executing_job_id = None
-                                continue
-                            job.message = "开始处理"
+                            if self._is_runner_gate_blocking_locked():
+                                now = time.time()
+                                if now - self._runner_gate_last_warn_at >= self._runner_gate_warn_interval_seconds:
+                                    logger.warning(
+                                        "[RunnerGate] GPU 忙碌覆盖生效，等待孤儿任务退出后再调度: orphan_jobs=%s",
+                                        list(self._orphan_executions.keys()),
+                                    )
+                                    self._runner_gate_last_warn_at = now
+                            else:
+                                # 正式从队列移除
+                                self.queue.popleft()
+                                self.running_job_id = job_id
+                                self._current_executing_job_id = job_id  # [V3.1.0] 记录实际执行的任务ID
+                                if not self._transition_job_status(job, "processing", "worker_start"):
+                                    logger.error("任务启动失败，状态迁移被拒绝: job=%s", job_id)
+                                    self.running_job_id = None
+                                    self._current_executing_job_id = None
+                                    continue
+                                job.message = "开始处理"
 
-                            # V3.1.0: 在推送 SSE 之前，先从 checkpoint 恢复进度
-                            # 这样断点续传时前端收到的进度是正确的，而非 0
-                            self._restore_progress_from_checkpoint(job)
+                                # V3.1.0: 在推送 SSE 之前，先从 checkpoint 恢复进度
+                                # 这样断点续传时前端收到的进度是正确的，而非 0
+                                self._restore_progress_from_checkpoint(job)
 
-                            # 推送队列变化和任务状态通知（在lock内，避免数据不一致）
-                            self._notify_queue_change()
-                            self._notify_job_status(job_id, "processing")
-                            # 推送初始进度（让前端立即知道任务的初始状态）
-                            self._notify_job_progress(job_id)
+                                # 推送队列变化和任务状态通知（在lock内，避免数据不一致）
+                                self._notify_queue_change()
+                                self._notify_job_status(job_id, "processing")
+                                # 推送初始进度（让前端立即知道任务的初始状态）
+                                self._notify_job_progress(job_id)
 
                     # 任务开始执行前保存状态（确保断电后能恢复 running 任务）
                     if self.running_job_id:
@@ -897,6 +912,7 @@ class JobQueueService:
                         self._current_executing_job_id = None
                         # [V3.1.0] 从待取消列表移除
                         cancel_request_time = self._pending_cancel_requests.pop(finished_job_id, None)
+                        self._clear_orphan_execution_locked(finished_job_id)
 
                     if (
                         cancel_request_time is not None
@@ -978,6 +994,53 @@ class JobQueueService:
 
         logger.info("Worker循环已停止")
 
+    def _clear_orphan_execution_locked(self, job_id: Optional[str]) -> None:
+        """清理已退出执行对应的孤儿标记（需持有 self.lock）。"""
+        if not job_id:
+            return
+
+        if self._orphan_executions.pop(job_id, None) is not None:
+            logger.info("[RunnerGate] 孤儿任务已实际退出并清理: %s", job_id)
+
+        if not self._orphan_executions and self._is_gpu_busy_override:
+            self._is_gpu_busy_override = False
+            logger.info("[RunnerGate] 孤儿任务全部清理，解除 GPU 忙碌覆盖")
+
+    def _check_orphan_cleanup_locked(self, now: Optional[float] = None) -> bool:
+        """检查并清理超时孤儿任务（需持有 self.lock）。"""
+        if not self._orphan_executions:
+            return True
+
+        checkpoint_time = now if now is not None else time.time()
+        expired_job_ids = [
+            orphan_job_id
+            for orphan_job_id, marked_at in self._orphan_executions.items()
+            if checkpoint_time - marked_at >= self._runner_gate_orphan_timeout_seconds
+        ]
+        for orphan_job_id in expired_job_ids:
+            self._orphan_executions.pop(orphan_job_id, None)
+            logger.warning("[RunnerGate] 孤儿任务超过保护窗口，按超时清理: %s", orphan_job_id)
+
+        return not self._orphan_executions
+
+    def _is_runner_gate_blocking_locked(self) -> bool:
+        """判断 RunnerGate 是否阻断新任务调度（需持有 self.lock）。"""
+        if not RUNNER_GATE_ENABLED:
+            return False
+        if not self._is_gpu_busy_override:
+            return False
+
+        if self._check_orphan_cleanup_locked():
+            self._is_gpu_busy_override = False
+            logger.info("[RunnerGate] 孤儿任务保护窗口结束，恢复队列调度")
+            return False
+        return True
+
+    def is_runner_gate_blocking(self) -> bool:
+        """提供给外部模块的 RunnerGate 状态只读接口。"""
+        with self.lock:
+            return self._is_runner_gate_blocking_locked()
+
     def _cancel_timeout_monitor(self):
         """
         [V3.1.0] 取消超时监控线程
@@ -1053,6 +1116,13 @@ class JobQueueService:
             if self.running_job_id == job_id:
                 self.running_job_id = None
                 logger.warning(f"[V3.1.0] 强制清除 running_job_id: {job_id}")
+                self._orphan_executions[job_id] = time.time()
+                if RUNNER_GATE_ENABLED:
+                    self._is_gpu_busy_override = True
+                    logger.warning(
+                        "[RunnerGate] 记录孤儿执行并启用 GPU 忙碌覆盖: %s",
+                        job_id,
+                    )
 
         # 保存状态
         if job:
