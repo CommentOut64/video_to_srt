@@ -2213,8 +2213,13 @@ class TranscriptionService:
                 f"[{overlap_start:.2f}s, {sentence.end:.2f}s]"
             )
 
-        # 获取上下文提示（现在使用清洗后的文本，避免下划线等原始 token）
-        context = subtitle_manager.get_context_window(sentence_index)
+        # 获取上下文提示（统一走压缩策略，避免全文拼接污染）
+        from app.services.whisper.whisper_prompt_policy import compact_whisper_context_for_patch
+
+        context = compact_whisper_context_for_patch(
+            subtitle_manager.get_context_window(sentence_index),
+            logger=self.logger,
+        )
 
         # Whisper 转录
         builder = get_transcribe_param_builder(logger=self.logger)
@@ -2442,8 +2447,13 @@ class TranscriptionService:
                 f"[{overlap_start:.2f}s, {sentence.end:.2f}s]"
             )
 
-        # 获取上下文提示（现在使用清洗后的文本，避免下划线等原始 token）
-        context = subtitle_manager.get_context_window(sentence_index)
+        # 获取上下文提示（统一走压缩策略，避免全文拼接污染）
+        from app.services.whisper.whisper_prompt_policy import compact_whisper_context_for_patch
+
+        context = compact_whisper_context_for_patch(
+            subtitle_manager.get_context_window(sentence_index),
+            logger=self.logger,
+        )
 
         # Whisper 转录（仅取文本，弃用时间戳）
         builder = get_transcribe_param_builder(logger=self.logger)
@@ -2659,8 +2669,13 @@ class TranscriptionService:
 
             # 检查是否触发缓冲池处理
             if buffer_service.should_trigger(has_long_silence=has_long_silence, is_eof=is_last):
-                # 获取上下文提示
-                context = subtitle_manager.get_context_window(sent_idx)
+                # 获取上下文提示（统一走压缩策略，避免全文拼接污染）
+                from app.services.whisper.whisper_prompt_policy import compact_whisper_context_for_patch
+
+                context = compact_whisper_context_for_patch(
+                    subtitle_manager.get_context_window(sent_idx),
+                    logger=self.logger,
+                )
 
                 # 处理缓冲池
                 aligned_results = buffer_service.process_buffer(
@@ -2720,7 +2735,16 @@ class TranscriptionService:
 
         # 处理缓冲池中的剩余内容
         if not buffer_service.is_empty:
-            context = subtitle_manager.get_context_window(patch_queue[-1]["index"]) if patch_queue else ""
+            from app.services.whisper.whisper_prompt_policy import compact_whisper_context_for_patch
+
+            context = (
+                compact_whisper_context_for_patch(
+                    subtitle_manager.get_context_window(patch_queue[-1]["index"]),
+                    logger=self.logger,
+                )
+                if patch_queue
+                else ""
+            )
             remaining_results = buffer_service.flush_remaining(
                 whisper_service=whisper_service,
                 language=getattr(job.settings, 'language', 'auto'),

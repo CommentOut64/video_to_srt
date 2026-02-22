@@ -113,6 +113,17 @@ class WhisperSanitizeRuntimeParams(_RuntimeBase):
     )
 
 
+class WhisperPromptRuntimeParams(_RuntimeBase):
+    is_enabled: Optional[bool] = Field(default=None, alias="enabled")
+    max_prompt_chars: Optional[int] = Field(default=None, ge=32, le=1024)
+    max_keyword_count: Optional[int] = Field(default=None, ge=1, le=128)
+    max_context_chars: Optional[int] = Field(default=None, ge=16, le=512)
+    max_history_chars: Optional[int] = Field(default=None, ge=32, le=2048)
+    reset_pause_sec: Optional[float] = Field(default=None, ge=0.0, le=30.0)
+    reset_no_speech_prob: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    reset_low_confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
+
 class SenseVoiceRuntimeParams(_RuntimeBase):
     language: Optional[str] = Field(default=None)
     is_use_itn: Optional[bool] = Field(default=None, alias="use_itn")
@@ -483,9 +494,74 @@ class SegmentationRuntimeParams(_RuntimeBase):
         return value
 
 
+class LanguagePolicyRuntimeParams(_RuntimeBase):
+    is_enabled: Optional[bool] = Field(default=None, alias="enabled")
+    default_language: Optional[str] = Field(default=None)
+    policy_version: Optional[str] = Field(default=None)
+    thresholds: Optional[Dict[str, float]] = Field(default=None)
+    carry_rules: Optional[Dict[str, List[float]]] = Field(default=None)
+    cross_chunk: Optional[Dict[str, Any]] = Field(default=None)
+
+    @field_validator("default_language")
+    @classmethod
+    def _validate_default_language(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        normalized = value.strip().lower()
+        if not normalized:
+            raise ValueError("default_language 不能为空字符串")
+        if not (2 <= len(normalized) <= 10 and normalized.replace("-", "").isalnum()):
+            raise ValueError("default_language 必须是 2-10 位语言码")
+        return normalized
+
+    @field_validator("thresholds")
+    @classmethod
+    def _validate_thresholds(cls, value: Optional[Dict[str, float]]) -> Optional[Dict[str, float]]:
+        if value is None:
+            return value
+        normalized: Dict[str, float] = {}
+        for key, item in value.items():
+            try:
+                normalized[str(key)] = float(item)
+            except (TypeError, ValueError):
+                raise ValueError(f"thresholds.{key} 必须为数值")
+        return normalized
+
+    @field_validator("carry_rules")
+    @classmethod
+    def _validate_carry_rules(
+        cls,
+        value: Optional[Dict[str, List[float]]],
+    ) -> Optional[Dict[str, List[float]]]:
+        if value is None:
+            return value
+        normalized: Dict[str, List[float]] = {}
+        for key, item in value.items():
+            if not isinstance(item, list) or len(item) < 2:
+                raise ValueError(f"carry_rules.{key} 必须为至少两个元素的数值数组")
+            pair = []
+            for num in item[:2]:
+                try:
+                    pair.append(float(num))
+                except (TypeError, ValueError):
+                    raise ValueError(f"carry_rules.{key} 必须为数值数组")
+            normalized[str(key)] = pair
+        return normalized
+
+    @field_validator("cross_chunk")
+    @classmethod
+    def _validate_cross_chunk(cls, value: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if value is None:
+            return value
+        if not isinstance(value, dict):
+            raise ValueError("cross_chunk 必须为对象")
+        return value
+
+
 class RuntimeGroupUpdateRequest(_RuntimeBase):
     whisper: Optional[WhisperRuntimeParams] = None
     whisper_sanitize: Optional[WhisperSanitizeRuntimeParams] = None
+    whisper_prompt: Optional[WhisperPromptRuntimeParams] = None
     sensevoice: Optional[SenseVoiceRuntimeParams] = None
     demucs: Optional[DemucsRuntimeParams] = None
     vad: Optional[VADRuntimeParams] = None
@@ -497,11 +573,13 @@ class RuntimeGroupUpdateRequest(_RuntimeBase):
     normalization: Optional[NormalizationRuntimeParams] = None
     arbitration: Optional[ArbitrationRuntimeParams] = None
     segmentation: Optional[SegmentationRuntimeParams] = None
+    language_policy: Optional[LanguagePolicyRuntimeParams] = None
 
 
 _RUNTIME_GROUP_MODELS = {
     "whisper": WhisperRuntimeParams,
     "whisper_sanitize": WhisperSanitizeRuntimeParams,
+    "whisper_prompt": WhisperPromptRuntimeParams,
     "sensevoice": SenseVoiceRuntimeParams,
     "demucs": DemucsRuntimeParams,
     "vad": VADRuntimeParams,
@@ -513,6 +591,7 @@ _RUNTIME_GROUP_MODELS = {
     "normalization": NormalizationRuntimeParams,
     "arbitration": ArbitrationRuntimeParams,
     "segmentation": SegmentationRuntimeParams,
+    "language_policy": LanguagePolicyRuntimeParams,
 }
 
 
@@ -569,6 +648,16 @@ _PARAM_SCHEMA: Dict[str, Any] = {
             "enabled": {"type": "bool", "default": True},
             "min_text_length": {"type": "int", "min": 0, "default": 2},
             "patterns": {"type": "object", "default": []},
+        },
+        "whisper_prompt": {
+            "enabled": {"type": "bool", "default": False},
+            "max_prompt_chars": {"type": "int", "min": 32, "max": 1024, "default": 180},
+            "max_keyword_count": {"type": "int", "min": 1, "max": 128, "default": 16},
+            "max_context_chars": {"type": "int", "min": 16, "max": 512, "default": 80},
+            "max_history_chars": {"type": "int", "min": 32, "max": 2048, "default": 160},
+            "reset_pause_sec": {"type": "float", "min": 0.0, "max": 30.0, "default": 1.8},
+            "reset_no_speech_prob": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.65},
+            "reset_low_confidence": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.35},
         },
         "sensevoice": {
             "language": {
@@ -737,6 +826,14 @@ _PARAM_SCHEMA: Dict[str, Any] = {
         "pipeline": {
             "batch_size": {"type": "int", "min": 1, "default": 16},
             "word_timestamps": {"type": "bool", "default": False},
+        },
+        "language_policy": {
+            "enabled": {"type": "bool", "default": True},
+            "default_language": {"type": "string", "default": "zh"},
+            "policy_version": {"type": "string", "default": "V3.2.0+dev.20260219.08"},
+            "thresholds": {"type": "object", "default": {}},
+            "carry_rules": {"type": "object", "default": {}},
+            "cross_chunk": {"type": "object", "default": {}},
         },
     },
 }

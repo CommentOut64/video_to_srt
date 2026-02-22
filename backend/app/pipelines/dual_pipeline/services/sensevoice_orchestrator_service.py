@@ -83,6 +83,11 @@ class SensevoiceOrchestratorService:
                 ctx.final_sentences = final_sentences
                 injection_stats = dict(run_result.injection_stats)
                 split_stats = dict(run_result.split_stats)
+                soft_cut_observe_snapshot = host._update_soft_cut_observability(
+                    split_stats=split_stats,
+                    chunk_index=ctx.chunk_index,
+                    stage="sensevoice_orchestrator",
+                )
                 alignment_result = run_result.alignment_result
                 aligned_facts = run_result.aligned_facts
                 fused_evidence = run_result.fused_evidence
@@ -98,6 +103,8 @@ class SensevoiceOrchestratorService:
                 }
                 for key, value in split_stats.items():
                     ctx.finalization_metrics[f"split_{key}"] = value
+                for key, value in soft_cut_observe_snapshot.items():
+                    ctx.finalization_metrics[f"soft_cut_obs_{key}"] = value
                 ctx.finalization_metrics["fact_word_count"] = float(len(aligned_facts.annotated_words))
                 ctx.finalization_metrics["fact_turn_count"] = float(len(aligned_facts.speaker_turns))
                 ctx.finalization_metrics["fact_mapping_count"] = float(len(aligned_facts.time_mappings))

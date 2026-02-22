@@ -1,6 +1,6 @@
 """
 软切决策契约定义（Phase A）。
-V3.2.0+dev.20260214.07
+V3.2.0+dev.20260220.01
 """
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ class SplitEvidenceSource(str, Enum):
     PUNCTUATION = "punctuation"
     SEMANTIC = "semantic"
     LLM = "llm"
+    FAST_DRAFT = "fast_draft"
     FORCE = "force"
 
 
@@ -111,6 +112,7 @@ class SoftCutPriorityProfile:
         if not order:
             order = [
                 SplitEvidenceSource.SPEAKER,
+                SplitEvidenceSource.FAST_DRAFT,
                 SplitEvidenceSource.PUNCTUATION,
                 SplitEvidenceSource.PAUSE,
                 SplitEvidenceSource.SEMANTIC,
@@ -201,6 +203,12 @@ def _default_source_rules() -> dict[SplitEvidenceSource, SourcePriorityRule]:
             min_confidence=0.0,
             trigger_threshold=1.0,
         ),
+        SplitEvidenceSource.FAST_DRAFT: SourcePriorityRule(
+            enabled=True,
+            weight=0.78,
+            min_confidence=0.40,
+            trigger_threshold=0.30,
+        ),
         SplitEvidenceSource.FORCE: SourcePriorityRule(
             enabled=True,
             weight=1.0,
@@ -214,7 +222,7 @@ def default_priority_profiles() -> dict[str, SoftCutPriorityProfile]:
     """默认优先级 profile 集合。"""
     base = _default_source_rules()
     punct_boost = {
-        "tiebreak_order": ["speaker", "punctuation", "pause", "semantic", "llm"],
+        "tiebreak_order": ["speaker", "fast_draft", "punctuation", "pause", "semantic", "llm"],
         "merge_window_ms": 120,
         "source_rules": {
             source.value: {
@@ -228,7 +236,7 @@ def default_priority_profiles() -> dict[str, SoftCutPriorityProfile]:
     }
 
     llm_ramp = {
-        "tiebreak_order": ["speaker", "llm", "punctuation", "pause", "semantic"],
+        "tiebreak_order": ["speaker", "fast_draft", "llm", "punctuation", "pause", "semantic"],
         "merge_window_ms": 120,
         "source_rules": {
             source.value: {
@@ -254,7 +262,7 @@ def default_priority_profiles() -> dict[str, SoftCutPriorityProfile]:
     }
 
     llm_primary = {
-        "tiebreak_order": ["speaker", "llm", "pause", "semantic", "punctuation"],
+        "tiebreak_order": ["speaker", "fast_draft", "llm", "pause", "semantic", "punctuation"],
         "merge_window_ms": 120,
         "source_rules": {
             source.value: {

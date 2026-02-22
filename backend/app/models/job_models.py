@@ -3,8 +3,21 @@
 
 与 preset_models.py 中的 1+3 预设模式保持一致
 """
+import os
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Optional, Any, Tuple
+
+
+def resolve_default_whisper_model() -> str:
+    """
+    解析默认 Whisper 模型。
+
+    临时策略：
+    - 暂停任务级 `transcription.whisper_model` 覆盖；
+    - 统一使用环境变量 `WHISPER_MODEL`，未设置时回退 `medium`。
+    """
+    model_name = str(os.environ.get("WHISPER_MODEL", "medium") or "").strip()
+    return model_name or "medium"
 
 
 # ========== 分组一: 预处理与音频设置 ==========
@@ -126,7 +139,7 @@ class TranscriptionConfig:
     sensevoice_device: str = "auto"
 
     # 辅助/复核模型: tiny/small/medium/large-v3
-    whisper_model: str = "medium"
+    whisper_model: str = field(default_factory=resolve_default_whisper_model)
 
     # 复核触发阈值: 0.0-1.0
     patching_threshold: float = 0.60
@@ -382,7 +395,8 @@ class JobSettings:
             transcription=TranscriptionConfig(
                 transcription_profile=transcription_data.get("transcription_profile", "sensevoice_only"),
                 sensevoice_device=transcription_data.get("sensevoice_device", "auto"),
-                whisper_model=transcription_data.get("whisper_model", "medium"),
+                # 临时禁用任务级 whisper_model 覆盖，统一读取 .env。
+                whisper_model=resolve_default_whisper_model(),
                 patching_threshold=transcription_data.get("patching_threshold", 0.60),
             ),
             refinement=RefinementConfig(
@@ -447,7 +461,8 @@ class JobSettings:
             transcription=TranscriptionConfig(
                 transcription_profile=preset.transcription.transcription_profile,
                 sensevoice_device=preset.transcription.sensevoice_device,
-                whisper_model=preset.transcription.whisper_model,
+                # 临时禁用预设内 whisper_model 覆盖，统一读取 .env。
+                whisper_model=resolve_default_whisper_model(),
                 patching_threshold=preset.transcription.patching_threshold,
             ),
             refinement=RefinementConfig(

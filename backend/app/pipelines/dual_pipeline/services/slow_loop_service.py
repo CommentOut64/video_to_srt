@@ -119,7 +119,16 @@ class SlowLoopService:
 
                     if not skip_whisper:
                         sv_context = sv_result.get("text_clean", "") if sv_result else None
-                        prompt = host._build_whisper_prompt(sv_context)
+                        pause_gap_sec = None
+                        if host._last_prompt_audio_end is not None and chunk is not None:
+                            pause_gap_sec = max(
+                                0.0,
+                                float(chunk.start) - float(host._last_prompt_audio_end),
+                            )
+                        prompt = host._build_whisper_prompt(
+                            sv_context,
+                            pause_gap_sec=pause_gap_sec,
+                        )
                         audio_with_overlap = host._extract_audio_with_overlap(ctx)
 
                         whisper_result = await host.slow_worker.infer(
@@ -143,6 +152,7 @@ class SlowLoopService:
                             host.logger.warning(
                                 f"Chunk {chunk_index}: 检测到 Whisper 幻觉，回退到 SenseVoice"
                             )
+                            host._reset_prompt_cache(reason="hallucination")
                             fallback_text = sv_result.get("text_clean", "")
                             whisper_result["text"] = fallback_text
                             whisper_result["text_itn_raw"] = (
@@ -166,7 +176,14 @@ class SlowLoopService:
 
                         ctx.whisper_result = copy.deepcopy(whisper_result)
                         ctx.whisper_skipped = False
-                        host._update_prompt_cache(whisper_result.get("text", ""))
+                        if not whisper_result.get("is_hallucination"):
+                            host._update_prompt_cache(
+                                whisper_result.get("text", ""),
+                                confidence=whisper_result.get("confidence"),
+                                whisper_result=whisper_result,
+                            )
+                            if chunk is not None:
+                                host._last_prompt_audio_end = float(chunk.end)
 
                         host.logger.debug(
                             f"Chunk {chunk_index}: Whisper 推理完成 "

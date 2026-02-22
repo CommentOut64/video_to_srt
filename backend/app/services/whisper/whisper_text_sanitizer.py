@@ -1,6 +1,6 @@
 """
 Whisper 文本清洗器（G-1 最小清洗 + G-2 完整清洗）。
-V3.2.0+dev.20260202.07
+V3.2.0+dev.20260218.01
 """
 from __future__ import annotations
 
@@ -23,6 +23,9 @@ class WhisperTextSanitizer:
         re.compile(r"^感谢.*?观看", re.IGNORECASE),
         re.compile(r"字幕由.*?提供$", re.IGNORECASE),
     ]
+    _GLOSSARY_MARKER_PATTERN = re.compile(
+        r"(?i)g[\s\|·•]*l[\s\|·•]*o[\s\|·•]*s[\s\|·•]*s[\s\|·•]*a[\s\|·•]*r[\s\|·•]*y(?:\s*[:：])?"
+    )
 
     def __init__(self, logger: Optional[logging.Logger] = None) -> None:
         self._logger = logger or logging.getLogger(__name__)
@@ -35,12 +38,14 @@ class WhisperTextSanitizer:
         text = text.strip()
 
         text = self._remove_prompt_echo(text, prompt)
+        text = self._remove_glossary_leak(text)
         text = self._remove_hallucination_markers(text)
         text = self._remove_extreme_repetition(text)
 
         if not text and raw_text.strip():
             # 兜底策略：避免 Prompt 回显剥离后把正文清空
-            fallback_text = self._remove_hallucination_markers(raw_text.strip())
+            fallback_text = self._remove_glossary_leak(raw_text.strip())
+            fallback_text = self._remove_hallucination_markers(fallback_text)
             fallback_text = self._remove_extreme_repetition(fallback_text)
             self._logger.warning(
                 "Whisper 最小清洗触发回退: prompt_len=%d, raw_len=%d",
@@ -66,9 +71,11 @@ class WhisperTextSanitizer:
         text = text.strip()
         runtime = self._load_runtime_config()
         if not runtime.get("enabled", True):
-            return text
+            text = self._remove_prompt_echo(text, prompt)
+            return self._remove_glossary_leak(text).strip()
 
         text = self._remove_prompt_echo(text, prompt)
+        text = self._remove_glossary_leak(text)
         text = self._apply_runtime_patterns(text, runtime.get("patterns") or [])
         text = self._remove_hallucination_markers(text)
         text = self._remove_extreme_repetition(text)
@@ -112,6 +119,29 @@ class WhisperTextSanitizer:
         for pattern in self._HALLUCINATION_PATTERNS:
             text = pattern.sub("", text)
         return text
+
+    def _remove_glossary_leak(self, text: str) -> str:
+        """
+        清理 Glossary 变体泄漏（如 `Glossary:`、`G l o s s a r y：`、`G | l o ...`）。
+
+        处理策略：
+        1. 若标记出现在前 25%（常见前缀回显），剔除标记本体并保留后文。
+        2. 若标记出现在中后段（常见尾部污染），截断标记及其后续内容。
+        """
+        if not text:
+            return text
+        cleaned = text
+        while True:
+            marker = self._GLOSSARY_MARKER_PATTERN.search(cleaned)
+            if marker is None:
+                break
+            start, end = marker.span()
+            if start <= max(6, int(len(cleaned) * 0.25)):
+                cleaned = (cleaned[:start] + cleaned[end:]).lstrip(" ：:|.-\t")
+                continue
+            cleaned = cleaned[:start].rstrip()
+            break
+        return cleaned
 
     def _load_runtime_config(self) -> Dict[str, Any]:
         runtime_data = get_model_runtime_config_service().get_effective_runtime_global()

@@ -90,6 +90,7 @@ from app.services.segmentation.soft_cut import (
     EvidenceBuilderConfig,
     SoftCutPlanProvider,
     SoftCutDecisionEngine,
+    SplitEvidenceSource,
     SpeakerChangeFact,
     SpeakerChangeTag,
     WindowDecisionContext,
@@ -152,9 +153,9 @@ from app.services.textflow import (
     DecisionSegmentationProcessor,
     OutputLayerProcessor,
 )
+from app.services.whisper.whisper_prompt_policy import WhisperPromptPolicy
 from app.services.whisper.whisper_text_sanitizer import WhisperTextSanitizer
 from app.pipelines.workers import FastWorker, SlowWorker
-from app.utils.prompt_builder import get_prompt_builder
 from app.utils.cancellation_token import CancelledException, PausedException  # V3.1.0: 捕获取消/暂停异常
 
 try:
@@ -200,10 +201,39 @@ class AsyncDualPipelineKernel:
     _SOFT_CUT_PAUSE_ANCHOR_MIN_GAP_SEC = 1.00
     _SOFT_CUT_PUNCT_ANCHOR_CONFIDENCE_WEAK = 0.62
     _SOFT_CUT_PUNCT_ANCHOR_CONFIDENCE_STRONG = 0.82
+    _SOFT_CUT_FAST_DRAFT_ANCHOR_CONFIDENCE = 0.92
+    _SOFT_CUT_FAST_DRAFT_MAX_DRIFT_SEC = 0.65
+    _SOFT_CUT_CJK_PAUSE_MIN_SCORE_FLOOR = 0.50
+    _SOFT_CUT_NO_FUSED_WINDOW_WARN_STREAK = 6
     _SPEAKER_REPAIR_MIN_TURN_DURATION_SEC = 0.45
     _SPEAKER_REPAIR_STRONG_BREAK_MIN_PAUSE_SEC = 0.30
     _SPEAKER_REPAIR_SENTENCE_END_PUNCT = {"。", "！", "？", ".", "!", "?"}
     _SPEAKER_REPAIR_EDGE_GUARD_SEC = 0.15
+    _WHISPER_REBALANCE_MAX_TAIL_WORDS = 2
+    _WHISPER_REBALANCE_MAX_TAIL_GAP_SEC = 0.08
+    _WHISPER_REBALANCE_MAX_TAIL_DURATION_SEC = 0.85
+    _WHISPER_REBALANCE_SINGLE_CHAR_CARRY = {
+        "是",
+        "才",
+        "经",
+        "过",
+        "直",
+        "因",
+        "检",
+        "警",
+        "一",
+    }
+    _WHISPER_REBALANCE_MULTI_CHAR_CARRY = {
+        "因为",
+        "以及",
+        "直到",
+        "经过",
+        "检测",
+        "都有",
+        "然而",
+        "但是",
+        "不过",
+    }
 
     def __init__(
         self,
@@ -284,7 +314,11 @@ class AsyncDualPipelineKernel:
         self.user_glossary = user_glossary
         self.previous_whisper_text: Optional[str] = None
         self._job_dir: Optional[Path] = None
-        self._bridge_prompt_hint: Optional[str] = None
+        self._last_prompt_audio_end: Optional[float] = None
+        self._whisper_prompt_policy = WhisperPromptPolicy(
+            logger=self.logger,
+            user_glossary=self.user_glossary,
+        )
         self._enable_bridge_batches: bool = False
         self._consume_turn_groups_only: bool = True
         self._turn_group_builder = TurnGroupBuilder()
@@ -317,6 +351,10 @@ class AsyncDualPipelineKernel:
             self._speaker_count,
             self._speaker_min_count,
             self._speaker_max_count,
+        )
+        self.logger.info(
+            "Whisper 提示词策略: {}",
+            self._whisper_prompt_policy.describe_config(),
         )
 
         # 判断是否为纯 SenseVoice 模式
@@ -561,6 +599,12 @@ class AsyncDualPipelineKernel:
         }
         self._dual_time_legacy_sentences_by_chunk: Dict[int, List[SentenceSegment]] = {}
         self._dual_time_experiment_sentences_by_chunk: Dict[int, List[SentenceSegment]] = {}
+        self._soft_cut_observe_total_chunks = 0
+        self._soft_cut_observe_decision_chunks = 0
+        self._soft_cut_observe_default_splitter_chunks = 0
+        self._soft_cut_observe_punctuation_anchor_chunks = 0
+        self._soft_cut_observe_punctuation_anchor_hits = 0
+        self._soft_cut_no_fused_window_streak = 0
         if self._is_dual_time_experiment_enabled:
             self.logger.info(
                 "双轨实验开启: mode={} tolerance_ms={} gpu_strategy=serial_postprocess",
@@ -1884,16 +1928,12 @@ class AsyncDualPipelineKernel:
                 now=time.time(),
             )
             for envelope in envelopes:
-                if envelope.group.prompt_text:
-                    self._bridge_prompt_hint = envelope.group.prompt_text
                 await self._enqueue_turn_group(envelope)
 
     async def _flush_bridge_controller(self) -> None:
         """强制刷新 Bridge 控制器缓冲。"""
         envelope = self._turn_group_builder.flush(reason="eof_flush")
         if envelope:
-            if envelope.group.prompt_text:
-                self._bridge_prompt_hint = envelope.group.prompt_text
             await self._enqueue_turn_group(envelope)
 
     async def _enqueue_turn_group(self, envelope: TurnGroupEnvelope) -> None:
@@ -2008,7 +2048,16 @@ class AsyncDualPipelineKernel:
                 token=token,
             )
 
-        prompt = self._build_whisper_prompt(group.prompt_text or None)
+        group_start = min((seg[0] for seg in group.audio_segments), default=0.0)
+        group_end = max((seg[1] for seg in group.audio_segments), default=group_start)
+        pause_gap_sec: Optional[float] = None
+        if self._last_prompt_audio_end is not None:
+            pause_gap_sec = max(0.0, float(group_start) - float(self._last_prompt_audio_end))
+
+        prompt = self._build_whisper_prompt(
+            group.prompt_text or None,
+            pause_gap_sec=pause_gap_sec,
+        )
         whisper_result = await self.slow_worker.process_turn_group(
             group,
             full_audio_array=self._full_audio_array,
@@ -2047,6 +2096,8 @@ class AsyncDualPipelineKernel:
 
         if whisper_result and self._hallucination_detector.is_hallucination(whisper_result, prompt):
             self.logger.warning("TurnGroup 检测到 Whisper 幻觉，回退快流: group_id=%s", group.group_id)
+            self._reset_prompt_cache(reason="hallucination")
+            self._last_prompt_audio_end = float(group_end)
             for _, ctx in contexts:
                 ctx.whisper_skipped = True
                 ctx.whisper_result = {}
@@ -2065,8 +2116,12 @@ class AsyncDualPipelineKernel:
         whisper_result["text"] = normalized_whisper.text_clean or whisper_result.get("text", "")
         whisper_result["language"] = group_language
 
-        if whisper_result.get("text"):
-            self._update_prompt_cache(str(whisper_result.get("text", "")))
+        self._update_prompt_cache(
+            str(whisper_result.get("text", "")),
+            confidence=whisper_result.get("confidence"),
+            whisper_result=whisper_result,
+        )
+        self._last_prompt_audio_end = float(group_end)
 
         batch_start = min((seg[0] for seg in group.audio_segments), default=0.0)
         chunk_results = self._split_whisper_result_by_chunks(
@@ -2900,31 +2955,18 @@ class AsyncDualPipelineKernel:
             config=self.patching_threshold or ThresholdConfig()
         )
 
-    def _build_whisper_prompt(self, sv_context: Optional[str]) -> str:
-        """
-        构建 Whisper Prompt（关键词 + 语义线索）。
-        """
-        prompt_builder = get_prompt_builder()
-        base_prompt = prompt_builder.build_prompt(
+    def _build_whisper_prompt(
+        self,
+        sv_context: Optional[str],
+        *,
+        pause_gap_sec: Optional[float] = None,
+    ) -> Optional[str]:
+        """构建 Whisper Prompt（统一策略入口）。"""
+        return self._whisper_prompt_policy.build_prompt(
             previous_text=self.previous_whisper_text,
-            user_glossary=self.user_glossary
+            semantic_text=sv_context,
+            pause_gap_sec=pause_gap_sec,
         )
-
-        context_segments: List[str] = []
-        if self._bridge_prompt_hint:
-            context_segments.append(self._bridge_prompt_hint.strip())
-        if sv_context:
-            semantic_hint = sv_context[-50:] if len(sv_context) > 50 else sv_context
-            semantic_hint = semantic_hint.lstrip()
-            if semantic_hint:
-                context_segments.append(semantic_hint)
-
-        if context_segments:
-            context_text = " ".join(segment for segment in context_segments if segment)
-            if base_prompt:
-                return f"Context: {context_text}. {base_prompt}"
-            return f"Context: {context_text}."
-        return base_prompt
 
     @staticmethod
     def _parse_source_chunk_indices(source_chunks: List[str]) -> List[int]:
@@ -2970,6 +3012,137 @@ class AsyncDualPipelineKernel:
         if not merged:
             return ""
         return " ".join(merged.split())
+
+    @staticmethod
+    def _normalize_whisper_boundary_token(token: Any) -> str:
+        token_str = str(token or "").replace("▁", " ").strip()
+        if not token_str:
+            return ""
+        return token_str.strip("\"'“”‘’()[]{}<>《》【】「」『』，。、！？：；,.!?;:")
+
+    @classmethod
+    def _is_cjk_token(cls, token: str) -> bool:
+        text = str(token or "")
+        return any("\u4e00" <= ch <= "\u9fff" for ch in text)
+
+    @classmethod
+    def _is_sentence_end_token(cls, token: str) -> bool:
+        text = str(token or "").strip()
+        if not text:
+            return False
+        return is_sentence_end_punct(
+            text,
+            "",
+            sentence_end_chars=tuple(cls._SPEAKER_REPAIR_SENTENCE_END_PUNCT),
+        )
+
+    @staticmethod
+    def _resolve_word_start_end_local(word: Dict[str, Any]) -> Tuple[float, float]:
+        start = float(word.get("start", 0.0) or 0.0)
+        end = float(word.get("end", word.get("start", 0.0)) or word.get("start", 0.0))
+        if end < start:
+            end = start
+        return start, end
+
+    @classmethod
+    def _resolve_whisper_tail_move_count(
+        cls,
+        left_words: Sequence[Dict[str, Any]],
+        right_words: Sequence[Dict[str, Any]],
+    ) -> int:
+        if not left_words or not right_words:
+            return 0
+
+        right_head = cls._normalize_whisper_boundary_token(right_words[0].get("word", ""))
+        if not right_head or not cls._is_cjk_token(right_head):
+            return 0
+
+        right_start, _ = cls._resolve_word_start_end_local(right_words[0])
+        max_tail = min(cls._WHISPER_REBALANCE_MAX_TAIL_WORDS, len(left_words))
+
+        for move_count in range(max_tail, 0, -1):
+            tail_words = list(left_words[-move_count:])
+            if move_count < len(left_words):
+                anchor_word = left_words[-move_count - 1]
+                anchor_token = cls._normalize_whisper_boundary_token(anchor_word.get("word", ""))
+                if cls._is_sentence_end_token(anchor_token):
+                    continue
+
+            normalized_tail_tokens = [
+                cls._normalize_whisper_boundary_token(item.get("word", ""))
+                for item in tail_words
+            ]
+            if any(not token for token in normalized_tail_tokens):
+                continue
+            if any(cls._is_sentence_end_token(token) for token in normalized_tail_tokens):
+                continue
+
+            merged_tail = "".join(normalized_tail_tokens)
+            if move_count == 1:
+                token = normalized_tail_tokens[0]
+                is_single_char_carry = len(token) == 1 and token in cls._WHISPER_REBALANCE_SINGLE_CHAR_CARRY
+                is_multi_char_carry = token in cls._WHISPER_REBALANCE_MULTI_CHAR_CARRY
+                if not (is_single_char_carry or is_multi_char_carry):
+                    continue
+            else:
+                if merged_tail not in cls._WHISPER_REBALANCE_MULTI_CHAR_CARRY:
+                    continue
+                if any(len(token) != 1 for token in normalized_tail_tokens):
+                    continue
+
+            tail_start, tail_end = cls._resolve_word_start_end_local(tail_words[0])
+            _, last_tail_end = cls._resolve_word_start_end_local(tail_words[-1])
+            tail_end = max(tail_end, last_tail_end)
+            if tail_end < tail_start:
+                tail_end = tail_start
+            if max(0.0, right_start - tail_end) > cls._WHISPER_REBALANCE_MAX_TAIL_GAP_SEC:
+                continue
+            if (tail_end - tail_start) > cls._WHISPER_REBALANCE_MAX_TAIL_DURATION_SEC:
+                continue
+            return move_count
+        return 0
+
+    @classmethod
+    def _rebalance_whisper_words_by_chunk(
+        cls,
+        words_by_chunk: Dict[int, List[Dict[str, Any]]],
+        ordered_indices: Sequence[int],
+    ) -> int:
+        if len(ordered_indices) <= 1:
+            return 0
+
+        moved_word_count = 0
+        for left_idx, right_idx in zip(ordered_indices[:-1], ordered_indices[1:]):
+            left_words = list(words_by_chunk.get(left_idx) or [])
+            right_words = list(words_by_chunk.get(right_idx) or [])
+            if not left_words or not right_words:
+                continue
+
+            move_count = cls._resolve_whisper_tail_move_count(left_words, right_words)
+            if move_count <= 0 or move_count > len(left_words):
+                continue
+
+            moved_words = left_words[-move_count:]
+            words_by_chunk[left_idx] = left_words[:-move_count]
+            words_by_chunk[right_idx] = moved_words + right_words
+            moved_word_count += move_count
+        return moved_word_count
+
+    @classmethod
+    def _resolve_fragment_local_time_range(
+        cls,
+        words: Sequence[Dict[str, Any]],
+        *,
+        fallback_start: float,
+        fallback_end: float,
+    ) -> Tuple[float, float]:
+        if not words:
+            return fallback_start, max(fallback_end, fallback_start)
+        start, _ = cls._resolve_word_start_end_local(words[0])
+        _, end = cls._resolve_word_start_end_local(words[-1])
+        if end < start:
+            end = start
+        return start, end
 
     @staticmethod
     def _find_target_chunk_by_overlap(
@@ -3056,6 +3229,7 @@ class AsyncDualPipelineKernel:
 
         assignments: Dict[int, List[Dict[str, Any]]] = {idx: [] for idx in chunk_ranges}
         ordered_indices = sorted(chunk_ranges.keys())
+        moved_words_total = 0
 
         for seg in raw_segments:
             seg_start = float(seg.get("start", 0.0) or 0.0) + batch_start
@@ -3078,12 +3252,27 @@ class AsyncDualPipelineKernel:
                         continue
                     words_by_chunk.setdefault(target_idx, []).append(word)
 
-                for idx, words in words_by_chunk.items():
+                moved_words_total += self._rebalance_whisper_words_by_chunk(
+                    words_by_chunk=words_by_chunk,
+                    ordered_indices=ordered_indices,
+                )
+
+                for idx in ordered_indices:
+                    words = list(words_by_chunk.get(idx) or [])
+                    if not words:
+                        continue
                     seg_fragment = dict(seg)
                     seg_fragment["words"] = list(words)
                     fragment_text = self._compose_whisper_text_from_words(words)
                     if fragment_text:
                         seg_fragment["text"] = fragment_text
+                    fragment_start, fragment_end = self._resolve_fragment_local_time_range(
+                        words,
+                        fallback_start=float(seg.get("start", 0.0) or 0.0),
+                        fallback_end=float(seg.get("end", 0.0) or 0.0),
+                    )
+                    seg_fragment["start"] = fragment_start
+                    seg_fragment["end"] = fragment_end
                     assignments[idx].append(seg_fragment)
                 continue
 
@@ -3095,6 +3284,13 @@ class AsyncDualPipelineKernel:
             )
             if target_idx is not None:
                 assignments[target_idx].append(seg)
+
+        if moved_words_total > 0:
+            self.logger.debug(
+                "Whisper批次回写跨chunk重平衡: moved_words={} chunk_count={}",
+                moved_words_total,
+                len(ordered_indices),
+            )
 
         results: Dict[int, Dict[str, Any]] = {}
         language = str(language_override or whisper_result.get("language", "auto"))
@@ -3250,6 +3446,13 @@ class AsyncDualPipelineKernel:
             "decision_split_writeback_ratio": float(split_stats.get("writeback_ratio", 0.0) or 0.0),
             "decision_split_writeback_used": bool(split_stats.get("writeback_used", 0.0)),
             "decision_split_writeback_blocked": bool(split_stats.get("writeback_blocked", 0.0)),
+            "decision_unknown_pseudo_drop_count": int(split_stats.get("unknown_pseudo_drop_count", 0) or 0),
+            "decision_unknown_pseudo_degrade_count": int(
+                split_stats.get("unknown_pseudo_degrade_count", 0) or 0
+            ),
+            "decision_unknown_pseudo_filter_fallback": bool(
+                split_stats.get("unknown_pseudo_filter_fallback", False)
+            ),
             "decision_split_reason_stats": split_reason_stats,
             "decision_split_risk_stats": split_risk_stats,
             "decision_sentence_texts": [str(sentence.text or "") for sentence in final_sentences],
@@ -3625,15 +3828,56 @@ class AsyncDualPipelineKernel:
             )
         return full_audio[start_sample:end_sample]
 
-    def _update_prompt_cache(self, whisper_text: str) -> None:
-        """更新 Whisper 上下文缓存。"""
-        self.previous_whisper_text = whisper_text
+    @staticmethod
+    def _estimate_avg_no_speech_prob(whisper_result: Optional[Dict[str, Any]]) -> Optional[float]:
+        """估算当前结果的平均 no_speech_prob。"""
+        if not isinstance(whisper_result, dict):
+            return None
+        raw_result = whisper_result.get("raw_result")
+        if not isinstance(raw_result, dict):
+            return None
+        segments = raw_result.get("segments")
+        if not isinstance(segments, list) or not segments:
+            return None
+        values: List[float] = []
+        for segment in segments:
+            if not isinstance(segment, dict):
+                continue
+            value = segment.get("no_speech_prob")
+            if isinstance(value, (float, int)):
+                values.append(float(value))
+        if not values:
+            return None
+        return float(sum(values) / len(values))
+
+    def _update_prompt_cache(
+        self,
+        whisper_text: str,
+        *,
+        confidence: Optional[float] = None,
+        whisper_result: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """更新 Whisper 上下文缓存（策略层统一裁剪与重置）。"""
+        avg_no_speech_prob = self._estimate_avg_no_speech_prob(whisper_result)
+        self.previous_whisper_text = self._whisper_prompt_policy.update_history(
+            previous_text=self.previous_whisper_text,
+            decoded_text=whisper_text,
+            confidence=float(confidence) if isinstance(confidence, (float, int)) else None,
+            avg_no_speech_prob=avg_no_speech_prob,
+            is_hallucination=False,
+        )
+
+    def _reset_prompt_cache(self, reason: str) -> None:
+        """重置 Whisper 上下文缓存。"""
+        self.previous_whisper_text = ""
+        self.logger.debug("Whisper 上下文已重置: reason=%s", reason)
 
     def restore_prompt_cache(self, previous_text: Optional[str]) -> None:
         """恢复 Whisper 上下文缓存（断点续传使用）。"""
-        self.previous_whisper_text = previous_text
-        if previous_text:
-            self.logger.debug(f"[v3.1.0] 已恢复 Whisper 上下文: {len(previous_text)} 字符")
+        restored = self._whisper_prompt_policy.restore_history(previous_text)
+        self.previous_whisper_text = restored
+        if restored:
+            self.logger.debug(f"[v3.1.0] 已恢复 Whisper 上下文: {len(restored)} 字符")
         else:
             self.logger.debug("[v3.1.0] Whisper 上下文为空")
 
@@ -3757,6 +4001,8 @@ class AsyncDualPipelineKernel:
         variant: str = "legacy",
         speaker_id: Optional[str] = None,
         turn_id: Optional[str] = None,
+        policy_snapshot: Optional[Any] = None,
+        is_fast_only_mode: bool = False,
     ) -> Layer456RunResult:
         """
         四层术语主入口：集合层→评分层→裁决层。
@@ -3773,6 +4019,8 @@ class AsyncDualPipelineKernel:
             variant=variant,
             speaker_id=speaker_id,
             turn_id=turn_id,
+            policy_snapshot=policy_snapshot,
+            is_fast_only_mode=is_fast_only_mode,
         )
 
     def _should_record_m2_stage0_sample(self, *, chunk_index: int) -> bool:
@@ -3896,6 +4144,64 @@ class AsyncDualPipelineKernel:
         """
         return self._textflow_facade_service.finalize_sensevoice_only(ctx)
 
+    def _update_soft_cut_observability(
+        self,
+        *,
+        split_stats: Dict[str, Any],
+        chunk_index: Optional[int],
+        stage: str,
+    ) -> Dict[str, Any]:
+        """记录 soft-cut 观测统计；连续无窗仅告警，不主动跳过计划。"""
+        self._soft_cut_observe_total_chunks += 1
+
+        applied_decision_count = int(split_stats.get("applied_decision_count", 0) or 0)
+        is_has_decision = 1 if applied_decision_count > 0 else 0
+        self._soft_cut_observe_decision_chunks += is_has_decision
+
+        is_default_splitter = int(split_stats.get("soft_cut_used_default_splitter", 0) or 0)
+        self._soft_cut_observe_default_splitter_chunks += is_default_splitter
+
+        punctuation_anchor_count = int(split_stats.get("fused_punctuation_anchor_count", 0) or 0)
+        is_punctuation_hit = int(split_stats.get("soft_cut_punctuation_anchor_hit", 0) or 0)
+        if punctuation_anchor_count > 0:
+            self._soft_cut_observe_punctuation_anchor_chunks += 1
+            self._soft_cut_observe_punctuation_anchor_hits += is_punctuation_hit
+
+        is_no_fused_window = int(split_stats.get("soft_cut_no_fused_window", 0) or 0) > 0
+        if is_no_fused_window:
+            self._soft_cut_no_fused_window_streak += 1
+        else:
+            self._soft_cut_no_fused_window_streak = 0
+
+        threshold = int(self._SOFT_CUT_NO_FUSED_WINDOW_WARN_STREAK)
+        diagnostic_code = str(split_stats.get("soft_cut_diagnostic_code", "") or "")
+        if self._soft_cut_no_fused_window_streak >= threshold:
+            diagnostic_code = "E_SOFT_CUT_NO_FUSED_WINDOW_STREAK"
+            if self._soft_cut_no_fused_window_streak == threshold:
+                # Why: 仅保留观测告警，避免“下一块直接空计划”造成可切分 chunk 被连锁跳过。
+                self.logger.warning(
+                    "soft-cut 连续无融合窗口: chunk={} stage={} streak={} threshold={}",
+                    chunk_index,
+                    stage,
+                    self._soft_cut_no_fused_window_streak,
+                    threshold,
+                )
+
+        total = max(1, self._soft_cut_observe_total_chunks)
+        punctuation_total = max(1, self._soft_cut_observe_punctuation_anchor_chunks)
+        snapshot = {
+            "total_chunks": int(self._soft_cut_observe_total_chunks),
+            "decision_chunk_ratio": float(self._soft_cut_observe_decision_chunks / total),
+            "default_splitter_ratio": float(self._soft_cut_observe_default_splitter_chunks / total),
+            "punctuation_anchor_hit_ratio": float(
+                self._soft_cut_observe_punctuation_anchor_hits / punctuation_total
+            ),
+            "no_fused_window_streak": int(self._soft_cut_no_fused_window_streak),
+            "skip_next_chunk_plan": 0,
+            "diagnostic_code": diagnostic_code,
+        }
+        return snapshot
+
     def _build_soft_cut_plan_for_decision(
         self,
         *,
@@ -3905,6 +4211,8 @@ class AsyncDualPipelineKernel:
         is_last_chunk: bool,
         aligned_facts: Optional[AlignedFacts] = None,
         fused_evidence: Optional[FusedEvidence] = None,
+        policy_snapshot: Optional[Any] = None,
+        is_fast_only_mode: bool = False,
     ) -> Optional[Any]:
         """
         统一 CutPlan 生产入口。
@@ -3914,14 +4222,26 @@ class AsyncDualPipelineKernel:
         - provider 异常时回退 M1，避免影响主流程可用性
         """
         try:
-            plan = self._soft_cut_plan_provider.build_plan(
-                annotated_words=annotated_words,
-                stream_id=stream_id,
-                block_id=block_id,
-                is_last_chunk=is_last_chunk,
-                aligned_facts=aligned_facts,
-                fused_evidence=fused_evidence,
-            )
+            try:
+                plan = self._soft_cut_plan_provider.build_plan(
+                    annotated_words=annotated_words,
+                    stream_id=stream_id,
+                    block_id=block_id,
+                    is_last_chunk=is_last_chunk,
+                    aligned_facts=aligned_facts,
+                    fused_evidence=fused_evidence,
+                    is_fast_only_mode=is_fast_only_mode,
+                )
+            except TypeError:
+                # 兼容第三方 provider 尚未接入新参数的场景。
+                plan = self._soft_cut_plan_provider.build_plan(
+                    annotated_words=annotated_words,
+                    stream_id=stream_id,
+                    block_id=block_id,
+                    is_last_chunk=is_last_chunk,
+                    aligned_facts=aligned_facts,
+                    fused_evidence=fused_evidence,
+                )
             return self._normalize_soft_cut_plan(
                 plan=plan,
                 stream_id=stream_id,
@@ -3941,6 +4261,8 @@ class AsyncDualPipelineKernel:
                 is_last_chunk=is_last_chunk,
                 aligned_facts=aligned_facts,
                 fused_evidence=fused_evidence,
+                policy_snapshot=policy_snapshot,
+                is_fast_only_mode=is_fast_only_mode,
             )
             return self._normalize_soft_cut_plan(
                 plan=plan,
@@ -3955,6 +4277,8 @@ class AsyncDualPipelineKernel:
         words: Sequence[AnnotatedWord],
         stream_id: str,
         aligned_facts: Optional[AlignedFacts],
+        policy_snapshot: Optional[Any] = None,
+        is_fast_only_mode: bool = False,
     ) -> FusedEvidence:
         """
         构建评分层契约（FusedEvidence）。
@@ -3963,7 +4287,12 @@ class AsyncDualPipelineKernel:
         - 将 pipeline 内散落的 speaker-change/anchor 拼装逻辑收口为单入口。
         - 该层仅产出证据，不触发裁决，保持与 CutPlan 解耦。
         """
-        anchor_candidates = self._build_soft_cut_anchor_candidates(words=words)
+        anchor_candidates = self._build_soft_cut_anchor_candidates(
+            words=words,
+            policy_snapshot=policy_snapshot,
+            is_fast_only_mode=is_fast_only_mode,
+            fast_draft_cuts=list(getattr(aligned_facts, "fast_draft_cuts", []) or []),
+        )
         pause_anchors = [item for item in anchor_candidates if item.anchor_type == AnchorType.PAUSE_ANCHOR]
         word_anchors = [item for item in anchor_candidates if item.anchor_type == AnchorType.WORD_BOUNDARY]
         semantic_anchors = [item for item in anchor_candidates if item.anchor_type == AnchorType.SEMANTIC_ANCHOR]
@@ -3975,6 +4304,7 @@ class AsyncDualPipelineKernel:
             "stream_id": str(stream_id),
             "word_count": int(len(words)),
             "anchor_candidate_count": int(len(anchor_candidates)),
+            "fast_draft_cut_count": int(len(getattr(aligned_facts, "fast_draft_cuts", []) or [])),
             "priority_profile": str(self._soft_cut_priority_active_profile),
             "time_axis_version": str(
                 getattr(aligned_facts, "time_axis_version", "m1_legacy") or "m1_legacy"
@@ -4146,6 +4476,8 @@ class AsyncDualPipelineKernel:
         is_last_chunk: bool,
         aligned_facts: Optional[AlignedFacts] = None,
         fused_evidence: Optional[FusedEvidence] = None,
+        policy_snapshot: Optional[Any] = None,
+        is_fast_only_mode: bool = False,
     ) -> Optional[Any]:
         """
         在评分层 -> 裁决层之间生成 CutPlan。
@@ -4174,7 +4506,12 @@ class AsyncDualPipelineKernel:
             chunk_end = chunk_start + 1e-3
 
         speaker_change_facts = self._build_soft_cut_speaker_change_facts(words=words)
-        anchor_candidates = self._build_soft_cut_anchor_candidates(words=words)
+        anchor_candidates = self._build_soft_cut_anchor_candidates(
+            words=words,
+            policy_snapshot=policy_snapshot,
+            is_fast_only_mode=is_fast_only_mode,
+            fast_draft_cuts=list(getattr(aligned_facts, "fast_draft_cuts", []) or []),
+        )
         pause_anchors = [item for item in anchor_candidates if item.anchor_type == AnchorType.PAUSE_ANCHOR]
         word_anchors = [item for item in anchor_candidates if item.anchor_type == AnchorType.WORD_BOUNDARY]
         semantic_anchors = [item for item in anchor_candidates if item.anchor_type == AnchorType.SEMANTIC_ANCHOR]
@@ -4219,6 +4556,8 @@ class AsyncDualPipelineKernel:
         window_contexts = self._resolve_soft_cut_window_contexts(
             words=words,
             cut_windows=all_windows,
+            policy_snapshot=policy_snapshot,
+            is_fast_only_mode=is_fast_only_mode,
         )
 
         plan = self._soft_cut_decision_engine.decide(
@@ -4641,9 +4980,34 @@ class AsyncDualPipelineKernel:
         self,
         *,
         words: Sequence[AnnotatedWord],
+        policy_snapshot: Optional[Any] = None,
+        is_fast_only_mode: bool = False,
+        fast_draft_cuts: Optional[Sequence[float]] = None,
     ) -> List[AnchorCandidate]:
         anchors: List[AnchorCandidate] = []
         last_pause_anchor_index: Optional[int] = None
+        language_tag = self._resolve_soft_cut_language_tag(policy_snapshot)
+        is_cjk_language = self._is_soft_cut_cjk_language(language_tag)
+        pause_anchor_trigger_sec = self._resolve_soft_cut_pause_anchor_trigger_sec(
+            policy_snapshot=policy_snapshot,
+            is_cjk_language=is_cjk_language,
+        )
+        pause_anchor_min_gap_sec = self._resolve_soft_cut_pause_anchor_min_gap_sec(
+            policy_snapshot=policy_snapshot,
+            is_cjk_language=is_cjk_language,
+        )
+        semantic_anchor_confidence = self._resolve_soft_cut_semantic_anchor_confidence(
+            policy_snapshot=policy_snapshot,
+            is_cjk_language=is_cjk_language,
+        )
+        semantic_anchor_words = self._resolve_soft_cut_semantic_anchor_words(policy_snapshot)
+        is_cjk_dual_mode = bool(is_cjk_language and not is_fast_only_mode)
+        if is_fast_only_mode:
+            # Why: fast-only 以快流稳定基线优先，soft-cut 仅保留保守锚点策略，避免中文短停顿/弱标点过切。
+            pause_anchor_trigger_sec = float(self._SOFT_CUT_PAUSE_ANCHOR_TRIGGER_SEC)
+            pause_anchor_min_gap_sec = float(self._SOFT_CUT_PAUSE_ANCHOR_MIN_GAP_SEC)
+            semantic_anchor_confidence = 0.0
+            semantic_anchor_words = set()
         for index in range(1, len(words)):
             left = words[index - 1]
             right = words[index]
@@ -4660,7 +5024,7 @@ class AsyncDualPipelineKernel:
                     confidence=1.0,
                 )
             )
-            if pause_duration >= self._SOFT_CUT_PAUSE_ANCHOR_TRIGGER_SEC:
+            if pause_duration >= pause_anchor_trigger_sec:
                 pause_anchor = AnchorCandidate(
                     anchor_type=AnchorType.PAUSE_ANCHOR,
                     anchor_time=boundary_time,
@@ -4671,7 +5035,7 @@ class AsyncDualPipelineKernel:
                 if last_pause_anchor_index is not None:
                     previous_pause = anchors[last_pause_anchor_index]
                     anchor_gap = max(0.0, float(pause_anchor.anchor_time) - float(previous_pause.anchor_time))
-                    if anchor_gap < self._SOFT_CUT_PAUSE_ANCHOR_MIN_GAP_SEC:
+                    if anchor_gap < pause_anchor_min_gap_sec:
                         previous_confidence = float(previous_pause.confidence or 0.0)
                         current_confidence = float(pause_anchor.confidence or 0.0)
                         if current_confidence >= previous_confidence:
@@ -4683,40 +5047,358 @@ class AsyncDualPipelineKernel:
             trailing_punct = str(left.trailing_punct or "").strip()
             if trailing_punct and trailing_punct[-1] in {"。", "！", "？", ".", "!", "?"}:
                 punct_char = trailing_punct[-1]
-                punct_confidence = (
-                    self._SOFT_CUT_PUNCT_ANCHOR_CONFIDENCE_STRONG
-                    if punct_char in {"！", "？", "!", "?"}
-                    else self._SOFT_CUT_PUNCT_ANCHOR_CONFIDENCE_WEAK
-                )
+                if punct_char in {"！", "？", "!", "?"}:
+                    punct_confidence = self._SOFT_CUT_PUNCT_ANCHOR_CONFIDENCE_STRONG
+                else:
+                    punct_confidence = self._SOFT_CUT_PUNCT_ANCHOR_CONFIDENCE_WEAK
+                punct_source = f"punct_proxy:{punct_char}"
                 anchors.append(
                     AnchorCandidate(
                         anchor_type=AnchorType.PUNCTUATION_ANCHOR,
                         anchor_time=boundary_time,
-                        source=f"punct_proxy:{punct_char}",
+                        source=punct_source,
                         confidence=punct_confidence,
                     )
                 )
 
-            right_word = str(right.word or "").strip().lower()
-            if right_word in self._soft_cut_semantic_conjunctions:
+            if self._is_soft_cut_semantic_anchor_hit(
+                words=words,
+                start_index=index,
+                semantic_anchor_words=semantic_anchor_words,
+            ):
+                semantic_source = "conjunction_rule"
                 anchors.append(
                     AnchorCandidate(
                         anchor_type=AnchorType.SEMANTIC_ANCHOR,
                         anchor_time=boundary_time,
-                        source="conjunction_rule",
-                        confidence=0.3,
+                        source=semantic_source,
+                        confidence=semantic_anchor_confidence,
                     )
                 )
+        if is_cjk_language and not is_fast_only_mode:
+            anchors.extend(
+                self._build_soft_cut_fast_draft_anchor_candidates(
+                    words=words,
+                    fast_draft_cuts=fast_draft_cuts or [],
+                )
+            )
         return anchors
+
+    def _build_soft_cut_fast_draft_anchor_candidates(
+        self,
+        *,
+        words: Sequence[AnnotatedWord],
+        fast_draft_cuts: Sequence[float],
+    ) -> List[AnchorCandidate]:
+        """
+        将快流切点映射为 soft-cut 候选锚点。
+
+        Why:
+        - 双流中文/日文在慢流文本弱标点场景下，fast-draft 的时间边界更稳定。
+        - 只注入“已映射到词边界”的锚点，避免把词内时间直接当切分位置。
+        """
+        if len(words) <= 1 or not fast_draft_cuts:
+            return []
+        anchors: List[AnchorCandidate] = []
+        seen_anchor_ms: set[int] = set()
+        max_drift_sec = max(0.05, float(self._SOFT_CUT_FAST_DRAFT_MAX_DRIFT_SEC))
+        for raw_cut_time in fast_draft_cuts:
+            try:
+                cut_time = float(raw_cut_time)
+            except (TypeError, ValueError):
+                continue
+            selection = self._word_boundary_mapper.select_best_boundary(
+                words=words,
+                event_time=cut_time,
+            )
+            if selection is None:
+                continue
+            split_idx = int(selection.split_idx)
+            if split_idx < 0 or split_idx >= len(words) - 1:
+                continue
+            anchor_time = self._resolve_soft_cut_boundary_time(
+                words=words,
+                split_idx=split_idx,
+            )
+            if abs(anchor_time - cut_time) > max_drift_sec:
+                continue
+            anchor_ms = int(round(anchor_time * 1000.0))
+            if anchor_ms in seen_anchor_ms:
+                continue
+            seen_anchor_ms.add(anchor_ms)
+            anchors.append(
+                AnchorCandidate(
+                    anchor_type=AnchorType.WORD_BOUNDARY,
+                    anchor_time=anchor_time,
+                    source="fast_draft_cut",
+                    confidence=float(self._SOFT_CUT_FAST_DRAFT_ANCHOR_CONFIDENCE),
+                    # Why: fast_draft 词边界是 CJK 双流同源时间证据，
+                    # 在窗口内排序时应优先于通用词边界候选。
+                    base_score_override=0.85,
+                )
+            )
+        return anchors
+
+    @staticmethod
+    def _resolve_soft_cut_boundary_time(
+        *,
+        words: Sequence[AnnotatedWord],
+        split_idx: int,
+    ) -> float:
+        if split_idx < 0 or split_idx >= len(words) - 1:
+            return 0.0
+        left_end = float(getattr(words[split_idx], "end", 0.0) or 0.0)
+        right_start = float(getattr(words[split_idx + 1], "start", left_end) or left_end)
+        return (left_end + right_start) / 2.0
+
+    def _resolve_soft_cut_semantic_anchor_words(
+        self,
+        policy_snapshot: Optional[Any],
+    ) -> set[str]:
+        if policy_snapshot is not None:
+            snapshot_words = getattr(policy_snapshot, "semantic_anchor_words", None)
+            if snapshot_words:
+                normalized = {
+                    str(item or "").strip().lower()
+                    for item in snapshot_words
+                    if str(item or "").strip()
+                }
+                if normalized:
+                    return normalized
+        return set(self._soft_cut_semantic_conjunctions)
+
+    def _resolve_soft_cut_language_tag(self, policy_snapshot: Optional[Any]) -> str:
+        if policy_snapshot is not None:
+            snapshot_tag = str(getattr(policy_snapshot, "language_tag", "") or "").strip().lower()
+            if snapshot_tag:
+                return snapshot_tag
+        return str(getattr(self._final_splitter.config, "language", "auto") or "auto").strip().lower()
+
+    @staticmethod
+    def _is_soft_cut_cjk_language(language_tag: str) -> bool:
+        tag = str(language_tag or "").strip().lower()
+        return tag.startswith(("zh", "yue", "ja", "jp", "ko"))
+
+    @staticmethod
+    def _resolve_soft_cut_threshold(
+        *,
+        policy_snapshot: Optional[Any],
+        key: str,
+        default: float,
+    ) -> float:
+        if policy_snapshot is not None:
+            thresholds = getattr(policy_snapshot, "thresholds", None)
+            if isinstance(thresholds, dict):
+                value = thresholds.get(key)
+                if value is not None:
+                    try:
+                        return float(value)
+                    except (TypeError, ValueError):
+                        pass
+        return float(default)
+
+    def _resolve_soft_cut_source_min_score(
+        self,
+        *,
+        policy_snapshot: Optional[Any],
+        key: str,
+        default: float,
+    ) -> float:
+        resolved = self._resolve_soft_cut_threshold(
+            policy_snapshot=policy_snapshot,
+            key=key,
+            default=default,
+        )
+        return max(0.0, min(1.0, float(resolved)))
+
+    def _resolve_soft_cut_pause_anchor_trigger_sec(
+        self,
+        *,
+        policy_snapshot: Optional[Any],
+        is_cjk_language: bool,
+    ) -> float:
+        default_value = 0.30 if is_cjk_language else self._SOFT_CUT_PAUSE_ANCHOR_TRIGGER_SEC
+        return max(
+            0.05,
+            self._resolve_soft_cut_threshold(
+                policy_snapshot=policy_snapshot,
+                key="soft_cut_pause_anchor_trigger_sec",
+                default=default_value,
+            ),
+        )
+
+    def _resolve_soft_cut_pause_anchor_min_gap_sec(
+        self,
+        *,
+        policy_snapshot: Optional[Any],
+        is_cjk_language: bool,
+    ) -> float:
+        default_value = 0.70 if is_cjk_language else self._SOFT_CUT_PAUSE_ANCHOR_MIN_GAP_SEC
+        return max(
+            0.05,
+            self._resolve_soft_cut_threshold(
+                policy_snapshot=policy_snapshot,
+                key="soft_cut_pause_anchor_min_gap_sec",
+                default=default_value,
+            ),
+        )
+
+    def _resolve_soft_cut_semantic_anchor_confidence(
+        self,
+        *,
+        policy_snapshot: Optional[Any],
+        is_cjk_language: bool,
+    ) -> float:
+        default_value = 0.62 if is_cjk_language else 0.30
+        resolved = self._resolve_soft_cut_threshold(
+            policy_snapshot=policy_snapshot,
+            key="soft_cut_semantic_anchor_confidence",
+            default=default_value,
+        )
+        return max(0.0, min(1.0, resolved))
+
+    def _resolve_soft_cut_weak_punct_anchor_confidence(
+        self,
+        *,
+        policy_snapshot: Optional[Any],
+        is_cjk_language: bool,
+    ) -> float:
+        default_value = 0.60 if is_cjk_language else 0.0
+        resolved = self._resolve_soft_cut_threshold(
+            policy_snapshot=policy_snapshot,
+            key="soft_cut_weak_punct_anchor_confidence",
+            default=default_value,
+        )
+        return max(0.0, min(1.0, resolved))
+
+    def _is_soft_cut_semantic_anchor_hit(
+        self,
+        *,
+        words: Sequence[AnnotatedWord],
+        start_index: int,
+        semantic_anchor_words: set[str],
+    ) -> bool:
+        if not semantic_anchor_words:
+            return False
+        semantic_tokens: List[str] = []
+        for item in semantic_anchor_words:
+            normalized = self._normalize_soft_cut_semantic_token(item)
+            if normalized:
+                semantic_tokens.append(normalized)
+        if not semantic_tokens:
+            return False
+
+        right_tokens: List[str] = []
+        for index in range(start_index, len(words)):
+            token = self._normalize_soft_cut_semantic_token(getattr(words[index], "word", ""))
+            if not token:
+                continue
+            right_tokens.append(token)
+            if len(right_tokens) >= 8:
+                break
+        if not right_tokens:
+            return False
+
+        first_token = right_tokens[0]
+        if first_token in semantic_tokens:
+            return True
+
+        right_compact = "".join(right_tokens)
+        right_spaced = " ".join(right_tokens)
+        for token in semantic_tokens:
+            if " " in token:
+                if right_spaced.startswith(token):
+                    return True
+                continue
+            if self._is_soft_cut_cjk_text(token):
+                if right_compact.startswith(token):
+                    return True
+        return False
+
+    @staticmethod
+    def _normalize_soft_cut_semantic_token(token: Any) -> str:
+        if token is None:
+            return ""
+        trim_chars = " \t\r\n，。、！？；：,.!?;:\"'“”‘’()[]{}（）【】<>《》"
+        return str(token).replace("▁", " ").strip().strip(trim_chars).lower()
+
+    @staticmethod
+    def _is_soft_cut_cjk_text(text: str) -> bool:
+        for char in str(text or ""):
+            if "\u4e00" <= char <= "\u9fff":
+                return True
+            if "\u3040" <= char <= "\u30ff":
+                return True
+            if "\uac00" <= char <= "\ud7af":
+                return True
+        return False
 
     def _resolve_soft_cut_window_contexts(
         self,
         *,
         words: Sequence[AnnotatedWord],
         cut_windows: Sequence[Any],
+        policy_snapshot: Optional[Any] = None,
+        is_fast_only_mode: bool = False,
     ) -> Dict[str, WindowDecisionContext]:
         contexts: Dict[str, WindowDecisionContext] = {}
+        language_tag = self._resolve_soft_cut_language_tag(policy_snapshot)
+        is_cjk_language = self._is_soft_cut_cjk_language(language_tag)
+        source_threshold_overrides: Dict[SplitEvidenceSource, float] = {}
+        allow_low_level_sources: frozenset[SplitEvidenceSource] = frozenset()
+        if is_cjk_language and not is_fast_only_mode:
+            # Why: CJK 双流低级窗口在“慢流弱标点”场景容易全部被挡掉，来源化阈值用于放宽但可控。
+            legacy_default = self._resolve_soft_cut_source_min_score(
+                policy_snapshot=policy_snapshot,
+                key="soft_cut_min_score",
+                default=0.35,
+            )
+            pause_min_score = self._resolve_soft_cut_source_min_score(
+                policy_snapshot=policy_snapshot,
+                key="soft_cut_min_score_pause",
+                default=legacy_default,
+            )
+            pause_min_score = max(
+                float(pause_min_score),
+                float(self._SOFT_CUT_CJK_PAUSE_MIN_SCORE_FLOOR),
+            )
+            source_threshold_overrides = {
+                SplitEvidenceSource.SEMANTIC: self._resolve_soft_cut_source_min_score(
+                    policy_snapshot=policy_snapshot,
+                    key="soft_cut_min_score_semantic",
+                    default=legacy_default,
+                ),
+                SplitEvidenceSource.LLM: self._resolve_soft_cut_source_min_score(
+                    policy_snapshot=policy_snapshot,
+                    key="soft_cut_min_score_llm",
+                    default=legacy_default,
+                ),
+                SplitEvidenceSource.PAUSE: pause_min_score,
+                SplitEvidenceSource.PUNCTUATION: self._resolve_soft_cut_source_min_score(
+                    policy_snapshot=policy_snapshot,
+                    key="soft_cut_min_score_punctuation",
+                    default=legacy_default,
+                ),
+                SplitEvidenceSource.FAST_DRAFT: self._resolve_soft_cut_source_min_score(
+                    policy_snapshot=policy_snapshot,
+                    key="soft_cut_min_score_fast_draft",
+                    default=legacy_default,
+                ),
+            }
+            # Why: CJK 双流中 low-level pause 误触发概率高，改为仅允许语义/标点/fast_draft 低级窗口放行。
+            allow_low_level_sources = frozenset(
+                source
+                for source in source_threshold_overrides.keys()
+                if source != SplitEvidenceSource.PAUSE
+            )
         for window in cut_windows:
+            trigger_source = getattr(window, "trigger_source", None)
+            if not isinstance(trigger_source, SplitEvidenceSource):
+                source_text = str(getattr(trigger_source, "value", trigger_source) or "").strip().lower()
+                try:
+                    trigger_source = SplitEvidenceSource(source_text)
+                except ValueError:
+                    trigger_source = SplitEvidenceSource.SPEAKER
             trigger_time = float(getattr(window, "trigger_time", 0.0))
             window_start = float(getattr(window, "start_time", trigger_time))
             window_end = float(getattr(window, "end_time", trigger_time))
@@ -4745,7 +5427,16 @@ class AsyncDualPipelineKernel:
             contexts[window_id] = WindowDecisionContext(
                 current_sentence_word_count=covered_words,
                 waiting_word_count=max(0, len(words) - covered_words),
-                depends_on_fast_draft=bool(has_fast_source and not has_non_fast_source),
+                depends_on_fast_draft=bool(
+                    trigger_source == SplitEvidenceSource.FAST_DRAFT
+                    or (has_fast_source and not has_non_fast_source)
+                ),
+                cut_threshold_override=source_threshold_overrides.get(trigger_source),
+                is_allow_low_level_semantic=bool(
+                    trigger_source in {SplitEvidenceSource.SEMANTIC, SplitEvidenceSource.LLM}
+                    and allow_low_level_sources
+                ),
+                allow_low_level_sources=allow_low_level_sources,
             )
         return contexts
 

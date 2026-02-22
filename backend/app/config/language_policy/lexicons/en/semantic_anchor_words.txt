@@ -1,0 +1,11 @@
+# English semantic anchor words
+however
+therefore
+meanwhile
+because
+although
+if
+when
+while
+and
+but

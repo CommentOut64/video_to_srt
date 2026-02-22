@@ -95,7 +95,8 @@ class SlowWorker:
             full_audio_array=full_audio_array,
             full_audio_sr=full_audio_sr,
         )
-        prompt = prompt_text or group.prompt_text or None
+        # Why: 禁止隐式回退到 group.prompt_text，避免关闭注入后仍发生上下文拼接污染。
+        prompt = prompt_text if prompt_text else None
         asr_result = await self.patch_engine.transcribe(
             audio,
             language=group.language or self.whisper_language,

@@ -1,6 +1,6 @@
 """
 软切证据融合服务（Phase C）。
-V3.2.0+dev.20260217.01
+V3.2.0+dev.20260220.01
 """
 
 from __future__ import annotations
@@ -341,6 +341,8 @@ class EvidenceFusion:
             return SplitEvidenceSource.PUNCTUATION
         if "semantic" in source_text:
             return SplitEvidenceSource.SEMANTIC
+        if "fast_draft" in source_text or "fastdraft" in source_text:
+            return SplitEvidenceSource.FAST_DRAFT
         if "pause" in source_text:
             return SplitEvidenceSource.PAUSE
         if "speaker" in source_text:

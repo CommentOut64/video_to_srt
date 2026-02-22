@@ -1,12 +1,12 @@
 """
 最终切分器（Phase G-4）。
-V3.2.0+dev.20260205.10
+V3.2.0+dev.20260219.13
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from app.models.sensevoice_models import SentenceSegment, WordTimestamp
 from app.services.punctuation.base import PuncPosition
@@ -35,10 +35,29 @@ class FinalSplitConfig:
     language: str = "auto"
     enable_balance: bool = True
     min_mapping_coverage: float = 0.6
+    is_enable_cjk_weak_punct_split: bool = True
+    is_enable_cjk_semantic_split: bool = True
+    cjk_weak_punct_min_tokens: int = 8
+    cjk_weak_punct_fallback_min_tokens: int = 12
+    cjk_weak_punct_fallback_min_duration: float = 1.8
+    cjk_semantic_split_min_tokens: int = 10
+    cjk_semantic_split_min_duration: float = 1.2
 
 
 class FinalSplitter:
     """最终切分器：基于标点 + 停顿 + 长度的联合切分。"""
+    _CONTINUATION_MERGE_MAX_GAP_SEC = 0.55
+    _CJK_CONTINUATION_MERGE_MAX_WORDS = 4
+    _CJK_CONTINUATION_MERGE_MAX_DURATION_SEC = 2.20
+    _CJK_DISCOURSE_BREAK_MARKERS = (
+        "然而",
+        "但是",
+        "不过",
+        "可是",
+        "与此同时",
+        "另外",
+        "此外",
+    )
 
     def __init__(
         self,
@@ -48,6 +67,7 @@ class FinalSplitter:
         self.config = config or FinalSplitConfig()
         self.logger = logger or logging.getLogger(__name__)
         self.last_split_stats: Optional[Dict[str, float]] = None
+        self._semantic_anchor_words: Set[str] = set()
         self._sentence_builder = SentenceSplitter(
             SplitConfig(
                 language=self.config.language,
@@ -102,6 +122,25 @@ class FinalSplitter:
         self.config.language = language
         self._sentence_builder.config.language = language
 
+    def set_semantic_anchor_words(self, words: Optional[Sequence[str]]) -> None:
+        """同步语言适配层语义锚词，用于无标点语义断点切分。"""
+        normalized: Set[str] = set()
+        for item in words or []:
+            token = self._normalize_boundary_token(str(item or "")).lower()
+            if token:
+                normalized.add(token)
+        self._semantic_anchor_words = normalized
+
+    def set_cjk_split_mode(
+        self,
+        *,
+        is_enable_weak_punct: bool,
+        is_enable_semantic: bool,
+    ) -> None:
+        """设置 CJK 扩展切分开关。"""
+        self.config.is_enable_cjk_weak_punct_split = bool(is_enable_weak_punct)
+        self.config.is_enable_cjk_semantic_split = bool(is_enable_semantic)
+
     def _split_words(
         self,
         words: List[WordTimestamp],
@@ -113,6 +152,8 @@ class FinalSplitter:
         last_candidate_idx: Optional[int] = None
         last_candidate_strength = 0
         pause_split_blocked_count = 0
+        cjk_weak_punct_split_count = 0
+        semantic_anchor_split_count = 0
         external_strength = external_strength or {}
 
         for idx, word in enumerate(words):
@@ -121,6 +162,11 @@ class FinalSplitter:
             punct_strength = self._get_punct_strength(words, idx, external_strength)
             pause_strength = self._pause_strength(words, idx)
             boundary_strength = max(punct_strength, pause_strength)
+            is_semantic_boundary = self._is_semantic_anchor_boundary(
+                words=words,
+                boundary_idx=idx,
+            )
+            strategy = self._sentence_builder.config.get_strategy()
 
             if boundary_strength > 0:
                 if boundary_strength > last_candidate_strength:
@@ -158,8 +204,42 @@ class FinalSplitter:
                     last_candidate_strength = 0
                 continue
 
+            if self._can_split_by_cjk_weak_punct(
+                tokens=tokens,
+                duration=duration,
+                punct_strength=punct_strength,
+                pause_strength=pause_strength,
+                is_semantic_boundary=is_semantic_boundary,
+                min_tokens=min_tokens,
+            ):
+                if not is_semantic_boundary and self._should_block_pause_split(words, start_idx, idx):
+                    pause_split_blocked_count += 1
+                    continue
+                segments.append(self._build_sentence(words, start_idx, idx))
+                cjk_weak_punct_split_count += 1
+                start_idx = idx + 1
+                last_candidate_idx = None
+                last_candidate_strength = 0
+                continue
+
+            if (
+                self._is_enable_cjk_semantic_split()
+                and is_semantic_boundary
+                and tokens >= max(min_tokens, self.config.cjk_semantic_split_min_tokens)
+                and duration >= max(self.config.min_duration, self.config.cjk_semantic_split_min_duration)
+            ):
+                current_token = self._normalize_boundary_token(words[idx].word or "")
+                if current_token and strategy.is_incomplete_ending(current_token):
+                    continue
+                segments.append(self._build_sentence(words, start_idx, idx))
+                semantic_anchor_split_count += 1
+                start_idx = idx + 1
+                last_candidate_idx = None
+                last_candidate_strength = 0
+                continue
+
             if pause_strength >= 2 and tokens >= min_tokens and duration >= self.config.min_duration:
-                if self._should_block_pause_split(words, start_idx, idx):
+                if not is_semantic_boundary and self._should_block_pause_split(words, start_idx, idx):
                     pause_split_blocked_count += 1
                     continue
                 segments.append(self._build_sentence(words, start_idx, idx))
@@ -174,7 +254,7 @@ class FinalSplitter:
                 and duration >= self.config.min_duration
                 and (punct_strength >= 1 or tokens >= self.config.max_tokens)
             ):
-                if self._should_block_pause_split(words, start_idx, idx):
+                if not is_semantic_boundary and self._should_block_pause_split(words, start_idx, idx):
                     pause_split_blocked_count += 1
                     continue
                 segments.append(self._build_sentence(words, start_idx, idx))
@@ -187,7 +267,92 @@ class FinalSplitter:
 
         return [seg for seg in segments if seg and seg.words], {
             "pause_split_blocked_count": float(pause_split_blocked_count),
+            "cjk_weak_punct_split_count": float(cjk_weak_punct_split_count),
+            "semantic_anchor_split_count": float(semantic_anchor_split_count),
         }
+
+    def _is_enable_cjk_weak_punct_split(self) -> bool:
+        """CJK 语言允许弱标点作为切分触发，缓解“无停顿但长句连写”问题。"""
+        if not bool(self.config.is_enable_cjk_weak_punct_split):
+            return False
+        language = str(self.config.language or "").strip().lower()
+        return language.startswith(("zh", "yue", "ja", "jp", "ko"))
+
+    def _is_enable_cjk_semantic_split(self) -> bool:
+        """仅在 CJK 且存在语义锚词时启用无标点语义断点切分。"""
+        language = str(self.config.language or "").strip().lower()
+        return (
+            bool(self.config.is_enable_cjk_semantic_split)
+            and language.startswith(("zh", "yue", "ja", "jp", "ko"))
+            and bool(self._semantic_anchor_words)
+        )
+
+    def _is_semantic_anchor_boundary(
+        self,
+        *,
+        words: Sequence[WordTimestamp],
+        boundary_idx: int,
+    ) -> bool:
+        if not self._semantic_anchor_words:
+            return False
+        next_idx = self._next_real_word_index(list(words), boundary_idx)
+        if next_idx is None:
+            return False
+        right_tokens: List[str] = []
+        idx = next_idx
+        while idx < len(words) and len(right_tokens) < 8:
+            if getattr(words[idx], "is_pseudo", False):
+                idx += 1
+                continue
+            token = self._normalize_boundary_token(words[idx].word or "").lower()
+            if token:
+                right_tokens.append(token)
+            idx += 1
+        if not right_tokens:
+            return False
+        right_compact = "".join(right_tokens)
+        right_spaced = " ".join(right_tokens)
+        first_token = right_tokens[0]
+        for anchor in self._semantic_anchor_words:
+            normalized = self._normalize_boundary_token(anchor).lower()
+            if not normalized:
+                continue
+            if " " in normalized:
+                if right_spaced.startswith(normalized):
+                    return True
+                continue
+            if self._is_cjk_text(normalized):
+                if right_compact.startswith(normalized):
+                    return True
+                continue
+            if first_token == normalized:
+                return True
+        return False
+
+    def _can_split_by_cjk_weak_punct(
+        self,
+        *,
+        tokens: int,
+        duration: float,
+        punct_strength: int,
+        pause_strength: int,
+        is_semantic_boundary: bool,
+        min_tokens: int,
+    ) -> bool:
+        if punct_strength < 1:
+            return False
+        if not self._is_enable_cjk_weak_punct_split():
+            return False
+        if tokens < max(min_tokens, self.config.cjk_weak_punct_min_tokens):
+            return False
+        if duration < self.config.min_duration:
+            return False
+        if pause_strength >= 1 or is_semantic_boundary:
+            return True
+        return (
+            tokens >= self.config.cjk_weak_punct_fallback_min_tokens
+            or duration >= self.config.cjk_weak_punct_fallback_min_duration
+        )
 
     def _should_block_pause_split(
         self,
@@ -356,9 +521,47 @@ class FinalSplitter:
         strategy = self._sentence_builder.config.get_strategy()
         left_last = self._normalize_boundary_token(left.words[-1].word or "")
         right_probe = self._build_probe_text(right.words, 0)
+        left_end = float(getattr(left.words[-1], "end", 0.0) or 0.0)
+        right_start = float(getattr(right.words[0], "start", left_end) or left_end)
+        gap_sec = max(0.0, right_start - left_end)
+        if gap_sec > self._CONTINUATION_MERGE_MAX_GAP_SEC:
+            return False
+
+        right_real_word_count = sum(1 for item in right.words if not getattr(item, "is_pseudo", False))
+        if right_real_word_count <= 0:
+            return False
+        right_duration = max(
+            0.0,
+            float(getattr(right, "end", right_start) or right_start)
+            - float(getattr(right, "start", right_start) or right_start),
+        )
+        right_probe_compact = str(right_probe or "").replace(" ", "")
+        is_cjk_context = self._is_cjk_text(left_last) or self._is_cjk_text(right_probe_compact)
+        is_cjk_discourse_break = bool(
+            is_cjk_context
+            and any(
+                right_probe_compact.startswith(marker)
+                for marker in self._CJK_DISCOURSE_BREAK_MARKERS
+            )
+        )
+
         if right_probe and strategy.is_continuation(right_probe):
+            if is_cjk_discourse_break:
+                return False
+            if is_cjk_context:
+                return (
+                    right_real_word_count <= self._CJK_CONTINUATION_MERGE_MAX_WORDS
+                    and right_duration <= self._CJK_CONTINUATION_MERGE_MAX_DURATION_SEC
+                )
             return True
         if left_last and strategy.is_incomplete_ending(left_last):
+            if is_cjk_context:
+                if is_cjk_discourse_break:
+                    return False
+                return (
+                    right_real_word_count <= (self._CJK_CONTINUATION_MERGE_MAX_WORDS + 1)
+                    and right_duration <= (self._CJK_CONTINUATION_MERGE_MAX_DURATION_SEC + 0.8)
+                )
             return True
         return False
 
@@ -401,6 +604,17 @@ class FinalSplitter:
     @staticmethod
     def _is_ascii_word(token: str) -> bool:
         return bool(token) and all(ch.isascii() for ch in token)
+
+    @staticmethod
+    def _is_cjk_text(text: str) -> bool:
+        for char in str(text or ""):
+            if "\u4e00" <= char <= "\u9fff":
+                return True
+            if "\u3040" <= char <= "\u30ff":
+                return True
+            if "\uac00" <= char <= "\ud7af":
+                return True
+        return False
 
     def _build_sentence(
         self,

@@ -1,6 +1,6 @@
 """
 软切决策引擎（Phase C）。
-V3.2.0+dev.20260214.09
+V3.2.0+dev.20260220.01
 """
 
 from __future__ import annotations
@@ -28,6 +28,9 @@ class WindowDecisionContext:
     current_sentence_word_count: int = 0
     waiting_word_count: int = 0
     depends_on_fast_draft: bool = False
+    cut_threshold_override: Optional[float] = None
+    is_allow_low_level_semantic: bool = False
+    allow_low_level_sources: frozenset[SplitEvidenceSource] = frozenset()
 
 
 @dataclass
@@ -45,6 +48,7 @@ class DecisionEngineConfig:
     score_bonus_speaker_source: float = 0.02
     score_bonus_semantic_source: float = 0.02
     score_bonus_llm_source: float = 0.10
+    score_bonus_fast_draft_source: float = 0.08
     score_bonus_punctuation_presence: float = 0.08
     deferred_max_wait_sec: float = 2.5
     deferred_max_wait_cap_sec: float = 4.2
@@ -105,7 +109,10 @@ class SoftCutDecisionEngine:
                 window=window,
                 scored_anchor=scored_anchor,
             )
-            if window.trigger_level == EvidenceLevel.LOW:
+            if (
+                window.trigger_level == EvidenceLevel.LOW
+                and not self._is_allow_low_level_window(window=window, context=context)
+            ):
                 report["skipped_low_level_count"] += 1
                 continue
             self._handle_scored_window(
@@ -245,13 +252,21 @@ class SoftCutDecisionEngine:
             source=str(getattr(anchor.evidence_source, "value", "") or ""),
         )
 
-    def _resolve_cut_threshold(self, *, current_sentence_word_count: int) -> float:
+    def _resolve_cut_threshold(
+        self,
+        *,
+        current_sentence_word_count: int,
+        cut_threshold_override: Optional[float] = None,
+    ) -> float:
+        base_threshold = float(self.config.cut_threshold_base)
+        if cut_threshold_override is not None:
+            base_threshold = max(0.0, min(1.0, float(cut_threshold_override)))
         start_words = max(0, int(self.config.cut_threshold_relax_start_words))
         span_words = max(1, int(self.config.cut_threshold_relax_span_words))
         relax_max = max(0.0, float(self.config.cut_threshold_relax_max))
         overflow_words = max(0, int(current_sentence_word_count) - start_words)
         relax_ratio = min(1.0, float(overflow_words) / float(span_words))
-        return float(self.config.cut_threshold_base) - (relax_ratio * relax_max)
+        return base_threshold - (relax_ratio * relax_max)
 
     def _should_cut_window(
         self,
@@ -263,8 +278,22 @@ class SoftCutDecisionEngine:
         score = self._score_window(window=window, anchor=anchor)
         threshold = self._resolve_cut_threshold(
             current_sentence_word_count=context.current_sentence_word_count,
+            cut_threshold_override=context.cut_threshold_override,
         )
         return score >= threshold
+
+    @staticmethod
+    def _is_allow_low_level_window(
+        *,
+        window: CutWindow,
+        context: WindowDecisionContext,
+    ) -> bool:
+        source = getattr(window, "trigger_source", None)
+        if context.allow_low_level_sources:
+            return source in set(context.allow_low_level_sources)
+        if not bool(context.is_allow_low_level_semantic):
+            return False
+        return source in {SplitEvidenceSource.SEMANTIC, SplitEvidenceSource.LLM}
 
     def _score_window(
         self,
@@ -300,6 +329,8 @@ class SoftCutDecisionEngine:
             return max(0.0, float(self.config.score_bonus_semantic_source))
         if source == SplitEvidenceSource.LLM:
             return max(0.0, float(self.config.score_bonus_llm_source))
+        if source == SplitEvidenceSource.FAST_DRAFT:
+            return max(0.0, float(self.config.score_bonus_fast_draft_source))
         if source == SplitEvidenceSource.SPEAKER:
             return max(0.0, float(self.config.score_bonus_speaker_source))
         return 0.0
@@ -315,6 +346,8 @@ class SoftCutDecisionEngine:
             return "semantic"
         if source == SplitEvidenceSource.LLM:
             return "llm_semantic"
+        if source == SplitEvidenceSource.FAST_DRAFT:
+            return "fast_draft"
         if source == SplitEvidenceSource.FORCE:
             return "forced_guard"
         if anchor.anchor_type == AnchorType.PAUSE_ANCHOR:

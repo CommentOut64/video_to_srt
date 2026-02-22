@@ -14,6 +14,7 @@ from app.models.sensevoice_models import SentenceSegment, TextSource
 from app.pipelines.dual_pipeline.services.textflow_facade_service import Layer456RunResult
 from app.schemas.pipeline_context import ProcessingContext
 from app.services.alignment.types import PunctTrack
+from app.services.language_policy import build_language_policy_snapshot
 
 
 class AlignmentStageService:
@@ -51,6 +52,11 @@ class AlignmentStageService:
             fused_evidence = run_result.fused_evidence
             injection_stats = dict(run_result.injection_stats)
             split_stats = dict(run_result.split_stats)
+            soft_cut_observe_snapshot = host._update_soft_cut_observability(
+                split_stats=split_stats,
+                chunk_index=ctx.chunk_index,
+                stage="sensevoice_only_alignment_stage",
+            )
             ctx.finalization_metrics = {
                 "coverage": alignment_result.coverage,
                 "gap_ratio": alignment_result.gap_ratio,
@@ -63,6 +69,8 @@ class AlignmentStageService:
             }
             for key, value in split_stats.items():
                 ctx.finalization_metrics[f"split_{key}"] = value
+            for key, value in soft_cut_observe_snapshot.items():
+                ctx.finalization_metrics[f"soft_cut_obs_{key}"] = value
             ctx.finalization_metrics["fact_word_count"] = float(len(aligned_facts.annotated_words))
             ctx.finalization_metrics["fact_turn_count"] = float(len(aligned_facts.speaker_turns))
             ctx.finalization_metrics["fact_mapping_count"] = float(len(aligned_facts.time_mappings))
@@ -192,6 +200,27 @@ class AlignmentStageService:
         sv_words = host._build_sv_word_timestamps(sv_result, chunk)
         speaker_id = host._resolve_speaker_id_for_chunk(ctx.audio_chunk) if ctx.audio_chunk else None
         turn_id = host._resolve_turn_id_for_chunk(ctx.audio_chunk) if ctx.audio_chunk else None
+        policy_snapshot = None
+        language_hint = str(
+            (tracks.chosen_track.language if tracks.chosen_track else "")
+            or whisper_result.get("language")
+            or getattr(chunk, "language", "")
+            or "auto"
+        )
+        try:
+            policy_snapshot = build_language_policy_snapshot(language_hint=language_hint)
+            host.logger.debug(
+                "语言策略快照注入: chunk={} language_tag={} policy_version={}",
+                ctx.chunk_index,
+                policy_snapshot.language_tag,
+                policy_snapshot.policy_version,
+            )
+        except Exception:
+            host.logger.exception(
+                "语言策略快照编译失败，回退空快照注入: chunk={} language_hint={}",
+                ctx.chunk_index,
+                language_hint,
+            )
 
         legacy_run = host._run_collection_scoring_decision_once(
             tracks=tracks,
@@ -203,6 +232,7 @@ class AlignmentStageService:
             variant="legacy",
             speaker_id=speaker_id,
             turn_id=turn_id,
+            policy_snapshot=policy_snapshot,
         )
 
         experiment_run: Optional[Layer456RunResult] = None
@@ -224,6 +254,7 @@ class AlignmentStageService:
                 variant="experiment",
                 speaker_id=speaker_id,
                 turn_id=turn_id,
+                policy_snapshot=policy_snapshot,
             )
             compare_payload = host._build_dual_time_compare_payload(
                 ctx=ctx,
@@ -271,6 +302,11 @@ class AlignmentStageService:
         words_for_split = run_result.words_for_split
         injection_stats = dict(run_result.injection_stats)
         split_stats = dict(run_result.split_stats)
+        soft_cut_observe_snapshot = host._update_soft_cut_observability(
+            split_stats=split_stats,
+            chunk_index=ctx.chunk_index,
+            stage="dual_or_patch_alignment_stage",
+        )
         final_sentences = run_result.final_sentences
         output_traces = list(run_result.output_traces or [])
         host._assign_sentence_identity_by_timeline_overlap(
@@ -295,6 +331,8 @@ class AlignmentStageService:
         }
         for key, value in split_stats.items():
             ctx.finalization_metrics[f"split_{key}"] = value
+        for key, value in soft_cut_observe_snapshot.items():
+            ctx.finalization_metrics[f"soft_cut_obs_{key}"] = value
         ctx.finalization_metrics["fact_word_count"] = float(len(aligned_facts.annotated_words))
         ctx.finalization_metrics["fact_turn_count"] = float(len(aligned_facts.speaker_turns))
         ctx.finalization_metrics["fact_mapping_count"] = float(len(aligned_facts.time_mappings))
