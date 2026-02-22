@@ -27,6 +27,7 @@ from app.models.job_models import JobState
 from app.schemas.profile_config import ProfileConfig
 from app.schemas.resume_context import ResumeContext
 from app.services.checkpoint import RuntimeCheckpointService
+from app.utils.cancellation_token import CancelledException, PausedException
 
 if TYPE_CHECKING:
     from app.services.hardware_profile_service import HardwareProfileProvider
@@ -291,6 +292,14 @@ class PipelineOrchestrator:
                 progress_emitter.complete("处理完成")
 
             self.logger.info(f"任务完成: {job.job_id}")
+
+        except CancelledException:
+            self.logger.info("Pipeline 取消: %s", job.job_id)
+            raise
+
+        except PausedException:
+            self.logger.info("Pipeline 暂停: %s", job.job_id)
+            raise
 
         except Exception as exc:
             self.logger.error(f"Pipeline 执行失败: {exc}", exc_info=True)

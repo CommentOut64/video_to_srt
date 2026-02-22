@@ -793,28 +793,32 @@ def create_transcription_router(
     async def cancel_job(job_id: str, delete_data: bool = False):
         """取消转录任务（V2.2: 使用队列服务）"""
         queue_service = get_queue_service(transcription_service)
-        ok, err, pending_delete = queue_service.cancel_job(job_id, delete_data=delete_data)
-        if not ok:
+        result = queue_service.cancel_job(job_id, delete_data=delete_data)
+        if not result.success:
             # 占用场景用 423 方便前端弹全局提示；运行中删除用 409 告知稍后再试
-            if "占用" in (err or ""):
+            if result.reason_code == "delete_blocked" or "占用" in (result.message or ""):
                 status = 423
-            elif "正在执行" in (err or "") or "取消中" in (err or ""):
+            elif result.reason_code == "cancel_running" or "取消中" in (result.message or ""):
                 status = 409
-            elif "未找到" in (err or ""):
+            elif result.reason_code == "cancel_not_found":
                 status = 404
             else:
                 status = 400
-            raise HTTPException(status_code=status, detail=err or "任务未找到")
+            raise HTTPException(status_code=status, detail=result.message or "任务未找到")
         job_snapshot = None
         job = transcription_service.job_lifecycle.state_repo.get_task(job_id)
         if job:
             job_snapshot = _build_task_snapshot(job)
         return {
             "job_id": job_id,
-            "canceled": ok,
+            "canceled": result.success,
             "data_deleted": delete_data,
-            "message": err,
-            "pending_delete": pending_delete,
+            "success": result.success,
+            "status": result.status,
+            "reason_code": result.reason_code,
+            "message": result.message,
+            "pending_delete": result.pending_delete,
+            "state_seq": result.state_seq,
             "task": job_snapshot,
         }
 

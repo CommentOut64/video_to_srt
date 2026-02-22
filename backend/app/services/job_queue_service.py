@@ -15,6 +15,7 @@ import os
 import sys
 import asyncio
 from collections import deque
+from dataclasses import dataclass
 from typing import Dict, Optional, Literal, Any
 from pathlib import Path
 import torch
@@ -37,6 +38,28 @@ logger = logging.getLogger(__name__)
 
 # 插队模式类型
 PrioritizeMode = Literal["gentle", "force"]
+
+
+@dataclass
+class CancelResult:
+    """取消/删除操作结果。"""
+
+    success: bool
+    status: str
+    reason_code: str
+    message: str
+    pending_delete: bool
+    state_seq: int = 0
+
+
+CANCEL_REASON_CODES: Dict[str, str] = {
+    "cancel_queued": "排队中任务直接取消",
+    "cancel_running": "运行中任务请求取消",
+    "cancel_already": "任务已取消或已完成",
+    "cancel_not_found": "任务不存在",
+    "delete_blocked": "删除被阻塞（任务仍在运行）",
+    "delete_failed": "删除失败",
+}
 
 
 def _run_async_safely(coro):
@@ -443,7 +466,7 @@ class JobQueueService:
 
         return True
 
-    def cancel_job(self, job_id: str, delete_data: bool = False):
+    def cancel_job(self, job_id: str, delete_data: bool = False) -> CancelResult:
         """
         取消任务（支持删除已完成的任务）
 
@@ -463,31 +486,59 @@ class JobQueueService:
             delete_data: 是否删除任务数据
 
         Returns:
-            Tuple[bool, Optional[str], bool]: (是否成功, 失败原因, 是否处于延迟删除状态)
+            CancelResult: 结构化取消结果
         """
         job = self.jobs.get(job_id)
 
-        # 如果任务不在队列服务中（可能是已完成的任务），直接调用transcription_service删除
+        # 任务不在队列服务中（可能是已完成或已删除）
         if not job:
             if delete_data:
-                # 尝试通过transcription_service删除已完成的任务
                 try:
                     result = self.transcription_service.cancel_job(job_id, delete_data=True)
                     success, err = result if isinstance(result, tuple) else (bool(result), None)
                     if success:
-                        # [V3.1.0] 推送任务删除事件（而非仅状态变更）
                         self._notify_job_removed(job_id)
-                        # [v3.1.0] 清理取消令牌
                         self._remove_cancellation_token(job_id)
-                        return True, None, False
-                    return False, err or "删除失败", False
+                        return CancelResult(
+                            success=True,
+                            status="removed",
+                            reason_code="cancel_already",
+                            message="任务已删除",
+                            pending_delete=False,
+                            state_seq=0,
+                        )
+                    reason_code = "delete_blocked" if "占用" in (err or "") else "delete_failed"
+                    return CancelResult(
+                        success=False,
+                        status="unknown",
+                        reason_code=reason_code,
+                        message=err or CANCEL_REASON_CODES[reason_code],
+                        pending_delete=False,
+                        state_seq=0,
+                    )
                 except Exception as e:
                     logger.warning(f"删除任务 {job_id} 失败: {e}")
-                    return False, str(e), False
-            return False, "任务未找到", False
+                    return CancelResult(
+                        success=False,
+                        status="unknown",
+                        reason_code="delete_failed",
+                        message=str(e),
+                        pending_delete=False,
+                        state_seq=0,
+                    )
+            return CancelResult(
+                success=False,
+                status="not_found",
+                reason_code="cancel_not_found",
+                message=CANCEL_REASON_CODES["cancel_not_found"],
+                pending_delete=False,
+                state_seq=0,
+            )
 
         from_status = job.status
         is_running = False  # [V3.1.0] 标记是否为正在运行的任务
+        reason_code = "cancel_queued"
+        result_message = CANCEL_REASON_CODES["cancel_queued"]
         cancel_request_time = time.time()
         logger.info(
             "[Lifecycle] 取消请求: job=%s, current_status=%s, delete_data=%s, request_time=%s",
@@ -496,6 +547,46 @@ class JobQueueService:
             delete_data,
             cancel_request_time,
         )
+
+        if job.status in ("finished", "failed", "canceled", "force_canceled", "removed") and not delete_data:
+            return CancelResult(
+                success=True,
+                status=job.status,
+                reason_code="cancel_already",
+                message=CANCEL_REASON_CODES["cancel_already"],
+                pending_delete=False,
+                state_seq=int(job.state_seq or 0),
+            )
+        if (
+            delete_data
+            and job.status in ("finished", "failed", "canceled", "force_canceled", "removed")
+            and self.running_job_id != job_id
+        ):
+            result = self.transcription_service.cancel_job(job_id, delete_data=True)
+            success, err = result if isinstance(result, tuple) else (bool(result), None)
+            if not success:
+                reason_code = "delete_blocked" if "占用" in (err or "") else "delete_failed"
+                return CancelResult(
+                    success=False,
+                    status=job.status,
+                    reason_code=reason_code,
+                    message=err or CANCEL_REASON_CODES[reason_code],
+                    pending_delete=False,
+                    state_seq=int(job.state_seq or 0),
+                )
+            with self.lock:
+                if job_id in self.jobs:
+                    del self.jobs[job_id]
+            self._remove_cancellation_token(job_id)
+            self._notify_job_removed(job_id)
+            return CancelResult(
+                success=True,
+                status="removed",
+                reason_code="cancel_already",
+                message="任务已删除",
+                pending_delete=False,
+                state_seq=int(job.state_seq or 0),
+            )
 
         with self.lock:
             # 设置取消标志
@@ -511,7 +602,14 @@ class JobQueueService:
             if job_id in self.queue:
                 if not self._transition_job_status(job, "canceled", "cancel_queued"):
                     logger.error("取消失败，状态迁移被拒绝: job=%s", job_id)
-                    return False, "状态迁移被拒绝", False
+                    return CancelResult(
+                        success=False,
+                        status=job.status,
+                        reason_code="delete_failed",
+                        message="状态迁移被拒绝",
+                        pending_delete=False,
+                        state_seq=int(job.state_seq or 0),
+                    )
                 self.queue.remove(job_id)
                 job.message = "已取消（未开始）"
                 logger.info(
@@ -520,6 +618,8 @@ class JobQueueService:
                     job.status,
                     time.time() - cancel_request_time,
                 )
+                reason_code = "cancel_queued"
+                result_message = CANCEL_REASON_CODES["cancel_queued"]
 
             # [V3.1.0] 如果是正在运行的任务，进入"取消中"状态
             # 不再立即清除 running_job_id，让 Worker 的 finally 块处理
@@ -527,7 +627,14 @@ class JobQueueService:
                 is_running = True
                 if not self._transition_job_status(job, "canceling", "cancel_running"):
                     logger.error("取消失败，状态迁移被拒绝: job=%s", job_id)
-                    return False, "状态迁移被拒绝", False
+                    return CancelResult(
+                        success=False,
+                        status=job.status,
+                        reason_code="delete_failed",
+                        message="状态迁移被拒绝",
+                        pending_delete=delete_data,
+                        state_seq=int(job.state_seq or 0),
+                    )
                 # 运行中删除：提示将延迟自动删除
                 job.message = "当前有进程占用，将延迟自动删除"
                 # 记录取消请求时间，用于超时保障
@@ -540,6 +647,22 @@ class JobQueueService:
                     job_id,
                     cancel_request_time,
                 )
+                reason_code = "cancel_running"
+                result_message = "任务正在执行，已请求取消" + ("并将在结束后删除" if delete_data else "")
+            else:
+                if not self._transition_job_status(job, "canceled", "cancel_direct"):
+                    logger.error("取消失败，状态迁移被拒绝: job=%s", job_id)
+                    return CancelResult(
+                        success=False,
+                        status=job.status,
+                        reason_code="delete_failed",
+                        message="状态迁移被拒绝",
+                        pending_delete=False,
+                        state_seq=int(job.state_seq or 0),
+                    )
+                job.message = "已取消"
+                reason_code = "cancel_queued"
+                result_message = "任务已取消"
 
         self._persist_queue_and_jobs([job], {job.job_id: from_status}, reason="cancel_request")
 
@@ -554,8 +677,14 @@ class JobQueueService:
             if delete_data:
                 with self.lock:
                     self._pending_delete_after_cancel.add(job_id)
-                return True, "任务正在执行，已请求取消并将在结束后删除", True
-            return True, None, False
+            return CancelResult(
+                success=True,
+                status=job.status,
+                reason_code=reason_code,
+                message=result_message,
+                pending_delete=delete_data,
+                state_seq=int(job.state_seq or 0),
+            )
 
         # 非运行中的任务：立即处理
         if delete_data:
@@ -563,7 +692,15 @@ class JobQueueService:
             success, err = result if isinstance(result, tuple) else (bool(result), None)
             if not success:
                 # 删除失败时不广播删除事件，保留任务文件供用户重试
-                return False, err or "删除失败", False
+                reason_code = "delete_blocked" if "占用" in (err or "") else "delete_failed"
+                return CancelResult(
+                    success=False,
+                    status=job.status,
+                    reason_code=reason_code,
+                    message=err or CANCEL_REASON_CODES[reason_code],
+                    pending_delete=False,
+                    state_seq=int(job.state_seq or 0),
+                )
 
             # [V3.1.0] 从内存中彻底移除任务，防止幽灵任务
             with self.lock:
@@ -587,7 +724,24 @@ class JobQueueService:
             # 同时推送到单任务频道，确保 EditorView 能收到
             self._notify_job_signal(job_id, "job_canceled")
 
-        return success, err, False
+        if delete_data and success:
+            return CancelResult(
+                success=True,
+                status="removed",
+                reason_code=reason_code,
+                message="任务已取消并删除",
+                pending_delete=False,
+                state_seq=int(job.state_seq or 0),
+            )
+
+        return CancelResult(
+            success=bool(success),
+            status=job.status,
+            reason_code=reason_code,
+            message=err or result_message,
+            pending_delete=False,
+            state_seq=int(job.state_seq or 0),
+        )
 
     def _worker_loop(self):
         """
@@ -1036,6 +1190,14 @@ class JobQueueService:
             )
 
             logger.info(f"[双流对齐] 任务完成: {job.job_id}")
+
+        except CancelledException as e:
+            logger.info("[双流对齐] 任务取消: %s", e.job_id)
+            raise
+
+        except PausedException as e:
+            logger.info("[双流对齐] 任务暂停: %s", e.job_id)
+            raise
 
         except Exception as e:
             logger.error(f"[双流对齐] 任务失败: {e}", exc_info=True)
