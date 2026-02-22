@@ -255,28 +255,24 @@ class SSEChannelManager extends EventEmitter {
       'subtitle.draft': (data) => {
         console.log(`[SSE Job ${jobId}] 草稿字幕:`, data)
         handlers.onDraft?.(data)
-        handlers.onSubtitleUpdate?.(data)
       },
 
       // Phase 5: 双模态架构 - 替换 Chunk 事件（慢流/Whisper）
       'subtitle.replace_chunk': (data) => {
         console.log(`[SSE Job ${jobId}] 替换 Chunk:`, data)
         handlers.onReplaceChunk?.(data)
-        handlers.onSubtitleUpdate?.(data)
       },
 
       // V3.1.0: 字幕恢复事件（断点续传后恢复字幕）
       'subtitle.restored': (data) => {
         console.log(`[SSE Job ${jobId}] 恢复字幕:`, data)
         handlers.onRestored?.(data)
-        handlers.onSubtitleUpdate?.(data)
       },
 
       // V3.5: 极速模式定稿事件
       'subtitle.finalized': (data) => {
         console.log(`[SSE Job ${jobId}] 定稿字幕:`, data)
         handlers.onFinalized?.(data)
-        handlers.onSubtitleUpdate?.(data)
       },
       // 说话人改绑/修订事件（后端唯一真源回推）
       'subtitle.revised': (data) => {

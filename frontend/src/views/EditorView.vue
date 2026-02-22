@@ -350,6 +350,10 @@ const isCancelPending = ref(false)
 const CANCEL_TIMEOUT_MS = 30000
 const CANCEL_TERMINAL_STATUSES = new Set(['canceled', 'failed', 'finished', 'removed', 'force_canceled'])
 let cancelTimeoutTimer = null
+// V3.2.4+dev.20260222.15: 定稿事件实时回拉后端真源（单飞+补偿，避免请求风暴）
+let isRealtimeFinalSyncInFlight = false
+let hasRealtimeFinalSyncPending = false
+let realtimeFinalSyncReason = null
 
 // Provide 编辑器上下文
 // ========== Provide 上下文 ==========
@@ -638,13 +642,11 @@ async function loadProject() {
       subscribeSSE()
       startProxyPolling()
     } else if (['canceled', 'force_canceled'].includes(jobStatus.status)) {
-      // 取消终态：优先保留本地恢复结果，若无本地数据则回退后端字幕
-      if (!hasLocalRestore) {
-        await loadTranscribingSegments()
-        if (projectStore.subtitles.length === 0) {
-          await loadFromSRT()
-        }
-      }
+      // V3.2.4+dev.20260222.14: 终态统一以后端为准，强制同步最终字幕口径
+      await syncSegmentsFromBackendAsSource({
+        reason: 'load_project_canceled_terminal',
+        allowSrtFallback: true,
+      })
     } else if (jobStatus.status === 'failed') {
       await loadTranscribingSegments()
     }
@@ -693,8 +695,49 @@ async function loadTranscribingSegments() {
         'http_segments'
       )
     }
+    return (textData.segments && textData.segments.length) || 0
   } catch (error) {
     console.warn('[EditorView] 加载转录文字失败:', error)
+    return 0
+  }
+}
+
+// V3.2.4+dev.20260222.14: 终态同步必须以后端为唯一数据源
+async function syncSegmentsFromBackendAsSource({ reason = 'unknown', allowSrtFallback = true } = {}) {
+  console.log(`[EditorView] 开始后端字幕强制同步: reason=${reason}`)
+  const count = await loadTranscribingSegments()
+  if (count === 0 && allowSrtFallback) {
+    console.log('[EditorView] 后端 segments 为空，回退加载 SRT')
+    await loadFromSRT()
+  }
+  console.log(`[EditorView] 后端字幕强制同步完成: count=${projectStore.subtitles.length}`)
+}
+
+// V3.2.4+dev.20260222.15: 每次定稿事件都立即触发后端回拉，且高频事件合并为“当前1次+补1次”
+async function scheduleRealtimeFinalSync(reason = 'subtitle_final_event') {
+  realtimeFinalSyncReason = reason
+  if (isRealtimeFinalSyncInFlight) {
+    hasRealtimeFinalSyncPending = true
+    return
+  }
+
+  isRealtimeFinalSyncInFlight = true
+  try {
+    do {
+      const currentReason = realtimeFinalSyncReason || reason
+      hasRealtimeFinalSyncPending = false
+      realtimeFinalSyncReason = null
+      try {
+        await syncSegmentsFromBackendAsSource({
+          reason: currentReason,
+          allowSrtFallback: false,
+        })
+      } catch (error) {
+        console.warn('[EditorView] 实时定稿后端回拉失败:', error)
+      }
+    } while (hasRealtimeFinalSyncPending)
+  } finally {
+    isRealtimeFinalSyncInFlight = false
   }
 }
 
@@ -802,29 +845,11 @@ function subscribeSSE() {
         state_seq: data.state_seq,
       })
 
-      // V3.1.2+dev.20260111.02: 任务完成处理
-      // 优先保留 SSE 推送的字幕（含置信度），无数据时从 API 加载
-      if (projectStore.subtitles.length === 0) {
-        console.log('[EditorView] 无字幕数据（可能断线），尝试恢复...')
-        // 先尝试从 segments API 加载（含置信度）
-        await loadTranscribingSegments()
-
-        // 如果还是没有数据，从 SRT 文件加载（无置信度，但至少有字幕）
-        if (projectStore.subtitles.length === 0) {
-          console.log('[EditorView] segments API 无数据，尝试从 SRT 恢复')
-          await loadFromSRT()
-        }
-      } else {
-        console.log(
-          `[EditorView] 保留 SSE 推送的 ${projectStore.subtitles.length} 条字幕（含置信度）`
-        )
-        // 将所有草稿标记为定稿
-        projectStore.subtitles.forEach((sub) => {
-          if (sub.isDraft) {
-            sub.isDraft = false
-          }
-        })
-      }
+      // V3.2.4+dev.20260222.14: 完成态不再本地“草稿改定稿”，必须立即以后端最终口径覆盖
+      await syncSegmentsFromBackendAsSource({
+        reason: 'signal_job_complete',
+        allowSrtFallback: true,
+      })
 
       stopProgressPolling()
       startProxyPolling()
@@ -937,12 +962,13 @@ function subscribeSSE() {
       taskStore.updateSSEHeartbeat()
     },
 
-    // V3.1.2+dev.20260113.01: 恢复 onSubtitleUpdate 回调
-    // 原因：专用处理器（onDraft等）处理新架构事件，onSubtitleUpdate 处理旧架构事件
-    // 两者互补，不会冲突
+    // V3.2.4+dev.20260222.14: onSubtitleUpdate 仅用于旧事件，避免新事件双路径改写导致状态漂移
     onSubtitleUpdate(data) {
-      // 只处理旧架构的字幕事件（sv_sentence, whisper_patch, llm_proof 等）
-      // 新架构事件（draft, replace_chunk）由专用处理器处理
+      // 新架构事件（draft/replace_chunk/finalized/restored）统一走专用处理器
+      if (data?.chunk_index !== undefined && data?.chunk_index !== null) {
+        return
+      }
+      // 仅处理旧架构字幕事件（sv_sentence/whisper_patch/llm_proof 等）
       if (data.sentence || data.sentence_index !== undefined) {
         console.log('[EditorView] 收到旧架构字幕更新:', data)
         handleStreamingSubtitle(data)
@@ -1091,9 +1117,12 @@ async function handleCancelTerminal(data, fallbackStatus = 'canceled') {
   const terminalStatus = data?.status || fallbackStatus
   isCancelPending.value = false
   stopCancelTimeoutPolling()
-  // 取消收敛后，将已推送草稿就地转为定稿，保持已有定稿不变
-  if (terminalStatus === 'canceled') {
-    await projectStore.finalizeDraftSubtitlesOnCancel()
+  // V3.2.4+dev.20260222.14: 取消终态同样以后端返回为准，不做本地草稿转定稿
+  if (['canceled', 'force_canceled'].includes(terminalStatus)) {
+    await syncSegmentsFromBackendAsSource({
+      reason: `signal_${terminalStatus}`,
+      allowSrtFallback: true,
+    })
   }
   progressStore.markStatus(props.jobId, terminalStatus, {
     updated_at: data?.updated_at ?? data?.timestamp,
@@ -1248,37 +1277,10 @@ function handleDraftSubtitle(data) {
 function handleReplaceChunk(data) {
   if (!data) return
 
-  // 后端数据格式: { chunk_index, old_indices, new_indices, sentences: [...] }
   const chunkIndex = data.chunk_index
-  const sentences = Array.isArray(data.sentences) ? data.sentences : []
-
-  // V3.1.2+dev.20260111.01: 转换为 projectStore 需要的格式，包含 display_confidence
-  const formattedSentences = sentences.map((sentence, idx) => ({
-    index: data.new_indices?.[idx] ?? idx,
-    text: sentence.text || '',
-    start: sentence.start ?? 0,
-    end: sentence.end ?? 0,
-    confidence: sentence.confidence ?? null,
-    display_confidence: sentence.display_confidence, // V3.1.2: 映射后准确率
-    confidence_source: sentence.confidence_source, // V3.1.2: 置信度来源
-    words: sentence.words || [],
-    warning_type: sentence.warning_type || 'none',
-    source: sentence.source || 'whisper',
-    is_modified: sentence.is_modified ?? false,
-    original_text: sentence.original_text ?? null,
-    speaker_id: sentence.speaker_id ?? null,
-    turn_id: sentence.turn_id ?? null,
-    speaker_label: sentence.speaker_label ?? null,
-    speaker_color_key: sentence.speaker_color_key ?? null,
-    binding_source: sentence.binding_source ?? null,
-    is_draft: false,
-    is_finalized: true,
-  }))
-
-  // 调用 projectStore 的替换方法
-  projectStore.replaceChunk(chunkIndex, formattedSentences)
-
-  console.log(`[EditorView] 替换 Chunk ${chunkIndex}，共 ${formattedSentences.length} 条定稿字幕`)
+  const finalizedCount = Array.isArray(data.sentences) ? data.sentences.length : 0
+  console.log(`[EditorView] 替换 Chunk ${chunkIndex}（定稿事件 ${finalizedCount} 条），立即以后端真源覆盖`)
+  void scheduleRealtimeFinalSync(`subtitle_replace_chunk_${chunkIndex ?? 'unknown'}`)
 }
 
 /**
@@ -1393,36 +1395,12 @@ function handleSubtitleEdited(data) {
 function handleFinalizedSubtitle(data) {
   if (!data) return
 
-  // 极速模式：按 chunk 维持映射，但句子标记为定稿
-  const sentence = data.sentence || {}
   const chunkIndex = data.chunk_index
-
-  // V3.1.2+dev.20260111.01: 构建 sentenceData，包含 display_confidence
-  const sentenceData = {
-    index: data.index ?? 0,
-    text: sentence.text || '',
-    start: sentence.start ?? 0,
-    end: sentence.end ?? 0,
-    confidence: sentence.confidence ?? null,
-    display_confidence: sentence.display_confidence, // V3.1.2: 映射后准确率
-    confidence_source: sentence.confidence_source, // V3.1.2: 置信度来源
-    words: sentence.words || [],
-    warning_type: sentence.warning_type || 'none',
-    is_modified: sentence.is_modified ?? false,
-    original_text: sentence.original_text ?? null,
-    speaker_id: sentence.speaker_id ?? null,
-    turn_id: sentence.turn_id ?? null,
-    speaker_label: sentence.speaker_label ?? null,
-    speaker_color_key: sentence.speaker_color_key ?? null,
-    binding_source: sentence.binding_source ?? null,
-    is_draft: false,
-    is_finalized: true,
-    source: sentence.source || 'sensevoice_only',
-  }
-
-  projectStore.appendOrUpdateDraft(chunkIndex, sentenceData)
-
-  console.log(`[EditorView] 极速模式定稿 Chunk ${chunkIndex}，句子索引 ${data.index}`)
+  const sentenceIndex = data.index
+  console.log(
+    `[EditorView] 极速模式定稿 Chunk ${chunkIndex}，句子索引 ${sentenceIndex}，立即以后端真源覆盖`
+  )
+  void scheduleRealtimeFinalSync(`subtitle_finalized_${chunkIndex ?? sentenceIndex ?? 'unknown'}`)
 }
 
 function handleRevisedSubtitle(data) {
