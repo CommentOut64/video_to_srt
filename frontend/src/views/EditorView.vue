@@ -346,6 +346,10 @@ const dualStreamProgress = computed(() => {
 let sseUnsubscribe = null
 let progressPollTimer = null
 let proxyPollTimer = null
+const isCancelPending = ref(false)
+const CANCEL_TIMEOUT_MS = 30000
+const CANCEL_TERMINAL_STATUSES = new Set(['canceled', 'force_canceled', 'failed', 'finished', 'removed'])
+let cancelTimeoutTimer = null
 
 // Provide 编辑器上下文
 // ========== Provide 上下文 ==========
@@ -405,6 +409,8 @@ watch(jobIdRef, async (newJobId, oldJobId) => {
 
   // 取消旧的 SSE 订阅
   cleanupSSE()
+  stopCancelTimeoutPolling()
+  isCancelPending.value = false
 
   // 重置项目状态
   projectStore.resetProject()
@@ -766,6 +772,10 @@ function subscribeSSE() {
 
     async onComplete(data) {
       console.log('[EditorView] 任务完成:', data)
+      if (isCancelPending.value) {
+        isCancelPending.value = false
+        stopCancelTimeoutPolling()
+      }
       progressStore.markStatus(props.jobId, 'finished', {
         percent: 100,
         phase: 'complete',
@@ -808,6 +818,10 @@ function subscribeSSE() {
 
     onFailed(data) {
       console.log('[EditorView] 任务失败:', data)
+      if (isCancelPending.value) {
+        isCancelPending.value = false
+        stopCancelTimeoutPolling()
+      }
       progressStore.markStatus(props.jobId, 'failed', {
         message: data.message,
         updated_at: data.updated_at ?? data.timestamp,
@@ -832,16 +846,40 @@ function subscribeSSE() {
       // 保持SSE连接和进度显示
     },
 
+    onPausePending(data) {
+      console.log('[EditorView] 任务暂停中:', data)
+      progressStore.markStatus(props.jobId, 'pausing', {
+        updated_at: data.updated_at ?? data.timestamp,
+      })
+      taskStore.updateTaskStatus(props.jobId, 'pausing', null, {
+        updated_at: data.updated_at ?? data.timestamp,
+      })
+    },
+
+    onPauseAck(data) {
+      console.log('[EditorView] 收到暂停确认:', data)
+    },
+
+    onCanceling(data) {
+      console.log('[EditorView] 收到 canceling 信号，等待终态:', data)
+      isCancelPending.value = true
+      startCancelTimeoutPolling()
+      progressStore.markStatus(props.jobId, 'canceling', {
+        updated_at: data.updated_at ?? data.timestamp,
+      })
+      taskStore.updateTaskStatus(props.jobId, 'canceling', null, {
+        updated_at: data.updated_at ?? data.timestamp,
+      })
+    },
+
     onCanceled(data) {
       console.log('[EditorView] 任务已取消:', data)
-      progressStore.markStatus(props.jobId, 'canceled', {
-        updated_at: data.updated_at ?? data.timestamp,
-      })
-      taskStore.updateTaskStatus(props.jobId, 'canceled', null, {
-        updated_at: data.updated_at ?? data.timestamp,
-      })
-      stopProgressPolling()
-      cleanupSSE()
+      handleCancelTerminal(data, 'canceled')
+    },
+
+    onForceCanceled(data) {
+      console.log('[EditorView] 任务已强制取消:', data)
+      handleCancelTerminal(data, 'force_canceled')
     },
 
     onResumed(data) {
@@ -1003,11 +1041,65 @@ function subscribeSSE() {
 
 // 清理SSE连接
 function cleanupSSE() {
+  stopCancelTimeoutPolling()
   if (sseUnsubscribe) {
     console.log('[EditorView] 清理SSE连接:', props.jobId)
     sseUnsubscribe()
     sseUnsubscribe = null
   }
+}
+
+function stopCancelTimeoutPolling() {
+  if (cancelTimeoutTimer) {
+    clearTimeout(cancelTimeoutTimer)
+    cancelTimeoutTimer = null
+  }
+}
+
+function isCancelTerminalStatus(status) {
+  return CANCEL_TERMINAL_STATUSES.has(status)
+}
+
+function handleCancelTerminal(data, fallbackStatus = 'canceled') {
+  const terminalStatus = data?.status || fallbackStatus
+  isCancelPending.value = false
+  stopCancelTimeoutPolling()
+  progressStore.markStatus(props.jobId, terminalStatus, {
+    updated_at: data?.updated_at ?? data?.timestamp,
+  })
+  taskStore.updateTaskStatus(props.jobId, terminalStatus, null, {
+    updated_at: data?.updated_at ?? data?.timestamp,
+  })
+  stopProgressPolling()
+  cleanupSSE()
+}
+
+function startCancelTimeoutPolling() {
+  if (!isCancelPending.value) return
+  stopCancelTimeoutPolling()
+  cancelTimeoutTimer = setTimeout(async () => {
+    if (!isCancelPending.value) return
+    console.warn('[EditorView] canceling 超时，主动拉取状态:', props.jobId)
+    try {
+      const snapshot = await transcriptionApi.getJobStatus(props.jobId, true)
+      const status = snapshot?.status || ''
+      if (isCancelTerminalStatus(status)) {
+        handleCancelTerminal(
+          {
+            status,
+            updated_at: snapshot?.updated_at,
+            timestamp: snapshot?.timestamp,
+          },
+          status
+        )
+        return
+      }
+      startCancelTimeoutPolling()
+    } catch (error) {
+      console.warn('[EditorView] canceling 兜底查询失败，下一轮重试:', error)
+      startCancelTimeoutPolling()
+    }
+  }, CANCEL_TIMEOUT_MS)
 }
 
 // 处理流式字幕更新（旧版兼容，已弃用）
@@ -1493,19 +1585,27 @@ async function cancelTranscription() {
   if (!confirm('确定要取消当前转录任务吗?')) return
   try {
     const result = await transcriptionApi.cancelJob(props.jobId, false)
+    const apiStatus = result?.task?.status || result?.status || 'canceling'
     if (result?.task) {
       taskStore.applyTaskSnapshot(result.task)
-      progressStore.markStatus(props.jobId, result.task.status || 'canceled', {
+      progressStore.markStatus(props.jobId, apiStatus, {
         updated_at: result.task.updated_at,
       })
     } else {
-      progressStore.markStatus(props.jobId, 'canceled')
-      taskStore.updateTaskStatus(props.jobId, 'canceled', null, { isServer: false })
+      progressStore.markStatus(props.jobId, apiStatus)
+      taskStore.updateTaskStatus(props.jobId, apiStatus, null, { isServer: false })
     }
-    // 取消后关闭SSE连接
-    cleanupSSE()
-    stopProgressPolling()
+    // Phase1: 取消后保留 SSE，等待终态信号后再断连
+    isCancelPending.value = true
+    startCancelTimeoutPolling()
+    console.log('[EditorView] 取消请求已发送，等待终态信号:', {
+      status: apiStatus,
+      reason_code: result?.reason_code,
+      pending_delete: result?.pending_delete,
+    })
   } catch (error) {
+    isCancelPending.value = false
+    stopCancelTimeoutPolling()
     console.error('取消任务失败:', error)
   }
 }
@@ -1925,6 +2025,8 @@ onUnmounted(() => {
   console.log('[EditorView] 组件卸载，保留SSE连接以支持后台任务')
 
   // 停止轮询（轮询仅是备用方案）
+  isCancelPending.value = false
+  stopCancelTimeoutPolling()
   stopProgressPolling()
   stopProxyPolling()
 })

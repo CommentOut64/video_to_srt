@@ -135,7 +135,7 @@ class SSEChannelManager extends EventEmitter {
 
     // 统一的信号处理函数
     const handleSignal = (data) => {
-      const signal = data.signal || data.code
+      const signal = data.signal || data.code || data.type || ''
       console.log(`[SSE Job ${jobId}] 信号:`, signal)
 
       // 分发特定信号事件
@@ -149,6 +149,14 @@ class SSEChannelManager extends EventEmitter {
         handlers.onCanceled?.(data)
       } else if (signal === 'job_resumed') {
         handlers.onResumed?.(data)
+      } else if (signal === 'job_canceling') {
+        handlers.onCanceling?.(data)
+      } else if (signal === 'job_force_canceled') {
+        handlers.onForceCanceled?.(data)
+      } else if (signal === 'pause_pending') {
+        handlers.onPausePending?.(data)
+      } else if (signal === 'pause_ack') {
+        handlers.onPauseAck?.(data)
       }
 
       handlers.onSignal?.(signal, data)
@@ -214,6 +222,10 @@ class SSEChannelManager extends EventEmitter {
       'signal.job_paused': handleSignal,
       'signal.job_canceled': handleSignal,
       'signal.job_resumed': handleSignal,
+      'signal.job_canceling': handleSignal,
+      'signal.job_force_canceled': handleSignal,
+      'signal.pause_pending': handleSignal,
+      'signal.pause_ack': handleSignal,
       'signal.phase_start': handleSignal,
       'signal.phase_complete': handleSignal,
       'signal.circuit_breaker': (data) => {
