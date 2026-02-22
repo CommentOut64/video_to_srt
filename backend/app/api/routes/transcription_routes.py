@@ -287,6 +287,10 @@ def create_transcription_router(
             load_deleted_indices,
             load_edits,
         )
+        from app.services.subtitle_visibility import (
+            filter_hidden_unknown_sentences,
+            is_hidden_unknown_sentence,
+        )
 
         job = transcription_service.get_job(job_id)
         if not job:
@@ -320,6 +324,8 @@ def create_transcription_router(
             if edits:
                 apply_edits_to_sentences_snapshot(sentences_snapshot, edits)
             for sentence in sentences_snapshot:
+                if is_hidden_unknown_sentence(sentence):
+                    continue
                 all_segments.append(
                     {
                         "id": int(sentence.get("_index", sentence.get("index", 0))),
@@ -345,6 +351,7 @@ def create_transcription_router(
         manual_segments = build_manual_segments(edits, deleted_indices)
         if manual_segments:
             all_segments.extend(manual_segments)
+        all_segments = filter_hidden_unknown_sentences(all_segments)
 
         all_segments.sort(
             key=lambda item: (
@@ -2052,6 +2059,10 @@ def create_transcription_router(
                 load_deleted_indices,
                 load_edits
             )
+            from app.services.subtitle_visibility import (
+                filter_hidden_unknown_sentences,
+                is_hidden_unknown_sentence,
+            )
             edits = load_edits(job_dir)
             deleted_indices = load_deleted_indices(job_dir)
 
@@ -2068,6 +2079,8 @@ def create_transcription_router(
                 from app.core.confidence_mapper import ConfidenceMapper
 
                 for sentence in sentences_snapshot:
+                    if is_hidden_unknown_sentence(sentence):
+                        continue
                     # V3.1.2: 处理置信度字段
                     # 注意：旧数据可能完全没有 confidence 字段，此时不应显示虚假的准确率
                     raw_conf = sentence.get("confidence")  # 可能为 None
@@ -2163,6 +2176,7 @@ def create_transcription_router(
             if manual_segments:
                 all_segments.extend(manual_segments)
                 all_segments.sort(key=lambda x: x.get('start', 0))
+            all_segments = filter_hidden_unknown_sentences(all_segments)
 
             # V3.2.0+dev.20260202.06: 统一按时间排序，避免前端展示/导出乱序
             all_segments.sort(

@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, Optional, Sequence
 
 from app.core.logging import resolve_loguru_logger
 from app.services.alignment.types import OutputLayerInput, OutputLayerOutput, OutputTrace
+from app.services.subtitle_visibility import is_hidden_unknown_sentence
 from app.services.text_protection import is_decimal_dot_in_text
 
 
@@ -129,9 +130,22 @@ class OutputLayerProcessor:
             sentence_segments=sentence_segments,
             language=data.language,
         )
+        raw_output_traces = list(data.output_traces or [])
+        filtered_sentences: list[Any] = []
+        filtered_traces: list[OutputTrace] = []
+        unknown_sentence_filtered_count = 0
+        for sentence_index, sentence in enumerate(sentence_segments):
+            if is_hidden_unknown_sentence(sentence):
+                unknown_sentence_filtered_count += 1
+                continue
+            filtered_sentences.append(sentence)
+            if sentence_index < len(raw_output_traces):
+                filtered_traces.append(raw_output_traces[sentence_index])
+        sentence_segments = filtered_sentences
+
         output_traces = self._resolve_output_traces(
             sentence_segments=sentence_segments,
-            output_traces=data.output_traces,
+            output_traces=filtered_traces,
         )
         self._apply_output_traces_to_sentences(
             sentence_segments=sentence_segments,
@@ -174,6 +188,8 @@ class OutputLayerProcessor:
                     len(sentence_segments),
                 )
 
+        segmentation_report = dict(data.segmentation_report or {})
+        segmentation_report["unknown_sentence_filtered_count"] = int(unknown_sentence_filtered_count)
         payload: Dict[str, Any] = {
             "chunk_index": int(data.chunk_index),
             "sentence_count": int(len(sentence_segments)),
@@ -195,14 +211,15 @@ class OutputLayerProcessor:
                 },
             },
             "injection_report": dict(data.injection_report or {}),
-            "segmentation_report": dict(data.segmentation_report or {}),
+            "segmentation_report": segmentation_report,
             "output_trace": [self._serialize_output_trace(item) for item in output_traces],
             "errors": output_errors,
         }
         self._logger.info(
-            "输出层完成: chunk_index={} sentences={} errors={}",
+            "输出层完成: chunk_index={} sentences={} filtered_unknown={} errors={}",
             data.chunk_index,
             len(sentence_segments),
+            int(unknown_sentence_filtered_count),
             len(output_errors),
         )
         return OutputLayerOutput(
