@@ -131,6 +131,7 @@ import { useProjectStore } from '@/stores/projectStore'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { useSubtitleSync, useHomophoneSearch, SortMode } from '@/composables'
 import transcriptionApi from '@/services/api/transcriptionApi'
+import projectApi from '@/services/api/projectApi'
 // 导入组件
 import SubtitleItem from './SubtitleItem.vue'
 import SearchToolbar from './SearchToolbar.vue'
@@ -150,9 +151,10 @@ const projectStore = useProjectStore()
 // 全局播放管理器
 const playbackManager = usePlaybackManager()
 
+const identityId = computed(() => projectStore.primaryId)
 const jobId = computed(() => projectStore.meta.jobId)
 // V3.2.0+dev.20260124.02: 字幕同步（防止 AI 覆盖用户编辑）
-const { onSubtitleEdit, applyPendingEditsToStore, forceSyncNow, pendingCount } = useSubtitleSync(jobId)
+const { onSubtitleEdit, applyPendingEditsToStore, forceSyncNow, pendingCount } = useSubtitleSync(identityId)
 
 // 同音搜索 composable（用 reactive 包裹，使模板 v-model 能正确写入 ref.value）
 const homophoneSearch = reactive(useHomophoneSearch({
@@ -187,7 +189,7 @@ const filteredSubtitles = computed(() => {
 })
 
 watch(
-  () => jobId.value,
+  () => identityId.value,
   async () => {
     hasAppliedPending.value = false
     if (pendingCount() > 0) {
@@ -199,7 +201,7 @@ watch(
 watch(
   () => subtitles.value.length,
   async (length) => {
-    if (!jobId.value || length === 0 || hasAppliedPending.value) return
+    if (!identityId.value || length === 0 || hasAppliedPending.value) return
     const applied = applyPendingEditsToStore(projectStore)
     if (applied > 0) {
       await forceSyncNow()
@@ -252,12 +254,18 @@ async function deleteSubtitle(id) {
   projectStore.removeSubtitle(id, { isUserEdit: true })
   emit('subtitle-delete', id)
 
-  if (!subtitle || subtitle.sentenceIndex === undefined) {
+  if (!subtitle) {
     return
   }
 
   try {
-    await transcriptionApi.deleteSubtitle(projectStore.meta.jobId, subtitle.sentenceIndex)
+    if (projectStore.meta.jobId && subtitle.sentenceIndex !== undefined) {
+      await transcriptionApi.deleteSubtitle(projectStore.meta.jobId, subtitle.sentenceIndex)
+      return
+    }
+    if (projectStore.meta.projectId && subtitle.segment_id) {
+      await projectApi.deleteSubtitle(projectStore.meta.projectId, subtitle.segment_id)
+    }
   } catch (error) {
     console.warn('[SubtitleList] 删除字幕同步失败:', error)
   }
@@ -282,21 +290,29 @@ async function addNewSubtitle() {
   try {
     const baseStart = projectStore.toBaseTime(newStart)
     const baseEnd = projectStore.toBaseTime(newStart + 3)
-    const response = await transcriptionApi.createSubtitle(projectStore.meta.jobId, {
-      text: '',
-      start: baseStart,
-      end: baseEnd
-    })
-    const data = response?.data?.data || response?.data
-    if (data?.index !== undefined) {
-      const newSubtitle = projectStore.subtitles[insertIndex]
-      if (newSubtitle) {
-        projectStore.updateSubtitle(newSubtitle.id, {
-          sentenceIndex: data.index,
-          isModified: true,
-          source: data.source || 'manual'
-        }, { isUserEdit: true })
-      }
+    let data = null
+    if (projectStore.meta.jobId) {
+      const response = await transcriptionApi.createSubtitle(projectStore.meta.jobId, {
+        text: '',
+        start: baseStart,
+        end: baseEnd
+      })
+      data = response?.data?.data || response?.data
+    } else if (projectStore.meta.projectId) {
+      data = await projectApi.createSubtitle(projectStore.meta.projectId, {
+        text: '',
+        start: baseStart,
+        end: baseEnd
+      })
+    }
+    const newSubtitle = projectStore.subtitles[insertIndex]
+    if (newSubtitle) {
+      projectStore.updateSubtitle(newSubtitle.id, {
+        sentenceIndex: data?.index ?? data?.legacy_index ?? newSubtitle.sentenceIndex,
+        segment_id: data?.segment_id ?? newSubtitle.segment_id,
+        isModified: true,
+        source: data?.source || data?.source_type || 'manual'
+      }, { isUserEdit: true })
     }
   } catch (error) {
     console.warn('[SubtitleList] 新增字幕同步失败:', error)
@@ -325,21 +341,29 @@ async function syncInsertedSubtitle(insertIndex, start, end, text) {
   try {
     const baseStart = projectStore.toBaseTime(start)
     const baseEnd = projectStore.toBaseTime(end)
-    const response = await transcriptionApi.createSubtitle(projectStore.meta.jobId, {
-      text,
-      start: baseStart,
-      end: baseEnd
-    })
-    const data = response?.data?.data || response?.data
-    if (data?.index !== undefined) {
-      const newSubtitle = projectStore.subtitles[insertIndex]
-      if (newSubtitle) {
-        projectStore.updateSubtitle(newSubtitle.id, {
-          sentenceIndex: data.index,
-          isModified: true,
-          source: data.source || 'manual'
-        }, { isUserEdit: true })
-      }
+    let data = null
+    if (projectStore.meta.jobId) {
+      const response = await transcriptionApi.createSubtitle(projectStore.meta.jobId, {
+        text,
+        start: baseStart,
+        end: baseEnd
+      })
+      data = response?.data?.data || response?.data
+    } else if (projectStore.meta.projectId) {
+      data = await projectApi.createSubtitle(projectStore.meta.projectId, {
+        text,
+        start: baseStart,
+        end: baseEnd
+      })
+    }
+    const newSubtitle = projectStore.subtitles[insertIndex]
+    if (newSubtitle) {
+      projectStore.updateSubtitle(newSubtitle.id, {
+        sentenceIndex: data?.index ?? data?.legacy_index ?? newSubtitle.sentenceIndex,
+        segment_id: data?.segment_id ?? newSubtitle.segment_id,
+        isModified: true,
+        source: data?.source || data?.source_type || 'manual'
+      }, { isUserEdit: true })
     }
   } catch (error) {
     console.warn('[SubtitleList] 插入字幕同步失败:', error)

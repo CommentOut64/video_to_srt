@@ -112,11 +112,21 @@ const emit = defineEmits(['ready', 'region-update', 'region-click', 'seek', 'zoo
 const projectStore = useProjectStore()
 const playbackManager = usePlaybackManager()
 const jobIdRef = computed(() => props.jobId || projectStore.meta.jobId)
-const { onSubtitleEdit } = useSubtitleSync(jobIdRef)
+const identityRef = computed(() => props.jobId || projectStore.primaryId)
+const { onSubtitleEdit } = useSubtitleSync(identityRef)
 
 // 编辑器上下文
-const editorContext = inject('editorContext', { isVideoReady: computed(() => true) })
-const isVideoReady = computed(() => editorContext.isVideoReady?.value ?? true)
+const editorContext = inject('editorContext', {
+  isMediaReady: computed(() => true),
+  isVideoReady: computed(() => true),
+  hasVideoSource: computed(() => true),
+})
+const isMediaReady = computed(
+  () => editorContext.isMediaReady?.value ?? editorContext.isVideoReady?.value ?? true
+)
+const hasVideoSource = computed(
+  () => editorContext.hasVideoSource?.value ?? Boolean(projectStore.meta.videoPath)
+)
 
 // ============ DOM Refs ============
 const containerRef = ref(null)
@@ -186,6 +196,7 @@ const {
   handleUpperZonePointerDown,
   handleUpperZonePointerMove,
   handleWaveformPointerLeave,
+  getTimeFromClientX,
   setupRegionPointerGuards,
   teardownRegionPointerGuards,
   cleanup: cleanupCursorDrag,
@@ -195,7 +206,7 @@ const {
   playbackManager,
   projectStore,
   isReady,
-  isVideoReady,
+  isMediaReady,
   emit
 )
 
@@ -225,7 +236,7 @@ const {
 
 // 包装右键菜单处理（需要传递额外参数）
 function handleWaveformContextMenu(e) {
-  onContextMenu(e, wavesurferRef, zoomLevel, isReady, renderSubtitleRegions)
+  onContextMenu(e, getTimeFromClientX)
 }
 
 // ============ WaveSurfer 初始化 ============
@@ -284,7 +295,8 @@ async function initWavesurfer() {
       media: document.createElement('audio'),
     })
 
-    wavesurferRef.value.setMuted(true)
+    // 有视频源时由 VideoStage 提供声音；纯音频模式下由 WaveSurfer 输出声音。
+    wavesurferRef.value.setMuted(hasVideoSource.value)
     zoomLevel.value = suggestedZoom
 
     setupWavesurferEvents()
@@ -318,11 +330,17 @@ function setupWavesurferEvents() {
         }
       })
     }
+    applyWaveformMediaState()
 
     // 根据实际时长重新调整配置
     const actualDuration = ws.getDuration()
     const containerWidth = containerRef.value?.offsetWidth || 800
     if (actualDuration > 0) {
+      // 纯音频场景下无视频元数据，需以波形真实时长作为全局时间上限。
+      if (!projectStore.meta.duration || Math.abs(projectStore.meta.duration - actualDuration) > 0.01) {
+        projectStore.meta.duration = actualDuration
+      }
+
       const { basePxPerSec, suggestedZoom, barConfig } = calculateWaveformConfig(
         actualDuration,
         containerWidth
@@ -364,6 +382,25 @@ function setupWavesurferEvents() {
       startPeaksPolling()
     }
   })
+}
+
+function applyWaveformMediaState() {
+  const ws = wavesurferRef.value
+  if (!ws) return
+
+  const targetRate = Number(projectStore.player.playbackRate) || 1
+  const rawVolume = Number(projectStore.player.volume)
+  const targetVolume = Math.max(0, Math.min(1, Number.isFinite(rawVolume) ? rawVolume : 1))
+
+  if (typeof ws.setPlaybackRate === 'function') {
+    ws.setPlaybackRate(targetRate)
+  }
+
+  const mediaElement = ws.getMediaElement?.()
+  if (mediaElement) {
+    mediaElement.playbackRate = targetRate
+    mediaElement.volume = targetVolume
+  }
 }
 
 async function loadAudioData() {
@@ -511,6 +548,29 @@ watch(
   () => projectStore.view.selectedSubtitleId,
   () => {
     if (isReady.value) renderSubtitleRegions()
+  }
+)
+
+watch(hasVideoSource, (nextHasVideo) => {
+  const ws = wavesurferRef.value
+  if (!ws) return
+  ws.setMuted(nextHasVideo)
+  applyWaveformMediaState()
+})
+
+watch(
+  () => projectStore.player.playbackRate,
+  () => {
+    if (!isReady.value) return
+    applyWaveformMediaState()
+  }
+)
+
+watch(
+  () => projectStore.player.volume,
+  () => {
+    if (!isReady.value) return
+    applyWaveformMediaState()
   }
 )
 

@@ -73,6 +73,7 @@ import TaskCardGrid from '@/components/task/TaskCardGrid.vue'
 import TaskCreateDialog from '@/components/task/TaskCreateDialog.vue'
 import { useTaskUpload } from '@/composables/task-list/useTaskUpload'
 import { useTaskThumbnail } from '@/composables/task-list/useTaskThumbnail'
+import { navigateToEditor } from '@/utils/editorNavigation'
 
 const router = useRouter()
 const taskStore = useUnifiedTaskStore()
@@ -134,8 +135,8 @@ function setFileTableRef(element) {
 }
 
 // 打开编辑器
-function openEditor(jobId) {
-  router.push(`/editor/${jobId}`)
+async function openEditor(jobId) {
+  await navigateToEditor(router, { jobId })
 }
 
 // 处理标题单击 - 用于区分单击（跳转）和双击（重命名）
@@ -149,9 +150,9 @@ function handleTitleClick(task) {
   }
 
   // 延迟执行单击操作，给双击留出时间
-  clickTimer = setTimeout(() => {
+  clickTimer = setTimeout(async () => {
     clickTimer = null
-    openEditor(task.job_id)
+    await openEditor(task.job_id)
   }, 200)
 }
 
