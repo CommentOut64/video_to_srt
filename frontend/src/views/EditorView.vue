@@ -49,7 +49,7 @@
         <div class="video-wrapper">
           <VideoStage
             ref="videoStageRef"
-            :job-id="mediaIdentityId"
+            :media-id="mediaIdentityId"
             :show-subtitle="true"
             :enable-keyboard="false"
             :progressive-url="resolvedProgressiveUrl"
@@ -59,7 +59,6 @@
             :proxy-state="proxyVideo.state.value"
             :proxy-error="proxyVideo.error.value"
             :auto-trigger-720p="proxyVideo.autoTrigger720p.value"
-            @loaded="handleVideoLoaded"
             @error="handleVideoError"
             @check-status="handleCheckVideoStatus"
             @resolution-change="handleResolutionChange"
@@ -78,10 +77,7 @@
         <div class="waveform-wrapper">
           <WaveformTimeline
             ref="waveformRef"
-            :job-id="mediaIdentityId"
-            @ready="handleWaveformReady"
-            @region-update="handleRegionUpdate"
-            @region-click="handleRegionClick"
+            :media-id="mediaIdentityId"
           />
         </div>
       </section>
@@ -139,8 +135,6 @@
               ref="subtitleListRef"
               :auto-scroll="true"
               :editable="true"
-              @subtitle-click="handleSubtitleClick"
-              @subtitle-edit="handleSubtitleEdit"
             />
           </div>
 
@@ -211,7 +205,7 @@
       :close-on-press-escape="true"
       @close="handleCloseAdvancedSettings"
     >
-      <AdvancedSettings v-model="advancedConfig" @change="handleAdvancedSettingsChange" />
+      <AdvancedSettings v-model="advancedConfig" />
       <template #footer>
         <span class="dialog-footer">
           <el-button @click="handleCancelAdvancedSettings">取消</el-button>
@@ -393,35 +387,6 @@ provide('editorContext', {
   hasVideoSource,
 })
 
-// 调试：监听 proxyVideo 状态变化
-watch(
-  () => proxyVideo.currentUrl.value,
-  (newUrl, oldUrl) => {
-    console.log('[EditorView] proxyVideo.currentUrl 变化:', {
-      oldUrl,
-      newUrl,
-      state: proxyVideo.state.value,
-      isReady: proxyVideo.isReady.value,
-      urls: {
-        preview360p: proxyVideo.urls.value.preview360p,
-        proxy720p: proxyVideo.urls.value.proxy720p,
-        source: proxyVideo.urls.value.source,
-      },
-    })
-  }
-)
-
-watch(
-  () => proxyVideo.state.value,
-  (newState, oldState) => {
-    console.log('[EditorView] proxyVideo.state 变化:', {
-      oldState,
-      newState,
-      currentUrl: proxyVideo.currentUrl.value,
-    })
-  }
-)
-
 // 将 projectStore 的估算双流进度同步到统一状态，供 UI 兜底展示
 watch(
   () => projectStore.dualStreamProgress,
@@ -435,13 +400,6 @@ watch(
 // 监听路由身份变化，重新加载项目
 watch([() => rawProps.projectId, () => rawProps.jobId], async ([newProjectId, newJobId], [oldProjectId, oldJobId]) => {
   if (newProjectId === oldProjectId && newJobId === oldJobId) return
-
-  console.log('[EditorView] 路由身份变化，重新加载项目:', {
-    oldProjectId,
-    newProjectId,
-    oldJobId,
-    newJobId,
-  })
 
   // 取消旧的 SSE 订阅
   cleanupSSE()
@@ -749,7 +707,6 @@ async function loadProject() {
         startProxyPolling()
       }
       notifyMissingVideoOnce()
-      console.log('[EditorView] 纯项目模式加载完成')
       return
     }
 
@@ -757,9 +714,7 @@ async function loadProject() {
       throw new Error('缺少任务标识，无法加载转录态项目')
     }
 
-    console.log('[EditorView] 获取任务状态:', activeJobId.value)
     const jobStatus = await transcriptionApi.getJobStatus(activeJobId.value, true)
-    console.log('[EditorView] 任务状态:', jobStatus)
     applyMediaPaths({ project: projectMeta, mediaStatus: jobStatus.media_status })
 
     progressStore.applySnapshot(
@@ -840,7 +795,6 @@ async function loadProject() {
     }
 
     notifyMissingVideoOnce()
-    console.log('[EditorView] 项目加载完成')
   } catch (error) {
     console.error('[EditorView] 加载项目失败:', error)
 
@@ -897,13 +851,10 @@ async function loadTranscribingSegments() {
 
 // V3.2.4+dev.20260222.14: 终态同步必须以后端为唯一数据源
 async function syncSegmentsFromBackendAsSource({ reason = 'unknown', allowSrtFallback = true } = {}) {
-  console.log(`[EditorView] 开始后端字幕强制同步: reason=${reason}`)
   const count = await loadTranscribingSegments()
   if (count === 0 && allowSrtFallback) {
-    console.log('[EditorView] 后端 segments 为空，回退加载 SRT')
     await loadFromSRT()
   }
-  console.log(`[EditorView] 后端字幕强制同步完成: count=${projectStore.subtitles.length}`)
 }
 
 // V3.2.4+dev.20260222.15: 每次定稿事件都立即触发后端回拉，且高频事件合并为“当前1次+补1次”
@@ -950,7 +901,6 @@ async function loadFromSRT() {
         videoPath: projectStore.meta.videoPath,
         audioPath: projectStore.meta.audioPath,
       })
-      console.log('[EditorView] 从 SRT 文件恢复成功（无置信度数据）')
     }
   } catch (error) {
     console.warn('[EditorView] 从 SRT 加载失败:', error)
@@ -1104,43 +1054,31 @@ function subscribeSSE() {
   }
   // 如果已经订阅，先取消避免重复订阅
   if (sseUnsubscribe) {
-    console.log('[EditorView] 已存在SSE订阅，先取消')
     sseUnsubscribe()
     sseUnsubscribe = null
   }
 
   if (!jobId && projectId) {
-    console.log('[EditorView] 订阅项目 SSE:', projectId)
     sseUnsubscribe = sseChannelManager.subscribeProject(projectId, {
-      onConnected() {
-        console.log('[EditorView] 项目 SSE 连接成功')
-      },
       onSubtitleUpdated(data) {
-        console.log('[EditorView] 收到项目字幕更新:', data)
         handleProjectSubtitleUpsert(data)
       },
       onSubtitleAdded(data) {
-        console.log('[EditorView] 收到项目字幕新增:', data)
         handleProjectSubtitleUpsert(data)
       },
       onSubtitleDeleted(data) {
-        console.log('[EditorView] 收到项目字幕删除:', data)
         handleProjectSubtitleDelete(data)
       },
     })
     return
   }
 
-  console.log('[EditorView] 订阅任务 SSE:', jobId)
-
   // 使用 sseChannelManager 订阅单任务频道
   sseUnsubscribe = sseChannelManager.subscribeJob(jobId, {
     onInitialState(data) {
-      console.log('[EditorView] SSE 初始状态:', data)
       progressStore.applySnapshot(jobId, data, 'sse_init')
       // 如果附带 Proxy 状态，直接应用到 proxyVideo，避免断线后进度丢失
       if (data.proxy) {
-        console.log('[EditorView] 同步初始 Proxy 状态:', data.proxy)
         proxyVideo.applySnapshot(data.proxy)
       }
     },
@@ -1156,8 +1094,6 @@ function subscribeSSE() {
     },
 
     onProgress(data) {
-      console.log('[EditorView] SSE 进度更新:', data.percent, data.phase, data.detail)
-      console.log('[EditorView] SSE status:', data.status, '| taskStatus:', taskStatus.value)
       progressStore.applySseProgress(jobId, data)
       if (data.detail) {
         projectStore.updateDualStreamProgressFromSSE({
@@ -1169,7 +1105,6 @@ function subscribeSSE() {
     },
 
     async onComplete(data) {
-      console.log('[EditorView] 任务完成:', data)
       if (isCancelPending.value) {
         isCancelPending.value = false
         stopCancelTimeoutPolling()
@@ -1199,7 +1134,6 @@ function subscribeSSE() {
     },
 
     onFailed(data) {
-      console.log('[EditorView] 任务失败:', data)
       if (isCancelPending.value) {
         isCancelPending.value = false
         stopCancelTimeoutPolling()
@@ -1220,7 +1154,6 @@ function subscribeSSE() {
     },
 
     onPaused(data) {
-      console.log('[EditorView] 任务已暂停:', data)
       progressStore.markStatus(jobId, 'paused', {
         updated_at: data.updated_at ?? data.timestamp,
         state_seq: data.state_seq,
@@ -1233,7 +1166,6 @@ function subscribeSSE() {
     },
 
     onPausePending(data) {
-      console.log('[EditorView] 任务暂停中:', data)
       progressStore.markStatus(jobId, 'pausing', {
         updated_at: data.updated_at ?? data.timestamp,
         state_seq: data.state_seq,
@@ -1244,12 +1176,7 @@ function subscribeSSE() {
       })
     },
 
-    onPauseAck(data) {
-      console.log('[EditorView] 收到暂停确认:', data)
-    },
-
     onCanceling(data) {
-      console.log('[EditorView] 收到 canceling 信号，等待终态:', data)
       isCancelPending.value = true
       startCancelTimeoutPolling()
       progressStore.markStatus(jobId, 'canceling', {
@@ -1263,18 +1190,15 @@ function subscribeSSE() {
     },
 
     async onCanceled(data) {
-      console.log('[EditorView] 任务已取消:', data)
       await handleCancelTerminal(data, 'canceled')
     },
 
     async onForceCanceled(data) {
-      console.log('[EditorView] 任务已强制取消:', data)
       await handleCancelTerminal(data, 'force_canceled')
     },
 
     onResumed(data) {
       // 新增：处理任务恢复信号
-      console.log('[EditorView] 任务已恢复:', data)
       progressStore.markStatus(jobId, data.status || 'queued', {
         updated_at: data.updated_at ?? data.timestamp,
         state_seq: data.state_seq,
@@ -1287,7 +1211,6 @@ function subscribeSSE() {
     },
 
     onConnected() {
-      console.log('[EditorView] SSE 连接成功')
       taskStore.updateTaskSSEStatus(jobId, true)
       taskStore.updateSSEHeartbeat()
       // 连接成功后，主动刷新一次进度状态
@@ -1310,78 +1233,48 @@ function subscribeSSE() {
       }
       // 仅处理旧架构字幕事件（sv_sentence/whisper_patch/llm_proof 等）
       if (data.sentence || data.sentence_index !== undefined) {
-        console.log('[EditorView] 收到旧架构字幕更新:', data)
         handleStreamingSubtitle(data)
       }
     },
 
     // Phase 5: 草稿字幕事件（快流/SenseVoice）
     onDraft(data) {
-      console.log('[EditorView] 收到草稿字幕:', data)
       handleDraftSubtitle(data)
     },
 
     // Phase 5: 替换 Chunk 事件（慢流/Whisper）
     onReplaceChunk(data) {
-      console.log('[EditorView] 收到替换 Chunk:', data)
       handleReplaceChunk(data)
     },
 
     // V3.1.0: 恢复字幕事件（断点续传后恢复）
     onRestored(data) {
-      console.log('[EditorView] 收到恢复字幕:', data)
       handleRestoredChunk(data)
     },
 
     // V3.5: 极速模式定稿事件
     onFinalized(data) {
-      console.log('[EditorView] 收到定稿字幕:', data)
       handleFinalizedSubtitle(data)
     },
 
     onRevised(data) {
-      console.log('[EditorView] 收到字幕修订:', data)
       handleRevisedSubtitle(data)
     },
 
     onSpeakerProfiles(data) {
-      console.log('[EditorView] 收到说话人资料更新:', data)
       handleSpeakerProfiles(data)
     },
 
     onSubtitleAdded(data) {
-      console.log('[EditorView] 收到新增字幕:', data)
       handleStreamingSubtitle(data)
     },
 
     onSubtitleDeleted(data) {
-      console.log('[EditorView] 收到删除字幕:', data)
       handleSubtitleDeleted(data)
     },
 
     onSubtitleEdited(data) {
-      console.log('[EditorView] 收到编辑字幕:', data)
       handleSubtitleEdited(data)
-    },
-
-    // 新增：BGM 检测事件
-    onBgmDetected(data) {
-      console.log('[EditorView] BGM 检测结果:', data)
-    },
-
-    // 新增：分离策略事件
-    onSeparationStrategy(data) {
-      console.log('[EditorView] 分离策略决策:', data)
-    },
-
-    // 新增：模型升级事件
-    onModelUpgrade(data) {
-      console.log('[EditorView] 模型升级:', data)
-    },
-
-    // 新增：熔断事件
-    onCircuitBreaker(data) {
-      console.log('[EditorView] 熔断触发:', data)
     },
 
     onLangidEvent(eventType, data) {
@@ -1398,35 +1291,27 @@ function subscribeSSE() {
 
     // === Proxy 视频转码事件（转发到 useProxyVideo）===
     onAnalyzeComplete(data) {
-      console.log('[EditorView] 转发 analyze_complete 到 useProxyVideo')
       proxyVideo.handlers.onAnalyzeComplete(data)
     },
     onRemuxProgress(data) {
-      console.log('[EditorView] 转发 remux_progress 到 useProxyVideo')
       proxyVideo.handlers.onRemuxProgress(data)
     },
     onRemuxComplete(data) {
-      console.log('[EditorView] 转发 remux_complete 到 useProxyVideo')
       proxyVideo.handlers.onRemuxComplete(data)
     },
     onPreview360pProgress(data) {
-      console.log('[EditorView] 转发 preview_360p_progress 到 useProxyVideo')
       proxyVideo.handlers.onPreview360pProgress(data)
     },
     onPreview360pComplete(data) {
-      console.log('[EditorView] 转发 preview_360p_complete 到 useProxyVideo')
       proxyVideo.handlers.onPreview360pComplete(data)
     },
     onProxyProgress(data) {
-      console.log('[EditorView] 转发 proxy_progress 到 useProxyVideo')
       proxyVideo.handlers.onProxyProgress(data)
     },
     onProxyComplete(data) {
-      console.log('[EditorView] 转发 proxy_complete 到 useProxyVideo')
       proxyVideo.handlers.onProxyComplete(data)
     },
     onProxyError(data) {
-      console.log('[EditorView] 转发 proxy_error 到 useProxyVideo')
       proxyVideo.handlers.onProxyError(data)
     },
   })
@@ -1436,7 +1321,6 @@ function subscribeSSE() {
 function cleanupSSE() {
   stopCancelTimeoutPolling()
   if (sseUnsubscribe) {
-    console.log('[EditorView] 清理SSE连接:', activeJobId.value || props.projectId)
     sseUnsubscribe()
     sseUnsubscribe = null
   }
@@ -1534,7 +1418,6 @@ function handleStreamingSubtitle(data) {
   }
 
   if (projectStore.isSentenceDeleted(sentenceIndex)) {
-    console.log(`[EditorView] 字幕已被用户删除，忽略 SSE: ${sentenceIndex}`)
     return
   }
 
@@ -1576,7 +1459,6 @@ function handleStreamingSubtitle(data) {
   // 恢复历史记录
   projectStore.resumeHistory()
 
-  console.log(`[EditorView] 字幕 #${sentenceIndex} 已更新，来源: ${source}`)
 }
 
 // Phase 5: 处理草稿字幕（快流/SenseVoice）
@@ -1611,9 +1493,6 @@ function handleDraftSubtitle(data) {
   // 调用 projectStore 的草稿处理方法，传递两个参数
   projectStore.appendOrUpdateDraft(chunkIndex, sentenceData)
 
-  console.log(
-    `[EditorView] 处理草稿字幕，chunk_index: ${chunkIndex}, sentence_index: ${sentenceIndex}`
-  )
 }
 
 // Phase 5: 处理替换 Chunk（慢流/Whisper）
@@ -1621,8 +1500,6 @@ function handleReplaceChunk(data) {
   if (!data) return
 
   const chunkIndex = data.chunk_index
-  const finalizedCount = Array.isArray(data.sentences) ? data.sentences.length : 0
-  console.log(`[EditorView] 替换 Chunk ${chunkIndex}（定稿事件 ${finalizedCount} 条），立即以后端真源覆盖`)
   void scheduleRealtimeFinalSync(`subtitle_replace_chunk_${chunkIndex ?? 'unknown'}`)
 }
 
@@ -1637,7 +1514,6 @@ function handleRestoredChunk(data) {
   const sentences = Array.isArray(data.sentences) ? data.sentences : []
 
   if (sentences.length === 0) {
-    console.log(`[EditorView] Chunk ${chunkIndex} 恢复的字幕为空，跳过`)
     return
   }
 
@@ -1667,7 +1543,6 @@ function handleRestoredChunk(data) {
   // 调用 projectStore 的恢复方法
   projectStore.restoreChunk(chunkIndex, formattedSentences)
 
-  console.log(`[EditorView] 恢复 Chunk ${chunkIndex}，共 ${formattedSentences.length} 条字幕`)
 }
 
 function handleSubtitleDeleted(data) {
@@ -1740,9 +1615,6 @@ function handleFinalizedSubtitle(data) {
 
   const chunkIndex = data.chunk_index
   const sentenceIndex = data.index
-  console.log(
-    `[EditorView] 极速模式定稿 Chunk ${chunkIndex}，句子索引 ${sentenceIndex}，立即以后端真源覆盖`
-  )
   void scheduleRealtimeFinalSync(`subtitle_finalized_${chunkIndex ?? sentenceIndex ?? 'unknown'}`)
 }
 
@@ -1777,7 +1649,6 @@ async function refreshTaskProgress() {
   }
   try {
     const jobStatus = await transcriptionApi.getJobStatus(activeJobId.value, true)
-    console.log('[EditorView] 刷新任务进度:', jobStatus)
 
     progressStore.applySnapshot(
       activeJobId.value,
@@ -1894,7 +1765,6 @@ async function saveProject() {
     }
     await projectStore.saveProject()
     lastSaved.value = Date.now()
-    console.log('[EditorView] 项目保存成功')
   } catch (error) {
     console.error('[EditorView] 保存失败:', error)
     alert('保存失败: ' + (error.message || '未知错误'))
@@ -1918,8 +1788,6 @@ async function pauseTranscription() {
       progressStore.markStatus(activeJobId.value, 'paused')
       taskStore.updateTaskStatus(activeJobId.value, 'paused', null, { isServer: false })
     }
-    // 暂停后保留SSE连接，以便恢复时能继续接收更新
-    console.log('[EditorView] 任务已暂停，保留SSE连接')
   } catch (error) {
     console.error('暂停任务失败:', error)
   }
@@ -1941,8 +1809,6 @@ async function resumeTranscription() {
       progressStore.markStatus(activeJobId.value, result.status || 'queued')
       taskStore.updateTaskStatus(activeJobId.value, result.status || 'queued', null, { isServer: false })
     }
-
-    console.log('[EditorView] 任务已恢复，状态:', result.status, '队列位置:', result.queue_position)
 
     await refreshTaskProgress()
     startProgressPolling()
@@ -1981,11 +1847,6 @@ async function cancelTranscription() {
       isCancelPending.value = true
       startCancelTimeoutPolling()
     }
-    console.log('[EditorView] 取消请求已发送，等待终态信号:', {
-      status: apiStatus,
-      reason_code: result?.reason_code,
-      pending_delete: result?.pending_delete,
-    })
   } catch (error) {
     isCancelPending.value = false
     stopCancelTimeoutPolling()
@@ -2081,8 +1942,6 @@ async function fetchLatestSegments() {
 
 async function handleASSExport(segments) {
   try {
-    console.log('[EditorView] 开始生成 ASS 字幕文件')
-
     const srtContent = segmentsToSRT(segments)
     if (activeJobId.value) {
       await mediaApi.saveSRTContent(activeJobId.value, srtContent)
@@ -2094,7 +1953,6 @@ async function handleASSExport(segments) {
       })
       const assData = await transcriptionApi.getASSContent(activeJobId.value)
       downloadFile(assData.content, assData.filename)
-      console.log('[EditorView] ASS 字幕文件导出成功:', assData.filename)
       return
     }
 
@@ -2167,10 +2025,6 @@ function stopResize() {
 
 // ========== 事件处理 ==========
 
-function handleVideoLoaded(duration) {
-  console.log('视频加载完成:', duration)
-}
-
 function handleVideoError(error) {
   if (!projectStore.meta.videoPath && !proxyVideo.currentUrl.value) {
     console.warn('[EditorView] 当前为纯音频模式，忽略视频错误:', error)
@@ -2195,7 +2049,6 @@ function handleUpgradeFailed(message) {
 
 // V3.1.2+dev.20260113.02: 处理720p升级开始
 function handleUpgradeStarted() {
-  console.log('[EditorView] 720p后台转码已启动')
   ElMessage.success({
     message: '后台转码已开始，完成后将自动替换',
     duration: 5000,
@@ -2203,44 +2056,17 @@ function handleUpgradeStarted() {
 }
 
 async function handleCheckVideoStatus() {
-  console.log('[EditorView] 视频加载失败，刷新 Proxy 视频状态...')
   try {
-    // 刷新 proxyVideo 状态（会从后端重新获取状态并自动订阅SSE）
+    // 刷新 proxyVideo 状态（从后端重新获取状态）
     await proxyVideo.refresh()
-    console.log('[EditorView] Proxy 视频状态已刷新:', {
-      state: proxyVideo.state.value,
-      isReady: proxyVideo.isReady.value,
-      isTranscoding: proxyVideo.isTranscoding.value,
-    })
   } catch (error) {
     console.error('[EditorView] 刷新 Proxy 视频状态失败:', error)
   }
 }
 
 function handleResolutionChange(resolution) {
-  console.log('[EditorView] 视频分辨率变更:', resolution)
   // 更新 projectStore 的视频信息
   projectStore.meta.currentResolution = resolution
-}
-
-function handleWaveformReady() {
-  console.log('波形加载完成')
-}
-
-function handleRegionUpdate(region) {
-  console.log('区域更新:', region)
-}
-
-function handleRegionClick(region) {
-  console.log('区域点击:', region)
-}
-
-function handleSubtitleClick(subtitle) {
-  console.log('字幕点击:', subtitle)
-}
-
-function handleSubtitleEdit(id, field, value) {
-  console.log('字幕编辑:', id, field, value)
 }
 
 // ========== 字幕全局偏移设置 ==========
@@ -2252,16 +2078,8 @@ watch(
   }
 )
 
-// V3.2.0+dev.20260209.03: 移除实时触发，仅在保存时应用
-function handleAdvancedSettingsChange(config) {
-  // 仅用于数据同步，不触发字幕偏移
-  console.log('[EditorView] 高级设置变化（未应用）:', config)
-}
-
 async function handleSaveAdvancedSettings() {
   try {
-    console.log('[EditorView] 保存高级设置:', advancedConfig.value)
-
     // V3.2.0+dev.20260209.04: 保存时规范化空值为 0
     let offset = advancedConfig.value.general.global_time_offset
     if (offset === '' || offset === null || offset === undefined) {
@@ -2277,9 +2095,6 @@ async function handleSaveAdvancedSettings() {
       await transcriptionApi.setJobSubtitleTimeOffset(projectStore.meta.jobId, offset)
     }
 
-    // TODO: 保存其他高级设置到后端或本地存储
-    // await transcriptionApi.saveAdvancedSettings(jobId, advancedConfig.value)
-
     ElMessage.success('高级设置已保存')
     showAdvancedSettings.value = false
   } catch (error) {
@@ -2289,12 +2104,10 @@ async function handleSaveAdvancedSettings() {
 }
 
 function handleCancelAdvancedSettings() {
-  console.log('[EditorView] 取消高级设置')
   showAdvancedSettings.value = false
 }
 
 function handleCloseAdvancedSettings() {
-  console.log('[EditorView] 关闭高级设置对话框')
   showAdvancedSettings.value = false
 }
 
@@ -2339,54 +2152,6 @@ function seekToEnd() {
   playbackManager.seekTo(projectStore.meta.duration)
 }
 
-function zoomInWave() {
-  console.log('波形放大')
-}
-
-function zoomOutWave() {
-  console.log('波形缩小')
-}
-
-function fitWave() {
-  console.log('波形适应屏幕')
-}
-
-function zoomInVideo() {
-  console.log('视频画面放大')
-}
-
-function zoomOutVideo() {
-  console.log('视频画面缩小')
-}
-
-function fitVideo() {
-  console.log('画面适应窗口')
-}
-
-function fontSizeUp() {
-  console.log('字体变大')
-}
-
-function fontSizeDown() {
-  console.log('字体变小')
-}
-
-function splitSubtitle() {
-  console.log('分割字幕')
-}
-
-function mergeSubtitle() {
-  console.log('合并字幕')
-}
-
-function exportSubtitle() {
-  // 触发导出菜单
-}
-
-function openTaskMonitor() {
-  console.log('打开任务监控')
-}
-
 // 使用快捷键系统
 useShortcuts({
   togglePlay,
@@ -2396,21 +2161,9 @@ useShortcuts({
   seekForward,
   seekToStart,
   seekToEnd,
-  zoomInWave,
-  zoomOutWave,
-  fitWave,
-  zoomInVideo,
-  zoomOutVideo,
-  fitVideo,
-  fontSizeUp,
-  fontSizeDown,
-  splitSubtitle,
-  mergeSubtitle,
   save: saveProject,
   undo,
   redo,
-  export: exportSubtitle,
-  openTaskMonitor,
 })
 
 // ========== 生命周期 ==========
@@ -2428,12 +2181,10 @@ onMounted(() => {
 onUnmounted(() => {
   if (!activeJobId.value && props.projectId) {
     // 纯 project 模式无后台任务续跑需求，卸载时应主动释放连接，避免悬挂订阅。
-    console.log('[EditorView] 组件卸载，project 模式主动清理 SSE 连接')
     cleanupSSE()
   } else {
     // 注意：job 模式不在这里关闭SSE连接，以支持页面切换时保持连接
     // SSE连接会在任务完成/失败时自动关闭，或由sseChannelManager统一管理
-    console.log('[EditorView] 组件卸载，保留SSE连接以支持后台任务')
   }
 
   // 停止轮询（轮询仅是备用方案）
@@ -2447,7 +2198,6 @@ onBeforeRouteLeave(async (to, from) => {
   if (isDirty.value) {
     try {
       await projectStore.saveProject()
-      console.log('[EditorView] 离开前自动保存成功')
     } catch (error) {
       console.error('[EditorView] 离开前保存失败:', error)
       const answer = window.confirm('保存失败，确定要离开吗? 未保存的修改可能会丢失。')

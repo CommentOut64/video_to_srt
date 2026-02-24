@@ -259,12 +259,12 @@ async function deleteSubtitle(id) {
   }
 
   try {
-    if (projectStore.meta.jobId && subtitle.sentenceIndex !== undefined) {
-      await transcriptionApi.deleteSubtitle(projectStore.meta.jobId, subtitle.sentenceIndex)
-      return
-    }
     if (projectStore.meta.projectId && subtitle.segment_id) {
       await projectApi.deleteSubtitle(projectStore.meta.projectId, subtitle.segment_id)
+      return
+    }
+    if (projectStore.meta.jobId && subtitle.sentenceIndex !== undefined) {
+      await transcriptionApi.deleteSubtitle(projectStore.meta.jobId, subtitle.sentenceIndex)
     }
   } catch (error) {
     console.warn('[SubtitleList] 删除字幕同步失败:', error)
@@ -291,19 +291,19 @@ async function addNewSubtitle() {
     const baseStart = projectStore.toBaseTime(newStart)
     const baseEnd = projectStore.toBaseTime(newStart + 3)
     let data = null
-    if (projectStore.meta.jobId) {
+    if (projectStore.meta.projectId) {
+      data = await projectApi.createSubtitle(projectStore.meta.projectId, {
+        text: '',
+        start: baseStart,
+        end: baseEnd
+      })
+    } else if (projectStore.meta.jobId) {
       const response = await transcriptionApi.createSubtitle(projectStore.meta.jobId, {
         text: '',
         start: baseStart,
         end: baseEnd
       })
       data = response?.data?.data || response?.data
-    } else if (projectStore.meta.projectId) {
-      data = await projectApi.createSubtitle(projectStore.meta.projectId, {
-        text: '',
-        start: baseStart,
-        end: baseEnd
-      })
     }
     const newSubtitle = projectStore.subtitles[insertIndex]
     if (newSubtitle) {
@@ -342,19 +342,19 @@ async function syncInsertedSubtitle(insertIndex, start, end, text) {
     const baseStart = projectStore.toBaseTime(start)
     const baseEnd = projectStore.toBaseTime(end)
     let data = null
-    if (projectStore.meta.jobId) {
+    if (projectStore.meta.projectId) {
+      data = await projectApi.createSubtitle(projectStore.meta.projectId, {
+        text,
+        start: baseStart,
+        end: baseEnd
+      })
+    } else if (projectStore.meta.jobId) {
       const response = await transcriptionApi.createSubtitle(projectStore.meta.jobId, {
         text,
         start: baseStart,
         end: baseEnd
       })
       data = response?.data?.data || response?.data
-    } else if (projectStore.meta.projectId) {
-      data = await projectApi.createSubtitle(projectStore.meta.projectId, {
-        text,
-        start: baseStart,
-        end: baseEnd
-      })
     }
     const newSubtitle = projectStore.subtitles[insertIndex]
     if (newSubtitle) {

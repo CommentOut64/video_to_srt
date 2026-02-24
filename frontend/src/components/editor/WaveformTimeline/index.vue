@@ -96,7 +96,7 @@ import {
 const props = defineProps({
   audioUrl: String,
   peaksUrl: String,
-  jobId: String,
+  mediaId: String,
   waveColor: { type: String, default: '#58a6ff' },
   progressColor: { type: String, default: '#238636' },
   cursorColor: { type: String, default: '#f85149' },
@@ -111,8 +111,7 @@ const emit = defineEmits(['ready', 'region-update', 'region-click', 'seek', 'zoo
 // ============ Store & Services ============
 const projectStore = useProjectStore()
 const playbackManager = usePlaybackManager()
-const jobIdRef = computed(() => props.jobId || projectStore.meta.jobId)
-const identityRef = computed(() => props.jobId || projectStore.primaryId)
+const identityRef = computed(() => props.mediaId || projectStore.primaryId)
 const { onSubtitleEdit } = useSubtitleSync(identityRef)
 
 // 编辑器上下文
@@ -149,13 +148,13 @@ const regionsPluginRef = ref(null)
 // ============ Computed ============
 const audioSource = computed(() => {
   if (props.audioUrl) return props.audioUrl
-  if (props.jobId) return `/api/media/${props.jobId}/audio`
+  if (props.mediaId) return `/api/media/${props.mediaId}/audio`
   return projectStore.meta.audioPath || ''
 })
 
 const peaksSource = computed(() => {
   if (props.peaksUrl) return props.peaksUrl
-  if (props.jobId) return `/api/media/${props.jobId}/peaks?samples=0`
+  if (props.mediaId) return `/api/media/${props.mediaId}/peaks?samples=0`
   return projectStore.meta.peaksPath || ''
 })
 
@@ -232,7 +231,7 @@ const {
   contextMenuItems,
   handleWaveformContextMenu: onContextMenu,
   handleContextMenuSelect,
-} = useWaveformContextMenu(projectStore, jobIdRef)
+} = useWaveformContextMenu(projectStore, identityRef)
 
 // 包装右键菜单处理（需要传递额外参数）
 function handleWaveformContextMenu(e) {
