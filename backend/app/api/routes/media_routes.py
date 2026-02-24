@@ -16,6 +16,7 @@ import asyncio
 import subprocess
 import time
 import logging
+import threading
 from pathlib import Path
 from typing import Optional, Tuple
 from fastapi import APIRouter, HTTPException, Request
@@ -43,6 +44,13 @@ NEED_TRANSCODE_FORMATS = {'.mkv', '.avi', '.mov', '.wmv', '.flv', '.m4v'}
 # 浏览器不兼容的视频编码（需要转码为H.264）
 NEED_TRANSCODE_CODECS = {'hevc', 'h265', 'vp9', 'av1'}
 
+# 可作为波形数据来源的音频文件扩展名
+AUDIO_SOURCE_EXTS = {'.wav', '.mp3', '.m4a', '.aac', '.flac', '.ogg', '.wma', '.opus'}
+
+# 音频抽取锁（按目录粒度，避免并发请求重复抽取同一文件）
+_audio_extract_lock_guard = threading.Lock()
+_audio_extract_locks: dict[str, threading.Lock] = {}
+
 # 注意：旧的 _proxy_generation_status 已废弃，改用 MediaPrepService 管理状态
 
 
@@ -53,6 +61,91 @@ def _find_video_file(job_dir: Path) -> Optional[Path]:
         if file.is_file() and file.suffix.lower() in video_exts:
             return file
     return None
+
+
+def _find_audio_source_file(job_dir: Path) -> Optional[Path]:
+    """在任务目录中查找可用于生成波形的音频源文件。"""
+    for file in job_dir.iterdir():
+        if not file.is_file():
+            continue
+        if file.suffix.lower() in AUDIO_SOURCE_EXTS and file.name.lower() != "audio.wav":
+            return file
+    return None
+
+
+def _get_audio_extract_lock(job_dir: Path) -> threading.Lock:
+    """获取目录级音频抽取锁，避免并发重复工作。"""
+    key = str(job_dir.resolve())
+    with _audio_extract_lock_guard:
+        lock = _audio_extract_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _audio_extract_locks[key] = lock
+    return lock
+
+
+def _ensure_waveform_audio(job_dir: Path, identifier: str) -> Path:
+    """
+    确保 `audio.wav` 存在（与 ASR 主流程解耦）。
+
+    场景：
+    - 导入项目仅有视频/音频文件时，按需抽取标准 `audio.wav`，供波形与时间轴使用。
+    """
+    audio_file = job_dir / "audio.wav"
+    if audio_file.exists():
+        return audio_file
+
+    lock = _get_audio_extract_lock(job_dir)
+    with lock:
+        if audio_file.exists():
+            return audio_file
+
+        source_media = _find_audio_source_file(job_dir) or _find_video_file(job_dir)
+        if source_media is None:
+            raise HTTPException(status_code=404, detail="音频源不存在")
+
+        # 使用带 .wav 后缀的临时文件，避免 FFmpeg 因扩展名无法识别封装格式。
+        tmp_audio_file = job_dir / "audio.tmp.wav"
+        ffmpeg_cmd = config.get_ffmpeg_command()
+        cmd = [
+            ffmpeg_cmd,
+            "-i",
+            str(source_media),
+            "-vn",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-y",
+            str(tmp_audio_file),
+        ]
+
+        logger.info("[media] 开始按需抽取音频: identifier=%s, source=%s", identifier, source_media.name)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=300,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        if result.returncode != 0:
+            if tmp_audio_file.exists():
+                tmp_audio_file.unlink(missing_ok=True)
+            logger.error(
+                "[media] 按需抽取音频失败: identifier=%s, source=%s, stderr=%s",
+                identifier,
+                source_media.name,
+                result.stderr.strip(),
+            )
+            raise HTTPException(status_code=500, detail="音频提取失败")
+
+        os.replace(tmp_audio_file, audio_file)
+        logger.info("[media] 按需抽取音频完成: identifier=%s, audio=%s", identifier, audio_file.name)
+        return audio_file
 
 
 def _resolve_media_dir(identifier: str) -> Path:
@@ -854,10 +947,7 @@ async def get_video(job_id: str, request: Request):
 async def get_audio(job_id: str, request: Request):
     """获取音频文件（支持Range请求）"""
     job_dir = _resolve_media_dir(job_id)
-    audio_file = job_dir / "audio.wav"
-
-    if not audio_file.exists():
-        raise HTTPException(status_code=404, detail="音频文件不存在")
+    audio_file = _ensure_waveform_audio(job_dir, job_id)
 
     return _serve_file_with_range(audio_file, request, 'audio/wav', job_id=job_id)
 
@@ -876,7 +966,7 @@ async def get_audio_peaks(job_id: str, samples: int = 0, method: str = "auto"):
         JSON: { peaks: [min, max, min, max, ...], duration: 180.5, method: "ffmpeg" }
     """
     job_dir = _resolve_media_dir(job_id)
-    audio_file = job_dir / "audio.wav"
+    audio_file = _ensure_waveform_audio(job_dir, job_id)
 
     # 【关键修改】获取音频时长，动态计算采样点
     if samples <= 0:
@@ -921,9 +1011,6 @@ async def get_audio_peaks(job_id: str, samples: int = 0, method: str = "auto"):
                     return JSONResponse(cached_data)
         except:
             pass
-
-    if not audio_file.exists():
-        raise HTTPException(status_code=404, detail="音频文件不存在")
 
     # 根据文件大小选择方法
     file_size_mb = audio_file.stat().st_size / (1024 * 1024)

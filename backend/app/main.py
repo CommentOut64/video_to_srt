@@ -56,6 +56,7 @@ from app.config.model_config import ModelPreloadConfig
 from app.api.routes import media_routes  # 新增：媒体资源路由
 from app.api.routes.project_routes import router as project_router
 from app.api.routes.legacy_compat_routes import router as legacy_router
+from app.api.routes.stream_routes import router as stream_router
 from app.api.routes.file_routes import create_file_router  # 新增：文件管理路由
 from app.api.routes import system_routes  # 新增：系统管理路由
 from app.api.routes import config_routes  # 新增：用户配置路由
@@ -226,6 +227,7 @@ app.include_router(config_routes.router)  # 新增：用户配置路由
 app.include_router(debug_routes.router)  # 新增：调试路由
 app.include_router(project_router)  # Task6: 项目路由
 app.include_router(legacy_router)  # Task6: legacy 兼容路由
+app.include_router(stream_router)  # Task6: 项目级 SSE 路由
 
 # 注册仅 Full 模式可用的路由
 if not IS_LITE:

@@ -265,8 +265,16 @@ class ProjectService:
         if video_file is not None:
             assets.append(self._build_asset("video", video_file, project_dir))
 
+        # 优先使用标准抽取产物 audio.wav；若不存在，则回退到源音频文件（mp3/m4a/...）。
+        audio_file = project_dir / "audio.wav"
+        if audio_file.exists():
+            assets.append(self._build_asset("audio", audio_file, project_dir))
+        else:
+            source_audio = self._find_audio_file(project_dir)
+            if source_audio is not None:
+                assets.append(self._build_asset("audio", source_audio, project_dir))
+
         named_assets = {
-            "audio": project_dir / "audio.wav",
             "peaks": project_dir / "peaks.json",
             "proxy_720p": project_dir / "proxy_720p.mp4",
             "preview_360p": project_dir / "preview_360p.mp4",
@@ -355,6 +363,14 @@ class ProjectService:
         video_exts = {".mp4", ".avi", ".mkv", ".mov", ".wmv", ".webm", ".flv", ".m4v"}
         for item in project_dir.iterdir():
             if item.is_file() and item.suffix.lower() in video_exts:
+                return item
+        return None
+
+    @staticmethod
+    def _find_audio_file(project_dir: Path) -> Optional[Path]:
+        audio_exts = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma"}
+        for item in project_dir.iterdir():
+            if item.is_file() and item.suffix.lower() in audio_exts:
                 return item
         return None
 
