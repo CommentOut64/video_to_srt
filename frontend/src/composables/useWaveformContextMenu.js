@@ -6,6 +6,7 @@
  */
 import { ref, computed } from 'vue'
 import transcriptionApi from '@/services/api/transcriptionApi'
+import projectApi from '@/services/api/projectApi'
 
 /**
  * 右键菜单 Composable
@@ -42,6 +43,11 @@ export function useWaveformContextMenu(projectStore, jobIdRef) {
   function handleWaveformContextMenu(e, getTimeFromClientX) {
     e.preventDefault()
     e.stopPropagation()
+
+    if (typeof getTimeFromClientX !== 'function') {
+      console.warn('[WaveformContextMenu] 缺少时间映射函数，忽略本次右键事件')
+      return
+    }
 
     const clickTime = getTimeFromClientX(e.clientX)
 
@@ -84,61 +90,99 @@ export function useWaveformContextMenu(projectStore, jobIdRef) {
    * 波形切分结果同步到后端
    */
   async function syncSplitSubtitles(result) {
-    const jobId = jobIdRef.value
-    if (!jobId) return
+    const jobId = projectStore.meta.jobId || jobIdRef.value
+    const projectId = projectStore.meta.projectId
+    if (!jobId && !projectId) return
 
     const { leftSubtitle, rightSubtitle, originalSentenceIndex } = result || {}
     if (!leftSubtitle || !rightSubtitle) return
 
     try {
-      if (originalSentenceIndex !== undefined) {
-        await transcriptionApi.updateSubtitle(jobId, originalSentenceIndex, {
-          text: leftSubtitle.text,
-          start: leftSubtitle.start,
-          end: leftSubtitle.end,
-        })
-        projectStore.updateSubtitle(
-          leftSubtitle.id,
-          {
-            sentenceIndex: originalSentenceIndex,
-            isModified: true,
-            source: 'split',
-          },
-          { isUserEdit: true }
-        )
-      } else {
-        const leftResp = await transcriptionApi.createSubtitle(jobId, {
-          text: leftSubtitle.text,
-          start: leftSubtitle.start,
-          end: leftSubtitle.end,
-        })
-        const leftData = leftResp?.data?.data || leftResp?.data
-        if (leftData?.index !== undefined) {
+      if (jobId) {
+        if (originalSentenceIndex !== undefined) {
+          await transcriptionApi.updateSubtitle(jobId, originalSentenceIndex, {
+            text: leftSubtitle.text,
+            start: projectStore.toBaseTime(leftSubtitle.start),
+            end: projectStore.toBaseTime(leftSubtitle.end),
+          })
           projectStore.updateSubtitle(
             leftSubtitle.id,
             {
-              sentenceIndex: leftData.index,
+              sentenceIndex: originalSentenceIndex,
               isModified: true,
-              source: leftData.source || 'manual',
+              source: 'split',
+            },
+            { isUserEdit: true }
+          )
+        } else {
+          const leftResp = await transcriptionApi.createSubtitle(jobId, {
+            text: leftSubtitle.text,
+            start: projectStore.toBaseTime(leftSubtitle.start),
+            end: projectStore.toBaseTime(leftSubtitle.end),
+          })
+          const leftData = leftResp?.data?.data || leftResp?.data
+          if (leftData?.index !== undefined) {
+            projectStore.updateSubtitle(
+              leftSubtitle.id,
+              {
+                sentenceIndex: leftData.index,
+                isModified: true,
+                source: leftData.source || 'manual',
+              },
+              { isUserEdit: true }
+            )
+          }
+        }
+
+        const rightResp = await transcriptionApi.createSubtitle(jobId, {
+          text: rightSubtitle.text,
+          start: projectStore.toBaseTime(rightSubtitle.start),
+          end: projectStore.toBaseTime(rightSubtitle.end),
+        })
+        const rightData = rightResp?.data?.data || rightResp?.data
+        if (rightData?.index !== undefined) {
+          projectStore.updateSubtitle(
+            rightSubtitle.id,
+            {
+              sentenceIndex: rightData.index,
+              isModified: true,
+              source: rightData.source || 'manual',
             },
             { isUserEdit: true }
           )
         }
-      }
+      } else {
+        const leftSegmentId = leftSubtitle.segment_id
+        if (leftSegmentId) {
+          const updatedLeft = await projectApi.updateSubtitle(projectId, leftSegmentId, {
+            text: leftSubtitle.text,
+            start: projectStore.toBaseTime(leftSubtitle.start),
+            end: projectStore.toBaseTime(leftSubtitle.end),
+          })
+          projectStore.updateSubtitle(
+            leftSubtitle.id,
+            {
+              sentenceIndex: updatedLeft?.legacy_index ?? leftSubtitle.sentenceIndex,
+              segment_id: updatedLeft?.segment_id ?? leftSegmentId,
+              isModified: true,
+              source: updatedLeft?.source_type || 'split',
+            },
+            { isUserEdit: true }
+          )
+        }
 
-      const rightResp = await transcriptionApi.createSubtitle(jobId, {
-        text: rightSubtitle.text,
-        start: rightSubtitle.start,
-        end: rightSubtitle.end,
-      })
-      const rightData = rightResp?.data?.data || rightResp?.data
-      if (rightData?.index !== undefined) {
+        const rightData = await projectApi.createSubtitle(projectId, {
+          text: rightSubtitle.text,
+          start: projectStore.toBaseTime(rightSubtitle.start),
+          end: projectStore.toBaseTime(rightSubtitle.end),
+        })
         projectStore.updateSubtitle(
           rightSubtitle.id,
           {
-            sentenceIndex: rightData.index,
+            sentenceIndex: rightData?.legacy_index ?? rightSubtitle.sentenceIndex,
+            segment_id: rightData?.segment_id ?? rightSubtitle.segment_id,
             isModified: true,
-            source: rightData.source || 'manual',
+            source: rightData?.source_type || 'manual',
           },
           { isUserEdit: true }
         )

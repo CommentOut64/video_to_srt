@@ -40,6 +40,7 @@ function createPlaybackManager() {
 
   // WaveSurfer 实例引用（由 WaveformTimeline 注册）
   let wavesurferInstance = null;
+  let waveSurferHandlers = null;
 
   // 锁状态
   let isSeekingInternal = false;
@@ -52,6 +53,7 @@ function createPlaybackManager() {
   // 定时器
   let seekLockTimer = null;
   let timeUpdateTimer = null;
+  let lastWaveSurferSyncAt = 0;
 
   // Store 引用（延迟获取，避免循环依赖）
   let _store = null;
@@ -70,6 +72,14 @@ function createPlaybackManager() {
    */
   function registerVideo(video) {
     if (videoElement === video) return;
+
+    if (videoElement) {
+      videoElement.removeEventListener("timeupdate", handleVideoTimeUpdate);
+      videoElement.removeEventListener("seeking", handleVideoSeeking);
+      videoElement.removeEventListener("seeked", handleVideoSeeked);
+      videoElement.removeEventListener("play", handleVideoPlay);
+      videoElement.removeEventListener("pause", handleVideoPause);
+    }
 
     videoElement = video;
 
@@ -102,13 +112,35 @@ function createPlaybackManager() {
    * @param {WaveSurfer} ws - WaveSurfer 实例
    */
   function registerWaveSurfer(ws) {
+    if (wavesurferInstance === ws) return;
+    unregisterWaveSurfer();
     wavesurferInstance = ws;
+    if (!wavesurferInstance?.on) return;
+
+    waveSurferHandlers = {
+      timeupdate: (currentTime) => handleWaveSurferTimeUpdate(currentTime),
+      play: () => handleWaveSurferPlay(),
+      pause: () => handleWaveSurferPause(),
+      finish: () => handleWaveSurferFinish(),
+    };
+
+    wavesurferInstance.on("timeupdate", waveSurferHandlers.timeupdate);
+    wavesurferInstance.on("play", waveSurferHandlers.play);
+    wavesurferInstance.on("pause", waveSurferHandlers.pause);
+    wavesurferInstance.on("finish", waveSurferHandlers.finish);
   }
 
   /**
    * 注销 WaveSurfer 实例
    */
   function unregisterWaveSurfer() {
+    if (wavesurferInstance && waveSurferHandlers) {
+      wavesurferInstance.un?.("timeupdate", waveSurferHandlers.timeupdate);
+      wavesurferInstance.un?.("play", waveSurferHandlers.play);
+      wavesurferInstance.un?.("pause", waveSurferHandlers.pause);
+      wavesurferInstance.un?.("finish", waveSurferHandlers.finish);
+    }
+    waveSurferHandlers = null;
     wavesurferInstance = null;
   }
 
@@ -185,6 +217,47 @@ function createPlaybackManager() {
   // ============ 核心操作 ============
 
   /**
+   * 解析可用时长（优先使用 store，缺失时回退 video/wavesurfer）
+   * 纯音频模式下，store.duration 可能在视频元数据缺失时为 0，需要兜底。
+   */
+  function resolveDuration(store) {
+    let duration = Number(store.meta.duration) || 0;
+
+    if (videoElement && Number.isFinite(videoElement.duration) && videoElement.duration > 0) {
+      duration = Math.max(duration, videoElement.duration);
+    }
+
+    if (wavesurferInstance) {
+      try {
+        const wsDuration = Number(wavesurferInstance.getDuration()) || 0;
+        if (wsDuration > 0) {
+          duration = Math.max(duration, wsDuration);
+        }
+      } catch {
+        // WaveSurfer 可能尚未就绪，忽略
+      }
+    }
+
+    if (duration > 0 && Math.abs((Number(store.meta.duration) || 0) - duration) > 0.01) {
+      store.meta.duration = duration;
+    }
+
+    return duration;
+  }
+
+  /**
+   * 当前是否存在可用的视频时钟源
+   */
+  function hasVideoClockAvailable() {
+    const domSrc = videoElement?.getAttribute?.("src");
+    return Boolean(
+      videoElement &&
+      domSrc &&
+      !videoElement.error
+    );
+  }
+
+  /**
    * 跳转到指定时间（核心方法）
    * 这是唯一应该直接修改播放时间的入口
    *
@@ -195,10 +268,12 @@ function createPlaybackManager() {
   function seekTo(time, options = {}) {
     const { fromDrag = false } = options;
     const store = getStore();
-    const duration = store.meta.duration || 0;
+    const duration = resolveDuration(store);
 
     // 确保时间在有效范围内
-    const clampedTime = Math.max(0, Math.min(duration, time));
+    const clampedTime = duration > 0
+      ? Math.max(0, Math.min(duration, time))
+      : Math.max(0, time);
 
     // 如果不是拖拽操作，获取锁
     if (!fromDrag && !isLocked()) {
@@ -356,6 +431,37 @@ function createPlaybackManager() {
   }
 
   /**
+   * 处理 WaveSurfer 的 timeupdate（仅在无视频时钟时生效）
+   */
+  function handleWaveSurferTimeUpdate(currentTime) {
+    if (hasVideoClockAvailable()) {
+      return;
+    }
+
+    if (!Number.isFinite(currentTime)) {
+      return;
+    }
+
+    if (isLocked() || isInProtectionPeriod()) {
+      return;
+    }
+
+    const now = Date.now();
+    // WaveSurfer 在播放中高频触发 timeupdate，使用节流避免持续重置定时器导致“仅暂停时更新”。
+    if (now - lastWaveSurferSyncAt < CONFIG.DEBOUNCE_DELAY) {
+      return;
+    }
+    lastWaveSurferSyncAt = now;
+
+    const store = getStore();
+    const diff = Math.abs(currentTime - store.player.currentTime);
+    if (diff > CONFIG.SYNC_THRESHOLD) {
+      store.player.currentTime = currentTime;
+    }
+    resolveDuration(store);
+  }
+
+  /**
    * 处理 Video 的 seeking 事件
    */
   function handleVideoSeeking() {
@@ -380,6 +486,19 @@ function createPlaybackManager() {
   }
 
   /**
+   * 处理 WaveSurfer 的 play（仅在无视频时钟时生效）
+   */
+  function handleWaveSurferPlay() {
+    if (hasVideoClockAvailable()) {
+      return;
+    }
+    const store = getStore();
+    if (!store.player.isPlaying) {
+      store.player.isPlaying = true;
+    }
+  }
+
+  /**
    * 处理 Video 的 pause 事件
    */
   function handleVideoPause() {
@@ -387,6 +506,30 @@ function createPlaybackManager() {
     if (store.player.isPlaying) {
       store.player.isPlaying = false;
     }
+  }
+
+  /**
+   * 处理 WaveSurfer 的 pause（仅在无视频时钟时生效）
+   */
+  function handleWaveSurferPause() {
+    if (hasVideoClockAvailable()) {
+      return;
+    }
+    const store = getStore();
+    if (store.player.isPlaying) {
+      store.player.isPlaying = false;
+    }
+  }
+
+  /**
+   * 处理 WaveSurfer 的 finish（仅在无视频时钟时生效）
+   */
+  function handleWaveSurferFinish() {
+    if (hasVideoClockAvailable()) {
+      return;
+    }
+    const store = getStore();
+    store.player.isPlaying = false;
   }
 
   // ============ 清理 ============
@@ -400,6 +543,7 @@ function createPlaybackManager() {
       clearTimeout(timeUpdateTimer);
       timeUpdateTimer = null;
     }
+    lastWaveSurferSyncAt = 0;
   }
 
   // ============ 公共 API ============

@@ -8,9 +8,10 @@
  * 4. 提供统一的 isReady 状态
  * 5. 控件操作拦截支持
  */
-import { ref, computed, watch, onMounted, onUnmounted, toRef, isRef } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, isRef } from 'vue'
 import { sseChannelManager } from '@/services/sseChannelManager'
 import { mediaApi } from '@/services/api'
+import { IS_LITE } from '@/config/flavor'
 
 /**
  * Proxy 视频状态枚举
@@ -73,6 +74,9 @@ export function useProxyVideo(jobIdInput) {
    * 视频是否就绪（可以播放）
    */
   const isReady = computed(() => {
+    if (IS_LITE && !jobId.value) {
+      return true
+    }
     return [
       ProxyState.READY_360P,
       ProxyState.READY_720P,

@@ -4,7 +4,7 @@
  * 职责：上层拖拽、指针守护、PlaybackManager 联动
  * 提取自 WaveformTimeline/index.vue L1009-1389
  */
-import { ref } from 'vue'
+import { ref, computed } from 'vue'
 import { ZOOM_BASE_PX_PER_SEC } from './useWaveformZoom.js'
 
 /**
@@ -14,7 +14,7 @@ import { ZOOM_BASE_PX_PER_SEC } from './useWaveformZoom.js'
  * @param {object} playbackManager - PlaybackManager 实例
  * @param {object} projectStore - Pinia store
  * @param {Ref<boolean>} isReady - 波形是否就绪
- * @param {Ref<boolean>} isVideoReady - 视频是否就绪
+ * @param {Ref<boolean>} isMediaReady - 媒体是否就绪（音频或视频可用）
  * @param {Function} emit - 事件发射函数
  */
 export function useWaveformCursorDrag(
@@ -23,7 +23,7 @@ export function useWaveformCursorDrag(
   playbackManager,
   projectStore,
   isReady,
-  isVideoReady,
+  isMediaReady,
   emit
 ) {
   // ============ 状态 ============
@@ -31,6 +31,7 @@ export function useWaveformCursorDrag(
   const isDraggingCursor = ref(false)
   const isRegionPointerDragging = ref(false)
   const currentMouseCursor = ref('default')
+  const canEditTimeline = computed(() => isMediaReady.value)
 
   // ============ 私有状态 ============
   let cursorDragStartTime = 0
@@ -322,8 +323,8 @@ export function useWaveformCursorDrag(
     if (!ws || !isReady.value) return
     if (e.pointerType === 'mouse' && e.button !== 0) return
 
-    if (!isVideoReady.value) {
-      console.warn('[WaveformCursorDrag] 视频未就绪，波形操作被拦截')
+    if (!canEditTimeline.value) {
+      console.warn('[WaveformCursorDrag] 媒体未就绪，时间轴暂不可编辑')
       return
     }
 
@@ -413,6 +414,7 @@ export function useWaveformCursorDrag(
     isRegionPointerDragging,
     currentMouseCursor,
     cursorDragMode,
+    getTimeFromClientX,
     // 上半区域事件
     handleUpperZonePointerDown,
     handleUpperZonePointerMove,
