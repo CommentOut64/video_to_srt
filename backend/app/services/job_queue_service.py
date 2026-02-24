@@ -1320,7 +1320,10 @@ class JobQueueService:
             )
 
         # 初始化管理器
-        subtitle_manager = get_streaming_subtitle_manager(job.job_id)
+        subtitle_manager = get_streaming_subtitle_manager(
+            job.job_id,
+            project_id=getattr(job, "project_id", None),
+        )
         progress_tracker = get_progress_tracker(job.job_id, preset_id)
         sse_manager = get_sse_manager()
 
