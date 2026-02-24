@@ -106,8 +106,8 @@ export function useSubtitleSync(identityRef) {
     return unref(identityRef) || projectStore.primaryId
   }
 
-  function hasJobContext() {
-    return Boolean(projectStore.meta.jobId)
+  function hasProjectContext() {
+    return Boolean(projectStore.meta.projectId)
   }
 
   function resolveProjectSegmentId(segmentOrIndex) {
@@ -148,14 +148,16 @@ export function useSubtitleSync(identityRef) {
 
     for (const [index, data] of batch) {
       try {
-        if (hasJobContext()) {
-          await transcriptionApi.updateSubtitle(projectStore.meta.jobId, index, data)
-        } else {
+        if (hasProjectContext()) {
           const segmentId = resolveProjectSegmentId(index)
           if (!segmentId) {
             throw new Error(`segment_id 不存在: ${index}`)
           }
           await projectApi.updateSubtitle(projectStore.meta.projectId, segmentId, data)
+        } else if (projectStore.meta.jobId) {
+          await transcriptionApi.updateSubtitle(projectStore.meta.jobId, index, data)
+        } else {
+          throw new Error('缺少可用的字幕同步上下文')
         }
 
         // 成功后清除错误记录
@@ -165,7 +167,6 @@ export function useSubtitleSync(identityRef) {
       } catch (error) {
         // V3.2.0+dev.20260124.01: 404 错误说明任务已完成或句子不存在，无需同步
         if (error.status === 404 || error.message?.includes('不存在')) {
-          console.log(`[useSubtitleSync] 句子 ${index} 不存在（任务可能已完成），跳过同步`)
           // 清除错误记录，不重试
           if (syncErrors.value.has(index)) {
             syncErrors.value.delete(index)
@@ -257,7 +258,7 @@ export function useSubtitleSync(identityRef) {
     }
   }
 
-  // 载入本地队列（基于 jobId）
+  // 载入本地队列（基于当前 identity）
   watch(
     () => getActiveIdentity(),
     async (identityId) => {
