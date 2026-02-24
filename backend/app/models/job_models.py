@@ -221,6 +221,8 @@ class JobSettings:
     # === 新版 1+3 预设配置 ===
     # 选择的宏预设 ID (fast/balanced/quality/custom)
     preset_id: str = "balanced"
+    # Task6: 任务模式（转录或纯编辑）
+    mode: str = "transcribe"  # transcribe | edit_only
 
     # 四个设置分组
     preprocessing: PreprocessingConfig = field(default_factory=PreprocessingConfig)
@@ -234,6 +236,7 @@ class JobSettings:
         return {
             # 新版配置
             "preset_id": self.preset_id,
+            "mode": self.mode,
             "preprocessing": {
                 "demucs_strategy": self.preprocessing.demucs_strategy,
                 "demucs_model": self.preprocessing.demucs_model,
@@ -363,6 +366,7 @@ class JobSettings:
         return cls(
             # 新版配置
             preset_id=data.get("preset_id", "balanced"),
+            mode=str(data.get("mode", "transcribe") or "transcribe"),
             preprocessing=PreprocessingConfig(
                 demucs_strategy=preprocessing_data.get("demucs_strategy", "auto"),
                 demucs_model=preprocessing_data.get("demucs_model", "htdemucs"),
@@ -522,6 +526,8 @@ class JobState:
     state_seq: int = 0  # 状态迁移序号，单调递增
     # V3.2.0+dev.20260130.10: 任务级字幕时间偏移（秒，None 表示使用全局默认）
     subtitle_time_offset: Optional[float] = None
+    # Task6: 对应的项目 ID（过渡期可为空）
+    project_id: Optional[str] = None
 
     # 媒体状态（用于编辑器，转录完成后更新）
     media_status: Optional[MediaStatus] = None
@@ -558,6 +564,7 @@ class JobState:
             "paused": self.paused,
             "settings": self.settings.to_dict(),
             "subtitle_time_offset": self.subtitle_time_offset,
+            "project_id": self.project_id,
             "updated_at": time.time(),
             "state_seq": int(self.state_seq or 0),
         }
@@ -601,6 +608,7 @@ class JobState:
             updatedAt=updated_at,
             state_seq=max(0, int(data.get("state_seq", 0) or 0)),
             subtitle_time_offset=data.get("subtitle_time_offset"),
+            project_id=data.get("project_id"),
         )
 
     def update_media_status(self, job_dir: str):
