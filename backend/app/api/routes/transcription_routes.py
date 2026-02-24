@@ -11,6 +11,7 @@ import uuid
 import shutil
 import time
 import logging
+from pathlib import Path
 from typing import Optional, List, Dict, Any, Literal, Set
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Request, Body
 from fastapi.responses import FileResponse, StreamingResponse
@@ -375,6 +376,54 @@ def create_transcription_router(
         if "task_config" in payload and isinstance(payload["task_config"], dict):
             return dict(payload["task_config"])
         return payload
+
+    def _resolve_legacy_project_bridge(job_id: str) -> Optional[Dict[str, Any]]:
+        """
+        解析旧任务桥接上下文。
+
+        返回 None 表示继续走原有 job_id 逻辑。
+        """
+        from app.services.legacy_projection_service import get_legacy_projection_service
+        from app.services.project_service import get_project_service
+        from app.services.subtitle_doc_service import get_subtitle_doc_service
+
+        legacy_service = get_legacy_projection_service()
+
+        # 正在内存中的任务优先按原链路处理，避免影响运行态转录。
+        running_job = transcription_service.get_job(job_id)
+        if running_job is not None and not legacy_service.is_legacy_job(job_id):
+            return None
+
+        try:
+            project_id, _ = legacy_service.resolve(job_id)
+        except FileNotFoundError:
+            return None
+        except Exception:
+            return None
+
+        project_service = get_project_service()
+        project_dir = project_service.get_project_dir(project_id)
+        if project_dir is None:
+            return None
+
+        return {
+            "project_id": project_id,
+            "project_dir": project_dir,
+            "subtitle_doc_service": get_subtitle_doc_service(),
+        }
+
+    def _find_segment_id_by_legacy_index(project_dir: Path, sentence_index: int) -> Optional[str]:
+        from app.services.subtitle_doc_service import get_subtitle_doc_service
+
+        subtitle_doc_service = get_subtitle_doc_service()
+        segments = subtitle_doc_service.load_segments(project_dir)
+        for segment in segments:
+            legacy_index = segment.get("legacy_index")
+            if legacy_index is None:
+                continue
+            if int(legacy_index) == int(sentence_index):
+                return str(segment.get("segment_id"))
+        return None
 
     def _build_job_settings_from_task_config(task_config: Optional[Dict[str, Any]]) -> JobSettings:
         """根据 task_config 生成 JobSettings。"""
@@ -1310,6 +1359,58 @@ def create_transcription_router(
         from app.services.streaming_subtitle import get_streaming_subtitle_manager_if_exists
         from app.services.subtitle_edit_store import create_manual_entry
 
+        bridge_ctx = _resolve_legacy_project_bridge(job_id)
+        if bridge_ctx is not None:
+            if payload.start < 0 or payload.end <= payload.start:
+                raise HTTPException(status_code=400, detail="时间戳不合法")
+
+            subtitle_doc_service = bridge_ctx["subtitle_doc_service"]
+            project_dir = bridge_ctx["project_dir"]
+            project_id = bridge_ctx["project_id"]
+            segment = subtitle_doc_service.create_segment(
+                project_dir=project_dir,
+                text=payload.text or "",
+                start=payload.start,
+                end=payload.end,
+            )
+            legacy_index = int(segment.get("legacy_index", -1))
+            sentence_payload = {
+                "index": legacy_index,
+                "text": segment.get("text", ""),
+                "start": segment.get("start", 0.0),
+                "end": segment.get("end", 0.0),
+                "confidence": None,
+                "display_confidence": None,
+                "confidence_source": "manual",
+                "source": "manual",
+                "is_modified": True,
+                "original_text": segment.get("original_text"),
+                "segment_id": segment.get("segment_id"),
+            }
+            sse_manager = get_sse_manager()
+            push_subtitle_event(
+                sse_manager,
+                job_id,
+                "added",
+                {
+                    "index": legacy_index,
+                    "sentence": sentence_payload,
+                    "source": "user_add",
+                    "is_update": True
+                }
+            )
+            sse_manager.broadcast_sync(
+                f"project:{project_id}",
+                "subtitle.added",
+                {
+                    "segment_id": segment.get("segment_id"),
+                    "segment": segment,
+                    "source": "user_add",
+                    "is_update": True,
+                },
+            )
+            return {"success": True, "data": sentence_payload}
+
         job = transcription_service.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="任务未找到")
@@ -1393,6 +1494,70 @@ def create_transcription_router(
             persist_snapshot,
             save_edit
         )
+
+        bridge_ctx = _resolve_legacy_project_bridge(job_id)
+        if bridge_ctx is not None:
+            update_payload = update.dict(exclude_none=True)
+            if not update_payload:
+                raise HTTPException(status_code=400, detail="更新内容为空")
+            if (
+                update_payload.get("start") is not None
+                and update_payload.get("end") is not None
+                and float(update_payload["end"]) < float(update_payload["start"])
+            ):
+                raise HTTPException(status_code=400, detail="结束时间必须大于等于开始时间")
+
+            project_dir = bridge_ctx["project_dir"]
+            project_id = bridge_ctx["project_id"]
+            subtitle_doc_service = bridge_ctx["subtitle_doc_service"]
+            segment_id = _find_segment_id_by_legacy_index(project_dir, sentence_index)
+            if segment_id is None:
+                raise HTTPException(status_code=404, detail=f"句子索引 {sentence_index} 不存在")
+
+            is_success = subtitle_doc_service.update_segment(
+                project_dir=project_dir,
+                segment_id=segment_id,
+                update=update_payload,
+            )
+            if not is_success:
+                raise HTTPException(status_code=404, detail=f"句子索引 {sentence_index} 不存在")
+            segment = subtitle_doc_service.get_segment(project_dir, segment_id)
+            if segment is None:
+                raise HTTPException(status_code=404, detail=f"句子索引 {sentence_index} 不存在")
+
+            sentence_payload = {
+                "index": int(segment.get("legacy_index", sentence_index)),
+                "text": segment.get("text", ""),
+                "start": segment.get("start", 0.0),
+                "end": segment.get("end", 0.0),
+                "is_modified": True,
+                "original_text": segment.get("original_text"),
+                "segment_id": segment.get("segment_id"),
+            }
+
+            sse_manager = get_sse_manager()
+            push_subtitle_event(
+                sse_manager,
+                job_id,
+                "edited",
+                {
+                    "index": sentence_payload["index"],
+                    "sentence": sentence_payload,
+                    "source": "user_edit",
+                    "is_update": True
+                }
+            )
+            sse_manager.broadcast_sync(
+                f"project:{project_id}",
+                "subtitle.edited",
+                {
+                    "segment_id": segment.get("segment_id"),
+                    "segment": segment,
+                    "source": "user_edit",
+                    "is_update": True,
+                },
+            )
+            return {"success": True, "data": sentence_payload}
 
         job = transcription_service.get_job(job_id)
         if not job:
@@ -1553,6 +1718,41 @@ def create_transcription_router(
         from app.services.sse_service import get_sse_manager, push_subtitle_event
         from app.services.streaming_subtitle import get_streaming_subtitle_manager_if_exists
         from app.services.subtitle_edit_store import add_deletion
+
+        bridge_ctx = _resolve_legacy_project_bridge(job_id)
+        if bridge_ctx is not None:
+            project_dir = bridge_ctx["project_dir"]
+            project_id = bridge_ctx["project_id"]
+            subtitle_doc_service = bridge_ctx["subtitle_doc_service"]
+            segment_id = _find_segment_id_by_legacy_index(project_dir, sentence_index)
+            if segment_id is None:
+                raise HTTPException(status_code=404, detail=f"句子索引 {sentence_index} 不存在")
+
+            is_success = subtitle_doc_service.delete_segment(project_dir, segment_id)
+            if not is_success:
+                raise HTTPException(status_code=404, detail=f"句子索引 {sentence_index} 不存在")
+
+            sse_manager = get_sse_manager()
+            push_subtitle_event(
+                sse_manager,
+                job_id,
+                "deleted",
+                {
+                    "index": sentence_index,
+                    "source": "user_delete",
+                    "is_update": True
+                }
+            )
+            sse_manager.broadcast_sync(
+                f"project:{project_id}",
+                "subtitle.deleted",
+                {
+                    "segment_id": segment_id,
+                    "source": "user_delete",
+                    "is_update": True,
+                },
+            )
+            return {"success": True, "data": {"index": sentence_index, "is_deleted": True}}
 
         job = transcription_service.get_job(job_id)
         if not job:

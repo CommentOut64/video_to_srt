@@ -55,6 +55,54 @@ def _find_video_file(job_dir: Path) -> Optional[Path]:
     return None
 
 
+def _resolve_media_dir(identifier: str) -> Path:
+    """
+    统一解析媒体目录。
+
+    identifier 可以是：
+    - job_id（目录直达）
+    - project_id（通过 project_meta 反查目录）
+    - legacy job_id（通过 legacy_projection 映射到 project）
+    """
+    normalized_identifier = str(identifier or "").strip()
+    if not normalized_identifier:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    direct_path = config.JOBS_DIR / normalized_identifier
+    if direct_path.exists():
+        return direct_path
+
+    # 尝试按 project_id 查找
+    try:
+        from app.services.project_service import get_project_service
+
+        project_service = get_project_service()
+        project = project_service.get_project(normalized_identifier)
+        if project and project.dir:
+            project_dir = Path(project.dir)
+            if project_dir.exists():
+                return project_dir
+    except Exception:
+        pass
+
+    # 尝试按 legacy job_id 映射
+    try:
+        from app.services.legacy_projection_service import get_legacy_projection_service
+        from app.services.project_service import get_project_service
+
+        legacy_service = get_legacy_projection_service()
+        project_id, _ = legacy_service.resolve(normalized_identifier)
+        project = get_project_service().get_project(project_id)
+        if project and project.dir:
+            project_dir = Path(project.dir)
+            if project_dir.exists():
+                return project_dir
+    except Exception:
+        pass
+
+    raise HTTPException(status_code=404, detail="任务不存在")
+
+
 def _find_best_h264(job_dir: Path):
     """
     V3.1.2+dev.20260114.21: 查找目录下最高分辨率且视频编码为 h264 的文件
@@ -668,7 +716,7 @@ async def get_video(job_id: str, request: Request):
     优先返回Proxy视频（如果存在），否则返回源视频
     对于不兼容的格式或编码（如HEVC/H.265），会触发异步生成Proxy
     """
-    job_dir = config.JOBS_DIR / job_id
+    job_dir = _resolve_media_dir(job_id)
     logger.debug(f"[media] 收到视频请求: {job_id}")
 
     if not job_dir.exists():
@@ -805,7 +853,7 @@ async def get_video(job_id: str, request: Request):
 @router.get("/{job_id}/audio")
 async def get_audio(job_id: str, request: Request):
     """获取音频文件（支持Range请求）"""
-    job_dir = config.JOBS_DIR / job_id
+    job_dir = _resolve_media_dir(job_id)
     audio_file = job_dir / "audio.wav"
 
     if not audio_file.exists():
@@ -827,7 +875,7 @@ async def get_audio_peaks(job_id: str, samples: int = 0, method: str = "auto"):
     Returns:
         JSON: { peaks: [min, max, min, max, ...], duration: 180.5, method: "ffmpeg" }
     """
-    job_dir = config.JOBS_DIR / job_id
+    job_dir = _resolve_media_dir(job_id)
     audio_file = job_dir / "audio.wav"
 
     # 【关键修改】获取音频时长，动态计算采样点
@@ -942,7 +990,7 @@ async def check_proxy_status(job_id: str):
             "estimated_remaining": null
         }
     """
-    job_dir = config.JOBS_DIR / job_id
+    job_dir = _resolve_media_dir(job_id)
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
 
@@ -1105,7 +1153,7 @@ async def get_thumbnail(job_id: str):
     Returns:
         Base64编码的缩略图 or JSON占位符
     """
-    job_dir = config.JOBS_DIR / job_id
+    job_dir = _resolve_media_dir(job_id)
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
 
@@ -1214,7 +1262,7 @@ async def get_thumbnails(job_id: str, count: int = 10, sprite: bool = True):
         - sprite=True: { sprite, thumb_width, thumb_height, cols, rows, timestamps }
         - sprite=False: { thumbnails: [base64_img1, ...], timestamps: [...] }
     """
-    job_dir = config.JOBS_DIR / job_id
+    job_dir = _resolve_media_dir(job_id)
 
     # 检查Sprite缓存
     sprite_cache = job_dir / f"sprite_{count}.json"
@@ -1326,7 +1374,7 @@ async def get_thumbnails(job_id: str, count: int = 10, sprite: bool = True):
 @router.get("/{job_id}/sprite.jpg")
 async def get_sprite_image(job_id: str):
     """直接获取Sprite图片文件"""
-    job_dir = config.JOBS_DIR / job_id
+    job_dir = _resolve_media_dir(job_id)
     sprite_file = job_dir / "sprite.jpg"
 
     if not sprite_file.exists():
@@ -1342,7 +1390,7 @@ async def get_preview_video(job_id: str, request: Request):
 
     用于在转码过程中快速预览视频内容
     """
-    job_dir = config.JOBS_DIR / job_id
+    job_dir = _resolve_media_dir(job_id)
 
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -1378,7 +1426,7 @@ async def get_progressive_status(job_id: str):
     - 720p 高质量进度/状态
     - 可用的视频 URL
     """
-    job_dir = config.JOBS_DIR / job_id
+    job_dir = _resolve_media_dir(job_id)
 
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -1496,7 +1544,7 @@ async def trigger_preview_generation(job_id: str):
 
     在某些情况下，可能需要手动触发预览生成
     """
-    job_dir = config.JOBS_DIR / job_id
+    job_dir = _resolve_media_dir(job_id)
 
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -1542,7 +1590,7 @@ async def post_process_transcription(job_id: str):
     Returns:
         JSON: { peaks: bool, thumbnails: bool, proxy: bool, sprite: bool }
     """
-    job_dir = config.JOBS_DIR / job_id
+    job_dir = _resolve_media_dir(job_id)
 
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -1599,7 +1647,7 @@ async def get_srt_content(job_id: str):
     Returns:
         JSON: { job_id, filename, content, encoding }
     """
-    job_dir = config.JOBS_DIR / job_id
+    job_dir = _resolve_media_dir(job_id)
 
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -1639,7 +1687,7 @@ async def save_srt_content(job_id: str, request: Request):
             auto_repair: true  // 可选，默认 true，是否自动修复重叠
         }
     """
-    job_dir = config.JOBS_DIR / job_id
+    job_dir = _resolve_media_dir(job_id)
 
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -1708,7 +1756,7 @@ async def get_ass_content(job_id: str):
     Returns:
         JSON: { job_id, filename, content, encoding }
     """
-    job_dir = config.JOBS_DIR / job_id
+    job_dir = _resolve_media_dir(job_id)
 
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -1754,7 +1802,7 @@ async def generate_ass_from_srt(job_id: str, request: Request):
     Returns:
         JSON: { job_id, filename, message, repaired_overlaps? }
     """
-    job_dir = config.JOBS_DIR / job_id
+    job_dir = _resolve_media_dir(job_id)
 
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -1837,7 +1885,7 @@ async def get_media_info(job_id: str, retry_missing: bool = True):
     Returns:
         JSON: 包含视频、音频、SRT等文件的可用状态
     """
-    job_dir = config.JOBS_DIR / job_id
+    job_dir = _resolve_media_dir(job_id)
 
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -1940,7 +1988,7 @@ async def _auto_generate_peaks(job_id: str, audio_file: Path, peaks_cache: Path)
     """自动生成波形数据（后台任务）- 使用动态采样"""
     try:
         # 获取视频时长以计算动态采样点数
-        job_dir = config.JOBS_DIR / job_id
+        job_dir = _resolve_media_dir(job_id)
         video_file = _find_video_file(job_dir)
         duration = 0.0
 
@@ -2070,7 +2118,7 @@ async def upgrade_to_720p(job_id: str):
                 status_code=400
             )
 
-        job_dir = config.JOBS_DIR / job_id
+        job_dir = _resolve_media_dir(job_id)
         if not job_dir.exists():
             return JSONResponse(
                 content={
