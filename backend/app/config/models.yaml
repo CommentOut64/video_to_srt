@@ -136,6 +136,17 @@
     pip: ["pyannote.audio==3.1.1", "torch==2.1.2"]
   resources: {vram_mb: 1000}
 
+- id: dnsmos-quality
+  kind: quality
+  framework: onnx
+  format: onnx
+  default_device: cpu
+  compute_type: fp32
+  source:
+    local_path: backend/models/pretrained/dnsmos
+    files: [sig_bak_ovr.onnx, model_v8.onnx]
+  resources: {cpu_threads: 2, vram_mb: 0}
+
 - id: demucs-htdemucs
   kind: separation
   framework: demucs

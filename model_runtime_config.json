@@ -18,6 +18,27 @@
       "enabled": true,
       "diarization_enabled": true,
       "diarization_model_id": "pyannote-speaker-diarization-community-1"
+    },
+    "dnsmos": {
+      "device": "cpu",
+      "personalized": false,
+      "ovrl_sep_hard": 2.0960908371247604,
+      "sig_sep_hard": 2.554166010717122,
+      "p808_sep_hard": 1.7823731696905278,
+      "ovrl_pass_hard": 2.3441922433760665,
+      "sig_pass_hard": 2.7914833247808972,
+      "bak_pass_hard": 1.8809400945693762,
+      "p808_pass_soft": 3.235022853899088
+    },
+    "smart_probe": {
+      "probe_sep_ratio_min": 0.26795501889788964,
+      "probe_min_coverage": 0.36689124315485816,
+      "probe_max_step_chunks": 30
+    },
+    "yamnet": {
+      "yamnet_music_conf_min": 0.15,
+      "yamnet_speech_conf_min": 0.85,
+      "yamnet_music_weak_max": 0.1
     }
   },
   "per_model": {},
