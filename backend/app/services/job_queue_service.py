@@ -630,8 +630,16 @@ class JobQueueService:
                 logger.info("[Lifecycle] 取消请求释放运行槽位: %s", job_id)
 
             if delete_data:
-                if job.status not in ("canceled", "removed"):
-                    if not self._transition_job_status(job, "canceled", "delete_request_cancel"):
+                can_direct_remove = (
+                    job.status != "removed"
+                    and (
+                        not STATE_MACHINE_GUARD_ENABLED
+                        or self.state_guard.validate_transition(job.status, "removed")
+                    )
+                )
+
+                if can_direct_remove:
+                    if not self._transition_job_status(job, "removed", "delete_request_remove_direct"):
                         return CancelResult(
                             success=False,
                             status=job.status,
@@ -640,16 +648,27 @@ class JobQueueService:
                             pending_delete=False,
                             state_seq=int(job.state_seq or 0),
                         )
-                if job.status != "removed":
-                    if not self._transition_job_status(job, "removed", "delete_request_remove"):
-                        return CancelResult(
-                            success=False,
-                            status=job.status,
-                            reason_code="delete_failed",
-                            message="状态迁移被拒绝",
-                            pending_delete=False,
-                            state_seq=int(job.state_seq or 0),
-                        )
+                else:
+                    if job.status not in ("canceled", "removed"):
+                        if not self._transition_job_status(job, "canceled", "delete_request_cancel"):
+                            return CancelResult(
+                                success=False,
+                                status=job.status,
+                                reason_code="delete_failed",
+                                message="状态迁移被拒绝",
+                                pending_delete=False,
+                                state_seq=int(job.state_seq or 0),
+                            )
+                    if job.status != "removed":
+                        if not self._transition_job_status(job, "removed", "delete_request_remove"):
+                            return CancelResult(
+                                success=False,
+                                status=job.status,
+                                reason_code="delete_failed",
+                                message="状态迁移被拒绝",
+                                pending_delete=False,
+                                state_seq=int(job.state_seq or 0),
+                            )
                 job.message = "任务已删除（后台清理中）"
                 self._logically_removed_jobs.add(job_id)
                 self._enqueue_physical_delete_locked(job)
