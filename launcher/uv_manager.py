@@ -11,11 +11,12 @@ V3.2.0+dev.20260209.01
 """
 
 import os
+import json
 import subprocess
 import shutil
 import logging
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 from dataclasses import dataclass
 
 logger = logging.getLogger("launcher.uv")
@@ -27,6 +28,17 @@ class UvResult:
     success: bool
     message: str
     needs_sync: bool = False
+
+
+@dataclass
+class OnnxRuntimeProviderStatus:
+    """ONNX Runtime 提供者状态快照。"""
+
+    is_ort_available: bool
+    is_cuda_provider_available: bool
+    ort_version: str
+    providers: Tuple[str, ...]
+    error_message: str = ""
 
 
 class UvManager:
@@ -251,6 +263,233 @@ class UvManager:
 
         except Exception as e:
             return UvResult(success=False, message=f"创建虚拟环境异常: {e}")
+
+    def _build_python_runtime_env(self, site_packages: Optional[Path]) -> Dict[str, str]:
+        """
+        构建运行 Python 探针脚本时的环境变量。
+
+        设计考虑：
+        - 优先将 `.venv/Lib/site-packages/torch/lib` 注入 PATH，减少 Windows 下 DLL 搜索歧义。
+        - 保持与启动器主流程一致，仅做最小必要补充，不覆盖用户已有 PATH。
+        """
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+
+        if site_packages:
+            torch_lib = site_packages / "torch" / "lib"
+            if torch_lib.exists():
+                env["PATH"] = f"{torch_lib};{env.get('PATH', '')}"
+        return env
+
+    @staticmethod
+    def _extract_json_from_stdout(stdout_text: str) -> Dict[str, Any]:
+        """从 stdout 中提取最后一行 JSON。"""
+        for line in reversed(stdout_text.splitlines()):
+            text = line.strip()
+            if not text:
+                continue
+            if text.startswith("{") and text.endswith("}"):
+                return json.loads(text)
+        return {}
+
+    def _inspect_onnxruntime_provider_status(
+        self,
+        python_exec: Path,
+        site_packages: Optional[Path],
+    ) -> OnnxRuntimeProviderStatus:
+        """
+        检查当前环境 onnxruntime 的 Provider 状态。
+
+        返回值不抛异常，统一收敛为结构化状态，便于上层稳定决策。
+        """
+        probe_script = (
+            "import json\n"
+            "result = {\n"
+            "  'is_ort_available': False,\n"
+            "  'is_cuda_provider_available': False,\n"
+            "  'ort_version': '',\n"
+            "  'providers': [],\n"
+            "  'error_message': ''\n"
+            "}\n"
+            "try:\n"
+            "  import onnxruntime as ort\n"
+            "  providers = list(ort.get_available_providers())\n"
+            "  result['is_ort_available'] = True\n"
+            "  result['ort_version'] = getattr(ort, '__version__', '')\n"
+            "  result['providers'] = providers\n"
+            "  result['is_cuda_provider_available'] = 'CUDAExecutionProvider' in providers\n"
+            "except Exception as exc:\n"
+            "  result['error_message'] = str(exc)\n"
+            "print(json.dumps(result, ensure_ascii=False))\n"
+        )
+
+        try:
+            result = subprocess.run(
+                [str(python_exec), "-c", probe_script],
+                cwd=str(self.project_root),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                env=self._build_python_runtime_env(site_packages),
+            )
+        except Exception as exc:
+            return OnnxRuntimeProviderStatus(
+                is_ort_available=False,
+                is_cuda_provider_available=False,
+                ort_version="",
+                providers=(),
+                error_message=f"探针执行失败: {exc}",
+            )
+
+        payload = self._extract_json_from_stdout(result.stdout)
+        if not payload:
+            stderr_tail = "\n".join(result.stderr.splitlines()[-3:]) if result.stderr else ""
+            return OnnxRuntimeProviderStatus(
+                is_ort_available=False,
+                is_cuda_provider_available=False,
+                ort_version="",
+                providers=(),
+                error_message=f"探针输出不可解析(returncode={result.returncode}) {stderr_tail}".strip(),
+            )
+
+        providers_raw = payload.get("providers") or []
+        providers = tuple(str(item) for item in providers_raw)
+        return OnnxRuntimeProviderStatus(
+            is_ort_available=bool(payload.get("is_ort_available")),
+            is_cuda_provider_available=bool(payload.get("is_cuda_provider_available")),
+            ort_version=str(payload.get("ort_version") or ""),
+            providers=providers,
+            error_message=str(payload.get("error_message") or ""),
+        )
+
+    def _get_installed_distribution_version(
+        self,
+        python_exec: Path,
+        package_name: str,
+    ) -> Optional[str]:
+        """读取指定 distribution 的版本；未安装时返回 None。"""
+        script = (
+            "import importlib.metadata as md\n"
+            f"name = {package_name!r}\n"
+            "try:\n"
+            "  print(md.version(name))\n"
+            "except Exception:\n"
+            "  print('')\n"
+        )
+        try:
+            result = subprocess.run(
+                [str(python_exec), "-c", script],
+                cwd=str(self.project_root),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+            )
+        except Exception as exc:
+            logger.warning("读取包版本失败: package=%s error=%s", package_name, exc)
+            return None
+
+        version_text = result.stdout.strip()
+        return version_text or None
+
+    def _reinstall_onnxruntime_gpu(
+        self,
+        python_exec: Path,
+        package_version: str,
+    ) -> UvResult:
+        """使用 uv pip 对 onnxruntime-gpu 做无依赖强制重装。"""
+        if not self.is_available():
+            return UvResult(success=False, message="uv 不可用，无法执行 ORT-GPU 自动修正")
+
+        cmd = [
+            str(self.uv_exec),
+            "pip",
+            "install",
+            "--python",
+            str(python_exec),
+            "--force-reinstall",
+            "--no-deps",
+            f"onnxruntime-gpu=={package_version}",
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=str(self.project_root),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=180,
+            )
+        except Exception as exc:
+            return UvResult(success=False, message=f"执行 ORT-GPU 自动修正异常: {exc}")
+
+        if result.returncode == 0:
+            return UvResult(success=True, message=f"onnxruntime-gpu=={package_version} 重装完成")
+
+        err_tail = "\n".join(result.stdout.splitlines()[-8:])
+        if result.stderr:
+            err_tail = f"{err_tail}\n{result.stderr}".strip()
+        return UvResult(
+            success=False,
+            message=f"onnxruntime-gpu 重装失败(returncode={result.returncode}):\n{err_tail}",
+        )
+
+    def ensure_onnxruntime_gpu_runtime(
+        self,
+        python_exec: Path,
+        site_packages: Optional[Path],
+    ) -> UvResult:
+        """
+        确保运行时 `onnxruntime` 指向可用的 GPU Provider 版本。
+
+        设计取舍：
+        - 不尝试从依赖图移除 `onnxruntime`（上游包强依赖，风险高）。
+        - 采用“uv sync 后重装 onnxruntime-gpu（无依赖）+ provider 探针”稳定结果。
+        """
+        gpu_version = self._get_installed_distribution_version(python_exec, "onnxruntime-gpu")
+        if not gpu_version:
+            return UvResult(success=True, message="未检测到 onnxruntime-gpu，跳过自动修正")
+
+        status_before = self._inspect_onnxruntime_provider_status(python_exec, site_packages)
+        if status_before.is_cuda_provider_available:
+            providers = ",".join(status_before.providers)
+            return UvResult(
+                success=True,
+                message=f"ONNX Runtime CUDA Provider 已可用: version={status_before.ort_version} providers=[{providers}]",
+            )
+
+        logger.warning(
+            "检测到 ONNX Runtime CUDA Provider 不可用，开始自动修正: version=%s providers=%s error=%s",
+            status_before.ort_version or "unknown",
+            list(status_before.providers),
+            status_before.error_message,
+        )
+        reinstall_result = self._reinstall_onnxruntime_gpu(python_exec, gpu_version)
+        if not reinstall_result.success:
+            return reinstall_result
+
+        status_after = self._inspect_onnxruntime_provider_status(python_exec, site_packages)
+        providers_after = ",".join(status_after.providers)
+        if status_after.is_cuda_provider_available:
+            return UvResult(
+                success=True,
+                message=f"ONNX Runtime GPU 自动修正成功: version={status_after.ort_version} providers=[{providers_after}]",
+            )
+
+        return UvResult(
+            success=False,
+            message=(
+                "ONNX Runtime GPU 自动修正后仍无 CUDA Provider: "
+                f"version={status_after.ort_version or 'unknown'} "
+                f"providers=[{providers_after}] "
+                f"error={status_after.error_message}"
+            ),
+        )
 
 
 def fix_pytorch_dll(site_packages: Path):
