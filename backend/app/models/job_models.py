@@ -25,7 +25,7 @@ def resolve_default_whisper_model() -> str:
 @dataclass
 class PreprocessingConfig:
     """
-    预处理与音频配置 (Demucs 人声分离 + 频谱分诊 + 熔断回溯)
+    预处理与音频配置 (Demucs 人声分离 + 音频预检 + 熔断回溯)
     对应文档分组一
     """
     # ========== 人声分离配置 ==========
@@ -41,15 +41,19 @@ class PreprocessingConfig:
     # 分离模式: global/on_demand (新增)
     separation_mode: str = "on_demand"
 
-    # ========== 频谱分诊配置 ==========
-    # 是否启用频谱分诊 (新增)
+    # ========== 音频预检配置 ==========
+    # 是否启用音频预检 (新增)
     enable_spectral_triage: bool = True
 
     # 分诊灵敏度: 0.0-1.0 (默认从 spectrum_thresholds.py: 0.35)
     spectrum_threshold: float = 0.35
 
-    # V3.2.0+dev.20260212.01: 临时下线 Brouhaha，默认关闭 SNR+C50 三层决策策略
-    use_snr_triage: bool = False
+    # V3.2.4+dev.20260224.01: 默认启用 DNSMOS 音频预检主链
+    use_dnsmos_triage: bool = True
+    # V3.2.4+dev.20260225.01: 默认启用 DNSMOS 中心扩散探针快判
+    use_smart_probe: bool = True
+    # V3.2.4+dev.20260225.02: 默认启用 ASR 风险前置守卫（命中后强制全局分离）
+    enable_asr_risk_guard: bool = True
 
     # ========== 熔断回溯配置 (新增) ==========
     # 是否启用熔断回溯
@@ -241,7 +245,11 @@ class JobSettings:
                 "separation_mode": self.preprocessing.separation_mode,
                 "enable_spectral_triage": self.preprocessing.enable_spectral_triage,
                 "spectrum_threshold": self.preprocessing.spectrum_threshold,
-                "use_snr_triage": self.preprocessing.use_snr_triage,
+                "use_dnsmos_triage": self.preprocessing.use_dnsmos_triage,
+                "use_smart_probe": self.preprocessing.use_smart_probe,
+                "enable_asr_risk_guard": self.preprocessing.enable_asr_risk_guard,
+                # 兼容字段：保留旧键，避免历史前端/任务读取失败
+                "use_snr_triage": self.preprocessing.use_dnsmos_triage,
                 "enable_fuse_breaker": self.preprocessing.enable_fuse_breaker,
                 "fuse_max_retry": self.preprocessing.fuse_max_retry,
                 "fuse_confidence_threshold": self.preprocessing.fuse_confidence_threshold,
@@ -370,7 +378,14 @@ class JobSettings:
                 separation_mode=preprocessing_data.get("separation_mode", "on_demand"),
                 enable_spectral_triage=preprocessing_data.get("enable_spectral_triage", True),
                 spectrum_threshold=preprocessing_data.get("spectrum_threshold", 0.35),
-                use_snr_triage=preprocessing_data.get("use_snr_triage", False),
+                use_dnsmos_triage=bool(
+                    preprocessing_data.get(
+                        "use_dnsmos_triage",
+                        preprocessing_data.get("use_snr_triage", True),
+                    )
+                ),
+                use_smart_probe=bool(preprocessing_data.get("use_smart_probe", True)),
+                enable_asr_risk_guard=bool(preprocessing_data.get("enable_asr_risk_guard", True)),
                 enable_fuse_breaker=preprocessing_data.get("enable_fuse_breaker", True),
                 fuse_max_retry=preprocessing_data.get("fuse_max_retry", 2),
                 fuse_confidence_threshold=preprocessing_data.get("fuse_confidence_threshold", 0.5),
@@ -437,7 +452,9 @@ class JobSettings:
                 separation_mode=preset.preprocessing.separation_mode,
                 enable_spectral_triage=preset.preprocessing.enable_spectral_triage,
                 spectrum_threshold=preset.preprocessing.spectrum_threshold,
-                use_snr_triage=False,  # V3.2.0+dev.20260212.01: 临时下线 Brouhaha，默认走兜底分诊
+                use_dnsmos_triage=True,
+                use_smart_probe=True,
+                enable_asr_risk_guard=True,
                 vad_filter=preset.preprocessing.vad_filter,
                 enable_fuse_breaker=True,
                 fuse_max_retry=1,
