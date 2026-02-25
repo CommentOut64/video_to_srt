@@ -55,18 +55,28 @@ class YAMNetPreprocessor:
     def _ensure_librosa(self):
         """懒加载 librosa"""
         if self._librosa is None:
-            import librosa
-            self._librosa = librosa
-            # 预计算 Mel 滤波器组 (性能优化)
-            # YAMNet 原始训练用的 mel basis 是基于 htk=True 的
-            self._mel_basis = librosa.filters.mel(
-                sr=self.sr,
-                n_fft=self.n_fft,
-                n_mels=self.n_mels,
-                fmin=self.fmin,
-                fmax=self.fmax,
-                htk=True  # 关键：YAMNet 使用 HTK 公式
-            )
+            try:
+                import librosa  # type: ignore
+
+                # 某些损坏环境会出现空命名空间包，需要显式校验关键 API。
+                if not hasattr(librosa, "filters") or not hasattr(librosa, "stft"):
+                    raise ImportError("librosa 缺少 filters/stft 接口")
+                self._librosa = librosa
+                # 预计算 Mel 滤波器组 (性能优化)
+                # YAMNet 原始训练用的 mel basis 是基于 htk=True 的
+                self._mel_basis = librosa.filters.mel(
+                    sr=self.sr,
+                    n_fft=self.n_fft,
+                    n_mels=self.n_mels,
+                    fmin=self.fmin,
+                    fmax=self.fmax,
+                    htk=True  # 关键：YAMNet 使用 HTK 公式
+                )
+            except Exception as exc:
+                logger.warning("YAMNet 预处理不可用（librosa 异常）: %s", exc)
+                self._librosa = False
+        if self._librosa is False:
+            return None
         return self._librosa
 
     def preprocess(self, waveform: np.ndarray) -> np.ndarray:
@@ -77,6 +87,8 @@ class YAMNetPreprocessor:
         Output: (1, 1, 96, 64) float32 (适用于 ONNX 输入)
         """
         librosa = self._ensure_librosa()
+        if librosa is None:
+            raise RuntimeError("librosa 不可用，无法执行 YAMNet 预处理")
 
         # 1. 确保长度
         # YAMNet 标准输入窗口是 0.96秒 (15360 samples，对应 96 帧)
@@ -191,13 +203,9 @@ class YAMNetClassifier:
 
         # 类别名称映射 (懒加载)
         self._class_names: Optional[List[str]] = None
-        self._acappella_threshold = 0.3
-        self._music_max_threshold = 0.15
-        self._music_avg_threshold = 0.10
-        self._speech_max_threshold = 0.8
-        self._speech_max_music_threshold = 0.1
-        self._speech_dominant_delta = 0.3
-        self._speech_dominant_music_max = 0.15
+        self._yamnet_music_conf_min = 0.15
+        self._yamnet_speech_conf_min = 0.85
+        self._yamnet_music_weak_max = 0.10
         self._probe_window_count = 3
 
         self.apply_runtime_params()
@@ -207,18 +215,21 @@ class YAMNetClassifier:
     def apply_runtime_params(self) -> None:
         """应用运行参数配置。"""
         runtime = get_yamnet_runtime_params()
-        self._acappella_threshold = float(runtime.get("acappella_threshold", 0.3))
-        self._music_max_threshold = float(runtime.get("music_max_threshold", 0.15))
-        self._music_avg_threshold = float(runtime.get("music_avg_threshold", 0.10))
-        self._speech_max_threshold = float(runtime.get("speech_max_threshold", 0.8))
-        self._speech_max_music_threshold = float(runtime.get("speech_max_music_threshold", 0.1))
-        self._speech_dominant_delta = float(runtime.get("speech_dominant_delta", 0.3))
-        self._speech_dominant_music_max = float(runtime.get("speech_dominant_music_max", 0.15))
+        # 优先读取新参数，旧参数仅做兼容回退
+        self._yamnet_music_conf_min = float(
+            runtime.get("yamnet_music_conf_min", runtime.get("music_max_threshold", 0.15))
+        )
+        self._yamnet_speech_conf_min = float(
+            runtime.get("yamnet_speech_conf_min", runtime.get("speech_max_threshold", 0.85))
+        )
+        self._yamnet_music_weak_max = float(
+            runtime.get("yamnet_music_weak_max", runtime.get("speech_max_music_threshold", 0.10))
+        )
         self._probe_window_count = int(runtime.get("probe_window_count", 3))
         duration_sec = float(runtime.get("probe_window_duration_sec", 0.975))
         self.window_samples = max(1, int(self.sample_rate * duration_sec))
     def _init_model(self):
-        """初始化 ONNX 模型（GPU 优先，CPU 回退）"""
+        """初始化 ONNX 模型（固定 CPU 执行）"""
         try:
             import onnxruntime as ort
 
@@ -226,31 +237,17 @@ class YAMNetClassifier:
                 logger.warning(f"YAMNet model not found: {self.model_path}")
                 return
 
-            # 检测可用的 providers
-            available_providers = ort.get_available_providers()
+            # Why: YAMNet 仅作为 DNSMOS 灰区兜底，固定 CPU 可避免 CUDA DLL 依赖抖动影响主链稳定性。
+            sess_options = self._create_optimized_session_options()
+            self.session = ort.InferenceSession(
+                str(self.model_path),
+                providers=['CPUExecutionProvider'],
+                sess_options=sess_options
+            )
+            self._device = 'cpu'
 
-            # GPU 优先策略：CUDA > CPU
-            if 'CUDAExecutionProvider' in available_providers:
-                # GPU 模式：使用 CUDA
-                providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-                self.session = ort.InferenceSession(
-                    str(self.model_path),
-                    providers=providers
-                )
-                self._device = 'cuda'
-                logger.info(f"YAMNet 使用 GPU 推理 (CUDA)")
-            else:
-                # CPU 模式：使用优化的 SessionOptions
-                sess_options = self._create_optimized_session_options()
-                self.session = ort.InferenceSession(
-                    str(self.model_path),
-                    providers=['CPUExecutionProvider'],
-                    sess_options=sess_options
-                )
-                self._device = 'cpu'
-
-                # 设置 P-Core 亲和性（仅 CPU 模式需要）
-                self._setup_pcore_affinity()
+            # 仅 CPU 模式下设置亲和性，减少与主链推理线程争用。
+            self._setup_pcore_affinity()
 
             logger.info(f"Loaded YAMNet model from {self.model_path} (device={self._device})")
 
@@ -426,29 +423,34 @@ class YAMNetClassifier:
         all_scores = []
 
         for probe in probes:
-            # 预处理
-            mel_input = self.preprocessor.preprocess(probe)
+            try:
+                # 预处理
+                mel_input = self.preprocessor.preprocess(probe)
 
-            # 推理
-            scores = self._run_inference(mel_input)
-            all_scores.append(scores)
+                # 推理
+                scores = self._run_inference(mel_input)
+                all_scores.append(scores)
 
-            # 聚合分数
-            m_score = np.max(scores[self.MUSIC_INDICES])
-            s_score = np.max(scores[self.SPEECH_INDICES])
-            a_score = scores[self.ACAPPELLA_INDEX]
+                # 聚合分数
+                m_score = np.max(scores[self.MUSIC_INDICES])
+                s_score = np.max(scores[self.SPEECH_INDICES])
+                a_score = scores[self.ACAPPELLA_INDEX]
 
-            music_scores.append(m_score)
-            speech_scores.append(s_score)
-            acappella_scores.append(a_score)
+                music_scores.append(m_score)
+                speech_scores.append(s_score)
+                acappella_scores.append(a_score)
+            except Exception as e:
+                logger.warning("YAMNet 预处理/推理失败，跳过单个 probe: chunk=%s, err=%s", chunk_id, e)
+                continue
 
         if not music_scores:
+            # 保守策略：灰区若 YAMNet 不可用，默认分离，避免漏分离。
             return YAMNetClassificationResult(
-                is_music=False,
-                confidence=0.0,
+                is_music=True,
+                confidence=1.0,
                 speech_score=0.0,
-                music_score=0.0,
-                tags=["Error"]
+                music_score=1.0,
+                tags=["ProbeErrorConservativeSeparate"]
             )
 
         # 3. 计算聚合指标
@@ -470,73 +472,35 @@ class YAMNetClassifier:
             f"Acappella={max_acappella:.3f}, Top={top_classes[0]}"
         )
 
-        # 4. 决策逻辑 (Circuit Breaker Logic)
-        # 核心原则：宁可多分离，不可漏分离（BGM 会严重影响转录质量）
+        # 4. 决策逻辑（YAMNet-Lite）
+        # Why: 该分类器只服务 DNSMOS 灰区裁决，规则收敛为三条以降低行为分叉。
         tags = []
-
-        # 规则 A: A Cappella (清唱) 豁免
-        # 如果检测到清唱，这是纯人声，不需要分离
-        if max_acappella > self._acappella_threshold:
-            tags.append("Acappella")
-            return YAMNetClassificationResult(
-                is_music=False,
-                confidence=max_music,
-                speech_score=avg_speech,
-                music_score=avg_music,
-                tags=tags + ["PassAsAcappella"],
-                top_classes=top_classes
-            )
-
-        # 规则 B: 明显背景音乐熔断 (优先级最高)
-        # 降低阈值：max_music > 0.15 或 avg_music > 0.10
-        # 因为带 BGM 的人声场景，music 分数通常不会很高
-        if max_music > self._music_max_threshold or avg_music > self._music_avg_threshold:
-            # 标记是否同时有人声
-            if max_speech > 0.3:
-                tags.append("SpeechWithBGM")
-            else:
-                tags.append("DetectedBGM")
-
+        if max_music >= self._yamnet_music_conf_min:
+            tags.append("MusicStrong")
             return YAMNetClassificationResult(
                 is_music=True,
                 confidence=max_music,
                 speech_score=avg_speech,
                 music_score=avg_music,
                 tags=tags,
-                top_classes=top_classes
+                top_classes=top_classes,
             )
 
-        # 规则 C: 纯净人声豁免
-        # 只有当人声极高且音乐极低时才豁免
-        if max_speech > self._speech_max_threshold and max_music < self._speech_max_music_threshold:
-            tags.append("CleanSpeech")
+        if max_speech >= self._yamnet_speech_conf_min and max_music < self._yamnet_music_weak_max:
+            tags.append("SpeechStrong")
             return YAMNetClassificationResult(
                 is_music=False,
                 confidence=max_music,
                 speech_score=avg_speech,
                 music_score=avg_music,
                 tags=tags,
-                top_classes=top_classes
+                top_classes=top_classes,
             )
 
-        # 规则 D: 人声主导豁免
-        # 人声必须远高于音乐，且音乐很弱
-        if avg_speech > avg_music + self._speech_dominant_delta and max_music < self._speech_dominant_music_max:
-            tags.append("SpeechDominant")
-            return YAMNetClassificationResult(
-                is_music=False,
-                confidence=max_music,
-                speech_score=avg_speech,
-                music_score=avg_music,
-                tags=tags,
-                top_classes=top_classes
-            )
-
-        # 规则 E: 模糊地带 -> 放行
-        # 交给 SenseVoice 的 confidence check 去处理
-        tags.append("PassToSenseVoice")
+        # 灰区保守策略：优先保障“该分离不漏分离”
+        tags.append("GrayConservativeSeparate")
         return YAMNetClassificationResult(
-            is_music=False,
+            is_music=True,
             confidence=max_music,
             speech_score=avg_speech,
             music_score=avg_music,

@@ -142,6 +142,11 @@ def get_demucs_runtime_params() -> Dict[str, Any]:
     return get_runtime_group("demucs")
 
 
+def get_dnsmos_runtime_params() -> Dict[str, Any]:
+    """获取 DNSMOS 运行参数。"""
+    return get_runtime_group("dnsmos")
+
+
 def get_smart_probe_runtime_params() -> Dict[str, Any]:
     """获取 SmartProbe 运行参数。"""
     return get_runtime_group("smart_probe")

@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import shutil
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -64,6 +65,9 @@ class PreprocessCacheService:
     """
 
     VERSION = "3.2.0+dev.20260127.05"
+    _ATOMIC_REPLACE_MAX_RETRIES = 8
+    _ATOMIC_REPLACE_BASE_DELAY_SECONDS = 0.05
+    _ATOMIC_REPLACE_MAX_DELAY_SECONDS = 0.3
 
     def __init__(self, job_dir: Path, logger: Optional[logging.Logger] = None) -> None:
         self.job_dir = Path(job_dir)
@@ -326,12 +330,15 @@ class PreprocessCacheService:
     def load_triage_results(
         self,
         total_chunks: int,
-        use_snr_triage: bool,
+        use_dnsmos_triage: bool,
         threshold: float,
         use_smart_probe: bool,
         smart_probe_params: Optional[Dict[str, Any]] = None,
+        triage_version: str = "",
+        dnsmos_model_hash: str = "",
+        dnsmos_threshold_profile_hash: str = "",
     ) -> Optional[Dict[str, Any]]:
-        """加载分诊缓存并校验配置"""
+        """加载音频预检缓存并校验配置。"""
         if not self.paths.triage_results_path.exists():
             return None
         try:
@@ -344,7 +351,13 @@ class PreprocessCacheService:
             return None
         if results.get("total_chunks") != total_chunks:
             return None
-        if results.get("use_snr_triage") != use_snr_triage:
+        if results.get("triage_version") != triage_version:
+            return None
+        if results.get("use_dnsmos_triage") != use_dnsmos_triage:
+            return None
+        if results.get("dnsmos_model_hash") != dnsmos_model_hash:
+            return None
+        if results.get("dnsmos_threshold_profile_hash") != dnsmos_threshold_profile_hash:
             return None
         if abs(float(results.get("threshold", threshold)) - threshold) > 1e-6:
             return None
@@ -357,7 +370,9 @@ class PreprocessCacheService:
             if not smart_probe_params:
                 return None
             cached_probe = results.get("probe", {})
-            if cached_probe.get("snr_threshold") != smart_probe_params.get("snr_threshold"):
+            if cached_probe.get("probe_sep_ratio_min") != smart_probe_params.get("probe_sep_ratio_min"):
+                return None
+            if cached_probe.get("probe_min_coverage") != smart_probe_params.get("probe_min_coverage"):
                 return None
             if cached_probe.get("max_step_chunks") != smart_probe_params.get("max_step_chunks"):
                 return None
@@ -381,20 +396,28 @@ class PreprocessCacheService:
         chunks: List[AudioChunk],
         triage_log: Optional[List[Dict[str, Any]]],
         probe_state: Optional[Dict[str, Any]],
-        use_snr_triage: bool,
+        use_dnsmos_triage: bool,
         threshold: float,
         use_smart_probe: bool,
+        triage_version: str,
+        dnsmos_model_hash: str,
+        dnsmos_threshold_profile_hash: str,
     ) -> None:
-        """保存分诊缓存结果"""
+        """保存音频预检缓存结果。"""
         if not chunks:
             return
         self.ensure_dirs()
         results = {
             "version": self.VERSION,
+            "triage_version": triage_version,
             "completed": True,
             "mode": "smart_probe" if use_smart_probe else "standard",
             "total_chunks": len(chunks),
-            "use_snr_triage": use_snr_triage,
+            "use_dnsmos_triage": use_dnsmos_triage,
+            # 兼容字段：保持旧键存在，但不再作为匹配主键
+            "use_snr_triage": use_dnsmos_triage,
+            "dnsmos_model_hash": dnsmos_model_hash,
+            "dnsmos_threshold_profile_hash": dnsmos_threshold_profile_hash,
             "threshold": threshold,
             "use_smart_probe": use_smart_probe,
             "probe": probe_state or {},
@@ -1183,7 +1206,7 @@ class PreprocessCacheService:
             json.dump(payload, f, ensure_ascii=False, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(temp_path, path)
+        PreprocessCacheService._atomic_replace(temp_path, path)
 
     @staticmethod
     def _atomic_write_numpy(path: Path, array: np.ndarray) -> None:
@@ -1193,7 +1216,7 @@ class PreprocessCacheService:
             np.save(f, array)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(temp_path, path)
+        PreprocessCacheService._atomic_replace(temp_path, path)
 
     @staticmethod
     def _atomic_write_audio(path: Path, audio: np.ndarray, sample_rate: int) -> None:
@@ -1202,7 +1225,36 @@ class PreprocessCacheService:
         sf.write(str(temp_path), audio, sample_rate, format="WAV")
         with open(temp_path, "r+b") as f:
             os.fsync(f.fileno())
-        os.replace(temp_path, path)
+        PreprocessCacheService._atomic_replace(temp_path, path)
+
+    @staticmethod
+    def _is_retryable_atomic_replace_error(exc: OSError) -> bool:
+        """判断是否属于 Windows 临时文件锁冲突。"""
+        if isinstance(exc, PermissionError):
+            return True
+        return getattr(exc, "winerror", None) in {5, 32}
+
+    @staticmethod
+    def _atomic_replace(temp_path: Path, target_path: Path) -> None:
+        """
+        原子替换（Windows 友好版）。
+
+        WinError 5/32 在杀软、索引器、并发读写场景下会偶发出现，
+        这里短退避重试，避免分离缓存写入因瞬时锁竞争失败。
+        """
+        delay_seconds = PreprocessCacheService._ATOMIC_REPLACE_BASE_DELAY_SECONDS
+        max_retries = PreprocessCacheService._ATOMIC_REPLACE_MAX_RETRIES
+        max_delay = PreprocessCacheService._ATOMIC_REPLACE_MAX_DELAY_SECONDS
+        for attempt in range(max_retries + 1):
+            try:
+                os.replace(temp_path, target_path)
+                return
+            except OSError as exc:
+                is_retryable = PreprocessCacheService._is_retryable_atomic_replace_error(exc)
+                if not is_retryable or attempt >= max_retries:
+                    raise
+                time.sleep(delay_seconds)
+                delay_seconds = min(delay_seconds * 1.6, max_delay)
 
     @staticmethod
     def _dir_size_bytes(path: Path) -> int:
