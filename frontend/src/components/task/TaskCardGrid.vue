@@ -7,11 +7,17 @@
         />
       </svg>
       <h2 class="empty-title">还没有任务</h2>
-      <p class="empty-desc">点击上方"上传视频"按钮开始创建字幕任务</p>
-      <el-button type="primary" size="large" @click="$emit('open-upload')">
-        <el-icon><Upload /></el-icon>
-        上传视频
-      </el-button>
+      <p class="empty-desc">导入字幕或上传视频开始创建任务</p>
+      <div class="empty-actions">
+        <el-button size="large" @click="$emit('open-import')">
+          <el-icon><Document /></el-icon>
+          导入字幕
+        </el-button>
+        <el-button v-if="canTranscribe" type="primary" size="large" @click="$emit('open-upload')">
+          <el-icon><Upload /></el-icon>
+          上传视频
+        </el-button>
+      </div>
     </div>
 
     <div v-else class="task-grid">
@@ -113,7 +119,10 @@
 </template>
 
 <script setup>
-import { Upload, Edit, Delete, Clock, Loading } from "@element-plus/icons-vue";
+import { Upload, Edit, Delete, Clock, Loading, Document } from "@element-plus/icons-vue";
+import { CAPABILITIES } from "@/config/flavor";
+
+const { canTranscribe } = CAPABILITIES;
 
 defineProps({
   tasks: {
@@ -148,6 +157,7 @@ defineProps({
 
 const emit = defineEmits([
   "open-upload",
+  "open-import",
   "retry-thumbnail",
   "update:editing-title",
   "finish-edit-title",
@@ -172,10 +182,17 @@ const emit = defineEmits([
 
 .task-main {
   flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: none;
   width: 100%;
   padding: 32px 24px;
   margin: 0 auto;
   max-width: 1400px;
+}
+
+.task-main::-webkit-scrollbar {
+  display: none;
 }
 
 .empty-state {
@@ -205,6 +222,11 @@ const emit = defineEmits([
   margin: 0 0 32px;
   color: var(--af-text-secondary);
   font-size: 14px;
+}
+
+.empty-state .empty-actions {
+  display: flex;
+  gap: 12px;
 }
 
 .task-grid {

@@ -23,12 +23,10 @@
             <div class="el-upload__text">
               拖拽视频文件到此处，或 <em>点击选择</em>
             </div>
-            <template #tip>
-              <div class="el-upload__tip">
-                支持 MP4, AVI, MOV 等常见视频格式，以及 MP3, WAV 等音频格式（最多5个）
-              </div>
-            </template>
           </el-upload>
+          <div v-if="uploadFiles.length === 0" class="upload-tip">
+            支持 MP4, AVI, MOV 等常见视频格式，以及 MP3, WAV 等音频格式（最多5个）
+          </div>
 
           <div v-if="uploadFiles.length > 0" class="selected-files-tags">
             <div class="tags-container">
@@ -58,7 +56,7 @@
                 :data="inputFiles"
                 @selection-change="handleFileSelectionChange"
                 @row-click="handleRowClick"
-                max-height="280"
+                max-height="218"
                 class="clickable-rows"
               >
                 <el-table-column type="selection" width="55" />
@@ -90,37 +88,29 @@
       </el-button>
     </div>
 
-    <div class="transcription-settings">
-      <div class="settings-header" @click="emit('toggle-advanced-settings')">
-        <span>转录设置</span>
-        <el-icon :class="{ 'is-expanded': showAdvancedSettings }"><ArrowDown /></el-icon>
-      </div>
-
-      <div class="settings-content" v-if="showAdvancedSettings">
-        <PresetSelector
-          :model-value="taskConfig"
-          :compact="true"
-          @update:model-value="emit('update:task-config', $event)"
-          @change="emit('preset-change', $event)"
-        />
-      </div>
-    </div>
+    <!-- V3.2.4: 设置区 Tab 化，始终可见 -->
+    <SettingsTabs
+      :model-value="taskConfig"
+      :custom-presets="customPresets"
+      @update:model-value="emit('update:task-config', $event)"
+      @save-preset="emit('save-preset')"
+      @delete-preset="emit('delete-preset', $event)"
+      @overwrite-preset="emit('overwrite-preset', $event)"
+    />
 
     <template #footer>
       <div class="dialog-footer">
-        <span v-if="uploadMode === 'select'" class="selection-info">
-          已选择 {{ selectedFiles.length }} 个文件
-        </span>
-        <span v-else-if="uploadFiles.length > 0" class="selection-info">
-          已选择 {{ uploadFiles.length }} 个文件
-        </span>
-        <div class="footer-buttons">
+        <div class="footer-left">
           <el-button @click="emit('close-upload-dialog')">取消</el-button>
+        </div>
+        <div class="footer-right">
+          <el-button @click="emit('save-preset')">保存预设</el-button>
           <el-button
-            v-if="uploadMode === 'upload' && uploadFiles.length > 0"
+            v-if="uploadMode === 'upload'"
             type="primary"
             class="primary-action-btn"
             :loading="uploading"
+            :disabled="uploadFiles.length === 0"
             @click="emit('upload')"
           >
             {{
@@ -152,8 +142,8 @@
 </template>
 
 <script setup>
-import { UploadFilled, Close, Loading, ArrowDown } from "@element-plus/icons-vue";
-import PresetSelector from "@/components/task/PresetSelector.vue";
+import { UploadFilled, Close, Loading } from "@element-plus/icons-vue";
+import SettingsTabs from "@/components/task/settings/SettingsTabs.vue";
 
 defineProps({
   showUploadDialog: {
@@ -188,13 +178,13 @@ defineProps({
     type: Boolean,
     default: false,
   },
-  showAdvancedSettings: {
-    type: Boolean,
-    default: false,
-  },
   taskConfig: {
     type: Object,
     required: true,
+  },
+  customPresets: {
+    type: Array,
+    default: () => [],
   },
   setUploadRef: {
     type: Function,
@@ -231,8 +221,9 @@ const emit = defineEmits([
   "update:upload-mode",
   "update:task-config",
   "open-input-folder",
-  "toggle-advanced-settings",
-  "preset-change",
+  "save-preset",
+  "delete-preset",
+  "overwrite-preset",
   "close-upload-dialog",
   "upload",
   "batch-create",
@@ -242,7 +233,7 @@ const emit = defineEmits([
 <style scoped>
 .tabs-container {
   position: relative;
-  margin-bottom: 20px;
+  margin-bottom: 12px;
 }
 
 .tabs-container .open-folder-btn {
@@ -264,7 +255,7 @@ const emit = defineEmits([
 }
 
 .file-list-container {
-  min-height: 300px;
+  height: 218px;
 }
 
 .file-list-container .loading-files {
@@ -273,7 +264,7 @@ const emit = defineEmits([
   justify-content: center;
   align-items: center;
   gap: 12px;
-  padding: 80px 24px;
+  height: 100%;
   color: var(--af-text-secondary);
 }
 
@@ -286,7 +277,7 @@ const emit = defineEmits([
   flex-direction: column;
   justify-content: center;
   align-items: center;
-  padding: 80px 24px;
+  height: 100%;
   text-align: center;
 }
 
@@ -307,9 +298,9 @@ const emit = defineEmits([
 }
 
 .selected-files-tags {
-  max-height: 80px;
-  margin-top: 12px;
-  padding: 10px;
+  height: 30px;
+  margin-top: 8px;
+  padding: 3px 10px;
   overflow-y: auto;
   background: var(--af-bg-tertiary);
   border: 1px solid var(--af-border-default);
@@ -319,20 +310,23 @@ const emit = defineEmits([
 .selected-files-tags .tags-container {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  align-items: center;
+  gap: 6px;
+  min-height: 100%;
 }
 
 .selected-files-tags .file-tag {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 3px;
   max-width: 200px;
-  padding: 4px 10px 4px 6px;
+  padding: 2px 8px 2px 4px;
   background: var(--af-bg-elevated);
   border: 1px solid var(--af-border-default);
   border-radius: 20px;
   color: var(--af-text-primary);
-  font-size: 12px;
+  font-size: 11px;
+  line-height: 1;
   transition: all var(--af-transition-fast);
   user-select: none;
   cursor: default;
@@ -340,8 +334,8 @@ const emit = defineEmits([
 
 .selected-files-tags .file-tag .tag-close {
   flex-shrink: 0;
-  width: 16px;
-  height: 16px;
+  width: 14px;
+  height: 14px;
   padding: 2px;
   border-radius: 50%;
   color: var(--af-text-muted);
@@ -360,49 +354,17 @@ const emit = defineEmits([
   white-space: nowrap;
 }
 
-.transcription-settings {
-  margin-top: 16px;
-  overflow: hidden;
-  border: 1px solid var(--af-border-default);
-  border-radius: var(--af-radius-md);
-}
-
-.transcription-settings .settings-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 10px 14px;
-  background: var(--af-bg-secondary);
-  transition: background var(--af-transition-fast);
-  cursor: pointer;
-}
-
-.transcription-settings .settings-header:hover {
-  background: var(--af-bg-tertiary);
-}
-
-.transcription-settings .settings-header span {
-  color: var(--af-text-secondary);
-  font-size: 14px;
-  font-weight: 500;
-}
-
-.transcription-settings .settings-header .el-icon {
-  color: var(--af-text-muted);
-  transition: transform var(--af-transition-fast);
-}
-
-.transcription-settings .settings-header .el-icon.is-expanded {
-  transform: rotate(180deg);
-}
-
-.transcription-settings .settings-content {
-  padding: 14px;
-  background: var(--af-bg-primary);
-  border-top: 1px solid var(--af-border-default);
+:deep(.el-upload) {
+  display: block;
 }
 
 :deep(.el-upload) .el-upload-dragger {
+  height: 180px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
   background: var(--af-bg-tertiary);
   border: 2px dashed var(--af-border-default);
   border-radius: var(--af-radius-md);
@@ -429,8 +391,13 @@ const emit = defineEmits([
   font-style: normal;
 }
 
-:deep(.el-upload) .el-upload__tip {
+.upload-tip {
+  height: 30px;
   margin-top: 8px;
+  padding: 3px 10px;
+  border: 1px solid transparent;
+  display: flex;
+  align-items: center;
   color: var(--af-text-muted);
   font-size: 12px;
 }
@@ -474,6 +441,7 @@ const emit = defineEmits([
 }
 
 :deep(.el-table) .el-table__header-wrapper th {
+  /* 原因: el-table 未暴露 header-wrapper 背景色的 CSS 变量 */
   background: var(--af-bg-secondary) !important;
   border-bottom: 1px solid var(--af-border-default);
   color: var(--af-text-secondary);
@@ -498,6 +466,7 @@ const emit = defineEmits([
 }
 
 :deep(.el-table) .el-table__body-wrapper tr:hover > td {
+  /* 原因: el-table hover 行背景需要覆盖默认 hover 色 */
   background: rgb(var(--af-accent-primary-rgb, 99, 102, 241), 8%) !important;
 }
 

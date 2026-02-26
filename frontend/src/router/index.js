@@ -2,32 +2,23 @@
  * Vue Router 配置。
  */
 import { createRouter, createWebHistory } from 'vue-router'
-import { IS_LITE, ROUTE_VISIBILITY } from '@/config/flavor'
 import { resolveProjectIdByJobId } from '@/utils/editorNavigation'
 
 const routes = [
   {
     path: '/',
-    redirect: IS_LITE ? '/import' : '/tasks',
+    redirect: '/tasks',
   },
   {
     path: '/tasks',
     name: 'TaskList',
     component: () => import('@/views/TaskListView.vue'),
     meta: { title: '任务列表' },
-    beforeEnter: (_, __, next) => {
-      if (!ROUTE_VISIBILITY.taskList) {
-        next('/import')
-        return
-      }
-      next()
-    },
   },
   {
+    // 兼容旧 /import 路由，重定向到 /tasks?action=import
     path: '/import',
-    name: 'Import',
-    component: () => import('@/views/ImportView.vue'),
-    meta: { title: '导入字幕' },
+    redirect: { path: '/tasks', query: { action: 'import' } },
   },
   {
     path: '/editor/project/:projectId',

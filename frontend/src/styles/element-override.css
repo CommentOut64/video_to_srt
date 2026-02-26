@@ -7,29 +7,14 @@
    全局 Element Plus 主题变量
    ============================================== */
 
-/* 修复对话框打开时页面抖动（滚动条消失导致） */
-/* document.scrollingElement 返回 HTML，滚动容器是 <html>
-   方案：禁用 EP 对 body 的操作，改为锁定 html 滚动 */
-
-/* 1. 禁用 Element Plus 对 body 的滚动锁定（防止左移） */
+/* 修复对话框打开时背景仍可滚动
+   EP 只给 document.body 添加 .el-popup-parent--hidden 类
+   直接利用 EP 原生机制锁定 body 滚动即可 */
 body.el-popup-parent--hidden {
-  overflow: visible !important;
+  overflow: hidden !important;
   padding-right: 0 !important;
   width: auto !important;
   position: static !important;
-}
-
-/* 2. 改为锁定 html 滚动（滚动条保持可见但不可滚动） */
-html.el-popup-parent--hidden {
-  overflow-y: scroll !important;
-  pointer-events: none;
-}
-
-/* 3. 弹窗层保持可交互 */
-html.el-popup-parent--hidden .el-overlay,
-html.el-popup-parent--hidden .el-dialog,
-html.el-popup-parent--hidden .el-message-box__wrapper {
-  pointer-events: auto;
 }
 
 :root {
@@ -478,38 +463,34 @@ html.el-popup-parent--hidden .el-message-box__wrapper {
   width: 100%;
 }
 
-.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .selection-info {
-  color: var(--af-text-secondary);
-  font-size: 14px;
-}
-
-.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .footer-buttons {
+.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .footer-left,
+.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .footer-right {
   display: flex;
   gap: 8px;
 }
 
 /* 原因：统一按钮样式 */
-.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .footer-buttons .el-button {
+.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .el-button {
   background: transparent;
   border: 1px solid transparent;
   color: var(--af-text-secondary);
 }
 
-.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .footer-buttons .el-button:hover {
+.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .el-button:hover {
   background: var(--af-bg-tertiary);
   border-color: var(--af-border-default);
   color: var(--af-text-primary);
 }
 
 /* 原因：主操作按钮高亮样式 */
-.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .footer-buttons .primary-action-btn {
+.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .primary-action-btn {
   background-color: var(--af-accent-primary);
   border-color: var(--af-accent-primary);
   color: var(--af-text-on-dark);
 }
 
-.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .footer-buttons .primary-action-btn:disabled,
-.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .footer-buttons .primary-action-btn.is-disabled {
+.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .primary-action-btn:disabled,
+.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .primary-action-btn.is-disabled {
   background-color: var(--af-bg-tertiary);
   border-color: var(--af-border-default);
   color: var(--af-text-disabled);
@@ -517,7 +498,7 @@ html.el-popup-parent--hidden .el-message-box__wrapper {
   opacity: 0.7;
 }
 
-.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .footer-buttons .primary-action-btn:hover:not(:disabled) {
+.el-dialog.upload-dialog .el-dialog__footer .dialog-footer .primary-action-btn:hover:not(:disabled) {
   background-color: var(--af-accent-primary-hover);
   border-color: var(--af-accent-primary-hover);
 }

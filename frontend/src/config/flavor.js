@@ -27,7 +27,7 @@ export const CAPABILITIES = Object.freeze({
 })
 
 export const ROUTE_VISIBILITY = Object.freeze({
-  taskList: !IS_LITE,
+  taskList: true, // Lite 也使用任务列表
   taskCreate: !IS_LITE,
   importPage: true,
   editor: true,

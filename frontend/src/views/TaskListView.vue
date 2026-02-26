@@ -3,6 +3,7 @@
     <TaskListHeader
       @open-about="showAboutDialog = true"
       @open-upload="showUploadDialog = true"
+      @open-import="showImportDialog = true"
       @exit-system="handleExit"
     />
 
@@ -15,6 +16,7 @@
       :format-date="formatDate"
       :get-task-display-name="getTaskDisplayName"
       @open-upload="showUploadDialog = true"
+      @open-import="showImportDialog = true"
       @retry-thumbnail="(jobId) => getThumbnailUrl(jobId, true)"
       @update:editing-title="(value) => (editingTitle = value)"
       @finish-edit-title="finishEditTitle"
@@ -34,8 +36,8 @@
       :loading-files="loadingFiles"
       :creating-batch="creatingBatch"
       :uploading="uploading"
-      :show-advanced-settings="showAdvancedSettings"
       :task-config="taskConfig"
+      :custom-presets="customPresets"
       :set-upload-ref="setUploadRef"
       :set-file-table-ref="setFileTableRef"
       :handle-file-change="handleFileChange"
@@ -47,10 +49,17 @@
       @update:upload-mode="(value) => (uploadMode = value)"
       @update:task-config="(value) => (taskConfig = value)"
       @open-input-folder="handleOpenInputFolder"
-      @toggle-advanced-settings="showAdvancedSettings = !showAdvancedSettings"
+      @save-preset="handleSavePreset"
+      @delete-preset="handleDeletePreset"
+      @overwrite-preset="handleOverwritePreset"
       @close-upload-dialog="closeUploadDialog"
       @upload="handleUpload"
       @batch-create="handleBatchCreate"
+    />
+
+    <ImportDialog
+      v-model:show-dialog="showImportDialog"
+      @import-success="handleImportSuccess"
     />
 
     <!-- 关于对话框 -->
@@ -59,35 +68,39 @@
 </template>
 
 <script setup>
-import { ref, computed, nextTick } from 'vue'
+import { ref, computed, nextTick, onMounted } from 'vue'
 import { storeToRefs } from 'pinia'
-import { useRouter } from 'vue-router'
+import { useRouter, useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox, ElLoading } from 'element-plus'
 import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
 import { useTranscriptionConfigStore } from '@/stores/transcriptionConfigStore'
-import { transcriptionApi, systemApi } from '@/services/api'
-// V3.1.0: 移除 sseChannelManager 导入，SSE 订阅由 App.vue 统一管理
-import AboutDialog from '@/components/AboutDialog.vue' // 关于对话框
+import { CAPABILITIES } from '@/config/flavor'
+import { transcriptionApi, systemApi, presetsApi } from '@/services/api'
+import AboutDialog from '@/components/AboutDialog.vue'
 import TaskListHeader from '@/components/task/TaskListHeader.vue'
 import TaskCardGrid from '@/components/task/TaskCardGrid.vue'
 import TaskCreateDialog from '@/components/task/TaskCreateDialog.vue'
+import ImportDialog from '@/components/task/ImportDialog.vue'
 import { useTaskUpload } from '@/composables/task-list/useTaskUpload'
 import { useTaskThumbnail } from '@/composables/task-list/useTaskThumbnail'
 import { navigateToEditor } from '@/utils/editorNavigation'
 
 const router = useRouter()
+const route = useRoute()
 const taskStore = useUnifiedTaskStore()
 const transcriptionConfigStore = useTranscriptionConfigStore()
 const { taskConfig } = storeToRefs(transcriptionConfigStore)
 
 const showAboutDialog = ref(false)
+const showImportDialog = ref(false)
 // 内联重命名相关
 const editingTaskId = ref(null) // 当前正在编辑的任务ID
 const editingTitle = ref('') // 编辑中的标题
 const originalTitle = ref('') // 原始标题（用于恢复）
 
-// 转录设置相关 - v3.5 预设模式
-const showAdvancedSettings = ref(false) // 是否显示高级设置
+// V3.2.4: 自定义预设（Tab 化重构后，showAdvancedSettings 已移除）
+const customPresets = ref([])
+const showSavePresetDialog = ref(false)
 
 // 计算属性 - 使用 computed 包装确保响应式
 const tasks = computed(() => taskStore.tasks)
@@ -132,6 +145,118 @@ function setUploadRef(element) {
 
 function setFileTableRef(element) {
   fileTableRef.value = element
+}
+
+// V3.2.4: 保存自定义预设 (Write-Through: localStorage + 后端)
+async function handleSavePreset() {
+  const name = prompt('请输入预设名称')
+  if (!name || !name.trim()) return
+
+  const presetConfig = {
+    preprocessing: { ...taskConfig.value.preprocessing },
+    transcription: { ...taskConfig.value.transcription },
+    refinement: { ...taskConfig.value.refinement },
+    compute: { ...taskConfig.value.compute },
+  }
+
+  try {
+    const res = await presetsApi.createCustomPreset(name.trim(), presetConfig)
+    if (res?.success && res.preset) {
+      customPresets.value = [...customPresets.value, res.preset]
+      saveCustomPresetsToStorage()
+      ElMessage.success(`预设"${name.trim()}"已保存`)
+    }
+  } catch {
+    // 后端失败时 fallback 到纯本地保存
+    const preset = {
+      id: 'custom_' + Date.now(),
+      name: name.trim(),
+      created_at: new Date().toISOString(),
+      config: presetConfig,
+    }
+    customPresets.value = [...customPresets.value, preset]
+    saveCustomPresetsToStorage()
+    ElMessage.success(`预设"${name.trim()}"已保存（本地）`)
+  }
+}
+
+// V3.2.4: 删除自定义预设 (Write-Through)
+async function handleDeletePreset(presetId) {
+  customPresets.value = customPresets.value.filter((p) => p.id !== presetId)
+  saveCustomPresetsToStorage()
+  ElMessage.success('预设已删除')
+
+  // 异步同步到后端，不阻塞 UI
+  presetsApi.deleteCustomPreset(presetId).catch(() => {})
+}
+
+// V3.2.4: 覆盖更新自定义预设（用当前配置覆写）
+function handleOverwritePreset(presetId) {
+  const idx = customPresets.value.findIndex((p) => p.id === presetId)
+  if (idx === -1) return
+
+  const updated = [...customPresets.value]
+  updated[idx] = {
+    ...updated[idx],
+    config: {
+      preprocessing: { ...taskConfig.value.preprocessing },
+      transcription: { ...taskConfig.value.transcription },
+      refinement: { ...taskConfig.value.refinement },
+      compute: { ...taskConfig.value.compute },
+    },
+  }
+  customPresets.value = updated
+  saveCustomPresetsToStorage()
+  ElMessage.success(`预设"${updated[idx].name}"已更新`)
+}
+
+// V3.2.4: localStorage 读写自定义预设
+const CUSTOM_PRESETS_KEY = 'user-custom-presets'
+
+function saveCustomPresetsToStorage() {
+  try {
+    localStorage.setItem(CUSTOM_PRESETS_KEY, JSON.stringify(customPresets.value))
+  } catch (error) {
+    console.warn('保存自定义预设失败:', error)
+  }
+}
+
+// V3.2.4: 初始化加载 (Read-Fallback: 优先后端，降级 localStorage)
+async function loadCustomPresets() {
+  try {
+    const res = await presetsApi.getCustomPresets()
+    if (res?.success && Array.isArray(res.presets)) {
+      customPresets.value = res.presets
+      saveCustomPresetsToStorage()
+      return
+    }
+  } catch {
+    // 后端不可用，降级读 localStorage
+  }
+
+  try {
+    const raw = localStorage.getItem(CUSTOM_PRESETS_KEY)
+    if (raw) {
+      customPresets.value = JSON.parse(raw)
+    }
+  } catch (error) {
+    console.warn('读取自定义预设失败:', error)
+  }
+}
+
+loadCustomPresets()
+
+// Lite 模式或 ?action=import 时自动弹出导入窗口
+onMounted(() => {
+  if (!CAPABILITIES.canTranscribe || route.query.action === 'import') {
+    showImportDialog.value = true
+  }
+})
+
+// 导入成功后跳转编辑器
+function handleImportSuccess(projectId) {
+  showImportDialog.value = false
+  router.push(`/editor/project/${projectId}`)
 }
 
 // 打开编辑器
@@ -396,7 +521,8 @@ async function handleExit() {
 .task-list-view {
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
   background: var(--af-bg-primary);
 }
 

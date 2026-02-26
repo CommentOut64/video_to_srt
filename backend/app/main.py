@@ -61,6 +61,7 @@ from app.api.routes.file_routes import create_file_router  # 新增：文件管�
 from app.api.routes import system_routes  # 新增：系统管理路由
 from app.api.routes import config_routes  # 新增：用户配置路由
 from app.api.routes import debug_routes  # 新增：调试路由
+from app.api.routes import presets_routes  # V3.2.4: 自定义预设路由
 from app.services.file_service import FileManagementService
 
 # 导入FFmpeg管理器
@@ -225,6 +226,7 @@ app.include_router(media_routes.router)  # 新增：媒体资源路由
 app.include_router(system_routes.router)  # 新增：系统管理路由
 app.include_router(config_routes.router)  # 新增：用户配置路由
 app.include_router(debug_routes.router)  # 新增：调试路由
+app.include_router(presets_routes.router)  # V3.2.4: 自定义预设路由
 app.include_router(project_router)  # Task6: 项目路由
 app.include_router(legacy_router)  # Task6: legacy 兼容路由
 app.include_router(stream_router)  # Task6: 项目级 SSE 路由

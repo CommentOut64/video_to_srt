@@ -23,6 +23,15 @@ def create_file_router(file_service: FileManagementService):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"获取文件列表失败: {str(e)}")
 
+    @router.get("/files/subtitles")
+    async def list_subtitle_files():
+        """获取输入目录中的所有字幕文件"""
+        try:
+            files = file_service.list_input_subtitle_files()
+            return {"files": files, "input_dir": file_service.input_dir}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"获取字幕文件列表失败: {str(e)}")
+
     @router.delete("/files/{filename}")
     async def delete_file(filename: str):
         """删除input目录中的文件"""

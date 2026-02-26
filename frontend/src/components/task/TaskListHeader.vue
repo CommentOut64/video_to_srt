@@ -11,7 +11,11 @@
       </h1>
     </div>
     <div class="header-right">
-      <el-button type="primary" @click="$emit('open-upload')">
+      <el-button @click="$emit('open-import')">
+        <el-icon><Document /></el-icon>
+        导入字幕
+      </el-button>
+      <el-button v-if="canTranscribe" type="primary" @click="$emit('open-upload')">
         <el-icon><Upload /></el-icon>
         上传视频
       </el-button>
@@ -24,14 +28,17 @@
 
 <script setup>
 import { Upload } from "@element-plus/icons-vue";
+import { Document } from "@element-plus/icons-vue";
+import { CAPABILITIES } from "@/config/flavor";
 
-defineEmits(["open-about", "open-upload", "exit-system"]);
+const { canTranscribe } = CAPABILITIES;
+
+defineEmits(["open-about", "open-upload", "open-import", "exit-system"]);
 </script>
 
 <style scoped>
 .task-header {
-  position: sticky;
-  top: 0;
+  flex-shrink: 0;
   z-index: 200;
   display: flex;
   justify-content: space-between;

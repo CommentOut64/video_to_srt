@@ -35,6 +35,26 @@ class ProjectAPI {
     return unwrapEnvelope(response, null)
   }
 
+  /**
+   * 从 input 目录本地路径导入项目（无需文件上传）
+   * @param {string} subtitleFilename - input 目录中的字幕文件名
+   * @param {string|null} mediaFilename - input 目录中的媒体文件名（可选）
+   * @param {string} title - 项目名称
+   * @returns {Promise<Object>} 项目数据
+   */
+  async importProjectLocal(subtitleFilename, mediaFilename = null, title = '') {
+    const formData = new FormData()
+    formData.append('subtitle_filename', subtitleFilename)
+    formData.append('flavor', FLAVOR)
+    if (title) formData.append('title', title)
+    if (mediaFilename) formData.append('media_filename', mediaFilename)
+
+    const response = await apiClient.post('/api/projects/import-local', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+    return unwrapEnvelope(response, null)
+  }
+
   async listProjects(flavor = null) {
     const params = flavor ? { flavor } : undefined
     const response = await apiClient.get('/api/projects', { params })
