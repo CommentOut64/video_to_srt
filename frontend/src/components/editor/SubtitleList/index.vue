@@ -125,7 +125,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, watch, nextTick } from 'vue'
+import { ref, reactive, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useProjectStore } from '@/stores/projectStore'
 import { usePlaybackManager } from '@/services/PlaybackManager'
@@ -140,7 +140,10 @@ import GroupHeader from './GroupHeader.vue'
 // Props
 const props = defineProps({
   autoScroll: { type: Boolean, default: true },
-  editable: { type: Boolean, default: true }
+  editable: { type: Boolean, default: true },
+  // 手动滚动后是否允许“温和自动恢复跟随”。
+  // true：6 秒无滚动后自动恢复；false：用户手动滚动后保持暂停跟随。
+  enableAutoResumeFollow: { type: Boolean, default: true },
 })
 
 const emit = defineEmits(['subtitle-click', 'subtitle-edit', 'subtitle-delete', 'subtitle-add'])
@@ -167,6 +170,11 @@ const collapsedGroups = ref(new Set())
 
 // Refs
 const listRef = ref(null)
+const isFollowPausedByUser = ref(false)
+const USER_SCROLL_AUTO_RESUME_DELAY_MS = 6000
+const PROGRAMMATIC_SCROLL_GUARD_MS = 900
+let followResumeTimer = null
+let programmaticScrollGuardUntil = 0
 
 // State
 const quickSearchText = ref('')     // 快速搜索文本（简单过滤）
@@ -372,6 +380,7 @@ async function syncInsertedSubtitle(insertIndex, start, end, text) {
 
 function scrollToBottom() {
   if (listRef.value) {
+    markProgrammaticScroll()
     listRef.value.scrollTop = listRef.value.scrollHeight
   }
 }
@@ -379,18 +388,87 @@ function scrollToBottom() {
 function scrollToItem(index) {
   const items = listRef.value?.querySelectorAll('.subtitle-item')
   if (items && items[index]) {
+    markProgrammaticScroll()
     items[index].scrollIntoView({ behavior: 'smooth', block: 'center' })
   }
+}
+
+function clearFollowResumeTimer() {
+  if (followResumeTimer) {
+    clearTimeout(followResumeTimer)
+    followResumeTimer = null
+  }
+}
+
+function markProgrammaticScroll() {
+  programmaticScrollGuardUntil = Date.now() + PROGRAMMATIC_SCROLL_GUARD_MS
+}
+
+function isInProgrammaticScrollGuard() {
+  return Date.now() < programmaticScrollGuardUntil
+}
+
+function scheduleFollowAutoResume() {
+  clearFollowResumeTimer()
+  if (!props.enableAutoResumeFollow) return
+  followResumeTimer = setTimeout(() => {
+    isFollowPausedByUser.value = false
+    followResumeTimer = null
+  }, USER_SCROLL_AUTO_RESUME_DELAY_MS)
+}
+
+function pauseFollowByUserScroll() {
+  if (!props.autoScroll) return
+  if (isInProgrammaticScrollGuard()) return
+  isFollowPausedByUser.value = true
+  scheduleFollowAutoResume()
+}
+
+function handleListScroll() {
+  pauseFollowByUserScroll()
+}
+
+function handleListWheel() {
+  pauseFollowByUserScroll()
+}
+
+function handleListTouchMove() {
+  pauseFollowByUserScroll()
 }
 
 // 自动滚动跟随当前播放
 watch(currentSubtitleId, (id) => {
   if (!props.autoScroll || !id) return
+  if (isFollowPausedByUser.value) return
   const index = filteredSubtitles.value.findIndex(s => s.id === id)
   if (index !== -1) {
     nextTick(() => scrollToItem(index))
   }
 })
+
+watch(
+  () => props.enableAutoResumeFollow,
+  (enabled) => {
+    // 用户重新启用自动恢复时，如果当前已暂停，则从当前时刻重新计时恢复。
+    if (enabled && isFollowPausedByUser.value) {
+      scheduleFollowAutoResume()
+      return
+    }
+    if (!enabled) {
+      clearFollowResumeTimer()
+    }
+  }
+)
+
+watch(
+  () => props.autoScroll,
+  (enabled) => {
+    if (!enabled) {
+      clearFollowResumeTimer()
+      isFollowPausedByUser.value = false
+    }
+  }
+)
 
 // 批量更新检测：超过阈值时禁用动画，避免重叠闪烁
 const BATCH_UPDATE_THRESHOLD = 5
@@ -409,6 +487,21 @@ watch(subtitles, (newList) => {
 
   previousSubtitleCount = newCount
 }, { flush: 'pre' })  // pre: 在 DOM 更新前触发
+
+onMounted(() => {
+  if (!listRef.value) return
+  listRef.value.addEventListener('scroll', handleListScroll, { passive: true })
+  listRef.value.addEventListener('wheel', handleListWheel, { passive: true })
+  listRef.value.addEventListener('touchmove', handleListTouchMove, { passive: true })
+})
+
+onUnmounted(() => {
+  clearFollowResumeTimer()
+  if (!listRef.value) return
+  listRef.value.removeEventListener('scroll', handleListScroll)
+  listRef.value.removeEventListener('wheel', handleListWheel)
+  listRef.value.removeEventListener('touchmove', handleListTouchMove)
+})
 
 // ========================
 // 同音搜索相关方法

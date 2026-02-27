@@ -134,6 +134,7 @@
             <SubtitleList
               ref="subtitleListRef"
               :auto-scroll="true"
+              :enable-auto-resume-follow="subtitleFollowAutoResumeEnabled"
               :editable="true"
             />
           </div>
@@ -307,6 +308,7 @@ const advancedConfig = ref({
     auto_save_interval: 60,
     preview_font_size: 24,
     enable_shortcuts: true,
+    subtitle_follow_auto_resume: true,
   },
   preprocessing: {
     demucs_strategy: 'auto',
@@ -335,6 +337,8 @@ const advancedConfig = ref({
   },
   preset_id: 'default',
 })
+const SUBTITLE_FOLLOW_AUTO_RESUME_PREF_KEY = 'editor-subtitle-follow-auto-resume'
+const subtitleFollowAutoResumeEnabled = ref(true)
 
 // 统一进度状态
 const progressStore = useProgressStore()
@@ -2069,6 +2073,13 @@ function handleResolutionChange(resolution) {
   projectStore.meta.currentResolution = resolution
 }
 
+function loadEditorInteractionPreferences() {
+  const savedAutoResume = localStorage.getItem(SUBTITLE_FOLLOW_AUTO_RESUME_PREF_KEY)
+  const resolved = savedAutoResume === null ? true : savedAutoResume === 'true'
+  subtitleFollowAutoResumeEnabled.value = resolved
+  advancedConfig.value.general.subtitle_follow_auto_resume = resolved
+}
+
 // ========== 字幕全局偏移设置 ==========
 // 同步 projectStore.subtitleOffset 到高级设置
 watch(
@@ -2089,6 +2100,11 @@ async function handleSaveAdvancedSettings() {
 
     // 1. 应用到前端 projectStore
     projectStore.setSubtitleOffset(offset)
+
+    // 1.1 应用并持久化“字幕手动滚动后自动恢复跟随”偏好
+    const followAutoResume = advancedConfig.value.general.subtitle_follow_auto_resume !== false
+    subtitleFollowAutoResumeEnabled.value = followAutoResume
+    localStorage.setItem(SUBTITLE_FOLLOW_AUTO_RESUME_PREF_KEY, String(followAutoResume))
 
     // 2. 保存到后端
     if (projectStore.meta.jobId) {
@@ -2119,7 +2135,11 @@ function formatLastSaved(timestamp) {
 // ========== 快捷键操作 ==========
 
 function togglePlay() {
-  projectStore.player.isPlaying = !projectStore.player.isPlaying
+  if (!isMediaReady.value) {
+    console.warn('[EditorView] 媒体未就绪，快捷键播放操作被拦截')
+    return
+  }
+  playbackManager.togglePlay()
 }
 
 function stepBackward() {
@@ -2174,6 +2194,7 @@ onMounted(() => {
   if (savedWidth) {
     sidebarWidth.value = parseInt(savedWidth)
   }
+  loadEditorInteractionPreferences()
 
   loadProject()
 })

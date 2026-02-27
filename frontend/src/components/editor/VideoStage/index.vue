@@ -507,7 +507,7 @@ watch(() => projectStore.player.isPlaying, async (playing) => {
       }
       // 其他错误才是真正的播放失败
       console.error('[VideoStage] 播放失败:', error)
-      projectStore.player.isPlaying = false
+      playbackManager.pause()
     } finally {
       currentPlayPromise = null
     }
@@ -713,7 +713,7 @@ function onPause() {
 }
 
 function onEnded() {
-  projectStore.player.isPlaying = false
+  playbackManager.pause()
   emit('ended')
 }
 
