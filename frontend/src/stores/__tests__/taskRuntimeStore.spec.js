@@ -1,16 +1,15 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
-import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
-import { useProgressStore } from '@/stores/progressStore'
+import { useTaskRuntimeStore } from '@/stores/taskRuntimeStore'
 
 describe('TaskRuntimeStore Phase 2', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
   })
 
-  it('统一真源：兼容入口共享同一运行时数据', () => {
-    const taskStore = useUnifiedTaskStore()
-    const progressStore = useProgressStore()
+  it('统一真源：任务与进度状态共享同一运行时数据', () => {
+    const taskStore = useTaskRuntimeStore()
+    const progressStore = useTaskRuntimeStore()
     const jobId = 'phase2-job-001'
     const now = Date.now()
 
@@ -40,8 +39,8 @@ describe('TaskRuntimeStore Phase 2', () => {
   })
 
   it('防倒退：低序号投影事件被拒绝', () => {
-    const taskStore = useUnifiedTaskStore()
-    const progressStore = useProgressStore()
+    const taskStore = useTaskRuntimeStore()
+    const progressStore = useTaskRuntimeStore()
     const jobId = 'phase2-job-002'
     const now = Date.now()
 
@@ -76,8 +75,8 @@ describe('TaskRuntimeStore Phase 2', () => {
   })
 
   it('同序号同时间戳：低优先级来源不覆盖 SSE 状态', () => {
-    const taskStore = useUnifiedTaskStore()
-    const progressStore = useProgressStore()
+    const taskStore = useTaskRuntimeStore()
+    const progressStore = useTaskRuntimeStore()
     const jobId = 'phase2-job-003'
     const now = Date.now()
 

@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
-import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
-import { useProgressStore } from '@/stores/progressStore'
+import { useTaskRuntimeStore } from '@/stores/taskRuntimeStore'
 import { PHASE0_FIXTURES } from './fixtures'
 
 describe('Phase 0 回归 - 任务链路', () => {
@@ -10,8 +9,8 @@ describe('Phase 0 回归 - 任务链路', () => {
   })
 
   it('覆盖 上传 -> 转录 -> 暂停/恢复 -> 取消 -> 刷新恢复', () => {
-    const taskStore = useUnifiedTaskStore()
-    const progressStore = useProgressStore()
+    const taskStore = useTaskRuntimeStore()
+    const progressStore = useTaskRuntimeStore()
     const now = Date.now()
     const { jobId, filename } = PHASE0_FIXTURES
 
@@ -80,7 +79,7 @@ describe('Phase 0 回归 - 任务链路', () => {
     // 刷新恢复
     taskStore.saveTasks()
     setActivePinia(createPinia())
-    const restoredTaskStore = useUnifiedTaskStore()
+    const restoredTaskStore = useTaskRuntimeStore()
     const restored = restoredTaskStore.getTask(jobId)
     expect(restored).toBeTruthy()
     expect(restored?.status).toBe('canceled')
