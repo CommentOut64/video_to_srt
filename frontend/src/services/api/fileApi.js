@@ -20,6 +20,14 @@ class FileAPI {
   }
 
   /**
+   * 获取 input 目录中的所有字幕文件
+   * @returns {Promise<{files: Array<{name: string, size: number, modified: string}>, input_dir: string}>}
+   */
+  async listSubtitleFiles() {
+    return apiClient.get('/api/files/subtitles')
+  }
+
+  /**
    * 删除 input 目录中的文件
    * @param {string} filename - 文件名
    * @returns {Promise<{success: boolean, message: string}>}

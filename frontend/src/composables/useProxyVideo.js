@@ -3,14 +3,14 @@
  *
  * 职责：
  * 1. 管理 Proxy 视频完整生命周期（状态机模式）
- * 2. 自动订阅/取消订阅 SSE 事件
- * 3. 处理刷新后状态恢复
+ * 2. 处理刷新后状态恢复
+ * 3. 接收外部 SSE 转发事件并更新本地状态
  * 4. 提供统一的 isReady 状态
  * 5. 控件操作拦截支持
  */
-import { ref, computed, watch, onMounted, onUnmounted, toRef, isRef } from 'vue'
-import { sseChannelManager } from '@/services/sseChannelManager'
+import { ref, computed, watch, isRef } from 'vue'
 import { mediaApi } from '@/services/api'
+import { IS_LITE } from '@/config/flavor'
 
 /**
  * Proxy 视频状态枚举
@@ -40,11 +40,11 @@ export const TranscodeDecision = {
 
 /**
  * Proxy 视频管理 Composable
- * @param {Ref<string>|string} jobIdInput - 任务ID（可以是 ref 或普通值）
+ * @param {Ref<string>|string} identityIdInput - 媒体身份 ID（可以是 ref 或普通值）
  */
-export function useProxyVideo(jobIdInput) {
+export function useProxyVideo(identityIdInput) {
   // 统一转换为 ref
-  const jobId = isRef(jobIdInput) ? jobIdInput : ref(jobIdInput)
+  const identityId = isRef(identityIdInput) ? identityIdInput : ref(identityIdInput)
 
   // ========== 响应式状态 ==========
   const state = ref(ProxyState.IDLE)
@@ -63,16 +63,15 @@ export function useProxyVideo(jobIdInput) {
   // 待替换的720p URL（用于延迟替换）
   const pending720pUrl = ref(null)
 
-  // SSE 订阅状态
-  const isSubscribed = ref(false)
-  let unsubscribeSSE = null
-
   // ========== 计算属性 ==========
 
   /**
    * 视频是否就绪（可以播放）
    */
   const isReady = computed(() => {
+    if (IS_LITE && !identityId.value) {
+      return true
+    }
     return [
       ProxyState.READY_360P,
       ProxyState.READY_720P,
@@ -156,7 +155,6 @@ export function useProxyVideo(jobIdInput) {
   const sseHandlers = {
     // 分析完成事件
     onAnalyzeComplete: (data) => {
-      console.log("[useProxyVideo] 分析完成:", data);
       decision.value = data.decision;
 
       if (data.decision === TranscodeDecision.DIRECT_PLAY) {
@@ -174,33 +172,29 @@ export function useProxyVideo(jobIdInput) {
 
     // 重封装进度
     onRemuxProgress: (data) => {
-      console.log("[useProxyVideo] 重封装进度:", data.progress);
       state.value = ProxyState.REMUXING;
       progress.value = data.progress || 0;
     },
 
     // 重封装完成
     onRemuxComplete: (data) => {
-      console.log("[useProxyVideo] 重封装完成:", data);
       state.value = ProxyState.READY_720P;
       urls.value.proxy720p =
-        data.video_url || `/api/media/${jobId.value}/video`;
+        data.video_url || `/api/media/${identityId.value}/video`;
       progress.value = 100;
     },
 
     // 360p 预览进度
     onPreview360pProgress: (data) => {
-      console.log("[useProxyVideo] 360p 进度:", data.progress);
       state.value = ProxyState.TRANSCODING_360;
       progress.value = data.progress || 0;
     },
 
     // 360p 预览完成
     onPreview360pComplete: (data) => {
-      console.log("[useProxyVideo] 360p 完成:", data);
       state.value = ProxyState.READY_360P;
       urls.value.preview360p =
-        data.video_url || `/api/media/${jobId.value}/video/preview`;
+        data.video_url || `/api/media/${identityId.value}/video/preview`;
       progress.value = 0; // 重置进度，准备 720p
 
       // 自动开始 720p（状态会由后续 SSE 事件更新）
@@ -209,7 +203,6 @@ export function useProxyVideo(jobIdInput) {
 
     // 720p Proxy 进度（后台静默转码，不更新状态）
     onProxyProgress: (data) => {
-      console.log("[useProxyVideo] 720p 后台转码进度:", data.progress);
       // 如果当前已有可播放视频（360p 或 source），保持当前状态，不显示转码提示
       // 只在内部记录进度，用于调试
       if (
@@ -225,24 +218,11 @@ export function useProxyVideo(jobIdInput) {
 
     // 720p Proxy 完成（立即无缝替换）
     onProxyComplete: (data) => {
-      console.log("[useProxyVideo] 720p 完成，准备替换:", data);
-      const new720pUrl = data.video_url || `/api/media/${jobId.value}/video`;
-
-      console.log("[useProxyVideo] 立即更新720p URL，触发无缝切换");
-      console.log("[useProxyVideo] 更新前 - urls.value.proxy720p:", urls.value.proxy720p);
+      const new720pUrl = data.video_url || `/api/media/${identityId.value}/video`;
 
       urls.value.proxy720p = new720pUrl;
       state.value = ProxyState.READY_720P;
       progress.value = 0;
-
-      console.log("[useProxyVideo] 更新后 - urls.value.proxy720p:", urls.value.proxy720p);
-      console.log("[useProxyVideo] 720p URL已更新，完整状态:", {
-        proxy720p: urls.value.proxy720p,
-        preview360p: urls.value.preview360p,
-        state: state.value,
-        currentUrl: currentUrl.value,
-        currentResolution: currentResolution.value
-      });
     },
 
     // Proxy 错误
@@ -254,7 +234,6 @@ export function useProxyVideo(jobIdInput) {
       const pausedForNewJob = reason.includes("paused_for_new_job");
 
       if (pausedForNewJob) {
-        console.log("[useProxyVideo] 720p 被中断以让路新任务，保持 360p 播放并等待重试");
         urls.value.proxy720p = null;
         pending720pUrl.value = null;
         progress.value = 0;
@@ -286,14 +265,12 @@ export function useProxyVideo(jobIdInput) {
    * 初始化：从后端恢复状态
    */
   async function initialize() {
-    if (!jobId.value) return;
+    if (!identityId.value) return;
 
     try {
       // 从后端获取当前状态
-      const response = await mediaApi.getProxyStatus(jobId.value);
+      const response = await mediaApi.getProxyStatus(identityId.value);
       const status = response.data || response;
-
-      console.log("[useProxyVideo] 初始化状态:", status);
 
       // 恢复 URLs（先恢复URL，用于判断是否有可播放视频）
       if (status.urls) {
@@ -307,14 +284,12 @@ export function useProxyVideo(jobIdInput) {
       if (!urls.value.proxy720p && status.best_playable_url) {
         pending720pUrl.value = status.best_playable_url;
         urls.value.proxy720p = status.best_playable_url;
-        console.log("[useProxyVideo] 使用后端最佳可播放URL作为初始候选:", status.best_playable_resolution);
       }
 
       // V3.1.2+dev.20260113.03: 静默转码逻辑
       // 如果后端返回 transcoding_720 但已有360p可用，保持 ready_360p 状态
       let effectiveState = status.state || ProxyState.IDLE;
       if (effectiveState === ProxyState.TRANSCODING_720 && urls.value.preview360p) {
-        console.log("[useProxyVideo] 720p正在后台转码，保持360p就绪状态（静默转码）");
         effectiveState = ProxyState.READY_360P;
       }
 
@@ -343,51 +318,17 @@ export function useProxyVideo(jobIdInput) {
   }
 
   /**
-   * 订阅 SSE 事件
-   */
-  function subscribeSSE() {
-    if (!jobId.value || isSubscribed.value) return;
-
-    console.log("[useProxyVideo] 订阅 SSE:", jobId.value);
-
-    unsubscribeSSE = sseChannelManager.subscribeJob(jobId.value, {
-      ...sseHandlers,
-      // 连接成功后刷新状态
-      onConnected: () => {
-        console.log("[useProxyVideo] SSE 连接成功");
-      },
-    });
-
-    isSubscribed.value = true;
-  }
-
-  /**
-   * 取消订阅 SSE
-   */
-  function unsubscribe() {
-    if (unsubscribeSSE) {
-      console.log("[useProxyVideo] 取消 SSE 订阅");
-      unsubscribeSSE();
-      unsubscribeSSE = null;
-      isSubscribed.value = false;
-    }
-  }
-
-  /**
    * 重试转码
    */
   async function retry() {
     if (state.value !== ProxyState.ERROR) return;
-
-    console.log("[useProxyVideo] 重试转码");
     error.value = null;
     state.value = ProxyState.ANALYZING;
     progress.value = 0;
 
     try {
       // 触发后端重新分析
-      await mediaApi.generatePreview(jobId.value);
-      subscribeSSE();
+      await mediaApi.generatePreview(identityId.value);
     } catch (e) {
       console.error("[useProxyVideo] 重试失败:", e);
       state.value = ProxyState.ERROR;
@@ -407,26 +348,13 @@ export function useProxyVideo(jobIdInput) {
    */
   function apply720pUpgrade() {
     if (!pending720pUrl.value) {
-      console.log("[useProxyVideo] 没有待替换的720p URL");
       return false;
     }
-
-    console.log("[useProxyVideo] 执行720p替换:", {
-      pending: pending720pUrl.value,
-      currentState: state.value,
-      current720p: urls.value.proxy720p,
-      current360p: urls.value.preview360p,
-    });
 
     urls.value.proxy720p = pending720pUrl.value;
     state.value = ProxyState.READY_720P;
     pending720pUrl.value = null; // 清除待替换状态
     progress.value = 0;
-
-    console.log("[useProxyVideo] 720p替换完成，新的URLs:", {
-      proxy720p: urls.value.proxy720p,
-      preview360p: urls.value.preview360p,
-    });
 
     return true;
   }
@@ -449,20 +377,9 @@ export function useProxyVideo(jobIdInput) {
 
   // ========== 生命周期 ==========
 
-  onMounted(() => {
-    if (jobId.value) {
-      initialize();
-    }
-  });
-
-  onUnmounted(() => {
-    unsubscribe();
-  });
-
-  // 监听 jobId 变化
-  watch(jobId, (newId, oldId) => {
+  // 监听身份变化
+  watch(identityId, (newId, oldId) => {
     if (oldId) {
-      unsubscribe();
       // 重置状态
       state.value = ProxyState.IDLE;
       progress.value = 0;
@@ -472,17 +389,7 @@ export function useProxyVideo(jobIdInput) {
     if (newId) {
       initialize();
     }
-  });
-
-  // 调试：监听 currentUrl 变化
-  watch(currentUrl, (newUrl, oldUrl) => {
-    console.log("[useProxyVideo] currentUrl 变化:", {
-      oldUrl,
-      newUrl,
-      state: state.value,
-      urls: { ...urls.value },
-    });
-  });
+  }, { immediate: true });
 
   // ========== 返回值 ==========
   return {
@@ -506,8 +413,6 @@ export function useProxyVideo(jobIdInput) {
     // 方法
     retry,
     refresh,
-    subscribeSSE,
-    unsubscribe,
     apply720pUpgrade, // 执行720p替换
     fallbackTo360p,   // 视频加载失败降级
     // 从后端快照直接同步当前状态（SSE initial_state/HTTP 兜底）
@@ -515,7 +420,6 @@ export function useProxyVideo(jobIdInput) {
       if (!proxyState) return;
       // V3.1.2+dev.20260114.08: 防止旧快照覆盖新状态（版本递增）
       if (proxyState.version !== undefined && version.value !== 0 && proxyState.version < version.value) {
-        console.log("[useProxyVideo] 忽略过期的状态快照", { incoming: proxyState.version, current: version.value });
         return;
       }
       if (proxyState.version !== undefined) {

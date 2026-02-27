@@ -150,7 +150,14 @@ class PipelineOrchestrator:
             )
 
             # V3.2.0+dev.20260125.07: 使用传入的 subtitle_manager，否则获取
-            _subtitle_manager = subtitle_manager if subtitle_manager else get_streaming_subtitle_manager(job.job_id)
+            _subtitle_manager = (
+                subtitle_manager
+                if subtitle_manager
+                else get_streaming_subtitle_manager(
+                    job.job_id,
+                    project_id=getattr(job, "project_id", None),
+                )
+            )
 
             # 恢复字幕状态
             if resume_context.is_resuming and resume_context.sentences_snapshot:

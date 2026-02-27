@@ -15,6 +15,9 @@ export const useProjectStore = defineStore("project", () => {
   // ========== 1. 项目元数据 ==========
   const meta = ref({
     jobId: null, // 转录任务ID
+    projectId: null, // 项目ID（Task6 主键）
+    mode: "normal", // normal | legacy
+    flavor: "full", // full | lite
     videoPath: null, // 视频文件路径
     audioPath: null, // 音频文件路径
     peaksPath: null, // 波形峰值数据路径
@@ -102,6 +105,7 @@ export const useProjectStore = defineStore("project", () => {
   });
 
   // ========== 6. 计算属性 ==========
+  const primaryId = computed(() => meta.value.projectId || meta.value.jobId || null);
   const totalSubtitles = computed(() => subtitles.value.length);
 
   const currentSubtitle = computed(() => {
@@ -259,10 +263,11 @@ export const useProjectStore = defineStore("project", () => {
     () => {
       // 跳过保存后的状态更新触发
       if (isUpdatingAfterSave) return;
-      if (!meta.value.jobId) return;
+      const cacheKey = meta.value.projectId || meta.value.jobId;
+      if (!cacheKey) return;
 
       // 更新内存缓存
-      memoryCache.set(meta.value.jobId, {
+      memoryCache.set(cacheKey, {
         subtitles: toRaw(subtitles.value),
         meta: toRaw(meta.value),
       });
@@ -275,7 +280,7 @@ export const useProjectStore = defineStore("project", () => {
 
       // 触发智能保存
       smartSaver.save({
-        jobId: meta.value.jobId,
+        jobId: cacheKey,
         subtitles: subtitles.value,
         meta: meta.value,
       });
@@ -380,13 +385,68 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   /**
+   * 从 Project API 数据载入字幕（Task6）。
+   * @param {Array|Object} payload - 允许传入 segments 数组，或 { segments, doc_meta } 对象
+   * @param {Object} metadata - 可选的附加 meta
+   */
+  function loadFromProjectData(payload, metadata = {}) {
+    const segments = Array.isArray(payload) ? payload : payload?.segments || [];
+    const docMeta = Array.isArray(payload) ? null : payload?.doc_meta || payload?.meta || null;
+    const now = Date.now();
+    subtitles.value = segments.map((seg, index) => {
+      const segmentId = String(seg.segment_id || seg.id || `seg-${index}`);
+      const legacyIndexRaw = seg.legacy_index ?? seg.sentence_index ?? index;
+      const sentenceIndex = Number.isFinite(Number(legacyIndexRaw)) ? Number(legacyIndexRaw) : index;
+      return {
+        id: `subtitle-${segmentId}`,
+        segment_id: segmentId,
+        sentenceIndex,
+        start: toDisplayTime(seg.start ?? 0),
+        end: toDisplayTime(seg.end ?? 0),
+        text: String(seg.text ?? ""),
+        isDirty: false,
+        isModified: Boolean(seg.is_modified),
+        originalText: seg.original_text ?? null,
+        chunk_id: null,
+        words: Array.isArray(seg.words) ? seg.words : [],
+        confidence: seg.confidence ?? null,
+        display_confidence: seg.display_confidence,
+        confidence_source: seg.confidence_source,
+        warning_type: seg.warning_type || "none",
+        source: seg.source_type || seg.source || "imported",
+        isDraft: Boolean(seg.is_draft),
+        isFinalized: seg.is_finalized ?? !Boolean(seg.is_draft),
+        ...normalizeSpeakerFields(seg, { stripSpeaker: Boolean(seg.is_draft) }),
+      };
+    });
+
+    meta.value = {
+      ...meta.value,
+      ...metadata,
+      projectId: metadata.projectId || docMeta?.project_id || meta.value.projectId,
+      mode: metadata.mode || meta.value.mode || "normal",
+      lastSaved: now,
+      isDirty: false,
+      subtitleOffset: subtitleOffset.value,
+    };
+
+    clearHistory();
+    chunkSubtitleMap.value.clear();
+    speakerProfiles.value = new Map();
+    deletedSentenceIndices.value.clear();
+  }
+
+  /**
    * 从缓存/存储恢复项目
    */
-  async function restoreProject(jobId) {
+  async function restoreProject(identityId) {
+    if (!identityId) {
+      return false;
+    }
     try {
       // 优先从内存缓存获取
-      if (memoryCache.has(jobId)) {
-        const cached = memoryCache.get(jobId);
+      if (memoryCache.has(identityId)) {
+        const cached = memoryCache.get(identityId);
         subtitles.value = cached.subtitles;
         meta.value = cached.meta;
         if (cached?.meta?.subtitleOffset !== undefined) {
@@ -399,7 +459,7 @@ export const useProjectStore = defineStore("project", () => {
       }
 
       // 使用智能保存系统恢复（支持 IndexedDB + localStorage 备份）
-      const saved = await smartSaver.restoreFromBackup(jobId);
+      const saved = await smartSaver.restoreFromBackup(identityId);
       if (saved) {
         subtitles.value = saved.subtitles;
         meta.value = saved.meta;
@@ -614,6 +674,7 @@ export const useProjectStore = defineStore("project", () => {
       source: 'split',
     };
     rightSubtitle.sentenceIndex = undefined;
+    rightSubtitle.segment_id = undefined;
     rightSubtitle.originalText = null;
 
     // 6. 原子操作：删除旧字幕，插入两个新字幕
@@ -1031,10 +1092,11 @@ export const useProjectStore = defineStore("project", () => {
     );
 
     // 关键路径使用同步备份 + 立即持久化，避免取消后用户立刻刷新导致数据丢失
-    if (meta.value.jobId) {
+    const cacheKey = primaryId.value;
+    if (cacheKey) {
       try {
         await smartSaver.forceSaveCritical({
-          jobId: meta.value.jobId,
+          jobId: cacheKey,
           subtitles: subtitles.value,
           meta: meta.value,
         });
@@ -1423,9 +1485,14 @@ export const useProjectStore = defineStore("project", () => {
     const srtContent = generateSRT();
     // await api.saveSubtitle(meta.value.jobId, srtContent)
 
+    const cacheKey = primaryId.value;
+    if (!cacheKey) {
+      return;
+    }
+
     // 强制立即保存到本地存储
     await smartSaver.forceSave({
-      jobId: meta.value.jobId,
+      jobId: cacheKey,
       subtitles: subtitles.value,
       meta: meta.value,
     });
@@ -1443,6 +1510,9 @@ export const useProjectStore = defineStore("project", () => {
     subtitles.value = [];
     meta.value = {
       jobId: null,
+      projectId: null,
+      mode: "normal",
+      flavor: "full",
       videoPath: null,
       audioPath: null,
       peaksPath: null,
@@ -1543,6 +1613,7 @@ export const useProjectStore = defineStore("project", () => {
     speakerProfiles,
 
     // 计算属性
+    primaryId,
     totalSubtitles,
     currentSubtitle,
     isDirty,
@@ -1564,6 +1635,7 @@ export const useProjectStore = defineStore("project", () => {
     // 操作方法
     importSRT,
     importSegments,
+    loadFromProjectData,
     restoreProject,
     updateSubtitle,
     addSubtitle,

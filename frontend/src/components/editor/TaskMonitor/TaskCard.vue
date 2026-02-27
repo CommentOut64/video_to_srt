@@ -127,6 +127,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { transcriptionApi } from '@/services/api'
 import { PHASE_CONFIG, STATUS_CONFIG, formatProgress } from '@/constants/taskPhases'
+import { navigateToEditor } from '@/utils/editorNavigation'
 
 const props = defineProps({
   task: { type: Object, required: true },
@@ -148,7 +149,7 @@ const showProgress = computed(() =>
 // 处理卡片点击事件
 function handleCardClick() {
   // 所有状态的任务都可以点击跳转到编辑器
-  openEditor()
+  void openEditor()
 }
 
 // 获取阶段样式
@@ -202,8 +203,8 @@ async function cancelTask() {
 }
 
 // 打开编辑器
-function openEditor() {
-  router.push(`/editor/${props.task.job_id}`)
+async function openEditor() {
+  await navigateToEditor(router, { jobId: props.task.job_id })
 }
 
 // 格式化时间

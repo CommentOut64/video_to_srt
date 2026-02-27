@@ -46,7 +46,7 @@ dependencies = [
     # --- AI 推理引擎 ---
     "faster-whisper==1.2.1",
     "ctranslate2>=4.5.0",  # 4.5.0+ 支持新 CUDA/cuDNN 运行时
-    "onnxruntime-gpu==1.18.0",  # CUDA 12.x + cuDNN 8.x
+    "onnxruntime-gpu==1.23.2",  # Python 3.10 可用的最新 1.x GPU 版
 
     # --- 标点恢复/分词 ---
     "punctuators>=0.0.7",
@@ -160,8 +160,8 @@ index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 override-dependencies = [
     # 与现有生态保持一致，统一 numpy 主版本
     "numpy==1.26.4",
-    # 锁定 onnxruntime 到支持 Python 3.10 的版本（安装后会被 onnxruntime-gpu 替换）
-    "onnxruntime==1.18.0",
+    # 锁定 onnxruntime 到与 GPU 版一致的 Python 3.10 可用版本
+    "onnxruntime==1.23.2",
 ]
 
 # 特殊依赖源配置

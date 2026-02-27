@@ -17,7 +17,13 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def push_subtitle_event(sse_manager, job_id: str, event_type: str, data: dict):
+def push_subtitle_event(
+    sse_manager,
+    job_id: str,
+    event_type: str,
+    data: dict,
+    project_id: Optional[str] = None,
+):
     """
     推送字幕事件（统一封装）
 
@@ -32,13 +38,20 @@ def push_subtitle_event(sse_manager, job_id: str, event_type: str, data: dict):
         f"subtitle.{event_type}",
         data
     )
+    if project_id:
+        sse_manager.broadcast_sync(
+            f"project:{project_id}",
+            f"subtitle.{event_type}",
+            data
+        )
 
 
 class StreamingSubtitleManager:
     """流式字幕管理器"""
 
-    def __init__(self, job_id: str):
+    def __init__(self, job_id: str, project_id: Optional[str] = None):
         self.job_id = job_id
+        self.project_id = project_id
         self.sentences: Dict[int, SentenceSegment] = {}  # key = sentence_index
         self.sentence_count = 0
         self.sse_manager = get_sse_manager()
@@ -118,6 +131,24 @@ class StreamingSubtitleManager:
             self._remove_speaker_fields_for_draft(payload)
         return payload
 
+    def _emit_subtitle_event(self, event_type: str, data: Dict[str, Any]) -> None:
+        """统一推送字幕事件，并在可用时同步 project 频道。"""
+        if self.project_id:
+            push_subtitle_event(
+                self.sse_manager,
+                self.job_id,
+                event_type,
+                data,
+                project_id=self.project_id,
+            )
+        else:
+            push_subtitle_event(
+                self.sse_manager,
+                self.job_id,
+                event_type,
+                data,
+            )
+
     def add_sentence(self, sentence: SentenceSegment) -> int:
         """
         添加新句子（SenseVoice 阶段）
@@ -151,15 +182,13 @@ class StreamingSubtitleManager:
             "words": [w.to_dict() if hasattr(w, 'to_dict') else w for w in getattr(sentence, 'words', [])]  # 确保包含 words
         }
 
-        push_subtitle_event(
-            self.sse_manager,
-            self.job_id,
+        self._emit_subtitle_event(
             "sv_sentence",
             {
                 "index": index,
                 "sentence": sentence_dict,
-                "source": "sensevoice"
-            }
+                "source": "sensevoice",
+            },
         )
 
         logger.debug(f"添加句子 {index}: {sentence.text[:30]}...")
@@ -238,16 +267,14 @@ class StreamingSubtitleManager:
             TextSource.LLM_TRANSLATION: "llm_trans",
         }.get(source, "batch_update")
 
-        push_subtitle_event(
-            self.sse_manager,
-            self.job_id,
+        self._emit_subtitle_event(
             event_type,
             {
                 "index": index,
                 "sentence": sentence.to_dict(),
                 "source": source.value,
-                "is_update": True
-            }
+                "is_update": True,
+            },
         )
 
         logger.debug(f"更新句子 {index} ({source.value}): {new_text[:30]}...")
@@ -269,15 +296,13 @@ class StreamingSubtitleManager:
         if confidence is not None:
             sentence.translation_confidence = confidence
 
-        push_subtitle_event(
-            self.sse_manager,
-            self.job_id,
+        self._emit_subtitle_event(
             "llm_trans",
             {
                 "index": index,
                 "translation": translation,
-                "confidence": confidence
-            }
+                "confidence": confidence,
+            },
         )
 
     def mark_for_deletion(self, index: int, reason: str = "garbage"):
@@ -296,14 +321,12 @@ class StreamingSubtitleManager:
         sentence.deletion_reason = reason
 
         # 推送 SSE 事件通知前端
-        push_subtitle_event(
-            self.sse_manager,
-            self.job_id,
+        self._emit_subtitle_event(
             "sentence_deleted",
             {
                 "index": index,
-                "reason": reason
-            }
+                "reason": reason,
+            },
         )
         logger.info(f"标记删除句子 {index}: {reason}")
 
@@ -443,15 +466,13 @@ class StreamingSubtitleManager:
 
         # V3.8: 在锁外推送 SSE 事件，避免长时间持锁
         for index, sentence_dict in sentences_to_push:
-            push_subtitle_event(
-                self.sse_manager,
-                self.job_id,
+            self._emit_subtitle_event(
                 "draft",
                 {
                     "index": index,
                     "chunk_index": chunk_index,
-                    "sentence": sentence_dict
-                }
+                    "sentence": sentence_dict,
+                },
             )
 
         # V3.8 调试日志：确认草稿已添加到管理器
@@ -519,16 +540,14 @@ class StreamingSubtitleManager:
                 new_indices = sorted(protected_sentences.keys())
                 self.chunk_sentences[chunk_index] = new_indices
 
-            push_subtitle_event(
-                self.sse_manager,
-                self.job_id,
+            self._emit_subtitle_event(
                 "replace_chunk",
                 {
                     "chunk_index": chunk_index,
                     "old_indices": old_indices,
                     "new_indices": new_indices,
-                    "sentences": []
-                }
+                    "sentences": [],
+                },
             )
             logger.warning(
                 f"replace_chunk: Chunk {chunk_index} 的定稿句子为空，"
@@ -588,16 +607,14 @@ class StreamingSubtitleManager:
                 )
             )
 
-        push_subtitle_event(
-            self.sse_manager,
-            self.job_id,
+        self._emit_subtitle_event(
             "replace_chunk",
             {
                 "chunk_index": chunk_index,
                 "old_indices": old_indices,
                 "new_indices": new_indices,
-                "sentences": sentences_data
-            }
+                "sentences": sentences_data,
+            },
         )
 
         # V3.8 调试日志：确认替换成功
@@ -672,16 +689,14 @@ class StreamingSubtitleManager:
 
         # V3.8: 在锁外推送 SSE 事件，避免死锁
         for index, sentence_dict in sentences_to_push:
-            push_subtitle_event(
-                self.sse_manager,
-                self.job_id,
+            self._emit_subtitle_event(
                 "finalized",
                 {
                     "index": index,
                     "chunk_index": chunk_index,
                     "sentence": sentence_dict,
-                    "mode": "sensevoice_only"
-                }
+                    "mode": "sensevoice_only",
+                },
             )
 
         logger.debug(
@@ -1031,15 +1046,13 @@ class StreamingSubtitleManager:
 
             if sentences_data:
                 # 推送恢复事件（使用新的事件类型，避免与实时推送混淆）
-                push_subtitle_event(
-                    self.sse_manager,
-                    self.job_id,
-                    "restored",  # 恢复事件类型
+                self._emit_subtitle_event(
+                    "restored",
                     {
                         "chunk_index": chunk_index,
                         "sentences": sentences_data,
-                        "is_restore": True
-                    }
+                        "is_restore": True,
+                    },
                 )
 
         # 推送手动新增字幕（不在 chunk 映射内）
@@ -1060,15 +1073,13 @@ class StreamingSubtitleManager:
             manual_sentences.append(sentence_dict)
 
         if manual_sentences:
-            push_subtitle_event(
-                self.sse_manager,
-                self.job_id,
+            self._emit_subtitle_event(
                 "restored",
                 {
                     "chunk_index": "manual",
                     "sentences": manual_sentences,
-                    "is_restore": True
-                }
+                    "is_restore": True,
+                },
             )
 
         logger.info(
@@ -1083,11 +1094,19 @@ class StreamingSubtitleManager:
 _subtitle_managers: Dict[str, StreamingSubtitleManager] = {}
 
 
-def get_streaming_subtitle_manager(job_id: str) -> StreamingSubtitleManager:
+def get_streaming_subtitle_manager(
+    job_id: str,
+    project_id: Optional[str] = None,
+) -> StreamingSubtitleManager:
     """获取或创建流式字幕管理器"""
     global _subtitle_managers
     if job_id not in _subtitle_managers:
-        _subtitle_managers[job_id] = StreamingSubtitleManager(job_id)
+        _subtitle_managers[job_id] = StreamingSubtitleManager(
+            job_id=job_id,
+            project_id=project_id,
+        )
+    elif project_id:
+        _subtitle_managers[job_id].project_id = project_id
     return _subtitle_managers[job_id]
 
 

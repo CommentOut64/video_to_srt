@@ -125,12 +125,13 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, watch, nextTick } from 'vue'
+import { ref, reactive, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useProjectStore } from '@/stores/projectStore'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { useSubtitleSync, useHomophoneSearch, SortMode } from '@/composables'
 import transcriptionApi from '@/services/api/transcriptionApi'
+import projectApi from '@/services/api/projectApi'
 // 导入组件
 import SubtitleItem from './SubtitleItem.vue'
 import SearchToolbar from './SearchToolbar.vue'
@@ -139,7 +140,10 @@ import GroupHeader from './GroupHeader.vue'
 // Props
 const props = defineProps({
   autoScroll: { type: Boolean, default: true },
-  editable: { type: Boolean, default: true }
+  editable: { type: Boolean, default: true },
+  // 手动滚动后是否允许“温和自动恢复跟随”。
+  // true：6 秒无滚动后自动恢复；false：用户手动滚动后保持暂停跟随。
+  enableAutoResumeFollow: { type: Boolean, default: true },
 })
 
 const emit = defineEmits(['subtitle-click', 'subtitle-edit', 'subtitle-delete', 'subtitle-add'])
@@ -150,9 +154,10 @@ const projectStore = useProjectStore()
 // 全局播放管理器
 const playbackManager = usePlaybackManager()
 
+const identityId = computed(() => projectStore.primaryId)
 const jobId = computed(() => projectStore.meta.jobId)
 // V3.2.0+dev.20260124.02: 字幕同步（防止 AI 覆盖用户编辑）
-const { onSubtitleEdit, applyPendingEditsToStore, forceSyncNow, pendingCount } = useSubtitleSync(jobId)
+const { onSubtitleEdit, applyPendingEditsToStore, forceSyncNow, pendingCount } = useSubtitleSync(identityId)
 
 // 同音搜索 composable（用 reactive 包裹，使模板 v-model 能正确写入 ref.value）
 const homophoneSearch = reactive(useHomophoneSearch({
@@ -165,6 +170,11 @@ const collapsedGroups = ref(new Set())
 
 // Refs
 const listRef = ref(null)
+const isFollowPausedByUser = ref(false)
+const USER_SCROLL_AUTO_RESUME_DELAY_MS = 6000
+const PROGRAMMATIC_SCROLL_GUARD_MS = 900
+let followResumeTimer = null
+let programmaticScrollGuardUntil = 0
 
 // State
 const quickSearchText = ref('')     // 快速搜索文本（简单过滤）
@@ -187,7 +197,7 @@ const filteredSubtitles = computed(() => {
 })
 
 watch(
-  () => jobId.value,
+  () => identityId.value,
   async () => {
     hasAppliedPending.value = false
     if (pendingCount() > 0) {
@@ -199,7 +209,7 @@ watch(
 watch(
   () => subtitles.value.length,
   async (length) => {
-    if (!jobId.value || length === 0 || hasAppliedPending.value) return
+    if (!identityId.value || length === 0 || hasAppliedPending.value) return
     const applied = applyPendingEditsToStore(projectStore)
     if (applied > 0) {
       await forceSyncNow()
@@ -252,12 +262,18 @@ async function deleteSubtitle(id) {
   projectStore.removeSubtitle(id, { isUserEdit: true })
   emit('subtitle-delete', id)
 
-  if (!subtitle || subtitle.sentenceIndex === undefined) {
+  if (!subtitle) {
     return
   }
 
   try {
-    await transcriptionApi.deleteSubtitle(projectStore.meta.jobId, subtitle.sentenceIndex)
+    if (projectStore.meta.projectId && subtitle.segment_id) {
+      await projectApi.deleteSubtitle(projectStore.meta.projectId, subtitle.segment_id)
+      return
+    }
+    if (projectStore.meta.jobId && subtitle.sentenceIndex !== undefined) {
+      await transcriptionApi.deleteSubtitle(projectStore.meta.jobId, subtitle.sentenceIndex)
+    }
   } catch (error) {
     console.warn('[SubtitleList] 删除字幕同步失败:', error)
   }
@@ -282,21 +298,29 @@ async function addNewSubtitle() {
   try {
     const baseStart = projectStore.toBaseTime(newStart)
     const baseEnd = projectStore.toBaseTime(newStart + 3)
-    const response = await transcriptionApi.createSubtitle(projectStore.meta.jobId, {
-      text: '',
-      start: baseStart,
-      end: baseEnd
-    })
-    const data = response?.data?.data || response?.data
-    if (data?.index !== undefined) {
-      const newSubtitle = projectStore.subtitles[insertIndex]
-      if (newSubtitle) {
-        projectStore.updateSubtitle(newSubtitle.id, {
-          sentenceIndex: data.index,
-          isModified: true,
-          source: data.source || 'manual'
-        }, { isUserEdit: true })
-      }
+    let data = null
+    if (projectStore.meta.projectId) {
+      data = await projectApi.createSubtitle(projectStore.meta.projectId, {
+        text: '',
+        start: baseStart,
+        end: baseEnd
+      })
+    } else if (projectStore.meta.jobId) {
+      const response = await transcriptionApi.createSubtitle(projectStore.meta.jobId, {
+        text: '',
+        start: baseStart,
+        end: baseEnd
+      })
+      data = response?.data?.data || response?.data
+    }
+    const newSubtitle = projectStore.subtitles[insertIndex]
+    if (newSubtitle) {
+      projectStore.updateSubtitle(newSubtitle.id, {
+        sentenceIndex: data?.index ?? data?.legacy_index ?? newSubtitle.sentenceIndex,
+        segment_id: data?.segment_id ?? newSubtitle.segment_id,
+        isModified: true,
+        source: data?.source || data?.source_type || 'manual'
+      }, { isUserEdit: true })
     }
   } catch (error) {
     console.warn('[SubtitleList] 新增字幕同步失败:', error)
@@ -325,21 +349,29 @@ async function syncInsertedSubtitle(insertIndex, start, end, text) {
   try {
     const baseStart = projectStore.toBaseTime(start)
     const baseEnd = projectStore.toBaseTime(end)
-    const response = await transcriptionApi.createSubtitle(projectStore.meta.jobId, {
-      text,
-      start: baseStart,
-      end: baseEnd
-    })
-    const data = response?.data?.data || response?.data
-    if (data?.index !== undefined) {
-      const newSubtitle = projectStore.subtitles[insertIndex]
-      if (newSubtitle) {
-        projectStore.updateSubtitle(newSubtitle.id, {
-          sentenceIndex: data.index,
-          isModified: true,
-          source: data.source || 'manual'
-        }, { isUserEdit: true })
-      }
+    let data = null
+    if (projectStore.meta.projectId) {
+      data = await projectApi.createSubtitle(projectStore.meta.projectId, {
+        text,
+        start: baseStart,
+        end: baseEnd
+      })
+    } else if (projectStore.meta.jobId) {
+      const response = await transcriptionApi.createSubtitle(projectStore.meta.jobId, {
+        text,
+        start: baseStart,
+        end: baseEnd
+      })
+      data = response?.data?.data || response?.data
+    }
+    const newSubtitle = projectStore.subtitles[insertIndex]
+    if (newSubtitle) {
+      projectStore.updateSubtitle(newSubtitle.id, {
+        sentenceIndex: data?.index ?? data?.legacy_index ?? newSubtitle.sentenceIndex,
+        segment_id: data?.segment_id ?? newSubtitle.segment_id,
+        isModified: true,
+        source: data?.source || data?.source_type || 'manual'
+      }, { isUserEdit: true })
     }
   } catch (error) {
     console.warn('[SubtitleList] 插入字幕同步失败:', error)
@@ -348,6 +380,7 @@ async function syncInsertedSubtitle(insertIndex, start, end, text) {
 
 function scrollToBottom() {
   if (listRef.value) {
+    markProgrammaticScroll()
     listRef.value.scrollTop = listRef.value.scrollHeight
   }
 }
@@ -355,18 +388,87 @@ function scrollToBottom() {
 function scrollToItem(index) {
   const items = listRef.value?.querySelectorAll('.subtitle-item')
   if (items && items[index]) {
+    markProgrammaticScroll()
     items[index].scrollIntoView({ behavior: 'smooth', block: 'center' })
   }
+}
+
+function clearFollowResumeTimer() {
+  if (followResumeTimer) {
+    clearTimeout(followResumeTimer)
+    followResumeTimer = null
+  }
+}
+
+function markProgrammaticScroll() {
+  programmaticScrollGuardUntil = Date.now() + PROGRAMMATIC_SCROLL_GUARD_MS
+}
+
+function isInProgrammaticScrollGuard() {
+  return Date.now() < programmaticScrollGuardUntil
+}
+
+function scheduleFollowAutoResume() {
+  clearFollowResumeTimer()
+  if (!props.enableAutoResumeFollow) return
+  followResumeTimer = setTimeout(() => {
+    isFollowPausedByUser.value = false
+    followResumeTimer = null
+  }, USER_SCROLL_AUTO_RESUME_DELAY_MS)
+}
+
+function pauseFollowByUserScroll() {
+  if (!props.autoScroll) return
+  if (isInProgrammaticScrollGuard()) return
+  isFollowPausedByUser.value = true
+  scheduleFollowAutoResume()
+}
+
+function handleListScroll() {
+  pauseFollowByUserScroll()
+}
+
+function handleListWheel() {
+  pauseFollowByUserScroll()
+}
+
+function handleListTouchMove() {
+  pauseFollowByUserScroll()
 }
 
 // 自动滚动跟随当前播放
 watch(currentSubtitleId, (id) => {
   if (!props.autoScroll || !id) return
+  if (isFollowPausedByUser.value) return
   const index = filteredSubtitles.value.findIndex(s => s.id === id)
   if (index !== -1) {
     nextTick(() => scrollToItem(index))
   }
 })
+
+watch(
+  () => props.enableAutoResumeFollow,
+  (enabled) => {
+    // 用户重新启用自动恢复时，如果当前已暂停，则从当前时刻重新计时恢复。
+    if (enabled && isFollowPausedByUser.value) {
+      scheduleFollowAutoResume()
+      return
+    }
+    if (!enabled) {
+      clearFollowResumeTimer()
+    }
+  }
+)
+
+watch(
+  () => props.autoScroll,
+  (enabled) => {
+    if (!enabled) {
+      clearFollowResumeTimer()
+      isFollowPausedByUser.value = false
+    }
+  }
+)
 
 // 批量更新检测：超过阈值时禁用动画，避免重叠闪烁
 const BATCH_UPDATE_THRESHOLD = 5
@@ -385,6 +487,21 @@ watch(subtitles, (newList) => {
 
   previousSubtitleCount = newCount
 }, { flush: 'pre' })  // pre: 在 DOM 更新前触发
+
+onMounted(() => {
+  if (!listRef.value) return
+  listRef.value.addEventListener('scroll', handleListScroll, { passive: true })
+  listRef.value.addEventListener('wheel', handleListWheel, { passive: true })
+  listRef.value.addEventListener('touchmove', handleListTouchMove, { passive: true })
+})
+
+onUnmounted(() => {
+  clearFollowResumeTimer()
+  if (!listRef.value) return
+  listRef.value.removeEventListener('scroll', handleListScroll)
+  listRef.value.removeEventListener('wheel', handleListWheel)
+  listRef.value.removeEventListener('touchmove', handleListTouchMove)
+})
 
 // ========================
 // 同音搜索相关方法

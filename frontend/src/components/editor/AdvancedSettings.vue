@@ -130,6 +130,24 @@
           </label>
         </div>
       </div>
+
+      <!-- 手动滚动后自动恢复跟随 -->
+      <div class="setting-row">
+        <div class="setting-label">
+          <span class="label-text">字幕跟随自动恢复</span>
+          <span class="label-hint">subtitle_follow_auto_resume</span>
+        </div>
+        <div class="setting-control">
+          <label class="toggle-switch">
+            <input
+              type="checkbox"
+              v-model="localConfig.general.subtitle_follow_auto_resume"
+              @change="emitChange"
+            />
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+      </div>
     </div>
 
     <!-- 分组一: 预处理与音频 -->
@@ -546,22 +564,33 @@ const tabs = [
   { id: 'system', label: 'System' }
 ]
 
-/* 本地配置 (深拷贝) */
-const localConfig = ref(JSON.parse(JSON.stringify(props.modelValue)))
+function normalizeConfig(config) {
+  const normalized = JSON.parse(JSON.stringify(config))
+  if (!normalized.general) {
+    normalized.general = {}
+  }
+  if (normalized.general.subtitle_follow_auto_resume === undefined) {
+    normalized.general.subtitle_follow_auto_resume = true
+  }
+  return normalized
+}
+
+/* 本地配置 (深拷贝 + 默认值归一化) */
+const localConfig = ref(normalizeConfig(props.modelValue))
 
 /* V3.2.0+dev.20260209.04: 移除自动规范化，允许用户输入空值和负号 */
 /* 发送变更事件（仅用于数据同步，不触发实际应用） */
 function emitChange() {
   /* 检查是否还匹配某个预设 */
   localConfig.value.preset_id = 'custom'
-  emit('update:modelValue', JSON.parse(JSON.stringify(localConfig.value)))
+  emit('update:modelValue', normalizeConfig(localConfig.value))
   // V3.2.0+dev.20260209.03: 移除 change 事件，避免实时触发字幕偏移
   // 只有点击"保存"按钮才真正应用
 }
 
 /* 监听外部值变化 */
 watch(() => props.modelValue, (newVal) => {
-  localConfig.value = JSON.parse(JSON.stringify(newVal))
+  localConfig.value = normalizeConfig(newVal)
 }, { deep: true })
 </script>
 

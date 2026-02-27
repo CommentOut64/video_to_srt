@@ -16,6 +16,7 @@
 import { ref, onUnmounted, unref, watch, toRaw } from 'vue'
 import localforage from 'localforage'
 import transcriptionApi from '@/services/api/transcriptionApi'
+import projectApi from '@/services/api/projectApi'
 import { useProjectStore } from '@/stores/projectStore'
 
 /**
@@ -38,19 +39,19 @@ function debounce(fn, delay) {
 
 /**
  * 字幕同步 Composable
- * @param {string} jobId - 任务 ID
+ * @param {string} identityId - 同步身份 ID（projectId 或 jobId）
  * @returns {Object} 同步方法和状态
  */
 const EDIT_QUEUE_PREFIX = 'subtitle-edit-queue-'
 
-function getQueueKey(jobId) {
-  return `${EDIT_QUEUE_PREFIX}${jobId}`
+function getQueueKey(identityId) {
+  return `${EDIT_QUEUE_PREFIX}${identityId}`
 }
 
-async function loadQueue(jobId) {
-  if (!jobId) return new Map()
+async function loadQueue(identityId) {
+  if (!identityId) return new Map()
   try {
-    const saved = await localforage.getItem(getQueueKey(jobId))
+    const saved = await localforage.getItem(getQueueKey(identityId))
     if (!saved || typeof saved !== 'object') {
       return new Map()
     }
@@ -62,8 +63,8 @@ async function loadQueue(jobId) {
   }
 }
 
-async function saveQueue(jobId, queue) {
-  if (!jobId) return
+async function saveQueue(identityId, queue) {
+  if (!identityId) return
   try {
     const payload = {}
     queue.forEach((value, key) => {
@@ -85,13 +86,13 @@ async function saveQueue(jobId, queue) {
       }
       payload[String(key)] = sanitized
     })
-    await localforage.setItem(getQueueKey(jobId), payload)
+    await localforage.setItem(getQueueKey(identityId), payload)
   } catch (error) {
     console.warn('[useSubtitleSync] 保存本地同步队列失败:', error)
   }
 }
 
-export function useSubtitleSync(jobIdRef) {
+export function useSubtitleSync(identityRef) {
   const projectStore = useProjectStore()
   // 待同步的编辑队列（Map: index -> update data）
   const pendingUpdates = ref(new Map())
@@ -99,7 +100,32 @@ export function useSubtitleSync(jobIdRef) {
   // 同步状态
   const isSyncing = ref(false)
   const syncErrors = ref(new Map())
-  const currentJobId = ref(null)
+  const currentIdentityId = ref(null)
+
+  function getActiveIdentity() {
+    return unref(identityRef) || projectStore.primaryId
+  }
+
+  function hasProjectContext() {
+    return Boolean(projectStore.meta.projectId)
+  }
+
+  function resolveProjectSegmentId(segmentOrIndex) {
+    if (segmentOrIndex === undefined || segmentOrIndex === null) {
+      return null
+    }
+    const target = String(segmentOrIndex)
+    const direct = projectStore.subtitles.find((item) => item.segment_id === target)
+    if (direct?.segment_id) {
+      return direct.segment_id
+    }
+    const index = Number(segmentOrIndex)
+    if (Number.isNaN(index)) {
+      return null
+    }
+    const byLegacyIndex = projectStore.subtitles.find((item) => Number(item.sentenceIndex) === index)
+    return byLegacyIndex?.segment_id || null
+  }
 
   /**
    * 真正的同步逻辑
@@ -109,8 +135,8 @@ export function useSubtitleSync(jobIdRef) {
       return
     }
 
-    const jobId = unref(jobIdRef)
-    if (!jobId) {
+    const identityId = getActiveIdentity()
+    if (!identityId) {
       return
     }
 
@@ -122,7 +148,17 @@ export function useSubtitleSync(jobIdRef) {
 
     for (const [index, data] of batch) {
       try {
-        await transcriptionApi.updateSubtitle(jobId, index, data)
+        if (hasProjectContext()) {
+          const segmentId = resolveProjectSegmentId(index)
+          if (!segmentId) {
+            throw new Error(`segment_id 不存在: ${index}`)
+          }
+          await projectApi.updateSubtitle(projectStore.meta.projectId, segmentId, data)
+        } else if (projectStore.meta.jobId) {
+          await transcriptionApi.updateSubtitle(projectStore.meta.jobId, index, data)
+        } else {
+          throw new Error('缺少可用的字幕同步上下文')
+        }
 
         // 成功后清除错误记录
         if (syncErrors.value.has(index)) {
@@ -131,7 +167,6 @@ export function useSubtitleSync(jobIdRef) {
       } catch (error) {
         // V3.2.0+dev.20260124.01: 404 错误说明任务已完成或句子不存在，无需同步
         if (error.status === 404 || error.message?.includes('不存在')) {
-          console.log(`[useSubtitleSync] 句子 ${index} 不存在（任务可能已完成），跳过同步`)
           // 清除错误记录，不重试
           if (syncErrors.value.has(index)) {
             syncErrors.value.delete(index)
@@ -151,7 +186,7 @@ export function useSubtitleSync(jobIdRef) {
       }
     }
 
-    await saveQueue(jobId, pendingUpdates.value)
+    await saveQueue(identityId, pendingUpdates.value)
     isSyncing.value = false
   }
 
@@ -166,7 +201,7 @@ export function useSubtitleSync(jobIdRef) {
    * @param {number} [end] - 新结束时间
    */
   const onSubtitleEdit = (index, { text, start, end }) => {
-    const jobId = unref(jobIdRef)
+    const identityId = getActiveIdentity()
     // 构建更新数据（只包含有值的字段）
     const update = {}
     if (text !== undefined) update.text = text
@@ -175,8 +210,8 @@ export function useSubtitleSync(jobIdRef) {
 
     // 加入同步队列（Map 会自动去重，只保留最后一次修改）
     pendingUpdates.value.set(index, update)
-    if (jobId) {
-      saveQueue(jobId, pendingUpdates.value)
+    if (identityId) {
+      saveQueue(identityId, pendingUpdates.value)
     }
 
     // 触发防抖同步
@@ -197,7 +232,9 @@ export function useSubtitleSync(jobIdRef) {
     if (!projectStore || pendingUpdates.value.size === 0) return 0
     let appliedCount = 0
     pendingUpdates.value.forEach((update, index) => {
-      const subtitle = projectStore.subtitles.find(s => s.sentenceIndex === index)
+      const subtitle = projectStore.subtitles.find(
+        (s) => s.sentenceIndex === index || s.segment_id === index
+      )
       if (!subtitle) return
       const displayUpdate = { ...update }
       if (update.start !== undefined) {
@@ -221,14 +258,14 @@ export function useSubtitleSync(jobIdRef) {
     }
   }
 
-  // 载入本地队列（基于 jobId）
+  // 载入本地队列（基于当前 identity）
   watch(
-    () => unref(jobIdRef),
-    async (jobId) => {
-      if (!jobId) return
-      if (currentJobId.value === jobId) return
-      pendingUpdates.value = await loadQueue(jobId)
-      currentJobId.value = jobId
+    () => getActiveIdentity(),
+    async (identityId) => {
+      if (!identityId) return
+      if (currentIdentityId.value === identityId) return
+      pendingUpdates.value = await loadQueue(identityId)
+      currentIdentityId.value = identityId
     },
     { immediate: true }
   )

@@ -1,7 +1,7 @@
 # Task 6-03: 前端实施方案
 
 > Type: Architecture | Status: Active
-> Version: V3.2.4+dev.20260222.01
+> Version: V3.2.4+dev.20260224.03
 > 上游文档: `Task6-00-总纲`, `Task6-01-领域模型与存储设计`
 
 ## 1. 实施顺序
@@ -762,25 +762,41 @@ export function useSubtitleSync(identityRef) {
 
 **文件**: `frontend/src/composables/useWaveformCursorDrag.js`
 **当前行数**: 426
-**修改量**: ~5 行
+**修改量**: ~15 行
 
 ```javascript
-// 原有（约 L326）
-if (!isVideoReady.value) {
-  console.warn('[WaveformCursorDrag] 视频未就绪')
-  return
-}
-
-// 改为
-import { IS_LITE } from '@/config/flavor'
-const canEditTimeline = computed(() => IS_LITE || isVideoReady.value)
+// 改造点 1：参数语义从 isVideoReady 升级为 isMediaReady（音频或视频可用）
+const canEditTimeline = computed(() => isMediaReady.value)
 if (!canEditTimeline.value) {
   console.warn('[WaveformCursorDrag] 时间轴不可编辑')
   return
 }
+
+// 改造点 2：导出统一时间换算函数，避免 WaveformTimeline 与右键菜单重复实现
+return {
+  getTimeFromClientX,
+  handleUpperZonePointerDown,
+  // ...
+}
 ```
 
-### 10.5 useProxyVideo.js 适配
+### 10.5 WaveformContextMenu / WaveformTimeline 契约统一
+
+**文件**:
+- `frontend/src/composables/useWaveformContextMenu.js`
+- `frontend/src/components/editor/WaveformTimeline/index.vue`
+
+```javascript
+// WaveformTimeline 内部统一传入时间换算函数
+onContextMenu(e, getTimeFromClientX)
+
+// useWaveformContextMenu 增加参数类型防护
+if (typeof getTimeFromClientX !== 'function') {
+  return
+}
+```
+
+### 10.6 useProxyVideo.js 适配
 
 **文件**: `frontend/src/composables/useProxyVideo.js`
 **当前行数**: 555
@@ -806,6 +822,68 @@ export function useProxyVideo(identityRef) {
   // ...
 }
 ```
+
+### 10.7 旧实现清理收敛（project-first）
+
+本阶段在不破坏旧任务兼容的前提下，做以下收敛：
+
+1. **字幕写回优先级统一为 `projectId > jobId`**
+   - 涉及文件：
+     - `frontend/src/composables/useSubtitleSync.js`
+     - `frontend/src/components/editor/SubtitleList/index.vue`
+     - `frontend/src/components/editor/SubtitleList/SubtitleItem.vue`
+     - `frontend/src/composables/useWaveformContextMenu.js`
+   - 规则：
+     - 只要存在 `projectId`，编辑写回统一走 `projectApi`
+     - 仅在缺失 `projectId` 时回退 `transcriptionApi`
+
+2. **媒体标识命名统一为 `mediaId`**
+   - 涉及文件：
+     - `frontend/src/components/editor/VideoStage/index.vue`
+     - `frontend/src/components/editor/WaveformTimeline/index.vue`
+     - `frontend/src/views/EditorView.vue`
+   - 目的：
+     - 避免 `jobId` 命名向组件内部泄漏旧语义
+     - 明确媒体访问依赖的是“媒体身份”，可由 `projectId` 或兼容 `jobId` 提供
+
+3. **移除 `useProxyVideo` 内部旧 SSE 订阅分支**
+   - 文件：`frontend/src/composables/useProxyVideo.js`
+   - 规则：
+     - `useProxyVideo` 仅负责状态机、HTTP 刷新与事件处理器
+     - SSE 连接统一由 `EditorView + sseChannelManager` 管理并转发到 handlers
+
+4. **移除视频区“不可用鼠标样式”旧提示**
+   - 文件：`frontend/src/components/editor/VideoStage/index.vue`
+   - 行为：
+     - 不再显示 `not-allowed` 光标
+     - 纯音频黑屏占位保持与有视频时一致的点击播放/暂停交互
+
+### 10.8 调试噪音清理（保留错误信号）
+
+为保证 Task6 解耦路径可长期维护，编辑链路内只保留 `warn/error` 级别信号，移除无业务副作用的观测日志：
+
+1. **Editor 主视图**
+   - 文件：`frontend/src/views/EditorView.vue`
+   - 处理：
+     - 删除仅用于开发期观测的 `console.log`
+     - 保留 `console.warn` / `console.error` 以支撑故障诊断
+
+2. **媒体与播放链路**
+   - 文件：
+     - `frontend/src/components/editor/VideoStage/index.vue`
+     - `frontend/src/composables/useProxyVideo.js`
+   - 处理：
+     - 删除转码状态/源切换过程中的调试输出
+     - 保留错误上报与失败降级逻辑，确保纯音频与有视频路径行为一致
+
+3. **字幕切分链路**
+   - 文件：
+     - `frontend/src/components/editor/SubtitleList/SubtitleItem.vue`
+     - `frontend/src/composables/useWaveformContextMenu.js`
+     - `frontend/src/composables/useSubtitleSync.js`
+   - 处理：
+     - 删除右键切分与同步过程的调试输出
+     - 保留切分失败、同步失败等异常告警
 
 ## 11. 实施约束
 

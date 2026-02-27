@@ -390,6 +390,39 @@ class SSEChannelManager extends EventEmitter {
   }
 
   /**
+   * 订阅项目频道（Task6-Lite）。
+   *
+   * 注意：
+   * - 依赖后端 `/api/stream/project/{projectId}` 端点。
+   * - 现阶段默认由调用方按能力决定是否启用（避免后端未就绪时反复重连）。
+   */
+  subscribeProject(projectId, handlers = {}) {
+    const channelId = `project:${projectId}`
+    const url = `${this.baseURL}/api/stream/project/${projectId}`
+
+    return this._subscribe(channelId, url, {
+      'subtitle.edited': (data) => {
+        handlers.onSubtitleUpdated?.(data)
+      },
+      'subtitle.added': (data) => {
+        handlers.onSubtitleAdded?.(data)
+      },
+      'subtitle.deleted': (data) => {
+        handlers.onSubtitleDeleted?.(data)
+      },
+      media_updated: (data) => {
+        handlers.onMediaUpdated?.(data)
+      },
+      connected: (data) => {
+        handlers.onConnected?.(data)
+      },
+      ping: () => {
+        handlers.onPing?.()
+      },
+    })
+  }
+
+  /**
    * 订阅模型下载进度
    * @param {Object} handlers - 事件处理器
    *   {

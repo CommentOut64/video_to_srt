@@ -47,26 +47,21 @@ from datetime import datetime
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # 导入核心配置和日志
-from app.core.config import config
+from app.core.config import FLAVOR, IS_LITE, config
 from app.core.logging import setup_logging
 
-# 导入新的转录服务（替换processor）
-from app.services.transcription_service import get_transcription_service
-from app.models.job_models import JobSettings
-from app.services.model_manager_v2 import get_model_manager_v2
 from app.config.model_config import ModelPreloadConfig
 
 # 导入API路由
-from app.api.routes import model_routes
-from app.api.routes import model_runtime_routes
 from app.api.routes import media_routes  # 新增：媒体资源路由
-from app.api.routes.transcription_routes import create_transcription_router
-from app.api.routes.speaker_routes import create_speaker_router
-from app.api.routes.demucs_routes import create_demucs_router  # 新增：Demucs配置路由
+from app.api.routes.project_routes import router as project_router
+from app.api.routes.legacy_compat_routes import router as legacy_router
+from app.api.routes.stream_routes import router as stream_router
 from app.api.routes.file_routes import create_file_router  # 新增：文件管理路由
 from app.api.routes import system_routes  # 新增：系统管理路由
 from app.api.routes import config_routes  # 新增：用户配置路由
 from app.api.routes import debug_routes  # 新增：调试路由
+from app.api.routes import presets_routes  # V3.2.4: 自定义预设路由
 from app.services.file_service import FileManagementService
 
 # 导入FFmpeg管理器
@@ -227,16 +222,27 @@ app.add_middleware(
 )
 
 # 注册API路由
-app.include_router(model_routes.router)
-app.include_router(model_runtime_routes.router)
 app.include_router(media_routes.router)  # 新增：媒体资源路由
 app.include_router(system_routes.router)  # 新增：系统管理路由
 app.include_router(config_routes.router)  # 新增：用户配置路由
 app.include_router(debug_routes.router)  # 新增：调试路由
+app.include_router(presets_routes.router)  # V3.2.4: 自定义预设路由
+app.include_router(project_router)  # Task6: 项目路由
+app.include_router(legacy_router)  # Task6: legacy 兼容路由
+app.include_router(stream_router)  # Task6: 项目级 SSE 路由
 
-# 注册Demucs配置路由（需要在转录路由之前注册）
-demucs_router = create_demucs_router()
-app.include_router(demucs_router)
+# 注册仅 Full 模式可用的路由
+if not IS_LITE:
+    from app.api.routes import model_routes
+    from app.api.routes import model_runtime_routes
+    from app.api.routes.demucs_routes import create_demucs_router
+
+    app.include_router(model_routes.router)
+    app.include_router(model_runtime_routes.router)
+
+    # 注册Demucs配置路由（需要在转录路由之前注册）
+    demucs_router = create_demucs_router()
+    app.include_router(demucs_router)
 
 @app.on_event("startup")
 async def startup_event():
@@ -272,19 +278,23 @@ async def startup_event():
             logger.warning(f"FFmpeg检测失败: {e}")
             logger.warning("转录功能可能无法使用，请手动安装FFmpeg")
 
-        # 3. 初始化模型管理器（此时事件循环已设置，后台验证可以正常推送SSE）
-        logger.info("步骤 3/4: 初始化模型管理器...")
-        model_manager = get_model_manager_v2()
-        logger.info("模型管理器初始化成功 (V2)")
+        if not IS_LITE:
+            # 3. 初始化模型管理器（此时事件循环已设置，后台验证可以正常推送SSE）
+            logger.info("步骤 3/4: 初始化模型管理器...")
+            from app.services.model_manager_v2 import get_model_manager_v2
+            model_manager = get_model_manager_v2()
+            logger.info("模型管理器初始化成功 (V2)")
 
-        # 4. 初始化队列服务（新增）
-        logger.info("步骤 4/4: 初始化任务队列服务...")
-        from app.services.job_queue_service import get_queue_service
-        from app.services.transcription_service import get_transcription_service
-        from app.core.config import config
-        transcription_service = get_transcription_service(str(config.JOBS_DIR))
-        queue_service = get_queue_service(transcription_service)
-        logger.info("任务队列服务已启动")
+            # 4. 初始化队列服务（新增）
+            logger.info("步骤 4/4: 初始化任务队列服务...")
+            from app.services.job_queue_service import get_queue_service
+            from app.services.transcription_service import get_transcription_service
+            from app.core.config import config
+            transcription_service = get_transcription_service(str(config.JOBS_DIR))
+            queue_service = get_queue_service(transcription_service)
+            logger.info("任务队列服务已启动")
+        else:
+            logger.info("Lite 模式启动: 跳过模型管理与转录队列初始化")
 
         # 4.5. 初始化媒体准备服务（独立线程执行转码，不阻塞主流程）
         from app.services.media_prep_service import get_media_prep_service
@@ -327,20 +337,22 @@ async def shutdown_event():
         except:
             pass
 
-        # 停止队列服务（新增）
-        from app.services.job_queue_service import get_queue_service
-        try:
-            queue_service = get_queue_service()
-            queue_service.shutdown()
-            logger.info("任务队列服务已停止")
-        except:
-            pass
+        if not IS_LITE:
+            # 停止队列服务（新增）
+            from app.services.job_queue_service import get_queue_service
+            try:
+                queue_service = get_queue_service()
+                queue_service.shutdown()
+                logger.info("任务队列服务已停止")
+            except:
+                pass
 
-        # 清理模型缓存
-        model_manager = get_model_manager_v2()
-        if model_manager:
-            model_manager.clear_cache()
-            logger.info("已清理模型缓存")
+            # 清理模型缓存
+            from app.services.model_manager_v2 import get_model_manager_v2
+            model_manager = get_model_manager_v2()
+            if model_manager:
+                model_manager.clear_cache()
+                logger.info("已清理模型缓存")
     except Exception as e:
         logger.error(f"清理资源失败: {str(e)}")
 
@@ -350,8 +362,11 @@ OUTPUT_DIR = str(config.OUTPUT_DIR)
 JOBS_DIR = str(config.JOBS_DIR)
 TEMP_DIR = str(config.TEMP_DIR)
 
-# 初始化转录服务
-transcription_service = get_transcription_service(JOBS_DIR)
+# 初始化转录服务（仅 Full 模式）
+transcription_service = None
+if not IS_LITE:
+    from app.services.transcription_service import get_transcription_service
+    transcription_service = get_transcription_service(JOBS_DIR)
 
 # 初始化文件管理服务
 file_service = FileManagementService(INPUT_DIR, OUTPUT_DIR)
@@ -361,13 +376,18 @@ file_router = create_file_router(file_service)
 app.include_router(file_router)
 
 # 注册转录路由（包含暂停、恢复等新功能）
-# 注意：model_routes已在第59行注册，这里不再重复注册
-transcription_router = create_transcription_router(transcription_service, file_service, OUTPUT_DIR)
-app.include_router(transcription_router)
+if not IS_LITE:
+    from app.api.routes.transcription_routes import create_transcription_router
+    from app.api.routes.speaker_routes import create_speaker_router
 
-# 注册 speaker 路由（说话人 profile/改绑/合并）
-speaker_router = create_speaker_router(transcription_service)
-app.include_router(speaker_router)
+    transcription_router = create_transcription_router(transcription_service, file_service, OUTPUT_DIR)
+    app.include_router(transcription_router)
+
+    # 注册 speaker 路由（说话人 profile/改绑/合并）
+    speaker_router = create_speaker_router(transcription_service)
+    app.include_router(speaker_router)
+else:
+    logger.info("Lite 模式启动: 跳过 transcription/speaker 路由注册")
 
 ModelPreloadConfig.print_config()
 
@@ -413,7 +433,9 @@ async def list_files():
                     stat = os.stat(file_path)
 
                     # 检查是否有断点
-                    checkpoint_info = transcription_service.check_file_checkpoint(file_path)
+                    checkpoint_info = None
+                    if transcription_service is not None:
+                        checkpoint_info = transcription_service.check_file_checkpoint(file_path)
 
                     file_info = FileInfo(
                         name=filename,
@@ -570,7 +592,10 @@ async def get_hardware_status():
 @app.post("/api/models/cache/clear")
 async def clear_models_cache():
     """清空模型缓存（ModelManager V2）。"""
+    if IS_LITE:
+        raise HTTPException(status_code=422, detail="Lite 模式不支持模型缓存管理")
     try:
+        from app.services.model_manager_v2 import get_model_manager_v2
         model_manager = get_model_manager_v2()
         model_manager.unload_all()
         logger.info("手动清空模型缓存成功")
@@ -589,10 +614,13 @@ async def clear_models_cache():
 @app.post("/api/models/cache/unload")
 async def unload_model(request: dict):
     """卸载指定模型（使用 ModelManager V2）。"""
+    if IS_LITE:
+        raise HTTPException(status_code=422, detail="Lite 模式不支持模型缓存管理")
     try:
         model_id = request.get("model_id")
         if not model_id:
             return {"success": False, "message": "缺少model_id参数"}
+        from app.services.model_manager_v2 import get_model_manager_v2
         model_manager = get_model_manager_v2()
         model_manager.unload_all()
         logger.info(f"卸载模型: {model_id} (清空缓存)")
@@ -608,10 +636,12 @@ async def shutdown_server():
         logger.info("收到关闭服务器请求")
 
         # 清理资源
-        model_manager = get_model_manager_v2()
-        if model_manager:
-            model_manager.unload_all()
-            logger.info("已清理模型缓存")
+        if not IS_LITE:
+            from app.services.model_manager_v2 import get_model_manager_v2
+            model_manager = get_model_manager_v2()
+            if model_manager:
+                model_manager.unload_all()
+                logger.info("已清理模型缓存")
         
         # 返回成功响应
         response = {

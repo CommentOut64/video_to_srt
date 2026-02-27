@@ -363,6 +363,19 @@ class Launcher:
         if site_packages:
             fix_pytorch_dll(site_packages)
 
+        # ONNX Runtime GPU 自动修正：
+        # 在 uv sync 后（或快速启动）做 provider 探针，必要时重装 onnxruntime-gpu，
+        # 规避 Windows 下 onnxruntime/onnxruntime-gpu 覆盖顺序导致的 CUDA Provider 丢失。
+        ort_fix_result = self.uv_manager.ensure_onnxruntime_gpu_runtime(
+            python_exec=python_exec,
+            site_packages=site_packages,
+        )
+        if ort_fix_result.success:
+            logger.info(ort_fix_result.message)
+        else:
+            # 不阻断启动：允许 CPU 回退，同时给出明确告警供排查。
+            logger.warning("ONNX Runtime GPU 自动修正失败，将继续启动（可回退 CPU）: %s", ort_fix_result.message)
+
         # 创建配置
         self.config = LauncherConfig(
             project_root=self.project_root,

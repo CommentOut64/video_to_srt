@@ -268,7 +268,10 @@ class TranscriptionService:
                 if hasattr(ctx, 'sv_result') and ctx.sv_result:
                     # 从 streaming_subtitle 获取句子
                     from app.services.streaming_subtitle import get_streaming_subtitle_manager
-                    subtitle_manager = get_streaming_subtitle_manager(job.job_id)
+                    subtitle_manager = get_streaming_subtitle_manager(
+                        job.job_id,
+                        project_id=getattr(job, "project_id", None),
+                    )
                     chunk_indices = subtitle_manager.chunk_sentences.get(ctx.chunk_index, [])
                     for idx in chunk_indices:
                         if idx in subtitle_manager.sentences:
@@ -294,6 +297,28 @@ class TranscriptionService:
                 offset_override=offset
             )
             subtitle_output.write_srt(segments, srt_path)
+
+            # Task6: 转录完成后自动创建/更新 Project 语义层元信息。
+            try:
+                from app.services.project_service import get_project_service
+                from app.services.subtitle_doc_service import get_subtitle_doc_service
+
+                subtitle_doc_service = get_subtitle_doc_service()
+                subtitle_doc_service.import_segments(
+                    project_dir=job_dir,
+                    segments=segments,
+                    source_type="transcribe",
+                )
+
+                project_service = get_project_service()
+                project = project_service.create_normal_project(
+                    job_id=job.job_id,
+                    title=job.title or Path(job.filename).stem,
+                    source_type="transcribe",
+                )
+                job.project_id = project.project_id
+            except Exception as exc:
+                self.logger.warning("Task6 project 自动创建失败，不影响主任务完成: %s", exc)
 
             job.srt_path = str(srt_path)
             job.status = 'finished'

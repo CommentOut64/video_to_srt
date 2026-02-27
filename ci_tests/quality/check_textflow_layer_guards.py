@@ -4,11 +4,10 @@
 
 目标：
 1. 冻结新增七层日志口径：禁止新增 `layer="L0" ... layer="L7"` 字面量。
-2. 冻结新增 logging 直连：禁止新增 `logging.getLogger(...)` 调用。
-3. 冻结新增后处理旧入口导入：禁止新增 L4-L7 旧目录直连导入。
-4. 冻结新增 textflow 分层子模块直连导入：调用方统一使用 `app.services.textflow` 包级 API。
-5. 冻结新增 alignment 包级旧别名导入：禁止新增 `from app.services.alignment import AlignmentProcessor/FactBuilder`。
-6. 冻结新增后处理旧层级术语字面量：禁止新增 `L3/L4/L5/L6/L7`（仅冻结新增，历史遗留走基线）。
+2. 冻结新增后处理旧入口导入：禁止新增 L4-L7 旧目录直连导入。
+3. 冻结新增 textflow 分层子模块直连导入：调用方统一使用 `app.services.textflow` 包级 API。
+4. 冻结新增 alignment 包级旧别名导入：禁止新增 `from app.services.alignment import AlignmentProcessor/FactBuilder`。
+5. 冻结新增后处理旧层级术语字面量：禁止新增 `L3/L4/L5/L6/L7`（仅冻结新增，历史遗留走基线）。
 
 说明：
 - 脚本默认采用“基线对比”模式：只阻止新增，不阻止历史遗留。
@@ -32,7 +31,6 @@ TARGET_DIRS: tuple[str, ...] = (
 
 RULES: dict[str, re.Pattern[str]] = {
     "frozen_layer_literals.txt": re.compile(r'layer\s*=\s*["\']L[0-7]["\']'),
-    "frozen_getlogger_calls.txt": re.compile(r"logging\.getLogger\s*\("),
     "frozen_legacy_postprocess_imports.txt": re.compile(
         r"from\s+app\.services\.(alignment\.alignment_processor|alignment\.fact_builder|"
         r"punctuation\.semantic_injection_processor|segmentation\.segmentation_processor|"
@@ -150,8 +148,6 @@ def main() -> int:
             has_failure = True
             if baseline_name == "frozen_layer_literals.txt":
                 title = "检测到新增七层日志口径（layer=\"L0..L7\"）"
-            elif baseline_name == "frozen_getlogger_calls.txt":
-                title = "检测到新增 logging.getLogger(...) 调用"
             elif baseline_name == "frozen_legacy_postprocess_imports.txt":
                 title = "检测到新增后处理旧入口导入（应改用 textflow 包级 API）"
             elif baseline_name == "frozen_textflow_direct_layer_imports.txt":

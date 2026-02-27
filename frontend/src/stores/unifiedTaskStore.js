@@ -9,6 +9,7 @@ import { ref, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useProjectStore } from './projectStore'
 import { normalizeTimestamp } from '@/utils/timestamp'
+import { navigateToEditor } from '@/utils/editorNavigation'
 
 export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
   const router = useRouter()
@@ -571,10 +572,8 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
     currentTask.value = task
     activeTaskId.value = jobId
 
-    // 仅在用户触发加载时进入编辑器
-    if (router.currentRoute.value.path !== `/editor/${jobId}`) {
-      router.push(`/editor/${jobId}`)
-    }
+    // 仅在用户触发加载时进入编辑器，并统一到 project 语义。
+    await navigateToEditor(router, { jobId })
 
     console.log(`[UnifiedTaskStore] 任务已加载: ${jobId}`)
     return true
