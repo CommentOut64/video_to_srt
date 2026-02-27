@@ -12,6 +12,8 @@ import { onMounted, onUnmounted } from 'vue'
  */
 export function useShortcuts(actions) {
   const handleKeydown = (e) => {
+    if (e.defaultPrevented) return
+
     // 1. 基础键位检测
     const key = e.key.toLowerCase()
     const code = e.code
@@ -21,10 +23,11 @@ export function useShortcuts(actions) {
 
     // 2. 焦点检测：如果在输入框内，部分快捷键失效
     const target = e.target
+    const tagName = target?.tagName
     // contentEditable 兼容富文本编辑器
-    const isInputActive = target.tagName === 'INPUT' ||
-                          target.tagName === 'TEXTAREA' ||
-                          target.isContentEditable
+    const isInputActive = tagName === 'INPUT' ||
+                          tagName === 'TEXTAREA' ||
+                          target?.isContentEditable
 
     // ==========================================
     // 第一类：绝对拦截 (即使在输入框中也要生效)
@@ -65,6 +68,8 @@ export function useShortcuts(actions) {
 
     // 播放/暂停 (Space)
     if (code === 'Space') {
+      // 长按空格会触发重复 keydown，忽略重复触发避免连续闪切
+      if (e.repeat) return
       e.preventDefault() // 阻止网页向下滚动
       actions.togglePlay?.()
       return
@@ -206,11 +211,14 @@ export function useShortcuts(actions) {
     }
   }
 
+  // 使用捕获阶段监听，避免子组件在冒泡阶段 stopPropagation 后丢失快捷键信号
+  const useCapture = true
+
   onMounted(() => {
-    window.addEventListener('keydown', handleKeydown)
+    window.addEventListener('keydown', handleKeydown, useCapture)
   })
 
   onUnmounted(() => {
-    window.removeEventListener('keydown', handleKeydown)
+    window.removeEventListener('keydown', handleKeydown, useCapture)
   })
 }
