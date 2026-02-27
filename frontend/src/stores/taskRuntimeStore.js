@@ -181,7 +181,7 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
     const isRejected = allowEqual ? incomingSeq < currentSeq : incomingSeq <= currentSeq
     if (isRejected) {
       console.warn(
-        `[UnifiedTaskStore] 拒绝旧序号事件: job=${task.job_id}, incoming_seq=${incomingSeq}, current_seq=${currentSeq}`
+        `[TaskRuntimeStore] 拒绝旧序号事件: job=${task.job_id}, incoming_seq=${incomingSeq}, current_seq=${currentSeq}`
       )
       return false
     }
@@ -610,7 +610,7 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
     const currentSeq = normalizeStateSeq(task.state_seq)
     if (incomingSeq > 0 && incomingSeq < currentSeq) {
       console.warn(
-        `[UnifiedTaskStore] 忽略旧序号进度更新: job=${jobId}, incoming_seq=${incomingSeq}, current_seq=${currentSeq}`
+        `[TaskRuntimeStore] 忽略旧序号进度更新: job=${jobId}, incoming_seq=${incomingSeq}, current_seq=${currentSeq}`
       )
       return false
     }
@@ -693,7 +693,7 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
   function checkSSEConnection() {
     if (Date.now() - lastHeartbeat.value > 30000) {  // 30 秒无心跳
       sseConnected.value = false
-      console.warn('[UnifiedTaskStore] SSE 连接超时')
+      console.warn('[TaskRuntimeStore] SSE 连接超时')
     }
   }
 
@@ -731,7 +731,7 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
       const currentSeq = normalizeStateSeq(task.state_seq)
       if (incomingSeq > 0 && incomingSeq < currentSeq) {
         console.warn(
-          `[UnifiedTaskStore] 忽略旧序号任务更新: job=${jobId}, incoming_seq=${incomingSeq}, current_seq=${currentSeq}`
+          `[TaskRuntimeStore] 忽略旧序号任务更新: job=${jobId}, incoming_seq=${incomingSeq}, current_seq=${currentSeq}`
         )
         return false
       }
@@ -897,12 +897,12 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
   async function loadTask(jobId) {
     const task = tasksMap.value.get(jobId)
     if (!task) {
-      console.error(`[UnifiedTaskStore] 任务未找到: ${jobId}`)
+      console.error(`[TaskRuntimeStore] 任务未找到: ${jobId}`)
       return false
     }
 
     if (task.status !== TaskStatus.FINISHED) {
-      console.warn(`[UnifiedTaskStore] 任务状态异常: ${task.status}`)
+      console.warn(`[TaskRuntimeStore] 任务状态异常: ${task.status}`)
       return false
     }
 
@@ -913,7 +913,7 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
     // 仅在用户触发加载时进入编辑器，并统一到 project 语义。
     await navigateToEditor(router, { jobId })
 
-    console.log(`[UnifiedTaskStore] 任务已加载: ${jobId}`)
+    console.log(`[TaskRuntimeStore] 任务已加载: ${jobId}`)
     return true
   }
 
@@ -922,7 +922,7 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
    */
   async function saveCurrentTask() {
     if (!currentTask.value) {
-      console.warn('[UnifiedTaskStore] 无当前任务')
+      console.warn('[TaskRuntimeStore] 无当前任务')
       return
     }
 
@@ -931,7 +931,7 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
     await projectStore.saveProject()
 
     currentTask.value.isDirty = false
-    console.log(`[UnifiedTaskStore] 当前任务已保存: ${currentTask.value.job_id}`)
+    console.log(`[TaskRuntimeStore] 当前任务已保存: ${currentTask.value.job_id}`)
   }
 
   /**
@@ -972,7 +972,7 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
       if (!result.reordered) {
         // 恢复原顺序
         queueOrder.value = oldOrder
-        console.error('[UnifiedTaskStore] 队列重排失败')
+        console.error('[TaskRuntimeStore] 队列重排失败')
       } else {
         // 持久化新顺序
         saveTasks()
@@ -980,7 +980,7 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
     } catch (error) {
       // 恢复原顺序
       queueOrder.value = oldOrder
-      console.error('[UnifiedTaskStore] 队列重排请求失败:', error)
+      console.error('[TaskRuntimeStore] 队列重排请求失败:', error)
       throw error
     }
   }
@@ -997,12 +997,12 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
       const response = await transcriptionApi.syncTasks()
 
       if (!response.success) {
-        console.warn('[UnifiedTaskStore] 任务同步失败:', response)
+        console.warn('[TaskRuntimeStore] 任务同步失败:', response)
         return false
       }
 
       const backendTasks = response.tasks || []
-      console.log(`[UnifiedTaskStore] 从后端同步了 ${backendTasks.length} 个任务`)
+      console.log(`[TaskRuntimeStore] 从后端同步了 ${backendTasks.length} 个任务`)
 
       // 1. 获取后端任务ID集合
       const backendTaskIds = new Set(backendTasks.map(t => t.id))
@@ -1012,13 +1012,13 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
       let deletedCount = 0
       for (const localId of localTaskIds) {
         if (!backendTaskIds.has(localId)) {
-          console.log(`[UnifiedTaskStore] 删除幽灵任务: ${localId}`)
+          console.log(`[TaskRuntimeStore] 删除幽灵任务: ${localId}`)
           tasksMap.value.delete(localId)
           deletedCount++
         }
       }
       if (deletedCount > 0) {
-        console.log(`[UnifiedTaskStore] 共清理了 ${deletedCount} 个幽灵任务`)
+        console.log(`[TaskRuntimeStore] 共清理了 ${deletedCount} 个幽灵任务`)
       }
 
       // 3. 更新或添加后端任务
@@ -1028,7 +1028,7 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
       for (const backendTask of backendTasks) {
         // V3.1.0: 过滤掉 filename 为空的任务，避免显示"未知任务"
         if (!backendTask.filename || backendTask.filename.trim() === '') {
-          console.warn(`[UnifiedTaskStore] 跳过 filename 为空的任务: ${backendTask.id}`)
+          console.warn(`[TaskRuntimeStore] 跳过 filename 为空的任务: ${backendTask.id}`)
           skippedCount++
           continue
         }
@@ -1050,17 +1050,17 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
       // 4. 更新队列顺序
       if (response.queue) {
         applyQueueOrder(response.queue, { timestamp: response.queue_updated_at })
-        console.log(`[UnifiedTaskStore] 队列顺序已同步: ${queueOrder.value.length} 个任务`)
+        console.log(`[TaskRuntimeStore] 队列顺序已同步: ${queueOrder.value.length} 个任务`)
       }
 
       console.log(
-        `[UnifiedTaskStore] 任务同步完成: ${updatedCount} 个更新, ${addedCount} 个新增, ${deletedCount} 个删除` +
+        `[TaskRuntimeStore] 任务同步完成: ${updatedCount} 个更新, ${addedCount} 个新增, ${deletedCount} 个删除` +
         (skippedCount > 0 ? `, ${skippedCount} 个跳过（filename为空）` : '')
       )
       saveTasks()
       return true
     } catch (error) {
-      console.error('[UnifiedTaskStore] 任务同步失败:', error)
+      console.error('[TaskRuntimeStore] 任务同步失败:', error)
       return false
     }
   }
@@ -1109,7 +1109,7 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
       // 保存队列顺序
       localStorage.setItem('queue-order', JSON.stringify(queueOrder.value))
     } catch (error) {
-      console.error('[UnifiedTaskStore] 保存任务列表失败:', error)
+      console.error('[TaskRuntimeStore] 保存任务列表失败:', error)
     }
   }
 
@@ -1135,17 +1135,17 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
         Array.from(tasksMap.value.values()).forEach((task) => {
           hydrateRuntimeStateFromTask(task, 'restore')
         })
-        console.log(`[UnifiedTaskStore] 已恢复 ${tasksArray.length} 个任务`)
+        console.log(`[TaskRuntimeStore] 已恢复 ${tasksArray.length} 个任务`)
       }
 
       // 恢复队列顺序
       const savedOrder = localStorage.getItem('queue-order')
       if (savedOrder) {
         queueOrder.value = JSON.parse(savedOrder)
-        console.log(`[UnifiedTaskStore] 已恢复队列顺序: ${queueOrder.value.length} 个任务`)
+        console.log(`[TaskRuntimeStore] 已恢复队列顺序: ${queueOrder.value.length} 个任务`)
       }
     } catch (error) {
-      console.error('[UnifiedTaskStore] 恢复任务列表失败:', error)
+      console.error('[TaskRuntimeStore] 恢复任务列表失败:', error)
     }
   }
 

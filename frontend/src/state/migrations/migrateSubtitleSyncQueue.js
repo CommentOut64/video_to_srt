@@ -34,7 +34,7 @@ function normalizeQueuePayload(rawPayload) {
 /**
  * localforage 字幕同步队列迁移
  *
- * Phase 4：useSubtitleSync -> subtitleDocumentStore。
+ * Phase 4：字幕同步队列迁移到 subtitleDocumentStore。
  * 当前 key 保持不变，仅做一次结构归一化，避免旧数据格式导致读取失败。
  */
 export async function migrateSubtitleSyncQueue(identityId) {

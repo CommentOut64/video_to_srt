@@ -2,10 +2,7 @@
  * Composables 统一导出入口
  */
 
-export { useSseManager } from './useSseManager'
 export { useProxyVideo, ProxyState, TranscodeDecision } from './useProxyVideo'
-export { useUpdateChecker } from './useUpdateChecker'
-export { useSubtitleSync } from './useSubtitleSync'
 
 // 同音检索与批量替换
 export {
