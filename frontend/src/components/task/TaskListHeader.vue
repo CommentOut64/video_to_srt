@@ -13,11 +13,11 @@
     <div class="header-right">
       <el-button @click="$emit('open-import')">
         <el-icon><Document /></el-icon>
-        导入字幕
+        字幕编辑
       </el-button>
       <el-button v-if="canTranscribe" type="primary" @click="$emit('open-upload')">
         <el-icon><Upload /></el-icon>
-        上传视频
+        视频转录
       </el-button>
       <el-button type="primary" @click="$emit('exit-system')">
         退出系统
