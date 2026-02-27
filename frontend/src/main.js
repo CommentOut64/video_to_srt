@@ -14,17 +14,17 @@ import './styles/element-override.css'
 // import './styles/main.scss'
 import App from './App.vue'
 import router from './router'
-import { useTheme } from './theme'
+import { useAppPreferenceStore } from './stores/appPreferenceStore'
 
-// 初始化主题系统（必须在创建应用实例之前）
-const { initialize: initializeTheme } = useTheme()
-initializeTheme()
+// 创建 Pinia 并初始化全局偏好
+const pinia = createPinia()
+const preferenceStore = useAppPreferenceStore(pinia)
+preferenceStore.initialize()
 
 // 创建应用实例
 const app = createApp(App)
 
 // 注册 Pinia 状态管理
-const pinia = createPinia()
 app.use(pinia)
 
 // 注册路由
