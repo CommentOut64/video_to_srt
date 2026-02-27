@@ -224,7 +224,7 @@ import {
   Setting,
 } from '@element-plus/icons-vue'
 import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
-import { useTranscriptionConfigStore } from '@/stores/transcriptionConfigStore'
+import { useTranscriptionPresetStore } from '@/stores/transcriptionPresetStore'
 import { selectCapabilities } from '@/state/capabilities/capabilitySelector'
 import { transcriptionApi, systemApi, presetsApi } from '@/services/api'
 import AboutDialog from '@/components/AboutDialog.vue'
@@ -247,8 +247,8 @@ const CUSTOM_PRESETS_KEY = 'user-custom-presets'
 const router = useRouter()
 const route = useRoute()
 const taskStore = useUnifiedTaskStore()
-const transcriptionConfigStore = useTranscriptionConfigStore()
-const { taskConfig } = storeToRefs(transcriptionConfigStore)
+const transcriptionPresetStore = useTranscriptionPresetStore()
+const { taskConfig } = storeToRefs(transcriptionPresetStore)
 const capabilities = selectCapabilities()
 
 const showAboutDialog = ref(false)
@@ -907,7 +907,7 @@ async function handleSaveAdvancedSettings() {
     }
     saveJsonStorage(ADVANCED_GENERAL_KEY, advancedGeneral.value)
 
-    transcriptionConfigStore.applyTaskConfig({
+    transcriptionPresetStore.applyTaskConfig({
       preset_id: advancedConfig.value.preset_id || taskConfig.value.preset_id,
       preprocessing: { ...advancedConfig.value.preprocessing },
       transcription: { ...advancedConfig.value.transcription },

@@ -13,7 +13,7 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
 import { useProgressStore } from '@/stores/progressStore'
-import { useUpdateChecker } from '@/composables'
+import { useAppUpdateStore } from '@/stores/appUpdateStore'
 import sseChannelManager from '@/services/sseChannelManager'
 import { heartbeatService } from '@/services/heartbeat'
 import UpdateDialog from '@/components/UpdateDialog.vue'
@@ -21,11 +21,13 @@ import { traceTaskProjection } from '@/state/observability/taskEventTrace'
 
 const taskStore = useUnifiedTaskStore()
 const progressStore = useProgressStore()
+const appUpdateStore = useAppUpdateStore()
+appUpdateStore.initialize()
 
 // V3.1.1+dev.20260105.01: 更新相关状态
 const showUpdateDialog = ref(false)
 const pendingUpdateInfo = ref(null)
-const { checkForUpdate } = useUpdateChecker()
+const checkForUpdate = appUpdateStore.checkForUpdate
 
 let unsubscribeGlobal = null
 let syncTimer = null

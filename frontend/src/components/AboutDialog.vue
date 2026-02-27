@@ -92,7 +92,7 @@
 <script setup>
 import { ref, watch, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
-import { useUpdateChecker } from '@/composables'
+import { useAppUpdateStore } from '@/stores/appUpdateStore'
 import systemApi from '@/services/api/systemApi'
 import UpdateDialog from './UpdateDialog.vue'
 
@@ -106,7 +106,9 @@ const isCheckingUpdate = ref(false)
 const showUpdateDialog = ref(false)
 const pendingUpdateInfo = ref(null)
 
-const { checkForUpdate } = useUpdateChecker()
+const appUpdateStore = useAppUpdateStore()
+appUpdateStore.initialize()
+const checkForUpdate = appUpdateStore.checkForUpdate
 
 // 获取版本号
 async function fetchVersion() {
