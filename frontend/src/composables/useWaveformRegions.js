@@ -87,7 +87,7 @@ export function useWaveformRegions(
 
     regionsPlugin.on('region-clicked', (region, e) => {
       e.stopPropagation()
-      projectStore.view.selectedSubtitleId = region.id
+      projectStore.setSelectedSubtitleId(region.id)
       playbackManager.seekTo(region.start)
       const ws = wavesurferRef.value
       if (ws) ws.play()

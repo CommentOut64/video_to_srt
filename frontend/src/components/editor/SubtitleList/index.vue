@@ -221,7 +221,7 @@ watch(
 
 // Methods
 function onSubtitleClick(subtitle) {
-  projectStore.view.selectedSubtitleId = subtitle.id
+  projectStore.setSelectedSubtitleId(subtitle.id)
   // 使用 PlaybackManager 进行跳转，确保视频和波形同步
   playbackManager.seekTo(subtitle.start)
   emit('subtitle-click', subtitle)

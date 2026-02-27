@@ -337,7 +337,7 @@ function setupWavesurferEvents() {
     if (actualDuration > 0) {
       // 纯音频场景下无视频元数据，需以波形真实时长作为全局时间上限。
       if (!projectStore.meta.duration || Math.abs(projectStore.meta.duration - actualDuration) > 0.01) {
-        projectStore.meta.duration = actualDuration
+        projectStore.setProjectDuration(actualDuration)
       }
 
       const { basePxPerSec, suggestedZoom, barConfig } = calculateWaveformConfig(

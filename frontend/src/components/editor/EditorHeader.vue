@@ -308,7 +308,7 @@ async function finishEditTitle() {
   
   try {
     if (!props.jobId) {
-      projectStore.meta.title = newTitle
+      projectStore.setProjectTitle(newTitle)
       emit('rename', newTitle)
       isEditingTitle.value = false
       return
@@ -330,7 +330,7 @@ async function finishEditTitle() {
     }
     
     // 更新 projectStore.meta.title
-    projectStore.meta.title = newTitle
+    projectStore.setProjectTitle(newTitle)
     
     // 通知父组件
     emit('rename', newTitle)

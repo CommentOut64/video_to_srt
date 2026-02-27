@@ -687,7 +687,7 @@ watch(() => props.progressiveUrl, async (newUrl, oldUrl) => {
 
 function onMetadataLoaded() {
   const video = videoRef.value
-  projectStore.meta.duration = video.duration
+  projectStore.setProjectDuration(video.duration)
   video.playbackRate = projectStore.player.playbackRate
   video.volume = projectStore.player.volume
   retryCount.value = 0

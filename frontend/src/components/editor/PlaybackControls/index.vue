@@ -283,18 +283,18 @@ function stopDrag() {
 // 音量控制
 function toggleMute() {
   if (isMuted.value) {
-    projectStore.player.volume = previousVolume.value
+    projectStore.setPlayerVolume(previousVolume.value)
     isMuted.value = false
   } else {
     previousVolume.value = projectStore.player.volume
-    projectStore.player.volume = 0
+    projectStore.setPlayerVolume(0)
     isMuted.value = true
   }
 }
 
 function handleVolumeChange(e) {
   const val = parseFloat(e.target.value)
-  projectStore.player.volume = val
+  projectStore.setPlayerVolume(val)
   if (val > 0) isMuted.value = false
   emit('volume-change', val)
 }
@@ -305,7 +305,7 @@ function toggleSpeedMenu() {
 }
 
 function setSpeed(speed) {
-  projectStore.player.playbackRate = speed
+  projectStore.setPlaybackRate(speed)
   showSpeedMenu.value = false
   emit('speed-change', speed)
 }

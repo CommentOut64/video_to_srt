@@ -546,8 +546,10 @@ function applyMediaPaths({ project = null, mediaStatus = null } = {}) {
   const identity = mediaIdentityId.value
   if (!identity) {
     isVideoAbsenceConfirmed.value = false
-    projectStore.meta.videoPath = null
-    projectStore.meta.audioPath = null
+    projectStore.setMediaPaths({
+      videoPath: null,
+      audioPath: null,
+    })
     return
   }
 
@@ -577,8 +579,10 @@ function applyMediaPaths({ project = null, mediaStatus = null } = {}) {
 
   isVideoAbsenceConfirmed.value = canDetermineVideoPresence && !hasVideo
 
-  projectStore.meta.videoPath = hasVideo ? mediaApi.getVideoUrl(identity) : null
-  projectStore.meta.audioPath = hasAudio ? mediaApi.getAudioUrl(identity) : null
+  projectStore.setMediaPaths({
+    videoPath: hasVideo ? mediaApi.getVideoUrl(identity) : null,
+    audioPath: hasAudio ? mediaApi.getAudioUrl(identity) : null,
+  })
 }
 
 function notifyMissingVideoOnce() {
@@ -660,13 +664,18 @@ async function loadProject() {
   try {
     await resolveIdentity()
 
-    projectStore.meta.projectId = props.projectId
-    projectStore.meta.jobId = activeJobId.value
-    projectStore.meta.mode = activeJobId.value ? 'legacy' : 'normal'
-    projectStore.meta.capabilitySnapshot = resolveCapabilitySnapshot()
-    projectStore.meta.flavor = selectFlavor(projectStore.meta.capabilitySnapshot)
-    projectStore.meta.videoPath = null
-    projectStore.meta.audioPath = null
+    const initialCapabilitySnapshot = resolveCapabilitySnapshot()
+    projectStore.setIdentity({
+      projectId: props.projectId,
+      jobId: activeJobId.value,
+      mode: activeJobId.value ? 'legacy' : 'normal',
+      capabilitySnapshot: initialCapabilitySnapshot,
+      flavor: selectFlavor(initialCapabilitySnapshot),
+    })
+    projectStore.setMediaPaths({
+      videoPath: null,
+      audioPath: null,
+    })
 
     let projectMeta = null
     if (props.projectId) {
@@ -676,10 +685,13 @@ async function loadProject() {
         console.warn('[EditorView] 读取项目媒体信息失败，使用状态兜底:', error)
       }
     }
-    projectStore.meta.capabilitySnapshot = resolveCapabilitySnapshot(
+    const projectMetaCapabilitySnapshot = resolveCapabilitySnapshot(
       projectMeta?.capability_snapshot || projectMeta?.capabilitySnapshot || projectStore.meta.capabilitySnapshot
     )
-    projectStore.meta.flavor = projectMeta?.flavor || selectFlavor(projectStore.meta.capabilitySnapshot)
+    projectStore.setIdentity({
+      capabilitySnapshot: projectMetaCapabilitySnapshot,
+      flavor: projectMeta?.flavor || selectFlavor(projectMetaCapabilitySnapshot),
+    })
     applyMediaPaths({ project: projectMeta })
 
     // 纯项目模式（Lite 导入）: 跳过任务状态，改走 project 频道同步
@@ -693,12 +705,15 @@ async function loadProject() {
       await loadSubtitleOffset()
       const project = projectMeta || (await projectApi.getProject(props.projectId))
       applyMediaPaths({ project })
-      projectStore.meta.title = project?.title || projectStore.meta.title
-      projectStore.meta.capabilitySnapshot = resolveCapabilitySnapshot(
+      projectStore.setProjectTitle(project?.title || projectStore.meta.title)
+      const projectCapabilitySnapshot = resolveCapabilitySnapshot(
         project?.capability_snapshot || project?.capabilitySnapshot || projectStore.meta.capabilitySnapshot
       )
-      projectStore.meta.flavor = project?.flavor || selectFlavor(projectStore.meta.capabilitySnapshot)
-      projectStore.meta.mode = project?.mode || 'normal'
+      projectStore.setIdentity({
+        capabilitySnapshot: projectCapabilitySnapshot,
+        flavor: project?.flavor || selectFlavor(projectCapabilitySnapshot),
+        mode: project?.mode || 'normal',
+      })
       const restored = await projectStore.restoreProject(props.projectId)
       // 恢复缓存后再次覆盖媒体路径，防止旧缓存 videoPath 误导为“有视频”。
       applyMediaPaths({ project })
@@ -747,11 +762,15 @@ async function loadProject() {
       'http_init'
     )
 
-    projectStore.meta.jobId = activeJobId.value
-    projectStore.meta.projectId = props.projectId || projectStore.meta.projectId
-    projectStore.meta.filename = jobStatus.filename || '未知文件'
-    projectStore.meta.title = jobStatus.title || ''
-    projectStore.meta.duration = jobStatus.media_status?.video?.duration || 0
+    projectStore.setIdentity({
+      jobId: activeJobId.value,
+      projectId: props.projectId || projectStore.meta.projectId,
+    })
+    projectStore.patchMeta({
+      filename: jobStatus.filename || '未知文件',
+    })
+    projectStore.setProjectTitle(jobStatus.title || '')
+    projectStore.setProjectDuration(jobStatus.media_status?.video?.duration || 0)
 
     try {
       await proxyVideo.refresh()
@@ -1037,7 +1056,7 @@ function handleProjectSubtitleUpsert(data) {
       isDraft: false,
       isFinalized: true,
     }
-    projectStore.subtitles.splice(finalIndex, 0, nextSubtitle)
+    projectStore.insertSubtitleAt(finalIndex, nextSubtitle)
   } finally {
     projectStore.resumeHistory()
   }
@@ -1054,7 +1073,7 @@ function handleProjectSubtitleDelete(data) {
   }
   projectStore.pauseHistory()
   try {
-    projectStore.subtitles.splice(index, 1)
+    projectStore.removeSubtitleAt(index)
   } finally {
     projectStore.resumeHistory()
   }
@@ -2082,7 +2101,7 @@ async function handleCheckVideoStatus() {
 
 function handleResolutionChange(resolution) {
   // 更新 projectStore 的视频信息
-  projectStore.meta.currentResolution = resolution
+  projectStore.setCurrentResolution(resolution)
 }
 
 function loadEditorInteractionPreferences() {

@@ -160,7 +160,7 @@ export function useWaveformZoom(wavesurferRef, containerRef, projectStore, updat
     const newPxPerSec = (clampedZoom / 100) * ZOOM_BASE_PX_PER_SEC
 
     ws.zoom(newPxPerSec)
-    projectStore.view.zoomLevel = clampedZoom
+    projectStore.setZoomLevel(clampedZoom)
 
     // 动态柱子宽度
     const newBarConfig = getAdaptiveBarConfig(newPxPerSec)
@@ -219,7 +219,7 @@ export function useWaveformZoom(wavesurferRef, containerRef, projectStore, updat
     zoomLevel.value = clampedValue
     const minPxPerSec = (clampedValue / 100) * ZOOM_BASE_PX_PER_SEC
     ws.zoom(minPxPerSec)
-    projectStore.view.zoomLevel = clampedValue
+    projectStore.setZoomLevel(clampedValue)
   }
 
   /**

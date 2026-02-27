@@ -227,6 +227,103 @@ export const useProjectStore = defineStore("project", () => {
     return snapshot;
   }
 
+  // ========== 6.2 Phase 1: 状态写入口收口 ==========
+  function patchMeta(patch = {}) {
+    if (!patch || typeof patch !== "object") {
+      return;
+    }
+    meta.value = {
+      ...meta.value,
+      ...patch,
+    };
+  }
+
+  function setIdentity(payload = {}) {
+    const nextPatch = {};
+    if (Object.prototype.hasOwnProperty.call(payload, "projectId")) {
+      nextPatch.projectId = payload.projectId || null;
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, "jobId")) {
+      nextPatch.jobId = payload.jobId || null;
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, "mode")) {
+      nextPatch.mode = payload.mode || "normal";
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, "flavor")) {
+      nextPatch.flavor = payload.flavor || "full";
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, "capabilitySnapshot")) {
+      nextPatch.capabilitySnapshot = normalizeCapabilitySnapshot(payload.capabilitySnapshot);
+    }
+    patchMeta(nextPatch);
+  }
+
+  function setMediaPaths(payload = {}) {
+    const nextPatch = {};
+    if (Object.prototype.hasOwnProperty.call(payload, "videoPath")) {
+      nextPatch.videoPath = payload.videoPath || null;
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, "audioPath")) {
+      nextPatch.audioPath = payload.audioPath || null;
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, "peaksPath")) {
+      nextPatch.peaksPath = payload.peaksPath || null;
+    }
+    patchMeta(nextPatch);
+  }
+
+  function setProjectTitle(title) {
+    patchMeta({ title: title || "" });
+  }
+
+  function setProjectDuration(duration) {
+    const normalized = Number(duration);
+    patchMeta({ duration: Number.isFinite(normalized) && normalized > 0 ? normalized : 0 });
+  }
+
+  function setCurrentResolution(resolution) {
+    patchMeta({ currentResolution: resolution || null });
+  }
+
+  function setZoomLevel(level) {
+    const normalized = Number(level);
+    view.value.zoomLevel = Number.isFinite(normalized) ? normalized : view.value.zoomLevel;
+  }
+
+  function setSelectedSubtitleId(subtitleId) {
+    view.value.selectedSubtitleId = subtitleId || null;
+  }
+
+  function setPlayerVolume(volume) {
+    const normalized = Number(volume);
+    if (!Number.isFinite(normalized)) {
+      return;
+    }
+    player.value.volume = Math.max(0, Math.min(1, normalized));
+  }
+
+  function setPlaybackRate(rate) {
+    const normalized = Number(rate);
+    if (!Number.isFinite(normalized)) {
+      return;
+    }
+    player.value.playbackRate = Math.max(0.25, Math.min(4, normalized));
+  }
+
+  function insertSubtitleAt(index, subtitle) {
+    const insertIndex = Math.max(0, Math.min(index, subtitles.value.length));
+    subtitles.value.splice(insertIndex, 0, subtitle);
+    return insertIndex;
+  }
+
+  function removeSubtitleAt(index) {
+    if (index < 0 || index >= subtitles.value.length) {
+      return null;
+    }
+    const removed = subtitles.value.splice(index, 1);
+    return removed[0] || null;
+  }
+
   const isDirty = computed(() => {
     return meta.value.isDirty || subtitles.value.some((s) => s.isDirty);
   });
@@ -1662,6 +1759,18 @@ export const useProjectStore = defineStore("project", () => {
     resumeHistory, // 恢复历史记录
 
     // 操作方法
+    patchMeta,
+    setIdentity,
+    setMediaPaths,
+    setProjectTitle,
+    setProjectDuration,
+    setCurrentResolution,
+    setZoomLevel,
+    setSelectedSubtitleId,
+    setPlayerVolume,
+    setPlaybackRate,
+    insertSubtitleAt,
+    removeSubtitleAt,
     importSRT,
     importSegments,
     loadFromProjectData,
