@@ -128,6 +128,7 @@
 import { ref, reactive, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useProjectStore } from '@/stores/projectStore'
+import { useSubtitleDocumentStore } from '@/stores/subtitleDocumentStore'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { useSubtitleSync, useHomophoneSearch, SortMode } from '@/composables'
 import transcriptionApi from '@/services/api/transcriptionApi'
@@ -150,6 +151,7 @@ const emit = defineEmits(['subtitle-click', 'subtitle-edit', 'subtitle-delete', 
 
 // Store
 const projectStore = useProjectStore()
+const subtitleDocumentStore = useSubtitleDocumentStore()
 
 // 全局播放管理器
 const playbackManager = usePlaybackManager()
@@ -186,7 +188,7 @@ const hasAppliedPending = ref(false)
 const subtitles = computed(() => projectStore.subtitles)
 const totalSubtitles = computed(() => projectStore.totalSubtitles)
 const currentSubtitleId = computed(() => projectStore.currentSubtitle?.id)
-const activeSubtitleId = computed(() => projectStore.view.selectedSubtitleId)
+const activeSubtitleId = computed(() => subtitleDocumentStore.selectedSubtitleId)
 // 草稿计数
 const draftCount = computed(() => projectStore.draftSubtitleCount)
 
@@ -221,7 +223,7 @@ watch(
 
 // Methods
 function onSubtitleClick(subtitle) {
-  projectStore.setSelectedSubtitleId(subtitle.id)
+  subtitleDocumentStore.setSelectedSubtitleId(subtitle.id)
   // 使用 PlaybackManager 进行跳转，确保视频和波形同步
   playbackManager.seekTo(subtitle.start)
   emit('subtitle-click', subtitle)

@@ -120,6 +120,7 @@
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted, inject } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
+import { usePlaybackStore } from '@/stores/playbackStore'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 
 // Props
@@ -137,6 +138,7 @@ const emit = defineEmits(['play', 'pause', 'seek', 'speed-change', 'volume-chang
 
 // Store
 const projectStore = useProjectStore()
+const playbackStore = usePlaybackStore()
 
 // 全局播放管理器（单例）
 const playbackManager = usePlaybackManager()
@@ -168,11 +170,11 @@ const dragProgressPercent = ref(0) // 拖动时的进度百分比
 const speedOptions = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2]
 
 // 从 Store 获取状态
-const currentTime = computed(() => projectStore.player.currentTime)
+const currentTime = computed(() => playbackStore.currentTime)
 const duration = computed(() => projectStore.meta.duration || 0)
-const isPlaying = computed(() => projectStore.player.isPlaying)
-const playbackRate = computed(() => projectStore.player.playbackRate)
-const volume = computed(() => (isMuted.value ? 0 : projectStore.player.volume))
+const isPlaying = computed(() => playbackStore.isPlaying)
+const playbackRate = computed(() => playbackStore.playbackRate)
+const volume = computed(() => (isMuted.value ? 0 : playbackStore.volume))
 
 // 进度百分比
 const progressPercent = computed(() => {
@@ -191,7 +193,7 @@ function togglePlay() {
     return
   }
   playbackManager.togglePlay()
-  emit(projectStore.player.isPlaying ? 'play' : 'pause')
+  emit(playbackStore.isPlaying ? 'play' : 'pause')
 }
 
 // 跳转
@@ -283,18 +285,18 @@ function stopDrag() {
 // 音量控制
 function toggleMute() {
   if (isMuted.value) {
-    projectStore.setPlayerVolume(previousVolume.value)
+    playbackStore.setVolume(previousVolume.value)
     isMuted.value = false
   } else {
-    previousVolume.value = projectStore.player.volume
-    projectStore.setPlayerVolume(0)
+    previousVolume.value = playbackStore.volume
+    playbackStore.setVolume(0)
     isMuted.value = true
   }
 }
 
 function handleVolumeChange(e) {
   const val = parseFloat(e.target.value)
-  projectStore.setPlayerVolume(val)
+  playbackStore.setVolume(val)
   if (val > 0) isMuted.value = false
   emit('volume-change', val)
 }
@@ -305,7 +307,7 @@ function toggleSpeedMenu() {
 }
 
 function setSpeed(speed) {
-  projectStore.setPlaybackRate(speed)
+  playbackStore.setPlaybackRate(speed)
   showSpeedMenu.value = false
   emit('speed-change', speed)
 }

@@ -74,6 +74,8 @@
  */
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, inject } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
+import { usePlaybackStore } from '@/stores/playbackStore'
+import { useSubtitleDocumentStore } from '@/stores/subtitleDocumentStore'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import ContextMenu from '@/components/editor/ContextMenu.vue'
 import WaveformHeader from './WaveformHeader.vue'
@@ -110,6 +112,8 @@ const emit = defineEmits(['ready', 'region-update', 'region-click', 'seek', 'zoo
 
 // ============ Store & Services ============
 const projectStore = useProjectStore()
+const playbackStore = usePlaybackStore()
+const subtitleDocumentStore = useSubtitleDocumentStore()
 const playbackManager = usePlaybackManager()
 const identityRef = computed(() => props.mediaId || projectStore.primaryId)
 const { onSubtitleEdit } = useSubtitleSync(identityRef)
@@ -158,7 +162,7 @@ const peaksSource = computed(() => {
   return projectStore.meta.peaksPath || ''
 })
 
-const currentTime = computed(() => projectStore.player.currentTime)
+const currentTime = computed(() => playbackStore.currentTime)
 const duration = computed(() => projectStore.meta.duration || 0)
 
 // 滚动条轨道 ref（从子组件获取）
@@ -175,7 +179,13 @@ const {
   handleZoomInput,
   handleZoomWithSmartAnchor,
   cleanup: cleanupZoom,
-} = useWaveformZoom(wavesurferRef, containerRef, projectStore, () => updateScrollbarThumb())
+} = useWaveformZoom(
+  wavesurferRef,
+  containerRef,
+  projectStore,
+  playbackStore,
+  () => updateScrollbarThumb()
+)
 
 // 滚动逻辑
 const {
@@ -186,7 +196,13 @@ const {
   startSmartFollow,
   stopSmartFollow,
   cleanup: cleanupScroll,
-} = useWaveformScroll(wavesurferRef, scrollbarTrackRef, zoomLevel, projectStore, isReady)
+} = useWaveformScroll(
+  wavesurferRef,
+  scrollbarTrackRef,
+  zoomLevel,
+  playbackStore,
+  isReady
+)
 
 // 光标拖拽逻辑
 const {
@@ -203,7 +219,7 @@ const {
   wavesurferRef,
   zoomLevel,
   playbackManager,
-  projectStore,
+  playbackStore,
   isReady,
   isMediaReady,
   emit
@@ -222,6 +238,7 @@ const {
   isReady,
   onSubtitleEdit,
   playbackManager,
+  subtitleDocumentStore,
   emit
 )
 
@@ -387,8 +404,8 @@ function applyWaveformMediaState() {
   const ws = wavesurferRef.value
   if (!ws) return
 
-  const targetRate = Number(projectStore.player.playbackRate) || 1
-  const rawVolume = Number(projectStore.player.volume)
+  const targetRate = Number(playbackStore.playbackRate) || 1
+  const rawVolume = Number(playbackStore.volume)
   const targetVolume = Math.max(0, Math.min(1, Number.isFinite(rawVolume) ? rawVolume : 1))
 
   if (typeof ws.setPlaybackRate === 'function') {
@@ -506,7 +523,7 @@ watch(
 )
 
 watch(
-  () => projectStore.player.isPlaying,
+  () => playbackStore.isPlaying,
   (playing) => {
     const ws = wavesurferRef.value
     if (!ws || !isReady.value) return
@@ -521,12 +538,12 @@ watch(
 )
 
 watch(
-  () => projectStore.player.currentTime,
+  () => playbackStore.currentTime,
   (newTime) => {
     const ws = wavesurferRef.value
     if (!ws || !isReady.value) return
 
-    const isPlaying = projectStore.player.isPlaying
+    const isPlaying = playbackStore.isPlaying
     const isSeeking = playbackManager.isLocked()
     if (isPlaying && !isSeeking) return
 
@@ -544,7 +561,7 @@ watch(
 )
 
 watch(
-  () => projectStore.view.selectedSubtitleId,
+  () => subtitleDocumentStore.selectedSubtitleId,
   () => {
     if (isReady.value) renderSubtitleRegions()
   }
@@ -558,7 +575,7 @@ watch(hasVideoSource, (nextHasVideo) => {
 })
 
 watch(
-  () => projectStore.player.playbackRate,
+  () => playbackStore.playbackRate,
   () => {
     if (!isReady.value) return
     applyWaveformMediaState()
@@ -566,7 +583,7 @@ watch(
 )
 
 watch(
-  () => projectStore.player.volume,
+  () => playbackStore.volume,
   () => {
     if (!isReady.value) return
     applyWaveformMediaState()

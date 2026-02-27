@@ -12,7 +12,7 @@ import { ZOOM_BASE_PX_PER_SEC } from './useWaveformZoom.js'
  * @param {Ref<object>} wavesurferRef - WaveSurfer 实例引用
  * @param {Ref<number>} zoomLevel - 当前缩放级别
  * @param {object} playbackManager - PlaybackManager 实例
- * @param {object} projectStore - Pinia store
+ * @param {object} playbackStore - 播放状态 store
  * @param {Ref<boolean>} isReady - 波形是否就绪
  * @param {Ref<boolean>} isMediaReady - 媒体是否就绪（音频或视频可用）
  * @param {Function} emit - 事件发射函数
@@ -21,7 +21,7 @@ export function useWaveformCursorDrag(
   wavesurferRef,
   zoomLevel,
   playbackManager,
-  projectStore,
+  playbackStore,
   isReady,
   isMediaReady,
   emit
@@ -34,7 +34,6 @@ export function useWaveformCursorDrag(
   const canEditTimeline = computed(() => isMediaReady.value)
 
   // ============ 私有状态 ============
-  let cursorDragStartTime = 0
   let cursorPointerId = null
   let cursorPointerTarget = null
   let cursorDragGuardsAttached = false
@@ -44,6 +43,11 @@ export function useWaveformCursorDrag(
   let regionPointerGuardEl = null
   let previousBodyUserSelect = ''
   let previousBodyWebkitSelect = ''
+
+  function getCurrentTimeSec() {
+    const value = Number(playbackStore.currentTime.value)
+    return Number.isFinite(value) ? value : 0
+  }
 
   // ============ 工具函数 ============
 
@@ -78,7 +82,7 @@ export function useWaveformCursorDrag(
     const ws = wavesurferRef.value
     if (!ws) return 0
 
-    const currentTime = projectStore.player.currentTime
+    const currentTime = getCurrentTimeSec()
     const pxPerSec = (zoomLevel.value / 100) * ZOOM_BASE_PX_PER_SEC
     return currentTime * pxPerSec
   }
@@ -343,7 +347,6 @@ export function useWaveformCursorDrag(
 
     if (canDrag) {
       isDraggingCursor.value = true
-      cursorDragStartTime = projectStore.player.currentTime
       cursorPointerId = typeof e.pointerId === 'number' ? e.pointerId : null
       cursorPointerTarget = e.currentTarget instanceof HTMLElement ? e.currentTarget : null
 

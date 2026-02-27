@@ -182,6 +182,7 @@
  */
 import { ref, computed, nextTick, watch } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
+import { usePlaybackStore } from '@/stores/playbackStore'
 import transcriptionApi from '@/services/api/transcriptionApi'
 import projectApi from '@/services/api/projectApi'
 import ContextMenu from '@/components/editor/ContextMenu.vue'
@@ -211,6 +212,7 @@ const emit = defineEmits([
 
 // Store
 const projectStore = useProjectStore()
+const playbackStore = usePlaybackStore()
 
 // 编辑状态
 const isEditing = ref(false)
@@ -226,7 +228,7 @@ const cursorPosition = ref(0)
 const isContextMenuOpen = ref(false)  // 防止菜单打开时 blur 触发 stopEditing
 
 // 播放状态
-const isPlaying = computed(() => projectStore.player.isPlaying)
+const isPlaying = computed(() => playbackStore.isPlaying)
 
 // 计算属性
 const itemClasses = computed(() => ({

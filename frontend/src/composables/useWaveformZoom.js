@@ -66,9 +66,16 @@ export function calculateWaveformConfig(videoDuration, containerWidth) {
  * @param {Ref<object>} wavesurferRef - WaveSurfer 实例引用
  * @param {Ref<HTMLElement>} containerRef - 容器 DOM 引用
  * @param {object} projectStore - Pinia store
+ * @param {object} playbackStore - 播放状态 store
  * @param {Function} updateScrollbarThumb - 更新滚动条回调
  */
-export function useWaveformZoom(wavesurferRef, containerRef, projectStore, updateScrollbarThumb) {
+export function useWaveformZoom(
+  wavesurferRef,
+  containerRef,
+  projectStore,
+  playbackStore,
+  updateScrollbarThumb
+) {
   // ============ 状态 ============
   const zoomLevel = ref(100)
 
@@ -79,6 +86,15 @@ export function useWaveformZoom(wavesurferRef, containerRef, projectStore, updat
   let lastSliderZoomTime = 0
 
   const SLIDER_THROTTLE_MS = 16 // ~60fps
+
+  function getCurrentTimeSec() {
+    const value = Number(playbackStore.currentTime.value)
+    return Number.isFinite(value) ? value : 0
+  }
+
+  function getIsPlaying() {
+    return Boolean(playbackStore.isPlaying.value)
+  }
 
   /**
    * 获取缓存的滚动容器（避免频繁 DOM 查询）
@@ -103,7 +119,7 @@ export function useWaveformZoom(wavesurferRef, containerRef, projectStore, updat
     if (!scrollContainer) return false
 
     const currentPxPerSec = (zoomLevel.value / 100) * ZOOM_BASE_PX_PER_SEC
-    const playheadX = projectStore.player.currentTime * currentPxPerSec
+    const playheadX = getCurrentTimeSec() * currentPxPerSec
     const { scrollLeft, clientWidth } = scrollContainer
 
     return playheadX >= scrollLeft - 10 && playheadX <= scrollLeft + clientWidth + 10
@@ -117,7 +133,7 @@ export function useWaveformZoom(wavesurferRef, containerRef, projectStore, updat
     if (!scrollContainer) return 0
 
     const currentPxPerSec = (zoomLevel.value / 100) * ZOOM_BASE_PX_PER_SEC
-    const playheadTotalX = projectStore.player.currentTime * currentPxPerSec
+    const playheadTotalX = getCurrentTimeSec() * currentPxPerSec
     return playheadTotalX - scrollContainer.scrollLeft
   }
 
@@ -186,7 +202,7 @@ export function useWaveformZoom(wavesurferRef, containerRef, projectStore, updat
 
     let anchorPx
 
-    if (projectStore.player.isPlaying) {
+    if (getIsPlaying()) {
       anchorPx = getPlayheadRelativeX()
     } else if (isPlayheadInViewport()) {
       anchorPx = getPlayheadRelativeX()

@@ -30,6 +30,7 @@ function debounce(fn, delay) {
  * @param {Ref<boolean>} isReady - 波形是否就绪
  * @param {Function} onSubtitleEdit - 字幕编辑回调
  * @param {object} playbackManager - PlaybackManager 实例
+ * @param {object} subtitleDocumentStore - 字幕文档 store
  * @param {Function} emit - 事件发射函数
  */
 export function useWaveformRegions(
@@ -39,6 +40,7 @@ export function useWaveformRegions(
   isReady,
   onSubtitleEdit,
   playbackManager,
+  subtitleDocumentStore,
   emit
 ) {
   // ============ 状态 ============
@@ -46,6 +48,14 @@ export function useWaveformRegions(
 
   // ============ 私有状态 ============
   let regionUpdateTimer = null
+
+  function getSelectedSubtitleId() {
+    return subtitleDocumentStore.selectedSubtitleId.value
+  }
+
+  function setSelectedSubtitleId(subtitleId) {
+    subtitleDocumentStore.setSelectedSubtitleId(subtitleId)
+  }
 
   // 节流的 Region 同步
   const debouncedRegionSync = debounce((sentenceIndex, start, end) => {
@@ -87,7 +97,7 @@ export function useWaveformRegions(
 
     regionsPlugin.on('region-clicked', (region, e) => {
       e.stopPropagation()
-      projectStore.setSelectedSubtitleId(region.id)
+      setSelectedSubtitleId(region.id)
       playbackManager.seekTo(region.start)
       const ws = wavesurferRef.value
       if (ws) ws.play()
@@ -105,7 +115,7 @@ export function useWaveformRegions(
 
     regionsPlugin.on('region-out', (region) => {
       const overlappingIds = detectOverlappingSubtitles(projectStore.subtitles)
-      const isSelected = region.id === projectStore.view.selectedSubtitleId
+      const isSelected = region.id === getSelectedSubtitleId()
 
       if (overlappingIds.has(region.id)) {
         region.setOptions({ color: OVERLAP_COLORS.error })
@@ -131,7 +141,7 @@ export function useWaveformRegions(
 
     regions.forEach((region) => {
       const isOverlapping = overlappingIds.has(region.id)
-      const isSelected = region.id === projectStore.view.selectedSubtitleId
+      const isSelected = region.id === getSelectedSubtitleId()
 
       if (isOverlapping) {
         region.setOptions({ color: OVERLAP_COLORS.error })
@@ -157,7 +167,7 @@ export function useWaveformRegions(
    * @returns {string} 颜色值
    */
   function computeRegionColor(subtitle, overlappingIds) {
-    const isSelected = subtitle.id === projectStore.view.selectedSubtitleId
+    const isSelected = subtitle.id === getSelectedSubtitleId()
     const isOverlapping = overlappingIds.has(subtitle.id)
 
     if (isOverlapping) return OVERLAP_COLORS.error

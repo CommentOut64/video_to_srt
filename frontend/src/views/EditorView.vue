@@ -230,8 +230,11 @@
 import { ref, computed, onMounted, onUnmounted, provide, watch } from 'vue'
 import { onBeforeRouteLeave, useRouter } from 'vue-router'
 import { useProjectStore } from '@/stores/projectStore'
+import { usePlaybackStore } from '@/stores/playbackStore'
 import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
 import { useProgressStore } from '@/stores/progressStore'
+import { useEditorSessionStore } from '@/stores/editorSessionStore'
+import { useSubtitleDocumentStore } from '@/stores/subtitleDocumentStore'
 import { legacyApi, mediaApi, projectApi, transcriptionApi } from '@/services/api'
 import sseChannelManager from '@/services/sseChannelManager'
 import { useShortcuts } from '@/hooks/useShortcuts'
@@ -270,7 +273,10 @@ const props = new Proxy(rawProps, {
 
 // Stores
 const projectStore = useProjectStore()
+const playbackStore = usePlaybackStore()
 const taskStore = useUnifiedTaskStore()
+const editorSessionStore = useEditorSessionStore()
+const subtitleDocumentStore = useSubtitleDocumentStore()
 const router = useRouter()
 
 // 全局播放管理器
@@ -372,6 +378,14 @@ let cancelTimeoutTimer = null
 let isRealtimeFinalSyncInFlight = false
 let hasRealtimeFinalSyncPending = false
 let realtimeFinalSyncReason = null
+
+watch(
+  () => activeJobId.value,
+  (jobId) => {
+    subtitleDocumentStore.bindTask(jobId)
+  },
+  { immediate: true }
+)
 
 const hasVideoSource = computed(() => {
   return !isVideoAbsenceConfirmed.value && !!projectStore.meta.videoPath && !!proxyVideo.currentUrl.value
@@ -719,16 +733,21 @@ async function loadProject() {
       applyMediaPaths({ project })
       if (!restored || projectStore.subtitles.length === 0) {
         const segments = await projectApi.getSubtitles(props.projectId)
-        projectStore.loadFromProjectData(segments, {
-          projectId: props.projectId,
-          jobId: project?.job_id || null,
-          title: project?.title || '',
-          filename: project?.title || '项目字幕',
-          videoPath: projectStore.meta.videoPath,
-          audioPath: projectStore.meta.audioPath,
-          mode: project?.mode || 'normal',
-          flavor: project?.flavor || selectFlavor(projectStore.meta.capabilitySnapshot),
-          capabilitySnapshot: projectStore.meta.capabilitySnapshot,
+        await editorSessionStore.restoreSession({
+          identity: {
+            projectId: props.projectId,
+            jobId: project?.job_id || null,
+            mode: project?.mode || 'normal',
+            flavor: project?.flavor || selectFlavor(projectStore.meta.capabilitySnapshot),
+            capabilitySnapshot: projectStore.meta.capabilitySnapshot,
+          },
+          metaPayload: {
+            title: project?.title || '',
+            filename: project?.title || '项目字幕',
+            videoPath: projectStore.meta.videoPath,
+            audioPath: projectStore.meta.audioPath,
+          },
+          segments,
         })
         // loadFromProjectData 会更新 meta，确保媒体路径继续以本次判定为准。
         applyMediaPaths({ project })
@@ -791,7 +810,7 @@ async function loadProject() {
       if (['canceled', 'force_canceled'].includes(jobStatus.status)) {
         const hasDraft = projectStore.subtitles.some((s) => s.isDraft)
         if (hasDraft) {
-          await projectStore.finalizeDraftSubtitlesOnCancel()
+          await subtitleDocumentStore.finalizeDraftSubtitlesOnTerminal('load_project_terminal')
         }
       }
     }
@@ -2182,23 +2201,23 @@ function togglePlay() {
 
 function stepBackward() {
   const frameTime = 1 / 30
-  const newTime = Math.max(0, projectStore.player.currentTime - frameTime)
+  const newTime = Math.max(0, playbackStore.currentTime - frameTime)
   playbackManager.seekTo(newTime)
 }
 
 function stepForward() {
   const frameTime = 1 / 30
-  const newTime = Math.min(projectStore.meta.duration, projectStore.player.currentTime + frameTime)
+  const newTime = Math.min(projectStore.meta.duration, playbackStore.currentTime + frameTime)
   playbackManager.seekTo(newTime)
 }
 
 function seekBackward() {
-  const newTime = Math.max(0, projectStore.player.currentTime - 5)
+  const newTime = Math.max(0, playbackStore.currentTime - 5)
   playbackManager.seekTo(newTime)
 }
 
 function seekForward() {
-  const newTime = Math.min(projectStore.meta.duration, projectStore.player.currentTime + 5)
+  const newTime = Math.min(projectStore.meta.duration, playbackStore.currentTime + 5)
   playbackManager.seekTo(newTime)
 }
 

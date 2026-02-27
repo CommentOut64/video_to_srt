@@ -152,6 +152,7 @@
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, inject } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
+import { usePlaybackStore } from '@/stores/playbackStore'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { ProxyState } from '@/composables/useProxyVideo'
 
@@ -180,6 +181,7 @@ const emit = defineEmits(['loaded', 'error', 'play', 'pause', 'timeupdate', 'end
 
 // Store
 const projectStore = useProjectStore()
+const playbackStore = usePlaybackStore()
 
 // 全局播放管理器（单例）
 const playbackManager = usePlaybackManager()
@@ -294,7 +296,7 @@ const canUpgrade = computed(() => {
 })
 
 const currentSubtitleText = computed(() => projectStore.currentSubtitle?.text || '')
-const isPlaying = computed(() => projectStore.player.isPlaying)
+const isPlaying = computed(() => playbackStore.isPlaying)
 
 // 字幕样式（控制位置）
 const subtitleStyle = computed(() => {
@@ -487,7 +489,7 @@ async function handleResolutionClick() {
 let currentPlayPromise = null
 
 // 监听 Store 播放状态（单向：Store → Video）
-watch(() => projectStore.player.isPlaying, async (playing) => {
+watch(() => playbackStore.isPlaying, async (playing) => {
   if (!videoRef.value || !hasVideoSource.value) return
 
   const video = videoRef.value
@@ -536,12 +538,12 @@ watch(videoRef, (video) => {
 }, { immediate: true })
 
 // 监听播放速度
-watch(() => projectStore.player.playbackRate, (rate) => {
+watch(() => playbackStore.playbackRate, (rate) => {
   if (videoRef.value) videoRef.value.playbackRate = rate
 })
 
 // 监听音量
-watch(() => projectStore.player.volume, (volume) => {
+watch(() => playbackStore.volume, (volume) => {
   if (videoRef.value) videoRef.value.volume = volume
 })
 
@@ -688,8 +690,8 @@ watch(() => props.progressiveUrl, async (newUrl, oldUrl) => {
 function onMetadataLoaded() {
   const video = videoRef.value
   projectStore.setProjectDuration(video.duration)
-  video.playbackRate = projectStore.player.playbackRate
-  video.volume = projectStore.player.volume
+  video.playbackRate = playbackStore.playbackRate
+  video.volume = playbackStore.volume
   retryCount.value = 0
   emit('loaded', video.duration)
   if (props.autoPlay) playbackManager.togglePlay()
@@ -808,7 +810,7 @@ function seek(seconds) {
     return
   }
   const video = videoRef.value
-  const baseTime = video ? video.currentTime : projectStore.player.currentTime
+  const baseTime = video ? video.currentTime : playbackStore.currentTime
   const newTime = Math.max(0, baseTime + seconds)
   playbackManager.seekTo(newTime)
 }
