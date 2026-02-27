@@ -68,6 +68,13 @@ vi.mock('@/services/SmartSaver', () => ({
       }
       return true
     },
+    async forceSaveCritical(payload) {
+      smartSaverMemory.set(payload.jobId, safeClone(payload))
+      if (typeof this.onSaveSuccess === 'function') {
+        this.onSaveSuccess(payload.jobId)
+      }
+      return true
+    },
     async restoreFromBackup(jobId) {
       const hit = smartSaverMemory.get(jobId)
       return hit ? safeClone(hit) : null
