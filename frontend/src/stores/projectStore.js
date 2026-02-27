@@ -1601,6 +1601,14 @@ export const useProjectStore = defineStore("project", () => {
     player.value.currentTime = time;
   }
 
+  function setIsPlaying(isPlaying) {
+    player.value.isPlaying = Boolean(isPlaying);
+  }
+
+  function setPlayerSeeking(isSeeking) {
+    player.value.isSeeking = Boolean(isSeeking);
+  }
+
   /**
    * 保存项目（持久化到后端 + 本地强制保存）
    */
@@ -1769,6 +1777,8 @@ export const useProjectStore = defineStore("project", () => {
     setSelectedSubtitleId,
     setPlayerVolume,
     setPlaybackRate,
+    setIsPlaying,
+    setPlayerSeeking,
     insertSubtitleAt,
     removeSubtitleAt,
     importSRT,

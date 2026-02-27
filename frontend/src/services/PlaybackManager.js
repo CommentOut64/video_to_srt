@@ -3,7 +3,7 @@
  *
  * 核心设计原则：
  * 1. 全局单例：整个应用只有一个实例，所有组件共享状态
- * 2. 单一数据源：所有状态通过 projectStore.player 管理
+ * 2. 单一数据源：所有播放态通过 playbackStore 管理
  * 3. 明确的数据流：User Action → Manager → Store → Video/WaveSurfer
  * 4. 集中式锁管理：避免多实例导致的锁状态不同步
  *
@@ -13,6 +13,7 @@
  */
 
 import { useProjectStore } from "@/stores/projectStore";
+import { usePlaybackStore } from "@/stores/playbackStore";
 
 // ============ 配置常量 ============
 const CONFIG = {
@@ -57,11 +58,18 @@ function createPlaybackManager() {
 
   // Store 引用（延迟获取，避免循环依赖）
   let _store = null;
+  let _playbackStore = null;
   function getStore() {
     if (!_store) {
       _store = useProjectStore();
     }
     return _store;
+  }
+  function getPlaybackStore() {
+    if (!_playbackStore) {
+      _playbackStore = usePlaybackStore();
+    }
+    return _playbackStore;
   }
 
   // ============ Video 注册 ============
@@ -150,9 +158,8 @@ function createPlaybackManager() {
    * 获取 Seek 锁
    */
   function acquireLock(reason = "") {
-    const store = getStore();
     isSeekingInternal = true;
-    store.player.isSeeking = true;
+    getPlaybackStore().setSeeking(true);
 
     // 清除之前的超时
     if (seekLockTimer) {
@@ -173,11 +180,10 @@ function createPlaybackManager() {
    */
   function releaseLock(delay = 0) {
     const doRelease = () => {
-      const store = getStore();
       isSeekingInternal = false;
       isDraggingInternal = false;
       dragSource = "";
-      store.player.isSeeking = false;
+      getPlaybackStore().setSeeking(false);
 
       if (seekLockTimer) {
         clearTimeout(seekLockTimer);
@@ -203,8 +209,7 @@ function createPlaybackManager() {
    * 检查是否被锁定
    */
   function isLocked() {
-    const store = getStore();
-    return isSeekingInternal || store.player.isSeeking;
+    return isSeekingInternal || getPlaybackStore().isSeeking.value;
   }
 
   /**
@@ -239,7 +244,7 @@ function createPlaybackManager() {
     }
 
     if (duration > 0 && Math.abs((Number(store.meta.duration) || 0) - duration) > 0.01) {
-      store.meta.duration = duration;
+      store.setProjectDuration(duration);
     }
 
     return duration;
@@ -284,7 +289,9 @@ function createPlaybackManager() {
     lastSeekTime = Date.now();
 
     // 1. 更新 Store（单一数据源）
-    store.player.currentTime = clampedTime;
+    const playbackStore = getPlaybackStore();
+    playbackStore.updateCurrentTimeRaw(clampedTime);
+    playbackStore.commitCurrentTime(clampedTime);
 
     // 2. 直接更新 Video 元素
     if (
@@ -369,24 +376,22 @@ function createPlaybackManager() {
    * 切换播放/暂停
    */
   function togglePlay() {
-    const store = getStore();
-    store.player.isPlaying = !store.player.isPlaying;
+    const playbackStore = getPlaybackStore();
+    playbackStore.setPlaying(!playbackStore.isPlaying.value);
   }
 
   /**
    * 播放
    */
   function play() {
-    const store = getStore();
-    store.player.isPlaying = true;
+    getPlaybackStore().setPlaying(true);
   }
 
   /**
    * 暂停
    */
   function pause() {
-    const store = getStore();
-    store.player.isPlaying = false;
+    getPlaybackStore().setPlaying(false);
   }
 
   // ============ Video 事件处理 ============
@@ -420,12 +425,13 @@ function createPlaybackManager() {
         return;
       }
 
-      const store = getStore();
-      const diff = Math.abs(videoTime - store.player.currentTime);
+      const playbackStore = getPlaybackStore();
+      const diff = Math.abs(videoTime - playbackStore.currentTime.value);
 
       // 只有差异足够大时才更新
       if (diff > CONFIG.SYNC_THRESHOLD) {
-        store.player.currentTime = videoTime;
+        playbackStore.updateCurrentTimeRaw(videoTime);
+        playbackStore.commitCurrentTime(videoTime);
       }
     }, CONFIG.DEBOUNCE_DELAY);
   }
@@ -453,12 +459,13 @@ function createPlaybackManager() {
     }
     lastWaveSurferSyncAt = now;
 
-    const store = getStore();
-    const diff = Math.abs(currentTime - store.player.currentTime);
+    const playbackStore = getPlaybackStore();
+    const diff = Math.abs(currentTime - playbackStore.currentTime.value);
     if (diff > CONFIG.SYNC_THRESHOLD) {
-      store.player.currentTime = currentTime;
+      playbackStore.updateCurrentTimeRaw(currentTime);
+      playbackStore.commitCurrentTime(currentTime);
     }
-    resolveDuration(store);
+    resolveDuration(getStore());
   }
 
   /**
@@ -479,9 +486,9 @@ function createPlaybackManager() {
    * 处理 Video 的 play 事件
    */
   function handleVideoPlay() {
-    const store = getStore();
-    if (!store.player.isPlaying) {
-      store.player.isPlaying = true;
+    const playbackStore = getPlaybackStore();
+    if (!playbackStore.isPlaying.value) {
+      playbackStore.setPlaying(true);
     }
   }
 
@@ -492,9 +499,9 @@ function createPlaybackManager() {
     if (hasVideoClockAvailable()) {
       return;
     }
-    const store = getStore();
-    if (!store.player.isPlaying) {
-      store.player.isPlaying = true;
+    const playbackStore = getPlaybackStore();
+    if (!playbackStore.isPlaying.value) {
+      playbackStore.setPlaying(true);
     }
   }
 
@@ -502,9 +509,9 @@ function createPlaybackManager() {
    * 处理 Video 的 pause 事件
    */
   function handleVideoPause() {
-    const store = getStore();
-    if (store.player.isPlaying) {
-      store.player.isPlaying = false;
+    const playbackStore = getPlaybackStore();
+    if (playbackStore.isPlaying.value) {
+      playbackStore.setPlaying(false);
     }
   }
 
@@ -515,9 +522,9 @@ function createPlaybackManager() {
     if (hasVideoClockAvailable()) {
       return;
     }
-    const store = getStore();
-    if (store.player.isPlaying) {
-      store.player.isPlaying = false;
+    const playbackStore = getPlaybackStore();
+    if (playbackStore.isPlaying.value) {
+      playbackStore.setPlaying(false);
     }
   }
 
@@ -528,8 +535,7 @@ function createPlaybackManager() {
     if (hasVideoClockAvailable()) {
       return;
     }
-    const store = getStore();
-    store.player.isPlaying = false;
+    getPlaybackStore().setPlaying(false);
   }
 
   // ============ 清理 ============
