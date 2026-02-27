@@ -78,12 +78,20 @@ class SpectrumDiagnosis:
     # 决策原因
     reason: str = ""
 
-    # Brouhaha 分诊扩展字段 (V3.1.1+dev.20260108.01)
-    snr: float = 0.0                           # 信噪比 (dB)
-    c50: float = 0.0                           # 清晰度指数 (dB)
-    snr_level: str = ""                        # SNR 级别: "high" / "warn" / "low"
-    c50_level: str = ""                        # C50 级别: "good" / "warn" / "bad"
-    triage_layer: int = 0                      # 决策层级: 1 / 2 / 3，0 表示未使用 SNR 策略
+    # DNSMOS 音频预检核心字段（V3.2.4+dev.20260224.01）
+    sig: float = 0.0                           # DNSMOS SIG（语音质量）
+    bak: float = 0.0                           # DNSMOS BAK（背景安静度）
+    ovrl: float = 0.0                          # DNSMOS OVRL（综合质量）
+    p808: float = 0.0                          # DNSMOS P.808 MOS
+    decision_source: str = ""                  # 决策来源：dnsmos_hard_separate / dnsmos_hard_pass / dnsmos_yamnet_fallback / compat_fallback
+    decision_margin: float = 0.0               # 与最近阈值边界的裕量（>0 越安全）
+
+    # 兼容字段（旧缓存/旧日志读取，不参与新主链判定）
+    snr: Optional[float] = None                # 旧 SNR 字段
+    c50: Optional[float] = None                # 旧 C50 字段
+    snr_level: str = ""                        # 旧 SNR 级别
+    c50_level: str = ""                        # 旧 C50 级别
+    triage_layer: int = 0                      # 旧层级字段，兼容保留
 
 
 class SeparationLevel(Enum):

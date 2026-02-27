@@ -11,6 +11,7 @@ from typing import Optional, Dict, Any, List, Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 
+from app.services.dnsmos_auto_tune_service import get_dnsmos_auto_tune_service
 from app.services.model_runtime_config_service import get_model_runtime_config_service
 from app.services.model_manager_v2 import get_model_manager_v2
 
@@ -23,6 +24,9 @@ _COMPUTE_TYPES = {"auto", "int8", "int8_float16", "float16", "float32", "fp32"}
 _SENSEVOICE_LANGUAGES = {"auto", "zh", "en", "yue", "ja", "ko", "nospeech"}
 _PUNCT_ALIGNMENT_METHODS = {"anchor", "dtw", "levenshtein"}
 _DEMUCS_MODELS = {"htdemucs", "htdemucs_ft", "mdx_extra", "mdx_extra_q"}
+_AUTO_TUNE_SCHEMA = {
+    "dnsmos": get_dnsmos_auto_tune_service().get_plan().to_dict(),
+}
 
 
 class _RuntimeBase(BaseModel):
@@ -293,10 +297,40 @@ class TimelineRuntimeParams(_RuntimeBase):
 
 
 class SmartProbeRuntimeParams(_RuntimeBase):
+    probe_sep_ratio_min: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    probe_min_coverage: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    probe_max_step_chunks: Optional[int] = Field(default=None, ge=1)
+    # 兼容字段：旧版本探针参数（已废弃）
     snr_threshold: Optional[float] = Field(default=None, ge=0.0)
 
 
+class DNSMOSRuntimeParams(_RuntimeBase):
+    device: Optional[str] = Field(default=None)
+    is_personalized: Optional[bool] = Field(default=None, alias="personalized")
+    ovrl_sep_hard: Optional[float] = Field(default=None, ge=0.0, le=5.0)
+    sig_sep_hard: Optional[float] = Field(default=None, ge=0.0, le=5.0)
+    p808_sep_hard: Optional[float] = Field(default=None, ge=0.0, le=5.0)
+    ovrl_pass_hard: Optional[float] = Field(default=None, ge=0.0, le=5.0)
+    sig_pass_hard: Optional[float] = Field(default=None, ge=0.0, le=5.0)
+    bak_pass_hard: Optional[float] = Field(default=None, ge=0.0, le=5.0)
+    p808_pass_soft: Optional[float] = Field(default=None, ge=0.0, le=5.0)
+
+    @field_validator("device")
+    @classmethod
+    def _validate_device(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        value_lower = value.lower()
+        if value_lower not in _DEVICE_OPTIONS:
+            raise ValueError("device 仅支持 auto/cuda/cpu")
+        return value_lower
+
+
 class YAMNetRuntimeParams(_RuntimeBase):
+    yamnet_music_conf_min: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    yamnet_speech_conf_min: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    yamnet_music_weak_max: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    # 兼容字段：旧版 YAMNet 参数
     acappella_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     music_max_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     music_avg_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
@@ -566,6 +600,7 @@ class RuntimeGroupUpdateRequest(_RuntimeBase):
     demucs: Optional[DemucsRuntimeParams] = None
     vad: Optional[VADRuntimeParams] = None
     timeline: Optional[TimelineRuntimeParams] = None
+    dnsmos: Optional[DNSMOSRuntimeParams] = None
     smart_probe: Optional[SmartProbeRuntimeParams] = None
     yamnet: Optional[YAMNetRuntimeParams] = None
     punctuation: Optional[PunctuationRuntimeParams] = None
@@ -584,6 +619,7 @@ _RUNTIME_GROUP_MODELS = {
     "demucs": DemucsRuntimeParams,
     "vad": VADRuntimeParams,
     "timeline": TimelineRuntimeParams,
+    "dnsmos": DNSMOSRuntimeParams,
     "smart_probe": SmartProbeRuntimeParams,
     "yamnet": YAMNetRuntimeParams,
     "punctuation": PunctuationRuntimeParams,
@@ -724,17 +760,26 @@ _PARAM_SCHEMA: Dict[str, Any] = {
             "sensevoice_merge_max_duration": {"type": "float", "min": 0.0, "default": 8.0},
             "sensevoice_smart_target_duration": {"type": "float", "min": 0.0, "default": 8.0},
         },
+        "dnsmos": {
+            "device": {"type": "enum", "enum": ["auto", "cuda", "cpu"], "default": "cpu"},
+            "personalized": {"type": "bool", "default": False},
+            "ovrl_sep_hard": {"type": "float", "min": 0.0, "max": 5.0, "default": 2.0},
+            "sig_sep_hard": {"type": "float", "min": 0.0, "max": 5.0, "default": 2.1},
+            "p808_sep_hard": {"type": "float", "min": 0.0, "max": 5.0, "default": 2.0},
+            "ovrl_pass_hard": {"type": "float", "min": 0.0, "max": 5.0, "default": 3.1},
+            "sig_pass_hard": {"type": "float", "min": 0.0, "max": 5.0, "default": 3.2},
+            "bak_pass_hard": {"type": "float", "min": 0.0, "max": 5.0, "default": 3.0},
+            "p808_pass_soft": {"type": "float", "min": 0.0, "max": 5.0, "default": 2.9},
+        },
         "smart_probe": {
-            "snr_threshold": {"type": "float", "min": 0.0, "default": 15.0},
+            "probe_sep_ratio_min": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.40},
+            "probe_min_coverage": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.30},
+            "probe_max_step_chunks": {"type": "int", "min": 1, "default": 30},
         },
         "yamnet": {
-            "acappella_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.3},
-            "music_max_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.15},
-            "music_avg_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.10},
-            "speech_max_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.8},
-            "speech_max_music_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.1},
-            "speech_dominant_delta": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.3},
-            "speech_dominant_music_max": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.15},
+            "yamnet_music_conf_min": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.15},
+            "yamnet_speech_conf_min": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.85},
+            "yamnet_music_weak_max": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.10},
             "probe_window_count": {"type": "int", "min": 1, "max": 5, "default": 3},
             "probe_window_duration_sec": {"type": "float", "min": 0.5, "max": 2.0, "default": 0.975},
         },
@@ -1089,4 +1134,5 @@ async def get_runtime_params_schema() -> Dict[str, Any]:
         "resident": _PARAM_SCHEMA["resident"],
         "per_model": _PARAM_SCHEMA["per_model"],
         "runtime": _PARAM_SCHEMA["runtime"],
+        "auto_tune": _AUTO_TUNE_SCHEMA,
     }

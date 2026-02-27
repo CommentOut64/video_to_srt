@@ -49,6 +49,12 @@ class PreprocessingSettingsAPI(BaseModel):
     enable_spectral_triage: bool = Field(default=True, description="是否启用频谱分诊")
     # 分诊灵敏度: 0.0-1.0
     spectrum_threshold: float = Field(default=0.35, ge=0.0, le=1.0, description="分诊灵敏度")
+    # 是否启用 DNSMOS 音频预检主链
+    use_dnsmos_triage: bool = Field(default=True, description="是否启用 DNSMOS 音频预检")
+    # 是否启用中心扩散智能探针（默认开启）
+    use_smart_probe: bool = Field(default=True, description="是否启用中心扩散智能探针")
+    # 是否启用 ASR 风险前置守卫（命中后强制全局分离）
+    enable_asr_risk_guard: bool = Field(default=True, description="是否启用 ASR 风险前置守卫")
     # VAD 静音过滤
     vad_filter: bool = Field(default=True, description="VAD 静音过滤")
     # 是否启用说话人检测（任务级）

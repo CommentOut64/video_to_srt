@@ -1,6 +1,6 @@
 # DNSMOS 替代 Brouhaha 深度评估与最终方案（v3.2.3）
 
-> 结论先行：当前频谱分诊真实行为已经是“YAMNet/规则兜底主导”，`brouhaha` 仅保留代码壳；DNSMOS 可作为主检测器接管，但必须按当前代码现状重构分支、缓存键、运行参数和 SmartProbe 才能稳定落地。
+> 结论先行：当前音频预检真实行为已经是“YAMNet/规则兜底主导”，`brouhaha` 仅保留代码壳；DNSMOS 可作为主检测器接管，但必须按当前代码现状重构分支、缓存键、运行参数和 SmartProbe 才能稳定落地。
 
 ---
 
@@ -8,7 +8,7 @@
 
 本评估基于以下代码与文档的交叉核验（已实际读取）：
 
-- 频谱分诊主链：
+- 音频预检主链：
   - `backend/app/pipelines/preprocessing_pipeline.py`
   - `backend/app/pipelines/stages/spectral_triage_stage.py`
   - `backend/app/services/audio_spectrum_classifier.py`
@@ -36,11 +36,11 @@
 
 ---
 
-## 2. 当前频谱分诊“真实结构”全分支拆解
+## 2. 当前音频预检“真实结构”全分支拆解
 
 ## 2.1 Pipeline 入口分支（`PreprocessingPipeline.process`）
 
-Stage 2（频谱分诊）并不是“直接跑分类器”，而是先走缓存/跳过分支：
+Stage 2（音频预检）并不是“直接跑分类器”，而是先走缓存/跳过分支：
 
 1. 若分离缓存命中（`skip_triage=True`）：
 - 直接跳过分诊。
@@ -248,13 +248,17 @@ V3.2.0+dev.20260215.01 更新：本节按“分支减法”重写，目标是删
 1. 只保留一条主判据：音频质量相关判断统一由 DNSMOS 负责。
 2. 只保留一个语义兜底：YAMNet 仅在 DNSMOS 灰区时触发。
 3. 删除重复判断：DNSMOS 可判的“噪声/清晰度”不再由传统频谱规则重复判断。
-4. 保持接口稳定：下游仍只消费 `needs_separation/recommended_model`。
-5. 保守优先：兜底不可用时不做复杂规则推理，直接走保守策略。
+4. 前置风险优先：ASR 风险判定必须在 DNSMOS 预检前执行，命中后直接切全局分离。
+5. 保持接口稳定：下游仍只消费 `needs_separation/recommended_model`。
+6. 保守优先：兜底不可用时不做复杂规则推理，直接走保守策略。
 
 ## 4.2 新决策树（唯一主链）
 
 ```text
 Chunk
+  -> [R0] ASR 风险前置守卫（chunk内多点采样平坦度）
+      -> 命中: 强制 GLOBAL 分离 + 跳过 DNSMOS 预检
+      -> 未命中: 进入 DNSMOS 主链
   -> [G0] 极短片段(<0.5s): PASS
   -> [G1] DNSMOS 可用?
       -> 否: 进入兼容降级链（仅用于模型缺失）
@@ -268,7 +272,7 @@ Chunk
 ```
 
 说明：
-- 常态路径只有 `G0 + G1 + D1/D2/D3`，不再并列多套质量判定体系。
+- 常态路径为 `R0 + G0 + G1 + D1/D2/D3`，不再并列多套质量判定体系。
 - `YAMNet-Lite` 不是主分诊器，只是 DNSMOS 灰区裁决器。
 
 ## 4.3 明确删除/合并清单（回答“分支是否过多”）
@@ -320,6 +324,7 @@ Chunk
 说明：
 - A Cappella、SpeechDominant 等规则不再独立保留，统一并入上面三条。
 - 避免“同一语义被多规则重复判定”导致行为不透明。
+- 执行设备固定为 `CPUExecutionProvider`，避免因 CUDA Provider/DLL 依赖异常导致灰区兜底链路抖动。
 
 ## 4.6 SmartProbe v2（DNSMOS 驱动）
 
@@ -331,8 +336,33 @@ Chunk
 
 新增目标：
 - 只决定“是否全量快判”，不单独承担质量判定。
+- 工程默认启用中心扩散探针（`use_smart_probe=true`），仅在任务配置显式关闭时回退标准逐 chunk 模式。
 
-## 4.7 数据结构与兼容
+## 4.7 ASR 风险前置守卫（新增）
+
+守卫位置与优先级：
+
+1. 位置固定在 `PreprocessingPipeline` 的 Stage2（DNSMOS 预检）之前。
+2. 判定命中后，直接旁路 `SpectralTriageStage`，并将当次任务分离模式强制为 `global`。
+3. 命中后不再信任 `on_demand` 分离缓存，优先尝试 `global` 缓存，不命中则重跑全局分离。
+
+chunk 内采样约束（避免“到原音频随机取点”）：
+
+1. 采样点固定在每个 chunk 内：`5% / 25% / 50% / 75% / 95%`。
+2. 采样窗口固定 `1.2s`，低能量窗口剔除（RMS 门限）。
+3. 每个 chunk 至少 `4` 个有效窗口才参与风险判定。
+
+当前阈值约束（针对 `input/日语听力测试.mp4` 校准）：
+
+1. chunk 级命中：
+- `mean_flatness >= 0.33`
+- `max_flatness >= 0.65`
+- `high_flatness_ratio >= 0.40`
+2. 视频级命中：
+- `risk_chunk_count >= max(2, ceil(0.05 * analyzed_chunk_count))`
+- 同时满足 `risk_chunk_ratio >= 0.05`
+
+## 4.8 数据结构与兼容
 
 `SpectrumDiagnosis` 统一核心字段：
 - `sig/bak/ovrl/p808`
@@ -360,6 +390,8 @@ Chunk
 2. `hop_sec=1.0`
 3. 官方多项式校准系数
 4. `mono_strategy=mean`（无业务特例不改）
+5. `asr_risk_guard.sample_positions=(0.05, 0.25, 0.5, 0.75, 0.95)`
+6. `asr_risk_guard.sample_window_sec=1.2`
 
 ## 5.2 必要运行参数（保留）
 
@@ -383,7 +415,7 @@ SmartProbe v2 阈值：
 
 1. `probe_sep_ratio_min`
 2. `probe_min_coverage`
-3. `probe_max_step_chunks`
+3. `probe_max_step_chunks`（固定，先不纳入自动调参）
 
 ## 5.3 明确移除参数（避免重复控制）
 
@@ -414,19 +446,21 @@ SmartProbe v2 阈值：
 6. `bak_pass_hard`
 7. `p808_pass_soft`
 
-中优先级（建议）：
+中优先级（建议，仅用于时延/吞吐）：
 
-1. `yamnet_music_conf_min`
-2. `yamnet_speech_conf_min`
-3. `yamnet_music_weak_max`
-4. `probe_sep_ratio_min`
-5. `probe_min_coverage`
+1. `probe_sep_ratio_min`
+2. `probe_min_coverage`
 
 不调（固定）：
 
 1. `window_sec/hop_sec`
 2. DNSMOS 校准系数
 3. `mono_strategy`（默认 mean）
+4. `yamnet_music_conf_min`
+5. `yamnet_speech_conf_min`
+6. `yamnet_music_weak_max`
+7. `probe_max_step_chunks`
+8. `asr_risk_guard` 的窗口采样结构参数（位置、窗口长度、最小窗口数）
 
 ## 6.2 标注目标（业务导向）
 
@@ -460,13 +494,8 @@ def suggest_params(trial):
     bak_pass_hard = trial.suggest_float("bak_pass_hard", 1.8, 4.0)
     p808_pass_soft = trial.suggest_float("p808_pass_soft", p808_sep_hard + 0.2, 3.8)
 
-    yamnet_music_conf_min = trial.suggest_float("yamnet_music_conf_min", 0.10, 0.35)
-    yamnet_speech_conf_min = trial.suggest_float("yamnet_speech_conf_min", 0.70, 0.98)
-    yamnet_music_weak_max = trial.suggest_float("yamnet_music_weak_max", 0.05, 0.20)
-
     probe_sep_ratio_min = trial.suggest_float("probe_sep_ratio_min", 0.20, 0.80)
     probe_min_coverage = trial.suggest_float("probe_min_coverage", 0.15, 0.60)
-    probe_max_step_chunks = trial.suggest_int("probe_max_step_chunks", 8, 48)
 ```
 
 ## 6.5 训练与验证流程
@@ -482,11 +511,11 @@ def suggest_params(trial):
 
 ## 6.6 回灌与灰度
 
-1. 回灌到 `runtime.dnsmos/runtime.yamnet/runtime.smart_probe`。
+1. 自动回灌到 `runtime.dnsmos/runtime.smart_probe`（`yamnet_*` 与 `probe_max_step_chunks` 固定不自动写）。
 2. 按流量灰度对比旧链路：
 - 漏分离率
 - CER 改善
-- 分诊平均耗时
+- 音频预检平均耗时
 
 ---
 
@@ -504,6 +533,52 @@ def suggest_params(trial):
 - `test_dnsmos_smart_probe.py`
 - `test_triage_cache_compat.py`
 7. 完成 Optuna 校准后，切换默认开关到 DNSMOS 主链。
+
+### 7.1 当前分支已落地项（V3.2.4+dev.20260225.02）
+
+1. 新增 `backend/app/services/dnsmos_service.py`，默认 CPU 推理，支持 SIG/BAK/OVRL/P808 输出。
+2. `AudioSpectrumClassifier` 已切换到 DNSMOS 主链，并输出 `decision_source/decision_margin`。
+3. `SmartProbeService` 已改为 DNSMOS v2 三态判定（`SEPARATE_ALL/PASS_ALL/ESCALATE_STANDARD`）。
+4. 音频预检缓存键已升级：`triage_version/use_dnsmos_triage/dnsmos_model_hash/dnsmos_threshold_profile_hash`。
+5. 运行参数已新增 `runtime.dnsmos`，并同步 SmartProbe v2 与 YAMNet-Lite 参数。
+6. 已新增单元测试：
+- `ci_tests/unit/test_dnsmos_triage_classifier.py`
+- `ci_tests/unit/test_dnsmos_smart_probe.py`
+- `ci_tests/unit/test_triage_cache_compat.py`
+7. 已新增自动调参服务：
+- `backend/app/services/dnsmos_auto_tune_service.py`
+- `GET /api/models/params` 新增 `auto_tune.dnsmos` 参数分层（mandatory/recommended/fixed）
+- 新增单测：`ci_tests/unit/test_dnsmos_auto_tune_service.py`、`ci_tests/unit/test_model_runtime_params_schema_dnsmos.py`
+8. 新增前置守卫：`backend/app/services/asr_risk_guard_service.py` 与 `PreprocessingPipeline` Stage1.5 接入。
+9. 当前行为：命中 ASR 风险后，预检直接旁路，分离模式强制 `global`（仅对当次任务生效）。
+10. `ModelRuntimeConfigService._runtime_defaults()` 已与本轮自动调参结果一致：
+- `runtime.dnsmos`：
+  `ovrl_sep_hard=2.0960908371`、
+  `sig_sep_hard=2.5541660107`、
+  `p808_sep_hard=1.7823731697`、
+  `ovrl_pass_hard=2.3441922434`、
+  `sig_pass_hard=2.7914833248`、
+  `bak_pass_hard=1.8809400946`、
+  `p808_pass_soft=3.2350228539`
+- `runtime.smart_probe`：
+  `probe_sep_ratio_min=0.2679550189`、
+  `probe_min_coverage=0.3668912432`、
+  `probe_max_step_chunks=30`
+
+### 7.2 API 字段变更清单（音频预检）
+
+1. `GET /api/models/params`
+- 新增 `auto_tune.dnsmos.mandatory`：
+  `ovrl_sep_hard/sig_sep_hard/p808_sep_hard/ovrl_pass_hard/sig_pass_hard/bak_pass_hard/p808_pass_soft`
+- 新增 `auto_tune.dnsmos.recommended`：
+  `probe_sep_ratio_min/probe_min_coverage`
+- 新增 `auto_tune.dnsmos.fixed`：
+  `yamnet_music_conf_min/yamnet_speech_conf_min/yamnet_music_weak_max/probe_max_step_chunks`
+
+2. `PUT /api/models/runtime`
+- `runtime.dnsmos` 支持 7 个核心阈值更新；
+- `runtime.smart_probe` 支持 `probe_sep_ratio_min/probe_min_coverage` 更新；
+- `runtime.yamnet` 参数仍可手动改，但不属于自动调参主域。
 
 ---
 

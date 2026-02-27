@@ -24,6 +24,7 @@ function buildDefaultTaskConfig() {
       spectrum_threshold: 0.35,
       vad_filter: true,
       enable_spectral_triage: true,
+      use_smart_probe: true,
       language_detection_mode: 'balanced',
       language_detection_device: 'auto',
       enable_speaker_embedding: false,

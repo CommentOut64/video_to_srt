@@ -405,17 +405,32 @@ class ModelRuntimeConfigService:
                 "max_wait_sec": 5.0,
                 "tail_idle_sec": 1.0,
             },
+            "dnsmos": {
+                # 默认 CPU，避免挤占主转录 GPU 资源
+                "device": "cpu",
+                "personalized": False,
+                # V3.2.4+dev.20260225.03: DNSMOS 自动调参回灌默认值
+                "ovrl_sep_hard": 2.0960908371247604,
+                "sig_sep_hard": 2.554166010717122,
+                "p808_sep_hard": 1.7823731696905278,
+                "ovrl_pass_hard": 2.3441922433760665,
+                "sig_pass_hard": 2.7914833247808972,
+                "bak_pass_hard": 1.8809400945693762,
+                "p808_pass_soft": 3.235022853899088,
+            },
             "smart_probe": {
-                "snr_threshold": 15.0,
+                # V3.2.4+dev.20260225.03: 探针自动调参回灌默认值
+                "probe_sep_ratio_min": 0.26795501889788964,
+                "probe_min_coverage": 0.36689124315485816,
+                # 固定参数（先不纳入自动调参）
+                "probe_max_step_chunks": 30,
             },
             "yamnet": {
-                "acappella_threshold": 0.3,
-                "music_max_threshold": 0.15,
-                "music_avg_threshold": 0.10,
-                "speech_max_threshold": 0.8,
-                "speech_max_music_threshold": 0.1,
-                "speech_dominant_delta": 0.3,
-                "speech_dominant_music_max": 0.15,
+                # 固定参数：先不作为自动调参重点
+                "yamnet_music_conf_min": 0.15,
+                "yamnet_speech_conf_min": 0.85,
+                "yamnet_music_weak_max": 0.10,
+                # 采样参数保留（不纳入自动调参重点）
                 "probe_window_count": 3,
                 "probe_window_duration_sec": 0.975,
             },
