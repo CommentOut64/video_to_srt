@@ -30,6 +30,8 @@ export const useProjectStore = defineStore("project", () => {
     isDirty: false, // 是否有未保存修改
     // 渐进式加载相关（状态由 useProxyVideo composable 管理）
     currentResolution: null, // 当前视频分辨率 ('360p', '720p', 'source')
+    // Phase 0.5: 能力协商快照留位（本期不参与行为判断）
+    capabilitySnapshot: null,
     // V3.2.0+dev.20260130.09: 字幕全局时间偏移（秒）
     subtitleOffset: 0,
   });
@@ -218,6 +220,13 @@ export const useProjectStore = defineStore("project", () => {
     }
   }
 
+  function normalizeCapabilitySnapshot(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object') {
+      return null;
+    }
+    return snapshot;
+  }
+
   const isDirty = computed(() => {
     return meta.value.isDirty || subtitles.value.some((s) => s.isDirty);
   });
@@ -326,6 +335,9 @@ export const useProjectStore = defineStore("project", () => {
       ...metadata,
       lastSaved: Date.now(),
       isDirty: false,
+      capabilitySnapshot: normalizeCapabilitySnapshot(
+        metadata?.capabilitySnapshot ?? metadata?.capability_snapshot ?? meta.value.capabilitySnapshot
+      ),
       subtitleOffset: subtitleOffset.value,
     };
 
@@ -373,6 +385,9 @@ export const useProjectStore = defineStore("project", () => {
       ...metadata,
       lastSaved: Date.now(),
       isDirty: false,
+      capabilitySnapshot: normalizeCapabilitySnapshot(
+        metadata?.capabilitySnapshot ?? metadata?.capability_snapshot ?? meta.value.capabilitySnapshot
+      ),
       subtitleOffset: subtitleOffset.value,
     };
 
@@ -427,6 +442,12 @@ export const useProjectStore = defineStore("project", () => {
       mode: metadata.mode || meta.value.mode || "normal",
       lastSaved: now,
       isDirty: false,
+      capabilitySnapshot: normalizeCapabilitySnapshot(
+        metadata?.capabilitySnapshot
+          ?? metadata?.capability_snapshot
+          ?? docMeta?.capability_snapshot
+          ?? meta.value.capabilitySnapshot
+      ),
       subtitleOffset: subtitleOffset.value,
     };
 
@@ -448,7 +469,10 @@ export const useProjectStore = defineStore("project", () => {
       if (memoryCache.has(identityId)) {
         const cached = memoryCache.get(identityId);
         subtitles.value = cached.subtitles;
-        meta.value = cached.meta;
+        meta.value = {
+          ...cached.meta,
+          capabilitySnapshot: normalizeCapabilitySnapshot(cached?.meta?.capabilitySnapshot),
+        };
         if (cached?.meta?.subtitleOffset !== undefined) {
           setSubtitleOffset(cached.meta.subtitleOffset, { applyDelta: false });
         }
@@ -462,7 +486,10 @@ export const useProjectStore = defineStore("project", () => {
       const saved = await smartSaver.restoreFromBackup(identityId);
       if (saved) {
         subtitles.value = saved.subtitles;
-        meta.value = saved.meta;
+        meta.value = {
+          ...saved.meta,
+          capabilitySnapshot: normalizeCapabilitySnapshot(saved?.meta?.capabilitySnapshot),
+        };
         if (saved?.meta?.subtitleOffset !== undefined) {
           setSubtitleOffset(saved.meta.subtitleOffset, { applyDelta: false });
         }
@@ -1525,6 +1552,8 @@ export const useProjectStore = defineStore("project", () => {
       isDirty: false,
       // 渐进式加载相关（状态由 useProxyVideo composable 管理）
       currentResolution: null,
+      // Phase 0.5: 能力协商快照留位（本期不参与行为判断）
+      capabilitySnapshot: null,
       // V3.2.0+dev.20260130.09: 字幕全局时间偏移（秒）
       subtitleOffset: subtitleOffset.value,
     };

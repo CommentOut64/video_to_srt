@@ -48,10 +48,12 @@ function createState(jobId) {
       mode: 'unknown'
     },
     lastSource: 'init',
+    stateSeq: 0,
     lastUpdate: 0,
     lastSseAt: 0,
     lastServerAt: 0,
-    lastRejected: null
+    lastRejected: null,
+    lastProjection: null
   }
 }
 
@@ -84,7 +86,8 @@ export const useProgressStore = defineStore('progress', () => {
       total: state.total,
       language: state.language
     }, {
-      updated_at: state.lastServerAt
+      updated_at: state.lastServerAt,
+      state_seq: state.stateSeq
     })
   }
 
@@ -130,6 +133,17 @@ export const useProgressStore = defineStore('progress', () => {
   function apply(jobId, payload = {}, source = 'unknown') {
     const state = ensureState(jobId)
     const now = Date.now()
+    const stateSeq = payload.state_seq ?? null
+    let hasProjectionRejected = false
+    const markProjection = (accepted, reason = null) => {
+      state.lastProjection = {
+        accepted,
+        reason,
+        source,
+        stateSeq,
+        at: now
+      }
+    }
     const incomingAt = normalizeTimestamp(payload.updated_at ?? payload.timestamp)
     if (incomingAt && state.lastServerAt && incomingAt < state.lastServerAt) {
       state.lastRejected = {
@@ -137,10 +151,16 @@ export const useProgressStore = defineStore('progress', () => {
         source,
         at: now
       }
+      hasProjectionRejected = true
+      markProjection(false, 'stale_server_timestamp')
       return state
     }
     if (incomingAt) {
       state.lastServerAt = incomingAt
+    }
+    const incomingSeq = Number(payload.state_seq)
+    if (Number.isFinite(incomingSeq) && incomingSeq > 0) {
+      state.stateSeq = Math.max(state.stateSeq || 0, Math.floor(incomingSeq))
     }
     const nextStatus = payload.status || state.status
     let dirty = false
@@ -199,10 +219,15 @@ export const useProgressStore = defineStore('progress', () => {
           source,
           at: now
         }
+        hasProjectionRejected = true
+        markProjection(false, 'percent_regression_rejected')
       }
     }
 
     if (!dirty) {
+      if (!hasProjectionRejected) {
+        markProjection(true, 'noop')
+      }
       return state
     }
 
@@ -211,6 +236,7 @@ export const useProgressStore = defineStore('progress', () => {
     if (source === 'sse') {
       state.lastSseAt = now
     }
+    markProjection(true, 'applied')
 
     syncTask(jobId, state)
     return state

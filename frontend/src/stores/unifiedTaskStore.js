@@ -254,35 +254,37 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
    */
   function updateTaskStatus(jobId, status, message = null, meta = {}) {
     const task = tasksMap.value.get(jobId)
-    if (task) {
-      const incomingSeq = normalizeStateSeq(meta.state_seq)
-      if (!applyStateSeqGuard(task, incomingSeq, { allowEqual: false })) {
-        return
-      }
-      const incomingAt = normalizeTimestamp(
-        meta.updated_at ?? meta.updatedAt ?? meta.timestamp
-      )
-      const isServer = meta.isServer !== false
-      if (!applyUpdateTimestamp(task, incomingAt, isServer)) {
-        return
-      }
-      task.status = status
-      if (message !== null) {
-        task.message = message
-      }
-      if (
-        [TaskStatus.CANCELED, TaskStatus.FORCE_CANCELED].includes(status) &&
-        !task.canceled_at
-      ) {
-        task.canceled_at = Date.now()
-      }
-      if (status === TaskStatus.REMOVED) {
-        deleteTask(jobId)
-        return
-      }
-      saveTasks()
-      console.log(`[UnifiedTaskStore] 任务状态已更新: ${jobId} -> ${status}`)
+    if (!task) {
+      return false
     }
+    const incomingSeq = normalizeStateSeq(meta.state_seq)
+    if (!applyStateSeqGuard(task, incomingSeq, { allowEqual: false })) {
+      return false
+    }
+    const incomingAt = normalizeTimestamp(
+      meta.updated_at ?? meta.updatedAt ?? meta.timestamp
+    )
+    const isServer = meta.isServer !== false
+    if (!applyUpdateTimestamp(task, incomingAt, isServer)) {
+      return false
+    }
+    task.status = status
+    if (message !== null) {
+      task.message = message
+    }
+    if (
+      [TaskStatus.CANCELED, TaskStatus.FORCE_CANCELED].includes(status) &&
+      !task.canceled_at
+    ) {
+      task.canceled_at = Date.now()
+    }
+    if (status === TaskStatus.REMOVED) {
+      deleteTask(jobId)
+      return true
+    }
+    saveTasks()
+    console.log(`[UnifiedTaskStore] 任务状态已更新: ${jobId} -> ${status}`)
+    return true
   }
 
   /**
@@ -290,7 +292,7 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
    */
   function updateTaskProgress(jobId, percent, status, extraData = {}, meta = {}) {
     const task = tasksMap.value.get(jobId)
-    if (!task) return
+    if (!task) return false
 
     const incomingSeq = normalizeStateSeq(meta.state_seq)
     const currentSeq = normalizeStateSeq(task.state_seq)
@@ -298,7 +300,7 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
       console.warn(
         `[UnifiedTaskStore] 忽略旧序号进度更新: job=${jobId}, incoming_seq=${incomingSeq}, current_seq=${currentSeq}`
       )
-      return
+      return false
     }
     if (incomingSeq > currentSeq) {
       task.state_seq = incomingSeq
@@ -309,7 +311,7 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
     )
     const isServer = meta.isServer !== false
     if (!applyUpdateTimestamp(task, incomingAt, isServer)) {
-      return
+      return false
     }
 
     applyProgressField(task, percent, status)
@@ -331,6 +333,7 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
     task.lastError = null  // 清除错误信息
 
     // 进度更新频繁，不立即保存到 localStorage
+    return true
   }
 
   /**
@@ -338,22 +341,24 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
    */
   function updateTaskSSEStatus(jobId, connected, error = null, meta = {}) {
     const task = tasksMap.value.get(jobId)
-    if (task) {
-      const incomingAt = normalizeTimestamp(
-        meta.updated_at ?? meta.updatedAt ?? meta.timestamp
-      )
-      const isServer = meta.isServer === true
-      if (isServer && !applyUpdateTimestamp(task, incomingAt, true)) {
-        return
-      }
-      task.sseConnected = connected
-      // 如果是被踢下线的情况，记录错误提示，供 UI 展示弹窗/提示
-      if (error) task.lastError = error
-      else if (connected) task.lastError = null
-      if (!isServer) {
-        task.updatedAt = Date.now()
-      }
+    if (!task) {
+      return false
     }
+    const incomingAt = normalizeTimestamp(
+      meta.updated_at ?? meta.updatedAt ?? meta.timestamp
+    )
+    const isServer = meta.isServer === true
+    if (isServer && !applyUpdateTimestamp(task, incomingAt, true)) {
+      return false
+    }
+    task.sseConnected = connected
+    // 如果是被踢下线的情况，记录错误提示，供 UI 展示弹窗/提示
+    if (error) task.lastError = error
+    else if (connected) task.lastError = null
+    if (!isServer) {
+      task.updatedAt = Date.now()
+    }
+    return true
   }
 
   /**
@@ -390,11 +395,11 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
    */
   function updateTask(jobId, updates, meta = {}) {
     const task = tasksMap.value.get(jobId)
-    if (!task) return
+    if (!task) return false
     const incomingSeq = normalizeStateSeq(meta.state_seq ?? updates.state_seq)
     if (updates.status !== undefined) {
       if (!applyStateSeqGuard(task, incomingSeq, { allowEqual: false })) {
-        return
+        return false
       }
     } else {
       const currentSeq = normalizeStateSeq(task.state_seq)
@@ -402,7 +407,7 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
         console.warn(
           `[UnifiedTaskStore] 忽略旧序号任务更新: job=${jobId}, incoming_seq=${incomingSeq}, current_seq=${currentSeq}`
         )
-        return
+        return false
       }
       if (incomingSeq > currentSeq) {
         task.state_seq = incomingSeq
@@ -413,7 +418,7 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
     )
     const isServer = meta.isServer !== false
     if (!applyUpdateTimestamp(task, incomingAt, isServer)) {
-      return
+      return false
     }
 
     // 检测任务是否刚完成
@@ -447,7 +452,7 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
     }
     if (updates.status === 'removed') {
       deleteTask(jobId)
-      return
+      return true
     }
 
     if (updates.progress !== undefined) {
@@ -458,6 +463,7 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
     Object.assign(task, updates)
     saveTasks()
     console.log(`[UnifiedTaskStore] 任务已更新: ${jobId}`, updates)
+    return true
   }
 
   function applyTaskSnapshot(snapshot, meta = {}) {

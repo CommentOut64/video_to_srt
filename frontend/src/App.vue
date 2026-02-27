@@ -17,6 +17,7 @@ import { useUpdateChecker } from '@/composables'
 import sseChannelManager from '@/services/sseChannelManager'
 import { heartbeatService } from '@/services/heartbeat'
 import UpdateDialog from '@/components/UpdateDialog.vue'
+import { traceTaskProjection } from '@/state/observability/taskEventTrace'
 
 const taskStore = useUnifiedTaskStore()
 const progressStore = useProgressStore()
@@ -119,7 +120,12 @@ onMounted(async () => {
 
       // 同步队列顺序
       if (state.queue && Array.isArray(state.queue)) {
-        taskStore.applyQueueOrder(state.queue, { timestamp: state.queue_updated_at })
+        const accepted = taskStore.applyQueueOrder(state.queue, { timestamp: state.queue_updated_at })
+        traceTaskProjection('global.initial.queue', {
+          source: 'sse',
+          accepted,
+          detail: { length: state.queue.length },
+        })
         console.log(`[App] 初始队列顺序已同步: ${state.queue.length} 个任务`)
       }
 
@@ -132,7 +138,14 @@ onMounted(async () => {
             return
           }
 
-          taskStore.applyTaskSnapshot(job)
+          const accepted = taskStore.applyTaskSnapshot(job)
+          traceTaskProjection('global.initial.job_snapshot', {
+            source: 'sse',
+            jobId: job.id,
+            state_seq: job.state_seq,
+            accepted,
+            detail: { status: job.status },
+          })
         })
       }
     },
@@ -145,8 +158,14 @@ onMounted(async () => {
 
       // 更新队列顺序到 store
       if (Array.isArray(queue)) {
-        taskStore.applyQueueOrder(queue, {
+        const accepted = taskStore.applyQueueOrder(queue, {
           updated_at: data?.updated_at ?? data?.timestamp
+        })
+        traceTaskProjection('global.queue_update', {
+          source: 'sse',
+          state_seq: data?.state_seq,
+          accepted,
+          detail: { length: queue.length },
         })
         console.log(`[App] 队列顺序已更新: ${queue.length} 个任务`)
       }
@@ -164,16 +183,27 @@ onMounted(async () => {
         // V3.1.0: onJobStatus 只更新 status 和 message，不更新 progress
         // 避免后端推送的低进度（如恢复时的 0）覆盖前端已有的高进度
         // progress 的更新由 onJobProgress 专门负责
-        taskStore.updateTaskStatus(jobId, status, data.message || '', {
+        const taskAccepted = taskStore.updateTaskStatus(jobId, status, data.message || '', {
           updated_at: data.updated_at ?? data.timestamp,
           state_seq: data.state_seq
         })
-        progressStore.markStatus(jobId, status, {
+        const progressState = progressStore.markStatus(jobId, status, {
           updated_at: data.updated_at ?? data.timestamp,
           state_seq: data.state_seq,
           message: data.message,
           phase: data.phase,
           phase_percent: data.phase_percent
+        })
+        traceTaskProjection('global.job_status', {
+          source: 'sse',
+          jobId,
+          state_seq: data.state_seq,
+          accepted: taskAccepted,
+          detail: {
+            status,
+            progressAccepted: progressState?.lastProjection?.accepted ?? null,
+            progressReason: progressState?.lastProjection?.reason ?? null,
+          },
         })
 
       }
@@ -186,7 +216,7 @@ onMounted(async () => {
       taskStore.updateSSEHeartbeat()
 
       // 更新 store 中的任务进度（实时更新卡片），传递完整数据
-      taskStore.updateTaskProgress(jobId, percent, data.status, {
+      const accepted = taskStore.updateTaskProgress(jobId, percent, data.status, {
         phase: data.phase,
         phase_percent: data.phase_percent,
         message: data.message,
@@ -197,6 +227,16 @@ onMounted(async () => {
         updated_at: data.updated_at ?? data.timestamp,
         state_seq: data.state_seq
       })
+      traceTaskProjection('global.job_progress', {
+        source: 'sse',
+        jobId,
+        state_seq: data.state_seq,
+        accepted,
+        detail: {
+          percent,
+          status: data.status,
+        },
+      })
     },
     onJobRenamed(data) {
       console.log('[App] 任务重命名:', data.job_id, data.title)
@@ -205,8 +245,14 @@ onMounted(async () => {
       if (data.title !== undefined) updates.title = data.title
       if (data.filename !== undefined) updates.filename = data.filename
 
-      taskStore.updateTask(data.job_id, updates, {
+      const accepted = taskStore.updateTask(data.job_id, updates, {
         updated_at: data.updated_at ?? data.timestamp
+      })
+      traceTaskProjection('global.job_renamed', {
+        source: 'sse',
+        jobId: data.job_id,
+        state_seq: data.state_seq,
+        accepted,
       })
     },
 
