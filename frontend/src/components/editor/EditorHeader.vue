@@ -220,7 +220,7 @@ import transcriptionApi from '@/services/api/transcriptionApi'
 import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
 import { useProjectStore } from '@/stores/projectStore'
 import { useProgressStore } from '@/stores/progressStore'
-import { ROUTE_VISIBILITY } from '@/config/flavor'
+import { selectRouteVisibility } from '@/state/capabilities/capabilitySelector'
 
 const taskStore = useUnifiedTaskStore()
 const projectStore = useProjectStore()
@@ -249,8 +249,9 @@ const props = defineProps({
 
 const emit = defineEmits(['undo', 'redo', 'export', 'pause', 'resume', 'cancel', 'rename'])
 const hasJobContext = computed(() => Boolean(props.jobId))
-const backRoute = computed(() => (ROUTE_VISIBILITY.taskList ? '/tasks' : '/import'))
-const backTooltip = computed(() => (ROUTE_VISIBILITY.taskList ? '返回任务列表' : '返回导入页'))
+const routeVisibility = computed(() => selectRouteVisibility(projectStore.meta.capabilitySnapshot))
+const backRoute = computed(() => (routeVisibility.value.taskList ? '/tasks' : '/import'))
+const backTooltip = computed(() => (routeVisibility.value.taskList ? '返回任务列表' : '返回导入页'))
 
 // V3.2.0+dev.20260122.02: 从 progressStore 获取当前任务的进度状态
 const jobProgress = computed(() => {

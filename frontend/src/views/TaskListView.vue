@@ -225,7 +225,7 @@ import {
 } from '@element-plus/icons-vue'
 import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
 import { useTranscriptionConfigStore } from '@/stores/transcriptionConfigStore'
-import { CAPABILITIES } from '@/config/flavor'
+import { selectCapabilities } from '@/state/capabilities/capabilitySelector'
 import { transcriptionApi, systemApi, presetsApi } from '@/services/api'
 import AboutDialog from '@/components/AboutDialog.vue'
 import TaskListHeader from '@/components/task/TaskListHeader.vue'
@@ -249,6 +249,7 @@ const route = useRoute()
 const taskStore = useUnifiedTaskStore()
 const transcriptionConfigStore = useTranscriptionConfigStore()
 const { taskConfig } = storeToRefs(transcriptionConfigStore)
+const capabilities = selectCapabilities()
 
 const showAboutDialog = ref(false)
 const showImportDialog = ref(false)
@@ -674,7 +675,7 @@ loadCustomPresets()
 
 onMounted(() => {
   loadTaskUiPreferences()
-  if (!CAPABILITIES.canTranscribe || route.query.action === 'import') {
+  if (!capabilities.canTranscribe || route.query.action === 'import') {
     showImportDialog.value = true
   }
 })

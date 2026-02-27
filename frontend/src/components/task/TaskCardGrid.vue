@@ -13,7 +13,12 @@
           <el-icon><Document /></el-icon>
           导入字幕
         </el-button>
-        <el-button v-if="canTranscribe" type="primary" size="large" @click="$emit('open-upload')">
+        <el-button
+          v-if="canRenderTranscribeAction"
+          type="primary"
+          size="large"
+          @click="$emit('open-upload')"
+        >
           <el-icon><Upload /></el-icon>
           上传视频
         </el-button>
@@ -347,9 +352,9 @@
 <script setup>
 import { computed } from "vue";
 import { Upload, Edit, Delete, Clock, Loading, Document, ArrowDown } from "@element-plus/icons-vue";
-import { CAPABILITIES } from "@/config/flavor";
+import { selectCapabilities } from "@/state/capabilities/capabilitySelector";
 
-const { canTranscribe } = CAPABILITIES;
+const canRenderTranscribeAction = selectCapabilities().canTranscribe;
 
 const props = defineProps({
   tasks: {

@@ -240,7 +240,10 @@ import { useSubtitleSync } from '@/composables'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { repairSubtitleOverlaps } from '@/utils/subtitleUtils'
 import { ElMessage } from 'element-plus'
-import { FLAVOR } from '@/config/flavor'
+import {
+  buildDefaultCapabilitySnapshot,
+  selectFlavor,
+} from '@/state/capabilities/capabilitySelector'
 
 // 组件导入
 import EditorHeader from '@/components/editor/EditorHeader.vue'
@@ -660,7 +663,8 @@ async function loadProject() {
     projectStore.meta.projectId = props.projectId
     projectStore.meta.jobId = activeJobId.value
     projectStore.meta.mode = activeJobId.value ? 'legacy' : 'normal'
-    projectStore.meta.flavor = FLAVOR
+    projectStore.meta.capabilitySnapshot = resolveCapabilitySnapshot()
+    projectStore.meta.flavor = selectFlavor(projectStore.meta.capabilitySnapshot)
     projectStore.meta.videoPath = null
     projectStore.meta.audioPath = null
 
@@ -672,6 +676,10 @@ async function loadProject() {
         console.warn('[EditorView] 读取项目媒体信息失败，使用状态兜底:', error)
       }
     }
+    projectStore.meta.capabilitySnapshot = resolveCapabilitySnapshot(
+      projectMeta?.capability_snapshot || projectMeta?.capabilitySnapshot || projectStore.meta.capabilitySnapshot
+    )
+    projectStore.meta.flavor = projectMeta?.flavor || selectFlavor(projectStore.meta.capabilitySnapshot)
     applyMediaPaths({ project: projectMeta })
 
     // 纯项目模式（Lite 导入）: 跳过任务状态，改走 project 频道同步
@@ -686,7 +694,10 @@ async function loadProject() {
       const project = projectMeta || (await projectApi.getProject(props.projectId))
       applyMediaPaths({ project })
       projectStore.meta.title = project?.title || projectStore.meta.title
-      projectStore.meta.flavor = project?.flavor || FLAVOR
+      projectStore.meta.capabilitySnapshot = resolveCapabilitySnapshot(
+        project?.capability_snapshot || project?.capabilitySnapshot || projectStore.meta.capabilitySnapshot
+      )
+      projectStore.meta.flavor = project?.flavor || selectFlavor(projectStore.meta.capabilitySnapshot)
       projectStore.meta.mode = project?.mode || 'normal'
       const restored = await projectStore.restoreProject(props.projectId)
       // 恢复缓存后再次覆盖媒体路径，防止旧缓存 videoPath 误导为“有视频”。
@@ -701,7 +712,8 @@ async function loadProject() {
           videoPath: projectStore.meta.videoPath,
           audioPath: projectStore.meta.audioPath,
           mode: project?.mode || 'normal',
-          flavor: project?.flavor || FLAVOR,
+          flavor: project?.flavor || selectFlavor(projectStore.meta.capabilitySnapshot),
+          capabilitySnapshot: projectStore.meta.capabilitySnapshot,
         })
         // loadFromProjectData 会更新 meta，确保媒体路径继续以本次判定为准。
         applyMediaPaths({ project })
@@ -2078,6 +2090,13 @@ function loadEditorInteractionPreferences() {
   const resolved = savedAutoResume === null ? true : savedAutoResume === 'true'
   subtitleFollowAutoResumeEnabled.value = resolved
   advancedConfig.value.general.subtitle_follow_auto_resume = resolved
+}
+
+function resolveCapabilitySnapshot(snapshot = null) {
+  if (snapshot && typeof snapshot === 'object') {
+    return snapshot
+  }
+  return buildDefaultCapabilitySnapshot()
 }
 
 // ========== 字幕全局偏移设置 ==========
