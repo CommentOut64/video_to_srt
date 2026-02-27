@@ -81,7 +81,6 @@ import ContextMenu from '@/components/editor/ContextMenu.vue'
 import WaveformHeader from './WaveformHeader.vue'
 import WaveformScrollbar from './WaveformScrollbar.vue'
 import {
-  useSubtitleSync,
   useWaveformZoom,
   useWaveformScroll,
   useWaveformCursorDrag,
@@ -116,7 +115,15 @@ const playbackStore = usePlaybackStore()
 const subtitleDocumentStore = useSubtitleDocumentStore()
 const playbackManager = usePlaybackManager()
 const identityRef = computed(() => props.mediaId || projectStore.primaryId)
-const { onSubtitleEdit } = useSubtitleSync(identityRef)
+const onSubtitleEdit = subtitleDocumentStore.onSubtitleEdit
+
+watch(
+  () => identityRef.value,
+  (identityId) => {
+    subtitleDocumentStore.bindSyncIdentity(identityId)
+  },
+  { immediate: true }
+)
 
 // 编辑器上下文
 const editorContext = inject('editorContext', {

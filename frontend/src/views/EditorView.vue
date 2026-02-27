@@ -231,15 +231,13 @@ import { ref, computed, onMounted, onUnmounted, provide, watch } from 'vue'
 import { onBeforeRouteLeave, useRouter } from 'vue-router'
 import { useProjectStore } from '@/stores/projectStore'
 import { usePlaybackStore } from '@/stores/playbackStore'
-import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
-import { useProgressStore } from '@/stores/progressStore'
+import { useTaskRuntimeStore } from '@/stores/taskRuntimeStore'
 import { useEditorSessionStore } from '@/stores/editorSessionStore'
 import { useSubtitleDocumentStore } from '@/stores/subtitleDocumentStore'
 import { legacyApi, mediaApi, projectApi, transcriptionApi } from '@/services/api'
 import sseChannelManager from '@/services/sseChannelManager'
 import { useShortcuts } from '@/hooks/useShortcuts'
 import { useProxyVideo } from '@/composables/useProxyVideo'
-import { useSubtitleSync } from '@/composables'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { repairSubtitleOverlaps } from '@/utils/subtitleUtils'
 import { ElMessage } from 'element-plus'
@@ -274,7 +272,7 @@ const props = new Proxy(rawProps, {
 // Stores
 const projectStore = useProjectStore()
 const playbackStore = usePlaybackStore()
-const taskStore = useUnifiedTaskStore()
+const taskStore = useTaskRuntimeStore()
 const editorSessionStore = useEditorSessionStore()
 const subtitleDocumentStore = useSubtitleDocumentStore()
 const router = useRouter()
@@ -286,7 +284,7 @@ const activeJobId = computed(() => props.jobId || null)
 // 解耦后统一以 project_id 作为编辑器媒体身份，job_id 仅保留任务控制用途。
 const mediaIdentityId = computed(() => props.projectId || props.jobId || null)
 const identityRef = computed(() => mediaIdentityId.value)
-const { forceSyncNow } = useSubtitleSync(identityRef)
+const forceSyncNow = subtitleDocumentStore.forceSyncNow
 
 // Proxy 视频加载状态（新重构版本）
 // V3.2.4+dev.20260224.01: project 模式也需要接入媒体状态，避免 progressiveUrl 为空导致视频无法加载
@@ -350,7 +348,7 @@ const SUBTITLE_FOLLOW_AUTO_RESUME_PREF_KEY = 'editor-subtitle-follow-auto-resume
 const subtitleFollowAutoResumeEnabled = ref(true)
 
 // 统一进度状态
-const progressStore = useProgressStore()
+const progressStore = taskStore
 // 修复：直接使用 getRawState 获取响应式状态对象，避免 computed 嵌套导致响应式丢失
 const jobProgress = computed(() => progressStore.getRawState(activeJobId.value))
 const taskStatus = computed(() => jobProgress.value.status || 'idle')
@@ -383,6 +381,14 @@ watch(
   () => activeJobId.value,
   (jobId) => {
     subtitleDocumentStore.bindTask(jobId)
+  },
+  { immediate: true }
+)
+
+watch(
+  () => identityRef.value,
+  (identityId) => {
+    subtitleDocumentStore.bindSyncIdentity(identityId)
   },
   { immediate: true }
 )

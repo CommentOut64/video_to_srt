@@ -130,7 +130,7 @@ import { ElMessage } from 'element-plus'
 import { useProjectStore } from '@/stores/projectStore'
 import { useSubtitleDocumentStore } from '@/stores/subtitleDocumentStore'
 import { usePlaybackManager } from '@/services/PlaybackManager'
-import { useSubtitleSync, useHomophoneSearch, SortMode } from '@/composables'
+import { useHomophoneSearch, SortMode } from '@/composables'
 import transcriptionApi from '@/services/api/transcriptionApi'
 import projectApi from '@/services/api/projectApi'
 // 导入组件
@@ -158,8 +158,10 @@ const playbackManager = usePlaybackManager()
 
 const identityId = computed(() => projectStore.primaryId)
 const jobId = computed(() => projectStore.meta.jobId)
-// V3.2.0+dev.20260124.02: 字幕同步（防止 AI 覆盖用户编辑）
-const { onSubtitleEdit, applyPendingEditsToStore, forceSyncNow, pendingCount } = useSubtitleSync(identityId)
+const onSubtitleEdit = subtitleDocumentStore.onSubtitleEdit
+const applyPendingEditsToStore = subtitleDocumentStore.applyPendingEditsToStore
+const forceSyncNow = subtitleDocumentStore.forceSyncNow
+const pendingCount = subtitleDocumentStore.pendingCount
 
 // 同音搜索 composable（用 reactive 包裹，使模板 v-model 能正确写入 ref.value）
 const homophoneSearch = reactive(useHomophoneSearch({
@@ -200,12 +202,14 @@ const filteredSubtitles = computed(() => {
 
 watch(
   () => identityId.value,
-  async () => {
+  async (identity) => {
+    await subtitleDocumentStore.bindSyncIdentity(identity)
     hasAppliedPending.value = false
     if (pendingCount() > 0) {
       await forceSyncNow()
     }
-  }
+  },
+  { immediate: true }
 )
 
 watch(

@@ -223,7 +223,7 @@ import {
   Operation,
   Setting,
 } from '@element-plus/icons-vue'
-import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
+import { useTaskRuntimeStore } from '@/stores/taskRuntimeStore'
 import { useTranscriptionPresetStore } from '@/stores/transcriptionPresetStore'
 import { selectCapabilities } from '@/state/capabilities/capabilitySelector'
 import { transcriptionApi, systemApi, presetsApi } from '@/services/api'
@@ -246,7 +246,7 @@ const CUSTOM_PRESETS_KEY = 'user-custom-presets'
 
 const router = useRouter()
 const route = useRoute()
-const taskStore = useUnifiedTaskStore()
+const taskStore = useTaskRuntimeStore()
 const transcriptionPresetStore = useTranscriptionPresetStore()
 const { taskConfig } = storeToRefs(transcriptionPresetStore)
 const capabilities = selectCapabilities()

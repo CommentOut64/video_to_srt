@@ -133,7 +133,7 @@
  */
 import { computed, ref, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
+import { useTaskRuntimeStore } from '@/stores/taskRuntimeStore'
 import Draggable from 'vuedraggable'
 import TaskGroup from './TaskGroup.vue'
 import TaskCard from './TaskCard.vue'
@@ -143,7 +143,7 @@ const props = defineProps({
 })
 
 const router = useRouter()
-const taskStore = useUnifiedTaskStore()
+const taskStore = useTaskRuntimeStore()
 
 // 从 store 获取数据
 const processingTask = computed(() => taskStore.processingTask)

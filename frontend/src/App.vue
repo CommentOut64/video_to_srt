@@ -11,16 +11,15 @@
  * - V3.1.1+dev.20260106.01: 使用 sessionStorage 防止会话内重复检查更新
  */
 import { ref, onMounted, onUnmounted } from 'vue'
-import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
-import { useProgressStore } from '@/stores/progressStore'
+import { useTaskRuntimeStore } from '@/stores/taskRuntimeStore'
 import { useAppUpdateStore } from '@/stores/appUpdateStore'
 import sseChannelManager from '@/services/sseChannelManager'
 import { heartbeatService } from '@/services/heartbeat'
 import UpdateDialog from '@/components/UpdateDialog.vue'
 import { traceTaskProjection } from '@/state/observability/taskEventTrace'
 
-const taskStore = useUnifiedTaskStore()
-const progressStore = useProgressStore()
+const taskStore = useTaskRuntimeStore()
+const progressStore = taskStore
 const appUpdateStore = useAppUpdateStore()
 appUpdateStore.initialize()
 

@@ -217,14 +217,13 @@ import SimpleProgress from '@/components/common/SimpleProgress.vue'
 import { PHASE_CONFIG, STATUS_CONFIG, formatProgress } from '@/constants/taskPhases'
 import { PROGRESS_ALLOCATION } from '@/components/common/progress/constants'
 import transcriptionApi from '@/services/api/transcriptionApi'
-import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
+import { useTaskRuntimeStore } from '@/stores/taskRuntimeStore'
 import { useProjectStore } from '@/stores/projectStore'
-import { useProgressStore } from '@/stores/progressStore'
 import { selectRouteVisibility } from '@/state/capabilities/capabilitySelector'
 
-const taskStore = useUnifiedTaskStore()
+const taskStore = useTaskRuntimeStore()
 const projectStore = useProjectStore()
-const progressStore = useProgressStore()
+const progressStore = taskStore
 
 
 const props = defineProps({
