@@ -200,6 +200,50 @@ def test_homophone_find_and_index_status_api(tmp_path: Path, monkeypatch) -> Non
     assert status_payload["data"]["status"] == "ready"
 
 
+def test_project_homophone_routes_compat_api(tmp_path: Path, monkeypatch) -> None:
+    client, _ = _build_client(tmp_path, monkeypatch)
+
+    find_resp = client.post(
+        "/api/projects/job-1/homophone/find",
+        json={
+            "mode": "homophone_strict",
+            "query_text": "同音",
+            "language": "zh",
+            "is_ignore_punctuation": False,
+            "limit": 10,
+        },
+    )
+    assert find_resp.status_code == 200
+    find_payload = find_resp.json()
+    assert find_payload["success"] is True
+    assert find_payload["data"]["index_status"] == "ready"
+    assert find_payload["data"]["project_id"] == "job-1"
+
+    status_resp = client.get("/api/projects/job-1/homophone/index-status")
+    assert status_resp.status_code == 200
+    status_payload = status_resp.json()
+    assert status_payload["success"] is True
+    assert status_payload["data"]["status"] == "ready"
+    assert status_payload["data"]["project_id"] == "job-1"
+
+    replace_resp = client.post(
+        "/api/projects/job-1/homophone/batch-replace",
+        json={
+            "mode": "literal",
+            "query_text": "foo",
+            "replace_text": "bar",
+            "language": "zh",
+            "is_ignore_punctuation": False,
+            "selected_sentence_indices": [0],
+        },
+    )
+    assert replace_resp.status_code == 200
+    replace_payload = replace_resp.json()
+    assert replace_payload["success"] is True
+    assert replace_payload["data"]["updated_count"] == 1
+    assert replace_payload["data"]["project_id"] == "job-1"
+
+
 def test_homophone_global_terms_api(tmp_path: Path, monkeypatch) -> None:
     client, fake_service = _build_client(tmp_path, monkeypatch)
 
