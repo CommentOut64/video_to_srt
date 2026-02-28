@@ -40,6 +40,7 @@
         :muted="muted"
         :preload="preloadStrategy"
         @loadedmetadata="onMetadataLoaded"
+        @loadeddata="onLoadedData"
         @timeupdate="onTimeUpdate"
         @play="onPlay"
         @pause="onPause"
@@ -47,8 +48,9 @@
         @error="onError"
         @seeking="onSeeking"
         @seeked="onSeeked"
-        @waiting="isBuffering = true"
-        @canplay="isBuffering = false"
+        @waiting="onWaiting"
+        @canplay="onCanPlay"
+        @playing="onPlaying"
         @progress="onProgress"
       />
 
@@ -207,6 +209,8 @@ const retryCount = ref(0)
 const maxRetries = 3
 const showProgressiveHint = ref(false)
 let progressiveHintTimer = null
+const BUFFERING_TIMEOUT_MS = 12000
+let bufferingTimeout = null
 
 // V3.1.2+dev.20260113.01: 分辨率标志/按钮状态
 const showResolutionBadge = ref(false)
@@ -410,6 +414,36 @@ function showHint(type, text = '') {
   }, 800)
 }
 
+function clearBufferingTimeout() {
+  if (bufferingTimeout) {
+    clearTimeout(bufferingTimeout)
+    bufferingTimeout = null
+  }
+}
+
+function setBuffering(active, reason = '') {
+  if (!active) {
+    isBuffering.value = false
+    clearBufferingTimeout()
+    return
+  }
+
+  if (!hasVideoSource.value || isProcessing.value || showAudioOnlyPlaceholder.value) {
+    isBuffering.value = false
+    clearBufferingTimeout()
+    return
+  }
+
+  isBuffering.value = true
+  clearBufferingTimeout()
+  bufferingTimeout = setTimeout(() => {
+    if (isBuffering.value) {
+      console.warn('[VideoStage] 加载遮罩超时自动收敛:', reason || 'unknown')
+      isBuffering.value = false
+    }
+  }, BUFFERING_TIMEOUT_MS)
+}
+
 // 显示分辨率提示（视频源变更时）
 function showResolutionHint() {
   showProgressiveHint.value = true
@@ -558,10 +592,15 @@ watch(() => playbackStore.volume, (volume) => {
 // 监听 effectiveVideoSource 变化
 watch(effectiveVideoSource, (newUrl, oldUrl) => {
   if (!newUrl) {
+    setBuffering(false, 'source-cleared')
     hasError.value = false
     errorMessage.value = ''
     canRetry.value = false
     retryCount.value = 0
+    return
+  }
+  if (newUrl !== oldUrl) {
+    setBuffering(true, 'source-changed')
   }
 })
 
@@ -600,6 +639,11 @@ watch(() => props.proxyState, async (newState, oldState) => {
 
   const wasTranscoding = transcodingStates.includes(oldState)
   const isNowReady = readyStates.includes(newState)
+  const isNowTranscoding = transcodingStates.includes(newState)
+
+  if (isNowTranscoding || newState === ProxyState.ERROR || !effectiveVideoSource.value) {
+    setBuffering(false, 'proxy-not-ready')
+  }
 
   if (wasTranscoding && isNowReady) {
     // 等待下一帧确保 effectiveVideoSource 已更新
@@ -618,8 +662,10 @@ watch(() => props.proxyState, async (newState, oldState) => {
 
       try {
         // 强制重新加载视频
+        setBuffering(true, 'proxy-ready-reload')
         video.load()
       } catch (error) {
+        setBuffering(false, 'proxy-ready-reload-failed')
         console.error('[VideoStage] 视频加载触发失败:', error)
       }
     }
@@ -655,6 +701,7 @@ watch(() => props.progressiveUrl, async (newUrl, oldUrl) => {
 
     try {
       // 强制重新加载视频
+      setBuffering(true, 'progressive-switch')
       video.load()
 
       // 等待元数据加载
@@ -687,26 +734,41 @@ watch(() => props.progressiveUrl, async (newUrl, oldUrl) => {
       if (wasPlaying) {
         await video.play()
       }
+      setBuffering(false, 'progressive-switch-loaded')
     } catch (error) {
+      setBuffering(false, 'progressive-switch-failed')
       console.error('[VideoStage] 视频源切换失败:', error)
     }
+  } else if (!newUrl) {
+    setBuffering(false, 'progressive-empty')
   }
 })
 
 // ========== 事件处理 ==========
 
-function onMetadataLoaded() {
-  const video = videoRef.value
+function onMetadataLoaded(event) {
+  const video = event?.target || videoRef.value
+  if (!video) {
+    return
+  }
   projectStore.setProjectDuration(video.duration)
   video.playbackRate = playbackStore.playbackRate
   video.volume = playbackStore.volume
   retryCount.value = 0
+  setBuffering(false, 'loadedmetadata')
   emit('loaded', video.duration)
   if (props.autoPlay) playbackManager.togglePlay()
 }
 
-function onTimeUpdate() {
-  const video = videoRef.value
+function onLoadedData() {
+  setBuffering(false, 'loadeddata')
+}
+
+function onTimeUpdate(event) {
+  const video = event?.target || videoRef.value
+  if (!video) {
+    return
+  }
   // 【重要】时间更新由 PlaybackManager 内部通过事件监听处理
   // 这里只负责发射事件通知外部
   emit('timeupdate', video.currentTime)
@@ -731,6 +793,18 @@ function onProgress() {
   // 可以计算缓冲进度
 }
 
+function onWaiting() {
+  setBuffering(true, 'waiting')
+}
+
+function onCanPlay() {
+  setBuffering(false, 'canplay')
+}
+
+function onPlaying() {
+  setBuffering(false, 'playing')
+}
+
 function onSeeking() {
   // PlaybackManager 内部处理
 }
@@ -745,11 +819,13 @@ function onError() {
 
   // 无视频源或转码中：不进入错误重试流程，避免纯音频场景被误判。
   if (!hasVideoSource.value || isProcessing.value || showAudioOnlyPlaceholder.value) {
+    setBuffering(false, 'error-ignored')
     hasError.value = false
     canRetry.value = false
     return
   }
 
+  setBuffering(false, 'error')
   hasError.value = true
 
   if (error) {
@@ -797,6 +873,7 @@ function retryLoad() {
 
   // 短暂延迟后重新加载，给父组件时间更新状态
   setTimeout(() => {
+    setBuffering(true, 'manual-retry')
     videoRef.value?.load()
   }, 500)
 }
@@ -1028,6 +1105,7 @@ onUnmounted(() => {
   document.removeEventListener('fullscreenchange', handleFullscreenChange)
   clearTimeout(stateHintTimer)
   clearTimeout(progressiveHintTimer)
+  clearBufferingTimeout()
   if (clickTimer) clearTimeout(clickTimer)
 
   // V3.1.2+dev.20260113.01: 清理分辨率标志相关定时器
