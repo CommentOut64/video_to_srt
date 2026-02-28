@@ -49,8 +49,15 @@ export function useWaveformRegions(
   // ============ 私有状态 ============
   let regionUpdateTimer = null
 
+  function resolveMaybeRefValue(valueOrRef) {
+    if (valueOrRef && typeof valueOrRef === 'object' && 'value' in valueOrRef) {
+      return valueOrRef.value
+    }
+    return valueOrRef
+  }
+
   function getSelectedSubtitleId() {
-    return subtitleDocumentStore.selectedSubtitleId.value
+    return resolveMaybeRefValue(subtitleDocumentStore?.selectedSubtitleId) ?? null
   }
 
   function setSelectedSubtitleId(subtitleId) {
@@ -58,10 +65,10 @@ export function useWaveformRegions(
   }
 
   // 节流的 Region 同步
-  const debouncedRegionSync = debounce((sentenceIndex, start, end) => {
-    if (sentenceIndex === undefined || sentenceIndex === null) return
-    if (projectStore.isSentenceDeleted?.(sentenceIndex)) return
-    onSubtitleEdit(sentenceIndex, { start, end })
+  const debouncedRegionSync = debounce((syncKey, start, end) => {
+    if (syncKey === undefined || syncKey === null) return
+    if (typeof syncKey === 'number' && projectStore.isSentenceDeleted?.(syncKey)) return
+    onSubtitleEdit(syncKey, { start, end })
   }, 200)
 
   // ============ Region 事件 ============
@@ -86,8 +93,9 @@ export function useWaveformRegions(
 
       // 波形拖拽同步到后端（节流）
       const subtitle = projectStore.subtitles.find((s) => s.id === region.id)
-      if (subtitle && subtitle.sentenceIndex !== undefined) {
-        debouncedRegionSync(subtitle.sentenceIndex, region.start, region.end)
+      const syncKey = subtitle?.segment_id || subtitle?.sentenceIndex
+      if (syncKey !== undefined && syncKey !== null) {
+        debouncedRegionSync(syncKey, region.start, region.end)
       }
       emit('region-update', region)
 

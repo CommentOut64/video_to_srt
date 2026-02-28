@@ -44,8 +44,19 @@ export function useWaveformCursorDrag(
   let previousBodyUserSelect = ''
   let previousBodyWebkitSelect = ''
 
+  function readPlaybackValue(maybeRefValue) {
+    if (
+      maybeRefValue &&
+      typeof maybeRefValue === 'object' &&
+      'value' in maybeRefValue
+    ) {
+      return maybeRefValue.value
+    }
+    return maybeRefValue
+  }
+
   function getCurrentTimeSec() {
-    const value = Number(playbackStore.currentTime.value)
+    const value = Number(readPlaybackValue(playbackStore.currentTime))
     return Number.isFinite(value) ? value : 0
   }
 

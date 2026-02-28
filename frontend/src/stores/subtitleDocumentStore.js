@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { computed, ref, toRaw, watch } from 'vue'
 import localforage from 'localforage'
-import transcriptionApi from '@/services/api/transcriptionApi'
+import { legacyApi } from '@/services/api'
 import projectApi from '@/services/api/projectApi'
 import { migrateSubtitleSyncQueue } from '@/state/migrations/migrateSubtitleSyncQueue'
 import { useProjectStore } from './projectStore'
@@ -13,6 +13,18 @@ let beforeUnloadRegistered = false
 
 function getQueueKey(identityId) {
   return `${EDIT_QUEUE_PREFIX}${identityId}`
+}
+
+function normalizeQueueKey(rawKey) {
+  const normalized = String(rawKey ?? '').trim()
+  if (!normalized) return null
+  if (/^-?\d+$/.test(normalized)) {
+    const numericKey = Number(normalized)
+    if (Number.isFinite(numericKey)) {
+      return numericKey
+    }
+  }
+  return normalized
 }
 
 function debounce(fn, delay) {
@@ -64,17 +76,80 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
     return Boolean(projectStore.meta.projectId)
   }
 
+  async function ensureProjectContext() {
+    if (projectStore.meta.projectId) {
+      return String(projectStore.meta.projectId)
+    }
+    const fallbackJobId = String(projectStore.meta.jobId || activeJobId.value || '').trim()
+    if (!fallbackJobId) {
+      throw new Error('缺少 project_id，且无可转换的 job_id')
+    }
+    const resolved = await legacyApi.resolveTask(fallbackJobId)
+    const projectId = String(resolved?.project_id || '').trim()
+    if (!projectId) {
+      throw new Error(`job_id 转 project_id 失败（job_id=${fallbackJobId}）`)
+    }
+    projectStore.setIdentity({ projectId })
+    return projectId
+  }
+
+  function findSubtitleByQueueKey(queueKey) {
+    if (queueKey === undefined || queueKey === null) return null
+    const target = String(queueKey)
+    const bySegmentId = projectStore.subtitles.find(
+      (item) => String(item.segment_id || '') === target
+    )
+    if (bySegmentId) return bySegmentId
+
+    const numericKey = Number(queueKey)
+    if (Number.isFinite(numericKey)) {
+      const bySentenceIndex = projectStore.subtitles.find(
+        (item) => Number(item.sentenceIndex) === numericKey
+      )
+      if (bySentenceIndex) return bySentenceIndex
+    }
+    return null
+  }
+
   function resolveProjectSegmentId(segmentOrIndex) {
-    if (segmentOrIndex === undefined || segmentOrIndex === null) return null
-    const target = String(segmentOrIndex)
+    const subtitle = findSubtitleByQueueKey(segmentOrIndex)
+    return subtitle?.segment_id || null
+  }
 
-    const direct = projectStore.subtitles.find((item) => String(item.segment_id || '') === target)
-    if (direct?.segment_id) return direct.segment_id
+  function resolveLegacySentenceIndex(queueKey) {
+    const numericKey = Number(queueKey)
+    if (Number.isFinite(numericKey)) return numericKey
+    const subtitle = findSubtitleByQueueKey(queueKey)
+    const sentenceIndex = Number(subtitle?.sentenceIndex)
+    return Number.isFinite(sentenceIndex) ? sentenceIndex : null
+  }
 
-    const legacyIndex = Number(segmentOrIndex)
-    if (Number.isNaN(legacyIndex)) return null
-    const fromLegacy = projectStore.subtitles.find((item) => Number(item.sentenceIndex) === legacyIndex)
-    return fromLegacy?.segment_id || null
+  function patchLocalSegmentId(queueKey, segmentId) {
+    if (!segmentId) return false
+    const subtitle = findSubtitleByQueueKey(queueKey)
+    if (!subtitle || subtitle.segment_id === segmentId) return false
+    projectStore.updateSubtitle(subtitle.id, { segment_id: String(segmentId) })
+    return true
+  }
+
+  async function resolveProjectSegmentIdFromServer(queueKey, cache) {
+    const sentenceIndex = resolveLegacySentenceIndex(queueKey)
+    if (!Number.isFinite(sentenceIndex) || !projectStore.meta.projectId) {
+      return null
+    }
+    if (!cache.snapshot) {
+      cache.snapshot = await projectApi.getSubtitles(projectStore.meta.projectId)
+    }
+    const segments = Array.isArray(cache.snapshot) ? cache.snapshot : []
+    const matched = segments.find((segment) => {
+      const legacyIndexRaw = segment?.legacy_index ?? segment?.sentence_index
+      return Number(legacyIndexRaw) === sentenceIndex
+    })
+    const segmentId = matched?.segment_id ? String(matched.segment_id) : null
+    if (segmentId) {
+      patchLocalSegmentId(queueKey, segmentId)
+    }
+    return segmentId
   }
 
   async function loadQueue(identityId) {
@@ -83,8 +158,8 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
       const saved = await localforage.getItem(getQueueKey(identityId))
       if (!saved || typeof saved !== 'object') return new Map()
       const entries = Object.entries(saved)
-        .map(([key, value]) => [Number(key), value])
-        .filter(([key]) => Number.isFinite(key))
+        .map(([key, value]) => [normalizeQueueKey(key), value])
+        .filter(([key]) => key !== null)
       return new Map(entries)
     } catch (error) {
       console.warn('[SubtitleDocumentStore] 读取本地同步队列失败:', error)
@@ -180,55 +255,74 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
     if (!identityId) return
 
     isSyncing.value = true
-    const batch = new Map(pendingUpdates.value)
-    pendingUpdates.value.clear()
+    try {
+      const projectId = await ensureProjectContext()
+      const batch = new Map(pendingUpdates.value)
+      pendingUpdates.value.clear()
+      const projectSegmentLookupCache = { snapshot: null }
 
-    for (const [index, data] of batch.entries()) {
-      try {
-        if (hasProjectContext()) {
-          const segmentId = resolveProjectSegmentId(index)
+      for (const [queueKey, data] of batch.entries()) {
+        try {
+          let segmentId = resolveProjectSegmentId(queueKey)
           if (!segmentId) {
-            throw new Error(`segment_id 不存在: ${index}`)
+            segmentId = await resolveProjectSegmentIdFromServer(queueKey, projectSegmentLookupCache)
           }
-          await projectApi.updateSubtitle(projectStore.meta.projectId, segmentId, data)
-        } else if (projectStore.meta.jobId) {
-          await transcriptionApi.updateSubtitle(projectStore.meta.jobId, index, data)
-        } else {
-          throw new Error('缺少可用的字幕同步上下文')
-        }
+          if (!segmentId) {
+            const staleSubtitle = findSubtitleByQueueKey(queueKey)
+            if (!staleSubtitle) {
+              // 队列里残留了已不存在的字幕键，直接丢弃避免阻塞后续导出。
+              syncErrors.value.delete(queueKey)
+              continue
+            }
+            throw new Error(`无法解析 segment_id，同步键=${queueKey}`)
+          }
+          await projectApi.updateSubtitle(projectId, segmentId, data)
 
-        if (syncErrors.value.has(index)) {
-          syncErrors.value.delete(index)
-        }
-      } catch (error) {
-        if (error?.status === 404 || error?.message?.includes('不存在')) {
-          syncErrors.value.delete(index)
-          continue
-        }
+          if (syncErrors.value.has(queueKey)) {
+            syncErrors.value.delete(queueKey)
+          }
+        } catch (error) {
+          if (error?.status === 404) {
+            syncErrors.value.delete(queueKey)
+            continue
+          }
 
-        console.error(`[SubtitleDocumentStore] 字幕同步失败: ${index}`, error)
-        syncErrors.value.set(index, error?.message || '同步失败')
-        if (!pendingUpdates.value.has(index)) {
-          pendingUpdates.value.set(index, data)
+          console.error(
+            `[SubtitleDocumentStore] 字幕同步失败: key=${queueKey}, identity=${identityId}, project=${projectStore.meta.projectId}, job=${projectStore.meta.jobId}`,
+            error
+          )
+          syncErrors.value.set(queueKey, error?.message || '同步失败')
+          if (!pendingUpdates.value.has(queueKey)) {
+            pendingUpdates.value.set(queueKey, data)
+          }
         }
       }
-    }
 
-    await saveQueue(identityId, pendingUpdates.value)
-    isSyncing.value = false
+      await saveQueue(identityId, pendingUpdates.value)
+    } finally {
+      isSyncing.value = false
+    }
   }
 
   const debouncedProcessQueue = debounce(processQueue, 800)
 
   function onSubtitleEdit(index, { text, start, end }) {
     const identityId = getActiveIdentity()
+    let queueKey = normalizeQueueKey(index)
+    if (queueKey === null) return
+    if (hasProjectContext()) {
+      const segmentId = resolveProjectSegmentId(queueKey)
+      if (segmentId) {
+        queueKey = segmentId
+      }
+    }
 
     const update = {}
     if (text !== undefined) update.text = text
     if (start !== undefined) update.start = projectStore.toBaseTime(start)
     if (end !== undefined) update.end = projectStore.toBaseTime(end)
 
-    pendingUpdates.value.set(index, update)
+    pendingUpdates.value.set(queueKey, update)
     if (identityId) {
       saveQueue(identityId, pendingUpdates.value)
     }

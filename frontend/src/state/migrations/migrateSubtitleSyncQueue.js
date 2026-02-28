@@ -10,9 +10,9 @@ function normalizeQueuePayload(rawPayload) {
   if (!rawPayload || typeof rawPayload !== 'object') return {}
 
   const normalized = {}
-  Object.entries(rawPayload).forEach(([rawIndex, value]) => {
-    const numericIndex = Number(rawIndex)
-    if (!Number.isFinite(numericIndex)) return
+  Object.entries(rawPayload).forEach(([rawKey, value]) => {
+    const queueKey = String(rawKey ?? '').trim()
+    if (!queueKey) return
     if (!value || typeof value !== 'object') return
 
     const sanitized = {}
@@ -25,7 +25,7 @@ function normalizeQueuePayload(rawPayload) {
     if (Object.prototype.hasOwnProperty.call(value, 'end')) {
       sanitized.end = Number(value.end)
     }
-    normalized[String(numericIndex)] = sanitized
+    normalized[queueKey] = sanitized
   })
 
   return normalized

@@ -42,16 +42,18 @@ const routes = [
     beforeEnter: async (to, _, next) => {
       const jobId = String(to.params.jobId || '').trim()
       if (!jobId) {
-        next()
+        next('/tasks')
         return
       }
 
-      const projectId = await resolveProjectIdByJobId(jobId)
-      if (projectId) {
+      try {
+        const projectId = await resolveProjectIdByJobId(jobId)
         next(`/editor/project/${projectId}`)
         return
+      } catch (error) {
+        console.error('[router] job 路径转换 project 失败:', error)
+        next('/tasks')
       }
-      next()
     },
   },
 ]

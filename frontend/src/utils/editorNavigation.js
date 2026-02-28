@@ -3,7 +3,7 @@
  *
  * 目标：
  * - 统一 Full/Lite 入口到 `project_id` 语义。
- * - 保留 `/editor/:jobId` 兼容回退。
+ * - `/editor/:jobId` 仅用于兼容跳板，必须转换为 `/editor/project/:projectId`。
  */
 
 import { legacyApi } from '@/services/api'
@@ -18,16 +18,19 @@ function normalizeId(value) {
 export async function resolveProjectIdByJobId(jobId) {
   const normalizedJobId = normalizeId(jobId)
   if (!normalizedJobId) {
-    return null
+    throw new Error('job_id 不能为空，无法转换为 project_id')
   }
 
   try {
     const result = await legacyApi.resolveTask(normalizedJobId)
     const projectId = normalizeId(result?.project_id)
-    return projectId || null
+    if (!projectId) {
+      throw new Error(`未返回 project_id（job_id=${normalizedJobId}）`)
+    }
+    return projectId
   } catch (error) {
-    console.warn('[editorNavigation] legacy resolve 失败，保留 job 路径兼容:', error)
-    return null
+    const reason = error?.message || '未知错误'
+    throw new Error(`job_id 转 project_id 失败（job_id=${normalizedJobId}）：${reason}`)
   }
 }
 
@@ -40,9 +43,7 @@ export async function navigateToEditor(router, { projectId = null, jobId = null,
     targetPath = `/editor/project/${normalizedProjectId}`
   } else if (normalizedJobId) {
     const resolvedProjectId = await resolveProjectIdByJobId(normalizedJobId)
-    targetPath = resolvedProjectId
-      ? `/editor/project/${resolvedProjectId}`
-      : `/editor/${normalizedJobId}`
+    targetPath = `/editor/project/${resolvedProjectId}`
   } else {
     return false
   }

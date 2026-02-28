@@ -72,6 +72,21 @@ function createPlaybackManager() {
     return _playbackStore;
   }
 
+  /**
+   * 兼容读取 Pinia setup store 字段（值或 Ref）
+   * 说明：setup store 在大多数场景会自动解包，历史代码里的 `.value` 会读到 undefined。
+   */
+  function readStoreValue(maybeRefValue) {
+    if (
+      maybeRefValue &&
+      typeof maybeRefValue === "object" &&
+      "value" in maybeRefValue
+    ) {
+      return maybeRefValue.value;
+    }
+    return maybeRefValue;
+  }
+
   // ============ Video 注册 ============
 
   /**
@@ -106,6 +121,13 @@ function createPlaybackManager() {
    */
   function unregisterVideo() {
     if (videoElement) {
+      try {
+        if (!videoElement.paused) {
+          videoElement.pause();
+        }
+      } catch {
+        // 某些浏览器在元素销毁阶段可能抛异常，忽略并继续解绑
+      }
       videoElement.removeEventListener("timeupdate", handleVideoTimeUpdate);
       videoElement.removeEventListener("seeking", handleVideoSeeking);
       videoElement.removeEventListener("seeked", handleVideoSeeked);
@@ -113,6 +135,7 @@ function createPlaybackManager() {
       videoElement.removeEventListener("pause", handleVideoPause);
       videoElement = null;
     }
+    getPlaybackStore().setPlaying(false);
   }
 
   /**
@@ -209,7 +232,7 @@ function createPlaybackManager() {
    * 检查是否被锁定
    */
   function isLocked() {
-    return isSeekingInternal || getPlaybackStore().isSeeking.value;
+    return isSeekingInternal || Boolean(readStoreValue(getPlaybackStore().isSeeking));
   }
 
   /**
@@ -377,7 +400,7 @@ function createPlaybackManager() {
    */
   function togglePlay() {
     const playbackStore = getPlaybackStore();
-    playbackStore.setPlaying(!playbackStore.isPlaying.value);
+    playbackStore.setPlaying(!Boolean(readStoreValue(playbackStore.isPlaying)));
   }
 
   /**
@@ -402,8 +425,6 @@ function createPlaybackManager() {
   function handleVideoTimeUpdate() {
     if (!videoElement) return;
 
-    const videoTime = videoElement.currentTime;
-
     // 锁定时不处理
     if (isLocked()) {
       return;
@@ -426,12 +447,17 @@ function createPlaybackManager() {
       }
 
       const playbackStore = getPlaybackStore();
-      const diff = Math.abs(videoTime - playbackStore.currentTime.value);
+      const latestVideoTime = videoElement?.currentTime;
+      const currentStoreTime = Number(readStoreValue(playbackStore.currentTime));
+      if (!Number.isFinite(latestVideoTime) || !Number.isFinite(currentStoreTime)) {
+        return;
+      }
+      const diff = Math.abs(latestVideoTime - currentStoreTime);
 
       // 只有差异足够大时才更新
       if (diff > CONFIG.SYNC_THRESHOLD) {
-        playbackStore.updateCurrentTimeRaw(videoTime);
-        playbackStore.commitCurrentTime(videoTime);
+        playbackStore.updateCurrentTimeRaw(latestVideoTime);
+        playbackStore.commitCurrentTime(latestVideoTime);
       }
     }, CONFIG.DEBOUNCE_DELAY);
   }
@@ -460,7 +486,11 @@ function createPlaybackManager() {
     lastWaveSurferSyncAt = now;
 
     const playbackStore = getPlaybackStore();
-    const diff = Math.abs(currentTime - playbackStore.currentTime.value);
+    const currentStoreTime = Number(readStoreValue(playbackStore.currentTime));
+    if (!Number.isFinite(currentStoreTime)) {
+      return;
+    }
+    const diff = Math.abs(currentTime - currentStoreTime);
     if (diff > CONFIG.SYNC_THRESHOLD) {
       playbackStore.updateCurrentTimeRaw(currentTime);
       playbackStore.commitCurrentTime(currentTime);
@@ -487,7 +517,7 @@ function createPlaybackManager() {
    */
   function handleVideoPlay() {
     const playbackStore = getPlaybackStore();
-    if (!playbackStore.isPlaying.value) {
+    if (!Boolean(readStoreValue(playbackStore.isPlaying))) {
       playbackStore.setPlaying(true);
     }
   }
@@ -500,7 +530,7 @@ function createPlaybackManager() {
       return;
     }
     const playbackStore = getPlaybackStore();
-    if (!playbackStore.isPlaying.value) {
+    if (!Boolean(readStoreValue(playbackStore.isPlaying))) {
       playbackStore.setPlaying(true);
     }
   }
@@ -510,7 +540,7 @@ function createPlaybackManager() {
    */
   function handleVideoPause() {
     const playbackStore = getPlaybackStore();
-    if (playbackStore.isPlaying.value) {
+    if (Boolean(readStoreValue(playbackStore.isPlaying))) {
       playbackStore.setPlaying(false);
     }
   }
@@ -523,7 +553,7 @@ function createPlaybackManager() {
       return;
     }
     const playbackStore = getPlaybackStore();
-    if (playbackStore.isPlaying.value) {
+    if (Boolean(readStoreValue(playbackStore.isPlaying))) {
       playbackStore.setPlaying(false);
     }
   }
@@ -541,6 +571,7 @@ function createPlaybackManager() {
   // ============ 清理 ============
 
   function cleanup() {
+    pause();
     unregisterVideo();
     unregisterWaveSurfer();
     forceReleaseLock();

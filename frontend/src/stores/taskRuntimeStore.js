@@ -253,7 +253,31 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
 
   function ensureRuntimeState(jobId) {
     if (!jobStates[jobId]) {
-      jobStates[jobId] = createRuntimeState(jobId)
+      const runtimeState = createRuntimeState(jobId)
+      const task = tasksMap.value.get(jobId)
+
+      // 运行态被清理后再次访问时，需从任务主状态回填，避免退回 idle 基线。
+      if (task) {
+        runtimeState.percent = clampPercent(task.progress ?? runtimeState.percent)
+        runtimeState.status = task.status || runtimeState.status
+        runtimeState.phase = task.phase || runtimeState.phase
+        runtimeState.phasePercent = clampPercent(task.phase_percent ?? runtimeState.phasePercent)
+        runtimeState.message = task.message ?? runtimeState.message
+        runtimeState.processed = task.processed ?? runtimeState.processed
+        runtimeState.total = task.total ?? runtimeState.total
+        runtimeState.language = task.language ?? runtimeState.language
+        runtimeState.stateSeq = Math.max(
+          runtimeState.stateSeq,
+          normalizeStateSeq(task.state_seq)
+        )
+        runtimeState.lastServerAt = normalizeTimestamp(
+          task.serverUpdatedAt ?? task.updatedAt
+        ) || runtimeState.lastServerAt
+        runtimeState.lastSource = 'task_restore'
+        runtimeState.lastUpdate = Date.now()
+      }
+
+      jobStates[jobId] = runtimeState
       console.log(`[TaskRuntimeStore] 创建任务运行态: ${jobId}`)
     }
     return jobStates[jobId]
@@ -911,7 +935,12 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
     activeTaskId.value = jobId
 
     // 仅在用户触发加载时进入编辑器，并统一到 project 语义。
-    await navigateToEditor(router, { jobId })
+    try {
+      await navigateToEditor(router, { jobId })
+    } catch (error) {
+      console.error(`[TaskRuntimeStore] 任务跳转失败: ${jobId}`, error)
+      return false
+    }
 
     console.log(`[TaskRuntimeStore] 任务已加载: ${jobId}`)
     return true

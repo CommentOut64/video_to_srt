@@ -37,13 +37,24 @@ export function useWaveformScroll(
   let pendingScrollEvent = null
   let followRafId = null
 
+  function readPlaybackValue(maybeRefValue) {
+    if (
+      maybeRefValue &&
+      typeof maybeRefValue === 'object' &&
+      'value' in maybeRefValue
+    ) {
+      return maybeRefValue.value
+    }
+    return maybeRefValue
+  }
+
   function getCurrentTimeSec() {
-    const value = Number(playbackStore.currentTime.value)
+    const value = Number(readPlaybackValue(playbackStore.currentTime))
     return Number.isFinite(value) ? value : 0
   }
 
   function getIsPlaying() {
-    return Boolean(playbackStore.isPlaying.value)
+    return Boolean(readPlaybackValue(playbackStore.isPlaying))
   }
 
   // ============ 计算属性 ============
