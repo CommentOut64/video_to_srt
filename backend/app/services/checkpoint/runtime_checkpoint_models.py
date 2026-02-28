@@ -25,4 +25,6 @@ class RuntimeCheckpointSnapshot:
     last_unit_commits: dict[str, str] = field(default_factory=dict)
     # Phase 2: 仅保存转录摘要提示，不复制 checkpoint 全量数据
     transcription_hint: dict[str, Any] | None = None
+    # V3.2.4+dev.20260228.01: 运行态字幕真源快照（草稿/定稿统一基线）
+    subtitle_runtime: dict[str, Any] | None = None
 

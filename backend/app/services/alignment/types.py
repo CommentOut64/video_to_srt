@@ -309,7 +309,7 @@ class DecisionLayerOutput:
 class OutputLayerInput:
     """输出层输入。"""
 
-    chunk_index: int
+    chunk_index: int | str
     sentence_segments: List[SentenceSegment]
     language: str = "auto"
     injection_report: Optional[Dict[str, Any]] = None

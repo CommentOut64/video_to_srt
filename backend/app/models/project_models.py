@@ -11,7 +11,7 @@ from time import time
 from typing import List, Literal, Optional
 import uuid
 
-ProjectMode = Literal["normal", "legacy"]
+ProjectMode = Literal["normal", "legacy", "import"]
 FlavorType = Literal["full", "lite"]
 SourceType = Literal["transcribe", "import", "legacy"]
 AssetType = Literal[

@@ -182,6 +182,10 @@ class SentenceSegment:
     is_finalized: bool = False                    # 是否已定稿（慢流完成）
     sv_original_text: Optional[str] = None        # SenseVoice 原始文本（用于对比）
     whisper_text: Optional[str] = None            # Whisper 识别文本（用于对比）
+    # V3.2.4+dev.20260228.01: 稳定句子身份（避免可变 sentence_index 漂移）
+    sentence_uid: Optional[str] = None            # 运行态稳定句子ID
+    segment_id: Optional[str] = None              # 对外编辑主键（与 sentence_uid 同步）
+    chunk_uid: Optional[str] = None               # 语义块唯一ID（支持 string chunk_id）
 
     # Phase 2: Timeline 语义绑定字段
     speaker_id: Optional[str] = None              # 句级说话人标识
@@ -313,6 +317,10 @@ class SentenceSegment:
             "group_id": self.group_id,
             "is_soft_break": self.is_soft_break,
             "group_position": self.group_position,
+            # V3.2.4+dev.20260228.01: 稳定身份字段
+            "sentence_uid": self.sentence_uid,
+            "segment_id": self.segment_id or self.sentence_uid,
+            "chunk_uid": self.chunk_uid,
             # Phase 2: Timeline 语义绑定字段
             "speaker_id": self.speaker_id,
             "turn_id": self.turn_id,
