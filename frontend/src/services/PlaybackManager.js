@@ -35,6 +35,7 @@ const CONFIG = {
  */
 function createPlaybackManager() {
   // ============ 私有状态 ============
+  let activeSessionId = "";
 
   // Video 元素引用（由 VideoStage 注册）
   let videoElement = null;
@@ -47,6 +48,11 @@ function createPlaybackManager() {
   let isSeekingInternal = false;
   let isDraggingInternal = false;
   let dragSource = "";
+
+  // V3.2.4+dev.20260228.01: 虚拟时间轴模式标记
+  // 当 WaveSurfer 加载静音占位音频时，其 timeupdate/play/pause/finish 事件
+  // 回报的是实际音频时间（≠虚拟时间轴时间），必须全部忽略
+  let isVirtualTimelineActive = false;
 
   // 时间保护
   let lastSeekTime = 0; // 上次 seek 的时间戳
@@ -87,13 +93,55 @@ function createPlaybackManager() {
     return maybeRefValue;
   }
 
+  function normalizeSessionId(sessionId) {
+    if (sessionId === null || sessionId === undefined) {
+      return "";
+    }
+    return String(sessionId).trim();
+  }
+
+  function isSessionMatched(sessionId) {
+    const normalizedSessionId = normalizeSessionId(sessionId);
+    if (!normalizedSessionId) {
+      return true;
+    }
+    return normalizedSessionId === activeSessionId;
+  }
+
+  function bindSession(sessionId, options = {}) {
+    const { force = false, resetPosition = true } = options;
+    const normalizedSessionId = normalizeSessionId(sessionId);
+
+    if (!force && normalizedSessionId === activeSessionId) {
+      return false;
+    }
+
+    pause({ force: true });
+    forceReleaseLock();
+
+    if (resetPosition) {
+      const playbackStore = getPlaybackStore();
+      playbackStore.updateCurrentTimeRaw(0);
+      playbackStore.commitCurrentTime(0);
+    }
+
+    activeSessionId = normalizedSessionId;
+    lastSeekTime = 0;
+    lastWaveSurferSyncAt = 0;
+    return true;
+  }
+
   // ============ Video 注册 ============
 
   /**
    * 注册 Video 元素（由 VideoStage 调用）
    * @param {HTMLVideoElement} video - Video 元素
    */
-  function registerVideo(video) {
+  function registerVideo(video, sessionId = "") {
+    if (sessionId) {
+      bindSession(sessionId, { resetPosition: false });
+    }
+
     if (videoElement === video) return;
 
     if (videoElement) {
@@ -142,7 +190,11 @@ function createPlaybackManager() {
    * 注册 WaveSurfer 实例（由 WaveformTimeline 调用）
    * @param {WaveSurfer} ws - WaveSurfer 实例
    */
-  function registerWaveSurfer(ws) {
+  function registerWaveSurfer(ws, sessionId = "") {
+    if (sessionId) {
+      bindSession(sessionId, { resetPosition: false });
+    }
+
     if (wavesurferInstance === ws) return;
     unregisterWaveSurfer();
     wavesurferInstance = ws;
@@ -242,6 +294,15 @@ function createPlaybackManager() {
     return Date.now() - lastSeekTime < CONFIG.SEEK_PROTECTION_PERIOD;
   }
 
+  /**
+   * V3.2.4+dev.20260228.01: 设置虚拟时间轴模式
+   * 虚拟模式下 WaveSurfer 加载的是占位静音音频，
+   * 其 timeupdate/play/pause/finish 事件均不可信，必须全部屏蔽。
+   */
+  function setVirtualTimelineActive(active) {
+    isVirtualTimelineActive = Boolean(active);
+  }
+
   // ============ 核心操作 ============
 
   /**
@@ -294,7 +355,13 @@ function createPlaybackManager() {
    * @param {boolean} options.fromDrag - 是否来自拖拽操作
    */
   function seekTo(time, options = {}) {
-    const { fromDrag = false } = options;
+    const { fromDrag = false, sessionId = "", force = false } = options;
+
+    if (!force && !isSessionMatched(sessionId)) {
+      const playbackStore = getPlaybackStore();
+      return Number(readStoreValue(playbackStore.currentTime)) || 0;
+    }
+
     const store = getStore();
     const duration = resolveDuration(store);
 
@@ -342,9 +409,14 @@ function createPlaybackManager() {
     if (!wavesurferInstance) return;
 
     try {
-      const duration = wavesurferInstance.getDuration();
+      const wsDuration = Number(wavesurferInstance.getDuration()) || 0;
+      const storeDuration = Number(getStore().meta.duration) || 0;
+      const duration = hasVideoClockAvailable()
+        ? wsDuration
+        : Math.max(wsDuration, storeDuration);
       if (duration > 0) {
-        wavesurferInstance.seekTo(time / duration);
+        const progress = Math.max(0, Math.min(1, time / duration));
+        wavesurferInstance.seekTo(progress);
       }
     } catch (e) {
       // WaveSurfer 可能未准备好
@@ -398,7 +470,11 @@ function createPlaybackManager() {
   /**
    * 切换播放/暂停
    */
-  function togglePlay() {
+  function togglePlay(options = {}) {
+    const { sessionId = "", force = false } = options;
+    if (!force && !isSessionMatched(sessionId)) {
+      return;
+    }
     const playbackStore = getPlaybackStore();
     playbackStore.setPlaying(!Boolean(readStoreValue(playbackStore.isPlaying)));
   }
@@ -406,14 +482,22 @@ function createPlaybackManager() {
   /**
    * 播放
    */
-  function play() {
+  function play(options = {}) {
+    const { sessionId = "", force = false } = options;
+    if (!force && !isSessionMatched(sessionId)) {
+      return;
+    }
     getPlaybackStore().setPlaying(true);
   }
 
   /**
    * 暂停
    */
-  function pause() {
+  function pause(options = {}) {
+    const { sessionId = "", force = false } = options;
+    if (!force && !isSessionMatched(sessionId)) {
+      return;
+    }
     getPlaybackStore().setPlaying(false);
   }
 
@@ -467,6 +551,11 @@ function createPlaybackManager() {
    */
   function handleWaveSurferTimeUpdate(currentTime) {
     if (hasVideoClockAvailable()) {
+      return;
+    }
+
+    // V3.2.4+dev.20260228.01: 虚拟时间轴模式下忽略 WaveSurfer 时间事件
+    if (isVirtualTimelineActive) {
       return;
     }
 
@@ -529,6 +618,9 @@ function createPlaybackManager() {
     if (hasVideoClockAvailable()) {
       return;
     }
+    if (isVirtualTimelineActive) {
+      return;
+    }
     const playbackStore = getPlaybackStore();
     if (!Boolean(readStoreValue(playbackStore.isPlaying))) {
       playbackStore.setPlaying(true);
@@ -552,6 +644,9 @@ function createPlaybackManager() {
     if (hasVideoClockAvailable()) {
       return;
     }
+    if (isVirtualTimelineActive) {
+      return;
+    }
     const playbackStore = getPlaybackStore();
     if (Boolean(readStoreValue(playbackStore.isPlaying))) {
       playbackStore.setPlaying(false);
@@ -565,22 +660,37 @@ function createPlaybackManager() {
     if (hasVideoClockAvailable()) {
       return;
     }
+    if (isVirtualTimelineActive) {
+      return;
+    }
     getPlaybackStore().setPlaying(false);
   }
 
   // ============ 清理 ============
 
-  function cleanup() {
-    pause();
+  function cleanup(options = {}) {
+    const { resetSession = false, resetPosition = true } = options;
+
+    pause({ force: true });
     unregisterVideo();
     unregisterWaveSurfer();
     forceReleaseLock();
+    isVirtualTimelineActive = false;
+
+    if (resetPosition) {
+      const playbackStore = getPlaybackStore();
+      playbackStore.updateCurrentTimeRaw(0);
+      playbackStore.commitCurrentTime(0);
+    }
 
     if (timeUpdateTimer) {
       clearTimeout(timeUpdateTimer);
       timeUpdateTimer = null;
     }
     lastWaveSurferSyncAt = 0;
+    if (resetSession) {
+      activeSessionId = "";
+    }
   }
 
   // ============ 公共 API ============
@@ -607,6 +717,9 @@ function createPlaybackManager() {
     togglePlay,
     play,
     pause,
+    bindSession,
+    getActiveSessionId: () => activeSessionId,
+    setVirtualTimelineActive,
 
     // 锁管理（高级用法）
     acquireLock,

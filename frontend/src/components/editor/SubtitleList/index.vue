@@ -156,7 +156,8 @@ const subtitleDocumentStore = useSubtitleDocumentStore()
 const playbackManager = usePlaybackManager()
 
 const identityId = computed(() => projectStore.primaryId)
-const jobId = computed(() => projectStore.meta.jobId)
+// 统一使用 project 主身份，兼容旧任务时可回退到 legacy job_id。
+const jobId = computed(() => projectStore.primaryId)
 const onSubtitleEdit = subtitleDocumentStore.onSubtitleEdit
 const applyPendingEditsToStore = subtitleDocumentStore.applyPendingEditsToStore
 const forceSyncNow = subtitleDocumentStore.forceSyncNow

@@ -1,7 +1,7 @@
 <template>
   <div class="timeline-header">
     <div class="zoom-controls">
-      <button class="zoom-btn" @click="$emit('zoom-out')" title="缩小">
+      <button class="zoom-btn" @click="$emit('zoom-out')" @mouseup="$event.target.blur()" title="缩小">
         <svg viewBox="0 0 24 24" fill="currentColor">
           <path d="M19 13H5v-2h14v2z" />
         </svg>
@@ -14,15 +14,16 @@
           :max="ZOOM_MAX"
           :step="ZOOM_STEP"
           @input="$emit('zoom-input', $event)"
+          @change="$event.target.blur()"
         />
       </div>
-      <button class="zoom-btn" @click="$emit('zoom-in')" title="放大">
+      <button class="zoom-btn" @click="$emit('zoom-in')" @mouseup="$event.target.blur()" title="放大">
         <svg viewBox="0 0 24 24" fill="currentColor">
           <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z" />
         </svg>
       </button>
       <span class="zoom-label">{{ zoomLevel }}%</span>
-      <button class="fit-btn" @click="$emit('fit-screen')" title="适应屏幕">
+      <button class="fit-btn" @click="$emit('fit-screen')" @mouseup="$event.target.blur()" title="适应屏幕">
         <svg viewBox="0 0 24 24" fill="currentColor">
           <path
             d="M3 5v4h2V5h4V3H5c-1.1 0-2 .9-2 2zm2 10H3v4c0 1.1.9 2 2 2h4v-2H5v-4zm14 4h-4v2h4c1.1 0 2-.9 2-2v-4h-2v4zm0-16h-4v2h4v4h2V5c0-1.1-.9-2-2-2z"

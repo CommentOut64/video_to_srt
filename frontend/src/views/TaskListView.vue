@@ -708,7 +708,9 @@ function handleImportSuccess(projectId) {
 // 打开编辑器
 async function openEditor(jobId) {
   try {
-    await navigateToEditor(router, { jobId })
+    const task = taskStore.getTask(jobId)
+    const identifier = task?.project_id || jobId
+    await navigateToEditor(router, { jobId: identifier })
   } catch (error) {
     ElMessage.error(error?.message || '任务到项目转换失败，无法打开编辑器')
   }
@@ -727,7 +729,7 @@ function handleTitleClick(task) {
   // 延迟执行单击操作，给双击留出时间
   clickTimer = setTimeout(async () => {
     clickTimer = null
-    await openEditor(task.job_id)
+    await openEditor(task.project_id || task.job_id)
   }, 200)
 }
 

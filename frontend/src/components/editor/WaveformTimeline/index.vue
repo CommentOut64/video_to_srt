@@ -77,6 +77,7 @@ import { useProjectStore } from '@/stores/projectStore'
 import { usePlaybackStore } from '@/stores/playbackStore'
 import { useSubtitleDocumentStore } from '@/stores/subtitleDocumentStore'
 import { usePlaybackManager } from '@/services/PlaybackManager'
+import { mediaApi } from '@/services/api'
 import ContextMenu from '@/components/editor/ContextMenu.vue'
 import WaveformHeader from './WaveformHeader.vue'
 import WaveformScrollbar from './WaveformScrollbar.vue'
@@ -116,14 +117,6 @@ const subtitleDocumentStore = useSubtitleDocumentStore()
 const playbackManager = usePlaybackManager()
 const identityRef = computed(() => props.mediaId || projectStore.primaryId)
 const onSubtitleEdit = subtitleDocumentStore.onSubtitleEdit
-
-watch(
-  () => identityRef.value,
-  (identityId) => {
-    subtitleDocumentStore.bindSyncIdentity(identityId)
-  },
-  { immediate: true }
-)
 
 // 编辑器上下文
 const editorContext = inject('editorContext', {
@@ -175,6 +168,12 @@ const duration = computed(() => projectStore.meta.duration || 0)
 // 滚动条轨道 ref（从子组件获取）
 const scrollbarTrackRef = computed(() => scrollbarRef.value?.trackRef)
 const silentAudioUrl = ref(null)
+const mediaCapability = ref('unknown')
+const shouldPollPeaks = ref(false)
+const isVirtualTimelineMode = ref(false)
+const isTimelineInteractive = computed(() => isMediaReady.value || isVirtualTimelineMode.value)
+let virtualClockRafId = null
+let virtualClockLastTs = 0
 
 function resolveFallbackDuration() {
   const subtitleMaxEnd = projectStore.subtitles.reduce((maxEnd, subtitle) => {
@@ -185,16 +184,42 @@ function resolveFallbackDuration() {
   return Math.max(metaDuration, subtitleMaxEnd, 1)
 }
 
+function canUseFallbackDuration() {
+  // 无视频或音频时钟不可用时，必须使用字幕/项目时长兜底，避免 0/1 秒时钟污染 seek。
+  return (
+    isVirtualTimelineMode.value
+    || !hasVideoSource.value
+    || mediaCapability.value !== 'audio_ready'
+  )
+}
+
+function resolveWaveformDuration(ws) {
+  const wsDuration = Number(ws?.getDuration?.()) || 0
+  if (!canUseFallbackDuration()) return wsDuration
+  return Math.max(wsDuration, resolveFallbackDuration())
+}
+
 function buildFlatPeaks(targetDuration) {
   const sampleCount = Math.max(4000, Math.min(Math.ceil(targetDuration * 20), 100000))
   return new Array(sampleCount * 2).fill(0)
 }
 
-function ensureSilentAudioUrl() {
-  if (silentAudioUrl.value) return silentAudioUrl.value
+// V3.2.4+dev.20260228.01: 生成与 targetDuration 匹配的静音 WAV
+// 旧实现固定 1 秒，导致 WaveSurfer getDuration() 返回 1，Region 定位/Seek 全部错乱
+function buildSilentAudioUrl(targetDuration) {
+  // 释放旧 URL 避免内存泄漏
+  if (silentAudioUrl.value) {
+    URL.revokeObjectURL(silentAudioUrl.value)
+    silentAudioUrl.value = null
+  }
 
+  const ceilDuration = Math.max(1, Math.ceil(targetDuration))
+  // V3.2.4+dev.20260228.02: 固定 8000Hz（浏览器 MediaElement 普遍支持的最低标准采样率）。
+  // 原自适应方案在时长 >30s 时会降到 <8000Hz，导致 Chromium FFmpegDemuxer 拒绝解码
+  // （DEMUXER_ERROR_NO_SUPPORTED_STREAMS）。
+  // 内存开销：16-bit mono → duration_sec * 16KB/s（30 分钟 ≈ 28.8MB，桌面端可接受）。
   const sampleRate = 8000
-  const frameCount = sampleRate
+  const frameCount = ceilDuration * sampleRate
   const dataSize = frameCount * 2
   const buffer = new ArrayBuffer(44 + dataSize)
   const view = new DataView(buffer)
@@ -218,24 +243,134 @@ function ensureSilentAudioUrl() {
   view.setUint16(34, 16, true)
   writeString(36, 'data')
   view.setUint32(40, dataSize, true)
+  // 所有采样保持 0（静音）
 
   const blob = new Blob([buffer], { type: 'audio/wav' })
   silentAudioUrl.value = URL.createObjectURL(blob)
   return silentAudioUrl.value
 }
 
-function loadFallbackBaseline(reason = '') {
+function setVirtualTimelineMode(enabled) {
+  const nextEnabled = Boolean(enabled)
+  if (isVirtualTimelineMode.value === nextEnabled) return
+  isVirtualTimelineMode.value = nextEnabled
+  // V3.2.4+dev.20260228.01: 通知 PlaybackManager 屏蔽/恢复 WaveSurfer 时间事件
+  playbackManager.setVirtualTimelineActive(nextEnabled)
+  if (!nextEnabled) {
+    stopVirtualClock()
+  }
+}
+
+function stopVirtualClock() {
+  if (virtualClockRafId !== null) {
+    cancelAnimationFrame(virtualClockRafId)
+    virtualClockRafId = null
+  }
+  virtualClockLastTs = 0
+}
+
+function runVirtualClockFrame(timestamp) {
+  if (!isVirtualTimelineMode.value || !playbackStore.isPlaying) {
+    stopVirtualClock()
+    return
+  }
+
+  if (!virtualClockLastTs) {
+    virtualClockLastTs = timestamp
+  }
+
+  const deltaSec = Math.max(0, (timestamp - virtualClockLastTs) / 1000)
+  virtualClockLastTs = timestamp
+
+  const playbackRate = Number(playbackStore.playbackRate) || 1
+  const currentStoreTime = Number(playbackStore.currentTime) || 0
+  const maxDuration = resolveFallbackDuration()
+  const nextTime = Math.min(maxDuration, currentStoreTime + deltaSec * playbackRate)
+
+  playbackStore.updateCurrentTimeRaw(nextTime)
+  playbackStore.commitCurrentTime(nextTime)
+  const ws = wavesurferRef.value
+  if (ws && isReady.value) {
+    const wsDuration = resolveWaveformDuration(ws)
+    if (wsDuration > 0) {
+      const progress = Math.max(0, Math.min(1, nextTime / wsDuration))
+      ws.seekTo(progress)
+    }
+  }
+
+  if (nextTime >= maxDuration) {
+    playbackStore.setPlaying(false)
+    stopVirtualClock()
+    return
+  }
+
+  virtualClockRafId = requestAnimationFrame(runVirtualClockFrame)
+}
+
+function startVirtualClock() {
+  if (!isVirtualTimelineMode.value || virtualClockRafId !== null) return
+  virtualClockLastTs = 0
+  virtualClockRafId = requestAnimationFrame(runVirtualClockFrame)
+}
+
+async function refreshMediaCapability() {
+  const identityId = props.mediaId || projectStore.primaryId || ''
+  const hasLocalAudioPath = Boolean(projectStore.meta.audioPath)
+
+  if (!identityId) {
+    mediaCapability.value = hasLocalAudioPath ? 'audio_ready' : 'no_media'
+    shouldPollPeaks.value = false
+    return mediaCapability.value
+  }
+
+  try {
+    const info = await mediaApi.getMediaInfo(identityId)
+    const audioState = String(info?.audio?.state || '').trim().toLowerCase()
+    const audioExists = Boolean(info?.audio?.exists) || audioState === 'ready'
+    const audioExtractable = Boolean(info?.audio?.extractable) || audioState === 'derivable'
+    const hasPeaks = Boolean(info?.peaks?.exists)
+
+    if (audioExists || hasLocalAudioPath) {
+      mediaCapability.value = 'audio_ready'
+      shouldPollPeaks.value = !hasPeaks && Boolean(peaksSource.value)
+      return mediaCapability.value
+    }
+
+    if (audioExtractable) {
+      mediaCapability.value = 'audio_derivable'
+      shouldPollPeaks.value = true
+      return mediaCapability.value
+    }
+
+    mediaCapability.value = 'no_media'
+    shouldPollPeaks.value = false
+    return mediaCapability.value
+  } catch (error) {
+    const hasPotentialAudio = hasLocalAudioPath || hasVideoSource.value
+    mediaCapability.value = hasPotentialAudio ? 'audio_derivable' : 'no_media'
+    shouldPollPeaks.value = mediaCapability.value === 'audio_derivable'
+    return mediaCapability.value
+  }
+}
+
+function loadFallbackBaseline(reason = '', options = {}) {
+  const { virtualTimeline = false } = options
   const ws = wavesurferRef.value
   if (!ws) return
 
   const fallbackDuration = resolveFallbackDuration()
   const baselinePeaks = buildFlatPeaks(fallbackDuration)
-  const silentUrl = ensureSilentAudioUrl()
+  // V3.2.4+dev.20260228.01: 静音 WAV 时长与 fallbackDuration 匹配
+  const silentUrl = buildSilentAudioUrl(fallbackDuration)
 
   console.warn('[WaveformTimeline] 音频不可用，启用无波形基线模式:', reason || 'unknown')
   hasError.value = false
   errorMessage.value = ''
+  // 重置就绪状态，防止 region 在加载中途被渲染到旧时长坐标系
+  isReady.value = false
   isLoading.value = true
+  projectStore.setProjectDuration(fallbackDuration)
+  setVirtualTimelineMode(virtualTimeline)
   ws.load(silentUrl, baselinePeaks, fallbackDuration)
 }
 
@@ -292,7 +427,12 @@ const {
   playbackManager,
   playbackStore,
   isReady,
-  isMediaReady,
+  isTimelineInteractive,
+  () => {
+    const ws = wavesurferRef.value
+    if (!ws) return resolveFallbackDuration()
+    return resolveWaveformDuration(ws)
+  },
   emit
 )
 
@@ -421,15 +561,16 @@ function setupWavesurferEvents() {
 
     // 根据实际时长重新调整配置
     const actualDuration = ws.getDuration()
+    const effectiveDuration = resolveWaveformDuration(ws)
     const containerWidth = containerRef.value?.offsetWidth || 800
-    if (actualDuration > 0) {
-      // 纯音频场景下无视频元数据，需以波形真实时长作为全局时间上限。
-      if (!projectStore.meta.duration || Math.abs(projectStore.meta.duration - actualDuration) > 0.01) {
-        projectStore.setProjectDuration(actualDuration)
+    if (effectiveDuration > 0) {
+      // 无媒体基线场景中，actualDuration 可能只有 1s（静音占位）；应以有效时长为准。
+      if (!projectStore.meta.duration || Math.abs(projectStore.meta.duration - effectiveDuration) > 0.01) {
+        projectStore.setProjectDuration(effectiveDuration)
       }
 
       const { basePxPerSec, suggestedZoom, barConfig } = calculateWaveformConfig(
-        actualDuration,
+        effectiveDuration,
         containerWidth
       )
       zoomLevel.value = suggestedZoom
@@ -439,7 +580,14 @@ function setupWavesurferEvents() {
 
     renderSubtitleRegions()
     emit('ready')
-    playbackManager.registerWaveSurfer(ws)
+    playbackManager.registerWaveSurfer(ws, identityRef.value)
+
+    if (isVirtualTimelineMode.value) {
+      ws.pause()
+      if (playbackStore.isPlaying) {
+        startVirtualClock()
+      }
+    }
 
     nextTick(() => {
       updateScrollbarThumb()
@@ -458,16 +606,56 @@ function setupWavesurferEvents() {
     nextTick(() => updateScrollbarThumb())
   })
 
-  ws.on('error', (error) => {
+  ws.on('error', async (error) => {
     console.error('Wavesurfer error:', error)
+
+    // V3.2.4+dev.20260228.02: 虚拟时间轴模式下，静音占位音频解码失败是预期行为。
+    // 波形数据（peaks）已通过 load() 的第二参数提供，直接标记就绪即可。
+    // 不再调用 loadFallbackBaseline 以避免 error → load → error 无限循环。
+    if (isVirtualTimelineMode.value) {
+      console.warn('[WaveformTimeline] 虚拟时间轴模式：音频解码失败（预期），直接进入就绪状态')
+      isLoading.value = false
+      hasError.value = false
+      if (!isReady.value) {
+        isReady.value = true
+        applyWaveformMediaState()
+        renderSubtitleRegions()
+        playbackManager.registerWaveSurfer(ws, identityRef.value)
+        emit('ready')
+
+        if (playbackStore.isPlaying) {
+          startVirtualClock()
+        }
+
+        nextTick(() => {
+          updateScrollbarThumb()
+          const wrapper = ws.getWrapper()
+          const scrollContainer = wrapper?.parentElement
+          if (scrollContainer) {
+            scrollContainer.addEventListener('scroll', updateScrollbarThumb)
+          }
+        })
+      }
+      return
+    }
+
     hasError.value = false
     isLoading.value = true
+
+    await refreshMediaCapability()
+    if (mediaCapability.value === 'no_media') {
+      stopPeaksPolling()
+      loadFallbackBaseline('wavesurfer_no_media', { virtualTimeline: true })
+      return
+    }
+
     if (retryCount.value < maxRetries) {
       retryCount.value++
       setTimeout(() => loadAudioData(), 1000)
     } else {
-      loadFallbackBaseline('wavesurfer_error_max_retries')
-      if (audioSource.value) {
+      // 错误兜底时仍需可编辑、可 seek、可模拟播放，统一进入虚拟时钟。
+      loadFallbackBaseline('wavesurfer_error_max_retries', { virtualTimeline: true })
+      if (shouldPollPeaks.value) {
         startPeaksPolling()
       }
     }
@@ -494,8 +682,16 @@ function applyWaveformMediaState() {
 }
 
 async function loadAudioData() {
+  const capability = await refreshMediaCapability()
+
+  if (capability === 'no_media') {
+    stopPeaksPolling()
+    loadFallbackBaseline('no_media_source', { virtualTimeline: true })
+    return
+  }
+
   if (!audioSource.value) {
-    loadFallbackBaseline('no_audio_source')
+    loadFallbackBaseline('no_audio_source', { virtualTimeline: true })
     return
   }
 
@@ -504,21 +700,37 @@ async function loadAudioData() {
       const response = await fetch(peaksSource.value)
       if (response.ok) {
         const data = await response.json()
+        setVirtualTimelineMode(false)
         wavesurferRef.value.load(audioSource.value, data.peaks, data.duration)
         return
       }
+
+      if (response.status === 404 && capability === 'audio_derivable') {
+        shouldPollPeaks.value = true
+      }
     }
+    setVirtualTimelineMode(false)
     wavesurferRef.value.load(audioSource.value)
   } catch (error) {
     console.error('加载音频失败:', error)
-    loadFallbackBaseline('audio_load_exception')
+    if (mediaCapability.value === 'no_media') {
+      loadFallbackBaseline('audio_load_exception_no_media', { virtualTimeline: true })
+      return
+    }
+    loadFallbackBaseline('audio_load_exception', { virtualTimeline: true })
   }
 }
 
 function startPeaksPolling() {
-  if (peaksCheckTimer) return
+  if (peaksCheckTimer || !shouldPollPeaks.value) return
   peaksCheckTimer = setInterval(async () => {
     try {
+      await refreshMediaCapability()
+      if (mediaCapability.value === 'no_media' || !shouldPollPeaks.value) {
+        stopPeaksPolling()
+        return
+      }
+
       if (peaksSource.value) {
         const response = await fetch(peaksSource.value)
         if (response.ok) {
@@ -547,6 +759,7 @@ function retryLoad() {
   errorMessage.value = ''
   isLoading.value = true
   retryCount.value = 0
+  stopPeaksPolling()
   loadAudioData()
 }
 
@@ -580,6 +793,27 @@ let regionUpdateTimer = null
 let lastSyncTime = 0
 
 watch(
+  () => identityRef.value,
+  async (identityId, oldIdentityId) => {
+    subtitleDocumentStore.bindSyncIdentity(identityId)
+    playbackManager.bindSession(identityId, { force: true, resetPosition: false })
+
+    if (identityId === oldIdentityId || !wavesurferRef.value) {
+      return
+    }
+
+    stopPeaksPolling()
+    stopVirtualClock()
+    hasError.value = false
+    errorMessage.value = ''
+    retryCount.value = 0
+    isLoading.value = true
+    await loadAudioData()
+  },
+  { immediate: true }
+)
+
+watch(
   () => projectStore.subtitles,
   () => {
     if (isReady.value && !isUpdatingRegions.value) {
@@ -601,6 +835,20 @@ watch(
   (playing) => {
     const ws = wavesurferRef.value
     if (!ws || !isReady.value) return
+
+    if (isVirtualTimelineMode.value) {
+      ws.pause()
+      if (playing) {
+        startVirtualClock()
+        startSmartFollow()
+      } else {
+        stopVirtualClock()
+        stopSmartFollow()
+      }
+      return
+    }
+
+    stopVirtualClock()
     if (playing) {
       ws.play()
       startSmartFollow()
@@ -617,9 +865,12 @@ watch(
     const ws = wavesurferRef.value
     if (!ws || !isReady.value) return
 
+    // V3.2.4+dev.20260228.01: 虚拟模式播放中，时间由 RAF 直接驱动 seekTo，watch 不介入
+    if (isVirtualTimelineMode.value && playbackStore.isPlaying) return
+
     const isPlaying = playbackStore.isPlaying
     const isSeeking = playbackManager.isLocked()
-    if (isPlaying && !isSeeking) return
+    if (!isVirtualTimelineMode.value && isPlaying && !isSeeking) return
 
     const now = Date.now()
     if (now - lastSyncTime < 50) return
@@ -628,8 +879,11 @@ watch(
     const currentWsTime = ws.getCurrentTime()
     const timeDiff = Math.abs(currentWsTime - newTime)
     if (timeDiff > 0.1) {
-      const wsDuration = ws.getDuration()
-      if (wsDuration > 0) ws.seekTo(newTime / wsDuration)
+      const wsDuration = resolveWaveformDuration(ws)
+      if (wsDuration > 0) {
+        const progress = Math.max(0, Math.min(1, newTime / wsDuration))
+        ws.seekTo(progress)
+      }
     }
   }
 )
@@ -638,6 +892,48 @@ watch(
   () => subtitleDocumentStore.selectedSubtitleId,
   () => {
     if (isReady.value) renderSubtitleRegions()
+  }
+)
+
+watch(
+  () => isVirtualTimelineMode.value,
+  (enabled) => {
+    const ws = wavesurferRef.value
+    if (!ws || !isReady.value) return
+
+    if (enabled) {
+      ws.pause()
+      if (playbackStore.isPlaying) {
+        startVirtualClock()
+      }
+      return
+    }
+
+    stopVirtualClock()
+    if (playbackStore.isPlaying) {
+      ws.play()
+    }
+  }
+)
+
+// V3.2.4+dev.20260228.01: 虚拟时间轴时长扩展监测
+// 字幕异步到达（SSE/恢复）时 fallbackDuration 可能远超初始化时的值，
+// 需要用匹配时长的静音音频重新加载基线，否则 Region 定位超出 WaveSurfer 内部 duration 范围
+let durationReloadTimer = null
+watch(
+  () => isVirtualTimelineMode.value ? resolveFallbackDuration() : 0,
+  (newDuration) => {
+    if (newDuration <= 0) return
+    const ws = wavesurferRef.value
+    if (!ws || !isReady.value) return
+    const currentWsDuration = Number(ws.getDuration()) || 0
+    // 新时长显著超过当前 WaveSurfer 时长（>20% 或 >1s）时重新加载
+    if (newDuration > currentWsDuration * 1.2 + 1) {
+      clearTimeout(durationReloadTimer)
+      durationReloadTimer = setTimeout(() => {
+        loadFallbackBaseline('duration_expanded', { virtualTimeline: true })
+      }, 300)
+    }
   }
 )
 
@@ -675,7 +971,9 @@ onMounted(async () => {
 onUnmounted(() => {
   containerRef.value?.removeEventListener('wheel', handleWheel)
   if (zoomRafId) cancelAnimationFrame(zoomRafId)
+  stopVirtualClock()
   clearTimeout(regionUpdateTimer)
+  clearTimeout(durationReloadTimer)
   stopPeaksPolling()
 
   // 清理所有 composables
@@ -685,6 +983,7 @@ onUnmounted(() => {
   cleanupRegions()
   teardownRegionPointerGuards()
 
+  playbackManager.setVirtualTimelineActive(false)
   playbackManager.unregisterWaveSurfer()
 
   if (wavesurferRef.value) {
@@ -777,6 +1076,7 @@ onUnmounted(() => {
 
 /* WaveSurfer 样式覆盖 */
 .waveform-wrapper #waveform :deep(.wavesurfer-cursor) {
+  will-change: transform;
   filter: drop-shadow(0 0 1px rgb(0 0 0 / 80%)) drop-shadow(0 0 2px rgb(255 255 255 / 50%))
     drop-shadow(0 0 4px rgb(var(--af-accent-danger-rgb) / 60%));
 }

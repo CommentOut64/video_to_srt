@@ -48,6 +48,7 @@
         <!-- 视频区域 -->
         <div class="video-wrapper">
           <VideoStage
+            :key="`video-${mediaIdentityId || 'none'}`"
             ref="videoStageRef"
             :media-id="mediaIdentityId"
             :show-subtitle="true"
@@ -76,6 +77,7 @@
         <!-- 波形时间轴 -->
         <div class="waveform-wrapper">
           <WaveformTimeline
+            :key="`wave-${mediaIdentityId || 'none'}`"
             ref="waveformRef"
             :media-id="mediaIdentityId"
           />
@@ -283,6 +285,7 @@ const playbackManager = usePlaybackManager()
 const activeJobId = computed(() => props.jobId || null)
 // 媒体链路统一以 project_id 为主；job_id 仅用于任务控制与进度链路。
 const mediaIdentityId = computed(() => props.projectId || props.jobId || null)
+const playbackSessionId = computed(() => props.projectId || props.jobId || '')
 const identityRef = computed(() => mediaIdentityId.value)
 const forceSyncNow = subtitleDocumentStore.forceSyncNow
 
@@ -432,6 +435,8 @@ watch(
 // 监听路由身份变化，重新加载项目
 watch([() => rawProps.projectId, () => rawProps.jobId], async ([newProjectId, newJobId], [oldProjectId, oldJobId]) => {
   if (newProjectId === oldProjectId && newJobId === oldJobId) return
+  const nextSessionId = newProjectId || newJobId || ''
+  playbackManager.bindSession(nextSessionId, { force: true, resetPosition: true })
 
   // 取消旧的 SSE 订阅
   cleanupSSE()
@@ -444,6 +449,14 @@ watch([() => rawProps.projectId, () => rawProps.jobId], async ([newProjectId, ne
   // 重新加载项目
   await loadProject()
 })
+
+watch(
+  () => playbackSessionId.value,
+  (sessionId) => {
+    playbackManager.bindSession(sessionId, { force: true, resetPosition: true })
+  },
+  { immediate: true }
+)
 
 // 监听保存时间用于同步 task-meta 的显示
 watch(
@@ -653,7 +666,10 @@ async function resolveIdentity() {
   if (resolvedProjectId.value) {
     try {
       const project = await projectApi.getProject(resolvedProjectId.value)
-      if (project?.job_id) {
+      const sourceType = String(project?.subtitle_doc?.source_type || '').trim().toLowerCase()
+      const mode = String(project?.mode || '').trim().toLowerCase()
+      const isProjectOnly = sourceType === 'import' || mode === 'import'
+      if (project?.job_id && !isProjectOnly) {
         resolvedJobId.value = project.job_id
       }
     } catch (error) {

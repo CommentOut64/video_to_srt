@@ -15,6 +15,7 @@ import { ZOOM_BASE_PX_PER_SEC } from './useWaveformZoom.js'
  * @param {object} playbackStore - 播放状态 store
  * @param {Ref<boolean>} isReady - 波形是否就绪
  * @param {Ref<boolean>} isMediaReady - 媒体是否就绪（音频或视频可用）
+ * @param {Function} resolveEffectiveDuration - 获取时间轴有效时长（秒）
  * @param {Function} emit - 事件发射函数
  */
 export function useWaveformCursorDrag(
@@ -24,6 +25,7 @@ export function useWaveformCursorDrag(
   playbackStore,
   isReady,
   isMediaReady,
+  resolveEffectiveDuration,
   emit
 ) {
   // ============ 状态 ============
@@ -80,10 +82,16 @@ export function useWaveformCursorDrag(
     const absoluteX = mouseRelativeX + scrollContainer.scrollLeft
 
     const pxPerSec = (zoomLevel.value / 100) * ZOOM_BASE_PX_PER_SEC
-    const duration = ws.getDuration()
+    const wsDuration = Number(ws.getDuration()) || 0
+    const fallbackDuration = Number(resolveEffectiveDuration?.() || 0)
+    const duration = Math.max(wsDuration, fallbackDuration)
 
     const time = absoluteX / pxPerSec
-    return Math.max(0, Math.min(time, duration))
+    // 无媒体或波形尚未就绪时，duration 可能暂时为 0，不能把点击强行裁剪回 0。
+    if (duration > 0) {
+      return Math.max(0, Math.min(time, duration))
+    }
+    return Math.max(0, time)
   }
 
   /**

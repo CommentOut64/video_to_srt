@@ -107,8 +107,9 @@ export function useWaveformRegions(
       e.stopPropagation()
       setSelectedSubtitleId(region.id)
       playbackManager.seekTo(region.start)
-      const ws = wavesurferRef.value
-      if (ws) ws.play()
+      // V3.2.4+dev.20260228.01: 通过 PlaybackManager 触发播放，
+      // 由 WaveformTimeline 的 isPlaying watcher 决定使用真实播放或虚拟时钟
+      playbackManager.play()
       emit('region-click', region)
     })
 

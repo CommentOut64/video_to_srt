@@ -533,9 +533,17 @@ watch(() => playbackStore.isPlaying, async (playing) => {
 // 【重要】监听 videoRef 变化，确保 Video 元素注册到 PlaybackManager
 watch(videoRef, (video) => {
   if (video) {
-    playbackManager.registerVideo(video)
+    playbackManager.registerVideo(video, mediaId.value)
   }
 }, { immediate: true })
+
+watch(
+  () => mediaId.value,
+  (sessionId) => {
+    playbackManager.bindSession(sessionId, { force: true, resetPosition: false })
+  },
+  { immediate: true }
+)
 
 // 监听播放速度
 watch(() => playbackStore.playbackRate, (rate) => {
@@ -1006,7 +1014,7 @@ onMounted(() => {
 
   // 【关键】注册 Video 元素到 PlaybackManager
   if (videoRef.value) {
-    playbackManager.registerVideo(videoRef.value)
+    playbackManager.registerVideo(videoRef.value, mediaId.value)
   }
 
   // V3.1.2+dev.20260113.01: 初始化时显示分辨率标志
