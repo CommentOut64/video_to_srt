@@ -211,6 +211,7 @@
  * - 双击重命名任务
  */
 import { computed, ref, nextTick } from 'vue'
+import { ElMessage } from 'element-plus'
 import TaskMonitor from './TaskMonitor/index.vue'
 import DualAnchorProgress from '@/components/common/DualAnchorProgress.vue'
 import SimpleProgress from '@/components/common/SimpleProgress.vue'

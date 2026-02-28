@@ -707,7 +707,11 @@ function handleImportSuccess(projectId) {
 
 // 打开编辑器
 async function openEditor(jobId) {
-  await navigateToEditor(router, { jobId })
+  try {
+    await navigateToEditor(router, { jobId })
+  } catch (error) {
+    ElMessage.error(error?.message || '任务到项目转换失败，无法打开编辑器')
+  }
 }
 
 // 处理标题单击 - 用于区分单击（跳转）和双击（重命名）

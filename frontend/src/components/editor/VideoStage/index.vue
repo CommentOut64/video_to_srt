@@ -1030,6 +1030,14 @@ onUnmounted(() => {
   document.removeEventListener('mousemove', handleSubtitleMouseMove)
   document.removeEventListener('mouseup', handleSubtitleMouseUp)
 
+  // 路由离开时确保媒体立即停播，避免音频残留
+  try {
+    videoRef.value?.pause()
+  } catch (error) {
+    console.warn('[VideoStage] 卸载暂停视频失败:', error)
+  }
+  playbackManager.pause()
+
   // 【关键】注销 Video 元素
   playbackManager.unregisterVideo()
 })

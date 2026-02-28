@@ -204,7 +204,11 @@ async function cancelTask() {
 
 // 打开编辑器
 async function openEditor() {
-  await navigateToEditor(router, { jobId: props.task.job_id })
+  try {
+    await navigateToEditor(router, { jobId: props.task.job_id })
+  } catch (error) {
+    ElMessage.error(error?.message || '任务到项目转换失败，无法打开编辑器')
+  }
 }
 
 // 格式化时间

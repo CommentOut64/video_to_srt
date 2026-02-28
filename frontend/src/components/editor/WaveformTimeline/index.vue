@@ -174,6 +174,70 @@ const duration = computed(() => projectStore.meta.duration || 0)
 
 // 滚动条轨道 ref（从子组件获取）
 const scrollbarTrackRef = computed(() => scrollbarRef.value?.trackRef)
+const silentAudioUrl = ref(null)
+
+function resolveFallbackDuration() {
+  const subtitleMaxEnd = projectStore.subtitles.reduce((maxEnd, subtitle) => {
+    const end = Number(subtitle?.end)
+    return Number.isFinite(end) ? Math.max(maxEnd, end) : maxEnd
+  }, 0)
+  const metaDuration = Number(projectStore.meta.duration) || 0
+  return Math.max(metaDuration, subtitleMaxEnd, 1)
+}
+
+function buildFlatPeaks(targetDuration) {
+  const sampleCount = Math.max(4000, Math.min(Math.ceil(targetDuration * 20), 100000))
+  return new Array(sampleCount * 2).fill(0)
+}
+
+function ensureSilentAudioUrl() {
+  if (silentAudioUrl.value) return silentAudioUrl.value
+
+  const sampleRate = 8000
+  const frameCount = sampleRate
+  const dataSize = frameCount * 2
+  const buffer = new ArrayBuffer(44 + dataSize)
+  const view = new DataView(buffer)
+
+  const writeString = (offset, value) => {
+    for (let i = 0; i < value.length; i++) {
+      view.setUint8(offset + i, value.charCodeAt(i))
+    }
+  }
+
+  writeString(0, 'RIFF')
+  view.setUint32(4, 36 + dataSize, true)
+  writeString(8, 'WAVE')
+  writeString(12, 'fmt ')
+  view.setUint32(16, 16, true)
+  view.setUint16(20, 1, true)
+  view.setUint16(22, 1, true)
+  view.setUint32(24, sampleRate, true)
+  view.setUint32(28, sampleRate * 2, true)
+  view.setUint16(32, 2, true)
+  view.setUint16(34, 16, true)
+  writeString(36, 'data')
+  view.setUint32(40, dataSize, true)
+
+  const blob = new Blob([buffer], { type: 'audio/wav' })
+  silentAudioUrl.value = URL.createObjectURL(blob)
+  return silentAudioUrl.value
+}
+
+function loadFallbackBaseline(reason = '') {
+  const ws = wavesurferRef.value
+  if (!ws) return
+
+  const fallbackDuration = resolveFallbackDuration()
+  const baselinePeaks = buildFlatPeaks(fallbackDuration)
+  const silentUrl = ensureSilentAudioUrl()
+
+  console.warn('[WaveformTimeline] 音频不可用，启用无波形基线模式:', reason || 'unknown')
+  hasError.value = false
+  errorMessage.value = ''
+  isLoading.value = true
+  ws.load(silentUrl, baselinePeaks, fallbackDuration)
+}
 
 // ============ Composables 集成 ============
 
@@ -255,7 +319,7 @@ const {
   contextMenuItems,
   handleWaveformContextMenu: onContextMenu,
   handleContextMenuSelect,
-} = useWaveformContextMenu(projectStore, identityRef)
+} = useWaveformContextMenu(projectStore)
 
 // 包装右键菜单处理（需要传递额外参数）
 function handleWaveformContextMenu(e) {
@@ -402,7 +466,10 @@ function setupWavesurferEvents() {
       retryCount.value++
       setTimeout(() => loadAudioData(), 1000)
     } else {
-      startPeaksPolling()
+      loadFallbackBaseline('wavesurfer_error_max_retries')
+      if (audioSource.value) {
+        startPeaksPolling()
+      }
     }
   })
 }
@@ -428,7 +495,7 @@ function applyWaveformMediaState() {
 
 async function loadAudioData() {
   if (!audioSource.value) {
-    isLoading.value = false
+    loadFallbackBaseline('no_audio_source')
     return
   }
 
@@ -444,7 +511,7 @@ async function loadAudioData() {
     wavesurferRef.value.load(audioSource.value)
   } catch (error) {
     console.error('加载音频失败:', error)
-    wavesurferRef.value.load(audioSource.value)
+    loadFallbackBaseline('audio_load_exception')
   }
 }
 
@@ -623,6 +690,10 @@ onUnmounted(() => {
   if (wavesurferRef.value) {
     wavesurferRef.value.destroy()
     wavesurferRef.value = null
+  }
+  if (silentAudioUrl.value) {
+    URL.revokeObjectURL(silentAudioUrl.value)
+    silentAudioUrl.value = null
   }
 })
 </script>
