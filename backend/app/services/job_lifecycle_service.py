@@ -89,10 +89,12 @@ class JobLifecycleService:
         try:
             jobs = self.state_repo.list_tasks()
             jobs = self._prune_import_only_tasks_from_repo(jobs)
+            jobs = self._prune_missing_workspace_tasks_from_repo(jobs)
             if not jobs:
                 self._import_legacy_tasks_from_disk()
                 jobs = self.state_repo.list_tasks()
                 jobs = self._prune_import_only_tasks_from_repo(jobs)
+                jobs = self._prune_missing_workspace_tasks_from_repo(jobs)
 
             loaded_count = 0
             for job in jobs:
@@ -753,6 +755,96 @@ class JobLifecycleService:
                 self.logger.info("已清理仅编辑项目的误导入任务状态: %s", job.job_id)
             except Exception as exc:
                 self.logger.warning("清理误导入任务状态失败，将跳过加载: %s (%s)", job.job_id, exc)
+        return filtered_jobs
+
+    def _resolve_existing_workspace_for_job(self, job: JobState) -> Tuple[Optional[Path], Optional[str]]:
+        """
+        解析任务可用工作目录：
+        1) 任务内 dir；
+        2) jobs/{project_id}、jobs/{job_id}；
+        3) ProjectIdResolver（可解析时回填 project_id）。
+        """
+        normalized_job_id = str(job.job_id or "").strip()
+        normalized_project_id = str(getattr(job, "project_id", "") or "").strip()
+
+        candidates: List[Path] = []
+        raw_dir = str(getattr(job, "dir", "") or "").strip()
+        if raw_dir:
+            candidates.append(Path(raw_dir))
+        if normalized_project_id:
+            candidates.append(self.jobs_root / normalized_project_id)
+        if normalized_job_id:
+            candidates.append(self.jobs_root / normalized_job_id)
+
+        for candidate in candidates:
+            try:
+                if candidate.exists():
+                    return candidate, normalized_project_id or None
+            except Exception:
+                continue
+
+        try:
+            from app.services.project_id_resolver import get_project_id_resolver
+
+            resolver = get_project_id_resolver()
+        except Exception:
+            resolver = None
+
+        if resolver is None:
+            return None, None
+
+        for identifier in (normalized_project_id, normalized_job_id):
+            if not identifier:
+                continue
+            try:
+                identity = resolver.resolve_or_fail(identifier)
+                return Path(identity.project_dir), str(identity.project_id or "").strip() or None
+            except Exception:
+                continue
+        return None, None
+
+    def _prune_missing_workspace_tasks_from_repo(self, jobs: List[JobState]) -> List[JobState]:
+        """
+        启动完整性清理：删除后端已无可用目录的孤儿任务记录。
+        """
+        filtered_jobs: List[JobState] = []
+        for job in jobs:
+            workspace_dir, resolved_project_id = self._resolve_existing_workspace_for_job(job)
+            if workspace_dir is not None and workspace_dir.exists():
+                has_changed = False
+                normalized_workspace = str(workspace_dir)
+                if str(getattr(job, "dir", "") or "").strip() != normalized_workspace:
+                    job.dir = normalized_workspace
+                    has_changed = True
+                if (
+                    resolved_project_id
+                    and resolved_project_id != str(getattr(job, "project_id", "") or "").strip()
+                ):
+                    job.project_id = resolved_project_id
+                    has_changed = True
+                if has_changed:
+                    try:
+                        self.state_repo.upsert_task(job)
+                    except Exception as exc:
+                        self.logger.warning("回写任务目录修正失败，将保持内存修正: %s (%s)", job.job_id, exc)
+                filtered_jobs.append(job)
+                continue
+
+            try:
+                self.state_repo.delete_task(job.job_id)
+            except Exception as exc:
+                self.logger.warning("清理目录缺失任务失败(状态删除): %s (%s)", job.job_id, exc)
+
+            try:
+                if job.input_path:
+                    self.job_index.remove_mapping(job.input_path)
+                fallback_path = self.job_index.get_file_path(job.job_id)
+                if fallback_path:
+                    self.job_index.remove_mapping(fallback_path)
+            except Exception as exc:
+                self.logger.warning("清理目录缺失任务失败(索引清理): %s (%s)", job.job_id, exc)
+
+            self.logger.info("已清理目录缺失任务状态: %s", job.job_id)
         return filtered_jobs
 
     def _load_project_meta_payload(self, job_dir: Path) -> Optional[Dict[str, Any]]:

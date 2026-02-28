@@ -83,6 +83,40 @@ def create_project_task_router(transcription_service) -> APIRouter:
             return runtime_dir
         return Path(identity.project_dir)
 
+    def _is_repo_task_match(candidate: Any, identifiers: set[str]) -> bool:
+        normalized_identifiers = {item for item in identifiers if item}
+        if not normalized_identifiers:
+            return False
+        candidate_job_id = str(getattr(candidate, "job_id", "") or "").strip()
+        candidate_project_id = str(getattr(candidate, "project_id", "") or "").strip()
+        candidate_dir = str(getattr(candidate, "dir", "") or "").strip()
+        candidate_workspace = Path(candidate_dir).name if candidate_dir else ""
+        return (
+            candidate_job_id in normalized_identifiers
+            or candidate_project_id in normalized_identifiers
+            or candidate_workspace in normalized_identifiers
+        )
+
+    def _find_repo_task_for_identifiers(identifiers: set[str]) -> Optional[Any]:
+        lifecycle = getattr(transcription_service, "job_lifecycle", None)
+        state_repo = getattr(lifecycle, "state_repo", None)
+        if state_repo is None:
+            return None
+        try:
+            candidates = []
+            for item in state_repo.list_tasks():
+                if _is_repo_task_match(item, identifiers):
+                    candidates.append(item)
+            if not candidates:
+                return None
+            candidates.sort(
+                key=lambda task: float(getattr(task, "updatedAt", 0) or 0.0),
+                reverse=True,
+            )
+            return candidates[0]
+        except Exception:
+            return None
+
     def _build_task_snapshot(job: Any) -> Dict[str, Any]:
         return {
             "id": getattr(job, "job_id", ""),
@@ -333,8 +367,43 @@ def create_project_task_router(transcription_service) -> APIRouter:
     @router.post("/{project_id}/tasks/cancel")
     async def cancel_project_task(project_id: str, delete_data: bool = False):
         """取消任务。"""
-        identity, runtime_job = _resolve_runtime_job_or_404(project_id)
-        runtime_job_id = str(getattr(runtime_job, "job_id", "") or "")
+        requested_identifier = str(project_id or "").strip()
+        if not requested_identifier:
+            raise HTTPException(status_code=404, detail="任务未找到")
+
+        identity = None
+        runtime_job = None
+        target_project_id = requested_identifier
+        try:
+            identity = _resolve_project_identity(project_id)
+            target_project_id = identity.project_id
+            runtime_job = _find_runtime_job_for_project(
+                identity.project_id,
+                legacy_job_id=identity.legacy_job_id,
+            )
+            if runtime_job is not None:
+                runtime_job.project_id = identity.project_id
+                if str(getattr(runtime_job, "dir", "") or "").strip() != str(identity.project_dir):
+                    runtime_job.dir = str(identity.project_dir)
+        except HTTPException:
+            identity = None
+            runtime_job = None
+
+        runtime_job_id = str(getattr(runtime_job, "job_id", "") or "").strip()
+        if not runtime_job_id:
+            if not delete_data:
+                raise HTTPException(status_code=404, detail="任务未找到")
+            fallback_identifiers = {requested_identifier, target_project_id}
+            repo_task = _find_repo_task_for_identifiers(fallback_identifiers)
+            if repo_task is not None:
+                runtime_job_id = str(getattr(repo_task, "job_id", "") or "").strip()
+                repo_project_id = str(getattr(repo_task, "project_id", "") or "").strip()
+                if repo_project_id:
+                    target_project_id = repo_project_id
+            if not runtime_job_id:
+                # 兜底到请求标识，复用 queue_service.cancel_job(delete_data=True) 的幂等删除能力。
+                runtime_job_id = requested_identifier
+
         queue_service = _get_queue_service(transcription_service)
         result = queue_service.cancel_job(runtime_job_id, delete_data=delete_data)
         if not result.success:
@@ -350,10 +419,13 @@ def create_project_task_router(transcription_service) -> APIRouter:
         job_snapshot = None
         persisted_job = transcription_service.job_lifecycle.state_repo.get_task(runtime_job_id)
         if persisted_job is not None:
-            persisted_job.project_id = identity.project_id
+            persisted_project_id = str(getattr(persisted_job, "project_id", "") or "").strip()
+            if persisted_project_id:
+                target_project_id = persisted_project_id
+            persisted_job.project_id = target_project_id
             job_snapshot = _build_task_snapshot(persisted_job)
         return {
-            "project_id": identity.project_id,
+            "project_id": target_project_id,
             "job_id": runtime_job_id,
             "canceled": bool(result.success),
             "data_deleted": bool(delete_data),
