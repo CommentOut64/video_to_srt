@@ -23,6 +23,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from app.core.config import config
+from app.services.project_id_resolver import ProjectIdentity, get_project_id_resolver
 from app.utils.ass_converter import ASSConverter
 from app.utils.text_utils import (
     repair_srt_overlaps,
@@ -46,6 +47,7 @@ NEED_TRANSCODE_CODECS = {'hevc', 'h265', 'vp9', 'av1'}
 
 # 可作为波形数据来源的音频文件扩展名
 AUDIO_SOURCE_EXTS = {'.wav', '.mp3', '.m4a', '.aac', '.flac', '.ogg', '.wma', '.opus'}
+VIDEO_SOURCE_EXTS = {'.mp4', '.avi', '.mkv', '.mov', '.wmv', '.webm', '.flv', '.m4v'}
 
 # 音频抽取锁（按目录粒度，避免并发请求重复抽取同一文件）
 _audio_extract_lock_guard = threading.Lock()
@@ -56,9 +58,8 @@ _audio_extract_locks: dict[str, threading.Lock] = {}
 
 def _find_video_file(job_dir: Path) -> Optional[Path]:
     """在任务目录中查找视频文件"""
-    video_exts = ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.webm', '.flv', '.m4v']
     for file in job_dir.iterdir():
-        if file.is_file() and file.suffix.lower() in video_exts:
+        if file.is_file() and file.suffix.lower() in VIDEO_SOURCE_EXTS:
             return file
     return None
 
@@ -102,6 +103,10 @@ def _ensure_waveform_audio(job_dir: Path, identifier: str) -> Path:
 
         source_media = _find_audio_source_file(job_dir) or _find_video_file(job_dir)
         if source_media is None:
+            raise HTTPException(status_code=404, detail="音频源不存在")
+
+        # 视频源不含音轨时直接返回 404，避免前端误判为“服务器异常可重试”。
+        if source_media.suffix.lower() in VIDEO_SOURCE_EXTS and not _has_audio_stream(source_media):
             raise HTTPException(status_code=404, detail="音频源不存在")
 
         # 使用带 .wav 后缀的临时文件，避免 FFmpeg 因扩展名无法识别封装格式。
@@ -148,52 +153,18 @@ def _ensure_waveform_audio(job_dir: Path, identifier: str) -> Path:
         return audio_file
 
 
+def _resolve_media_identity_or_404(identifier: str) -> ProjectIdentity:
+    """统一解析媒体身份，输出规范 project 语义。"""
+    resolver = get_project_id_resolver()
+    try:
+        return resolver.resolve_or_fail(identifier)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 def _resolve_media_dir(identifier: str) -> Path:
-    """
-    统一解析媒体目录。
-
-    identifier 可以是：
-    - job_id（目录直达）
-    - project_id（通过 project_meta 反查目录）
-    - legacy job_id（通过 legacy_projection 映射到 project）
-    """
-    normalized_identifier = str(identifier or "").strip()
-    if not normalized_identifier:
-        raise HTTPException(status_code=404, detail="任务不存在")
-
-    direct_path = config.JOBS_DIR / normalized_identifier
-    if direct_path.exists():
-        return direct_path
-
-    # 尝试按 project_id 查找
-    try:
-        from app.services.project_service import get_project_service
-
-        project_service = get_project_service()
-        project = project_service.get_project(normalized_identifier)
-        if project and project.dir:
-            project_dir = Path(project.dir)
-            if project_dir.exists():
-                return project_dir
-    except Exception:
-        pass
-
-    # 尝试按 legacy job_id 映射
-    try:
-        from app.services.legacy_projection_service import get_legacy_projection_service
-        from app.services.project_service import get_project_service
-
-        legacy_service = get_legacy_projection_service()
-        project_id, _ = legacy_service.resolve(normalized_identifier)
-        project = get_project_service().get_project(project_id)
-        if project and project.dir:
-            project_dir = Path(project.dir)
-            if project_dir.exists():
-                return project_dir
-    except Exception:
-        pass
-
-    raise HTTPException(status_code=404, detail="任务不存在")
+    """兼容旧调用：仅返回媒体目录。"""
+    return _resolve_media_identity_or_404(identifier).project_dir
 
 
 def _find_best_h264(job_dir: Path):
@@ -426,6 +397,35 @@ def _get_video_codec(video_path: Path) -> Optional[str]:
     except Exception as e:
         print(f"[media] 获取视频编码失败: {e}")
     return None
+
+
+def _has_audio_stream(video_path: Path) -> bool:
+    """检测视频是否包含可提取音轨。"""
+    ffprobe_cmd = config.get_ffprobe_command()
+    cmd = [
+        ffprobe_cmd,
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=index",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(video_path),
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            encoding="utf-8",
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
+    except Exception:
+        return False
 
 
 async def _get_video_duration(video_path: Path) -> float:
@@ -801,16 +801,25 @@ async def _generate_sprite_thumbnails(video_path: Path, output_path: Path, count
         return None
 
 
-@router.get("/{job_id}/video")
-async def get_video(job_id: str, request: Request):
+@router.get("/{identifier}/video")
+async def get_video(identifier: str, request: Request):
     """
     获取视频文件（支持Range请求，自动Proxy转码）
 
     优先返回Proxy视频（如果存在），否则返回源视频
     对于不兼容的格式或编码（如HEVC/H.265），会触发异步生成Proxy
     """
-    job_dir = _resolve_media_dir(job_id)
-    logger.debug(f"[media] 收到视频请求: {job_id}")
+    job_id = identifier
+    media_identity = _resolve_media_identity_or_404(job_id)
+    project_id = media_identity.project_id
+    job_dir = media_identity.project_dir
+
+    logger.debug(
+        "[media] 收到视频请求: identifier=%s, project_id=%s, dir=%s",
+        job_id,
+        project_id,
+        job_dir,
+    )
 
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -823,31 +832,36 @@ async def get_video(job_id: str, request: Request):
 
     # V3.1.2+dev.20260114.08: 仅在调度器/状态标记 ready 时返回720p，避免未落盘即切换
     from app.services.proxy_720_scheduler import get_proxy_scheduler
-    scheduler_state = get_proxy_scheduler().get_state(job_id)
+    scheduler_state = {}
+    proxy_scheduler = get_proxy_scheduler()
+    scheduler_state = proxy_scheduler.get_state(project_id) or {}
+
     proxy_status_ready = False
     try:
         from app.services.media_prep_service import get_media_prep_service
-        proxy_status = get_media_prep_service().get_proxy_status(job_id)
+
+        media_prep = get_media_prep_service()
+        proxy_status = media_prep.get_proxy_status(project_id)
         proxy_status_ready = proxy_status and proxy_status.get("status") == "completed"
     except Exception:
         proxy_status_ready = False
 
     if proxy_720p.exists() and (scheduler_state.get("state") == "ready" or proxy_status_ready):
         logger.debug(f"[media] 返回720p高清视频（已就绪）")
-        return _serve_file_with_range(proxy_720p, request, 'video/mp4', job_id=job_id)
+        return _serve_file_with_range(proxy_720p, request, 'video/mp4', job_id=project_id)
 
     if remux_video.exists():
         print(f"[media] 返回重封装视频")
-        return _serve_file_with_range(remux_video, request, 'video/mp4', job_id=job_id)
+        return _serve_file_with_range(remux_video, request, 'video/mp4', job_id=project_id)
 
     if preview_360p.exists():
         print(f"[media] 返回360p预览视频")
-        return _serve_file_with_range(preview_360p, request, 'video/mp4', job_id=job_id)
+        return _serve_file_with_range(preview_360p, request, 'video/mp4', job_id=project_id)
 
     # 2. 查找源视频
     video_file = _find_video_file(job_dir)
     if not video_file:
-        print(f"[media] 视频文件不存在: {job_id}")
+        print(f"[media] 视频文件不存在: {project_id}")
         raise HTTPException(status_code=404, detail="视频文件不存在")
 
     logger.debug(f"找到源视频: {video_file.name}, 扩展名: {video_file.suffix.lower()}")
@@ -882,13 +896,13 @@ async def get_video(job_id: str, request: Request):
         preview_360p = job_dir / "preview_360p.mp4"
 
         # 检查 360p 预览状态
-        preview_status = media_prep.get_preview_status(job_id)
+        preview_status = media_prep.get_preview_status(project_id)
         preview_in_progress = preview_status and preview_status.get("status") in ["queued", "processing"]
         preview_completed = preview_status and preview_status.get("status") == "completed"
         print(f"[media] 360p预览状态: {preview_status}, 进行中={preview_in_progress}, 已完成={preview_completed}")
 
         # 检查 720p Proxy 状态
-        proxy_status = media_prep.get_proxy_status(job_id)
+        proxy_status = media_prep.get_proxy_status(project_id)
         proxy_in_progress = proxy_status and proxy_status.get("status") in ["queued", "processing"]
         proxy_completed = proxy_status and proxy_status.get("status") == "completed"
         print(f"[media] 720p Proxy状态: {proxy_status}, 进行中={proxy_in_progress}, 已完成={proxy_completed}")
@@ -899,12 +913,12 @@ async def get_video(job_id: str, request: Request):
         # 优先级1: 如果 720p 已完成，返回 720p 视频
         if proxy_completed and proxy_720p.exists():
             print(f"[media] 返回已完成的720p高清视频")
-            return _serve_file_with_range(proxy_720p, request, 'video/mp4', job_id=job_id)
+            return _serve_file_with_range(proxy_720p, request, 'video/mp4', job_id=project_id)
 
         # 优先级2: 如果 360p 已完成，返回 360p 视频（720p可能正在处理或未启动）
         if preview_completed and preview_360p.exists():
             print(f"[media] 返回已完成的360p预览视频")
-            return _serve_file_with_range(preview_360p, request, 'video/mp4', job_id=job_id)
+            return _serve_file_with_range(preview_360p, request, 'video/mp4', job_id=project_id)
 
         # 如果有任务正在处理，返回进度信息
         if preview_in_progress or proxy_in_progress:
@@ -925,7 +939,7 @@ async def get_video(job_id: str, request: Request):
         # 只启动 360p 预览转码（快速让用户看到视频）
         # 720p 高清转码将在转录完成后、队列空闲时自动触发
         print(f"[media] 调用 enqueue_preview() 启动360p转码: {video_file} -> {preview_360p}")
-        success = media_prep.enqueue_preview(job_id, video_file, preview_360p, priority=5)
+        success = media_prep.enqueue_preview(project_id, video_file, preview_360p, priority=5)
         print(f"[media] enqueue_preview() 返回: {success}")
 
         raise HTTPException(
@@ -940,20 +954,22 @@ async def get_video(job_id: str, request: Request):
 
     # 4. 返回兼容格式的源视频
     # 日志已在编码检测时输出，此处不再重复
-    return _serve_file_with_range(video_file, request, 'video/mp4', job_id=job_id)
+    return _serve_file_with_range(video_file, request, 'video/mp4', job_id=project_id)
 
 
-@router.get("/{job_id}/audio")
-async def get_audio(job_id: str, request: Request):
+@router.get("/{identifier}/audio")
+async def get_audio(identifier: str, request: Request):
     """获取音频文件（支持Range请求）"""
-    job_dir = _resolve_media_dir(job_id)
-    audio_file = _ensure_waveform_audio(job_dir, job_id)
+    job_id = identifier
+    media_identity = _resolve_media_identity_or_404(job_id)
+    job_dir = media_identity.project_dir
+    audio_file = _ensure_waveform_audio(job_dir, media_identity.project_id)
 
-    return _serve_file_with_range(audio_file, request, 'audio/wav', job_id=job_id)
+    return _serve_file_with_range(audio_file, request, 'audio/wav', job_id=media_identity.project_id)
 
 
-@router.get("/{job_id}/peaks")
-async def get_audio_peaks(job_id: str, samples: int = 0, method: str = "auto"):
+@router.get("/{identifier}/peaks")
+async def get_audio_peaks(identifier: str, samples: int = 0, method: str = "auto"):
     """
     获取音频波形峰值数据（优化：动态采样密度）
 
@@ -965,8 +981,10 @@ async def get_audio_peaks(job_id: str, samples: int = 0, method: str = "auto"):
     Returns:
         JSON: { peaks: [min, max, min, max, ...], duration: 180.5, method: "ffmpeg" }
     """
-    job_dir = _resolve_media_dir(job_id)
-    audio_file = _ensure_waveform_audio(job_dir, job_id)
+    job_id = identifier
+    media_identity = _resolve_media_identity_or_404(job_id)
+    job_dir = media_identity.project_dir
+    audio_file = _ensure_waveform_audio(job_dir, media_identity.project_id)
 
     # 【关键修改】获取音频时长，动态计算采样点
     if samples <= 0:
@@ -1057,8 +1075,8 @@ async def get_audio_peaks(job_id: str, samples: int = 0, method: str = "auto"):
         raise HTTPException(status_code=500, detail=f"波形数据生成失败: {str(e)}")
 
 
-@router.get("/{job_id}/proxy-status")
-async def check_proxy_status(job_id: str):
+@router.get("/{identifier}/proxy-status")
+async def check_proxy_status(identifier: str):
     """
     获取 Proxy 视频完整状态（用于前端刷新后恢复）
 
@@ -1077,7 +1095,10 @@ async def check_proxy_status(job_id: str):
             "estimated_remaining": null
         }
     """
-    job_dir = _resolve_media_dir(job_id)
+    job_id = identifier
+    media_identity = _resolve_media_identity_or_404(job_id)
+    project_id = media_identity.project_id
+    job_dir = media_identity.project_dir
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
 
@@ -1086,7 +1107,7 @@ async def check_proxy_status(job_id: str):
     from app.services.proxy_720_scheduler import get_proxy_scheduler  # 统一720p调度
 
     media_prep = get_media_prep_service()
-    task_status = media_prep.get_full_task_status(job_id)
+    task_status = media_prep.get_full_task_status(project_id)
 
     # 检查文件存在性，构建 URLs
     preview_360p = job_dir / "preview_360p.mp4"
@@ -1095,13 +1116,15 @@ async def check_proxy_status(job_id: str):
     source_video = _find_video_file(job_dir)
 
     urls = {
-        "360p": f"/api/media/{job_id}/video/preview" if preview_360p.exists() else None,
-        "720p": f"/api/media/{job_id}/video" if (proxy_720p.exists() or remux_video.exists()) else None,
-        "source": f"/api/media/{job_id}/video" if source_video else None
+        "360p": f"/api/media/{project_id}/video/preview" if preview_360p.exists() else None,
+        "720p": f"/api/media/{project_id}/video" if (proxy_720p.exists() or remux_video.exists()) else None,
+        "source": f"/api/media/{project_id}/video" if source_video else None
     }
 
     # V3.1.2+dev.20260114.06: 读取调度器状态（用于版本/状态一致性）
-    scheduler_state = get_proxy_scheduler().get_state(job_id)
+    scheduler_state = {}
+    proxy_scheduler = get_proxy_scheduler()
+    scheduler_state = proxy_scheduler.get_state(project_id) or {}
 
     # 如果没有任务状态，根据文件存在性和调度器状态推断
     if not task_status:
@@ -1116,7 +1139,7 @@ async def check_proxy_status(job_id: str):
             progress = 100
             # V3.1.2+dev.20260114.06: 确保任务被调度器跟踪，但不在此处触发
             if source_video:
-                get_proxy_scheduler().ensure_tracked(job_id, source_video, trigger_type="editor_check")
+                get_proxy_scheduler().ensure_tracked(project_id, source_video, trigger_type="editor_check")
         elif source_video:
             # 分析是否需要转码
             from app.utils.media_analyzer import media_analyzer
@@ -1137,12 +1160,12 @@ async def check_proxy_status(job_id: str):
                     if decision == TranscodeDecision.REMUX_ONLY:
                         # 仅重封装
                         remux_output = job_dir / "remux.mp4"
-                        media_prep.enqueue_remux(job_id, source_video, remux_output, priority=3)
-                        print(f"[media] 自动启动重封装任务: {job_id}")
+                        media_prep.enqueue_remux(project_id, source_video, remux_output, priority=3)
+                        print(f"[media] 自动启动重封装任务: {project_id}")
                     else:
                         # 需要完整转码，启动360p预览
-                        media_prep.enqueue_preview(job_id, source_video, preview_360p, priority=5)
-                        print(f"[media] 自动启动360p预览转码: {job_id}")
+                        media_prep.enqueue_preview(project_id, source_video, preview_360p, priority=5)
+                        print(f"[media] 自动启动360p预览转码: {project_id}")
             except Exception as e:
                 print(f"[media] 分析视频失败: {e}")
                 state = "idle"
@@ -1160,17 +1183,19 @@ async def check_proxy_status(job_id: str):
             "started_at": None,
             "estimated_remaining": None,
             "auto_trigger_720p": config.PROXY_CONFIG.get('auto_trigger_720p', True),
-            "version": scheduler_state.get("version")
+            "version": scheduler_state.get("version"),
+            "project_id": project_id,
+            "legacy_job_id": None,
         })
 
     # 【新增】检查360p是否需要重试（处理意外关闭的情况）
     # 如果360p不存在且没有正在进行的360p任务，自动启动360p转码
     if not preview_360p.exists() and source_video:
-        preview_status = media_prep.get_preview_status(job_id)
+        preview_status = media_prep.get_preview_status(project_id)
         preview_in_progress = preview_status and preview_status.get("status") in ["queued", "processing"]
 
         if not preview_in_progress:
-            print(f"[media] 360p不存在且未在队列中，自动启动360p转码: {job_id}")
+            print(f"[media] 360p不存在且未在队列中，自动启动360p转码: {project_id}")
             try:
                 # 分析视频决策
                 from app.utils.media_analyzer import media_analyzer
@@ -1180,8 +1205,8 @@ async def check_proxy_status(job_id: str):
 
                 if decision != TranscodeDecision.DIRECT_PLAY:
                     # 需要转码，启动360p预览
-                    media_prep.enqueue_preview(job_id, source_video, preview_360p, priority=5)
-                    print(f"[media] 已自动启动360p预览转码: {job_id}")
+                    media_prep.enqueue_preview(project_id, source_video, preview_360p, priority=5)
+                    print(f"[media] 已自动启动360p预览转码: {project_id}")
             except Exception as e:
                 print(f"[media] 自动启动360p转码失败: {e}")
 
@@ -1199,7 +1224,7 @@ async def check_proxy_status(job_id: str):
     best_playable_url = None
     best_playable_resolution = None
     if best_h264_path:
-        best_playable_url = f"/api/media/{job_id}/video"
+        best_playable_url = f"/api/media/{project_id}/video"
         if best_h264_path.name == "proxy_720p.mp4":
             best_playable_resolution = "720p"
         elif best_h264_path.name.startswith("preview_"):
@@ -1225,12 +1250,14 @@ async def check_proxy_status(job_id: str):
         "auto_trigger_720p": config.PROXY_CONFIG.get('auto_trigger_720p', True),
         "version": scheduler_state.get("version"),
         "best_playable_url": best_playable_url,
-        "best_playable_resolution": best_playable_resolution
+        "best_playable_resolution": best_playable_resolution,
+        "project_id": project_id,
+        "legacy_job_id": None,
     })
 
 
-@router.get("/{job_id}/thumbnail")
-async def get_thumbnail(job_id: str):
+@router.get("/{identifier}/thumbnail")
+async def get_thumbnail(identifier: str):
     """
     获取任务的单个缩略图（第一帧）用于任务卡片展示（第二阶段修复：实时更新）
 
@@ -1240,9 +1267,25 @@ async def get_thumbnail(job_id: str):
     Returns:
         Base64编码的缩略图 or JSON占位符
     """
-    job_dir = _resolve_media_dir(job_id)
+    job_id = identifier
+    try:
+        job_dir = _resolve_media_dir(job_id)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            return JSONResponse(
+                {
+                    "thumbnail": None,
+                    "message": "任务不存在",
+                }
+            )
+        raise
     if not job_dir.exists():
-        raise HTTPException(status_code=404, detail="任务不存在")
+        return JSONResponse(
+            {
+                "thumbnail": None,
+                "message": "任务不存在",
+            }
+        )
 
     # 检查缓存的缩略图文件
     cached_thumbnail = job_dir / "thumbnail.jpg"
@@ -1335,8 +1378,8 @@ async def get_thumbnail(job_id: str):
         })
 
 
-@router.get("/{job_id}/thumbnails")
-async def get_thumbnails(job_id: str, count: int = 10, sprite: bool = True):
+@router.get("/{identifier}/thumbnails")
+async def get_thumbnails(identifier: str, count: int = 10, sprite: bool = True):
     """
     获取视频缩略图
 
@@ -1349,6 +1392,7 @@ async def get_thumbnails(job_id: str, count: int = 10, sprite: bool = True):
         - sprite=True: { sprite, thumb_width, thumb_height, cols, rows, timestamps }
         - sprite=False: { thumbnails: [base64_img1, ...], timestamps: [...] }
     """
+    job_id = identifier
     job_dir = _resolve_media_dir(job_id)
 
     # 检查Sprite缓存
@@ -1458,9 +1502,10 @@ async def get_thumbnails(job_id: str, count: int = 10, sprite: bool = True):
         raise HTTPException(status_code=500, detail=f"缩略图生成失败: {str(e)}")
 
 
-@router.get("/{job_id}/sprite.jpg")
-async def get_sprite_image(job_id: str):
+@router.get("/{identifier}/sprite.jpg")
+async def get_sprite_image(identifier: str):
     """直接获取Sprite图片文件"""
+    job_id = identifier
     job_dir = _resolve_media_dir(job_id)
     sprite_file = job_dir / "sprite.jpg"
 
@@ -1470,14 +1515,17 @@ async def get_sprite_image(job_id: str):
     return FileResponse(str(sprite_file), media_type="image/jpeg")
 
 
-@router.get("/{job_id}/video/preview")
-async def get_preview_video(job_id: str, request: Request):
+@router.get("/{identifier}/video/preview")
+async def get_preview_video(identifier: str, request: Request):
     """
     获取 360p 预览视频（渐进式加载第一阶段）
 
     用于在转码过程中快速预览视频内容
     """
-    job_dir = _resolve_media_dir(job_id)
+    job_id = identifier
+    media_identity = _resolve_media_identity_or_404(job_id)
+    project_id = media_identity.project_id
+    job_dir = media_identity.project_dir
 
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -1485,12 +1533,12 @@ async def get_preview_video(job_id: str, request: Request):
     # 查找 360p 预览视频
     preview_360p = job_dir / "preview_360p.mp4"
     if preview_360p.exists():
-        return _serve_file_with_range(preview_360p, request, 'video/mp4', job_id=job_id)
+        return _serve_file_with_range(preview_360p, request, 'video/mp4', job_id=project_id)
 
     # 如果没有 360p，尝试返回 720p proxy
     proxy_video = job_dir / "proxy_720p.mp4"
     if proxy_video.exists():
-        return _serve_file_with_range(proxy_video, request, 'video/mp4', job_id=job_id)
+        return _serve_file_with_range(proxy_video, request, 'video/mp4', job_id=project_id)
 
     # 都没有，返回 202 表示正在生成
     raise HTTPException(
@@ -1502,8 +1550,8 @@ async def get_preview_video(job_id: str, request: Request):
     )
 
 
-@router.get("/{job_id}/status/progressive")
-async def get_progressive_status(job_id: str):
+@router.get("/{identifier}/status/progressive")
+async def get_progressive_status(identifier: str):
     """
     获取渐进式加载状态
 
@@ -1513,7 +1561,10 @@ async def get_progressive_status(job_id: str):
     - 720p 高质量进度/状态
     - 可用的视频 URL
     """
-    job_dir = _resolve_media_dir(job_id)
+    job_id = identifier
+    media_identity = _resolve_media_identity_or_404(job_id)
+    project_id = media_identity.project_id
+    job_dir = media_identity.project_dir
 
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -1546,7 +1597,7 @@ async def get_progressive_status(job_id: str):
     media_prep = get_media_prep_service()
 
     # 获取 360p 预览状态
-    preview_status_info = media_prep.get_preview_status(job_id)
+    preview_status_info = media_prep.get_preview_status(project_id)
     if preview_status_info:
         preview_status = {
             "status": preview_status_info.get("status", "not_started"),
@@ -1554,7 +1605,7 @@ async def get_progressive_status(job_id: str):
         }
 
     # 获取 720p proxy 状态
-    proxy_status_info = media_prep.get_proxy_status(job_id)
+    proxy_status_info = media_prep.get_proxy_status(project_id)
     if proxy_status_info:
         proxy_status = {
             "status": proxy_status_info.get("status", "not_started"),
@@ -1569,13 +1620,13 @@ async def get_progressive_status(job_id: str):
 
         if not preview_exists and not preview_in_progress:
             # 启动360p预览转码
-            print(f"[media] progressive-status 检测到需要转码，自动触发: {job_id}")
-            success = media_prep.enqueue_preview(job_id, video_file, preview_360p, priority=5)
+            print(f"[media] progressive-status 检测到需要转码，自动触发: {project_id}")
+            success = media_prep.enqueue_preview(project_id, video_file, preview_360p, priority=5)
             print(f"[media] enqueue_preview() 返回: {success}")
 
             # 更新状态为已入队
             if success:
-                preview_status_info = media_prep.get_preview_status(job_id)
+                preview_status_info = media_prep.get_preview_status(project_id)
                 if preview_status_info:
                     preview_status = {
                         "status": preview_status_info.get("status", "queued"),
@@ -1584,18 +1635,19 @@ async def get_progressive_status(job_id: str):
 
     # 构建响应
     result = {
-        "job_id": job_id,
+        "job_id": project_id,
+        "project_id": project_id,
         "needs_transcode": needs_transcode,
         "transcode_reason": transcode_reason,
         "preview_360p": {
             "exists": preview_360p.exists(),
-            "url": f"/api/media/{job_id}/video/preview" if preview_360p.exists() else None,
+            "url": f"/api/media/{project_id}/video/preview" if preview_360p.exists() else None,
             "size": preview_360p.stat().st_size if preview_360p.exists() else 0,
             "status": preview_status  # 包含转码状态和进度
         },
         "proxy_720p": {
             "exists": proxy_720p.exists(),
-            "url": f"/api/media/{job_id}/video" if proxy_720p.exists() else None,
+            "url": f"/api/media/{project_id}/video" if proxy_720p.exists() else None,
             "size": proxy_720p.stat().st_size if proxy_720p.exists() else 0,
             "status": proxy_status
         },
@@ -1603,20 +1655,20 @@ async def get_progressive_status(job_id: str):
             "exists": video_file is not None,
             "filename": video_file.name if video_file else None,
             "compatible": not needs_transcode,
-            "url": f"/api/media/{job_id}/video" if video_file and not needs_transcode else None
+            "url": f"/api/media/{project_id}/video" if video_file and not needs_transcode else None
         },
         "recommended_url": None  # 推荐使用的视频 URL
     }
 
     # 确定推荐的视频 URL
     if proxy_720p.exists():
-        result["recommended_url"] = f"/api/media/{job_id}/video"
+        result["recommended_url"] = f"/api/media/{project_id}/video"
         result["current_resolution"] = "720p"
     elif preview_360p.exists():
-        result["recommended_url"] = f"/api/media/{job_id}/video/preview"
+        result["recommended_url"] = f"/api/media/{project_id}/video/preview"
         result["current_resolution"] = "360p"
     elif video_file and not needs_transcode:
-        result["recommended_url"] = f"/api/media/{job_id}/video"
+        result["recommended_url"] = f"/api/media/{project_id}/video"
         result["current_resolution"] = "source"
     else:
         result["current_resolution"] = None
@@ -1624,14 +1676,17 @@ async def get_progressive_status(job_id: str):
     return JSONResponse(result)
 
 
-@router.post("/{job_id}/generate-preview")
-async def trigger_preview_generation(job_id: str):
+@router.post("/{identifier}/generate-preview")
+async def trigger_preview_generation(identifier: str):
     """
     手动触发 360p 预览视频生成
 
     在某些情况下，可能需要手动触发预览生成
     """
-    job_dir = _resolve_media_dir(job_id)
+    job_id = identifier
+    media_identity = _resolve_media_identity_or_404(job_id)
+    project_id = media_identity.project_id
+    job_dir = media_identity.project_dir
 
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -1646,7 +1701,7 @@ async def trigger_preview_generation(job_id: str):
         return JSONResponse({
             "success": True,
             "message": "预览视频已存在",
-            "url": f"/api/media/{job_id}/video/preview"
+            "url": f"/api/media/{project_id}/video/preview"
         })
 
     # 异步生成 360p 预览
@@ -1658,7 +1713,7 @@ async def trigger_preview_generation(job_id: str):
         pass
 
     asyncio.create_task(
-        progressive_video_generator.generate_360p_preview(job_id, video_file, preview_360p)
+        progressive_video_generator.generate_360p_preview(project_id, video_file, preview_360p)
     )
 
     return JSONResponse({
@@ -1668,8 +1723,8 @@ async def trigger_preview_generation(job_id: str):
     })
 
 
-@router.post("/{job_id}/post-process")
-async def post_process_transcription(job_id: str):
+@router.post("/{identifier}/post-process")
+async def post_process_transcription(identifier: str):
     """
     转录后处理：预生成编辑器所需的所有数据
     在转录完成后调用，异步生成波形、缩略图、Proxy视频
@@ -1677,7 +1732,10 @@ async def post_process_transcription(job_id: str):
     Returns:
         JSON: { peaks: bool, thumbnails: bool, proxy: bool, sprite: bool }
     """
-    job_dir = _resolve_media_dir(job_id)
+    job_id = identifier
+    media_identity = _resolve_media_identity_or_404(job_id)
+    project_id = media_identity.project_id
+    job_dir = media_identity.project_dir
 
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -1695,7 +1753,7 @@ async def post_process_transcription(job_id: str):
         audio_file = job_dir / "audio.wav"
         if audio_file.exists():
             # 使用 samples=0 让后端自动计算采样点数
-            await get_audio_peaks(job_id, 0)
+            await get_audio_peaks(project_id, 0)
             results["peaks"] = True
     except Exception as e:
         print(f"[media] 波形生成失败: {e}")
@@ -1705,7 +1763,7 @@ async def post_process_transcription(job_id: str):
         sprite_cache = job_dir / "sprite_10.json"
         thumbnails_cache = job_dir / "thumbnails_10.json"
         if not sprite_cache.exists() and not thumbnails_cache.exists():
-            await get_thumbnails(job_id, 10, sprite=True)
+            await get_thumbnails(project_id, 10, sprite=True)
         results["thumbnails"] = True
         results["sprite"] = sprite_cache.exists()
     except Exception as e:
@@ -1720,21 +1778,24 @@ async def post_process_transcription(job_id: str):
             # 使用 MediaPrepService 管理转码
             from app.services.media_prep_service import get_media_prep_service
             media_prep = get_media_prep_service()
-            media_prep.enqueue_proxy(job_id, video_file, proxy_video, priority=20)
+            media_prep.enqueue_proxy(project_id, video_file, proxy_video, priority=20)
             results["proxy"] = True
 
     return JSONResponse(results)
 
 
-@router.get("/{job_id}/srt")
-async def get_srt_content(job_id: str):
+@router.get("/{identifier}/srt")
+async def get_srt_content(identifier: str):
     """
     获取SRT字幕文件内容
 
     Returns:
         JSON: { job_id, filename, content, encoding }
     """
-    job_dir = _resolve_media_dir(job_id)
+    job_id = identifier
+    media_identity = _resolve_media_identity_or_404(job_id)
+    project_id = media_identity.project_id
+    job_dir = media_identity.project_dir
 
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -1753,7 +1814,8 @@ async def get_srt_content(job_id: str):
             content = f.read()
 
         return JSONResponse({
-            "job_id": job_id,
+            "job_id": project_id,
+            "project_id": project_id,
             "filename": srt_file.name,
             "content": content,
             "encoding": "utf-8"
@@ -1762,8 +1824,8 @@ async def get_srt_content(job_id: str):
         raise HTTPException(status_code=500, detail=f"读取SRT文件失败: {str(e)}")
 
 
-@router.post("/{job_id}/srt")
-async def save_srt_content(job_id: str, request: Request):
+@router.post("/{identifier}/srt")
+async def save_srt_content(identifier: str, request: Request):
     """
     保存编辑后的SRT字幕文件
     V3.1.1+dev.20260106.03: 保存前自动修复时间戳重叠
@@ -1774,7 +1836,10 @@ async def save_srt_content(job_id: str, request: Request):
             auto_repair: true  // 可选，默认 true，是否自动修复重叠
         }
     """
-    job_dir = _resolve_media_dir(job_id)
+    job_id = identifier
+    media_identity = _resolve_media_identity_or_404(job_id)
+    project_id = media_identity.project_id
+    job_dir = media_identity.project_dir
 
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -1792,7 +1857,7 @@ async def save_srt_content(job_id: str, request: Request):
         if auto_repair:
             content, repaired_count = repair_srt_overlaps(content, gap_ms=1.0)
             if repaired_count > 0:
-                logger.info(f"[{job_id}] 自动修复了 {repaired_count} 处时间戳重叠")
+                logger.info(f"[{project_id}] 自动修复了 {repaired_count} 处时间戳重叠")
 
         srt_file = None
         for file in job_dir.iterdir():
@@ -1819,7 +1884,8 @@ async def save_srt_content(job_id: str, request: Request):
         response_data = {
             "success": True,
             "message": "SRT文件保存成功",
-            "filename": srt_file.name
+            "filename": srt_file.name,
+            "project_id": project_id,
         }
 
         # V3.1.1+dev.20260106.03: 返回修复信息
@@ -1835,15 +1901,18 @@ async def save_srt_content(job_id: str, request: Request):
         raise HTTPException(status_code=500, detail=f"保存SRT文件失败: {str(e)}")
 
 
-@router.get("/{job_id}/ass")
-async def get_ass_content(job_id: str):
+@router.get("/{identifier}/ass")
+async def get_ass_content(identifier: str):
     """
     获取 ASS 字幕文件内容
 
     Returns:
         JSON: { job_id, filename, content, encoding }
     """
-    job_dir = _resolve_media_dir(job_id)
+    job_id = identifier
+    media_identity = _resolve_media_identity_or_404(job_id)
+    project_id = media_identity.project_id
+    job_dir = media_identity.project_dir
 
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -1862,7 +1931,8 @@ async def get_ass_content(job_id: str):
             content = f.read()
 
         return JSONResponse({
-            "job_id": job_id,
+            "job_id": project_id,
+            "project_id": project_id,
             "filename": ass_file.name,
             "content": content,
             "encoding": "utf-8"
@@ -1871,8 +1941,8 @@ async def get_ass_content(job_id: str):
         raise HTTPException(status_code=500, detail=f"读取ASS文件失败: {str(e)}")
 
 
-@router.post("/{job_id}/ass/generate")
-async def generate_ass_from_srt(job_id: str, request: Request):
+@router.post("/{identifier}/ass/generate")
+async def generate_ass_from_srt(identifier: str, request: Request):
     """
     从 SRT 文件生成 ASS 字幕文件
     V3.1.1+dev.20260106.03: 生成前自动修复时间戳重叠
@@ -1889,7 +1959,10 @@ async def generate_ass_from_srt(job_id: str, request: Request):
     Returns:
         JSON: { job_id, filename, message, repaired_overlaps? }
     """
-    job_dir = _resolve_media_dir(job_id)
+    job_id = identifier
+    media_identity = _resolve_media_identity_or_404(job_id)
+    project_id = media_identity.project_id
+    job_dir = media_identity.project_dir
 
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -1927,7 +2000,7 @@ async def generate_ass_from_srt(job_id: str, request: Request):
 
             if repaired_count > 0:
                 subtitles = repair_timestamp_overlaps(subtitles, gap_ms=1.0)
-                logger.info(f"[{job_id}] ASS生成前自动修复了 {repaired_count} 处时间戳重叠")
+                logger.info(f"[{project_id}] ASS生成前自动修复了 {repaired_count} 处时间戳重叠")
 
         # 生成 ASS 文件
         ass_file = job_dir / f"{srt_file.stem}.ass"
@@ -1943,7 +2016,8 @@ async def generate_ass_from_srt(job_id: str, request: Request):
         logger.info(f"ASS 文件已生成: {ass_file}")
 
         response_data = {
-            "job_id": job_id,
+            "job_id": project_id,
+            "project_id": project_id,
             "filename": ass_file.name,
             "message": "ASS文件生成成功"
         }
@@ -1960,8 +2034,8 @@ async def generate_ass_from_srt(job_id: str, request: Request):
         raise HTTPException(status_code=500, detail=f"生成ASS文件失败: {str(e)}")
 
 
-@router.get("/{job_id}/info")
-async def get_media_info(job_id: str, retry_missing: bool = True):
+@router.get("/{identifier}/info")
+async def get_media_info(identifier: str, retry_missing: bool = True):
     """
     获取任务的媒体信息摘要（支持自动重试生成缺失资源）
 
@@ -1972,15 +2046,20 @@ async def get_media_info(job_id: str, retry_missing: bool = True):
     Returns:
         JSON: 包含视频、音频、SRT等文件的可用状态
     """
-    job_dir = _resolve_media_dir(job_id)
+    job_id = identifier
+    media_identity = _resolve_media_identity_or_404(job_id)
+    project_id = media_identity.project_id
+    job_dir = media_identity.project_dir
 
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
 
     video_file = _find_video_file(job_dir)
     audio_file = job_dir / "audio.wav"
+    audio_source_file = _find_audio_source_file(job_dir)
     proxy_video = job_dir / "proxy_720p.mp4"
     peaks_cache = job_dir / "peaks_2000.json"
+    peaks_caches = list(job_dir.glob("peaks_*_v*.json"))
     sprite_cache = job_dir / "sprite_10.json"
     thumbnails_cache = job_dir / "thumbnails_10.json"
     thumbnail_single = job_dir / "thumbnail.jpg"
@@ -2003,7 +2082,7 @@ async def get_media_info(job_id: str, retry_missing: bool = True):
     # 获取Proxy生成状态（从 MediaPrepService）
     from app.services.media_prep_service import get_media_prep_service
     media_prep = get_media_prep_service()
-    proxy_status = media_prep.get_proxy_status(job_id)
+    proxy_status = media_prep.get_proxy_status(project_id)
 
     # 智能重试：如果资源缺失且启用重试，则尝试异步生成
     if retry_missing:
@@ -2011,7 +2090,7 @@ async def get_media_info(job_id: str, retry_missing: bool = True):
         if not peaks_cache.exists() and audio_file.exists():
             try:
                 print(f"[media] 检测到波形数据缺失，尝试生成: {job_id}")
-                asyncio.create_task(_auto_generate_peaks(job_id, audio_file, peaks_cache))
+                asyncio.create_task(_auto_generate_peaks(project_id, audio_file, peaks_cache))
             except Exception as e:
                 print(f"[media] 波形数据生成失败: {e}")
 
@@ -2019,7 +2098,7 @@ async def get_media_info(job_id: str, retry_missing: bool = True):
         if not thumbnail_single.exists() and video_file:
             try:
                 print(f"[media] 检测到缩略图缺失，尝试生成: {job_id}")
-                asyncio.create_task(_auto_generate_thumbnail(job_id, video_file, thumbnail_single))
+                asyncio.create_task(_auto_generate_thumbnail(project_id, video_file, thumbnail_single))
             except Exception as e:
                 print(f"[media] 缩略图生成失败: {e}")
 
@@ -2027,13 +2106,21 @@ async def get_media_info(job_id: str, retry_missing: bool = True):
         if needs_proxy and not proxy_video.exists():
             if not (proxy_status and proxy_status.get("status") in ["queued", "processing"]):
                 try:
-                    print(f"[media] 检测到Proxy缺失，尝试生成: {job_id}")
-                    media_prep.enqueue_proxy(job_id, video_file, proxy_video, priority=30)
+                    print(f"[media] 检测到Proxy缺失，尝试生成: {project_id}")
+                    media_prep.enqueue_proxy(project_id, video_file, proxy_video, priority=30)
                 except Exception as e:
                     print(f"[media] Proxy视频生成失败: {e}")
 
+    video_has_audio_stream = _has_audio_stream(video_file) if video_file else False
+    audio_extractable = bool(audio_source_file or video_has_audio_stream)
+    audio_state = "ready" if (audio_file.exists() or audio_source_file) else ("derivable" if video_has_audio_stream else "absent")
+    media_mode = "with_audio" if audio_state in {"ready", "derivable"} else "no_media"
+
     return JSONResponse({
-        "job_id": job_id,
+        "job_id": project_id,
+        "project_id": project_id,
+        "identifier": str(job_id or "").strip(),
+        "media_mode": media_mode,
         "video": {
             "exists": video_file is not None,
             "filename": video_file.name if video_file else None,
@@ -2043,30 +2130,34 @@ async def get_media_info(job_id: str, retry_missing: bool = True):
             "proxy_exists": proxy_video.exists(),
             "proxy_generating": proxy_status and proxy_status.get("status") == "processing",
             "proxy_progress": proxy_status.get("progress", 0) if proxy_status else 0,
-            "url": f"/api/media/{job_id}/video" if video_file or proxy_video.exists() else None
+            "url": f"/api/media/{project_id}/video" if video_file or proxy_video.exists() else None
         },
         "audio": {
             "exists": audio_file.exists(),
-            "url": f"/api/media/{job_id}/audio" if audio_file.exists() else None
+            "source_exists": audio_source_file is not None,
+            "extractable": audio_extractable,
+            "state": audio_state,
+            "url": f"/api/media/{project_id}/audio" if (audio_file.exists() or audio_extractable) else None
         },
         "peaks": {
-            "exists": peaks_cache.exists(),
-            "generating": not peaks_cache.exists() and audio_file.exists() and retry_missing,
-            "url": f"/api/media/{job_id}/peaks" if audio_file.exists() else None
+            "exists": peaks_cache.exists() or len(peaks_caches) > 0,
+            "cache_files": len(peaks_caches),
+            "generating": not (peaks_cache.exists() or len(peaks_caches) > 0) and audio_extractable and retry_missing,
+            "url": f"/api/media/{project_id}/peaks" if audio_extractable else None
         },
         "thumbnails": {
             "exists": thumbnails_cache.exists() or sprite_cache.exists(),
             "sprite_exists": sprite_cache.exists(),
             "single_exists": thumbnail_single.exists(),
             "generating": not thumbnail_single.exists() and video_file and retry_missing,
-            "url": f"/api/media/{job_id}/thumbnails" if video_file else None,
-            "sprite_url": f"/api/media/{job_id}/sprite.jpg" if sprite_cache.exists() else None,
-            "thumbnail_url": f"/api/media/{job_id}/thumbnail" if video_file else None
+            "url": f"/api/media/{project_id}/thumbnails" if video_file else None,
+            "sprite_url": f"/api/media/{project_id}/sprite.jpg" if sprite_cache.exists() else None,
+            "thumbnail_url": f"/api/media/{project_id}/thumbnail" if video_file else None
         },
         "srt": {
             "exists": srt_file is not None,
             "filename": srt_file.name if srt_file else None,
-            "url": f"/api/media/{job_id}/srt" if srt_file else None
+            "url": f"/api/media/{project_id}/srt" if srt_file else None
         }
     })
 
@@ -2168,8 +2259,8 @@ async def _auto_generate_thumbnail(job_id: str, video_file: Path, thumbnail_file
         print(f"[media] 缩略图自动生成失败 [{job_id}]: {e}")
 
 
-@router.post("/{job_id}/upgrade-720p")
-async def upgrade_to_720p(job_id: str):
+@router.post("/{identifier}/upgrade-720p")
+async def upgrade_to_720p(identifier: str):
     """
     V3.1.2+dev.20260114.07: 手动触发720p转码（自动启用时禁止手动）
 
@@ -2187,11 +2278,13 @@ async def upgrade_to_720p(job_id: str):
         }
     """
     try:
-        from app.services.media_prep_service import get_media_prep_service
         from app.services.proxy_720_scheduler import get_proxy_scheduler
 
-        media_prep = get_media_prep_service()
         scheduler = get_proxy_scheduler()
+        job_id = identifier
+        media_identity = _resolve_media_identity_or_404(job_id)
+        project_id = media_identity.project_id
+        job_dir = media_identity.project_dir
 
         # 自动模式下禁止手动
         auto_enabled = config.PROXY_CONFIG.get('auto_trigger_720p', False)
@@ -2205,7 +2298,6 @@ async def upgrade_to_720p(job_id: str):
                 status_code=400
             )
 
-        job_dir = _resolve_media_dir(job_id)
         if not job_dir.exists():
             return JSONResponse(
                 content={
@@ -2236,7 +2328,7 @@ async def upgrade_to_720p(job_id: str):
 
         # 调度器统一检查：360p、队列、进行中等
         result = scheduler.request(
-            job_id,
+            project_id,
             video_file,
             trigger_type="manual",
             auto_enabled=auto_enabled,
