@@ -59,6 +59,7 @@ export function useProxyVideo(identityIdInput) {
     proxy720p: null,
     source: null
   })
+  const resolvedProjectId = ref(null)
 
   // 待替换的720p URL（用于延迟替换）
   const pending720pUrl = ref(null)
@@ -179,8 +180,9 @@ export function useProxyVideo(identityIdInput) {
     // 重封装完成
     onRemuxComplete: (data) => {
       state.value = ProxyState.READY_720P;
+      const canonicalId = resolvedProjectId.value || identityId.value;
       urls.value.proxy720p =
-        data.video_url || `/api/media/${identityId.value}/video`;
+        data.video_url || `/api/media/${canonicalId}/video`;
       progress.value = 100;
     },
 
@@ -193,8 +195,9 @@ export function useProxyVideo(identityIdInput) {
     // 360p 预览完成
     onPreview360pComplete: (data) => {
       state.value = ProxyState.READY_360P;
+      const canonicalId = resolvedProjectId.value || identityId.value;
       urls.value.preview360p =
-        data.video_url || `/api/media/${identityId.value}/video/preview`;
+        data.video_url || `/api/media/${canonicalId}/video/preview`;
       progress.value = 0; // 重置进度，准备 720p
 
       // 自动开始 720p（状态会由后续 SSE 事件更新）
@@ -218,7 +221,8 @@ export function useProxyVideo(identityIdInput) {
 
     // 720p Proxy 完成（立即无缝替换）
     onProxyComplete: (data) => {
-      const new720pUrl = data.video_url || `/api/media/${identityId.value}/video`;
+      const canonicalId = resolvedProjectId.value || identityId.value;
+      const new720pUrl = data.video_url || `/api/media/${canonicalId}/video`;
 
       urls.value.proxy720p = new720pUrl;
       state.value = ProxyState.READY_720P;
@@ -271,6 +275,7 @@ export function useProxyVideo(identityIdInput) {
       // 从后端获取当前状态
       const response = await mediaApi.getProxyStatus(identityId.value);
       const status = response.data || response;
+      resolvedProjectId.value = status.project_id || identityId.value;
 
       // 恢复 URLs（先恢复URL，用于判断是否有可播放视频）
       if (status.urls) {
@@ -385,6 +390,7 @@ export function useProxyVideo(identityIdInput) {
       progress.value = 0;
       error.value = null;
       urls.value = { preview360p: null, proxy720p: null, source: null };
+      resolvedProjectId.value = null;
     }
     if (newId) {
       initialize();
@@ -424,6 +430,9 @@ export function useProxyVideo(identityIdInput) {
       }
       if (proxyState.version !== undefined) {
         version.value = proxyState.version;
+      }
+      if (proxyState.project_id) {
+        resolvedProjectId.value = proxyState.project_id;
       }
       let nextState = proxyState.state || state.value;
       let nextError = proxyState.error || null;

@@ -542,6 +542,7 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
     )
     const task = {
       job_id: taskData.job_id,
+      project_id: taskData.project_id || taskData.job_id,
       filename: taskData.filename,
       file_path: taskData.file_path || null,
       status: taskData.status || TaskStatus.CREATED,
@@ -848,6 +849,9 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
       if (snapshot.message !== undefined) task.message = snapshot.message
       if (snapshot.filename) task.filename = snapshot.filename
       if (snapshot.title !== undefined) task.title = snapshot.title
+      if (snapshot.project_id !== undefined) {
+        task.project_id = snapshot.project_id || task.project_id || task.job_id
+      }
       if (snapshot.phase) task.phase = snapshot.phase
       if (snapshot.phase_percent !== undefined) {
         task.phase_percent = Math.round(snapshot.phase_percent * 10) / 10
@@ -881,6 +885,7 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
 
     addTask({
       job_id: jobId,
+      project_id: snapshot.project_id || jobId,
       filename: snapshot.filename,
       status: snapshot.status,
       progress: snapshot.progress,
@@ -1155,6 +1160,7 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
             t.job_id,
             {
               ...t,
+              project_id: t.project_id || t.job_id,
               canceled_at: t.canceled_at || null,
               state_seq: normalizeStateSeq(t.state_seq),
               serverUpdatedAt: normalizeTimestamp(t.serverUpdatedAt) || 0

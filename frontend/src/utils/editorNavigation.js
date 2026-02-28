@@ -15,6 +15,11 @@ function normalizeId(value) {
   return String(value).trim()
 }
 
+function isProjectIdentifier(identifier) {
+  const normalized = normalizeId(identifier)
+  return /^proj[_-]/i.test(normalized) || /^p-/i.test(normalized)
+}
+
 export async function resolveProjectIdByJobId(jobId) {
   const normalizedJobId = normalizeId(jobId)
   if (!normalizedJobId) {
@@ -42,7 +47,9 @@ export async function navigateToEditor(router, { projectId = null, jobId = null,
   if (normalizedProjectId) {
     targetPath = `/editor/project/${normalizedProjectId}`
   } else if (normalizedJobId) {
-    const resolvedProjectId = await resolveProjectIdByJobId(normalizedJobId)
+    const resolvedProjectId = isProjectIdentifier(normalizedJobId)
+      ? normalizedJobId
+      : await resolveProjectIdByJobId(normalizedJobId)
     targetPath = `/editor/project/${resolvedProjectId}`
   } else {
     return false

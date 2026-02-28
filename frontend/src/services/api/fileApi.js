@@ -43,7 +43,7 @@ class FileAPI {
    * @returns {Promise<{success: boolean, jobs: Array, failed: Array, total: number, succeeded: number, failed_count: number}>}
    */
   async createJobsBatch(filenames, taskConfig = null) {
-    return apiClient.post('/api/create-jobs-batch', {
+    return apiClient.post('/api/create-tasks-batch', {
       filenames,
       ...(taskConfig ? { task_config: taskConfig } : {}),
     })

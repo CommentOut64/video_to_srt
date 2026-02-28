@@ -22,20 +22,20 @@ class MediaAPI {
 
   /**
    * 获取视频 URL（支持 Range 请求，自动处理 Proxy）
-   * @param {string} jobId - 任务ID
+   * @param {string} identifier - project_id 或兼容 job_id
    * @returns {string} 视频URL
    */
-  getVideoUrl(jobId) {
-    return `${this._getBaseURL()}/api/media/${jobId}/video`
+  getVideoUrl(identifier) {
+    return `${this._getBaseURL()}/api/media/${identifier}/video`
   }
 
   /**
    * 获取音频 URL（支持 Range 请求）
-   * @param {string} jobId - 任务ID
+   * @param {string} identifier - project_id 或兼容 job_id
    * @returns {string} 音频URL
    */
-  getAudioUrl(jobId) {
-    return `${this._getBaseURL()}/api/media/${jobId}/audio`
+  getAudioUrl(identifier) {
+    return `${this._getBaseURL()}/api/media/${identifier}/audio`
   }
 
   /**
@@ -106,8 +106,8 @@ class MediaAPI {
    *   srt: Object
    * }>}
    */
-  async getMediaInfo(jobId) {
-    return apiClient.get(`/api/media/${jobId}/info`)
+  async getMediaInfo(identifier) {
+    return apiClient.get(`/api/media/${identifier}/info`)
   }
 
   /**
@@ -122,8 +122,8 @@ class MediaAPI {
    *   needs_proxy: boolean
    * }>}
    */
-  async getProxyStatus(jobId) {
-    return apiClient.get(`/api/media/${jobId}/proxy-status`)
+  async getProxyStatus(identifier) {
+    return apiClient.get(`/api/media/${identifier}/proxy-status`)
   }
 
   /**
