@@ -226,7 +226,7 @@ import {
 import { useTaskRuntimeStore } from '@/stores/taskRuntimeStore'
 import { useTranscriptionPresetStore } from '@/stores/transcriptionPresetStore'
 import { selectCapabilities } from '@/state/capabilities/capabilitySelector'
-import { transcriptionApi, systemApi, presetsApi } from '@/services/api'
+import { transcriptionApi, projectApi, systemApi, presetsApi } from '@/services/api'
 import AboutDialog from '@/components/AboutDialog.vue'
 import TaskListHeader from '@/components/task/TaskListHeader.vue'
 import TaskCardGrid from '@/components/task/TaskCardGrid.vue'
@@ -853,6 +853,7 @@ async function finishEditTitle(task) {
   if (editingTaskId.value !== task.job_id) return
 
   const newTitle = editingTitle.value.trim()
+  const projectIdentifier = task.project_id || task.job_id
 
   // 如果标题为空，提示并恢复原名称
   if (!newTitle) {
@@ -869,11 +870,38 @@ async function finishEditTitle(task) {
   }
 
   try {
-    // 调用 API 重命名任务
-    const result = await transcriptionApi.renameJob(task.job_id, newTitle)
+    const isProjectOnly = Boolean(task.is_project_only)
+    let result = null
+    let renamedByProjectApi = false
 
-    // 更新本地 store
-    if (result?.task) {
+    if (isProjectOnly) {
+      if (!projectIdentifier) {
+        throw new Error('任务标识缺失，无法重命名')
+      }
+      result = await projectApi.updateProjectTitle(projectIdentifier, newTitle)
+      renamedByProjectApi = true
+    } else {
+      try {
+        result = await transcriptionApi.renameJob(task.job_id, newTitle)
+      } catch (error) {
+        const isNotFound = Number(error?.status) === 404
+        if (!isNotFound || !projectIdentifier) {
+          throw error
+        }
+        result = await projectApi.updateProjectTitle(projectIdentifier, newTitle)
+        renamedByProjectApi = true
+      }
+    }
+
+    if (renamedByProjectApi) {
+      taskStore.updateTask(
+        task.job_id,
+        {
+          title: result?.title || newTitle,
+        },
+        { updated_at: result?.updated_at }
+      )
+    } else if (result?.task) {
       taskStore.applyTaskSnapshot(result.task, {
         updated_at: result.task.updated_at ?? result.updated_at,
       })
