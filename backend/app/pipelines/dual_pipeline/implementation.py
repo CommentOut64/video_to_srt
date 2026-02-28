@@ -1867,37 +1867,47 @@ class AsyncDualPipelineKernel:
             )
 
         total_sentences = 0
-        finalized_sentences: List[SentenceSegment] = []
+        finalized_chunks: List[tuple[int | str, List[SentenceSegment]]] = []
+        chunk_ref_seen: Dict[str, int] = {}
         for chunk in chunks:
             sentences = chunk.sentences
+            base_chunk_ref = self._resolve_semantic_chunk_ref(
+                chunk=chunk,
+                fallback_chunk_index=ctx.chunk_index,
+            )
+            chunk_ref = self._dedupe_semantic_chunk_ref(
+                base_chunk_ref=base_chunk_ref,
+                seen_counts=chunk_ref_seen,
+            )
             if is_final_output:
                 for sentence in sentences:
                     sentence.is_finalized = True
                     sentence.is_draft = False
-                finalized_sentences.extend(sentences)
+                finalized_chunks.append((chunk_ref, sentences))
             else:
-                self.subtitle_manager.add_draft_sentences(ctx.chunk_index, sentences)
+                self.subtitle_manager.add_draft_sentences(chunk_ref, sentences)
             total_sentences += len(sentences)
 
-        if is_final_output and finalized_sentences:
-            self._emit_output_layer(
-                chunk_index=ctx.chunk_index,
-                sentence_segments=finalized_sentences,
-                language=str(ctx.audio_chunk.language or (ctx.sv_result or {}).get("language") or "auto"),
-                injection_report={
-                    "mapping_coverage": 0.0,
-                    "mismatch_count": 0.0,
-                    "error_code": "",
-                    "blocked": 0.0,
-                },
-                segmentation_report={
-                    "boundary_score_stats": {},
-                    "forced_split_count": 0.0,
-                    "error_code": "",
-                },
-                output_traces=None,
-                default_trace_reason="semantic_buffer_final",
-            )
+        if is_final_output and finalized_chunks:
+            for chunk_ref, finalized_sentences in finalized_chunks:
+                self._emit_output_layer(
+                    chunk_index=chunk_ref,
+                    sentence_segments=finalized_sentences,
+                    language=str(ctx.audio_chunk.language or (ctx.sv_result or {}).get("language") or "auto"),
+                    injection_report={
+                        "mapping_coverage": 0.0,
+                        "mismatch_count": 0.0,
+                        "error_code": "",
+                        "blocked": 0.0,
+                    },
+                    segmentation_report={
+                        "boundary_score_stats": {},
+                        "forced_split_count": 0.0,
+                        "error_code": "",
+                    },
+                    output_traces=None,
+                    default_trace_reason="semantic_buffer_final",
+                )
 
         phase = "定稿" if is_final_output else "草稿"
         self.logger.debug(
@@ -2903,36 +2913,46 @@ class AsyncDualPipelineKernel:
         if not chunks:
             return
         total_sentences = 0
-        finalized_sentences: List[SentenceSegment] = []
+        finalized_chunks: List[tuple[int | str, List[SentenceSegment]]] = []
+        chunk_ref_seen: Dict[str, int] = {}
         for chunk in chunks:
             sentences = chunk.sentences
+            base_chunk_ref = self._resolve_semantic_chunk_ref(
+                chunk=chunk,
+                fallback_chunk_index=chunk_index,
+            )
+            chunk_ref = self._dedupe_semantic_chunk_ref(
+                base_chunk_ref=base_chunk_ref,
+                seen_counts=chunk_ref_seen,
+            )
             if is_final_output:
                 for sentence in sentences:
                     sentence.is_finalized = True
                     sentence.is_draft = False
-                finalized_sentences.extend(sentences)
+                finalized_chunks.append((chunk_ref, sentences))
             else:
-                self.subtitle_manager.add_draft_sentences(chunk_index, sentences)
+                self.subtitle_manager.add_draft_sentences(chunk_ref, sentences)
             total_sentences += len(sentences)
-        if is_final_output and finalized_sentences:
-            self._emit_output_layer(
-                chunk_index=chunk_index,
-                sentence_segments=finalized_sentences,
-                language="auto",
-                injection_report={
-                    "mapping_coverage": 0.0,
-                    "mismatch_count": 0.0,
-                    "error_code": "",
-                    "blocked": 0.0,
-                },
-                segmentation_report={
-                    "boundary_score_stats": {},
-                    "forced_split_count": 0.0,
-                    "error_code": "",
-                },
-                output_traces=None,
-                default_trace_reason="semantic_buffer_flush_final",
-            )
+        if is_final_output and finalized_chunks:
+            for chunk_ref, finalized_sentences in finalized_chunks:
+                self._emit_output_layer(
+                    chunk_index=chunk_ref,
+                    sentence_segments=finalized_sentences,
+                    language="auto",
+                    injection_report={
+                        "mapping_coverage": 0.0,
+                        "mismatch_count": 0.0,
+                        "error_code": "",
+                        "blocked": 0.0,
+                    },
+                    segmentation_report={
+                        "boundary_score_stats": {},
+                        "forced_split_count": 0.0,
+                        "error_code": "",
+                    },
+                    output_traces=None,
+                    default_trace_reason="semantic_buffer_flush_final",
+                )
         phase = "定稿" if is_final_output else "草稿"
         self.logger.debug(
             "SemanticBuffer 尾部刷新完成: %s %d 个句子",
@@ -2986,6 +3006,38 @@ class AsyncDualPipelineKernel:
                 except ValueError:
                     continue
         return sorted(set(indices))
+
+    def _resolve_semantic_chunk_ref(
+        self,
+        *,
+        chunk: SemanticChunk,
+        fallback_chunk_index: int,
+    ) -> int | str:
+        """为语义块选择稳定 chunk 引用。"""
+        source_indices = self._parse_source_chunk_indices(list(chunk.source_chunks or []))
+        if source_indices:
+            # 优先使用 source chunk 的首索引，确保与慢流 replace_chunk 的 int 口径可对齐。
+            return int(source_indices[0])
+        chunk_id = str(getattr(chunk, "chunk_id", "") or "").strip()
+        if chunk_id:
+            return chunk_id
+        return int(fallback_chunk_index)
+
+    @staticmethod
+    def _dedupe_semantic_chunk_ref(
+        *,
+        base_chunk_ref: int | str,
+        seen_counts: Dict[str, int],
+    ) -> int | str:
+        """
+        对同一轮输出中的重复 chunk_ref 追加后缀，避免草稿互相覆盖。
+        """
+        key = str(base_chunk_ref)
+        seen = int(seen_counts.get(key, 0))
+        seen_counts[key] = seen + 1
+        if seen <= 0:
+            return base_chunk_ref
+        return f"{key}#{seen}"
 
     @staticmethod
     def _distance_to_range(value: float, span: tuple[float, float]) -> float:
@@ -5523,7 +5575,7 @@ class AsyncDualPipelineKernel:
     def _emit_output_layer(
         self,
         *,
-        chunk_index: int,
+        chunk_index: int | str,
         sentence_segments: Sequence[SentenceSegment],
         language: str,
         injection_report: Dict[str, Any],

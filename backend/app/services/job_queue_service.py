@@ -31,6 +31,7 @@ from app.config.lifecycle_config import (
 from app.services.sse_service import get_sse_manager
 from app.core.config import config
 from app.services.checkpoint import RuntimeCheckpointService
+from app.services.project_id_resolver import get_project_id_resolver
 from app.services.task_state_repository import QueueState
 from app.utils.cancellation_token import (
     CancellationToken,
@@ -238,7 +239,7 @@ class JobQueueService:
 
     def _find_video_file(self, job_id: str) -> Optional[Path]:
         """V3.1.2+dev.20260114.11: 查找源视频（跳过 preview/proxy/remux）"""
-        job_dir = config.JOBS_DIR / job_id
+        job_dir = self._resolve_project_dir_for_identifier(job_id)
         if not job_dir.exists():
             return None
         video_exts = ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.webm', '.flv', '.m4v']
@@ -248,6 +249,64 @@ class JobQueueService:
                     continue
                 return file
         return None
+
+    def _resolve_project_dir_for_identifier(self, identifier: Optional[str]) -> Path:
+        """
+        解析任务目录（优先直达目录，缺失时再走 project 解析）。
+
+        Why:
+        - 新任务在 project_meta 生成前，目录通常仍可通过 job_id 直达；
+        - 老任务目录被规范化后，旧 job_id 可能失效，需要 resolver 转换到 project 目录。
+        """
+        normalized_identifier = str(identifier or "").strip()
+        if not normalized_identifier:
+            return Path(config.JOBS_DIR)
+
+        direct_dir = config.JOBS_DIR / normalized_identifier
+        if direct_dir.exists():
+            return direct_dir
+
+        try:
+            identity = get_project_id_resolver().resolve_or_fail(normalized_identifier)
+            return identity.project_dir
+        except Exception:
+            return direct_dir
+
+    def _ensure_job_project_dir(self, job: JobState, persist_if_rebind: bool = False) -> Optional[Path]:
+        """
+        确保 JobState 绑定到可用目录。
+
+        策略：
+        1. 当前 job.dir 可用则直接返回；
+        2. job.dir 失效时，按 project_id/job_id 解析并回写；
+        3. 可选持久化回写，避免后续继续使用旧目录。
+        """
+        current_dir = Path(job.dir) if str(job.dir or "").strip() else None
+        if current_dir and current_dir.exists():
+            return current_dir
+
+        for identifier in (getattr(job, "project_id", None), getattr(job, "job_id", None)):
+            normalized_identifier = str(identifier or "").strip()
+            if not normalized_identifier:
+                continue
+
+            try:
+                identity = get_project_id_resolver().resolve_or_fail(normalized_identifier)
+            except Exception:
+                continue
+
+            job.project_id = identity.project_id
+            job.dir = str(identity.project_dir)
+
+            if persist_if_rebind:
+                try:
+                    self.transcription_service.job_lifecycle.save_job_meta(job)
+                except Exception as exc:
+                    logger.warning("回写任务目录映射失败: %s, %s", job.job_id, exc)
+
+            return identity.project_dir
+
+        return current_dir
 
     def add_job(self, job: JobState):
         """
@@ -416,8 +475,9 @@ class JobQueueService:
         # Phase 1: 恢复请求到达后清理暂停/取消控制信号，
         # 防止 PauseBarrier 在下一个单元边界误判并再次停机。
         try:
-            if job.dir:
-                runtime_service = RuntimeCheckpointService(job_dir=Path(job.dir))
+            job_dir = self._ensure_job_project_dir(job, persist_if_rebind=True)
+            if job_dir:
+                runtime_service = RuntimeCheckpointService(job_dir=job_dir)
                 runtime_service.clear_pause_requested()
                 runtime_service.clear_cancel_requested()
         except Exception as exc:
@@ -500,7 +560,7 @@ class JobQueueService:
                 repo_job = None
                 state_seq = 0
                 input_path = ""
-                job_dir = str(Path(config.JOBS_DIR) / job_id)
+                job_dir = str(self._resolve_project_dir_for_identifier(job_id))
                 try:
                     repo_job = self.state_repo.get_task(job_id)
                     if repo_job:
@@ -1021,7 +1081,7 @@ class JobQueueService:
         self.transcription_service.save_job_meta(job)
         signal_type = "job_complete" if job.status == "finished" else f"job_{job.status}"
         self.sse_manager.broadcast_sync(
-            f"job:{job.job_id}",
+            f"project:{getattr(job, 'project_id', None) or job.job_id}",
             f"signal.{signal_type}",
             {
                 "signal": signal_type,
@@ -1328,12 +1388,12 @@ class JobQueueService:
         from app.services.subtitle_edit_store import load_deleted_indices, load_edits
         from pathlib import Path
         import librosa
-        import soundfile as sf
+        from app.utils.audio_extractor import audio_extractor
 
         def push_signal_event(sse_manager, job_id: str, signal_code: str, message: str = ""):
             """推送信号事件"""
             sse_manager.broadcast_sync(
-                f"job:{job_id}",
+                f"project:{job_id}",
                 f"signal.{signal_code}",
                 {"signal": signal_code, "message": message}
             )
@@ -1358,7 +1418,10 @@ class JobQueueService:
 
         cancellation_token = self.get_cancellation_token(job.job_id)
 
-        job_dir = Path(job.dir)
+        job_dir = self._ensure_job_project_dir(job, persist_if_rebind=True)
+        if job_dir is None:
+            raise FileNotFoundError(f"任务目录不存在: job_id={job.job_id}, dir={job.dir}")
+        job_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_manager = CheckpointManagerV37(job_dir, logger)
         checkpoint_manager.save_checkpoint({"original_settings": job.settings.to_dict()})
 
@@ -1374,11 +1437,12 @@ class JobQueueService:
             # 预触发 Proxy 生成（不阻塞主流程）
             await self._maybe_trigger_proxy_generation(job)
 
-            # 加载完整音频（用于 Audio Overlap）
-            full_audio, sr = librosa.load(job.input_path, sr=16000, mono=True)
+            # V3.2.4+dev.20260301.01: 使用 FFmpeg 提取音频（与导入模式一致，避免波形偏移）
             audio_path = job_dir / "audio.wav"
-            sf.write(str(audio_path), full_audio, sr)
-            logger.info(f"音频文件已保存: {audio_path}")
+            audio_extractor.extract_fast_sync(Path(job.input_path), audio_path)
+            logger.info(f"音频文件已保存（FFmpeg PCM_16）: {audio_path}")
+            # 从 WAV 加载为 numpy 数组（用于 Audio Overlap pipeline）
+            full_audio, sr = librosa.load(str(audio_path), sr=16000, mono=True)
 
             # 恢复字幕状态并叠加用户编辑（保留在调用方）
             if checkpoint and getattr(checkpoint, "transcription", None):
@@ -1442,7 +1506,7 @@ class JobQueueService:
             logger.error(f"[双流对齐] 任务失败: {e}", exc_info=True)
             self._transition_job_status(job, "failed", "pipeline_error")
             job.error = str(e)
-            push_signal_event(sse_manager, job.job_id, "job_failed", str(e))
+            push_signal_event(sse_manager, str(getattr(job, "project_id", None) or job.job_id), "job_failed", str(e))
             raise
 
         finally:
@@ -1465,7 +1529,10 @@ class JobQueueService:
         )
 
         try:
-            job_dir = Path(job.dir)
+            job_dir = self._ensure_job_project_dir(job, persist_if_rebind=True)
+            if job_dir is None or not job_dir.exists():
+                logger.warning("[Proxy预生成] 任务目录不可用，跳过: %s", job.job_id)
+                return
 
             # 查找视频文件
             video_file = _find_video_file(job_dir)
@@ -1598,7 +1665,8 @@ class JobQueueService:
                     paused = media_prep.cancel_proxy_job(job_id, "paused_for_new_job")
                     if paused:
                         # 清理可能的半成品，避免返回坏文件
-                        proxy_file = config.JOBS_DIR / job_id / "proxy_720p.mp4"
+                        proxy_dir = self._resolve_project_dir_for_identifier(job_id)
+                        proxy_file = proxy_dir / "proxy_720p.mp4"
                         if proxy_file.exists():
                             try:
                                 proxy_file.unlink()
@@ -1815,7 +1883,8 @@ class JobQueueService:
             "updated_at": int(time.time() * 1000)
         }
 
-        self.sse_manager.broadcast_sync(f"job:{job_id}", f"signal.{signal}", data)
+        channel_identifier = str(getattr(job, "project_id", None) or job_id)
+        self.sse_manager.broadcast_sync(f"project:{channel_identifier}", f"signal.{signal}", data)
         logger.debug(f"[单任务SSE] 推送信号: {job_id[:8]}... -> signal.{signal}")
 
     def _validate_finish_integrity(self, job: "JobState") -> tuple[bool, str]:
@@ -1827,7 +1896,7 @@ class JobQueueService:
         2. sentences_snapshot 不得残留草稿标记。
         """
         try:
-            job_dir = Path(job.dir) if job.dir else None
+            job_dir = self._ensure_job_project_dir(job)
             if not job_dir or not job_dir.exists():
                 return True, ""
 
@@ -1911,7 +1980,7 @@ class JobQueueService:
             "checkpoint_found": False,
         }
         try:
-            job_dir = Path(job.dir) if job.dir else None
+            job_dir = self._ensure_job_project_dir(job)
             if not job_dir or not job_dir.exists():
                 return payload
 
@@ -1977,7 +2046,7 @@ class JobQueueService:
         """V3.2.0+dev.20260123.04: 暂停握手确认（检查点落盘完成）"""
         payload = self._build_pause_ack_payload(job)
         self.sse_manager.broadcast_sync(
-            f"job:{job.job_id}",
+            f"project:{getattr(job, 'project_id', None) or job.job_id}",
             "signal.pause_ack",
             payload,
         )
@@ -2019,7 +2088,7 @@ class JobQueueService:
         logger.info(f"[V3.1.0] 尝试从 checkpoint 恢复进度: {job.job_id}, 当前进度={job.progress:.1f}%")
 
         try:
-            job_dir = Path(job.dir) if job.dir else None
+            job_dir = self._ensure_job_project_dir(job)
             if not job_dir:
                 logger.info(f"[V3.1.0] 任务目录为空，跳过恢复: job.dir={job.dir}")
                 return

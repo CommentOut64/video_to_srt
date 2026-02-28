@@ -19,6 +19,8 @@ from app.services.checkpoint.runtime_checkpoint_repository import RuntimeCheckpo
 
 class RuntimeCheckpointService:
     """运行时断点服务。"""
+    _KEY_TRANSCRIPTION_HINT = "transcription_hint"
+    _KEY_SUBTITLE_RUNTIME = "subtitle_runtime_v1"
 
     def __init__(self, job_dir: Path, db_file_name: str = "runtime_state.db") -> None:
         self.job_dir = Path(job_dir)
@@ -54,7 +56,16 @@ class RuntimeCheckpointService:
     def save_transcription_hint(self, hint: dict[str, Any]) -> None:
         """保存转录摘要提示（仅关键索引，不写入全量快照）。"""
         payload = json.dumps(hint, ensure_ascii=False)
-        self.repository.upsert_control_signal(key="transcription_hint", value=payload)
+        self.repository.upsert_control_signal(key=self._KEY_TRANSCRIPTION_HINT, value=payload)
+
+    def save_subtitle_runtime(self, runtime_payload: dict[str, Any]) -> None:
+        """保存字幕运行态真源快照。"""
+        payload = json.dumps(runtime_payload, ensure_ascii=False)
+        self.repository.upsert_control_signal(key=self._KEY_SUBTITLE_RUNTIME, value=payload)
+
+    def load_subtitle_runtime(self) -> dict[str, Any] | None:
+        """读取字幕运行态真源快照。"""
+        return self._load_json_control_signal(self._KEY_SUBTITLE_RUNTIME)
 
     def mark_pause_requested(self) -> None:
         """写入暂停请求信号。"""
@@ -82,21 +93,30 @@ class RuntimeCheckpointService:
 
     def load_snapshot(self) -> RuntimeCheckpointSnapshot:
         """读取运行时快照。"""
-        transcription_hint: dict[str, Any] | None = None
-        raw_hint = self.repository.get_control_signal("transcription_hint")
-        if raw_hint:
-            try:
-                parsed_hint = json.loads(raw_hint)
-                if isinstance(parsed_hint, dict):
-                    transcription_hint = parsed_hint
-            except json.JSONDecodeError as exc:
-                self.logger.warning("解析 transcription_hint 失败: %s", exc)
+        transcription_hint = self._load_json_control_signal(self._KEY_TRANSCRIPTION_HINT)
+        subtitle_runtime = self._load_json_control_signal(self._KEY_SUBTITLE_RUNTIME)
         return RuntimeCheckpointSnapshot(
             last_unit_commits=self.repository.list_unit_commits(),
             transcription_hint=transcription_hint,
+            subtitle_runtime=subtitle_runtime,
         )
 
     def has_runtime_state(self) -> bool:
         """判断是否存在 runtime_state 记录。"""
         return self.repository.has_any_state()
+
+    def _load_json_control_signal(self, key: str) -> dict[str, Any] | None:
+        """读取 JSON 控制信号并安全解析。"""
+        raw_value = self.repository.get_control_signal(key)
+        if not raw_value:
+            return None
+        try:
+            parsed = json.loads(raw_value)
+        except json.JSONDecodeError as exc:
+            self.logger.warning("解析 %s 失败: %s", key, exc)
+            return None
+        if not isinstance(parsed, dict):
+            self.logger.warning("%s 不是对象，已忽略", key)
+            return None
+        return parsed
 

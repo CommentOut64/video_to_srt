@@ -185,7 +185,7 @@ class FastPunctuationPipeline:
         }
 
         sse_manager = get_sse_manager()
-        sse_manager.broadcast_sync(f"job:{self.job_id}", "debug.punctuation", payload)
+        sse_manager.broadcast_sync(f"project:{self.job_id}", "debug.punctuation", payload)
         append_debug_punctuation_line(ctx.job_dir, payload, logger=self.logger)
 
         decision = metadata.get("punctuation_decision", {})
@@ -199,7 +199,7 @@ class FastPunctuationPipeline:
                 "sv_confidence": sv_confidence,
             }
             sse_manager.broadcast_sync(
-                f"job:{self.job_id}",
+                f"project:{self.job_id}",
                 "debug.punctuation_scheduler",
                 scheduler_payload,
             )

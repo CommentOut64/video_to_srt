@@ -13,13 +13,14 @@ import gc
 import json
 import logging
 import os
+import re
 import shutil
 import threading
-import uuid
 from pathlib import Path
 from typing import Dict, Optional, List, Any, Tuple
 
 from app.models.job_models import JobState, JobSettings
+from app.models.project_models import generate_project_id
 from app.models.task_state_machine import get_state_guard
 from app.config.lifecycle_config import STATE_MACHINE_GUARD_ENABLED
 from app.services.job_index_service import JobIndexService, get_job_index_service
@@ -49,6 +50,9 @@ class JobLifecycleService:
         "transcribing",
         "running",
     }
+    _WORKSPACE_PROJECT_PATTERN = re.compile(
+        r"^p-\d{8}-\d{6}-(tr|im|lg)-[a-z0-9-]+-[0-9a-z]{4}$"
+    )
 
     def __init__(
         self,
@@ -84,14 +88,20 @@ class JobLifecycleService:
         """
         try:
             jobs = self.state_repo.list_tasks()
+            jobs = self._prune_import_only_tasks_from_repo(jobs)
             if not jobs:
                 self._import_legacy_tasks_from_disk()
                 jobs = self.state_repo.list_tasks()
+                jobs = self._prune_import_only_tasks_from_repo(jobs)
 
             loaded_count = 0
             for job in jobs:
                 from_status = job.status
                 self.state_guard.sync_seq(job.job_id, job.state_seq)
+                inferred_project_id = self._infer_project_id_for_loaded_job(job)
+                if inferred_project_id and inferred_project_id != str(getattr(job, "project_id", "") or "").strip():
+                    job.project_id = inferred_project_id
+                    self.state_repo.upsert_task(job)
                 if self._apply_restart_pause(job):
                     self._persist_job_state(job, from_status=from_status, reason="system_restart")
 
@@ -111,13 +121,16 @@ class JobLifecycleService:
         filename: str,
         src_path: str,
         settings: JobSettings,
-        job_id: Optional[str] = None
+        job_id: Optional[str] = None,
+        job_dir_name: Optional[str] = None,
     ) -> JobState:
         """
         创建转录任务
         """
-        job_id = job_id or uuid.uuid4().hex
-        job_dir = self.jobs_root / job_id
+        # 纯 Project 语义：新建任务默认直接使用 project_id。
+        job_id = str(job_id or "").strip() or generate_project_id()
+        normalized_dir_name = str(job_dir_name or "").strip() or job_id
+        job_dir = self.jobs_root / normalized_dir_name
         job_dir.mkdir(parents=True, exist_ok=True)
 
         dest_path = job_dir / filename
@@ -143,7 +156,8 @@ class JobLifecycleService:
             settings=settings,
             status="uploaded",
             phase="pending",
-            message="文件已上传"
+            message="文件已上传",
+            project_id=job_id,
         )
 
         with self.lock:
@@ -183,6 +197,9 @@ class JobLifecycleService:
 
             job_dir = self.jobs_root / job_id
             if not job_dir.exists():
+                return None
+            if self._should_skip_legacy_import_dir(job_dir):
+                self.logger.debug("跳过仅编辑项目的任务元信息加载: %s", job_id)
                 return None
 
             legacy_job = self._load_job_meta_from_file(job_id, job_dir)
@@ -266,6 +283,8 @@ class JobLifecycleService:
                 continue
             summaries.append({
                 "id": job.job_id,
+                "job_id": job.job_id,
+                "project_id": str(getattr(job, "project_id", "") or "").strip() or job.job_id,
                 "filename": job.filename,
                 "title": job.title,
                 "status": job.status,
@@ -683,6 +702,101 @@ class JobLifecycleService:
                     conn=conn,
                 )
 
+    @classmethod
+    def _is_workspace_project_identifier(cls, identifier: str) -> bool:
+        normalized_identifier = str(identifier or "").strip()
+        if not normalized_identifier:
+            return False
+        return bool(cls._WORKSPACE_PROJECT_PATTERN.fullmatch(normalized_identifier))
+
+    def _infer_project_id_for_loaded_job(self, job: JobState) -> Optional[str]:
+        """
+        为历史任务补齐 project_id，避免重启后回退到旧标识。
+        """
+        current_project_id = str(getattr(job, "project_id", "") or "").strip()
+        if current_project_id:
+            return current_project_id
+
+        job_dir_raw = str(getattr(job, "dir", "") or "").strip()
+        if job_dir_raw:
+            workspace_dir = Path(job_dir_raw)
+            workspace_name = workspace_dir.name
+            if self._is_workspace_project_identifier(workspace_name):
+                return workspace_name
+
+            payload = self._load_project_meta_payload(workspace_dir)
+            if isinstance(payload, dict):
+                meta_project_id = str(payload.get("project_id") or "").strip()
+                if meta_project_id:
+                    return meta_project_id
+
+        if self._is_workspace_project_identifier(job.job_id):
+            return job.job_id
+
+        return str(job.job_id or "").strip() or None
+
+    def _prune_import_only_tasks_from_repo(self, jobs: List[JobState]) -> List[JobState]:
+        """
+        启动兜底：清理历史误导入到 task_state 的仅编辑项目任务。
+        """
+        filtered_jobs: List[JobState] = []
+        for job in jobs:
+            job_dir = Path(str(job.dir or "").strip()) if str(job.dir or "").strip() else self.jobs_root / job.job_id
+            if not self._should_skip_legacy_import_dir(job_dir):
+                filtered_jobs.append(job)
+                continue
+
+            try:
+                self.state_repo.delete_task(job.job_id)
+                if job.input_path:
+                    self.job_index.remove_mapping(job.input_path)
+                self.logger.info("已清理仅编辑项目的误导入任务状态: %s", job.job_id)
+            except Exception as exc:
+                self.logger.warning("清理误导入任务状态失败，将跳过加载: %s (%s)", job.job_id, exc)
+        return filtered_jobs
+
+    def _load_project_meta_payload(self, job_dir: Path) -> Optional[Dict[str, Any]]:
+        """
+        读取项目元信息；读取失败时返回 None，不阻断主流程。
+        """
+        project_meta_path = job_dir / "project_meta.json"
+        if not project_meta_path.exists():
+            return None
+        try:
+            with open(project_meta_path, "r", encoding="utf-8") as meta_file:
+                payload = json.load(meta_file)
+            if isinstance(payload, dict):
+                return payload
+            self.logger.warning("project_meta.json 结构非法，忽略过滤: %s", project_meta_path)
+            return None
+        except Exception as exc:
+            self.logger.warning("读取 project_meta.json 失败，忽略过滤: %s (%s)", project_meta_path, exc)
+            return None
+
+    def _should_skip_legacy_import_dir(self, job_dir: Path) -> bool:
+        """
+        判定目录是否应跳过 legacy 任务导入。
+
+        规则：
+        - `project_meta.subtitle_doc.source_type=import` 或 `mode=import`
+          视为仅编辑项目，不参与任务状态导入。
+        """
+        payload = self._load_project_meta_payload(job_dir)
+        if payload is None:
+            return False
+
+        subtitle_doc = payload.get("subtitle_doc")
+        source_type = ""
+        if isinstance(subtitle_doc, dict):
+            source_type = str(subtitle_doc.get("source_type") or "").strip().lower()
+        mode = str(payload.get("mode") or "").strip().lower()
+
+        is_import_only_project = source_type == "import" or mode == "import"
+        if is_import_only_project:
+            self.logger.debug("识别为仅编辑项目，跳过 legacy 导入: %s", job_dir)
+            return True
+        return False
+
     def _import_legacy_tasks_from_disk(self) -> None:
         """
         兼容迁移：从旧版 job_meta.json / checkpoint.json 导入任务。
@@ -694,6 +808,8 @@ class JobLifecycleService:
 
             job_id = job_dir.name
             if self.state_repo.get_task(job_id):
+                continue
+            if self._should_skip_legacy_import_dir(job_dir):
                 continue
 
             job = self._load_job_meta_from_file(job_id, job_dir)
@@ -730,6 +846,9 @@ class JobLifecycleService:
                 data = json.load(f)
             job = JobState.from_meta_dict(data)
             job.dir = str(job_dir)
+            inferred_project_id = self._infer_project_id_for_loaded_job(job)
+            if inferred_project_id:
+                job.project_id = inferred_project_id
             self.logger.debug(f"从 job_meta.json 读取任务: {job_id}")
             return job
         except Exception as exc:
@@ -765,6 +884,9 @@ class JobLifecycleService:
             srt_path=str(srt_files[0]) if srt_files else None,
             paused=not is_finished,
         )
+        inferred_project_id = self._infer_project_id_for_loaded_job(job)
+        if inferred_project_id:
+            job.project_id = inferred_project_id
 
         checkpoint_path = job_dir / "checkpoint.json"
         if checkpoint_path.exists():
@@ -798,15 +920,10 @@ class JobLifecycleService:
         def extract_audio_for_waveform() -> None:
             """后台提取音频供波形图使用"""
             try:
-                import warnings
-                import librosa
-                import soundfile as sf
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", message="PySoundFile failed")
-                    warnings.filterwarnings("ignore", message="audioread")
-                    audio_array, sr = librosa.load(str(dest_path), sr=16000, mono=True)
-                sf.write(str(audio_path), audio_array, sr)
-                self.logger.info(f"[{job_id}] 音频提取完成: {audio_path}")
+                # V3.2.4+dev.20260301.01: 使用 FFmpeg 提取（与导入模式一致，避免波形偏移）
+                from app.utils.audio_extractor import audio_extractor
+                audio_extractor.extract_fast_sync(Path(dest_path), audio_path)
+                self.logger.info(f"[{job_id}] 音频提取完成（FFmpeg PCM_16）: {audio_path}")
             except Exception as exc:
                 self.logger.error(f"[{job_id}] 音频提取失败: {exc}")
 

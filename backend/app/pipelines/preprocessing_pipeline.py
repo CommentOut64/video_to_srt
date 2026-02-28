@@ -201,6 +201,11 @@ class PreprocessingPipeline:
         self.logger.info(f"开始预处理流程: {video_path}")
         token = self.cancellation_token  # v3.1.0: 简化引用
         job_id = job_state.job_id if job_state else None
+        channel_identifier = (
+            str(getattr(job_state, "project_id", "") or "").strip()
+            if job_state is not None
+            else ""
+        ) or job_id
         self._vad_intervals = None
         runtime_checkpoint_service: Optional[RuntimeCheckpointService] = None
         pause_barrier: Optional[PauseBarrier] = None
@@ -218,9 +223,9 @@ class PreprocessingPipeline:
             sse_manager = get_sse_manager()
 
         def broadcast_preprocess_event(event: str, payload: Dict[str, Any]) -> None:
-            if not sse_manager or not job_id:
+            if not sse_manager or not channel_identifier:
                 return
-            sse_manager.broadcast_sync(f"job:{job_id}", event, payload)
+            sse_manager.broadcast_sync(f"project:{channel_identifier}", event, payload)
 
         cache_service: Optional[PreprocessCacheService] = None
         if job_dir:

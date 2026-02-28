@@ -64,6 +64,7 @@ class TaskStateRepository:
                 """
                 CREATE TABLE IF NOT EXISTS tasks (
                     job_id TEXT PRIMARY KEY,
+                    project_id TEXT,
                     filename TEXT,
                     title TEXT,
                     dir TEXT,
@@ -146,6 +147,7 @@ class TaskStateRepository:
             )
             self._ensure_tasks_column(conn, "subtitle_time_offset", "REAL")
             self._ensure_tasks_column(conn, "state_seq", "INTEGER DEFAULT 0")
+            self._ensure_tasks_column(conn, "project_id", "TEXT")
             self._ensure_task_events_column(conn, "state_seq", "INTEGER DEFAULT 0")
 
     def _ensure_tasks_column(self, conn: sqlite3.Connection, name: str, column_type: str) -> None:
@@ -169,15 +171,16 @@ class TaskStateRepository:
             target_conn.execute(
                 """
                 INSERT INTO tasks (
-                    job_id, filename, title, dir, input_path, status, state_seq, phase, progress,
+                    job_id, project_id, filename, title, dir, input_path, status, state_seq, phase, progress,
                     phase_percent, message, error, processed, total, language, srt_path,
                     canceled, paused, subtitle_time_offset, settings_json, updated_at, created_at
                 ) VALUES (
-                    :job_id, :filename, :title, :dir, :input_path, :status, :state_seq, :phase, :progress,
+                    :job_id, :project_id, :filename, :title, :dir, :input_path, :status, :state_seq, :phase, :progress,
                     :phase_percent, :message, :error, :processed, :total, :language, :srt_path,
                     :canceled, :paused, :subtitle_time_offset, :settings_json, :updated_at, :created_at
                 )
                 ON CONFLICT(job_id) DO UPDATE SET
+                    project_id=excluded.project_id,
                     filename=excluded.filename,
                     title=excluded.title,
                     dir=excluded.dir,
@@ -550,6 +553,7 @@ class TaskStateRepository:
         job.updatedAt = int(now_seconds * 1000)
         return {
             "job_id": job.job_id,
+            "project_id": job.project_id,
             "filename": job.filename,
             "title": job.title,
             "dir": job.dir,
@@ -580,6 +584,7 @@ class TaskStateRepository:
         updated_at_ms = None
         if row["updated_at"] is not None:
             updated_at_ms = int(row["updated_at"] * 1000)
+        project_id = row["project_id"] if "project_id" in row.keys() else None
         return JobState(
             job_id=row["job_id"],
             filename=row["filename"] or "unknown",
@@ -601,6 +606,7 @@ class TaskStateRepository:
             canceled=bool(row["canceled"]),
             paused=bool(row["paused"]),
             subtitle_time_offset=row["subtitle_time_offset"],
+            project_id=project_id,
             createdAt=created_at_ms,
             updatedAt=updated_at_ms,
         )

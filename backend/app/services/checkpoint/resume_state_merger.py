@@ -45,7 +45,7 @@ class MergedResumeState:
     previous_whisper_text: str = ""
     sentences_snapshot: List[Dict[str, Any]] = field(default_factory=list)
     sentence_count: int = 0
-    chunk_sentences_map: Dict[int, List[int]] = field(default_factory=dict)
+    chunk_sentences_map: Dict[Any, List[int]] = field(default_factory=dict)
 
     # 审计信息
     merge_decisions: List[MergeDecision] = field(default_factory=list)
@@ -318,15 +318,17 @@ class ResumeStateMerger:
         return normalized
 
     @staticmethod
-    def _normalize_chunk_sentences_map(raw_map: Any) -> Dict[int, List[int]]:
+    def _normalize_chunk_sentences_map(raw_map: Any) -> Dict[Any, List[int]]:
         if not isinstance(raw_map, dict):
             return {}
-        normalized: Dict[int, List[int]] = {}
+        normalized: Dict[Any, List[int]] = {}
         for raw_key, raw_value in raw_map.items():
-            try:
-                key = int(raw_key)
-            except (TypeError, ValueError):
-                continue
+            key: Any = raw_key
+            if isinstance(raw_key, str) and raw_key.lstrip("-").isdigit():
+                try:
+                    key = int(raw_key)
+                except (TypeError, ValueError):
+                    key = raw_key
             if not isinstance(raw_value, list):
                 continue
             normalized[key] = []

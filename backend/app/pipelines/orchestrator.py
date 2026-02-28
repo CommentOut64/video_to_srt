@@ -158,6 +158,10 @@ class PipelineOrchestrator:
                     project_id=getattr(job, "project_id", None),
                 )
             )
+            try:
+                _subtitle_manager.bind_runtime_checkpoint_service(_job_dir)
+            except Exception as exc:
+                self.logger.warning("绑定 runtime 字幕持久化失败，降级为仅内存字幕: %s", exc)
 
             # 恢复字幕状态
             if resume_context.is_resuming and resume_context.sentences_snapshot:
@@ -263,6 +267,8 @@ class PipelineOrchestrator:
                     chunk_indices = _subtitle_manager.chunk_sentences.get(
                         ctx.chunk_index, []
                     )
+                    if hasattr(_subtitle_manager, "get_chunk_sentence_indices"):
+                        chunk_indices = _subtitle_manager.get_chunk_sentence_indices(ctx.chunk_index)
                     for idx in chunk_indices:
                         if idx in _subtitle_manager.sentences:
                             pipeline_sentences.append(_subtitle_manager.sentences[idx])
@@ -289,6 +295,30 @@ class PipelineOrchestrator:
                 offset_override=offset
             )
             subtitle_output.write_srt(segments, srt_path)
+
+            # V3.2.4+dev.20260228.01:
+            # 流水线完成态不再写入 subtitle_edits.json（编辑增量文件）。
+            # 运行态真源由 StreamingSubtitleManager + runtime_state.db 维护。
+            try:
+                from app.services.project_service import get_project_service
+
+                project_service = get_project_service()
+                existing_project = project_service._load_project_meta(_job_dir)  # type: ignore[attr-defined]
+                stable_project_id = (
+                    getattr(job, "project_id", None)
+                    or (existing_project.project_id if existing_project else None)
+                    or job.job_id
+                )
+                project = project_service.create_normal_project(
+                    job_id=job.job_id,
+                    title=job.title or Path(job.filename).stem,
+                    source_type="transcribe",
+                    project_id=stable_project_id,
+                    project_dir=_job_dir,
+                )
+                job.project_id = project.project_id
+            except Exception as exc:
+                self.logger.warning("Task6 project 元信息收口失败，不影响主任务完成: %s", exc)
 
             job.srt_path = str(srt_path)
             job.status = "finished"

@@ -191,7 +191,8 @@ class OutputLayerProcessor:
         segmentation_report = dict(data.segmentation_report or {})
         segmentation_report["unknown_sentence_filtered_count"] = int(unknown_sentence_filtered_count)
         payload: Dict[str, Any] = {
-            "chunk_index": int(data.chunk_index),
+            "chunk_index": self._try_parse_chunk_index(data.chunk_index),
+            "chunk_uid": str(data.chunk_index),
             "sentence_count": int(len(sentence_segments)),
             "sentence_segments": [
                 self._serialize_sentence_segment(item) for item in sentence_segments
@@ -226,6 +227,26 @@ class OutputLayerProcessor:
             output_payload=payload,
             output_traces=output_traces,
         )
+
+    @staticmethod
+    def _try_parse_chunk_index(chunk_ref: Any) -> Optional[int]:
+        """兼容 string chunk_id，尽力解析 legacy chunk_index。"""
+        if isinstance(chunk_ref, int):
+            return chunk_ref
+        chunk_text = str(chunk_ref or "").strip()
+        if not chunk_text:
+            return None
+        if chunk_text.lstrip("-").isdigit():
+            try:
+                return int(chunk_text)
+            except ValueError:
+                return None
+        if chunk_text.startswith("chunk-"):
+            try:
+                return int(chunk_text.split("-")[-1])
+            except ValueError:
+                return None
+        return None
 
     def _apply_language_punctuation_standardization(
         self,
