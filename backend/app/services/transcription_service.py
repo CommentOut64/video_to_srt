@@ -311,10 +311,16 @@ class TranscriptionService:
                 )
 
                 project_service = get_project_service()
+                existing_project = project_service._load_project_meta(job_dir)  # type: ignore[attr-defined]
+                stable_project_id = (
+                    getattr(job, "project_id", None)
+                    or (existing_project.project_id if existing_project else None)
+                )
                 project = project_service.create_normal_project(
                     job_id=job.job_id,
                     title=job.title or Path(job.filename).stem,
                     source_type="transcribe",
+                    project_id=stable_project_id,
                 )
                 job.project_id = project.project_id
             except Exception as exc:

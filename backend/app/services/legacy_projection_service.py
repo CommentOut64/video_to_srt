@@ -56,7 +56,17 @@ class LegacyProjectionService:
         with self._lock:
             cached = self._map.get("mappings", {}).get(normalized_job_id)
             if isinstance(cached, dict) and cached.get("project_id"):
-                return str(cached["project_id"]), False
+                cached_project_id = str(cached["project_id"])
+                cached_project = self._project_service.get_project(cached_project_id)
+                if (
+                    cached_project is not None
+                    and str(cached_project.job_id or "").strip() == normalized_job_id
+                ):
+                    return cached_project_id, False
+
+                # 历史映射失效：project 已不存在或与 job_id 不匹配，移除后重新解析。
+                self._map.get("mappings", {}).pop(normalized_job_id, None)
+                self._save_map()
 
         job_dir = config.JOBS_DIR / normalized_job_id
         if not job_dir.exists():
@@ -65,7 +75,6 @@ class LegacyProjectionService:
         existing_project = self._project_service._load_project_meta(job_dir)  # type: ignore[attr-defined]
         if (
             existing_project is not None
-            and existing_project.mode == "legacy"
             and existing_project.job_id == normalized_job_id
         ):
             self._record_mapping(normalized_job_id, existing_project.project_id, False)

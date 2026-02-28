@@ -5,8 +5,10 @@ Project API 路由。
 from __future__ import annotations
 
 import logging
+import json
 from pathlib import Path
 from typing import Literal, Optional
+from time import time
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
@@ -86,6 +88,111 @@ def _read_local_file(path: str) -> str:
     """读取本地文件内容，自动检测编码"""
     raw_bytes = Path(path).read_bytes()
     return _decode_upload_content(raw_bytes)
+
+
+def _restore_segments_from_checkpoint(project_dir: Path) -> list[dict]:
+    """
+    从 checkpoint/transcription_text 恢复字幕段（仅用于缺失真源时修复）。
+    """
+    candidate_paths = [
+        project_dir / "checkpoint.json",
+        project_dir / "transcription_text.json",
+    ]
+    for snapshot_path in candidate_paths:
+        if not snapshot_path.exists():
+            continue
+        try:
+            with open(snapshot_path, "r", encoding="utf-8") as file:
+                payload = json.load(file)
+        except Exception:
+            continue
+
+        transcription_payload = payload.get("transcription", payload)
+        sentences = transcription_payload.get("sentences_snapshot", [])
+        if not isinstance(sentences, list) or not sentences:
+            continue
+
+        segments = []
+        for sentence in sentences:
+            if not isinstance(sentence, dict):
+                continue
+            text = str(sentence.get("text", "") or "")
+            if not text.strip():
+                continue
+            start = float(sentence.get("start", 0.0) or 0.0)
+            end = float(sentence.get("end", start) or start)
+            if end < start:
+                end = start
+            segments.append({"text": text, "start": start, "end": end})
+
+        if segments:
+            segments.sort(key=lambda item: (float(item["start"]), float(item["end"])))
+            return segments
+    return []
+
+
+def _restore_segments_from_srt(project_dir: Path) -> list[dict]:
+    """
+    从目录中最新 SRT 文件恢复字幕段（仅用于缺失真源时修复）。
+    """
+    subtitle_doc_service = get_subtitle_doc_service()
+    srt_files = sorted(
+        project_dir.glob("*.srt"),
+        key=lambda path: path.stat().st_mtime if path.exists() else 0,
+        reverse=True,
+    )
+    for srt_path in srt_files:
+        try:
+            raw_bytes = srt_path.read_bytes()
+        except Exception:
+            continue
+        try:
+            content = _decode_upload_content(raw_bytes)
+        except HTTPException:
+            continue
+        segments = subtitle_doc_service.parse_srt(content)
+        if segments:
+            return segments
+    return []
+
+
+def _try_rehydrate_subtitle_source(project_id: str, project_dir: Path) -> list[dict]:
+    """
+    在 subtitle_edits 缺失或为空时，尝试自动重建 project 字幕真源。
+    """
+    subtitle_doc_service = get_subtitle_doc_service()
+    project_service = get_project_service()
+    project = project_service.get_project(project_id)
+
+    restored_segments = _restore_segments_from_checkpoint(project_dir)
+    if not restored_segments:
+        restored_segments = _restore_segments_from_srt(project_dir)
+    if not restored_segments:
+        return []
+
+    source_type = "legacy" if (project and project.mode == "legacy") else "transcribe"
+    subtitle_doc_service.import_segments(
+        project_dir=project_dir,
+        segments=restored_segments,
+        source_type=source_type,
+    )
+
+    if project and project.subtitle_doc:
+        project.subtitle_doc.doc_id = project.project_id
+        project.subtitle_doc.project_id = project.project_id
+        project.subtitle_doc.source_type = source_type  # type: ignore[assignment]
+        project.subtitle_doc.segment_count = len(restored_segments)
+        project.subtitle_doc.updated_at = time()
+        project.updated_at = time()
+        project_service.save_project(project, project_dir=project_dir)
+
+    logger.warning(
+        "project 字幕真源缺失，已自动重建: project_id=%s, dir=%s, segments=%s",
+        project_id,
+        project_dir,
+        len(restored_segments),
+    )
+    return subtitle_doc_service.load_segments(project_dir)
 
 
 @router.post("/import")
@@ -219,6 +326,8 @@ async def list_project_subtitles(project_id: str):
     if project_dir is None:
         raise HTTPException(status_code=404, detail="项目不存在")
     segments = subtitle_doc_service.load_segments(project_dir)
+    if not segments:
+        segments = _try_rehydrate_subtitle_source(project_id, project_dir)
     return {"success": True, "data": segments}
 
 
