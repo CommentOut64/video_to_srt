@@ -54,12 +54,35 @@ class FastLoopService:
                     token.raise_if_canceled()
                 if retries >= max_retry:
                     if allow_drop:
-                        host.logger.warning(
-                            "FastWorker 投递 queue_inter 超时，丢弃载荷: reason=%s, retries=%s",
-                            reason,
-                            retries,
+                        is_terminal_request = bool(
+                            token and (
+                                getattr(token, "is_canceled", False)
+                                or getattr(token, "is_paused", False)
+                            )
                         )
-                        return False
+                        has_downstream_error = bool(getattr(host, "errors", None))
+                        if is_terminal_request or has_downstream_error:
+                            queue_inter = getattr(host, "queue_inter", None)
+                            queue_size = queue_inter.qsize() if queue_inter is not None else -1
+                            queue_maxsize = getattr(queue_inter, "maxsize", -1)
+                            host.logger.warning(
+                                f"FastWorker 投递 queue_inter 超时，丢弃载荷: reason={reason}, "
+                                f"retries={retries}, is_terminal_request={is_terminal_request}, "
+                                f"has_downstream_error={has_downstream_error}, "
+                                f"queue_inter_size={queue_size}/{queue_maxsize}"
+                            )
+                            return False
+
+                        # 正常路径下不允许丢失结束/错误信号，否则下游可能永远收不到 is_end 导致卡死。
+                        queue_inter = getattr(host, "queue_inter", None)
+                        queue_size = queue_inter.qsize() if queue_inter is not None else -1
+                        queue_maxsize = getattr(queue_inter, "maxsize", -1)
+                        host.logger.warning(
+                            f"FastWorker 投递 queue_inter 超时，继续等待下游腾挪容量: reason={reason}, "
+                            f"retries={retries}, queue_inter_size={queue_size}/{queue_maxsize}"
+                        )
+                        retries = 0
+                        continue
                     raise RuntimeError(
                         f"FastWorker 投递 queue_inter 超时: reason={reason}, retries={retries}"
                     )

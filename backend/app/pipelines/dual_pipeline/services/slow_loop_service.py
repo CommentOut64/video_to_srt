@@ -56,12 +56,35 @@ class SlowLoopService:
                     token.raise_if_canceled()
                 if retries >= max_retry:
                     if allow_drop:
-                        host.logger.warning(
-                            "SlowWorker 投递 queue_final 超时，丢弃载荷: reason=%s, retries=%s",
-                            reason,
-                            retries,
+                        is_terminal_request = bool(
+                            token and (
+                                getattr(token, "is_canceled", False)
+                                or getattr(token, "is_paused", False)
+                            )
                         )
-                        return False
+                        has_downstream_error = bool(getattr(host, "errors", None))
+                        if is_terminal_request or has_downstream_error:
+                            queue_final = getattr(host, "queue_final", None)
+                            queue_size = queue_final.qsize() if queue_final is not None else -1
+                            queue_maxsize = getattr(queue_final, "maxsize", -1)
+                            host.logger.warning(
+                                f"SlowWorker 投递 queue_final 超时，丢弃载荷: reason={reason}, "
+                                f"retries={retries}, is_terminal_request={is_terminal_request}, "
+                                f"has_downstream_error={has_downstream_error}, "
+                                f"queue_final_size={queue_size}/{queue_maxsize}"
+                            )
+                            return False
+
+                        # 正常路径下不允许丢失结束/错误信号，否则对齐阶段可能永远等待 is_end。
+                        queue_final = getattr(host, "queue_final", None)
+                        queue_size = queue_final.qsize() if queue_final is not None else -1
+                        queue_maxsize = getattr(queue_final, "maxsize", -1)
+                        host.logger.warning(
+                            f"SlowWorker 投递 queue_final 超时，继续等待下游腾挪容量: reason={reason}, "
+                            f"retries={retries}, queue_final_size={queue_size}/{queue_maxsize}"
+                        )
+                        retries = 0
+                        continue
                     raise RuntimeError(
                         f"SlowWorker 投递 queue_final 超时: reason={reason}, retries={retries}"
                     )
