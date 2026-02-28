@@ -51,7 +51,7 @@ describe('Phase 4 回归 - 字幕同步队列迁移', () => {
     await localforage.setItem(queueKey, {
       '1': { text: '第一条', start: '1.25', end: 2.5, extra: 'ignore' },
       '2': { text: '第二条' },
-      abc: { text: '无效索引' },
+      abc: { text: 'segment-id 索引' },
       '3': null,
       '4': 'invalid',
     })
@@ -59,10 +59,11 @@ describe('Phase 4 回归 - 字幕同步队列迁移', () => {
     const result = await migrateSubtitleSyncQueue(identityId)
     const migratedPayload = localforage.__dump(queueKey)
 
-    expect(result).toEqual({ migrated: true, count: 2 })
+    expect(result).toEqual({ migrated: true, count: 3 })
     expect(migratedPayload).toEqual({
       '1': { text: '第一条', start: 1.25, end: 2.5 },
       '2': { text: '第二条' },
+      abc: { text: 'segment-id 索引' },
     })
   })
 
@@ -72,7 +73,7 @@ describe('Phase 4 回归 - 字幕同步队列迁移', () => {
 
     await localforage.setItem(queueKey, {
       '0': { text: '旧文本A', start: '0.5', end: '1.5' },
-      x: { text: '无效索引' },
+      x: { text: 'segment-id 样式键' },
       '1': { text: '旧文本B' },
     })
 
@@ -93,7 +94,7 @@ describe('Phase 4 回归 - 字幕同步队列迁移', () => {
       }
     }
 
-    expect(subtitleDocumentStore.pendingCount()).toBe(2)
+    expect(subtitleDocumentStore.pendingCount()).toBe(3)
     expect(subtitleDocumentStore.applyPendingEditsToStore(targetStore)).toBe(2)
     expect(updates).toEqual([
       { id: 's0', payload: { text: '旧文本A', start: 0.5, end: 1.5 } },
