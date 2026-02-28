@@ -540,6 +540,13 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
     const serverUpdatedAt = normalizeTimestamp(
       taskData.updated_at ?? taskData.updatedAt ?? taskData.timestamp
     )
+    const createdAt = normalizeTimestamp(
+      taskData.createdAt ?? taskData.created_time ?? taskData.created_at
+    )
+    const completedAt = normalizeTimestamp(taskData.completed_at ?? taskData.completedAt)
+    const pausedAt = normalizeTimestamp(taskData.paused_at ?? taskData.pausedAt)
+    const failedAt = normalizeTimestamp(taskData.failed_at ?? taskData.failedAt)
+    const canceledAt = normalizeTimestamp(taskData.canceled_at ?? taskData.canceledAt)
     const task = {
       job_id: taskData.job_id,
       project_id: taskData.project_id || taskData.job_id,
@@ -554,13 +561,15 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
       language: taskData.language || null,
       processed: taskData.processed || 0,
       total: taskData.total || 0,
-      createdAt: taskData.createdAt || Date.now(),
+      createdAt: createdAt || Date.now(),
       updatedAt: serverUpdatedAt || Date.now(),
       serverUpdatedAt: serverUpdatedAt || 0,
-      completed_at: taskData.completed_at || null,  // 完成时间
-      paused_at: taskData.paused_at || null,        // 暂停时间
-      failed_at: taskData.failed_at || null,        // 失败时间
-      canceled_at: taskData.canceled_at || null,    // 取消时间
+      completed_at: completedAt,                    // 完成时间
+      paused_at: pausedAt,                          // 暂停时间
+      failed_at: failedAt,                          // 失败时间
+      canceled_at: canceledAt,                      // 取消时间
+      is_project_only: Boolean(taskData.is_project_only),
+      source_type: taskData.source_type || null,
       state_seq: normalizeStateSeq(taskData.state_seq),
       isDirty: false,
       sseConnected: false,
@@ -859,7 +868,24 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
       if (snapshot.processed !== undefined) task.processed = snapshot.processed
       if (snapshot.total !== undefined) task.total = snapshot.total
       if (snapshot.language !== undefined) task.language = snapshot.language
-      if (snapshot.created_time) task.createdAt = snapshot.created_time
+      const snapshotCreatedAt = normalizeTimestamp(
+        snapshot.created_time ?? snapshot.createdAt ?? snapshot.created_at
+      )
+      if (snapshotCreatedAt) task.createdAt = snapshotCreatedAt
+      const snapshotCompletedAt = normalizeTimestamp(snapshot.completed_at)
+      if (snapshotCompletedAt) task.completed_at = snapshotCompletedAt
+      const snapshotPausedAt = normalizeTimestamp(snapshot.paused_at)
+      if (snapshotPausedAt) task.paused_at = snapshotPausedAt
+      const snapshotFailedAt = normalizeTimestamp(snapshot.failed_at)
+      if (snapshotFailedAt) task.failed_at = snapshotFailedAt
+      const snapshotCanceledAt = normalizeTimestamp(snapshot.canceled_at)
+      if (snapshotCanceledAt) task.canceled_at = snapshotCanceledAt
+      if (snapshot.is_project_only !== undefined) {
+        task.is_project_only = Boolean(snapshot.is_project_only)
+      }
+      if (snapshot.source_type !== undefined) {
+        task.source_type = snapshot.source_type || null
+      }
       if (snapshot.progress !== undefined) {
         applyProgressField(task, snapshot.progress, snapshot.status)
       }
@@ -895,9 +921,16 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
       language: snapshot.language,
       processed: snapshot.processed || 0,
       total: snapshot.total || 0,
-      createdAt: snapshot.created_time || Date.now(),
+      createdAt: normalizeTimestamp(
+        snapshot.created_time ?? snapshot.createdAt ?? snapshot.created_at
+      ) || Date.now(),
       updated_at: incomingAt,
+      completed_at: snapshot.completed_at,
+      paused_at: snapshot.paused_at,
+      failed_at: snapshot.failed_at,
       canceled_at: snapshot.canceled_at,
+      is_project_only: snapshot.is_project_only,
+      source_type: snapshot.source_type,
       state_seq: incomingSeq
     })
     const newTask = tasksMap.value.get(jobId)
@@ -1156,16 +1189,28 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
       if (saved) {
         const tasksArray = JSON.parse(saved)
         tasksMap.value = new Map(
-          tasksArray.map(t => [
-            t.job_id,
-            {
-              ...t,
-              project_id: t.project_id || t.job_id,
-              canceled_at: t.canceled_at || null,
-              state_seq: normalizeStateSeq(t.state_seq),
-              serverUpdatedAt: normalizeTimestamp(t.serverUpdatedAt) || 0
-            }
-          ])
+          tasksArray.map((t) => {
+            const createdAt = normalizeTimestamp(t.createdAt ?? t.created_time ?? t.created_at)
+            const updatedAt = normalizeTimestamp(t.updatedAt ?? t.updated_at)
+            const serverUpdatedAt = normalizeTimestamp(t.serverUpdatedAt) || updatedAt || 0
+            return [
+              t.job_id,
+              {
+                ...t,
+                project_id: t.project_id || t.job_id,
+                createdAt: createdAt || Date.now(),
+                updatedAt: updatedAt || Date.now(),
+                completed_at: normalizeTimestamp(t.completed_at),
+                paused_at: normalizeTimestamp(t.paused_at),
+                failed_at: normalizeTimestamp(t.failed_at),
+                canceled_at: normalizeTimestamp(t.canceled_at),
+                state_seq: normalizeStateSeq(t.state_seq),
+                serverUpdatedAt,
+                is_project_only: Boolean(t.is_project_only),
+                source_type: t.source_type || null,
+              }
+            ]
+          })
         )
         Array.from(tasksMap.value.values()).forEach((task) => {
           hydrateRuntimeStateFromTask(task, 'restore')
