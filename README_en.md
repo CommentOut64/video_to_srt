@@ -11,7 +11,7 @@
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-009688?logo=fastapi&logoColor=white)
 
-<img src="https://cdn.jsdelivr.net/gh/CommentOut64/anchor-flux@main/assets/pic2.png" image-rendering: crisp-edges/>
+<img src="https://cdn.jsdelivr.net/gh/CommentOut64/anchor-flux@main/assets/pic3.png" image-rendering: crisp-edges/>
 
 AnchorFlux is not just another high-precision transcription script; it is a full-stack subtitle production solution tailored for video creators and developers.
 
