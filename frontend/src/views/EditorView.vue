@@ -668,7 +668,10 @@ async function resolveIdentity() {
       const project = await projectApi.getProject(resolvedProjectId.value)
       const sourceType = String(project?.subtitle_doc?.source_type || '').trim().toLowerCase()
       const mode = String(project?.mode || '').trim().toLowerCase()
-      const isProjectOnly = sourceType === 'import' || mode === 'import'
+      const taskMode = String(project?.task_mode || '').trim().toLowerCase()
+      const isProjectOnly = taskMode
+        ? taskMode === 'subtitle_edit'
+        : (sourceType === 'import' || mode === 'import')
       if (project?.job_id && !isProjectOnly) {
         resolvedJobId.value = project.job_id
       }
@@ -718,6 +721,7 @@ async function loadProject() {
       projectId,
       jobId: activeJobId.value,
       mode: 'normal',
+      taskMode: activeJobId.value ? 'transcribe' : 'subtitle_edit',
       capabilitySnapshot: initialCapabilitySnapshot,
       flavor: selectFlavor(initialCapabilitySnapshot),
     })
@@ -740,6 +744,7 @@ async function loadProject() {
     projectStore.setIdentity({
       capabilitySnapshot: projectMetaCapabilitySnapshot,
       flavor: projectMeta?.flavor || selectFlavor(projectMetaCapabilitySnapshot),
+      taskMode: projectMeta?.task_mode || projectStore.meta.taskMode || 'transcribe',
     })
     applyMediaPaths({ project: projectMeta })
 
@@ -762,6 +767,7 @@ async function loadProject() {
         capabilitySnapshot: projectCapabilitySnapshot,
         flavor: project?.flavor || selectFlavor(projectCapabilitySnapshot),
         mode: project?.mode || 'normal',
+        taskMode: project?.task_mode || 'subtitle_edit',
       })
       const restored = await projectStore.restoreProject(projectId)
       // 恢复缓存后再次覆盖媒体路径，防止旧缓存 videoPath 误导为“有视频”。
@@ -773,6 +779,7 @@ async function loadProject() {
             projectId,
             jobId: project?.job_id || null,
             mode: project?.mode || 'normal',
+            taskMode: project?.task_mode || 'subtitle_edit',
             flavor: project?.flavor || selectFlavor(projectStore.meta.capabilitySnapshot),
             capabilitySnapshot: projectStore.meta.capabilitySnapshot,
           },
@@ -819,6 +826,7 @@ async function loadProject() {
     projectStore.setIdentity({
       jobId: activeJobId.value,
       projectId: props.projectId || projectStore.meta.projectId,
+      taskMode: projectMeta?.task_mode || 'transcribe',
     })
     projectStore.patchMeta({
       filename: jobStatus.filename || '未知文件',

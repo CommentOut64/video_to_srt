@@ -765,13 +765,17 @@ function onLoadedData() {
 }
 
 function onTimeUpdate(event) {
-  const video = event?.target || videoRef.value
+  const video = event?.target ?? videoRef.value ?? null
   if (!video) {
+    return
+  }
+  const currentTime = Number(video?.currentTime)
+  if (!Number.isFinite(currentTime)) {
     return
   }
   // 【重要】时间更新由 PlaybackManager 内部通过事件监听处理
   // 这里只负责发射事件通知外部
-  emit('timeupdate', video.currentTime)
+  emit('timeupdate', currentTime)
 }
 
 function onPlay() {

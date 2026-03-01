@@ -84,6 +84,36 @@
           <section class="sidebar-block">
             <div class="block-title">
               <el-icon><CollectionTag /></el-icon>
+              <span>任务类型</span>
+            </div>
+            <div class="mode-switch mode-switch--triple">
+              <button
+                class="mode-btn"
+                :class="{ active: taskModeFilter === 'all' }"
+                @click="setTaskModeFilter('all')"
+              >
+                全部
+              </button>
+              <button
+                class="mode-btn"
+                :class="{ active: taskModeFilter === 'transcribe' }"
+                @click="setTaskModeFilter('transcribe')"
+              >
+                视频转录
+              </button>
+              <button
+                class="mode-btn"
+                :class="{ active: taskModeFilter === 'subtitle_edit' }"
+                @click="setTaskModeFilter('subtitle_edit')"
+              >
+                字幕编辑
+              </button>
+            </div>
+          </section>
+
+          <section class="sidebar-block">
+            <div class="block-title">
+              <el-icon><CollectionTag /></el-icon>
               <span>重要设置</span>
             </div>
 
@@ -239,6 +269,7 @@ import { navigateToEditor } from '@/utils/editorNavigation'
 
 const DISPLAY_MODE_KEY = 'task-ui-display-mode'
 const SORT_MODE_KEY = 'task-ui-sort-mode'
+const TASK_MODE_FILTER_KEY = 'task-ui-task-mode-filter'
 const GROUP_COLLAPSE_KEY = 'task-ui-group-collapse'
 const SIDEBAR_SETTINGS_KEY = 'task-ui-sidebar-settings'
 const ADVANCED_GENERAL_KEY = 'task-advanced-general'
@@ -259,6 +290,7 @@ const isEdgeHovered = ref(false)
 
 const displayMode = ref('card')
 const sortMode = ref('grouped')
+const taskModeFilter = ref('all')
 const groupCollapseState = ref({
   workspace: false,
   interrupted: false,
@@ -378,9 +410,20 @@ function getEndTime(task) {
   )
 }
 
+function resolveTaskMode(task) {
+  const normalized = String(task?.task_mode || '').trim().toLowerCase()
+  if (normalized === 'transcribe' || normalized === 'subtitle_edit') {
+    return normalized
+  }
+  return Boolean(task?.is_project_only) ? 'subtitle_edit' : 'transcribe'
+}
+
 function shouldIncludeTask(task) {
   if (!task || task.status === 'removed') return false
   if (!showCanceledTasks.value && ['canceled', 'force_canceled'].includes(task.status)) {
+    return false
+  }
+  if (taskModeFilter.value !== 'all' && resolveTaskMode(task) !== taskModeFilter.value) {
     return false
   }
   return true
@@ -497,9 +540,15 @@ function setSortMode(mode) {
   }
 }
 
+function setTaskModeFilter(mode) {
+  if (!['all', 'transcribe', 'subtitle_edit'].includes(mode)) return
+  taskModeFilter.value = mode
+}
+
 function loadTaskUiPreferences() {
   const savedDisplay = localStorage.getItem(DISPLAY_MODE_KEY)
   const savedSort = localStorage.getItem(SORT_MODE_KEY)
+  const savedTaskModeFilter = localStorage.getItem(TASK_MODE_FILTER_KEY)
   const savedCollapse = parseJsonStorage(GROUP_COLLAPSE_KEY, null)
   const savedSidebarSettings = parseJsonStorage(SIDEBAR_SETTINGS_KEY, null)
   const savedAdvancedGeneral = parseJsonStorage(ADVANCED_GENERAL_KEY, null)
@@ -509,6 +558,9 @@ function loadTaskUiPreferences() {
   }
   if (savedSort === 'grouped' || savedSort === 'edited_time') {
     sortMode.value = savedSort
+  }
+  if (['all', 'transcribe', 'subtitle_edit'].includes(String(savedTaskModeFilter || ''))) {
+    taskModeFilter.value = String(savedTaskModeFilter)
   }
   if (savedCollapse && typeof savedCollapse === 'object') {
     groupCollapseState.value = {
@@ -536,6 +588,10 @@ watch(displayMode, (value) => {
 
 watch(sortMode, (value) => {
   localStorage.setItem(SORT_MODE_KEY, value)
+})
+
+watch(taskModeFilter, (value) => {
+  localStorage.setItem(TASK_MODE_FILTER_KEY, value)
 })
 
 watch(
@@ -870,7 +926,7 @@ async function finishEditTitle(task) {
   }
 
   try {
-    const isProjectOnly = Boolean(task.is_project_only)
+    const isProjectOnly = resolveTaskMode(task) === 'subtitle_edit'
     let result = null
     let renamedByProjectApi = false
 
@@ -1172,6 +1228,10 @@ async function handleExit() {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 6px;
+}
+
+.mode-switch--triple {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .mode-btn {
