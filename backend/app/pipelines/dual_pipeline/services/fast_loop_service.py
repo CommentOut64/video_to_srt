@@ -31,6 +31,7 @@ class FastLoopService:
         max_retry: int = 6,
         allow_drop: bool = False,
         reason: str = "",
+        is_must_deliver: bool = False,
     ) -> bool:
         """
         带取消守卫的 queue_inter 投递。
@@ -50,39 +51,57 @@ class FastLoopService:
                 return True
             except asyncio.TimeoutError:
                 retries += 1
-                if token:
+                is_terminal_payload = is_must_deliver or bool(
+                    getattr(payload, "is_end", False) or getattr(payload, "error", None)
+                )
+                is_terminal_request = bool(
+                    token and (
+                        getattr(token, "is_canceled", False)
+                        or getattr(token, "is_paused", False)
+                    )
+                )
+                if token and not is_terminal_payload:
                     token.raise_if_canceled()
+                if allow_drop and is_terminal_payload and is_terminal_request:
+                    queue_inter = getattr(host, "queue_inter", None)
+                    queue_size = queue_inter.qsize() if queue_inter is not None else -1
+                    queue_maxsize = getattr(queue_inter, "maxsize", -1)
+                    host.logger.warning(
+                        f"FastWorker 投递 queue_inter 超时，终止请求已生效，丢弃终止载荷: "
+                        f"reason={reason}, retries={retries}, "
+                        f"queue_inter_size={queue_size}/{queue_maxsize}"
+                    )
+                    return False
                 if retries >= max_retry:
-                    if allow_drop:
-                        is_terminal_request = bool(
-                            token and (
-                                getattr(token, "is_canceled", False)
-                                or getattr(token, "is_paused", False)
-                            )
-                        )
-                        has_downstream_error = bool(getattr(host, "errors", None))
-                        if is_terminal_request or has_downstream_error:
-                            queue_inter = getattr(host, "queue_inter", None)
-                            queue_size = queue_inter.qsize() if queue_inter is not None else -1
-                            queue_maxsize = getattr(queue_inter, "maxsize", -1)
+                    queue_inter = getattr(host, "queue_inter", None)
+                    queue_size = queue_inter.qsize() if queue_inter is not None else -1
+                    queue_maxsize = getattr(queue_inter, "maxsize", -1)
+
+                    if allow_drop and not is_terminal_payload:
+                        if is_terminal_request:
                             host.logger.warning(
                                 f"FastWorker 投递 queue_inter 超时，丢弃载荷: reason={reason}, "
                                 f"retries={retries}, is_terminal_request={is_terminal_request}, "
-                                f"has_downstream_error={has_downstream_error}, "
                                 f"queue_inter_size={queue_size}/{queue_maxsize}"
                             )
                             return False
 
-                        # 正常路径下不允许丢失结束/错误信号，否则下游可能永远收不到 is_end 导致卡死。
-                        queue_inter = getattr(host, "queue_inter", None)
-                        queue_size = queue_inter.qsize() if queue_inter is not None else -1
-                        queue_maxsize = getattr(queue_inter, "maxsize", -1)
                         host.logger.warning(
                             f"FastWorker 投递 queue_inter 超时，继续等待下游腾挪容量: reason={reason}, "
                             f"retries={retries}, queue_inter_size={queue_size}/{queue_maxsize}"
                         )
                         retries = 0
                         continue
+
+                    if is_terminal_payload:
+                        # 终止/错误载荷是控制信号，必须送达下游，不能因背压被丢弃。
+                        host.logger.warning(
+                            f"FastWorker 投递 queue_inter 超时，但载荷为终止信号，继续等待送达: "
+                            f"reason={reason}, retries={retries}, queue_inter_size={queue_size}/{queue_maxsize}"
+                        )
+                        retries = 0
+                        continue
+
                     raise RuntimeError(
                         f"FastWorker 投递 queue_inter 超时: reason={reason}, retries={retries}"
                     )
@@ -207,6 +226,7 @@ class FastLoopService:
                 token=token,
                 allow_drop=True,
                 reason="cancel_error_ctx",
+                is_must_deliver=True,
             )
             return
 
@@ -228,6 +248,7 @@ class FastLoopService:
                 token=token,
                 allow_drop=True,
                 reason="exception_error_ctx",
+                is_must_deliver=True,
             )
             should_send_end_signal = False
             return
@@ -251,6 +272,7 @@ class FastLoopService:
                     token=token,
                     allow_drop=True,
                     reason="end_ctx",
+                    is_must_deliver=True,
                 )
                 if pause_requested:
                     host.logger.debug("[V3.1.0] FastWorker 已发送暂停结束信号，等待下游排空")
