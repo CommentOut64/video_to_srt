@@ -291,6 +291,10 @@ class ProgressEventEmitter:
 
         logger.error(f"[ProgressEmitter] 任务失败: {self.job.job_id} - {error_message}")
 
+    def _channel_identifier(self) -> str:
+        """解析当前任务的 project 频道标识。"""
+        return str(getattr(self.job, "project_id", None) or self.job.job_id)
+
     def _recalculate_and_push(
         self,
         phase: str,
@@ -351,7 +355,7 @@ class ProgressEventEmitter:
             logger.warning(f"[ProgressEmitter] SSE管理器为None，无法推送进度: {phase}")
             return
 
-        channel_id = f"job:{self.job.job_id}"
+        channel_id = f"project:{self._channel_identifier()}"
         event_type = f"progress.{phase}"
         data["updated_at"] = int(time.time() * 1000)
 
@@ -364,13 +368,15 @@ class ProgressEventEmitter:
             logger.warning(f"[ProgressEmitter] SSE管理器为None，无法推送总体进度")
             return
 
-        channel_id = f"job:{self.job.job_id}"
+        channel_id = f"project:{self._channel_identifier()}"
         job_id = self.job.job_id
         updated_at_ms = int(time.time() * 1000)
+        project_id = self._channel_identifier()
 
         # 构建总体进度数据
         overall_data = {
             "job_id": job_id,
+            "project_id": project_id,
             "phase": self.job.phase,
             "percent": self.detail.total,
             "phase_percent": self._get_current_phase_percent(),
@@ -396,7 +402,7 @@ class ProgressEventEmitter:
 
         # 同时推送到全局频道 (用于任务列表)
         global_data = {
-            "id": job_id,
+            "id": project_id,
             "percent": self.detail.total,
             "message": self._get_current_message(),
             "status": self.job.status,
@@ -410,9 +416,10 @@ class ProgressEventEmitter:
         if self.sse_manager is None:
             return
 
-        channel_id = f"job:{self.job.job_id}"
+        channel_id = f"project:{self._channel_identifier()}"
         signal_data = {
             "job_id": self.job.job_id,
+            "project_id": self._channel_identifier(),
             "signal": signal_type,
             "message": message,
             "updated_at": int(time.time() * 1000)

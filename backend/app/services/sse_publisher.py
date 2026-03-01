@@ -77,6 +77,18 @@ class SSEPublisher:
 
         logger.debug(f"[SSEPublisher] 初始化: job_id={job_id}")
 
+    def _resolve_channel_identifier(self, job: Optional["JobState"] = None) -> str:
+        """统一解析 project 频道标识。"""
+        target_job = job or self._job
+        if target_job is not None:
+            project_id = str(getattr(target_job, "project_id", "") or "").strip()
+            if project_id:
+                return project_id
+            runtime_job_id = str(getattr(target_job, "job_id", "") or "").strip()
+            if runtime_job_id:
+                return runtime_job_id
+        return str(self.job_id)
+
     # ========== 进度事件 ==========
 
     def publish_progress(
@@ -100,7 +112,7 @@ class SSEPublisher:
             "updated_at": int(time.time() * 1000),
         }
 
-        channel_id = f"job:{self.job_id}"
+        channel_id = f"project:{self._resolve_channel_identifier()}"
         event_type = f"progress.{phase}"
 
         self.sse_manager.broadcast_sync(channel_id, event_type, data)
@@ -119,15 +131,16 @@ class SSEPublisher:
         updated_at_ms = payload.get("updated_at") or int(time.time() * 1000)
         payload["updated_at"] = updated_at_ms
         payload.setdefault("timestamp", time.time())
+        payload.setdefault("project_id", self._resolve_channel_identifier())
 
-        channel_id = f"job:{self.job_id}"
+        channel_id = f"project:{self._resolve_channel_identifier()}"
 
         # 推送到任务频道
         self.sse_manager.broadcast_sync(channel_id, "progress.overall", payload)
 
         # 同时推送到全局频道（用于任务列表）
         global_payload = {
-            "id": self.job_id,
+            "id": payload.get("project_id") or self._resolve_channel_identifier(),
             "percent": payload.get("percent", 0),
             "message": payload.get("message", ""),
             "status": payload.get("status", ""),
@@ -146,10 +159,12 @@ class SSEPublisher:
             job: 任务状态对象
         """
         updated_at_ms = int(time.time() * 1000)
-        channel_id = f"job:{job.job_id}"
+        channel_identifier = self._resolve_channel_identifier(job)
+        channel_id = f"project:{channel_identifier}"
 
         progress_data = {
             "job_id": job.job_id,
+            "project_id": channel_identifier,
             "phase": job.phase,
             "percent": job.progress,
             "phase_percent": job.phase_percent,
@@ -164,7 +179,7 @@ class SSEPublisher:
         self.sse_manager.broadcast_sync(channel_id, "progress.overall", progress_data)
 
         global_progress_data = {
-            "id": job.job_id,
+            "id": channel_identifier,
             "percent": job.progress,
             "phase_percent": job.phase_percent,
             "message": job.message,
@@ -197,7 +212,8 @@ class SSEPublisher:
             aligned_count: 已对齐段落数
             total_count: 总段落数
         """
-        channel_id = f"job:{job.job_id}"
+        channel_identifier = self._resolve_channel_identifier(job)
+        channel_id = f"project:{channel_identifier}"
         batch_progress = (current_batch / total_batches) * 100 if total_batches > 0 else 0
         segment_progress = (aligned_count / total_count) * 100 if total_count > 0 else 0
 
@@ -206,6 +222,7 @@ class SSEPublisher:
             "progress.align",
             {
                 "job_id": job.job_id,
+                "project_id": channel_identifier,
                 "phase": "align",
                 "batch": {
                     "current": current_batch,
@@ -416,13 +433,14 @@ class SSEPublisher:
         """
         signal_data = {
             "job_id": job.job_id,
+            "project_id": self._resolve_channel_identifier(job),
             "signal": signal_type,
             "message": message or job.message,
             "status": job.status,
             "percent": job.progress,
             "updated_at": int(time.time() * 1000),
         }
-        channel_id = f"job:{job.job_id}"
+        channel_id = f"project:{self._resolve_channel_identifier(job)}"
         self.sse_manager.broadcast_sync(channel_id, f"signal.{signal_type}", signal_data)
         logger.debug(f"[SSEPublisher] 推送任务信号: {signal_type}")
 
@@ -442,6 +460,7 @@ class SSEPublisher:
         """
         signal_data = {
             "job_id": self.job_id,
+            "project_id": self._resolve_channel_identifier(),
             "signal": signal_type,
             "message": message,
             "updated_at": int(time.time() * 1000),
@@ -449,7 +468,7 @@ class SSEPublisher:
         if data:
             signal_data.update(data)
 
-        channel_id = f"job:{self.job_id}"
+        channel_id = f"project:{self._resolve_channel_identifier()}"
 
         # 推送到任务频道
         self.sse_manager.broadcast_sync(channel_id, f"signal.{signal_type}", signal_data)
@@ -486,7 +505,7 @@ class SSEPublisher:
         if include_timestamp:
             payload["updated_at"] = int(time.time() * 1000)
 
-        channel_id = f"job:{self.job_id}"
+        channel_id = f"project:{self._resolve_channel_identifier()}"
         self.sse_manager.broadcast_sync(channel_id, "signal.bgm_detected", payload)
 
         logger.debug(f"[SSEPublisher] 推送 BGM 检测: level={level}")
@@ -517,7 +536,7 @@ class SSEPublisher:
         if include_timestamp:
             payload["updated_at"] = int(time.time() * 1000)
 
-        channel_id = f"job:{self.job_id}"
+        channel_id = f"project:{self._resolve_channel_identifier()}"
         self.sse_manager.broadcast_sync(channel_id, "signal.separation_strategy", payload)
 
         logger.debug(f"[SSEPublisher] 推送分离策略: {payload.get('strategy', 'unknown')}")
@@ -607,7 +626,10 @@ class SSEPublisher:
     def _get_subtitle_manager(self) -> StreamingSubtitleManager:
         """延迟获取 StreamingSubtitleManager"""
         if self._subtitle_manager is None:
-            self._subtitle_manager = get_streaming_subtitle_manager(self.job_id)
+            self._subtitle_manager = get_streaming_subtitle_manager(
+                self.job_id,
+                project_id=self._resolve_channel_identifier(),
+            )
             # 确保使用相同的 SSE 管理器
             self._subtitle_manager.sse_manager = self.sse_manager
         return self._subtitle_manager

@@ -76,7 +76,17 @@ class SubtitleDocService:
         segments: List[dict],
         source_type: str = "import",
     ) -> SubtitleDocMeta:
-        """导入字幕并写入 `subtitle_edits.json`。"""
+        """
+        导入字幕并写入 `subtitle_edits.json`。
+
+        约束：
+        - 仅允许 `import/legacy` 基线导入；
+        - `transcribe` 运行态基线必须写入 runtime_state，不允许写入编辑增量文件。
+        """
+        if source_type == "transcribe":
+            raise RuntimeError(
+                "禁止将转录运行态写入 subtitle_edits.json；请改用 runtime_state 字幕真源。"
+            )
         project_dir.mkdir(parents=True, exist_ok=True)
 
         edits: Dict[str, dict] = {}

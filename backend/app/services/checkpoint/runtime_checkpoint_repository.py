@@ -182,12 +182,13 @@ class RuntimeCheckpointRepository:
                 """
                 SELECT
                     (SELECT COUNT(1) FROM unit_journal) AS journal_count,
-                    (SELECT COUNT(1) FROM unit_commits) AS commit_count
+                    (SELECT COUNT(1) FROM unit_commits) AS commit_count,
+                    (SELECT COUNT(1) FROM control_signals) AS control_count
                 """
             ).fetchone()
         if not row:
             return False
-        return bool(row["journal_count"] or row["commit_count"])
+        return bool(row["journal_count"] or row["commit_count"] or row["control_count"])
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

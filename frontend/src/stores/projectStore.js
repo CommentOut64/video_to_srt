@@ -17,6 +17,7 @@ export const useProjectStore = defineStore("project", () => {
     jobId: null, // 转录任务ID
     projectId: null, // 项目ID（Task6 主键）
     mode: "normal", // normal | legacy
+    taskMode: "transcribe", // transcribe | subtitle_edit
     flavor: "full", // full | lite
     videoPath: null, // 视频文件路径
     audioPath: null, // 音频文件路径
@@ -30,6 +31,8 @@ export const useProjectStore = defineStore("project", () => {
     isDirty: false, // 是否有未保存修改
     // 渐进式加载相关（状态由 useProxyVideo composable 管理）
     currentResolution: null, // 当前视频分辨率 ('360p', '720p', 'source')
+    // Phase 0.5: 能力协商快照留位（本期不参与行为判断）
+    capabilitySnapshot: null,
     // V3.2.0+dev.20260130.09: 字幕全局时间偏移（秒）
     subtitleOffset: 0,
   });
@@ -218,6 +221,113 @@ export const useProjectStore = defineStore("project", () => {
     }
   }
 
+  function normalizeCapabilitySnapshot(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object') {
+      return null;
+    }
+    return snapshot;
+  }
+
+  // ========== 6.2 Phase 1: 状态写入口收口 ==========
+  function patchMeta(patch = {}) {
+    if (!patch || typeof patch !== "object") {
+      return;
+    }
+    meta.value = {
+      ...meta.value,
+      ...patch,
+    };
+  }
+
+  function setIdentity(payload = {}) {
+    const nextPatch = {};
+    if (Object.prototype.hasOwnProperty.call(payload, "projectId")) {
+      nextPatch.projectId = payload.projectId || null;
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, "jobId")) {
+      nextPatch.jobId = payload.jobId || null;
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, "mode")) {
+      nextPatch.mode = payload.mode || "normal";
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, "taskMode")) {
+      nextPatch.taskMode = payload.taskMode || "transcribe";
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, "flavor")) {
+      nextPatch.flavor = payload.flavor || "full";
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, "capabilitySnapshot")) {
+      nextPatch.capabilitySnapshot = normalizeCapabilitySnapshot(payload.capabilitySnapshot);
+    }
+    patchMeta(nextPatch);
+  }
+
+  function setMediaPaths(payload = {}) {
+    const nextPatch = {};
+    if (Object.prototype.hasOwnProperty.call(payload, "videoPath")) {
+      nextPatch.videoPath = payload.videoPath || null;
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, "audioPath")) {
+      nextPatch.audioPath = payload.audioPath || null;
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, "peaksPath")) {
+      nextPatch.peaksPath = payload.peaksPath || null;
+    }
+    patchMeta(nextPatch);
+  }
+
+  function setProjectTitle(title) {
+    patchMeta({ title: title || "" });
+  }
+
+  function setProjectDuration(duration) {
+    const normalized = Number(duration);
+    patchMeta({ duration: Number.isFinite(normalized) && normalized > 0 ? normalized : 0 });
+  }
+
+  function setCurrentResolution(resolution) {
+    patchMeta({ currentResolution: resolution || null });
+  }
+
+  function setZoomLevel(level) {
+    const normalized = Number(level);
+    view.value.zoomLevel = Number.isFinite(normalized) ? normalized : view.value.zoomLevel;
+  }
+
+  function setSelectedSubtitleId(subtitleId) {
+    view.value.selectedSubtitleId = subtitleId || null;
+  }
+
+  function setPlayerVolume(volume) {
+    const normalized = Number(volume);
+    if (!Number.isFinite(normalized)) {
+      return;
+    }
+    player.value.volume = Math.max(0, Math.min(1, normalized));
+  }
+
+  function setPlaybackRate(rate) {
+    const normalized = Number(rate);
+    if (!Number.isFinite(normalized)) {
+      return;
+    }
+    player.value.playbackRate = Math.max(0.25, Math.min(4, normalized));
+  }
+
+  function insertSubtitleAt(index, subtitle) {
+    const insertIndex = Math.max(0, Math.min(index, subtitles.value.length));
+    subtitles.value.splice(insertIndex, 0, subtitle);
+    return insertIndex;
+  }
+
+  function removeSubtitleAt(index) {
+    if (index < 0 || index >= subtitles.value.length) {
+      return null;
+    }
+    const removed = subtitles.value.splice(index, 1);
+    return removed[0] || null;
+  }
+
   const isDirty = computed(() => {
     return meta.value.isDirty || subtitles.value.some((s) => s.isDirty);
   });
@@ -326,6 +436,9 @@ export const useProjectStore = defineStore("project", () => {
       ...metadata,
       lastSaved: Date.now(),
       isDirty: false,
+      capabilitySnapshot: normalizeCapabilitySnapshot(
+        metadata?.capabilitySnapshot ?? metadata?.capability_snapshot ?? meta.value.capabilitySnapshot
+      ),
       subtitleOffset: subtitleOffset.value,
     };
 
@@ -373,6 +486,9 @@ export const useProjectStore = defineStore("project", () => {
       ...metadata,
       lastSaved: Date.now(),
       isDirty: false,
+      capabilitySnapshot: normalizeCapabilitySnapshot(
+        metadata?.capabilitySnapshot ?? metadata?.capability_snapshot ?? meta.value.capabilitySnapshot
+      ),
       subtitleOffset: subtitleOffset.value,
     };
 
@@ -425,8 +541,15 @@ export const useProjectStore = defineStore("project", () => {
       ...metadata,
       projectId: metadata.projectId || docMeta?.project_id || meta.value.projectId,
       mode: metadata.mode || meta.value.mode || "normal",
+      taskMode: metadata.taskMode || metadata.task_mode || meta.value.taskMode || "transcribe",
       lastSaved: now,
       isDirty: false,
+      capabilitySnapshot: normalizeCapabilitySnapshot(
+        metadata?.capabilitySnapshot
+          ?? metadata?.capability_snapshot
+          ?? docMeta?.capability_snapshot
+          ?? meta.value.capabilitySnapshot
+      ),
       subtitleOffset: subtitleOffset.value,
     };
 
@@ -448,7 +571,10 @@ export const useProjectStore = defineStore("project", () => {
       if (memoryCache.has(identityId)) {
         const cached = memoryCache.get(identityId);
         subtitles.value = cached.subtitles;
-        meta.value = cached.meta;
+        meta.value = {
+          ...cached.meta,
+          capabilitySnapshot: normalizeCapabilitySnapshot(cached?.meta?.capabilitySnapshot),
+        };
         if (cached?.meta?.subtitleOffset !== undefined) {
           setSubtitleOffset(cached.meta.subtitleOffset, { applyDelta: false });
         }
@@ -462,7 +588,10 @@ export const useProjectStore = defineStore("project", () => {
       const saved = await smartSaver.restoreFromBackup(identityId);
       if (saved) {
         subtitles.value = saved.subtitles;
-        meta.value = saved.meta;
+        meta.value = {
+          ...saved.meta,
+          capabilitySnapshot: normalizeCapabilitySnapshot(saved?.meta?.capabilitySnapshot),
+        };
         if (saved?.meta?.subtitleOffset !== undefined) {
           setSubtitleOffset(saved.meta.subtitleOffset, { applyDelta: false });
         }
@@ -1477,6 +1606,14 @@ export const useProjectStore = defineStore("project", () => {
     player.value.currentTime = time;
   }
 
+  function setIsPlaying(isPlaying) {
+    player.value.isPlaying = Boolean(isPlaying);
+  }
+
+  function setPlayerSeeking(isSeeking) {
+    player.value.isSeeking = Boolean(isSeeking);
+  }
+
   /**
    * 保存项目（持久化到后端 + 本地强制保存）
    */
@@ -1512,6 +1649,7 @@ export const useProjectStore = defineStore("project", () => {
       jobId: null,
       projectId: null,
       mode: "normal",
+      taskMode: "transcribe",
       flavor: "full",
       videoPath: null,
       audioPath: null,
@@ -1525,6 +1663,8 @@ export const useProjectStore = defineStore("project", () => {
       isDirty: false,
       // 渐进式加载相关（状态由 useProxyVideo composable 管理）
       currentResolution: null,
+      // Phase 0.5: 能力协商快照留位（本期不参与行为判断）
+      capabilitySnapshot: null,
       // V3.2.0+dev.20260130.09: 字幕全局时间偏移（秒）
       subtitleOffset: subtitleOffset.value,
     };
@@ -1633,6 +1773,20 @@ export const useProjectStore = defineStore("project", () => {
     resumeHistory, // 恢复历史记录
 
     // 操作方法
+    patchMeta,
+    setIdentity,
+    setMediaPaths,
+    setProjectTitle,
+    setProjectDuration,
+    setCurrentResolution,
+    setZoomLevel,
+    setSelectedSubtitleId,
+    setPlayerVolume,
+    setPlaybackRate,
+    setIsPlaying,
+    setPlayerSeeking,
+    insertSubtitleAt,
+    removeSubtitleAt,
     importSRT,
     importSegments,
     loadFromProjectData,

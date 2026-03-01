@@ -5,5 +5,4 @@
 export { baseTokens } from './tokens/base.js'
 export { darkTheme } from './tokens/dark.js'
 export { themes, defaultThemeId, getTheme, getAvailableThemes } from './tokens/index.js'
-export { useTheme } from './composables/useTheme.js'
 export { injectTheme, injectBaseTokens } from './utils/inject.js'

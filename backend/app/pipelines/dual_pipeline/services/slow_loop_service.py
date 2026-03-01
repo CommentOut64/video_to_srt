@@ -33,6 +33,7 @@ class SlowLoopService:
         max_retry: int = 6,
         allow_drop: bool = False,
         reason: str = "",
+        is_must_deliver: bool = False,
     ) -> bool:
         """
         带取消守卫的 queue_final 投递。
@@ -52,16 +53,57 @@ class SlowLoopService:
                 return True
             except asyncio.TimeoutError:
                 retries += 1
-                if token:
+                is_terminal_payload = is_must_deliver or bool(
+                    getattr(payload, "is_end", False) or getattr(payload, "error", None)
+                )
+                is_terminal_request = bool(
+                    token and (
+                        getattr(token, "is_canceled", False)
+                        or getattr(token, "is_paused", False)
+                    )
+                )
+                if token and not is_terminal_payload:
                     token.raise_if_canceled()
+                if allow_drop and is_terminal_payload and is_terminal_request:
+                    queue_final = getattr(host, "queue_final", None)
+                    queue_size = queue_final.qsize() if queue_final is not None else -1
+                    queue_maxsize = getattr(queue_final, "maxsize", -1)
+                    host.logger.warning(
+                        f"SlowWorker 投递 queue_final 超时，终止请求已生效，丢弃终止载荷: "
+                        f"reason={reason}, retries={retries}, "
+                        f"queue_final_size={queue_size}/{queue_maxsize}"
+                    )
+                    return False
                 if retries >= max_retry:
-                    if allow_drop:
+                    queue_final = getattr(host, "queue_final", None)
+                    queue_size = queue_final.qsize() if queue_final is not None else -1
+                    queue_maxsize = getattr(queue_final, "maxsize", -1)
+
+                    if allow_drop and not is_terminal_payload:
+                        if is_terminal_request:
+                            host.logger.warning(
+                                f"SlowWorker 投递 queue_final 超时，丢弃载荷: reason={reason}, "
+                                f"retries={retries}, is_terminal_request={is_terminal_request}, "
+                                f"queue_final_size={queue_size}/{queue_maxsize}"
+                            )
+                            return False
+
                         host.logger.warning(
-                            "SlowWorker 投递 queue_final 超时，丢弃载荷: reason=%s, retries=%s",
-                            reason,
-                            retries,
+                            f"SlowWorker 投递 queue_final 超时，继续等待下游腾挪容量: reason={reason}, "
+                            f"retries={retries}, queue_final_size={queue_size}/{queue_maxsize}"
                         )
-                        return False
+                        retries = 0
+                        continue
+
+                    if is_terminal_payload:
+                        # 终止/错误载荷属于控制信号，必须投递到对齐阶段触发收敛退出。
+                        host.logger.warning(
+                            f"SlowWorker 投递 queue_final 超时，但载荷为终止信号，继续等待送达: "
+                            f"reason={reason}, retries={retries}, queue_final_size={queue_size}/{queue_maxsize}"
+                        )
+                        retries = 0
+                        continue
+
                     raise RuntimeError(
                         f"SlowWorker 投递 queue_final 超时: reason={reason}, retries={retries}"
                     )
@@ -135,11 +177,14 @@ class SlowLoopService:
                 ctx = payload
 
                 if ctx.is_end or ctx.error:
+                    if ctx.error and not ctx.is_end:
+                        ctx.is_end = True
                     await self._put_queue_final_with_guard(
                         payload=ctx,
                         token=token,
                         allow_drop=True,
                         reason="upstream_end_or_error",
+                        is_must_deliver=True,
                     )
                     break
 
@@ -304,6 +349,7 @@ class SlowLoopService:
                 token=token,
                 allow_drop=True,
                 reason="cancel_error_ctx",
+                is_must_deliver=True,
             )
 
         except Exception as exc:
@@ -324,6 +370,7 @@ class SlowLoopService:
                 token=token,
                 allow_drop=True,
                 reason="exception_error_ctx",
+                is_must_deliver=True,
             )
         finally:
             if pause_requested:

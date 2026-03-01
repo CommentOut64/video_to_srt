@@ -16,6 +16,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from app.services.project_id_resolver import get_project_id_resolver
 from app.services.speaker_store import SpeakerStoreService
 from app.services.sse_service import get_sse_manager, push_subtitle_event
 from app.services.streaming_subtitle import get_streaming_subtitle_manager_if_exists
@@ -49,14 +50,41 @@ def create_speaker_router(transcription_service: TranscriptionService) -> APIRou
     router = APIRouter(prefix="/api/speakers", tags=["speakers"])
     sse_manager = get_sse_manager()
 
-    def _resolve_job(job_id: str) -> Any:
-        job = transcription_service.get_job(job_id)
+    def _resolve_job(project_id: str) -> Any:
+        normalized_identifier = str(project_id or "").strip()
+        job = transcription_service.get_job(normalized_identifier)
+        if job:
+            if not getattr(job, "project_id", None):
+                job.project_id = normalized_identifier
+            return job
+
+        try:
+            identity = get_project_id_resolver().resolve_or_fail(normalized_identifier)
+        except Exception:
+            raise HTTPException(status_code=404, detail="任务未找到")
+
+        for identifier in (identity.project_id, identity.legacy_job_id):
+            normalized = str(identifier or "").strip()
+            if not normalized:
+                continue
+            job = transcription_service.get_job(normalized)
+            if job:
+                job.project_id = identity.project_id
+                return job
+
+        runtime_jobs = getattr(getattr(transcription_service, "job_lifecycle", None), "jobs", None)
+        if isinstance(runtime_jobs, dict):
+            for runtime_job in runtime_jobs.values():
+                if str(getattr(runtime_job, "project_id", "") or "").strip() != identity.project_id:
+                    continue
+                return runtime_job
+
         if not job:
             raise HTTPException(status_code=404, detail="任务未找到")
         return job
 
-    def _resolve_speaker_service(job_id: str) -> SpeakerStoreService:
-        job = _resolve_job(job_id)
+    def _resolve_speaker_service(project_id: str) -> SpeakerStoreService:
+        job = _resolve_job(project_id)
         return SpeakerStoreService(job_dir=Path(job.dir))
 
     def _build_sentence_payload(
@@ -88,35 +116,35 @@ def create_speaker_router(transcription_service: TranscriptionService) -> APIRou
             sentence_payload["index"] = sentence_index
         return sentence_payload
 
-    @router.get("/{job_id}/profiles")
-    async def list_profiles(job_id: str) -> dict[str, object]:
+    @router.get("/{project_id}/profiles")
+    async def list_profiles(project_id: str) -> dict[str, object]:
         """查询说话人 profile 列表。"""
-        speaker_service = _resolve_speaker_service(job_id)
+        speaker_service = _resolve_speaker_service(project_id)
         profiles = speaker_service.list_speaker_profiles()
         return {
-            "job_id": job_id,
+            "project_id": project_id,
             "profiles": profiles,
         }
 
-    @router.get("/{job_id}/profiles/{speaker_id}/subtitles")
-    async def list_profile_subtitles(job_id: str, speaker_id: str) -> dict[str, object]:
+    @router.get("/{project_id}/profiles/{speaker_id}/subtitles")
+    async def list_profile_subtitles(project_id: str, speaker_id: str) -> dict[str, object]:
         """查询指定说话人的句子绑定列表。"""
-        speaker_service = _resolve_speaker_service(job_id)
+        speaker_service = _resolve_speaker_service(project_id)
         links = speaker_service.list_subtitle_speaker_links(speaker_id=speaker_id)
         return {
-            "job_id": job_id,
+            "project_id": project_id,
             "speaker_id": speaker_id,
             "subtitles": links,
         }
 
-    @router.patch("/{job_id}/profiles/{speaker_id}")
+    @router.patch("/{project_id}/profiles/{speaker_id}")
     async def patch_profile(
-        job_id: str,
+        project_id: str,
         speaker_id: str,
         payload: SpeakerProfilePatchRequest,
     ) -> dict[str, object]:
         """更新说话人 profile。"""
-        speaker_service = _resolve_speaker_service(job_id)
+        speaker_service = _resolve_speaker_service(project_id)
         update_payload = payload.dict(exclude_none=True)
         if not update_payload:
             raise HTTPException(status_code=400, detail="更新内容为空")
@@ -145,7 +173,7 @@ def create_speaker_router(transcription_service: TranscriptionService) -> APIRou
 
         push_subtitle_event(
             sse_manager,
-            job_id,
+            project_id,
             "speaker_profiles",
             {
                 "revision_id": revision_id,
@@ -162,14 +190,14 @@ def create_speaker_router(transcription_service: TranscriptionService) -> APIRou
             "updated_at": updated_at,
         }
 
-    @router.patch("/{job_id}/subtitles/{sentence_index}")
+    @router.patch("/{project_id}/subtitles/{sentence_index}")
     async def patch_subtitle_speaker(
-        job_id: str,
+        project_id: str,
         sentence_index: int,
         payload: SubtitleSpeakerPatchRequest,
     ) -> dict[str, object]:
         """改绑句级 speaker。"""
-        speaker_service = _resolve_speaker_service(job_id)
+        speaker_service = _resolve_speaker_service(project_id)
         updated_link = speaker_service.rebind_subtitle_speaker(
             sentence_index=sentence_index,
             speaker_id=payload.speaker_id,
@@ -180,7 +208,7 @@ def create_speaker_router(transcription_service: TranscriptionService) -> APIRou
 
         revision_id = uuid.uuid4().hex
         updated_at = float(updated_link.get("updated_at") or 0.0)
-        subtitle_manager = get_streaming_subtitle_manager_if_exists(job_id)
+        subtitle_manager = get_streaming_subtitle_manager_if_exists(project_id)
         sentence_payload = _build_sentence_payload(
             sentence_index=sentence_index,
             link_row=updated_link,
@@ -200,7 +228,7 @@ def create_speaker_router(transcription_service: TranscriptionService) -> APIRou
 
         push_subtitle_event(
             sse_manager,
-            job_id,
+            project_id,
             "revised",
             {
                 "index": sentence_index,
@@ -217,15 +245,15 @@ def create_speaker_router(transcription_service: TranscriptionService) -> APIRou
             "updated_at": updated_at,
         }
 
-    @router.post("/{job_id}/profiles/merge")
-    async def merge_profiles(job_id: str, payload: SpeakerMergeRequest) -> dict[str, object]:
+    @router.post("/{project_id}/profiles/merge")
+    async def merge_profiles(project_id: str, payload: SpeakerMergeRequest) -> dict[str, object]:
         """合并 speaker。"""
         source_speaker_id = payload.source_speaker_id.strip()
         target_speaker_id = payload.target_speaker_id.strip()
         if source_speaker_id == target_speaker_id:
             raise HTTPException(status_code=400, detail="源 speaker 与目标 speaker 不能相同")
 
-        speaker_service = _resolve_speaker_service(job_id)
+        speaker_service = _resolve_speaker_service(project_id)
         affected_before = speaker_service.list_subtitle_speaker_links(
             speaker_id=source_speaker_id
         )
@@ -256,7 +284,7 @@ def create_speaker_router(transcription_service: TranscriptionService) -> APIRou
             int(item["sentence_index"]) for item in affected_before
         ]
         revised_sentences: list[dict[str, object]] = []
-        subtitle_manager = get_streaming_subtitle_manager_if_exists(job_id)
+        subtitle_manager = get_streaming_subtitle_manager_if_exists(project_id)
         if affected_sentence_indices:
             affected_after_map = speaker_service.get_subtitle_speaker_map(
                 sentence_indices=affected_sentence_indices
@@ -276,7 +304,7 @@ def create_speaker_router(transcription_service: TranscriptionService) -> APIRou
         if revised_sentences:
             push_subtitle_event(
                 sse_manager,
-                job_id,
+                project_id,
                 "revised",
                 {
                     "sentences": revised_sentences,
@@ -289,7 +317,7 @@ def create_speaker_router(transcription_service: TranscriptionService) -> APIRou
         profiles = speaker_service.list_speaker_profiles()
         push_subtitle_event(
             sse_manager,
-            job_id,
+            project_id,
             "speaker_profiles",
             {
                 "revision_id": revision_id,

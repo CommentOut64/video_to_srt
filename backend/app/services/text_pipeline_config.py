@@ -773,6 +773,12 @@ class ArbitrationConfig:
     max_length_ratio: float = 3.0
     low_confidence_threshold: float = 0.5
     is_hallucination_block: bool = True
+    is_enable_fast_tail_guard: bool = True
+    fast_tail_min_extra_chars: int = 10
+    fast_tail_min_wh_coverage: float = 0.92
+    fast_tail_min_fast_confidence: float = 0.55
+    fast_tail_max_slow_advantage: float = 0.2
+    fast_tail_require_end_match_ratio: float = 0.9
 
     @classmethod
     def from_runtime(cls, raw: Optional[Dict[str, Any]]) -> "ArbitrationConfig":
@@ -798,6 +804,36 @@ class ArbitrationConfig:
             is_hallucination_block=bool(
                 _read_runtime_value(raw, "hallucination_block", cls.is_hallucination_block)
             ),
+            is_enable_fast_tail_guard=bool(
+                _read_runtime_value(raw, "enable_fast_tail_guard", cls.is_enable_fast_tail_guard)
+            ),
+            fast_tail_min_extra_chars=int(
+                _read_runtime_value(raw, "fast_tail_min_extra_chars", cls.fast_tail_min_extra_chars)
+            ),
+            fast_tail_min_wh_coverage=float(
+                _read_runtime_value(raw, "fast_tail_min_wh_coverage", cls.fast_tail_min_wh_coverage)
+            ),
+            fast_tail_min_fast_confidence=float(
+                _read_runtime_value(
+                    raw,
+                    "fast_tail_min_fast_confidence",
+                    cls.fast_tail_min_fast_confidence,
+                )
+            ),
+            fast_tail_max_slow_advantage=float(
+                _read_runtime_value(
+                    raw,
+                    "fast_tail_max_slow_advantage",
+                    cls.fast_tail_max_slow_advantage,
+                )
+            ),
+            fast_tail_require_end_match_ratio=float(
+                _read_runtime_value(
+                    raw,
+                    "fast_tail_require_end_match_ratio",
+                    cls.fast_tail_require_end_match_ratio,
+                )
+            ),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -808,6 +844,12 @@ class ArbitrationConfig:
             "max_length_ratio": self.max_length_ratio,
             "low_confidence_threshold": self.low_confidence_threshold,
             "hallucination_block": self.is_hallucination_block,
+            "enable_fast_tail_guard": self.is_enable_fast_tail_guard,
+            "fast_tail_min_extra_chars": self.fast_tail_min_extra_chars,
+            "fast_tail_min_wh_coverage": self.fast_tail_min_wh_coverage,
+            "fast_tail_min_fast_confidence": self.fast_tail_min_fast_confidence,
+            "fast_tail_max_slow_advantage": self.fast_tail_max_slow_advantage,
+            "fast_tail_require_end_match_ratio": self.fast_tail_require_end_match_ratio,
         }
 
 

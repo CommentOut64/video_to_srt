@@ -48,6 +48,7 @@
         <!-- 视频区域 -->
         <div class="video-wrapper">
           <VideoStage
+            :key="`video-${mediaIdentityId || 'none'}`"
             ref="videoStageRef"
             :media-id="mediaIdentityId"
             :show-subtitle="true"
@@ -76,6 +77,7 @@
         <!-- 波形时间轴 -->
         <div class="waveform-wrapper">
           <WaveformTimeline
+            :key="`wave-${mediaIdentityId || 'none'}`"
             ref="waveformRef"
             :media-id="mediaIdentityId"
           />
@@ -230,17 +232,21 @@
 import { ref, computed, onMounted, onUnmounted, provide, watch } from 'vue'
 import { onBeforeRouteLeave, useRouter } from 'vue-router'
 import { useProjectStore } from '@/stores/projectStore'
-import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
-import { useProgressStore } from '@/stores/progressStore'
+import { usePlaybackStore } from '@/stores/playbackStore'
+import { useTaskRuntimeStore } from '@/stores/taskRuntimeStore'
+import { useEditorSessionStore } from '@/stores/editorSessionStore'
+import { useSubtitleDocumentStore } from '@/stores/subtitleDocumentStore'
 import { legacyApi, mediaApi, projectApi, transcriptionApi } from '@/services/api'
 import sseChannelManager from '@/services/sseChannelManager'
 import { useShortcuts } from '@/hooks/useShortcuts'
 import { useProxyVideo } from '@/composables/useProxyVideo'
-import { useSubtitleSync } from '@/composables'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { repairSubtitleOverlaps } from '@/utils/subtitleUtils'
 import { ElMessage } from 'element-plus'
-import { FLAVOR } from '@/config/flavor'
+import {
+  buildDefaultCapabilitySnapshot,
+  selectFlavor,
+} from '@/state/capabilities/capabilitySelector'
 
 // 组件导入
 import EditorHeader from '@/components/editor/EditorHeader.vue'
@@ -267,17 +273,21 @@ const props = new Proxy(rawProps, {
 
 // Stores
 const projectStore = useProjectStore()
-const taskStore = useUnifiedTaskStore()
+const playbackStore = usePlaybackStore()
+const taskStore = useTaskRuntimeStore()
+const editorSessionStore = useEditorSessionStore()
+const subtitleDocumentStore = useSubtitleDocumentStore()
 const router = useRouter()
 
 // 全局播放管理器
 const playbackManager = usePlaybackManager()
 
 const activeJobId = computed(() => props.jobId || null)
-// 解耦后统一以 project_id 作为编辑器媒体身份，job_id 仅保留任务控制用途。
+// 媒体链路统一以 project_id 为主；job_id 仅用于任务控制与进度链路。
 const mediaIdentityId = computed(() => props.projectId || props.jobId || null)
+const playbackSessionId = computed(() => props.projectId || props.jobId || '')
 const identityRef = computed(() => mediaIdentityId.value)
-const { forceSyncNow } = useSubtitleSync(identityRef)
+const forceSyncNow = subtitleDocumentStore.forceSyncNow
 
 // Proxy 视频加载状态（新重构版本）
 // V3.2.4+dev.20260224.01: project 模式也需要接入媒体状态，避免 progressiveUrl 为空导致视频无法加载
@@ -341,7 +351,7 @@ const SUBTITLE_FOLLOW_AUTO_RESUME_PREF_KEY = 'editor-subtitle-follow-auto-resume
 const subtitleFollowAutoResumeEnabled = ref(true)
 
 // 统一进度状态
-const progressStore = useProgressStore()
+const progressStore = taskStore
 // 修复：直接使用 getRawState 获取响应式状态对象，避免 computed 嵌套导致响应式丢失
 const jobProgress = computed(() => progressStore.getRawState(activeJobId.value))
 const taskStatus = computed(() => jobProgress.value.status || 'idle')
@@ -370,11 +380,32 @@ let isRealtimeFinalSyncInFlight = false
 let hasRealtimeFinalSyncPending = false
 let realtimeFinalSyncReason = null
 
+watch(
+  () => activeJobId.value,
+  (jobId) => {
+    subtitleDocumentStore.bindTask(jobId)
+  },
+  { immediate: true }
+)
+
+watch(
+  () => identityRef.value,
+  (identityId) => {
+    subtitleDocumentStore.bindSyncIdentity(identityId)
+  },
+  { immediate: true }
+)
+
 const hasVideoSource = computed(() => {
-  return !isVideoAbsenceConfirmed.value && !!projectStore.meta.videoPath && !!proxyVideo.currentUrl.value
+  return !isVideoAbsenceConfirmed.value && !!proxyVideo.currentUrl.value
 })
 const isMediaReady = computed(() => {
-  return hasVideoSource.value || !!projectStore.meta.audioPath || proxyVideo.isReady.value
+  return (
+    hasVideoSource.value
+    || !!projectStore.meta.audioPath
+    || proxyVideo.isReady.value
+    || projectStore.subtitles.length > 0
+  )
 })
 
 // Provide 编辑器上下文
@@ -404,6 +435,8 @@ watch(
 // 监听路由身份变化，重新加载项目
 watch([() => rawProps.projectId, () => rawProps.jobId], async ([newProjectId, newJobId], [oldProjectId, oldJobId]) => {
   if (newProjectId === oldProjectId && newJobId === oldJobId) return
+  const nextSessionId = newProjectId || newJobId || ''
+  playbackManager.bindSession(nextSessionId, { force: true, resetPosition: true })
 
   // 取消旧的 SSE 订阅
   cleanupSSE()
@@ -416,6 +449,14 @@ watch([() => rawProps.projectId, () => rawProps.jobId], async ([newProjectId, ne
   // 重新加载项目
   await loadProject()
 })
+
+watch(
+  () => playbackSessionId.value,
+  (sessionId) => {
+    playbackManager.bindSession(sessionId, { force: true, resetPosition: true })
+  },
+  { immediate: true }
+)
 
 // 监听保存时间用于同步 task-meta 的显示
 watch(
@@ -543,8 +584,10 @@ function applyMediaPaths({ project = null, mediaStatus = null } = {}) {
   const identity = mediaIdentityId.value
   if (!identity) {
     isVideoAbsenceConfirmed.value = false
-    projectStore.meta.videoPath = null
-    projectStore.meta.audioPath = null
+    projectStore.setMediaPaths({
+      videoPath: null,
+      audioPath: null,
+    })
     return
   }
 
@@ -574,8 +617,10 @@ function applyMediaPaths({ project = null, mediaStatus = null } = {}) {
 
   isVideoAbsenceConfirmed.value = canDetermineVideoPresence && !hasVideo
 
-  projectStore.meta.videoPath = hasVideo ? mediaApi.getVideoUrl(identity) : null
-  projectStore.meta.audioPath = hasAudio ? mediaApi.getAudioUrl(identity) : null
+  projectStore.setMediaPaths({
+    videoPath: hasVideo ? mediaApi.getVideoUrl(identity) : null,
+    audioPath: hasAudio ? mediaApi.getAudioUrl(identity) : null,
+  })
 }
 
 function notifyMissingVideoOnce() {
@@ -621,7 +666,13 @@ async function resolveIdentity() {
   if (resolvedProjectId.value) {
     try {
       const project = await projectApi.getProject(resolvedProjectId.value)
-      if (project?.job_id) {
+      const sourceType = String(project?.subtitle_doc?.source_type || '').trim().toLowerCase()
+      const mode = String(project?.mode || '').trim().toLowerCase()
+      const taskMode = String(project?.task_mode || '').trim().toLowerCase()
+      const isProjectOnly = taskMode
+        ? taskMode === 'subtitle_edit'
+        : (sourceType === 'import' || mode === 'import')
+      if (project?.job_id && !isProjectOnly) {
         resolvedJobId.value = project.job_id
       }
     } catch (error) {
@@ -639,9 +690,13 @@ async function resolveIdentity() {
         if (router.currentRoute.value.params.projectId !== projectId) {
           router.replace(`/editor/project/${projectId}`)
         }
+        return
       }
+      throw new Error(`未返回 project_id（job_id=${rawProps.jobId}）`)
     } catch (error) {
-      console.warn('[EditorView] 旧任务 resolve 失败，保持 job 直连模式:', error)
+      throw new Error(
+        `job_id 转 project_id 失败（job_id=${rawProps.jobId}）：${error?.message || '未知错误'}`
+      )
     }
   }
 }
@@ -656,26 +711,45 @@ async function loadProject() {
 
   try {
     await resolveIdentity()
+    const projectId = props.projectId
+    if (!projectId) {
+      throw new Error('缺少 project_id，无法进入编辑器（job 转 project 失败）')
+    }
 
-    projectStore.meta.projectId = props.projectId
-    projectStore.meta.jobId = activeJobId.value
-    projectStore.meta.mode = activeJobId.value ? 'legacy' : 'normal'
-    projectStore.meta.flavor = FLAVOR
-    projectStore.meta.videoPath = null
-    projectStore.meta.audioPath = null
+    const initialCapabilitySnapshot = resolveCapabilitySnapshot()
+    projectStore.setIdentity({
+      projectId,
+      jobId: activeJobId.value,
+      mode: 'normal',
+      taskMode: activeJobId.value ? 'transcribe' : 'subtitle_edit',
+      capabilitySnapshot: initialCapabilitySnapshot,
+      flavor: selectFlavor(initialCapabilitySnapshot),
+    })
+    projectStore.setMediaPaths({
+      videoPath: null,
+      audioPath: null,
+    })
 
     let projectMeta = null
-    if (props.projectId) {
+    if (projectId) {
       try {
-        projectMeta = await projectApi.getProject(props.projectId)
+        projectMeta = await projectApi.getProject(projectId)
       } catch (error) {
         console.warn('[EditorView] 读取项目媒体信息失败，使用状态兜底:', error)
       }
     }
+    const projectMetaCapabilitySnapshot = resolveCapabilitySnapshot(
+      projectMeta?.capability_snapshot || projectMeta?.capabilitySnapshot || projectStore.meta.capabilitySnapshot
+    )
+    projectStore.setIdentity({
+      capabilitySnapshot: projectMetaCapabilitySnapshot,
+      flavor: projectMeta?.flavor || selectFlavor(projectMetaCapabilitySnapshot),
+      taskMode: projectMeta?.task_mode || projectStore.meta.taskMode || 'transcribe',
+    })
     applyMediaPaths({ project: projectMeta })
 
     // 纯项目模式（Lite 导入）: 跳过任务状态，改走 project 频道同步
-    if (!activeJobId.value && props.projectId) {
+    if (!activeJobId.value && projectId) {
       try {
         await proxyVideo.refresh()
       } catch (e) {
@@ -683,25 +757,39 @@ async function loadProject() {
       }
 
       await loadSubtitleOffset()
-      const project = projectMeta || (await projectApi.getProject(props.projectId))
+      const project = projectMeta || (await projectApi.getProject(projectId))
       applyMediaPaths({ project })
-      projectStore.meta.title = project?.title || projectStore.meta.title
-      projectStore.meta.flavor = project?.flavor || FLAVOR
-      projectStore.meta.mode = project?.mode || 'normal'
-      const restored = await projectStore.restoreProject(props.projectId)
+      projectStore.setProjectTitle(project?.title || projectStore.meta.title)
+      const projectCapabilitySnapshot = resolveCapabilitySnapshot(
+        project?.capability_snapshot || project?.capabilitySnapshot || projectStore.meta.capabilitySnapshot
+      )
+      projectStore.setIdentity({
+        capabilitySnapshot: projectCapabilitySnapshot,
+        flavor: project?.flavor || selectFlavor(projectCapabilitySnapshot),
+        mode: project?.mode || 'normal',
+        taskMode: project?.task_mode || 'subtitle_edit',
+      })
+      const restored = await projectStore.restoreProject(projectId)
       // 恢复缓存后再次覆盖媒体路径，防止旧缓存 videoPath 误导为“有视频”。
       applyMediaPaths({ project })
       if (!restored || projectStore.subtitles.length === 0) {
-        const segments = await projectApi.getSubtitles(props.projectId)
-        projectStore.loadFromProjectData(segments, {
-          projectId: props.projectId,
-          jobId: project?.job_id || null,
-          title: project?.title || '',
-          filename: project?.title || '项目字幕',
-          videoPath: projectStore.meta.videoPath,
-          audioPath: projectStore.meta.audioPath,
-          mode: project?.mode || 'normal',
-          flavor: project?.flavor || FLAVOR,
+        const segments = await projectApi.getSubtitles(projectId)
+        await editorSessionStore.restoreSession({
+          identity: {
+            projectId,
+            jobId: project?.job_id || null,
+            mode: project?.mode || 'normal',
+            taskMode: project?.task_mode || 'subtitle_edit',
+            flavor: project?.flavor || selectFlavor(projectStore.meta.capabilitySnapshot),
+            capabilitySnapshot: projectStore.meta.capabilitySnapshot,
+          },
+          metaPayload: {
+            title: project?.title || '',
+            filename: project?.title || '项目字幕',
+            videoPath: projectStore.meta.videoPath,
+            audioPath: projectStore.meta.audioPath,
+          },
+          segments,
         })
         // loadFromProjectData 会更新 meta，确保媒体路径继续以本次判定为准。
         applyMediaPaths({ project })
@@ -735,11 +823,16 @@ async function loadProject() {
       'http_init'
     )
 
-    projectStore.meta.jobId = activeJobId.value
-    projectStore.meta.projectId = props.projectId || projectStore.meta.projectId
-    projectStore.meta.filename = jobStatus.filename || '未知文件'
-    projectStore.meta.title = jobStatus.title || ''
-    projectStore.meta.duration = jobStatus.media_status?.video?.duration || 0
+    projectStore.setIdentity({
+      jobId: activeJobId.value,
+      projectId: props.projectId || projectStore.meta.projectId,
+      taskMode: projectMeta?.task_mode || 'transcribe',
+    })
+    projectStore.patchMeta({
+      filename: jobStatus.filename || '未知文件',
+    })
+    projectStore.setProjectTitle(jobStatus.title || '')
+    projectStore.setProjectDuration(jobStatus.media_status?.video?.duration || 0)
 
     try {
       await proxyVideo.refresh()
@@ -747,7 +840,7 @@ async function loadProject() {
       console.warn('[EditorView] 刷新 Proxy 状态失败（初始阶段，忽略）:', e)
     }
 
-    const restoreKey = activeJobId.value || props.projectId
+    const restoreKey = projectId
     const restored = restoreKey ? await projectStore.restoreProject(restoreKey) : false
     // 恢复缓存后再次覆盖媒体路径，避免历史缓存导致 videoPath 误判。
     applyMediaPaths({ project: projectMeta, mediaStatus: jobStatus.media_status })
@@ -760,7 +853,7 @@ async function loadProject() {
       if (['canceled', 'force_canceled'].includes(jobStatus.status)) {
         const hasDraft = projectStore.subtitles.some((s) => s.isDraft)
         if (hasDraft) {
-          await projectStore.finalizeDraftSubtitlesOnCancel()
+          await subtitleDocumentStore.finalizeDraftSubtitlesOnTerminal('load_project_terminal')
         }
       }
     }
@@ -769,9 +862,6 @@ async function loadProject() {
 
     if (jobStatus.status === 'finished') {
       await loadTranscribingSegments()
-      if (projectStore.subtitles.length === 0) {
-        await loadFromSRT()
-      }
       if (!proxyVideo.isReady.value) {
         subscribeSSE()
         startProxyPolling()
@@ -792,7 +882,6 @@ async function loadProject() {
     } else if (['canceled', 'force_canceled'].includes(jobStatus.status)) {
       await syncSegmentsFromBackendAsSource({
         reason: 'load_project_canceled_terminal',
-        allowSrtFallback: true,
       })
     } else if (jobStatus.status === 'failed') {
       await loadTranscribingSegments()
@@ -820,45 +909,33 @@ async function loadProject() {
 
 // 加载转录中的 segments
 async function loadTranscribingSegments() {
-  if (!activeJobId.value) {
-    return 0
+  const projectId = props.projectId || projectStore.meta.projectId
+  if (!projectId) {
+    throw new Error('缺少 project_id，无法拉取字幕真源')
   }
   try {
-    const textData = await transcriptionApi.getTranscriptionText(activeJobId.value)
-    if (textData.segments && textData.segments.length > 0) {
-      // 直接导入 segments，保留 sentenceIndex 字段
-      projectStore.importSegments(textData.segments, {
+    const segments = await projectApi.getSubtitles(projectId)
+    if (Array.isArray(segments) && segments.length > 0) {
+      projectStore.loadFromProjectData(segments, {
         jobId: activeJobId.value,
-        projectId: props.projectId || projectStore.meta.projectId,
+        projectId,
         filename: projectStore.meta.filename,
         duration: projectStore.meta.duration,
         videoPath: projectStore.meta.videoPath,
         audioPath: projectStore.meta.audioPath,
       })
-      progressStore.applySnapshot(
-        activeJobId.value,
-        {
-          percent: textData.progress?.percentage,
-          phase: taskPhase.value,
-          status: taskStatus.value,
-          phase_percent: textData.progress?.phase_percent,
-        },
-        'http_segments'
-      )
     }
-    return (textData.segments && textData.segments.length) || 0
+    return Array.isArray(segments) ? segments.length : 0
   } catch (error) {
-    console.warn('[EditorView] 加载转录文字失败:', error)
+    console.warn('[EditorView] 拉取 project 字幕真源失败:', error)
     return 0
   }
 }
 
 // V3.2.4+dev.20260222.14: 终态同步必须以后端为唯一数据源
-async function syncSegmentsFromBackendAsSource({ reason = 'unknown', allowSrtFallback = true } = {}) {
-  const count = await loadTranscribingSegments()
-  if (count === 0 && allowSrtFallback) {
-    await loadFromSRT()
-  }
+async function syncSegmentsFromBackendAsSource({ reason = 'unknown' } = {}) {
+  void reason
+  await loadTranscribingSegments()
 }
 
 // V3.2.4+dev.20260222.15: 每次定稿事件都立即触发后端回拉，且高频事件合并为“当前1次+补1次”
@@ -878,7 +955,6 @@ async function scheduleRealtimeFinalSync(reason = 'subtitle_final_event') {
       try {
         await syncSegmentsFromBackendAsSource({
           reason: currentReason,
-          allowSrtFallback: false,
         })
       } catch (error) {
         console.warn('[EditorView] 实时定稿后端回拉失败:', error)
@@ -886,28 +962,6 @@ async function scheduleRealtimeFinalSync(reason = 'subtitle_final_event') {
     } while (hasRealtimeFinalSyncPending)
   } finally {
     isRealtimeFinalSyncInFlight = false
-  }
-}
-
-// V3.1.2: 从 SRT 文件加载（fallback，无置信度数据）
-async function loadFromSRT() {
-  if (!mediaIdentityId.value) {
-    return
-  }
-  try {
-    const srtData = await mediaApi.getSRTContent(mediaIdentityId.value)
-    if (srtData.content) {
-      projectStore.importSRT(srtData.content, {
-        jobId: activeJobId.value,
-        projectId: props.projectId || projectStore.meta.projectId,
-        filename: srtData.filename || projectStore.meta.filename,
-        duration: projectStore.meta.duration,
-        videoPath: projectStore.meta.videoPath,
-        audioPath: projectStore.meta.audioPath,
-      })
-    }
-  } catch (error) {
-    console.warn('[EditorView] 从 SRT 加载失败:', error)
   }
 }
 
@@ -1025,7 +1079,7 @@ function handleProjectSubtitleUpsert(data) {
       isDraft: false,
       isFinalized: true,
     }
-    projectStore.subtitles.splice(finalIndex, 0, nextSubtitle)
+    projectStore.insertSubtitleAt(finalIndex, nextSubtitle)
   } finally {
     projectStore.resumeHistory()
   }
@@ -1042,7 +1096,7 @@ function handleProjectSubtitleDelete(data) {
   }
   projectStore.pauseHistory()
   try {
-    projectStore.subtitles.splice(index, 1)
+    projectStore.removeSubtitleAt(index)
   } finally {
     projectStore.resumeHistory()
   }
@@ -1127,7 +1181,6 @@ function subscribeSSE() {
       // V3.2.4+dev.20260222.14: 完成态不再本地“草稿改定稿”，必须立即以后端最终口径覆盖
       await syncSegmentsFromBackendAsSource({
         reason: 'signal_job_complete',
-        allowSrtFallback: true,
       })
 
       stopProgressPolling()
@@ -1352,7 +1405,6 @@ async function handleCancelTerminal(data, fallbackStatus = 'canceled') {
   if (['canceled', 'force_canceled'].includes(terminalStatus)) {
     await syncSegmentsFromBackendAsSource({
       reason: `signal_${terminalStatus}`,
-      allowSrtFallback: true,
     })
   }
   progressStore.markStatus(activeJobId.value, terminalStatus, {
@@ -1884,7 +1936,14 @@ async function handleExportEvent(event) {
 }
 
 async function handleExport(format) {
-  const segments = await fetchLatestSegments()
+  let segments = []
+  try {
+    segments = await fetchLatestSegments()
+  } catch (error) {
+    const reason = error?.message || '字幕同步未完成，请稍后重试'
+    alert(`导出失败：${reason}`)
+    return
+  }
   const displaySegments = projectStore.applyOffsetToSegments(segments || [])
   if (!displaySegments || displaySegments.length === 0) {
     alert('导出失败：后端未返回字幕数据')
@@ -1920,52 +1979,48 @@ async function handleExport(format) {
 }
 
 async function fetchLatestSegments() {
-  try {
-    await forceSyncNow()
-    if (activeJobId.value) {
-      const response = await transcriptionApi.getTranscriptionText(activeJobId.value)
-      return response?.segments || []
+  await forceSyncNow()
+
+  const pending = subtitleDocumentStore.pendingCount()
+  const syncErrors = subtitleDocumentStore.syncErrors
+  const syncErrorCount = Number(syncErrors?.size || 0)
+  if (pending > 0 || syncErrorCount > 0) {
+    let firstErrorDetail = ''
+    if (syncErrorCount > 0 && typeof syncErrors?.entries === 'function') {
+      const firstError = syncErrors.entries().next().value
+      if (firstError) {
+        firstErrorDetail = `，首条错误: [${firstError[0]}] ${firstError[1]}`
+      }
     }
-    if (props.projectId) {
-      const segments = await projectApi.getSubtitles(props.projectId)
-      return Array.isArray(segments)
-        ? segments.map((segment, index) => ({
-            id: segment.legacy_index ?? index,
-            start: segment.start,
-            end: segment.end,
-            text: segment.text,
-          }))
-        : []
-    }
-    return []
-  } catch (error) {
-    console.error('[EditorView] 获取后端字幕失败:', error)
-    return []
+    throw new Error(`仍有未同步修改（待同步 ${pending} 条，错误 ${syncErrorCount} 条${firstErrorDetail}）`)
   }
+
+  const projectId = props.projectId || projectStore.meta.projectId
+  if (!projectId) {
+    throw new Error('缺少 project_id：无法导出，请从任务列表重新打开并完成任务到项目转换')
+  }
+  const segments = await projectApi.getSubtitles(projectId)
+  return Array.isArray(segments)
+    ? segments.map((segment, index) => ({
+        id: segment.legacy_index ?? index,
+        start: segment.start,
+        end: segment.end,
+        text: segment.text,
+      }))
+    : []
 }
 
 async function handleASSExport(segments) {
   try {
     const srtContent = segmentsToSRT(segments)
-    if (activeJobId.value) {
-      await mediaApi.saveSRTContent(activeJobId.value, srtContent)
-      await transcriptionApi.generateASS(activeJobId.value, {
-        style_preset: 'default',
-        title: projectName.value.replace(/\.[^/.]+$/, ''),
-        video_width: 1920,
-        video_height: 1080,
-      })
-      const assData = await transcriptionApi.getASSContent(activeJobId.value)
-      downloadFile(assData.content, assData.filename)
-      return
+    const projectId = props.projectId || projectStore.meta.projectId
+    if (!projectId) {
+      throw new Error('缺少 project_id：无法导出 ASS，请从任务列表重新打开并完成任务到项目转换')
     }
-
-    if (props.projectId) {
-      const exported = await projectApi.exportSubtitles(props.projectId, 'ass')
-      const fileName = `${projectName.value.replace(/\.[^/.]+$/, '')}.ass`
-      downloadFile(exported?.content || '', fileName)
-      return
-    }
+    const exported = await projectApi.exportSubtitles(projectId, 'ass')
+    const fileName = `${projectName.value.replace(/\.[^/.]+$/, '')}.ass`
+    downloadFile(exported?.content || '', fileName)
+    return
   } catch (error) {
     console.error('[EditorView] 导出 ASS 文件失败:', error)
     alert('导出 ASS 文件失败: ' + (error.message || '未知错误'))
@@ -2070,7 +2125,7 @@ async function handleCheckVideoStatus() {
 
 function handleResolutionChange(resolution) {
   // 更新 projectStore 的视频信息
-  projectStore.meta.currentResolution = resolution
+  projectStore.setCurrentResolution(resolution)
 }
 
 function loadEditorInteractionPreferences() {
@@ -2078,6 +2133,13 @@ function loadEditorInteractionPreferences() {
   const resolved = savedAutoResume === null ? true : savedAutoResume === 'true'
   subtitleFollowAutoResumeEnabled.value = resolved
   advancedConfig.value.general.subtitle_follow_auto_resume = resolved
+}
+
+function resolveCapabilitySnapshot(snapshot = null) {
+  if (snapshot && typeof snapshot === 'object') {
+    return snapshot
+  }
+  return buildDefaultCapabilitySnapshot()
 }
 
 // ========== 字幕全局偏移设置 ==========
@@ -2144,23 +2206,23 @@ function togglePlay() {
 
 function stepBackward() {
   const frameTime = 1 / 30
-  const newTime = Math.max(0, projectStore.player.currentTime - frameTime)
+  const newTime = Math.max(0, playbackStore.currentTime - frameTime)
   playbackManager.seekTo(newTime)
 }
 
 function stepForward() {
   const frameTime = 1 / 30
-  const newTime = Math.min(projectStore.meta.duration, projectStore.player.currentTime + frameTime)
+  const newTime = Math.min(projectStore.meta.duration, playbackStore.currentTime + frameTime)
   playbackManager.seekTo(newTime)
 }
 
 function seekBackward() {
-  const newTime = Math.max(0, projectStore.player.currentTime - 5)
+  const newTime = Math.max(0, playbackStore.currentTime - 5)
   playbackManager.seekTo(newTime)
 }
 
 function seekForward() {
-  const newTime = Math.min(projectStore.meta.duration, projectStore.player.currentTime + 5)
+  const newTime = Math.min(projectStore.meta.duration, playbackStore.currentTime + 5)
   playbackManager.seekTo(newTime)
 }
 
@@ -2200,6 +2262,7 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  playbackManager.pause()
   if (!activeJobId.value && props.projectId) {
     // 纯 project 模式无后台任务续跑需求，卸载时应主动释放连接，避免悬挂订阅。
     cleanupSSE()
@@ -2216,6 +2279,7 @@ onUnmounted(() => {
 })
 
 onBeforeRouteLeave(async (to, from) => {
+  playbackManager.pause()
   if (isDirty.value) {
     try {
       await projectStore.saveProject()

@@ -15,7 +15,7 @@
         <el-icon><Document /></el-icon>
         字幕编辑
       </el-button>
-      <el-button v-if="canTranscribe" type="primary" @click="$emit('open-upload')">
+      <el-button v-if="canRenderTranscribeAction" type="primary" @click="$emit('open-upload')">
         <el-icon><Upload /></el-icon>
         视频转录
       </el-button>
@@ -29,9 +29,9 @@
 <script setup>
 import { Upload } from "@element-plus/icons-vue";
 import { Document } from "@element-plus/icons-vue";
-import { CAPABILITIES } from "@/config/flavor";
+import { selectCapabilities } from "@/state/capabilities/capabilitySelector";
 
-const { canTranscribe } = CAPABILITIES;
+const canRenderTranscribeAction = selectCapabilities().canTranscribe;
 
 defineEmits(["open-about", "open-upload", "open-import", "exit-system"]);
 </script>

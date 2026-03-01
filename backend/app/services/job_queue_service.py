@@ -31,6 +31,7 @@ from app.config.lifecycle_config import (
 from app.services.sse_service import get_sse_manager
 from app.core.config import config
 from app.services.checkpoint import RuntimeCheckpointService
+from app.services.project_id_resolver import get_project_id_resolver
 from app.services.task_state_repository import QueueState
 from app.utils.cancellation_token import (
     CancellationToken,
@@ -178,6 +179,8 @@ class JobQueueService:
         # V3.2.4+dev.20260222.07: 调度线程与执行线程解耦
         self._runner_threads: Dict[str, threading.Thread] = {}
         self._dispatch_interval_seconds: float = 0.2
+        self._paused_head_log_at: Dict[str, float] = {}
+        self._paused_head_log_interval_seconds: float = 30.0
 
         # 依赖服务
         self.transcription_service = transcription_service
@@ -238,7 +241,7 @@ class JobQueueService:
 
     def _find_video_file(self, job_id: str) -> Optional[Path]:
         """V3.1.2+dev.20260114.11: 查找源视频（跳过 preview/proxy/remux）"""
-        job_dir = config.JOBS_DIR / job_id
+        job_dir = self._resolve_project_dir_for_identifier(job_id)
         if not job_dir.exists():
             return None
         video_exts = ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.webm', '.flv', '.m4v']
@@ -249,6 +252,113 @@ class JobQueueService:
                 return file
         return None
 
+    @staticmethod
+    def _is_generated_media_file(file_path: Path) -> bool:
+        normalized_name = file_path.name.lower()
+        return (
+            normalized_name.startswith(("preview_", "proxy_"))
+            or normalized_name in {"remux.mp4", "audio.wav"}
+        )
+
+    def _resolve_primary_input_path(self, job: JobState, job_dir: Path) -> Optional[Path]:
+        """
+        解析任务主输入文件，避免把 audio.wav/preview/proxy 等派生产物当作原始输入。
+        """
+        preferred_input = Path(str(getattr(job, "input_path", "") or "").strip()) if str(getattr(job, "input_path", "") or "").strip() else None
+        if preferred_input is not None:
+            try:
+                if preferred_input.exists() and preferred_input.is_file() and not self._is_generated_media_file(preferred_input):
+                    return preferred_input
+            except Exception:
+                pass
+
+        video_exts = {".mp4", ".avi", ".mkv", ".mov", ".wmv", ".webm", ".flv", ".m4v"}
+        audio_exts = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma"}
+        media_candidates = []
+        try:
+            for file in sorted(job_dir.iterdir(), key=lambda item: item.name.lower()):
+                if not file.is_file():
+                    continue
+                suffix = file.suffix.lower()
+                if suffix not in video_exts and suffix not in audio_exts:
+                    continue
+                if file.name.lower().endswith(".tmp"):
+                    continue
+                if self._is_generated_media_file(file):
+                    continue
+                media_candidates.append(file)
+        except Exception:
+            return preferred_input if preferred_input and preferred_input.exists() else None
+
+        for file in media_candidates:
+            if file.suffix.lower() in video_exts:
+                return file
+        for file in media_candidates:
+            if file.suffix.lower() in audio_exts:
+                return file
+
+        if preferred_input is not None and preferred_input.exists() and preferred_input.is_file():
+            return preferred_input
+        return None
+
+    def _resolve_project_dir_for_identifier(self, identifier: Optional[str]) -> Path:
+        """
+        解析任务目录（优先直达目录，缺失时再走 project 解析）。
+
+        Why:
+        - 新任务在 project_meta 生成前，目录通常仍可通过 job_id 直达；
+        - 老任务目录被规范化后，旧 job_id 可能失效，需要 resolver 转换到 project 目录。
+        """
+        normalized_identifier = str(identifier or "").strip()
+        if not normalized_identifier:
+            return Path(config.JOBS_DIR)
+
+        direct_dir = config.JOBS_DIR / normalized_identifier
+        if direct_dir.exists():
+            return direct_dir
+
+        try:
+            identity = get_project_id_resolver().resolve_or_fail(normalized_identifier)
+            return identity.project_dir
+        except Exception:
+            return direct_dir
+
+    def _ensure_job_project_dir(self, job: JobState, persist_if_rebind: bool = False) -> Optional[Path]:
+        """
+        确保 JobState 绑定到可用目录。
+
+        策略：
+        1. 当前 job.dir 可用则直接返回；
+        2. job.dir 失效时，按 project_id/job_id 解析并回写；
+        3. 可选持久化回写，避免后续继续使用旧目录。
+        """
+        current_dir = Path(job.dir) if str(job.dir or "").strip() else None
+        if current_dir and current_dir.exists():
+            return current_dir
+
+        for identifier in (getattr(job, "project_id", None), getattr(job, "job_id", None)):
+            normalized_identifier = str(identifier or "").strip()
+            if not normalized_identifier:
+                continue
+
+            try:
+                identity = get_project_id_resolver().resolve_or_fail(normalized_identifier)
+            except Exception:
+                continue
+
+            job.project_id = identity.project_id
+            job.dir = str(identity.project_dir)
+
+            if persist_if_rebind:
+                try:
+                    self.transcription_service.job_lifecycle.save_job_meta(job)
+                except Exception as exc:
+                    logger.warning("回写任务目录映射失败: %s, %s", job.job_id, exc)
+
+            return identity.project_dir
+
+        return current_dir
+
     def add_job(self, job: JobState):
         """
         添加任务到队列
@@ -257,6 +367,9 @@ class JobQueueService:
             job: 任务状态对象
         """
         with self.lock:
+            removed_paused = self._drop_paused_jobs_from_queue_locked()
+            if removed_paused > 0:
+                logger.info("新增任务前已清理暂停队列项: removed=%s", removed_paused)
             from_status = job.status
             is_transitioned = self._transition_job_status(job, "queued", "queue_add")
             if not is_transitioned:
@@ -266,7 +379,7 @@ class JobQueueService:
             self.queue.append(job.job_id)
             job.message = f"排队中 (位置: {len(self.queue)})"
 
-        logger.info(f"任务已加入队列: {job.job_id} (队列长度: {len(self.queue)})")
+        logger.info("任务已加入队列: %s (队列长度: %s)", self._describe_job_identity(job.job_id, job), len(self.queue))
 
         # 保存队列状态和任务元信息
         self._persist_queue_and_jobs([job], {job.job_id: from_status}, reason="queue_add")
@@ -278,6 +391,44 @@ class JobQueueService:
     def get_job(self, job_id: str) -> Optional[JobState]:
         """获取任务状态"""
         return self.jobs.get(job_id)
+
+    @staticmethod
+    def _describe_job_identity(job_id: str, job: Optional[JobState] = None) -> str:
+        """
+        日志用任务标识描述：优先展示 project_id，同时保留 queue/job 维度。
+        """
+        queue_id = str(job_id or "").strip()
+        runtime_job_id = str(getattr(job, "job_id", "") or "").strip() if job else ""
+        project_id = str(getattr(job, "project_id", "") or "").strip() if job else ""
+        candidates = []
+        for value in (project_id, runtime_job_id, queue_id):
+            normalized = str(value or "").strip()
+            if normalized and normalized not in candidates:
+                candidates.append(normalized)
+        if not candidates:
+            return queue_id or "unknown"
+        if len(candidates) == 1:
+            return candidates[0]
+        return " | ".join(candidates)
+
+    def _drop_paused_jobs_from_queue_locked(self) -> int:
+        """
+        清理队列中的 paused 任务，避免其阻塞新任务调度。
+        """
+        if not self.queue:
+            return 0
+        kept_queue = deque()
+        removed = 0
+        while self.queue:
+            queued_job_id = self.queue.popleft()
+            queued_job = self.jobs.get(queued_job_id)
+            if queued_job is not None and str(getattr(queued_job, "status", "") or "") == "paused":
+                removed += 1
+                self._paused_head_log_at.pop(queued_job_id, None)
+                continue
+            kept_queue.append(queued_job_id)
+        self.queue = kept_queue
+        return removed
 
     def _transition_job_status(self, job: JobState, target_status: str, reason: str) -> bool:
         """
@@ -416,8 +567,9 @@ class JobQueueService:
         # Phase 1: 恢复请求到达后清理暂停/取消控制信号，
         # 防止 PauseBarrier 在下一个单元边界误判并再次停机。
         try:
-            if job.dir:
-                runtime_service = RuntimeCheckpointService(job_dir=Path(job.dir))
+            job_dir = self._ensure_job_project_dir(job, persist_if_rebind=True)
+            if job_dir:
+                runtime_service = RuntimeCheckpointService(job_dir=job_dir)
                 runtime_service.clear_pause_requested()
                 runtime_service.clear_cancel_requested()
         except Exception as exc:
@@ -500,7 +652,7 @@ class JobQueueService:
                 repo_job = None
                 state_seq = 0
                 input_path = ""
-                job_dir = str(Path(config.JOBS_DIR) / job_id)
+                job_dir = str(self._resolve_project_dir_for_identifier(job_id))
                 try:
                     repo_job = self.state_repo.get_task(job_id)
                     if repo_job:
@@ -552,8 +704,21 @@ class JobQueueService:
                         input_path=input_path,
                     )
 
+                # V3.2.4+dev.20260301.01: 传入回退标识，修复 job_id 不匹配导致 DB 删除 0 行
                 try:
-                    self.state_repo.delete_task(job_id)
+                    fallback_pid = str(getattr(repo_job, "project_id", "") or "").strip() if repo_job else None
+                    fallback_d = str(getattr(repo_job, "dir", "") or "").strip() if repo_job else None
+                    deleted_rows = self.state_repo.delete_task(
+                        job_id,
+                        fallback_project_id=fallback_pid or None,
+                        fallback_dir=fallback_d or job_dir,
+                    )
+                    if deleted_rows == 0:
+                        logger.warning(
+                            "[Lifecycle] delete_task(Branch1) 影响 0 行: "
+                            "job_id=%s, fallback_pid=%s, fallback_dir=%s",
+                            job_id, fallback_pid, fallback_d or job_dir,
+                        )
                 except Exception as exc:
                     logger.warning("逻辑删除任务状态失败(任务可能已不存在): %s, %s", job_id, exc)
                 self.heartbeat_service.release(job_id, self._lease_owner)
@@ -687,8 +852,19 @@ class JobQueueService:
                 job.message = "已取消"
 
         if delete_data:
+            # V3.2.4+dev.20260301.01: 传入回退标识
             try:
-                self.state_repo.delete_task(job_id)
+                deleted_rows = self.state_repo.delete_task(
+                    job_id,
+                    fallback_project_id=str(getattr(job, "project_id", "") or "").strip() or None,
+                    fallback_dir=str(getattr(job, "dir", "") or "").strip() or None,
+                )
+                if deleted_rows == 0:
+                    logger.warning(
+                        "[Lifecycle] delete_task(Branch2) 影响 0 行: "
+                        "job_id=%s, project_id=%s, dir=%s",
+                        job_id, getattr(job, "project_id", ""), getattr(job, "dir", ""),
+                    )
             except Exception as exc:
                 logger.warning("逻辑删除任务状态失败(稍后重试物理清理): %s, %s", job_id, exc)
             self.heartbeat_service.release(job_id, self._lease_owner)
@@ -820,15 +996,56 @@ class JobQueueService:
             if not job:
                 logger.warning("⚠️ 任务不存在，跳过: %s", job_id)
                 self.queue.popleft()
+                self._paused_head_log_at.pop(job_id, None)
+                self._save_state()
                 continue
 
             if job.status == "paused":
-                logger.info("[V3.2.0+dev.20260124.01] 队列头任务已暂停，等待恢复: %s", job_id)
-                return False
+                job_workspace = self._ensure_job_project_dir(job, persist_if_rebind=True)
+                if job_workspace is None or not job_workspace.exists():
+                    canonical_job_id = str(getattr(job, "job_id", "") or "").strip()
+                    logger.warning(
+                        "队列头暂停任务目录缺失，自动清理: queue_id=%s, canonical_job_id=%s",
+                        job_id,
+                        canonical_job_id or job_id,
+                    )
+                    self.queue.popleft()
+                    self.jobs.pop(job_id, None)
+                    if canonical_job_id and canonical_job_id != job_id:
+                        self.jobs.pop(canonical_job_id, None)
+                    self._paused_head_log_at.pop(job_id, None)
+                    if canonical_job_id:
+                        self._paused_head_log_at.pop(canonical_job_id, None)
+                    for stale_task_id in {job_id, canonical_job_id}:
+                        normalized_stale_task_id = str(stale_task_id or "").strip()
+                        if not normalized_stale_task_id:
+                            continue
+                        try:
+                            self.state_repo.delete_task(normalized_stale_task_id)
+                        except Exception as exc:
+                            logger.warning(
+                                "清理目录缺失暂停任务失败: %s, %s",
+                                normalized_stale_task_id,
+                                exc,
+                            )
+                        self.heartbeat_service.release(normalized_stale_task_id, self._lease_owner)
+                    self._save_state()
+                    continue
+                # paused 任务不应长期占据队头；移出队列，等待用户手动恢复时重新入队
+                self.queue.popleft()
+                self._paused_head_log_at.pop(job_id, None)
+                logger.info(
+                    "[V3.2.0+dev.20260124.01] 清理队列头暂停任务（保留任务状态，等待手动恢复）: %s",
+                    self._describe_job_identity(job_id, job),
+                )
+                self._save_state()
+                continue
 
             if job.status in ["canceled", "canceling", "force_canceled", "failed", "removed"]:
                 logger.info("⏭️ 跳过已取消/失败的任务: %s", job_id)
                 self.queue.popleft()
+                self._paused_head_log_at.pop(job_id, None)
+                self._save_state()
                 continue
 
             is_runner_gate_blocking = self._is_runner_gate_blocking_locked()
@@ -854,6 +1071,7 @@ class JobQueueService:
             self.queue.popleft()
             self.running_job_id = job_id
             self._current_executing_job_id = job_id
+            self._paused_head_log_at.pop(job_id, None)
             if not self._transition_job_status(job, "processing", "worker_start"):
                 logger.error("任务启动失败，状态迁移被拒绝: job=%s", job_id)
                 self.running_job_id = None
@@ -1021,7 +1239,7 @@ class JobQueueService:
         self.transcription_service.save_job_meta(job)
         signal_type = "job_complete" if job.status == "finished" else f"job_{job.status}"
         self.sse_manager.broadcast_sync(
-            f"job:{job.job_id}",
+            f"project:{getattr(job, 'project_id', None) or job.job_id}",
             f"signal.{signal_type}",
             {
                 "signal": signal_type,
@@ -1132,7 +1350,11 @@ class JobQueueService:
                         if not is_runner_alive:
                             self._logically_removed_jobs.discard(job_id)
                     try:
-                        self.state_repo.delete_task(job_id)
+                        # V3.2.4+dev.20260301.01: 物理删除后补偿清理，传入目录路径回退
+                        self.state_repo.delete_task(
+                            job_id,
+                            fallback_dir=payload.get("job_dir"),
+                        )
                     except Exception:
                         pass
                     self.heartbeat_service.release(job_id, self._lease_owner)
@@ -1328,12 +1550,12 @@ class JobQueueService:
         from app.services.subtitle_edit_store import load_deleted_indices, load_edits
         from pathlib import Path
         import librosa
-        import soundfile as sf
+        from app.utils.audio_extractor import audio_extractor
 
         def push_signal_event(sse_manager, job_id: str, signal_code: str, message: str = ""):
             """推送信号事件"""
             sse_manager.broadcast_sync(
-                f"job:{job_id}",
+                f"project:{job_id}",
                 f"signal.{signal_code}",
                 {"signal": signal_code, "message": message}
             )
@@ -1358,7 +1580,10 @@ class JobQueueService:
 
         cancellation_token = self.get_cancellation_token(job.job_id)
 
-        job_dir = Path(job.dir)
+        job_dir = self._ensure_job_project_dir(job, persist_if_rebind=True)
+        if job_dir is None:
+            raise FileNotFoundError(f"任务目录不存在: job_id={job.job_id}, dir={job.dir}")
+        job_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_manager = CheckpointManagerV37(job_dir, logger)
         checkpoint_manager.save_checkpoint({"original_settings": job.settings.to_dict()})
 
@@ -1374,11 +1599,27 @@ class JobQueueService:
             # 预触发 Proxy 生成（不阻塞主流程）
             await self._maybe_trigger_proxy_generation(job)
 
-            # 加载完整音频（用于 Audio Overlap）
-            full_audio, sr = librosa.load(job.input_path, sr=16000, mono=True)
+            # V3.2.4+dev.20260301.01: 使用 FFmpeg 提取音频（与导入模式一致，避免波形偏移）
             audio_path = job_dir / "audio.wav"
-            sf.write(str(audio_path), full_audio, sr)
-            logger.info(f"音频文件已保存: {audio_path}")
+            source_input_path = self._resolve_primary_input_path(job, job_dir)
+            if source_input_path is None:
+                raise FileNotFoundError(f"未找到可用输入媒体: job={self._describe_job_identity(job.job_id, job)}")
+
+            normalized_input_path = str(source_input_path)
+            if str(getattr(job, "input_path", "") or "").strip() != normalized_input_path:
+                job.input_path = normalized_input_path
+                self.transcription_service.save_job_meta(job)
+
+            if source_input_path.resolve() == audio_path.resolve():
+                logger.info(
+                    "输入媒体已是目标音频文件，跳过FFmpeg提取: %s",
+                    self._describe_job_identity(job.job_id, job),
+                )
+            else:
+                audio_extractor.extract_fast_sync(source_input_path, audio_path)
+                logger.info(f"音频文件已保存（FFmpeg PCM_16）: {audio_path}")
+            # 从 WAV 加载为 numpy 数组（用于 Audio Overlap pipeline）
+            full_audio, sr = librosa.load(str(audio_path), sr=16000, mono=True)
 
             # 恢复字幕状态并叠加用户编辑（保留在调用方）
             if checkpoint and getattr(checkpoint, "transcription", None):
@@ -1442,7 +1683,7 @@ class JobQueueService:
             logger.error(f"[双流对齐] 任务失败: {e}", exc_info=True)
             self._transition_job_status(job, "failed", "pipeline_error")
             job.error = str(e)
-            push_signal_event(sse_manager, job.job_id, "job_failed", str(e))
+            push_signal_event(sse_manager, str(getattr(job, "project_id", None) or job.job_id), "job_failed", str(e))
             raise
 
         finally:
@@ -1458,41 +1699,77 @@ class JobQueueService:
         在转录任务开始时调用，让 H265 等不兼容格式的视频提前开始转码，
         用户打开编辑器时可能已完成转码。
         """
-        from app.services.media_prep_service import get_media_prep_service
         from app.api.routes.media_routes import (
-            _get_video_codec, NEED_TRANSCODE_CODECS, NEED_TRANSCODE_FORMATS,
-            BROWSER_COMPATIBLE_FORMATS, _find_video_file
+            _analyze_transcode_requirement,
+            _find_video_file,
         )
+        from app.services.media_prep_service import TranscodeDecision, get_media_prep_service
 
         try:
-            job_dir = Path(job.dir)
+            job_dir = self._ensure_job_project_dir(job, persist_if_rebind=True)
+            if job_dir is None or not job_dir.exists():
+                logger.warning("[Proxy预生成] 任务目录不可用，跳过: %s", job.job_id)
+                return
 
             # 查找视频文件
             video_file = _find_video_file(job_dir)
             if not video_file:
                 return
 
-            # 检查是否需要转码
-            needs_transcode = False
-            if video_file.suffix.lower() in NEED_TRANSCODE_FORMATS:
-                needs_transcode = True
-            elif video_file.suffix.lower() in BROWSER_COMPATIBLE_FORMATS:
-                codec = _get_video_codec(video_file)
-                if codec and codec in NEED_TRANSCODE_CODECS:
-                    needs_transcode = True
+            needs_transcode, transcode_reason, transcode_decision = _analyze_transcode_requirement(video_file)
+            if not needs_transcode:
+                logger.debug(
+                    "[Proxy预生成] 直播放行，跳过预生成: job=%s, video=%s",
+                    job.job_id,
+                    video_file.name,
+                )
+                return
 
-            if needs_transcode:
-                # 先生成 360p 预览（高优先级，快速）
-                preview_360p = job_dir / "preview_360p.mp4"
-                if not preview_360p.exists():
-                    media_prep = get_media_prep_service()
-                    enqueued = media_prep.enqueue_preview(
-                        job.job_id, video_file, preview_360p, priority=5
+            media_prep = get_media_prep_service()
+            project_identifier = str(getattr(job, "project_id", "") or "").strip() or job.job_id
+
+            if transcode_decision == TranscodeDecision.REMUX_ONLY.value:
+                remux_output = job_dir / "remux.mp4"
+                if not remux_output.exists():
+                    enqueued = media_prep.enqueue_remux(
+                        project_identifier,
+                        video_file,
+                        remux_output,
+                        priority=3,
                     )
                     if enqueued:
-                        logger.info(f"[Proxy预生成] 检测到不兼容格式，提前入队360p预览: {job.job_id}")
+                        logger.info(
+                            "[Proxy预生成] 触发重封装预处理: job=%s, reason=%s, decision=%s",
+                            project_identifier,
+                            transcode_reason,
+                            transcode_decision,
+                        )
+                return
 
-                # 720p 将在 360p 完成后或转录完成后自动触发（由 media_prep_service 和 transcription_service 处理）
+            if transcode_decision == TranscodeDecision.TRANSCODE_AUDIO.value:
+                logger.info(
+                    "[Proxy预生成] 检测到仅音频转码需求，跳过自动360p预生成: job=%s, reason=%s",
+                    project_identifier,
+                    transcode_reason,
+                )
+                return
+
+            # 仅完整转码决策触发 360p 预览，720p 由后续空闲调度触发
+            preview_360p = job_dir / "preview_360p.mp4"
+            if not preview_360p.exists():
+                enqueued = media_prep.enqueue_preview(
+                    project_identifier,
+                    video_file,
+                    preview_360p,
+                    priority=5,
+                )
+                if enqueued:
+                    logger.info(
+                        "[Proxy预生成] 提前入队360p预览: job=%s, reason=%s, decision=%s",
+                        project_identifier,
+                        transcode_reason,
+                        transcode_decision,
+                    )
         except Exception as e:
             # 预触发失败不影响主流程
             logger.warning(f"[Proxy预生成] 预触发失败，忽略: {e}")
@@ -1598,7 +1875,8 @@ class JobQueueService:
                     paused = media_prep.cancel_proxy_job(job_id, "paused_for_new_job")
                     if paused:
                         # 清理可能的半成品，避免返回坏文件
-                        proxy_file = config.JOBS_DIR / job_id / "proxy_720p.mp4"
+                        proxy_dir = self._resolve_project_dir_for_identifier(job_id)
+                        proxy_file = proxy_dir / "proxy_720p.mp4"
                         if proxy_file.exists():
                             try:
                                 proxy_file.unlink()
@@ -1815,7 +2093,8 @@ class JobQueueService:
             "updated_at": int(time.time() * 1000)
         }
 
-        self.sse_manager.broadcast_sync(f"job:{job_id}", f"signal.{signal}", data)
+        channel_identifier = str(getattr(job, "project_id", None) or job_id)
+        self.sse_manager.broadcast_sync(f"project:{channel_identifier}", f"signal.{signal}", data)
         logger.debug(f"[单任务SSE] 推送信号: {job_id[:8]}... -> signal.{signal}")
 
     def _validate_finish_integrity(self, job: "JobState") -> tuple[bool, str]:
@@ -1827,7 +2106,7 @@ class JobQueueService:
         2. sentences_snapshot 不得残留草稿标记。
         """
         try:
-            job_dir = Path(job.dir) if job.dir else None
+            job_dir = self._ensure_job_project_dir(job)
             if not job_dir or not job_dir.exists():
                 return True, ""
 
@@ -1911,7 +2190,7 @@ class JobQueueService:
             "checkpoint_found": False,
         }
         try:
-            job_dir = Path(job.dir) if job.dir else None
+            job_dir = self._ensure_job_project_dir(job)
             if not job_dir or not job_dir.exists():
                 return payload
 
@@ -1977,7 +2256,7 @@ class JobQueueService:
         """V3.2.0+dev.20260123.04: 暂停握手确认（检查点落盘完成）"""
         payload = self._build_pause_ack_payload(job)
         self.sse_manager.broadcast_sync(
-            f"job:{job.job_id}",
+            f"project:{getattr(job, 'project_id', None) or job.job_id}",
             "signal.pause_ack",
             payload,
         )
@@ -2019,7 +2298,7 @@ class JobQueueService:
         logger.info(f"[V3.1.0] 尝试从 checkpoint 恢复进度: {job.job_id}, 当前进度={job.progress:.1f}%")
 
         try:
-            job_dir = Path(job.dir) if job.dir else None
+            job_dir = self._ensure_job_project_dir(job)
             if not job_dir:
                 logger.info(f"[V3.1.0] 任务目录为空，跳过恢复: job.dir={job.dir}")
                 return
@@ -2267,13 +2546,13 @@ class JobQueueService:
         # 1. 从状态仓库加载（包含完整的任务元信息）
         job = self.transcription_service.load_job_meta(job_id)
         if job:
-            logger.info(f"从状态仓库恢复任务: {job_id}")
+            logger.info("从状态仓库恢复任务: %s", self._describe_job_identity(job_id, job))
             return job
 
         # 2. 降级：从 checkpoint 恢复（兼容旧版本）
         job = self.transcription_service.restore_job_from_checkpoint(job_id)
         if job:
-            logger.info(f"从 checkpoint 恢复任务（旧版兼容）: {job_id}")
+            logger.info("从 checkpoint 恢复任务（旧版兼容）: %s", self._describe_job_identity(job_id, job))
             # 同时保存到状态仓库，便于下次直接加载
             self.transcription_service.save_job_meta(job)
             return job
@@ -2382,17 +2661,47 @@ class JobQueueService:
                 job = self._load_job_for_recovery(job_id)
                 if not job:
                     continue
-                self.state_guard.sync_seq(job.job_id, job.state_seq)
+                canonical_job_id = str(getattr(job, "job_id", "") or "").strip() or str(job_id or "").strip()
+                if not canonical_job_id:
+                    continue
+                self.state_guard.sync_seq(canonical_job_id, job.state_seq)
 
-                if job.status in ("finished", "failed", "canceled", "force_canceled", "removed"):
-                    logger.info(f"[V3.2.0+dev.20260124.01] 过滤终态任务: {job_id}")
+                workspace_dir = self._ensure_job_project_dir(job, persist_if_rebind=True)
+                if workspace_dir is None or not workspace_dir.exists():
+                    logger.warning(
+                        "恢复队列时发现目录缺失任务，跳过并清理: queue_id=%s, canonical_job_id=%s",
+                        job_id,
+                        canonical_job_id,
+                    )
+                    for stale_task_id in {str(job_id or "").strip(), canonical_job_id}:
+                        if not stale_task_id:
+                            continue
+                        try:
+                            self.state_repo.delete_task(stale_task_id)
+                        except Exception as exc:
+                            logger.warning("清理目录缺失恢复任务失败: %s, %s", stale_task_id, exc)
+                        self.heartbeat_service.release(stale_task_id, self._lease_owner)
                     continue
 
-                from_status_map[job_id] = job.status
+                if canonical_job_id in self.jobs:
+                    if canonical_job_id != str(job_id or "").strip():
+                        try:
+                            self.state_repo.delete_task(str(job_id or "").strip())
+                        except Exception:
+                            pass
+                    continue
+
+                if job.status in ("finished", "failed", "canceled", "force_canceled", "removed"):
+                    logger.info(f"[V3.2.0+dev.20260124.01] 过滤终态任务: {canonical_job_id}")
+                    continue
+
+                from_status_map[canonical_job_id] = job.status
                 self._apply_restart_pause(job, expired_jobs, timeout_jobs)
-                self.queue.append(job_id)
-                self.jobs[job_id] = job
+                self.jobs[canonical_job_id] = job
                 jobs_to_persist.append(job)
+                if job.status == "paused":
+                    continue
+                self.queue.append(canonical_job_id)
 
             for job_id in job_ids:
                 if job_id in self.jobs:
@@ -2400,15 +2709,44 @@ class JobQueueService:
                 job = self._load_job_for_recovery(job_id)
                 if not job:
                     continue
-                self.state_guard.sync_seq(job.job_id, job.state_seq)
+                canonical_job_id = str(getattr(job, "job_id", "") or "").strip() or str(job_id or "").strip()
+                if not canonical_job_id:
+                    continue
+                self.state_guard.sync_seq(canonical_job_id, job.state_seq)
+
+                workspace_dir = self._ensure_job_project_dir(job, persist_if_rebind=True)
+                if workspace_dir is None or not workspace_dir.exists():
+                    logger.warning(
+                        "恢复任务池时发现目录缺失任务，跳过并清理: queue_id=%s, canonical_job_id=%s",
+                        job_id,
+                        canonical_job_id,
+                    )
+                    for stale_task_id in {str(job_id or "").strip(), canonical_job_id}:
+                        if not stale_task_id:
+                            continue
+                        try:
+                            self.state_repo.delete_task(stale_task_id)
+                        except Exception as exc:
+                            logger.warning("清理目录缺失恢复任务失败: %s, %s", stale_task_id, exc)
+                        self.heartbeat_service.release(stale_task_id, self._lease_owner)
+                    continue
+
+                if canonical_job_id in self.jobs:
+                    continue
                 if job.status in ("finished", "failed", "canceled", "force_canceled", "removed"):
                     continue
-                from_status_map[job_id] = job.status
+                from_status_map[canonical_job_id] = job.status
                 self._apply_restart_pause(job, expired_jobs, timeout_jobs)
-                self.jobs[job_id] = job
+                self.jobs[canonical_job_id] = job
                 jobs_to_persist.append(job)
 
             if jobs_to_persist:
+                removed_paused = self._drop_paused_jobs_from_queue_locked()
+                if removed_paused > 0:
+                    logger.info(
+                        "[V3.2.0+dev.20260124.01] 恢复阶段清理暂停队列项: removed=%s",
+                        removed_paused,
+                    )
                 self._persist_queue_and_jobs(jobs_to_persist, from_status_map, reason="system_restart")
             else:
                 self._save_state()

@@ -9,6 +9,7 @@
  */
 
 import { apiClient } from './client'
+import projectTaskApi from './projectTaskApi'
 
 class TranscriptionAPI {
   /**
@@ -57,7 +58,7 @@ class TranscriptionAPI {
       formData.append("task_config", JSON.stringify(taskConfig));
     }
 
-    return apiClient.post("/api/create-job", formData);
+    return apiClient.post("/api/create-task", formData);
   }
 
   /**
@@ -116,9 +117,7 @@ class TranscriptionAPI {
    * @returns {Promise<{job_id: string, canceled: boolean, data_deleted: boolean}>}
    */
   async cancelJob(jobId, deleteData = false) {
-    return apiClient.post(`/api/cancel/${jobId}`, null, {
-      params: { delete_data: deleteData },
-    });
+    return projectTaskApi.cancelTask(jobId, deleteData);
   }
 
   /**
@@ -127,7 +126,7 @@ class TranscriptionAPI {
    * @returns {Promise<{job_id: string, paused: boolean}>}
    */
   async pauseJob(jobId) {
-    return apiClient.post(`/api/pause/${jobId}`);
+    return projectTaskApi.pauseTask(jobId);
   }
 
   /**
@@ -141,7 +140,7 @@ class TranscriptionAPI {
    * @returns {Promise<{job_id: string, resumed: boolean, status: string, queue_position: number}>}
    */
   async resumeJob(jobId) {
-    return apiClient.post(`/api/resume/${jobId}`);
+    return projectTaskApi.resumeTask(jobId);
   }
 
   /**
@@ -151,9 +150,7 @@ class TranscriptionAPI {
    * @returns {Promise<{job_id: string, prioritized: boolean, mode: string, queue_position: number}>}
    */
   async prioritizeJob(jobId, mode = "gentle") {
-    return apiClient.post(`/api/prioritize/${jobId}`, null, {
-      params: { mode },
-    });
+    return projectTaskApi.prioritizeTask(jobId, mode);
   }
 
   /**
@@ -163,9 +160,7 @@ class TranscriptionAPI {
    * @returns {Promise<Object>} 完整任务对象
    */
   async getJobStatus(jobId, includeMedia = true) {
-    return apiClient.get(`/api/status/${jobId}`, {
-      params: { include_media: includeMedia },
-    });
+    return projectTaskApi.getTaskStatus(jobId, includeMedia);
   }
 
   /**
@@ -174,7 +169,7 @@ class TranscriptionAPI {
    * @returns {Promise<{offset: number, source: string}>}
    */
   async getJobSubtitleTimeOffset(jobId) {
-    return apiClient.get(`/api/jobs/${jobId}/subtitle-time-offset`);
+    return apiClient.get(`/api/projects/${jobId}/subtitle-time-offset`);
   }
 
   /**
@@ -184,7 +179,7 @@ class TranscriptionAPI {
    * @returns {Promise<{offset: number, source: string}>}
    */
   async setJobSubtitleTimeOffset(jobId, offset) {
-    return apiClient.post(`/api/jobs/${jobId}/subtitle-time-offset`, { offset });
+    return apiClient.post(`/api/projects/${jobId}/subtitle-time-offset`, { offset });
   }
 
   /**
@@ -192,7 +187,7 @@ class TranscriptionAPI {
    * @returns {Promise<{queue: string[], running: string, interrupted: string, jobs: Object}>}
    */
   async getQueueStatus() {
-    return apiClient.get("/api/queue-status");
+    return projectTaskApi.getQueueStatus();
   }
 
   /**
@@ -286,7 +281,7 @@ class TranscriptionAPI {
    * @returns {Promise<{success: boolean, tasks: Array, count: number, timestamp: number}>}
    */
   async syncTasks() {
-    return apiClient.get("/api/sync-tasks");
+    return projectTaskApi.syncTasks();
   }
 
   /**
@@ -294,7 +289,7 @@ class TranscriptionAPI {
    * @returns {Promise<{jobs: Object[], count: number}>}
    */
   async getIncompleteJobs() {
-    return apiClient.get("/api/incomplete-jobs");
+    return apiClient.get("/api/incomplete-tasks");
   }
 
   /**
@@ -312,7 +307,7 @@ class TranscriptionAPI {
    * @returns {Promise<Object>} 任务对象
    */
   async restoreJob(jobId) {
-    return apiClient.post(`/api/restore-job/${jobId}`);
+    return apiClient.post(`/api/restore-task/${jobId}`);
   }
 
   /**
@@ -363,7 +358,7 @@ class TranscriptionAPI {
    * @returns {Promise<{success: boolean, job_id: string, title: string, message: string}>}
    */
   async renameJob(jobId, title) {
-    return apiClient.post(`/api/rename-job/${jobId}`, {
+    return apiClient.post(`/api/rename-task/${jobId}`, {
       title,
     });
   }
@@ -379,7 +374,7 @@ class TranscriptionAPI {
    * @returns {Promise<{success: boolean, data: Object}>}
    */
   async updateSubtitle(jobId, sentenceIndex, update) {
-    return apiClient.patch(`/api/jobs/${jobId}/subtitles/${sentenceIndex}`, update);
+    return apiClient.patch(`/api/projects/${jobId}/subtitles/legacy/${sentenceIndex}`, update);
   }
 
   /**
@@ -392,7 +387,7 @@ class TranscriptionAPI {
    * @returns {Promise<{success: boolean, data: Object}>}
    */
   async createSubtitle(jobId, payload) {
-    return apiClient.post(`/api/jobs/${jobId}/subtitles`, payload);
+    return apiClient.post(`/api/projects/${jobId}/subtitles`, payload);
   }
 
   /**
@@ -402,7 +397,7 @@ class TranscriptionAPI {
    * @returns {Promise<{success: boolean, data: Object}>}
    */
   async deleteSubtitle(jobId, sentenceIndex) {
-    return apiClient.delete(`/api/jobs/${jobId}/subtitles/${sentenceIndex}`);
+    return apiClient.delete(`/api/projects/${jobId}/subtitles/legacy/${sentenceIndex}`);
   }
 
   // ========================
@@ -420,7 +415,7 @@ class TranscriptionAPI {
    * @returns {Promise<{matches: Array, clusters: Object}>}
    */
   async homophoneFind(jobId, payload) {
-    return apiClient.post(`/api/jobs/${jobId}/homophone/find`, payload);
+    return apiClient.post(`/api/projects/${jobId}/homophone/find`, payload);
   }
 
   /**
@@ -429,7 +424,7 @@ class TranscriptionAPI {
    * @returns {Promise<{status: string, progress: number, message: string}>}
    */
   async getHomophoneIndexStatus(jobId) {
-    return apiClient.get(`/api/jobs/${jobId}/homophone/index-status`);
+    return apiClient.get(`/api/projects/${jobId}/homophone/index-status`);
   }
 
   /**
@@ -441,7 +436,7 @@ class TranscriptionAPI {
    * @returns {Promise<{success: boolean, replaced_count: number, updated_subtitles: Array}>}
    */
   async homophoneBatchReplace(jobId, payload) {
-    return apiClient.post(`/api/jobs/${jobId}/homophone/batch-replace`, payload);
+    return apiClient.post(`/api/projects/${jobId}/homophone/batch-replace`, payload);
   }
 
   /**

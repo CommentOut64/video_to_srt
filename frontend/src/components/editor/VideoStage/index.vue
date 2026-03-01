@@ -40,6 +40,7 @@
         :muted="muted"
         :preload="preloadStrategy"
         @loadedmetadata="onMetadataLoaded"
+        @loadeddata="onLoadedData"
         @timeupdate="onTimeUpdate"
         @play="onPlay"
         @pause="onPause"
@@ -47,8 +48,9 @@
         @error="onError"
         @seeking="onSeeking"
         @seeked="onSeeked"
-        @waiting="isBuffering = true"
-        @canplay="isBuffering = false"
+        @waiting="onWaiting"
+        @canplay="onCanPlay"
+        @playing="onPlaying"
         @progress="onProgress"
       />
 
@@ -152,6 +154,7 @@
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, inject } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
+import { usePlaybackStore } from '@/stores/playbackStore'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { ProxyState } from '@/composables/useProxyVideo'
 
@@ -180,6 +183,7 @@ const emit = defineEmits(['loaded', 'error', 'play', 'pause', 'timeupdate', 'end
 
 // Store
 const projectStore = useProjectStore()
+const playbackStore = usePlaybackStore()
 
 // 全局播放管理器（单例）
 const playbackManager = usePlaybackManager()
@@ -205,6 +209,8 @@ const retryCount = ref(0)
 const maxRetries = 3
 const showProgressiveHint = ref(false)
 let progressiveHintTimer = null
+const BUFFERING_TIMEOUT_MS = 12000
+let bufferingTimeout = null
 
 // V3.1.2+dev.20260113.01: 分辨率标志/按钮状态
 const showResolutionBadge = ref(false)
@@ -294,7 +300,7 @@ const canUpgrade = computed(() => {
 })
 
 const currentSubtitleText = computed(() => projectStore.currentSubtitle?.text || '')
-const isPlaying = computed(() => projectStore.player.isPlaying)
+const isPlaying = computed(() => playbackStore.isPlaying)
 
 // 字幕样式（控制位置）
 const subtitleStyle = computed(() => {
@@ -408,6 +414,36 @@ function showHint(type, text = '') {
   }, 800)
 }
 
+function clearBufferingTimeout() {
+  if (bufferingTimeout) {
+    clearTimeout(bufferingTimeout)
+    bufferingTimeout = null
+  }
+}
+
+function setBuffering(active, reason = '') {
+  if (!active) {
+    isBuffering.value = false
+    clearBufferingTimeout()
+    return
+  }
+
+  if (!hasVideoSource.value || isProcessing.value || showAudioOnlyPlaceholder.value) {
+    isBuffering.value = false
+    clearBufferingTimeout()
+    return
+  }
+
+  isBuffering.value = true
+  clearBufferingTimeout()
+  bufferingTimeout = setTimeout(() => {
+    if (isBuffering.value) {
+      console.warn('[VideoStage] 加载遮罩超时自动收敛:', reason || 'unknown')
+      isBuffering.value = false
+    }
+  }, BUFFERING_TIMEOUT_MS)
+}
+
 // 显示分辨率提示（视频源变更时）
 function showResolutionHint() {
   showProgressiveHint.value = true
@@ -487,7 +523,7 @@ async function handleResolutionClick() {
 let currentPlayPromise = null
 
 // 监听 Store 播放状态（单向：Store → Video）
-watch(() => projectStore.player.isPlaying, async (playing) => {
+watch(() => playbackStore.isPlaying, async (playing) => {
   if (!videoRef.value || !hasVideoSource.value) return
 
   const video = videoRef.value
@@ -531,27 +567,40 @@ watch(() => projectStore.player.isPlaying, async (playing) => {
 // 【重要】监听 videoRef 变化，确保 Video 元素注册到 PlaybackManager
 watch(videoRef, (video) => {
   if (video) {
-    playbackManager.registerVideo(video)
+    playbackManager.registerVideo(video, mediaId.value)
   }
 }, { immediate: true })
 
+watch(
+  () => mediaId.value,
+  (sessionId) => {
+    playbackManager.bindSession(sessionId, { force: true, resetPosition: false })
+  },
+  { immediate: true }
+)
+
 // 监听播放速度
-watch(() => projectStore.player.playbackRate, (rate) => {
+watch(() => playbackStore.playbackRate, (rate) => {
   if (videoRef.value) videoRef.value.playbackRate = rate
 })
 
 // 监听音量
-watch(() => projectStore.player.volume, (volume) => {
+watch(() => playbackStore.volume, (volume) => {
   if (videoRef.value) videoRef.value.volume = volume
 })
 
 // 监听 effectiveVideoSource 变化
 watch(effectiveVideoSource, (newUrl, oldUrl) => {
   if (!newUrl) {
+    setBuffering(false, 'source-cleared')
     hasError.value = false
     errorMessage.value = ''
     canRetry.value = false
     retryCount.value = 0
+    return
+  }
+  if (newUrl !== oldUrl) {
+    setBuffering(true, 'source-changed')
   }
 })
 
@@ -590,6 +639,11 @@ watch(() => props.proxyState, async (newState, oldState) => {
 
   const wasTranscoding = transcodingStates.includes(oldState)
   const isNowReady = readyStates.includes(newState)
+  const isNowTranscoding = transcodingStates.includes(newState)
+
+  if (isNowTranscoding || newState === ProxyState.ERROR || !effectiveVideoSource.value) {
+    setBuffering(false, 'proxy-not-ready')
+  }
 
   if (wasTranscoding && isNowReady) {
     // 等待下一帧确保 effectiveVideoSource 已更新
@@ -608,8 +662,10 @@ watch(() => props.proxyState, async (newState, oldState) => {
 
       try {
         // 强制重新加载视频
+        setBuffering(true, 'proxy-ready-reload')
         video.load()
       } catch (error) {
+        setBuffering(false, 'proxy-ready-reload-failed')
         console.error('[VideoStage] 视频加载触发失败:', error)
       }
     }
@@ -645,6 +701,7 @@ watch(() => props.progressiveUrl, async (newUrl, oldUrl) => {
 
     try {
       // 强制重新加载视频
+      setBuffering(true, 'progressive-switch')
       video.load()
 
       // 等待元数据加载
@@ -677,29 +734,48 @@ watch(() => props.progressiveUrl, async (newUrl, oldUrl) => {
       if (wasPlaying) {
         await video.play()
       }
+      setBuffering(false, 'progressive-switch-loaded')
     } catch (error) {
+      setBuffering(false, 'progressive-switch-failed')
       console.error('[VideoStage] 视频源切换失败:', error)
     }
+  } else if (!newUrl) {
+    setBuffering(false, 'progressive-empty')
   }
 })
 
 // ========== 事件处理 ==========
 
-function onMetadataLoaded() {
-  const video = videoRef.value
-  projectStore.meta.duration = video.duration
-  video.playbackRate = projectStore.player.playbackRate
-  video.volume = projectStore.player.volume
+function onMetadataLoaded(event) {
+  const video = event?.target || videoRef.value
+  if (!video) {
+    return
+  }
+  projectStore.setProjectDuration(video.duration)
+  video.playbackRate = playbackStore.playbackRate
+  video.volume = playbackStore.volume
   retryCount.value = 0
+  setBuffering(false, 'loadedmetadata')
   emit('loaded', video.duration)
   if (props.autoPlay) playbackManager.togglePlay()
 }
 
-function onTimeUpdate() {
-  const video = videoRef.value
+function onLoadedData() {
+  setBuffering(false, 'loadeddata')
+}
+
+function onTimeUpdate(event) {
+  const video = event?.target ?? videoRef.value ?? null
+  if (!video) {
+    return
+  }
+  const currentTime = Number(video?.currentTime)
+  if (!Number.isFinite(currentTime)) {
+    return
+  }
   // 【重要】时间更新由 PlaybackManager 内部通过事件监听处理
   // 这里只负责发射事件通知外部
-  emit('timeupdate', video.currentTime)
+  emit('timeupdate', currentTime)
 }
 
 function onPlay() {
@@ -721,6 +797,18 @@ function onProgress() {
   // 可以计算缓冲进度
 }
 
+function onWaiting() {
+  setBuffering(true, 'waiting')
+}
+
+function onCanPlay() {
+  setBuffering(false, 'canplay')
+}
+
+function onPlaying() {
+  setBuffering(false, 'playing')
+}
+
 function onSeeking() {
   // PlaybackManager 内部处理
 }
@@ -735,11 +823,13 @@ function onError() {
 
   // 无视频源或转码中：不进入错误重试流程，避免纯音频场景被误判。
   if (!hasVideoSource.value || isProcessing.value || showAudioOnlyPlaceholder.value) {
+    setBuffering(false, 'error-ignored')
     hasError.value = false
     canRetry.value = false
     return
   }
 
+  setBuffering(false, 'error')
   hasError.value = true
 
   if (error) {
@@ -787,6 +877,7 @@ function retryLoad() {
 
   // 短暂延迟后重新加载，给父组件时间更新状态
   setTimeout(() => {
+    setBuffering(true, 'manual-retry')
     videoRef.value?.load()
   }, 500)
 }
@@ -808,7 +899,7 @@ function seek(seconds) {
     return
   }
   const video = videoRef.value
-  const baseTime = video ? video.currentTime : projectStore.player.currentTime
+  const baseTime = video ? video.currentTime : playbackStore.currentTime
   const newTime = Math.max(0, baseTime + seconds)
   playbackManager.seekTo(newTime)
 }
@@ -1004,7 +1095,7 @@ onMounted(() => {
 
   // 【关键】注册 Video 元素到 PlaybackManager
   if (videoRef.value) {
-    playbackManager.registerVideo(videoRef.value)
+    playbackManager.registerVideo(videoRef.value, mediaId.value)
   }
 
   // V3.1.2+dev.20260113.01: 初始化时显示分辨率标志
@@ -1018,6 +1109,7 @@ onUnmounted(() => {
   document.removeEventListener('fullscreenchange', handleFullscreenChange)
   clearTimeout(stateHintTimer)
   clearTimeout(progressiveHintTimer)
+  clearBufferingTimeout()
   if (clickTimer) clearTimeout(clickTimer)
 
   // V3.1.2+dev.20260113.01: 清理分辨率标志相关定时器
@@ -1027,6 +1119,14 @@ onUnmounted(() => {
   // 清理字幕拖动事件监听器
   document.removeEventListener('mousemove', handleSubtitleMouseMove)
   document.removeEventListener('mouseup', handleSubtitleMouseUp)
+
+  // 路由离开时确保媒体立即停播，避免音频残留
+  try {
+    videoRef.value?.pause()
+  } catch (error) {
+    console.warn('[VideoStage] 卸载暂停视频失败:', error)
+  }
+  playbackManager.pause()
 
   // 【关键】注销 Video 元素
   playbackManager.unregisterVideo()

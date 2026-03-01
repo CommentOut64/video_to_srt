@@ -126,7 +126,7 @@ class ProgressiveVideoGenerator:
 
         try:
             self.sse.broadcast_sync(
-                f"job:{job_id}",
+                f"project:{job_id}",
                 f"{stage}_progress",
                 {
                     "job_id": job_id,
@@ -148,7 +148,7 @@ class ProgressiveVideoGenerator:
             resolution = "360p" if stage == 'preview_360p' else "720p"
 
             self.sse.broadcast_sync(
-                f"job:{job_id}",
+                f"project:{job_id}",
                 f"{stage}_complete",
                 {
                     "job_id": job_id,

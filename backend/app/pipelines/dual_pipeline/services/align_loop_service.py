@@ -60,13 +60,14 @@ class AlignLoopService:
                         token.raise_if_canceled()
                     continue
 
+                if ctx.error:
+                    if isinstance(ctx.error, CancelledException):
+                        host.logger.info(f"上游取消信号: {ctx.error}")
+                    else:
+                        host.logger.error(f"上游错误: {ctx.error}")
+                    raise ctx.error
+
                 if ctx.is_end:
-                    if ctx.error:
-                        if isinstance(ctx.error, CancelledException):
-                            host.logger.info(f"上游取消信号: {ctx.error}")
-                        else:
-                            host.logger.error(f"上游错误: {ctx.error}")
-                        raise ctx.error
                     break
 
                 chunk_index = ctx.chunk_index

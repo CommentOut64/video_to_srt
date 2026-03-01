@@ -79,8 +79,7 @@
 <script setup>
 import { ref, computed } from "vue";
 import { ElMessage, ElMessageBox, ElLoading } from "element-plus";
-import { useUpdateChecker } from "@/composables";
-import systemApi from "@/services/api/systemApi";
+import { useAppUpdateStore } from "@/stores/appUpdateStore";
 
 const props = defineProps({
   // 更新信息
@@ -94,18 +93,19 @@ const emit = defineEmits(["ignore", "scheduled", "updating"]);
 
 const visible = defineModel({ type: Boolean, default: false });
 
+const appUpdateStore = useAppUpdateStore();
+appUpdateStore.initialize();
 const {
   ignoreCurrentUpdate,
   triggerImmediateUpdate,
   scheduleDelayedUpdate,
-  hasDelayedUpdate,
-} = useUpdateChecker();
+} = appUpdateStore;
 
 const isUpdating = ref(false);
 const isScheduling = ref(false);
 
 // 是否已安排延迟更新
-const hasScheduledUpdate = computed(() => hasDelayedUpdate.value);
+const hasScheduledUpdate = computed(() => appUpdateStore.hasDelayedUpdate);
 
 /**
  * 忽略本次更新

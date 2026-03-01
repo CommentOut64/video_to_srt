@@ -919,7 +919,7 @@ class PreprocessCacheService:
             return
         sse_manager = get_sse_manager()
         sse_manager.broadcast_sync(
-            f"job:{job_id}",
+            f"project:{job_id}",
             "signal.cache_gc_recommend",
             {
                 "job_id": job_id,

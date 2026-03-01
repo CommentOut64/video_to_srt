@@ -211,20 +211,20 @@
  * - 双击重命名任务
  */
 import { computed, ref, nextTick } from 'vue'
+import { ElMessage } from 'element-plus'
 import TaskMonitor from './TaskMonitor/index.vue'
 import DualAnchorProgress from '@/components/common/DualAnchorProgress.vue'
 import SimpleProgress from '@/components/common/SimpleProgress.vue'
 import { PHASE_CONFIG, STATUS_CONFIG, formatProgress } from '@/constants/taskPhases'
 import { PROGRESS_ALLOCATION } from '@/components/common/progress/constants'
 import transcriptionApi from '@/services/api/transcriptionApi'
-import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
+import { useTaskRuntimeStore } from '@/stores/taskRuntimeStore'
 import { useProjectStore } from '@/stores/projectStore'
-import { useProgressStore } from '@/stores/progressStore'
-import { ROUTE_VISIBILITY } from '@/config/flavor'
+import { selectRouteVisibility } from '@/state/capabilities/capabilitySelector'
 
-const taskStore = useUnifiedTaskStore()
+const taskStore = useTaskRuntimeStore()
 const projectStore = useProjectStore()
-const progressStore = useProgressStore()
+const progressStore = taskStore
 
 
 const props = defineProps({
@@ -249,8 +249,9 @@ const props = defineProps({
 
 const emit = defineEmits(['undo', 'redo', 'export', 'pause', 'resume', 'cancel', 'rename'])
 const hasJobContext = computed(() => Boolean(props.jobId))
-const backRoute = computed(() => (ROUTE_VISIBILITY.taskList ? '/tasks' : '/import'))
-const backTooltip = computed(() => (ROUTE_VISIBILITY.taskList ? '返回任务列表' : '返回导入页'))
+const routeVisibility = computed(() => selectRouteVisibility(projectStore.meta.capabilitySnapshot))
+const backRoute = computed(() => (routeVisibility.value.taskList ? '/tasks' : '/import'))
+const backTooltip = computed(() => (routeVisibility.value.taskList ? '返回任务列表' : '返回导入页'))
 
 // V3.2.0+dev.20260122.02: 从 progressStore 获取当前任务的进度状态
 const jobProgress = computed(() => {
@@ -307,7 +308,7 @@ async function finishEditTitle() {
   
   try {
     if (!props.jobId) {
-      projectStore.meta.title = newTitle
+      projectStore.setProjectTitle(newTitle)
       emit('rename', newTitle)
       isEditingTitle.value = false
       return
@@ -329,7 +330,7 @@ async function finishEditTitle() {
     }
     
     // 更新 projectStore.meta.title
-    projectStore.meta.title = newTitle
+    projectStore.setProjectTitle(newTitle)
     
     // 通知父组件
     emit('rename', newTitle)

@@ -182,7 +182,7 @@
  */
 import { ref, computed, nextTick, watch } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
-import transcriptionApi from '@/services/api/transcriptionApi'
+import { usePlaybackStore } from '@/stores/playbackStore'
 import projectApi from '@/services/api/projectApi'
 import ContextMenu from '@/components/editor/ContextMenu.vue'
 
@@ -211,6 +211,7 @@ const emit = defineEmits([
 
 // Store
 const projectStore = useProjectStore()
+const playbackStore = usePlaybackStore()
 
 // 编辑状态
 const isEditing = ref(false)
@@ -226,7 +227,7 @@ const cursorPosition = ref(0)
 const isContextMenuOpen = ref(false)  // 防止菜单打开时 blur 触发 stopEditing
 
 // 播放状态
-const isPlaying = computed(() => projectStore.player.isPlaying)
+const isPlaying = computed(() => playbackStore.isPlaying)
 
 // 计算属性
 const itemClasses = computed(() => ({
@@ -430,83 +431,43 @@ async function handleContextMenuSelect(key) {
 }
 
 async function syncSplitSubtitles(result) {
-  const jobId = projectStore.meta.jobId
   const projectId = projectStore.meta.projectId
-  if (!jobId && !projectId) return
+  if (!projectId) {
+    throw new Error('缺少 project_id，禁止走 job 字幕切分分支')
+  }
 
-  const { originalSentenceIndex, leftSubtitle, rightSubtitle } = result
+  const { leftSubtitle, rightSubtitle } = result
   if (!leftSubtitle || !rightSubtitle) return
 
   try {
-    if (projectId) {
-      const leftSegmentId = leftSubtitle.segment_id || props.subtitle.segment_id
-      if (leftSegmentId) {
-        const updatedLeft = await projectApi.updateSubtitle(projectId, leftSegmentId, {
-          text: leftSubtitle.text,
-          start: projectStore.toBaseTime(leftSubtitle.start),
-          end: projectStore.toBaseTime(leftSubtitle.end)
-        })
-        projectStore.updateSubtitle(leftSubtitle.id, {
-          sentenceIndex: updatedLeft?.legacy_index ?? leftSubtitle.sentenceIndex,
-          segment_id: updatedLeft?.segment_id ?? leftSegmentId,
-          isModified: true,
-          source: updatedLeft?.source_type || 'split'
-        }, { isUserEdit: true })
-      }
-
-      const rightData = await projectApi.createSubtitle(projectId, {
-        text: rightSubtitle.text,
-        start: projectStore.toBaseTime(rightSubtitle.start),
-        end: projectStore.toBaseTime(rightSubtitle.end)
-      })
-      projectStore.updateSubtitle(rightSubtitle.id, {
-        sentenceIndex: rightData?.legacy_index ?? rightSubtitle.sentenceIndex,
-        segment_id: rightData?.segment_id ?? rightSubtitle.segment_id,
-        isModified: true,
-        source: rightData?.source_type || 'manual'
-      }, { isUserEdit: true })
-    } else if (jobId) {
-      if (originalSentenceIndex !== undefined) {
-        await transcriptionApi.updateSubtitle(jobId, originalSentenceIndex, {
-          text: leftSubtitle.text,
-          start: projectStore.toBaseTime(leftSubtitle.start),
-          end: projectStore.toBaseTime(leftSubtitle.end)
-        })
-        projectStore.updateSubtitle(leftSubtitle.id, {
-          sentenceIndex: originalSentenceIndex,
-          isModified: true,
-          source: 'split'
-        }, { isUserEdit: true })
-      } else {
-        const leftResp = await transcriptionApi.createSubtitle(jobId, {
-          text: leftSubtitle.text,
-          start: projectStore.toBaseTime(leftSubtitle.start),
-          end: projectStore.toBaseTime(leftSubtitle.end)
-        })
-        const leftData = leftResp?.data?.data || leftResp?.data
-        if (leftData?.index !== undefined) {
-          projectStore.updateSubtitle(leftSubtitle.id, {
-            sentenceIndex: leftData.index,
-            isModified: true,
-            source: leftData.source || 'manual'
-          }, { isUserEdit: true })
-        }
-      }
-
-      const rightResp = await transcriptionApi.createSubtitle(jobId, {
-        text: rightSubtitle.text,
-        start: projectStore.toBaseTime(rightSubtitle.start),
-        end: projectStore.toBaseTime(rightSubtitle.end)
-      })
-      const rightData = rightResp?.data?.data || rightResp?.data
-      if (rightData?.index !== undefined) {
-        projectStore.updateSubtitle(rightSubtitle.id, {
-          sentenceIndex: rightData.index,
-          isModified: true,
-          source: rightData.source || 'manual'
-        }, { isUserEdit: true })
-      }
+    const leftSegmentId = leftSubtitle.segment_id || props.subtitle.segment_id
+    if (!leftSegmentId) {
+      throw new Error('切分左半字幕缺少 segment_id，无法同步到 project 字幕真源')
     }
+
+    const updatedLeft = await projectApi.updateSubtitle(projectId, leftSegmentId, {
+      text: leftSubtitle.text,
+      start: projectStore.toBaseTime(leftSubtitle.start),
+      end: projectStore.toBaseTime(leftSubtitle.end)
+    })
+    projectStore.updateSubtitle(leftSubtitle.id, {
+      sentenceIndex: updatedLeft?.legacy_index ?? leftSubtitle.sentenceIndex,
+      segment_id: updatedLeft?.segment_id ?? leftSegmentId,
+      isModified: true,
+      source: updatedLeft?.source_type || 'split'
+    }, { isUserEdit: true })
+
+    const rightData = await projectApi.createSubtitle(projectId, {
+      text: rightSubtitle.text,
+      start: projectStore.toBaseTime(rightSubtitle.start),
+      end: projectStore.toBaseTime(rightSubtitle.end)
+    })
+    projectStore.updateSubtitle(rightSubtitle.id, {
+      sentenceIndex: rightData?.legacy_index ?? rightSubtitle.sentenceIndex,
+      segment_id: rightData?.segment_id ?? rightSubtitle.segment_id,
+      isModified: true,
+      source: rightData?.source_type || 'manual'
+    }, { isUserEdit: true })
   } catch (error) {
     console.warn('[SubtitleItem] 切分同步失败:', error)
   }

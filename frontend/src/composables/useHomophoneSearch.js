@@ -111,7 +111,7 @@ function escapeRegExp(text) {
 /**
  * 同音检索与批量替换 Composable
  * @param {Object} options - 配置选项
- * @param {Ref<string>} options.jobId - 当前任务 ID
+ * @param {Ref<string>} options.jobId - 当前项目主身份（project_id，兼容 legacy job_id）
  * @param {Ref<Array>} options.subtitles - 字幕列表引用
  * @returns {Object} 同音搜索相关状态和方法
  */

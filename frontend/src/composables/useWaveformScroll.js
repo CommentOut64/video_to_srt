@@ -12,14 +12,14 @@ import { ZOOM_BASE_PX_PER_SEC } from './useWaveformZoom.js'
  * @param {Ref<object>} wavesurferRef - WaveSurfer 实例引用
  * @param {Ref<HTMLElement>} scrollbarTrackRef - 滚动条轨道 DOM 引用
  * @param {Ref<number>} zoomLevel - 当前缩放级别
- * @param {object} projectStore - Pinia store
+ * @param {object} playbackStore - 播放状态 store
  * @param {Ref<boolean>} isReady - 波形是否就绪
  */
 export function useWaveformScroll(
   wavesurferRef,
   scrollbarTrackRef,
   zoomLevel,
-  projectStore,
+  playbackStore,
   isReady
 ) {
   // ============ 滚动条状态 ============
@@ -36,6 +36,26 @@ export function useWaveformScroll(
   let scrollbarRafId = null
   let pendingScrollEvent = null
   let followRafId = null
+
+  function readPlaybackValue(maybeRefValue) {
+    if (
+      maybeRefValue &&
+      typeof maybeRefValue === 'object' &&
+      'value' in maybeRefValue
+    ) {
+      return maybeRefValue.value
+    }
+    return maybeRefValue
+  }
+
+  function getCurrentTimeSec() {
+    const value = Number(readPlaybackValue(playbackStore.currentTime))
+    return Number.isFinite(value) ? value : 0
+  }
+
+  function getIsPlaying() {
+    return Boolean(readPlaybackValue(playbackStore.isPlaying))
+  }
 
   // ============ 计算属性 ============
   const scrollbarThumbStyle = computed(() => ({
@@ -250,7 +270,7 @@ export function useWaveformScroll(
     const scrollContainer = wrapper.parentElement
     if (!scrollContainer) return
 
-    const currentTime = projectStore.player.currentTime
+    const currentTime = getCurrentTimeSec()
     const duration = ws.getDuration()
     if (!duration) return
 
@@ -281,7 +301,7 @@ export function useWaveformScroll(
     if (followRafId) return
 
     const loop = () => {
-      if (projectStore.player.isPlaying && isReady.value) {
+      if (getIsPlaying() && isReady.value) {
         smartScrollFollow()
         followRafId = requestAnimationFrame(loop)
       } else {

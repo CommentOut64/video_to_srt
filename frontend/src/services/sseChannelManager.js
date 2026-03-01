@@ -52,6 +52,11 @@ class SSEChannelManager extends EventEmitter {
     const url = `${this.baseURL}/api/events/global`
 
     return this._subscribe(channelId, url, {
+      force_disconnect: (data) => {
+        console.warn('[SSE Global] 收到服务器强制断开:', data?.reason)
+        handlers.force_disconnect?.(data)
+        this.unsubscribe(channelId)
+      },
       initial_state: (data) => {
         console.log('[SSE Global] 初始状态:', data)
         handlers.onInitialState?.(data)
@@ -114,7 +119,7 @@ class SSEChannelManager extends EventEmitter {
    * @returns {Function} 取消订阅函数
    */
   subscribeJob(jobId, handlers = {}) {
-    const channelId = `job:${jobId}`
+    const channelId = `project:${jobId}`
     const url = `${this.baseURL}/api/stream/${jobId}`
 
     // V3.1.0: 区分总体进度和阶段进度
@@ -191,6 +196,11 @@ class SSEChannelManager extends EventEmitter {
     }
 
     return this._subscribe(channelId, url, {
+      force_disconnect: (data) => {
+        console.warn(`[SSE Job ${jobId}] 收到服务器强制断开:`, data?.reason)
+        handlers.force_disconnect?.(data)
+        this.unsubscribe(channelId)
+      },
       // === 初始状态 ===
       initial_state: (data) => {
         console.log(`[SSE Job ${jobId}] 初始状态:`, data)
@@ -401,6 +411,11 @@ class SSEChannelManager extends EventEmitter {
     const url = `${this.baseURL}/api/stream/project/${projectId}`
 
     return this._subscribe(channelId, url, {
+      force_disconnect: (data) => {
+        console.warn(`[SSE Project ${projectId}] 收到服务器强制断开:`, data?.reason)
+        handlers.force_disconnect?.(data)
+        this.unsubscribe(channelId)
+      },
       'subtitle.edited': (data) => {
         handlers.onSubtitleUpdated?.(data)
       },
@@ -585,12 +600,12 @@ class SSEChannelManager extends EventEmitter {
         // 我们可以通过readyState判断，如果是CLOSED则可能是不可恢复错误
         const readyState = eventSource.readyState
 
-        // 对于job频道，如果连接失败，先尝试验证任务是否存在
-        if (channelId.startsWith('job:') && readyState === EventSource.CLOSED) {
+        // 对于项目频道，如果连接失败，先尝试验证任务是否存在
+        if (channelId.startsWith('project:') && readyState === EventSource.CLOSED) {
           const jobId = channelId.split(':')[1]
 
           // 尝试调用一个轻量级API验证任务是否存在
-          fetch(`${this.baseURL}/api/status/${jobId}`)
+          fetch(`${this.baseURL}/api/projects/${jobId}/tasks/status`)
             .then(res => {
               if (res.status === 404) {
                 console.error(`[SSE ${channelId}] 任务不存在，停止重连`)
@@ -751,15 +766,19 @@ class SSEChannelManager extends EventEmitter {
    */
   reconnect(channelId) {
     console.log(`[SSEChannelManager] 手动重连: ${channelId}`)
+    const config = this.channelConfigs.get(channelId)
+    if (!config) {
+      console.error(`[SSE ${channelId}] 无配置信息，无法重连`)
+      return
+    }
+
+    // unsubscribe 会清空 channelConfigs 与 handlers，需要先备份。
+    const url = config.url
+    const eventHandlers = { ...config.eventHandlers }
 
     this.unsubscribe(channelId)
-
-    const config = this.channelConfigs.get(channelId)
-    if (config) {
-      this._createConnection(channelId, config.url, config.eventHandlers)
-    } else {
-      console.error(`[SSE ${channelId}] 无配置信息，无法重连`)
-    }
+    this.channelConfigs.set(channelId, { url, eventHandlers })
+    this._createConnection(channelId, url, eventHandlers)
   }
 
   /**

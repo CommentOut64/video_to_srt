@@ -11,13 +11,21 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import shutil
 from pathlib import Path
 from threading import RLock
-from time import time
+from time import sleep, time
 from typing import Dict, List, Optional, Tuple
 
 from app.core.config import FLAVOR, config
-from app.models.project_models import Project, SubtitleDocMeta, generate_legacy_project_id
+from app.models.project_models import (
+    Project,
+    SubtitleDocMeta,
+    derive_compat_project_mode,
+    generate_legacy_project_id,
+    infer_task_mode,
+)
 from app.services.project_service import ProjectService, get_project_service
 from app.services.subtitle_doc_service import SubtitleDocService, get_subtitle_doc_service
 from app.services.subtitle_edit_store import load_deleted_indices, load_edits
@@ -30,6 +38,9 @@ class LegacyProjectionService:
     """旧任务投影服务。"""
 
     MAP_FILE = "_legacy_map.json"
+    _WORKSPACE_PROJECT_PATTERN = re.compile(
+        r"^p-\d{8}-\d{6}-(tr|im|lg)-[a-z0-9-]+-[0-9a-z]{4}$"
+    )
 
     def __init__(
         self,
@@ -41,6 +52,7 @@ class LegacyProjectionService:
         self._map_path = config.JOBS_DIR / self.MAP_FILE
         self._lock = RLock()
         self._map = self._load_map()
+        self._sanitize_workspace_mappings()
 
     def resolve(self, job_id: str) -> Tuple[str, bool]:
         """
@@ -53,21 +65,66 @@ class LegacyProjectionService:
         if not normalized_job_id:
             raise FileNotFoundError("job_id 不能为空")
 
+        if self._is_workspace_project_identifier(normalized_job_id):
+            with self._lock:
+                mappings = self._map.get("mappings", {})
+                if normalized_job_id in mappings:
+                    mappings.pop(normalized_job_id, None)
+                    self._save_map()
+
         with self._lock:
             cached = self._map.get("mappings", {}).get(normalized_job_id)
             if isinstance(cached, dict) and cached.get("project_id"):
-                return str(cached["project_id"]), False
+                cached_project_id = str(cached["project_id"])
+                cached_project = self._project_service.get_project(cached_project_id)
+                if (
+                    cached_project is not None
+                    and str(cached_project.job_id or "").strip() == normalized_job_id
+                ):
+                    self._ensure_project_dir_canonical(
+                        project=cached_project,
+                        legacy_job_id=normalized_job_id,
+                    )
+                    return cached_project_id, False
+
+                # 历史映射失效：project 已不存在或与 job_id 不匹配，移除后重新解析。
+                self._map.get("mappings", {}).pop(normalized_job_id, None)
+                self._save_map()
 
         job_dir = config.JOBS_DIR / normalized_job_id
         if not job_dir.exists():
             raise FileNotFoundError(f"任务不存在: {normalized_job_id}")
 
         existing_project = self._project_service._load_project_meta(job_dir)  # type: ignore[attr-defined]
-        if (
-            existing_project is not None
-            and existing_project.mode == "legacy"
-            and existing_project.job_id == normalized_job_id
-        ):
+        if existing_project is not None and str(existing_project.project_id or "").strip():
+            if self._should_preserve_workspace_identity(existing_project, normalized_job_id):
+                previous_project_id = str(existing_project.project_id or "").strip()
+                if previous_project_id != normalized_job_id:
+                    if not str(existing_project.job_id or "").strip() and previous_project_id:
+                        existing_project.job_id = previous_project_id
+                    existing_project.project_id = normalized_job_id
+                    logger.info(
+                        "legacy 解析保持 workspace 主身份: workspace=%s old_project_id=%s",
+                        normalized_job_id,
+                        previous_project_id,
+                    )
+                self._normalize_project_metadata_for_workspace(existing_project, normalized_job_id)
+                existing_project.dir = str(job_dir)
+                existing_project.updated_at = time()
+                self._project_service.save_project(existing_project, project_dir=job_dir)
+                return normalized_job_id, False
+
+            meta_job_id = str(existing_project.job_id or "").strip()
+            if not meta_job_id:
+                # 补齐历史 project_meta 缺失的 job_id，确保后续 legacy 映射可追踪。
+                existing_project.job_id = normalized_job_id
+                existing_project.updated_at = time()
+                self._project_service.save_project(existing_project, project_dir=job_dir)
+
+            self._ensure_project_dir_canonical(
+                project=existing_project,
+                legacy_job_id=normalized_job_id,
+            )
             self._record_mapping(normalized_job_id, existing_project.project_id, False)
             return existing_project.project_id, False
 
@@ -81,14 +138,15 @@ class LegacyProjectionService:
             raise FileNotFoundError(f"任务目录不存在: {job_dir}")
 
         project_id = generate_legacy_project_id(job_id)
-        restored_segments = self._restore_subtitles(job_dir)
+        project_dir = self._promote_legacy_dir(job_dir, project_id)
+        restored_segments = self._restore_subtitles(project_dir)
         segment_count = len(restored_segments)
 
-        subtitle_file = job_dir / "subtitle_edits.json"
+        subtitle_file = project_dir / "subtitle_edits.json"
         if not subtitle_file.exists() and restored_segments:
             try:
                 self._subtitle_doc_service.import_segments(
-                    project_dir=job_dir,
+                    project_dir=project_dir,
                     segments=restored_segments,
                     source_type="legacy",
                 )
@@ -108,17 +166,142 @@ class LegacyProjectionService:
             project_id=project_id,
             title=job_id,
             mode="legacy",
+            task_mode="transcribe",
             flavor="lite" if FLAVOR == "lite" else "full",
             job_id=job_id,
             subtitle_doc=subtitle_doc,
-            media_assets=self._project_service.scan_media_assets(job_dir),
-            dir=str(job_dir),
+            media_assets=self._project_service.scan_media_assets(project_dir),
+            dir=str(project_dir),
             created_at=time(),
             updated_at=time(),
         )
-        self._project_service.save_project(project, project_dir=job_dir)
+        self._project_service.save_project(project, project_dir=project_dir)
         self._record_mapping(job_id, project_id, True)
         return project_id
+
+    def _ensure_project_dir_canonical(self, project: Project, legacy_job_id: str) -> None:
+        """
+        确保 legacy 任务在解析后立即切换为 project 目录语义。
+
+        规则：
+        1. 旧目录 `jobs/{job_id}` 必须迁移到 `jobs/{project_id}`；
+        2. 迁移后立即回写 `project_meta.dir`；
+        3. 旧目录必须被删除（通过 rename/move 达成）。
+        """
+        project_dir = Path(project.dir) if project.dir else (config.JOBS_DIR / legacy_job_id)
+        if not project_dir.exists():
+            legacy_dir = config.JOBS_DIR / legacy_job_id
+            canonical_dir = config.JOBS_DIR / project.project_id
+            if legacy_dir.exists():
+                project_dir = legacy_dir
+            elif canonical_dir.exists():
+                project_dir = canonical_dir
+        if not project_dir.exists():
+            return
+
+        target_dir = self._promote_legacy_dir(project_dir, project.project_id)
+        if str(target_dir) == str(project_dir):
+            return
+
+        project.dir = str(target_dir)
+        project.updated_at = time()
+        self._project_service.save_project(project, project_dir=target_dir)
+        self._record_mapping(legacy_job_id, project.project_id, False)
+
+    def _promote_legacy_dir(self, source_dir: Path, project_id: str) -> Path:
+        """
+        将 legacy job 目录提升为 project 目录，并删除旧目录入口。
+
+        - 首选同卷 `os.replace`（原子重命名）；
+        - 目标目录已存在时，执行覆盖式合并后删除旧目录。
+        """
+        normalized_project_id = str(project_id or "").strip()
+        if not normalized_project_id:
+            return source_dir
+
+        target_dir = config.JOBS_DIR / normalized_project_id
+        try:
+            if source_dir.resolve() == target_dir.resolve():
+                return target_dir
+        except Exception:
+            if source_dir == target_dir:
+                return target_dir
+
+        if not source_dir.exists():
+            if target_dir.exists():
+                return target_dir
+            raise FileNotFoundError(f"legacy目录不存在: {source_dir}")
+
+        target_dir.parent.mkdir(parents=True, exist_ok=True)
+        if not target_dir.exists():
+            self._replace_dir_with_retry(source_dir, target_dir)
+            return target_dir
+
+        # 冲突场景：目标目录存在时，按“目标为主 + 源覆盖”策略合并，随后删除源目录。
+        shutil.copytree(source_dir, target_dir, dirs_exist_ok=True)
+        self._remove_dir_with_retry(source_dir)
+        return target_dir
+
+    @staticmethod
+    def _is_windows_path_busy_error(exc: BaseException) -> bool:
+        if not isinstance(exc, OSError):
+            return False
+        winerror = getattr(exc, "winerror", None)
+        return winerror in {5, 32}
+
+    def _replace_dir_with_retry(
+        self,
+        source_dir: Path,
+        target_dir: Path,
+        max_retries: int = 8,
+    ) -> None:
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                os.replace(source_dir, target_dir)
+                return
+            except (PermissionError, OSError) as exc:
+                if not self._is_windows_path_busy_error(exc):
+                    raise
+                last_exc = exc
+                wait_seconds = min(1.6, 0.1 * (2 ** (attempt - 1)))
+                logger.warning(
+                    "legacy目录提升被占用，准备重试: source=%s, target=%s, attempt=%s/%s, wait=%.2fs, err=%s",
+                    source_dir,
+                    target_dir,
+                    attempt,
+                    max_retries,
+                    wait_seconds,
+                    exc,
+                )
+                sleep(wait_seconds)
+
+        raise RuntimeError(
+            f"legacy目录被占用，无法完成迁移: {source_dir} -> {target_dir}, err={last_exc}"
+        ) from last_exc
+
+    def _remove_dir_with_retry(self, source_dir: Path, max_retries: int = 8) -> None:
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                shutil.rmtree(source_dir, ignore_errors=False)
+                return
+            except (PermissionError, OSError) as exc:
+                if not self._is_windows_path_busy_error(exc):
+                    raise
+                last_exc = exc
+                wait_seconds = min(1.6, 0.1 * (2 ** (attempt - 1)))
+                logger.warning(
+                    "legacy目录清理被占用，准备重试: dir=%s, attempt=%s/%s, wait=%.2fs, err=%s",
+                    source_dir,
+                    attempt,
+                    max_retries,
+                    wait_seconds,
+                    exc,
+                )
+                sleep(wait_seconds)
+
+        raise RuntimeError(f"legacy源目录删除失败（被占用）: {source_dir}, err={last_exc}") from last_exc
 
     def _restore_subtitles(self, job_dir: Path) -> List[dict]:
         """按优先级恢复字幕。"""
@@ -325,7 +508,26 @@ class LegacyProjectionService:
             json.dump(self._map, file, ensure_ascii=False, indent=2)
         os.replace(temp_path, self._map_path)
 
+    def _sanitize_workspace_mappings(self) -> None:
+        """
+        启动时清理历史 `p-*` 污染映射，避免 workspace 再次被回退为旧标识。
+        """
+        with self._lock:
+            mappings = self._map.setdefault("mappings", {})
+            keys_to_remove = [
+                key
+                for key in list(mappings.keys())
+                if self._is_workspace_project_identifier(str(key or ""))
+            ]
+            if not keys_to_remove:
+                return
+            for key in keys_to_remove:
+                mappings.pop(key, None)
+            self._save_map()
+
     def _record_mapping(self, job_id: str, project_id: str, is_new_migration: bool) -> None:
+        if self._is_workspace_project_identifier(job_id):
+            return
         with self._lock:
             mappings = self._map.setdefault("mappings", {})
             mappings[job_id] = {
@@ -334,6 +536,46 @@ class LegacyProjectionService:
                 "status": "migrated" if is_new_migration else "existing",
             }
             self._save_map()
+
+    @classmethod
+    def _is_workspace_project_identifier(cls, identifier: str) -> bool:
+        normalized_identifier = str(identifier or "").strip()
+        if not normalized_identifier:
+            return False
+        return bool(cls._WORKSPACE_PROJECT_PATTERN.fullmatch(normalized_identifier))
+
+    def _should_preserve_workspace_identity(self, project: Project, identifier: str) -> bool:
+        if not self._is_workspace_project_identifier(identifier):
+            return False
+        project_mode = str(getattr(project, "mode", "") or "").strip().lower()
+        return project_mode != "legacy"
+
+    @staticmethod
+    def _normalize_project_metadata_for_workspace(project: Project, project_id: str) -> None:
+        subtitle_doc = getattr(project, "subtitle_doc", None)
+        source_type = str(getattr(subtitle_doc, "source_type", "") or "").strip().lower()
+        inferred_task_mode = infer_task_mode(
+            raw_task_mode=getattr(project, "task_mode", None),
+            project_mode=getattr(project, "mode", None),
+            subtitle_source_type=source_type,
+            project_dir=str(getattr(project, "dir", "") or ""),
+        )
+        project.task_mode = inferred_task_mode
+        project.mode = derive_compat_project_mode(
+            task_mode=inferred_task_mode,
+            existing_mode=getattr(project, "mode", "normal"),
+        )
+
+        if subtitle_doc is not None:
+            subtitle_doc.project_id = project_id
+            doc_id = str(getattr(subtitle_doc, "doc_id", "") or "").strip()
+            if not doc_id or doc_id == str(getattr(project, "job_id", "") or "").strip():
+                subtitle_doc.doc_id = project_id
+            if inferred_task_mode == "subtitle_edit" and source_type == "transcribe":
+                subtitle_doc.source_type = "import"
+            elif inferred_task_mode == "transcribe" and source_type == "import":
+                subtitle_doc.source_type = "transcribe"
+            subtitle_doc.updated_at = time()
 
     def is_legacy_job(self, job_id: str) -> bool:
         """判断是否为已映射 legacy 任务。"""

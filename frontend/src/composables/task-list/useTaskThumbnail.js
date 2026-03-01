@@ -83,12 +83,14 @@ export function useTaskThumbnail({ tasks, taskStore }) {
 
     try {
       console.log(`[useTaskThumbnail] 请求缩略图: ${jobId}`);
-      const result = await transcriptionApi.getThumbnail(jobId);
+      const task = taskStore.getTask(jobId);
+      const mediaIdentifier =
+        (task?.project_id && String(task.project_id).trim()) || jobId;
+      const result = await transcriptionApi.getThumbnail(mediaIdentifier);
       const thumbnail = result.thumbnail || null;
 
       // 如果获取失败但视频可能还在处理中，标记为"待重试"而非永久失败
       if (!thumbnail) {
-        const task = taskStore.getTask(jobId);
         // 如果任务正在处理中，保持undefined状态以便后续重试
         if (task && (task.status === "processing" || task.status === "queued")) {
           console.log(

@@ -4,8 +4,8 @@
 
 使用场景：
 1. 模型下载进度推送（频道：models）
-2. 转录任务进度推送（频道：job:{job_id}）
-3. 转录文字流式输出（频道：job:{job_id}）
+2. 转录任务进度推送（频道：project:{project_id}）
+3. 转录文字流式输出（频道：project:{project_id}）
 
 核心原则：
 - 单通道原则：每个资源只建立一个SSE连接
@@ -62,7 +62,7 @@ class SSEManager:
         订阅指定频道的SSE事件流
 
         Args:
-            channel_id: 频道ID（如 "models", "job:abc123"）
+            channel_id: 频道ID（如 "models", "project:abc123"）
             request: FastAPI请求对象
             initial_state_callback: 初始状态回调函数（可选，用于推送initial_state）
 
@@ -403,21 +403,21 @@ SSE_DEBUG_TAGS = {
 def push_progress_event(sse_manager: SSEManager, job_id: str, phase: str, data: dict):
     """推送进度事件"""
     tag = f"progress.{phase}"
-    channel_id = f"job:{job_id}"
+    channel_id = f"project:{job_id}"
     sse_manager.broadcast_sync(channel_id, tag, data)
 
 
 def push_subtitle_event(sse_manager: SSEManager, job_id: str, event_type: str, sentence_data: dict):
     """推送字幕流式事件"""
     tag = f"subtitle.{event_type}"
-    channel_id = f"job:{job_id}"
+    channel_id = f"project:{job_id}"
     sse_manager.broadcast_sync(channel_id, tag, sentence_data)
 
 
 def push_signal_event(sse_manager: SSEManager, job_id: str, signal_type: str, message: str = ""):
     """推送信号事件"""
     tag = f"signal.{signal_type}"
-    channel_id = f"job:{job_id}"
+    channel_id = f"project:{job_id}"
     sse_manager.broadcast_sync(channel_id, tag, {"job_id": job_id, "signal": signal_type, "message": message})
 
 

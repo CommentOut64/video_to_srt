@@ -84,6 +84,36 @@
           <section class="sidebar-block">
             <div class="block-title">
               <el-icon><CollectionTag /></el-icon>
+              <span>任务类型</span>
+            </div>
+            <div class="mode-switch mode-switch--triple">
+              <button
+                class="mode-btn"
+                :class="{ active: taskModeFilter === 'all' }"
+                @click="setTaskModeFilter('all')"
+              >
+                全部
+              </button>
+              <button
+                class="mode-btn"
+                :class="{ active: taskModeFilter === 'transcribe' }"
+                @click="setTaskModeFilter('transcribe')"
+              >
+                视频转录
+              </button>
+              <button
+                class="mode-btn"
+                :class="{ active: taskModeFilter === 'subtitle_edit' }"
+                @click="setTaskModeFilter('subtitle_edit')"
+              >
+                字幕编辑
+              </button>
+            </div>
+          </section>
+
+          <section class="sidebar-block">
+            <div class="block-title">
+              <el-icon><CollectionTag /></el-icon>
               <span>重要设置</span>
             </div>
 
@@ -223,10 +253,10 @@ import {
   Operation,
   Setting,
 } from '@element-plus/icons-vue'
-import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
-import { useTranscriptionConfigStore } from '@/stores/transcriptionConfigStore'
-import { CAPABILITIES } from '@/config/flavor'
-import { transcriptionApi, systemApi, presetsApi } from '@/services/api'
+import { useTaskRuntimeStore } from '@/stores/taskRuntimeStore'
+import { useTranscriptionPresetStore } from '@/stores/transcriptionPresetStore'
+import { selectCapabilities } from '@/state/capabilities/capabilitySelector'
+import { transcriptionApi, projectApi, systemApi, presetsApi } from '@/services/api'
 import AboutDialog from '@/components/AboutDialog.vue'
 import TaskListHeader from '@/components/task/TaskListHeader.vue'
 import TaskCardGrid from '@/components/task/TaskCardGrid.vue'
@@ -239,6 +269,7 @@ import { navigateToEditor } from '@/utils/editorNavigation'
 
 const DISPLAY_MODE_KEY = 'task-ui-display-mode'
 const SORT_MODE_KEY = 'task-ui-sort-mode'
+const TASK_MODE_FILTER_KEY = 'task-ui-task-mode-filter'
 const GROUP_COLLAPSE_KEY = 'task-ui-group-collapse'
 const SIDEBAR_SETTINGS_KEY = 'task-ui-sidebar-settings'
 const ADVANCED_GENERAL_KEY = 'task-advanced-general'
@@ -246,9 +277,10 @@ const CUSTOM_PRESETS_KEY = 'user-custom-presets'
 
 const router = useRouter()
 const route = useRoute()
-const taskStore = useUnifiedTaskStore()
-const transcriptionConfigStore = useTranscriptionConfigStore()
-const { taskConfig } = storeToRefs(transcriptionConfigStore)
+const taskStore = useTaskRuntimeStore()
+const transcriptionPresetStore = useTranscriptionPresetStore()
+const { taskConfig } = storeToRefs(transcriptionPresetStore)
+const capabilities = selectCapabilities()
 
 const showAboutDialog = ref(false)
 const showImportDialog = ref(false)
@@ -258,6 +290,7 @@ const isEdgeHovered = ref(false)
 
 const displayMode = ref('card')
 const sortMode = ref('grouped')
+const taskModeFilter = ref('all')
 const groupCollapseState = ref({
   workspace: false,
   interrupted: false,
@@ -377,9 +410,20 @@ function getEndTime(task) {
   )
 }
 
+function resolveTaskMode(task) {
+  const normalized = String(task?.task_mode || '').trim().toLowerCase()
+  if (normalized === 'transcribe' || normalized === 'subtitle_edit') {
+    return normalized
+  }
+  return Boolean(task?.is_project_only) ? 'subtitle_edit' : 'transcribe'
+}
+
 function shouldIncludeTask(task) {
   if (!task || task.status === 'removed') return false
   if (!showCanceledTasks.value && ['canceled', 'force_canceled'].includes(task.status)) {
+    return false
+  }
+  if (taskModeFilter.value !== 'all' && resolveTaskMode(task) !== taskModeFilter.value) {
     return false
   }
   return true
@@ -496,9 +540,15 @@ function setSortMode(mode) {
   }
 }
 
+function setTaskModeFilter(mode) {
+  if (!['all', 'transcribe', 'subtitle_edit'].includes(mode)) return
+  taskModeFilter.value = mode
+}
+
 function loadTaskUiPreferences() {
   const savedDisplay = localStorage.getItem(DISPLAY_MODE_KEY)
   const savedSort = localStorage.getItem(SORT_MODE_KEY)
+  const savedTaskModeFilter = localStorage.getItem(TASK_MODE_FILTER_KEY)
   const savedCollapse = parseJsonStorage(GROUP_COLLAPSE_KEY, null)
   const savedSidebarSettings = parseJsonStorage(SIDEBAR_SETTINGS_KEY, null)
   const savedAdvancedGeneral = parseJsonStorage(ADVANCED_GENERAL_KEY, null)
@@ -508,6 +558,9 @@ function loadTaskUiPreferences() {
   }
   if (savedSort === 'grouped' || savedSort === 'edited_time') {
     sortMode.value = savedSort
+  }
+  if (['all', 'transcribe', 'subtitle_edit'].includes(String(savedTaskModeFilter || ''))) {
+    taskModeFilter.value = String(savedTaskModeFilter)
   }
   if (savedCollapse && typeof savedCollapse === 'object') {
     groupCollapseState.value = {
@@ -535,6 +588,10 @@ watch(displayMode, (value) => {
 
 watch(sortMode, (value) => {
   localStorage.setItem(SORT_MODE_KEY, value)
+})
+
+watch(taskModeFilter, (value) => {
+  localStorage.setItem(TASK_MODE_FILTER_KEY, value)
 })
 
 watch(
@@ -674,7 +731,7 @@ loadCustomPresets()
 
 onMounted(() => {
   loadTaskUiPreferences()
-  if (!CAPABILITIES.canTranscribe || route.query.action === 'import') {
+  if (!capabilities.canTranscribe || route.query.action === 'import') {
     showImportDialog.value = true
   }
 })
@@ -706,7 +763,13 @@ function handleImportSuccess(projectId) {
 
 // 打开编辑器
 async function openEditor(jobId) {
-  await navigateToEditor(router, { jobId })
+  try {
+    const task = taskStore.getTask(jobId)
+    const identifier = task?.project_id || jobId
+    await navigateToEditor(router, { jobId: identifier })
+  } catch (error) {
+    ElMessage.error(error?.message || '任务到项目转换失败，无法打开编辑器')
+  }
 }
 
 // 处理标题单击 - 用于区分单击（跳转）和双击（重命名）
@@ -722,7 +785,7 @@ function handleTitleClick(task) {
   // 延迟执行单击操作，给双击留出时间
   clickTimer = setTimeout(async () => {
     clickTimer = null
-    await openEditor(task.job_id)
+    await openEditor(task.project_id || task.job_id)
   }, 200)
 }
 
@@ -846,6 +909,7 @@ async function finishEditTitle(task) {
   if (editingTaskId.value !== task.job_id) return
 
   const newTitle = editingTitle.value.trim()
+  const projectIdentifier = task.project_id || task.job_id
 
   // 如果标题为空，提示并恢复原名称
   if (!newTitle) {
@@ -862,11 +926,38 @@ async function finishEditTitle(task) {
   }
 
   try {
-    // 调用 API 重命名任务
-    const result = await transcriptionApi.renameJob(task.job_id, newTitle)
+    const isProjectOnly = resolveTaskMode(task) === 'subtitle_edit'
+    let result = null
+    let renamedByProjectApi = false
 
-    // 更新本地 store
-    if (result?.task) {
+    if (isProjectOnly) {
+      if (!projectIdentifier) {
+        throw new Error('任务标识缺失，无法重命名')
+      }
+      result = await projectApi.updateProjectTitle(projectIdentifier, newTitle)
+      renamedByProjectApi = true
+    } else {
+      try {
+        result = await transcriptionApi.renameJob(task.job_id, newTitle)
+      } catch (error) {
+        const isNotFound = Number(error?.status) === 404
+        if (!isNotFound || !projectIdentifier) {
+          throw error
+        }
+        result = await projectApi.updateProjectTitle(projectIdentifier, newTitle)
+        renamedByProjectApi = true
+      }
+    }
+
+    if (renamedByProjectApi) {
+      taskStore.updateTask(
+        task.job_id,
+        {
+          title: result?.title || newTitle,
+        },
+        { updated_at: result?.updated_at }
+      )
+    } else if (result?.task) {
       taskStore.applyTaskSnapshot(result.task, {
         updated_at: result.task.updated_at ?? result.updated_at,
       })
@@ -906,7 +997,7 @@ async function handleSaveAdvancedSettings() {
     }
     saveJsonStorage(ADVANCED_GENERAL_KEY, advancedGeneral.value)
 
-    transcriptionConfigStore.applyTaskConfig({
+    transcriptionPresetStore.applyTaskConfig({
       preset_id: advancedConfig.value.preset_id || taskConfig.value.preset_id,
       preprocessing: { ...advancedConfig.value.preprocessing },
       transcription: { ...advancedConfig.value.transcription },
@@ -1137,6 +1228,10 @@ async function handleExit() {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 6px;
+}
+
+.mode-switch--triple {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .mode-btn {

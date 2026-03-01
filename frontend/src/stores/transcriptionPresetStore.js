@@ -1,7 +1,7 @@
 /**
- * 转录配置 Store
+ * 转录预设 Store（Phase 4 正式入口）
  *
- * 统一管理编辑器与任务列表的转录配置来源，避免默认值覆盖用户选择。
+ * 统一管理任务级转录配置来源，避免默认值覆盖用户选择。
  * 通过 localStorage 持久化，保证刷新后仍保持最后一次选择。
  */
 import { defineStore } from 'pinia'
@@ -89,8 +89,8 @@ function mergeTaskConfig(baseConfig, patchConfig) {
   return result
 }
 
-export const useTranscriptionConfigStore = defineStore(
-  'transcriptionConfig',
+export const useTranscriptionPresetStore = defineStore(
+  'transcriptionPreset',
   () => {
     const taskConfig = ref(buildDefaultTaskConfig())
     const hasLoaded = ref(false)
