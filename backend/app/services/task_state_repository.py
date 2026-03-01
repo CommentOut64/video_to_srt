@@ -233,12 +233,73 @@ class TaskStateRepository:
             rows = conn.execute(query, params).fetchall()
         return [self._row_to_job(row) for row in rows]
 
-    def delete_task(self, job_id: str, conn: Optional[sqlite3.Connection] = None) -> None:
+    def delete_task(
+        self,
+        job_id: str,
+        conn: Optional[sqlite3.Connection] = None,
+        *,
+        fallback_project_id: Optional[str] = None,
+        fallback_dir: Optional[str] = None,
+    ) -> int:
+        """
+        删除任务记录。
+
+        V3.2.4+dev.20260301.01: 修复 job_id 不匹配时静默删除失败的问题。
+        优先按 job_id 主键删除；如果影响 0 行，依次尝试 project_id 和 dir 列回退。
+
+        Returns:
+            实际删除的行数
+        """
         target_conn = conn or self._connect()
         try:
-            target_conn.execute("DELETE FROM tasks WHERE job_id = ?", (job_id,))
+            cursor = target_conn.execute(
+                "DELETE FROM tasks WHERE job_id = ?", (job_id,)
+            )
+            deleted = cursor.rowcount
+            if deleted > 0:
+                if conn is None:
+                    target_conn.commit()
+                return deleted
+
+            # 回退 1: 按 project_id 列删除
+            normalized_pid = str(fallback_project_id or "").strip()
+            if normalized_pid:
+                cursor = target_conn.execute(
+                    "DELETE FROM tasks WHERE project_id = ?",
+                    (normalized_pid,),
+                )
+                deleted = cursor.rowcount
+                if deleted > 0:
+                    self.logger.info(
+                        "delete_task 主键未命中，按 project_id 回退删除: "
+                        "job_id=%s, project_id=%s, deleted=%d",
+                        job_id, normalized_pid, deleted,
+                    )
+                    if conn is None:
+                        target_conn.commit()
+                    return deleted
+
+            # 回退 2: 按 dir 列删除
+            normalized_dir = str(fallback_dir or "").strip()
+            if normalized_dir:
+                cursor = target_conn.execute(
+                    "DELETE FROM tasks WHERE dir = ?",
+                    (normalized_dir,),
+                )
+                deleted = cursor.rowcount
+                if deleted > 0:
+                    self.logger.info(
+                        "delete_task 主键和 project_id 均未命中，"
+                        "按 dir 回退删除: job_id=%s, dir=%s, deleted=%d",
+                        job_id, normalized_dir, deleted,
+                    )
+                    if conn is None:
+                        target_conn.commit()
+                    return deleted
+
             if conn is None:
                 target_conn.commit()
+            return 0
         finally:
             if conn is None:
                 target_conn.close()

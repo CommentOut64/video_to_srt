@@ -704,8 +704,21 @@ class JobQueueService:
                         input_path=input_path,
                     )
 
+                # V3.2.4+dev.20260301.01: 传入回退标识，修复 job_id 不匹配导致 DB 删除 0 行
                 try:
-                    self.state_repo.delete_task(job_id)
+                    fallback_pid = str(getattr(repo_job, "project_id", "") or "").strip() if repo_job else None
+                    fallback_d = str(getattr(repo_job, "dir", "") or "").strip() if repo_job else None
+                    deleted_rows = self.state_repo.delete_task(
+                        job_id,
+                        fallback_project_id=fallback_pid or None,
+                        fallback_dir=fallback_d or job_dir,
+                    )
+                    if deleted_rows == 0:
+                        logger.warning(
+                            "[Lifecycle] delete_task(Branch1) 影响 0 行: "
+                            "job_id=%s, fallback_pid=%s, fallback_dir=%s",
+                            job_id, fallback_pid, fallback_d or job_dir,
+                        )
                 except Exception as exc:
                     logger.warning("逻辑删除任务状态失败(任务可能已不存在): %s, %s", job_id, exc)
                 self.heartbeat_service.release(job_id, self._lease_owner)
@@ -839,8 +852,19 @@ class JobQueueService:
                 job.message = "已取消"
 
         if delete_data:
+            # V3.2.4+dev.20260301.01: 传入回退标识
             try:
-                self.state_repo.delete_task(job_id)
+                deleted_rows = self.state_repo.delete_task(
+                    job_id,
+                    fallback_project_id=str(getattr(job, "project_id", "") or "").strip() or None,
+                    fallback_dir=str(getattr(job, "dir", "") or "").strip() or None,
+                )
+                if deleted_rows == 0:
+                    logger.warning(
+                        "[Lifecycle] delete_task(Branch2) 影响 0 行: "
+                        "job_id=%s, project_id=%s, dir=%s",
+                        job_id, getattr(job, "project_id", ""), getattr(job, "dir", ""),
+                    )
             except Exception as exc:
                 logger.warning("逻辑删除任务状态失败(稍后重试物理清理): %s, %s", job_id, exc)
             self.heartbeat_service.release(job_id, self._lease_owner)
@@ -1326,7 +1350,11 @@ class JobQueueService:
                         if not is_runner_alive:
                             self._logically_removed_jobs.discard(job_id)
                     try:
-                        self.state_repo.delete_task(job_id)
+                        # V3.2.4+dev.20260301.01: 物理删除后补偿清理，传入目录路径回退
+                        self.state_repo.delete_task(
+                            job_id,
+                            fallback_dir=payload.get("job_dir"),
+                        )
                     except Exception:
                         pass
                     self.heartbeat_service.release(job_id, self._lease_owner)

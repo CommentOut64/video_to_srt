@@ -115,6 +115,10 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
   const cleanupTimers = new Map()
   const completedQueue = []
 
+  // V3.2.4+dev.20260301.01: 最近删除保护窗口，防止 syncTasksFromBackend 复活已删除任务
+  const RECENTLY_DELETED_TTL_MS = 10_000
+  const _recentlyDeletedIds = new Map()
+
   // ========== 计算属性 ==========
   // 将 Map 转换为数组供组件使用
   const tasks = computed(() => Array.from(tasksMap.value.values()))
@@ -859,6 +863,12 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
       return true
     }
 
+    // V3.2.4+dev.20260301.01: 如果任务在最近删除保护窗口内，拒绝"复活"
+    if (_isRecentlyDeleted(jobId)) {
+      console.log(`[TaskRuntimeStore] 拒绝复活最近删除的任务: ${jobId}`)
+      return false
+    }
+
     const incomingAt = normalizeTimestamp(
       snapshot.updated_at ?? snapshot.updatedAt ?? snapshot.timestamp ?? meta.timestamp
     )
@@ -1042,12 +1052,39 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
    * 删除任务
    */
   function deleteTask(jobId) {
+    // V3.2.4+dev.20260301.01: 记录到 recently-deleted 保护窗口，防止 sync 复活
+    _recentlyDeletedIds.set(jobId, Date.now())
     tasksMap.value.delete(jobId)
     cleanupJobState(jobId)
     // 同时从队列顺序中删除
     queueOrder.value = queueOrder.value.filter(id => id !== jobId)
     saveTasks()
     console.log(`[TaskRuntimeStore] 任务已删除: ${jobId}`)
+  }
+
+  /**
+   * V3.2.4+dev.20260301.01: 检查任务是否在最近删除保护窗口内
+   */
+  function _isRecentlyDeleted(jobId) {
+    const deletedAt = _recentlyDeletedIds.get(jobId)
+    if (!deletedAt) return false
+    if (Date.now() - deletedAt < RECENTLY_DELETED_TTL_MS) {
+      return true
+    }
+    _recentlyDeletedIds.delete(jobId)
+    return false
+  }
+
+  /**
+   * V3.2.4+dev.20260301.01: 清理过期的 recently-deleted 记录
+   */
+  function _pruneRecentlyDeleted() {
+    const now = Date.now()
+    for (const [id, ts] of _recentlyDeletedIds) {
+      if (now - ts >= RECENTLY_DELETED_TTL_MS) {
+        _recentlyDeletedIds.delete(id)
+      }
+    }
   }
 
   function hasStaleState(statuses, staleMs = 30000) {
@@ -1141,7 +1178,8 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
       for (const localId of localTaskIds) {
         if (!backendTaskIds.has(localId)) {
           console.log(`[TaskRuntimeStore] 删除幽灵任务: ${localId}`)
-          tasksMap.value.delete(localId)
+          // V3.2.4+dev.20260301.01: 通过 deleteTask 确保记录到 recently-deleted 保护窗口
+          deleteTask(localId)
           deletedCount++
         }
       }
@@ -1150,6 +1188,8 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
       }
 
       // 3. 更新或添加后端任务
+      // V3.2.4+dev.20260301.01: 同步前清理过期的 recently-deleted 记录
+      _pruneRecentlyDeleted()
       let updatedCount = 0
       let addedCount = 0
       let skippedCount = 0
@@ -1157,6 +1197,13 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
         // V3.1.0: 过滤掉 filename 为空的任务，避免显示"未知任务"
         if (!backendTask.filename || backendTask.filename.trim() === '') {
           console.warn(`[TaskRuntimeStore] 跳过 filename 为空的任务: ${backendTask.id}`)
+          skippedCount++
+          continue
+        }
+
+        // V3.2.4+dev.20260301.01: 保护窗口内的任务不允许被 sync 复活
+        if (_isRecentlyDeleted(backendTask.id)) {
+          console.log(`[TaskRuntimeStore] 同步时跳过最近删除的任务: ${backendTask.id}`)
           skippedCount++
           continue
         }
