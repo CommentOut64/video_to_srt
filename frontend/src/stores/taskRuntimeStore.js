@@ -17,11 +17,24 @@ const CLEANUP_CONFIG = {
   CLEANUP_DELAY: 30000,
   MAX_COMPLETED_STATES: 10,
 }
+const TASK_MODE = {
+  TRANSCRIBE: 'transcribe',
+  SUBTITLE_EDIT: 'subtitle_edit',
+}
 
 function clampPercent(value) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return 0
   const normalized = Math.max(0, Math.min(100, Number(value)))
   return Math.round(normalized * 10) / 10
+}
+
+function normalizeTaskMode(value, options = {}) {
+  const fallback = options.fallback || TASK_MODE.TRANSCRIBE
+  const normalized = String(value || '').trim().toLowerCase()
+  if (normalized === TASK_MODE.TRANSCRIBE || normalized === TASK_MODE.SUBTITLE_EDIT) {
+    return normalized
+  }
+  return fallback
 }
 
 function createRuntimeState(jobId) {
@@ -547,6 +560,11 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
     const pausedAt = normalizeTimestamp(taskData.paused_at ?? taskData.pausedAt)
     const failedAt = normalizeTimestamp(taskData.failed_at ?? taskData.failedAt)
     const canceledAt = normalizeTimestamp(taskData.canceled_at ?? taskData.canceledAt)
+    const normalizedTaskMode = normalizeTaskMode(taskData.task_mode, {
+      fallback: Boolean(taskData.is_project_only)
+        ? TASK_MODE.SUBTITLE_EDIT
+        : TASK_MODE.TRANSCRIBE,
+    })
     const task = {
       job_id: taskData.job_id,
       project_id: taskData.project_id || taskData.job_id,
@@ -568,8 +586,12 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
       paused_at: pausedAt,                          // 暂停时间
       failed_at: failedAt,                          // 失败时间
       canceled_at: canceledAt,                      // 取消时间
-      is_project_only: Boolean(taskData.is_project_only),
-      source_type: taskData.source_type || null,
+      task_mode: normalizedTaskMode,
+      is_project_only:
+        taskData.is_project_only !== undefined
+          ? Boolean(taskData.is_project_only)
+          : normalizedTaskMode === TASK_MODE.SUBTITLE_EDIT,
+      source_type: taskData.source_type || (normalizedTaskMode === TASK_MODE.SUBTITLE_EDIT ? 'import' : null),
       state_seq: normalizeStateSeq(taskData.state_seq),
       isDirty: false,
       sseConnected: false,
@@ -861,6 +883,17 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
       if (snapshot.project_id !== undefined) {
         task.project_id = snapshot.project_id || task.project_id || task.job_id
       }
+      const incomingTaskMode = normalizeTaskMode(snapshot.task_mode, {
+        fallback:
+          snapshot.is_project_only !== undefined
+            ? (Boolean(snapshot.is_project_only) ? TASK_MODE.SUBTITLE_EDIT : TASK_MODE.TRANSCRIBE)
+            : normalizeTaskMode(task.task_mode, {
+              fallback: Boolean(task.is_project_only)
+                ? TASK_MODE.SUBTITLE_EDIT
+                : TASK_MODE.TRANSCRIBE,
+            }),
+      })
+      task.task_mode = incomingTaskMode
       if (snapshot.phase) task.phase = snapshot.phase
       if (snapshot.phase_percent !== undefined) {
         task.phase_percent = Math.round(snapshot.phase_percent * 10) / 10
@@ -880,11 +913,14 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
       if (snapshotFailedAt) task.failed_at = snapshotFailedAt
       const snapshotCanceledAt = normalizeTimestamp(snapshot.canceled_at)
       if (snapshotCanceledAt) task.canceled_at = snapshotCanceledAt
-      if (snapshot.is_project_only !== undefined) {
-        task.is_project_only = Boolean(snapshot.is_project_only)
-      }
+      task.is_project_only =
+        snapshot.is_project_only !== undefined
+          ? Boolean(snapshot.is_project_only)
+          : incomingTaskMode === TASK_MODE.SUBTITLE_EDIT
       if (snapshot.source_type !== undefined) {
-        task.source_type = snapshot.source_type || null
+        task.source_type = snapshot.source_type || (incomingTaskMode === TASK_MODE.SUBTITLE_EDIT ? 'import' : null)
+      } else if (!task.source_type && incomingTaskMode === TASK_MODE.SUBTITLE_EDIT) {
+        task.source_type = 'import'
       }
       if (snapshot.progress !== undefined) {
         applyProgressField(task, snapshot.progress, snapshot.status)
@@ -929,6 +965,7 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
       paused_at: snapshot.paused_at,
       failed_at: snapshot.failed_at,
       canceled_at: snapshot.canceled_at,
+      task_mode: snapshot.task_mode,
       is_project_only: snapshot.is_project_only,
       source_type: snapshot.source_type,
       state_seq: incomingSeq
@@ -1068,7 +1105,31 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
         return false
       }
 
-      const backendTasks = response.tasks || []
+      const backendTasksRaw = response.tasks || []
+      const dedupedTasksById = new Map()
+      for (const task of backendTasksRaw) {
+        const taskId = String(task?.id || task?.job_id || '').trim()
+        if (!taskId) continue
+        const existing = dedupedTasksById.get(taskId)
+        if (!existing) {
+          dedupedTasksById.set(taskId, task)
+          continue
+        }
+        const existingUpdatedAt = normalizeTimestamp(
+          existing?.updated_at ?? existing?.updatedAt ?? existing?.timestamp
+        ) || 0
+        const incomingUpdatedAt = normalizeTimestamp(
+          task?.updated_at ?? task?.updatedAt ?? task?.timestamp
+        ) || 0
+        if (incomingUpdatedAt >= existingUpdatedAt) {
+          dedupedTasksById.set(taskId, task)
+        }
+      }
+      const backendTasks = Array.from(dedupedTasksById.values())
+      const dedupedCount = backendTasksRaw.length - backendTasks.length
+      if (dedupedCount > 0) {
+        console.log(`[TaskRuntimeStore] 语义去重完成: 合并 ${dedupedCount} 条重复任务快照`)
+      }
       console.log(`[TaskRuntimeStore] 从后端同步了 ${backendTasks.length} 个任务`)
 
       // 1. 获取后端任务ID集合
@@ -1206,8 +1267,21 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
                 canceled_at: normalizeTimestamp(t.canceled_at),
                 state_seq: normalizeStateSeq(t.state_seq),
                 serverUpdatedAt,
+                task_mode: normalizeTaskMode(t.task_mode, {
+                  fallback: Boolean(t.is_project_only)
+                    ? TASK_MODE.SUBTITLE_EDIT
+                    : TASK_MODE.TRANSCRIBE,
+                }),
                 is_project_only: Boolean(t.is_project_only),
-                source_type: t.source_type || null,
+                source_type:
+                  t.source_type ||
+                  (normalizeTaskMode(t.task_mode, {
+                    fallback: Boolean(t.is_project_only)
+                      ? TASK_MODE.SUBTITLE_EDIT
+                      : TASK_MODE.TRANSCRIBE,
+                  }) === TASK_MODE.SUBTITLE_EDIT
+                    ? 'import'
+                    : null),
               }
             ]
           })

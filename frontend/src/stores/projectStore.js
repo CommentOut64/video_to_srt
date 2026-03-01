@@ -17,6 +17,7 @@ export const useProjectStore = defineStore("project", () => {
     jobId: null, // 转录任务ID
     projectId: null, // 项目ID（Task6 主键）
     mode: "normal", // normal | legacy
+    taskMode: "transcribe", // transcribe | subtitle_edit
     flavor: "full", // full | lite
     videoPath: null, // 视频文件路径
     audioPath: null, // 音频文件路径
@@ -248,6 +249,9 @@ export const useProjectStore = defineStore("project", () => {
     }
     if (Object.prototype.hasOwnProperty.call(payload, "mode")) {
       nextPatch.mode = payload.mode || "normal";
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, "taskMode")) {
+      nextPatch.taskMode = payload.taskMode || "transcribe";
     }
     if (Object.prototype.hasOwnProperty.call(payload, "flavor")) {
       nextPatch.flavor = payload.flavor || "full";
@@ -537,6 +541,7 @@ export const useProjectStore = defineStore("project", () => {
       ...metadata,
       projectId: metadata.projectId || docMeta?.project_id || meta.value.projectId,
       mode: metadata.mode || meta.value.mode || "normal",
+      taskMode: metadata.taskMode || metadata.task_mode || meta.value.taskMode || "transcribe",
       lastSaved: now,
       isDirty: false,
       capabilitySnapshot: normalizeCapabilitySnapshot(
@@ -1644,6 +1649,7 @@ export const useProjectStore = defineStore("project", () => {
       jobId: null,
       projectId: null,
       mode: "normal",
+      taskMode: "transcribe",
       flavor: "full",
       videoPath: null,
       audioPath: null,
