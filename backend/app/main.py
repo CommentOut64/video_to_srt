@@ -425,6 +425,19 @@ async def startup_event():
         except Exception as migration_exc:
             logger.warning("Project workspace 迁移检查失败: %s", migration_exc)
 
+        # 5.7. 启动补齐 project 元数据（重点补齐 task_mode，防止前端任务模式漂移）
+        logger.info("执行 Project 元数据完整性检查...")
+        try:
+            from app.services.project_service import get_project_service
+
+            normalized_projects = get_project_service().list_projects()
+            logger.info(
+                "Project 元数据完整性检查完成: total=%s",
+                len(normalized_projects),
+            )
+        except Exception as metadata_exc:
+            logger.warning("Project 元数据完整性检查失败: %s", metadata_exc)
+
         # 5.6. 可选：启动阶段执行 Project 单语义强闸（默认关闭）
         strict_guard_enabled = str(os.getenv("PROJECT_SEMANTIC_GUARD_STRICT", "")).strip().lower()
         if strict_guard_enabled in {"1", "true", "yes", "on"}:

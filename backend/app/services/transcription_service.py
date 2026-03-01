@@ -321,6 +321,7 @@ class TranscriptionService:
                 project = project_service.create_normal_project(
                     job_id=job.job_id,
                     title=job.title or Path(job.filename).stem,
+                    task_mode="transcribe",
                     source_type="transcribe",
                     project_id=stable_project_id,
                     project_dir=job_dir,
@@ -454,16 +455,24 @@ class TranscriptionService:
         Returns:
             JobState: 创建的任务状态对象
         """
-        target_project_id = str(project_id or job_id or "").strip() or generate_project_id()
         from app.services.project_naming_service import get_project_naming_service
 
+        explicit_identifier = str(project_id or job_id or "").strip()
+        if explicit_identifier:
+            # 兼容调用方显式指定 ID 的场景：目录名与任务主键保持一致，避免再次产生双主键。
+            target_project_id = explicit_identifier
+            workspace_dir_name = explicit_identifier
+        else:
+            # 新建任务强制使用 canonical workspace 标识作为 project/job 主键。
+            workspace_dir_name = get_project_naming_service().generate_workspace_dir_name(
+                jobs_root=self.job_lifecycle.jobs_root,
+                mode="transcribe",
+                title=Path(filename).stem,
+                source_filename=filename,
+            )
+            target_project_id = workspace_dir_name
+
         project_title = str(Path(filename).stem or target_project_id)
-        workspace_dir_name = get_project_naming_service().generate_workspace_dir_name(
-            jobs_root=self.job_lifecycle.jobs_root,
-            mode="transcribe",
-            title=project_title,
-            source_filename=filename,
-        )
         job = self.job_lifecycle.create_job(
             filename=filename,
             src_path=src_path,
@@ -480,6 +489,7 @@ class TranscriptionService:
         project_service.create_normal_project(
             job_id=target_project_id,
             title=project_title,
+            task_mode="transcribe",
             source_type="transcribe",
             project_id=target_project_id,
             project_dir=Path(job.dir),
@@ -743,7 +753,7 @@ class TranscriptionService:
         try:
             from pathlib import Path
             from app.core.config import config
-            from app.services.media_prep_service import get_media_prep_service
+            from app.services.media_prep_service import TranscodeDecision, get_media_prep_service
             from app.services.project_id_resolver import get_project_id_resolver
 
             self.logger.info(f"[720p] 开始检查是否需要触发720p转码: {job_id}")
@@ -791,6 +801,32 @@ class TranscriptionService:
                 return
 
             media_prep = get_media_prep_service()
+            try:
+                from app.utils.media_analyzer import media_analyzer
+
+                video_info = media_analyzer.analyze_sync(video_file)
+                video_info["container"] = video_file.suffix.lower()
+                decision = media_prep.analyze_transcode_decision(video_info)
+            except Exception as exc:
+                self.logger.warning(f"[720p] 媒体分析失败，跳过自动720p触发: {project_id}, err={exc}")
+                return
+
+            if decision == TranscodeDecision.DIRECT_PLAY:
+                self.logger.info(f"[720p] 源视频可直播放，跳过720p触发: {project_id}")
+                return
+
+            if decision == TranscodeDecision.REMUX_ONLY:
+                remux_output = job_dir / "remux.mp4"
+                if not remux_output.exists():
+                    enqueued = media_prep.enqueue_remux(project_id, video_file, remux_output, priority=3)
+                    self.logger.info(
+                        "[720p] 仅需重封装，改为触发 remux: %s, enqueued=%s",
+                        project_id,
+                        enqueued,
+                    )
+                else:
+                    self.logger.info(f"[720p] remux 已存在，跳过自动触发: {project_id}")
+                return
 
             # 检查 720p 是否已在队列中
             proxy_status = media_prep.get_proxy_status(project_id)

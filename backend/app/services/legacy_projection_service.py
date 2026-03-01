@@ -19,7 +19,13 @@ from time import sleep, time
 from typing import Dict, List, Optional, Tuple
 
 from app.core.config import FLAVOR, config
-from app.models.project_models import Project, SubtitleDocMeta, generate_legacy_project_id
+from app.models.project_models import (
+    Project,
+    SubtitleDocMeta,
+    derive_compat_project_mode,
+    generate_legacy_project_id,
+    infer_task_mode,
+)
 from app.services.project_service import ProjectService, get_project_service
 from app.services.subtitle_doc_service import SubtitleDocService, get_subtitle_doc_service
 from app.services.subtitle_edit_store import load_deleted_indices, load_edits
@@ -160,6 +166,7 @@ class LegacyProjectionService:
             project_id=project_id,
             title=job_id,
             mode="legacy",
+            task_mode="transcribe",
             flavor="lite" if FLAVOR == "lite" else "full",
             job_id=job_id,
             subtitle_doc=subtitle_doc,
@@ -547,17 +554,28 @@ class LegacyProjectionService:
     def _normalize_project_metadata_for_workspace(project: Project, project_id: str) -> None:
         subtitle_doc = getattr(project, "subtitle_doc", None)
         source_type = str(getattr(subtitle_doc, "source_type", "") or "").strip().lower()
-        project_mode = str(getattr(project, "mode", "") or "").strip().lower()
+        inferred_task_mode = infer_task_mode(
+            raw_task_mode=getattr(project, "task_mode", None),
+            project_mode=getattr(project, "mode", None),
+            subtitle_source_type=source_type,
+            project_dir=str(getattr(project, "dir", "") or ""),
+        )
+        project.task_mode = inferred_task_mode
+        project.mode = derive_compat_project_mode(
+            task_mode=inferred_task_mode,
+            existing_mode=getattr(project, "mode", "normal"),
+        )
 
         if subtitle_doc is not None:
             subtitle_doc.project_id = project_id
             doc_id = str(getattr(subtitle_doc, "doc_id", "") or "").strip()
             if not doc_id or doc_id == str(getattr(project, "job_id", "") or "").strip():
                 subtitle_doc.doc_id = project_id
+            if inferred_task_mode == "subtitle_edit" and source_type == "transcribe":
+                subtitle_doc.source_type = "import"
+            elif inferred_task_mode == "transcribe" and source_type == "import":
+                subtitle_doc.source_type = "transcribe"
             subtitle_doc.updated_at = time()
-
-        if source_type == "import" and project_mode != "legacy":
-            project.mode = "import"
 
     def is_legacy_job(self, job_id: str) -> bool:
         """判断是否为已映射 legacy 任务。"""

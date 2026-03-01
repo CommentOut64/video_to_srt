@@ -17,6 +17,7 @@ from time import sleep, time
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 from app.core.config import config
+from app.models.project_models import derive_compat_project_mode, infer_task_mode
 from app.services.project_id_resolver import ProjectIdentity, get_project_id_resolver
 from app.services.project_naming_service import (
     ProjectNamingService,
@@ -285,11 +286,17 @@ class ProjectDirectoryMigrator:
         source_type = ""
         if project.subtitle_doc is not None:
             source_type = str(project.subtitle_doc.source_type or "").strip().lower()
+        inferred_task_mode = infer_task_mode(
+            raw_task_mode=getattr(project, "task_mode", None),
+            project_mode=getattr(project, "mode", None),
+            subtitle_source_type=source_type,
+            project_dir=str(project_dir),
+        )
 
         mode = "transcribe"
         if str(project.mode or "").strip().lower() == "legacy" or source_type == "legacy":
             mode = "legacy"
-        elif source_type == "import":
+        elif inferred_task_mode == "subtitle_edit":
             mode = "import"
 
         title = str(project.title or "").strip() or project_id
@@ -343,6 +350,17 @@ class ProjectDirectoryMigrator:
             ".opus",
             ".wma",
         }
+        for item in project_dir.iterdir():
+            if not item.is_file() or item.suffix.lower() not in media_exts:
+                continue
+            normalized_name = item.name.lower()
+            if normalized_name.endswith(".tmp"):
+                continue
+            if normalized_name.startswith(("preview_", "proxy_")) or normalized_name == "remux.mp4":
+                continue
+            return item.name
+
+        # 兜底：若仅有转码产物，仍返回一个可用文件名，避免迁移失败
         for item in project_dir.iterdir():
             if item.is_file() and item.suffix.lower() in media_exts:
                 return item.name
@@ -399,8 +417,22 @@ class ProjectDirectoryMigrator:
                 subtitle_doc.doc_id = target_project_id
             subtitle_doc.updated_at = time()
 
-        if source_type == "import" and project_mode != "legacy":
-            project.mode = "import"
+        inferred_task_mode = infer_task_mode(
+            raw_task_mode=getattr(project, "task_mode", None),
+            project_mode=getattr(project, "mode", None),
+            subtitle_source_type=source_type,
+            project_dir=str(target_dir),
+        )
+        project.task_mode = inferred_task_mode
+        project.mode = derive_compat_project_mode(
+            task_mode=inferred_task_mode,
+            existing_mode=getattr(project, "mode", "normal"),
+        )
+        if subtitle_doc is not None:
+            if inferred_task_mode == "subtitle_edit" and source_type == "transcribe":
+                subtitle_doc.source_type = "import"
+            elif inferred_task_mode == "transcribe" and source_type == "import":
+                subtitle_doc.source_type = "transcribe"
 
         project.dir = str(target_dir)
         self._project_service.save_project(project, project_dir=target_dir)

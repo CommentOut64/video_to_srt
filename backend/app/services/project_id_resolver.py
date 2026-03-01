@@ -16,6 +16,7 @@ from time import time
 from typing import Any, Optional
 
 from app.core.config import config
+from app.models.project_models import derive_compat_project_mode, infer_task_mode
 from app.services.legacy_projection_service import get_legacy_projection_service
 from app.services.project_service import get_project_service
 
@@ -292,17 +293,28 @@ class ProjectIdResolver:
         """
         subtitle_doc = getattr(project, "subtitle_doc", None)
         source_type = str(getattr(subtitle_doc, "source_type", "") or "").strip().lower()
-        project_mode = str(getattr(project, "mode", "") or "").strip().lower()
+        inferred_task_mode = infer_task_mode(
+            raw_task_mode=getattr(project, "task_mode", None),
+            project_mode=getattr(project, "mode", None),
+            subtitle_source_type=source_type,
+            project_dir=str(getattr(project, "dir", "") or ""),
+        )
+        project.task_mode = inferred_task_mode
+        project.mode = derive_compat_project_mode(
+            task_mode=inferred_task_mode,
+            existing_mode=getattr(project, "mode", "normal"),
+        )
 
         if subtitle_doc is not None:
             subtitle_doc.project_id = project_id
             doc_id = str(getattr(subtitle_doc, "doc_id", "") or "").strip()
             if not doc_id or doc_id == str(getattr(project, "job_id", "") or "").strip():
                 subtitle_doc.doc_id = project_id
+            if inferred_task_mode == "subtitle_edit" and source_type == "transcribe":
+                subtitle_doc.source_type = "import"
+            elif inferred_task_mode == "transcribe" and source_type == "import":
+                subtitle_doc.source_type = "transcribe"
             subtitle_doc.updated_at = time()
-
-        if source_type == "import" and project_mode != "legacy":
-            project.mode = "import"
 
 
 _project_id_resolver: Optional[ProjectIdResolver] = None

@@ -24,7 +24,11 @@ from app.models.project_models import (
     ProjectMode,
     SourceType,
     SubtitleDocMeta,
+    TaskMode,
+    derive_compat_project_mode,
     generate_project_id,
+    infer_task_mode,
+    normalize_task_mode,
 )
 from app.services.project_naming_service import get_project_naming_service
 from app.services.subtitle_edit_store import load_deleted_indices, load_edits
@@ -96,6 +100,7 @@ class ProjectService:
             project_id=project_id,
             title=normalized_title,
             mode="import",
+            task_mode="subtitle_edit",
             flavor=normalized_flavor,
             subtitle_doc=subtitle_doc,
             media_assets=media_assets,
@@ -113,6 +118,7 @@ class ProjectService:
         *,
         flavor: str = FLAVOR,
         mode: ProjectMode = "normal",
+        task_mode: TaskMode = "transcribe",
         source_type: SourceType = "transcribe",
         project_id: Optional[str] = None,
         project_dir: Optional[Path] = None,
@@ -150,11 +156,24 @@ class ProjectService:
 
         normalized_title = str(title or "").strip() or target_project_id
         normalized_flavor = "lite" if str(flavor).lower() == "lite" else "full"
+        normalized_task_mode = infer_task_mode(
+            raw_task_mode=task_mode,
+            project_mode=mode,
+            subtitle_source_type=source_type,
+            project_dir=str(job_dir),
+        )
+        normalized_mode = derive_compat_project_mode(
+            task_mode=normalized_task_mode,
+            existing_mode=mode,
+        )
+        normalized_source_type: SourceType = (
+            "import" if normalized_task_mode == "subtitle_edit" else source_type
+        )
         segment_count = self._estimate_segment_count(job_dir)
         subtitle_doc = SubtitleDocMeta(
             doc_id=target_project_id,
             project_id=target_project_id,
-            source_type=source_type,
+            source_type=normalized_source_type,
             segment_count=segment_count,
             version=1,
             created_at=time(),
@@ -164,7 +183,8 @@ class ProjectService:
         project = Project(
             project_id=target_project_id,
             title=normalized_title,
-            mode=mode,
+            mode=normalized_mode,
+            task_mode=normalized_task_mode,
             flavor=normalized_flavor,
             job_id=job_id,
             subtitle_doc=subtitle_doc,
@@ -326,6 +346,7 @@ class ProjectService:
         target_dir.mkdir(parents=True, exist_ok=True)
 
         project.dir = str(target_dir)
+        self._normalize_project_metadata(project=project, project_dir=target_dir)
         project.updated_at = time()
         self._save_project_meta(project, target_dir)
         self._cache_project(project, target_dir)
@@ -373,10 +394,80 @@ class ProjectService:
         try:
             with open(meta_path, "r", encoding="utf-8") as file:
                 payload = json.load(file)
-            return Project.from_dict(payload, project_dir=str(project_dir))
+            has_explicit_task_mode = (
+                isinstance(payload, dict)
+                and normalize_task_mode(payload.get("task_mode")) is not None
+            )
+            project = Project.from_dict(payload, project_dir=str(project_dir))
+            if self._normalize_project_metadata(
+                project=project,
+                project_dir=project_dir,
+                force_task_mode_write=not has_explicit_task_mode,
+            ):
+                # 启动或读取时自动补齐 task_mode 与兼容字段，确保元数据始终完整一致。
+                self._save_project_meta(project, project_dir)
+            return project
         except Exception as exc:
             logger.warning("读取 project_meta 失败: %s (%s)", project_dir, exc)
             return None
+
+    def _normalize_project_metadata(
+        self,
+        *,
+        project: Project,
+        project_dir: Path,
+        force_task_mode_write: bool = False,
+    ) -> bool:
+        """
+        统一补齐并校正任务模式元数据。
+        """
+        has_changed = False
+        subtitle_doc = getattr(project, "subtitle_doc", None)
+        raw_source_type = getattr(subtitle_doc, "source_type", "") if subtitle_doc else ""
+        inferred_task_mode = infer_task_mode(
+            raw_task_mode=getattr(project, "task_mode", None),
+            project_mode=getattr(project, "mode", None),
+            subtitle_source_type=raw_source_type,
+            project_dir=str(project_dir),
+        )
+        current_task_mode = normalize_task_mode(getattr(project, "task_mode", None))
+        if current_task_mode != inferred_task_mode:
+            project.task_mode = inferred_task_mode
+            has_changed = True
+        elif force_task_mode_write:
+            # `Project.from_dict` 可能已经推断出 task_mode，但原始 JSON 字段缺失；
+            # 启动/读取时需要回写，保证后续链路只依赖显式元数据。
+            project.task_mode = inferred_task_mode
+            has_changed = True
+
+        normalized_mode = derive_compat_project_mode(
+            task_mode=inferred_task_mode,
+            existing_mode=getattr(project, "mode", "normal"),
+        )
+        if getattr(project, "mode", None) != normalized_mode:
+            project.mode = normalized_mode
+            has_changed = True
+
+        if subtitle_doc is not None:
+            expected_source_type: SourceType = (
+                "import" if inferred_task_mode == "subtitle_edit" else "transcribe"
+            )
+            normalized_source_type = str(getattr(subtitle_doc, "source_type", "") or "").strip().lower()
+            if normalized_source_type not in {"import", "legacy", "transcribe"}:
+                subtitle_doc.source_type = expected_source_type
+                has_changed = True
+            elif normalized_source_type == "import" and inferred_task_mode == "transcribe":
+                subtitle_doc.source_type = expected_source_type
+                has_changed = True
+            elif normalized_source_type == "transcribe" and inferred_task_mode == "subtitle_edit":
+                subtitle_doc.source_type = expected_source_type
+                has_changed = True
+
+            if str(getattr(subtitle_doc, "project_id", "") or "").strip() != project.project_id:
+                subtitle_doc.project_id = project.project_id
+                has_changed = True
+
+        return has_changed
 
     def _cache_project(self, project: Project, project_dir: Path) -> None:
         with self._lock:
@@ -465,9 +556,22 @@ class ProjectService:
     @staticmethod
     def _find_video_file(project_dir: Path) -> Optional[Path]:
         video_exts = {".mp4", ".avi", ".mkv", ".mov", ".wmv", ".webm", ".flv", ".m4v"}
-        for item in project_dir.iterdir():
-            if item.is_file() and item.suffix.lower() in video_exts:
-                return item
+        source_candidates = []
+        generated_candidates = []
+        for item in sorted(project_dir.iterdir(), key=lambda candidate: candidate.name.lower()):
+            if not item.is_file() or item.suffix.lower() not in video_exts:
+                continue
+            normalized_name = item.name.lower()
+            if normalized_name.endswith(".tmp"):
+                continue
+            if normalized_name.startswith(("preview_", "proxy_")) or normalized_name == "remux.mp4":
+                generated_candidates.append(item)
+                continue
+            source_candidates.append(item)
+        if source_candidates:
+            return source_candidates[0]
+        if generated_candidates:
+            return generated_candidates[0]
         return None
 
     @staticmethod

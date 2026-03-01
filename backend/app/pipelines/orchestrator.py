@@ -312,6 +312,7 @@ class PipelineOrchestrator:
                 project = project_service.create_normal_project(
                     job_id=job.job_id,
                     title=job.title or Path(job.filename).stem,
+                    task_mode="transcribe",
                     source_type="transcribe",
                     project_id=stable_project_id,
                     project_dir=_job_dir,
