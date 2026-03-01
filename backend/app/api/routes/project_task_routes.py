@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException
+from app.models.project_models import infer_task_mode
 
 
 def _get_queue_service(transcription_service):
@@ -118,9 +119,27 @@ def create_project_task_router(transcription_service) -> APIRouter:
             return None
 
     def _build_task_snapshot(job: Any) -> Dict[str, Any]:
+        project_id = str(getattr(job, "project_id", "") or "").strip() or str(
+            getattr(job, "job_id", "") or ""
+        ).strip()
+        resolved_project_mode: Optional[str] = None
+        if project_id:
+            try:
+                resolved_project = _get_project_service().get_project(project_id)
+            except Exception:
+                resolved_project = None
+            if resolved_project is not None:
+                resolved_project_mode = _resolve_project_task_mode(resolved_project)
+
+        task_mode = infer_task_mode(
+            raw_task_mode=resolved_project_mode or getattr(job, "task_mode", None),
+            project_mode=None,
+            subtitle_source_type=None,
+            project_dir=str(getattr(job, "dir", "") or ""),
+        )
         return {
             "id": getattr(job, "job_id", ""),
-            "project_id": getattr(job, "project_id", None),
+            "project_id": project_id or None,
             "filename": getattr(job, "filename", ""),
             "title": getattr(job, "title", ""),
             "status": getattr(job, "status", ""),
@@ -132,6 +151,8 @@ def create_project_task_router(transcription_service) -> APIRouter:
             "total": getattr(job, "total", 0),
             "language": getattr(job, "language", None),
             "updated_at": getattr(job, "updatedAt", None),
+            "task_mode": task_mode,
+            "is_project_only": task_mode == "subtitle_edit",
         }
 
     def _map_cancel_error_status(reason_code: str, message: str) -> int:
@@ -153,13 +174,14 @@ def create_project_task_router(transcription_service) -> APIRouter:
         title = str(getattr(project, "title", "") or "").strip()
         subtitle_doc = getattr(project, "subtitle_doc", None)
         source_type = str(getattr(subtitle_doc, "source_type", "") or "").strip()
+        task_mode = _resolve_project_task_mode(project)
         segment_count = int(getattr(subtitle_doc, "segment_count", 0) or 0)
         created_at = getattr(project, "created_at", None)
         updated_at = getattr(project, "updated_at", None)
 
         if title:
             filename = title
-        elif source_type == "import":
+        elif task_mode == "subtitle_edit":
             filename = f"{project_id}.srt"
         else:
             filename = project_id
@@ -180,14 +202,22 @@ def create_project_task_router(transcription_service) -> APIRouter:
             "created_time": created_at,
             "updated_at": updated_at,
             "source_type": source_type or "import",
-            "is_project_only": True,
+            "task_mode": task_mode,
+            "is_project_only": task_mode == "subtitle_edit",
         }
 
-    def _is_project_only_project(project: Any) -> bool:
+    def _resolve_project_task_mode(project: Any) -> str:
         subtitle_doc = getattr(project, "subtitle_doc", None)
         source_type = str(getattr(subtitle_doc, "source_type", "") or "").strip().lower()
-        mode = str(getattr(project, "mode", "") or "").strip().lower()
-        return source_type == "import" or mode == "import"
+        return infer_task_mode(
+            raw_task_mode=getattr(project, "task_mode", None),
+            project_mode=getattr(project, "mode", None),
+            subtitle_source_type=source_type,
+            project_dir=str(getattr(project, "dir", "") or ""),
+        )
+
+    def _is_project_only_project(project: Any) -> bool:
+        return _resolve_project_task_mode(project) == "subtitle_edit"
 
     def _build_media_status_from_workspace(project_id: str, workspace_dir: Path) -> Dict[str, Any]:
         video_exts = {".mp4", ".avi", ".mkv", ".mov", ".wmv", ".webm", ".flv", ".m4v"}
@@ -259,6 +289,14 @@ def create_project_task_router(transcription_service) -> APIRouter:
         result = runtime_job.to_dict() if hasattr(runtime_job, "to_dict") else {}
         result["job_id"] = runtime_job_id
         result["project_id"] = identity.project_id
+        runtime_task_mode = infer_task_mode(
+            raw_task_mode=result.get("task_mode", getattr(runtime_job, "task_mode", None)),
+            project_mode=None,
+            subtitle_source_type=None,
+            project_dir=str(getattr(runtime_job, "dir", "") or str(identity.project_dir)),
+        )
+        result["task_mode"] = runtime_task_mode
+        result["is_project_only"] = runtime_task_mode == "subtitle_edit"
 
         queue_state = transcription_service.job_lifecycle.state_repo.load_queue_state()
         if queue_state:
@@ -498,31 +536,107 @@ def create_project_task_router(transcription_service) -> APIRouter:
         """
         同步任务列表（project 语义镜像）。
         """
+        def _is_snapshot_preferred(incoming: Dict[str, Any], existing: Dict[str, Any]) -> bool:
+            active_statuses = {"processing", "queued", "paused", "canceling", "pausing", "created", "uploaded"}
+            incoming_status = str(incoming.get("status", "") or "").strip().lower()
+            existing_status = str(existing.get("status", "") or "").strip().lower()
+            incoming_active = incoming_status in active_statuses
+            existing_active = existing_status in active_statuses
+            if incoming_active != existing_active:
+                return incoming_active
+
+            incoming_updated_at = float(incoming.get("updated_at") or incoming.get("created_time") or 0.0)
+            existing_updated_at = float(existing.get("updated_at") or existing.get("created_time") or 0.0)
+            if incoming_updated_at != existing_updated_at:
+                return incoming_updated_at > existing_updated_at
+
+            incoming_seq = int(incoming.get("state_seq") or 0)
+            existing_seq = int(existing.get("state_seq") or 0)
+            if incoming_seq != existing_seq:
+                return incoming_seq > existing_seq
+
+            incoming_id = str(incoming.get("id", "") or "").strip()
+            existing_id = str(existing.get("id", "") or "").strip()
+            incoming_project_id = str(incoming.get("project_id", "") or "").strip()
+            existing_project_id = str(existing.get("project_id", "") or "").strip()
+            incoming_is_canonical = incoming_id == incoming_project_id and bool(incoming_project_id)
+            existing_is_canonical = existing_id == existing_project_id and bool(existing_project_id)
+            if incoming_is_canonical != existing_is_canonical:
+                return incoming_is_canonical
+            return incoming_id > existing_id
+
         lifecycle = transcription_service.job_lifecycle
+        project_service = _get_project_service()
         tasks = lifecycle.list_tasks_summary()
         existing_project_ids: set[str] = set()
         for task in tasks:
             task_id = str(task.get("id", "") or "").strip()
             if not task_id:
                 continue
+            resolved_project = None
             task_project_id = str(task.get("project_id", "") or "").strip()
             resolve_seed = task_project_id or task_id
             try:
                 resolved_project_id = _resolve_project_identity(resolve_seed).project_id
                 task["project_id"] = resolved_project_id
                 existing_project_ids.add(resolved_project_id)
+                resolved_project = project_service.get_project(resolved_project_id)
             except HTTPException:
-                task["project_id"] = resolve_seed
-                existing_project_ids.add(resolve_seed)
+                alias_project = project_service.find_project_by_alias(resolve_seed)
+                if alias_project is not None:
+                    alias_project_id = str(getattr(alias_project, "project_id", "") or "").strip()
+                    if alias_project_id:
+                        task["project_id"] = alias_project_id
+                        existing_project_ids.add(alias_project_id)
+                        resolved_project = alias_project
+                    else:
+                        task["project_id"] = resolve_seed
+                        existing_project_ids.add(resolve_seed)
+                else:
+                    task["project_id"] = resolve_seed
+                    existing_project_ids.add(resolve_seed)
+
+            subtitle_doc = getattr(resolved_project, "subtitle_doc", None) if resolved_project is not None else None
+            subtitle_source_type = (
+                str(getattr(subtitle_doc, "source_type", "") or "").strip().lower()
+                if subtitle_doc is not None
+                else str(task.get("source_type", "") or "").strip().lower()
+            )
+            if resolved_project is not None:
+                resolved_task_mode = _resolve_project_task_mode(resolved_project)
+            else:
+                resolved_task_mode = infer_task_mode(
+                    raw_task_mode=task.get("task_mode"),
+                    project_mode=None,
+                    subtitle_source_type=subtitle_source_type,
+                    project_dir=str(task.get("dir", "") or ""),
+                )
+            task["task_mode"] = resolved_task_mode
+            task["is_project_only"] = resolved_task_mode == "subtitle_edit"
 
         # 合并“仅编辑项目”（存在 project_meta，但无运行态 task_state）
-        project_service = _get_project_service()
         for project in project_service.list_projects():
             project_id = str(getattr(project, "project_id", "") or "").strip()
             if not project_id or project_id in existing_project_ids:
                 continue
+            if not _is_project_only_project(project):
+                continue
             tasks.append(_build_project_only_task_snapshot(project))
             existing_project_ids.add(project_id)
+
+        deduped_tasks_by_identity: Dict[str, Dict[str, Any]] = {}
+        for task in tasks:
+            project_id = str(task.get("project_id", "") or task.get("id", "") or "").strip()
+            if not project_id:
+                continue
+            task_mode = str(task.get("task_mode", "") or "transcribe").strip().lower()
+            if task_mode not in {"transcribe", "subtitle_edit"}:
+                task_mode = "transcribe"
+            dedupe_key = f"{project_id}::{task_mode}"
+            existing = deduped_tasks_by_identity.get(dedupe_key)
+            if existing is None or _is_snapshot_preferred(task, existing):
+                deduped_tasks_by_identity[dedupe_key] = task
+        tasks = list(deduped_tasks_by_identity.values())
 
         tasks.sort(
             key=lambda item: float(item.get("updated_at") or item.get("created_time") or 0.0),

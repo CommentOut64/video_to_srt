@@ -19,6 +19,7 @@ import json
 
 from app.core.config import config
 from app.models.job_models import JobSettings, JobState
+from app.models.project_models import infer_task_mode
 from app.services.transcription_service import TranscriptionService
 from app.services.file_service import FileManagementService
 from app.services.sse_service import get_sse_manager
@@ -1153,32 +1154,63 @@ def create_transcription_router(
         from app.services.project_service import get_project_service
 
         lifecycle = transcription_service.job_lifecycle
+        project_service = get_project_service()
         tasks = lifecycle.list_tasks_summary()
         existing_project_ids: Set[str] = set()
         for task in tasks:
             task_id = str(task.get("id", "") or "").strip()
             if not task_id:
                 continue
+            resolved_project = None
             task_project_id = str(task.get("project_id", "") or "").strip()
             resolve_seed = task_project_id or task_id
             try:
                 resolved_project_id = _resolve_project_id_or_404(resolve_seed)
+                resolved_project = project_service.get_project(resolved_project_id)
             except HTTPException:
-                resolved_project_id = resolve_seed
+                alias_project = project_service.find_project_by_alias(resolve_seed)
+                if alias_project is not None:
+                    alias_project_id = str(getattr(alias_project, "project_id", "") or "").strip()
+                    resolved_project_id = alias_project_id or resolve_seed
+                    resolved_project = alias_project
+                else:
+                    resolved_project_id = resolve_seed
             task["project_id"] = resolved_project_id
+            subtitle_doc = getattr(resolved_project, "subtitle_doc", None) if resolved_project is not None else None
+            subtitle_source_type = (
+                str(getattr(subtitle_doc, "source_type", "") or "").strip().lower()
+                if subtitle_doc is not None
+                else str(task.get("source_type", "") or "").strip().lower()
+            )
+            task_mode = infer_task_mode(
+                raw_task_mode=task.get("task_mode"),
+                project_mode=getattr(resolved_project, "mode", None) if resolved_project is not None else None,
+                subtitle_source_type=subtitle_source_type,
+                project_dir=str(getattr(resolved_project, "dir", "") or ""),
+            )
+            task["task_mode"] = task_mode
+            task["is_project_only"] = task_mode == "subtitle_edit"
             existing_project_ids.add(resolved_project_id)
 
-        project_service = get_project_service()
         for project in project_service.list_projects():
             project_id = str(getattr(project, "project_id", "") or "").strip()
             if not project_id or project_id in existing_project_ids:
                 continue
-
             subtitle_doc = getattr(project, "subtitle_doc", None)
+            source_type = str(getattr(subtitle_doc, "source_type", "") or "").strip().lower()
+            task_mode = infer_task_mode(
+                raw_task_mode=getattr(project, "task_mode", None),
+                project_mode=getattr(project, "mode", None),
+                subtitle_source_type=source_type,
+                project_dir=str(getattr(project, "dir", "") or ""),
+            )
+            if task_mode != "subtitle_edit":
+                continue
+
             source_type = str(getattr(subtitle_doc, "source_type", "") or "").strip()
             segment_count = int(getattr(subtitle_doc, "segment_count", 0) or 0)
             title = str(getattr(project, "title", "") or "").strip()
-            filename = title or (f"{project_id}.srt" if source_type == "import" else project_id)
+            filename = title or (f"{project_id}.srt" if task_mode == "subtitle_edit" else project_id)
 
             tasks.append(
                 {
@@ -1197,7 +1229,8 @@ def create_transcription_router(
                     "total": segment_count,
                     "language": None,
                     "source_type": source_type or "import",
-                    "is_project_only": True,
+                    "task_mode": task_mode,
+                    "is_project_only": task_mode == "subtitle_edit",
                 }
             )
             existing_project_ids.add(project_id)
@@ -2467,17 +2500,47 @@ def create_transcription_router(
             }
         """
         try:
-            # 从队列服务或转录服务获取任务
-            job_id = identifier
+            normalized_identifier = str(identifier or "").strip()
+            if not normalized_identifier:
+                raise HTTPException(status_code=404, detail="任务未找到")
+
+            # 先解析运行态任务ID，兼容 project_id / legacy job_id
+            resolved_runtime_job_id = _resolve_runtime_job_id(normalized_identifier)
+            job_id = str(resolved_runtime_job_id or normalized_identifier)
             queue_service = get_queue_service(transcription_service)
             job = queue_service.get_job(job_id)
 
             if not job:
-                # 如果队列服务中没有，尝试从 jobs 目录恢复
+                # 如果队列服务中没有，尝试从状态仓库恢复
                 job = transcription_service.get_job(job_id)
 
             if not job:
-                raise HTTPException(status_code=404, detail="任务未找到")
+                identity = _resolve_project_identity(normalized_identifier)
+                if identity is None:
+                    raise HTTPException(status_code=404, detail="任务未找到")
+
+                # 兼容仅编辑项目或已脱离运行态任务的项目重命名
+                from app.services.project_service import get_project_service
+                project_service = get_project_service()
+                updated = project_service.update_title(identity.project_id, title.strip() if title else "")
+                if not updated:
+                    raise HTTPException(status_code=404, detail="任务未找到")
+                project = project_service.get_project(identity.project_id)
+                updated_at = getattr(project, "updated_at", None) if project else None
+                if updated_at is None:
+                    raise HTTPException(status_code=500, detail="任务重命名更新时间戳缺失")
+                resolved_title = str(getattr(project, "title", "") or "").strip() if project else (title.strip() if title else "")
+                return {
+                    "success": True,
+                    "job_id": str(resolved_runtime_job_id or identity.project_id),
+                    "project_id": identity.project_id,
+                    "title": resolved_title,
+                    "message": "任务重命名成功",
+                    "task": None,
+                    "updated_at": updated_at
+                }
+
+            canonical_job_id = str(getattr(job, "job_id", "") or "").strip() or job_id
 
             # 更新 title 字段
             job.title = title.strip() if title else ""
@@ -2498,7 +2561,9 @@ def create_transcription_router(
                 except Exception as e:
                     print(f"保存任务状态失败: {e}")
 
-            persisted_job = transcription_service.job_lifecycle.state_repo.get_task(job_id)
+            persisted_job = transcription_service.job_lifecycle.state_repo.get_task(canonical_job_id)
+            if persisted_job is None and canonical_job_id != job_id:
+                persisted_job = transcription_service.job_lifecycle.state_repo.get_task(job_id)
             if not persisted_job or persisted_job.updatedAt is None:
                 raise HTTPException(status_code=500, detail="任务重命名更新时间戳缺失")
             updated_at = persisted_job.updatedAt
@@ -2508,16 +2573,18 @@ def create_transcription_router(
                 "global",
                 "job_renamed",
                 {
-                    "job_id": job_id,
+                    "job_id": canonical_job_id,
                     "title": job.title,
                     "filename": job.filename,
-                    "updated_at": updated_at
+                    "updated_at": updated_at,
+                    "project_id": str(getattr(persisted_job, "project_id", "") or "")
                 }
             )
 
             return {
                 "success": True,
-                "job_id": job_id,
+                "job_id": canonical_job_id,
+                "project_id": str(getattr(persisted_job, "project_id", "") or ""),
                 "title": job.title,
                 "message": "任务重命名成功",
                 "task": job_snapshot,

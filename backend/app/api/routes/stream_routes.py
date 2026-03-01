@@ -71,6 +71,7 @@ async def stream_project_events(project_id: str, request: Request):
             "project_id": project_id,
             "title": project.title,
             "mode": project.mode,
+            "task_mode": getattr(project, "task_mode", "transcribe"),
             "flavor": project.flavor,
             "job_id": project.job_id,
             "segment_count": segment_count,

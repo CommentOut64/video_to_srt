@@ -57,10 +57,23 @@ _audio_extract_locks: dict[str, threading.Lock] = {}
 
 
 def _find_video_file(job_dir: Path) -> Optional[Path]:
-    """在任务目录中查找视频文件"""
-    for file in job_dir.iterdir():
-        if file.is_file() and file.suffix.lower() in VIDEO_SOURCE_EXTS:
-            return file
+    """在任务目录中查找源视频文件（默认跳过 preview/proxy/remux 产物）。"""
+    source_candidates = []
+    generated_candidates = []
+    for file in sorted(job_dir.iterdir(), key=lambda item: item.name.lower()):
+        if not file.is_file() or file.suffix.lower() not in VIDEO_SOURCE_EXTS:
+            continue
+        normalized_name = file.name.lower()
+        if normalized_name.endswith(".tmp"):
+            continue
+        if normalized_name.startswith(("preview_", "proxy_")) or normalized_name == "remux.mp4":
+            generated_candidates.append(file)
+            continue
+        source_candidates.append(file)
+    if source_candidates:
+        return source_candidates[0]
+    if generated_candidates:
+        return generated_candidates[0]
     return None
 
 
@@ -397,6 +410,46 @@ def _get_video_codec(video_path: Path) -> Optional[str]:
     except Exception as e:
         print(f"[media] 获取视频编码失败: {e}")
     return None
+
+
+def _analyze_transcode_requirement(video_file: Optional[Path]) -> Tuple[bool, str, Optional[str]]:
+    """
+    统一分析视频是否需要转码，避免多个接口判断口径不一致。
+
+    Returns:
+        (needs_transcode, reason, decision)
+    """
+    if video_file is None or not video_file.exists():
+        return False, "", None
+
+    try:
+        from app.services.media_prep_service import get_media_prep_service, TranscodeDecision
+        from app.utils.media_analyzer import media_analyzer
+
+        media_prep = get_media_prep_service()
+        video_info = media_analyzer.analyze_sync(video_file)
+        video_info["container"] = video_file.suffix.lower()
+        decision = media_prep.analyze_transcode_decision(video_info)
+        decision_value = str(getattr(decision, "value", str(decision)))
+
+        if decision == TranscodeDecision.DIRECT_PLAY:
+            return False, "", decision_value
+        if decision == TranscodeDecision.REMUX_ONLY:
+            return True, f"容器不兼容 ({video_file.suffix})", decision_value
+        if decision == TranscodeDecision.TRANSCODE_AUDIO:
+            return True, "音频编码不兼容", decision_value
+        return True, "视频编码不兼容", decision_value
+    except Exception as exc:
+        logger.warning("[media] 决策分析失败，回退扩展名/编码规则: %s", exc)
+
+    suffix = video_file.suffix.lower()
+    if suffix in NEED_TRANSCODE_FORMATS:
+        return True, f"格式不兼容 ({video_file.suffix})", "fallback_extension"
+    if suffix in BROWSER_COMPATIBLE_FORMATS:
+        codec = _get_video_codec(video_file)
+        if codec and codec in NEED_TRANSCODE_CODECS:
+            return True, f"编码不兼容 ({codec.upper()})", "fallback_codec"
+    return False, "", "fallback_direct"
 
 
 def _has_audio_stream(video_path: Path) -> bool:
@@ -866,30 +919,13 @@ async def get_video(identifier: str, request: Request):
 
     logger.debug(f"找到源视频: {video_file.name}, 扩展名: {video_file.suffix.lower()}")
 
-    # 3. 检查是否需要生成Proxy（先检查扩展名，再检查编码）
-    needs_transcode = False
-    transcode_reason = ""
-
-    # 3.1 检查文件扩展名
-    if video_file.suffix.lower() in NEED_TRANSCODE_FORMATS:
-        needs_transcode = True
-        transcode_reason = f"格式不兼容 ({video_file.suffix})"
-        print(f"[media] 扩展名需要转码: {video_file.suffix.lower()} 属于 {NEED_TRANSCODE_FORMATS}")
-    # 3.2 即使是 .mp4/.webm，也需检查实际编码是否兼容
-    elif video_file.suffix.lower() in BROWSER_COMPATIBLE_FORMATS:
-        codec = _get_video_codec(video_file)
-        if codec and codec in NEED_TRANSCODE_CODECS:
-            needs_transcode = True
-            transcode_reason = f"编码不兼容 ({codec.upper()})"
-            logger.debug(f"视频编码检测: {codec} (不兼容，需转码)")
-        else:
-            # 编码兼容，无需转码
-            logger.debug(f"视频编码检测: {codec} (兼容)")
+    # 3. 检查是否需要生成Proxy（统一走转码决策，避免误判）
+    needs_transcode, transcode_reason, transcode_decision = _analyze_transcode_requirement(video_file)
 
     if needs_transcode:
-        print(f"[media] 视频需要转码: {transcode_reason}")
+        print(f"[media] 视频需要转码: {transcode_reason}, decision={transcode_decision}")
         # 使用 MediaPrepService 管理转码任务（渐进式：360p 优先，720p 后续）
-        from app.services.media_prep_service import get_media_prep_service
+        from app.services.media_prep_service import TranscodeDecision, get_media_prep_service
         media_prep = get_media_prep_service()
 
         # 360p 预览视频路径
@@ -907,6 +943,10 @@ async def get_video(identifier: str, request: Request):
         proxy_completed = proxy_status and proxy_status.get("status") == "completed"
         print(f"[media] 720p Proxy状态: {proxy_status}, 进行中={proxy_in_progress}, 已完成={proxy_completed}")
 
+        remux_status = media_prep.get_remux_status(project_id)
+        remux_in_progress = remux_status and remux_status.get("status") in ["queued", "processing"]
+        remux_completed = remux_status and remux_status.get("status") == "completed"
+
         # 720p Proxy 视频路径（使用函数开始时定义的变量）
         # proxy_720p 已在 line 509 定义
 
@@ -920,11 +960,26 @@ async def get_video(identifier: str, request: Request):
             print(f"[media] 返回已完成的360p预览视频")
             return _serve_file_with_range(preview_360p, request, 'video/mp4', job_id=project_id)
 
+        # 优先级2.5: 如果 remux 已完成，返回 remux
+        if remux_completed and remux_video.exists():
+            print(f"[media] 返回已完成的重封装视频")
+            return _serve_file_with_range(remux_video, request, 'video/mp4', job_id=project_id)
+
         # 如果有任务正在处理，返回进度信息
-        if preview_in_progress or proxy_in_progress:
+        if preview_in_progress or proxy_in_progress or remux_in_progress:
             # 优先显示 360p 进度（因为它更快完成）
-            current_progress = preview_status.get("progress", 0) if preview_in_progress else proxy_status.get("progress", 0)
-            current_stage = "360p预览" if preview_in_progress else "720p高清"
+            if preview_in_progress:
+                current_progress = preview_status.get("progress", 0)
+                current_stage = "360p预览"
+                current_stage_code = "preview_360p"
+            elif remux_in_progress:
+                current_progress = remux_status.get("progress", 0)
+                current_stage = "容器重封装"
+                current_stage_code = "remux"
+            else:
+                current_progress = proxy_status.get("progress", 0)
+                current_stage = "720p高清"
+                current_stage_code = "proxy_720p"
             print(f"[media] 转码进行中: {current_stage}, 进度={current_progress}%")
             raise HTTPException(
                 status_code=202,
@@ -932,12 +987,33 @@ async def get_video(identifier: str, request: Request):
                     "message": f"正在生成{current_stage}版本...",
                     "progress": current_progress,
                     "proxy_generating": True,
-                    "stage": "preview_360p" if preview_in_progress else "proxy_720p"
+                    "stage": current_stage_code
                 }
             )
 
-        # 只启动 360p 预览转码（快速让用户看到视频）
-        # 720p 高清转码将在转录完成后、队列空闲时自动触发
+        if transcode_decision == TranscodeDecision.REMUX_ONLY.value:
+            print(f"[media] 调用 enqueue_remux() 启动容器重封装: {video_file} -> {remux_video}")
+            success = media_prep.enqueue_remux(project_id, video_file, remux_video, priority=3)
+            print(f"[media] enqueue_remux() 返回: {success}")
+            raise HTTPException(
+                status_code=202,
+                detail={
+                    "message": "视频容器不兼容，正在重封装...",
+                    "format": video_file.suffix,
+                    "proxy_generating": True,
+                    "stage": "remux",
+                },
+            )
+
+        if transcode_decision == TranscodeDecision.TRANSCODE_AUDIO.value:
+            logger.info(
+                "[media] 仅音频编码不兼容，优先返回源视频避免阻塞主流程: project_id=%s, source=%s",
+                project_id,
+                video_file.name,
+            )
+            return _serve_file_with_range(video_file, request, 'video/mp4', job_id=project_id)
+
+        # 仅在明确需要完整转码时启动 360p 预览，避免兼容视频被误触发无限转码。
         print(f"[media] 调用 enqueue_preview() 启动360p转码: {video_file} -> {preview_360p}")
         success = media_prep.enqueue_preview(project_id, video_file, preview_360p, priority=5)
         print(f"[media] enqueue_preview() 返回: {success}")
@@ -1141,31 +1217,37 @@ async def check_proxy_status(identifier: str):
             if source_video:
                 get_proxy_scheduler().ensure_tracked(project_id, source_video, trigger_type="editor_check")
         elif source_video:
-            # 分析是否需要转码
-            from app.utils.media_analyzer import media_analyzer
             try:
-                video_info = media_analyzer.analyze_sync(source_video)
-                video_info['container'] = source_video.suffix.lower()
-                decision = media_prep.analyze_transcode_decision(video_info)
-
-                if decision == TranscodeDecision.DIRECT_PLAY:
+                needs_transcode, transcode_reason, decision = _analyze_transcode_requirement(source_video)
+                if not needs_transcode:
                     state = "direct_play"
                     progress = 100
                 else:
-                    # 需要转码但任务还没启动，自动启动转码
-                    state = "analyzing"
-                    progress = 0
-
-                    # 根据决策类型启动相应任务
-                    if decision == TranscodeDecision.REMUX_ONLY:
+                    if decision == TranscodeDecision.REMUX_ONLY.value:
+                        # 仅重封装：自动启动 remux，不触发 360p/720p 全转码。
+                        state = "analyzing"
+                        progress = 0
                         # 仅重封装
                         remux_output = job_dir / "remux.mp4"
-                        media_prep.enqueue_remux(project_id, source_video, remux_output, priority=3)
-                        print(f"[media] 自动启动重封装任务: {project_id}")
+                        enqueued = media_prep.enqueue_remux(project_id, source_video, remux_output, priority=3)
+                        print(
+                            f"[media] 自动启动重封装任务: project_id={project_id}, "
+                            f"decision={decision}, reason={transcode_reason}, enqueued={enqueued}"
+                        )
+                    elif decision == TranscodeDecision.TRANSCODE_AUDIO.value:
+                        # 音频兼容性问题先不自动触发转码，避免阻塞主流程与重复排队。
+                        state = "direct_play"
+                        progress = 100
                     else:
+                        # 仅在完整转码决策下触发 360p 预览。
+                        state = "analyzing"
+                        progress = 0
                         # 需要完整转码，启动360p预览
-                        media_prep.enqueue_preview(project_id, source_video, preview_360p, priority=5)
-                        print(f"[media] 自动启动360p预览转码: {project_id}")
+                        enqueued = media_prep.enqueue_preview(project_id, source_video, preview_360p, priority=5)
+                        print(
+                            f"[media] 自动启动360p预览转码: project_id={project_id}, "
+                            f"decision={decision}, reason={transcode_reason}, enqueued={enqueued}"
+                        )
             except Exception as e:
                 print(f"[media] 分析视频失败: {e}")
                 state = "idle"
@@ -1193,20 +1275,28 @@ async def check_proxy_status(identifier: str):
     if not preview_360p.exists() and source_video:
         preview_status = media_prep.get_preview_status(project_id)
         preview_in_progress = preview_status and preview_status.get("status") in ["queued", "processing"]
+        remux_status = media_prep.get_remux_status(project_id)
+        remux_in_progress = remux_status and remux_status.get("status") in ["queued", "processing"]
+        remux_video = job_dir / "remux.mp4"
 
         if not preview_in_progress:
-            print(f"[media] 360p不存在且未在队列中，自动启动360p转码: {project_id}")
             try:
-                # 分析视频决策
-                from app.utils.media_analyzer import media_analyzer
-                video_info = media_analyzer.analyze_sync(source_video)
-                video_info['container'] = source_video.suffix.lower()
-                decision = media_prep.analyze_transcode_decision(video_info)
-
-                if decision != TranscodeDecision.DIRECT_PLAY:
-                    # 需要转码，启动360p预览
-                    media_prep.enqueue_preview(project_id, source_video, preview_360p, priority=5)
-                    print(f"[media] 已自动启动360p预览转码: {project_id}")
+                needs_transcode, _, decision = _analyze_transcode_requirement(source_video)
+                if needs_transcode:
+                    if decision == TranscodeDecision.REMUX_ONLY.value:
+                        if not remux_video.exists() and not remux_in_progress:
+                            remux_enqueued = media_prep.enqueue_remux(project_id, source_video, remux_video, priority=3)
+                            print(
+                                f"[media] 检测到 remux 缺失，按决策触发重封装: "
+                                f"project_id={project_id}, decision={decision}, enqueued={remux_enqueued}"
+                            )
+                    elif decision == TranscodeDecision.TRANSCODE_FULL.value:
+                        # 仅在完整转码决策下补触发 360p，避免可直播视频反复入队。
+                        enqueued = media_prep.enqueue_preview(project_id, source_video, preview_360p, priority=5)
+                        print(
+                            f"[media] 检测到360p缺失，按决策触发360p转码: "
+                            f"project_id={project_id}, decision={decision}, enqueued={enqueued}"
+                        )
             except Exception as e:
                 print(f"[media] 自动启动360p转码失败: {e}")
 
@@ -1574,19 +1664,8 @@ async def get_progressive_status(identifier: str):
     preview_360p = job_dir / "preview_360p.mp4"
     proxy_720p = job_dir / "proxy_720p.mp4"
 
-    # 判断是否需要转码
-    needs_transcode = False
-    transcode_reason = ""
-
-    if video_file:
-        if video_file.suffix.lower() in NEED_TRANSCODE_FORMATS:
-            needs_transcode = True
-            transcode_reason = f"格式不兼容 ({video_file.suffix})"
-        elif video_file.suffix.lower() in BROWSER_COMPATIBLE_FORMATS:
-            codec = _get_video_codec(video_file)
-            if codec and codec in NEED_TRANSCODE_CODECS:
-                needs_transcode = True
-                transcode_reason = f"编码不兼容 ({codec.upper()})"
+    # 判断是否需要转码（统一决策）
+    needs_transcode, transcode_reason, transcode_decision = _analyze_transcode_requirement(video_file)
 
     # 获取生成状态
     preview_status = None
@@ -1617,21 +1696,30 @@ async def get_progressive_status(identifier: str):
         # 检查是否需要启动转码
         preview_exists = preview_360p.exists()
         preview_in_progress = preview_status_info and preview_status_info.get("status") in ["queued", "processing"]
+        remux_video = job_dir / "remux.mp4"
+        remux_status_info = media_prep.get_remux_status(project_id)
+        remux_in_progress = remux_status_info and remux_status_info.get("status") in ["queued", "processing"]
 
-        if not preview_exists and not preview_in_progress:
-            # 启动360p预览转码
-            print(f"[media] progressive-status 检测到需要转码，自动触发: {project_id}")
-            success = media_prep.enqueue_preview(project_id, video_file, preview_360p, priority=5)
-            print(f"[media] enqueue_preview() 返回: {success}")
+        if transcode_decision == "remux_only":
+            if not remux_video.exists() and not remux_in_progress:
+                print(f"[media] progressive-status 检测到需重封装，自动触发: {project_id}")
+                remux_success = media_prep.enqueue_remux(project_id, video_file, remux_video, priority=3)
+                print(f"[media] enqueue_remux() 返回: {remux_success}")
+        elif transcode_decision == "transcode_full":
+            if not preview_exists and not preview_in_progress:
+                # 仅完整转码决策才补触发 360p 预览
+                print(f"[media] progressive-status 检测到需要转码，自动触发: {project_id}")
+                success = media_prep.enqueue_preview(project_id, video_file, preview_360p, priority=5)
+                print(f"[media] enqueue_preview() 返回: {success}")
 
-            # 更新状态为已入队
-            if success:
-                preview_status_info = media_prep.get_preview_status(project_id)
-                if preview_status_info:
-                    preview_status = {
-                        "status": preview_status_info.get("status", "queued"),
-                        "progress": preview_status_info.get("progress", 0)
-                    }
+                # 更新状态为已入队
+                if success:
+                    preview_status_info = media_prep.get_preview_status(project_id)
+                    if preview_status_info:
+                        preview_status = {
+                            "status": preview_status_info.get("status", "queued"),
+                            "progress": preview_status_info.get("progress", 0)
+                        }
 
     # 构建响应
     result = {
@@ -1769,17 +1857,30 @@ async def post_process_transcription(identifier: str):
     except Exception as e:
         print(f"[media] 缩略图生成失败: {e}")
 
-    # 3. 检查是否需要生成Proxy
+    # 3. 检查是否需要生成Proxy/重封装（统一转码决策）
     video_file = _find_video_file(job_dir)
-    if video_file and video_file.suffix.lower() in NEED_TRANSCODE_FORMATS:
+    if video_file:
+        needs_proxy, _, decision = _analyze_transcode_requirement(video_file)
+    else:
+        needs_proxy, decision = False, None
+
+    if needs_proxy:
         results["proxy_needed"] = True
-        proxy_video = job_dir / "proxy_720p.mp4"
-        if not proxy_video.exists():
-            # 使用 MediaPrepService 管理转码
-            from app.services.media_prep_service import get_media_prep_service
-            media_prep = get_media_prep_service()
-            media_prep.enqueue_proxy(project_id, video_file, proxy_video, priority=20)
-            results["proxy"] = True
+        from app.services.media_prep_service import get_media_prep_service
+
+        media_prep = get_media_prep_service()
+        if decision == "remux_only":
+            remux_video = job_dir / "remux.mp4"
+            if not remux_video.exists():
+                results["proxy"] = bool(
+                    media_prep.enqueue_remux(project_id, video_file, remux_video, priority=20)
+                )
+        else:
+            proxy_video = job_dir / "proxy_720p.mp4"
+            if not proxy_video.exists():
+                results["proxy"] = bool(
+                    media_prep.enqueue_proxy(project_id, video_file, proxy_video, priority=20)
+                )
 
     return JSONResponse(results)
 
@@ -2070,14 +2171,9 @@ async def get_media_info(identifier: str, retry_missing: bool = True):
             srt_file = file
             break
 
-    needs_proxy = video_file and video_file.suffix.lower() in NEED_TRANSCODE_FORMATS
-
-    # 检查编码是否需要转码（如 HEVC 等浏览器不兼容的编码）
-    video_codec = None
-    if video_file and not needs_proxy and video_file.suffix.lower() in BROWSER_COMPATIBLE_FORMATS:
-        video_codec = _get_video_codec(video_file)
-        if video_codec and video_codec in NEED_TRANSCODE_CODECS:
-            needs_proxy = True
+    # 统一决策 Proxy 需求，避免接口间口径不一致导致重复触发
+    needs_proxy, _, transcode_decision = _analyze_transcode_requirement(video_file)
+    video_codec = _get_video_codec(video_file) if video_file else None
 
     # 获取Proxy生成状态（从 MediaPrepService）
     from app.services.media_prep_service import get_media_prep_service
@@ -2104,7 +2200,24 @@ async def get_media_info(identifier: str, retry_missing: bool = True):
 
         # 3. 如果需要Proxy但不存在且未在生成中，触发生成
         if needs_proxy and not proxy_video.exists():
-            if not (proxy_status and proxy_status.get("status") in ["queued", "processing"]):
+            try:
+                queue_busy = bool(media_prep._is_transcription_queue_busy())  # noqa: SLF001
+            except Exception:
+                queue_busy = False
+
+            if queue_busy:
+                print(f"[media] 转录队列繁忙，跳过自动Proxy生成: {project_id}")
+            elif transcode_decision == "remux_only":
+                remux_video = job_dir / "remux.mp4"
+                remux_status = media_prep.get_remux_status(project_id)
+                remux_in_progress = remux_status and remux_status.get("status") in ["queued", "processing"]
+                if not remux_video.exists() and not remux_in_progress:
+                    try:
+                        print(f"[media] 检测到仅需重封装，尝试生成 remux: {project_id}")
+                        media_prep.enqueue_remux(project_id, video_file, remux_video, priority=30)
+                    except Exception as e:
+                        print(f"[media] remux 生成失败: {e}")
+            elif not (proxy_status and proxy_status.get("status") in ["queued", "processing"]):
                 try:
                     print(f"[media] 检测到Proxy缺失，尝试生成: {project_id}")
                     media_prep.enqueue_proxy(project_id, video_file, proxy_video, priority=30)
