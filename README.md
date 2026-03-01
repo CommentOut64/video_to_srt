@@ -11,7 +11,7 @@
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-009688?logo=fastapi&logoColor=white)
 
-<img src="https://cdn.jsdelivr.net/gh/CommentOut64/anchor-flux@main/assets/pic2.png" image-rendering: crisp-edges/>
+<img src="https://cdn.jsdelivr.net/gh/CommentOut64/anchor-flux@main/assets/pic3.png" image-rendering: crisp-edges/>
 
 **AnchorFlux** 不仅仅是一个高精度的语音转写工具，它是一套为视频创作者量身定制的**全流程字幕生产解决方案**。
 
