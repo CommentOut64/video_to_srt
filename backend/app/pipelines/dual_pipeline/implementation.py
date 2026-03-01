@@ -1611,10 +1611,40 @@ class AsyncDualPipelineKernel:
             result["l0_missing_fields"] = list(missing_fields)
             log = self._bind_log(chunk_index=chunk_index)
             log.warning(
-                "L0 输入缺失: source=%s missing=%s",
+                "L0 输入缺失: source={} missing={}",
                 source,
                 ",".join(missing_fields),
             )
+
+    def _normalize_fast_l0_payload(
+        self,
+        sv_result: Dict[str, Any],
+        *,
+        chunk_index: Optional[int] = None,
+    ) -> None:
+        """
+        归一化快流 L0 载荷，保证下游可恢复处理。
+
+        约束：
+        - words 必须是 list；缺失或类型不合法时归一化为空列表；
+        - 保留 L0 缺失告警，不在此处抛异常中断主流程。
+        """
+        if not isinstance(sv_result, dict):
+            return
+        words = sv_result.get("words")
+        if words is None:
+            sv_result["words"] = []
+            log = self._bind_log(chunk_index=chunk_index)
+            log.debug("L0 快流 words 缺失，已归一化为空列表继续执行")
+            return
+        if isinstance(words, list):
+            return
+        sv_result["words"] = []
+        log = self._bind_log(chunk_index=chunk_index)
+        log.warning(
+            "L0 快流 words 类型非法，已归一化为空列表: type={}",
+            type(words).__name__,
+        )
 
     async def run(
         self,
@@ -1874,6 +1904,7 @@ class AsyncDualPipelineKernel:
             base_chunk_ref = self._resolve_semantic_chunk_ref(
                 chunk=chunk,
                 fallback_chunk_index=ctx.chunk_index,
+                prefer_fallback_anchor=not is_final_output,
             )
             chunk_ref = self._dedupe_semantic_chunk_ref(
                 base_chunk_ref=base_chunk_ref,
@@ -2381,6 +2412,7 @@ class AsyncDualPipelineKernel:
         if not ctx.sv_result or not ctx.audio_chunk:
             return None
         sv_result = ctx.sv_result
+        self._normalize_fast_l0_payload(sv_result, chunk_index=ctx.chunk_index)
         # V3.2.0+dev.20260203.10: L0 使用 raw_text 作为规范化入口
         raw_text = sv_result.get("raw_text")
         if raw_text is None or str(raw_text).strip() == "":
@@ -2920,6 +2952,7 @@ class AsyncDualPipelineKernel:
             base_chunk_ref = self._resolve_semantic_chunk_ref(
                 chunk=chunk,
                 fallback_chunk_index=chunk_index,
+                prefer_fallback_anchor=not is_final_output,
             )
             chunk_ref = self._dedupe_semantic_chunk_ref(
                 base_chunk_ref=base_chunk_ref,
@@ -3012,8 +3045,15 @@ class AsyncDualPipelineKernel:
         *,
         chunk: SemanticChunk,
         fallback_chunk_index: int,
+        prefer_fallback_anchor: bool = False,
     ) -> int | str:
         """为语义块选择稳定 chunk 引用。"""
+        if prefer_fallback_anchor:
+            # Why:
+            # - 双流模式下慢流/对齐阶段按当前 ctx.chunk_index 做定稿覆盖；
+            # - 草稿若锚定到 source_chunks 首索引，可能落到更早 chunk，导致后续 replace_chunk 无法覆盖，
+            #   进而残留草稿与定稿重叠（典型表现：同时间段一条 draft + 一条 finalized）。
+            return int(fallback_chunk_index)
         source_indices = self._parse_source_chunk_indices(list(chunk.source_chunks or []))
         if source_indices:
             # 优先使用 source chunk 的首索引，确保与慢流 replace_chunk 的 int 口径可对齐。
