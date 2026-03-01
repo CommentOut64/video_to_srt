@@ -5,6 +5,12 @@ import path from 'path'
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [vue()],
+  define: {
+    // Task6-Lite: 前端 flavor 编译时常量，支持 tree-shaking
+    __APP_FLAVOR__: JSON.stringify(process.env.VITE_APP_FLAVOR || 'full'),
+    __IS_LITE__:
+      process.env.VITE_LITE_MODE === 'true' || process.env.VITE_APP_FLAVOR === 'lite',
+  },
   // 生产环境构建配置 - 移除 console 和 debugger
   esbuild: {
     drop: ['console', 'debugger'],

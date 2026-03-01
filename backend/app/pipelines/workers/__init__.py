@@ -5,7 +5,7 @@ Workers package for async dual pipeline
 - FastWorker: SenseVoice 快流推理
 - SlowWorker: Whisper 慢流推理
 """
-__all__ = ["FastWorker", "SlowWorker", "SlowWorkerResult"]
+__all__ = ["FastWorker", "SlowWorker"]
 
 
 def __getattr__(name: str):
@@ -14,10 +14,10 @@ def __getattr__(name: str):
         from .fast_worker import FastWorker
 
         return FastWorker
-    if name in {"SlowWorker", "SlowWorkerResult"}:
-        from .slow_worker import SlowWorker, SlowWorkerResult
+    if name == "SlowWorker":
+        from .slow_worker import SlowWorker
 
-        return {"SlowWorker": SlowWorker, "SlowWorkerResult": SlowWorkerResult}[name]
+        return SlowWorker
     raise AttributeError(f"module 'app.pipelines.workers' has no attribute {name!r}")
 
 

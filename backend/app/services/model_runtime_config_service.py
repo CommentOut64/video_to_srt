@@ -280,9 +280,33 @@ class ModelRuntimeConfigService:
             return value or None
 
         return {
+            "whisper_prompt": {
+                "enabled": norm_str(os.getenv("WHISPER_PROMPT_ENABLED")),
+                "max_prompt_chars": norm_str(os.getenv("WHISPER_PROMPT_MAX_CHARS")),
+                "max_keyword_count": norm_str(os.getenv("WHISPER_PROMPT_MAX_KEYWORDS")),
+                "max_context_chars": norm_str(os.getenv("WHISPER_PROMPT_MAX_CONTEXT_CHARS")),
+                "max_history_chars": norm_str(os.getenv("WHISPER_PROMPT_MAX_HISTORY_CHARS")),
+                "reset_pause_sec": norm_str(os.getenv("WHISPER_PROMPT_RESET_PAUSE_SEC")),
+                "reset_no_speech_prob": norm_str(os.getenv("WHISPER_PROMPT_RESET_NO_SPEECH")),
+                "reset_low_confidence": norm_str(os.getenv("WHISPER_PROMPT_RESET_LOW_CONF")),
+            },
             "sensevoice": {
                 "device": norm_str(os.getenv("SENSEVOICE_DEVICE")),
                 "model_type": norm_str(os.getenv("SENSEVOICE_MODEL_TYPE")),
+            },
+            "demucs": {
+                "global_group_duration_sec": norm_str(os.getenv("DEMUCS_GLOBAL_GROUP_DURATION_SEC")),
+            },
+            "timeline": {
+                "enabled": norm_str(os.getenv("TIMELINE_ENABLED")),
+                "device": norm_str(os.getenv("TIMELINE_DEVICE")),
+                "diarization_enabled": norm_str(os.getenv("TIMELINE_DIARIZATION_ENABLED")),
+                "diarization_model_id": norm_str(os.getenv("TIMELINE_DIARIZATION_MODEL_ID")),
+                "diarization_local_path": norm_str(os.getenv("TIMELINE_DIARIZATION_LOCAL_PATH")),
+                "diarization_hf_token": norm_str(os.getenv("TIMELINE_DIARIZATION_HF_TOKEN")),
+                "diarization_max_speakers": norm_str(os.getenv("TIMELINE_DIARIZATION_MAX_SPEAKERS")),
+                "diarization_min_speakers": norm_str(os.getenv("TIMELINE_DIARIZATION_MIN_SPEAKERS")),
+                "diarization_num_speakers": norm_str(os.getenv("TIMELINE_DIARIZATION_NUM_SPEAKERS")),
             },
         }
 
@@ -307,6 +331,16 @@ class ModelRuntimeConfigService:
                 "min_text_length": 2,
                 "patterns": [],
             },
+            "whisper_prompt": {
+                "enabled": False,
+                "max_prompt_chars": 180,
+                "max_keyword_count": 16,
+                "max_context_chars": 80,
+                "max_history_chars": 160,
+                "reset_pause_sec": 1.8,
+                "reset_no_speech_prob": 0.65,
+                "reset_low_confidence": 0.35,
+            },
             "sensevoice": {
                 "language": "auto",
                 # V3.2.0+dev.20260203.08: 恢复默认开启模型端 ITN
@@ -323,6 +357,7 @@ class ModelRuntimeConfigService:
                 "shifts": 1,
                 "overlap": 0.5,
                 "segment_length": 10,
+                "global_group_duration_sec": 1800.0,
                 "segment_buffer_sec": 2.0,
                 "bgm_sample_duration": 10.0,
                 "bgm_light_threshold": 0.02,
@@ -347,17 +382,55 @@ class ModelRuntimeConfigService:
                 "sensevoice_merge_max_duration": 8.0,
                 "sensevoice_smart_target_duration": 8.0,
             },
+            "timeline": {
+                "enabled": True,
+                "device": "cuda",
+                "segmentation_boundary_threshold": 0.55,
+                "segmentation_min_boundary_interval_sec": 0.2,
+                "min_support_turns": 2,
+                "min_total_duration": 2.0,
+                "merge_similarity_threshold": 0.88,
+                "long_pause_cut_sec": 1.8,
+                "diarization_enabled": False,
+                "diarization_model_id": "pyannote-speaker-diarization-community-1",
+                "diarization_local_path": "",
+                "diarization_hf_token": None,
+                "diarization_max_speakers": None,
+                "diarization_min_speakers": None,
+                "diarization_num_speakers": None,
+            },
+            "flush_policy": {
+                "min_audio_sec": 6.0,
+                "min_token_count": 40,
+                "max_wait_sec": 5.0,
+                "tail_idle_sec": 1.0,
+            },
+            "dnsmos": {
+                # 默认 CPU，避免挤占主转录 GPU 资源
+                "device": "cpu",
+                "personalized": False,
+                # V3.2.4+dev.20260225.03: DNSMOS 自动调参回灌默认值
+                "ovrl_sep_hard": 2.0960908371247604,
+                "sig_sep_hard": 2.554166010717122,
+                "p808_sep_hard": 1.7823731696905278,
+                "ovrl_pass_hard": 2.3441922433760665,
+                "sig_pass_hard": 2.7914833247808972,
+                "bak_pass_hard": 1.8809400945693762,
+                "p808_pass_soft": 3.235022853899088,
+            },
             "smart_probe": {
-                "snr_threshold": 15.0,
+                # V3.2.4+dev.20260225.03: 探针自动调参回灌默认值
+                "probe_sep_ratio_min": 0.26795501889788964,
+                "probe_min_coverage": 0.36689124315485816,
+                # 固定参数（先不纳入自动调参）
+                "probe_max_step_chunks": 30,
             },
             "yamnet": {
-                "acappella_threshold": 0.3,
-                "music_max_threshold": 0.15,
-                "music_avg_threshold": 0.10,
-                "speech_max_threshold": 0.8,
-                "speech_max_music_threshold": 0.1,
-                "speech_dominant_delta": 0.3,
-                "speech_dominant_music_max": 0.15,
+                # 固定参数：先不作为自动调参重点
+                "yamnet_music_conf_min": 0.15,
+                "yamnet_speech_conf_min": 0.85,
+                "yamnet_music_weak_max": 0.10,
+                # 采样参数保留（不纳入自动调参重点）
                 "probe_window_count": 3,
                 "probe_window_duration_sec": 0.975,
             },
@@ -400,7 +473,7 @@ class ModelRuntimeConfigService:
                 "force_split_on_sentence_end_punct": True,
                 "keep_sentence_end_punct": False,
             },
-            # V3.2.0+dev.20260205.09: L4 对齐层运行参数
+            # V3.2.0+dev.20260205.09: 集合层（collection）对齐运行参数
             "alignment": {
                 "enable": True,
                 "score_threshold": 0.30,
@@ -410,14 +483,14 @@ class ModelRuntimeConfigService:
                 "min_valid_neighbors": 1,
                 "min_word_duration_ms": 100,
                 "use_sv_timebase": True,
-                # V3.2.0+dev.20260206.02: 双轨实验仅在 L4-L6 串行执行，不并行占用 GPU。
+                # V3.2.0+dev.20260206.02: 双轨实验仅在 collection/scoring/decision 串行执行，不并行占用 GPU。
                 "enable_dual_time_experiment": False,
                 "dual_time_mode": "off",
                 "dual_time_write_debug_srt": False,
                 "dual_time_boundary_tolerance_ms": 250,
                 "dual_time_active_min_boundary_f1": 0.85,
             },
-            # V3.2.0+dev.20260210.01: L6 切分层统一参数入口。
+            # V3.2.0+dev.20260210.01: 裁决层（decision）统一参数入口。
             "segmentation": {
                 "enable": True,
                 "min_chars": 6,
@@ -427,6 +500,7 @@ class ModelRuntimeConfigService:
                 "long_pause_sec": 0.8,
                 "soft_pause_sec": 0.4,
                 "short_merge_max_chars": 22,
+                "force_split_on_sentence_end_punct": True,
                 "keep_sentence_end_punct": False,
                 "final.min_tokens": 5,
                 "final.max_tokens": 50,
@@ -435,8 +509,131 @@ class ModelRuntimeConfigService:
                 "final.soft_pause": 0.35,
                 "final.long_pause": 0.8,
                 "final.min_mapping_coverage": 0.6,
+                "soft_cut.enable": True,
+                "soft_cut.overlap_degrade_enable": False,
+                "soft_cut.plan_provider": "m1_internal",
+                "soft_cut.plan_provider_class": "",
+                "soft_cut.priority.active_profile": "punct_boost_transition",
+                "soft_cut.priority.profiles": {
+                    "punct_boost_transition": {
+                        "tiebreak_order": ["speaker", "punctuation", "pause", "semantic", "llm"],
+                        "merge_window_ms": 120,
+                        "source_rules": {
+                            "speaker": {
+                                "enabled": True,
+                                "weight": 0.85,
+                                "min_confidence": 0.45,
+                                "trigger_threshold": 0.42,
+                            },
+                            "pause": {
+                                "enabled": True,
+                                "weight": 0.55,
+                                "min_confidence": 0.35,
+                                "trigger_threshold": 0.30,
+                            },
+                            "punctuation": {
+                                "enabled": True,
+                                "weight": 0.75,
+                                "min_confidence": 0.35,
+                                "trigger_threshold": 0.28,
+                            },
+                            "semantic": {
+                                "enabled": True,
+                                "weight": 0.45,
+                                "min_confidence": 0.30,
+                                "trigger_threshold": 0.24,
+                            },
+                            "llm": {
+                                "enabled": False,
+                                "weight": 0.0,
+                                "min_confidence": 0.0,
+                                "trigger_threshold": 1.0,
+                            },
+                        },
+                    },
+                    "llm_ramp_up": {
+                        "tiebreak_order": ["speaker", "llm", "punctuation", "pause", "semantic"],
+                        "merge_window_ms": 120,
+                        "source_rules": {
+                            "speaker": {
+                                "enabled": True,
+                                "weight": 0.85,
+                                "min_confidence": 0.45,
+                                "trigger_threshold": 0.42,
+                            },
+                            "pause": {
+                                "enabled": True,
+                                "weight": 0.55,
+                                "min_confidence": 0.35,
+                                "trigger_threshold": 0.30,
+                            },
+                            "punctuation": {
+                                "enabled": True,
+                                "weight": 0.35,
+                                "min_confidence": 0.35,
+                                "trigger_threshold": 0.28,
+                            },
+                            "semantic": {
+                                "enabled": True,
+                                "weight": 0.45,
+                                "min_confidence": 0.30,
+                                "trigger_threshold": 0.24,
+                            },
+                            "llm": {
+                                "enabled": True,
+                                "weight": 0.78,
+                                "min_confidence": 0.50,
+                                "trigger_threshold": 0.36,
+                            },
+                        },
+                    },
+                    "llm_primary_no_punct": {
+                        "tiebreak_order": ["speaker", "llm", "pause", "semantic", "punctuation"],
+                        "merge_window_ms": 120,
+                        "source_rules": {
+                            "speaker": {
+                                "enabled": True,
+                                "weight": 0.85,
+                                "min_confidence": 0.45,
+                                "trigger_threshold": 0.42,
+                            },
+                            "pause": {
+                                "enabled": True,
+                                "weight": 0.50,
+                                "min_confidence": 0.35,
+                                "trigger_threshold": 0.28,
+                            },
+                            "punctuation": {
+                                "enabled": False,
+                                "weight": 0.0,
+                                "min_confidence": 1.0,
+                                "trigger_threshold": 1.0,
+                            },
+                            "semantic": {
+                                "enabled": True,
+                                "weight": 0.45,
+                                "min_confidence": 0.30,
+                                "trigger_threshold": 0.24,
+                            },
+                            "llm": {
+                                "enabled": True,
+                                "weight": 0.92,
+                                "min_confidence": 0.55,
+                                "trigger_threshold": 0.40,
+                            },
+                        },
+                    },
+                },
             },
-            # V3.2.0+dev.20260204.03: L2 文本仲裁层运行参数
+            # V3.2.0+dev.20260215.09: M2 阶段0开关与观测配置（仅观测，不改主链结果）。
+            "m2": {
+                "enable": False,
+                "nw_v2.enable": False,
+                "time_mapping.enable": False,
+                "shadow.sample_rate": 0.1,
+                "shadow.provider_class": "",
+            },
+            # V3.2.0+dev.20260204.03: L2 文本选文层运行参数
             "arbitration": {
                 "enable": True,
                 "text_source_preference": "auto",
@@ -458,6 +655,12 @@ class ModelRuntimeConfigService:
                 "cjk_digit_merge": True,
                 "collapse_spaces": True,
                 "punct_width": "auto",
+            },
+            # V3.2.0+dev.20260221.07: 语言适配层（准备层编译快照）运行参数。
+            "language_policy": {
+                "enabled": True,
+                "default_language": "zh",
+                "policy_version": "V3.2.0+dev.20260221.07",
             },
             "pipeline": {
                 "batch_size": 16,
@@ -524,6 +727,8 @@ class ModelRuntimeConfigService:
             return "vad"
         if spec.kind == "punct":
             return "punctuation"
+        if spec.kind == "speaker" and "segmentation" in spec.id:
+            return "timeline"
         return None
 
     def get_effective_global(self) -> Dict[str, Any]:

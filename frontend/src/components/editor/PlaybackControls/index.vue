@@ -1,11 +1,11 @@
 <template>
   <!-- 底座模式或紧凑模式 -->
-  <div class="playback-controls" :class="{ compact, pedestal, disabled: !isVideoReady }">
+  <div class="playback-controls" :class="{ compact, pedestal, disabled: !isMediaReady }">
     <!-- 主控制区 -->
     <div class="controls-main">
       <!-- 快退 -->
       <el-tooltip content="快退5秒" placement="top" :show-after="500">
-        <button class="ctrl-btn" :disabled="!isVideoReady" @click="seek(-seekStep)">
+        <button class="ctrl-btn" :disabled="!isMediaReady" @click="seek(-seekStep)">
           <svg viewBox="0 0 24 24" fill="currentColor">
             <path d="M11 18V6l-8.5 6 8.5 6zm.5-6l8.5 6V6l-8.5 6z" />
           </svg>
@@ -14,7 +14,7 @@
 
       <!-- 播放/暂停 -->
       <el-tooltip :content="isPlaying ? '暂停' : '播放'" placement="top" :show-after="500">
-        <button class="ctrl-btn play" :disabled="!isVideoReady" @click="togglePlay">
+        <button class="ctrl-btn play" :disabled="!isMediaReady" @click="togglePlay">
           <svg v-if="!isPlaying" viewBox="0 0 24 24" fill="currentColor">
             <path d="M8 5v14l11-7z" />
           </svg>
@@ -26,7 +26,7 @@
 
       <!-- 快进 -->
       <el-tooltip content="快进5秒" placement="top" :show-after="500">
-        <button class="ctrl-btn" :disabled="!isVideoReady" @click="seek(seekStep)">
+        <button class="ctrl-btn" :disabled="!isMediaReady" @click="seek(seekStep)">
           <svg viewBox="0 0 24 24" fill="currentColor">
             <path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z" />
           </svg>
@@ -120,6 +120,7 @@
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted, inject } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
+import { usePlaybackStore } from '@/stores/playbackStore'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 
 // Props
@@ -137,13 +138,19 @@ const emit = defineEmits(['play', 'pause', 'seek', 'speed-change', 'volume-chang
 
 // Store
 const projectStore = useProjectStore()
+const playbackStore = usePlaybackStore()
 
 // 全局播放管理器（单例）
 const playbackManager = usePlaybackManager()
 
-// 注入编辑器上下文（获取视频就绪状态）
-const editorContext = inject('editorContext', { isVideoReady: computed(() => true) })
-const isVideoReady = computed(() => editorContext.isVideoReady?.value ?? true)
+// 注入编辑器上下文（媒体就绪：音频或视频可用）
+const editorContext = inject('editorContext', {
+  isMediaReady: computed(() => true),
+  isVideoReady: computed(() => true),
+})
+const isMediaReady = computed(
+  () => editorContext.isMediaReady?.value ?? editorContext.isVideoReady?.value ?? true
+)
 
 // Refs
 const progressRef = ref(null)
@@ -163,11 +170,11 @@ const dragProgressPercent = ref(0) // 拖动时的进度百分比
 const speedOptions = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2]
 
 // 从 Store 获取状态
-const currentTime = computed(() => projectStore.player.currentTime)
+const currentTime = computed(() => playbackStore.currentTime)
 const duration = computed(() => projectStore.meta.duration || 0)
-const isPlaying = computed(() => projectStore.player.isPlaying)
-const playbackRate = computed(() => projectStore.player.playbackRate)
-const volume = computed(() => (isMuted.value ? 0 : projectStore.player.volume))
+const isPlaying = computed(() => playbackStore.isPlaying)
+const playbackRate = computed(() => playbackStore.playbackRate)
+const volume = computed(() => (isMuted.value ? 0 : playbackStore.volume))
 
 // 进度百分比
 const progressPercent = computed(() => {
@@ -181,21 +188,22 @@ const progressPercent = computed(() => {
 
 // 播放/暂停
 function togglePlay() {
-  if (!isVideoReady.value) {
-    console.warn('[PlaybackControls] 视频未就绪，播放操作被拦截')
+  if (!isMediaReady.value) {
+    console.warn('[PlaybackControls] 媒体未就绪，播放操作被拦截')
     return
   }
   playbackManager.togglePlay()
-  emit(projectStore.player.isPlaying ? 'play' : 'pause')
+  emit(playbackStore.isPlaying ? 'play' : 'pause')
 }
 
 // 跳转
 function seek(seconds) {
-  if (!isVideoReady.value) {
-    console.warn('[PlaybackControls] 视频未就绪，跳转操作被拦截')
+  if (!isMediaReady.value) {
+    console.warn('[PlaybackControls] 媒体未就绪，跳转操作被拦截')
     return
   }
-  const newTime = Math.max(0, Math.min(duration.value, currentTime.value + seconds))
+  // 上限交由 PlaybackManager 根据可用媒体时长统一裁剪，避免 duration 初始为 0 时被锁死在开头。
+  const newTime = Math.max(0, currentTime.value + seconds)
   playbackManager.seekTo(newTime)
   emit('seek', newTime)
 }
@@ -205,8 +213,8 @@ let rafId = null // requestAnimationFrame ID，用于节流
 let pendingTime = null // 待更新的时间
 
 function handleProgressMouseDown(e) {
-  if (!isVideoReady.value) {
-    console.warn('[PlaybackControls] 视频未就绪，进度条操作被拦截')
+  if (!isMediaReady.value) {
+    console.warn('[PlaybackControls] 媒体未就绪，进度条操作被拦截')
     return
   }
   if (!progressRef.value || !duration.value) return
@@ -277,18 +285,18 @@ function stopDrag() {
 // 音量控制
 function toggleMute() {
   if (isMuted.value) {
-    projectStore.player.volume = previousVolume.value
+    playbackStore.setVolume(previousVolume.value)
     isMuted.value = false
   } else {
-    previousVolume.value = projectStore.player.volume
-    projectStore.player.volume = 0
+    previousVolume.value = playbackStore.volume
+    playbackStore.setVolume(0)
     isMuted.value = true
   }
 }
 
 function handleVolumeChange(e) {
   const val = parseFloat(e.target.value)
-  projectStore.player.volume = val
+  playbackStore.setVolume(val)
   if (val > 0) isMuted.value = false
   emit('volume-change', val)
 }
@@ -299,7 +307,7 @@ function toggleSpeedMenu() {
 }
 
 function setSpeed(speed) {
-  projectStore.player.playbackRate = speed
+  playbackStore.setPlaybackRate(speed)
   showSpeedMenu.value = false
   emit('speed-change', speed)
 }
@@ -378,7 +386,7 @@ onUnmounted(() => {
   border-radius: 0;
 }
 
-/* 禁用状态：视频未就绪时整体变灰 */
+/* 禁用状态：媒体未就绪时整体变灰 */
 .playback-controls.disabled {
   cursor: not-allowed;
   pointer-events: none;

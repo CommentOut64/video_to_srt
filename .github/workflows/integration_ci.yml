@@ -52,6 +52,12 @@ jobs:
         shell: pwsh
         run: .\.venv\Scripts\python.exe -m ruff check backend
 
+      - name: Run textflow layer guards (Phase A freeze)
+        shell: pwsh
+        env:
+          PYTHONUTF8: "1"
+        run: .\.venv\Scripts\python.exe ci_tests\quality\check_textflow_layer_guards.py
+
       - name: Run unit tests (quality metrics)
         shell: pwsh
         env:
@@ -59,14 +65,6 @@ jobs:
           PYTHONUTF8: "1"
         run: |
           .\.venv\Scripts\python.exe -m pytest ci_tests\quality\test_quality_evaluation.py::TestMetricsUnit -v --tb=short
-
-      - name: Run dummy integration tests
-        shell: pwsh
-        env:
-          INTEGRATION_PROFILE: ci
-          PYTHONUTF8: "1"
-        run: |
-          .\.venv\Scripts\python.exe -m pytest ci_tests\integration\test_local_pipeline.py -m "not slow and not gpu" --tb=short
 
       - name: Run integration CI
         shell: pwsh

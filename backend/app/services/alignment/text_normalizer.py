@@ -60,7 +60,7 @@ class TextNormalizer:
         self._logger = resolve_loguru_logger(
             logger,
             __name__,
-            layer="L1",
+            layer="规范层",
             processor_name="text_normalizer",
         )
         self._itn_cache: Dict[str, object] = {}
@@ -120,7 +120,7 @@ class TextNormalizer:
         )
         mapping_coverage = _calc_mapping_coverage(raw_to_clean)
         self._logger.info(
-            "L1 规范化完成 input_len={} clean_len={} itn_fallback={} mapping_cov={:.2f} lang={}",
+            "规范层完成 input_len={} clean_len={} itn_fallback={} mapping_cov={:.2f} lang={}",
             len(base_text),
             len(text_clean),
             1 if itn_fallback else 0,
@@ -294,13 +294,12 @@ class TextNormalizer:
             is_to_fullwidth = _should_use_fullwidth(lang, text)
 
         normalized = text
-        if config.is_decimal_protection_enabled:
-            normalized = _DECIMAL_DOT_PATTERN.sub(_DECIMAL_DOT_PLACEHOLDER, normalized)
+        # V3.2.0+dev.20260218.03: 小数点为硬保护，不允许通过配置关闭。
+        normalized = _DECIMAL_DOT_PATTERN.sub(_DECIMAL_DOT_PLACEHOLDER, normalized)
         mapping = _PUNCT_TO_FULLWIDTH if is_to_fullwidth else _PUNCT_TO_HALFWIDTH
         for old, new in mapping.items():
             normalized = normalized.replace(old, new)
-        if config.is_decimal_protection_enabled:
-            normalized = normalized.replace(_DECIMAL_DOT_PLACEHOLDER, ".")
+        normalized = normalized.replace(_DECIMAL_DOT_PLACEHOLDER, ".")
         return normalized
 
 
@@ -318,7 +317,8 @@ def _mark_safe_punct(text: str, lang: str, config: NormalizationConfig) -> Set[i
                 if text[idx] == ".":
                     safe.add(idx)
     for idx, ch in enumerate(text):
-        if config.is_decimal_protection_enabled and ch in _DECIMAL_DOT_CHARS and _is_decimal_dot(text, idx):
+        # V3.2.0+dev.20260218.03: 小数点为硬保护，不允许通过配置关闭。
+        if ch in _DECIMAL_DOT_CHARS and _is_decimal_dot(text, idx):
             safe.add(idx)
             continue
         if config.is_abbrev_dot_protection_enabled and ch == "." and _is_english_abbrev_dot(text, idx):

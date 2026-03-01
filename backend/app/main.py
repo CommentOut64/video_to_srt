@@ -7,11 +7,25 @@ import asyncio
 import time
 import subprocess
 import warnings
+from pathlib import Path
 
 # 抑制 libpng iCCP 警告（必须在导入图像库之前设置）
 os.environ['QT_LOGGING_RULES'] = '*.debug=false;qt.qpa.*=false'
 warnings.filterwarnings('ignore', message='.*iCCP.*')
 warnings.filterwarnings('ignore', message='.*sRGB.*')
+
+# V3.2.0+dev.20260218.01: 抑制第三方库的弃用/未来警告（来自依赖库内部，不影响功能）
+# --- SpeechBrain 相关 ---
+warnings.filterwarnings('ignore', message=r'.*torchaudio\._backend\.list_audio_backends has been deprecated.*')
+warnings.filterwarnings('ignore', message=r'.*torch\.cuda\.amp\.custom_fwd.*is deprecated.*')
+warnings.filterwarnings('ignore', message=r".*Module 'speechbrain\.pretrained' was deprecated.*")
+warnings.filterwarnings('ignore', message=r'.*Requested Pretrainer collection using symlinks on Windows.*')
+# --- pyannote / lightning 相关 ---
+# torchcodec 警告消息以 \n 开头，需要 (?s) 使 . 匹配换行符
+warnings.filterwarnings('ignore', message=r'(?s).*torchcodec is not installed correctly.*')
+warnings.filterwarnings('ignore', message=r'(?s).*TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD.*')
+warnings.filterwarnings('ignore', message=r'.*TensorFloat-32 \(TF32\) has been disabled.*')
+warnings.filterwarnings('ignore', message=r'.*std\(\): degrees of freedom is <= 0.*')
 
 # 尝试抑制 C 库级别的 libpng 警告
 try:
@@ -34,25 +48,21 @@ from datetime import datetime
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # 导入核心配置和日志
-from app.core.config import config
+from app.core.config import FLAVOR, IS_LITE, config
 from app.core.logging import setup_logging
 
-# 导入新的转录服务（替换processor）
-from app.services.transcription_service import get_transcription_service
-from app.models.job_models import JobSettings
-from app.services.model_manager_v2 import get_model_manager_v2
 from app.config.model_config import ModelPreloadConfig
 
 # 导入API路由
-from app.api.routes import model_routes
-from app.api.routes import model_runtime_routes
 from app.api.routes import media_routes  # 新增：媒体资源路由
-from app.api.routes.transcription_routes import create_transcription_router
-from app.api.routes.demucs_routes import create_demucs_router  # 新增：Demucs配置路由
+from app.api.routes.project_routes import router as project_router
+from app.api.routes.legacy_compat_routes import router as legacy_router
+from app.api.routes.stream_routes import router as stream_router
 from app.api.routes.file_routes import create_file_router  # 新增：文件管理路由
 from app.api.routes import system_routes  # 新增：系统管理路由
 from app.api.routes import config_routes  # 新增：用户配置路由
 from app.api.routes import debug_routes  # 新增：调试路由
+from app.api.routes import presets_routes  # V3.2.4: 自定义预设路由
 from app.services.file_service import FileManagementService
 
 # 导入FFmpeg管理器
@@ -213,21 +223,34 @@ app.add_middleware(
 )
 
 # 注册API路由
-app.include_router(model_routes.router)
-app.include_router(model_runtime_routes.router)
 app.include_router(media_routes.router)  # 新增：媒体资源路由
 app.include_router(system_routes.router)  # 新增：系统管理路由
 app.include_router(config_routes.router)  # 新增：用户配置路由
 app.include_router(debug_routes.router)  # 新增：调试路由
+app.include_router(presets_routes.router)  # V3.2.4: 自定义预设路由
+app.include_router(project_router)  # Task6: 项目路由
+app.include_router(legacy_router)  # Task6: legacy 兼容路由
+app.include_router(stream_router)  # Task6: 项目级 SSE 路由
 
-# 注册Demucs配置路由（需要在转录路由之前注册）
-demucs_router = create_demucs_router()
-app.include_router(demucs_router)
+# 注册仅 Full 模式可用的路由
+if not IS_LITE:
+    from app.api.routes import model_routes
+    from app.api.routes import model_runtime_routes
+    from app.api.routes.demucs_routes import create_demucs_router
+
+    app.include_router(model_routes.router)
+    app.include_router(model_runtime_routes.router)
+
+    # 注册Demucs配置路由（需要在转录路由之前注册）
+    demucs_router = create_demucs_router()
+    app.include_router(demucs_router)
 
 @app.on_event("startup")
 async def startup_event():
     """应用启动事件 - 初始化模型管理器和FFmpeg检测"""
     try:
+        transcription_service_instance = None
+
         logger.info("="  * 60)
         logger.info("服务启动中...")
         logger.info("=" * 60)
@@ -258,19 +281,22 @@ async def startup_event():
             logger.warning(f"FFmpeg检测失败: {e}")
             logger.warning("转录功能可能无法使用，请手动安装FFmpeg")
 
-        # 3. 初始化模型管理器（此时事件循环已设置，后台验证可以正常推送SSE）
-        logger.info("步骤 3/4: 初始化模型管理器...")
-        model_manager = get_model_manager_v2()
-        logger.info("模型管理器初始化成功 (V2)")
+        if not IS_LITE:
+            # 3. 初始化模型管理器（此时事件循环已设置，后台验证可以正常推送SSE）
+            logger.info("步骤 3/4: 初始化模型管理器...")
+            from app.services.model_manager_v2 import get_model_manager_v2
+            model_manager = get_model_manager_v2()
+            logger.info("模型管理器初始化成功 (V2)")
 
-        # 4. 初始化队列服务（新增）
-        logger.info("步骤 4/4: 初始化任务队列服务...")
-        from app.services.job_queue_service import get_queue_service
-        from app.services.transcription_service import get_transcription_service
-        from app.core.config import config
-        transcription_service = get_transcription_service(str(config.JOBS_DIR))
-        queue_service = get_queue_service(transcription_service)
-        logger.info("任务队列服务已启动")
+            # 4. 初始化队列服务（新增）
+            logger.info("步骤 4/4: 初始化任务队列服务...")
+            from app.services.job_queue_service import get_queue_service
+            from app.services.transcription_service import get_transcription_service
+            transcription_service_instance = get_transcription_service(str(config.JOBS_DIR))
+            queue_service = get_queue_service(transcription_service_instance)
+            logger.info("任务队列服务已启动")
+        else:
+            logger.info("Lite 模式启动: 跳过模型管理与转录队列初始化")
 
         # 4.5. 初始化媒体准备服务（独立线程执行转码，不阻塞主流程）
         from app.services.media_prep_service import get_media_prep_service
@@ -286,6 +312,174 @@ async def startup_event():
             logger.info("任务索引映射清理完成")
         except Exception as e:
             logger.warning(f"清理任务索引映射失败: {e}")
+
+        # 5.5. 启动时自动规范旧 workspace 到 Project 单语义
+        logger.info("执行 Project workspace 语义迁移检查...")
+        try:
+            from app.services.project_directory_migrator import get_project_directory_migrator
+            from app.services.project_id_resolver import get_project_id_resolver
+
+            state_jobs = []
+            state_repo = None
+            if transcription_service_instance is not None:
+                state_jobs = list(transcription_service_instance.job_lifecycle.jobs.values())
+                state_repo = transcription_service_instance.job_lifecycle.state_repo
+
+            migration_report = get_project_id_resolver().migrate_existing_workspaces(
+                state_jobs=state_jobs,
+            )
+            updated_jobs = list(migration_report.get("updated_jobs", []))
+
+            migration_enabled_raw = str(
+                os.getenv("PROJECT_DIR_MIGRATION_ENABLED", "1")
+            ).strip().lower()
+            is_migration_enabled = migration_enabled_raw not in {"0", "false", "no", "off"}
+            migration_dry_run_raw = str(
+                os.getenv("PROJECT_DIR_MIGRATION_DRY_RUN", "0")
+            ).strip().lower()
+            is_migration_dry_run = migration_dry_run_raw in {"1", "true", "yes", "on"}
+
+            if is_migration_enabled:
+                dir_report = get_project_directory_migrator().migrate(
+                    jobs_root=config.JOBS_DIR,
+                    state_jobs=state_jobs,
+                    state_repo=state_repo,
+                    dry_run=is_migration_dry_run,
+                    allow_legacy_resolution=not is_migration_dry_run,
+                )
+                updated_jobs.extend(list(dir_report.get("updated_jobs", [])))
+                logger.info(
+                    (
+                        "Project 目录命名迁移结果: dry_run=%s scanned=%s renamed=%s "
+                        "skipped=%s failed=%s updated_jobs=%s updated_task_rows=%s"
+                    ),
+                    bool(dir_report.get("dry_run", False)),
+                    dir_report.get("scanned", 0),
+                    dir_report.get("renamed", 0),
+                    dir_report.get("skipped", 0),
+                    dir_report.get("failed", 0),
+                    len(dir_report.get("updated_jobs", [])),
+                    dir_report.get("updated_task_rows", 0),
+                )
+                dir_failures = list(dir_report.get("failures", []))
+                for failure in dir_failures[:10]:
+                    logger.warning(
+                        "Project 目录命名迁移失败: dir=%s error=%s",
+                        failure.get("dir", ""),
+                        failure.get("error", ""),
+                    )
+                if len(dir_failures) > 10:
+                    logger.warning(
+                        "Project 目录命名迁移失败项过多，已截断展示: remaining=%s",
+                        len(dir_failures) - 10,
+                    )
+            else:
+                logger.info("Project 目录命名迁移已禁用（PROJECT_DIR_MIGRATION_ENABLED）")
+
+            persisted_jobs = 0
+            if transcription_service_instance is not None and updated_jobs:
+                deduplicated_jobs = []
+                seen_runtime_job_ids = set()
+                for runtime_job in updated_jobs:
+                    runtime_job_id = getattr(runtime_job, "job_id", None)
+                    if runtime_job_id and runtime_job_id in seen_runtime_job_ids:
+                        continue
+                    if runtime_job_id:
+                        seen_runtime_job_ids.add(runtime_job_id)
+                    deduplicated_jobs.append(runtime_job)
+
+                for runtime_job in deduplicated_jobs:
+                    if transcription_service_instance.save_job_meta(runtime_job):
+                        persisted_jobs += 1
+                        continue
+                    logger.warning(
+                        "Project 迁移后任务元信息回写失败: job_id=%s project_id=%s",
+                        getattr(runtime_job, "job_id", ""),
+                        getattr(runtime_job, "project_id", ""),
+                    )
+
+            logger.info(
+                (
+                    "Project workspace 迁移结果: scanned=%s resolved=%s "
+                    "migrated_alias=%s failed=%s updated_jobs=%s persisted=%s"
+                ),
+                migration_report.get("scanned", 0),
+                migration_report.get("resolved", 0),
+                migration_report.get("migrated_alias", 0),
+                migration_report.get("failed", 0),
+                len(updated_jobs),
+                persisted_jobs,
+            )
+            failures = list(migration_report.get("failures", []))
+            for failure in failures[:10]:
+                logger.warning(
+                    "Project workspace 迁移失败: identifier=%s error=%s",
+                    failure.get("identifier", ""),
+                    failure.get("error", ""),
+                )
+            if len(failures) > 10:
+                logger.warning(
+                    "Project workspace 迁移失败项过多，已截断展示: remaining=%s",
+                    len(failures) - 10,
+                )
+        except Exception as migration_exc:
+            logger.warning("Project workspace 迁移检查失败: %s", migration_exc)
+
+        # 5.7. 启动补齐 project 元数据（重点补齐 task_mode，防止前端任务模式漂移）
+        logger.info("执行 Project 元数据完整性检查...")
+        try:
+            from app.services.project_service import get_project_service
+
+            normalized_projects = get_project_service().list_projects()
+            logger.info(
+                "Project 元数据完整性检查完成: total=%s",
+                len(normalized_projects),
+            )
+        except Exception as metadata_exc:
+            logger.warning("Project 元数据完整性检查失败: %s", metadata_exc)
+
+        # 5.6. 可选：启动阶段执行 Project 单语义强闸（默认关闭）
+        strict_guard_enabled = str(os.getenv("PROJECT_SEMANTIC_GUARD_STRICT", "")).strip().lower()
+        if strict_guard_enabled in {"1", "true", "yes", "on"}:
+            strict_all_enabled = str(os.getenv("PROJECT_SEMANTIC_GUARD_STRICT_ALL", "")).strip().lower()
+            is_strict_all = strict_all_enabled in {"1", "true", "yes", "on"}
+            logger.info("Project 单语义强闸已启用: strict_all=%s", is_strict_all)
+            try:
+                repo_root = Path(__file__).resolve().parents[2]
+                guard_script = repo_root / "scripts" / "check_project_semantic_guard.py"
+                if not guard_script.exists():
+                    raise FileNotFoundError(f"守卫脚本不存在: {guard_script}")
+
+                guard_cmd = [
+                    sys.executable,
+                    str(guard_script),
+                    "--repo-root",
+                    str(repo_root),
+                ]
+                if is_strict_all:
+                    guard_cmd.append("--strict-all")
+
+                guard_result = subprocess.run(
+                    guard_cmd,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                guard_stdout = str(guard_result.stdout or "").strip()
+                guard_stderr = str(guard_result.stderr or "").strip()
+                if guard_stdout:
+                    logger.info("Project 单语义强闸输出:\n%s", guard_stdout)
+                if guard_stderr:
+                    logger.warning("Project 单语义强闸 stderr:\n%s", guard_stderr)
+                if guard_result.returncode != 0:
+                    raise RuntimeError(
+                        "Project 单语义强闸失败，请先修复新增 job 语义违例再启动。"
+                    )
+            except Exception as guard_exc:
+                logger.error("Project 单语义强闸失败: %s", guard_exc)
+                raise
 
         # 不在启动时预加载模型，等待前端就绪后通过API调用
         logger.info("后端服务已就绪，等待前端启动后进行模型预加载")
@@ -313,20 +507,22 @@ async def shutdown_event():
         except:
             pass
 
-        # 停止队列服务（新增）
-        from app.services.job_queue_service import get_queue_service
-        try:
-            queue_service = get_queue_service()
-            queue_service.shutdown()
-            logger.info("任务队列服务已停止")
-        except:
-            pass
+        if not IS_LITE:
+            # 停止队列服务（新增）
+            from app.services.job_queue_service import get_queue_service
+            try:
+                queue_service = get_queue_service()
+                queue_service.shutdown()
+                logger.info("任务队列服务已停止")
+            except:
+                pass
 
-        # 清理模型缓存
-        model_manager = get_model_manager_v2()
-        if model_manager:
-            model_manager.clear_cache()
-            logger.info("已清理模型缓存")
+            # 清理模型缓存
+            from app.services.model_manager_v2 import get_model_manager_v2
+            model_manager = get_model_manager_v2()
+            if model_manager:
+                model_manager.clear_cache()
+                logger.info("已清理模型缓存")
     except Exception as e:
         logger.error(f"清理资源失败: {str(e)}")
 
@@ -336,8 +532,11 @@ OUTPUT_DIR = str(config.OUTPUT_DIR)
 JOBS_DIR = str(config.JOBS_DIR)
 TEMP_DIR = str(config.TEMP_DIR)
 
-# 初始化转录服务
-transcription_service = get_transcription_service(JOBS_DIR)
+# 初始化转录服务（仅 Full 模式）
+transcription_service = None
+if not IS_LITE:
+    from app.services.transcription_service import get_transcription_service
+    transcription_service = get_transcription_service(JOBS_DIR)
 
 # 初始化文件管理服务
 file_service = FileManagementService(INPUT_DIR, OUTPUT_DIR)
@@ -347,9 +546,21 @@ file_router = create_file_router(file_service)
 app.include_router(file_router)
 
 # 注册转录路由（包含暂停、恢复等新功能）
-# 注意：model_routes已在第59行注册，这里不再重复注册
-transcription_router = create_transcription_router(transcription_service, file_service, OUTPUT_DIR)
-app.include_router(transcription_router)
+if not IS_LITE:
+    from app.api.routes.transcription_routes import create_transcription_router
+    from app.api.routes.project_task_routes import create_project_task_router
+    from app.api.routes.speaker_routes import create_speaker_router
+
+    transcription_router = create_transcription_router(transcription_service, file_service, OUTPUT_DIR)
+    project_task_router = create_project_task_router(transcription_service)
+    app.include_router(transcription_router)
+    app.include_router(project_task_router)
+
+    # 注册 speaker 路由（说话人 profile/改绑/合并）
+    speaker_router = create_speaker_router(transcription_service)
+    app.include_router(speaker_router)
+else:
+    logger.info("Lite 模式启动: 跳过 transcription/speaker 路由注册")
 
 ModelPreloadConfig.print_config()
 
@@ -395,7 +606,9 @@ async def list_files():
                     stat = os.stat(file_path)
 
                     # 检查是否有断点
-                    checkpoint_info = transcription_service.check_file_checkpoint(file_path)
+                    checkpoint_info = None
+                    if transcription_service is not None:
+                        checkpoint_info = transcription_service.check_file_checkpoint(file_path)
 
                     file_info = FileInfo(
                         name=filename,
@@ -435,8 +648,8 @@ async def delete_file(filename: str):
         raise HTTPException(status_code=500, detail=f"删除文件失败: {str(e)}")
 
 # 所有转录相关的路由已经在transcription_routes.py中定义，这里的重复定义已被删除
-# 原有的/api/upload, /api/create-job, /api/start(已注释), /api/status/{job_id},
-# /api/download/{job_id}, /api/copy-result/{job_id}等端点现在都由transcription_routes.py处理
+# 原有的 /api/upload, /api/create-task, /api/start(已注释), /api/status/{identifier},
+# /api/download/{identifier}, /api/copy-result/{identifier} 等端点现在都由 transcription_routes.py 处理
 
 @app.get("/api/ping")
 async def ping():
@@ -552,7 +765,10 @@ async def get_hardware_status():
 @app.post("/api/models/cache/clear")
 async def clear_models_cache():
     """清空模型缓存（ModelManager V2）。"""
+    if IS_LITE:
+        raise HTTPException(status_code=422, detail="Lite 模式不支持模型缓存管理")
     try:
+        from app.services.model_manager_v2 import get_model_manager_v2
         model_manager = get_model_manager_v2()
         model_manager.unload_all()
         logger.info("手动清空模型缓存成功")
@@ -571,10 +787,13 @@ async def clear_models_cache():
 @app.post("/api/models/cache/unload")
 async def unload_model(request: dict):
     """卸载指定模型（使用 ModelManager V2）。"""
+    if IS_LITE:
+        raise HTTPException(status_code=422, detail="Lite 模式不支持模型缓存管理")
     try:
         model_id = request.get("model_id")
         if not model_id:
             return {"success": False, "message": "缺少model_id参数"}
+        from app.services.model_manager_v2 import get_model_manager_v2
         model_manager = get_model_manager_v2()
         model_manager.unload_all()
         logger.info(f"卸载模型: {model_id} (清空缓存)")
@@ -590,10 +809,12 @@ async def shutdown_server():
         logger.info("收到关闭服务器请求")
 
         # 清理资源
-        model_manager = get_model_manager_v2()
-        if model_manager:
-            model_manager.unload_all()
-            logger.info("已清理模型缓存")
+        if not IS_LITE:
+            from app.services.model_manager_v2 import get_model_manager_v2
+            model_manager = get_model_manager_v2()
+            if model_manager:
+                model_manager.unload_all()
+                logger.info("已清理模型缓存")
         
         # 返回成功响应
         response = {

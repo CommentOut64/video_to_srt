@@ -10,11 +10,12 @@ import logging
 import subprocess
 import os
 from pathlib import Path
-from typing import Optional, Dict, Any, Literal, Callable
+from typing import Optional, Dict, Any, Literal, Callable, List
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 
 from app.core.config import config
+from app.services.project_id_resolver import get_project_id_resolver
 from app.services.proxy_720_scheduler import get_proxy_scheduler
 
 logger = logging.getLogger(__name__)
@@ -104,6 +105,54 @@ class MediaPrepService:
         scheduler = get_proxy_scheduler()
         scheduler.bind_media_prep(self)
 
+    def _canonical_project_id(self, identifier: str) -> str:
+        normalized_identifier = str(identifier or "").strip()
+        if not normalized_identifier:
+            raise FileNotFoundError("identifier 不能为空")
+        identity = get_project_id_resolver().resolve_or_fail(normalized_identifier)
+        self._canonicalize_runtime_keys(identity.project_id, [normalized_identifier, identity.legacy_job_id])
+        return identity.project_id
+
+    def _resolve_project_dir(self, identifier: str) -> Path:
+        normalized_identifier = str(identifier or "").strip()
+        if not normalized_identifier:
+            raise FileNotFoundError("identifier 不能为空")
+        identity = get_project_id_resolver().resolve_or_fail(normalized_identifier)
+        self._canonicalize_runtime_keys(identity.project_id, [normalized_identifier, identity.legacy_job_id])
+        return identity.project_dir
+
+    def _canonicalize_runtime_keys(self, project_id: str, aliases: List[Optional[str]]) -> None:
+        """把运行态内存中的旧 key（job_id）提升为 project_id，避免双轨状态分叉。"""
+        normalized_project_id = str(project_id or "").strip()
+        if not normalized_project_id:
+            return
+
+        normalized_aliases: List[str] = []
+        for alias in aliases:
+            alias_value = str(alias or "").strip()
+            if alias_value and alias_value not in normalized_aliases:
+                normalized_aliases.append(alias_value)
+
+        with self.lock:
+            canonical_status = self.task_status.setdefault(normalized_project_id, {})
+            for alias in normalized_aliases:
+                if alias == normalized_project_id:
+                    continue
+                legacy_status = self.task_status.pop(alias, None)
+                if isinstance(legacy_status, dict):
+                    for task_type, task_state in legacy_status.items():
+                        if task_type not in canonical_status:
+                            canonical_status[task_type] = task_state
+
+                legacy_timer = self.pending_720p_checks.pop(alias, None)
+                if legacy_timer is not None and normalized_project_id not in self.pending_720p_checks:
+                    self.pending_720p_checks[normalized_project_id] = legacy_timer
+
+        with self._process_lock:
+            for pid, process_key in list(self._process_job_map.items()):
+                if process_key in normalized_aliases and process_key != normalized_project_id:
+                    self._process_job_map[pid] = normalized_project_id
+
     def enqueue_proxy(self, job_id: str, video_path: Path, output_path: Path,
                       priority: int = 10) -> bool:
         """
@@ -118,19 +167,21 @@ class MediaPrepService:
         Returns:
             bool: 是否成功加入队列
         """
+        project_id = self._canonical_project_id(job_id)
+
         # 检查是否已在队列或执行中
         with self.lock:
-            if job_id in self.task_status:
-                status = self.task_status[job_id].get("proxy_720p", {})
+            if project_id in self.task_status:
+                status = self.task_status[project_id].get("proxy_720p", {})
                 if status.get("status") in ["queued", "processing"]:
-                    logger.info(f"[MediaPrep] Proxy任务已存在，跳过: {job_id}")
+                    logger.info(f"[MediaPrep] Proxy任务已存在，跳过: {project_id}")
                     return False
 
             # 初始化状态
-            if job_id not in self.task_status:
-                self.task_status[job_id] = {}
+            if project_id not in self.task_status:
+                self.task_status[project_id] = {}
 
-            self.task_status[job_id]["proxy_720p"] = {
+            self.task_status[project_id]["proxy_720p"] = {
                 "status": "queued",
                 "progress": 0,
                 "video_path": str(video_path),
@@ -140,13 +191,13 @@ class MediaPrepService:
         # 加入优先级队列 (priority, timestamp, task_data)
         task = (priority, time.time(), {
             "type": "proxy_720p",
-            "job_id": job_id,
+            "job_id": project_id,
             "video_path": video_path,
             "output_path": output_path
         })
         self.task_queue.put(task)
 
-        logger.info(f"[MediaPrep] Proxy任务已入队: {job_id} (priority={priority})")
+        logger.info(f"[MediaPrep] Proxy任务已入队: {project_id} (priority={priority})")
         return True
 
     def enqueue_preview(self, job_id: str, video_path: Path, output_path: Path,
@@ -163,19 +214,21 @@ class MediaPrepService:
         Returns:
             bool: 是否成功加入队列
         """
+        project_id = self._canonical_project_id(job_id)
+
         # 检查是否已在队列或执行中
         with self.lock:
-            if job_id in self.task_status:
-                status = self.task_status[job_id].get("preview_360p", {})
+            if project_id in self.task_status:
+                status = self.task_status[project_id].get("preview_360p", {})
                 if status.get("status") in ["queued", "processing"]:
-                    logger.info(f"[MediaPrep] 360p预览任务已存在，跳过: {job_id}")
+                    logger.info(f"[MediaPrep] 360p预览任务已存在，跳过: {project_id}")
                     return False
 
             # 初始化状态
-            if job_id not in self.task_status:
-                self.task_status[job_id] = {}
+            if project_id not in self.task_status:
+                self.task_status[project_id] = {}
 
-            self.task_status[job_id]["preview_360p"] = {
+            self.task_status[project_id]["preview_360p"] = {
                 "status": "queued",
                 "progress": 0,
                 "video_path": str(video_path),
@@ -185,27 +238,35 @@ class MediaPrepService:
         # 加入优先级队列 (priority越小越优先)
         task = (priority, time.time(), {
             "type": "preview_360p",
-            "job_id": job_id,
+            "job_id": project_id,
             "video_path": video_path,
             "output_path": output_path
         })
         self.task_queue.put(task)
 
-        logger.info(f"[MediaPrep] 360p预览任务已入队: {job_id} (priority={priority})")
+        logger.info(f"[MediaPrep] 360p预览任务已入队: {project_id} (priority={priority})")
         return True
 
     def get_proxy_status(self, job_id: str) -> Optional[Dict]:
         """获取 720p Proxy 任务状态"""
+        try:
+            project_id = self._canonical_project_id(job_id)
+        except FileNotFoundError:
+            return None
         with self.lock:
-            if job_id in self.task_status:
-                return self.task_status[job_id].get("proxy_720p")
+            if project_id in self.task_status:
+                return self.task_status[project_id].get("proxy_720p")
         return None
 
     def get_preview_status(self, job_id: str) -> Optional[Dict]:
         """获取 360p 预览任务状态"""
+        try:
+            project_id = self._canonical_project_id(job_id)
+        except FileNotFoundError:
+            return None
         with self.lock:
-            if job_id in self.task_status:
-                return self.task_status[job_id].get("preview_360p")
+            if project_id in self.task_status:
+                return self.task_status[project_id].get("preview_360p")
         return None
 
     def is_proxy_in_progress(self, job_id: str) -> bool:
@@ -233,8 +294,9 @@ class MediaPrepService:
             }
         """
         try:
+            project_id = self._canonical_project_id(job_id)
             # 步骤1: 检查任务目录是否存在
-            job_dir = config.JOBS_DIR / job_id
+            job_dir = self._resolve_project_dir(project_id)
             if not job_dir.exists():
                 return {
                     "success": False,
@@ -243,7 +305,7 @@ class MediaPrepService:
                 }
 
             # 步骤2: 检查360p是否完成
-            preview_status = self.get_preview_status(job_id)
+            preview_status = self.get_preview_status(project_id)
             if not preview_status or preview_status.get("status") != "completed":
                 return {
                     "success": False,
@@ -260,7 +322,7 @@ class MediaPrepService:
                     "reason": "already_exists"
                 }
 
-            proxy_status = self.get_proxy_status(job_id)
+            proxy_status = self.get_proxy_status(project_id)
             if proxy_status and proxy_status.get("status") in ["queued", "processing"]:
                 return {
                     "success": False,
@@ -294,8 +356,8 @@ class MediaPrepService:
                 }
 
             # 步骤6: 启动720p转码
-            logger.info(f"[MediaPrep] 触发720p转码: {job_id}, force={force}")
-            success = self.enqueue_proxy(job_id, video_file, proxy_720p_path, priority=10)
+            logger.info(f"[MediaPrep] 触发720p转码: {project_id}, force={force}")
+            success = self.enqueue_proxy(project_id, video_file, proxy_720p_path, priority=10)
 
             if success:
                 return {
@@ -396,17 +458,19 @@ class MediaPrepService:
         Returns:
             bool: 是否成功加入队列
         """
+        project_id = self._canonical_project_id(job_id)
+
         with self.lock:
-            if job_id in self.task_status:
-                status = self.task_status[job_id].get("remux", {})
+            if project_id in self.task_status:
+                status = self.task_status[project_id].get("remux", {})
                 if status.get("status") in ["queued", "processing"]:
-                    logger.info(f"[MediaPrep] 重封装任务已存在，跳过: {job_id}")
+                    logger.info(f"[MediaPrep] 重封装任务已存在，跳过: {project_id}")
                     return False
 
-            if job_id not in self.task_status:
-                self.task_status[job_id] = {}
+            if project_id not in self.task_status:
+                self.task_status[project_id] = {}
 
-            self.task_status[job_id]["remux"] = {
+            self.task_status[project_id]["remux"] = {
                 "status": "queued",
                 "progress": 0,
                 "video_path": str(video_path),
@@ -415,20 +479,24 @@ class MediaPrepService:
 
         task = (priority, time.time(), {
             "type": "remux",
-            "job_id": job_id,
+            "job_id": project_id,
             "video_path": video_path,
             "output_path": output_path
         })
         self.task_queue.put(task)
 
-        logger.info(f"[MediaPrep] 重封装任务已入队: {job_id} (priority={priority})")
+        logger.info(f"[MediaPrep] 重封装任务已入队: {project_id} (priority={priority})")
         return True
 
     def get_remux_status(self, job_id: str) -> Optional[Dict]:
         """获取重封装任务状态"""
+        try:
+            project_id = self._canonical_project_id(job_id)
+        except FileNotFoundError:
+            return None
         with self.lock:
-            if job_id in self.task_status:
-                return self.task_status[job_id].get("remux")
+            if project_id in self.task_status:
+                return self.task_status[project_id].get("remux")
         return None
 
     def get_full_task_status(self, job_id: str) -> Optional[Dict]:
@@ -446,11 +514,15 @@ class MediaPrepService:
                 "error": None
             }
         """
+        try:
+            project_id = self._canonical_project_id(job_id)
+        except FileNotFoundError:
+            return None
         with self.lock:
-            if job_id not in self.task_status:
+            if project_id not in self.task_status:
                 return None
 
-            status = self.task_status[job_id]
+            status = self.task_status[project_id]
             preview = status.get("preview_360p", {})
             proxy = status.get("proxy_720p", {})
             remux = status.get("remux", {})
@@ -515,7 +587,20 @@ class MediaPrepService:
 
                 # 分发任务
                 task_type = task.get("type")
-                job_id = task.get("job_id")
+                raw_job_id = str(task.get("job_id", "")).strip()
+                if not raw_job_id:
+                    logger.warning("[MediaPrep] 跳过无效任务（缺少 job_id）: %s", task)
+                    self.task_queue.task_done()
+                    continue
+
+                try:
+                    job_id = self._canonical_project_id(raw_job_id)
+                except FileNotFoundError as exc:
+                    logger.error("[MediaPrep] 任务身份解析失败，跳过执行: id=%s, err=%s", raw_job_id, exc)
+                    self.task_queue.task_done()
+                    continue
+
+                task["job_id"] = job_id
 
                 logger.info(f"[MediaPrep] 开始执行任务: {task_type} - {job_id}")
 
@@ -538,12 +623,14 @@ class MediaPrepService:
         执行 360p 预览视频转码任务（在独立线程中）
         使用配置中的编码参数，优先快速生成
         """
-        job_id = task["job_id"]
+        job_id = self._canonical_project_id(task["job_id"])
         video_path = Path(task["video_path"])
         output_path = Path(task["output_path"])
 
         # 更新状态
         with self.lock:
+            self.task_status.setdefault(job_id, {})
+            self.task_status[job_id].setdefault("preview_360p", {"status": "queued", "progress": 0})
             self.task_status[job_id]["preview_360p"]["status"] = "processing"
 
         try:
@@ -691,12 +778,14 @@ class MediaPrepService:
         2. 优先使用 GPU 加速（NVENC），回退到 CPU
         3. 检测转录队列状态，如有新任务则降低优先级
         """
-        job_id = task["job_id"]
+        job_id = self._canonical_project_id(task["job_id"])
         video_path = Path(task["video_path"])
         output_path = Path(task["output_path"])
 
         # 更新状态
         with self.lock:
+            self.task_status.setdefault(job_id, {})
+            self.task_status[job_id].setdefault("proxy_720p", {"status": "queued", "progress": 0})
             self.task_status[job_id]["proxy_720p"]["status"] = "processing"
 
         # V3.1.2+dev.20260114.03: 通知调度器进入 processing，保证状态文件与队列一致
@@ -904,6 +993,12 @@ class MediaPrepService:
             # 检查2: 有正在执行的任务（覆盖整个流水线生命周期）
             if queue_service.running_job_id is not None:
                 logger.debug(f"[MediaPrep] 队列繁忙: 正在执行任务 {queue_service.running_job_id}")
+                return True
+
+            # V3.2.4+dev.20260222.01: RunnerGate 生效时，队列虽然无 running_job_id
+            # 但孤儿执行可能仍占用 GPU，需继续判定为繁忙
+            if hasattr(queue_service, "is_runner_gate_blocking") and queue_service.is_runner_gate_blocking():
+                logger.debug("[MediaPrep] 队列繁忙: RunnerGate 正在阻断新任务")
                 return True
 
             # 检查3: 有活跃的进度追踪器（双重保险，防止边界情况）
@@ -1151,7 +1246,7 @@ class MediaPrepService:
 
     def _push_preview_progress(self, job_id: str, progress: float, completed: bool = False):
         """推送 360p 预览进度到 SSE"""
-        channel_id = f"job:{job_id}"
+        channel_id = f"project:{job_id}"
         event_type = "preview_360p_complete" if completed else "preview_360p_progress"
 
         data = {
@@ -1168,7 +1263,7 @@ class MediaPrepService:
 
     def _push_proxy_progress(self, job_id: str, progress: float, completed: bool = False):
         """推送 Proxy 进度到 SSE"""
-        channel_id = f"job:{job_id}"
+        channel_id = f"project:{job_id}"
         event_type = "proxy_complete" if completed else "proxy_progress"
 
         data = {
@@ -1184,7 +1279,7 @@ class MediaPrepService:
 
     def _push_remux_progress(self, job_id: str, progress: float, completed: bool = False):
         """推送重封装进度到 SSE"""
-        channel_id = f"job:{job_id}"
+        channel_id = f"project:{job_id}"
         event_type = "remux_complete" if completed else "remux_progress"
 
         data = {
@@ -1226,7 +1321,7 @@ class MediaPrepService:
             try:
                 from app.services.sse_service import get_sse_manager
                 sse_manager = get_sse_manager()
-                channel_id = f"job:{job_id}"
+                channel_id = f"project:{job_id}"
 
                 sse_manager.broadcast_sync(channel_id, event_type, data)
                 return True
@@ -1252,12 +1347,14 @@ class MediaPrepService:
         使用 -c:v copy -c:a copy 直接复制流，速度极快
         通常几秒内完成，比完整转码快 10-100 倍
         """
-        job_id = task["job_id"]
+        job_id = self._canonical_project_id(task["job_id"])
         video_path = Path(task["video_path"])
         output_path = Path(task["output_path"])
 
         # 更新状态
         with self.lock:
+            self.task_status.setdefault(job_id, {})
+            self.task_status[job_id].setdefault("remux", {"status": "queued", "progress": 0})
             self.task_status[job_id]["remux"]["status"] = "processing"
 
         try:
@@ -1410,11 +1507,15 @@ class MediaPrepService:
         # V3.1.2+dev.20260114.10: 按 job_id 终止/降优先级（队列新任务优先）
     def cancel_proxy_job(self, job_id: str, reason: str = "paused_for_new_job") -> bool:
         """终止指定 job 的 proxy 进程，并标记状态，便于后续重排队"""
+        try:
+            project_id = self._canonical_project_id(job_id)
+        except FileNotFoundError:
+            return False
         target_pid = None
         target_process = None
         with self._process_lock:
             for pid, jid in list(self._process_job_map.items()):
-                if jid == job_id:
+                if jid == project_id:
                     target_pid = pid
                     target_process = self._active_processes.get(pid)
                     break
@@ -1428,38 +1529,42 @@ class MediaPrepService:
                     target_process.wait(timeout=3)
                 except subprocess.TimeoutExpired:
                     target_process.kill()
-            logger.info(f"[MediaPrep] 已终止720p进程: job_id={job_id}, pid={target_pid}, reason={reason}")
+            logger.info(f"[MediaPrep] 已终止720p进程: job_id={project_id}, pid={target_pid}, reason={reason}")
         except Exception as e:
-            logger.warning(f"[MediaPrep] 终止720p进程失败: job_id={job_id}, pid={target_pid}, err={e}")
+            logger.warning(f"[MediaPrep] 终止720p进程失败: job_id={project_id}, pid={target_pid}, err={e}")
 
         # 清理登记
         self._unregister_process(target_process)
 
         with self.lock:
-            if job_id in self.task_status and "proxy_720p" in self.task_status[job_id]:
+            if project_id in self.task_status and "proxy_720p" in self.task_status[project_id]:
                 # V3.1.2+dev.20260114.18: 被新任务打断不标记失败，回到待检查状态，清理错误
                 if reason == "paused_for_new_job":
-                    self.task_status[job_id]["proxy_720p"]["status"] = "waiting_check"
-                    self.task_status[job_id]["proxy_720p"]["error"] = None
-                    self.task_status[job_id]["proxy_720p"]["progress"] = 0
+                    self.task_status[project_id]["proxy_720p"]["status"] = "waiting_check"
+                    self.task_status[project_id]["proxy_720p"]["error"] = None
+                    self.task_status[project_id]["proxy_720p"]["progress"] = 0
                 else:
-                    self.task_status[job_id]["proxy_720p"]["status"] = "failed"
-                    self.task_status[job_id]["proxy_720p"]["error"] = reason
-                    self.task_status[job_id]["proxy_720p"]["progress"] = 0
+                    self.task_status[project_id]["proxy_720p"]["status"] = "failed"
+                    self.task_status[project_id]["proxy_720p"]["error"] = reason
+                    self.task_status[project_id]["proxy_720p"]["progress"] = 0
         # V3.1.2+dev.20260114.13: 被新任务打断时不推送错误事件，静默等待重排队
         if reason != "paused_for_new_job":
             try:
-                self._push_proxy_error(job_id, reason)
+                self._push_proxy_error(project_id, reason)
             except Exception as e:
-                logger.debug(f"[MediaPrep] 推送 proxy 错误事件失败: {job_id}, {e}")
+                logger.debug(f"[MediaPrep] 推送 proxy 错误事件失败: {project_id}, {e}")
         return True
 
     def set_low_priority_by_job(self, job_id: str) -> bool:
         """将指定 job 的 proxy 进程设置为低优先级"""
+        try:
+            project_id = self._canonical_project_id(job_id)
+        except FileNotFoundError:
+            return False
         target_pid = None
         with self._process_lock:
             for pid, jid in list(self._process_job_map.items()):
-                if jid == job_id:
+                if jid == project_id:
                     target_pid = pid
                     break
         if target_pid is None:
@@ -1491,12 +1596,16 @@ class MediaPrepService:
         Returns:
             int: 被终止的进程数
         """
+        try:
+            project_id = self._canonical_project_id(job_id)
+        except FileNotFoundError:
+            return 0
         killed_count = 0
         with self._process_lock:
             # 找到该 job_id 对应的所有进程
             pids_to_kill = [
                 pid for pid, jid in self._process_job_map.items()
-                if jid == job_id
+                if jid == project_id
             ]
 
             for pid in pids_to_kill:
@@ -1510,7 +1619,7 @@ class MediaPrepService:
                             except subprocess.TimeoutExpired:
                                 process.kill()  # 强制终止
                             killed_count += 1
-                            logger.info(f"[MediaPrep] 已终止任务 {job_id} 的进程: PID={pid}")
+                            logger.info(f"[MediaPrep] 已终止任务 {project_id} 的进程: PID={pid}")
                     except Exception as e:
                         logger.warning(f"[MediaPrep] 终止进程失败 PID={pid}: {e}")
 
@@ -1521,15 +1630,15 @@ class MediaPrepService:
                     del self._process_job_map[pid]
 
         # 取消该任务的 720p 检查定时器
-        timer = self.pending_720p_checks.pop(job_id, None)
+        timer = self.pending_720p_checks.pop(project_id, None)
         if timer:
             timer.cancel()
-            logger.info(f"[MediaPrep] 已取消任务 {job_id} 的 720p 检查定时器")
+            logger.info(f"[MediaPrep] 已取消任务 {project_id} 的 720p 检查定时器")
 
         # V3.1.2+dev.20260113.01: 移除状态修改逻辑
         # 原因：MediaPrep 和 TranscriptionService 是独立系统，不应互相修改状态
         # 只终止进程，不修改任务状态
-        logger.info(f"[MediaPrep] 已终止任务 {job_id} 的 {killed_count} 个进程，不修改任务状态")
+        logger.info(f"[MediaPrep] 已终止任务 {project_id} 的 {killed_count} 个进程，不修改任务状态")
 
         return killed_count
 

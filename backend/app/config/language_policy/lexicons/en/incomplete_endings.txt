@@ -1,0 +1,14 @@
+# English incomplete endings (stage A baseline)
+and
+or
+but
+to
+for
+with
+at
+on
+in
+of
+the
+a
+an

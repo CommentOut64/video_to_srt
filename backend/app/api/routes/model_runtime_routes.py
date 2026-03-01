@@ -11,6 +11,7 @@ from typing import Optional, Dict, Any, List, Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 
+from app.services.dnsmos_auto_tune_service import get_dnsmos_auto_tune_service
 from app.services.model_runtime_config_service import get_model_runtime_config_service
 from app.services.model_manager_v2 import get_model_manager_v2
 
@@ -23,6 +24,9 @@ _COMPUTE_TYPES = {"auto", "int8", "int8_float16", "float16", "float32", "fp32"}
 _SENSEVOICE_LANGUAGES = {"auto", "zh", "en", "yue", "ja", "ko", "nospeech"}
 _PUNCT_ALIGNMENT_METHODS = {"anchor", "dtw", "levenshtein"}
 _DEMUCS_MODELS = {"htdemucs", "htdemucs_ft", "mdx_extra", "mdx_extra_q"}
+_AUTO_TUNE_SCHEMA = {
+    "dnsmos": get_dnsmos_auto_tune_service().get_plan().to_dict(),
+}
 
 
 class _RuntimeBase(BaseModel):
@@ -113,6 +117,17 @@ class WhisperSanitizeRuntimeParams(_RuntimeBase):
     )
 
 
+class WhisperPromptRuntimeParams(_RuntimeBase):
+    is_enabled: Optional[bool] = Field(default=None, alias="enabled")
+    max_prompt_chars: Optional[int] = Field(default=None, ge=32, le=1024)
+    max_keyword_count: Optional[int] = Field(default=None, ge=1, le=128)
+    max_context_chars: Optional[int] = Field(default=None, ge=16, le=512)
+    max_history_chars: Optional[int] = Field(default=None, ge=32, le=2048)
+    reset_pause_sec: Optional[float] = Field(default=None, ge=0.0, le=30.0)
+    reset_no_speech_prob: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    reset_low_confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
+
 class SenseVoiceRuntimeParams(_RuntimeBase):
     language: Optional[str] = Field(default=None)
     is_use_itn: Optional[bool] = Field(default=None, alias="use_itn")
@@ -159,6 +174,7 @@ class DemucsRuntimeParams(_RuntimeBase):
     shifts: Optional[int] = Field(default=None, ge=1, le=5)
     overlap: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     segment_length: Optional[int] = Field(default=None, ge=1)
+    global_group_duration_sec: Optional[float] = Field(default=None, ge=60.0)
     segment_buffer_sec: Optional[float] = Field(default=None, ge=0.0)
     bgm_sample_duration: Optional[float] = Field(default=None, ge=1.0)
     bgm_light_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
@@ -231,11 +247,90 @@ class VADRuntimeParams(_RuntimeBase):
         return self
 
 
+class TimelineRuntimeParams(_RuntimeBase):
+    is_enabled: Optional[bool] = Field(default=None, alias="enabled")
+    device: Optional[str] = Field(default=None)
+    is_diarization_enabled: Optional[bool] = Field(default=None, alias="diarization_enabled")
+    diarization_model_id: Optional[str] = Field(default=None)
+    diarization_local_path: Optional[str] = Field(default=None)
+    diarization_hf_token: Optional[str] = Field(default=None)
+    diarization_max_speakers: Optional[int] = Field(default=None, ge=1)
+    diarization_min_speakers: Optional[int] = Field(default=None, ge=1)
+    diarization_num_speakers: Optional[int] = Field(default=None, ge=1)
+    segmentation_boundary_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    segmentation_min_boundary_interval_sec: Optional[float] = Field(default=None, ge=0.0)
+    min_support_turns: Optional[int] = Field(default=None, ge=1)
+    min_total_duration: Optional[float] = Field(default=None, ge=0.0)
+    merge_similarity_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    long_pause_cut_sec: Optional[float] = Field(default=None, ge=0.0)
+
+    @field_validator("device")
+    @classmethod
+    def _validate_device(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        value_lower = value.lower()
+        if value_lower not in _DEVICE_OPTIONS:
+            raise ValueError("device 仅支持 auto/cuda/cpu")
+        return value_lower
+
+    @model_validator(mode="after")
+    def _validate_speaker_constraints(self):
+        if self.diarization_num_speakers is not None:
+            if (
+                self.diarization_min_speakers is not None
+                and self.diarization_num_speakers < self.diarization_min_speakers
+            ):
+                raise ValueError("diarization_num_speakers 必须 >= diarization_min_speakers")
+            if (
+                self.diarization_max_speakers is not None
+                and self.diarization_num_speakers > self.diarization_max_speakers
+            ):
+                raise ValueError("diarization_num_speakers 必须 <= diarization_max_speakers")
+        if (
+            self.diarization_min_speakers is not None
+            and self.diarization_max_speakers is not None
+            and self.diarization_min_speakers > self.diarization_max_speakers
+        ):
+            raise ValueError("diarization_min_speakers 必须 <= diarization_max_speakers")
+        return self
+
+
 class SmartProbeRuntimeParams(_RuntimeBase):
+    probe_sep_ratio_min: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    probe_min_coverage: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    probe_max_step_chunks: Optional[int] = Field(default=None, ge=1)
+    # 兼容字段：旧版本探针参数（已废弃）
     snr_threshold: Optional[float] = Field(default=None, ge=0.0)
 
 
+class DNSMOSRuntimeParams(_RuntimeBase):
+    device: Optional[str] = Field(default=None)
+    is_personalized: Optional[bool] = Field(default=None, alias="personalized")
+    ovrl_sep_hard: Optional[float] = Field(default=None, ge=0.0, le=5.0)
+    sig_sep_hard: Optional[float] = Field(default=None, ge=0.0, le=5.0)
+    p808_sep_hard: Optional[float] = Field(default=None, ge=0.0, le=5.0)
+    ovrl_pass_hard: Optional[float] = Field(default=None, ge=0.0, le=5.0)
+    sig_pass_hard: Optional[float] = Field(default=None, ge=0.0, le=5.0)
+    bak_pass_hard: Optional[float] = Field(default=None, ge=0.0, le=5.0)
+    p808_pass_soft: Optional[float] = Field(default=None, ge=0.0, le=5.0)
+
+    @field_validator("device")
+    @classmethod
+    def _validate_device(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        value_lower = value.lower()
+        if value_lower not in _DEVICE_OPTIONS:
+            raise ValueError("device 仅支持 auto/cuda/cpu")
+        return value_lower
+
+
 class YAMNetRuntimeParams(_RuntimeBase):
+    yamnet_music_conf_min: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    yamnet_speech_conf_min: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    yamnet_music_weak_max: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    # 兼容字段：旧版 YAMNet 参数
     acappella_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     music_max_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     music_avg_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
@@ -373,31 +468,166 @@ class ArbitrationRuntimeParams(_RuntimeBase):
         return value_lower
 
 
+class SegmentationRuntimeParams(_RuntimeBase):
+    is_enable: Optional[bool] = Field(default=None, alias="enable")
+    min_chars: Optional[int] = Field(default=None, ge=1)
+    min_duration_sec: Optional[float] = Field(default=None, ge=0.0)
+    max_duration_sec: Optional[float] = Field(default=None, ge=0.0)
+    max_tokens: Optional[int] = Field(default=None, ge=1)
+    long_pause_sec: Optional[float] = Field(default=None, ge=0.0)
+    soft_pause_sec: Optional[float] = Field(default=None, ge=0.0)
+    short_merge_max_chars: Optional[int] = Field(default=None, ge=1)
+    is_force_split_on_sentence_end_punct: Optional[bool] = Field(
+        default=None,
+        alias="force_split_on_sentence_end_punct",
+    )
+    is_keep_sentence_end_punct: Optional[bool] = Field(default=None, alias="keep_sentence_end_punct")
+    is_enable_soft_cut: Optional[bool] = Field(default=None, alias="soft_cut.enable")
+    is_enable_soft_cut_overlap_degrade: Optional[bool] = Field(
+        default=None,
+        alias="soft_cut.overlap_degrade_enable",
+    )
+    soft_cut_plan_provider: Optional[str] = Field(default=None, alias="soft_cut.plan_provider")
+    soft_cut_plan_provider_class: Optional[str] = Field(default=None, alias="soft_cut.plan_provider_class")
+    soft_cut_priority_active_profile: Optional[str] = Field(
+        default=None,
+        alias="soft_cut.priority.active_profile",
+    )
+    soft_cut_priority_profiles: Optional[Dict[str, Any]] = Field(
+        default=None,
+        alias="soft_cut.priority.profiles",
+    )
+
+    @model_validator(mode="after")
+    def _validate_duration_limits(self):
+        if (
+            self.max_duration_sec is not None
+            and self.min_duration_sec is not None
+            and self.max_duration_sec < self.min_duration_sec
+        ):
+            raise ValueError("max_duration_sec 必须 >= min_duration_sec")
+        return self
+
+    @field_validator("soft_cut_priority_active_profile")
+    @classmethod
+    def _validate_soft_cut_priority_active_profile(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("soft_cut.priority.active_profile 不能为空字符串")
+        return normalized
+
+    @field_validator("soft_cut_priority_profiles")
+    @classmethod
+    def _validate_soft_cut_priority_profiles(cls, value: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if value is None:
+            return value
+        if not isinstance(value, dict):
+            raise ValueError("soft_cut.priority.profiles 必须为对象")
+        return value
+
+
+class LanguagePolicyRuntimeParams(_RuntimeBase):
+    is_enabled: Optional[bool] = Field(default=None, alias="enabled")
+    default_language: Optional[str] = Field(default=None)
+    policy_version: Optional[str] = Field(default=None)
+    thresholds: Optional[Dict[str, float]] = Field(default=None)
+    carry_rules: Optional[Dict[str, List[float]]] = Field(default=None)
+    cross_chunk: Optional[Dict[str, Any]] = Field(default=None)
+
+    @field_validator("default_language")
+    @classmethod
+    def _validate_default_language(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        normalized = value.strip().lower()
+        if not normalized:
+            raise ValueError("default_language 不能为空字符串")
+        if not (2 <= len(normalized) <= 10 and normalized.replace("-", "").isalnum()):
+            raise ValueError("default_language 必须是 2-10 位语言码")
+        return normalized
+
+    @field_validator("thresholds")
+    @classmethod
+    def _validate_thresholds(cls, value: Optional[Dict[str, float]]) -> Optional[Dict[str, float]]:
+        if value is None:
+            return value
+        normalized: Dict[str, float] = {}
+        for key, item in value.items():
+            try:
+                normalized[str(key)] = float(item)
+            except (TypeError, ValueError):
+                raise ValueError(f"thresholds.{key} 必须为数值")
+        return normalized
+
+    @field_validator("carry_rules")
+    @classmethod
+    def _validate_carry_rules(
+        cls,
+        value: Optional[Dict[str, List[float]]],
+    ) -> Optional[Dict[str, List[float]]]:
+        if value is None:
+            return value
+        normalized: Dict[str, List[float]] = {}
+        for key, item in value.items():
+            if not isinstance(item, list) or len(item) < 2:
+                raise ValueError(f"carry_rules.{key} 必须为至少两个元素的数值数组")
+            pair = []
+            for num in item[:2]:
+                try:
+                    pair.append(float(num))
+                except (TypeError, ValueError):
+                    raise ValueError(f"carry_rules.{key} 必须为数值数组")
+            normalized[str(key)] = pair
+        return normalized
+
+    @field_validator("cross_chunk")
+    @classmethod
+    def _validate_cross_chunk(cls, value: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if value is None:
+            return value
+        if not isinstance(value, dict):
+            raise ValueError("cross_chunk 必须为对象")
+        return value
+
+
 class RuntimeGroupUpdateRequest(_RuntimeBase):
     whisper: Optional[WhisperRuntimeParams] = None
+    whisper_sanitize: Optional[WhisperSanitizeRuntimeParams] = None
+    whisper_prompt: Optional[WhisperPromptRuntimeParams] = None
     sensevoice: Optional[SenseVoiceRuntimeParams] = None
     demucs: Optional[DemucsRuntimeParams] = None
     vad: Optional[VADRuntimeParams] = None
+    timeline: Optional[TimelineRuntimeParams] = None
+    dnsmos: Optional[DNSMOSRuntimeParams] = None
     smart_probe: Optional[SmartProbeRuntimeParams] = None
     yamnet: Optional[YAMNetRuntimeParams] = None
     punctuation: Optional[PunctuationRuntimeParams] = None
     pipeline: Optional[PipelineRuntimeParams] = None
     normalization: Optional[NormalizationRuntimeParams] = None
     arbitration: Optional[ArbitrationRuntimeParams] = None
+    segmentation: Optional[SegmentationRuntimeParams] = None
+    language_policy: Optional[LanguagePolicyRuntimeParams] = None
 
 
 _RUNTIME_GROUP_MODELS = {
     "whisper": WhisperRuntimeParams,
     "whisper_sanitize": WhisperSanitizeRuntimeParams,
+    "whisper_prompt": WhisperPromptRuntimeParams,
     "sensevoice": SenseVoiceRuntimeParams,
     "demucs": DemucsRuntimeParams,
     "vad": VADRuntimeParams,
+    "timeline": TimelineRuntimeParams,
+    "dnsmos": DNSMOSRuntimeParams,
     "smart_probe": SmartProbeRuntimeParams,
     "yamnet": YAMNetRuntimeParams,
     "punctuation": PunctuationRuntimeParams,
     "pipeline": PipelineRuntimeParams,
     "normalization": NormalizationRuntimeParams,
     "arbitration": ArbitrationRuntimeParams,
+    "segmentation": SegmentationRuntimeParams,
+    "language_policy": LanguagePolicyRuntimeParams,
 }
 
 
@@ -455,6 +685,16 @@ _PARAM_SCHEMA: Dict[str, Any] = {
             "min_text_length": {"type": "int", "min": 0, "default": 2},
             "patterns": {"type": "object", "default": []},
         },
+        "whisper_prompt": {
+            "enabled": {"type": "bool", "default": False},
+            "max_prompt_chars": {"type": "int", "min": 32, "max": 1024, "default": 180},
+            "max_keyword_count": {"type": "int", "min": 1, "max": 128, "default": 16},
+            "max_context_chars": {"type": "int", "min": 16, "max": 512, "default": 80},
+            "max_history_chars": {"type": "int", "min": 32, "max": 2048, "default": 160},
+            "reset_pause_sec": {"type": "float", "min": 0.0, "max": 30.0, "default": 1.8},
+            "reset_no_speech_prob": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.65},
+            "reset_low_confidence": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.35},
+        },
         "sensevoice": {
             "language": {
                 "type": "enum",
@@ -478,10 +718,28 @@ _PARAM_SCHEMA: Dict[str, Any] = {
             "shifts": {"type": "int", "min": 1, "max": 5, "default": 1},
             "overlap": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.5},
             "segment_length": {"type": "int", "min": 1, "default": 10},
+            "global_group_duration_sec": {"type": "float", "min": 60.0, "default": 1800.0},
             "segment_buffer_sec": {"type": "float", "min": 0.0, "default": 2.0},
             "bgm_sample_duration": {"type": "float", "min": 1.0, "default": 10.0},
             "bgm_light_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.02},
             "bgm_heavy_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.15},
+        },
+        "timeline": {
+            "enabled": {"type": "bool", "default": True},
+            "device": {"type": "enum", "enum": ["auto", "cuda", "cpu"], "default": "cuda"},
+            "diarization_enabled": {"type": "bool", "default": False},
+            "diarization_model_id": {"type": "string", "default": "pyannote-speaker-diarization-community-1"},
+            "diarization_local_path": {"type": "string", "default": ""},
+            "diarization_hf_token": {"type": "string", "default": None},
+            "diarization_max_speakers": {"type": "int", "min": 1, "default": None},
+            "diarization_min_speakers": {"type": "int", "min": 1, "default": None},
+            "diarization_num_speakers": {"type": "int", "min": 1, "default": 3},
+            "segmentation_boundary_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.55},
+            "segmentation_min_boundary_interval_sec": {"type": "float", "min": 0.0, "default": 0.2},
+            "min_support_turns": {"type": "int", "min": 1, "default": 2},
+            "min_total_duration": {"type": "float", "min": 0.0, "default": 2.0},
+            "merge_similarity_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.88},
+            "long_pause_cut_sec": {"type": "float", "min": 0.0, "default": 1.8},
         },
         "vad": {
             "method": {"type": "enum", "enum": ["silero", "pyannote"], "default": "silero"},
@@ -502,17 +760,26 @@ _PARAM_SCHEMA: Dict[str, Any] = {
             "sensevoice_merge_max_duration": {"type": "float", "min": 0.0, "default": 8.0},
             "sensevoice_smart_target_duration": {"type": "float", "min": 0.0, "default": 8.0},
         },
+        "dnsmos": {
+            "device": {"type": "enum", "enum": ["auto", "cuda", "cpu"], "default": "cpu"},
+            "personalized": {"type": "bool", "default": False},
+            "ovrl_sep_hard": {"type": "float", "min": 0.0, "max": 5.0, "default": 2.0},
+            "sig_sep_hard": {"type": "float", "min": 0.0, "max": 5.0, "default": 2.1},
+            "p808_sep_hard": {"type": "float", "min": 0.0, "max": 5.0, "default": 2.0},
+            "ovrl_pass_hard": {"type": "float", "min": 0.0, "max": 5.0, "default": 3.1},
+            "sig_pass_hard": {"type": "float", "min": 0.0, "max": 5.0, "default": 3.2},
+            "bak_pass_hard": {"type": "float", "min": 0.0, "max": 5.0, "default": 3.0},
+            "p808_pass_soft": {"type": "float", "min": 0.0, "max": 5.0, "default": 2.9},
+        },
         "smart_probe": {
-            "snr_threshold": {"type": "float", "min": 0.0, "default": 15.0},
+            "probe_sep_ratio_min": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.40},
+            "probe_min_coverage": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.30},
+            "probe_max_step_chunks": {"type": "int", "min": 1, "default": 30},
         },
         "yamnet": {
-            "acappella_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.3},
-            "music_max_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.15},
-            "music_avg_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.10},
-            "speech_max_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.8},
-            "speech_max_music_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.1},
-            "speech_dominant_delta": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.3},
-            "speech_dominant_music_max": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.15},
+            "yamnet_music_conf_min": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.15},
+            "yamnet_speech_conf_min": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.85},
+            "yamnet_music_weak_max": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.10},
             "probe_window_count": {"type": "int", "min": 1, "max": 5, "default": 3},
             "probe_window_duration_sec": {"type": "float", "min": 0.5, "max": 2.0, "default": 0.975},
         },
@@ -566,6 +833,28 @@ _PARAM_SCHEMA: Dict[str, Any] = {
             "low_confidence_threshold": {"type": "float", "min": 0.0, "max": 1.0, "default": 0.5},
             "hallucination_block": {"type": "bool", "default": True},
         },
+        "segmentation": {
+            "enable": {"type": "bool", "default": True},
+            "min_chars": {"type": "int", "min": 1, "default": 6},
+            "min_duration_sec": {"type": "float", "min": 0.0, "default": 0.8},
+            "max_duration_sec": {"type": "float", "min": 0.0, "default": 12.0},
+            "max_tokens": {"type": "int", "min": 1, "default": 40},
+            "long_pause_sec": {"type": "float", "min": 0.0, "default": 0.8},
+            "soft_pause_sec": {"type": "float", "min": 0.0, "default": 0.4},
+            "short_merge_max_chars": {"type": "int", "min": 1, "default": 22},
+            "force_split_on_sentence_end_punct": {"type": "bool", "default": True},
+            "keep_sentence_end_punct": {"type": "bool", "default": False},
+            "soft_cut.enable": {"type": "bool", "default": True},
+            "soft_cut.overlap_degrade_enable": {"type": "bool", "default": False},
+            "soft_cut.plan_provider": {"type": "string", "default": "m1_internal"},
+            "soft_cut.plan_provider_class": {"type": "string", "default": ""},
+            "soft_cut.priority.active_profile": {
+                "type": "enum",
+                "enum": ["punct_boost_transition", "llm_ramp_up", "llm_primary_no_punct"],
+                "default": "punct_boost_transition",
+            },
+            "soft_cut.priority.profiles": {"type": "object", "default": {}},
+        },
         "normalization": {
             "itn.enable": {"type": "bool", "default": True},
             "itn.quality_min_ratio": {"type": "float", "min": 0.0, "default": 0.30},
@@ -582,6 +871,14 @@ _PARAM_SCHEMA: Dict[str, Any] = {
         "pipeline": {
             "batch_size": {"type": "int", "min": 1, "default": 16},
             "word_timestamps": {"type": "bool", "default": False},
+        },
+        "language_policy": {
+            "enabled": {"type": "bool", "default": True},
+            "default_language": {"type": "string", "default": "zh"},
+            "policy_version": {"type": "string", "default": "V3.2.0+dev.20260219.08"},
+            "thresholds": {"type": "object", "default": {}},
+            "carry_rules": {"type": "object", "default": {}},
+            "cross_chunk": {"type": "object", "default": {}},
         },
     },
 }
@@ -837,4 +1134,5 @@ async def get_runtime_params_schema() -> Dict[str, Any]:
         "resident": _PARAM_SCHEMA["resident"],
         "per_model": _PARAM_SCHEMA["per_model"],
         "runtime": _PARAM_SCHEMA["runtime"],
+        "auto_tune": _AUTO_TUNE_SCHEMA,
     }

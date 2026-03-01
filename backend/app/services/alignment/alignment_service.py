@@ -6,7 +6,7 @@ Phase 3 实现 - 2025-12-10
 实现 Needleman-Wunsch 序列对齐算法，用于将 Whisper 文本对齐到 SenseVoice 时间轴。
 支持静音区硬约束、能量锚点校准、VAD 边界校准和 Gap 填补。
 """
-# V3.2.0+dev.20260205.09: L4 对齐层口径收敛与词级置信度来源修正。
+# V3.2.0+dev.20260205.09: 集合层对齐口径收敛与词级置信度来源修正。
 
 import logging
 from typing import List, Optional, Tuple, Dict, Sequence
@@ -21,6 +21,12 @@ from app.models.confidence_models import (
 )
 from app.models.sensevoice_models import WordTimestamp
 from app.services.alignment.gap_resolver import GapResolver, GapResolution, GapResolutionResult
+from app.services.alignment.nw_v2_core import (
+    AlignmentPriorProvider,
+    NeedlemanWunschScoreConfig,
+    NeedlemanWunschV2Core,
+    ZeroPriorProvider,
+)
 from app.services.alignment.quality_stats import QualityStatsCalculator
 from app.services.alignment.types import AlignmentResult as LayerAlignmentResult
 from app.utils.text_utils import smart_join_words
@@ -49,6 +55,10 @@ class AlignmentConfig:
     # 置信度融合
     sv_weight: float = 0.4          # SenseVoice 置信度权重
     whisper_weight: float = 0.6     # Whisper 置信度权重
+    # V3.2.0+dev.20260215.11: NW V2 开关与加权参数
+    is_enable_nw_v2: bool = False
+    nw_v2_confidence_alpha: float = 0.6
+    nw_v2_prior_beta: float = 0.4
 
 
 class AlignmentService:
@@ -76,6 +86,17 @@ class AlignmentService:
         self.logger = logger or logging.getLogger(__name__)
         self.gap_resolver = gap_resolver or GapResolver(logger=self.logger)
         self.quality_stats_calculator = quality_stats_calculator or QualityStatsCalculator(logger=self.logger)
+        self._prior_provider: AlignmentPriorProvider = ZeroPriorProvider()
+        self._nw_core = NeedlemanWunschV2Core(
+            NeedlemanWunschScoreConfig(
+                base_match_score=float(self.config.match_score),
+                base_mismatch_penalty=float(self.config.mismatch_penalty),
+                base_gap_penalty=float(self.config.gap_penalty),
+                confidence_alpha=float(self.config.nw_v2_confidence_alpha),
+                prior_beta=float(self.config.nw_v2_prior_beta),
+                is_enable_weighted_scoring=bool(self.config.is_enable_nw_v2),
+            )
+        )
 
     async def align(
         self,
@@ -149,7 +170,7 @@ class AlignmentService:
         vad_intervals: Optional[List[Tuple[float, float]]] = None,
         token_confidences: Optional[Sequence[Optional[float]]] = None,
     ) -> LayerAlignmentResult:
-        """L4 专用：对齐 clean_text 并输出 AlignmentResult。"""
+        """集合层专用：对齐 clean_text 并输出 AlignmentResult。"""
         if vad_range is None:
             vad_range = self._resolve_vad_range(sv_tokens, vad_intervals)
 
@@ -204,7 +225,13 @@ class AlignmentService:
             return [], empty_result, quality_stats
 
         # 2. Needleman-Wunsch 序列对齐
-        alignment_path = self._needleman_wunsch(whisper_words, sv_words)
+        sv_confidences = [token.confidence for token in sv_tokens]
+        alignment_path = self._needleman_wunsch(
+            whisper_words,
+            sv_words,
+            seq1_confidences=token_confidences,
+            seq2_confidences=sv_confidences,
+        )
 
         # 3. 生成对齐后的字级时间戳
         aligned_words = self._generate_aligned_words(
@@ -324,10 +351,13 @@ class AlignmentService:
     def _needleman_wunsch(
         self,
         seq1: List[str],
-        seq2: List[str]
+        seq2: List[str],
+        *,
+        seq1_confidences: Optional[Sequence[Optional[float]]] = None,
+        seq2_confidences: Optional[Sequence[Optional[float]]] = None,
     ) -> List[Tuple[Optional[int], Optional[int]]]:
         """
-        Needleman-Wunsch 全局序列对齐算法
+        Needleman-Wunsch 全局序列对齐算法（统一 V1/V2 内核）。
 
         Args:
             seq1: 序列1（Whisper 词列表）
@@ -339,68 +369,14 @@ class AlignmentService:
                 - (i, None): seq1[i] 插入（SenseVoice 漏字）
                 - (None, j): seq2[j] 删除（SenseVoice 幻觉）
         """
-        m, n = len(seq1), len(seq2)
-
-        # 初始化得分矩阵和回溯矩阵
-        score = np.zeros((m + 1, n + 1), dtype=int)
-        traceback = np.zeros((m + 1, n + 1), dtype=int)
-
-        # 初始化第一行和第一列
-        for i in range(1, m + 1):
-            score[i][0] = score[i-1][0] + self.config.gap_penalty
-            traceback[i][0] = 1
-
-        for j in range(1, n + 1):
-            score[0][j] = score[0][j-1] + self.config.gap_penalty
-            traceback[0][j] = 2
-
-        # 填充得分矩阵
-        for i in range(1, m + 1):
-            for j in range(1, n + 1):
-                if self._is_match(seq1[i-1], seq2[j-1]):
-                    match = score[i-1][j-1] + self.config.match_score
-                else:
-                    match = score[i-1][j-1] + self.config.mismatch_penalty
-
-                delete = score[i-1][j] + self.config.gap_penalty
-                insert = score[i][j-1] + self.config.gap_penalty
-
-                max_score = max(match, delete, insert)
-                score[i][j] = max_score
-
-                if max_score == match:
-                    traceback[i][j] = 0
-                elif max_score == delete:
-                    traceback[i][j] = 1
-                else:
-                    traceback[i][j] = 2
-
-        # 回溯生成对齐路径
-        alignment_path = []
-        i, j = m, n
-
-        while i > 0 or j > 0:
-            if i == 0:
-                alignment_path.append((None, j - 1))
-                j -= 1
-            elif j == 0:
-                alignment_path.append((i - 1, None))
-                i -= 1
-            else:
-                direction = traceback[i][j]
-                if direction == 0:
-                    alignment_path.append((i - 1, j - 1))
-                    i -= 1
-                    j -= 1
-                elif direction == 1:
-                    alignment_path.append((i - 1, None))
-                    i -= 1
-                else:
-                    alignment_path.append((None, j - 1))
-                    j -= 1
-
-        alignment_path.reverse()
-        return alignment_path
+        return self._nw_core.align(
+            seq1,
+            seq2,
+            seq1_confidences=seq1_confidences,
+            seq2_confidences=seq2_confidences,
+            prior_provider=self._prior_provider,
+            match_fn=self._is_match,
+        )
 
     def _is_match(self, word1: str, word2: str) -> bool:
         """

@@ -9,17 +9,22 @@
  */
 
 import { apiClient } from './client'
+import projectTaskApi from './projectTaskApi'
 
 class TranscriptionAPI {
   /**
    * 上传文件并创建转录任务
    * @param {File} file - 视频文件对象
    * @param {Function} onProgress - 上传进度回调 (percent) => void
+   * @param {Object|null} taskConfig - 任务级配置（可选）
    * @returns {Promise<{job_id: string, filename: string, message: string, queue_position: number}>}
    */
-  async uploadFile(file, onProgress = null) {
+  async uploadFile(file, onProgress = null, taskConfig = null) {
     const formData = new FormData();
     formData.append("file", file);
+    if (taskConfig && typeof taskConfig === "object") {
+      formData.append("task_config", JSON.stringify(taskConfig));
+    }
 
     const config = {
       headers: {
@@ -43,13 +48,17 @@ class TranscriptionAPI {
   /**
    * 为本地 input 文件创建转录任务
    * @param {string} filename - 文件名
+   * @param {Object|null} taskConfig - 任务级配置（可选）
    * @returns {Promise<{job_id: string, filename: string}>}
    */
-  async createJob(filename) {
+  async createJob(filename, taskConfig = null) {
     const formData = new FormData();
     formData.append("filename", filename);
+    if (taskConfig && typeof taskConfig === "object") {
+      formData.append("task_config", JSON.stringify(taskConfig));
+    }
 
-    return apiClient.post("/api/create-job", formData);
+    return apiClient.post("/api/create-task", formData);
   }
 
   /**
@@ -108,9 +117,7 @@ class TranscriptionAPI {
    * @returns {Promise<{job_id: string, canceled: boolean, data_deleted: boolean}>}
    */
   async cancelJob(jobId, deleteData = false) {
-    return apiClient.post(`/api/cancel/${jobId}`, null, {
-      params: { delete_data: deleteData },
-    });
+    return projectTaskApi.cancelTask(jobId, deleteData);
   }
 
   /**
@@ -119,7 +126,7 @@ class TranscriptionAPI {
    * @returns {Promise<{job_id: string, paused: boolean}>}
    */
   async pauseJob(jobId) {
-    return apiClient.post(`/api/pause/${jobId}`);
+    return projectTaskApi.pauseTask(jobId);
   }
 
   /**
@@ -133,7 +140,7 @@ class TranscriptionAPI {
    * @returns {Promise<{job_id: string, resumed: boolean, status: string, queue_position: number}>}
    */
   async resumeJob(jobId) {
-    return apiClient.post(`/api/resume/${jobId}`);
+    return projectTaskApi.resumeTask(jobId);
   }
 
   /**
@@ -143,9 +150,7 @@ class TranscriptionAPI {
    * @returns {Promise<{job_id: string, prioritized: boolean, mode: string, queue_position: number}>}
    */
   async prioritizeJob(jobId, mode = "gentle") {
-    return apiClient.post(`/api/prioritize/${jobId}`, null, {
-      params: { mode },
-    });
+    return projectTaskApi.prioritizeTask(jobId, mode);
   }
 
   /**
@@ -155,9 +160,7 @@ class TranscriptionAPI {
    * @returns {Promise<Object>} 完整任务对象
    */
   async getJobStatus(jobId, includeMedia = true) {
-    return apiClient.get(`/api/status/${jobId}`, {
-      params: { include_media: includeMedia },
-    });
+    return projectTaskApi.getTaskStatus(jobId, includeMedia);
   }
 
   /**
@@ -166,7 +169,7 @@ class TranscriptionAPI {
    * @returns {Promise<{offset: number, source: string}>}
    */
   async getJobSubtitleTimeOffset(jobId) {
-    return apiClient.get(`/api/jobs/${jobId}/subtitle-time-offset`);
+    return apiClient.get(`/api/projects/${jobId}/subtitle-time-offset`);
   }
 
   /**
@@ -176,7 +179,7 @@ class TranscriptionAPI {
    * @returns {Promise<{offset: number, source: string}>}
    */
   async setJobSubtitleTimeOffset(jobId, offset) {
-    return apiClient.post(`/api/jobs/${jobId}/subtitle-time-offset`, { offset });
+    return apiClient.post(`/api/projects/${jobId}/subtitle-time-offset`, { offset });
   }
 
   /**
@@ -184,7 +187,7 @@ class TranscriptionAPI {
    * @returns {Promise<{queue: string[], running: string, interrupted: string, jobs: Object}>}
    */
   async getQueueStatus() {
-    return apiClient.get("/api/queue-status");
+    return projectTaskApi.getQueueStatus();
   }
 
   /**
@@ -278,7 +281,7 @@ class TranscriptionAPI {
    * @returns {Promise<{success: boolean, tasks: Array, count: number, timestamp: number}>}
    */
   async syncTasks() {
-    return apiClient.get("/api/sync-tasks");
+    return projectTaskApi.syncTasks();
   }
 
   /**
@@ -286,7 +289,7 @@ class TranscriptionAPI {
    * @returns {Promise<{jobs: Object[], count: number}>}
    */
   async getIncompleteJobs() {
-    return apiClient.get("/api/incomplete-jobs");
+    return apiClient.get("/api/incomplete-tasks");
   }
 
   /**
@@ -304,7 +307,7 @@ class TranscriptionAPI {
    * @returns {Promise<Object>} 任务对象
    */
   async restoreJob(jobId) {
-    return apiClient.post(`/api/restore-job/${jobId}`);
+    return apiClient.post(`/api/restore-task/${jobId}`);
   }
 
   /**
@@ -355,7 +358,7 @@ class TranscriptionAPI {
    * @returns {Promise<{success: boolean, job_id: string, title: string, message: string}>}
    */
   async renameJob(jobId, title) {
-    return apiClient.post(`/api/rename-job/${jobId}`, {
+    return apiClient.post(`/api/rename-task/${jobId}`, {
       title,
     });
   }
@@ -371,7 +374,7 @@ class TranscriptionAPI {
    * @returns {Promise<{success: boolean, data: Object}>}
    */
   async updateSubtitle(jobId, sentenceIndex, update) {
-    return apiClient.patch(`/api/jobs/${jobId}/subtitles/${sentenceIndex}`, update);
+    return apiClient.patch(`/api/projects/${jobId}/subtitles/legacy/${sentenceIndex}`, update);
   }
 
   /**
@@ -384,7 +387,7 @@ class TranscriptionAPI {
    * @returns {Promise<{success: boolean, data: Object}>}
    */
   async createSubtitle(jobId, payload) {
-    return apiClient.post(`/api/jobs/${jobId}/subtitles`, payload);
+    return apiClient.post(`/api/projects/${jobId}/subtitles`, payload);
   }
 
   /**
@@ -394,7 +397,121 @@ class TranscriptionAPI {
    * @returns {Promise<{success: boolean, data: Object}>}
    */
   async deleteSubtitle(jobId, sentenceIndex) {
-    return apiClient.delete(`/api/jobs/${jobId}/subtitles/${sentenceIndex}`);
+    return apiClient.delete(`/api/projects/${jobId}/subtitles/legacy/${sentenceIndex}`);
+  }
+
+  // ========================
+  // 同音检索与批量替换 API
+  // ========================
+
+  /**
+   * 同音查找
+   * @param {string} jobId - 任务ID
+   * @param {Object} payload - 查找参数
+   * @param {string} payload.query - 搜索关键词
+   * @param {string} payload.mode - 搜索模式 (literal/regex/homophone_strict/homophone_fuzzy)
+   * @param {string} [payload.reading] - 指定读音（仅同音模式）
+   * @param {boolean} [payload.ignore_punctuation] - 是否忽略标点
+   * @returns {Promise<{matches: Array, clusters: Object}>}
+   */
+  async homophoneFind(jobId, payload) {
+    return apiClient.post(`/api/projects/${jobId}/homophone/find`, payload);
+  }
+
+  /**
+   * 获取同音索引状态
+   * @param {string} jobId - 任务ID
+   * @returns {Promise<{status: string, progress: number, message: string}>}
+   */
+  async getHomophoneIndexStatus(jobId) {
+    return apiClient.get(`/api/projects/${jobId}/homophone/index-status`);
+  }
+
+  /**
+   * 批量替换
+   * @param {string} jobId - 任务ID
+   * @param {Object} payload - 替换参数
+   * @param {Array<{sentence_index: number, char_start: number, char_end: number}>} payload.targets - 替换目标
+   * @param {string} payload.replacement - 替换文本
+   * @returns {Promise<{success: boolean, replaced_count: number, updated_subtitles: Array}>}
+   */
+  async homophoneBatchReplace(jobId, payload) {
+    return apiClient.post(`/api/projects/${jobId}/homophone/batch-replace`, payload);
+  }
+
+  /**
+   * 获取全局术语表
+   * @returns {Promise<{terms: Array<{pattern: string, replacement: string, enabled: boolean}>}>}
+   */
+  async getHomophoneGlobalTerms() {
+    return apiClient.get('/api/settings/homophone/global-terms');
+  }
+
+  /**
+   * 保存全局术语表
+   * @param {Object} payload - 术语表数据
+   * @param {Array<{pattern: string, replacement: string, enabled: boolean}>} payload.terms - 术语列表
+   * @returns {Promise<{success: boolean}>}
+   */
+  async putHomophoneGlobalTerms(payload) {
+    return apiClient.put('/api/settings/homophone/global-terms', payload);
+  }
+
+  /**
+   * 获取说话人资料列表
+   * @param {string} jobId - 任务ID
+   * @returns {Promise<{job_id: string, profiles: Array}>}
+   */
+  async listSpeakerProfiles(jobId) {
+    return apiClient.get(`/api/speakers/${jobId}/profiles`);
+  }
+
+  /**
+   * 获取指定说话人的字幕绑定列表
+   * @param {string} jobId - 任务ID
+   * @param {string} speakerId - 说话人ID
+   * @returns {Promise<{job_id: string, speaker_id: string, subtitles: Array}>}
+   */
+  async listSpeakerSubtitles(jobId, speakerId) {
+    return apiClient.get(`/api/speakers/${jobId}/profiles/${speakerId}/subtitles`);
+  }
+
+  /**
+   * 更新说话人资料（名称/颜色/锁定/状态）
+   * @param {string} jobId - 任务ID
+   * @param {string} speakerId - 说话人ID
+   * @param {Object} payload - 更新字段
+   * @returns {Promise<{success: boolean, data: Object, revision_id: string, updated_at: number}>}
+   */
+  async updateSpeakerProfile(jobId, speakerId, payload) {
+    return apiClient.patch(`/api/speakers/${jobId}/profiles/${speakerId}`, payload);
+  }
+
+  /**
+   * 改绑句级 speaker
+   * @param {string} jobId - 任务ID
+   * @param {number} sentenceIndex - 句子索引
+   * @param {string} speakerId - 目标说话人ID
+   * @returns {Promise<{success: boolean, data: Object, revision_id: string, updated_at: number}>}
+   */
+  async rebindSubtitleSpeaker(jobId, sentenceIndex, speakerId) {
+    return apiClient.patch(`/api/speakers/${jobId}/subtitles/${sentenceIndex}`, {
+      speaker_id: speakerId,
+    });
+  }
+
+  /**
+   * 合并说话人
+   * @param {string} jobId - 任务ID
+   * @param {string} sourceSpeakerId - 源说话人ID
+   * @param {string} targetSpeakerId - 目标说话人ID
+   * @returns {Promise<{success: boolean, data: Object, revision_id: string, updated_at: number}>}
+   */
+  async mergeSpeakerProfiles(jobId, sourceSpeakerId, targetSpeakerId) {
+    return apiClient.post(`/api/speakers/${jobId}/profiles/merge`, {
+      source_speaker_id: sourceSpeakerId,
+      target_speaker_id: targetSpeakerId,
+    });
   }
 }
 

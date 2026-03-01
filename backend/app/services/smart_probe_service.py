@@ -1,239 +1,228 @@
 """
-SmartProbeService - 智能探针分诊服务
+SmartProbeService - DNSMOS 驱动的智能探针服务。
 
-V3.1.2+dev.20260109.01: 新增智能探针分诊策略
-
-使用中心扩散探针策略，快速判断视频是否需要全量探测：
-- 从中心点开始探测
-- 使用斐波那契数列扩散（1, 1, 2, 3, 5, 8...）
-- 达到最大步长后转为线性扫描
-- 一旦发现"脏"chunk（SNR < 阈值），立即触发全量探测
-- 如果全部通过，则判定为纯净视频
-
-核心优势：
-- 快速筛选：平均只需检测 30-40% 的 chunks
-- 智能扩散：优先检测中心区域，逐步扩散到边缘
-- 保守策略：一旦发现干扰，立即触发全量探测
+策略：
+- 先中心后扩散抽样；
+- 按抽样结果判断 `SEPARATE_ALL / PASS_ALL / ESCALATE_STANDARD`；
+- 只做快判，不替代标准逐 chunk 音频预检。
 """
-import logging
-from typing import List, Dict, Tuple, Optional
 
-from app.services.runtime_param_resolver import get_smart_probe_runtime_params
+from __future__ import annotations
+
+import logging
+from typing import Dict, List, Optional, Tuple
+
+from app.services.runtime_param_resolver import get_dnsmos_runtime_params, get_smart_probe_runtime_params
 
 logger = logging.getLogger(__name__)
 
 
 class SmartProbeService:
-    """
-    智能探针分诊服务
-
-    使用中心扩散探针策略（Center-Out Exponential/Linear Probe）
-    快速判断视频是否需要全量探测
-    """
+    """DNSMOS 智能探针服务。"""
 
     def __init__(
         self,
-        brouhaha_service,
-        snr_threshold: float = 15.0,
-        max_step_chunks: int = 30
-    ):
-        """
-        初始化智能探针服务
+        dnsmos_service,
+        probe_sep_ratio_min: float = 0.40,
+        probe_min_coverage: float = 0.30,
+        max_step_chunks: int = 30,
+    ) -> None:
+        self.dnsmos = dnsmos_service
+        self.probe_sep_ratio_min = probe_sep_ratio_min
+        self.probe_min_coverage = probe_min_coverage
+        self.max_step_chunks = max_step_chunks
 
-        Args:
-            brouhaha_service: Brouhaha SNR 检测服务实例
-            snr_threshold: SNR 阈值，低于此值触发分离（默认 15.0 dB）
-            max_step_chunks: 最大步长（chunk数），达到此步长后转为线性扫描
-                           假设1个chunk=0.5s，30个chunk=15s，保证不漏掉长于15s的BGM
-        """
-        self.brouhaha = brouhaha_service
-        self.threshold = snr_threshold
-        self.max_step = max_step_chunks
-
-    def _fibonacci_generator(self):
-        """生成斐波那契数列: 1, 1, 2, 3, 5, 8..."""
+    @staticmethod
+    def _fibonacci_generator():
         a, b = 0, 1
         while True:
             yield b
             a, b = b, a + b
 
+    @staticmethod
+    def _get_dnsmos_thresholds() -> Dict[str, float]:
+        runtime = get_dnsmos_runtime_params()
+        return {
+            "ovrl_sep_hard": float(runtime.get("ovrl_sep_hard", 2.0)),
+            "sig_sep_hard": float(runtime.get("sig_sep_hard", 2.1)),
+            "p808_sep_hard": float(runtime.get("p808_sep_hard", 2.0)),
+            "ovrl_pass_hard": float(runtime.get("ovrl_pass_hard", 3.1)),
+            "sig_pass_hard": float(runtime.get("sig_pass_hard", 3.2)),
+            "bak_pass_hard": float(runtime.get("bak_pass_hard", 3.0)),
+            "p808_pass_soft": float(runtime.get("p808_pass_soft", 2.9)),
+        }
+
+    def _check_chunk(self, chunk) -> Dict[str, object]:
+        thresholds = self._get_dnsmos_thresholds()
+        result = self.dnsmos.detect(chunk.audio, sr=chunk.sample_rate, chunk_id=chunk.index)
+        if not result.is_valid:
+            return {
+                "sig": None,
+                "bak": None,
+                "ovrl": None,
+                "p808": None,
+                "is_hard_separate": False,
+                "is_hard_pass": False,
+                "probe_decision": "gray",
+                "calculated": False,
+            }
+
+        is_hard_separate = (
+            result.ovrl <= thresholds["ovrl_sep_hard"]
+            or result.sig <= thresholds["sig_sep_hard"]
+            or result.p808 <= thresholds["p808_sep_hard"]
+        )
+        is_hard_pass = (
+            result.ovrl >= thresholds["ovrl_pass_hard"]
+            and result.sig >= thresholds["sig_pass_hard"]
+            and result.bak >= thresholds["bak_pass_hard"]
+            and result.p808 >= thresholds["p808_pass_soft"]
+        )
+        if is_hard_separate:
+            probe_decision = "separate"
+        elif is_hard_pass:
+            probe_decision = "pass"
+        else:
+            probe_decision = "gray"
+
+        return {
+            "sig": float(result.sig),
+            "bak": float(result.bak),
+            "ovrl": float(result.ovrl),
+            "p808": float(result.p808),
+            "is_hard_separate": is_hard_separate,
+            "is_hard_pass": is_hard_pass,
+            "probe_decision": probe_decision,
+            "calculated": True,
+        }
+
+    def _evaluate_state(self, n_chunks: int, cache: Dict[int, Dict[str, object]]) -> str:
+        if not cache:
+            return "ESCALATE_STANDARD"
+        values = list(cache.values())
+        separate_count = sum(1 for item in values if bool(item.get("is_hard_separate", False)))
+        pass_count = sum(1 for item in values if bool(item.get("is_hard_pass", False)))
+        probed = len(values)
+        coverage = probed / max(1, n_chunks)
+        sep_ratio = separate_count / max(1, probed)
+
+        if sep_ratio >= self.probe_sep_ratio_min:
+            return "SEPARATE_ALL"
+        if coverage >= self.probe_min_coverage and pass_count == probed:
+            return "PASS_ALL"
+        return "ESCALATE_STANDARD"
+
     def run_probe(
         self,
         chunks: List,
-        progress_callback: Optional[callable] = None
-    ) -> Tuple[str, Dict[int, Dict], List[int]]:
+        progress_callback: Optional[callable] = None,
+    ) -> Tuple[str, Dict[int, Dict[str, object]], List[int]]:
         """
-        执行中心扩散探针 (Center-Out Exponential/Linear Probe)
+        执行中心扩散探针。
 
-        Args:
-            chunks: AudioChunk 列表
-            progress_callback: 进度回调函数，接收 (current, total) 参数
-
-        Returns:
-            decision: 'SEPARATE_ALL' | 'PASS_ALL'
-            cache: {chunk_index: {'snr': float, 'c50': float, 'decision': str}}
-            probe_sequence: 探测顺序列表
+        返回：
+        - decision: `SEPARATE_ALL` | `PASS_ALL` | `ESCALATE_STANDARD`
+        - cache: 已探测 chunk 结果缓存
+        - probe_sequence: 探测顺序
         """
-        n = len(chunks)
-        if n == 0:
+        n_chunks = len(chunks)
+        if n_chunks == 0:
             return "PASS_ALL", {}, []
 
-        center = n // 2
-        cache = {}  # 缓存结果
+        center = n_chunks // 2
+        cache: Dict[int, Dict[str, object]] = {}
         probe_sequence: List[int] = []
+        visited = set()
 
-        # 1. 优先探测中心
-        is_dirty, result = self._check_chunk(chunks[center])
-        cache[center] = result
-        probe_sequence.append(center)
+        def _probe(index: int) -> None:
+            if index < 0 or index >= n_chunks or index in visited:
+                return
+            visited.add(index)
+            cache[index] = self._check_chunk(chunks[index])
+            probe_sequence.append(index)
+            if progress_callback:
+                progress_callback(len(visited), n_chunks)
 
-        if progress_callback:
-            progress_callback(1, n)
+        # 1. 中心点
+        _probe(center)
+        decision = self._evaluate_state(n_chunks=n_chunks, cache=cache)
+        if decision in {"SEPARATE_ALL", "PASS_ALL"}:
+            return decision, cache, probe_sequence
 
-        if is_dirty:
-            logger.info(
-                f"探针: 中心点 [{center}] 发现干扰 (SNR={result['snr']:.1f}dB)，"
-                f"触发全量探测"
-            )
-            return "SEPARATE_ALL", cache, probe_sequence
-
-        # 2. 斐波那契扩散 + 线性扫描
+        # 2. 斐波那契扩散
         fib_gen = self._fibonacci_generator()
-        visited_indices = {center}
-        cumulative_radius = 0  # 累加半径
-
-        while True:
-            try:
-                # 获取下一个斐波那契数
-                fib_step = next(fib_gen)
-            except StopIteration:
-                break  # 理论上斐波那契无限，这里防御性编程
-
-            # 关键逻辑修复：
-            # 增量 = min(斐波那契增长, 最大步长限制)
-            # 效果：前期按 1,1,2,3,5... 加速扩散
-            #      一旦超过 max_step，后期按 max_step, max_step... 匀速线性扩散
-            current_increment = min(fib_step, self.max_step)
-
-            # 累加总半径
-            cumulative_radius += current_increment
-
+        cumulative_radius = 0
+        while len(visited) < n_chunks:
+            step = min(next(fib_gen), self.max_step_chunks)
+            cumulative_radius += step
             left = center - cumulative_radius
             right = center + cumulative_radius
-
-            # 检查是否全部越界（探测结束）
-            if left < 0 and right >= n:
+            if left < 0 and right >= n_chunks:
                 break
+            _probe(left)
+            _probe(right)
+            decision = self._evaluate_state(n_chunks=n_chunks, cache=cache)
+            if decision in {"SEPARATE_ALL", "PASS_ALL"}:
+                return decision, cache, probe_sequence
 
-            # 探测左翼
-            if left >= 0 and left not in visited_indices:
-                is_dirty, result = self._check_chunk(chunks[left])
-                cache[left] = result
-                visited_indices.add(left)
-                probe_sequence.append(left)
-
-                if progress_callback:
-                    progress_callback(len(visited_indices), n)
-
-                if is_dirty:
-                    logger.info(
-                        f"探针: 左翼 [{left}] 发现干扰 (SNR={result['snr']:.1f}dB)，"
-                        f"触发全量探测"
-                    )
-                    return "SEPARATE_ALL", cache, probe_sequence
-
-            # 探测右翼
-            if right < n and right not in visited_indices:
-                is_dirty, result = self._check_chunk(chunks[right])
-                cache[right] = result
-                visited_indices.add(right)
-                probe_sequence.append(right)
-
-                if progress_callback:
-                    progress_callback(len(visited_indices), n)
-
-                if is_dirty:
-                    logger.info(
-                        f"探针: 右翼 [{right}] 发现干扰 (SNR={result['snr']:.1f}dB)，"
-                        f"触发全量探测"
-                    )
-                    return "SEPARATE_ALL", cache, probe_sequence
-
-        coverage = len(cache) / n
+        # 3. 最终判定
+        decision = self._evaluate_state(n_chunks=n_chunks, cache=cache)
+        if decision not in {"SEPARATE_ALL", "PASS_ALL"}:
+            decision = "ESCALATE_STANDARD"
         logger.info(
-            f"探针: 通过智能快筛 (覆盖率 {coverage:.1%})，判定为纯净视频"
+            "智能探针完成: decision=%s, probed=%d/%d",
+            decision,
+            len(cache),
+            n_chunks,
         )
-        return "PASS_ALL", cache, probe_sequence
-
-    def _check_chunk(self, chunk) -> Tuple[bool, Dict]:
-        """
-        实际推理逻辑
-
-        Args:
-            chunk: AudioChunk 对象
-
-        Returns:
-            is_dirty: 是否需要分离
-            result: 检测结果字典
-        """
-        # 调用 Brouhaha 检测 SNR 和 C50
-        brouhaha_result = self.brouhaha.detect(
-            chunk.audio,
-            chunk.sample_rate,
-            chunk_id=chunk.index
-        )
-
-        snr = brouhaha_result.snr
-        c50 = brouhaha_result.c50
-
-        is_dirty = snr < self.threshold
-
-        return is_dirty, {
-            "snr": snr,
-            "c50": c50,
-            "calculated": True,
-            "probe_decision": "separate" if is_dirty else "pass"
-        }
+        return decision, cache, probe_sequence
 
 
-# 单例访问
 _smart_probe_instance: Optional[SmartProbeService] = None
 
 
 def get_smart_probe_service(
-    snr_threshold: Optional[float] = None,
-    max_step_chunks: Optional[int] = None
+    probe_sep_ratio_min: Optional[float] = None,
+    probe_min_coverage: Optional[float] = None,
+    max_step_chunks: Optional[int] = None,
 ) -> SmartProbeService:
-    """
-    获取智能探针服务单例
-
-    Args:
-        snr_threshold: SNR 阈值（默认 15.0 dB）
-        max_step_chunks: 最大步长（默认 30 chunks）
-
-    Returns:
-        SmartProbeService: 智能探针服务实例
-    """
+    """获取智能探针服务单例。"""
     global _smart_probe_instance
     runtime = get_smart_probe_runtime_params()
-    effective_snr = snr_threshold if snr_threshold is not None else runtime.get("snr_threshold", 15.0)
-    effective_max_step = max_step_chunks if max_step_chunks is not None else 30
+    effective_sep_ratio = (
+        probe_sep_ratio_min
+        if probe_sep_ratio_min is not None
+        else float(runtime.get("probe_sep_ratio_min", 0.40))
+    )
+    effective_min_coverage = (
+        probe_min_coverage
+        if probe_min_coverage is not None
+        else float(runtime.get("probe_min_coverage", 0.30))
+    )
+    effective_max_step = (
+        max_step_chunks
+        if max_step_chunks is not None
+        else int(runtime.get("probe_max_step_chunks", 30))
+    )
 
     if _smart_probe_instance is None:
-        from app.services.brouhaha_service import get_brouhaha_service
-        brouhaha = get_brouhaha_service()
+        from app.services.dnsmos_service import get_dnsmos_service
+
+        dnsmos = get_dnsmos_service()
         _smart_probe_instance = SmartProbeService(
-            brouhaha_service=brouhaha,
-            snr_threshold=effective_snr,
-            max_step_chunks=effective_max_step
+            dnsmos_service=dnsmos,
+            probe_sep_ratio_min=effective_sep_ratio,
+            probe_min_coverage=effective_min_coverage,
+            max_step_chunks=effective_max_step,
         )
     else:
-        _smart_probe_instance.threshold = effective_snr
-        _smart_probe_instance.max_step = effective_max_step
+        _smart_probe_instance.probe_sep_ratio_min = effective_sep_ratio
+        _smart_probe_instance.probe_min_coverage = effective_min_coverage
+        _smart_probe_instance.max_step_chunks = effective_max_step
     return _smart_probe_instance
 
 
-def reset_smart_probe_service():
-    """重置智能探针服务单例（用于测试）"""
+def reset_smart_probe_service() -> None:
+    """重置智能探针服务单例。"""
     global _smart_probe_instance
     _smart_probe_instance = None

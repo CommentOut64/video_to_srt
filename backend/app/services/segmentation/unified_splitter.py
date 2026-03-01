@@ -14,6 +14,7 @@ from app.models.sensevoice_models import SentenceSegment, TextSource, WordTimest
 from app.services.model_runtime_config_service import get_model_runtime_config_service
 from app.services.punctuation.base import PuncPosition
 from app.services.punctuation.final_splitter import FinalSplitter, FinalSplitConfig
+from app.services.text_protection import should_preserve_trailing_punct
 
 
 _STRONG_END_PUNCT = set("。？！.!?")
@@ -96,7 +97,7 @@ class UnifiedSplitter:
         text_clean = sv_result.get("text_clean", "")
         text_display = sv_result.get("text_itn_raw") or text_clean
         words_data = sv_result.get("words", [])
-        words = self._build_words(words_data)
+        words = self._build_words(words_data, logger=self.logger)
         if not words:
             return self._build_fallback_sentence(
                 text_display=text_display,
@@ -138,7 +139,7 @@ class UnifiedSplitter:
         text_clean = sv_result.get("text_clean", "")
         text_display = sv_result.get("text_itn_raw") or text_clean
         words_data = sv_result.get("words", [])
-        words = self._build_words(words_data)
+        words = self._build_words(words_data, logger=self.logger)
         if not words:
             return self._build_fallback_sentence(
                 text_display=text_display,
@@ -373,15 +374,40 @@ class UnifiedSplitter:
                 last_word.word = _strip_trailing_sentence_punct(last_word.word)
 
     @staticmethod
-    def _build_words(words_data: List[Dict[str, Any]]) -> List[WordTimestamp]:
+    def _build_words(
+        words_data: Optional[Sequence[Dict[str, Any]]],
+        *,
+        logger: Optional[logging.Logger] = None,
+    ) -> List[WordTimestamp]:
+        if words_data is None:
+            return []
+        if (
+            not isinstance(words_data, Sequence)
+            or isinstance(words_data, (str, bytes, bytearray, dict))
+        ):
+            if logger:
+                logger.warning(
+                    "UnifiedSplitter 输入 words 类型非法，按空列表处理: type=%s",
+                    type(words_data).__name__,
+                )
+            return []
+
+        def _to_float(value: Any, default: float) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
         words: List[WordTimestamp] = []
         for word in words_data:
+            if not isinstance(word, dict):
+                continue
             words.append(
                 WordTimestamp(
-                    word=word.get("word", ""),
-                    start=word.get("start", 0.0),
-                    end=word.get("end", 0.0),
-                    confidence=word.get("confidence", 1.0),
+                    word=str(word.get("word", "") or ""),
+                    start=_to_float(word.get("start", 0.0), 0.0),
+                    end=_to_float(word.get("end", 0.0), 0.0),
+                    confidence=_to_float(word.get("confidence", 1.0), 1.0),
                     confidence_raw=word.get("confidence_raw"),
                     confidence_display_raw=word.get("confidence_display_raw"),
                     token_type=word.get("token_type"),
@@ -575,5 +601,8 @@ def _strip_trailing_sentence_punct(text: Optional[str]) -> str:
     punct_to_remove = {"。", ".", "，", ",", "、", "；", ";"}
     idx = len(text) - 1
     while idx >= 0 and text[idx] in punct_to_remove:
+        # V3.2.0+dev.20260218.03: 保护规则 - 数字结构尾部点号不删除（避免 0. 被截断成 0）。
+        if should_preserve_trailing_punct(text, idx):
+            break
         idx -= 1
     return text[: idx + 1]

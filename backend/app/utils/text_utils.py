@@ -106,19 +106,16 @@ def repair_timestamp_overlaps(segments: List[Dict], gap_ms: float = 1.0) -> List
     if not segments:
         return []
 
-    # 按开始时间排序
-    sorted_segs = sorted(segments, key=lambda x: x.get('start', 0))
-
     repaired_segs = []
     gap_sec = gap_ms / 1000.0  # 转换为秒
 
-    for i in range(len(sorted_segs)):
+    for i in range(len(segments)):
         # 浅拷贝，避免修改原数据
-        current = sorted_segs[i].copy()
+        current = segments[i].copy()
 
         # 如果不是最后一条，检查与后面的重叠
-        if i < len(sorted_segs) - 1:
-            next_seg = sorted_segs[i + 1]
+        if i < len(segments) - 1:
+            next_seg = segments[i + 1]
             next_start = next_seg.get('start', 0)
             current_end = current.get('end', 0)
 

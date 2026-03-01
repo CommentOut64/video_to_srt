@@ -182,6 +182,24 @@ class SentenceSegment:
     is_finalized: bool = False                    # 是否已定稿（慢流完成）
     sv_original_text: Optional[str] = None        # SenseVoice 原始文本（用于对比）
     whisper_text: Optional[str] = None            # Whisper 识别文本（用于对比）
+    # V3.2.4+dev.20260228.01: 稳定句子身份（避免可变 sentence_index 漂移）
+    sentence_uid: Optional[str] = None            # 运行态稳定句子ID
+    segment_id: Optional[str] = None              # 对外编辑主键（与 sentence_uid 同步）
+    chunk_uid: Optional[str] = None               # 语义块唯一ID（支持 string chunk_id）
+
+    # Phase 2: Timeline 语义绑定字段
+    speaker_id: Optional[str] = None              # 句级说话人标识
+    turn_id: Optional[str] = None                 # 句级 turn 标识
+    speaker_label: Optional[str] = None           # 句级说话人展示名
+    speaker_color_key: Optional[str] = None       # 句级说话人颜色键
+    binding_source: Optional[str] = None          # 句级绑定来源（auto/user）
+    split_reason: Optional[str] = None            # 句级切分原因（裁决层/输出层透传）
+    split_risk: Optional[str] = None              # 句级切分风险（裁决层/输出层透传）
+    window_id: Optional[str] = None               # 触发窗口 ID（soft-cut）
+    pyannote_frame_time: Optional[float] = None   # 原始 pyannote 帧时间
+    mapped_cut_time: Optional[float] = None       # 吸附后的切分时间
+    mapping_quality: Optional[str] = None         # 时间映射质量等级
+    mapping_reason: Optional[str] = None          # 时间映射原因
 
     def __post_init__(self):
         """初始化后处理：计算 display_confidence"""
@@ -298,7 +316,24 @@ class SentenceSegment:
             # Layer 2: 语义分组相关字段
             "group_id": self.group_id,
             "is_soft_break": self.is_soft_break,
-            "group_position": self.group_position
+            "group_position": self.group_position,
+            # V3.2.4+dev.20260228.01: 稳定身份字段
+            "sentence_uid": self.sentence_uid,
+            "segment_id": self.segment_id or self.sentence_uid,
+            "chunk_uid": self.chunk_uid,
+            # Phase 2: Timeline 语义绑定字段
+            "speaker_id": self.speaker_id,
+            "turn_id": self.turn_id,
+            "speaker_label": self.speaker_label,
+            "speaker_color_key": self.speaker_color_key,
+            "binding_source": self.binding_source,
+            "split_reason": self.split_reason,
+            "split_risk": self.split_risk,
+            "window_id": self.window_id,
+            "pyannote_frame_time": self.pyannote_frame_time,
+            "mapped_cut_time": self.mapped_cut_time,
+            "mapping_quality": self.mapping_quality,
+            "mapping_reason": self.mapping_reason,
         }
 
 

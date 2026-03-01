@@ -30,6 +30,7 @@ function debounce(fn, delay) {
  * @param {Ref<boolean>} isReady - 波形是否就绪
  * @param {Function} onSubtitleEdit - 字幕编辑回调
  * @param {object} playbackManager - PlaybackManager 实例
+ * @param {object} subtitleDocumentStore - 字幕文档 store
  * @param {Function} emit - 事件发射函数
  */
 export function useWaveformRegions(
@@ -39,6 +40,7 @@ export function useWaveformRegions(
   isReady,
   onSubtitleEdit,
   playbackManager,
+  subtitleDocumentStore,
   emit
 ) {
   // ============ 状态 ============
@@ -47,11 +49,26 @@ export function useWaveformRegions(
   // ============ 私有状态 ============
   let regionUpdateTimer = null
 
+  function resolveMaybeRefValue(valueOrRef) {
+    if (valueOrRef && typeof valueOrRef === 'object' && 'value' in valueOrRef) {
+      return valueOrRef.value
+    }
+    return valueOrRef
+  }
+
+  function getSelectedSubtitleId() {
+    return resolveMaybeRefValue(subtitleDocumentStore?.selectedSubtitleId) ?? null
+  }
+
+  function setSelectedSubtitleId(subtitleId) {
+    subtitleDocumentStore.setSelectedSubtitleId(subtitleId)
+  }
+
   // 节流的 Region 同步
-  const debouncedRegionSync = debounce((sentenceIndex, start, end) => {
-    if (sentenceIndex === undefined || sentenceIndex === null) return
-    if (projectStore.isSentenceDeleted?.(sentenceIndex)) return
-    onSubtitleEdit(sentenceIndex, { start, end })
+  const debouncedRegionSync = debounce((syncKey, start, end) => {
+    if (syncKey === undefined || syncKey === null) return
+    if (typeof syncKey === 'number' && projectStore.isSentenceDeleted?.(syncKey)) return
+    onSubtitleEdit(syncKey, { start, end })
   }, 200)
 
   // ============ Region 事件 ============
@@ -76,8 +93,9 @@ export function useWaveformRegions(
 
       // 波形拖拽同步到后端（节流）
       const subtitle = projectStore.subtitles.find((s) => s.id === region.id)
-      if (subtitle && subtitle.sentenceIndex !== undefined) {
-        debouncedRegionSync(subtitle.sentenceIndex, region.start, region.end)
+      const syncKey = subtitle?.segment_id || subtitle?.sentenceIndex
+      if (syncKey !== undefined && syncKey !== null) {
+        debouncedRegionSync(syncKey, region.start, region.end)
       }
       emit('region-update', region)
 
@@ -87,10 +105,11 @@ export function useWaveformRegions(
 
     regionsPlugin.on('region-clicked', (region, e) => {
       e.stopPropagation()
-      projectStore.view.selectedSubtitleId = region.id
+      setSelectedSubtitleId(region.id)
       playbackManager.seekTo(region.start)
-      const ws = wavesurferRef.value
-      if (ws) ws.play()
+      // V3.2.4+dev.20260228.01: 通过 PlaybackManager 触发播放，
+      // 由 WaveformTimeline 的 isPlaying watcher 决定使用真实播放或虚拟时钟
+      playbackManager.play()
       emit('region-click', region)
     })
 
@@ -105,7 +124,7 @@ export function useWaveformRegions(
 
     regionsPlugin.on('region-out', (region) => {
       const overlappingIds = detectOverlappingSubtitles(projectStore.subtitles)
-      const isSelected = region.id === projectStore.view.selectedSubtitleId
+      const isSelected = region.id === getSelectedSubtitleId()
 
       if (overlappingIds.has(region.id)) {
         region.setOptions({ color: OVERLAP_COLORS.error })
@@ -131,7 +150,7 @@ export function useWaveformRegions(
 
     regions.forEach((region) => {
       const isOverlapping = overlappingIds.has(region.id)
-      const isSelected = region.id === projectStore.view.selectedSubtitleId
+      const isSelected = region.id === getSelectedSubtitleId()
 
       if (isOverlapping) {
         region.setOptions({ color: OVERLAP_COLORS.error })
@@ -157,7 +176,7 @@ export function useWaveformRegions(
    * @returns {string} 颜色值
    */
   function computeRegionColor(subtitle, overlappingIds) {
-    const isSelected = subtitle.id === projectStore.view.selectedSubtitleId
+    const isSelected = subtitle.id === getSelectedSubtitleId()
     const isOverlapping = overlappingIds.has(subtitle.id)
 
     if (isOverlapping) return OVERLAP_COLORS.error

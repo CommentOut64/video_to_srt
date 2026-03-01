@@ -16,8 +16,8 @@ from app.services.punctuation.base import PuncPosition
 from app.services.model_runtime_config_service import get_model_runtime_config_service
 from app.services.punctuation.semantic_injector import SemanticInjector
 from app.services.punctuation.final_splitter import FinalSplitter, FinalSplitConfig
-from app.services.semantic_grouper import SemanticGrouper, GroupConfig
 from app.services.segmentation.unified_splitter import UnifiedSplitter
+from app.services.text_protection import should_preserve_trailing_punct
 
 if TYPE_CHECKING:
     from app.services.audio.chunk_engine import AudioChunk
@@ -38,7 +38,7 @@ class DefaultAligner:
         self,
         alignment_config: Optional[AlignmentConfig] = None,
         final_split_config: Optional[FinalSplitConfig] = None,
-        final_group_config: Optional[GroupConfig] = None,
+        final_group_config: Optional[Any] = None,
         is_enable_semantic_grouping: bool = True,
         alignment_score_threshold: float = 0.3,
         is_enable_fallback: bool = True,
@@ -68,14 +68,7 @@ class DefaultAligner:
             )
         self.final_splitter = FinalSplitter(final_split_config, logger=self.logger)
 
-        if final_group_config is None:
-            final_group_config = GroupConfig(
-                max_group_gap=2.0,
-                max_group_duration=10.0,
-                max_group_sentences=5,
-                enable_overlap_detection=True,
-            )
-        self.final_grouper = SemanticGrouper(final_group_config)
+        # Phase 4: 旧语义分组服务下线，定稿链不再执行语义 regroup。
         # V3.2.0+dev.20260202.08: 语义注入器（对齐后标点注入）
         self._semantic_injector = SemanticInjector(
             logger=self.logger,
@@ -366,8 +359,6 @@ class DefaultAligner:
             clean_text=punctuation_clean_text,
             punctuation_positions=punctuation_positions,
         )
-        if self.is_enable_semantic_grouping:
-            sentences = self.final_grouper.group(sentences)
         return sentences
 
     @staticmethod
@@ -474,6 +465,9 @@ def _strip_trailing_punct_smart(text: Optional[str]) -> str:
 
     idx = len(text) - 1
     while idx >= 0 and text[idx] in punct_to_remove:
+        # V3.2.0+dev.20260218.03: 保护规则 - 数字结构尾部点号不删除（避免 0. 被截断成 0）。
+        if should_preserve_trailing_punct(text, idx):
+            break
         idx -= 1
 
     return text[: idx + 1]

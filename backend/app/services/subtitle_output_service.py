@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple, TYPE_CHECKING
 
 from app.services.user_config_service import get_user_config_service
+from app.services.subtitle_visibility import filter_hidden_unknown_sentences
 from app.utils.text_utils import (
     detect_timestamp_overlaps,
     format_srt_timestamp,
@@ -193,7 +194,8 @@ class SubtitleOutputService:
             offset = offset_override if offset_override is not None else get_user_config_service().get_subtitle_time_offset()
 
         segments: List[Segment] = []
-        for sentence in sentences:
+        visible_sentences = filter_hidden_unknown_sentences(sentences)
+        for sentence in visible_sentences:
             # 优先使用清洗后的文本
             base_text = getattr(sentence, "text_clean", None) or sentence.text
             translation = getattr(sentence, "translation", None)

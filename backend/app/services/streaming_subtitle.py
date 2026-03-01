@@ -7,49 +7,299 @@
 3. 支持多阶段增量更新（SV → Whisper → LLM）
 """
 import copy
+import hashlib
 import threading
+import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from app.models.sensevoice_models import SentenceSegment, TextSource
 from app.services.sse_service import get_sse_manager
+from app.services.subtitle_visibility import is_hidden_unknown_sentence
 import logging
 
 logger = logging.getLogger(__name__)
 
 
-def push_subtitle_event(sse_manager, job_id: str, event_type: str, data: dict):
+def push_subtitle_event(
+    sse_manager,
+    job_id: str,
+    event_type: str,
+    data: dict,
+    project_id: Optional[str] = None,
+):
     """
     推送字幕事件（统一封装）
 
     Args:
         sse_manager: SSE 管理器
-        job_id: 任务 ID
+        job_id: 运行态任务 ID（兼容字段）
         event_type: 事件类型
         data: 事件数据
     """
+    channel_identifier = str(project_id or job_id)
     sse_manager.broadcast_sync(
-        f"job:{job_id}",
+        f"project:{channel_identifier}",
         f"subtitle.{event_type}",
-        data
+        data,
     )
 
 
 class StreamingSubtitleManager:
     """流式字幕管理器"""
 
-    def __init__(self, job_id: str):
+    def __init__(self, job_id: str, project_id: Optional[str] = None):
         self.job_id = job_id
+        self.project_id = project_id
         self.sentences: Dict[int, SentenceSegment] = {}  # key = sentence_index
         self.sentence_count = 0
         self.sse_manager = get_sse_manager()
 
         # Phase 4: Chunk 级别的句子索引映射
         # chunk_sentences[chunk_index] = [sentence_index_1, sentence_index_2, ...]
-        self.chunk_sentences: Dict[int, List[int]] = {}
+        self.chunk_sentences: Dict[Any, List[int]] = {}
 
         # V3.8: 添加锁保护，防止 remove_marked_sentences 在错误时机执行
         self._lock = threading.RLock()
         # V3.8: 标记是否允许删除句子
         self._deletion_enabled = False
+        # V3.2.4+dev.20260228.01: 运行态字幕真源持久化（project runtime_state.db）。
+        self._runtime_checkpoint_service: Optional[Any] = None
+        self._runtime_checkpoint_db_path: Optional[Path] = None
+
+    def bind_runtime_checkpoint_service(self, job_dir: Path) -> None:
+        """绑定 runtime checkpoint 服务，用于持久化运行态字幕真源。"""
+        from app.services.checkpoint import RuntimeCheckpointService
+
+        normalized_job_dir = Path(job_dir)
+        runtime_db_path = normalized_job_dir / "runtime_state.db"
+        if (
+            self._runtime_checkpoint_service is not None
+            and self._runtime_checkpoint_db_path == runtime_db_path
+        ):
+            return
+        self._runtime_checkpoint_service = RuntimeCheckpointService(job_dir=normalized_job_dir)
+        self._runtime_checkpoint_db_path = runtime_db_path
+        self._persist_runtime_subtitle_state(reason="bind_runtime_service")
+
+    @staticmethod
+    def _normalize_chunk_ref(chunk_ref: Any) -> Any:
+        """标准化 chunk 引用（支持 int chunk_index 和 string chunk_id）。"""
+        if isinstance(chunk_ref, int):
+            return chunk_ref
+        if isinstance(chunk_ref, str):
+            normalized = chunk_ref.strip()
+            if normalized.lstrip("-").isdigit():
+                try:
+                    return int(normalized)
+                except ValueError:
+                    return normalized
+            if normalized.startswith("chunk-"):
+                suffix = normalized.split("-")[-1]
+                if suffix.lstrip("-").isdigit():
+                    try:
+                        return int(suffix)
+                    except ValueError:
+                        return normalized
+            return normalized
+        if chunk_ref is None:
+            return "chunk:unknown"
+        return str(chunk_ref)
+
+    @staticmethod
+    def _try_parse_chunk_index(chunk_ref: Any) -> Optional[int]:
+        """尝试从 chunk_ref 解析 legacy chunk_index。"""
+        if isinstance(chunk_ref, int):
+            return chunk_ref
+        chunk_ref_text = str(chunk_ref or "").strip()
+        if not chunk_ref_text:
+            return None
+        if chunk_ref_text.lstrip("-").isdigit():
+            try:
+                return int(chunk_ref_text)
+            except ValueError:
+                return None
+        if chunk_ref_text.startswith("chunk-"):
+            try:
+                return int(chunk_ref_text.split("-")[-1])
+            except ValueError:
+                return None
+        return None
+
+    def _iter_chunk_alias_keys(self, chunk_ref: Any) -> List[Any]:
+        """
+        返回与 chunk_ref 等价的所有映射键（含历史别名与语义后缀键）。
+        """
+        normalized_ref = self._normalize_chunk_ref(chunk_ref)
+        alias_keys: List[Any] = []
+        seen = set()
+
+        def _add_key(key: Any) -> None:
+            marker = (type(key).__name__, str(key))
+            if marker in seen:
+                return
+            seen.add(marker)
+            alias_keys.append(key)
+
+        _add_key(normalized_ref)
+        _add_key(str(normalized_ref))
+
+        parsed_index = self._try_parse_chunk_index(normalized_ref)
+        if parsed_index is not None:
+            _add_key(parsed_index)
+            _add_key(str(parsed_index))
+            _add_key(f"chunk-{parsed_index}")
+
+            for existing_key in list(self.chunk_sentences.keys()):
+                key_text = str(existing_key)
+                if key_text.startswith(f"{parsed_index}#"):
+                    _add_key(existing_key)
+                    continue
+                if key_text.startswith(f"chunk-{parsed_index}#"):
+                    _add_key(existing_key)
+                    continue
+                if key_text.startswith(f"chunk-{parsed_index}+"):
+                    _add_key(existing_key)
+                    continue
+                if f"+chunk-{parsed_index}" in key_text:
+                    _add_key(existing_key)
+
+        return alias_keys
+
+    def _remove_chunk_alias_mappings(self, chunk_ref: Any) -> None:
+        """删除 chunk_ref 对应的所有别名映射，避免旧键残留。"""
+        for alias_key in self._iter_chunk_alias_keys(chunk_ref):
+            if alias_key in self.chunk_sentences:
+                del self.chunk_sentences[alias_key]
+
+    def _build_sentence_uid(
+        self,
+        *,
+        chunk_ref: Any,
+        sentence: SentenceSegment,
+    ) -> str:
+        """构建稳定 sentence_uid。"""
+        chunk_key = str(self._normalize_chunk_ref(chunk_ref))
+        stable_text = str(sentence.text_clean or sentence.text or "")
+        seed = (
+            f"{self.project_id or self.job_id}|{chunk_key}|"
+            f"{float(sentence.start):.3f}|{float(sentence.end):.3f}|{stable_text}"
+        )
+        digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:16]
+        return f"seg-{digest}"
+
+    def _ensure_sentence_identity(
+        self,
+        sentence: SentenceSegment,
+        *,
+        chunk_ref: Any,
+    ) -> None:
+        """确保句子具备稳定身份字段。"""
+        normalized_chunk_ref = self._normalize_chunk_ref(chunk_ref)
+        if not getattr(sentence, "chunk_uid", None):
+            sentence.chunk_uid = str(normalized_chunk_ref)
+        if not getattr(sentence, "sentence_uid", None):
+            sentence.sentence_uid = self._build_sentence_uid(
+                chunk_ref=normalized_chunk_ref,
+                sentence=sentence,
+            )
+        if not getattr(sentence, "segment_id", None):
+            sentence.segment_id = sentence.sentence_uid
+
+    def _persist_runtime_subtitle_state(self, *, reason: str) -> None:
+        """持久化运行态字幕快照到 runtime_state.db。"""
+        if self._runtime_checkpoint_service is None:
+            return
+        try:
+            payload = self.to_checkpoint_data()
+            payload["updated_reason"] = reason
+            payload["updated_at"] = payload.get("updated_at") or time.time()
+            self._runtime_checkpoint_service.save_subtitle_runtime(payload)
+        except Exception as exc:
+            logger.warning(
+                "运行态字幕快照写入失败: job_id=%s reason=%s error=%s",
+                self.job_id,
+                reason,
+                exc,
+            )
+
+    @staticmethod
+    def _remove_speaker_fields_for_draft(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """草稿事件强制移除 speaker 相关字段。"""
+        for key in (
+            "speaker_id",
+            "turn_id",
+            "speaker_label",
+            "speaker_color_key",
+            "binding_source",
+        ):
+            payload.pop(key, None)
+        return payload
+
+    @staticmethod
+    def _is_hidden_unknown_sentence(sentence: SentenceSegment) -> bool:
+        """统一 unknown 字幕可见性判断。"""
+        return is_hidden_unknown_sentence(sentence)
+
+    def _filter_unknown_sentences(
+        self,
+        sentences: List[SentenceSegment],
+    ) -> List[SentenceSegment]:
+        return [
+            sentence for sentence in list(sentences or [])
+            if not self._is_hidden_unknown_sentence(sentence)
+        ]
+
+    def _build_sentence_payload(
+        self,
+        sentence: SentenceSegment,
+        *,
+        index: Optional[int] = None,
+        is_draft: Optional[bool] = None,
+        is_finalized: Optional[bool] = None,
+        sanitize_draft_speaker: bool = False,
+    ) -> Dict[str, Any]:
+        """统一序列化句子 payload，避免多处字段漂移。"""
+        payload = sentence.to_dict() if hasattr(sentence, "to_dict") else {
+            "text": sentence.text_clean or sentence.text,
+            "start": sentence.start,
+            "end": sentence.end,
+            "confidence": sentence.confidence,
+            "confidence_display_raw": getattr(sentence, "confidence_display_raw", None),
+            "display_confidence": getattr(sentence, "display_confidence", None),
+            "confidence_source": getattr(sentence, "confidence_source", None),
+            "source": sentence.source.value if hasattr(sentence.source, "value") else str(sentence.source),
+            "is_modified": getattr(sentence, "is_modified", False),
+            "original_text": getattr(sentence, "original_text", None),
+            "warning_type": getattr(getattr(sentence, "warning_type", None), "value", "none"),
+            "words": [w.to_dict() if hasattr(w, "to_dict") else w for w in getattr(sentence, "words", [])],
+            "speaker_id": getattr(sentence, "speaker_id", None),
+            "turn_id": getattr(sentence, "turn_id", None),
+            "speaker_label": getattr(sentence, "speaker_label", None),
+            "speaker_color_key": getattr(sentence, "speaker_color_key", None),
+            "binding_source": getattr(sentence, "binding_source", None),
+            "sentence_uid": getattr(sentence, "sentence_uid", None),
+            "segment_id": getattr(sentence, "segment_id", None),
+            "chunk_uid": getattr(sentence, "chunk_uid", None),
+        }
+        if index is not None:
+            payload["index"] = index
+        if is_draft is not None:
+            payload["is_draft"] = bool(is_draft)
+        if is_finalized is not None:
+            payload["is_finalized"] = bool(is_finalized)
+        if sanitize_draft_speaker:
+            self._remove_speaker_fields_for_draft(payload)
+        return payload
+
+    def _emit_subtitle_event(self, event_type: str, data: Dict[str, Any]) -> None:
+        """统一推送字幕事件（project 单频道）。"""
+        push_subtitle_event(
+            self.sse_manager,
+            self.job_id,
+            event_type,
+            data,
+            project_id=self.project_id,
+        )
 
     def add_sentence(self, sentence: SentenceSegment) -> int:
         """
@@ -61,7 +311,12 @@ class StreamingSubtitleManager:
         Returns:
             int: 句子索引
         """
+        if self._is_hidden_unknown_sentence(sentence):
+            logger.info("跳过 unknown 字幕写入: job_id=%s", self.job_id)
+            return -1
+
         index = self.sentence_count
+        self._ensure_sentence_identity(sentence, chunk_ref="chunk:legacy")
         self.sentences[index] = sentence
         self.sentence_count += 1
 
@@ -80,18 +335,17 @@ class StreamingSubtitleManager:
             "words": [w.to_dict() if hasattr(w, 'to_dict') else w for w in getattr(sentence, 'words', [])]  # 确保包含 words
         }
 
-        push_subtitle_event(
-            self.sse_manager,
-            self.job_id,
+        self._emit_subtitle_event(
             "sv_sentence",
             {
                 "index": index,
                 "sentence": sentence_dict,
-                "source": "sensevoice"
-            }
+                "source": "sensevoice",
+            },
         )
 
         logger.debug(f"添加句子 {index}: {sentence.text[:30]}...")
+        self._persist_runtime_subtitle_state(reason="add_sentence")
         return index
 
     def update_sentence(
@@ -155,6 +409,11 @@ class StreamingSubtitleManager:
             sentence.perplexity = perplexity
             sentence.warning_type = sentence.compute_warning_type()
 
+        if self._is_hidden_unknown_sentence(sentence):
+            self.remove_sentence_by_index(index)
+            logger.info("移除更新后变为 unknown 的字幕: job_id=%s index=%s", self.job_id, index)
+            return
+
         # 推送 SSE 事件
         event_type = {
             TextSource.WHISPER_PATCH: "whisper_patch",
@@ -162,19 +421,18 @@ class StreamingSubtitleManager:
             TextSource.LLM_TRANSLATION: "llm_trans",
         }.get(source, "batch_update")
 
-        push_subtitle_event(
-            self.sse_manager,
-            self.job_id,
+        self._emit_subtitle_event(
             event_type,
             {
                 "index": index,
                 "sentence": sentence.to_dict(),
                 "source": source.value,
-                "is_update": True
-            }
+                "is_update": True,
+            },
         )
 
         logger.debug(f"更新句子 {index} ({source.value}): {new_text[:30]}...")
+        self._persist_runtime_subtitle_state(reason="update_sentence")
 
     def set_translation(self, index: int, translation: str, confidence: float = None):
         """
@@ -193,15 +451,13 @@ class StreamingSubtitleManager:
         if confidence is not None:
             sentence.translation_confidence = confidence
 
-        push_subtitle_event(
-            self.sse_manager,
-            self.job_id,
+        self._emit_subtitle_event(
             "llm_trans",
             {
                 "index": index,
                 "translation": translation,
-                "confidence": confidence
-            }
+                "confidence": confidence,
+            },
         )
 
     def mark_for_deletion(self, index: int, reason: str = "garbage"):
@@ -220,14 +476,12 @@ class StreamingSubtitleManager:
         sentence.deletion_reason = reason
 
         # 推送 SSE 事件通知前端
-        push_subtitle_event(
-            self.sse_manager,
-            self.job_id,
+        self._emit_subtitle_event(
             "sentence_deleted",
             {
                 "index": index,
-                "reason": reason
-            }
+                "reason": reason,
+            },
         )
         logger.info(f"标记删除句子 {index}: {reason}")
 
@@ -256,6 +510,7 @@ class StreamingSubtitleManager:
 
             if marked_indices:
                 logger.info(f"已删除 {len(marked_indices)} 个垃圾句子: {marked_indices}")
+                self._persist_runtime_subtitle_state(reason="remove_marked_sentences")
 
             return len(marked_indices)
 
@@ -274,6 +529,7 @@ class StreamingSubtitleManager:
         sentences = [
             s for s in self.sentences.values()
             if not getattr(s, 'marked_for_deletion', False)
+            and not self._is_hidden_unknown_sentence(s)
         ]
         sentences.sort(key=lambda s: s.start)
         # V3.8 调试日志：导出时记录句子数量
@@ -304,11 +560,26 @@ class StreamingSubtitleManager:
         ]
         return " ".join(context_texts)
 
+    def get_chunk_sentence_indices(self, chunk_ref: Any) -> List[int]:
+        """获取指定 chunk 引用下的句子索引。"""
+        resolved: List[int] = []
+        seen_indices = set()
+        for alias_key in self._iter_chunk_alias_keys(chunk_ref):
+            indices = self.chunk_sentences.get(alias_key)
+            if not isinstance(indices, list):
+                continue
+            for idx in indices:
+                if idx in seen_indices:
+                    continue
+                seen_indices.add(idx)
+                resolved.append(idx)
+        return resolved
+
     # ========== Phase 4: 双流对齐专用方法 ==========
 
     def add_draft_sentences(
         self,
-        chunk_index: int,
+        chunk_ref: Any,
         sentences: List[SentenceSegment]
     ) -> List[int]:
         """
@@ -320,69 +591,90 @@ class StreamingSubtitleManager:
         V3.8: 深拷贝句子对象，避免共享引用导致的竞态条件
 
         Args:
-            chunk_index: Chunk 索引
+            chunk_ref: Chunk 引用（支持 int chunk_index 或 string chunk_id）
             sentences: 句子列表
 
         Returns:
             List[int]: 句子索引列表
         """
+        visible_sentences = self._filter_unknown_sentences(sentences)
+        chunk_key = self._normalize_chunk_ref(chunk_ref)
+        dropped_unknown_count = max(0, len(list(sentences or [])) - len(visible_sentences))
+        if dropped_unknown_count > 0:
+            logger.info(
+                "草稿链路过滤 unknown 字幕: job_id=%s chunk=%s count=%s",
+                self.job_id,
+                chunk_key,
+                dropped_unknown_count,
+            )
+
         sentence_indices = []
         sentences_to_push = []  # V3.8: 收集待推送的句子数据
 
         with self._lock:
-            for sentence in sentences:
+            old_indices = self.get_chunk_sentence_indices(chunk_key)
+            protected_indices: List[int] = []
+            for old_index in old_indices:
+                old_sentence = self.sentences.get(old_index)
+                if old_sentence is None:
+                    continue
+                if getattr(old_sentence, "is_modified", False):
+                    protected_indices.append(old_index)
+                    continue
+                del self.sentences[old_index]
+
+            for sentence in visible_sentences:
                 # V3.8 修复：深拷贝句子对象，避免共享引用
                 sentence_copy = copy.deepcopy(sentence)
+                sentence_copy.is_draft = True
+                sentence_copy.is_finalized = False
 
                 index = self.sentence_count
+                self._ensure_sentence_identity(sentence_copy, chunk_ref=chunk_key)
                 self.sentences[index] = sentence_copy
                 self.sentence_count += 1
                 sentence_indices.append(index)
 
-                # V3.8: 收集待推送的句子数据（在锁内准备，锁外推送）
-                # V3.1.2+dev.20260113.01: fallback 字典补充 display_confidence 和 confidence_source
-                sentence_dict = sentence_copy.to_dict() if hasattr(sentence_copy, 'to_dict') else {
-                    "index": index,
-                    "text": sentence_copy.text_clean or sentence_copy.text,
-                    "start": sentence_copy.start,
-                    "end": sentence_copy.end,
-                    "confidence": sentence_copy.confidence,
-                    "confidence_display_raw": getattr(sentence_copy, 'confidence_display_raw', None),
-                    "display_confidence": getattr(sentence_copy, 'display_confidence', None),  # V3.1.2: 映射后准确率
-                    "confidence_source": getattr(sentence_copy, 'confidence_source', None),    # V3.1.2: 置信度来源
-                    "source": sentence_copy.source.value if hasattr(sentence_copy.source, 'value') else str(sentence_copy.source),
-                    "is_draft": True,
-                    "words": [w.to_dict() if hasattr(w, 'to_dict') else w for w in getattr(sentence_copy, 'words', [])]
-                }
+                # 草稿事件口径：仅文本/时间字段，不透传 speaker 标签
+                sentence_dict = self._build_sentence_payload(
+                    sentence_copy,
+                    index=index,
+                    is_draft=True,
+                    is_finalized=False,
+                    sanitize_draft_speaker=True,
+                )
                 sentences_to_push.append((index, sentence_dict))
 
             # 记录 Chunk 级别的索引映射
-            self.chunk_sentences[chunk_index] = sentence_indices
+            self._remove_chunk_alias_mappings(chunk_key)
+            self.chunk_sentences[chunk_key] = sorted(protected_indices + sentence_indices)
 
         # V3.8: 在锁外推送 SSE 事件，避免长时间持锁
+        chunk_index_for_event = self._try_parse_chunk_index(chunk_key)
         for index, sentence_dict in sentences_to_push:
-            push_subtitle_event(
-                self.sse_manager,
-                self.job_id,
+            event_payload = {
+                "index": index,
+                "chunk_index": chunk_index_for_event if chunk_index_for_event is not None else chunk_key,
+                "chunk_uid": str(chunk_key),
+                "sentence": sentence_dict,
+            }
+            self._emit_subtitle_event(
                 "draft",
-                {
-                    "index": index,
-                    "chunk_index": chunk_index,
-                    "sentence": sentence_dict
-                }
+                event_payload,
             )
 
         # V3.8 调试日志：确认草稿已添加到管理器
         logger.debug(
-            f"add_draft_sentences: Chunk {chunk_index} 添加 {len(sentences)} 个草稿, "
+            f"add_draft_sentences: Chunk {chunk_key} 添加 {len(visible_sentences)} 个草稿, "
             f"索引 {sentence_indices}, 当前总句子数={len(self.sentences)}"
         )
 
+        self._persist_runtime_subtitle_state(reason="add_draft_sentences")
         return sentence_indices
 
     def replace_chunk(
         self,
-        chunk_index: int,
+        chunk_ref: Any,
         sentences: List[SentenceSegment]
     ) -> List[int]:
         """
@@ -400,25 +692,68 @@ class StreamingSubtitleManager:
         4. 推送 replace_chunk 事件
 
         Args:
-            chunk_index: Chunk 索引
+            chunk_ref: Chunk 引用（支持 int chunk_index 或 string chunk_id）
             sentences: 定稿句子列表
 
         Returns:
             List[int]: 新的句子索引列表
         """
-        # 防御性检查：如果新句子列表为空，保留原有草稿，不要删除
-        if not sentences:
-            existing_indices = self.chunk_sentences.get(chunk_index, [])
-            logger.warning(
-                f"replace_chunk: Chunk {chunk_index} 的定稿句子为空，"
-                f"保留原有 {len(existing_indices)} 个草稿句子以避免字幕丢失"
+        visible_sentences = self._filter_unknown_sentences(sentences)
+        chunk_key = self._normalize_chunk_ref(chunk_ref)
+        dropped_unknown_count = max(0, len(list(sentences or [])) - len(visible_sentences))
+        if dropped_unknown_count > 0:
+            logger.info(
+                "定稿替换过滤 unknown 字幕: job_id=%s chunk=%s count=%s",
+                self.job_id,
+                chunk_key,
+                dropped_unknown_count,
             )
-            return existing_indices
+
+        # 防御性处理：空定稿也要完成 chunk 收口，避免前端草稿永久停留“生成中”。
+        if not visible_sentences:
+            with self._lock:
+                old_indices = self.get_chunk_sentence_indices(chunk_key)
+                protected_sentences = {}
+                for old_index in old_indices:
+                    if old_index not in self.sentences:
+                        continue
+                    old_sentence = self.sentences[old_index]
+                    if getattr(old_sentence, 'is_modified', False):
+                        protected_sentences[old_index] = old_sentence
+                        logger.info(
+                            f"[V3.2.0+dev.20260216.11] 空定稿保留用户编辑: "
+                            f"chunk={chunk_key}, index={old_index}"
+                        )
+                    else:
+                        del self.sentences[old_index]
+
+                new_indices = sorted(protected_sentences.keys())
+                self._remove_chunk_alias_mappings(chunk_key)
+                self.chunk_sentences[chunk_key] = new_indices
+
+            chunk_index_for_event = self._try_parse_chunk_index(chunk_key)
+            self._emit_subtitle_event(
+                "replace_chunk",
+                {
+                    "chunk_index": chunk_index_for_event if chunk_index_for_event is not None else chunk_key,
+                    "chunk_uid": str(chunk_key),
+                    "old_indices": old_indices,
+                    "new_indices": new_indices,
+                    "sentences": [],
+                },
+            )
+            logger.warning(
+                f"replace_chunk: Chunk {chunk_key} 的定稿句子为空，"
+                f"已清理 {max(len(old_indices) - len(new_indices), 0)} 个草稿并推送空替换事件，"
+                f"保留用户编辑 {len(new_indices)} 条"
+            )
+            self._persist_runtime_subtitle_state(reason="replace_chunk_empty")
+            return new_indices
 
         # V3.8: 使用锁保护整个替换过程
         with self._lock:
             # 删除旧的草稿句子（V3.2.0+dev.20260124.01: 保护用户编辑）
-            old_indices = self.chunk_sentences.get(chunk_index, [])
+            old_indices = self.get_chunk_sentence_indices(chunk_key)
             protected_sentences = {}  # 保存被保护的用户编辑句子
 
             for old_index in old_indices:
@@ -429,16 +764,20 @@ class StreamingSubtitleManager:
                         protected_sentences[old_index] = old_sentence
                         logger.info(
                             f"[V3.2.0+dev.20260124.01] 保护用户编辑: "
-                            f"chunk={chunk_index}, index={old_index}"
+                            f"chunk={chunk_key}, index={old_index}"
                         )
                     else:
                         del self.sentences[old_index]
 
             # 添加新的定稿句子
             new_indices = []
-            for sentence in sentences:
+            for sentence in visible_sentences:
+                sentence_copy = copy.deepcopy(sentence)
+                sentence_copy.is_draft = False
+                sentence_copy.is_finalized = True
                 index = self.sentence_count
-                self.sentences[index] = sentence
+                self._ensure_sentence_identity(sentence_copy, chunk_ref=chunk_key)
+                self.sentences[index] = sentence_copy
                 self.sentence_count += 1
                 new_indices.append(index)
 
@@ -448,53 +787,49 @@ class StreamingSubtitleManager:
                 new_indices.append(protected_index)
 
             # 更新 Chunk 索引映射
-            self.chunk_sentences[chunk_index] = sorted(new_indices)
+            self._remove_chunk_alias_mappings(chunk_key)
+            self.chunk_sentences[chunk_key] = sorted(new_indices)
 
         # 推送 SSE 事件（批量替换）- 在锁外推送，避免死锁
-        # V3.1.2+dev.20260113.01: fallback 字典补充 display_confidence 和 confidence_source
-        sentences_data = [
-            sentence.to_dict() if hasattr(sentence, 'to_dict') else {
-                "index": new_indices[i],
-                "text": sentence.text_clean or sentence.text,
-                "start": sentence.start,
-                "end": sentence.end,
-                "confidence": sentence.confidence,
-                "confidence_display_raw": getattr(sentence, 'confidence_display_raw', None),
-                "display_confidence": getattr(sentence, 'display_confidence', None),  # V3.1.2: 映射后准确率
-                "confidence_source": getattr(sentence, 'confidence_source', None),    # V3.1.2: 置信度来源
-                "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),
-                "is_draft": False,
-                "is_finalized": True,
-                "words": [w.to_dict() if hasattr(w, 'to_dict') else w for w in getattr(sentence, 'words', [])]
-            }
-            for i, sentence in enumerate(sentences)
-        ]
+        sentences_data: List[Dict[str, Any]] = []
+        for i, sentence in enumerate(visible_sentences):
+            sentence_index = new_indices[i] if i < len(new_indices) else None
+            sentences_data.append(
+                self._build_sentence_payload(
+                    sentence,
+                    index=sentence_index,
+                    is_draft=False,
+                    is_finalized=True,
+                    sanitize_draft_speaker=False,
+                )
+            )
 
-        push_subtitle_event(
-            self.sse_manager,
-            self.job_id,
+        chunk_index_for_event = self._try_parse_chunk_index(chunk_key)
+        self._emit_subtitle_event(
             "replace_chunk",
             {
-                "chunk_index": chunk_index,
+                "chunk_index": chunk_index_for_event if chunk_index_for_event is not None else chunk_key,
+                "chunk_uid": str(chunk_key),
                 "old_indices": old_indices,
                 "new_indices": new_indices,
-                "sentences": sentences_data
-            }
+                "sentences": sentences_data,
+            },
         )
 
         # V3.8 调试日志：确认替换成功
         logger.debug(
-            f"replace_chunk: Chunk {chunk_index} 替换完成 - "
+            f"replace_chunk: Chunk {chunk_key} 替换完成 - "
             f"删除 {len(old_indices)} 个草稿 {old_indices}, "
-            f"添加 {len(new_indices)} 个定稿 {new_indices}, "
+            f"添加 {len(visible_sentences)} 个定稿 {new_indices}, "
             f"当前总句子数={len(self.sentences)}"
         )
 
+        self._persist_runtime_subtitle_state(reason="replace_chunk")
         return new_indices
 
     def add_finalized_sentences(
         self,
-        chunk_index: int,
+        chunk_ref: Any,
         sentences: List[SentenceSegment]
     ) -> List[int]:
         """
@@ -506,17 +841,37 @@ class StreamingSubtitleManager:
         V3.8: 添加锁保护和深拷贝，防止竞态条件
 
         Args:
-            chunk_index: Chunk 索引
+            chunk_ref: Chunk 引用（支持 int chunk_index 或 string chunk_id）
             sentences: 定稿句子列表
 
         Returns:
             List[int]: 句子索引列表
         """
+        visible_sentences = self._filter_unknown_sentences(sentences)
+        chunk_key = self._normalize_chunk_ref(chunk_ref)
+        dropped_unknown_count = max(0, len(list(sentences or [])) - len(visible_sentences))
+        if dropped_unknown_count > 0:
+            logger.info(
+                "极速定稿过滤 unknown 字幕: job_id=%s chunk=%s count=%s",
+                self.job_id,
+                chunk_key,
+                dropped_unknown_count,
+            )
+
         sentence_indices = []
         sentences_to_push = []  # V3.8: 收集待推送的句子数据
 
         with self._lock:
-            for sentence in sentences:
+            old_indices = self.get_chunk_sentence_indices(chunk_key)
+            for old_index in old_indices:
+                existing_sentence = self.sentences.get(old_index)
+                if existing_sentence is None:
+                    continue
+                if getattr(existing_sentence, "is_modified", False):
+                    continue
+                del self.sentences[old_index]
+
+            for sentence in visible_sentences:
                 # V3.8 修复：深拷贝句子对象，避免共享引用
                 sentence_copy = copy.deepcopy(sentence)
 
@@ -525,50 +880,45 @@ class StreamingSubtitleManager:
                 sentence_copy.is_finalized = True
 
                 index = self.sentence_count
+                self._ensure_sentence_identity(sentence_copy, chunk_ref=chunk_key)
                 self.sentences[index] = sentence_copy
                 self.sentence_count += 1
                 sentence_indices.append(index)
 
-                # V3.8: 收集待推送的句子数据（在锁内准备，锁外推送）
-                # V3.1.2+dev.20260113.01: fallback 字典补充 display_confidence 和 confidence_source
-                sentence_dict = sentence_copy.to_dict() if hasattr(sentence_copy, 'to_dict') else {
-                    "index": index,
-                    "text": sentence_copy.text_clean or sentence_copy.text,
-                    "start": sentence_copy.start,
-                    "end": sentence_copy.end,
-                    "confidence": sentence_copy.confidence,
-                    "confidence_display_raw": getattr(sentence_copy, 'confidence_display_raw', None),
-                    "display_confidence": getattr(sentence_copy, 'display_confidence', None),  # V3.1.2: 映射后准确率
-                    "confidence_source": getattr(sentence_copy, 'confidence_source', None),    # V3.1.2: 置信度来源
-                    "source": sentence_copy.source.value if hasattr(sentence_copy.source, 'value') else str(sentence_copy.source),
-                    "is_draft": False,
-                    "is_finalized": True,
-                    "words": [w.to_dict() if hasattr(w, 'to_dict') else w for w in getattr(sentence_copy, 'words', [])]
-                }
+                # 定稿事件允许透传 speaker 字段
+                sentence_dict = self._build_sentence_payload(
+                    sentence_copy,
+                    index=index,
+                    is_draft=False,
+                    is_finalized=True,
+                    sanitize_draft_speaker=False,
+                )
                 sentences_to_push.append((index, sentence_dict))
 
             # 记录 Chunk 级别的索引映射
-            self.chunk_sentences[chunk_index] = sentence_indices
+            self._remove_chunk_alias_mappings(chunk_key)
+            self.chunk_sentences[chunk_key] = sentence_indices
 
         # V3.8: 在锁外推送 SSE 事件，避免死锁
+        chunk_index_for_event = self._try_parse_chunk_index(chunk_key)
         for index, sentence_dict in sentences_to_push:
-            push_subtitle_event(
-                self.sse_manager,
-                self.job_id,
+            self._emit_subtitle_event(
                 "finalized",
                 {
                     "index": index,
-                    "chunk_index": chunk_index,
+                    "chunk_index": chunk_index_for_event if chunk_index_for_event is not None else chunk_key,
+                    "chunk_uid": str(chunk_key),
                     "sentence": sentence_dict,
-                    "mode": "sensevoice_only"
-                }
+                    "mode": "sensevoice_only",
+                },
             )
 
         logger.debug(
-            f"添加定稿句子 [极速模式]: Chunk {chunk_index}, "
-            f"{len(sentences)} 个句子, 索引 {sentence_indices}"
+            f"添加定稿句子 [极速模式]: Chunk {chunk_key}, "
+            f"{len(visible_sentences)} 个句子, 索引 {sentence_indices}"
         )
 
+        self._persist_runtime_subtitle_state(reason="add_finalized_sentences")
         return sentence_indices
 
     # ========== V3.1.0: 字幕持久化方法 ==========
@@ -586,29 +936,32 @@ class StreamingSubtitleManager:
             dict: 可直接保存到 Checkpoint 的字幕数据
         """
         sentences_snapshot = []
+        visible_indices = set()
         for idx, sentence in self.sentences.items():
-            # 使用 SentenceSegment.to_dict() 序列化
-            # V3.1.2+dev.20260113.01: fallback 字典补充 display_confidence 和 confidence_source
-            sentence_dict = sentence.to_dict() if hasattr(sentence, 'to_dict') else {
-                "text": sentence.text_clean or sentence.text,
-                "start": sentence.start,
-                "end": sentence.end,
-                "confidence": sentence.confidence,
-                "confidence_display_raw": getattr(sentence, 'confidence_display_raw', None),
-                "display_confidence": getattr(sentence, 'display_confidence', None),  # V3.1.2: 映射后准确率
-                "confidence_source": getattr(sentence, 'confidence_source', None),    # V3.1.2: 置信度来源
-                "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),
-            }
+            if self._is_hidden_unknown_sentence(sentence):
+                continue
+            # Checkpoint 持久化保留全量字段（包括 speaker），供恢复与最终导出使用
+            sentence_dict = self._build_sentence_payload(sentence)
             # 添加索引信息
             sentence_dict["_index"] = idx
             sentence_dict["_is_draft"] = getattr(sentence, 'is_draft', False)
             sentence_dict["_is_finalized"] = getattr(sentence, 'is_finalized', False)
             sentences_snapshot.append(sentence_dict)
+            visible_indices.add(idx)
+
+        chunk_sentences_map: Dict[str, List[int]] = {}
+        for chunk_ref, indices in self.chunk_sentences.items():
+            chunk_key = str(chunk_ref)
+            chunk_sentences_map[chunk_key] = [
+                idx for idx in indices if idx in visible_indices
+            ]
 
         return {
             "sentences_snapshot": sentences_snapshot,
             "sentence_count": self.sentence_count,
-            "chunk_sentences_map": self.chunk_sentences
+            "chunk_sentences_map": chunk_sentences_map,
+            "version": "3.2.4+dev.20260228.01",
+            "updated_at": time.time(),
         }
 
     def restore_from_checkpoint(self, checkpoint_data: dict) -> bool:
@@ -693,8 +1046,20 @@ class StreamingSubtitleManager:
                 sentence.perplexity = sentence_dict.get("perplexity")
                 sentence.translation = sentence_dict.get("translation")
                 sentence.translation_confidence = sentence_dict.get("translation_confidence")
-                sentence.is_draft = sentence_dict.get("_is_draft", False)
-                sentence.is_finalized = sentence_dict.get("_is_finalized", False)
+                restored_is_draft = bool(sentence_dict.get("_is_draft", False))
+                restored_is_finalized = sentence_dict.get("_is_finalized")
+                if restored_is_finalized is None:
+                    restored_is_finalized = not restored_is_draft
+                sentence.is_draft = restored_is_draft
+                sentence.is_finalized = bool(restored_is_finalized)
+                sentence.sentence_uid = sentence_dict.get("sentence_uid") or sentence_dict.get("segment_id")
+                sentence.segment_id = sentence_dict.get("segment_id") or sentence.sentence_uid
+                sentence.chunk_uid = sentence_dict.get("chunk_uid")
+                sentence.speaker_id = sentence_dict.get("speaker_id")
+                sentence.turn_id = sentence_dict.get("turn_id")
+                sentence.speaker_label = sentence_dict.get("speaker_label")
+                sentence.speaker_color_key = sentence_dict.get("speaker_color_key")
+                sentence.binding_source = sentence_dict.get("binding_source")
 
                 # 恢复字级时间戳
                 words_data = sentence_dict.get("words", [])
@@ -714,6 +1079,12 @@ class StreamingSubtitleManager:
                     )
                     sentence.words.append(word)
 
+                if self._is_hidden_unknown_sentence(sentence):
+                    continue
+                self._ensure_sentence_identity(
+                    sentence,
+                    chunk_ref=sentence.chunk_uid or "chunk:restored",
+                )
                 self.sentences[idx] = sentence
                 restored_count += 1
 
@@ -723,8 +1094,23 @@ class StreamingSubtitleManager:
             # 恢复 Chunk 映射
             # JSON 反序列化后键是 str，需要转换为 int
             if chunk_sentences_map:
+                normalized_map: Dict[Any, List[int]] = {}
+                for raw_key, raw_indices in chunk_sentences_map.items():
+                    parsed_key = self._try_parse_chunk_index(raw_key)
+                    normalized_key: Any = parsed_key if parsed_key is not None else str(raw_key)
+                    if not isinstance(raw_indices, list):
+                        continue
+                    normalized_map[normalized_key] = [
+                        int(item) for item in raw_indices
+                        if isinstance(item, int) or str(item).lstrip("-").isdigit()
+                    ]
+                self.chunk_sentences = normalized_map
                 self.chunk_sentences = {
-                    int(k): v for k, v in chunk_sentences_map.items()
+                    chunk_index: [
+                        idx for idx in indices
+                        if idx in self.sentences and not self._is_hidden_unknown_sentence(self.sentences[idx])
+                    ]
+                    for chunk_index, indices in self.chunk_sentences.items()
                 }
 
             logger.info(
@@ -733,6 +1119,7 @@ class StreamingSubtitleManager:
                 f"sentence_count={self.sentence_count}, "
                 f"chunk_count={len(self.chunk_sentences)}"
             )
+            self._persist_runtime_subtitle_state(reason="restore_from_checkpoint")
             return True
 
         except Exception as e:
@@ -780,6 +1167,7 @@ class StreamingSubtitleManager:
                 self.job_id,
                 updated_count
             )
+            self._persist_runtime_subtitle_state(reason="apply_user_edits")
         return updated_count
 
     def add_manual_sentence(self, index: int, text: str, start: float, end: float) -> None:
@@ -796,7 +1184,9 @@ class StreamingSubtitleManager:
             )
             sentence.source = TextSource.MANUAL
             sentence.is_modified = True
+            self._ensure_sentence_identity(sentence, chunk_ref="chunk:manual")
             self.sentences[index] = sentence
+        self._persist_runtime_subtitle_state(reason="add_manual_sentence")
 
     def remove_sentence_by_index(self, index: int) -> bool:
         """
@@ -817,6 +1207,8 @@ class StreamingSubtitleManager:
                     else:
                         del self.chunk_sentences[chunk_index]
 
+        if removed:
+            self._persist_runtime_subtitle_state(reason="remove_sentence_by_index")
         return removed
 
     def apply_user_deletions(self, deleted_indices: List[int]) -> int:
@@ -865,6 +1257,7 @@ class StreamingSubtitleManager:
                 self.job_id,
                 added_count
             )
+            self._persist_runtime_subtitle_state(reason="apply_manual_entries")
         return added_count
 
     def push_restored_subtitles_to_frontend(self):
@@ -880,32 +1273,27 @@ class StreamingSubtitleManager:
             for idx in sentence_indices:
                 if idx in self.sentences:
                     sentence = self.sentences[idx]
-                    # V3.1.2+dev.20260113.01: fallback 字典补充 display_confidence 和 confidence_source
-                    sentence_dict = sentence.to_dict() if hasattr(sentence, 'to_dict') else {
-                        "text": sentence.text_clean or sentence.text,
-                        "start": sentence.start,
-                        "end": sentence.end,
-                        "confidence": sentence.confidence,
-                        "confidence_display_raw": getattr(sentence, 'confidence_display_raw', None),
-                        "display_confidence": getattr(sentence, 'display_confidence', None),  # V3.1.2: 映射后准确率
-                        "confidence_source": getattr(sentence, 'confidence_source', None),    # V3.1.2: 置信度来源
-                    }
-                    sentence_dict["index"] = idx
-                    sentence_dict["is_draft"] = getattr(sentence, 'is_draft', False)
-                    sentence_dict["is_finalized"] = getattr(sentence, 'is_finalized', True)
+                    if self._is_hidden_unknown_sentence(sentence):
+                        continue
+                    is_draft = bool(getattr(sentence, "is_draft", False))
+                    sentence_dict = self._build_sentence_payload(
+                        sentence,
+                        index=idx,
+                        is_draft=is_draft,
+                        is_finalized=bool(getattr(sentence, "is_finalized", True)),
+                        sanitize_draft_speaker=is_draft,
+                    )
                     sentences_data.append(sentence_dict)
 
             if sentences_data:
                 # 推送恢复事件（使用新的事件类型，避免与实时推送混淆）
-                push_subtitle_event(
-                    self.sse_manager,
-                    self.job_id,
-                    "restored",  # 恢复事件类型
+                self._emit_subtitle_event(
+                    "restored",
                     {
                         "chunk_index": chunk_index,
                         "sentences": sentences_data,
-                        "is_restore": True
-                    }
+                        "is_restore": True,
+                    },
                 )
 
         # 推送手动新增字幕（不在 chunk 映射内）
@@ -913,31 +1301,26 @@ class StreamingSubtitleManager:
         for idx, sentence in self.sentences.items():
             if idx >= 0:
                 continue
-            sentence_dict = sentence.to_dict() if hasattr(sentence, 'to_dict') else {
-                "text": sentence.text_clean or sentence.text,
-                "start": sentence.start,
-                "end": sentence.end,
-                "confidence": sentence.confidence,
-                "confidence_display_raw": getattr(sentence, 'confidence_display_raw', None),
-                "display_confidence": getattr(sentence, 'display_confidence', None),
-                "confidence_source": getattr(sentence, 'confidence_source', None),
-                "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),
-            }
-            sentence_dict["index"] = idx
-            sentence_dict["is_draft"] = getattr(sentence, 'is_draft', False)
-            sentence_dict["is_finalized"] = getattr(sentence, 'is_finalized', True)
+            if self._is_hidden_unknown_sentence(sentence):
+                continue
+            is_draft = bool(getattr(sentence, "is_draft", False))
+            sentence_dict = self._build_sentence_payload(
+                sentence,
+                index=idx,
+                is_draft=is_draft,
+                is_finalized=bool(getattr(sentence, "is_finalized", True)),
+                sanitize_draft_speaker=is_draft,
+            )
             manual_sentences.append(sentence_dict)
 
         if manual_sentences:
-            push_subtitle_event(
-                self.sse_manager,
-                self.job_id,
+            self._emit_subtitle_event(
                 "restored",
                 {
                     "chunk_index": "manual",
                     "sentences": manual_sentences,
-                    "is_restore": True
-                }
+                    "is_restore": True,
+                },
             )
 
         logger.info(
@@ -952,11 +1335,19 @@ class StreamingSubtitleManager:
 _subtitle_managers: Dict[str, StreamingSubtitleManager] = {}
 
 
-def get_streaming_subtitle_manager(job_id: str) -> StreamingSubtitleManager:
+def get_streaming_subtitle_manager(
+    job_id: str,
+    project_id: Optional[str] = None,
+) -> StreamingSubtitleManager:
     """获取或创建流式字幕管理器"""
     global _subtitle_managers
     if job_id not in _subtitle_managers:
-        _subtitle_managers[job_id] = StreamingSubtitleManager(job_id)
+        _subtitle_managers[job_id] = StreamingSubtitleManager(
+            job_id=job_id,
+            project_id=project_id,
+        )
+    elif project_id:
+        _subtitle_managers[job_id].project_id = project_id
     return _subtitle_managers[job_id]
 
 

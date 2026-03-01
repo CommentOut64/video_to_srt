@@ -1,20 +1,46 @@
 {
-    "version": "1.1",
-    "global": {},
-    "runtime": {
-        "punctuation": {
-            "force_split_on_sentence_end_punct": true,
-            "sv_fallback_mode": "tolerant",
-            "source_preference": "merged"
-        },
-        "alignment": {
-            "dual_time_boundary_tolerance_ms": 250,
-            "enable_dual_time_experiment": true,
-            "dual_time_active_min_boundary_f1": 0.85,
-            "dual_time_write_debug_srt": false,
-            "dual_time_mode": "shadow"
-        }
+  "version": "1.1",
+  "global": {},
+  "runtime": {
+    "punctuation": {
+      "force_split_on_sentence_end_punct": true,
+      "sv_fallback_mode": "tolerant",
+      "source_preference": "merged"
     },
-    "per_model": {},
-    "resident_models": []
+    "alignment": {
+      "dual_time_boundary_tolerance_ms": 250,
+      "enable_dual_time_experiment": false,
+      "dual_time_active_min_boundary_f1": 0.85,
+      "dual_time_write_debug_srt": false,
+      "dual_time_mode": "off"
+    },
+    "timeline": {
+      "enabled": true,
+      "diarization_enabled": true,
+      "diarization_model_id": "pyannote-speaker-diarization-community-1"
+    },
+    "dnsmos": {
+      "device": "cpu",
+      "personalized": false,
+      "ovrl_sep_hard": 2.0960908371247604,
+      "sig_sep_hard": 2.554166010717122,
+      "p808_sep_hard": 1.7823731696905278,
+      "ovrl_pass_hard": 2.3441922433760665,
+      "sig_pass_hard": 2.7914833247808972,
+      "bak_pass_hard": 1.8809400945693762,
+      "p808_pass_soft": 3.235022853899088
+    },
+    "smart_probe": {
+      "probe_sep_ratio_min": 0.26795501889788964,
+      "probe_min_coverage": 0.36689124315485816,
+      "probe_max_step_chunks": 30
+    },
+    "yamnet": {
+      "yamnet_music_conf_min": 0.15,
+      "yamnet_speech_conf_min": 0.85,
+      "yamnet_music_weak_max": 0.1
+    }
+  },
+  "per_model": {},
+  "resident_models": []
 }

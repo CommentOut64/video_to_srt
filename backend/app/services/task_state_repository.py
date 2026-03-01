@@ -64,11 +64,13 @@ class TaskStateRepository:
                 """
                 CREATE TABLE IF NOT EXISTS tasks (
                     job_id TEXT PRIMARY KEY,
+                    project_id TEXT,
                     filename TEXT,
                     title TEXT,
                     dir TEXT,
                     input_path TEXT,
                     status TEXT,
+                    state_seq INTEGER DEFAULT 0,
                     phase TEXT,
                     progress REAL,
                     phase_percent REAL,
@@ -96,6 +98,7 @@ class TaskStateRepository:
                     from_status TEXT,
                     to_status TEXT,
                     reason TEXT,
+                    state_seq INTEGER DEFAULT 0,
                     payload_json TEXT,
                     created_at REAL
                 )
@@ -143,6 +146,9 @@ class TaskStateRepository:
                 """
             )
             self._ensure_tasks_column(conn, "subtitle_time_offset", "REAL")
+            self._ensure_tasks_column(conn, "state_seq", "INTEGER DEFAULT 0")
+            self._ensure_tasks_column(conn, "project_id", "TEXT")
+            self._ensure_task_events_column(conn, "state_seq", "INTEGER DEFAULT 0")
 
     def _ensure_tasks_column(self, conn: sqlite3.Connection, name: str, column_type: str) -> None:
         cursor = conn.execute("PRAGMA table_info(tasks)")
@@ -151,6 +157,13 @@ class TaskStateRepository:
             return
         conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {column_type}")
 
+    def _ensure_task_events_column(self, conn: sqlite3.Connection, name: str, column_type: str) -> None:
+        cursor = conn.execute("PRAGMA table_info(task_events)")
+        columns = {row["name"] for row in cursor.fetchall()}
+        if name in columns:
+            return
+        conn.execute(f"ALTER TABLE task_events ADD COLUMN {name} {column_type}")
+
     def upsert_task(self, job: JobState, conn: Optional[sqlite3.Connection] = None) -> None:
         payload = self._job_to_row(job)
         target_conn = conn or self._connect()
@@ -158,20 +171,22 @@ class TaskStateRepository:
             target_conn.execute(
                 """
                 INSERT INTO tasks (
-                    job_id, filename, title, dir, input_path, status, phase, progress,
+                    job_id, project_id, filename, title, dir, input_path, status, state_seq, phase, progress,
                     phase_percent, message, error, processed, total, language, srt_path,
                     canceled, paused, subtitle_time_offset, settings_json, updated_at, created_at
                 ) VALUES (
-                    :job_id, :filename, :title, :dir, :input_path, :status, :phase, :progress,
+                    :job_id, :project_id, :filename, :title, :dir, :input_path, :status, :state_seq, :phase, :progress,
                     :phase_percent, :message, :error, :processed, :total, :language, :srt_path,
                     :canceled, :paused, :subtitle_time_offset, :settings_json, :updated_at, :created_at
                 )
                 ON CONFLICT(job_id) DO UPDATE SET
+                    project_id=excluded.project_id,
                     filename=excluded.filename,
                     title=excluded.title,
                     dir=excluded.dir,
                     input_path=excluded.input_path,
                     status=excluded.status,
+                    state_seq=excluded.state_seq,
                     phase=excluded.phase,
                     progress=excluded.progress,
                     phase_percent=excluded.phase_percent,
@@ -218,12 +233,73 @@ class TaskStateRepository:
             rows = conn.execute(query, params).fetchall()
         return [self._row_to_job(row) for row in rows]
 
-    def delete_task(self, job_id: str, conn: Optional[sqlite3.Connection] = None) -> None:
+    def delete_task(
+        self,
+        job_id: str,
+        conn: Optional[sqlite3.Connection] = None,
+        *,
+        fallback_project_id: Optional[str] = None,
+        fallback_dir: Optional[str] = None,
+    ) -> int:
+        """
+        删除任务记录。
+
+        V3.2.4+dev.20260301.01: 修复 job_id 不匹配时静默删除失败的问题。
+        优先按 job_id 主键删除；如果影响 0 行，依次尝试 project_id 和 dir 列回退。
+
+        Returns:
+            实际删除的行数
+        """
         target_conn = conn or self._connect()
         try:
-            target_conn.execute("DELETE FROM tasks WHERE job_id = ?", (job_id,))
+            cursor = target_conn.execute(
+                "DELETE FROM tasks WHERE job_id = ?", (job_id,)
+            )
+            deleted = cursor.rowcount
+            if deleted > 0:
+                if conn is None:
+                    target_conn.commit()
+                return deleted
+
+            # 回退 1: 按 project_id 列删除
+            normalized_pid = str(fallback_project_id or "").strip()
+            if normalized_pid:
+                cursor = target_conn.execute(
+                    "DELETE FROM tasks WHERE project_id = ?",
+                    (normalized_pid,),
+                )
+                deleted = cursor.rowcount
+                if deleted > 0:
+                    self.logger.info(
+                        "delete_task 主键未命中，按 project_id 回退删除: "
+                        "job_id=%s, project_id=%s, deleted=%d",
+                        job_id, normalized_pid, deleted,
+                    )
+                    if conn is None:
+                        target_conn.commit()
+                    return deleted
+
+            # 回退 2: 按 dir 列删除
+            normalized_dir = str(fallback_dir or "").strip()
+            if normalized_dir:
+                cursor = target_conn.execute(
+                    "DELETE FROM tasks WHERE dir = ?",
+                    (normalized_dir,),
+                )
+                deleted = cursor.rowcount
+                if deleted > 0:
+                    self.logger.info(
+                        "delete_task 主键和 project_id 均未命中，"
+                        "按 dir 回退删除: job_id=%s, dir=%s, deleted=%d",
+                        job_id, normalized_dir, deleted,
+                    )
+                    if conn is None:
+                        target_conn.commit()
+                    return deleted
+
             if conn is None:
                 target_conn.commit()
+            return 0
         finally:
             if conn is None:
                 target_conn.close()
@@ -332,7 +408,8 @@ class TaskStateRepository:
         from_status: Optional[str],
         to_status: Optional[str],
         reason: Optional[str],
-        payload: Optional[Dict[str, Any]],
+        state_seq: int = 0,
+        payload: Optional[Dict[str, Any]] = None,
         conn: Optional[sqlite3.Connection] = None
     ) -> None:
         payload_json = json.dumps(payload or {})
@@ -341,8 +418,8 @@ class TaskStateRepository:
             target_conn.execute(
                 """
                 INSERT INTO task_events (
-                    job_id, event_type, from_status, to_status, reason, payload_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    job_id, event_type, from_status, to_status, reason, state_seq, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -350,6 +427,7 @@ class TaskStateRepository:
                     from_status,
                     to_status,
                     reason,
+                    max(0, int(state_seq or 0)),
                     payload_json,
                     time.time(),
                 ),
@@ -364,7 +442,7 @@ class TaskStateRepository:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT event_type, from_status, to_status, reason, payload_json, created_at
+                SELECT event_type, from_status, to_status, reason, state_seq, payload_json, created_at
                 FROM task_events
                 WHERE job_id = ?
                 ORDER BY id ASC
@@ -380,6 +458,7 @@ class TaskStateRepository:
                     "from_status": row["from_status"],
                     "to_status": row["to_status"],
                     "reason": row["reason"],
+                    "state_seq": row["state_seq"] or 0,
                     "payload": payload,
                     "created_at": row["created_at"],
                 }
@@ -535,11 +614,13 @@ class TaskStateRepository:
         job.updatedAt = int(now_seconds * 1000)
         return {
             "job_id": job.job_id,
+            "project_id": job.project_id,
             "filename": job.filename,
             "title": job.title,
             "dir": job.dir,
             "input_path": job.input_path,
             "status": job.status,
+            "state_seq": max(0, int(job.state_seq or 0)),
             "phase": job.phase,
             "progress": job.progress,
             "phase_percent": job.phase_percent,
@@ -564,6 +645,7 @@ class TaskStateRepository:
         updated_at_ms = None
         if row["updated_at"] is not None:
             updated_at_ms = int(row["updated_at"] * 1000)
+        project_id = row["project_id"] if "project_id" in row.keys() else None
         return JobState(
             job_id=row["job_id"],
             filename=row["filename"] or "unknown",
@@ -572,6 +654,7 @@ class TaskStateRepository:
             input_path=row["input_path"] or "",
             settings=settings,
             status=row["status"] or "queued",
+            state_seq=max(0, int((row["state_seq"] or 0))),
             phase=row["phase"] or "pending",
             progress=row["progress"] or 0.0,
             phase_percent=row["phase_percent"] or 0.0,
@@ -584,6 +667,7 @@ class TaskStateRepository:
             canceled=bool(row["canceled"]),
             paused=bool(row["paused"]),
             subtitle_time_offset=row["subtitle_time_offset"],
+            project_id=project_id,
             createdAt=created_at_ms,
             updatedAt=updated_at_ms,
         )

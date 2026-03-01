@@ -500,12 +500,15 @@ class SpeechAnalysisService:
         manager = get_model_manager_v2()
         model_dir = Path(manager.ensure_available(self.model_id))
         try:
-            # V3.2.0+dev.20260127.11: 修复模型加载，添加 savedir 参数
-            classifier = classifier_cls.from_hparams(
-                source=model_dir.as_posix(),
-                savedir=model_dir.as_posix(),  # 添加 savedir 参数
-                run_opts={"device": device},
-            )
+            # V3.2.0+dev.20260218.01: 抑制 SpeechBrain 模型加载时的第三方库警告
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                classifier = classifier_cls.from_hparams(
+                    source=model_dir.as_posix(),
+                    savedir=model_dir.as_posix(),
+                    run_opts={"device": device},
+                )
         except Exception as exc:
             raise RuntimeError(f"LangID 模型加载失败: {model_dir} -> {exc}") from exc
 

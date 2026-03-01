@@ -12,6 +12,10 @@ from app.models.confidence_models import AlignedWord
 from app.models.sensevoice_models import WordTimestamp
 from app.services.punctuation.base import PuncPosition, WordTimestampLike, apply_punctuation
 from app.services.punctuation.postprocess import build_clean_text
+from app.services.text_protection import (
+    can_merge_word_tokens,
+    should_skip_raw_punctuation,
+)
 
 
 _LEFT_QUOTES = set("“‘「『《（【")
@@ -189,6 +193,8 @@ class SemanticInjector:
         for raw_idx, char in enumerate(raw_text):
             if char not in _PUNCTUATION_SET:
                 continue
+            if should_skip_raw_punctuation(raw_text, raw_idx, char):
+                continue
             if raw_idx >= len(raw_to_clean):
                 continue
             if raw_to_clean[raw_idx] is not None:
@@ -286,18 +292,27 @@ class SemanticInjector:
             if span is None:
                 continue
             start, end = span
+            core = tokens[idx][1]
+            prev_core = tokens[idx - 1][1] if idx > 0 else ""
+            next_core = tokens[idx + 1][1] if idx + 1 < len(tokens) else ""
             for ch in leading:
                 if ch in _PUNCTUATION_SET:
+                    # V3.2.0+dev.20260218.03: 保护规则 - 跳过跨 token 小数点前缀注入（如 1 | .4）。
+                    if can_merge_word_tokens(prev_core, f"{ch}{core}"):
+                        continue
                     positions.append(PuncPosition(char_index=start, punctuation=ch, confidence=confidence))
             for ch in trailing:
                 if ch in _PUNCTUATION_SET:
+                    # V3.2.0+dev.20260218.03: 保护规则 - 跳过跨 token 小数点后缀注入（如 0. | 15）。
+                    if can_merge_word_tokens(f"{core}{ch}", next_core):
+                        continue
                     if ch in _WEAK_PUNCTUATION_SET:
                         weak_count += 1
                     positions.append(PuncPosition(char_index=end, punctuation=ch, confidence=confidence))
 
         # V3.2.0+dev.20260205.06: 移除弱标点过滤逻辑
         # 原因：密集标点问题已从根源修复（Prompt格式 + condition_on_previous_text禁用）
-        # 弱标点过滤会误伤英文等语言的正常逗号，且 L3 后处理已有规则引擎过滤异常标点
+        # 弱标点过滤会误伤英文等语言的正常逗号，且标点前置域后处理已有规则引擎过滤异常标点
         # 保留 weak_count 统计用于调试，但不再执行过滤
 
         if not positions:

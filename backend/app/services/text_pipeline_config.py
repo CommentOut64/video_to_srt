@@ -1,11 +1,11 @@
 """
 文本处理统一参数入口（TextPipelineConfig）。
-V3.2.0+dev.20260204.10
+V3.2.0+dev.20260214.10
 """
-# V3.2.0+dev.20260205.09: 接入 L4 对齐层参数。
+# V3.2.0+dev.20260205.09: 接入 collection 对齐层参数。
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
 from app.services.model_runtime_config_service import get_model_runtime_config_service
@@ -63,7 +63,7 @@ def _read_runtime_optional(raw: Dict[str, Any], key: str) -> Tuple[Any, bool]:
 
 @dataclass
 class PunctuationSchedulerOverride:
-    """L3 标点调度覆盖项（仅当运行参数显式设置时生效）。"""
+    """标点前置域调度覆盖项（仅当运行参数显式设置时生效）。"""
 
     mode: Optional[str] = None
     fast_confidence_threshold: Optional[float] = None
@@ -259,7 +259,7 @@ class NormalizationConfig:
 
 @dataclass
 class AlignmentLayerConfig:
-    """L4 对齐层参数。"""
+    """集合层（collection）对齐参数。"""
 
     is_enabled: bool = True
     score_threshold: float = 0.3
@@ -269,7 +269,7 @@ class AlignmentLayerConfig:
     min_valid_neighbors: int = 1
     min_word_duration_ms: int = 100
     use_sv_timebase: bool = True
-    # V3.2.0+dev.20260206.02: 双轨实验配置（仅影响 L4-L6 CPU 后处理，不并行占用 GPU）。
+    # V3.2.0+dev.20260206.02: 双轨实验配置（仅影响 collection/scoring/decision CPU 后处理，不并行占用 GPU）。
     is_enable_dual_time_experiment: bool = False
     dual_time_mode: str = "off"
     is_dual_time_write_debug_srt: bool = False
@@ -332,7 +332,7 @@ class AlignmentLayerConfig:
 
 @dataclass
 class SegmentationLayerConfig:
-    """L6 切分层参数。"""
+    """裁决层（decision）切分参数。"""
 
     is_enabled: bool = True
     min_chars: int = 6
@@ -342,6 +342,7 @@ class SegmentationLayerConfig:
     long_pause_sec: float = 0.8
     soft_pause_sec: float = 0.4
     short_merge_max_chars: int = 22
+    is_force_split_on_sentence_end_punct: bool = True
     is_keep_sentence_end_punct: bool = False
 
     final_min_tokens: int = 5
@@ -351,6 +352,216 @@ class SegmentationLayerConfig:
     final_soft_pause: float = 0.35
     final_long_pause: float = 0.8
     final_min_mapping_coverage: float = 0.6
+    is_enable_soft_cut: bool = True
+    is_enable_soft_cut_overlap_degrade: bool = False
+    soft_cut_plan_provider: str = "m1_internal"
+    soft_cut_plan_provider_class: str = ""
+    soft_cut_priority_active_profile: str = "punct_boost_transition"
+    soft_cut_priority_profiles: Dict[str, Dict[str, Any]] = field(
+        default_factory=lambda: {
+            "punct_boost_transition": {
+                "tiebreak_order": ["speaker", "punctuation", "pause", "semantic", "llm"],
+                "merge_window_ms": 120,
+                "source_rules": {
+                    "speaker": {
+                        "enabled": True,
+                        "weight": 0.85,
+                        "min_confidence": 0.45,
+                        "trigger_threshold": 0.42,
+                    },
+                    "pause": {
+                        "enabled": True,
+                        "weight": 0.55,
+                        "min_confidence": 0.35,
+                        "trigger_threshold": 0.30,
+                    },
+                    "punctuation": {
+                        "enabled": True,
+                        "weight": 0.75,
+                        "min_confidence": 0.35,
+                        "trigger_threshold": 0.28,
+                    },
+                    "semantic": {
+                        "enabled": True,
+                        "weight": 0.45,
+                        "min_confidence": 0.30,
+                        "trigger_threshold": 0.24,
+                    },
+                    "llm": {
+                        "enabled": False,
+                        "weight": 0.0,
+                        "min_confidence": 0.0,
+                        "trigger_threshold": 1.0,
+                    },
+                },
+            },
+            "llm_ramp_up": {
+                "tiebreak_order": ["speaker", "llm", "punctuation", "pause", "semantic"],
+                "merge_window_ms": 120,
+                "source_rules": {
+                    "speaker": {
+                        "enabled": True,
+                        "weight": 0.85,
+                        "min_confidence": 0.45,
+                        "trigger_threshold": 0.42,
+                    },
+                    "pause": {
+                        "enabled": True,
+                        "weight": 0.55,
+                        "min_confidence": 0.35,
+                        "trigger_threshold": 0.30,
+                    },
+                    "punctuation": {
+                        "enabled": True,
+                        "weight": 0.35,
+                        "min_confidence": 0.35,
+                        "trigger_threshold": 0.28,
+                    },
+                    "semantic": {
+                        "enabled": True,
+                        "weight": 0.45,
+                        "min_confidence": 0.30,
+                        "trigger_threshold": 0.24,
+                    },
+                    "llm": {
+                        "enabled": True,
+                        "weight": 0.78,
+                        "min_confidence": 0.50,
+                        "trigger_threshold": 0.36,
+                    },
+                },
+            },
+            "llm_primary_no_punct": {
+                "tiebreak_order": ["speaker", "llm", "pause", "semantic", "punctuation"],
+                "merge_window_ms": 120,
+                "source_rules": {
+                    "speaker": {
+                        "enabled": True,
+                        "weight": 0.85,
+                        "min_confidence": 0.45,
+                        "trigger_threshold": 0.42,
+                    },
+                    "pause": {
+                        "enabled": True,
+                        "weight": 0.50,
+                        "min_confidence": 0.35,
+                        "trigger_threshold": 0.28,
+                    },
+                    "punctuation": {
+                        "enabled": False,
+                        "weight": 0.0,
+                        "min_confidence": 1.0,
+                        "trigger_threshold": 1.0,
+                    },
+                    "semantic": {
+                        "enabled": True,
+                        "weight": 0.45,
+                        "min_confidence": 0.30,
+                        "trigger_threshold": 0.24,
+                    },
+                    "llm": {
+                        "enabled": True,
+                        "weight": 0.92,
+                        "min_confidence": 0.55,
+                        "trigger_threshold": 0.40,
+                    },
+                },
+            },
+        }
+    )
+
+    @classmethod
+    def _merge_priority_profiles_from_runtime(
+        cls,
+        *,
+        raw: Dict[str, Any],
+        base_profiles: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        merged_profiles: Dict[str, Dict[str, Any]] = {
+            name: {
+                "tiebreak_order": list((payload or {}).get("tiebreak_order") or []),
+                "merge_window_ms": int((payload or {}).get("merge_window_ms", 120) or 120),
+                "source_rules": dict((payload or {}).get("source_rules") or {}),
+            }
+            for name, payload in base_profiles.items()
+        }
+
+        runtime_profiles = _read_runtime_value(raw, "soft_cut.priority.profiles", None)
+        if runtime_profiles is None:
+            runtime_profiles = _read_runtime_value(raw, "soft_cut.priority.profile", None)
+        if isinstance(runtime_profiles, dict):
+            for name, payload in runtime_profiles.items():
+                profile_name = str(name or "").strip()
+                if not profile_name:
+                    continue
+                existing = merged_profiles.get(
+                    profile_name,
+                    {
+                        "tiebreak_order": [],
+                        "merge_window_ms": 120,
+                        "source_rules": {},
+                    },
+                )
+                if isinstance(payload, dict):
+                    if "tiebreak_order" in payload:
+                        existing["tiebreak_order"] = list(payload.get("tiebreak_order") or [])
+                    if "merge_window_ms" in payload:
+                        existing["merge_window_ms"] = int(payload.get("merge_window_ms") or 120)
+                    if isinstance(payload.get("source_rules"), dict):
+                        merged_source_rules = dict(existing.get("source_rules") or {})
+                        merged_source_rules.update(dict(payload.get("source_rules") or {}))
+                        existing["source_rules"] = merged_source_rules
+                    if isinstance(payload.get("source"), dict):
+                        merged_source_rules = dict(existing.get("source_rules") or {})
+                        merged_source_rules.update(dict(payload.get("source") or {}))
+                        existing["source_rules"] = merged_source_rules
+                    merged_profiles[profile_name] = existing
+
+        for key, value in raw.items():
+            if not isinstance(key, str):
+                continue
+            active_prefix = "soft_cut.priority.profile."
+            if key.startswith(active_prefix):
+                path = key[len(active_prefix):]
+            elif key.startswith("soft_cut.priority.profiles."):
+                path = key[len("soft_cut.priority.profiles."):]
+            else:
+                continue
+            parts = path.split(".")
+            if len(parts) < 2:
+                continue
+            profile_name = str(parts[0] or "").strip()
+            if not profile_name:
+                continue
+            profile_payload = merged_profiles.setdefault(
+                profile_name,
+                {
+                    "tiebreak_order": [],
+                    "merge_window_ms": 120,
+                    "source_rules": {},
+                },
+            )
+            if parts[1] == "tiebreak_order":
+                if isinstance(value, list):
+                    profile_payload["tiebreak_order"] = list(value)
+                continue
+            if parts[1] == "merge_window_ms":
+                try:
+                    profile_payload["merge_window_ms"] = int(value)
+                except (TypeError, ValueError):
+                    pass
+                continue
+            if len(parts) >= 4 and parts[1] == "source":
+                source_name = str(parts[2] or "").strip().lower()
+                field_name = str(parts[3] or "").strip()
+                if not source_name or not field_name:
+                    continue
+                source_rules = dict(profile_payload.get("source_rules") or {})
+                source_rule_payload = dict(source_rules.get(source_name) or {})
+                source_rule_payload[field_name] = value
+                source_rules[source_name] = source_rule_payload
+                profile_payload["source_rules"] = source_rules
+        return merged_profiles
 
     @classmethod
     def from_runtime(
@@ -370,6 +581,30 @@ class SegmentationLayerConfig:
                 cls.is_keep_sentence_end_punct,
             ),
         )
+        force_split_on_sentence_end_punct = _read_runtime_value(
+            raw,
+            "force_split_on_sentence_end_punct",
+            _read_runtime_value(
+                punctuation_raw,
+                "force_split_on_sentence_end_punct",
+                cls.is_force_split_on_sentence_end_punct,
+            ),
+        )
+        priority_active_profile = str(
+            _read_runtime_value(
+                raw,
+                "soft_cut.priority.active_profile",
+                cls.soft_cut_priority_active_profile,
+            )
+            or cls.soft_cut_priority_active_profile
+        ).strip() or cls.soft_cut_priority_active_profile
+        base_priority_profiles = cls().soft_cut_priority_profiles
+        merged_priority_profiles = cls._merge_priority_profiles_from_runtime(
+            raw=raw,
+            base_profiles=base_priority_profiles,
+        )
+        if priority_active_profile not in merged_priority_profiles:
+            priority_active_profile = cls.soft_cut_priority_active_profile
 
         return cls(
             is_enabled=bool(_read_runtime_value(raw, "enable", cls.is_enabled)),
@@ -390,6 +625,7 @@ class SegmentationLayerConfig:
             short_merge_max_chars=int(
                 _read_runtime_value(raw, "short_merge_max_chars", cls.short_merge_max_chars)
             ),
+            is_force_split_on_sentence_end_punct=bool(force_split_on_sentence_end_punct),
             is_keep_sentence_end_punct=bool(keep_sentence_end_punct),
             final_min_tokens=int(
                 _read_runtime_value(raw, "final.min_tokens", cls.final_min_tokens)
@@ -416,18 +652,92 @@ class SegmentationLayerConfig:
                     cls.final_min_mapping_coverage,
                 )
             ),
+            is_enable_soft_cut=bool(
+                _read_runtime_value(
+                    raw,
+                    "soft_cut.enable",
+                    cls.is_enable_soft_cut,
+                )
+            ),
+            is_enable_soft_cut_overlap_degrade=bool(
+                _read_runtime_value(
+                    raw,
+                    "soft_cut.overlap_degrade_enable",
+                    cls.is_enable_soft_cut_overlap_degrade,
+                )
+            ),
+            soft_cut_plan_provider=str(
+                _read_runtime_value(
+                    raw,
+                    "soft_cut.plan_provider",
+                    cls.soft_cut_plan_provider,
+                )
+                or cls.soft_cut_plan_provider
+            ).strip(),
+            soft_cut_plan_provider_class=str(
+                _read_runtime_value(
+                    raw,
+                    "soft_cut.plan_provider_class",
+                    cls.soft_cut_plan_provider_class,
+                )
+                or cls.soft_cut_plan_provider_class
+            ).strip(),
+            soft_cut_priority_active_profile=priority_active_profile,
+            soft_cut_priority_profiles=merged_priority_profiles,
+        )
+
+
+@dataclass
+class M2StageConfig:
+    """M2 阶段开关与观测参数。"""
+
+    is_enabled: bool = False
+    is_nw_v2_enabled: bool = False
+    is_time_mapping_enabled: bool = False
+    shadow_sample_rate: float = 0.1
+    shadow_provider_class: str = ""
+
+    @classmethod
+    def from_runtime(cls, raw: Optional[Dict[str, Any]]) -> "M2StageConfig":
+        raw = raw or {}
+        sample_rate = float(
+            _read_runtime_value(raw, "shadow.sample_rate", cls.shadow_sample_rate)
+        )
+        sample_rate = min(1.0, max(0.0, sample_rate))
+        return cls(
+            is_enabled=bool(_read_runtime_value(raw, "enable", cls.is_enabled)),
+            is_nw_v2_enabled=bool(
+                _read_runtime_value(raw, "nw_v2.enable", cls.is_nw_v2_enabled)
+            ),
+            is_time_mapping_enabled=bool(
+                _read_runtime_value(
+                    raw,
+                    "time_mapping.enable",
+                    cls.is_time_mapping_enabled,
+                )
+            ),
+            shadow_sample_rate=sample_rate,
+            shadow_provider_class=str(
+                _read_runtime_value(
+                    raw,
+                    "shadow.provider_class",
+                    cls.shadow_provider_class,
+                )
+                or cls.shadow_provider_class
+            ).strip(),
         )
 
 
 @dataclass
 class TextPipelineConfig:
-    """文本处理流水线参数入口（L1/L2/L3/L4/L6）。"""
+    """文本处理流水线参数入口（规范化/仲裁/标点前置/集合/裁决）。"""
 
     normalization: NormalizationConfig
     arbitration: "ArbitrationConfig"
     punctuation: "PunctuationConfig"
     alignment: AlignmentLayerConfig
     segmentation: SegmentationLayerConfig
+    m2: M2StageConfig
 
     @classmethod
     def from_runtime(cls, runtime: Optional[Dict[str, Any]] = None) -> "TextPipelineConfig":
@@ -439,6 +749,7 @@ class TextPipelineConfig:
         punctuation_raw = effective.get("punctuation", {}) if isinstance(effective, dict) else {}
         alignment_raw = effective.get("alignment", {}) if isinstance(effective, dict) else {}
         segmentation_raw = effective.get("segmentation", {}) if isinstance(effective, dict) else {}
+        m2_raw = effective.get("m2", {}) if isinstance(effective, dict) else {}
         return cls(
             normalization=NormalizationConfig.from_runtime(normalization_raw),
             arbitration=ArbitrationConfig.from_runtime(arbitration_raw),
@@ -448,12 +759,13 @@ class TextPipelineConfig:
                 segmentation_raw,
                 punctuation_raw=punctuation_raw,
             ),
+            m2=M2StageConfig.from_runtime(m2_raw),
         )
 
 
 @dataclass
 class ArbitrationConfig:
-    """L2 文本仲裁层参数。"""
+    """L2 文本选文层参数。"""
 
     is_enabled: bool = True
     text_source_preference: str = "auto"
@@ -461,6 +773,12 @@ class ArbitrationConfig:
     max_length_ratio: float = 3.0
     low_confidence_threshold: float = 0.5
     is_hallucination_block: bool = True
+    is_enable_fast_tail_guard: bool = True
+    fast_tail_min_extra_chars: int = 10
+    fast_tail_min_wh_coverage: float = 0.92
+    fast_tail_min_fast_confidence: float = 0.55
+    fast_tail_max_slow_advantage: float = 0.2
+    fast_tail_require_end_match_ratio: float = 0.9
 
     @classmethod
     def from_runtime(cls, raw: Optional[Dict[str, Any]]) -> "ArbitrationConfig":
@@ -486,6 +804,36 @@ class ArbitrationConfig:
             is_hallucination_block=bool(
                 _read_runtime_value(raw, "hallucination_block", cls.is_hallucination_block)
             ),
+            is_enable_fast_tail_guard=bool(
+                _read_runtime_value(raw, "enable_fast_tail_guard", cls.is_enable_fast_tail_guard)
+            ),
+            fast_tail_min_extra_chars=int(
+                _read_runtime_value(raw, "fast_tail_min_extra_chars", cls.fast_tail_min_extra_chars)
+            ),
+            fast_tail_min_wh_coverage=float(
+                _read_runtime_value(raw, "fast_tail_min_wh_coverage", cls.fast_tail_min_wh_coverage)
+            ),
+            fast_tail_min_fast_confidence=float(
+                _read_runtime_value(
+                    raw,
+                    "fast_tail_min_fast_confidence",
+                    cls.fast_tail_min_fast_confidence,
+                )
+            ),
+            fast_tail_max_slow_advantage=float(
+                _read_runtime_value(
+                    raw,
+                    "fast_tail_max_slow_advantage",
+                    cls.fast_tail_max_slow_advantage,
+                )
+            ),
+            fast_tail_require_end_match_ratio=float(
+                _read_runtime_value(
+                    raw,
+                    "fast_tail_require_end_match_ratio",
+                    cls.fast_tail_require_end_match_ratio,
+                )
+            ),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -496,12 +844,18 @@ class ArbitrationConfig:
             "max_length_ratio": self.max_length_ratio,
             "low_confidence_threshold": self.low_confidence_threshold,
             "hallucination_block": self.is_hallucination_block,
+            "enable_fast_tail_guard": self.is_enable_fast_tail_guard,
+            "fast_tail_min_extra_chars": self.fast_tail_min_extra_chars,
+            "fast_tail_min_wh_coverage": self.fast_tail_min_wh_coverage,
+            "fast_tail_min_fast_confidence": self.fast_tail_min_fast_confidence,
+            "fast_tail_max_slow_advantage": self.fast_tail_max_slow_advantage,
+            "fast_tail_require_end_match_ratio": self.fast_tail_require_end_match_ratio,
         }
 
 
 @dataclass
 class PunctuationConfig:
-    """L3 标点层参数。"""
+    """标点前置域参数。"""
 
     is_enabled: bool = True
     source_preference: str = "merged"

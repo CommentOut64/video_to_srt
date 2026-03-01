@@ -35,6 +35,7 @@ class ProcessingMode(Enum):
 
 from app.models.job_models import JobSettings, JobState
 from app.models.hardware_models import HardwareInfo, OptimizationConfig
+from app.models.project_models import generate_project_id
 from app.services.hardware_profile_service import get_hardware_profile_provider
 from app.services.job_lifecycle_service import get_job_lifecycle_service
 from app.core.config import config  # 导入统一配置
@@ -228,6 +229,16 @@ class TranscriptionService:
                 env_value=os.getenv("DEBUG_PUNCTUATION"),
                 config_value=bool(getattr(debug_config, "punctuation_output", False)),
             )
+            preprocessing = getattr(job.settings, "preprocessing", None)
+            is_enable_speaker_detection = bool(
+                getattr(preprocessing, "is_enable_speaker_detection", True)
+            )
+            is_enable_speaker_guided_split = bool(
+                getattr(preprocessing, "is_enable_speaker_guided_split", True)
+            )
+            speaker_count = max(0, int(getattr(preprocessing, "speaker_count", 0) or 0))
+            speaker_min_count = max(0, int(getattr(preprocessing, "speaker_min_count", 0) or 0))
+            speaker_max_count = max(0, int(getattr(preprocessing, "speaker_max_count", 0) or 0))
 
             # 动态创建转录流水线
             transcription_pipeline = AsyncDualPipeline(
@@ -237,6 +248,11 @@ class TranscriptionService:
                 patch_engine=patch_engine,
                 patching_threshold=patching_threshold,
                 debug_punctuation=debug_punctuation,
+                is_enable_speaker_detection=is_enable_speaker_detection,
+                is_enable_speaker_guided_split=is_enable_speaker_guided_split,
+                speaker_count=speaker_count,
+                speaker_min_count=speaker_min_count,
+                speaker_max_count=speaker_max_count,
                 logger=self.logger
             )
 
@@ -253,8 +269,18 @@ class TranscriptionService:
                 if hasattr(ctx, 'sv_result') and ctx.sv_result:
                     # 从 streaming_subtitle 获取句子
                     from app.services.streaming_subtitle import get_streaming_subtitle_manager
-                    subtitle_manager = get_streaming_subtitle_manager(job.job_id)
+                    subtitle_manager = get_streaming_subtitle_manager(
+                        job.job_id,
+                        project_id=getattr(job, "project_id", None),
+                    )
+                    try:
+                        subtitle_manager.bind_runtime_checkpoint_service(job_dir)
+                    except Exception:
+                        # 兼容旧流程：持久化失败不影响主转录链路
+                        pass
                     chunk_indices = subtitle_manager.chunk_sentences.get(ctx.chunk_index, [])
+                    if hasattr(subtitle_manager, "get_chunk_sentence_indices"):
+                        chunk_indices = subtitle_manager.get_chunk_sentence_indices(ctx.chunk_index)
                     for idx in chunk_indices:
                         if idx in subtitle_manager.sentences:
                             final_sentences.append(subtitle_manager.sentences[idx])
@@ -280,8 +306,32 @@ class TranscriptionService:
             )
             subtitle_output.write_srt(segments, srt_path)
 
+            # V3.2.4+dev.20260228.01:
+            # 完成态不再将流水线结果写回 subtitle_edits.json（编辑增量文件）。
+            # 运行态真源由 StreamingSubtitleManager + runtime_state.db 维护。
+            try:
+                from app.services.project_service import get_project_service
+
+                project_service = get_project_service()
+                existing_project = project_service._load_project_meta(job_dir)  # type: ignore[attr-defined]
+                stable_project_id = (
+                    getattr(job, "project_id", None)
+                    or (existing_project.project_id if existing_project else None)
+                )
+                project = project_service.create_normal_project(
+                    job_id=job.job_id,
+                    title=job.title or Path(job.filename).stem,
+                    task_mode="transcribe",
+                    source_type="transcribe",
+                    project_id=stable_project_id,
+                    project_dir=job_dir,
+                )
+                job.project_id = project.project_id
+            except Exception as exc:
+                self.logger.warning("Task6 project 元信息创建失败，不影响主任务完成: %s", exc)
+
             job.srt_path = str(srt_path)
-            job.status = 'completed'
+            job.status = 'finished'
             job.message = '转录完成'
             job.progress = 100
 
@@ -389,7 +439,8 @@ class TranscriptionService:
         filename: str,
         src_path: str,
         settings: JobSettings,
-        job_id: Optional[str] = None
+        job_id: Optional[str] = None,
+        project_id: Optional[str] = None,
     ) -> JobState:
         """
         创建转录任务
@@ -398,17 +449,54 @@ class TranscriptionService:
             filename: 文件名
             src_path: 源文件路径
             settings: 任务设置
-            job_id: 任务ID（可选，不提供则自动生成）
+            job_id: 兼容字段（等价于 project_id）
+            project_id: 项目ID（可选，不提供则自动生成）
 
         Returns:
             JobState: 创建的任务状态对象
         """
-        return self.job_lifecycle.create_job(
+        from app.services.project_naming_service import get_project_naming_service
+
+        explicit_identifier = str(project_id or job_id or "").strip()
+        if explicit_identifier:
+            # 兼容调用方显式指定 ID 的场景：目录名与任务主键保持一致，避免再次产生双主键。
+            target_project_id = explicit_identifier
+            workspace_dir_name = explicit_identifier
+        else:
+            # 新建任务强制使用 canonical workspace 标识作为 project/job 主键。
+            workspace_dir_name = get_project_naming_service().generate_workspace_dir_name(
+                jobs_root=self.job_lifecycle.jobs_root,
+                mode="transcribe",
+                title=Path(filename).stem,
+                source_filename=filename,
+            )
+            target_project_id = workspace_dir_name
+
+        project_title = str(Path(filename).stem or target_project_id)
+        job = self.job_lifecycle.create_job(
             filename=filename,
             src_path=src_path,
             settings=settings,
-            job_id=job_id
+            job_id=target_project_id,
+            job_dir_name=workspace_dir_name,
         )
+        job.project_id = target_project_id
+
+        # 严格约束：创建阶段就落盘 project 元信息，禁止“先 job 后 project”。
+        from app.services.project_service import get_project_service
+
+        project_service = get_project_service()
+        project_service.create_normal_project(
+            job_id=target_project_id,
+            title=project_title,
+            task_mode="transcribe",
+            source_type="transcribe",
+            project_id=target_project_id,
+            project_dir=Path(job.dir),
+        )
+
+        self.job_lifecycle.save_job_meta(job)
+        return job
 
     def save_job_meta(self, job: JobState) -> bool:
         """
@@ -604,13 +692,22 @@ class TranscriptionService:
         try:
             import asyncio
             import aiohttp
+            from app.services.project_id_resolver import get_project_id_resolver
+
+            media_identifier = str(job_id or "").strip()
+            if media_identifier:
+                try:
+                    media_identifier = get_project_id_resolver().resolve_or_fail(media_identifier).project_id
+                except FileNotFoundError:
+                    # 新任务在 project 元信息落盘前允许使用原标识触发预处理。
+                    pass
 
             async def do_post_process():
                 """异步执行预处理请求"""
                 try:
                     # 调用媒体预处理接口
                     async with aiohttp.ClientSession() as session:
-                        url = f"http://127.0.0.1:8000/api/media/{job_id}/post-process"
+                        url = f"http://127.0.0.1:8000/api/media/{media_identifier}/post-process"
                         async with session.post(url, timeout=aiohttp.ClientTimeout(total=300)) as resp:
                             if resp.status == 200:
                                 result = await resp.json()
@@ -618,7 +715,7 @@ class TranscriptionService:
                             else:
                                 self.logger.warning(f"媒体预处理请求失败: {resp.status}")
                 except asyncio.TimeoutError:
-                    self.logger.warning(f"媒体预处理超时: {job_id}")
+                    self.logger.warning(f"媒体预处理超时: {media_identifier}")
                 except Exception as e:
                     self.logger.warning(f"媒体预处理异常: {e}")
 
@@ -634,10 +731,10 @@ class TranscriptionService:
                 thread = threading.Thread(target=run_in_thread, daemon=True)
                 thread.start()
 
-            self.logger.info(f"已触发媒体预处理任务: {job_id}")
+            self.logger.info(f"已触发媒体预处理任务: {media_identifier}")
 
             # 触发 720p 高清转码（队列空闲时执行）
-            self._trigger_720p_transcode_if_idle(job_id)
+            self._trigger_720p_transcode_if_idle(media_identifier)
 
         except Exception as e:
             # 预处理失败不影响转录结果
@@ -656,13 +753,29 @@ class TranscriptionService:
         try:
             from pathlib import Path
             from app.core.config import config
-            from app.services.media_prep_service import get_media_prep_service
+            from app.services.media_prep_service import TranscodeDecision, get_media_prep_service
+            from app.services.project_id_resolver import get_project_id_resolver
 
             self.logger.info(f"[720p] 开始检查是否需要触发720p转码: {job_id}")
 
-            job_dir = config.JOBS_DIR / job_id
+            normalized_identifier = str(job_id or "").strip()
+            if not normalized_identifier:
+                self.logger.info("[720p] 标识为空，跳过")
+                return
+
+            project_id = normalized_identifier
+            job_dir = config.JOBS_DIR / normalized_identifier
             if not job_dir.exists():
-                self.logger.info(f"[720p] 任务目录不存在，跳过: {job_id}")
+                try:
+                    identity = get_project_id_resolver().resolve_or_fail(normalized_identifier)
+                    project_id = identity.project_id
+                    job_dir = identity.project_dir
+                except FileNotFoundError:
+                    self.logger.info(f"[720p] 任务目录不存在，跳过: {normalized_identifier}")
+                    return
+
+            if not job_dir.exists():
+                self.logger.info(f"[720p] 项目目录不存在，跳过: {project_id}")
                 return
 
             # 查找视频文件
@@ -674,7 +787,7 @@ class TranscriptionService:
                     break
 
             if not video_file:
-                self.logger.info(f"[720p] 未找到视频文件，跳过: {job_id}")
+                self.logger.info(f"[720p] 未找到视频文件，跳过: {project_id}")
                 return
 
             self.logger.info(f"[720p] 找到视频文件: {video_file.name}")
@@ -684,15 +797,41 @@ class TranscriptionService:
 
             # 720p 已存在则跳过
             if proxy_720p.exists():
-                self.logger.info(f"[720p] 已存在，跳过: {job_id}")
+                self.logger.info(f"[720p] 已存在，跳过: {project_id}")
                 return
 
             media_prep = get_media_prep_service()
+            try:
+                from app.utils.media_analyzer import media_analyzer
+
+                video_info = media_analyzer.analyze_sync(video_file)
+                video_info["container"] = video_file.suffix.lower()
+                decision = media_prep.analyze_transcode_decision(video_info)
+            except Exception as exc:
+                self.logger.warning(f"[720p] 媒体分析失败，跳过自动720p触发: {project_id}, err={exc}")
+                return
+
+            if decision == TranscodeDecision.DIRECT_PLAY:
+                self.logger.info(f"[720p] 源视频可直播放，跳过720p触发: {project_id}")
+                return
+
+            if decision == TranscodeDecision.REMUX_ONLY:
+                remux_output = job_dir / "remux.mp4"
+                if not remux_output.exists():
+                    enqueued = media_prep.enqueue_remux(project_id, video_file, remux_output, priority=3)
+                    self.logger.info(
+                        "[720p] 仅需重封装，改为触发 remux: %s, enqueued=%s",
+                        project_id,
+                        enqueued,
+                    )
+                else:
+                    self.logger.info(f"[720p] remux 已存在，跳过自动触发: {project_id}")
+                return
 
             # 检查 720p 是否已在队列中
-            proxy_status = media_prep.get_proxy_status(job_id)
+            proxy_status = media_prep.get_proxy_status(project_id)
             if proxy_status and proxy_status.get("status") in ["queued", "processing", "completed"]:
-                self.logger.info(f"[720p] 任务已存在或完成（状态={proxy_status.get('status')}），跳过: {job_id}")
+                self.logger.info(f"[720p] 任务已存在或完成（状态={proxy_status.get('status')}），跳过: {project_id}")
                 return
 
             # 检查 360p 预览是否已完成（必须先有360p才能启动720p）
@@ -705,11 +844,11 @@ class TranscriptionService:
                 self.logger.debug(f"[720p] 360p文件存在，认为已完成: {job_id}")
             else:
                 # 文件不存在，检查内存状态（可能正在转码中）
-                preview_status = media_prep.get_preview_status(job_id)
+                preview_status = media_prep.get_preview_status(project_id)
                 preview_completed = preview_status and preview_status.get("status") == "completed"
 
             if not preview_completed:
-                self.logger.info(f"[720p] 360p预览未完成，跳过720p转码: {job_id}")
+                self.logger.info(f"[720p] 360p预览未完成，跳过720p转码: {project_id}")
                 return
 
             # V3.1.2+dev.20260114.05: 交给 720p 调度器统一排队，避免重复入队
@@ -717,7 +856,7 @@ class TranscriptionService:
 
             scheduler = get_proxy_scheduler()
             scheduler.request(
-                job_id,
+                project_id,
                 video_file,
                 trigger_type="transcription_done",
                 auto_enabled=config.PROXY_CONFIG.get('auto_trigger_720p', False),
@@ -1794,11 +1933,9 @@ class TranscriptionService:
         splitter = SentenceSplitter(config)
         sentences = splitter.split(sv_result.words, sv_result.text_clean)
 
-        # Layer 2: 语义分组 (可选，已实现)
+        # Layer 2: 语义分组服务已下线（Phase 4），保留基础分句结果。
         if enable_grouping:
-            from app.services.semantic_grouper import SemanticGrouper, GroupConfig
-            grouper = SemanticGrouper(GroupConfig(language=config.language))
-            sentences = grouper.group(sentences)
+            self.logger.debug("语义分组已下线，跳过 grouping")
 
         # 【阶段三】VAD 边缘吸附 (Head Snap)
         # 逻辑：如果是 Chunk 的第一句话，且 CTC 延迟在合理范围内（<0.6s），
@@ -2200,8 +2337,13 @@ class TranscriptionService:
                 f"[{overlap_start:.2f}s, {sentence.end:.2f}s]"
             )
 
-        # 获取上下文提示（现在使用清洗后的文本，避免下划线等原始 token）
-        context = subtitle_manager.get_context_window(sentence_index)
+        # 获取上下文提示（统一走压缩策略，避免全文拼接污染）
+        from app.services.whisper.whisper_prompt_policy import compact_whisper_context_for_patch
+
+        context = compact_whisper_context_for_patch(
+            subtitle_manager.get_context_window(sentence_index),
+            logger=self.logger,
+        )
 
         # Whisper 转录
         builder = get_transcribe_param_builder(logger=self.logger)
@@ -2429,8 +2571,13 @@ class TranscriptionService:
                 f"[{overlap_start:.2f}s, {sentence.end:.2f}s]"
             )
 
-        # 获取上下文提示（现在使用清洗后的文本，避免下划线等原始 token）
-        context = subtitle_manager.get_context_window(sentence_index)
+        # 获取上下文提示（统一走压缩策略，避免全文拼接污染）
+        from app.services.whisper.whisper_prompt_policy import compact_whisper_context_for_patch
+
+        context = compact_whisper_context_for_patch(
+            subtitle_manager.get_context_window(sentence_index),
+            logger=self.logger,
+        )
 
         # Whisper 转录（仅取文本，弃用时间戳）
         builder = get_transcribe_param_builder(logger=self.logger)
@@ -2646,8 +2793,13 @@ class TranscriptionService:
 
             # 检查是否触发缓冲池处理
             if buffer_service.should_trigger(has_long_silence=has_long_silence, is_eof=is_last):
-                # 获取上下文提示
-                context = subtitle_manager.get_context_window(sent_idx)
+                # 获取上下文提示（统一走压缩策略，避免全文拼接污染）
+                from app.services.whisper.whisper_prompt_policy import compact_whisper_context_for_patch
+
+                context = compact_whisper_context_for_patch(
+                    subtitle_manager.get_context_window(sent_idx),
+                    logger=self.logger,
+                )
 
                 # 处理缓冲池
                 aligned_results = buffer_service.process_buffer(
@@ -2707,7 +2859,16 @@ class TranscriptionService:
 
         # 处理缓冲池中的剩余内容
         if not buffer_service.is_empty:
-            context = subtitle_manager.get_context_window(patch_queue[-1]["index"]) if patch_queue else ""
+            from app.services.whisper.whisper_prompt_policy import compact_whisper_context_for_patch
+
+            context = (
+                compact_whisper_context_for_patch(
+                    subtitle_manager.get_context_window(patch_queue[-1]["index"]),
+                    logger=self.logger,
+                )
+                if patch_queue
+                else ""
+            )
             remaining_results = buffer_service.flush_remaining(
                 whisper_service=whisper_service,
                 language=getattr(job.settings, 'language', 'auto'),

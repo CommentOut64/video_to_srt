@@ -1,0 +1,108 @@
+# ================================
+# 多语言策略静态配置（language_policy/policy.yaml）
+# ================================
+# 说明：
+# - 结构化阈值与规则放在 YAML；
+# - 高频词表放在 lexicons/*.txt；
+# - 运行时临时覆盖通过 model_runtime_config.json 的 runtime.language_policy 写入。
+
+policy_version: V3.2.0+dev.20260221.07
+default_language: zh
+
+language_aliases:
+  auto: zh
+  mixed: zh
+  zh-cn: zh
+  zh-hans: zh
+  zh-hant: zh
+  en-us: en
+  en-gb: en
+  ja-jp: ja
+
+languages:
+  zh:
+    sentence_end_chars: "。？！.!?"
+    lexicon:
+      continuation_words: continuation_words.txt
+      incomplete_endings: incomplete_endings.txt
+      semantic_anchor_words: semantic_anchor_words.txt
+    thresholds:
+      final_min_mapping_coverage: 0.60
+      soft_cut_min_score: 0.35
+      soft_cut_min_score_pause: 0.34
+      soft_cut_min_score_punctuation: 0.40
+      soft_cut_min_score_semantic: 0.35
+      soft_cut_min_score_llm: 0.35
+      soft_cut_min_score_fast_draft: 0.20
+      soft_cut_pause_anchor_trigger_sec: 0.30
+      soft_cut_pause_anchor_min_gap_sec: 0.70
+      soft_cut_semantic_anchor_confidence: 0.70
+      soft_cut_weak_punct_anchor_confidence: 0.60
+      singleton_tail_max_gap_sec: 0.65
+      singleton_tail_max_duration_sec: 0.95
+    carry_rules:
+      short_tail: [0.45, 2.20]
+      singleton_tail: [0.65, 0.95]
+    cross_chunk:
+      english_carry_words: ["a", "an", "the"]
+      cjk_carry_words: ["经", "直", "才", "因", "检", "警", "因为", "以及", "直到", "经过", "检测"]
+      cjk_max_gap_sec: 0.10
+      cjk_max_duration_sec: 0.80
+
+  en:
+    sentence_end_chars: ".!?"
+    lexicon:
+      continuation_words: continuation_words.txt
+      incomplete_endings: incomplete_endings.txt
+      semantic_anchor_words: semantic_anchor_words.txt
+    thresholds:
+      final_min_mapping_coverage: 0.60
+      soft_cut_min_score: 0.35
+      soft_cut_min_score_pause: 0.35
+      soft_cut_min_score_punctuation: 0.35
+      soft_cut_min_score_semantic: 0.35
+      soft_cut_min_score_llm: 0.35
+      soft_cut_min_score_fast_draft: 0.35
+      soft_cut_pause_anchor_trigger_sec: 0.40
+      soft_cut_pause_anchor_min_gap_sec: 1.00
+      soft_cut_semantic_anchor_confidence: 0.30
+      soft_cut_weak_punct_anchor_confidence: 0.00
+      singleton_tail_max_gap_sec: 0.60
+      singleton_tail_max_duration_sec: 0.95
+    carry_rules:
+      short_tail: [0.45, 2.20]
+      singleton_tail: [0.60, 0.95]
+    cross_chunk:
+      english_carry_words: ["a", "an", "the"]
+      cjk_carry_words: []
+      cjk_max_gap_sec: 0.10
+      cjk_max_duration_sec: 0.80
+
+  ja:
+    sentence_end_chars: "。？！.!?"
+    lexicon:
+      continuation_words: continuation_words.txt
+      incomplete_endings: incomplete_endings.txt
+      semantic_anchor_words: semantic_anchor_words.txt
+    thresholds:
+      final_min_mapping_coverage: 0.60
+      soft_cut_min_score: 0.35
+      soft_cut_min_score_pause: 0.34
+      soft_cut_min_score_punctuation: 0.40
+      soft_cut_min_score_semantic: 0.35
+      soft_cut_min_score_llm: 0.35
+      soft_cut_min_score_fast_draft: 0.30
+      soft_cut_pause_anchor_trigger_sec: 0.30
+      soft_cut_pause_anchor_min_gap_sec: 0.70
+      soft_cut_semantic_anchor_confidence: 0.70
+      soft_cut_weak_punct_anchor_confidence: 0.60
+      singleton_tail_max_gap_sec: 0.60
+      singleton_tail_max_duration_sec: 0.95
+    carry_rules:
+      short_tail: [0.45, 2.20]
+      singleton_tail: [0.60, 0.95]
+    cross_chunk:
+      english_carry_words: ["a", "an", "the"]
+      cjk_carry_words: []
+      cjk_max_gap_sec: 0.10
+      cjk_max_duration_sec: 0.80

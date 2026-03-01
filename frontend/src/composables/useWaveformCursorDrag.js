@@ -4,7 +4,7 @@
  * 职责：上层拖拽、指针守护、PlaybackManager 联动
  * 提取自 WaveformTimeline/index.vue L1009-1389
  */
-import { ref } from 'vue'
+import { ref, computed } from 'vue'
 import { ZOOM_BASE_PX_PER_SEC } from './useWaveformZoom.js'
 
 /**
@@ -12,18 +12,20 @@ import { ZOOM_BASE_PX_PER_SEC } from './useWaveformZoom.js'
  * @param {Ref<object>} wavesurferRef - WaveSurfer 实例引用
  * @param {Ref<number>} zoomLevel - 当前缩放级别
  * @param {object} playbackManager - PlaybackManager 实例
- * @param {object} projectStore - Pinia store
+ * @param {object} playbackStore - 播放状态 store
  * @param {Ref<boolean>} isReady - 波形是否就绪
- * @param {Ref<boolean>} isVideoReady - 视频是否就绪
+ * @param {Ref<boolean>} isMediaReady - 媒体是否就绪（音频或视频可用）
+ * @param {Function} resolveEffectiveDuration - 获取时间轴有效时长（秒）
  * @param {Function} emit - 事件发射函数
  */
 export function useWaveformCursorDrag(
   wavesurferRef,
   zoomLevel,
   playbackManager,
-  projectStore,
+  playbackStore,
   isReady,
-  isVideoReady,
+  isMediaReady,
+  resolveEffectiveDuration,
   emit
 ) {
   // ============ 状态 ============
@@ -31,9 +33,9 @@ export function useWaveformCursorDrag(
   const isDraggingCursor = ref(false)
   const isRegionPointerDragging = ref(false)
   const currentMouseCursor = ref('default')
+  const canEditTimeline = computed(() => isMediaReady.value)
 
   // ============ 私有状态 ============
-  let cursorDragStartTime = 0
   let cursorPointerId = null
   let cursorPointerTarget = null
   let cursorDragGuardsAttached = false
@@ -43,6 +45,22 @@ export function useWaveformCursorDrag(
   let regionPointerGuardEl = null
   let previousBodyUserSelect = ''
   let previousBodyWebkitSelect = ''
+
+  function readPlaybackValue(maybeRefValue) {
+    if (
+      maybeRefValue &&
+      typeof maybeRefValue === 'object' &&
+      'value' in maybeRefValue
+    ) {
+      return maybeRefValue.value
+    }
+    return maybeRefValue
+  }
+
+  function getCurrentTimeSec() {
+    const value = Number(readPlaybackValue(playbackStore.currentTime))
+    return Number.isFinite(value) ? value : 0
+  }
 
   // ============ 工具函数 ============
 
@@ -64,10 +82,16 @@ export function useWaveformCursorDrag(
     const absoluteX = mouseRelativeX + scrollContainer.scrollLeft
 
     const pxPerSec = (zoomLevel.value / 100) * ZOOM_BASE_PX_PER_SEC
-    const duration = ws.getDuration()
+    const wsDuration = Number(ws.getDuration()) || 0
+    const fallbackDuration = Number(resolveEffectiveDuration?.() || 0)
+    const duration = Math.max(wsDuration, fallbackDuration)
 
     const time = absoluteX / pxPerSec
-    return Math.max(0, Math.min(time, duration))
+    // 无媒体或波形尚未就绪时，duration 可能暂时为 0，不能把点击强行裁剪回 0。
+    if (duration > 0) {
+      return Math.max(0, Math.min(time, duration))
+    }
+    return Math.max(0, time)
   }
 
   /**
@@ -77,7 +101,7 @@ export function useWaveformCursorDrag(
     const ws = wavesurferRef.value
     if (!ws) return 0
 
-    const currentTime = projectStore.player.currentTime
+    const currentTime = getCurrentTimeSec()
     const pxPerSec = (zoomLevel.value / 100) * ZOOM_BASE_PX_PER_SEC
     return currentTime * pxPerSec
   }
@@ -322,8 +346,8 @@ export function useWaveformCursorDrag(
     if (!ws || !isReady.value) return
     if (e.pointerType === 'mouse' && e.button !== 0) return
 
-    if (!isVideoReady.value) {
-      console.warn('[WaveformCursorDrag] 视频未就绪，波形操作被拦截')
+    if (!canEditTimeline.value) {
+      console.warn('[WaveformCursorDrag] 媒体未就绪，时间轴暂不可编辑')
       return
     }
 
@@ -342,7 +366,6 @@ export function useWaveformCursorDrag(
 
     if (canDrag) {
       isDraggingCursor.value = true
-      cursorDragStartTime = projectStore.player.currentTime
       cursorPointerId = typeof e.pointerId === 'number' ? e.pointerId : null
       cursorPointerTarget = e.currentTarget instanceof HTMLElement ? e.currentTarget : null
 
@@ -413,6 +436,7 @@ export function useWaveformCursorDrag(
     isRegionPointerDragging,
     currentMouseCursor,
     cursorDragMode,
+    getTimeFromClientX,
     // 上半区域事件
     handleUpperZonePointerDown,
     handleUpperZonePointerMove,

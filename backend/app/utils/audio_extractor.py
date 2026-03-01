@@ -44,11 +44,22 @@ class AudioExtractor:
             return self._copy_audio_stream_sync(video_path, output_path)
         return self._convert_to_wav_sync(video_path, output_path)
 
+    @staticmethod
+    def _is_same_path(path_a: Path, path_b: Path) -> bool:
+        """判断两个路径是否指向同一文件（不存在时回退绝对路径比较）。"""
+        try:
+            return path_a.resolve() == path_b.resolve()
+        except Exception:
+            return os.path.abspath(str(path_a)) == os.path.abspath(str(path_b))
+
     async def _copy_audio_stream(self, video_path: Path, output_path: Path) -> Path:
         """复制音频流（不重新编码）"""
         # Whisper 需要 WAV，必须转码
         if output_path.suffix == '.wav':
             return await self._convert_to_wav(video_path, output_path)
+
+        if self._is_same_path(video_path, output_path):
+            return output_path
 
         cmd = [
             self.ffmpeg_cmd,
@@ -67,6 +78,9 @@ class AudioExtractor:
         if output_path.suffix == '.wav':
             return self._convert_to_wav_sync(video_path, output_path)
 
+        if self._is_same_path(video_path, output_path):
+            return output_path
+
         cmd = [
             self.ffmpeg_cmd,
             '-i', str(video_path),
@@ -82,6 +96,8 @@ class AudioExtractor:
     async def _convert_to_wav(self, video_path: Path, output_path: Path) -> Path:
         """转换为 WAV（用于 Whisper）"""
         wav_path = output_path.with_suffix('.wav')
+        if self._is_same_path(video_path, wav_path):
+            return wav_path
 
         cmd = [
             self.ffmpeg_cmd,
@@ -100,6 +116,8 @@ class AudioExtractor:
     def _convert_to_wav_sync(self, video_path: Path, output_path: Path) -> Path:
         """同步版本转换为 WAV"""
         wav_path = output_path.with_suffix('.wav')
+        if self._is_same_path(video_path, wav_path):
+            return wav_path
 
         cmd = [
             self.ffmpeg_cmd,

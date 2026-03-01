@@ -89,7 +89,7 @@ class TranscriptionState:
     # 保存已生成的所有字幕句子，确保恢复时不丢失
     sentences_snapshot: List[Dict[str, Any]] = field(default_factory=list)
     sentence_count: int = 0  # 全局句子计数器
-    chunk_sentences_map: Dict[int, List[int]] = field(default_factory=dict)  # chunk_index -> [sentence_indices]
+    chunk_sentences_map: Dict[str, List[int]] = field(default_factory=dict)  # chunk_ref -> [sentence_indices]
 
 
 @dataclass
@@ -257,11 +257,11 @@ class CheckpointV37:
         # V3.1.0: 字幕快照
         checkpoint.transcription.sentences_snapshot = trans.get("sentences_snapshot", [])
         checkpoint.transcription.sentence_count = trans.get("sentence_count", 0)
-        # chunk_sentences_map 的键是 int，JSON 反序列化后变成 str，需要转换
+        # chunk_sentences_map 支持 int/string chunk_ref。
         raw_chunk_map = trans.get("chunk_sentences_map", {})
-        checkpoint.transcription.chunk_sentences_map = {
-            int(k): v for k, v in raw_chunk_map.items()
-        } if raw_chunk_map else {}
+        checkpoint.transcription.chunk_sentences_map = (
+            {str(k): v for k, v in raw_chunk_map.items()} if raw_chunk_map else {}
+        )
 
         # 输出状态
         output = data.get("output", {})
@@ -1105,10 +1105,10 @@ class CheckpointManagerV37:
             if "sentence_count" in trans_data:
                 trans.sentence_count = trans_data["sentence_count"]
             if "chunk_sentences_map" in trans_data:
-                # JSON 键是 str，需要转换为 int
+                # chunk_ref 允许 string 语义键（如 semantic chunk_id）。
                 raw_map = trans_data["chunk_sentences_map"]
                 trans.chunk_sentences_map = {
-                    int(k): v for k, v in raw_map.items()
+                    str(k): v for k, v in raw_map.items()
                 } if raw_map else {}
             # 支持 finalized_indices 字段（用于恢复点计算）
             if "finalized_indices" in trans_data:

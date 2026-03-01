@@ -2,8 +2,8 @@
   <header class="editor-header tw-flex tw-items-center tw-justify-between tw-h-14 tw-px-4 tw-bg-bg-secondary tw-border-b tw-border-border tw-flex-shrink-0">
     <!-- 左侧：返回 + 任务信息堆叠 -->
     <div class="header-left tw-flex tw-items-center tw-gap-3">
-      <el-tooltip content="返回任务列表" placement="bottom" :show-after="500">
-        <router-link to="/tasks" class="nav-back">
+      <el-tooltip :content="backTooltip" placement="bottom" :show-after="500">
+        <router-link :to="backRoute" class="nav-back">
           <svg viewBox="0 0 24 24" fill="currentColor">
             <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/>
           </svg>
@@ -46,9 +46,12 @@
 
     <!-- 中间：动态进度区 -->
     <div class="header-center">
+      <div v-if="!hasJobContext" class="queue-progress">
+        <span class="progress-text">纯编辑模式</span>
+      </div>
       <!-- 场景1: 当前任务转录中或已暂停 -->
       <el-popover
-        v-if="showCurrentTaskProgress"
+        v-else-if="showCurrentTaskProgress"
         trigger="hover"
         :width="240"
         popper-class="control-popover-dark"
@@ -130,6 +133,7 @@
     <div class="header-right">
       <!-- 任务监控器 -->
       <el-popover
+        v-if="hasJobContext"
         trigger="click"
         :width="400"
         popper-class="task-monitor-popover"
@@ -147,10 +151,10 @@
             <span v-if="activeTasks > 0" class="badge">{{ activeTasks }}</span>
           </div>
         </template>
-        <TaskMonitor :current-job-id="jobId" />
+        <TaskMonitor v-if="jobId" :current-job-id="jobId" />
       </el-popover>
 
-      <div class="divider-vertical"></div>
+      <div v-if="hasJobContext" class="divider-vertical"></div>
 
       <!-- 撤销/重做 -->
       <el-tooltip content="撤销 (Ctrl+Z)" placement="bottom">
@@ -207,23 +211,24 @@
  * - 双击重命名任务
  */
 import { computed, ref, nextTick } from 'vue'
+import { ElMessage } from 'element-plus'
 import TaskMonitor from './TaskMonitor/index.vue'
 import DualAnchorProgress from '@/components/common/DualAnchorProgress.vue'
 import SimpleProgress from '@/components/common/SimpleProgress.vue'
 import { PHASE_CONFIG, STATUS_CONFIG, formatProgress } from '@/constants/taskPhases'
 import { PROGRESS_ALLOCATION } from '@/components/common/progress/constants'
 import transcriptionApi from '@/services/api/transcriptionApi'
-import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
+import { useTaskRuntimeStore } from '@/stores/taskRuntimeStore'
 import { useProjectStore } from '@/stores/projectStore'
-import { useProgressStore } from '@/stores/progressStore'
+import { selectRouteVisibility } from '@/state/capabilities/capabilitySelector'
 
-const taskStore = useUnifiedTaskStore()
+const taskStore = useTaskRuntimeStore()
 const projectStore = useProjectStore()
-const progressStore = useProgressStore()
+const progressStore = taskStore
 
 
 const props = defineProps({
-  jobId: { type: String, required: true },
+  jobId: { type: String, default: null },
   taskName: { type: String, default: '未命名项目' },
   currentTaskStatus: { type: String, default: 'idle' },      // 'processing', 'queued', 'paused', 'finished', etc.
   currentTaskPhase: { type: String, default: 'pending' },    // 任务阶段（transcribe, align, etc.）
@@ -243,9 +248,26 @@ const props = defineProps({
 })
 
 const emit = defineEmits(['undo', 'redo', 'export', 'pause', 'resume', 'cancel', 'rename'])
+const hasJobContext = computed(() => Boolean(props.jobId))
+const routeVisibility = computed(() => selectRouteVisibility(projectStore.meta.capabilitySnapshot))
+const backRoute = computed(() => (routeVisibility.value.taskList ? '/tasks' : '/import'))
+const backTooltip = computed(() => (routeVisibility.value.taskList ? '返回任务列表' : '返回导入页'))
 
 // V3.2.0+dev.20260122.02: 从 progressStore 获取当前任务的进度状态
-const jobProgress = computed(() => progressStore.getJobProgress(props.jobId).value)
+const jobProgress = computed(() => {
+  if (!props.jobId) {
+    return {
+      status: 'idle',
+      phase: 'pending',
+      percent: 0,
+      message: '',
+      detail: null,
+      dualStream: null,
+      lastSseAt: 0,
+    }
+  }
+  return progressStore.getJobProgress(props.jobId).value
+})
 
 // ========== 任务名称编辑 ==========
 const isEditingTitle = ref(false)
@@ -285,6 +307,12 @@ async function finishEditTitle() {
   }
   
   try {
+    if (!props.jobId) {
+      projectStore.setProjectTitle(newTitle)
+      emit('rename', newTitle)
+      isEditingTitle.value = false
+      return
+    }
     // 调用 API 重命名任务
     const result = await transcriptionApi.renameJob(props.jobId, newTitle)
 
@@ -302,7 +330,7 @@ async function finishEditTitle() {
     }
     
     // 更新 projectStore.meta.title
-    projectStore.meta.title = newTitle
+    projectStore.setProjectTitle(newTitle)
     
     // 通知父组件
     emit('rename', newTitle)
@@ -328,7 +356,8 @@ const isPaused = computed(() => ['pausing', 'paused'].includes(jobProgress.value
 
 // V3.2.0+dev.20260122.02: 始终显示当前任务进度条，不再切换到队列进度条
 const showCurrentTaskProgress = computed(() => {
-  return ['processing', 'queued', 'pausing', 'paused', 'finished'].includes(jobProgress.value.status)
+  return hasJobContext.value
+    && ['processing', 'queued', 'pausing', 'paused', 'finished'].includes(jobProgress.value.status)
 })
 
 function clampPercent(value) {
@@ -448,6 +477,7 @@ const statusClass = computed(() => {
 
 // V3.2.0+dev.20260122.02: 元信息文字，从 progressStore 获取状态
 const metaText = computed(() => {
+  if (!hasJobContext.value) return '编辑模式'
   const status = jobProgress.value.status
   if (status === 'pausing') return '正在暂停...'
   if (status === 'paused') return '已暂停'

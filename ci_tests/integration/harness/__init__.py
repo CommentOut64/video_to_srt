@@ -30,7 +30,15 @@ from .mock_services import (
 )
 from .audio_factory import AudioFactory
 from .report_builder import ReportBuilder, StageReport
-from .test_runner import IntegrationTestRunner, PipelineTestConfig, PipelineTestResult
+
+# test_runner 依赖完整后端运行时（prometheus_client 等），延迟加载以避免轻量 CI 环境报错
+def __getattr__(name: str):
+    if name in ("IntegrationTestRunner", "PipelineTestConfig", "PipelineTestResult"):
+        from .test_runner import IntegrationTestRunner, PipelineTestConfig, PipelineTestResult
+        return {"IntegrationTestRunner": IntegrationTestRunner,
+                "PipelineTestConfig": PipelineTestConfig,
+                "PipelineTestResult": PipelineTestResult}[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "SRTParser",

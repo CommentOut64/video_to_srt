@@ -4,6 +4,23 @@
     :class="itemClasses"
     @click="handleClick"
   >
+    <!-- 簇颜色条（时间线模式，搜索激活时显示） -->
+    <div
+      v-if="clusterColor"
+      class="cluster-color-bar"
+      :style="{ backgroundColor: clusterColor }"
+    />
+
+    <!-- 复选框（搜索模式显示） -->
+    <el-checkbox
+      v-if="isSelectable"
+      :model-value="isSelected"
+      size="small"
+      class="item-checkbox"
+      @click.stop
+      @change="handleSelectChange"
+    />
+
     <!-- 序号 -->
     <div class="item-index">{{ index + 1 }}</div>
 
@@ -165,7 +182,8 @@
  */
 import { ref, computed, nextTick, watch } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
-import transcriptionApi from '@/services/api/transcriptionApi'
+import { usePlaybackStore } from '@/stores/playbackStore'
+import projectApi from '@/services/api/projectApi'
 import ContextMenu from '@/components/editor/ContextMenu.vue'
 
 const props = defineProps({
@@ -174,6 +192,11 @@ const props = defineProps({
   isActive: { type: Boolean, default: false },
   isCurrent: { type: Boolean, default: false },
   editable: { type: Boolean, default: true },
+  // 同音搜索相关 props
+  matchSpans: { type: Array, default: () => [] },  // 匹配区域 [{start, end, readingKey}]
+  isSelected: { type: Boolean, default: false },   // 是否选中（批量替换）
+  isSelectable: { type: Boolean, default: false }, // 是否显示复选框
+  clusterColor: { type: String, default: null },   // 簇颜色条（时间线模式）
 })
 
 const emit = defineEmits([
@@ -182,11 +205,13 @@ const emit = defineEmits([
   'update-text',
   'delete',
   'insert-before',
-  'insert-after'
+  'insert-after',
+  'select-change',  // 同音搜索：选择变化
 ])
 
 // Store
 const projectStore = useProjectStore()
+const playbackStore = usePlaybackStore()
 
 // 编辑状态
 const isEditing = ref(false)
@@ -202,7 +227,7 @@ const cursorPosition = ref(0)
 const isContextMenuOpen = ref(false)  // 防止菜单打开时 blur 触发 stopEditing
 
 // 播放状态
-const isPlaying = computed(() => projectStore.player.isPlaying)
+const isPlaying = computed(() => playbackStore.isPlaying)
 
 // 计算属性
 const itemClasses = computed(() => ({
@@ -212,7 +237,9 @@ const itemClasses = computed(() => ({
   'is-draft': props.subtitle.isDraft,
   'warning-low-confidence': props.subtitle.warning_type === 'low_confidence',
   'warning-high-perplexity': props.subtitle.warning_type === 'high_perplexity',
-  'warning-both': props.subtitle.warning_type === 'both'
+  'warning-both': props.subtitle.warning_type === 'both',
+  'is-match-selected': props.isSelectable && props.isSelected,
+  'has-cluster-color': !!props.clusterColor,
 }))
 
 // 置信度徽章
@@ -264,6 +291,11 @@ function handleClick() {
   // 点击字幕块时重置删除确认状态
   resetDeleteConfirm()
   emit('click', props.subtitle)
+}
+
+// 选择变化处理（同音搜索）
+function handleSelectChange(checked) {
+  emit('select-change', props.index, checked)
 }
 
 // 时间更新
@@ -356,30 +388,20 @@ const contextMenuItems = computed(() => {
 
 // 编辑区域右键事件处理
 function handleTextareaContextMenu(e) {
-  console.log('[SubtitleItem] 右键事件触发', {
-    isEditing: isEditing.value,
-    isDraft: props.subtitle.isDraft,
-    hasTextarea: !!editTextarea.value,
-    hasContextMenu: !!contextMenuRef.value
-  })
-
   e.preventDefault()
   e.stopPropagation()
 
   if (!isEditing.value || props.subtitle.isDraft) {
-    console.log('[SubtitleItem] 右键菜单被阻止：不在编辑模式或是草稿')
     return
   }
 
   // 获取光标位置
   const textarea = editTextarea.value
   if (!textarea) {
-    console.log('[SubtitleItem] 右键菜单被阻止：textarea不存在')
     return
   }
 
   cursorPosition.value = textarea.selectionStart
-  console.log('[SubtitleItem] 显示右键菜单，光标位置:', cursorPosition.value)
 
   // 标记菜单打开，防止 blur 触发 stopEditing
   isContextMenuOpen.value = true
@@ -390,24 +412,17 @@ function handleTextareaContextMenu(e) {
 
 // 右键菜单项选择处理
 async function handleContextMenuSelect(key) {
-  console.log('[SubtitleItem] 菜单项被选择:', key)
-
   // 重置菜单打开标志
   isContextMenuOpen.value = false
 
   if (key === 'split') {
-    console.log('[SubtitleItem] 开始切分，光标位置:', cursorPosition.value)
-
     const result = projectStore.splitSubtitle(props.subtitle.id, {
       cursorPosition: cursorPosition.value
     })
 
-    console.log('[SubtitleItem] 切分结果:', result)
-
     if (!result.success) {
       console.error('[SubtitleItem] 切分失败:', result.error)
     } else {
-      console.log('[SubtitleItem] 切分成功:', result)
       await syncSplitSubtitles(result)
       // 切分成功后退出编辑模式
       isEditing.value = false
@@ -416,53 +431,43 @@ async function handleContextMenuSelect(key) {
 }
 
 async function syncSplitSubtitles(result) {
-  const jobId = projectStore.meta.jobId
-  if (!jobId) return
+  const projectId = projectStore.meta.projectId
+  if (!projectId) {
+    throw new Error('缺少 project_id，禁止走 job 字幕切分分支')
+  }
 
-  const { originalSentenceIndex, leftSubtitle, rightSubtitle } = result
+  const { leftSubtitle, rightSubtitle } = result
   if (!leftSubtitle || !rightSubtitle) return
 
   try {
-    if (originalSentenceIndex !== undefined) {
-      await transcriptionApi.updateSubtitle(jobId, originalSentenceIndex, {
-        text: leftSubtitle.text,
-        start: projectStore.toBaseTime(leftSubtitle.start),
-        end: projectStore.toBaseTime(leftSubtitle.end)
-      })
-      projectStore.updateSubtitle(leftSubtitle.id, {
-        sentenceIndex: originalSentenceIndex,
-        isModified: true,
-        source: 'split'
-      }, { isUserEdit: true })
-    } else {
-      const leftResp = await transcriptionApi.createSubtitle(jobId, {
-        text: leftSubtitle.text,
-        start: projectStore.toBaseTime(leftSubtitle.start),
-        end: projectStore.toBaseTime(leftSubtitle.end)
-      })
-      const leftData = leftResp?.data?.data || leftResp?.data
-      if (leftData?.index !== undefined) {
-        projectStore.updateSubtitle(leftSubtitle.id, {
-          sentenceIndex: leftData.index,
-          isModified: true,
-          source: leftData.source || 'manual'
-        }, { isUserEdit: true })
-      }
+    const leftSegmentId = leftSubtitle.segment_id || props.subtitle.segment_id
+    if (!leftSegmentId) {
+      throw new Error('切分左半字幕缺少 segment_id，无法同步到 project 字幕真源')
     }
 
-    const rightResp = await transcriptionApi.createSubtitle(jobId, {
+    const updatedLeft = await projectApi.updateSubtitle(projectId, leftSegmentId, {
+      text: leftSubtitle.text,
+      start: projectStore.toBaseTime(leftSubtitle.start),
+      end: projectStore.toBaseTime(leftSubtitle.end)
+    })
+    projectStore.updateSubtitle(leftSubtitle.id, {
+      sentenceIndex: updatedLeft?.legacy_index ?? leftSubtitle.sentenceIndex,
+      segment_id: updatedLeft?.segment_id ?? leftSegmentId,
+      isModified: true,
+      source: updatedLeft?.source_type || 'split'
+    }, { isUserEdit: true })
+
+    const rightData = await projectApi.createSubtitle(projectId, {
       text: rightSubtitle.text,
       start: projectStore.toBaseTime(rightSubtitle.start),
       end: projectStore.toBaseTime(rightSubtitle.end)
     })
-    const rightData = rightResp?.data?.data || rightResp?.data
-    if (rightData?.index !== undefined) {
-      projectStore.updateSubtitle(rightSubtitle.id, {
-        sentenceIndex: rightData.index,
-        isModified: true,
-        source: rightData.source || 'manual'
-      }, { isUserEdit: true })
-    }
+    projectStore.updateSubtitle(rightSubtitle.id, {
+      sentenceIndex: rightData?.legacy_index ?? rightSubtitle.sentenceIndex,
+      segment_id: rightData?.segment_id ?? rightSubtitle.segment_id,
+      isModified: true,
+      source: rightData?.source_type || 'manual'
+    }, { isUserEdit: true })
   } catch (error) {
     console.warn('[SubtitleItem] 切分同步失败:', error)
   }
@@ -475,8 +480,14 @@ function handleContextMenuClose() {
 
 // 渲染带置信度高亮的文本
 function renderTextWithHighlight() {
-  const words = props.subtitle.words
   const text = props.subtitle.text
+
+  // 如果有同音搜索匹配区域，优先使用匹配高亮
+  if (props.matchSpans && props.matchSpans.length > 0) {
+    return renderMatchHighlight(text, props.matchSpans)
+  }
+
+  const words = props.subtitle.words
 
   // 如果没有字级数据，直接返回文本
   if (!words || words.length === 0) {
@@ -546,6 +557,49 @@ function renderTextWithHighlight() {
       }
     }
   }
+  return html
+}
+
+/**
+ * 渲染同音搜索匹配高亮
+ * @param {string} text - 原始文本
+ * @param {Array<{start: number, end: number, readingKey?: string}>} spans - 匹配区域
+ * @returns {string} 带高亮标记的 HTML
+ */
+function renderMatchHighlight(text, spans) {
+  if (!text || !spans || spans.length === 0) {
+    return escapeHtml(text)
+  }
+
+  // 按 start 排序并去重
+  const sortedSpans = [...spans].sort((a, b) => a.start - b.start)
+
+  let html = ''
+  let lastEnd = 0
+
+  for (const span of sortedSpans) {
+    const { start, end } = span
+
+    // 跳过无效区域
+    if (start < lastEnd || start >= text.length) continue
+
+    // 添加匹配前的普通文本
+    if (start > lastEnd) {
+      html += escapeHtml(text.slice(lastEnd, start))
+    }
+
+    // 添加高亮匹配文本
+    const matchText = text.slice(start, Math.min(end, text.length))
+    html += `<mark class="match-highlight">${escapeHtml(matchText)}</mark>`
+
+    lastEnd = Math.min(end, text.length)
+  }
+
+  // 添加剩余文本
+  if (lastEnd < text.length) {
+    html += escapeHtml(text.slice(lastEnd))
+  }
+
   return html
 }
 
@@ -991,5 +1045,48 @@ function formatDuration(seconds) {
 
 .delete-btn-confirming:hover {
   background: rgb(var(--af-accent-danger-rgb), 0.10);
+}
+
+/* 同音搜索相关样式 */
+
+/* 簇颜色条 */
+.cluster-color-bar {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  border-radius: var(--af-radius-md) 0 0 var(--af-radius-md);
+}
+
+/* 复选框 */
+.item-checkbox {
+  flex-shrink: 0;
+  margin-right: 4px;
+}
+
+/* 匹配高亮样式 */
+.text-row .text-preview :deep(.match-highlight) {
+  background-color: rgb(var(--af-accent-warning-rgb), 0.35);
+  color: var(--af-text-primary);
+  padding: 1px 2px;
+  border-radius: 2px;
+  font-weight: 500;
+}
+
+/* 选中状态的匹配项 */
+.subtitle-item.is-match-selected {
+  border-color: var(--af-accent-primary);
+  background: rgb(var(--af-accent-primary-rgb), 0.05);
+}
+
+/* 有簇颜色条时增加左侧内边距 */
+.subtitle-item.has-cluster-color {
+  padding-left: 14px;
+}
+
+.subtitle-item.is-match-selected .item-index {
+  background: var(--af-accent-primary);
+  color: var(--af-text-on-dark);
 }
 </style>

@@ -1,5 +1,5 @@
 <template>
-  <div class="video-stage" :class="{ 'is-fullscreen': isFullscreen, 'video-not-ready': !isVideoReady }">
+  <div class="video-stage" :class="{ 'is-fullscreen': isFullscreen }">
     <!-- 视频容器 -->
     <div class="video-container" ref="containerRef" @click="handleContainerClick" @dblclick="toggleFullscreen">
       <!-- 视频转码中的占位符 -->
@@ -29,13 +29,18 @@
         </div>
       </transition>
 
+      <!-- 纯音频模式占位（无视频时保持纯黑背景） -->
+      <div v-if="showAudioOnlyPlaceholder" class="audio-only-placeholder"></div>
+
       <!-- HTML5 视频元素 -->
       <video
         ref="videoRef"
-        :src="effectiveVideoSource"
+        v-show="hasVideoSource"
+        :src="hasVideoSource ? effectiveVideoSource : null"
         :muted="muted"
         :preload="preloadStrategy"
         @loadedmetadata="onMetadataLoaded"
+        @loadeddata="onLoadedData"
         @timeupdate="onTimeUpdate"
         @play="onPlay"
         @pause="onPause"
@@ -43,8 +48,9 @@
         @error="onError"
         @seeking="onSeeking"
         @seeked="onSeeked"
-        @waiting="isBuffering = true"
-        @canplay="isBuffering = false"
+        @waiting="onWaiting"
+        @canplay="onCanPlay"
+        @playing="onPlaying"
         @progress="onProgress"
       />
 
@@ -146,15 +152,16 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, nextTick, inject } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
+import { usePlaybackStore } from '@/stores/playbackStore'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { ProxyState } from '@/composables/useProxyVideo'
 
 // Props
 const props = defineProps({
   videoUrl: String,
-  jobId: String,
+  mediaId: String,
   autoPlay: { type: Boolean, default: false },
   muted: { type: Boolean, default: false },
   showSubtitle: { type: Boolean, default: true },
@@ -176,9 +183,16 @@ const emit = defineEmits(['loaded', 'error', 'play', 'pause', 'timeupdate', 'end
 
 // Store
 const projectStore = useProjectStore()
+const playbackStore = usePlaybackStore()
 
 // 全局播放管理器（单例）
 const playbackManager = usePlaybackManager()
+
+// 编辑器上下文（用于纯音频场景放开播放控制）
+const editorContext = inject('editorContext', {
+  isMediaReady: computed(() => true),
+  isVideoReady: computed(() => true),
+})
 
 // Refs
 const videoRef = ref(null)
@@ -195,6 +209,8 @@ const retryCount = ref(0)
 const maxRetries = 3
 const showProgressiveHint = ref(false)
 let progressiveHintTimer = null
+const BUFFERING_TIMEOUT_MS = 12000
+let bufferingTimeout = null
 
 // V3.1.2+dev.20260113.01: 分辨率标志/按钮状态
 const showResolutionBadge = ref(false)
@@ -217,14 +233,16 @@ const dragStartPos = ref({ x: 0, y: 0 })  // 拖动起始位置
 const dragStartSubtitlePos = ref({ x: 0, y: 0 })  // 拖动开始时的字幕位置
 
 // Computed
+const mediaId = computed(() => props.mediaId || projectStore.primaryId || null)
+
 const videoSource = computed(() => {
-  if (props.videoUrl) return props.videoUrl
-  if (props.jobId) return `/api/media/${props.jobId}/video`
-  return projectStore.meta.videoPath || ''
+  return props.videoUrl || null
 })
 
-// 标记当前是否启用了渐进式模式（父组件传入 progressiveUrl 即表示受控模式）
-const isProgressiveMode = computed(() => props.progressiveUrl !== undefined)
+// 标记当前是否启用了渐进式模式（Task6 编辑器始终由 proxy 状态受控）。
+const isProgressiveMode = computed(() => {
+  return props.progressiveUrl !== undefined || props.proxyState !== null
+})
 
 // 实际使用的视频源（支持渐进式加载）
 const effectiveVideoSource = computed(() => {
@@ -238,6 +256,8 @@ const effectiveVideoSource = computed(() => {
   }
   return videoSource.value
 })
+
+const hasVideoSource = computed(() => !!effectiveVideoSource.value)
 
 // 动态 preload 策略（根据视频时长决定）
 const preloadStrategy = computed(() => {
@@ -280,7 +300,7 @@ const canUpgrade = computed(() => {
 })
 
 const currentSubtitleText = computed(() => projectStore.currentSubtitle?.text || '')
-const isPlaying = computed(() => projectStore.player.isPlaying)
+const isPlaying = computed(() => playbackStore.isPlaying)
 
 // 字幕样式（控制位置）
 const subtitleStyle = computed(() => {
@@ -305,6 +325,10 @@ const isVideoReady = computed(() => {
   return !!effectiveVideoSource.value && !props.isUpgrading
 })
 
+const isMediaReady = computed(
+  () => editorContext.isMediaReady?.value ?? editorContext.isVideoReady?.value ?? isVideoReady.value
+)
+
 // 是否处于转码/处理中
 const isProcessing = computed(() => {
   if (props.proxyState) {
@@ -321,6 +345,16 @@ const isProcessing = computed(() => {
 // 是否显示 Proxy 错误
 const showProxyError = computed(() => {
   return props.proxyState === ProxyState.ERROR && props.proxyError
+})
+
+const showAudioOnlyPlaceholder = computed(() => {
+  if (hasVideoSource.value) {
+    return false
+  }
+  if (isProcessing.value || showProxyError.value || hasError.value) {
+    return false
+  }
+  return true
 })
 
 // 转码占位符相关
@@ -380,6 +414,36 @@ function showHint(type, text = '') {
   }, 800)
 }
 
+function clearBufferingTimeout() {
+  if (bufferingTimeout) {
+    clearTimeout(bufferingTimeout)
+    bufferingTimeout = null
+  }
+}
+
+function setBuffering(active, reason = '') {
+  if (!active) {
+    isBuffering.value = false
+    clearBufferingTimeout()
+    return
+  }
+
+  if (!hasVideoSource.value || isProcessing.value || showAudioOnlyPlaceholder.value) {
+    isBuffering.value = false
+    clearBufferingTimeout()
+    return
+  }
+
+  isBuffering.value = true
+  clearBufferingTimeout()
+  bufferingTimeout = setTimeout(() => {
+    if (isBuffering.value) {
+      console.warn('[VideoStage] 加载遮罩超时自动收敛:', reason || 'unknown')
+      isBuffering.value = false
+    }
+  }, BUFFERING_TIMEOUT_MS)
+}
+
 // 显示分辨率提示（视频源变更时）
 function showResolutionHint() {
   showProgressiveHint.value = true
@@ -427,14 +491,14 @@ function handleResolutionHover(isHovering) {
 
 // V3.1.2+dev.20260113.01: 处理分辨率标志点击
 async function handleResolutionClick() {
-  if (!canUpgrade.value) return
+  if (!canUpgrade.value || !mediaId.value) return
 
   // 隐藏气泡
   showUpgradeBubble.value = false
 
   try {
     // 调用手动触发720p的API
-    const response = await fetch(`/api/media/${props.jobId}/upgrade-720p`, {
+    const response = await fetch(`/api/media/${mediaId.value}/upgrade-720p`, {
       method: 'POST'
     })
 
@@ -442,7 +506,6 @@ async function handleResolutionClick() {
 
     if (result.success) {
       // 成功：触发全局Toast提示（由父组件处理）
-      console.log('[VideoStage] 720p转码已启动')
       emit('upgrade-started')
     } else {
       // 失败：显示错误提示
@@ -460,8 +523,8 @@ async function handleResolutionClick() {
 let currentPlayPromise = null
 
 // 监听 Store 播放状态（单向：Store → Video）
-watch(() => projectStore.player.isPlaying, async (playing) => {
-  if (!videoRef.value) return
+watch(() => playbackStore.isPlaying, async (playing) => {
+  if (!videoRef.value || !hasVideoSource.value) return
 
   const video = videoRef.value
   const isPaused = video.paused
@@ -480,7 +543,7 @@ watch(() => projectStore.player.isPlaying, async (playing) => {
       }
       // 其他错误才是真正的播放失败
       console.error('[VideoStage] 播放失败:', error)
-      projectStore.player.isPlaying = false
+      playbackManager.pause()
     } finally {
       currentPlayPromise = null
     }
@@ -504,37 +567,47 @@ watch(() => projectStore.player.isPlaying, async (playing) => {
 // 【重要】监听 videoRef 变化，确保 Video 元素注册到 PlaybackManager
 watch(videoRef, (video) => {
   if (video) {
-    playbackManager.registerVideo(video)
+    playbackManager.registerVideo(video, mediaId.value)
   }
 }, { immediate: true })
 
+watch(
+  () => mediaId.value,
+  (sessionId) => {
+    playbackManager.bindSession(sessionId, { force: true, resetPosition: false })
+  },
+  { immediate: true }
+)
+
 // 监听播放速度
-watch(() => projectStore.player.playbackRate, (rate) => {
+watch(() => playbackStore.playbackRate, (rate) => {
   if (videoRef.value) videoRef.value.playbackRate = rate
 })
 
 // 监听音量
-watch(() => projectStore.player.volume, (volume) => {
+watch(() => playbackStore.volume, (volume) => {
   if (videoRef.value) videoRef.value.volume = volume
 })
 
-// 调试：监听 effectiveVideoSource 变化
+// 监听 effectiveVideoSource 变化
 watch(effectiveVideoSource, (newUrl, oldUrl) => {
-  console.log('[VideoStage] effectiveVideoSource 变化:', {
-    oldUrl,
-    newUrl,
-    progressiveUrl: props.progressiveUrl,
-    proxyState: props.proxyState,
-    isProcessing: isProcessing.value,
-    isProgressiveMode: isProgressiveMode.value
-  })
+  if (!newUrl) {
+    setBuffering(false, 'source-cleared')
+    hasError.value = false
+    errorMessage.value = ''
+    canRetry.value = false
+    retryCount.value = 0
+    return
+  }
+  if (newUrl !== oldUrl) {
+    setBuffering(true, 'source-changed')
+  }
 })
 
 // 监听转码状态变化（刷新后恢复时清除错误状态）
 watch(() => props.isUpgrading, (isUpgrading) => {
   if (isUpgrading) {
     // 正在转码时，清除错误状态，显示转码提示
-    console.log('[VideoStage] 检测到转码状态，清除错误提示')
     hasError.value = false
     errorMessage.value = ''
     retryCount.value = 0
@@ -566,14 +639,13 @@ watch(() => props.proxyState, async (newState, oldState) => {
 
   const wasTranscoding = transcodingStates.includes(oldState)
   const isNowReady = readyStates.includes(newState)
+  const isNowTranscoding = transcodingStates.includes(newState)
+
+  if (isNowTranscoding || newState === ProxyState.ERROR || !effectiveVideoSource.value) {
+    setBuffering(false, 'proxy-not-ready')
+  }
 
   if (wasTranscoding && isNowReady) {
-    console.log('[VideoStage] 转码完成，自动加载视频:', {
-      oldState,
-      newState,
-      url: effectiveVideoSource.value
-    })
-
     // 等待下一帧确保 effectiveVideoSource 已更新
     await nextTick()
 
@@ -590,9 +662,10 @@ watch(() => props.proxyState, async (newState, oldState) => {
 
       try {
         // 强制重新加载视频
+        setBuffering(true, 'proxy-ready-reload')
         video.load()
-        console.log('[VideoStage] 视频加载触发成功')
       } catch (error) {
+        setBuffering(false, 'proxy-ready-reload-failed')
         console.error('[VideoStage] 视频加载触发失败:', error)
       }
     }
@@ -602,12 +675,6 @@ watch(() => props.proxyState, async (newState, oldState) => {
 // 监听视频源变化（渐进式加载升级时）
 watch(() => props.progressiveUrl, async (newUrl, oldUrl) => {
   if (newUrl && newUrl !== oldUrl) {
-    console.log('[VideoStage] 检测到视频源变更:', {
-      oldUrl,
-      newUrl,
-      resolution: props.currentResolution
-    })
-
     const video = videoRef.value
     if (!video) {
       console.warn('[VideoStage] 视频元素不存在，跳过加载')
@@ -634,6 +701,7 @@ watch(() => props.progressiveUrl, async (newUrl, oldUrl) => {
 
     try {
       // 强制重新加载视频
+      setBuffering(true, 'progressive-switch')
       video.load()
 
       // 等待元数据加载
@@ -666,31 +734,48 @@ watch(() => props.progressiveUrl, async (newUrl, oldUrl) => {
       if (wasPlaying) {
         await video.play()
       }
-
-      console.log('[VideoStage] 视频源切换成功，已恢复播放状态')
+      setBuffering(false, 'progressive-switch-loaded')
     } catch (error) {
+      setBuffering(false, 'progressive-switch-failed')
       console.error('[VideoStage] 视频源切换失败:', error)
     }
+  } else if (!newUrl) {
+    setBuffering(false, 'progressive-empty')
   }
 })
 
 // ========== 事件处理 ==========
 
-function onMetadataLoaded() {
-  const video = videoRef.value
-  projectStore.meta.duration = video.duration
-  video.playbackRate = projectStore.player.playbackRate
-  video.volume = projectStore.player.volume
+function onMetadataLoaded(event) {
+  const video = event?.target || videoRef.value
+  if (!video) {
+    return
+  }
+  projectStore.setProjectDuration(video.duration)
+  video.playbackRate = playbackStore.playbackRate
+  video.volume = playbackStore.volume
   retryCount.value = 0
+  setBuffering(false, 'loadedmetadata')
   emit('loaded', video.duration)
   if (props.autoPlay) playbackManager.togglePlay()
 }
 
-function onTimeUpdate() {
-  const video = videoRef.value
+function onLoadedData() {
+  setBuffering(false, 'loadeddata')
+}
+
+function onTimeUpdate(event) {
+  const video = event?.target ?? videoRef.value ?? null
+  if (!video) {
+    return
+  }
+  const currentTime = Number(video?.currentTime)
+  if (!Number.isFinite(currentTime)) {
+    return
+  }
   // 【重要】时间更新由 PlaybackManager 内部通过事件监听处理
   // 这里只负责发射事件通知外部
-  emit('timeupdate', video.currentTime)
+  emit('timeupdate', currentTime)
 }
 
 function onPlay() {
@@ -704,12 +789,24 @@ function onPause() {
 }
 
 function onEnded() {
-  projectStore.player.isPlaying = false
+  playbackManager.pause()
   emit('ended')
 }
 
 function onProgress() {
   // 可以计算缓冲进度
+}
+
+function onWaiting() {
+  setBuffering(true, 'waiting')
+}
+
+function onCanPlay() {
+  setBuffering(false, 'canplay')
+}
+
+function onPlaying() {
+  setBuffering(false, 'playing')
 }
 
 function onSeeking() {
@@ -724,13 +821,15 @@ function onError() {
   const video = videoRef.value
   const error = video?.error
 
-  // 如果视频正在转码中，不显示错误（显示转码占位符）
-  if (isProcessing.value || !effectiveVideoSource.value) {
-    console.log('[VideoStage] 视频正在转码或源为空，跳过错误提示')
+  // 无视频源或转码中：不进入错误重试流程，避免纯音频场景被误判。
+  if (!hasVideoSource.value || isProcessing.value || showAudioOnlyPlaceholder.value) {
+    setBuffering(false, 'error-ignored')
     hasError.value = false
+    canRetry.value = false
     return
   }
 
+  setBuffering(false, 'error')
   hasError.value = true
 
   if (error) {
@@ -748,7 +847,6 @@ function onError() {
   // 自动重试机制（但先检查是否是转码导致的 404）
   if (canRetry.value && retryCount.value < maxRetries) {
     retryCount.value++
-    console.log(`[VideoStage] 视频加载失败，将检查转码状态并重试 ${retryCount.value}/${maxRetries}`)
     errorMessage.value = `${errorMessage.value}，正在检查视频状态...`
 
     // 触发父组件刷新视频状态（检查是否正在转码）
@@ -767,7 +865,9 @@ function onError() {
 }
 
 function retryLoad() {
-  console.log('[VideoStage] 手动重试，先刷新视频状态')
+  if (!hasVideoSource.value) {
+    return
+  }
   hasError.value = false
   errorMessage.value = ''
   retryCount.value = 0
@@ -777,29 +877,30 @@ function retryLoad() {
 
   // 短暂延迟后重新加载，给父组件时间更新状态
   setTimeout(() => {
+    setBuffering(true, 'manual-retry')
     videoRef.value?.load()
   }, 500)
 }
 
 // 控制方法（带拦截）
 function togglePlay() {
-  // 视频未就绪时拦截操作
-  if (!isVideoReady.value) {
-    console.warn('[VideoStage] 视频未就绪，播放操作被拦截')
+  // 媒体未就绪时拦截操作（纯音频场景允许播放）
+  if (!isMediaReady.value) {
+    console.warn('[VideoStage] 媒体未就绪，播放操作被拦截')
     return
   }
   playbackManager.togglePlay()
 }
 
 function seek(seconds) {
-  // 视频未就绪时拦截操作
-  if (!isVideoReady.value) {
-    console.warn('[VideoStage] 视频未就绪，跳转操作被拦截')
+  // 媒体未就绪时拦截操作（纯音频场景允许跳转）
+  if (!isMediaReady.value) {
+    console.warn('[VideoStage] 媒体未就绪，跳转操作被拦截')
     return
   }
   const video = videoRef.value
-  if (!video) return
-  const newTime = Math.max(0, Math.min(video.duration, video.currentTime + seconds))
+  const baseTime = video ? video.currentTime : playbackStore.currentTime
+  const newTime = Math.max(0, baseTime + seconds)
   playbackManager.seekTo(newTime)
 }
 
@@ -994,7 +1095,7 @@ onMounted(() => {
 
   // 【关键】注册 Video 元素到 PlaybackManager
   if (videoRef.value) {
-    playbackManager.registerVideo(videoRef.value)
+    playbackManager.registerVideo(videoRef.value, mediaId.value)
   }
 
   // V3.1.2+dev.20260113.01: 初始化时显示分辨率标志
@@ -1008,6 +1109,7 @@ onUnmounted(() => {
   document.removeEventListener('fullscreenchange', handleFullscreenChange)
   clearTimeout(stateHintTimer)
   clearTimeout(progressiveHintTimer)
+  clearBufferingTimeout()
   if (clickTimer) clearTimeout(clickTimer)
 
   // V3.1.2+dev.20260113.01: 清理分辨率标志相关定时器
@@ -1017,6 +1119,14 @@ onUnmounted(() => {
   // 清理字幕拖动事件监听器
   document.removeEventListener('mousemove', handleSubtitleMouseMove)
   document.removeEventListener('mouseup', handleSubtitleMouseUp)
+
+  // 路由离开时确保媒体立即停播，避免音频残留
+  try {
+    videoRef.value?.pause()
+  } catch (error) {
+    console.warn('[VideoStage] 卸载暂停视频失败:', error)
+  }
+  playbackManager.pause()
 
   // 【关键】注销 Video 元素
   playbackManager.unregisterVideo()
@@ -1039,6 +1149,7 @@ onUnmounted(() => {
   width: 100%;
   height: 100%;
   background: var(--af-video-bg);
+  cursor: pointer;
 }
 
 .video-container video {
@@ -1048,9 +1159,11 @@ onUnmounted(() => {
   height: auto;
 }
 
-/* 视频未就绪时的样式（禁用交互提示） */
-.video-stage.video-not-ready .video-container {
-  cursor: not-allowed;
+.audio-only-placeholder {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background: #000;
 }
 
 /* 字幕覆盖层 - 可拖动版本 */

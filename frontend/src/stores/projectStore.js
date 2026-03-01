@@ -15,6 +15,10 @@ export const useProjectStore = defineStore("project", () => {
   // ========== 1. 项目元数据 ==========
   const meta = ref({
     jobId: null, // 转录任务ID
+    projectId: null, // 项目ID（Task6 主键）
+    mode: "normal", // normal | legacy
+    taskMode: "transcribe", // transcribe | subtitle_edit
+    flavor: "full", // full | lite
     videoPath: null, // 视频文件路径
     audioPath: null, // 音频文件路径
     peaksPath: null, // 波形峰值数据路径
@@ -27,6 +31,8 @@ export const useProjectStore = defineStore("project", () => {
     isDirty: false, // 是否有未保存修改
     // 渐进式加载相关（状态由 useProxyVideo composable 管理）
     currentResolution: null, // 当前视频分辨率 ('360p', '720p', 'source')
+    // Phase 0.5: 能力协商快照留位（本期不参与行为判断）
+    capabilitySnapshot: null,
     // V3.2.0+dev.20260130.09: 字幕全局时间偏移（秒）
     subtitleOffset: 0,
   });
@@ -52,6 +58,9 @@ export const useProjectStore = defineStore("project", () => {
     draftChunks: 0, // 草稿 Chunk 数
     finalizedChunks: 0, // 定稿 Chunk 数
   });
+
+  // 说话人 profile 缓存（后端真源的前端镜像）
+  const speakerProfiles = ref(new Map());
 
   // ========== 3. Undo/Redo 历史记录 ==========
   // 【重要】撤销/重做策略：
@@ -99,6 +108,7 @@ export const useProjectStore = defineStore("project", () => {
   });
 
   // ========== 6. 计算属性 ==========
+  const primaryId = computed(() => meta.value.projectId || meta.value.jobId || null);
   const totalSubtitles = computed(() => subtitles.value.length);
 
   const currentSubtitle = computed(() => {
@@ -179,6 +189,27 @@ export const useProjectStore = defineStore("project", () => {
     });
   }
 
+  function normalizeSpeakerFields(source = {}, options = {}) {
+    const { stripSpeaker = false } = options;
+    if (stripSpeaker) {
+      return {
+        speaker_id: null,
+        turn_id: null,
+        speaker_label: null,
+        speaker_color_key: null,
+        binding_source: null,
+      };
+    }
+    const speakerId = source.speaker_id ?? source.speakerId ?? null;
+    return {
+      speaker_id: speakerId,
+      turn_id: source.turn_id ?? source.turnId ?? null,
+      speaker_label: source.speaker_label ?? source.speakerLabel ?? speakerId,
+      speaker_color_key: source.speaker_color_key ?? source.speakerColorKey ?? null,
+      binding_source: source.binding_source ?? source.bindingSource ?? null,
+    };
+  }
+
   function setSubtitleOffset(value, options = {}) {
     const { applyDelta = true } = options;
     const normalized = Math.round(clampSubtitleOffset(value) * 1000) / 1000;
@@ -188,6 +219,113 @@ export const useProjectStore = defineStore("project", () => {
     if (applyDelta) {
       applyOffsetDelta(normalized - previous);
     }
+  }
+
+  function normalizeCapabilitySnapshot(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object') {
+      return null;
+    }
+    return snapshot;
+  }
+
+  // ========== 6.2 Phase 1: 状态写入口收口 ==========
+  function patchMeta(patch = {}) {
+    if (!patch || typeof patch !== "object") {
+      return;
+    }
+    meta.value = {
+      ...meta.value,
+      ...patch,
+    };
+  }
+
+  function setIdentity(payload = {}) {
+    const nextPatch = {};
+    if (Object.prototype.hasOwnProperty.call(payload, "projectId")) {
+      nextPatch.projectId = payload.projectId || null;
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, "jobId")) {
+      nextPatch.jobId = payload.jobId || null;
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, "mode")) {
+      nextPatch.mode = payload.mode || "normal";
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, "taskMode")) {
+      nextPatch.taskMode = payload.taskMode || "transcribe";
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, "flavor")) {
+      nextPatch.flavor = payload.flavor || "full";
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, "capabilitySnapshot")) {
+      nextPatch.capabilitySnapshot = normalizeCapabilitySnapshot(payload.capabilitySnapshot);
+    }
+    patchMeta(nextPatch);
+  }
+
+  function setMediaPaths(payload = {}) {
+    const nextPatch = {};
+    if (Object.prototype.hasOwnProperty.call(payload, "videoPath")) {
+      nextPatch.videoPath = payload.videoPath || null;
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, "audioPath")) {
+      nextPatch.audioPath = payload.audioPath || null;
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, "peaksPath")) {
+      nextPatch.peaksPath = payload.peaksPath || null;
+    }
+    patchMeta(nextPatch);
+  }
+
+  function setProjectTitle(title) {
+    patchMeta({ title: title || "" });
+  }
+
+  function setProjectDuration(duration) {
+    const normalized = Number(duration);
+    patchMeta({ duration: Number.isFinite(normalized) && normalized > 0 ? normalized : 0 });
+  }
+
+  function setCurrentResolution(resolution) {
+    patchMeta({ currentResolution: resolution || null });
+  }
+
+  function setZoomLevel(level) {
+    const normalized = Number(level);
+    view.value.zoomLevel = Number.isFinite(normalized) ? normalized : view.value.zoomLevel;
+  }
+
+  function setSelectedSubtitleId(subtitleId) {
+    view.value.selectedSubtitleId = subtitleId || null;
+  }
+
+  function setPlayerVolume(volume) {
+    const normalized = Number(volume);
+    if (!Number.isFinite(normalized)) {
+      return;
+    }
+    player.value.volume = Math.max(0, Math.min(1, normalized));
+  }
+
+  function setPlaybackRate(rate) {
+    const normalized = Number(rate);
+    if (!Number.isFinite(normalized)) {
+      return;
+    }
+    player.value.playbackRate = Math.max(0.25, Math.min(4, normalized));
+  }
+
+  function insertSubtitleAt(index, subtitle) {
+    const insertIndex = Math.max(0, Math.min(index, subtitles.value.length));
+    subtitles.value.splice(insertIndex, 0, subtitle);
+    return insertIndex;
+  }
+
+  function removeSubtitleAt(index) {
+    if (index < 0 || index >= subtitles.value.length) {
+      return null;
+    }
+    const removed = subtitles.value.splice(index, 1);
+    return removed[0] || null;
   }
 
   const isDirty = computed(() => {
@@ -235,10 +373,11 @@ export const useProjectStore = defineStore("project", () => {
     () => {
       // 跳过保存后的状态更新触发
       if (isUpdatingAfterSave) return;
-      if (!meta.value.jobId) return;
+      const cacheKey = meta.value.projectId || meta.value.jobId;
+      if (!cacheKey) return;
 
       // 更新内存缓存
-      memoryCache.set(meta.value.jobId, {
+      memoryCache.set(cacheKey, {
         subtitles: toRaw(subtitles.value),
         meta: toRaw(meta.value),
       });
@@ -251,7 +390,7 @@ export const useProjectStore = defineStore("project", () => {
 
       // 触发智能保存
       smartSaver.save({
-        jobId: meta.value.jobId,
+        jobId: cacheKey,
         subtitles: subtitles.value,
         meta: meta.value,
       });
@@ -281,6 +420,7 @@ export const useProjectStore = defineStore("project", () => {
       // Phase 5: 双模态架构新增字段
       chunk_id: null, // 物理切片ID
       isDraft: false, // 已导入的SRT都是定稿
+      isFinalized: true,
       words: [], // 字级置信度数据
       // V3.1.2+dev.20260112.01: SRT 无置信度数据，置空避免显示误导性的 100%
       confidence: null,
@@ -288,6 +428,7 @@ export const useProjectStore = defineStore("project", () => {
       confidence_source: 'srt_fallback',  // 标记来源用于 UI 判断
       warning_type: "none", // 警告类型: none/low_confidence/high_perplexity/both
       source: "imported", // 来源: sensevoice/whisper/imported
+      ...normalizeSpeakerFields({}, { stripSpeaker: true }),
     }));
 
     meta.value = {
@@ -295,6 +436,9 @@ export const useProjectStore = defineStore("project", () => {
       ...metadata,
       lastSaved: Date.now(),
       isDirty: false,
+      capabilitySnapshot: normalizeCapabilitySnapshot(
+        metadata?.capabilitySnapshot ?? metadata?.capability_snapshot ?? meta.value.capabilitySnapshot
+      ),
       subtitleOffset: subtitleOffset.value,
     };
 
@@ -302,6 +446,7 @@ export const useProjectStore = defineStore("project", () => {
     clearHistory();
     // 清除 Chunk 映射
     chunkSubtitleMap.value.clear();
+    speakerProfiles.value = new Map();
     deletedSentenceIndices.value.clear();
   }
 
@@ -325,13 +470,15 @@ export const useProjectStore = defineStore("project", () => {
       isModified: seg.is_modified ?? false,
       originalText: seg.original_text ?? null,
       chunk_id: null,
-      isDraft: false,
       words: [],
       confidence: seg.confidence ?? null,
       display_confidence: seg.display_confidence,  // V3.1.2: 映射后准确率
       confidence_source: seg.confidence_source,    // V3.1.2: 置信度来源
       warning_type: "none",
       source: seg.source || "imported",
+      isDraft: seg.is_draft ?? false,
+      isFinalized: seg.is_finalized ?? !(seg.is_draft ?? false),
+      ...normalizeSpeakerFields(seg, { stripSpeaker: Boolean(seg.is_draft) }),
     }));
 
     meta.value = {
@@ -339,6 +486,9 @@ export const useProjectStore = defineStore("project", () => {
       ...metadata,
       lastSaved: Date.now(),
       isDirty: false,
+      capabilitySnapshot: normalizeCapabilitySnapshot(
+        metadata?.capabilitySnapshot ?? metadata?.capability_snapshot ?? meta.value.capabilitySnapshot
+      ),
       subtitleOffset: subtitleOffset.value,
     };
 
@@ -346,19 +496,85 @@ export const useProjectStore = defineStore("project", () => {
     clearHistory();
     // 清除 Chunk 映射
     chunkSubtitleMap.value.clear();
+    speakerProfiles.value = new Map();
+    deletedSentenceIndices.value.clear();
+  }
+
+  /**
+   * 从 Project API 数据载入字幕（Task6）。
+   * @param {Array|Object} payload - 允许传入 segments 数组，或 { segments, doc_meta } 对象
+   * @param {Object} metadata - 可选的附加 meta
+   */
+  function loadFromProjectData(payload, metadata = {}) {
+    const segments = Array.isArray(payload) ? payload : payload?.segments || [];
+    const docMeta = Array.isArray(payload) ? null : payload?.doc_meta || payload?.meta || null;
+    const now = Date.now();
+    subtitles.value = segments.map((seg, index) => {
+      const segmentId = String(seg.segment_id || seg.id || `seg-${index}`);
+      const legacyIndexRaw = seg.legacy_index ?? seg.sentence_index ?? index;
+      const sentenceIndex = Number.isFinite(Number(legacyIndexRaw)) ? Number(legacyIndexRaw) : index;
+      return {
+        id: `subtitle-${segmentId}`,
+        segment_id: segmentId,
+        sentenceIndex,
+        start: toDisplayTime(seg.start ?? 0),
+        end: toDisplayTime(seg.end ?? 0),
+        text: String(seg.text ?? ""),
+        isDirty: false,
+        isModified: Boolean(seg.is_modified),
+        originalText: seg.original_text ?? null,
+        chunk_id: null,
+        words: Array.isArray(seg.words) ? seg.words : [],
+        confidence: seg.confidence ?? null,
+        display_confidence: seg.display_confidence,
+        confidence_source: seg.confidence_source,
+        warning_type: seg.warning_type || "none",
+        source: seg.source_type || seg.source || "imported",
+        isDraft: Boolean(seg.is_draft),
+        isFinalized: seg.is_finalized ?? !Boolean(seg.is_draft),
+        ...normalizeSpeakerFields(seg, { stripSpeaker: Boolean(seg.is_draft) }),
+      };
+    });
+
+    meta.value = {
+      ...meta.value,
+      ...metadata,
+      projectId: metadata.projectId || docMeta?.project_id || meta.value.projectId,
+      mode: metadata.mode || meta.value.mode || "normal",
+      taskMode: metadata.taskMode || metadata.task_mode || meta.value.taskMode || "transcribe",
+      lastSaved: now,
+      isDirty: false,
+      capabilitySnapshot: normalizeCapabilitySnapshot(
+        metadata?.capabilitySnapshot
+          ?? metadata?.capability_snapshot
+          ?? docMeta?.capability_snapshot
+          ?? meta.value.capabilitySnapshot
+      ),
+      subtitleOffset: subtitleOffset.value,
+    };
+
+    clearHistory();
+    chunkSubtitleMap.value.clear();
+    speakerProfiles.value = new Map();
     deletedSentenceIndices.value.clear();
   }
 
   /**
    * 从缓存/存储恢复项目
    */
-  async function restoreProject(jobId) {
+  async function restoreProject(identityId) {
+    if (!identityId) {
+      return false;
+    }
     try {
       // 优先从内存缓存获取
-      if (memoryCache.has(jobId)) {
-        const cached = memoryCache.get(jobId);
+      if (memoryCache.has(identityId)) {
+        const cached = memoryCache.get(identityId);
         subtitles.value = cached.subtitles;
-        meta.value = cached.meta;
+        meta.value = {
+          ...cached.meta,
+          capabilitySnapshot: normalizeCapabilitySnapshot(cached?.meta?.capabilitySnapshot),
+        };
         if (cached?.meta?.subtitleOffset !== undefined) {
           setSubtitleOffset(cached.meta.subtitleOffset, { applyDelta: false });
         }
@@ -369,10 +585,13 @@ export const useProjectStore = defineStore("project", () => {
       }
 
       // 使用智能保存系统恢复（支持 IndexedDB + localStorage 备份）
-      const saved = await smartSaver.restoreFromBackup(jobId);
+      const saved = await smartSaver.restoreFromBackup(identityId);
       if (saved) {
         subtitles.value = saved.subtitles;
-        meta.value = saved.meta;
+        meta.value = {
+          ...saved.meta,
+          capabilitySnapshot: normalizeCapabilitySnapshot(saved?.meta?.capabilitySnapshot),
+        };
         if (saved?.meta?.subtitleOffset !== undefined) {
           setSubtitleOffset(saved.meta.subtitleOffset, { applyDelta: false });
         }
@@ -584,6 +803,7 @@ export const useProjectStore = defineStore("project", () => {
       source: 'split',
     };
     rightSubtitle.sentenceIndex = undefined;
+    rightSubtitle.segment_id = undefined;
     rightSubtitle.originalText = null;
 
     // 6. 原子操作：删除旧字幕，插入两个新字幕
@@ -768,7 +988,11 @@ export const useProjectStore = defineStore("project", () => {
       confidence_source,   // V3.1.2: 置信度来源
       words = [],
       warning_type = "none",
+      is_draft,
+      is_finalized,
     } = sentenceData;
+    const isDraftSentence = is_draft ?? !Boolean(is_finalized);
+    const isFinalizedSentence = is_finalized ?? !isDraftSentence;
 
     if (deletedSentenceIndices.value.has(sentenceIndex)) {
       console.log(`[ProjectStore] 草稿字幕已被用户删除，跳过: ${sentenceIndex}`);
@@ -793,14 +1017,16 @@ export const useProjectStore = defineStore("project", () => {
       isModified: sentenceData.is_modified ?? false,
       originalText: sentenceData.original_text ?? null,
       chunk_id,
-      isDraft: true, // 标记为草稿
+      isDraft: isDraftSentence,
+      isFinalized: isFinalizedSentence,
       words: normalized.words,
       confidence,
       display_confidence,  // V3.1.2: 映射后准确率
       confidence_source,   // V3.1.2: 置信度来源
       warning_type,
-      source: "sensevoice",
+      source: sentenceData.source || (isDraftSentence ? "sensevoice" : "finalized"),
       sentenceIndex, // 保留原始句子索引
+      ...normalizeSpeakerFields(sentenceData, { stripSpeaker: Boolean(isDraftSentence) }),
     };
 
     if (existingIndex >= 0) {
@@ -882,6 +1108,7 @@ export const useProjectStore = defineStore("project", () => {
         originalText: sentence.original_text ?? null,
         chunk_id,
         isDraft: false, // 定稿
+        isFinalized: true,
         words: normalized.words || [],
         confidence: sentence.confidence ?? null,
         display_confidence: sentence.display_confidence,  // V3.1.2: 映射后准确率
@@ -889,6 +1116,7 @@ export const useProjectStore = defineStore("project", () => {
         warning_type: sentence.warning_type || "none",
         source: sentence.source || "whisper",
         sentenceIndex: sentence.index,
+        ...normalizeSpeakerFields(sentence, { stripSpeaker: false }),
       };
 
       // 按时间顺序插入
@@ -909,6 +1137,102 @@ export const useProjectStore = defineStore("project", () => {
     updateDualStreamProgress();
 
     // 恢复历史记录
+    resumeHistory();
+  }
+
+  /**
+   * 取消收敛时将已推送草稿转为定稿。
+   *
+   * 约束：
+   * 1. 已有定稿保持不变
+   * 2. 草稿转定稿时沿用“同句索引优先去重”策略，避免与既有定稿重复
+   * 3. 未推送数据不处理
+   */
+  async function finalizeDraftSubtitlesOnCancel() {
+    pauseHistory();
+
+    const finalizedSentenceKeys = new Set();
+    const finalizedChunkKeys = new Set();
+    subtitles.value.forEach((subtitle) => {
+      if (subtitle.isDraft) return;
+      if (subtitle.sentenceIndex !== undefined && subtitle.sentenceIndex !== null) {
+        finalizedSentenceKeys.add(String(subtitle.sentenceIndex));
+      }
+      if (subtitle.chunk_id !== undefined && subtitle.chunk_id !== null) {
+        finalizedChunkKeys.add(
+          `${subtitle.chunk_id}::${(subtitle.text || "").trim()}::${Number(subtitle.start || 0).toFixed(3)}::${Number(subtitle.end || 0).toFixed(3)}`
+        );
+      }
+    });
+
+    const removedIds = new Set();
+    subtitles.value = subtitles.value
+      .map((subtitle) => {
+        if (!subtitle.isDraft) {
+          return subtitle;
+        }
+
+        const hasSentenceIndex = subtitle.sentenceIndex !== undefined && subtitle.sentenceIndex !== null;
+        const sentenceKey = hasSentenceIndex ? String(subtitle.sentenceIndex) : null;
+        const chunkKey = subtitle.chunk_id !== undefined && subtitle.chunk_id !== null
+          ? `${subtitle.chunk_id}::${(subtitle.text || "").trim()}::${Number(subtitle.start || 0).toFixed(3)}::${Number(subtitle.end || 0).toFixed(3)}`
+          : null;
+        const isDuplicated = Boolean(
+          (sentenceKey && finalizedSentenceKeys.has(sentenceKey))
+          || (chunkKey && finalizedChunkKeys.has(chunkKey))
+        );
+        if (isDuplicated) {
+          removedIds.add(subtitle.id);
+          return null;
+        }
+
+        if (sentenceKey) {
+          finalizedSentenceKeys.add(sentenceKey);
+        }
+        if (chunkKey) {
+          finalizedChunkKeys.add(chunkKey);
+        }
+
+        return {
+          ...subtitle,
+          isDraft: false,
+          isFinalized: true,
+          source: subtitle.source || "cancel_finalized",
+        };
+      })
+      .filter(Boolean);
+
+    if (removedIds.size > 0) {
+      chunkSubtitleMap.value.forEach((subtitleIds, chunkId) => {
+        const filtered = (subtitleIds || []).filter((id) => !removedIds.has(id));
+        chunkSubtitleMap.value.set(chunkId, filtered);
+      });
+    }
+
+    subtitles.value.sort((left, right) => {
+      const byStart = (left.start || 0) - (right.start || 0);
+      if (byStart !== 0) return byStart;
+      return (left.end || 0) - (right.end || 0);
+    });
+
+    updateDualStreamProgress();
+    console.log(
+      `[ProjectStore] 取消收敛完成，草稿转定稿并去重: removed=${removedIds.size}`
+    );
+
+    // 关键路径使用同步备份 + 立即持久化，避免取消后用户立刻刷新导致数据丢失
+    const cacheKey = primaryId.value;
+    if (cacheKey) {
+      try {
+        await smartSaver.forceSaveCritical({
+          jobId: cacheKey,
+          subtitles: subtitles.value,
+          meta: meta.value,
+        });
+      } catch (error) {
+        console.error("[ProjectStore] 取消收敛后关键保存失败:", error);
+      }
+    }
     resumeHistory();
   }
 
@@ -974,6 +1298,7 @@ export const useProjectStore = defineStore("project", () => {
         originalText: sentence.original_text ?? null,
         chunk_id,
         isDraft: sentence.is_draft ?? false,
+        isFinalized: sentence.is_finalized ?? !(sentence.is_draft ?? false),
         isRestored: true, // 标记为恢复的字幕
         words: normalized.words || [],
         confidence: sentence.confidence ?? null,
@@ -982,6 +1307,7 @@ export const useProjectStore = defineStore("project", () => {
         warning_type: sentence.warning_type || "none",
         source: sentence.source || "restored",
         sentenceIndex: sentence.index,
+        ...normalizeSpeakerFields(sentence, { stripSpeaker: Boolean(sentence.is_draft ?? false) }),
       };
 
       // 按时间顺序插入
@@ -1003,6 +1329,142 @@ export const useProjectStore = defineStore("project", () => {
     updateDualStreamProgress();
 
     // 恢复历史记录
+    resumeHistory();
+  }
+
+  /**
+   * 应用后端推送的修订事件（包含说话人改绑）。
+   *
+   * 支持两种格式：
+   * - 单条：{ index, sentence }
+   * - 批量：{ sentences: [...] }
+   */
+  function applyRevisedSubtitle(data) {
+    if (!data) return;
+
+    const revisions = Array.isArray(data.sentences)
+      ? data.sentences
+      : [data.sentence ? { ...data.sentence, index: data.index ?? data.sentence.index } : data];
+
+    if (revisions.length === 0) return;
+    pauseHistory();
+
+    let revisedCount = 0;
+    revisions.forEach((revision) => {
+      const sentenceIndex = revision.index ?? revision.sentenceIndex;
+      if (sentenceIndex === undefined || sentenceIndex === null) {
+        return;
+      }
+
+      const existingIndex = subtitles.value.findIndex((item) => item.sentenceIndex === sentenceIndex);
+      const isDraft = revision.is_draft ?? (existingIndex >= 0 ? subtitles.value[existingIndex].isDraft : false);
+      const isFinalized = revision.is_finalized ?? !isDraft;
+      const speakerFields = normalizeSpeakerFields(revision, { stripSpeaker: Boolean(isDraft) });
+
+      const hasTiming =
+        revision.start !== undefined
+        || revision.end !== undefined
+        || revision.words !== undefined;
+      let normalizedTiming = {};
+      if (hasTiming) {
+        const normalized = applyOffsetToSentenceData({
+          start: revision.start ?? 0,
+          end: revision.end ?? (revision.start ?? 0),
+          words: revision.words || [],
+        });
+        normalizedTiming = {
+          ...(revision.start !== undefined ? { start: normalized.start } : {}),
+          ...(revision.end !== undefined ? { end: normalized.end } : {}),
+          ...(revision.words !== undefined ? { words: normalized.words } : {}),
+        };
+      }
+
+      if (existingIndex >= 0) {
+        const current = subtitles.value[existingIndex];
+        subtitles.value[existingIndex] = {
+          ...current,
+          ...(revision.text !== undefined ? { text: revision.text } : {}),
+          ...normalizedTiming,
+          ...(revision.warning_type !== undefined ? { warning_type: revision.warning_type } : {}),
+          ...(revision.source !== undefined ? { source: revision.source } : {}),
+          isDraft,
+          isFinalized,
+          sentenceIndex,
+          ...speakerFields,
+        };
+      } else {
+        const normalized = applyOffsetToSentenceData({
+          start: revision.start ?? 0,
+          end: revision.end ?? 0,
+          words: revision.words || [],
+        });
+        const newSubtitle = {
+          id: buildUniqueSubtitleId(`revised-${sentenceIndex}`),
+          sentenceIndex,
+          start: normalized.start,
+          end: normalized.end,
+          text: revision.text || "",
+          isDirty: false,
+          isModified: revision.is_modified ?? false,
+          originalText: revision.original_text ?? null,
+          chunk_id: null,
+          isDraft,
+          isFinalized,
+          words: normalized.words || [],
+          confidence: revision.confidence ?? null,
+          display_confidence: revision.display_confidence,
+          confidence_source: revision.confidence_source,
+          warning_type: revision.warning_type || "none",
+          source: revision.source || "revised",
+          ...speakerFields,
+        };
+        const insertIndex = findInsertIndex(normalized.start);
+        subtitles.value.splice(insertIndex, 0, newSubtitle);
+      }
+      revisedCount += 1;
+    });
+
+    if (revisedCount > 0) {
+      subtitles.value.sort((left, right) => {
+        const byStart = (left.start ?? 0) - (right.start ?? 0);
+        if (byStart !== 0) return byStart;
+        return (left.end ?? 0) - (right.end ?? 0);
+      });
+      updateDualStreamProgress();
+    }
+    resumeHistory();
+  }
+
+  /**
+   * 应用后端推送的说话人 profile 更新。
+   */
+  function applySpeakerProfiles(data) {
+    if (!data || !Array.isArray(data.profiles) || data.profiles.length === 0) {
+      return;
+    }
+
+    pauseHistory();
+    const nextProfiles = new Map(speakerProfiles.value);
+    data.profiles.forEach((profile) => {
+      if (!profile?.speaker_id) return;
+      nextProfiles.set(profile.speaker_id, profile);
+    });
+    speakerProfiles.value = nextProfiles;
+
+    subtitles.value = subtitles.value.map((subtitle) => {
+      if (subtitle.isDraft || !subtitle.speaker_id) {
+        return subtitle;
+      }
+      const profile = speakerProfiles.value.get(subtitle.speaker_id);
+      if (!profile) {
+        return subtitle;
+      }
+      return {
+        ...subtitle,
+        speaker_label: profile.display_name || subtitle.speaker_label || subtitle.speaker_id,
+        speaker_color_key: profile.color_key || subtitle.speaker_color_key,
+      };
+    });
     resumeHistory();
   }
 
@@ -1144,6 +1606,14 @@ export const useProjectStore = defineStore("project", () => {
     player.value.currentTime = time;
   }
 
+  function setIsPlaying(isPlaying) {
+    player.value.isPlaying = Boolean(isPlaying);
+  }
+
+  function setPlayerSeeking(isSeeking) {
+    player.value.isSeeking = Boolean(isSeeking);
+  }
+
   /**
    * 保存项目（持久化到后端 + 本地强制保存）
    */
@@ -1152,9 +1622,14 @@ export const useProjectStore = defineStore("project", () => {
     const srtContent = generateSRT();
     // await api.saveSubtitle(meta.value.jobId, srtContent)
 
+    const cacheKey = primaryId.value;
+    if (!cacheKey) {
+      return;
+    }
+
     // 强制立即保存到本地存储
     await smartSaver.forceSave({
-      jobId: meta.value.jobId,
+      jobId: cacheKey,
       subtitles: subtitles.value,
       meta: meta.value,
     });
@@ -1172,6 +1647,10 @@ export const useProjectStore = defineStore("project", () => {
     subtitles.value = [];
     meta.value = {
       jobId: null,
+      projectId: null,
+      mode: "normal",
+      taskMode: "transcribe",
+      flavor: "full",
       videoPath: null,
       audioPath: null,
       peaksPath: null,
@@ -1184,6 +1663,8 @@ export const useProjectStore = defineStore("project", () => {
       isDirty: false,
       // 渐进式加载相关（状态由 useProxyVideo composable 管理）
       currentResolution: null,
+      // Phase 0.5: 能力协商快照留位（本期不参与行为判断）
+      capabilitySnapshot: null,
       // V3.2.0+dev.20260130.09: 字幕全局时间偏移（秒）
       subtitleOffset: subtitleOffset.value,
     };
@@ -1205,6 +1686,7 @@ export const useProjectStore = defineStore("project", () => {
       finalizedChunks: 0,
     };
     deletedSentenceIndices.value.clear();
+    speakerProfiles.value = new Map();
     console.log("[ProjectStore] 项目已重置");
   }
 
@@ -1268,8 +1750,10 @@ export const useProjectStore = defineStore("project", () => {
     // Phase 5: 双模态架构状态
     chunkSubtitleMap,
     dualStreamProgress,
+    speakerProfiles,
 
     // 计算属性
+    primaryId,
     totalSubtitles,
     currentSubtitle,
     isDirty,
@@ -1289,8 +1773,23 @@ export const useProjectStore = defineStore("project", () => {
     resumeHistory, // 恢复历史记录
 
     // 操作方法
+    patchMeta,
+    setIdentity,
+    setMediaPaths,
+    setProjectTitle,
+    setProjectDuration,
+    setCurrentResolution,
+    setZoomLevel,
+    setSelectedSubtitleId,
+    setPlayerVolume,
+    setPlaybackRate,
+    setIsPlaying,
+    setPlayerSeeking,
+    insertSubtitleAt,
+    removeSubtitleAt,
     importSRT,
     importSegments,
+    loadFromProjectData,
     restoreProject,
     updateSubtitle,
     addSubtitle,
@@ -1306,7 +1805,10 @@ export const useProjectStore = defineStore("project", () => {
     // Phase 5: 双模态架构方法
     appendOrUpdateDraft,
     replaceChunk,
+    finalizeDraftSubtitlesOnCancel,
     restoreChunk, // V3.1.0: 断点续传字幕恢复
+    applyRevisedSubtitle,
+    applySpeakerProfiles,
     updateDualStreamProgress,
     updateDualStreamProgressFromSSE,  // V3.1.0: 从 SSE 更新双流进度
 

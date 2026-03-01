@@ -20,6 +20,14 @@ class FileAPI {
   }
 
   /**
+   * 获取 input 目录中的所有字幕文件
+   * @returns {Promise<{files: Array<{name: string, size: number, modified: string}>, input_dir: string}>}
+   */
+  async listSubtitleFiles() {
+    return apiClient.get('/api/files/subtitles')
+  }
+
+  /**
    * 删除 input 目录中的文件
    * @param {string} filename - 文件名
    * @returns {Promise<{success: boolean, message: string}>}
@@ -31,11 +39,13 @@ class FileAPI {
   /**
    * 批量创建转录任务（从 input 目录选择多个文件）
    * @param {string[]} filenames - 文件名列表
+   * @param {Object|null} taskConfig - 任务级配置（可选）
    * @returns {Promise<{success: boolean, jobs: Array, failed: Array, total: number, succeeded: number, failed_count: number}>}
    */
-  async createJobsBatch(filenames) {
-    return apiClient.post('/api/create-jobs-batch', {
-      filenames
+  async createJobsBatch(filenames, taskConfig = null) {
+    return apiClient.post('/api/create-tasks-batch', {
+      filenames,
+      ...(taskConfig ? { task_config: taskConfig } : {}),
     })
   }
 

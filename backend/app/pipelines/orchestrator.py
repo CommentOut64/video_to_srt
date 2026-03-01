@@ -23,9 +23,12 @@ from typing import List, Optional, Tuple, TYPE_CHECKING
 import numpy as np
 
 from app.core.config import config
+from app.config.lifecycle_config import RESUME_MERGER_ENABLED
 from app.models.job_models import JobState
 from app.schemas.profile_config import ProfileConfig
 from app.schemas.resume_context import ResumeContext
+from app.services.checkpoint import RuntimeCheckpointService
+from app.utils.cancellation_token import CancelledException, PausedException
 
 if TYPE_CHECKING:
     from app.services.hardware_profile_service import HardwareProfileProvider
@@ -147,7 +150,18 @@ class PipelineOrchestrator:
             )
 
             # V3.2.0+dev.20260125.07: 使用传入的 subtitle_manager，否则获取
-            _subtitle_manager = subtitle_manager if subtitle_manager else get_streaming_subtitle_manager(job.job_id)
+            _subtitle_manager = (
+                subtitle_manager
+                if subtitle_manager
+                else get_streaming_subtitle_manager(
+                    job.job_id,
+                    project_id=getattr(job, "project_id", None),
+                )
+            )
+            try:
+                _subtitle_manager.bind_runtime_checkpoint_service(_job_dir)
+            except Exception as exc:
+                self.logger.warning("绑定 runtime 字幕持久化失败，降级为仅内存字幕: %s", exc)
 
             # 恢复字幕状态
             if resume_context.is_resuming and resume_context.sentences_snapshot:
@@ -172,6 +186,22 @@ class PipelineOrchestrator:
                 env_value=os.getenv("DEBUG_PUNCTUATION"),
                 config_value=bool(getattr(debug_config, "punctuation_output", False)),
             )
+            preprocessing = getattr(job.settings, "preprocessing", None)
+            is_enable_speaker_detection = bool(
+                getattr(preprocessing, "is_enable_speaker_detection", True)
+            )
+            is_enable_speaker_guided_split = bool(
+                getattr(preprocessing, "is_enable_speaker_guided_split", True)
+            )
+            speaker_count = max(0, int(getattr(preprocessing, "speaker_count", 0) or 0))
+            speaker_min_count = max(
+                0,
+                int(getattr(preprocessing, "speaker_min_count", 0) or 0),
+            )
+            speaker_max_count = max(
+                0,
+                int(getattr(preprocessing, "speaker_max_count", 0) or 0),
+            )
             transcription_pipeline = AsyncDualPipeline(
                 job_id=job.job_id,
                 transcription_profile=profile_config.transcription_profile,
@@ -179,6 +209,11 @@ class PipelineOrchestrator:
                 patch_engine=profile_config.patch_engine,
                 patching_threshold=profile_config.patching_threshold,
                 debug_punctuation=debug_punctuation,
+                is_enable_speaker_detection=is_enable_speaker_detection,
+                is_enable_speaker_guided_split=is_enable_speaker_guided_split,
+                speaker_count=speaker_count,
+                speaker_min_count=speaker_min_count,
+                speaker_max_count=speaker_max_count,
                 logger=self.logger,
                 cancellation_token=cancellation_token,
                 progress_emitter=progress_emitter,
@@ -232,6 +267,8 @@ class PipelineOrchestrator:
                     chunk_indices = _subtitle_manager.chunk_sentences.get(
                         ctx.chunk_index, []
                     )
+                    if hasattr(_subtitle_manager, "get_chunk_sentence_indices"):
+                        chunk_indices = _subtitle_manager.get_chunk_sentence_indices(ctx.chunk_index)
                     for idx in chunk_indices:
                         if idx in _subtitle_manager.sentences:
                             pipeline_sentences.append(_subtitle_manager.sentences[idx])
@@ -259,8 +296,33 @@ class PipelineOrchestrator:
             )
             subtitle_output.write_srt(segments, srt_path)
 
+            # V3.2.4+dev.20260228.01:
+            # 流水线完成态不再写入 subtitle_edits.json（编辑增量文件）。
+            # 运行态真源由 StreamingSubtitleManager + runtime_state.db 维护。
+            try:
+                from app.services.project_service import get_project_service
+
+                project_service = get_project_service()
+                existing_project = project_service._load_project_meta(_job_dir)  # type: ignore[attr-defined]
+                stable_project_id = (
+                    getattr(job, "project_id", None)
+                    or (existing_project.project_id if existing_project else None)
+                    or job.job_id
+                )
+                project = project_service.create_normal_project(
+                    job_id=job.job_id,
+                    title=job.title or Path(job.filename).stem,
+                    task_mode="transcribe",
+                    source_type="transcribe",
+                    project_id=stable_project_id,
+                    project_dir=_job_dir,
+                )
+                job.project_id = project.project_id
+            except Exception as exc:
+                self.logger.warning("Task6 project 元信息收口失败，不影响主任务完成: %s", exc)
+
             job.srt_path = str(srt_path)
-            job.status = "completed"
+            job.status = "finished"
             job.message = "转录完成"
             job.progress = 100
 
@@ -269,6 +331,14 @@ class PipelineOrchestrator:
                 progress_emitter.complete("处理完成")
 
             self.logger.info(f"任务完成: {job.job_id}")
+
+        except CancelledException:
+            self.logger.info("Pipeline 取消: %s", job.job_id)
+            raise
+
+        except PausedException:
+            self.logger.info("Pipeline 暂停: %s", job.job_id)
+            raise
 
         except Exception as exc:
             self.logger.error(f"Pipeline 执行失败: {exc}", exc_info=True)
@@ -430,17 +500,133 @@ class PipelineOrchestrator:
 
         V3.2.0+dev.20260125.07: 支持外部传入 checkpoint_manager
         """
+        if not RESUME_MERGER_ENABLED:
+            return self._build_resume_context_legacy(job, checkpoint_manager, job_dir)
+
+        from app.services.checkpoint.resume_state_merger import ResumeStateMerger
+
+        _job_dir = job_dir if job_dir else Path(job.dir)
+        merged_state = ResumeStateMerger(job_dir=_job_dir).merge()
+        is_has_resume_data = bool(
+            merged_state.runtime_state_available or merged_state.checkpoint_json_available
+        )
+        if not is_has_resume_data:
+            return ResumeContext(checkpoint=None)
+
+        safe_indices = set()
+        if merged_state.finalized_indices:
+            max_finalized = max(merged_state.finalized_indices)
+            safe_indices = set(range(max_finalized + 1))
+        elif merged_state.fast_processed_indices and merged_state.slow_processed_indices:
+            safe_indices = merged_state.fast_processed_indices & merged_state.slow_processed_indices
+
+        merge_decisions = [
+            {
+                "field_name": decision.field_name,
+                "source": decision.source,
+                "reason": decision.reason,
+                "value_summary": decision.value_summary,
+            }
+            for decision in merged_state.merge_decisions
+        ]
+        for decision in merge_decisions:
+            self.logger.info(
+                "恢复合并决策: field=%s source=%s reason=%s summary=%s",
+                decision["field_name"],
+                decision["source"],
+                decision["reason"],
+                decision["value_summary"],
+            )
+
+        checkpoint_payload = {
+            "runtime_state": {
+                "source": "resume_merger",
+                "runtime_state_available": merged_state.runtime_state_available,
+                "checkpoint_json_available": merged_state.checkpoint_json_available,
+            },
+            "preprocessing": {
+                "vad_completed": merged_state.vad_completed,
+                "spectral_triage_completed": merged_state.spectral_triage_completed,
+                "separation_completed": merged_state.separation_completed,
+                "langid_completed": merged_state.langid_completed,
+            },
+            "transcription": {
+                "fast_processed_indices": sorted(merged_state.fast_processed_indices),
+                "slow_processed_indices": sorted(merged_state.slow_processed_indices),
+                "finalized_indices": sorted(merged_state.finalized_indices),
+                "previous_whisper_text": merged_state.previous_whisper_text,
+                "sentences_snapshot": merged_state.sentences_snapshot,
+                "sentence_count": merged_state.sentence_count,
+                "chunk_sentences_map": merged_state.chunk_sentences_map,
+            },
+        }
+        return ResumeContext(
+            checkpoint=checkpoint_payload,
+            safe_processed_indices=safe_indices,
+            fast_processed_indices=set(merged_state.fast_processed_indices),
+            slow_processed_indices=set(merged_state.slow_processed_indices),
+            finalized_indices=set(merged_state.finalized_indices),
+            previous_whisper_text=merged_state.previous_whisper_text,
+            sentences_snapshot=list(merged_state.sentences_snapshot),
+            sentence_count=int(merged_state.sentence_count),
+            chunk_sentences_map=dict(merged_state.chunk_sentences_map),
+            merge_decisions=merge_decisions,
+        )
+
+    def _build_resume_context_legacy(
+        self,
+        job: JobState,
+        checkpoint_manager: Optional["CheckpointManagerV37"] = None,
+        job_dir: Optional[Path] = None,
+    ) -> ResumeContext:
+        """构建恢复上下文（灰度回退旧逻辑）。"""
         from app.services.job.checkpoint_manager import CheckpointManagerV37
 
         _job_dir = job_dir if job_dir else Path(job.dir)
-        _checkpoint_manager = checkpoint_manager if checkpoint_manager else CheckpointManagerV37(_job_dir, logger=self.logger)
+        runtime_state_service = RuntimeCheckpointService(job_dir=_job_dir)
+
+        # Phase 1: runtime_state.db 优先作为恢复入口。
+        if runtime_state_service.has_runtime_state():
+            snapshot = runtime_state_service.load_snapshot()
+            preprocess_commit = snapshot.last_unit_commits.get("preprocess")
+            runtime_checkpoint = {
+                "runtime_state": {
+                    "source": "runtime_state.db",
+                    "last_unit_commits": snapshot.last_unit_commits,
+                },
+                "preprocessing": {
+                    # 仅当预处理单元已提交，才允许跳过到已完成状态。
+                    "vad_completed": preprocess_commit in {
+                        "vad_chunk",
+                        "triage_chunk",
+                        "separation_chunk",
+                        "langid_chunk",
+                        "speaker_chunk",
+                    },
+                    "spectral_triage_completed": preprocess_commit in {
+                        "triage_chunk",
+                        "separation_chunk",
+                        "langid_chunk",
+                        "speaker_chunk",
+                    },
+                    "separation_completed": preprocess_commit in {
+                        "separation_chunk",
+                        "langid_chunk",
+                        "speaker_chunk",
+                    },
+                },
+            }
+            return ResumeContext.from_checkpoint(runtime_checkpoint)
+
+        _checkpoint_manager = checkpoint_manager if checkpoint_manager else CheckpointManagerV37(
+            _job_dir,
+            logger=self.logger,
+        )
         checkpoint = _checkpoint_manager.load_checkpoint()
         if not checkpoint:
             return ResumeContext(checkpoint=None)
 
-        checkpoint_dict = (
-            checkpoint.to_dict() if hasattr(checkpoint, "to_dict") else checkpoint
-        )
+        checkpoint_dict = checkpoint.to_dict() if hasattr(checkpoint, "to_dict") else checkpoint
         return ResumeContext.from_checkpoint(checkpoint_dict)
 
     def _update_progress(

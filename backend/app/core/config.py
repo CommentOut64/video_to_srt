@@ -9,7 +9,7 @@
 import os
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -461,8 +461,33 @@ class ProjectConfig:
         return base_weights
 
 
+# --- Flavor 统一解析 ---
+def _resolve_flavor_from_env() -> Tuple[str, bool]:
+    """
+    解析运行 flavor。
+
+    优先级：
+    1. ANCHORFLUX_FLAVOR=full|lite
+    2. 兼容旧变量 ANCHORFLUX_LITE=true|1|yes
+    3. 默认 full
+    """
+    raw_flavor = str(os.environ.get("ANCHORFLUX_FLAVOR", "")).strip().lower()
+    raw_lite = str(os.environ.get("ANCHORFLUX_LITE", "")).strip().lower()
+
+    if raw_flavor in ("full", "lite"):
+        flavor = raw_flavor
+    elif raw_lite in ("true", "1", "yes"):
+        flavor = "lite"
+    else:
+        flavor = "full"
+
+    return flavor, (flavor == "lite")
+
+
 # 全局配置实例
 config = ProjectConfig()
+FLAVOR, IS_LITE = _resolve_flavor_from_env()
+logger.info("AnchorFlux flavor: %s (IS_LITE=%s)", FLAVOR, IS_LITE)
 
 # 打印配置信息（启动时显示）
 # 注意：避免在模块导入时使用emoji，以防编码问题

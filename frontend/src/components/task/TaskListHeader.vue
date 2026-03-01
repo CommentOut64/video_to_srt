@@ -11,9 +11,13 @@
       </h1>
     </div>
     <div class="header-right">
-      <el-button type="primary" @click="$emit('open-upload')">
+      <el-button @click="$emit('open-import')">
+        <el-icon><Document /></el-icon>
+        字幕编辑
+      </el-button>
+      <el-button v-if="canRenderTranscribeAction" type="primary" @click="$emit('open-upload')">
         <el-icon><Upload /></el-icon>
-        上传视频
+        视频转录
       </el-button>
       <el-button type="primary" @click="$emit('exit-system')">
         退出系统
@@ -24,14 +28,17 @@
 
 <script setup>
 import { Upload } from "@element-plus/icons-vue";
+import { Document } from "@element-plus/icons-vue";
+import { selectCapabilities } from "@/state/capabilities/capabilitySelector";
 
-defineEmits(["open-about", "open-upload", "exit-system"]);
+const canRenderTranscribeAction = selectCapabilities().canTranscribe;
+
+defineEmits(["open-about", "open-upload", "open-import", "exit-system"]);
 </script>
 
 <style scoped>
 .task-header {
-  position: sticky;
-  top: 0;
+  flex-shrink: 0;
   z-index: 200;
   display: flex;
   justify-content: space-between;

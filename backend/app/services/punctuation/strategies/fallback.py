@@ -14,6 +14,7 @@ from app.services.punctuation.base import (
     WordTimestampLike,
     build_split_points,
 )
+from app.services.text_protection import should_skip_raw_punctuation
 
 
 class RuleBasedPunctuationStrategy(PunctuationStrategy):
@@ -87,6 +88,8 @@ class RuleBasedPunctuationStrategy(PunctuationStrategy):
         positions: List[PuncPosition] = []
         for idx, char in enumerate(text):
             if char in self._punctuation_chars:
+                if should_skip_raw_punctuation(text, idx, char):
+                    continue
                 positions.append(PuncPosition(char_index=idx, punctuation=char, confidence=1.0))
         return positions
 

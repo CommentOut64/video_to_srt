@@ -11,20 +11,25 @@
  * - V3.1.1+dev.20260106.01: 使用 sessionStorage 防止会话内重复检查更新
  */
 import { ref, onMounted, onUnmounted } from 'vue'
-import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
-import { useUpdateChecker } from '@/composables'
+import { useTaskRuntimeStore } from '@/stores/taskRuntimeStore'
+import { useAppUpdateStore } from '@/stores/appUpdateStore'
 import sseChannelManager from '@/services/sseChannelManager'
 import { heartbeatService } from '@/services/heartbeat'
 import UpdateDialog from '@/components/UpdateDialog.vue'
+import { traceTaskProjection } from '@/state/observability/taskEventTrace'
 
-const taskStore = useUnifiedTaskStore()
+const taskStore = useTaskRuntimeStore()
+const progressStore = taskStore
+const appUpdateStore = useAppUpdateStore()
+appUpdateStore.initialize()
 
 // V3.1.1+dev.20260105.01: 更新相关状态
 const showUpdateDialog = ref(false)
 const pendingUpdateInfo = ref(null)
-const { checkForUpdate } = useUpdateChecker()
+const checkForUpdate = appUpdateStore.checkForUpdate
 
 let unsubscribeGlobal = null
+let syncTimer = null
 
 // V3.1.1+dev.20260106.01: sessionStorage key，用于防止会话内重复检查更新
 const UPDATE_CHECK_SESSION_KEY = 'anchorflux_update_checked_this_session'
@@ -71,6 +76,25 @@ async function checkUpdateOnStartup() {
   }
 }
 
+function startPeriodicSync() {
+  if (syncTimer) {
+    clearInterval(syncTimer)
+  }
+  syncTimer = setInterval(async () => {
+    const needsSync =
+      taskStore.hasStaleState('canceling', 30000) ||
+      !sseChannelManager.isGlobalHealthy()
+    if (!needsSync) return
+
+    console.log('[App] 检测到异常状态，触发兜底同步')
+    try {
+      await taskStore.syncTasksFromBackend()
+    } catch (error) {
+      console.warn('[App] 兜底同步失败:', error)
+    }
+  }, 60000)
+}
+
 onMounted(async () => {
   console.log('[App] 应用已挂载，执行初始化')
 
@@ -86,21 +110,8 @@ onMounted(async () => {
   // V3.1.1+dev.20260106.01: 启动时检查更新（每个会话只检查一次，不阻塞其他初始化）
   checkUpdateOnStartup()
 
-  // 第一步：从后端同步任务列表（第一阶段修复：数据同步）
-  console.log('[App] 步骤 1: 从后端同步任务列表...')
-  try {
-    const syncSuccess = await taskStore.syncTasksFromBackend()
-    if (syncSuccess) {
-      console.log('[App] 任务列表同步成功')
-    } else {
-      console.warn('[App] 任务列表同步失败，将使用本地 localStorage 数据')
-    }
-  } catch (error) {
-    console.error('[App] 任务列表同步异常:', error)
-  }
-
-  // 第二步：订阅全局 SSE 事件流（用于实时更新）
-  console.log('[App] 步骤 2: 订阅全局 SSE 事件流...')
+  // 第一步：订阅全局 SSE 事件流（先订阅避免和 HTTP 同步竞态）
+  console.log('[App] 步骤 1: 订阅全局 SSE 事件流...')
   unsubscribeGlobal = sseChannelManager.subscribeGlobal({
     onInitialState(state) {
       console.log('[App] 全局初始状态:', state)
@@ -110,7 +121,12 @@ onMounted(async () => {
 
       // 同步队列顺序
       if (state.queue && Array.isArray(state.queue)) {
-        taskStore.applyQueueOrder(state.queue, { timestamp: state.queue_updated_at })
+        const accepted = taskStore.applyQueueOrder(state.queue, { timestamp: state.queue_updated_at })
+        traceTaskProjection('global.initial.queue', {
+          source: 'sse',
+          accepted,
+          detail: { length: state.queue.length },
+        })
         console.log(`[App] 初始队列顺序已同步: ${state.queue.length} 个任务`)
       }
 
@@ -123,7 +139,14 @@ onMounted(async () => {
             return
           }
 
-          taskStore.applyTaskSnapshot(job)
+          const accepted = taskStore.applyTaskSnapshot(job)
+          traceTaskProjection('global.initial.job_snapshot', {
+            source: 'sse',
+            jobId: job.id,
+            state_seq: job.state_seq,
+            accepted,
+            detail: { status: job.status },
+          })
         })
       }
     },
@@ -136,8 +159,14 @@ onMounted(async () => {
 
       // 更新队列顺序到 store
       if (Array.isArray(queue)) {
-        taskStore.applyQueueOrder(queue, {
+        const accepted = taskStore.applyQueueOrder(queue, {
           updated_at: data?.updated_at ?? data?.timestamp
+        })
+        traceTaskProjection('global.queue_update', {
+          source: 'sse',
+          state_seq: data?.state_seq,
+          accepted,
+          detail: { length: queue.length },
         })
         console.log(`[App] 队列顺序已更新: ${queue.length} 个任务`)
       }
@@ -155,8 +184,27 @@ onMounted(async () => {
         // V3.1.0: onJobStatus 只更新 status 和 message，不更新 progress
         // 避免后端推送的低进度（如恢复时的 0）覆盖前端已有的高进度
         // progress 的更新由 onJobProgress 专门负责
-        taskStore.updateTaskStatus(jobId, status, data.message || '', {
-          updated_at: data.updated_at ?? data.timestamp
+        const taskAccepted = taskStore.updateTaskStatus(jobId, status, data.message || '', {
+          updated_at: data.updated_at ?? data.timestamp,
+          state_seq: data.state_seq
+        })
+        const progressState = progressStore.markStatus(jobId, status, {
+          updated_at: data.updated_at ?? data.timestamp,
+          state_seq: data.state_seq,
+          message: data.message,
+          phase: data.phase,
+          phase_percent: data.phase_percent
+        })
+        traceTaskProjection('global.job_status', {
+          source: 'sse',
+          jobId,
+          state_seq: data.state_seq,
+          accepted: taskAccepted,
+          detail: {
+            status,
+            progressAccepted: progressState?.lastProjection?.accepted ?? null,
+            progressReason: progressState?.lastProjection?.reason ?? null,
+          },
         })
 
       }
@@ -169,7 +217,7 @@ onMounted(async () => {
       taskStore.updateSSEHeartbeat()
 
       // 更新 store 中的任务进度（实时更新卡片），传递完整数据
-      taskStore.updateTaskProgress(jobId, percent, data.status, {
+      const accepted = taskStore.updateTaskProgress(jobId, percent, data.status, {
         phase: data.phase,
         phase_percent: data.phase_percent,
         message: data.message,
@@ -177,7 +225,18 @@ onMounted(async () => {
         total: data.total,
         language: data.language
       }, {
-        updated_at: data.updated_at ?? data.timestamp
+        updated_at: data.updated_at ?? data.timestamp,
+        state_seq: data.state_seq
+      })
+      traceTaskProjection('global.job_progress', {
+        source: 'sse',
+        jobId,
+        state_seq: data.state_seq,
+        accepted,
+        detail: {
+          percent,
+          status: data.status,
+        },
       })
     },
     onJobRenamed(data) {
@@ -187,8 +246,14 @@ onMounted(async () => {
       if (data.title !== undefined) updates.title = data.title
       if (data.filename !== undefined) updates.filename = data.filename
 
-      taskStore.updateTask(data.job_id, updates, {
+      const accepted = taskStore.updateTask(data.job_id, updates, {
         updated_at: data.updated_at ?? data.timestamp
+      })
+      traceTaskProjection('global.job_renamed', {
+        source: 'sse',
+        jobId: data.job_id,
+        state_seq: data.state_seq,
+        accepted,
       })
     },
 
@@ -201,6 +266,7 @@ onMounted(async () => {
 
       // 从 store 中彻底移除任务
       taskStore.deleteTask(jobId)
+      progressStore.clearJobState(jobId)
 
     },
 
@@ -223,6 +289,22 @@ onMounted(async () => {
       taskStore.updateSSEHeartbeat()
     }
   })
+
+  // 第二步：HTTP 同步任务列表（兜底，避免漏事件）
+  console.log('[App] 步骤 2: 从后端同步任务列表...')
+  try {
+    const syncSuccess = await taskStore.syncTasksFromBackend()
+    if (syncSuccess) {
+      console.log('[App] 任务列表同步成功')
+    } else {
+      console.warn('[App] 任务列表同步失败，将使用本地 localStorage 数据')
+    }
+  } catch (error) {
+    console.error('[App] 任务列表同步异常:', error)
+  }
+
+  // 第三步：启动低频兜底同步
+  startPeriodicSync()
 })
 
 onUnmounted(() => {
@@ -231,6 +313,10 @@ onUnmounted(() => {
   // 取消全局订阅
   if (unsubscribeGlobal) {
     unsubscribeGlobal()
+  }
+  if (syncTimer) {
+    clearInterval(syncTimer)
+    syncTimer = null
   }
 
   // 停止心跳服务

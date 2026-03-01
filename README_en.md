@@ -6,7 +6,7 @@
 
 [![Chinese README](https://img.shields.io/badge/README-中文-blue.svg)](README.md)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Version](https://img.shields.io/badge/version-v3.2.2-brightgreen.svg)
+![Version](https://img.shields.io/badge/version-v3.2.4-brightgreen.svg)
 ![Vue](https://img.shields.io/badge/Vue-3.5+-4FC08D?logo=vue.js&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-009688?logo=fastapi&logoColor=white)
@@ -63,13 +63,8 @@ AnchorFlux is not just another high-precision transcription script; it is a full
 
 ### Basic Requirements
 - **OS:** Windows 10/11
-- **GPU:** NVIDIA GPU supporting CUDA 11.8+ (at least 4GB VRAM recommended for best performance)
-- **Important Note: Even without dedicated graphics card, you can still use express mode (SenseVoice only), but cannot use Whisper model**
+- **GPU:** NVIDIA GPU supporting CUDA 12.8+ (at least 4GB VRAM recommended for best performance)
 - **Memory:** 16GB+ recommended
-
-### Local Deployment Requirements
-- **Python:** 3.10+
-- **Node.js:** 21+
 
 ## Quick Start
 
@@ -79,23 +74,6 @@ AnchorFlux is not just another high-precision transcription script; it is a full
 3. **Wait for automatic dependency download to complete (maintain network connectivity, takes 10-20 minutes)**
 4. **Will automatically start and jump to browser page after completion**
 5. **Use One-Click Start.bat for next startup**
-
-### Manual Installation
-1. **Clone repository**
-```bash
-git clone https://github.com/CommentOut64/anchor-flux.git
-cd anchor-flux-main
-```
-2. **Install CUDA and cuDNN**
-   - Download and install [CUDA 11.8+](https://developer.nvidia.com/cuda-11-8-0-download-archive)
-   - Download and install [cuDNN 8](https://developer.nvidia.com/rdp/cudnn-archive)
-   - Verify installation: `nvidia-smi` and `nvcc --version`
-
-3. **Run startup script**
-```bash
-# Run
-run.bat
-```
 
 ### Switching Whisper Models
 
@@ -125,17 +103,6 @@ Download Faster-Whisper model files from HuggingFace and place them in the speci
    └── vocabulary.txt
    ```
    > Tip: `<any-hash-name>` can be any string, such as `main` or `v1`
-
-**Available Models:**
-
-| Model | HuggingFace Repository | VRAM Required |
-|-------|------------------------|---------------|
-| tiny | Systran/faster-whisper-tiny | ~1GB |
-| base | Systran/faster-whisper-base | ~1GB |
-| small | Systran/faster-whisper-small | ~2GB |
-| medium | Systran/faster-whisper-medium | ~5GB |
-| large-v3 | Systran/faster-whisper-large-v3 | ~10GB (float16) / ~6GB (int8) |
-| turbo | Systran/faster-whisper-large-v3-turbo | ~6GB |
 
 ### Runtime Modes
 
@@ -193,17 +160,15 @@ flowchart TB
         G --> H[Slow Stream Whisper]
     end
 
-    H --> L0
-    F --> L0
+    H --> P0
+    F --> P0
 
     subgraph Post Processing
-        L0[L0 Raw Output] --> L1[L1 Normalization]
-        L1 --> L2[L2 Arbitration]
-        L2 --> L3[L3 Punctuation]
-        L3 --> L4[L4 Alignment]
-        L4 --> L5[L5 Semantic Injection]
-        L5 --> L6[L6 Segmentation]
-        L6 --> L7[L7 Output]
+        P0[Preparation Layer] --> P1[Language Adapter Layer]
+        P1 --> C1[Collection Layer]
+        C1 --> C2[Scoring Layer]
+        C2 --> C3[Decision Layer]
+        C3 --> C4[Output Layer]
     end
 
     subgraph Push
@@ -212,19 +177,19 @@ flowchart TB
         M[Export SRT/ASS]
     end
 
-    L7 --> K
-    L7 --> L
-    L7 --> M
+    C4 --> K
+    C4 --> L
+    C4 --> M
 ```
 
 ## Core Architecture
 
-The system adopts the "spatiotemporal decoupling" philosophy, separating the definition of time boundaries from the generation of semantic content, achieving high-quality subtitle output through a seven-layer post-processing pipeline.
+The system adopts the "spatiotemporal decoupling" philosophy, separating the definition of time boundaries from the generation of semantic content, and achieving high-quality subtitle output through a unified preparation-plus-four-layer pipeline.
 
 ### 1. Dual-Anchor Mechanism
 
 * **Time Anchor (SenseVoice):** Utilizes SenseVoice model (ONNX quantized inference) running on CPU, using CTC decoding to generate high-precision word-level timestamps, defining the absolute time boundaries of subtitles.
-* **Content Anchor (Whisper):** Utilizes Whisper model running on GPU, focusing on semantic coherence and contextual understanding, mapping semantic text to time anchors through the L4 alignment layer.
+* **Content Anchor (Whisper):** Utilizes Whisper model running on GPU, focusing on semantic coherence and contextual understanding, mapping semantic text to time anchors through the Collection-layer alignment path.
 
 ### 2. Asynchronous Dual-Stream Pipeline
 
@@ -234,16 +199,14 @@ The system adopts a three-level pipeline architecture with "out-of-order executi
 * **Bridge Semantic Batching:** Aggregates semantic sentences from fast stream into Whisper batches, triggers flush on language switch, speaker switch, pause timeout, etc., improving GPU efficiency and enhancing context consistency.
 * **Slow Stream (SlowWorker):** Executes Whisper inference sequentially on GPU, maintains audio context to ensure semantic coherence.
 
-### 3. Seven-Layer Post-Processing Architecture (L0-L7)
+### 3. Unified Preparation + Four-Layer Post-Processing Architecture
 
-* **L0 Raw Output:** Receives raw recognition results from fast/slow streams
-* **L1 Normalization:** Text cleaning, ITN (Inverse Text Normalization), character mapping
-* **L2 Arbitration:** Selects fast or slow stream text based on quality signals (confidence, repetition detection, hallucination detection)
-* **L3 Punctuation:** Generates punctuation position candidates, supports multi-source punctuation fusion
-* **L4 Alignment:** Uses Needleman-Wunsch algorithm to align slow stream text to fast stream time anchors
-* **L5 Semantic Injection:** Injects punctuation positions into aligned word stream
-* **L6 Segmentation:** Segments into final sentences based on multi-signal boundaries (pause, length, speaker, punctuation)
-* **L7 Output:** Formatting and distribution, pushes finalized subtitles
+* **Preparation Layer:** Merges fast/slow outputs, performs normalization, text arbitration, punctuation pre-processing, and policy snapshot compilation into one canonical input
+* **Language Adapter Layer:** Builds a read-only policy snapshot from language cues, centralizing thresholds, continuation words, sentence-end rules, and cross-chunk carry rules
+* **Collection Layer:** Aligns text with timeline facts, applies gap repair and monotonic-time constraints, and outputs verifiable alignment results
+* **Scoring Layer:** Injects punctuation and applies quality gates without changing timestamps, blocking low-coverage injection from propagating downstream
+* **Decision Layer:** Executes soft-cut planning, boundary guards, and sentence-level finalization under one decision path
+* **Output Layer:** Handles formatting, distribution, and persistence, then publishes finalized subtitles and export payloads
 
 ## Key Technical Features
 
@@ -255,36 +218,28 @@ To address Whisper's attention decay in long audio segments, the system implemen
 * **RMS Validation:** Rejects segmentation at high-energy (speaking) positions, avoiding word truncation
 * **Dual Constraints:** 12-second soft limit (SenseVoice's optimal processing duration) + 30-second hard limit (physical input window)
 
-### Spectral Triage and Smart Probe
+### Audio Precheck and Smart Probe
 
-Before processing, audio blocks undergo multi-layer spectral analysis to determine if vocal separation is needed.
+Before processing, audio blocks undergo multi-layer audio precheck analysis to determine if vocal separation is needed.
 
-* **SNR+C50 Three-Layer Decision:** Uses Brouhaha model to calculate signal-to-noise ratio and clarity metrics. Layer 1 for fast screening (pass high-quality/separate low-quality), Layer 2 for spectral feature supplementary judgment, Layer 3 for YAMNet semantic classification fallback.
-* **Smart Probe Mode:** Center-out exponential probe strategy for quickly determining if full detection is needed. Pure videos are directly marked as no separation needed; if interference is detected, falls back to standard triage mode.
-* **On-Demand Separation:** Separates only audio blocks marked by spectral triage, saving GPU resources compared to global track separation.
+* **DNSMOS Three-Layer Decision:** Uses DNSMOS metrics for speech quality evaluation. Layer 1 for fast screening (pass high-quality/separate low-quality), Layer 2 for spectral feature supplementary judgment, Layer 3 for YAMNet semantic classification fallback.
+* **Smart Probe Mode:** Center-out exponential probe strategy for quickly determining if full detection is needed. Pure videos are directly marked as no separation needed; if interference is detected, falls back to standard precheck mode.
+* **On-Demand Separation:** Separates only audio blocks marked by audio precheck, saving GPU resources compared to global track separation.
 
-### Language Detection and Injection
+### Preparation-Layer Text Arbitration
 
-Multi-mode language detection based on SpeechBrain, with detection results injected into ASR engines to improve recognition accuracy.
+A quality-signal-driven text selection mechanism that produces one chosen text track before the four-layer pipeline, preventing low-quality content from leaking into downstream stages.
 
-* **Three Detection Modes:** fast (quick sampling), balanced (group probing), precise (full detection), automatically selected based on video characteristics.
-* **Center-Out Probe:** Balanced mode groups chunks by time window, using probe strategy to quickly determine language distribution, auto-degrading when consistency is insufficient.
-* **Language Injection to ASR:** Detection results injected into SenseVoice and Whisper, eliminating language guessing overhead and improving accuracy in multilingual scenarios.
+* **Quality Signals:** Confidence, length ratio, repetition detection, hallucination detection, and ITN fallback markers
+* **Decision Logic:** Automatically falls back to the fast stream when the slow stream shows repetition, hallucination, or abnormal length patterns, while emitting reusable arbitration diagnostics
 
-### L2 Text Arbitration
+### Collection-Layer Time Alignment
 
-Intelligent text selection mechanism based on multi-dimensional quality signals, preventing low-quality output from entering final subtitles.
+The core mechanism that maps slow-stream semantic text onto fast-stream time anchors and establishes timeline facts for downstream stages.
 
-* **Quality Signals:** Confidence, length ratio, repetition detection, hallucination detection, ITN fallback flag
-* **Decision Logic:** Automatically falls back to fast stream when slow stream shows repetition/hallucination, ensuring output stability
-
-### L4 Time Alignment
-
-Core mechanism for precisely mapping slow stream semantic text to fast stream time anchors.
-
-* **Needleman-Wunsch Alignment:** Global sequence alignment algorithm, handling insertions, deletions, substitutions
-* **Gap Repair:** Automatically detects and repairs alignment gaps, supports multiple repair strategies
-* **Coverage Statistics:** Real-time alignment coverage calculation, triggers degradation on low coverage
+* **Global Sequence Alignment:** Handles insertions, deletions, and substitutions over a unified word stream
+* **Gap Repair and Monotonic Constraints:** Repairs alignment gaps and enforces monotonic timestamps to avoid word-level time rollback
+* **Coverage Gating:** Tracks alignment coverage and gap ratio in real time, and triggers degradation when quality falls below threshold
 
 ## Configuration Options
 

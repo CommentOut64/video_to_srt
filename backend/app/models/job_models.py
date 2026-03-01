@@ -3,8 +3,21 @@
 
 与 preset_models.py 中的 1+3 预设模式保持一致
 """
+import os
 from dataclasses import dataclass, field, asdict
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
+
+
+def resolve_default_whisper_model() -> str:
+    """
+    解析默认 Whisper 模型。
+
+    临时策略：
+    - 暂停任务级 `transcription.whisper_model` 覆盖；
+    - 统一使用环境变量 `WHISPER_MODEL`，未设置时回退 `medium`。
+    """
+    model_name = str(os.environ.get("WHISPER_MODEL", "medium") or "").strip()
+    return model_name or "medium"
 
 
 # ========== 分组一: 预处理与音频设置 ==========
@@ -12,7 +25,7 @@ from typing import List, Dict, Optional, Any
 @dataclass
 class PreprocessingConfig:
     """
-    预处理与音频配置 (Demucs 人声分离 + 频谱分诊 + 熔断回溯)
+    预处理与音频配置 (Demucs 人声分离 + 音频预检 + 熔断回溯)
     对应文档分组一
     """
     # ========== 人声分离配置 ==========
@@ -28,15 +41,19 @@ class PreprocessingConfig:
     # 分离模式: global/on_demand (新增)
     separation_mode: str = "on_demand"
 
-    # ========== 频谱分诊配置 ==========
-    # 是否启用频谱分诊 (新增)
+    # ========== 音频预检配置 ==========
+    # 是否启用音频预检 (新增)
     enable_spectral_triage: bool = True
 
     # 分诊灵敏度: 0.0-1.0 (默认从 spectrum_thresholds.py: 0.35)
     spectrum_threshold: float = 0.35
 
-    # V3.1.1+dev.20260108.02: 是否启用 SNR+C50 三层决策策略（默认启用）
-    use_snr_triage: bool = True
+    # V3.2.4+dev.20260224.01: 默认启用 DNSMOS 音频预检主链
+    use_dnsmos_triage: bool = True
+    # V3.2.4+dev.20260225.01: 默认启用 DNSMOS 中心扩散探针快判
+    use_smart_probe: bool = True
+    # V3.2.4+dev.20260225.02: 默认启用 ASR 风险前置守卫（命中后强制全局分离）
+    enable_asr_risk_guard: bool = True
 
     # ========== 熔断回溯配置 (新增) ==========
     # 是否启用熔断回溯
@@ -63,6 +80,12 @@ class PreprocessingConfig:
     langid_whitelist: List[str] = field(default_factory=lambda: ["zh", "ja", "en"])
     langid_logit_bias_score: float = 2.5
     enable_speaker_embedding: bool = True  # V3.2.0+dev.20260207.01: 默认开启声纹聚类
+    # V3.2.0+dev.20260217.06: 任务级 speaker 行为配置（阶段B/C）
+    is_enable_speaker_detection: bool = True
+    is_enable_speaker_guided_split: bool = True
+    speaker_count: int = 0  # 0=auto
+    speaker_min_count: int = 0  # 0=auto
+    speaker_max_count: int = 0  # 0=auto
 
     # ========== 预处理缓存配置 ==========
     # 是否启用预处理缓存 GC（默认关闭）
@@ -76,6 +99,33 @@ class PreprocessingConfig:
 
     # 缓存任务数上限，0 表示不限制
     max_tasks: int = 0
+
+    def resolve_speaker_count(self) -> Optional[int]:
+        """
+        解析任务级固定说话人数。
+
+        约定：
+        - 0 表示自动推断，返回 None；
+        - >0 表示固定人数，直接返回。
+        """
+        normalized_count = max(0, int(self.speaker_count or 0))
+        if normalized_count <= 0:
+            return None
+        return normalized_count
+
+    def resolve_speaker_min_max(self) -> Tuple[Optional[int], Optional[int]]:
+        """
+        解析任务级人数范围（仅在 speaker_count=0 时生效）。
+        """
+        if self.resolve_speaker_count() is not None:
+            return None, None
+        normalized_min = max(0, int(self.speaker_min_count or 0))
+        normalized_max = max(0, int(self.speaker_max_count or 0))
+        min_value = normalized_min if normalized_min > 0 else None
+        max_value = normalized_max if normalized_max > 0 else None
+        if min_value is not None and max_value is not None and max_value < min_value:
+            max_value = min_value
+        return min_value, max_value
 
 
 # ========== 分组二: 转录核心设置 ==========
@@ -93,7 +143,7 @@ class TranscriptionConfig:
     sensevoice_device: str = "auto"
 
     # 辅助/复核模型: tiny/small/medium/large-v3
-    whisper_model: str = "medium"
+    whisper_model: str = field(default_factory=resolve_default_whisper_model)
 
     # 复核触发阈值: 0.0-1.0
     patching_threshold: float = 0.60
@@ -175,6 +225,8 @@ class JobSettings:
     # === 新版 1+3 预设配置 ===
     # 选择的宏预设 ID (fast/balanced/quality/custom)
     preset_id: str = "balanced"
+    # Task6: 任务模式（转录或纯编辑）
+    mode: str = "transcribe"  # transcribe | edit_only
 
     # 四个设置分组
     preprocessing: PreprocessingConfig = field(default_factory=PreprocessingConfig)
@@ -188,6 +240,7 @@ class JobSettings:
         return {
             # 新版配置
             "preset_id": self.preset_id,
+            "mode": self.mode,
             "preprocessing": {
                 "demucs_strategy": self.preprocessing.demucs_strategy,
                 "demucs_model": self.preprocessing.demucs_model,
@@ -195,7 +248,11 @@ class JobSettings:
                 "separation_mode": self.preprocessing.separation_mode,
                 "enable_spectral_triage": self.preprocessing.enable_spectral_triage,
                 "spectrum_threshold": self.preprocessing.spectrum_threshold,
-                "use_snr_triage": self.preprocessing.use_snr_triage,
+                "use_dnsmos_triage": self.preprocessing.use_dnsmos_triage,
+                "use_smart_probe": self.preprocessing.use_smart_probe,
+                "enable_asr_risk_guard": self.preprocessing.enable_asr_risk_guard,
+                # 兼容字段：保留旧键，避免历史前端/任务读取失败
+                "use_snr_triage": self.preprocessing.use_dnsmos_triage,
                 "enable_fuse_breaker": self.preprocessing.enable_fuse_breaker,
                 "fuse_max_retry": self.preprocessing.fuse_max_retry,
                 "fuse_confidence_threshold": self.preprocessing.fuse_confidence_threshold,
@@ -207,6 +264,11 @@ class JobSettings:
                 "langid_whitelist": self.preprocessing.langid_whitelist,
                 "langid_logit_bias_score": self.preprocessing.langid_logit_bias_score,
                 "enable_speaker_embedding": self.preprocessing.enable_speaker_embedding,
+                "enable_speaker_detection": self.preprocessing.is_enable_speaker_detection,
+                "enable_speaker_guided_split": self.preprocessing.is_enable_speaker_guided_split,
+                "speaker_count": int(self.preprocessing.speaker_count),
+                "speaker_min_count": int(self.preprocessing.speaker_min_count),
+                "speaker_max_count": int(self.preprocessing.speaker_max_count),
                 "enable_preprocess_cache_gc": self.preprocessing.is_preprocess_cache_gc_enabled,
                 "cache_budget_gb": self.preprocessing.cache_budget_gb,
                 "ttl_hours": self.preprocessing.ttl_hours,
@@ -280,10 +342,39 @@ class JobSettings:
             langid_whitelist = raw_whitelist
         else:
             langid_whitelist = ["zh", "ja", "en"]
+        def _to_non_negative_int(value: Any, default: int = 0) -> int:
+            try:
+                return max(0, int(value))
+            except (TypeError, ValueError):
+                return default
+
+        speaker_count = _to_non_negative_int(preprocessing_data.get("speaker_count", 0))
+        speaker_min_count = _to_non_negative_int(preprocessing_data.get("speaker_min_count", 0))
+        speaker_max_count = _to_non_negative_int(preprocessing_data.get("speaker_max_count", 0))
+        if speaker_count > 0:
+            speaker_min_count = 0
+            speaker_max_count = 0
+        elif speaker_min_count > 0 and speaker_max_count > 0 and speaker_max_count < speaker_min_count:
+            speaker_max_count = speaker_min_count
+        is_enable_speaker_detection = bool(
+            preprocessing_data.get(
+                "enable_speaker_detection",
+                preprocessing_data.get("is_enable_speaker_detection", True),
+            )
+        )
+        is_enable_speaker_guided_split = bool(
+            preprocessing_data.get(
+                "enable_speaker_guided_split",
+                preprocessing_data.get("is_enable_speaker_guided_split", True),
+            )
+        )
+        if not is_enable_speaker_detection:
+            is_enable_speaker_guided_split = False
 
         return cls(
             # 新版配置
             preset_id=data.get("preset_id", "balanced"),
+            mode=str(data.get("mode", "transcribe") or "transcribe"),
             preprocessing=PreprocessingConfig(
                 demucs_strategy=preprocessing_data.get("demucs_strategy", "auto"),
                 demucs_model=preprocessing_data.get("demucs_model", "htdemucs"),
@@ -291,7 +382,14 @@ class JobSettings:
                 separation_mode=preprocessing_data.get("separation_mode", "on_demand"),
                 enable_spectral_triage=preprocessing_data.get("enable_spectral_triage", True),
                 spectrum_threshold=preprocessing_data.get("spectrum_threshold", 0.35),
-                use_snr_triage=preprocessing_data.get("use_snr_triage", True),
+                use_dnsmos_triage=bool(
+                    preprocessing_data.get(
+                        "use_dnsmos_triage",
+                        preprocessing_data.get("use_snr_triage", True),
+                    )
+                ),
+                use_smart_probe=bool(preprocessing_data.get("use_smart_probe", True)),
+                enable_asr_risk_guard=bool(preprocessing_data.get("enable_asr_risk_guard", True)),
                 enable_fuse_breaker=preprocessing_data.get("enable_fuse_breaker", True),
                 fuse_max_retry=preprocessing_data.get("fuse_max_retry", 2),
                 fuse_confidence_threshold=preprocessing_data.get("fuse_confidence_threshold", 0.5),
@@ -303,6 +401,11 @@ class JobSettings:
                 langid_whitelist=langid_whitelist,
                 langid_logit_bias_score=preprocessing_data.get("langid_logit_bias_score", 2.5),
                 enable_speaker_embedding=preprocessing_data.get("enable_speaker_embedding", True),
+                is_enable_speaker_detection=is_enable_speaker_detection,
+                is_enable_speaker_guided_split=is_enable_speaker_guided_split,
+                speaker_count=speaker_count,
+                speaker_min_count=speaker_min_count,
+                speaker_max_count=speaker_max_count,
                 is_preprocess_cache_gc_enabled=preprocessing_data.get("enable_preprocess_cache_gc", False),
                 cache_budget_gb=preprocessing_data.get("cache_budget_gb", 0.0),
                 ttl_hours=preprocessing_data.get("ttl_hours", 0.0),
@@ -311,7 +414,8 @@ class JobSettings:
             transcription=TranscriptionConfig(
                 transcription_profile=transcription_data.get("transcription_profile", "sensevoice_only"),
                 sensevoice_device=transcription_data.get("sensevoice_device", "auto"),
-                whisper_model=transcription_data.get("whisper_model", "medium"),
+                # 临时禁用任务级 whisper_model 覆盖，统一读取 .env。
+                whisper_model=resolve_default_whisper_model(),
                 patching_threshold=transcription_data.get("patching_threshold", 0.60),
             ),
             refinement=RefinementConfig(
@@ -352,7 +456,9 @@ class JobSettings:
                 separation_mode=preset.preprocessing.separation_mode,
                 enable_spectral_triage=preset.preprocessing.enable_spectral_triage,
                 spectrum_threshold=preset.preprocessing.spectrum_threshold,
-                use_snr_triage=True,  # V3.1.1+dev.20260108.02: 默认启用 SNR+C50 策略
+                use_dnsmos_triage=True,
+                use_smart_probe=True,
+                enable_asr_risk_guard=True,
                 vad_filter=preset.preprocessing.vad_filter,
                 enable_fuse_breaker=True,
                 fuse_max_retry=1,
@@ -363,6 +469,11 @@ class JobSettings:
                 langid_confidence_threshold=0.7,
                 langid_whitelist=["zh", "ja", "en"],
                 langid_logit_bias_score=2.5,
+                is_enable_speaker_detection=True,
+                is_enable_speaker_guided_split=True,
+                speaker_count=0,
+                speaker_min_count=0,
+                speaker_max_count=0,
                 is_preprocess_cache_gc_enabled=False,
                 cache_budget_gb=0.0,
                 ttl_hours=0.0,
@@ -371,7 +482,8 @@ class JobSettings:
             transcription=TranscriptionConfig(
                 transcription_profile=preset.transcription.transcription_profile,
                 sensevoice_device=preset.transcription.sensevoice_device,
-                whisper_model=preset.transcription.whisper_model,
+                # 临时禁用预设内 whisper_model 覆盖，统一读取 .env。
+                whisper_model=resolve_default_whisper_model(),
                 patching_threshold=preset.transcription.patching_threshold,
             ),
             refinement=RefinementConfig(
@@ -428,8 +540,11 @@ class JobState:
     title: str = ""  # 用户自定义的任务名称，为空时使用 filename
     createdAt: Optional[int] = None  # 创建时间戳
     updatedAt: Optional[int] = None  # 更新时间戳（毫秒）
+    state_seq: int = 0  # 状态迁移序号，单调递增
     # V3.2.0+dev.20260130.10: 任务级字幕时间偏移（秒，None 表示使用全局默认）
     subtitle_time_offset: Optional[float] = None
+    # Task6: 对应的项目 ID（过渡期可为空）
+    project_id: Optional[str] = None
 
     # 媒体状态（用于编辑器，转录完成后更新）
     media_status: Optional[MediaStatus] = None
@@ -466,7 +581,9 @@ class JobState:
             "paused": self.paused,
             "settings": self.settings.to_dict(),
             "subtitle_time_offset": self.subtitle_time_offset,
-            "updated_at": time.time()
+            "project_id": self.project_id,
+            "updated_at": time.time(),
+            "state_seq": int(self.state_seq or 0),
         }
 
     @classmethod
@@ -506,7 +623,9 @@ class JobState:
             canceled=data.get("canceled", False),
             paused=data.get("paused", False),
             updatedAt=updated_at,
+            state_seq=max(0, int(data.get("state_seq", 0) or 0)),
             subtitle_time_offset=data.get("subtitle_time_offset"),
+            project_id=data.get("project_id"),
         )
 
     def update_media_status(self, job_dir: str):

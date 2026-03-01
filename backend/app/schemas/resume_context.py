@@ -20,12 +20,18 @@ class ResumeContext:
     previous_whisper_text: str = ""
     sentences_snapshot: List[Dict[str, Any]] = field(default_factory=list)
     sentence_count: int = 0
-    chunk_sentences_map: Dict[int, List[int]] = field(default_factory=dict)
+    chunk_sentences_map: Dict[Any, List[int]] = field(default_factory=dict)
+    merge_decisions: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def is_resuming(self) -> bool:
         """是否处于恢复模式"""
         return self.checkpoint is not None
+
+    @property
+    def is_merged_resume(self) -> bool:
+        """是否经过双源合并恢复。"""
+        return len(self.merge_decisions) > 0
 
     @classmethod
     def from_checkpoint(cls, checkpoint: Optional[Dict[str, Any]]) -> "ResumeContext":
@@ -80,9 +86,24 @@ class ResumeContext:
         sentences_snapshot = transcription.get("sentences_snapshot", []) or []
         sentence_count = transcription.get("sentence_count", 0) or 0
         raw_chunk_map = transcription.get("chunk_sentences_map", {}) or {}
-        chunk_sentences_map = (
-            {int(k): v for k, v in raw_chunk_map.items()} if raw_chunk_map else {}
-        )
+        chunk_sentences_map: Dict[Any, List[int]] = {}
+        if raw_chunk_map:
+            for raw_key, raw_indices in raw_chunk_map.items():
+                normalized_key: Any = raw_key
+                if isinstance(raw_key, str) and raw_key.lstrip("-").isdigit():
+                    try:
+                        normalized_key = int(raw_key)
+                    except ValueError:
+                        normalized_key = raw_key
+                if not isinstance(raw_indices, list):
+                    continue
+                normalized_indices: List[int] = []
+                for raw_index in raw_indices:
+                    try:
+                        normalized_indices.append(int(raw_index))
+                    except (TypeError, ValueError):
+                        continue
+                chunk_sentences_map[normalized_key] = normalized_indices
 
         return cls(
             checkpoint=checkpoint,

@@ -39,7 +39,7 @@ class FastPunctuationPipeline:
         self.logger = logger or logging.getLogger(__name__)
         self._punctuation_scheduler = get_punctuation_scheduler()
         # V3.2.0+dev.20260204.06: 统一入口 - 快流标点也通过 L3Processor 产出 PunctTrack
-        self._l3_processor = PunctuationProcessor(
+        self._punctuation_pre_processor = PunctuationProcessor(
             punctuation_service=punctuation_service,
             logger=self.logger,
         )
@@ -66,8 +66,8 @@ class FastPunctuationPipeline:
 
         try:
             chosen_track = self._resolve_chosen_track(ctx, sv_result, normalization, language)
-            output = await self._l3_processor.process(
-                data=self._l3_input(chosen_track, words)
+            output = await self._punctuation_pre_processor.process(
+                data=self._build_punctuation_pre_input(chosen_track, words)
             )
         except Exception as exc:
             self.logger.warning("快流标点处理失败，继续主流程: %s", exc)
@@ -148,11 +148,11 @@ class FastPunctuationPipeline:
         )
 
     @staticmethod
-    def _l3_input(track: TextTrack, words: List[Dict[str, Any]]):
+    def _build_punctuation_pre_input(track: TextTrack, words: List[Dict[str, Any]]):
         # 延迟导入避免循环依赖
-        from app.services.alignment.types import L3Input
+        from app.services.alignment.types import PunctuationPreInput
 
-        return L3Input(
+        return PunctuationPreInput(
             chosen_text_track=track,
             sv_punct_source=None,
             wh_punct_source=None,
@@ -185,7 +185,7 @@ class FastPunctuationPipeline:
         }
 
         sse_manager = get_sse_manager()
-        sse_manager.broadcast_sync(f"job:{self.job_id}", "debug.punctuation", payload)
+        sse_manager.broadcast_sync(f"project:{self.job_id}", "debug.punctuation", payload)
         append_debug_punctuation_line(ctx.job_dir, payload, logger=self.logger)
 
         decision = metadata.get("punctuation_decision", {})
@@ -199,7 +199,7 @@ class FastPunctuationPipeline:
                 "sv_confidence": sv_confidence,
             }
             sse_manager.broadcast_sync(
-                f"job:{self.job_id}",
+                f"project:{self.job_id}",
                 "debug.punctuation_scheduler",
                 scheduler_payload,
             )
@@ -289,3 +289,4 @@ class FastPunctuationPipeline:
             model_id=model_result.model_id,
             processing_time_ms=model_result.processing_time_ms,
         )
+

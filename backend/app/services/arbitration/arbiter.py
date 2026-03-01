@@ -1,6 +1,6 @@
 """
-L2 文本仲裁处理器（单路径）。
-V3.2.0+dev.20260204.04
+L2 文本选文处理器（单路径）。
+V3.2.0+dev.20260216.01
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ class ArbitrationResult:
 
 
 class TextArbiterProcessor:
-    """处理器模式：单路径仲裁，输出明确来源与原因。"""
+    """处理器模式：单路径选文，输出明确来源与原因。"""
 
     _DEFAULT_CONFIG: Dict[str, Any] = {
         "enable": True,
@@ -36,6 +36,15 @@ class TextArbiterProcessor:
         "max_length_ratio": 3.0,
         "low_confidence_threshold": 0.5,
         "hallucination_block": True,
+        # V3.2.4+dev.20260301.05:
+        # 慢流优先策略在“快流包含慢流完整内容 + 额外有效尾句”时会漏句，
+        # 因此引入 fast_tail_guard，保护跨说话人切换附近的快流补尾信息。
+        "enable_fast_tail_guard": True,
+        "fast_tail_min_extra_chars": 10,
+        "fast_tail_min_wh_coverage": 0.92,
+        "fast_tail_min_fast_confidence": 0.55,
+        "fast_tail_max_slow_advantage": 0.2,
+        "fast_tail_require_end_match_ratio": 0.9,
     }
 
     def __init__(
@@ -47,7 +56,7 @@ class TextArbiterProcessor:
         self._logger = resolve_loguru_logger(
             logger,
             __name__,
-            layer="L2",
+            layer="选文层",
             processor_name="text_arbiter_processor",
         )
         self._config_override = dict(config) if config else None
@@ -74,7 +83,7 @@ class TextArbiterProcessor:
                 coverage=coverage,
                 error_code=error_code,
             )
-            self._logger.warning("L2 仲裁缺失输入，回退 fast")
+            self._logger.warning("选文层缺失输入，回退 fast")
             return L2Output(chosen_text_track=None, arbitration_result=result)
 
         chosen_source, reason = self._decide_source(
@@ -138,34 +147,106 @@ class TextArbiterProcessor:
             return chosen_source, "disabled_preference"
 
         if quality.is_hallucination and bool(config.get("hallucination_block", True)):
-            self._logger.debug("L2 仲裁门控: hallucination_flag=true")
+            self._logger.debug("选文层门控: hallucination_flag=true")
             return "fast", "hallucination"
 
         if quality.is_repetition:
-            self._logger.debug("L2 仲裁门控: repetition_flag=true")
+            self._logger.debug("选文层门控: repetition_flag=true")
             return "fast", "repetition"
 
         length_ratio = self._resolve_length_ratio(quality.length_ratio, sv_text, wh_text)
         min_ratio = float(config.get("min_length_ratio", 0.65))
         max_ratio = float(config.get("max_length_ratio", 3.0))
         if length_ratio < min_ratio:
-            self._logger.debug("L2 仲裁门控: length_ratio=%.2f < %.2f", length_ratio, min_ratio)
+            self._logger.debug("选文层门控: length_ratio={:.2f} < {:.2f}", length_ratio, min_ratio)
             return "slow", "length_ratio_low"
         if length_ratio > max_ratio:
-            self._logger.debug("L2 仲裁门控: length_ratio=%.2f > %.2f", length_ratio, max_ratio)
+            self._logger.debug("选文层门控: length_ratio={:.2f} > {:.2f}", length_ratio, max_ratio)
             return "fast", "length_ratio_high"
 
         slow_conf = float(quality.confidence_slow or 0.0)
         low_conf = float(config.get("low_confidence_threshold", 0.5))
         if slow_conf < low_conf:
-            self._logger.debug("L2 仲裁门控: slow_conf=%.2f < %.2f", slow_conf, low_conf)
+            self._logger.debug("选文层门控: slow_conf={:.2f} < {:.2f}", slow_conf, low_conf)
             return "fast", "low_confidence_slow"
+
+        if self._is_fast_tail_guard_triggered(
+            quality=quality,
+            config=config,
+            sv_text=sv_text,
+            wh_text=wh_text,
+        ):
+            return "fast", "fast_tail_guard"
 
         if preference == "fast":
             return "fast", "preference_fast"
         if preference == "slow":
             return "slow", "preference_slow"
         return "slow", "auto_slow"
+
+    def _is_fast_tail_guard_triggered(
+        self,
+        *,
+        quality: QualitySignals,
+        config: Dict[str, Any],
+        sv_text: str,
+        wh_text: str,
+    ) -> bool:
+        """检测“快流包含慢流且额外尾句”场景，避免 auto_slow 造成漏句。"""
+        if not bool(config.get("enable_fast_tail_guard", True)):
+            return False
+        normalized_sv = self._normalize_text(sv_text)
+        normalized_wh = self._normalize_text(wh_text)
+        if not normalized_sv or not normalized_wh:
+            return False
+        if len(normalized_sv) <= len(normalized_wh):
+            return False
+
+        fast_conf = float(quality.confidence_fast or 0.0)
+        slow_conf = float(quality.confidence_slow or 0.0)
+        min_fast_conf = float(config.get("fast_tail_min_fast_confidence", 0.55))
+        max_slow_advantage = float(config.get("fast_tail_max_slow_advantage", 0.2))
+        if fast_conf < min_fast_conf:
+            return False
+        if (slow_conf - fast_conf) > max_slow_advantage:
+            return False
+
+        matcher = SequenceMatcher(None, normalized_wh, normalized_sv)
+        blocks = matcher.get_matching_blocks()
+        content_blocks = [block for block in blocks if block.size > 0]
+        if not content_blocks:
+            return False
+
+        covered_wh_chars = sum(block.size for block in content_blocks)
+        covered_wh_ratio = covered_wh_chars / max(len(normalized_wh), 1)
+        min_wh_coverage = float(config.get("fast_tail_min_wh_coverage", 0.92))
+        if covered_wh_ratio < min_wh_coverage:
+            return False
+
+        last_block = max(content_blocks, key=lambda item: item.a + item.size)
+        wh_end_ratio = (last_block.a + last_block.size) / max(len(normalized_wh), 1)
+        required_end_match_ratio = float(config.get("fast_tail_require_end_match_ratio", 0.9))
+        if wh_end_ratio < required_end_match_ratio:
+            return False
+
+        tail_start = last_block.b + last_block.size
+        fast_tail = normalized_sv[tail_start:].strip(" ,.;:!?")
+        min_tail_chars = int(config.get("fast_tail_min_extra_chars", 10))
+        if len(fast_tail) < min_tail_chars:
+            return False
+        if not any(ch.isalnum() for ch in fast_tail):
+            return False
+
+        self._logger.info(
+            "选文层 fast_tail_guard 命中: wh_coverage={:.2f} wh_end_ratio={:.2f} "
+            "tail_chars={} slow_conf={:.2f} fast_conf={:.2f}",
+            covered_wh_ratio,
+            wh_end_ratio,
+            len(fast_tail),
+            slow_conf,
+            fast_conf,
+        )
+        return True
 
     def _resolve_config(self) -> Dict[str, Any]:
         if self._config_override is not None:
@@ -222,6 +303,10 @@ class TextArbiterProcessor:
         return len(sv_text) / max(len(wh_text), 1)
 
     @staticmethod
+    def _normalize_text(text: str) -> str:
+        return " ".join(str(text or "").strip().lower().split())
+
+    @staticmethod
     def _compute_coverage(sv_text: str, wh_text: str) -> float:
         """使用序列相似度估算覆盖率。"""
         if not sv_text or not wh_text:
@@ -260,7 +345,7 @@ class TextArbiterProcessor:
         result: ArbitrationResult,
     ) -> None:
         message = (
-            "L2 仲裁完成 chosen_source={} reason={} coverage={:.2f} sv_score={:.2f} "
+            "选文层完成 chosen_source={} reason={} coverage={:.2f} sv_score={:.2f} "
             "wh_score={:.2f} input_len=({}, {}) output_len={}"
         )
         if result.error_code:
