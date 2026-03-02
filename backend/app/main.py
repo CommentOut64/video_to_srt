@@ -63,6 +63,7 @@ from app.api.routes import system_routes  # 新增：系统管理路由
 from app.api.routes import config_routes  # 新增：用户配置路由
 from app.api.routes import debug_routes  # 新增：调试路由
 from app.api.routes import presets_routes  # V3.2.4: 自定义预设路由
+from app.api.routes.homophone_routes import create_homophone_router  # 同音检索路由（Full/Lite 共用）
 from app.services.file_service import FileManagementService
 
 # 导入FFmpeg管理器
@@ -544,6 +545,10 @@ file_service = FileManagementService(INPUT_DIR, OUTPUT_DIR)
 # 注册文件管理路由
 file_router = create_file_router(file_service)
 app.include_router(file_router)
+
+# 注册同音检索路由（纯 project 语义，Full/Lite 共用）
+homophone_router = create_homophone_router()
+app.include_router(homophone_router)
 
 # 注册转录路由（包含暂停、恢复等新功能）
 if not IS_LITE:
