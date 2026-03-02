@@ -10,7 +10,7 @@
  */
 import { ref, computed, watch, isRef } from 'vue'
 import { mediaApi } from '@/services/api'
-import { IS_LITE } from '@/config/flavor'
+import { selectCapabilities } from '@/state/capabilities/capabilitySelector'
 
 /**
  * Proxy 视频状态枚举
@@ -43,6 +43,8 @@ export const TranscodeDecision = {
  * @param {Ref<string>|string} identityIdInput - 媒体身份 ID（可以是 ref 或普通值）
  */
 export function useProxyVideo(identityIdInput) {
+  const baseCapabilities = selectCapabilities()
+
   // 统一转换为 ref
   const identityId = isRef(identityIdInput) ? identityIdInput : ref(identityIdInput)
 
@@ -70,7 +72,7 @@ export function useProxyVideo(identityIdInput) {
    * 视频是否就绪（可以播放）
    */
   const isReady = computed(() => {
-    if (IS_LITE && !identityId.value) {
+    if (!baseCapabilities.canTranscribe && !identityId.value) {
       return true
     }
     return [

@@ -13,17 +13,42 @@ const DEFAULT_CAPABILITY_SNAPSHOT = Object.freeze({
   taskSwitcherMode: 'legacy',
 })
 
+const ALLOWED_TOP_KEYS = new Set([
+  'profile',
+  'flavor',
+  'isLite',
+  'version',
+  'capabilities',
+  'routeVisibility',
+  // 技术债字段：暂保留顶层兼容，后续再归并到 capabilities
+  'canShowEditorProgress',
+  'canUseTaskMonitor',
+  'taskSwitcherMode',
+])
+
 function mergeSnapshot(snapshot = {}) {
+  const normalizedSnapshot = (
+    snapshot
+    && typeof snapshot === 'object'
+    && !Array.isArray(snapshot)
+  ) ? snapshot : {}
+  const filtered = {}
+  for (const key of Object.keys(normalizedSnapshot)) {
+    if (ALLOWED_TOP_KEYS.has(key)) {
+      filtered[key] = normalizedSnapshot[key]
+    }
+  }
+
   return {
     ...DEFAULT_CAPABILITY_SNAPSHOT,
-    ...snapshot,
+    ...filtered,
     capabilities: {
       ...DEFAULT_CAPABILITY_SNAPSHOT.capabilities,
-      ...(snapshot.capabilities || {}),
+      ...(filtered.capabilities || {}),
     },
     routeVisibility: {
       ...DEFAULT_CAPABILITY_SNAPSHOT.routeVisibility,
-      ...(snapshot.routeVisibility || {}),
+      ...(filtered.routeVisibility || {}),
     },
   }
 }

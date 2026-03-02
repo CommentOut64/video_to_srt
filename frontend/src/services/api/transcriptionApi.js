@@ -406,7 +406,7 @@ class TranscriptionAPI {
 
   /**
    * 同音查找
-   * @param {string} jobId - 任务ID
+   * @param {string} projectId - 项目ID
    * @param {Object} payload - 查找参数
    * @param {string} payload.query - 搜索关键词
    * @param {string} payload.mode - 搜索模式 (literal/regex/homophone_strict/homophone_fuzzy)
@@ -414,29 +414,29 @@ class TranscriptionAPI {
    * @param {boolean} [payload.ignore_punctuation] - 是否忽略标点
    * @returns {Promise<{matches: Array, clusters: Object}>}
    */
-  async homophoneFind(jobId, payload) {
-    return apiClient.post(`/api/projects/${jobId}/homophone/find`, payload);
+  async homophoneFind(projectId, payload) {
+    return apiClient.post(`/api/projects/${projectId}/homophone/find`, payload);
   }
 
   /**
    * 获取同音索引状态
-   * @param {string} jobId - 任务ID
+   * @param {string} projectId - 项目ID
    * @returns {Promise<{status: string, progress: number, message: string}>}
    */
-  async getHomophoneIndexStatus(jobId) {
-    return apiClient.get(`/api/projects/${jobId}/homophone/index-status`);
+  async getHomophoneIndexStatus(projectId) {
+    return apiClient.get(`/api/projects/${projectId}/homophone/index-status`);
   }
 
   /**
    * 批量替换
-   * @param {string} jobId - 任务ID
+   * @param {string} projectId - 项目ID
    * @param {Object} payload - 替换参数
    * @param {Array<{sentence_index: number, char_start: number, char_end: number}>} payload.targets - 替换目标
    * @param {string} payload.replacement - 替换文本
    * @returns {Promise<{success: boolean, replaced_count: number, updated_subtitles: Array}>}
    */
-  async homophoneBatchReplace(jobId, payload) {
-    return apiClient.post(`/api/projects/${jobId}/homophone/batch-replace`, payload);
+  async homophoneBatchReplace(projectId, payload) {
+    return apiClient.post(`/api/projects/${projectId}/homophone/batch-replace`, payload);
   }
 
   /**
