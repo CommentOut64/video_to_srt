@@ -26,6 +26,20 @@ const ALLOWED_TOP_KEYS = new Set([
   'taskSwitcherMode',
 ])
 
+function mergeObjectWithBooleanUpperBound(baseObject, overrideObject = {}) {
+  const mergedObject = {
+    ...baseObject,
+    ...(overrideObject || {}),
+  }
+  // 治理规则：运行时基线为 false 的布尔能力不可被外部快照提升为 true
+  for (const key of Object.keys(baseObject || {})) {
+    if (typeof baseObject[key] === 'boolean' && baseObject[key] === false) {
+      mergedObject[key] = false
+    }
+  }
+  return mergedObject
+}
+
 function mergeSnapshot(snapshot = {}) {
   const normalizedSnapshot = (
     snapshot
@@ -42,14 +56,14 @@ function mergeSnapshot(snapshot = {}) {
   return {
     ...DEFAULT_CAPABILITY_SNAPSHOT,
     ...filtered,
-    capabilities: {
-      ...DEFAULT_CAPABILITY_SNAPSHOT.capabilities,
-      ...(filtered.capabilities || {}),
-    },
-    routeVisibility: {
-      ...DEFAULT_CAPABILITY_SNAPSHOT.routeVisibility,
-      ...(filtered.routeVisibility || {}),
-    },
+    capabilities: mergeObjectWithBooleanUpperBound(
+      DEFAULT_CAPABILITY_SNAPSHOT.capabilities,
+      filtered.capabilities || {},
+    ),
+    routeVisibility: mergeObjectWithBooleanUpperBound(
+      DEFAULT_CAPABILITY_SNAPSHOT.routeVisibility,
+      filtered.routeVisibility || {},
+    ),
   }
 }
 

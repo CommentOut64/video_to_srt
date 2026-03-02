@@ -11,7 +11,7 @@
       </h1>
     </div>
     <div class="header-right">
-      <el-button @click="$emit('open-import')">
+      <el-button v-if="canRenderProjectCreateAction" @click="$emit('open-import')">
         <el-icon><Document /></el-icon>
         字幕编辑
       </el-button>
@@ -29,9 +29,11 @@
 <script setup>
 import { Upload } from "@element-plus/icons-vue";
 import { Document } from "@element-plus/icons-vue";
-import { selectCapabilities } from "@/state/capabilities/capabilitySelector";
+import { selectRouteVisibility } from "@/state/capabilities/capabilitySelector";
 
-const canRenderTranscribeAction = selectCapabilities().canTranscribe;
+const routeVisibility = selectRouteVisibility();
+const canRenderTranscribeAction = routeVisibility.transcribeCreate;
+const canRenderProjectCreateAction = routeVisibility.projectCreate;
 
 defineEmits(["open-about", "open-upload", "open-import", "exit-system"]);
 </script>

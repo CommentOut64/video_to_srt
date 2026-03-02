@@ -9,7 +9,7 @@
       <h2 class="empty-title">还没有任务</h2>
       <p class="empty-desc">导入字幕或上传视频开始创建任务</p>
       <div class="empty-actions">
-        <el-button size="large" @click="$emit('open-import')">
+        <el-button v-if="canRenderProjectCreateAction" size="large" @click="$emit('open-import')">
           <el-icon><Document /></el-icon>
           导入字幕
         </el-button>
@@ -352,9 +352,11 @@
 <script setup>
 import { computed } from "vue";
 import { Upload, Edit, Delete, Clock, Loading, Document, ArrowDown } from "@element-plus/icons-vue";
-import { selectCapabilities } from "@/state/capabilities/capabilitySelector";
+import { selectRouteVisibility } from "@/state/capabilities/capabilitySelector";
 
-const canRenderTranscribeAction = selectCapabilities().canTranscribe;
+const routeVisibility = selectRouteVisibility();
+const canRenderTranscribeAction = routeVisibility.transcribeCreate;
+const canRenderProjectCreateAction = routeVisibility.projectCreate;
 
 const props = defineProps({
   tasks: {
