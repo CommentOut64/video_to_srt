@@ -49,20 +49,20 @@ def test_index_and_search_strict_returns_expected_match(tmp_path: Path) -> None:
     }
     service = _build_service(tmp_path, mapping)
     service.index_chunk(
-        job_id="job-1",
+        project_id="project-1",
         revision=1,
         chunk_index=0,
         language="zh",
         sentences=[SentenceRecord(index=0, text="甲"), SentenceRecord(index=1, text="乙")],
     )
 
-    status = service.get_index_status("job-1")
+    status = service.get_index_status("project-1")
     assert status is not None
     assert status.status == "ready"
     assert status.last_committed_chunk == 0
 
     matches = service.search_homophone(
-        job_id="job-1",
+        project_id="project-1",
         revision=1,
         language="zh",
         query_text="甲",
@@ -86,7 +86,7 @@ def test_search_never_matches_across_sentences(tmp_path: Path) -> None:
     }
     service = _build_service(tmp_path, mapping)
     service.index_chunk(
-        job_id="job-2",
+        project_id="project-2",
         revision=1,
         chunk_index=0,
         language="zh",
@@ -94,7 +94,7 @@ def test_search_never_matches_across_sentences(tmp_path: Path) -> None:
     )
 
     matches = service.search_homophone(
-        job_id="job-2",
+        project_id="project-2",
         revision=1,
         language="zh",
         query_text="甲乙",

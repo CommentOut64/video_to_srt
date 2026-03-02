@@ -50,7 +50,7 @@ class HomophoneService:
     def index_chunk(
         self,
         *,
-        job_id: str,
+        project_id: str,
         revision: int,
         chunk_index: int,
         language: Language,
@@ -59,7 +59,7 @@ class HomophoneService:
         now = self._now_iso()
         self._db.upsert_index_state(
             IndexState(
-                job_id=job_id,
+                project_id=project_id,
                 revision=revision,
                 status="building",
                 last_committed_chunk=max(-1, chunk_index - 1),
@@ -74,7 +74,7 @@ class HomophoneService:
             for token_index, token in enumerate(token_readings):
                 records.append(
                     PostingRecord(
-                        job_id=job_id,
+                        project_id=project_id,
                         revision=revision,
                         language=language,
                         chunk_index=chunk_index,
@@ -94,7 +94,7 @@ class HomophoneService:
         now_done = self._now_iso()
         self._db.upsert_index_state(
             IndexState(
-                job_id=job_id,
+                project_id=project_id,
                 revision=revision,
                 status="ready",
                 last_committed_chunk=chunk_index,
@@ -106,7 +106,7 @@ class HomophoneService:
     def search_homophone(
         self,
         *,
-        job_id: str,
+        project_id: str,
         revision: int,
         language: Language,
         query_text: str,
@@ -125,7 +125,7 @@ class HomophoneService:
             return []
 
         candidate_sentence_indices = self._collect_candidate_sentence_indices(
-            job_id=job_id,
+            project_id=project_id,
             revision=revision,
             language=language,
             query_key_sequence=query_key_sequence,
@@ -137,7 +137,7 @@ class HomophoneService:
             return []
 
         sentence_rows = self._db.list_sentence_postings(
-            job_id=job_id,
+            project_id=project_id,
             revision=revision,
             language=language,
             sentence_indices=sorted(candidate_sentence_indices),
@@ -163,7 +163,7 @@ class HomophoneService:
     def _collect_candidate_sentence_indices(
         self,
         *,
-        job_id: str,
+        project_id: str,
         revision: int,
         language: Language,
         query_key_sequence: List[str],
@@ -177,7 +177,7 @@ class HomophoneService:
         per_seed_limit = max(limit * 8, 1000)
         for seed_key in seed_keys:
             rows = self._db.query_postings(
-                job_id=job_id,
+                project_id=project_id,
                 revision=revision,
                 language=language,
                 key_value=seed_key,
@@ -192,7 +192,7 @@ class HomophoneService:
             prefix_limit = max(limit * 12, 2000)
             for key_prefix in self._build_fuzzy_prefixes(seed_keys):
                 rows = self._db.query_postings_by_prefix(
-                    job_id=job_id,
+                    project_id=project_id,
                     revision=revision,
                     language=language,
                     key_prefix=key_prefix,
@@ -618,8 +618,8 @@ class HomophoneService:
     def list_global_terms(self) -> List[GlobalTermRule]:
         return self._db.list_global_terms()
 
-    def get_index_status(self, job_id: str) -> Optional[IndexState]:
-        return self._db.get_latest_index_state(job_id)
+    def get_index_status(self, project_id: str) -> Optional[IndexState]:
+        return self._db.get_latest_index_state(project_id)
 
     @staticmethod
     def _now_iso() -> str:

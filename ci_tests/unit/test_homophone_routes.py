@@ -18,7 +18,7 @@ from app.services.homophone.db import GlobalTermRule, IndexState
 class _FakeIdentity:
     project_id: str
     project_dir: Path
-    legacy_job_id: str | None = None
+    legacy_project_id: str | None = None
 
 
 class _FakeProjectIdResolver:
@@ -32,7 +32,7 @@ class _FakeProjectIdResolver:
         return _FakeIdentity(
             project_id=self._project_id,
             project_dir=self._project_dir,
-            legacy_job_id=None,
+            legacy_project_id=None,
         )
 
 
@@ -50,7 +50,7 @@ class _FakeMatch:
 class _FakeHomophoneService:
     def __init__(self) -> None:
         self._state = IndexState(
-            job_id="project-1",
+            project_id="project-1",
             revision=1,
             status="ready",
             last_committed_chunk=0,
@@ -69,15 +69,15 @@ class _FakeHomophoneService:
             )
         ]
 
-    def get_index_status(self, job_id: str) -> IndexState | None:
-        if job_id != "project-1":
+    def get_index_status(self, project_id: str) -> IndexState | None:
+        if project_id != "project-1":
             return None
         return self._state
 
     def index_chunk(
         self,
         *,
-        job_id: str,
+        project_id: str,
         revision: int,
         chunk_index: int,
         language: str,
@@ -88,7 +88,7 @@ class _FakeHomophoneService:
     def search_homophone(
         self,
         *,
-        job_id: str,
+        project_id: str,
         revision: int,
         language: str,
         query_text: str,

@@ -237,7 +237,6 @@ def create_homophone_router() -> APIRouter:
     ) -> Optional[Any]:
         """确保同音索引可查询。"""
         homophone_service = get_homophone_service()
-        # 同音服务内部参数名仍为 job_id，此处统一传 project_id，避免旧任务语义泄漏到接口层。
         state = homophone_service.get_index_status(project_id)
         if state is not None:
             return state
@@ -259,7 +258,7 @@ def create_homophone_router() -> APIRouter:
             for item in segments
         ]
         homophone_service.index_chunk(
-            job_id=project_id,
+            project_id=project_id,
             revision=1,
             chunk_index=0,
             language=language,
@@ -294,7 +293,7 @@ def create_homophone_router() -> APIRouter:
         indexed_language = request_language
 
         matches = homophone_service.search_homophone(
-            job_id=normalized_project_id,
+            project_id=normalized_project_id,
             revision=state.revision,
             language=request_language,
             query_text=payload.query_text,
@@ -308,7 +307,7 @@ def create_homophone_router() -> APIRouter:
                 if fallback_language == request_language:
                     continue
                 fallback_matches = homophone_service.search_homophone(
-                    job_id=normalized_project_id,
+                    project_id=normalized_project_id,
                     revision=state.revision,
                     language=fallback_language,
                     query_text=payload.query_text,
@@ -335,7 +334,7 @@ def create_homophone_router() -> APIRouter:
                         for item in segments
                     ]
                     homophone_service.index_chunk(
-                        job_id=normalized_project_id,
+                        project_id=normalized_project_id,
                         revision=state.revision,
                         chunk_index=0,
                         language=detected_language,
@@ -346,7 +345,7 @@ def create_homophone_router() -> APIRouter:
                         state = refreshed_state
 
                     fallback_matches = homophone_service.search_homophone(
-                        job_id=normalized_project_id,
+                        project_id=normalized_project_id,
                         revision=state.revision,
                         language=detected_language,
                         query_text=payload.query_text,
@@ -487,7 +486,7 @@ def create_homophone_router() -> APIRouter:
         homophone_matches: Dict[int, List[Any]] = {}
         if payload.mode in {"homophone_strict", "homophone_fuzzy"} and state is not None:
             query_matches = homophone_service.search_homophone(
-                job_id=normalized_project_id,
+                project_id=normalized_project_id,
                 revision=state.revision,
                 language=payload.language,
                 query_text=payload.query_text,
@@ -568,4 +567,3 @@ def create_homophone_router() -> APIRouter:
         }
 
     return router
-
