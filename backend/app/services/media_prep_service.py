@@ -21,7 +21,14 @@ from app.services.proxy_720_scheduler import get_proxy_scheduler
 logger = logging.getLogger(__name__)
 
 # 任务类型
-TaskType = Literal["preview_360p", "proxy_720p", "remux", "waveform", "thumbnail"]
+TaskType = Literal[
+    "preview_360p",
+    "proxy_720p",
+    "normalize_h264",
+    "remux",
+    "waveform",
+    "thumbnail",
+]
 
 
 class TranscodeDecision(Enum):
@@ -105,6 +112,17 @@ class MediaPrepService:
         scheduler = get_proxy_scheduler()
         scheduler.bind_media_prep(self)
 
+    @staticmethod
+    def _is_proxy_pipeline_enabled() -> bool:
+        """
+        是否启用旧的 360p/720p 渐进 proxy 管线。
+
+        策略：
+        - browser_compat: 启用（开发态复现浏览器限制）
+        - electron_native: 关闭（Electron 原生播放优先）
+        """
+        return config.is_browser_compat_media_profile()
+
     def _canonical_project_id(self, identifier: str) -> str:
         normalized_identifier = str(identifier or "").strip()
         if not normalized_identifier:
@@ -167,6 +185,14 @@ class MediaPrepService:
         Returns:
             bool: 是否成功加入队列
         """
+        if not self._is_proxy_pipeline_enabled():
+            logger.info(
+                "[MediaPrep] 当前 profile=%s，已禁用720p proxy入队: %s",
+                config.MEDIA_PROFILE,
+                job_id,
+            )
+            return False
+
         project_id = self._canonical_project_id(job_id)
 
         # 检查是否已在队列或执行中
@@ -214,6 +240,14 @@ class MediaPrepService:
         Returns:
             bool: 是否成功加入队列
         """
+        if not self._is_proxy_pipeline_enabled():
+            logger.info(
+                "[MediaPrep] 当前 profile=%s，已禁用360p preview入队: %s",
+                config.MEDIA_PROFILE,
+                job_id,
+            )
+            return False
+
         project_id = self._canonical_project_id(job_id)
 
         # 检查是否已在队列或执行中
@@ -293,6 +327,13 @@ class MediaPrepService:
                 "reason": str (失败时)
             }
         """
+        if not self._is_proxy_pipeline_enabled():
+            return {
+                "success": False,
+                "message": "当前运行 profile 已禁用 720p 升级",
+                "reason": "disabled_by_profile",
+            }
+
         try:
             project_id = self._canonical_project_id(job_id)
             # 步骤1: 检查任务目录是否存在
@@ -403,18 +444,26 @@ class MediaPrepService:
         audio_codec = audio_info.get('codec', '').lower() if audio_info else ''
         container = video_info.get('container', '').lower()
 
+        compatible_video_codecs = set(compatibility.get("compatible_video_codecs", set()))
+        need_transcode_codecs = set(compatibility.get("need_transcode_codecs", set()))
+
+        # Electron 原生 profile：放行 HEVC/H265 直播（MP4 直放，MKV 走 remux 分支）。
+        if config.is_electron_native_media_profile():
+            compatible_video_codecs.update({"hevc", "h265"})
+            need_transcode_codecs.difference_update({"hevc", "h265"})
+
         # 确保容器格式以点号开头
         if container and not container.startswith('.'):
             container = f'.{container}'
 
         # 检查各项兼容性
         container_ok = container in compatibility['compatible_containers']
-        video_ok = video_codec in compatibility['compatible_video_codecs']
+        video_ok = video_codec in compatible_video_codecs
         # 无音频流或音频编解码器兼容均视为音频OK
         audio_ok = not audio_codec or audio_codec in compatibility['compatible_audio_codecs']
 
         # 检查是否是必须转码的编解码器
-        video_must_transcode = video_codec in compatibility['need_transcode_codecs']
+        video_must_transcode = video_codec in need_transcode_codecs
 
         logger.debug(
             f"[MediaPrep] 转码决策分析: container={container}({container_ok}), "
@@ -441,6 +490,49 @@ class MediaPrepService:
 
         # 视频不兼容，需完整转码
         return TranscodeDecision.TRANSCODE_FULL
+
+    def enqueue_normalize_h264(
+        self,
+        job_id: str,
+        video_path: Path,
+        output_path: Path,
+        priority: int = 4,
+    ) -> bool:
+        """
+        将 H264 归一化任务加入队列（用于 Electron 下的格式兜底）。
+
+        说明：
+        - 与旧 proxy_720p 解耦，不做分辨率降级。
+        - 统一输出 H264/AAC 的 MP4，兼顾兼容性与可编辑性。
+        """
+        project_id = self._canonical_project_id(job_id)
+
+        with self.lock:
+            if project_id in self.task_status:
+                status = self.task_status[project_id].get("normalize_h264", {})
+                if status.get("status") in ["queued", "processing"]:
+                    logger.info(f"[MediaPrep] normalize_h264任务已存在，跳过: {project_id}")
+                    return False
+
+            if project_id not in self.task_status:
+                self.task_status[project_id] = {}
+
+            self.task_status[project_id]["normalize_h264"] = {
+                "status": "queued",
+                "progress": 0,
+                "video_path": str(video_path),
+                "output_path": str(output_path),
+            }
+
+        task = (priority, time.time(), {
+            "type": "normalize_h264",
+            "job_id": project_id,
+            "video_path": video_path,
+            "output_path": output_path,
+        })
+        self.task_queue.put(task)
+        logger.info(f"[MediaPrep] normalize_h264任务已入队: {project_id} (priority={priority})")
+        return True
 
     def enqueue_remux(self, job_id: str, video_path: Path, output_path: Path,
                       priority: int = 3) -> bool:
@@ -499,17 +591,28 @@ class MediaPrepService:
                 return self.task_status[project_id].get("remux")
         return None
 
+    def get_normalize_status(self, job_id: str) -> Optional[Dict]:
+        """获取 H264 归一化任务状态"""
+        try:
+            project_id = self._canonical_project_id(job_id)
+        except FileNotFoundError:
+            return None
+        with self.lock:
+            if project_id in self.task_status:
+                return self.task_status[project_id].get("normalize_h264")
+        return None
+
     def get_full_task_status(self, job_id: str) -> Optional[Dict]:
         """
         获取任务的完整状态（用于前端刷新后恢复）
 
         Returns:
             {
-                "state": "transcoding_720",  # 当前状态
+                "state": "transcoding_720",  # 当前状态（兼容前端旧状态机）
                 "progress": 45.5,            # 当前进度
-                "decision": "transcode_full", # 转码决策
                 "preview_360p": {...},
                 "proxy_720p": {...},
+                "normalize_h264": {...},
                 "remux": {...},
                 "error": None
             }
@@ -525,6 +628,7 @@ class MediaPrepService:
             status = self.task_status[project_id]
             preview = status.get("preview_360p", {})
             proxy = status.get("proxy_720p", {})
+            normalize = status.get("normalize_h264", {})
             remux = status.get("remux", {})
 
             # 确定当前状态
@@ -532,7 +636,17 @@ class MediaPrepService:
             progress = 0
             error = None
 
-            if remux.get("status") == "processing":
+            if normalize.get("status") == "processing":
+                # 为兼容前端旧状态机，normalize 仍映射到 transcoding_720。
+                state = "transcoding_720"
+                progress = normalize.get("progress", 0)
+            elif normalize.get("status") == "completed":
+                state = "ready_720p"
+                progress = 100
+            elif normalize.get("status") == "failed":
+                state = "error"
+                error = normalize.get("error")
+            elif remux.get("status") == "processing":
                 state = "remuxing"
                 progress = remux.get("progress", 0)
             elif remux.get("status") == "completed":
@@ -569,8 +683,10 @@ class MediaPrepService:
                 "progress": progress,
                 "preview_360p": preview,
                 "proxy_720p": proxy,
+                "normalize_h264": normalize,
                 "remux": remux,
-                "error": error
+                "error": error,
+                "media_profile": config.MEDIA_PROFILE,
             }
 
     def _consumer_loop(self):
@@ -608,6 +724,8 @@ class MediaPrepService:
                     self._execute_preview_task(task)
                 elif task_type == "proxy_720p":
                     self._execute_proxy_task(task)
+                elif task_type == "normalize_h264":
+                    self._execute_normalize_h264_task(task)
                 elif task_type == "remux":
                     self._execute_remux_task(task)
 
@@ -743,16 +861,17 @@ class MediaPrepService:
                 logger.info(f"[MediaPrep] 360p预览转码完成: {output_path}")
                 self._push_preview_progress(job_id, 100, completed=True)
 
-                # V3.1.2+dev.20260114.02: 交给 720p 调度器统一管理（自动/手动互斥、队列空闲再启动）
-                scheduler = get_proxy_scheduler()
-                scheduler.request(
-                    job_id,
-                    video_path,
-                    trigger_type="preview_complete",
-                    auto_enabled=config.PROXY_CONFIG.get('auto_trigger_720p', False),
-                    force=False,
-                    priority=100
-                )
+                # browser_compat 才保留 720p 自动调度；electron_native 下显式禁用。
+                if self._is_proxy_pipeline_enabled():
+                    scheduler = get_proxy_scheduler()
+                    scheduler.request(
+                        job_id,
+                        video_path,
+                        trigger_type="preview_complete",
+                        auto_enabled=config.PROXY_CONFIG.get('auto_trigger_720p', False),
+                        force=False,
+                        priority=100
+                    )
             else:
                 # 失败
                 error_msg = f"FFmpeg 返回码: {process.returncode}"
@@ -824,6 +943,19 @@ class MediaPrepService:
         job_id = self._canonical_project_id(task["job_id"])
         video_path = Path(task["video_path"])
         output_path = Path(task["output_path"])
+
+        if not self._is_proxy_pipeline_enabled():
+            logger.info("[MediaPrep] 当前 profile=%s，跳过720p proxy执行: %s", config.MEDIA_PROFILE, job_id)
+            with self.lock:
+                self.task_status.setdefault(job_id, {})
+                self.task_status[job_id].setdefault("proxy_720p", {"status": "queued", "progress": 0})
+                self.task_status[job_id]["proxy_720p"]["status"] = "failed"
+                self.task_status[job_id]["proxy_720p"]["error"] = "disabled_by_profile"
+            try:
+                get_proxy_scheduler().mark_failed(job_id, "disabled_by_profile")
+            except Exception:
+                pass
+            return
 
         # 更新状态
         with self.lock:
@@ -1322,6 +1454,36 @@ class MediaPrepService:
 
         self._broadcast_progress(job_id, event_type, data)
 
+    def _push_normalize_progress(self, job_id: str, progress: float, completed: bool = False):
+        """
+        推送 H264 归一化进度到 SSE。
+
+        兼容策略：
+        - 新事件：normalize_progress / normalize_complete
+        - 旧事件镜像：proxy_progress / proxy_complete（避免前端未升级时无感知）
+        """
+        normalize_event = "normalize_complete" if completed else "normalize_progress"
+        normalize_data = {
+            "job_id": job_id,
+            "progress": progress,
+            "completed": completed,
+            "type": "normalize_h264",
+        }
+        if completed:
+            normalize_data["video_url"] = f"/api/media/{job_id}/video"
+        self._broadcast_progress(job_id, normalize_event, normalize_data)
+
+        legacy_event = "proxy_complete" if completed else "proxy_progress"
+        legacy_data = {
+            "job_id": job_id,
+            "progress": progress,
+            "completed": completed,
+            "type": "normalize_h264",
+        }
+        if completed:
+            legacy_data["video_url"] = f"/api/media/{job_id}/video"
+        self._broadcast_progress(job_id, legacy_event, legacy_data)
+
     def _broadcast_progress(
         self,
         job_id: str,
@@ -1367,6 +1529,131 @@ class MediaPrepService:
                     )
 
         return False
+
+    def _execute_normalize_h264_task(self, task: dict):
+        """
+        执行 H264 归一化任务（将不兼容视频统一转为 H264/AAC MP4）。
+
+        设计目标：
+        - 与 proxy_720p 解耦，不依赖 360p/720p 渐进链路。
+        - 在 Electron profile 下作为视频兼容兜底主路径。
+        """
+        job_id = self._canonical_project_id(task["job_id"])
+        video_path = Path(task["video_path"])
+        output_path = Path(task["output_path"])
+
+        with self.lock:
+            self.task_status.setdefault(job_id, {})
+            self.task_status[job_id].setdefault("normalize_h264", {"status": "queued", "progress": 0})
+            self.task_status[job_id]["normalize_h264"]["status"] = "processing"
+
+        try:
+            duration = self._get_video_duration(video_path)
+            normalize_config = config.PROXY_CONFIG.get("normalize_h264", {})
+            preset = normalize_config.get("preset", "veryfast")
+            crf = normalize_config.get("crf", 23)
+            audio_bitrate = normalize_config.get("audio_bitrate", "128k")
+            audio_sample_rate = normalize_config.get("audio_sample_rate", 44100)
+            pixel_format = normalize_config.get("pixel_format", "yuv420p")
+            cpu_threads = config.get_ffmpeg_cpu_threads()
+
+            ffmpeg_cmd = config.get_ffmpeg_command()
+            cmd = [
+                ffmpeg_cmd,
+                "-i", str(video_path),
+                "-threads", str(cpu_threads),
+                "-map", "0:v:0",
+                "-map", "0:a:0?",
+                "-c:v", "libx264",
+                "-preset", preset,
+                "-crf", str(crf),
+                "-pix_fmt", pixel_format,
+                "-c:a", "aac",
+                "-b:a", audio_bitrate,
+                "-ar", str(audio_sample_rate),
+                "-movflags", "+faststart",
+                "-progress", "pipe:1",
+                "-y",
+                str(output_path),
+            ]
+            logger.info(
+                "[MediaPrep] 开始H264归一化: %s -> %s",
+                video_path.name,
+                output_path.name,
+            )
+
+            creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+            self._register_process(process, job_id)
+
+            last_logged_progress = 0
+            try:
+                for line in process.stdout:
+                    if self.stop_event.is_set():
+                        process.terminate()
+                        logger.info(f"[MediaPrep] normalize_h264 转码被中断: {job_id}")
+                        break
+
+                    line_str = line.decode("utf-8", errors="replace").strip()
+                    if line_str.startswith("out_time_ms="):
+                        try:
+                            out_time_ms = int(line_str.split("=", 1)[1])
+                            if duration > 0:
+                                progress = min(100, (out_time_ms / 1000000) / duration * 100)
+                                progress = round(progress, 1)
+                                with self.lock:
+                                    self.task_status[job_id]["normalize_h264"]["progress"] = progress
+                                self._push_normalize_progress(job_id, progress)
+
+                                if progress >= last_logged_progress + 10:
+                                    logger.info(
+                                        "[MediaPrep] normalize_h264 转码进度: %s - %.1f%%",
+                                        job_id,
+                                        progress,
+                                    )
+                                    last_logged_progress = int(progress / 10) * 10
+                        except Exception:
+                            pass
+            finally:
+                self._unregister_process(process)
+
+            process.wait()
+
+            if process.returncode == 0 and output_path.exists():
+                with self.lock:
+                    self.task_status[job_id]["normalize_h264"]["status"] = "completed"
+                    self.task_status[job_id]["normalize_h264"]["progress"] = 100
+                logger.info(f"[MediaPrep] normalize_h264 完成: {output_path}")
+                self._push_normalize_progress(job_id, 100, completed=True)
+            else:
+                error_msg = f"FFmpeg 返回码: {process.returncode}"
+                with self.lock:
+                    self.task_status[job_id]["normalize_h264"]["status"] = "failed"
+                    self.task_status[job_id]["normalize_h264"]["error"] = error_msg
+                logger.error(f"[MediaPrep] normalize_h264 失败: {error_msg}")
+                self._broadcast_progress(job_id, "proxy_error", {
+                    "job_id": job_id,
+                    "message": f"normalize_h264失败: {error_msg}",
+                    "type": "normalize_h264",
+                    "reason": "normalize_h264_failed",
+                })
+
+        except Exception as e:
+            with self.lock:
+                self.task_status[job_id]["normalize_h264"]["status"] = "failed"
+                self.task_status[job_id]["normalize_h264"]["error"] = str(e)
+            logger.error(f"[MediaPrep] normalize_h264 异常: {e}", exc_info=True)
+            self._broadcast_progress(job_id, "proxy_error", {
+                "job_id": job_id,
+                "message": str(e),
+                "type": "normalize_h264",
+                "reason": "normalize_h264_exception",
+            })
 
     def _execute_remux_task(self, task: dict):
         """
