@@ -157,7 +157,7 @@ const playbackManager = usePlaybackManager()
 
 const identityId = computed(() => projectStore.primaryId)
 // 统一使用 project 主身份，兼容旧任务时可回退到 legacy job_id。
-const jobId = computed(() => projectStore.primaryId)
+const projectId = computed(() => projectStore.primaryId)
 const onSubtitleEdit = subtitleDocumentStore.onSubtitleEdit
 const applyPendingEditsToStore = subtitleDocumentStore.applyPendingEditsToStore
 const forceSyncNow = subtitleDocumentStore.forceSyncNow
@@ -165,7 +165,7 @@ const pendingCount = subtitleDocumentStore.pendingCount
 
 // 同音搜索 composable（用 reactive 包裹，使模板 v-model 能正确写入 ref.value）
 const homophoneSearch = reactive(useHomophoneSearch({
-  jobId,
+  projectId,
   subtitles: computed(() => projectStore.subtitles),
 }))
 
@@ -581,7 +581,7 @@ async function handleBatchReplace() {
           // 兜底：若增量回填未命中本地字幕（如刚打开页面本地列表为空），再执行整量导入。
           if (patchedCount === 0 && projectStore.subtitles.length === 0) {
             projectStore.importSegments(segments, {
-              jobId: jobId.value,
+              jobId: projectId.value,
               filename: projectStore.meta.filename,
               duration: projectStore.meta.duration,
               videoPath: projectStore.meta.videoPath,
