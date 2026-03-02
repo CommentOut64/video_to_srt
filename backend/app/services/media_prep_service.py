@@ -769,6 +769,49 @@ class MediaPrepService:
 
             logger.error(f"[MediaPrep] 360p预览转码异常: {e}", exc_info=True)
 
+    def _is_cuda_available_for_proxy(self) -> bool:
+        """
+        检测 CUDA 是否可用
+
+        设计取舍：
+        - Lite 环境不安装 torch 时，必须平滑回退到 CPU 转码，不可抛错中断
+        - Full 环境维持原有 NVENC 优先逻辑
+        """
+        try:
+            import torch
+        except ImportError:
+            logger.info("[MediaPrep] 未安装 torch，720p 转码回退 CPU 路径")
+            return False
+
+        try:
+            return bool(torch.cuda.is_available())
+        except Exception as exc:
+            logger.warning("[MediaPrep] CUDA 可用性检测失败，720p 转码回退 CPU: %s", exc)
+            return False
+
+    def _clear_cuda_cache_if_available(self) -> None:
+        """在可用时清理 CUDA 缓存，Lite 环境下无操作。"""
+        try:
+            import torch
+        except ImportError:
+            return
+
+        if not torch.cuda.is_available():
+            return
+
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+        try:
+            memory_allocated = torch.cuda.memory_allocated() / 1024**3
+            memory_reserved = torch.cuda.memory_reserved() / 1024**3
+            logger.info(
+                f"[MediaPrep] CUDA 缓存已清理 - "
+                f"已分配: {memory_allocated:.2f}GB, 已保留: {memory_reserved:.2f}GB"
+            )
+        except Exception:
+            return
+
     def _execute_proxy_task(self, task: dict):
         """
         执行 720p Proxy 转码任务（在独立线程中）
@@ -805,8 +848,7 @@ class MediaPrepService:
             queue_busy = self._is_transcription_queue_busy()
 
             # 步骤4: 检测 GPU 可用性
-            import torch
-            gpu_available = torch.cuda.is_available()
+            gpu_available = self._is_cuda_available_for_proxy()
 
             # 步骤5: 从配置读取参数
             proxy_config = config.PROXY_CONFIG.get('proxy_720p', {})
@@ -1119,7 +1161,6 @@ class MediaPrepService:
         5. 等待资源释放
         """
         try:
-            import torch
             import gc
 
             logger.info("[MediaPrep] 开始卸载模型以释放显存...")
@@ -1165,22 +1206,9 @@ class MediaPrepService:
             except Exception as e:
                 logger.debug(f"[MediaPrep] 卸载 Brouhaha 模型失败（可能未加载）: {e}")
 
-            # 5. 清理 CUDA 缓存
+            # 5. 清理 CUDA 缓存（Lite 下自动跳过）
             gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-
-                # 记录显存状态
-                try:
-                    memory_allocated = torch.cuda.memory_allocated() / 1024**3
-                    memory_reserved = torch.cuda.memory_reserved() / 1024**3
-                    logger.info(
-                        f"[MediaPrep] CUDA 缓存已清理 - "
-                        f"已分配: {memory_allocated:.2f}GB, 已保留: {memory_reserved:.2f}GB"
-                    )
-                except:
-                    pass
+            self._clear_cuda_cache_if_available()
 
             # 6. 等待资源释放
             import time
