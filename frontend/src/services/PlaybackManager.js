@@ -62,6 +62,18 @@ function createPlaybackManager() {
   let timeUpdateTimer = null;
   let lastWaveSurferSyncAt = 0;
 
+  function resetSeekLockTimeout() {
+    if (seekLockTimer) {
+      clearTimeout(seekLockTimer);
+    }
+
+    seekLockTimer = setTimeout(() => {
+      if (isSeekingInternal) {
+        forceReleaseLock();
+      }
+    }, CONFIG.SEEK_LOCK_TIMEOUT);
+  }
+
   // Store 引用（延迟获取，避免循环依赖）
   let _store = null;
   let _playbackStore = null;
@@ -235,18 +247,7 @@ function createPlaybackManager() {
   function acquireLock(reason = "") {
     isSeekingInternal = true;
     getPlaybackStore().setSeeking(true);
-
-    // 清除之前的超时
-    if (seekLockTimer) {
-      clearTimeout(seekLockTimer);
-    }
-
-    // 设置超时保护
-    seekLockTimer = setTimeout(() => {
-      if (isSeekingInternal) {
-        forceReleaseLock();
-      }
-    }, CONFIG.SEEK_LOCK_TIMEOUT);
+    resetSeekLockTimeout();
   }
 
   /**
@@ -442,6 +443,8 @@ function createPlaybackManager() {
       return;
     }
 
+    // 拖拽过程中持续续期锁超时，避免长按反向拖动时被 3s 超时强制解锁。
+    resetSeekLockTimeout();
     seekTo(time, { fromDrag: true });
   }
 

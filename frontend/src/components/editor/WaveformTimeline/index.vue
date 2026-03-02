@@ -81,6 +81,7 @@ import { mediaApi } from '@/services/api'
 import ContextMenu from '@/components/editor/ContextMenu.vue'
 import WaveformHeader from './WaveformHeader.vue'
 import WaveformScrollbar from './WaveformScrollbar.vue'
+import { logWaveformDragDiagnostics } from '@/composables/waveformDragDiagnostics.js'
 import {
   useWaveformZoom,
   useWaveformScroll,
@@ -104,6 +105,7 @@ const props = defineProps({
   cursorColor: { type: String, default: '#f85149' },
   height: { type: Number, default: 128 },
   regionColor: { type: String, default: 'rgba(88, 166, 255, 0.25)' },
+  regionMinLength: { type: Number, default: 0.05 },
   dragEnabled: { type: Boolean, default: true },
   resizeEnabled: { type: Boolean, default: true },
 })
@@ -164,6 +166,23 @@ const peaksSource = computed(() => {
 
 const currentTime = computed(() => playbackStore.currentTime)
 const duration = computed(() => projectStore.meta.duration || 0)
+
+function normalizeRegionTimeForSignature(time) {
+  const value = Number(time)
+  if (!Number.isFinite(value)) return '0.000'
+  return value.toFixed(3)
+}
+
+const regionRenderSignature = computed(() => {
+  const selectedId = subtitleDocumentStore.selectedSubtitleId ?? ''
+  const subtitlesSnapshot = projectStore.subtitles
+    .map(
+      (subtitle) =>
+        `${subtitle.id}:${normalizeRegionTimeForSignature(subtitle.start)}:${normalizeRegionTimeForSignature(subtitle.end)}`
+    )
+    .join('|')
+  return `${subtitlesSnapshot}#selected:${selectedId}#color:${props.regionColor}`
+})
 
 // 滚动条轨道 ref（从子组件获取）
 const scrollbarTrackRef = computed(() => scrollbarRef.value?.trackRef)
@@ -441,6 +460,7 @@ const {
   isUpdatingRegions,
   setupRegionEvents,
   renderSubtitleRegions,
+  flushPendingRegionCommits,
   cleanup: cleanupRegions,
 } = useWaveformRegions(
   regionsPluginRef,
@@ -791,6 +811,29 @@ function handleWheel(e) {
 // ============ Watchers ============
 let regionUpdateTimer = null
 let lastSyncTime = 0
+let hasDeferredRegionRender = false
+
+function clearScheduledRegionRender() {
+  if (regionUpdateTimer) {
+    clearTimeout(regionUpdateTimer)
+    regionUpdateTimer = null
+  }
+}
+
+function scheduleRegionRender(delay = 80, reason = 'unknown') {
+  if (!isReady.value) return
+  clearScheduledRegionRender()
+  regionUpdateTimer = setTimeout(() => {
+    regionUpdateTimer = null
+    flushPendingRegionCommits({ force: true })
+    logWaveformDragDiagnostics('timeline-region-render-commit', {
+      reason,
+      subtitlesCount: projectStore.subtitles.length,
+    })
+    renderSubtitleRegions()
+    hasDeferredRegionRender = false
+  }, Math.max(0, delay))
+}
 
 watch(
   () => identityRef.value,
@@ -814,20 +857,62 @@ watch(
 )
 
 watch(
-  () => projectStore.subtitles,
+  () => regionRenderSignature.value,
   () => {
-    if (isReady.value && !isUpdatingRegions.value) {
-      clearTimeout(regionUpdateTimer)
-      regionUpdateTimer = setTimeout(() => renderSubtitleRegions(), 100)
-    } else if (!isReady.value) {
+    if (isRegionPointerDragging.value) {
+      clearScheduledRegionRender()
+      hasDeferredRegionRender = true
+      logWaveformDragDiagnostics('timeline-skip-render-while-region-dragging', {
+        subtitlesCount: projectStore.subtitles.length,
+        reason: 'builtin-guard',
+      })
+      return
+    }
+
+    if (!isReady.value) {
       setTimeout(() => {
         if (isReady.value && projectStore.subtitles.length > 0) {
-          renderSubtitleRegions()
+          scheduleRegionRender(0, 'late-ready')
         }
       }, 500)
+      return
     }
+
+    if (isUpdatingRegions.value) {
+      hasDeferredRegionRender = true
+      return
+    }
+
+    scheduleRegionRender(80, 'signature-change')
   },
-  { deep: true }
+  { flush: 'post' }
+)
+
+watch(
+  () => isRegionPointerDragging.value,
+  (isDragging, wasDragging) => {
+    if (isDragging) {
+      clearScheduledRegionRender()
+      hasDeferredRegionRender = true
+      return
+    }
+
+    if (!wasDragging) return
+    if (!isReady.value) return
+
+    flushPendingRegionCommits({ force: true })
+    scheduleRegionRender(0, 'drag-end-replay')
+  }
+)
+
+watch(
+  () => isUpdatingRegions.value,
+  (isUpdating, wasUpdating) => {
+    if (isUpdating || !wasUpdating) return
+    if (!hasDeferredRegionRender) return
+    if (isRegionPointerDragging.value || !isReady.value) return
+    scheduleRegionRender(0, 'regions-lock-released')
+  }
 )
 
 watch(
@@ -885,13 +970,6 @@ watch(
         ws.seekTo(progress)
       }
     }
-  }
-)
-
-watch(
-  () => subtitleDocumentStore.selectedSubtitleId,
-  () => {
-    if (isReady.value) renderSubtitleRegions()
   }
 )
 
@@ -972,7 +1050,7 @@ onUnmounted(() => {
   containerRef.value?.removeEventListener('wheel', handleWheel)
   if (zoomRafId) cancelAnimationFrame(zoomRafId)
   stopVirtualClock()
-  clearTimeout(regionUpdateTimer)
+  clearScheduledRegionRender()
   clearTimeout(durationReloadTimer)
   stopPeaksPolling()
 
