@@ -77,6 +77,27 @@ FULL_RUNTIME_ENABLED = not IS_LITE
 FULL_RUNTIME_DISABLE_REASON = ""
 
 
+def _windows_hidden_subprocess_kwargs() -> dict:
+    """Windows 下子进程无窗口参数。"""
+    if os.name != "nt":
+        return {}
+
+    kwargs = {}
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if creationflags:
+        kwargs["creationflags"] = creationflags
+
+    startupinfo_cls = getattr(subprocess, "STARTUPINFO", None)
+    startf_use_showwindow = getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+    sw_hide = getattr(subprocess, "SW_HIDE", 0)
+    if startupinfo_cls and startf_use_showwindow:
+        startupinfo = startupinfo_cls()
+        startupinfo.dwFlags |= startf_use_showwindow
+        startupinfo.wShowWindow = sw_hide
+        kwargs["startupinfo"] = startupinfo
+    return kwargs
+
+
 def _resolve_ui_mode_from_env() -> str:
     """解析 UI 模式，未知值回退到 browser。"""
     raw_ui_mode = str(os.environ.get("ANCHORFLUX_UI_MODE", "browser")).strip().lower()
@@ -203,22 +224,32 @@ def cleanup_old_processes():
         logger.warning("psutil 未安装，使用备选方案清理进程")
         # 回退到 taskkill 方案
         try:
-            # 使用 netstat 和 taskkill
             result = subprocess.run(
-                'netstat -ano | findstr ":8000" | findstr "LISTENING"',
-                shell=True,
+                ["netstat", "-ano", "-p", "tcp"],
                 capture_output=True,
-                timeout=5
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+                **_windows_hidden_subprocess_kwargs(),
             )
             if result.returncode == 0 and result.stdout:
-                # V3.1.0+dev.20260104.01: 修复 Windows 编码问题
-                lines = result.stdout.decode('utf-8', errors='replace').strip().split('\n')
+                lines = result.stdout.strip().split('\n')
                 for line in lines:
+                    if ':8000' not in line:
+                        continue
+                    if "LISTENING" not in line.upper() and "侦听" not in line:
+                        continue
                     parts = line.split()
                     if len(parts) >= 5:
                         pid = parts[-1]
                         if pid != str(current_pid):
-                            subprocess.run(['taskkill', '/F', '/PID', pid], capture_output=True, timeout=3)
+                            subprocess.run(
+                                ['taskkill', '/F', '/PID', pid],
+                                capture_output=True,
+                                timeout=3,
+                                **_windows_hidden_subprocess_kwargs(),
+                            )
                             cleaned_count += 1
                             logger.info(f"已清理端口 8000 上的旧进程 (PID: {pid})")
         except Exception as e:
@@ -498,6 +529,7 @@ async def startup_event():
                     check=False,
                     encoding="utf-8",
                     errors="replace",
+                    **_windows_hidden_subprocess_kwargs(),
                 )
                 guard_stdout = str(guard_result.stdout or "").strip()
                 guard_stderr = str(guard_result.stderr or "").strip()

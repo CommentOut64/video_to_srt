@@ -18,7 +18,7 @@ import signal
 import logging
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
@@ -45,6 +45,55 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 logger = logging.getLogger("launcher")
+
+
+def _windows_hidden_subprocess_kwargs() -> Dict[str, Any]:
+    """
+    返回 Windows 下无窗口子进程参数。
+
+    设计取舍：
+    - 统一用于内部维护命令（netstat/taskkill 等），避免弹出 cmd 闪窗；
+    - 不依赖 shell=True，尽量直接调用可执行文件。
+    """
+    if os.name != "nt":
+        return {}
+
+    kwargs: Dict[str, Any] = {}
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if creationflags:
+        kwargs["creationflags"] = creationflags
+
+    startupinfo_cls = getattr(subprocess, "STARTUPINFO", None)
+    startf_use_showwindow = getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+    sw_hide = getattr(subprocess, "SW_HIDE", 0)
+    if startupinfo_cls and startf_use_showwindow:
+        startupinfo = startupinfo_cls()
+        startupinfo.dwFlags |= startf_use_showwindow
+        startupinfo.wShowWindow = sw_hide
+        kwargs["startupinfo"] = startupinfo
+    return kwargs
+
+
+def _configure_windows_console_utf8() -> None:
+    """
+    Windows 下配置控制台为 UTF-8，避免通过 `os.system(chcp ...)` 拉起额外 cmd 窗口。
+
+    仅在当前进程实际附着控制台时设置，GUI/无控制台场景直接跳过。
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        has_console = bool(kernel32.GetConsoleWindow())
+        if not has_console:
+            return
+        kernel32.SetConsoleCP(65001)
+        kernel32.SetConsoleOutputCP(65001)
+    except Exception:
+        # 编码设置失败不影响主流程。
+        pass
 
 
 class SingleInstanceGuard:
@@ -135,11 +184,20 @@ class ProcessManager:
         """
         try:
             result = subprocess.run(
-                f'netstat -ano | findstr ":{port}" | findstr "LISTENING"',
-                shell=True, capture_output=True, text=True, timeout=2
+                ["netstat", "-ano", "-p", "tcp"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=2,
+                **_windows_hidden_subprocess_kwargs(),
             )
             if result.returncode == 0 and result.stdout:
                 for line in result.stdout.strip().split('\n'):
+                    if f":{port}" not in line:
+                        continue
+                    if "LISTENING" not in line.upper() and "侦听" not in line:
+                        continue
                     parts = line.split()
                     if len(parts) >= 5:
                         try:
@@ -188,7 +246,9 @@ class ProcessManager:
                     else:
                         subprocess.run(
                             ['taskkill', '/F', '/PID', str(pid)],
-                            capture_output=True, timeout=2
+                            capture_output=True,
+                            timeout=2,
+                            **_windows_hidden_subprocess_kwargs(),
                         )
                     cleaned_any = True
                 except Exception as e:
@@ -241,20 +301,16 @@ class ProcessManager:
         ]
 
         try:
-            creationflags = 0
-            if os.name == 'nt':
-                if config.dev_mode:
-                    creationflags = subprocess.CREATE_NEW_CONSOLE
-                elif config.flavor == 'lite':
-                    # Lite 打包版要求无命令行窗口，后端进程改为无窗口模式。
-                    creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
-
             popen_kwargs = {
                 'cwd': str(backend_dir),
                 'env': env,
             }
-            if creationflags:
-                popen_kwargs['creationflags'] = creationflags
+            if os.name == 'nt':
+                if config.dev_mode:
+                    popen_kwargs['creationflags'] = subprocess.CREATE_NEW_CONSOLE
+                else:
+                    # 生产模式统一无窗口，避免启动/退出阶段出现命令行闪窗。
+                    popen_kwargs.update(_windows_hidden_subprocess_kwargs())
 
             self.backend_process = subprocess.Popen(cmd, **popen_kwargs)
 
@@ -400,6 +456,7 @@ class ProcessManager:
                     ["taskkill", "/F", "/PID", str(pid), "/T"],
                     capture_output=True,
                     timeout=3,
+                    **_windows_hidden_subprocess_kwargs(),
                 )
                 logger.warning("按端口兜底终止进程: port=%s pid=%s", port, pid)
             except Exception as exc:
@@ -412,6 +469,7 @@ class ProcessManager:
                     ["taskkill", "/F", "/IM", image_name],
                     capture_output=True,
                     timeout=3,
+                    **_windows_hidden_subprocess_kwargs(),
                 )
             except Exception:
                 pass
@@ -885,8 +943,7 @@ class Launcher:
 
 def main():
     """主入口"""
-    if os.name == 'nt':
-        os.system('chcp 65001 >nul 2>&1')
+    _configure_windows_console_utf8()
 
     os.environ['PYTHONIOENCODING'] = 'utf-8'
     os.environ['PYTHONUTF8'] = '1'

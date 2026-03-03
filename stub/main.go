@@ -32,7 +32,7 @@ func main() {
 	// 解析 Python 入口：
 	// - 生产默认优先 pythonw.exe（避免弹出控制台窗口）；
 	// - 通过 ANCHORFLUX_STUB_CONSOLE=true 可强制使用 python.exe（便于调试）。
-	pythonPath, useWindowless := resolvePythonPath(baseDir)
+	pythonPath, useConsole := resolvePythonPath(baseDir)
 	if pythonPath == "" {
 		fatal(
 			"Python 环境未安装\n\n请先运行: uv sync\n\n候选路径:\n- %s\n- %s",
@@ -48,11 +48,12 @@ func main() {
 	// 启动 Python launcher
 	cmd := exec.Command(pythonPath, args...)
 	cmd.Dir = baseDir
-	if !useWindowless {
+	if useConsole {
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 	}
+	applyWindowlessProcessAttr(cmd, !useConsole)
 
 	// 运行并等待退出
 	if err := cmd.Run(); err != nil {
@@ -60,7 +61,7 @@ func main() {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			os.Exit(exitErr.ExitCode())
 		}
-		if !useWindowless {
+		if useConsole {
 			fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)
 			waitEnter()
 		}
@@ -68,19 +69,19 @@ func main() {
 	}
 }
 
-// resolvePythonPath 返回可用 python 路径及是否为无窗口模式。
+// resolvePythonPath 返回可用 python 路径及是否需要控制台模式。
 func resolvePythonPath(baseDir string) (string, bool) {
 	useConsole := isTrue(os.Getenv("ANCHORFLUX_STUB_CONSOLE"))
 	if !useConsole {
 		pythonw := filepath.Join(baseDir, pythonwExeRelPath)
 		if fileExists(pythonw) {
-			return pythonw, true
+			return pythonw, false
 		}
 	}
 
 	python := filepath.Join(baseDir, pythonExeRelPath)
 	if fileExists(python) {
-		return python, false
+		return python, useConsole
 	}
 	return "", false
 }

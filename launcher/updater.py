@@ -27,6 +27,27 @@ from datetime import datetime
 logger = logging.getLogger("launcher.updater")
 
 
+def _windows_hidden_subprocess_kwargs() -> Dict[str, Any]:
+    """Windows 下子进程无窗口参数。"""
+    if os.name != "nt":
+        return {}
+
+    kwargs: Dict[str, Any] = {}
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if creationflags:
+        kwargs["creationflags"] = creationflags
+
+    startupinfo_cls = getattr(subprocess, "STARTUPINFO", None)
+    startf_use_showwindow = getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+    sw_hide = getattr(subprocess, "SW_HIDE", 0)
+    if startupinfo_cls and startf_use_showwindow:
+        startupinfo = startupinfo_cls()
+        startupinfo.dwFlags |= startf_use_showwindow
+        startupinfo.wShowWindow = sw_hide
+        kwargs["startupinfo"] = startupinfo
+    return kwargs
+
+
 @dataclass
 class UpdateInfo:
     """更新信息"""
@@ -382,7 +403,8 @@ class SelfUpdater:
             logger.info("启动新版本启动器...")
             subprocess.Popen(
                 [str(current_exe), "--cleanup-old"],
-                cwd=str(current_exe.parent)
+                cwd=str(current_exe.parent),
+                **_windows_hidden_subprocess_kwargs(),
             )
 
             # Step 5: 退出当前进程

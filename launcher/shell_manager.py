@@ -12,10 +12,32 @@ import os
 import subprocess
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 from urllib import error, request
 
 logger = logging.getLogger("launcher.shell")
+
+
+def _windows_hidden_subprocess_kwargs() -> Dict[str, Any]:
+    """返回 Windows 下无窗口子进程参数。"""
+    if os.name != "nt":
+        return {}
+
+    kwargs: Dict[str, Any] = {}
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if creationflags:
+        kwargs["creationflags"] = creationflags
+
+    startupinfo_cls = getattr(subprocess, "STARTUPINFO", None)
+    startf_use_showwindow = getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+    sw_hide = getattr(subprocess, "SW_HIDE", 0)
+    if startupinfo_cls and startf_use_showwindow:
+        startupinfo = startupinfo_cls()
+        startupinfo.dwFlags |= startf_use_showwindow
+        startupinfo.wShowWindow = sw_hide
+        kwargs["startupinfo"] = startupinfo
+
+    return kwargs
 
 
 def wait_backend_ready(base_url: str, timeout_sec: int = 60) -> bool:
@@ -72,11 +94,15 @@ def open_browser_fallback(url: str) -> bool:
     """在 Shell 拉起失败时回退浏览器打开。"""
     try:
         if os.name == "nt":
-            subprocess.Popen(
-                ["cmd", "/c", "start", "", url],
-                shell=False,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
+            startfile = getattr(os, "startfile", None)
+            if callable(startfile):
+                startfile(url)
+            else:
+                subprocess.Popen(
+                    ["cmd", "/c", "start", "", url],
+                    shell=False,
+                    **_windows_hidden_subprocess_kwargs(),
+                )
         else:
             import webbrowser
 

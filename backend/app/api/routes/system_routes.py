@@ -16,7 +16,7 @@ import time
 from datetime import datetime
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Any, Dict, Optional, List
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +28,28 @@ _shutdown_started_at: Optional[str] = None
 _shutdown_watchdog_lock = threading.Lock()
 _shutdown_watchdog_timer: Optional[threading.Timer] = None
 _shutdown_watchdog_deadline: Optional[float] = None
+
+
+def _windows_hidden_subprocess_kwargs() -> Dict[str, Any]:
+    """Windows 下子进程无窗口参数。"""
+    if os.name != "nt":
+        return {}
+
+    kwargs: Dict[str, Any] = {}
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if creationflags:
+        kwargs["creationflags"] = creationflags
+
+    startupinfo_cls = getattr(subprocess, "STARTUPINFO", None)
+    startf_use_showwindow = getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+    sw_hide = getattr(subprocess, "SW_HIDE", 0)
+    if startupinfo_cls and startf_use_showwindow:
+        startupinfo = startupinfo_cls()
+        startupinfo.dwFlags |= startf_use_showwindow
+        startupinfo.wShowWindow = sw_hide
+        kwargs["startupinfo"] = startupinfo
+
+    return kwargs
 
 
 # ========== 请求/响应模型 ==========
@@ -390,7 +412,8 @@ def _kill_all_ffmpeg_processes() -> int:
             result = subprocess.run(
                 ['taskkill', '/F', '/IM', 'ffmpeg.exe'],
                 capture_output=True,
-                timeout=10
+                timeout=10,
+                **_windows_hidden_subprocess_kwargs(),
             )
             if result.returncode == 0:
                 killed_count += 1
@@ -455,6 +478,7 @@ def _force_exit_with_best_effort(reason: str) -> None:
                 ["taskkill", "/F", "/T", "/PID", str(os.getpid())],
                 capture_output=True,
                 timeout=2,
+                **_windows_hidden_subprocess_kwargs(),
             )
         except Exception:
             pass
@@ -675,18 +699,29 @@ async def _terminate_processes():
                 # 备选方案：使用 netstat + taskkill
                 try:
                     result = subprocess.run(
-                        'netstat -ano | findstr ":5173" | findstr "LISTENING"',
-                        shell=True,
+                        ["netstat", "-ano", "-p", "tcp"],
                         capture_output=True,
-                        timeout=5
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=5,
+                        **_windows_hidden_subprocess_kwargs(),
                     )
                     if result.returncode == 0 and result.stdout:
-                        # V3.1.0+dev.20260104.01: 修复 Windows 编码问题
-                        for line in result.stdout.decode('utf-8', errors='replace').strip().split('\n'):
+                        for line in result.stdout.strip().split('\n'):
+                            if ":5173" not in line:
+                                continue
+                            if "LISTENING" not in line.upper() and "侦听" not in line:
+                                continue
                             parts = line.split()
                             if len(parts) >= 5:
                                 pid = parts[-1]
-                                subprocess.run(['taskkill', '/F', '/PID', pid], capture_output=True, timeout=3)
+                                subprocess.run(
+                                    ['taskkill', '/F', '/PID', pid],
+                                    capture_output=True,
+                                    timeout=3,
+                                    **_windows_hidden_subprocess_kwargs(),
+                                )
                                 logger.info(f"已终止前端进程 (PID: {pid})")
                 except Exception:
                     pass
@@ -698,24 +733,24 @@ async def _terminate_processes():
             try:
                 # 终止标题包含 Video2SRT 的 cmd 窗口（Backend/Frontend 子窗口）
                 subprocess.run(
-                    'taskkill /F /IM cmd.exe /FI "WINDOWTITLE eq Video2SRT*"',
-                    shell=True,
+                    ["taskkill", "/F", "/IM", "cmd.exe", "/FI", "WINDOWTITLE eq Video2SRT*"],
                     capture_output=True,
-                    timeout=3
+                    timeout=3,
+                    **_windows_hidden_subprocess_kwargs(),
                 )
                 # 终止主窗口（标题是 "Video to SRT GPU"，精确匹配）
                 subprocess.run(
-                    'taskkill /F /IM cmd.exe /FI "WINDOWTITLE eq Video to SRT GPU"',
-                    shell=True,
+                    ["taskkill", "/F", "/IM", "cmd.exe", "/FI", "WINDOWTITLE eq Video to SRT GPU"],
                     capture_output=True,
-                    timeout=3
+                    timeout=3,
+                    **_windows_hidden_subprocess_kwargs(),
                 )
                 # 备用：匹配 "Video to SRT*" 模式
                 subprocess.run(
-                    'taskkill /F /IM cmd.exe /FI "WINDOWTITLE eq Video to SRT*"',
-                    shell=True,
+                    ["taskkill", "/F", "/IM", "cmd.exe", "/FI", "WINDOWTITLE eq Video to SRT*"],
                     capture_output=True,
-                    timeout=3
+                    timeout=3,
+                    **_windows_hidden_subprocess_kwargs(),
                 )
                 logger.info("主窗口终止命令已发送")
             except Exception as e:
