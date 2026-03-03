@@ -10,6 +10,7 @@ import os
 import gc
 import signal
 import json
+import re
 from datetime import datetime
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
@@ -93,6 +94,25 @@ async def unregister_client(req: UnregisterRequest):
     client_registry.unregister(req.client_id)
 
     return {"success": True}
+
+
+@router.get("/api/system/ready")
+async def system_ready():
+    """Electron / Launcher 启动链路就绪探针。"""
+    from app.core.config import FLAVOR
+
+    ui_mode = str(os.environ.get("ANCHORFLUX_UI_MODE", "browser")).strip().lower() or "browser"
+    build_version = str(os.environ.get("ANCHORFLUX_BUILD_VERSION", "")).strip()
+    version = build_version if build_version else CURRENT_VERSION
+
+    return {
+        "success": True,
+        "ready": True,
+        "flavor": FLAVOR,
+        "ui_mode": ui_mode,
+        "version": version,
+        "timestamp": datetime.now().isoformat(),
+    }
 
 
 @router.get("/api/system/has-active-clients")
@@ -626,6 +646,11 @@ class CheckUpdateResponse(BaseModel):
     changelog: Optional[str] = None
     download_url: Optional[str] = None
     release_date: Optional[str] = None
+    profile: Optional[str] = None
+    channel: Optional[str] = None
+    manifest_url: Optional[str] = None
+    sha256: Optional[str] = None
+    size: int = 0
     force_update: bool = False  # V3.1.1+dev.20260105.01: 强制更新标志
 
 
@@ -634,23 +659,93 @@ class TriggerUpdateRequest(BaseModel):
     download_url: str
     version: str
     changelog: Optional[str] = None
+    profile: Optional[str] = None
+    flavor: Optional[str] = None
+    channel: Optional[str] = None
+    manifest_url: Optional[str] = None
+    sha256: Optional[str] = None
+    size: Optional[int] = None
     delay_mode: bool = False  # V3.1.1+dev.20260105.01: 延迟更新模式（重启时更新）
 
 
 # 当前版本号
-CURRENT_VERSION = "3.1.1"
+CURRENT_VERSION = os.getenv("ANCHORFLUX_BUILD_VERSION", "3.2.4")
+LEGACY_VERSION_CHECK_URL = "https://gitee.com/comment_out/anchor-flux-update/raw/master/version.json"
+UPDATE_MANIFEST_ROOT_URL = os.getenv(
+    "ANCHORFLUX_UPDATE_MANIFEST_ROOT",
+    "https://gitee.com/comment_out/anchor-flux-update/raw/master",
+)
+UPDATE_MANIFEST_FILES = {
+    "lite": os.getenv("ANCHORFLUX_UPDATE_MANIFEST_LITE", "latest-lite.json"),
+    "full": os.getenv("ANCHORFLUX_UPDATE_MANIFEST_FULL", "latest-full.json"),
+}
+_FLAVOR_SUFFIX_PATTERN = re.compile(r"-(lite|full)$", re.IGNORECASE)
 
-# V3.1.1+dev.20260105.01: 版本检查配置（使用 Gitee 镜像的 version.json）
-VERSION_CHECK_URL = "https://gitee.com/comment_out/anchor-flux-update/raw/master/version.json"
+
+def _normalize_channel_from_flavor(raw_flavor: str) -> str:
+    return "lite" if str(raw_flavor).strip().lower() == "lite" else "full"
+
+
+def _build_manifest_url(channel: str) -> str:
+    configured = str(UPDATE_MANIFEST_FILES.get(channel, UPDATE_MANIFEST_FILES["full"])).strip()
+    if configured.startswith("http://") or configured.startswith("https://"):
+        return configured
+    return f"{UPDATE_MANIFEST_ROOT_URL.rstrip('/')}/{configured.lstrip('/')}"
+
+
+def _parse_version_tuple(version: str) -> tuple[int, int, int]:
+    """
+    版本比较归一化。
+
+    支持以下格式：
+    - 3.2.4
+    - 3.2.4-lite / 3.2.4-full
+    - 3.2.4+dev.20260303.04
+    - v3.2.4-lite
+    """
+    normalized = str(version or "").strip().lower().lstrip("v")
+    normalized = _FLAVOR_SUFFIX_PATTERN.sub("", normalized)
+    normalized = normalized.split("+", 1)[0]
+    parts = [int(p) for p in re.findall(r"\d+", normalized)[:3]]
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
+
+
+def _fetch_manifest_json(manifest_url: str) -> dict:
+    import urllib.request
+
+    req = urllib.request.Request(
+        manifest_url,
+        headers={
+            "User-Agent": "AnchorFlux-Updater/1.0",
+            "Accept": "application/json",
+            "Cache-Control": "no-cache",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _parse_int(raw_value: object, default: int = 0) -> int:
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError):
+        return default
 
 
 @router.get("/api/system/version")
 async def get_current_version():
     """获取当前系统版本"""
+    from app.core.config import FLAVOR
+
+    channel = _normalize_channel_from_flavor(FLAVOR)
     return {
         "success": True,
         "version": CURRENT_VERSION,
-        "build_date": "2026-01-04"  # TODO: 从构建信息读取
+        "flavor": FLAVOR,
+        "channel": channel,
+        "build_date": "2026-03-03",
     }
 
 
@@ -659,71 +754,79 @@ async def check_update():
     """
     检查是否有新版本可用
 
-    V3.1.1+dev.20260105.01: 从 Gitee 镜像的 version.json 获取版本信息
-    version.json 格式:
-    {
-        "latest_version": "3.1.3",
-        "force_update": false,
-        "changelog": "更新内容",
-        "download_url": "https://github.com/.../update_v3.1.3.zip"
-    }
+    优先读取 profile 化清单（latest-lite/latest-full），
+    404 时回退 legacy version.json，保持旧通道兼容。
     """
-    import urllib.request
     import urllib.error
+    from app.core.config import FLAVOR
 
     try:
-        logger.info(f"Checking for updates: {VERSION_CHECK_URL}")
-
-        # 发送请求获取 version.json
-        req = urllib.request.Request(
-            VERSION_CHECK_URL,
-            headers={
-                'User-Agent': 'AnchorFlux-Updater/1.0',
-                'Accept': 'application/json',
-                'Cache-Control': 'no-cache'  # 避免缓存
-            }
+        channel = _normalize_channel_from_flavor(FLAVOR)
+        manifest_url = _build_manifest_url(channel)
+        logger.info(
+            "检查更新: flavor=%s channel=%s manifest=%s",
+            FLAVOR,
+            channel,
+            manifest_url,
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=15) as response:
-                data = json.loads(response.read().decode('utf-8'))
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                logger.info("version.json not found")
-                return CheckUpdateResponse(
-                    has_update=False,
-                    current_version=CURRENT_VERSION
-                ).dict()
-            raise
-
-        # 解析 version.json 格式
-        latest_version = data.get('latest_version', '').lstrip('v')
-        changelog = data.get('changelog', '')
-        download_url = data.get('download_url', '')
-        force_update = data.get('force_update', False)
-
-        # 比较版本号（使用元组比较以支持语义化版本）
-        def parse_version(v):
-            """将版本字符串解析为可比较的元组"""
+            data = _fetch_manifest_json(manifest_url)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                raise
+            logger.warning("更新清单不存在，回退 legacy 通道: %s", LEGACY_VERSION_CHECK_URL)
             try:
-                parts = v.split('.')
-                return tuple(int(p) for p in parts[:3])
-            except (ValueError, AttributeError):
-                return (0, 0, 0)
+                data = _fetch_manifest_json(LEGACY_VERSION_CHECK_URL)
+                manifest_url = LEGACY_VERSION_CHECK_URL
+            except urllib.error.HTTPError as legacy_exc:
+                if legacy_exc.code == 404:
+                    logger.info("未找到可用更新清单")
+                    return CheckUpdateResponse(
+                        has_update=False,
+                        current_version=CURRENT_VERSION,
+                        channel=channel,
+                        manifest_url=manifest_url,
+                    ).dict()
+                raise
 
-        current_tuple = parse_version(CURRENT_VERSION)
-        latest_tuple = parse_version(latest_version)
-        has_update = latest_tuple > current_tuple
+        latest_version = str(data.get("latest_version") or data.get("version") or "").strip().lstrip("v")
+        changelog = str(data.get("changelog") or "")
+        download_url = str(data.get("download_url") or "")
+        release_date = str(data.get("release_date") or "")
+        force_update = bool(data.get("force_update", False))
+        profile = str(data.get("profile") or f"{channel}-offline")
+        sha256 = str(data.get("sha256") or "")
+        size = _parse_int(data.get("size"), 0)
 
-        logger.info(f"Current: {CURRENT_VERSION} ({current_tuple}), Latest: {latest_version} ({latest_tuple}), Has update: {has_update}")
+        current_version = str(os.getenv("ANCHORFLUX_BUILD_VERSION", CURRENT_VERSION)).strip()
+        current_tuple = _parse_version_tuple(current_version)
+        latest_tuple = _parse_version_tuple(latest_version)
+        has_update = bool(latest_version) and latest_tuple > current_tuple
+
+        logger.info(
+            "更新比较: current=%s(%s) latest=%s(%s) has_update=%s profile=%s",
+            current_version,
+            current_tuple,
+            latest_version,
+            latest_tuple,
+            has_update,
+            profile,
+        )
 
         return CheckUpdateResponse(
             has_update=has_update,
-            current_version=CURRENT_VERSION,
+            current_version=current_version,
             latest_version=latest_version,
             changelog=changelog,
             download_url=download_url,
-            force_update=force_update
+            release_date=release_date,
+            profile=profile,
+            channel=channel,
+            manifest_url=manifest_url,
+            sha256=sha256,
+            size=size,
+            force_update=force_update,
         ).dict()
 
     except Exception as e:
@@ -748,30 +851,55 @@ async def trigger_update(req: TriggerUpdateRequest):
     此 API 会:
     1. 在项目根目录写入 update_signal.json
     2. 如果不是延迟模式，关闭后端服务
-    3. Bootloader 检测到信号文件后执行更新
+    3. Launcher 检测到信号文件后执行更新
     """
-    from app.core.config import config
+    from app.core.config import FLAVOR, config
 
     try:
         # 获取项目根目录
         project_root = config.PROJECT_ROOT
         signal_file = project_root / "update_signal.json"
 
+        resolved_channel = str(req.channel or "").strip().lower()
+        if resolved_channel not in {"full", "lite"}:
+            if req.profile:
+                resolved_channel = "lite" if str(req.profile).lower().startswith("lite") else "full"
+            elif req.flavor:
+                resolved_channel = _normalize_channel_from_flavor(req.flavor)
+            else:
+                resolved_channel = _normalize_channel_from_flavor(FLAVOR)
+
+        resolved_flavor = str(req.flavor or resolved_channel).strip().lower()
+        resolved_profile = str(req.profile or f"{resolved_channel}-offline").strip()
+        target_version = str(req.version).strip()
+
         # 写入更新信号文件
         signal_data = {
-            "version": req.version,
+            "version": target_version,
             "download_url": req.download_url,
             "changelog": req.changelog,
+            "profile": resolved_profile,
+            "flavor": resolved_flavor,
+            "channel": resolved_channel,
+            "manifest_url": req.manifest_url,
+            "sha256": req.sha256,
+            "size": req.size if req.size is not None else 0,
             "triggered_at": datetime.now().isoformat(),
-            "current_version": CURRENT_VERSION,
-            "delay_mode": req.delay_mode  # V3.1.1+dev.20260105.01: 记录延迟模式
+            "current_version": str(os.getenv("ANCHORFLUX_BUILD_VERSION", CURRENT_VERSION)),
+            "delay_mode": req.delay_mode,
         }
 
         with open(signal_file, 'w', encoding='utf-8') as f:
             json.dump(signal_data, f, ensure_ascii=False, indent=2)
 
         logger.info(f"Update signal written: {signal_file}")
-        logger.info(f"Target version: {req.version}, Delay mode: {req.delay_mode}")
+        logger.info(
+            "Update target: version=%s profile=%s channel=%s delay_mode=%s",
+            target_version,
+            resolved_profile,
+            resolved_channel,
+            req.delay_mode,
+        )
 
         # 根据模式返回不同响应
         if req.delay_mode:
@@ -780,6 +908,8 @@ async def trigger_update(req: TriggerUpdateRequest):
                 "success": True,
                 "message": "更新已安排，将在下次重启时执行",
                 "signal_file": str(signal_file),
+                "profile": resolved_profile,
+                "channel": resolved_channel,
                 "delay_mode": True
             }
         else:
@@ -788,6 +918,8 @@ async def trigger_update(req: TriggerUpdateRequest):
                 "success": True,
                 "message": "更新信号已写入，系统即将重启进行更新",
                 "signal_file": str(signal_file),
+                "profile": resolved_profile,
+                "channel": resolved_channel,
                 "delay_mode": False
             }
             # 异步关闭后端（等待响应发送后）

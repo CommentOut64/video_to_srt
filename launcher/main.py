@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 AnchorFlux Launcher - 主入口
-V3.2.0+dev.20260209.04
+V3.2.4+dev.20260303.04
 
 新架构启动器，特性：
 - uv 依赖管理（替代 pip，智能检测依赖状态）
@@ -23,10 +23,18 @@ from typing import Optional
 from .config import (
     VERSION, APP_NAME, LauncherConfig,
     get_project_root, load_env_config, detect_dev_mode,
-    DEFAULT_BACKEND_PORT, DEFAULT_FRONTEND_PORT
+    DEFAULT_UI_MODE, DEFAULT_RUNTIME_POLICY, DEFAULT_FLAVOR,
+    DEFAULT_BACKEND_PORT, DEFAULT_FRONTEND_PORT,
+    normalize_ui_mode, normalize_runtime_policy, normalize_flavor
 )
 from .uv_manager import UvManager, fix_pytorch_dll
 from .updater import SelfUpdater
+from .shell_manager import (
+    wait_backend_ready,
+    launch_electron,
+    open_browser_fallback,
+    resolve_shell_path,
+)
 
 # 配置日志
 logging.basicConfig(
@@ -35,6 +43,72 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 logger = logging.getLogger("launcher")
+
+
+class SingleInstanceGuard:
+    """
+    启动器单实例锁。
+
+    设计取舍：
+    - 使用文件锁保证同一目录仅允许一个 launcher 主循环运行；
+    - 第二次启动不抢占，不杀旧进程，仅走“激活已有实例”路径。
+    """
+
+    def __init__(self, lock_path: Path):
+        self.lock_path = lock_path
+        self._handle: Optional[object] = None
+
+    def acquire(self) -> bool:
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = open(self.lock_path, "a+b")
+        try:
+            self._handle.seek(0)
+            self._handle.write(b"\0")
+            self._handle.flush()
+            self._handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self._close_handle()
+            return False
+
+        self._handle.seek(0)
+        self._handle.truncate()
+        self._handle.write(str(os.getpid()).encode("utf-8"))
+        self._handle.flush()
+        return True
+
+    def release(self) -> None:
+        if self._handle is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                self._handle.seek(0)
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            self._close_handle()
+
+    def _close_handle(self) -> None:
+        if self._handle is not None:
+            try:
+                self._handle.close()
+            except OSError:
+                pass
+            self._handle = None
 
 
 class ProcessManager:
@@ -136,6 +210,11 @@ class ProcessManager:
         if config.hf_mirror:
             env['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
+        env['ANCHORFLUX_UI_MODE'] = config.ui_mode
+        env['ANCHORFLUX_RUNTIME_POLICY'] = config.runtime_policy
+        env['ANCHORFLUX_FLAVOR'] = config.flavor
+        env['ANCHORFLUX_LITE'] = 'true' if config.flavor == 'lite' else 'false'
+
         # 设置 PATH（PyTorch DLL 等）
         if config.site_packages:
             torch_lib = config.site_packages / "torch" / "lib"
@@ -168,6 +247,12 @@ class ProcessManager:
                 )
 
             logger.info(f"后端已启动: PID={self.backend_process.pid}")
+            logger.info(
+                "后端运行模式: flavor=%s ui_mode=%s runtime_policy=%s",
+                config.flavor,
+                config.ui_mode,
+                config.runtime_policy,
+            )
 
             time.sleep(3)
             if self.backend_process.poll() is not None:
@@ -283,6 +368,8 @@ class Launcher:
         self.uv_manager: Optional[UvManager] = None
         self.updater: Optional[SelfUpdater] = None
         self.process_manager: Optional[ProcessManager] = None
+        self.instance_guard: Optional[SingleInstanceGuard] = None
+        self._exit_code_override: Optional[int] = None
         self._running = True
 
     def _signal_handler(self, signum, frame):
@@ -291,6 +378,40 @@ class Launcher:
         self._running = False
         if self.process_manager:
             self.process_manager.terminate_all()
+
+    def _activate_running_instance(
+        self,
+        *,
+        ui_mode: str,
+        dev_mode: bool,
+        backend_port: int,
+        frontend_port: int,
+        shell_path: Optional[Path],
+    ) -> None:
+        """激活已运行实例的界面，不重启后端。"""
+        backend_url = f"http://127.0.0.1:{backend_port}"
+        browser_url = (
+            f"http://127.0.0.1:{frontend_port}"
+            if dev_mode
+            else backend_url
+        )
+        normalized_ui_mode = normalize_ui_mode(ui_mode)
+
+        logger.info("检测到已运行实例，尝试激活现有窗口...")
+        if normalized_ui_mode == "none":
+            logger.info("当前模式为 none，不拉起 UI。")
+            return
+
+        if normalized_ui_mode == "electron":
+            wait_backend_ready(backend_url, timeout_sec=8)
+            target_shell_path = resolve_shell_path(self.project_root, shell_path)
+            if launch_electron(target_shell_path):
+                return
+            logger.warning("激活 Electron 失败，回退浏览器")
+            open_browser_fallback(browser_url)
+            return
+
+        open_browser_fallback(browser_url)
 
     def initialize(self) -> bool:
         """初始化启动器"""
@@ -313,6 +434,49 @@ class Launcher:
 
         # 加载环境配置
         env_config = load_env_config(self.project_root)
+        raw_ui_mode = os.environ.get(
+            "ANCHORFLUX_UI_MODE",
+            env_config.get("ANCHORFLUX_UI_MODE", DEFAULT_UI_MODE),
+        )
+        raw_runtime_policy = os.environ.get(
+            "ANCHORFLUX_RUNTIME_POLICY",
+            env_config.get("ANCHORFLUX_RUNTIME_POLICY", DEFAULT_RUNTIME_POLICY),
+        )
+        raw_flavor = os.environ.get(
+            "ANCHORFLUX_FLAVOR",
+            env_config.get("ANCHORFLUX_FLAVOR", ""),
+        )
+        if not str(raw_flavor).strip():
+            raw_lite = os.environ.get(
+                "ANCHORFLUX_LITE",
+                env_config.get("ANCHORFLUX_LITE", ""),
+            )
+            if str(raw_lite).strip().lower() in ("true", "1", "yes"):
+                raw_flavor = "lite"
+            else:
+                raw_flavor = DEFAULT_FLAVOR
+        raw_shell_path = os.environ.get(
+            "ANCHORFLUX_SHELL_PATH",
+            env_config.get("ANCHORFLUX_SHELL_PATH", ""),
+        ).strip()
+        shell_path: Optional[Path] = None
+        if raw_shell_path:
+            shell_path = Path(raw_shell_path)
+            if not shell_path.is_absolute():
+                shell_path = (self.project_root / shell_path).resolve()
+
+        # 单实例守卫：第二次启动仅激活已有实例，不抢占也不重启。
+        self.instance_guard = SingleInstanceGuard(self.project_root / "data" / "launcher.lock")
+        if not self.instance_guard.acquire():
+            self._activate_running_instance(
+                ui_mode=raw_ui_mode,
+                dev_mode=dev_mode,
+                backend_port=DEFAULT_BACKEND_PORT,
+                frontend_port=DEFAULT_FRONTEND_PORT,
+                shell_path=shell_path,
+            )
+            self._exit_code_override = 0
+            return False
 
         # 初始化 uv 管理器
         self.uv_manager = UvManager(self.project_root, dev_mode)
@@ -385,7 +549,18 @@ class Launcher:
             site_packages=site_packages,
             tools_dir=self.project_root / "tools",
             hf_mirror=env_config.get('USE_HF_MIRROR', 'true').lower() == 'true',
-            log_level='DEBUG' if dev_mode else 'INFO'
+            log_level='DEBUG' if dev_mode else 'INFO',
+            ui_mode=normalize_ui_mode(raw_ui_mode),
+            runtime_policy=normalize_runtime_policy(raw_runtime_policy),
+            flavor=normalize_flavor(raw_flavor),
+            shell_path=shell_path,
+        )
+        logger.info(
+            "启动器配置: flavor=%s ui_mode=%s runtime_policy=%s shell_path=%s",
+            self.config.flavor,
+            self.config.ui_mode,
+            self.config.runtime_policy,
+            self.config.shell_path or "<default>",
         )
 
         # 初始化管理器
@@ -398,83 +573,132 @@ class Launcher:
 
         return True
 
+    def _launch_ui(self) -> None:
+        """
+        根据 ui_mode 触发 UI 启动。
+
+        设计取舍：
+        - `browser` 模式沿用后端自带的自动打开逻辑，Launcher 不重复打开。
+        - `electron` 模式由 Launcher 负责等待后端就绪并拉起 Shell。
+        """
+        if self.config is None:
+            return
+
+        backend_url = f"http://127.0.0.1:{self.config.backend_port}"
+        browser_url = (
+            f"http://127.0.0.1:{self.config.frontend_port}"
+            if self.config.dev_mode
+            else backend_url
+        )
+
+        if self.config.ui_mode == "none":
+            logger.info("UI 模式为 none，跳过 UI 启动。")
+            return
+
+        if self.config.ui_mode == "browser":
+            logger.info("UI 模式为 browser，由后端负责自动打开浏览器。")
+            return
+
+        if self.config.ui_mode != "electron":
+            logger.warning("未知 UI 模式，回退为 browser: %s", self.config.ui_mode)
+            return
+
+        logger.info("UI 模式为 electron，等待后端就绪后启动 Shell...")
+        if not wait_backend_ready(backend_url, timeout_sec=60):
+            logger.warning("后端就绪探针超时，回退浏览器。")
+            open_browser_fallback(browser_url)
+            return
+
+        shell_path = resolve_shell_path(self.project_root, self.config.shell_path)
+        if not launch_electron(shell_path):
+            logger.warning("Electron Shell 启动失败，回退浏览器。")
+            open_browser_fallback(browser_url)
+
     def run(self) -> int:
         """运行主循环"""
-        if not self.initialize():
-            input("按 Enter 键退出...")
-            return 1
-
-        while self._running:
-            # 清理旧进程
-            self.process_manager.cleanup_old_processes(
-                self.config.backend_port,
-                self.config.frontend_port
-            )
-
-            # 启动后端
-            if not self.process_manager.start_backend(self.config):
-                logger.error("后端启动失败")
+        try:
+            if not self.initialize():
+                if self._exit_code_override is not None:
+                    return self._exit_code_override
                 input("按 Enter 键退出...")
                 return 1
 
-            # 启动前端（开发模式）
-            if self.config.dev_mode:
-                if not self.process_manager.start_frontend(self.config):
-                    logger.warning("前端启动失败，继续运行...")
+            while self._running:
+                # 清理旧进程
+                self.process_manager.cleanup_old_processes(
+                    self.config.backend_port,
+                    self.config.frontend_port
+                )
 
-            # 显示启动信息
-            logger.info("")
-            logger.info("=" * 50)
-            logger.info("服务启动成功!")
-            logger.info("=" * 50)
+                # 启动后端
+                if not self.process_manager.start_backend(self.config):
+                    logger.error("后端启动失败")
+                    input("按 Enter 键退出...")
+                    return 1
 
-            if self.config.dev_mode:
-                logger.info(f"前端: http://localhost:{self.config.frontend_port}")
-            logger.info(f"应用: http://localhost:{self.config.backend_port}")
-            logger.info(f"API 文档: http://localhost:{self.config.backend_port}/docs")
-            logger.info("")
-            logger.info("按 Ctrl+C 停止，或使用应用内的「退出系统」按钮")
-            logger.info("=" * 50)
+                # 启动前端（开发模式）
+                if self.config.dev_mode:
+                    if not self.process_manager.start_frontend(self.config):
+                        logger.warning("前端启动失败，继续运行...")
 
-            # 等待后端退出
-            exit_code = self.process_manager.wait_for_backend_exit()
-            logger.info(f"后端退出，代码: {exit_code}")
+                self._launch_ui()
 
-            # 检查更新信号
-            update_info = self.updater.check_signal()
+                # 显示启动信息
+                logger.info("")
+                logger.info("=" * 50)
+                logger.info("服务启动成功!")
+                logger.info("=" * 50)
 
-            if update_info:
-                logger.info(f"检测到更新: {update_info.version}")
+                if self.config.dev_mode:
+                    logger.info(f"前端: http://localhost:{self.config.frontend_port}")
+                logger.info(f"应用: http://localhost:{self.config.backend_port}")
+                logger.info(f"API 文档: http://localhost:{self.config.backend_port}/docs")
+                logger.info("")
+                logger.info("按 Ctrl+C 停止，或使用应用内的「退出系统」按钮")
+                logger.info("=" * 50)
+
+                # 等待后端退出
+                exit_code = self.process_manager.wait_for_backend_exit()
+                logger.info(f"后端退出，代码: {exit_code}")
+
+                # 检查更新信号
+                update_info = self.updater.check_signal()
+
+                if update_info:
+                    logger.info(f"检测到更新: {update_info.version}")
+                    self.process_manager.terminate_all()
+
+                    # 使用 GUI 执行更新
+                    from .ui import is_gui_available, run_update_gui
+
+                    if is_gui_available():
+                        def update_func(progress_callback):
+                            return self.updater.execute_update(update_info, progress_callback)
+
+                        run_update_gui(update_func)
+                    else:
+                        result = self.updater.execute_update(
+                            update_info,
+                            lambda msg, prog: logger.info(f"[{int(prog*100):3d}%] {msg}")
+                        )
+                        if not result.success:
+                            logger.error(f"更新失败: {result.message}")
+
+                    time.sleep(2)
+                    continue
+                else:
+                    logger.info("正常关闭")
+                    self._running = False
+
+            # 清理
+            if self.process_manager:
                 self.process_manager.terminate_all()
 
-                # 使用 GUI 执行更新
-                from .ui import is_gui_available, run_update_gui
-
-                if is_gui_available():
-                    def update_func(progress_callback):
-                        return self.updater.execute_update(update_info, progress_callback)
-
-                    run_update_gui(update_func)
-                else:
-                    result = self.updater.execute_update(
-                        update_info,
-                        lambda msg, prog: logger.info(f"[{int(prog*100):3d}%] {msg}")
-                    )
-                    if not result.success:
-                        logger.error(f"更新失败: {result.message}")
-
-                time.sleep(2)
-                continue
-            else:
-                logger.info("正常关闭")
-                self._running = False
-
-        # 清理
-        if self.process_manager:
-            self.process_manager.terminate_all()
-
-        logger.info("启动器关闭完成")
-        return 0
+            logger.info("启动器关闭完成")
+            return 0
+        finally:
+            if self.instance_guard is not None:
+                self.instance_guard.release()
 
 
 def main():

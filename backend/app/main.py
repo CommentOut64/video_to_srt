@@ -64,6 +64,7 @@ from app.api.routes import config_routes  # 新增：用户配置路由
 from app.api.routes import debug_routes  # 新增：调试路由
 from app.api.routes import presets_routes  # V3.2.4: 自定义预设路由
 from app.api.routes.homophone_routes import create_homophone_router  # 同音检索路由（Full/Lite 共用）
+from app.api.routes.project_task_routes import create_project_task_router  # Project 任务路由（Full/Lite 共用）
 from app.services.file_service import FileManagementService
 
 # 导入FFmpeg管理器
@@ -71,6 +72,35 @@ from app.services.ffmpeg_manager import get_ffmpeg_manager
 
 # 配置日志（在其他初始化之前）
 logger = setup_logging()
+VALID_UI_MODES = {"browser", "electron", "none"}
+FULL_RUNTIME_ENABLED = not IS_LITE
+FULL_RUNTIME_DISABLE_REASON = ""
+
+
+def _resolve_ui_mode_from_env() -> str:
+    """解析 UI 模式，未知值回退到 browser。"""
+    raw_ui_mode = str(os.environ.get("ANCHORFLUX_UI_MODE", "browser")).strip().lower()
+    if raw_ui_mode in VALID_UI_MODES:
+        return raw_ui_mode
+    logger.warning("未知 ANCHORFLUX_UI_MODE=%s，回退为 browser", raw_ui_mode)
+    return "browser"
+
+
+def _disable_full_runtime(reason: str, exc=None):
+    """
+    关闭 Full 专属能力，回退为 Lite 能力集运行。
+
+    设计取舍：
+    - 当 flavor 判定为 full 但运行时依赖缺失时，优先保证服务可启动；
+    - 降级后仅禁用 Full 路由与初始化，不影响 Lite 编辑链路。
+    """
+    global FULL_RUNTIME_ENABLED, FULL_RUNTIME_DISABLE_REASON
+    FULL_RUNTIME_ENABLED = False
+    FULL_RUNTIME_DISABLE_REASON = reason
+    if exc is not None:
+        logger.warning("Full 能力降级为 Lite：%s（%s）", reason, exc)
+    else:
+        logger.warning("Full 能力降级为 Lite：%s", reason)
 
 
 def cleanup_old_processes():
@@ -234,17 +264,29 @@ app.include_router(legacy_router)  # Task6: legacy 兼容路由
 app.include_router(stream_router)  # Task6: 项目级 SSE 路由
 
 # 注册仅 Full 模式可用的路由
-if not IS_LITE:
-    from app.api.routes import model_routes
-    from app.api.routes import model_runtime_routes
-    from app.api.routes.demucs_routes import create_demucs_router
+if FULL_RUNTIME_ENABLED:
+    try:
+        from app.api.routes import model_routes
+        from app.api.routes import model_runtime_routes
+        from app.api.routes.demucs_routes import create_demucs_router
+    except ModuleNotFoundError as import_exc:
+        _disable_full_runtime("模型/分离路由依赖缺失", import_exc)
+    else:
+        app.include_router(model_routes.router)
+        app.include_router(model_runtime_routes.router)
 
-    app.include_router(model_routes.router)
-    app.include_router(model_runtime_routes.router)
+        # 注册Demucs配置路由（需要在转录路由之前注册）
+        demucs_router = create_demucs_router()
+        app.include_router(demucs_router)
 
-    # 注册Demucs配置路由（需要在转录路由之前注册）
-    demucs_router = create_demucs_router()
-    app.include_router(demucs_router)
+if not FULL_RUNTIME_ENABLED:
+    if IS_LITE:
+        logger.info("Lite 模式启动：已禁用 Full 专属路由。")
+    else:
+        logger.warning(
+            "检测到 Full 运行时依赖不完整，已按 Lite 能力集启动。原因: %s",
+            FULL_RUNTIME_DISABLE_REASON or "未知原因",
+        )
 
 @app.on_event("startup")
 async def startup_event():
@@ -282,20 +324,25 @@ async def startup_event():
             logger.warning(f"FFmpeg检测失败: {e}")
             logger.warning("转录功能可能无法使用，请手动安装FFmpeg")
 
-        if not IS_LITE:
-            # 3. 初始化模型管理器（此时事件循环已设置，后台验证可以正常推送SSE）
-            logger.info("步骤 3/4: 初始化模型管理器...")
-            from app.services.model_manager_v2 import get_model_manager_v2
-            model_manager = get_model_manager_v2()
-            logger.info("模型管理器初始化成功 (V2)")
+        if FULL_RUNTIME_ENABLED:
+            try:
+                # 3. 初始化模型管理器（此时事件循环已设置，后台验证可以正常推送SSE）
+                logger.info("步骤 3/4: 初始化模型管理器...")
+                from app.services.model_manager_v2 import get_model_manager_v2
+                model_manager = get_model_manager_v2()
+                logger.info("模型管理器初始化成功 (V2)")
 
-            # 4. 初始化队列服务（新增）
-            logger.info("步骤 4/4: 初始化任务队列服务...")
-            from app.services.job_queue_service import get_queue_service
-            from app.services.transcription_service import get_transcription_service
-            transcription_service_instance = get_transcription_service(str(config.JOBS_DIR))
-            queue_service = get_queue_service(transcription_service_instance)
-            logger.info("任务队列服务已启动")
+                # 4. 初始化队列服务（新增）
+                logger.info("步骤 4/4: 初始化任务队列服务...")
+                from app.services.job_queue_service import get_queue_service
+                from app.services.transcription_service import get_transcription_service
+                transcription_service_instance = get_transcription_service(str(config.JOBS_DIR))
+                queue_service = get_queue_service(transcription_service_instance)
+                logger.info("任务队列服务已启动")
+            except ModuleNotFoundError as import_exc:
+                _disable_full_runtime("启动阶段 Full 依赖缺失", import_exc)
+                transcription_service_instance = None
+                logger.info("已回退为 Lite 能力集启动（保留编辑与项目能力）。")
         else:
             logger.info("Lite 模式启动: 跳过模型管理与转录队列初始化")
 
@@ -485,8 +532,14 @@ async def startup_event():
         # 不在启动时预加载模型，等待前端就绪后通过API调用
         logger.info("后端服务已就绪，等待前端启动后进行模型预加载")
 
-        # 6. 延迟检查并打开浏览器（如果没有活跃客户端）
-        asyncio.create_task(open_browser_if_needed())
+        # 6. 根据 ui_mode 决定是否自动打开浏览器
+        ui_mode = _resolve_ui_mode_from_env()
+        if ui_mode == "browser":
+            asyncio.create_task(open_browser_if_needed())
+        elif ui_mode == "electron":
+            logger.info("UI 模式为 electron，跳过后端自动打开浏览器。")
+        else:
+            logger.info("UI 模式为 none，跳过所有自动 UI 行为。")
 
         logger.info("=" * 60)
         logger.info("服务启动完成")
@@ -508,7 +561,7 @@ async def shutdown_event():
         except:
             pass
 
-        if not IS_LITE:
+        if FULL_RUNTIME_ENABLED:
             # 停止队列服务（新增）
             from app.services.job_queue_service import get_queue_service
             try:
@@ -535,9 +588,13 @@ TEMP_DIR = str(config.TEMP_DIR)
 
 # 初始化转录服务（仅 Full 模式）
 transcription_service = None
-if not IS_LITE:
-    from app.services.transcription_service import get_transcription_service
-    transcription_service = get_transcription_service(JOBS_DIR)
+if FULL_RUNTIME_ENABLED:
+    try:
+        from app.services.transcription_service import get_transcription_service
+        transcription_service = get_transcription_service(JOBS_DIR)
+    except ModuleNotFoundError as import_exc:
+        _disable_full_runtime("转录服务依赖缺失", import_exc)
+        transcription_service = None
 
 # 初始化文件管理服务
 file_service = FileManagementService(INPUT_DIR, OUTPUT_DIR)
@@ -550,22 +607,26 @@ app.include_router(file_router)
 homophone_router = create_homophone_router()
 app.include_router(homophone_router)
 
-# 注册转录路由（包含暂停、恢复等新功能）
-if not IS_LITE:
-    from app.api.routes.transcription_routes import create_transcription_router
-    from app.api.routes.project_task_routes import create_project_task_router
-    from app.api.routes.speaker_routes import create_speaker_router
+# 注册 project 任务路由（Full/Lite 共用，Lite 提供同步/删除能力）
+project_task_router = create_project_task_router(transcription_service)
+app.include_router(project_task_router)
 
-    transcription_router = create_transcription_router(transcription_service, file_service, OUTPUT_DIR)
-    project_task_router = create_project_task_router(transcription_service)
-    app.include_router(transcription_router)
-    app.include_router(project_task_router)
+# 注册转录路由（仅 Full 模式）
+if FULL_RUNTIME_ENABLED and transcription_service is not None:
+    try:
+        from app.api.routes.transcription_routes import create_transcription_router
+        from app.api.routes.speaker_routes import create_speaker_router
+    except ModuleNotFoundError as import_exc:
+        _disable_full_runtime("转录路由依赖缺失", import_exc)
+    else:
+        transcription_router = create_transcription_router(transcription_service, file_service, OUTPUT_DIR)
+        app.include_router(transcription_router)
 
-    # 注册 speaker 路由（说话人 profile/改绑/合并）
-    speaker_router = create_speaker_router(transcription_service)
-    app.include_router(speaker_router)
+        # 注册 speaker 路由（说话人 profile/改绑/合并）
+        speaker_router = create_speaker_router(transcription_service)
+        app.include_router(speaker_router)
 else:
-    logger.info("Lite 模式启动: 跳过 transcription/speaker 路由注册")
+    logger.info("Lite 模式启动: 保留 project-task 路由，跳过 transcription/speaker 路由注册")
 
 ModelPreloadConfig.print_config()
 
@@ -770,7 +831,7 @@ async def get_hardware_status():
 @app.post("/api/models/cache/clear")
 async def clear_models_cache():
     """清空模型缓存（ModelManager V2）。"""
-    if IS_LITE:
+    if not FULL_RUNTIME_ENABLED:
         raise HTTPException(status_code=422, detail="Lite 模式不支持模型缓存管理")
     try:
         from app.services.model_manager_v2 import get_model_manager_v2
@@ -792,7 +853,7 @@ async def clear_models_cache():
 @app.post("/api/models/cache/unload")
 async def unload_model(request: dict):
     """卸载指定模型（使用 ModelManager V2）。"""
-    if IS_LITE:
+    if not FULL_RUNTIME_ENABLED:
         raise HTTPException(status_code=422, detail="Lite 模式不支持模型缓存管理")
     try:
         model_id = request.get("model_id")
@@ -814,7 +875,7 @@ async def shutdown_server():
         logger.info("收到关闭服务器请求")
 
         # 清理资源
-        if not IS_LITE:
+        if FULL_RUNTIME_ENABLED:
             from app.services.model_manager_v2 import get_model_manager_v2
             model_manager = get_model_manager_v2()
             if model_manager:

@@ -83,7 +83,7 @@ class UvManager:
             )
 
         try:
-            cmd = [str(self.uv_exec), "sync", "--check", "--quiet"]
+            cmd = [str(self.uv_exec), "sync", "--check", "--quiet", "--no-install-project"]
 
             result = subprocess.run(
                 cmd,
@@ -135,7 +135,7 @@ class UvManager:
             )
 
         # 构建命令
-        cmd = [str(self.uv_exec), "sync"]
+        cmd = [str(self.uv_exec), "sync", "--no-install-project"]
 
         if self.dev_mode:
             # 开发模式：安装所有可选依赖
