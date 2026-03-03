@@ -1,5 +1,5 @@
 const path = require("path");
-const { app, BrowserWindow, nativeTheme } = require("electron");
+const { app, BrowserWindow, nativeTheme, shell } = require("electron");
 const fs = require("fs");
 const http = require("http");
 const https = require("https");
@@ -21,6 +21,31 @@ const WINDOW_BG_COLOR = "#0b1220";
 let mainWindow = null;
 let isBackendShutdownTriggered = false;
 let isAppExitInProgress = false;
+let appOrigin = null;
+
+try {
+  appOrigin = new URL(BACKEND_BASE_URL).origin;
+} catch (_) {
+  appOrigin = null;
+}
+
+function isInternalUrl(rawUrl) {
+  if (!rawUrl || !appOrigin) {
+    return false;
+  }
+  try {
+    return new URL(rawUrl).origin === appOrigin;
+  } catch (_) {
+    return false;
+  }
+}
+
+function openExternalUrl(rawUrl) {
+  if (!rawUrl || isInternalUrl(rawUrl)) {
+    return;
+  }
+  shell.openExternal(rawUrl).catch(() => {});
+}
 
 function requestBackendShutdown() {
   if (isBackendShutdownTriggered) {
@@ -179,6 +204,22 @@ function createMainWindow() {
 
   mainWindow.removeMenu();
   mainWindow.loadFile(path.join(__dirname, "loading.html"));
+
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (isInternalUrl(url)) {
+      return { action: "allow" };
+    }
+    openExternalUrl(url);
+    return { action: "deny" };
+  });
+
+  mainWindow.webContents.on("will-navigate", (event, url) => {
+    if (isInternalUrl(url)) {
+      return;
+    }
+    event.preventDefault();
+    openExternalUrl(url);
+  });
 
   mainWindow.on("closed", () => {
     mainWindow = null;
