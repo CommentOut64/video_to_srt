@@ -3,6 +3,7 @@
     v-model="visible"
     title="有新的更新可用"
     width="320px"
+    :lock-scroll="false"
     :close-on-click-modal="!isUpdating"
     :close-on-press-escape="!isUpdating"
     :show-close="!isUpdating"
@@ -153,6 +154,7 @@ async function handleImmediateUpdate() {
         confirmButtonText: "确定更新",
         cancelButtonText: "取消",
         type: "warning",
+        lockScroll: false,
       }
     );
   } catch {

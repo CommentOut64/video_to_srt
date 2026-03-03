@@ -223,6 +223,7 @@
       v-model="showAdvancedSettings"
       title="高级设置"
       width="600px"
+      :lock-scroll="false"
       :close-on-click-modal="false"
       :close-on-press-escape="true"
       @close="handleCloseAdvancedSettings"
@@ -798,6 +799,7 @@ async function deleteTask(jobId) {
       confirmButtonText: '删除',
       cancelButtonText: '取消',
       type: 'warning',
+      lockScroll: false,
     })
 
     // 调用后端 API 删除任务数据
@@ -1037,6 +1039,7 @@ async function handleExit() {
       confirmButtonText: '确定退出',
       cancelButtonText: '取消',
       type: 'warning',
+      lockScroll: false,
     })
 
     // 显示关闭进度
@@ -1084,7 +1087,7 @@ async function handleExit() {
       ? '系统已安全关闭，请手动关闭此浏览器标签页。'
       : '系统关闭可能未完全成功，请手动检查后台进程。'
 
-    await ElMessageBox.alert(message, '关闭完成', { type: shutdownSuccess ? 'success' : 'warning' })
+    await ElMessageBox.alert(message, '关闭完成', { type: shutdownSuccess ? 'success' : 'warning', lockScroll: false })
 
     // 尝试关闭当前窗口（部分浏览器可能阻止）
     try {
