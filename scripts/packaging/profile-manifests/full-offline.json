@@ -1,0 +1,18 @@
+{
+  "profile": "full-offline",
+  "flavor": "full",
+  "uiMode": "electron",
+  "runtimePolicy": "offline",
+  "python": {
+    "version": "3.10",
+    "syncArgs": ["--frozen", "--no-dev", "--extra", "full"],
+    "excludePackages": [],
+    "includeWheelCache": true,
+    "includeUvBinary": true,
+    "precompilePyc": false
+  },
+  "frontendBuildEnv": {
+    "VITE_APP_FLAVOR": "full",
+    "VITE_LITE_MODE": "false"
+  }
+}

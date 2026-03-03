@@ -1,0 +1,35 @@
+appId: com.anchorflux.shell
+productName: AnchorFluxShell
+asar: true
+
+directories:
+  output: dist-shell
+  buildResources: build
+
+files:
+  - main.js
+  - preload.js
+  - loading.html
+  - package.json
+  - build/icon.ico
+
+extraResources:
+  - from: build/icon.ico
+    to: icon.ico
+
+win:
+  executableName: AnchorFluxShell
+  icon: build/icon.ico
+  target:
+    - target: nsis
+      arch:
+        - x64
+  artifactName: AnchorFluxShell-${version}-${arch}.${ext}
+
+nsis:
+  oneClick: false
+  perMachine: true
+  allowToChangeInstallationDirectory: true
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+  installerHeaderIcon: build/icon.ico

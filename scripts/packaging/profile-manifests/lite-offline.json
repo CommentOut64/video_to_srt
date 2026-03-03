@@ -1,0 +1,31 @@
+{
+  "profile": "lite-offline",
+  "flavor": "lite",
+  "uiMode": "electron",
+  "runtimePolicy": "offline",
+  "python": {
+    "version": "3.10",
+    "syncArgs": ["--frozen", "--no-dev"],
+    "excludePackages": [
+      "torch",
+      "torchaudio",
+      "demucs",
+      "faster-whisper",
+      "onnxruntime-gpu",
+      "onnxruntime_gpu",
+      "pyannote-audio",
+      "speechbrain",
+      "librosa",
+      "scipy",
+      "silero-vad",
+      "punctuators"
+    ],
+    "includeWheelCache": true,
+    "includeUvBinary": true,
+    "precompilePyc": true
+  },
+  "frontendBuildEnv": {
+    "VITE_APP_FLAVOR": "lite",
+    "VITE_LITE_MODE": "true"
+  }
+}
