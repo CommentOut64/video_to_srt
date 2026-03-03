@@ -33,6 +33,12 @@ from app.utils.text_utils import segments_to_srt
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
+# V3.2.4+dev.20260304.12: 统一导入媒体格式白名单，保持前后端一致。
+SUPPORTED_IMPORT_MEDIA_EXTENSIONS = frozenset(
+    FileManagementService.VIDEO_EXTENSIONS | FileManagementService.AUDIO_EXTENSIONS
+)
+MEDIA_UPLOAD_CHUNK_SIZE = 1024 * 1024
+
 
 class ProjectTitleUpdateRequest(BaseModel):
     """更新项目标题请求。"""
@@ -137,6 +143,46 @@ def _read_local_file(path: str) -> str:
     """读取本地文件内容，自动检测编码"""
     raw_bytes = Path(path).read_bytes()
     return _decode_upload_content(raw_bytes)
+
+
+def _normalize_upload_filename(filename: str) -> str:
+    """规范化上传文件名，避免路径注入和空文件名。"""
+    normalized_name = Path(str(filename or "")).name.strip()
+    if not normalized_name:
+        raise HTTPException(status_code=400, detail="媒体文件名不能为空")
+    return normalized_name
+
+
+def _validate_import_media_extension(filename: str) -> str:
+    """校验导入媒体扩展名是否在白名单内。"""
+    suffix = Path(filename).suffix.lower()
+    if suffix not in SUPPORTED_IMPORT_MEDIA_EXTENSIONS:
+        supported = ", ".join(sorted(SUPPORTED_IMPORT_MEDIA_EXTENSIONS))
+        normalized_suffix = suffix or "<none>"
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的媒体格式: {normalized_suffix}，支持格式: {supported}",
+        )
+    return suffix
+
+
+async def _persist_uploaded_media_file(
+    upload_file: UploadFile,
+    target_path: Path,
+    chunk_size: int = MEDIA_UPLOAD_CHUNK_SIZE,
+) -> int:
+    """
+    分块写入上传媒体，避免一次性读取大文件导致内存峰值和超时放大。
+    """
+    total_written_bytes = 0
+    with target_path.open("wb") as output_fp:
+        while True:
+            chunk = await upload_file.read(chunk_size)
+            if not chunk:
+                break
+            output_fp.write(chunk)
+            total_written_bytes += len(chunk)
+    return total_written_bytes
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -572,9 +618,29 @@ async def import_project(
         raise HTTPException(status_code=500, detail="项目目录创建失败")
 
     if video_file is not None and video_file.filename:
-        video_bytes = await video_file.read()
-        target_path = project_dir / video_file.filename
-        target_path.write_bytes(video_bytes)
+        media_filename = _normalize_upload_filename(video_file.filename)
+        _validate_import_media_extension(media_filename)
+        target_path = project_dir / media_filename
+        try:
+            written_size = await _persist_uploaded_media_file(video_file, target_path)
+        except HTTPException:
+            target_path.unlink(missing_ok=True)
+            raise
+        except Exception as exc:
+            target_path.unlink(missing_ok=True)
+            logger.exception(
+                "导入项目保存媒体文件失败: project_id=%s, file=%s",
+                project.project_id,
+                media_filename,
+            )
+            raise HTTPException(status_code=500, detail="媒体文件保存失败，请重试") from exc
+        finally:
+            await video_file.close()
+
+        if written_size <= 0:
+            target_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail="媒体文件为空")
+
         project_service.refresh_media_assets(project.project_id)
         project = project_service.get_project(project.project_id) or project
 
@@ -615,6 +681,7 @@ async def import_project_local(
     # 2. 可选：获取媒体文件路径
     media_path: Optional[str] = None
     if media_filename:
+        _validate_import_media_extension(media_filename)
         media_path = file_service.get_input_file_path(media_filename)
         if not Path(media_path).exists():
             raise HTTPException(status_code=404, detail=f"媒体文件不存在: {media_filename}")

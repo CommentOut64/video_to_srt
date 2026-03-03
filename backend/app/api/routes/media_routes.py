@@ -53,6 +53,12 @@ NORMALIZED_H264_FILENAME = "normalized_h264.mp4"
 # 音频抽取锁（按目录粒度，避免并发请求重复抽取同一文件）
 _audio_extract_lock_guard = threading.Lock()
 _audio_extract_locks: dict[str, threading.Lock] = {}
+_video_request_log_guard = threading.Lock()
+_video_request_log_windows: dict[str, Tuple[float, int]] = {}
+_transcode_cache_guard = threading.Lock()
+_transcode_decision_cache: dict[str, dict] = {}
+_VIDEO_REQUEST_LOG_THROTTLE_SECONDS = 1.0
+_TRANSCODE_CACHE_TTL_SECONDS = 2.0
 
 # 注意：旧的 _proxy_generation_status 已废弃，改用 MediaPrepService 管理状态
 
@@ -422,6 +428,22 @@ def _analyze_transcode_requirement(video_file: Optional[Path]) -> Tuple[bool, st
     """
     if video_file is None or not video_file.exists():
         return False, "", None
+    cache_key = str(video_file.resolve())
+    file_size = 0
+    file_mtime_ns = 0
+    try:
+        stat = video_file.stat()
+        file_size = int(stat.st_size)
+        file_mtime_ns = int(stat.st_mtime_ns)
+        cached = _get_cached_transcode_decision(
+            cache_key=cache_key,
+            size=file_size,
+            mtime_ns=file_mtime_ns,
+        )
+        if cached is not None:
+            return cached
+    except OSError:
+        cache_key = ""
 
     try:
         from app.services.media_prep_service import get_media_prep_service, TranscodeDecision
@@ -434,26 +456,112 @@ def _analyze_transcode_requirement(video_file: Optional[Path]) -> Tuple[bool, st
         decision_value = str(getattr(decision, "value", str(decision)))
 
         if decision == TranscodeDecision.DIRECT_PLAY:
-            return False, "", decision_value
+            result = (False, "", decision_value)
+            _set_cached_transcode_decision(cache_key, file_size, file_mtime_ns, result)
+            return result
         if decision == TranscodeDecision.REMUX_ONLY:
-            return True, f"容器不兼容 ({video_file.suffix})", decision_value
+            result = (True, f"容器不兼容 ({video_file.suffix})", decision_value)
+            _set_cached_transcode_decision(cache_key, file_size, file_mtime_ns, result)
+            return result
         if decision == TranscodeDecision.TRANSCODE_AUDIO:
-            return True, "音频编码不兼容", decision_value
-        return True, "视频编码不兼容", decision_value
+            result = (True, "音频编码不兼容", decision_value)
+            _set_cached_transcode_decision(cache_key, file_size, file_mtime_ns, result)
+            return result
+        result = (True, "视频编码不兼容", decision_value)
+        _set_cached_transcode_decision(cache_key, file_size, file_mtime_ns, result)
+        return result
     except Exception as exc:
         logger.warning("[media] 决策分析失败，回退扩展名/编码规则: %s", exc)
 
     suffix = video_file.suffix.lower()
     if suffix in NEED_TRANSCODE_FORMATS:
-        return True, f"格式不兼容 ({video_file.suffix})", "fallback_extension"
+        result = (True, f"格式不兼容 ({video_file.suffix})", "fallback_extension")
+        _set_cached_transcode_decision(cache_key, file_size, file_mtime_ns, result)
+        return result
     if suffix in BROWSER_COMPATIBLE_FORMATS:
         fallback_need_transcode_codecs = set(NEED_TRANSCODE_CODECS)
         if _is_electron_native_profile():
             fallback_need_transcode_codecs.difference_update({"hevc", "h265"})
         codec = _get_video_codec(video_file)
         if codec and codec in fallback_need_transcode_codecs:
-            return True, f"编码不兼容 ({codec.upper()})", "fallback_codec"
-    return False, "", "fallback_direct"
+            result = (True, f"编码不兼容 ({codec.upper()})", "fallback_codec")
+            _set_cached_transcode_decision(cache_key, file_size, file_mtime_ns, result)
+            return result
+    result = (False, "", "fallback_direct")
+    _set_cached_transcode_decision(cache_key, file_size, file_mtime_ns, result)
+    return result
+
+
+def _get_cached_transcode_decision(
+    cache_key: str,
+    size: int,
+    mtime_ns: int,
+) -> Optional[Tuple[bool, str, Optional[str]]]:
+    if not cache_key:
+        return None
+    now = time.monotonic()
+    with _transcode_cache_guard:
+        cached = _transcode_decision_cache.get(cache_key)
+        if not cached:
+            return None
+        if now - float(cached.get("cached_at", 0.0)) > _TRANSCODE_CACHE_TTL_SECONDS:
+            _transcode_decision_cache.pop(cache_key, None)
+            return None
+        if int(cached.get("size", -1)) != int(size) or int(cached.get("mtime_ns", -1)) != int(mtime_ns):
+            _transcode_decision_cache.pop(cache_key, None)
+            return None
+        result = cached.get("result")
+        if not isinstance(result, tuple) or len(result) != 3:
+            _transcode_decision_cache.pop(cache_key, None)
+            return None
+        return result  # type: ignore[return-value]
+
+
+def _set_cached_transcode_decision(
+    cache_key: str,
+    size: int,
+    mtime_ns: int,
+    result: Tuple[bool, str, Optional[str]],
+) -> None:
+    if not cache_key:
+        return
+    with _transcode_cache_guard:
+        _transcode_decision_cache[cache_key] = {
+            "cached_at": time.monotonic(),
+            "size": int(size),
+            "mtime_ns": int(mtime_ns),
+            "result": result,
+        }
+
+
+def _log_video_request(project_id: str, identifier: str, job_dir: Path) -> None:
+    """折叠同项目短时间内的重复视频请求日志，避免高频噪声掩盖异常。"""
+    now = time.monotonic()
+    suppressed = 0
+    with _video_request_log_guard:
+        previous = _video_request_log_windows.get(project_id)
+        if previous and now - previous[0] < _VIDEO_REQUEST_LOG_THROTTLE_SECONDS:
+            _video_request_log_windows[project_id] = (previous[0], previous[1] + 1)
+            return
+        if previous and previous[1] > 1:
+            suppressed = previous[1] - 1
+        _video_request_log_windows[project_id] = (now, 1)
+
+    if suppressed > 0:
+        logger.debug(
+            "[media] 收到视频请求: identifier=%s, project_id=%s, dir=%s (1s内重复请求已折叠: %s)",
+            identifier,
+            project_id,
+            job_dir,
+            suppressed,
+        )
+    else:
+        logger.debug(
+            "[media] 收到视频请求: identifier=%s, project_id=%s, dir=%s",
+            identifier,
+            project_id,
+            job_dir,
+        )
 
 
 def _is_browser_compat_profile() -> bool:
@@ -883,12 +991,7 @@ async def get_video(identifier: str, request: Request):
     project_id = media_identity.project_id
     job_dir = media_identity.project_dir
 
-    logger.debug(
-        "[media] 收到视频请求: identifier=%s, project_id=%s, dir=%s",
-        job_id,
-        project_id,
-        job_dir,
-    )
+    _log_video_request(project_id=project_id, identifier=job_id, job_dir=job_dir)
 
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")

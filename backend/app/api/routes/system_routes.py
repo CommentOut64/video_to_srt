@@ -11,6 +11,8 @@ import gc
 import signal
 import json
 import re
+import threading
+import time
 from datetime import datetime
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
@@ -19,6 +21,13 @@ from typing import Optional, List
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+_shutdown_lock = asyncio.Lock()
+_shutdown_in_progress = False
+_shutdown_termination_scheduled = False
+_shutdown_started_at: Optional[str] = None
+_shutdown_watchdog_lock = threading.Lock()
+_shutdown_watchdog_timer: Optional[threading.Timer] = None
+_shutdown_watchdog_deadline: Optional[float] = None
 
 
 # ========== 请求/响应模型 ==========
@@ -142,7 +151,26 @@ async def shutdown_system(req: ShutdownRequest):
     5. 清理临时文件（可选，保留断点数据）
     6. 终止所有相关进程和命令行窗口
     """
+    global _shutdown_in_progress, _shutdown_started_at
     cleanup_report = {}
+    is_lite_runtime = _is_lite_runtime()
+    current_shutdown_started_at = datetime.now().isoformat()
+    force_timeout_sec = _resolve_shutdown_force_timeout_sec()
+
+    async with _shutdown_lock:
+        if _shutdown_in_progress:
+            force_timeout_sec = _schedule_shutdown_watchdog("duplicate_shutdown_guard")
+            logger.info("收到重复系统关闭请求，复用进行中的关闭流程")
+            return {
+                "success": True,
+                "message": "系统关闭流程进行中",
+                "already_in_progress": True,
+                "shutdown_started_at": _shutdown_started_at,
+                "force_timeout_sec": force_timeout_sec,
+            }
+        _shutdown_in_progress = True
+        _shutdown_started_at = current_shutdown_started_at
+        force_timeout_sec = _schedule_shutdown_watchdog("shutdown_route_timeout")
 
     try:
         logger.info("=" * 60)
@@ -152,30 +180,34 @@ async def shutdown_system(req: ShutdownRequest):
         # ========== Phase 1: 保存断点数据 ==========
         logger.info("Phase 1: 保存断点数据...")
         
-        # 1.1 保存所有运行中任务的状态
-        try:
-            from app.services.job_queue_service import get_queue_service
-            queue_service = get_queue_service()
-            
-            # 获取当前运行的任务
-            running_job_id = queue_service.running_job_id
-            if running_job_id:
-                job = queue_service.get_job(running_job_id)
-                if job:
-                    # 设置暂停标志，让流水线保存 checkpoint
-                    job.paused = True
-                    job.message = "系统关闭，自动保存进度"
-                    # 保存任务元信息
-                    queue_service.transcription_service.save_job_meta(job)
-                    logger.info(f"已保存运行中任务状态: {running_job_id}")
-            
-            # 保存队列状态
-            queue_service._save_state()
-            cleanup_report["checkpoint_saved"] = True
-            logger.info("断点数据已保存")
-        except Exception as e:
-            logger.warning(f"保存断点数据失败: {e}")
-            cleanup_report["checkpoint_saved"] = False
+        # 1.1 保存所有运行中任务的状态（Lite 不加载 Full 任务队列）
+        if is_lite_runtime:
+            cleanup_report["checkpoint_saved"] = "skipped_lite"
+            logger.info("Lite 模式关闭：跳过任务断点保存")
+        else:
+            try:
+                from app.services.job_queue_service import get_queue_service
+                queue_service = get_queue_service()
+
+                # 获取当前运行的任务
+                running_job_id = queue_service.running_job_id
+                if running_job_id:
+                    job = queue_service.get_job(running_job_id)
+                    if job:
+                        # 设置暂停标志，让流水线保存 checkpoint
+                        job.paused = True
+                        job.message = "系统关闭，自动保存进度"
+                        # 保存任务元信息
+                        queue_service.transcription_service.save_job_meta(job)
+                        logger.info(f"已保存运行中任务状态: {running_job_id}")
+
+                # 保存队列状态
+                queue_service._save_state()
+                cleanup_report["checkpoint_saved"] = True
+                logger.info("断点数据已保存")
+            except Exception as e:
+                logger.warning(f"保存断点数据失败: {e}")
+                cleanup_report["checkpoint_saved"] = False
 
         # ========== Phase 2: 停止服务 ==========
         logger.info("Phase 2: 停止后台服务...")
@@ -193,16 +225,20 @@ async def shutdown_system(req: ShutdownRequest):
             logger.warning(f"停止媒体准备服务失败: {e}")
             cleanup_report["media_prep_stopped"] = False
 
-        # 2.2 停止任务队列服务
-        try:
-            from app.services.job_queue_service import get_queue_service
-            queue_service = get_queue_service()
-            queue_service.shutdown()
-            cleanup_report["queue_service_stopped"] = True
-            logger.info("任务队列服务已停止")
-        except Exception as e:
-            logger.warning(f"停止任务队列服务失败: {e}")
-            cleanup_report["queue_service_stopped"] = False
+        # 2.2 停止任务队列服务（Lite 不加载 Full 任务队列）
+        if is_lite_runtime:
+            cleanup_report["queue_service_stopped"] = "skipped_lite"
+            logger.info("Lite 模式关闭：跳过任务队列停止")
+        else:
+            try:
+                from app.services.job_queue_service import get_queue_service
+                queue_service = get_queue_service()
+                queue_service.shutdown()
+                cleanup_report["queue_service_stopped"] = True
+                logger.info("任务队列服务已停止")
+            except Exception as e:
+                logger.warning(f"停止任务队列服务失败: {e}")
+                cleanup_report["queue_service_stopped"] = False
 
         # ========== Phase 3: 终止所有 FFmpeg 进程 ==========
         logger.info("Phase 3: 终止所有FFmpeg进程...")
@@ -215,33 +251,40 @@ async def shutdown_system(req: ShutdownRequest):
         # ========== Phase 4: 清理 GPU 资源 ==========
         logger.info("Phase 4: 清理GPU资源...")
 
-        # 4.1 卸载所有模型
-        try:
-            from app.services.model_manager_v2 import get_model_manager_v2
-            model_manager = get_model_manager_v2()
-            if model_manager:
-                model_manager.unload_all()
-                cleanup_report["models_unloaded"] = True
-                logger.info("GPU模型已卸载")
-        except Exception as e:
-            logger.warning(f"卸载模型失败: {e}")
-            cleanup_report["models_unloaded"] = False
-
-        # 4.2 清理 GPU 缓存
-        try:
-            gc.collect()
+        if is_lite_runtime:
+            cleanup_report["models_unloaded"] = "skipped_lite"
+            cleanup_report["gpu_cache_cleared"] = "skipped_lite"
+            logger.info("Lite 模式关闭：跳过 GPU 资源清理")
+        else:
+            # 4.1 卸载所有模型
             try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-                    logger.info("GPU缓存已清理")
-                    cleanup_report["gpu_cache_cleared"] = True
-            except ImportError:
+                from app.services.model_manager_v2 import get_model_manager_v2
+                model_manager = get_model_manager_v2()
+                if model_manager:
+                    model_manager.unload_all()
+                    cleanup_report["models_unloaded"] = True
+                    logger.info("GPU模型已卸载")
+            except Exception as e:
+                logger.warning(f"卸载模型失败: {e}")
+                cleanup_report["models_unloaded"] = False
+
+            # 4.2 清理 GPU 缓存
+            try:
+                gc.collect()
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                        logger.info("GPU缓存已清理")
+                        cleanup_report["gpu_cache_cleared"] = True
+                    else:
+                        cleanup_report["gpu_cache_cleared"] = False
+                except ImportError:
+                    cleanup_report["gpu_cache_cleared"] = False
+            except Exception as e:
+                logger.warning(f"清理GPU缓存失败: {e}")
                 cleanup_report["gpu_cache_cleared"] = False
-        except Exception as e:
-            logger.warning(f"清理GPU缓存失败: {e}")
-            cleanup_report["gpu_cache_cleared"] = False
 
         # ========== Phase 5: 清理临时文件（可选）和日志 ==========
         # V3.1.1+dev.20260106.02: 每次关闭都清理超过7天的日志
@@ -260,7 +303,8 @@ async def shutdown_system(req: ShutdownRequest):
         response = {
             "success": True,
             "message": "系统正在关闭...",
-            "cleanup_report": cleanup_report
+            "cleanup_report": cleanup_report,
+            "force_timeout_sec": force_timeout_sec,
         }
 
         logger.info("资源清理完成，准备关闭进程")
@@ -270,11 +314,19 @@ async def shutdown_system(req: ShutdownRequest):
         logger.error(f"关闭系统失败: {str(e)}", exc_info=True)
         response = {
             "success": False,
-            "message": f"关闭系统失败: {str(e)}"
+            "message": f"关闭系统失败: {str(e)}",
+            "force_timeout_sec": force_timeout_sec,
         }
 
     # Phase 6: 异步执行进程终止（响应发送后执行）
-    asyncio.create_task(_terminate_processes())
+    should_schedule_termination = False
+    global _shutdown_termination_scheduled
+    async with _shutdown_lock:
+        if not _shutdown_termination_scheduled:
+            _shutdown_termination_scheduled = True
+            should_schedule_termination = True
+    if should_schedule_termination:
+        asyncio.create_task(_terminate_processes())
 
     return response
 
@@ -287,31 +339,50 @@ def _kill_all_ffmpeg_processes() -> int:
         int: 被终止的进程数
     """
     killed_count = 0
-    
+
     try:
         import psutil
-        
-        current_pid = os.getpid()
+
         ffmpeg_names = {'ffmpeg.exe', 'ffprobe.exe', 'ffmpeg', 'ffprobe'}
-        
-        for proc in psutil.process_iter(['pid', 'name', 'ppid']):
+        target_processes = []
+        for proc in psutil.process_iter(['pid', 'name']):
             try:
-                proc_name = proc.info['name'].lower() if proc.info['name'] else ''
-                
-                # 检查是否是 FFmpeg 相关进程
+                proc_name = (proc.info.get('name') or '').lower()
                 if proc_name in ffmpeg_names:
-                    # 终止进程
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=3)
-                    except psutil.TimeoutExpired:
-                        proc.kill()
-                    killed_count += 1
-                    logger.debug(f"已终止 FFmpeg 进程: PID={proc.info['pid']}")
-                    
+                    target_processes.append(proc)
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
-                
+
+        if not target_processes:
+            return 0
+
+        # 先批量 terminate，再统一 wait，避免逐进程串行超时累计。
+        for proc in target_processes:
+            try:
+                proc.terminate()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+
+        gone, alive = psutil.wait_procs(target_processes, timeout=2.0)
+        killed_count += len(gone)
+
+        if alive:
+            for proc in alive:
+                try:
+                    proc.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+            force_gone, still_alive = psutil.wait_procs(alive, timeout=1.0)
+            killed_count += len(force_gone)
+            for proc in still_alive:
+                logger.warning("FFmpeg 进程仍未退出: PID=%s", getattr(proc, "pid", "unknown"))
+
+        logger.debug(
+            "FFmpeg 进程清理完成: detected=%s terminated=%s",
+            len(target_processes),
+            killed_count,
+        )
+
     except ImportError:
         logger.warning("psutil 未安装，使用 taskkill 回退方案")
         # 回退方案：使用 taskkill
@@ -323,13 +394,109 @@ def _kill_all_ffmpeg_processes() -> int:
             )
             if result.returncode == 0:
                 killed_count += 1
-        except:
-            pass
-            
+        except Exception:
+            logger.warning("taskkill 终止 FFmpeg 进程失败")
+
     except Exception as e:
         logger.warning(f"终止 FFmpeg 进程失败: {e}")
         
     return killed_count
+
+
+def _is_lite_runtime() -> bool:
+    """判断当前是否 Lite 运行时，避免在关闭流程误触发 Full 依赖导入。"""
+    from app.core.config import FLAVOR, IS_LITE
+
+    if bool(IS_LITE):
+        return True
+    return str(FLAVOR).strip().lower() == "lite"
+
+
+def _resolve_shutdown_force_timeout_sec() -> int:
+    """解析关闭强制超时时间（秒）。"""
+    raw_value = str(os.getenv("ANCHORFLUX_SHUTDOWN_FORCE_TIMEOUT_SEC", "18")).strip()
+    try:
+        timeout_sec = int(raw_value)
+    except ValueError:
+        timeout_sec = 18
+    return max(8, min(120, timeout_sec))
+
+
+def _force_exit_with_best_effort(reason: str) -> None:
+    """
+    强制退出兜底。
+
+    设计取舍：
+    - 当关闭流程出现阻塞时，优先保证“进程不残留”；
+    - 该函数可被 watchdog 线程调用，必须避免抛异常。
+    """
+    try:
+        logger.error("关闭看门狗触发强制退出: reason=%s", reason)
+    except Exception:
+        pass
+
+    # 尽力先杀子进程，避免 orphan。
+    try:
+        import psutil
+
+        current_process = psutil.Process(os.getpid())
+        children = current_process.children(recursive=True)
+        for child in children:
+            try:
+                child.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+    except Exception:
+        pass
+
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(os.getpid())],
+                capture_output=True,
+                timeout=2,
+            )
+        except Exception:
+            pass
+
+    os._exit(1)
+
+
+def _schedule_shutdown_watchdog(reason: str) -> int:
+    """
+    启动关闭超时看门狗。
+
+    返回值：
+        int: 看门狗超时阈值（秒）
+    """
+    timeout_sec = _resolve_shutdown_force_timeout_sec()
+    global _shutdown_watchdog_timer, _shutdown_watchdog_deadline
+    with _shutdown_watchdog_lock:
+        if _shutdown_watchdog_timer and _shutdown_watchdog_timer.is_alive():
+            return timeout_sec
+        _shutdown_watchdog_deadline = time.time() + float(timeout_sec)
+        _shutdown_watchdog_timer = threading.Timer(
+            timeout_sec,
+            _force_exit_with_best_effort,
+            kwargs={"reason": reason},
+        )
+        _shutdown_watchdog_timer.daemon = True
+        _shutdown_watchdog_timer.start()
+    logger.warning("关闭看门狗已启动: timeout=%ss reason=%s", timeout_sec, reason)
+    return timeout_sec
+
+
+def _cancel_shutdown_watchdog() -> None:
+    """关闭看门狗（正常退出路径）。"""
+    global _shutdown_watchdog_timer, _shutdown_watchdog_deadline
+    with _shutdown_watchdog_lock:
+        if _shutdown_watchdog_timer is not None:
+            try:
+                _shutdown_watchdog_timer.cancel()
+            except Exception:
+                pass
+        _shutdown_watchdog_timer = None
+        _shutdown_watchdog_deadline = None
 
 
 def _cleanup_temp_files_safely() -> bool:
@@ -562,6 +729,7 @@ async def _terminate_processes():
     # 自我终止
     logger.info("后端进程即将退出...")
     logger.info("=" * 60)
+    _cancel_shutdown_watchdog()
 
     # 使用 os._exit 确保立即退出，不执行 cleanup handlers
     os._exit(0)
@@ -693,6 +861,28 @@ def _build_manifest_url(channel: str) -> str:
     return f"{UPDATE_MANIFEST_ROOT_URL.rstrip('/')}/{configured.lstrip('/')}"
 
 
+def _is_truthy(value: Optional[str]) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_falsy(value: Optional[str]) -> bool:
+    return str(value or "").strip().lower() in {"0", "false", "no", "off"}
+
+
+def _allow_legacy_manifest_fallback(channel: str) -> bool:
+    """
+    更新清单回退策略：
+    - 显式配置 `ANCHORFLUX_UPDATE_ALLOW_LEGACY_FALLBACK` 时按配置执行；
+    - 未配置时，Lite 默认不回退 legacy，Full 默认回退以兼容旧通道。
+    """
+    raw_toggle = os.getenv("ANCHORFLUX_UPDATE_ALLOW_LEGACY_FALLBACK", "")
+    if _is_truthy(raw_toggle):
+        return True
+    if _is_falsy(raw_toggle):
+        return False
+    return channel != "lite"
+
+
 def _parse_version_tuple(version: str) -> tuple[int, int, int]:
     """
     版本比较归一化。
@@ -754,8 +944,12 @@ async def check_update():
     """
     检查是否有新版本可用
 
-    优先读取 profile 化清单（latest-lite/latest-full），
-    404 时回退 legacy version.json，保持旧通道兼容。
+    优先读取 profile 化清单（latest-lite/latest-full）。
+
+    回退策略：
+    - Lite 默认不回退 legacy version.json（避免混用 Full/Lite 通道）；
+    - Full 默认回退 legacy；
+    - 可通过 ANCHORFLUX_UPDATE_ALLOW_LEGACY_FALLBACK 覆盖默认行为。
     """
     import urllib.error
     from app.core.config import FLAVOR
@@ -763,6 +957,7 @@ async def check_update():
     try:
         channel = _normalize_channel_from_flavor(FLAVOR)
         manifest_url = _build_manifest_url(channel)
+        current_version = str(os.getenv("ANCHORFLUX_BUILD_VERSION", CURRENT_VERSION)).strip()
         logger.info(
             "检查更新: flavor=%s channel=%s manifest=%s",
             FLAVOR,
@@ -775,6 +970,19 @@ async def check_update():
         except urllib.error.HTTPError as exc:
             if exc.code != 404:
                 raise
+            if not _allow_legacy_manifest_fallback(channel):
+                logger.info(
+                    "更新清单不存在，按通道策略跳过 legacy 回退: channel=%s manifest=%s",
+                    channel,
+                    manifest_url,
+                )
+                return CheckUpdateResponse(
+                    has_update=False,
+                    current_version=current_version,
+                    channel=channel,
+                    manifest_url=manifest_url,
+                ).dict()
+
             logger.warning("更新清单不存在，回退 legacy 通道: %s", LEGACY_VERSION_CHECK_URL)
             try:
                 data = _fetch_manifest_json(LEGACY_VERSION_CHECK_URL)
@@ -784,7 +992,7 @@ async def check_update():
                     logger.info("未找到可用更新清单")
                     return CheckUpdateResponse(
                         has_update=False,
-                        current_version=CURRENT_VERSION,
+                        current_version=current_version,
                         channel=channel,
                         manifest_url=manifest_url,
                     ).dict()
@@ -799,7 +1007,6 @@ async def check_update():
         sha256 = str(data.get("sha256") or "")
         size = _parse_int(data.get("size"), 0)
 
-        current_version = str(os.getenv("ANCHORFLUX_BUILD_VERSION", CURRENT_VERSION)).strip()
         current_tuple = _parse_version_tuple(current_version)
         latest_tuple = _parse_version_tuple(latest_version)
         has_update = bool(latest_version) and latest_tuple > current_tuple
@@ -938,6 +1145,7 @@ async def trigger_update(req: TriggerUpdateRequest):
 async def _shutdown_for_update():
     """为更新关闭后端服务"""
     await asyncio.sleep(1)  # 等待响应发送完成
+    _schedule_shutdown_watchdog("update_shutdown_timeout")
 
     logger.info("=" * 60)
     logger.info("Shutting down for update...")
@@ -953,4 +1161,5 @@ async def _shutdown_for_update():
 
     # 退出进程（Bootloader 会检测到并执行更新）
     logger.info("Backend exiting for update...")
+    _cancel_shutdown_watchdog()
     os._exit(0)
