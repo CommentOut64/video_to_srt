@@ -13,26 +13,44 @@
         @mouseenter="isEdgeHovered = true"
         @mouseleave="isEdgeHovered = false"
       >
-        <button
+        <el-popover
           v-if="!isSidebarOpen"
-          class="sidebar-edge-btn"
-          :class="{ visible: isEdgeHovered }"
-          title="展开任务侧栏"
-          @click="isSidebarOpen = true"
+          content="展开任务侧栏"
+          placement="right"
+          trigger="hover"
+          popper-class="hint-popover-compact"
+          :show-after="500"
         >
-          <el-icon><ArrowRightBold /></el-icon>
-        </button>
+          <template #reference>
+            <button
+              class="sidebar-edge-btn"
+              :class="{ visible: isEdgeHovered }"
+              @click="isSidebarOpen = true"
+            >
+              <el-icon><ArrowRightBold /></el-icon>
+            </button>
+          </template>
+        </el-popover>
       </div>
 
       <aside class="task-sidebar" :class="{ open: isSidebarOpen }">
-        <button
+        <el-popover
           v-if="isSidebarOpen"
-          class="sidebar-collapse-btn"
-          title="折叠任务侧栏"
-          @click="isSidebarOpen = false"
+          content="折叠任务侧栏"
+          placement="right"
+          trigger="hover"
+          popper-class="hint-popover-compact"
+          :show-after="500"
         >
-          <el-icon><ArrowLeftBold /></el-icon>
-        </button>
+          <template #reference>
+            <button
+              class="sidebar-collapse-btn"
+              @click="isSidebarOpen = false"
+            >
+              <el-icon><ArrowLeftBold /></el-icon>
+            </button>
+          </template>
+        </el-popover>
 
         <div class="sidebar-inner">
           <section class="sidebar-block">
@@ -222,13 +240,15 @@
     <el-dialog
       v-model="showAdvancedSettings"
       title="高级设置"
-      width="600px"
+      width="720px"
+      class="advanced-settings-dialog"
+      align-center
       :lock-scroll="false"
       :close-on-click-modal="false"
       :close-on-press-escape="true"
       @close="handleCloseAdvancedSettings"
     >
-      <AdvancedSettings v-model="advancedConfig" />
+      <AdvancedSettings v-model="advancedConfig" @open-about="showAboutDialog = true" />
       <template #footer>
         <span class="dialog-footer">
           <el-button @click="handleCancelAdvancedSettings">取消</el-button>
@@ -1017,7 +1037,7 @@ async function handleSaveAdvancedSettings() {
     })
 
     ElMessage.success('高级设置已保存')
-    showAdvancedSettings.value = false
+    // V3.2.4+dev.20260303.04: 保存后不关闭窗口，允许用户继续修改
   } catch (error) {
     console.error('保存高级设置失败:', error)
     ElMessage.error('保存高级设置失败: ' + (error.message || '未知错误'))

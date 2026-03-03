@@ -115,19 +115,28 @@
           </button>
           <!-- 右侧弹簧 + 视图切换按钮（搜索激活时显示） -->
           <div class="tw-flex-1" />
-          <button
+          <el-popover
             v-if="subtitleListRef?.isSearchActive"
-            class="tab-nav-icon-btn"
-            :title="subtitleListRef?.sortMode === 'grouped' ? '当前：分组模式（点击切换为时间线）' : '当前：时间线模式（点击切换为分组）'"
-            @click="subtitleListRef?.toggleSortMode?.()"
+            :content="subtitleListRef?.sortMode === 'grouped' ? '当前：分组模式（点击切换为时间线）' : '当前：时间线模式（点击切换为分组）'"
+            placement="top"
+            trigger="hover"
+            popper-class="hint-popover-compact"
+            :show-after="500"
           >
-            <svg v-if="subtitleListRef?.sortMode === 'grouped'" viewBox="0 0 24 24" fill="currentColor">
-              <path d="M3 15h4v-2H3v2zm0 4h4v-2H3v2zm0-8h4V9H3v2zm4-6v2h14V5H7zm0 10h14v-2H7v2zm0 4h14v-2H7v2z"/>
-            </svg>
-            <svg v-else viewBox="0 0 24 24" fill="currentColor">
-              <path d="M3 14h4v-4H3v4zm0 5h4v-4H3v4zM3 9h4V5H3v4zm5 5h13v-4H8v4zm0 5h13v-4H8v4zM8 5v4h13V5H8z"/>
-            </svg>
-          </button>
+            <template #reference>
+              <button
+                class="tab-nav-icon-btn"
+                @click="subtitleListRef?.toggleSortMode?.()"
+              >
+                <svg v-if="subtitleListRef?.sortMode === 'grouped'" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M3 15h4v-2H3v2zm0 4h4v-2H3v2zm0-8h4V9H3v2zm4-6v2h14V5H7zm0 10h14v-2H7v2zm0 4h14v-2H7v2z"/>
+                </svg>
+                <svg v-else viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M3 14h4v-4H3v4zm0 5h4v-4H3v4zM3 9h4V5H3v4zm5 5h13v-4H8v4zm0 5h13v-4H8v4zM8 5v4h13V5H8z"/>
+                </svg>
+              </button>
+            </template>
+          </el-popover>
         </div>
 
         <!-- 标签页内容 -->
@@ -189,13 +198,23 @@
           {{ errorCount }} 个问题
         </span>
         <span class="divider">|</span>
-        <button class="settings-btn" @click="showAdvancedSettings = true" title="高级设置">
-          <svg viewBox="0 0 24 24" fill="currentColor">
-            <path
-              d="M19.14,12.94c0.04-0.3,0.06-0.61,0.06-0.94c0-0.32-0.02-0.64-0.07-0.94l2.03-1.58c0.18-0.14,0.23-0.41,0.12-0.61 l-1.92-3.32c-0.12-0.22-0.37-0.29-0.59-0.22l-2.39,0.96c-0.5-0.38-1.03-0.7-1.62-0.94L14.4,2.81c-0.04-0.24-0.24-0.41-0.48-0.41 h-3.84c-0.24,0-0.43,0.17-0.47,0.41L9.25,5.35C8.66,5.59,8.12,5.92,7.63,6.29L5.24,5.33c-0.22-0.08-0.47,0-0.59,0.22L2.74,8.87 C2.62,9.08,2.66,9.34,2.86,9.48l2.03,1.58C4.84,11.36,4.8,11.69,4.8,12s0.02,0.64,0.07,0.94l-2.03,1.58 c-0.18,0.14-0.23,0.41-0.12,0.61l1.92,3.32c0.12,0.22,0.37,0.29,0.59,0.22l2.39-0.96c0.5,0.38,1.03,0.7,1.62,0.94l0.36,2.54 c0.05,0.24,0.24,0.41,0.48,0.41h3.84c0.24,0,0.44-0.17,0.47-0.41l0.36-2.54c0.59-0.24,1.13-0.56,1.62-0.94l2.39,0.96 c0.22,0.08,0.47,0,0.59-0.22l1.92-3.32c0.12-0.22,0.07-0.47-0.12-0.61L19.14,12.94z M12,15.6c-1.98,0-3.6-1.62-3.6-3.6 s1.62-3.6,3.6-3.6s3.6,1.62,3.6,3.6S13.98,15.6,12,15.6z"
-            />
-          </svg>
-        </button>
+        <el-popover
+          content="高级设置"
+          placement="top"
+          trigger="hover"
+          popper-class="hint-popover-compact"
+          :show-after="500"
+        >
+          <template #reference>
+            <button class="settings-btn" @click="showAdvancedSettings = true">
+              <svg viewBox="0 0 24 24" fill="currentColor">
+                <path
+                  d="M19.14,12.94c0.04-0.3,0.06-0.61,0.06-0.94c0-0.32-0.02-0.64-0.07-0.94l2.03-1.58c0.18-0.14,0.23-0.41,0.12-0.61 l-1.92-3.32c-0.12-0.22-0.37-0.29-0.59-0.22l-2.39,0.96c-0.5-0.38-1.03-0.7-1.62-0.94L14.4,2.81c-0.04-0.24-0.24-0.41-0.48-0.41 h-3.84c-0.24,0-0.43,0.17-0.47,0.41L9.25,5.35C8.66,5.59,8.12,5.92,7.63,6.29L5.24,5.33c-0.22-0.08-0.47,0-0.59,0.22L2.74,8.87 C2.62,9.08,2.66,9.34,2.86,9.48l2.03,1.58C4.84,11.36,4.8,11.69,4.8,12s0.02,0.64,0.07,0.94l-2.03,1.58 c-0.18,0.14-0.23,0.41-0.12,0.61l1.92,3.32c0.12,0.22,0.37,0.29,0.59,0.22l2.39-0.96c0.5,0.38,1.03,0.7,1.62,0.94l0.36,2.54 c0.05,0.24,0.24,0.41,0.48,0.41h3.84c0.24,0,0.44-0.17,0.47-0.41l0.36-2.54c0.59-0.24,1.13-0.56,1.62-0.94l2.39,0.96 c0.22,0.08,0.47,0,0.59-0.22l1.92-3.32c0.12-0.22,0.07-0.47-0.12-0.61L19.14,12.94z M12,15.6c-1.98,0-3.6-1.62-3.6-3.6 s1.62-3.6,3.6-3.6s3.6,1.62,3.6,3.6S13.98,15.6,12,15.6z"
+                />
+              </svg>
+            </button>
+          </template>
+        </el-popover>
       </div>
     </footer>
 
@@ -203,12 +222,19 @@
     <el-dialog
       v-model="showAdvancedSettings"
       title="高级设置"
-      width="600px"
+      width="720px"
+      class="advanced-settings-dialog"
+      align-center
+      :lock-scroll="false"
       :close-on-click-modal="false"
       :close-on-press-escape="true"
       @close="handleCloseAdvancedSettings"
     >
-      <AdvancedSettings v-model="advancedConfig" />
+      <AdvancedSettings
+        v-model="advancedConfig"
+        :enable-shortcut-customization="true"
+        @open-about="showAboutDialog = true"
+      />
       <template #footer>
         <span class="dialog-footer">
           <el-button @click="handleCancelAdvancedSettings">取消</el-button>
@@ -216,6 +242,9 @@
         </span>
       </template>
     </el-dialog>
+
+    <!-- V3.2.4+dev.20260303.04: 高级设置内"关于"Tab 触发 -->
+    <AboutDialog v-model="showAboutDialog" />
   </div>
 </template>
 
@@ -243,6 +272,14 @@ import { useProxyVideo } from '@/composables/useProxyVideo'
 import { useUndoRedoSync } from '@/composables'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { repairSubtitleOverlaps } from '@/utils/subtitleUtils'
+import {
+  DEFAULT_EDITOR_SHORTCUT_CONFIG,
+  detectBrowserReservedShortcutConflicts,
+  detectEditorShortcutConflicts,
+  getEditorShortcutActionLabel,
+  getEditorShortcutComboLabel,
+  normalizeEditorShortcutConfig,
+} from '@/utils/editorShortcuts'
 import { ElMessage } from 'element-plus'
 import {
   buildDefaultCapabilitySnapshot,
@@ -256,6 +293,7 @@ import VideoStage from '@/components/editor/VideoStage/index.vue'
 import SubtitleList from '@/components/editor/SubtitleList/index.vue'
 import WaveformTimeline from '@/components/editor/WaveformTimeline/index.vue'
 import AdvancedSettings from '@/components/editor/AdvancedSettings.vue'
+import AboutDialog from '@/components/AboutDialog.vue'
 
 // Props
 const rawProps = defineProps({
@@ -315,6 +353,7 @@ const loadError = ref(null)
 
 // 高级设置状态
 const showAdvancedSettings = ref(false)
+const showAboutDialog = ref(false)
 const advancedConfig = ref({
   general: {
     global_time_offset: projectStore.subtitleOffset, // 从 store 初始化
@@ -323,6 +362,7 @@ const advancedConfig = ref({
     preview_font_size: 24,
     enable_shortcuts: true,
     subtitle_follow_auto_resume: true,
+    hide_timeline_scale: false,
     merge_separator: 'space',
     merge_separator_custom: '',
   },
@@ -351,10 +391,17 @@ const advancedConfig = ref({
     gpu_id: 0,
     temp_file_policy: 'delete_on_complete',
   },
+  shortcuts: { ...DEFAULT_EDITOR_SHORTCUT_CONFIG },
   preset_id: 'default',
 })
 const SUBTITLE_FOLLOW_AUTO_RESUME_PREF_KEY = 'editor-subtitle-follow-auto-resume'
+const HIDE_TIMELINE_SCALE_PREF_KEY = 'editor-hide-timeline-scale'
+const SHORTCUT_ENABLED_PREF_KEY = 'editor-shortcuts-enabled'
+const SHORTCUT_CONFIG_PREF_KEY = 'editor-shortcuts-config'
 const subtitleFollowAutoResumeEnabled = ref(true)
+const hideTimelineScale = ref(false)
+const shortcutEnabled = ref(true)
+const shortcutConfig = ref({ ...DEFAULT_EDITOR_SHORTCUT_CONFIG })
 
 // 统一进度状态
 const progressStore = taskStore
@@ -426,6 +473,7 @@ provide('editorContext', {
   // 兼容旧注入名称，避免存量组件行为突变。
   isVideoReady: isMediaReady,
   hasVideoSource,
+  hideTimelineScale,
 })
 
 // 将 projectStore 的估算双流进度同步到统一状态，供 UI 兜底展示
@@ -2139,10 +2187,34 @@ function handleResolutionChange(resolution) {
 }
 
 function loadEditorInteractionPreferences() {
+  // 加载快捷键启用开关（仅保存后生效）
+  const savedShortcutEnabled = localStorage.getItem(SHORTCUT_ENABLED_PREF_KEY)
+  const resolvedShortcutEnabled = savedShortcutEnabled === null ? true : savedShortcutEnabled === 'true'
+  shortcutEnabled.value = resolvedShortcutEnabled
+  advancedConfig.value.general.enable_shortcuts = resolvedShortcutEnabled
+
+  // 加载快捷键映射（缺失/异常时回退默认）
+  try {
+    const savedShortcutConfig = localStorage.getItem(SHORTCUT_CONFIG_PREF_KEY)
+    const parsed = savedShortcutConfig ? JSON.parse(savedShortcutConfig) : {}
+    const normalized = normalizeEditorShortcutConfig(parsed)
+    shortcutConfig.value = normalized
+    advancedConfig.value.shortcuts = { ...normalized }
+  } catch {
+    const fallback = normalizeEditorShortcutConfig({})
+    shortcutConfig.value = fallback
+    advancedConfig.value.shortcuts = { ...fallback }
+  }
+
   const savedAutoResume = localStorage.getItem(SUBTITLE_FOLLOW_AUTO_RESUME_PREF_KEY)
   const resolved = savedAutoResume === null ? true : savedAutoResume === 'true'
   subtitleFollowAutoResumeEnabled.value = resolved
   advancedConfig.value.general.subtitle_follow_auto_resume = resolved
+
+  // 加载隐藏波形刻度设置
+  const savedHideScale = localStorage.getItem(HIDE_TIMELINE_SCALE_PREF_KEY)
+  hideTimelineScale.value = savedHideScale === 'true'
+  advancedConfig.value.general.hide_timeline_scale = hideTimelineScale.value
 
   // V3.2.4+dev.20260302.02: 加载合并分隔符设置
   try {
@@ -2182,15 +2254,48 @@ async function handleSaveAdvancedSettings() {
     }
     offset = Number(offset)
 
+    // 0. 快捷键占用校验：浏览器保留组合直接拦截
+    const browserReservedConflicts = detectBrowserReservedShortcutConflicts(advancedConfig.value.shortcuts)
+    if (browserReservedConflicts.length > 0) {
+      const firstConflict = browserReservedConflicts[0]
+      ElMessage.error(
+        `快捷键被浏览器占用：${getEditorShortcutActionLabel(firstConflict.action)} 不能使用 ${getEditorShortcutComboLabel(firstConflict.combo)}`
+      )
+      return
+    }
+
+    // 0.1 快捷键冲突校验：同一组合不可绑定多个动作
+    const normalizedShortcutConfig = normalizeEditorShortcutConfig(advancedConfig.value.shortcuts)
+    const shortcutConflicts = detectEditorShortcutConflicts(normalizedShortcutConfig)
+    if (shortcutConflicts.length > 0) {
+      const firstConflict = shortcutConflicts[0]
+      ElMessage.error(
+        `快捷键冲突：${getEditorShortcutActionLabel(firstConflict.firstAction)} 与 ${getEditorShortcutActionLabel(firstConflict.secondAction)} 都使用了 ${getEditorShortcutComboLabel(firstConflict.combo)}`
+      )
+      return
+    }
+
     // 1. 应用到前端 projectStore
     projectStore.setSubtitleOffset(offset)
 
-    // 1.1 应用并持久化”字幕手动滚动后自动恢复跟随”偏好
+    // 1.1 应用并持久化快捷键开关与映射（保存后立即生效）
+    const isShortcutOn = advancedConfig.value.general.enable_shortcuts !== false
+    shortcutEnabled.value = isShortcutOn
+    shortcutConfig.value = normalizedShortcutConfig
+    advancedConfig.value.shortcuts = { ...normalizedShortcutConfig }
+    localStorage.setItem(SHORTCUT_ENABLED_PREF_KEY, String(isShortcutOn))
+    localStorage.setItem(SHORTCUT_CONFIG_PREF_KEY, JSON.stringify(normalizedShortcutConfig))
+
+    // 1.2 应用并持久化”字幕手动滚动后自动恢复跟随”偏好
     const followAutoResume = advancedConfig.value.general.subtitle_follow_auto_resume !== false
     subtitleFollowAutoResumeEnabled.value = followAutoResume
     localStorage.setItem(SUBTITLE_FOLLOW_AUTO_RESUME_PREF_KEY, String(followAutoResume))
 
-    // 1.2 V3.2.4+dev.20260302.02: 持久化合并分隔符设置
+    // 1.3 应用并持久化”隐藏波形刻度”偏好
+    hideTimelineScale.value = advancedConfig.value.general.hide_timeline_scale === true
+    localStorage.setItem(HIDE_TIMELINE_SCALE_PREF_KEY, String(hideTimelineScale.value))
+
+    // 1.4 V3.2.4+dev.20260302.02: 持久化合并分隔符设置
     const separatorConfig = {
       type: advancedConfig.value.general.merge_separator || 'space',
       custom: advancedConfig.value.general.merge_separator_custom || ''
@@ -2203,7 +2308,7 @@ async function handleSaveAdvancedSettings() {
     }
 
     ElMessage.success('高级设置已保存')
-    showAdvancedSettings.value = false
+    // V3.2.4+dev.20260303.04: 保存后不关闭窗口，允许用户继续修改
   } catch (error) {
     console.error('[EditorView] 保存高级设置失败:', error)
     ElMessage.error('保存高级设置失败: ' + (error.message || '未知错误'))
@@ -2275,6 +2380,9 @@ useShortcuts({
   save: saveProject,
   undo,
   redo,
+}, {
+  isShortcutEnabled: shortcutEnabled,
+  shortcutConfig,
 })
 
 // ========== 生命周期 ==========
