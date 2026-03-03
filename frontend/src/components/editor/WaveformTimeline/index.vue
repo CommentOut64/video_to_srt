@@ -125,9 +125,13 @@ const editorContext = inject('editorContext', {
   isMediaReady: computed(() => true),
   isVideoReady: computed(() => true),
   hasVideoSource: computed(() => true),
+  hideTimelineScale: ref(false),
 })
 const isMediaReady = computed(
   () => editorContext.isMediaReady?.value ?? editorContext.isVideoReady?.value ?? true
+)
+const hideTimelineScale = computed(
+  () => editorContext.hideTimelineScale?.value ?? false
 )
 const hasVideoSource = computed(
   () => editorContext.hasVideoSource?.value ?? Boolean(projectStore.meta.videoPath)
@@ -150,6 +154,7 @@ const maxRetries = 3
 // WaveSurfer 实例
 const wavesurferRef = ref(null)
 const regionsPluginRef = ref(null)
+const timelinePluginRef = ref(null)
 
 // ============ Computed ============
 const audioSource = computed(() => {
@@ -420,6 +425,7 @@ const {
   handleScrollbarWheel,
   startSmartFollow,
   stopSmartFollow,
+  clearUserScrollOverride,
   cleanup: cleanupScroll,
 } = useWaveformScroll(
   wavesurferRef,
@@ -512,6 +518,7 @@ async function initWavesurfer() {
       secondaryFontColor: 'var(--af-text-muted)',
       style: { fontSize: '10px', fontFamily: 'var(--af-font-mono)' },
     })
+    timelinePluginRef.value = timelinePlugin
 
     const containerWidth = containerRef.value?.offsetWidth || 800
     const estimatedDuration = projectStore.meta.duration || 60
@@ -611,6 +618,7 @@ function setupWavesurferEvents() {
 
     nextTick(() => {
       updateScrollbarThumb()
+      applyTimelineVisibility(hideTimelineScale.value)
       const wrapper = ws.getWrapper()
       const scrollContainer = wrapper?.parentElement
       if (scrollContainer) {
@@ -649,6 +657,7 @@ function setupWavesurferEvents() {
 
         nextTick(() => {
           updateScrollbarThumb()
+          applyTimelineVisibility(hideTimelineScale.value)
           const wrapper = ws.getWrapper()
           const scrollContainer = wrapper?.parentElement
           if (scrollContainer) {
@@ -964,6 +973,8 @@ watch(
     const currentWsTime = ws.getCurrentTime()
     const timeDiff = Math.abs(currentWsTime - newTime)
     if (timeDiff > 0.1) {
+      // 时间跳变说明用户 seek，清除滚动覆盖以恢复智能跟随
+      clearUserScrollOverride()
       const wsDuration = resolveWaveformDuration(ws)
       if (wsDuration > 0) {
         const progress = Math.max(0, Math.min(1, newTime / wsDuration))
@@ -1037,6 +1048,21 @@ watch(
     applyWaveformMediaState()
   }
 )
+
+// 波形刻度显隐控制
+function applyTimelineVisibility(hidden) {
+  const plugin = timelinePluginRef.value
+  if (!plugin) return
+  // timelineWrapper 是 Timeline 插件的根 DOM 元素
+  const wrapper = plugin.timelineWrapper || plugin.wrapper
+  if (wrapper) {
+    wrapper.style.display = hidden ? 'none' : ''
+  }
+}
+
+watch(hideTimelineScale, (hidden) => {
+  applyTimelineVisibility(hidden)
+})
 
 // ============ 生命周期 ============
 onMounted(async () => {
