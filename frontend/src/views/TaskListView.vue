@@ -149,7 +149,7 @@
           </section>
 
           <section class="sidebar-footer">
-            <el-button class="more-settings-btn" type="primary" plain @click="openAdvancedSettingsDialog">
+            <el-button class="more-settings-btn" @click="openAdvancedSettingsDialog">
               <el-icon><Setting /></el-icon>
               更多设置
             </el-button>
