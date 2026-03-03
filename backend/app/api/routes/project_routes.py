@@ -21,6 +21,9 @@ from app.services.subtitle_edit_store import (
     create_manual_entry,
     load_deleted_indices,
     load_edits,
+    remove_deletion,
+    remove_manual_entry,
+    restore_manual_entry,
     save_edit,
 )
 from app.services.sse_service import get_sse_manager
@@ -51,6 +54,33 @@ class SubtitleUpdateRequest(BaseModel):
     text: Optional[str] = None
     start: Optional[float] = Field(default=None, ge=0.0)
     end: Optional[float] = Field(default=None, ge=0.0)
+
+
+# V3.2.4+dev.20260303.01: undo/redo 批量同步请求模型
+
+
+class BatchSyncUpdateItem(BaseModel):
+    segment_id: str = Field(..., min_length=1)
+    text: Optional[str] = None
+    start: Optional[float] = Field(default=None, ge=0.0)
+    end: Optional[float] = Field(default=None, ge=0.0)
+
+
+class BatchSyncCreateItem(BaseModel):
+    text: str = Field(default="")
+    start: float = Field(..., ge=0.0)
+    end: float = Field(..., ge=0.0)
+    restore_segment_id: Optional[str] = Field(default=None)
+
+
+class BatchSyncDeleteItem(BaseModel):
+    segment_id: str = Field(..., min_length=1)
+
+
+class BatchSyncRequest(BaseModel):
+    updates: list[BatchSyncUpdateItem] = Field(default_factory=list)
+    creates: list[BatchSyncCreateItem] = Field(default_factory=list)
+    deletes: list[BatchSyncDeleteItem] = Field(default_factory=list)
 
 
 class ProjectSubtitleTimeOffsetRequest(BaseModel):
@@ -936,6 +966,465 @@ async def delete_project_subtitle(project_id: str, segment_id: str):
         {"segment_id": segment_id, "source": "project_api", "is_update": True},
     )
     return {"success": True, "data": {"segment_id": segment_id, "is_deleted": True}}
+
+
+# V3.2.4+dev.20260303.01: undo/redo 批量同步端点
+
+
+@router.post("/{project_id}/subtitles/batch-sync")
+async def batch_sync_project_subtitles(project_id: str, body: BatchSyncRequest):
+    """undo/redo 后端增量同步（支持 runtime 与 subtitle_doc 双路径）。"""
+    project_service = get_project_service()
+    subtitle_doc_service = get_subtitle_doc_service()
+    project_dir = project_service.get_project_dir(project_id)
+    if project_dir is None:
+        raise HTTPException(status_code=404, detail="项目不存在")
+
+    runtime_segments = _load_runtime_subtitle_segments(project_dir)
+    is_runtime = bool(runtime_segments)
+    results: dict[str, Any] = {
+        "updated": 0,
+        "created": 0,
+        "deleted": 0,
+        "created_segments": [],
+        "errors": [],
+    }
+
+    # 前置校验 end >= start
+    for item in body.updates:
+        if (
+            item.start is not None
+            and item.end is not None
+            and item.end < item.start
+        ):
+            results["errors"].append(
+                f"update: {item.segment_id} end({item.end}) < start({item.start})"
+            )
+    for item in body.creates:
+        if item.end < item.start:
+            results["errors"].append(
+                f"create: end({item.end}) < start({item.start})"
+            )
+    if results["errors"]:
+        return {"success": False, "data": results}
+
+    if is_runtime:
+        _batch_sync_runtime(project_id, project_dir, body, runtime_segments, results)
+    else:
+        _batch_sync_subtitle_doc(
+            project_id, project_dir, body, subtitle_doc_service, results
+        )
+
+    return {
+        "success": len(results["errors"]) == 0,
+        "data": results,
+    }
+
+
+def _batch_sync_runtime(
+    project_id: str,
+    project_dir: Path,
+    body: BatchSyncRequest,
+    runtime_segments: list[dict],
+    results: dict[str, Any],
+) -> None:
+    """Runtime 路径批量同步。"""
+    composed = _compose_runtime_segments_with_user_edits(project_dir, runtime_segments)
+
+    # 1. updates
+    for item in body.updates:
+        seg = _find_segment_by_segment_id(composed, item.segment_id)
+        if not seg:
+            results["errors"].append(f"update: {item.segment_id} 不存在")
+            continue
+        payload: dict[str, Any] = {}
+        if item.text is not None:
+            payload["text"] = item.text
+        if item.start is not None:
+            payload["start"] = item.start
+        if item.end is not None:
+            payload["end"] = item.end
+        if payload:
+            save_edit(
+                project_dir,
+                int(seg["legacy_index"]),
+                payload,
+                original_text=str(seg.get("text", "")),
+            )
+            results["updated"] += 1
+            composed_after = _compose_runtime_segments_with_user_edits(
+                project_dir, runtime_segments
+            )
+            updated_segment = _find_segment_by_segment_id(
+                composed_after, item.segment_id
+            )
+            if updated_segment is not None:
+                _publish_project_subtitle_event(
+                    project_id,
+                    "edited",
+                    {
+                        "segment_id": item.segment_id,
+                        "segment": updated_segment,
+                        "source": "project_api",
+                        "is_update": True,
+                    },
+                )
+
+    # 2. deletes
+    for item in body.deletes:
+        seg = _find_segment_by_segment_id(composed, item.segment_id)
+        if not seg:
+            results["errors"].append(f"delete: {item.segment_id} 不存在")
+            continue
+        idx = int(seg["legacy_index"])
+        if idx < 0:
+            remove_manual_entry(project_dir, idx)
+        else:
+            add_deletion(project_dir, idx)
+        results["deleted"] += 1
+        _publish_project_subtitle_event(
+            project_id,
+            "deleted",
+            {
+                "segment_id": item.segment_id,
+                "source": "project_api",
+                "is_update": True,
+            },
+        )
+
+    # 3. creates
+    for item in body.creates:
+        if item.restore_segment_id:
+            _handle_runtime_restore(
+                project_id, project_dir, item, runtime_segments, results
+            )
+        else:
+            new_index, entry = create_manual_entry(
+                project_dir, item.text or "", float(item.start), float(item.end)
+            )
+            segment_id = _manual_segment_id(new_index)
+            segment = {
+                "segment_id": segment_id,
+                "sentence_uid": None,
+                "chunk_uid": "chunk:manual",
+                "text": str(entry.get("text", item.text or "")),
+                "start": float(entry.get("start", float(item.start))),
+                "end": float(entry.get("end", float(item.end))),
+                "legacy_index": int(new_index),
+                "source_type": "manual",
+                "is_modified": True,
+                "original_text": entry.get("original_text"),
+            }
+            results["created_segments"].append({
+                "segment_id": segment_id,
+                "legacy_index": new_index,
+                "text": segment["text"],
+                "start": segment["start"],
+                "end": segment["end"],
+            })
+            results["created"] += 1
+            _publish_project_subtitle_event(
+                project_id,
+                "added",
+                {"segment": segment, "source": "project_api", "is_update": True},
+            )
+
+
+def _handle_runtime_restore(
+    project_id: str,
+    project_dir: Path,
+    item: BatchSyncCreateItem,
+    runtime_segments: list[dict],
+    results: dict[str, Any],
+) -> None:
+    """Runtime 路径恢复已删除字幕。"""
+    seg_id = item.restore_segment_id
+    if not seg_id:
+        return
+
+    # 区分正索引（runtime 基线）与负索引（手动新增）
+    if seg_id.startswith("manual-"):
+        try:
+            original_index = -int(seg_id.split("-", 1)[1])
+        except (ValueError, IndexError):
+            results["errors"].append(f"restore: {seg_id} 索引解析失败")
+            return
+        ok = restore_manual_entry(
+            project_dir, original_index, item.text or "", float(item.start), float(item.end)
+        )
+        if ok:
+            segment = {
+                "segment_id": seg_id,
+                "sentence_uid": None,
+                "chunk_uid": "chunk:manual",
+                "text": str(item.text or ""),
+                "start": float(item.start),
+                "end": float(item.end),
+                "legacy_index": int(original_index),
+                "source_type": "manual",
+                "is_modified": True,
+                "original_text": None,
+            }
+            results["created_segments"].append({
+                "segment_id": seg_id,
+                "legacy_index": original_index,
+                "text": segment["text"],
+                "start": segment["start"],
+                "end": segment["end"],
+            })
+            results["created"] += 1
+            _publish_project_subtitle_event(
+                project_id,
+                "added",
+                {"segment": segment, "source": "project_api", "is_update": True},
+            )
+        else:
+            results["errors"].append(f"restore: {seg_id} 手动字幕恢复失败")
+    else:
+        target = _find_segment_by_segment_id(runtime_segments, seg_id)
+        if not target:
+            results["errors"].append(f"restore: {seg_id} 未找到")
+            return
+        idx = int(target["legacy_index"])
+        remove_deletion(project_dir, idx)
+        # 如果内容有变，补存编辑
+        delta: dict[str, Any] = {}
+        if item.text and item.text != str(target.get("text", "")):
+            delta["text"] = item.text
+        if item.start is not None and abs(item.start - float(target.get("start", 0))) > 0.001:
+            delta["start"] = item.start
+        if item.end is not None and abs(item.end - float(target.get("end", 0))) > 0.001:
+            delta["end"] = item.end
+        if delta:
+            save_edit(project_dir, idx, delta)
+        composed_after = _compose_runtime_segments_with_user_edits(
+            project_dir, runtime_segments
+        )
+        restored_segment = _find_segment_by_segment_id(composed_after, seg_id)
+        restored_text = (
+            str(restored_segment.get("text", ""))
+            if restored_segment is not None
+            else str(item.text or target.get("text", ""))
+        )
+        restored_start = (
+            float(restored_segment.get("start", 0.0))
+            if restored_segment is not None
+            else float(item.start if item.start is not None else target.get("start", 0.0))
+        )
+        restored_end = (
+            float(restored_segment.get("end", restored_start))
+            if restored_segment is not None
+            else float(item.end if item.end is not None else target.get("end", restored_start))
+        )
+        results["created_segments"].append({
+            "segment_id": seg_id,
+            "legacy_index": idx,
+            "text": restored_text,
+            "start": restored_start,
+            "end": restored_end,
+        })
+        results["created"] += 1
+        _publish_project_subtitle_event(
+            project_id,
+            "added",
+            {
+                "segment": restored_segment
+                if restored_segment is not None
+                else {
+                    "segment_id": seg_id,
+                    "legacy_index": idx,
+                    "text": restored_text,
+                    "start": restored_start,
+                    "end": restored_end,
+                    "source_type": "restored",
+                    "is_modified": True,
+                },
+                "source": "project_api",
+                "is_update": True,
+            },
+        )
+
+
+def _batch_sync_subtitle_doc(
+    project_id: str,
+    project_dir: Path,
+    body: BatchSyncRequest,
+    subtitle_doc_service: Any,
+    results: dict[str, Any],
+) -> None:
+    """Subtitle Doc 路径批量同步。"""
+    # 1. updates
+    for item in body.updates:
+        payload = {
+            k: v
+            for k, v in {"text": item.text, "start": item.start, "end": item.end}.items()
+            if v is not None
+        }
+        ok = subtitle_doc_service.update_segment(project_dir, item.segment_id, payload)
+        if ok:
+            results["updated"] += 1
+            segment = subtitle_doc_service.get_segment(project_dir, item.segment_id)
+            if segment is not None:
+                _publish_project_subtitle_event(
+                    project_id,
+                    "edited",
+                    {
+                        "segment_id": item.segment_id,
+                        "segment": segment,
+                        "source": "project_api",
+                        "is_update": True,
+                    },
+                )
+        else:
+            results["errors"].append(f"update: {item.segment_id} 不存在")
+
+    # 2. deletes
+    for item in body.deletes:
+        ok = subtitle_doc_service.delete_segment(project_dir, item.segment_id)
+        if ok:
+            results["deleted"] += 1
+            _publish_project_subtitle_event(
+                project_id,
+                "deleted",
+                {
+                    "segment_id": item.segment_id,
+                    "source": "project_api",
+                    "is_update": True,
+                },
+            )
+        else:
+            results["errors"].append(f"delete: {item.segment_id} 不存在")
+
+    # 3. creates
+    for item in body.creates:
+        if item.restore_segment_id:
+            _handle_subtitle_doc_restore(
+                project_id, project_dir, item, subtitle_doc_service, results
+            )
+        else:
+            new_seg = subtitle_doc_service.create_segment(
+                project_dir, item.text or "", float(item.start), float(item.end)
+            )
+            results["created_segments"].append({
+                "segment_id": new_seg.get("segment_id"),
+                "legacy_index": new_seg.get("legacy_index"),
+                "text": new_seg.get("text"),
+                "start": new_seg.get("start"),
+                "end": new_seg.get("end"),
+            })
+            results["created"] += 1
+            _publish_project_subtitle_event(
+                project_id,
+                "added",
+                {"segment": new_seg, "source": "project_api", "is_update": True},
+            )
+
+
+def _handle_subtitle_doc_restore(
+    project_id: str,
+    project_dir: Path,
+    item: BatchSyncCreateItem,
+    subtitle_doc_service: Any,
+    results: dict[str, Any],
+) -> None:
+    """Subtitle Doc 路径恢复已删除字幕（通过 tombstone 映射）。"""
+    seg_id = item.restore_segment_id
+    if not seg_id:
+        return
+
+    if seg_id.startswith("manual-"):
+        try:
+            original_index = -int(seg_id.split("-", 1)[1])
+        except (ValueError, IndexError):
+            results["errors"].append(f"restore: {seg_id} 索引解析失败")
+            return
+        ok = restore_manual_entry(
+            project_dir, original_index, item.text or "", float(item.start), float(item.end)
+        )
+        if ok:
+            segment = {
+                "segment_id": seg_id,
+                "legacy_index": int(original_index),
+                "text": str(item.text or ""),
+                "start": float(item.start),
+                "end": float(item.end),
+                "source_type": "manual",
+                "is_modified": True,
+                "is_deleted": False,
+            }
+            results["created_segments"].append({
+                "segment_id": seg_id,
+                "legacy_index": original_index,
+                "text": segment["text"],
+                "start": segment["start"],
+                "end": segment["end"],
+            })
+            results["created"] += 1
+            _publish_project_subtitle_event(
+                project_id,
+                "added",
+                {"segment": segment, "source": "project_api", "is_update": True},
+            )
+        else:
+            results["errors"].append(f"restore: {seg_id} 手动字幕恢复失败")
+    else:
+        # 通过 tombstone 恢复：restore_segment 查询 _deleted_segment_map
+        update: dict[str, Any] = {}
+        if item.text:
+            update["text"] = item.text
+        if item.start is not None:
+            update["start"] = item.start
+        if item.end is not None:
+            update["end"] = item.end
+        restored_index = subtitle_doc_service.restore_segment(
+            project_dir, seg_id, update or None
+        )
+        if restored_index is not None:
+            restored_segment = subtitle_doc_service.get_segment(project_dir, seg_id)
+            restored_text = (
+                str(restored_segment.get("text", ""))
+                if restored_segment is not None
+                else str(item.text or "")
+            )
+            restored_start = (
+                float(restored_segment.get("start", 0.0))
+                if restored_segment is not None
+                else float(item.start if item.start is not None else 0.0)
+            )
+            restored_end = (
+                float(restored_segment.get("end", restored_start))
+                if restored_segment is not None
+                else float(item.end if item.end is not None else restored_start)
+            )
+            results["created_segments"].append({
+                "segment_id": seg_id,
+                "legacy_index": restored_index,
+                "text": restored_text,
+                "start": restored_start,
+                "end": restored_end,
+            })
+            results["created"] += 1
+            _publish_project_subtitle_event(
+                project_id,
+                "added",
+                {
+                    "segment": restored_segment
+                    if restored_segment is not None
+                    else {
+                        "segment_id": seg_id,
+                        "legacy_index": restored_index,
+                        "text": restored_text,
+                        "start": restored_start,
+                        "end": restored_end,
+                        "source_type": "restored",
+                        "is_modified": True,
+                    },
+                    "source": "project_api",
+                    "is_update": True,
+                },
+            )
+        else:
+            results["errors"].append(f"restore: {seg_id} tombstone 中未找到")
 
 
 @router.patch("/{project_id}/subtitles/legacy/{sentence_index}")
