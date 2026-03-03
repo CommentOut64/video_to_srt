@@ -3,6 +3,7 @@
     class="subtitle-item"
     :class="itemClasses"
     @click="handleClick"
+    @contextmenu.prevent="handleItemContextMenu"
   >
     <!-- 簇颜色条（时间线模式，搜索激活时显示） -->
     <div
@@ -376,14 +377,37 @@ function resetDeleteConfirm() {
 
 // 右键菜单项配置
 const contextMenuItems = computed(() => {
-  if (!isEditing.value || props.subtitle.isDraft) {
+  if (props.subtitle.isDraft) {
     return []
   }
 
-  return [{
-    key: 'split',
-    label: '从此处切分',
-  }]
+  const items = []
+
+  // 切分（仅编辑模式）
+  if (isEditing.value) {
+    items.push({ key: 'split', label: '从此处切分' })
+  }
+
+  // 通过 id 在 store 中查找真实索引（props.index 可能来自 filteredSubtitles，与 store 索引不一致）
+  const storeIndex = projectStore.subtitles.findIndex(s => s.id === props.subtitle.id)
+
+  // 与前字幕合并：前一条存在且非草稿时显示
+  if (storeIndex > 0) {
+    const prevSubtitle = projectStore.subtitles[storeIndex - 1]
+    if (prevSubtitle && !prevSubtitle.isDraft) {
+      items.push({ key: 'merge-prev', label: '与前字幕合并' })
+    }
+  }
+
+  // 与后字幕合并：后一条存在且非草稿时显示
+  if (storeIndex >= 0 && storeIndex < projectStore.subtitles.length - 1) {
+    const nextSubtitle = projectStore.subtitles[storeIndex + 1]
+    if (nextSubtitle && !nextSubtitle.isDraft) {
+      items.push({ key: 'merge-next', label: '与后字幕合并' })
+    }
+  }
+
+  return items
 })
 
 // 编辑区域右键事件处理
@@ -410,6 +434,19 @@ function handleTextareaContextMenu(e) {
   contextMenuRef.value?.show(e.clientX, e.clientY)
 }
 
+// 字幕块右键事件处理（非编辑模式入口）
+function handleItemContextMenu(e) {
+  if (props.subtitle.isDraft) return
+  // 编辑模式下 textarea 有自己的 handler（stopPropagation），不会走到这里
+  // 这里处理非编辑模式下的右键，以及编辑模式下右键非 textarea 区域的情况
+  if (contextMenuItems.value.length === 0) return
+
+  // 阻止冒泡，防止 ContextMenu 的 document 级 contextmenu 监听器立即触发 hide()
+  e.stopPropagation()
+
+  contextMenuRef.value?.show(e.clientX, e.clientY)
+}
+
 // 右键菜单项选择处理
 async function handleContextMenuSelect(key) {
   // 重置菜单打开标志
@@ -428,8 +465,22 @@ async function handleContextMenuSelect(key) {
       isEditing.value = false
     }
   }
+
+  if (key === 'merge-prev' || key === 'merge-next') {
+    const direction = key === 'merge-prev' ? 'prev' : 'next'
+    const result = projectStore.mergeSubtitles(props.subtitle.id, direction)
+
+    if (!result.success) {
+      console.error('[SubtitleItem] 合并失败:', result.error)
+    } else {
+      await syncMergeSubtitles(result)
+      // 合并成功后退出编辑模式
+      isEditing.value = false
+    }
+  }
 }
 
+// V3.2.4+dev.20260303.01: 切分同步 — pauseHistory 仅包裹同步赋值，不包裹 await
 async function syncSplitSubtitles(result) {
   const projectId = projectStore.meta.projectId
   if (!projectId) {
@@ -450,26 +501,77 @@ async function syncSplitSubtitles(result) {
       start: projectStore.toBaseTime(leftSubtitle.start),
       end: projectStore.toBaseTime(leftSubtitle.end)
     })
-    projectStore.updateSubtitle(leftSubtitle.id, {
-      sentenceIndex: updatedLeft?.legacy_index ?? leftSubtitle.sentenceIndex,
-      segment_id: updatedLeft?.segment_id ?? leftSegmentId,
-      isModified: true,
-      source: updatedLeft?.source_type || 'split'
-    }, { isUserEdit: true })
+    projectStore.pauseHistory()
+    try {
+      projectStore.updateSubtitle(leftSubtitle.id, {
+        sentenceIndex: updatedLeft?.legacy_index ?? leftSubtitle.sentenceIndex,
+        segment_id: updatedLeft?.segment_id ?? leftSegmentId,
+        isModified: true,
+        source: updatedLeft?.source_type || 'split'
+      }, { isUserEdit: false })
+    } finally {
+      projectStore.resumeHistory()
+    }
 
     const rightData = await projectApi.createSubtitle(projectId, {
       text: rightSubtitle.text,
       start: projectStore.toBaseTime(rightSubtitle.start),
       end: projectStore.toBaseTime(rightSubtitle.end)
     })
-    projectStore.updateSubtitle(rightSubtitle.id, {
-      sentenceIndex: rightData?.legacy_index ?? rightSubtitle.sentenceIndex,
-      segment_id: rightData?.segment_id ?? rightSubtitle.segment_id,
-      isModified: true,
-      source: rightData?.source_type || 'manual'
-    }, { isUserEdit: true })
+    projectStore.pauseHistory()
+    try {
+      projectStore.updateSubtitle(rightSubtitle.id, {
+        sentenceIndex: rightData?.legacy_index ?? rightSubtitle.sentenceIndex,
+        segment_id: rightData?.segment_id ?? rightSubtitle.segment_id,
+        isModified: true,
+        source: rightData?.source_type || 'manual'
+      }, { isUserEdit: false })
+    } finally {
+      projectStore.resumeHistory()
+    }
   } catch (error) {
     console.warn('[SubtitleItem] 切分同步失败:', error)
+  }
+}
+
+// V3.2.4+dev.20260303.01: 合并同步 — pauseHistory 仅包裹同步赋值，不包裹 await
+async function syncMergeSubtitles(result) {
+  const projectId = projectStore.meta.projectId
+  if (!projectId) {
+    throw new Error('缺少 project_id，禁止走 job 字幕合并分支')
+  }
+
+  const { keptSubtitle, removedSubtitle } = result
+  if (!keptSubtitle || !removedSubtitle) return
+
+  try {
+    // 1. 更新保留的字幕（文本+时间戳）
+    if (keptSubtitle.segment_id) {
+      const updatedKept = await projectApi.updateSubtitle(projectId, keptSubtitle.segment_id, {
+        text: keptSubtitle.text,
+        start: projectStore.toBaseTime(keptSubtitle.start),
+        end: projectStore.toBaseTime(keptSubtitle.end)
+      })
+      // 仅同步赋值期间 pause，窗口极小
+      projectStore.pauseHistory()
+      try {
+        projectStore.updateSubtitle(keptSubtitle.id, {
+          sentenceIndex: updatedKept?.legacy_index ?? keptSubtitle.sentenceIndex,
+          segment_id: updatedKept?.segment_id ?? keptSubtitle.segment_id,
+          isModified: true,
+          source: updatedKept?.source_type || 'merge'
+        }, { isUserEdit: false })
+      } finally {
+        projectStore.resumeHistory()
+      }
+    }
+
+    // 2. 删除被合并的字幕
+    if (removedSubtitle.segment_id) {
+      await projectApi.deleteSubtitle(projectId, removedSubtitle.segment_id)
+    }
+  } catch (error) {
+    console.warn('[SubtitleItem] 合并同步失败:', error)
   }
 }
 

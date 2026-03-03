@@ -6,6 +6,10 @@
  */
 import { ref, computed } from 'vue'
 import { ZOOM_BASE_PX_PER_SEC } from './useWaveformZoom.js'
+import {
+  getWaveformDragDiagnosticsConfig,
+  logWaveformDragDiagnostics,
+} from './waveformDragDiagnostics.js'
 
 /**
  * 光标拖拽 Composable
@@ -45,6 +49,21 @@ export function useWaveformCursorDrag(
   let regionPointerGuardEl = null
   let previousBodyUserSelect = ''
   let previousBodyWebkitSelect = ''
+  let cursorMoveSampleCount = 0
+
+  function getDiagConfig() {
+    return getWaveformDragDiagnosticsConfig()
+  }
+
+  function logDiag(eventName, payload = {}) {
+    logWaveformDragDiagnostics(eventName, {
+      ...payload,
+      cursorPointerId,
+      regionPointerId,
+      isDraggingCursor: isDraggingCursor.value,
+      isRegionPointerDragging: isRegionPointerDragging.value,
+    })
+  }
 
   function readPlaybackValue(maybeRefValue) {
     if (
@@ -60,6 +79,25 @@ export function useWaveformCursorDrag(
   function getCurrentTimeSec() {
     const value = Number(readPlaybackValue(playbackStore.currentTime))
     return Number.isFinite(value) ? value : 0
+  }
+
+  function syncCursorDirectly(newTime) {
+    const ws = wavesurferRef.value
+    const wsDuration = Number(ws?.getDuration?.()) || 0
+    const fallbackDuration = Number(resolveEffectiveDuration?.() || 0)
+    const duration = Math.max(wsDuration, fallbackDuration)
+
+    if (ws && duration > 0 && typeof ws.seekTo === 'function') {
+      const progress = Math.max(0, Math.min(1, newTime / duration))
+      ws.seekTo(progress)
+    }
+
+    if (typeof playbackStore.updateCurrentTimeRaw === 'function') {
+      playbackStore.updateCurrentTimeRaw(newTime)
+    }
+    if (typeof playbackStore.commitCurrentTime === 'function') {
+      playbackStore.commitCurrentTime(newTime)
+    }
   }
 
   // ============ 工具函数 ============
@@ -153,8 +191,10 @@ export function useWaveformCursorDrag(
       cursorPointerId !== null &&
       e.pointerId !== cursorPointerId
     ) {
+      logDiag('cursor-pointerup-ignored', { eventPointerId: e.pointerId })
       return
     }
+    logDiag('cursor-pointerup', { eventPointerId: e?.pointerId ?? null })
     handleCursorDragEnd()
   }
 
@@ -165,8 +205,10 @@ export function useWaveformCursorDrag(
       cursorPointerId !== null &&
       e.pointerId !== cursorPointerId
     ) {
+      logDiag('cursor-pointercancel-ignored', { eventPointerId: e.pointerId })
       return
     }
+    logDiag('cursor-pointercancel', { eventPointerId: e?.pointerId ?? null })
     handleCursorDragEnd()
   }
 
@@ -182,8 +224,35 @@ export function useWaveformCursorDrag(
       }
 
       const newTime = getTimeFromClientX(e.clientX)
-      playbackManager.updateDragging(newTime)
+      const diagConfig = getDiagConfig()
+      const playbackManagerDragging =
+        typeof playbackManager?.isDragging === 'function'
+          ? playbackManager.isDragging()
+          : null
+      if (diagConfig.bypassPlaybackManagerDuringCursorDrag) {
+        syncCursorDirectly(newTime)
+      } else {
+        if (playbackManagerDragging === false) {
+          // 拖拽会话本身仍在进行中，若 PlaybackManager 状态意外丢失则就地恢复。
+          playbackManager.startDragging('waveformCursor')
+          logDiag('cursor-drag-manager-recover', {
+            eventPointerId: e.pointerId,
+            newTime,
+          })
+        }
+        playbackManager.updateDragging(newTime)
+      }
       emit('seek', newTime)
+      cursorMoveSampleCount += 1
+      if (cursorMoveSampleCount % 20 === 0) {
+        logDiag('cursor-drag-move-sample', {
+          eventPointerId: e.pointerId,
+          sample: cursorMoveSampleCount,
+          newTime,
+          bypassPlaybackManager: diagConfig.bypassPlaybackManagerDuringCursorDrag,
+          playbackManagerDragging,
+        })
+      }
     } catch (error) {
       console.error('[WaveformCursorDrag] 拖拽移动出错:', error)
       handleCursorDragEnd()
@@ -213,7 +282,13 @@ export function useWaveformCursorDrag(
       cursorPointerId = null
       detachCursorDragGuards()
 
-      playbackManager.stopDragging()
+      const diagConfig = getDiagConfig()
+      if (!diagConfig.bypassPlaybackManagerDuringCursorDrag) {
+        playbackManager.stopDragging()
+      }
+      logDiag('cursor-drag-end', {
+        bypassPlaybackManager: diagConfig.bypassPlaybackManagerDuringCursorDrag,
+      })
     } catch (error) {
       console.error('[WaveformCursorDrag] 拖拽结束出错:', error)
     }
@@ -262,8 +337,10 @@ export function useWaveformCursorDrag(
       regionPointerId !== null &&
       e.pointerId !== regionPointerId
     ) {
+      logDiag('region-pointerup-ignored', { eventPointerId: e.pointerId })
       return
     }
+    logDiag('region-pointerup', { eventPointerId: e?.pointerId ?? null })
     finalizeRegionPointerDrag()
   }
 
@@ -273,32 +350,22 @@ export function useWaveformCursorDrag(
       regionPointerId !== null &&
       e.pointerId !== regionPointerId
     ) {
+      logDiag('region-pointercancel-ignored', { eventPointerId: e.pointerId })
       return
     }
+    logDiag('region-pointercancel', { eventPointerId: e?.pointerId ?? null })
     finalizeRegionPointerDrag()
   }
 
   function finalizeRegionPointerDrag() {
     if (!isRegionPointerDragging.value) return
-
-    if (
-      regionPointerTarget &&
-      typeof regionPointerId === 'number' &&
-      typeof regionPointerTarget.releasePointerCapture === 'function'
-    ) {
-      try {
-        if (regionPointerTarget.hasPointerCapture?.(regionPointerId)) {
-          regionPointerTarget.releasePointerCapture(regionPointerId)
-        }
-      } catch (error) {
-        console.debug('[WaveformCursorDrag] 释放 Region 指针捕获失败:', error)
-      }
-    }
+    logDiag('region-drag-finalize-start')
 
     regionPointerId = null
     regionPointerTarget = null
     isRegionPointerDragging.value = false
     detachRegionDragGuards()
+    logDiag('region-drag-finalize-end')
   }
 
   function handleRegionPointerDown(e) {
@@ -315,14 +382,11 @@ export function useWaveformCursorDrag(
     regionPointerId = e.pointerId
     regionPointerTarget = regionEl
     isRegionPointerDragging.value = true
-
-    if (typeof regionEl.setPointerCapture === 'function') {
-      try {
-        regionEl.setPointerCapture(e.pointerId)
-      } catch (error) {
-        console.debug('[WaveformCursorDrag] Region 指针捕获失败:', error)
-      }
-    }
+    logDiag('region-pointerdown', {
+      eventPointerId: e.pointerId,
+      pointerType: e.pointerType,
+      part: regionEl.getAttribute('part') || '',
+    })
 
     attachRegionDragGuards()
   }
@@ -363,26 +427,42 @@ export function useWaveformCursorDrag(
     }
 
     const clickTime = getTimeFromClientX(e.clientX)
+    const diagConfig = getDiagConfig()
+    logDiag('cursor-pointerdown', {
+      eventPointerId: e.pointerId,
+      pointerType: e.pointerType,
+      canDrag,
+      clickTime,
+      mode: cursorDragMode.value,
+    })
 
     if (canDrag) {
       isDraggingCursor.value = true
+      cursorMoveSampleCount = 0
       cursorPointerId = typeof e.pointerId === 'number' ? e.pointerId : null
       cursorPointerTarget = e.currentTarget instanceof HTMLElement ? e.currentTarget : null
 
-      playbackManager.startDragging('waveformCursor')
-      playbackManager.updateDragging(clickTime)
+      if (diagConfig.bypassPlaybackManagerDuringCursorDrag) {
+        syncCursorDirectly(clickTime)
+      } else {
+        playbackManager.startDragging('waveformCursor')
+        playbackManager.updateDragging(clickTime)
+      }
       emit('seek', clickTime)
 
       if (
         cursorPointerTarget &&
         typeof cursorPointerTarget.setPointerCapture === 'function' &&
-        typeof e.pointerId === 'number'
+        typeof e.pointerId === 'number' &&
+        !diagConfig.disablePointerCapture
       ) {
         try {
           cursorPointerTarget.setPointerCapture(e.pointerId)
         } catch (error) {
           console.debug('[WaveformCursorDrag] 光标指针捕获失败:', error)
         }
+      } else if (diagConfig.disablePointerCapture) {
+        logDiag('cursor-pointercapture-skipped')
       }
 
       attachCursorDragGuards()

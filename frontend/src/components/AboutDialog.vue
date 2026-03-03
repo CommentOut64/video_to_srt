@@ -3,6 +3,7 @@
     v-model="visible"
     title="关于"
     width="320px"
+    :lock-scroll="false"
     :close-on-click-modal="true"
     :close-on-press-escape="true"
     class="about-dialog"

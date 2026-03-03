@@ -6,6 +6,10 @@
  */
 import { ref } from 'vue'
 import { detectOverlappingSubtitles, OVERLAP_COLORS } from '@/utils/subtitleUtils'
+import {
+  getWaveformDragDiagnosticsConfig,
+  logWaveformDragDiagnostics,
+} from './waveformDragDiagnostics.js'
 
 /**
  * 简单防抖工具
@@ -48,6 +52,12 @@ export function useWaveformRegions(
 
   // ============ 私有状态 ============
   let regionUpdateTimer = null
+  let pendingRegionCommitTimer = null
+  const pendingRegionCommits = new Map()
+
+  function logDiag(eventName, payload = {}) {
+    logWaveformDragDiagnostics(eventName, payload)
+  }
 
   function resolveMaybeRefValue(valueOrRef) {
     if (valueOrRef && typeof valueOrRef === 'object' && 'value' in valueOrRef) {
@@ -64,12 +74,135 @@ export function useWaveformRegions(
     subtitleDocumentStore.setSelectedSubtitleId(subtitleId)
   }
 
+  function resolveRegionMinLength() {
+    const fallbackMinLength = 0.05
+    const rawValue = Number(props.regionMinLength)
+    if (!Number.isFinite(rawValue)) {
+      return fallbackMinLength
+    }
+    return Math.max(0, rawValue)
+  }
+
   // 节流的 Region 同步
   const debouncedRegionSync = debounce((syncKey, start, end) => {
     if (syncKey === undefined || syncKey === null) return
     if (typeof syncKey === 'number' && projectStore.isSentenceDeleted?.(syncKey)) return
     onSubtitleEdit(syncKey, { start, end })
   }, 200)
+
+  function resolveFiniteTime(rawValue, fallback = 0) {
+    const normalized = Number(rawValue)
+    return Number.isFinite(normalized) ? normalized : fallback
+  }
+
+  function scheduleFlushPendingRegionCommits(delay = 16) {
+    if (pendingRegionCommitTimer) {
+      clearTimeout(pendingRegionCommitTimer)
+    }
+    pendingRegionCommitTimer = setTimeout(() => {
+      pendingRegionCommitTimer = null
+      flushPendingRegionCommits()
+    }, delay)
+  }
+
+  function commitRegionTimeChange(regionSnapshot) {
+    const regionId = regionSnapshot?.id
+    if (!regionId) return false
+
+    const subtitle = projectStore.subtitles.find((s) => s.id === regionId)
+    if (!subtitle) return false
+
+    const nextStart = resolveFiniteTime(regionSnapshot.start, resolveFiniteTime(subtitle.start, 0))
+    const nextEnd = resolveFiniteTime(regionSnapshot.end, resolveFiniteTime(subtitle.end, nextStart))
+    const currentStart = resolveFiniteTime(subtitle.start, 0)
+    const currentEnd = resolveFiniteTime(subtitle.end, currentStart)
+    const hasTimeChanged =
+      Math.abs(currentStart - nextStart) > 0.0005 || Math.abs(currentEnd - nextEnd) > 0.0005
+
+    if (!hasTimeChanged) {
+      return false
+    }
+
+    projectStore.updateSubtitle(
+      regionId,
+      {
+        start: nextStart,
+        end: nextEnd,
+      },
+      { isUserEdit: true }
+    )
+
+    const syncKey = subtitle?.segment_id || subtitle?.sentenceIndex
+    if (syncKey !== undefined && syncKey !== null) {
+      debouncedRegionSync(syncKey, nextStart, nextEnd)
+    }
+
+    const emittedRegion = regionSnapshot.region ?? {
+      id: regionId,
+      start: nextStart,
+      end: nextEnd,
+    }
+    emit('region-update', emittedRegion)
+    logDiag('regions-emit-region-update', {
+      regionId,
+      syncKey: syncKey ?? null,
+      deferred: regionSnapshot.deferred === true,
+    })
+
+    // 拖拽结束后检测并标记重叠区域
+    checkAndMarkOverlaps()
+    return true
+  }
+
+  function queuePendingRegionCommit(region, side = null) {
+    const regionId = region?.id
+    if (!regionId) return
+
+    pendingRegionCommits.set(regionId, {
+      id: regionId,
+      start: region.start,
+      end: region.end,
+      side: side || null,
+      region,
+      deferred: true,
+    })
+
+    logDiag('regions-region-updated-deferred', {
+      regionId,
+      side: side || null,
+      start: region.start,
+      end: region.end,
+      pendingCount: pendingRegionCommits.size,
+    })
+    scheduleFlushPendingRegionCommits(16)
+  }
+
+  function flushPendingRegionCommits(options = {}) {
+    const { force = false } = options
+    if (pendingRegionCommits.size === 0) return 0
+    if (!force && isUpdatingRegions.value) {
+      scheduleFlushPendingRegionCommits(16)
+      return 0
+    }
+
+    const snapshots = Array.from(pendingRegionCommits.values())
+    pendingRegionCommits.clear()
+    let committedCount = 0
+
+    snapshots.forEach((snapshot) => {
+      if (commitRegionTimeChange(snapshot)) {
+        committedCount += 1
+      }
+    })
+
+    if (committedCount > 0) {
+      logDiag('regions-pending-commit-flushed', {
+        committedCount,
+        force,
+      })
+    }
+    return committedCount
+  }
 
   // ============ Region 事件 ============
 
@@ -80,27 +213,36 @@ export function useWaveformRegions(
     const regionsPlugin = regionsPluginRef.value
     if (!regionsPlugin) return
 
-    regionsPlugin.on('region-updated', (region) => {
-      if (isUpdatingRegions.value) return
-      projectStore.updateSubtitle(
-        region.id,
-        {
-          start: region.start,
-          end: region.end,
-        },
-        { isUserEdit: true }
-      )
+    regionsPlugin.on('region-update', (region, side) => {
+      const diagConfig = getWaveformDragDiagnosticsConfig()
+      if (!diagConfig.logRegionUpdateFlow) return
+      logDiag('regions-plugin-region-update', {
+        regionId: region.id,
+        side: side || null,
+        start: region.start,
+        end: region.end,
+      })
+    })
 
-      // 波形拖拽同步到后端（节流）
-      const subtitle = projectStore.subtitles.find((s) => s.id === region.id)
-      const syncKey = subtitle?.segment_id || subtitle?.sentenceIndex
-      if (syncKey !== undefined && syncKey !== null) {
-        debouncedRegionSync(syncKey, region.start, region.end)
+    regionsPlugin.on('region-updated', (region, side) => {
+      logDiag('regions-plugin-region-updated', {
+        regionId: region.id,
+        side: side || null,
+        start: region.start,
+        end: region.end,
+      })
+      if (isUpdatingRegions.value) {
+        queuePendingRegionCommit(region, side)
+        return
       }
-      emit('region-update', region)
-
-      // 拖拽结束后检测并标记重叠区域
-      checkAndMarkOverlaps()
+      commitRegionTimeChange({
+        id: region.id,
+        start: region.start,
+        end: region.end,
+        side: side || null,
+        region,
+        deferred: false,
+      })
     })
 
     regionsPlugin.on('region-clicked', (region, e) => {
@@ -221,78 +363,84 @@ export function useWaveformRegions(
     const overlappingIds = detectOverlappingSubtitles(projectStore.subtitles)
 
     isUpdatingRegions.value = true
+    try {
+      // 构建现有 regions 的 Map（id → region）
+      const existingRegions = new Map()
+      regionsPlugin.getRegions().forEach((region) => {
+        existingRegions.set(region.id, region)
+      })
 
-    // 构建现有 regions 的 Map（id → region）
-    const existingRegions = new Map()
-    regionsPlugin.getRegions().forEach((region) => {
-      existingRegions.set(region.id, region)
-    })
+      // 记录本次需要保留的 region IDs
+      const newSubtitleIds = new Set()
+      let addedCount = 0
+      let updatedCount = 0
 
-    // 记录本次需要保留的 region IDs
-    const newSubtitleIds = new Set()
-    let addedCount = 0
-    let updatedCount = 0
+      projectStore.subtitles.forEach((subtitle) => {
+        if (subtitle.start === undefined || subtitle.end === undefined) {
+          console.warn(`[WaveformRegions] 跳过无效字幕: id=${subtitle.id}`)
+          return
+        }
 
-    projectStore.subtitles.forEach((subtitle) => {
-      if (subtitle.start === undefined || subtitle.end === undefined) {
-        console.warn(`[WaveformRegions] 跳过无效字幕: id=${subtitle.id}`)
-        return
-      }
+        newSubtitleIds.add(subtitle.id)
+        const targetColor = computeRegionColor(subtitle, overlappingIds)
+        const existing = existingRegions.get(subtitle.id)
 
-      newSubtitleIds.add(subtitle.id)
-      const targetColor = computeRegionColor(subtitle, overlappingIds)
-      const existing = existingRegions.get(subtitle.id)
-
-      if (existing) {
-        // 已存在：检查是否需要更新
-        const needsTimeUpdate =
-          Math.abs(existing.start - subtitle.start) > 0.001 ||
-          Math.abs(existing.end - subtitle.end) > 0.001
-        // 注意：region.color 可能是 undefined，需要通过 element style 获取
-        // 简化处理：每次都更新颜色（setOptions 内部会做优化）
-        if (needsTimeUpdate) {
-          existing.setOptions({
+        if (existing) {
+          // 与 addRegion 参数保持一致，避免历史 region 遗留旧的极小宽度阈值。
+          existing.minLength = resolveRegionMinLength()
+          // 已存在：检查是否需要更新
+          const needsTimeUpdate =
+            Math.abs(existing.start - subtitle.start) > 0.001 ||
+            Math.abs(existing.end - subtitle.end) > 0.001
+          // 注意：region.color 可能是 undefined，需要通过 element style 获取
+          // 简化处理：每次都更新颜色（setOptions 内部会做优化）
+          if (needsTimeUpdate) {
+            existing.setOptions({
+              start: subtitle.start,
+              end: subtitle.end,
+              color: targetColor,
+            })
+            updatedCount++
+          } else {
+            // 仅更新颜色（选中状态变化等）
+            existing.setOptions({ color: targetColor })
+          }
+        } else {
+          // 新增：添加 region
+          regionsPlugin.addRegion({
+            id: subtitle.id,
             start: subtitle.start,
             end: subtitle.end,
             color: targetColor,
+            minLength: resolveRegionMinLength(),
+            drag: props.dragEnabled,
+            resize: props.resizeEnabled,
           })
-          updatedCount++
-        } else {
-          // 仅更新颜色（选中状态变化等）
-          existing.setOptions({ color: targetColor })
+          addedCount++
         }
-      } else {
-        // 新增：添加 region
-        regionsPlugin.addRegion({
-          id: subtitle.id,
-          start: subtitle.start,
-          end: subtitle.end,
-          color: targetColor,
-          drag: props.dragEnabled,
-          resize: props.resizeEnabled,
-        })
-        addedCount++
-      }
-    })
+      })
 
-    // 删除已不存在的 regions
-    let removedCount = 0
-    existingRegions.forEach((region, id) => {
-      if (!newSubtitleIds.has(id)) {
-        region.remove()
-        removedCount++
-      }
-    })
+      // 删除已不存在的 regions
+      let removedCount = 0
+      existingRegions.forEach((region, id) => {
+        if (!newSubtitleIds.has(id)) {
+          region.remove()
+          removedCount++
+        }
+      })
 
-    if (addedCount > 0 || updatedCount > 0 || removedCount > 0) {
-      console.log(
-        `[WaveformRegions] 增量更新: +${addedCount} 新增, ~${updatedCount} 更新, -${removedCount} 删除`
-      )
+      if (addedCount > 0 || updatedCount > 0 || removedCount > 0) {
+        console.log(
+          `[WaveformRegions] 增量更新: +${addedCount} 新增, ~${updatedCount} 更新, -${removedCount} 删除`
+        )
+      }
+    } finally {
+      // 仅保持一个微任务周期的渲染锁，避免快速拖拽时吞掉 region-updated。
+      Promise.resolve().then(() => {
+        isUpdatingRegions.value = false
+        flushPendingRegionCommits()
+      })
     }
-
-    setTimeout(() => {
-      isUpdatingRegions.value = false
-    }, 100)
   }
 
   /**
@@ -312,7 +460,10 @@ export function useWaveformRegions(
    */
   function cleanup() {
     clearTimeout(regionUpdateTimer)
+    clearTimeout(pendingRegionCommitTimer)
     regionUpdateTimer = null
+    pendingRegionCommitTimer = null
+    pendingRegionCommits.clear()
   }
 
   return {
@@ -323,6 +474,7 @@ export function useWaveformRegions(
     renderSubtitleRegions,
     checkAndMarkOverlaps,
     scheduleRegionUpdate,
+    flushPendingRegionCommits,
     // 清理
     cleanup,
   }

@@ -138,6 +138,57 @@ def add_deletion(job_dir: Path, sentence_index: int) -> None:
     _persist_state(job_dir, edits, deleted_indices, next_manual_index)
 
 
+# V3.2.4+dev.20260303.01: undo/redo 后端增量同步支持函数
+
+
+def remove_deletion(job_dir: Path, sentence_index: int) -> None:
+    """撤销删除：从 deleted_indices 中移除（仅用于正索引字幕）。"""
+    edits, deleted_indices, next_manual_index = _load_state(job_dir)
+    if sentence_index not in deleted_indices:
+        return
+    deleted_indices.discard(sentence_index)
+    _persist_state(job_dir, edits, deleted_indices, next_manual_index)
+
+
+def remove_manual_entry(job_dir: Path, sentence_index: int) -> bool:
+    """移除手动新增字幕（负索引），用于撤销新增。"""
+    if sentence_index >= 0:
+        return False
+    edits, deleted_indices, next_manual_index = _load_state(job_dir)
+    if sentence_index not in edits:
+        return False
+    del edits[sentence_index]
+    _persist_state(job_dir, edits, deleted_indices, next_manual_index)
+    return True
+
+
+def restore_manual_entry(
+    job_dir: Path,
+    sentence_index: int,
+    text: str,
+    start: float,
+    end: float,
+) -> bool:
+    """恢复已删除的手动字幕（负索引）：将数据写回 edits 并从 deleted_indices 移除。
+
+    add_deletion 对负索引会 del edits[index]，仅靠 remove_deletion
+    无法恢复丢失的数据，需要调用方提供完整内容重建。
+    """
+    if sentence_index >= 0:
+        return False
+    edits, deleted_indices, next_manual_index = _load_state(job_dir)
+    edits[sentence_index] = {
+        "text": text,
+        "start": start,
+        "end": end,
+        "source": "manual",
+        "updated_at": time.time(),
+    }
+    deleted_indices.discard(sentence_index)
+    _persist_state(job_dir, edits, deleted_indices, next_manual_index)
+    return True
+
+
 def create_manual_entry(
     job_dir: Path,
     text: str,

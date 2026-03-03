@@ -81,6 +81,7 @@ import { mediaApi } from '@/services/api'
 import ContextMenu from '@/components/editor/ContextMenu.vue'
 import WaveformHeader from './WaveformHeader.vue'
 import WaveformScrollbar from './WaveformScrollbar.vue'
+import { logWaveformDragDiagnostics } from '@/composables/waveformDragDiagnostics.js'
 import {
   useWaveformZoom,
   useWaveformScroll,
@@ -104,6 +105,7 @@ const props = defineProps({
   cursorColor: { type: String, default: '#f85149' },
   height: { type: Number, default: 128 },
   regionColor: { type: String, default: 'rgba(88, 166, 255, 0.25)' },
+  regionMinLength: { type: Number, default: 0.05 },
   dragEnabled: { type: Boolean, default: true },
   resizeEnabled: { type: Boolean, default: true },
 })
@@ -123,9 +125,13 @@ const editorContext = inject('editorContext', {
   isMediaReady: computed(() => true),
   isVideoReady: computed(() => true),
   hasVideoSource: computed(() => true),
+  hideTimelineScale: ref(false),
 })
 const isMediaReady = computed(
   () => editorContext.isMediaReady?.value ?? editorContext.isVideoReady?.value ?? true
+)
+const hideTimelineScale = computed(
+  () => editorContext.hideTimelineScale?.value ?? false
 )
 const hasVideoSource = computed(
   () => editorContext.hasVideoSource?.value ?? Boolean(projectStore.meta.videoPath)
@@ -148,6 +154,7 @@ const maxRetries = 3
 // WaveSurfer 实例
 const wavesurferRef = ref(null)
 const regionsPluginRef = ref(null)
+const timelinePluginRef = ref(null)
 
 // ============ Computed ============
 const audioSource = computed(() => {
@@ -164,6 +171,23 @@ const peaksSource = computed(() => {
 
 const currentTime = computed(() => playbackStore.currentTime)
 const duration = computed(() => projectStore.meta.duration || 0)
+
+function normalizeRegionTimeForSignature(time) {
+  const value = Number(time)
+  if (!Number.isFinite(value)) return '0.000'
+  return value.toFixed(3)
+}
+
+const regionRenderSignature = computed(() => {
+  const selectedId = subtitleDocumentStore.selectedSubtitleId ?? ''
+  const subtitlesSnapshot = projectStore.subtitles
+    .map(
+      (subtitle) =>
+        `${subtitle.id}:${normalizeRegionTimeForSignature(subtitle.start)}:${normalizeRegionTimeForSignature(subtitle.end)}`
+    )
+    .join('|')
+  return `${subtitlesSnapshot}#selected:${selectedId}#color:${props.regionColor}`
+})
 
 // 滚动条轨道 ref（从子组件获取）
 const scrollbarTrackRef = computed(() => scrollbarRef.value?.trackRef)
@@ -401,6 +425,7 @@ const {
   handleScrollbarWheel,
   startSmartFollow,
   stopSmartFollow,
+  clearUserScrollOverride,
   cleanup: cleanupScroll,
 } = useWaveformScroll(
   wavesurferRef,
@@ -441,6 +466,7 @@ const {
   isUpdatingRegions,
   setupRegionEvents,
   renderSubtitleRegions,
+  flushPendingRegionCommits,
   cleanup: cleanupRegions,
 } = useWaveformRegions(
   regionsPluginRef,
@@ -492,6 +518,7 @@ async function initWavesurfer() {
       secondaryFontColor: 'var(--af-text-muted)',
       style: { fontSize: '10px', fontFamily: 'var(--af-font-mono)' },
     })
+    timelinePluginRef.value = timelinePlugin
 
     const containerWidth = containerRef.value?.offsetWidth || 800
     const estimatedDuration = projectStore.meta.duration || 60
@@ -591,6 +618,7 @@ function setupWavesurferEvents() {
 
     nextTick(() => {
       updateScrollbarThumb()
+      applyTimelineVisibility(hideTimelineScale.value)
       const wrapper = ws.getWrapper()
       const scrollContainer = wrapper?.parentElement
       if (scrollContainer) {
@@ -629,6 +657,7 @@ function setupWavesurferEvents() {
 
         nextTick(() => {
           updateScrollbarThumb()
+          applyTimelineVisibility(hideTimelineScale.value)
           const wrapper = ws.getWrapper()
           const scrollContainer = wrapper?.parentElement
           if (scrollContainer) {
@@ -791,6 +820,29 @@ function handleWheel(e) {
 // ============ Watchers ============
 let regionUpdateTimer = null
 let lastSyncTime = 0
+let hasDeferredRegionRender = false
+
+function clearScheduledRegionRender() {
+  if (regionUpdateTimer) {
+    clearTimeout(regionUpdateTimer)
+    regionUpdateTimer = null
+  }
+}
+
+function scheduleRegionRender(delay = 80, reason = 'unknown') {
+  if (!isReady.value) return
+  clearScheduledRegionRender()
+  regionUpdateTimer = setTimeout(() => {
+    regionUpdateTimer = null
+    flushPendingRegionCommits({ force: true })
+    logWaveformDragDiagnostics('timeline-region-render-commit', {
+      reason,
+      subtitlesCount: projectStore.subtitles.length,
+    })
+    renderSubtitleRegions()
+    hasDeferredRegionRender = false
+  }, Math.max(0, delay))
+}
 
 watch(
   () => identityRef.value,
@@ -814,20 +866,62 @@ watch(
 )
 
 watch(
-  () => projectStore.subtitles,
+  () => regionRenderSignature.value,
   () => {
-    if (isReady.value && !isUpdatingRegions.value) {
-      clearTimeout(regionUpdateTimer)
-      regionUpdateTimer = setTimeout(() => renderSubtitleRegions(), 100)
-    } else if (!isReady.value) {
+    if (isRegionPointerDragging.value) {
+      clearScheduledRegionRender()
+      hasDeferredRegionRender = true
+      logWaveformDragDiagnostics('timeline-skip-render-while-region-dragging', {
+        subtitlesCount: projectStore.subtitles.length,
+        reason: 'builtin-guard',
+      })
+      return
+    }
+
+    if (!isReady.value) {
       setTimeout(() => {
         if (isReady.value && projectStore.subtitles.length > 0) {
-          renderSubtitleRegions()
+          scheduleRegionRender(0, 'late-ready')
         }
       }, 500)
+      return
     }
+
+    if (isUpdatingRegions.value) {
+      hasDeferredRegionRender = true
+      return
+    }
+
+    scheduleRegionRender(80, 'signature-change')
   },
-  { deep: true }
+  { flush: 'post' }
+)
+
+watch(
+  () => isRegionPointerDragging.value,
+  (isDragging, wasDragging) => {
+    if (isDragging) {
+      clearScheduledRegionRender()
+      hasDeferredRegionRender = true
+      return
+    }
+
+    if (!wasDragging) return
+    if (!isReady.value) return
+
+    flushPendingRegionCommits({ force: true })
+    scheduleRegionRender(0, 'drag-end-replay')
+  }
+)
+
+watch(
+  () => isUpdatingRegions.value,
+  (isUpdating, wasUpdating) => {
+    if (isUpdating || !wasUpdating) return
+    if (!hasDeferredRegionRender) return
+    if (isRegionPointerDragging.value || !isReady.value) return
+    scheduleRegionRender(0, 'regions-lock-released')
+  }
 )
 
 watch(
@@ -879,19 +973,14 @@ watch(
     const currentWsTime = ws.getCurrentTime()
     const timeDiff = Math.abs(currentWsTime - newTime)
     if (timeDiff > 0.1) {
+      // 时间跳变说明用户 seek，清除滚动覆盖以恢复智能跟随
+      clearUserScrollOverride()
       const wsDuration = resolveWaveformDuration(ws)
       if (wsDuration > 0) {
         const progress = Math.max(0, Math.min(1, newTime / wsDuration))
         ws.seekTo(progress)
       }
     }
-  }
-)
-
-watch(
-  () => subtitleDocumentStore.selectedSubtitleId,
-  () => {
-    if (isReady.value) renderSubtitleRegions()
   }
 )
 
@@ -960,6 +1049,21 @@ watch(
   }
 )
 
+// 波形刻度显隐控制
+function applyTimelineVisibility(hidden) {
+  const plugin = timelinePluginRef.value
+  if (!plugin) return
+  // timelineWrapper 是 Timeline 插件的根 DOM 元素
+  const wrapper = plugin.timelineWrapper || plugin.wrapper
+  if (wrapper) {
+    wrapper.style.display = hidden ? 'none' : ''
+  }
+}
+
+watch(hideTimelineScale, (hidden) => {
+  applyTimelineVisibility(hidden)
+})
+
 // ============ 生命周期 ============
 onMounted(async () => {
   await nextTick()
@@ -972,7 +1076,7 @@ onUnmounted(() => {
   containerRef.value?.removeEventListener('wheel', handleWheel)
   if (zoomRafId) cancelAnimationFrame(zoomRafId)
   stopVirtualClock()
-  clearTimeout(regionUpdateTimer)
+  clearScheduledRegionRender()
   clearTimeout(durationReloadTimer)
   stopPeaksPolling()
 

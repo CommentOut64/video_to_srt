@@ -37,6 +37,11 @@ export function useWaveformScroll(
   let pendingScrollEvent = null
   let followRafId = null
 
+  // 用户滚动覆盖：播放期间用户主动滚动时暂停跟随
+  let userScrollOverride = false
+  let userScrollTimeoutId = null
+  const USER_SCROLL_RESUME_MS = 5000
+
   function readPlaybackValue(maybeRefValue) {
     if (
       maybeRefValue &&
@@ -115,6 +120,7 @@ export function useWaveformScroll(
     if (!scrollContainer) return
 
     e.preventDefault()
+    activateUserScrollOverride()
 
     // 缓存容器尺寸
     cachedScrollWidth = wrapper.scrollWidth
@@ -244,6 +250,7 @@ export function useWaveformScroll(
     if (!scrollContainer) return
 
     e.preventDefault()
+    activateUserScrollOverride()
 
     // 动态阻尼系数
     const BASE_SPEED = 2
@@ -255,12 +262,40 @@ export function useWaveformScroll(
     updateScrollbarThumb()
   }
 
+  // ============ 用户滚动覆盖 ============
+
+  /**
+   * 激活用户滚动覆盖：暂停智能跟随，超时后自动恢复
+   */
+  function activateUserScrollOverride() {
+    userScrollOverride = true
+    if (userScrollTimeoutId) clearTimeout(userScrollTimeoutId)
+    userScrollTimeoutId = setTimeout(() => {
+      userScrollOverride = false
+      userScrollTimeoutId = null
+    }, USER_SCROLL_RESUME_MS)
+  }
+
+  /**
+   * 立即清除用户滚动覆盖（seek 跳转时调用，恢复跟随）
+   */
+  function clearUserScrollOverride() {
+    userScrollOverride = false
+    if (userScrollTimeoutId) {
+      clearTimeout(userScrollTimeoutId)
+      userScrollTimeoutId = null
+    }
+  }
+
   // ============ 智能跟随方法 ============
 
   /**
    * 智能跟随滚动：90%边缘触发，翻页式滚动
+   * 用户主动滚动期间跳过，避免抢夺滚动控制权
    */
   function smartScrollFollow() {
+    if (userScrollOverride) return
+
     const ws = wavesurferRef.value
     if (!ws || !isReady.value) return
 
@@ -327,6 +362,7 @@ export function useWaveformScroll(
    */
   function cleanup() {
     stopSmartFollow()
+    clearUserScrollOverride()
     if (scrollbarRafId) {
       cancelAnimationFrame(scrollbarRafId)
       scrollbarRafId = null
@@ -346,6 +382,7 @@ export function useWaveformScroll(
     // 智能跟随方法
     startSmartFollow,
     stopSmartFollow,
+    clearUserScrollOverride,
     // 清理
     cleanup,
   }

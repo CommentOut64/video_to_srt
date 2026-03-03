@@ -64,18 +64,26 @@
         @mousedown="handleSubtitleMouseDown"
       >
         <!-- 左上角：方向切换按钮 -->
-        <button class="subtitle-control-btn direction-btn" @click.stop="toggleSubtitleDirection" title="切换方向">
-          <svg viewBox="0 0 24 24" fill="currentColor">
-            <path d="M9 4v3h5v12h3V7h5V4H9zm-6 8h3v7h3v-7h3V9H3v3z"/>
-          </svg>
-        </button>
+        <el-popover content="切换方向" placement="top" trigger="hover" popper-class="hint-popover-compact" :show-after="500">
+          <template #reference>
+            <button class="subtitle-control-btn direction-btn" @click.stop="toggleSubtitleDirection">
+              <svg viewBox="0 0 24 24" fill="currentColor">
+                <path d="M9 4v3h5v12h3V7h5V4H9zm-6 8h3v7h3v-7h3V9H3v3z"/>
+              </svg>
+            </button>
+          </template>
+        </el-popover>
 
         <!-- 右上角：重置按钮 -->
-        <button class="subtitle-control-btn reset-btn" @click.stop="resetSubtitlePosition" title="重置位置">
-          <svg viewBox="0 0 24 24" fill="currentColor">
-            <path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/>
-          </svg>
-        </button>
+        <el-popover content="重置位置" placement="top" trigger="hover" popper-class="hint-popover-compact" :show-after="500">
+          <template #reference>
+            <button class="subtitle-control-btn reset-btn" @click.stop="resetSubtitlePosition">
+              <svg viewBox="0 0 24 24" fill="currentColor">
+                <path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/>
+              </svg>
+            </button>
+          </template>
+        </el-popover>
 
         <span class="subtitle-text">{{ currentSubtitleText }}</span>
       </div>

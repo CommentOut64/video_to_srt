@@ -7,145 +7,241 @@
         :key="tab.id"
         class="tab-btn"
         :class="{ active: activeTab === tab.id }"
-        @click="activeTab = tab.id"
+        @click="handleTabClick(tab.id)"
       >
         {{ tab.label }}
       </button>
     </div>
 
-    <!-- 分组零: 常规设置 -->
+    <!-- V3.2.4+dev.20260303.03: 常规设置分组重构 -->
     <div v-show="activeTab === 'general'" class="settings-panel">
-      <div class="panel-header">
-        <span class="panel-title">常规设置</span>
-      </div>
 
-      <!-- 全局时间偏移 -->
-      <div class="setting-row">
-        <div class="setting-label">
-          <span class="label-text">全局时间偏移</span>
-          <span class="label-hint">global_time_offset (秒)</span>
+      <!-- 字幕组 -->
+      <div class="setting-group">
+        <div class="group-header">
+          <span class="group-title">字幕</span>
         </div>
-        <div class="setting-control slider-control">
-          <input
-            type="range"
-            min="-10"
-            max="10"
-            step="0.1"
-            v-model.number="localConfig.general.global_time_offset"
-            @change="emitChange"
-          />
-          <span class="slider-value">{{ Number(localConfig.general.global_time_offset || 0).toFixed(1) }}s</span>
-        </div>
-      </div>
 
-      <!-- 精确时间偏移输入 -->
-      <div class="setting-row">
-        <div class="setting-label">
-          <span class="label-text">精确偏移值</span>
-          <span class="label-hint">输入精确数值（秒）</span>
+        <!-- 全局时间偏移 -->
+        <div class="setting-row">
+          <div class="setting-label">
+            <span class="label-text">全局时间偏移</span>
+            <span class="label-hint">调整所有字幕的时间偏移（秒）</span>
+          </div>
+          <div class="setting-control">
+            <el-input-number
+              v-model="localConfig.general.global_time_offset"
+              :step="0.01"
+              :precision="2"
+              :controls="false"
+              @change="emitChange"
+              size="small"
+            />
+          </div>
         </div>
-        <div class="setting-control">
-          <input
-            type="number"
-            step="0.01"
-            v-model="localConfig.general.global_time_offset"
-            @input="emitChange"
-            placeholder="0.00"
-          />
-        </div>
-      </div>
 
-      <!-- 字幕显示时长调整 -->
-      <div class="setting-row">
-        <div class="setting-label">
-          <span class="label-text">字幕显示时长调整</span>
-          <span class="label-hint">duration_adjust (秒)</span>
-        </div>
-        <div class="setting-control slider-control">
-          <input
-            type="range"
-            min="-2"
-            max="2"
-            step="0.1"
-            v-model.number="localConfig.general.duration_adjust"
-            @change="emitChange"
-          />
-          <span class="slider-value">{{ localConfig.general.duration_adjust >= 0 ? '+' : '' }}{{ localConfig.general.duration_adjust.toFixed(1) }}s</span>
+        <!-- 全局时长调整 -->
+        <div class="setting-row">
+          <div class="setting-label">
+            <span class="label-text">全局时长调整</span>
+            <span class="label-hint">调整所有字幕的持续时间 (秒)</span>
+          </div>
+          <div class="setting-control">
+            <el-input-number
+              v-model="localConfig.general.duration_adjust"
+              :step="0.1"
+              :precision="1"
+              :controls="false"
+              @change="emitChange"
+              size="small"
+            />
+          </div>
         </div>
       </div>
 
-      <!-- 自动保存间隔 -->
-      <div class="setting-row">
-        <div class="setting-label">
-          <span class="label-text">自动保存间隔</span>
-          <span class="label-hint">auto_save_interval (秒)</span>
+      <!-- 预览组 -->
+      <div class="setting-group">
+        <div class="group-header">
+          <span class="group-title">预览</span>
         </div>
-        <div class="setting-control">
-          <select
-            v-model.number="localConfig.general.auto_save_interval"
-            @change="emitChange"
-          >
-            <option :value="0">关闭</option>
-            <option :value="30">30 秒</option>
-            <option :value="60">1 分钟</option>
-            <option :value="120">2 分钟</option>
-            <option :value="300">5 分钟</option>
-          </select>
-        </div>
-      </div>
 
-      <!-- 字幕预览字体大小 -->
-      <div class="setting-row">
-        <div class="setting-label">
-          <span class="label-text">预览字体大小</span>
-          <span class="label-hint">preview_font_size (px)</span>
-        </div>
-        <div class="setting-control slider-control">
-          <input
-            type="range"
-            min="12"
-            max="48"
-            step="1"
-            v-model.number="localConfig.general.preview_font_size"
-            @change="emitChange"
-          />
-          <span class="slider-value">{{ localConfig.general.preview_font_size }}px</span>
-        </div>
-      </div>
-
-      <!-- 快捷键启用 -->
-      <div class="setting-row">
-        <div class="setting-label">
-          <span class="label-text">启用快捷键</span>
-          <span class="label-hint">enable_shortcuts</span>
-        </div>
-        <div class="setting-control">
-          <label class="toggle-switch">
-            <input
-              type="checkbox"
-              v-model="localConfig.general.enable_shortcuts"
+        <!-- 字幕预览字体大小 -->
+        <div class="setting-row">
+          <div class="setting-label">
+            <span class="label-text">预览字体大小</span>
+          </div>
+          <div class="setting-control slider-control">
+            <el-slider
+              v-model="localConfig.general.preview_font_size"
+              :min="12"
+              :max="48"
+              :step="1"
+              :show-tooltip="false"
               @change="emitChange"
             />
-            <span class="toggle-slider"></span>
-          </label>
+            <span class="slider-value">{{ localConfig.general.preview_font_size }}px</span>
+          </div>
         </div>
       </div>
 
-      <!-- 手动滚动后自动恢复跟随 -->
-      <div class="setting-row">
-        <div class="setting-label">
-          <span class="label-text">字幕跟随自动恢复</span>
-          <span class="label-hint">subtitle_follow_auto_resume</span>
+      <!-- 界面组 -->
+      <div class="setting-group">
+        <div class="group-header">
+          <span class="group-title">界面</span>
         </div>
-        <div class="setting-control">
-          <label class="toggle-switch">
-            <input
-              type="checkbox"
+
+        <!-- 隐藏波形刻度 -->
+        <div class="setting-row">
+          <div class="setting-label">
+            <span class="label-text">隐藏波形刻度</span>
+            <span class="label-hint">隐藏波形区域顶部的刻度</span>
+          </div>
+          <div class="setting-control">
+            <el-switch
+              v-model="localConfig.general.hide_timeline_scale"
+              @change="emitChange"
+            />
+          </div>
+        </div>
+
+        <!-- 字幕跟随自动恢复 -->
+        <div class="setting-row">
+          <div class="setting-label">
+            <span class="label-text">字幕跟随自动恢复</span>
+            <span class="label-hint">开启后字幕列表会在无滚动操作后5s自动恢复跟随</span>
+          </div>
+          <div class="setting-control">
+            <el-switch
               v-model="localConfig.general.subtitle_follow_auto_resume"
               @change="emitChange"
             />
-            <span class="toggle-slider"></span>
-          </label>
+          </div>
+        </div>
+
+        <!-- 自动保存间隔 -->
+        <div class="setting-row">
+          <div class="setting-label">
+            <span class="label-text">自动保存间隔</span>
+          </div>
+          <div class="setting-control">
+            <el-select
+              v-model="localConfig.general.auto_save_interval"
+              @change="emitChange"
+              size="small"
+            >
+              <el-option :value="0" label="关闭" />
+              <el-option :value="30" label="30 秒" />
+              <el-option :value="60" label="1 分钟" />
+              <el-option :value="120" label="2 分钟" />
+              <el-option :value="300" label="5 分钟" />
+            </el-select>
+          </div>
+        </div>
+      </div>
+
+      <!-- 合并和拆分组 -->
+      <div class="setting-group">
+        <div class="group-header">
+          <span class="group-title">合并和拆分</span>
+        </div>
+
+        <!-- 字幕合并分隔符 -->
+        <div class="setting-row">
+          <div class="setting-label">
+            <span class="label-text">字幕合并分隔符</span>
+            <span class="label-hint">会在合并两条字幕时自动添加至合并处</span>
+          </div>
+          <div class="setting-control">
+            <el-select
+              v-model="localConfig.general.merge_separator"
+              @change="emitChange"
+              size="small"
+            >
+              <el-option value="space" label="空格 (默认)" />
+              <el-option value="comma-full" label="全角逗号 ，" />
+              <el-option value="comma-half" label="半角逗号 ," />
+              <el-option value="period-full" label="全角句号 。" />
+              <el-option value="period-half" label="半角句号 ." />
+              <el-option value="custom" label="自定义" />
+            </el-select>
+          </div>
+        </div>
+
+        <!-- 自定义分隔符输入（仅当选择"自定义"时显示） -->
+        <div
+          class="setting-row"
+          v-if="localConfig.general.merge_separator === 'custom'"
+        >
+          <div class="setting-label">
+            <span class="label-text">自定义分隔符</span>
+            <span class="label-hint">merge_separator_custom</span>
+          </div>
+          <div class="setting-control">
+            <el-input
+              v-model="localConfig.general.merge_separator_custom"
+              @input="emitChange"
+              placeholder="输入自定义分隔符"
+              :maxlength="10"
+              size="small"
+            />
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 分组零点五: 快捷键 -->
+    <div
+      v-if="enableShortcutCustomization"
+      v-show="activeTab === 'shortcuts'"
+      class="settings-panel"
+    >
+      <div class="panel-header">
+        <span class="panel-title">快捷键映射（编辑器）</span>
+      </div>
+      <div class="setting-row">
+        <div class="setting-label">
+          <span class="label-text">提示</span>
+          <span class="label-hint">点“录制”后按任意组合键；Esc 取消录制；浏览器保留组合会被拦截（如 Ctrl+W / Ctrl+T / F5）</span>
+        </div>
+        <div class="setting-control">
+          <el-button
+            size="small"
+            @click="resetAllShortcutsToDefault"
+          >
+            全部恢复默认
+          </el-button>
+        </div>
+      </div>
+
+      <div
+        v-for="shortcutField in editorShortcutFields"
+        :key="shortcutField.key"
+        class="setting-row"
+      >
+        <div class="setting-label">
+          <span class="label-text">{{ shortcutField.label }}</span>
+          <span class="label-hint">{{ shortcutField.key }}</span>
+        </div>
+        <div class="setting-control shortcut-control">
+          <el-input
+            :model-value="getShortcutDisplay(localConfig.shortcuts[shortcutField.key])"
+            readonly
+            size="small"
+          />
+          <el-button
+            size="small"
+            :type="recordingActionKey === shortcutField.key ? 'danger' : 'primary'"
+            @click="startShortcutRecording(shortcutField.key)"
+          >
+            {{ recordingActionKey === shortcutField.key ? '录制中...' : '录制' }}
+          </el-button>
+          <el-button
+            size="small"
+            text
+            @click="resetShortcutToDefault(shortcutField.key)"
+          >
+            恢复默认
+          </el-button>
         </div>
       </div>
     </div>
@@ -163,14 +259,15 @@
           <span class="label-hint">demucs_strategy</span>
         </div>
         <div class="setting-control">
-          <select
+          <el-select
             v-model="localConfig.preprocessing.demucs_strategy"
             @change="emitChange"
+            size="small"
           >
-            <option value="off">Off - 禁止分离</option>
-            <option value="auto">Auto - 智能分诊</option>
-            <option value="force_on">Force On - 极致分离</option>
-          </select>
+            <el-option value="off" label="Off - 禁止分离" />
+            <el-option value="auto" label="Auto - 智能分诊" />
+            <el-option value="force_on" label="Force On - 极致分离" />
+          </el-select>
         </div>
       </div>
 
@@ -184,16 +281,17 @@
           <span class="label-hint">demucs_model</span>
         </div>
         <div class="setting-control">
-          <select
+          <el-select
             v-model="localConfig.preprocessing.demucs_model"
             :disabled="localConfig.preprocessing.demucs_strategy === 'off'"
             @change="emitChange"
+            size="small"
           >
-            <option value="htdemucs">htdemucs (推荐)</option>
-            <option value="htdemucs_ft">htdemucs_ft (Fine-tuned)</option>
-            <option value="mdx_q">mdx_q (量化版)</option>
-            <option value="mdx_extra">mdx_extra (高质量)</option>
-          </select>
+            <el-option value="htdemucs" label="htdemucs (推荐)" />
+            <el-option value="htdemucs_ft" label="htdemucs_ft (Fine-tuned)" />
+            <el-option value="mdx_q" label="mdx_q (量化版)" />
+            <el-option value="mdx_extra" label="mdx_extra (高质量)" />
+          </el-select>
         </div>
       </div>
 
@@ -207,12 +305,12 @@
           <span class="label-hint">demucs_shifts (1-5)</span>
         </div>
         <div class="setting-control slider-control">
-          <input
-            type="range"
-            min="1"
-            max="5"
-            step="1"
-            v-model.number="localConfig.preprocessing.demucs_shifts"
+          <el-slider
+            v-model="localConfig.preprocessing.demucs_shifts"
+            :min="1"
+            :max="5"
+            :step="1"
+            :show-tooltip="false"
             :disabled="localConfig.preprocessing.demucs_strategy === 'off'"
             @change="emitChange"
           />
@@ -227,12 +325,12 @@
           <span class="label-hint">spectrum_threshold (0.0-1.0)</span>
         </div>
         <div class="setting-control slider-control">
-          <input
-            type="range"
-            min="0"
-            max="1"
-            step="0.05"
-            v-model.number="localConfig.preprocessing.spectrum_threshold"
+          <el-slider
+            v-model="localConfig.preprocessing.spectrum_threshold"
+            :min="0"
+            :max="1"
+            :step="0.05"
+            :show-tooltip="false"
             @change="emitChange"
           />
           <span class="slider-value">{{ localConfig.preprocessing.spectrum_threshold.toFixed(2) }}</span>
@@ -246,14 +344,10 @@
           <span class="label-hint">vad_filter</span>
         </div>
         <div class="setting-control">
-          <label class="toggle-switch">
-            <input
-              type="checkbox"
-              v-model="localConfig.preprocessing.vad_filter"
-              @change="emitChange"
-            />
-            <span class="toggle-slider"></span>
-          </label>
+          <el-switch
+            v-model="localConfig.preprocessing.vad_filter"
+            @change="emitChange"
+          />
         </div>
       </div>
     </div>
@@ -271,14 +365,15 @@
           <span class="label-hint">transcription_profile</span>
         </div>
         <div class="setting-control">
-          <select
+          <el-select
             v-model="localConfig.transcription.transcription_profile"
             @change="emitChange"
+            size="small"
           >
-            <option value="sensevoice_only">SenseVoice Only (极速)</option>
-            <option value="sv_whisper_patch">SV + Whisper 复核</option>
-            <option value="sv_whisper_dual">SV + Whisper 双流并行</option>
-          </select>
+            <el-option value="sensevoice_only" label="SenseVoice Only (极速)" />
+            <el-option value="sv_whisper_patch" label="SV + Whisper 复核" />
+            <el-option value="sv_whisper_dual" label="SV + Whisper 双流并行" />
+          </el-select>
         </div>
       </div>
 
@@ -289,13 +384,14 @@
           <span class="label-hint">sensevoice_device</span>
         </div>
         <div class="setting-control">
-          <select
+          <el-select
             v-model="localConfig.transcription.sensevoice_device"
             @change="emitChange"
+            size="small"
           >
-            <option value="auto">Auto (优先 GPU)</option>
-            <option value="cpu">强制 CPU</option>
-          </select>
+            <el-option value="auto" label="Auto (优先 GPU)" />
+            <el-option value="cpu" label="强制 CPU" />
+          </el-select>
         </div>
       </div>
 
@@ -309,16 +405,17 @@
           <span class="label-hint">whisper_model</span>
         </div>
         <div class="setting-control">
-          <select
+          <el-select
             v-model="localConfig.transcription.whisper_model"
             :disabled="localConfig.transcription.transcription_profile === 'sensevoice_only'"
             @change="emitChange"
+            size="small"
           >
-            <option value="tiny">Tiny</option>
-            <option value="small">Small</option>
-            <option value="medium">Medium (推荐)</option>
-            <option value="large-v3">Large-v3 (高精度)</option>
-          </select>
+            <el-option value="tiny" label="Tiny" />
+            <el-option value="small" label="Small" />
+            <el-option value="medium" label="Medium (推荐)" />
+            <el-option value="large-v3" label="Large-v3 (高精度)" />
+          </el-select>
         </div>
       </div>
 
@@ -332,12 +429,12 @@
           <span class="label-hint">patching_threshold (0.0-1.0)</span>
         </div>
         <div class="setting-control slider-control">
-          <input
-            type="range"
-            min="0"
-            max="1"
-            step="0.05"
-            v-model.number="localConfig.transcription.patching_threshold"
+          <el-slider
+            v-model="localConfig.transcription.patching_threshold"
+            :min="0"
+            :max="1"
+            :step="0.05"
+            :show-tooltip="false"
             :disabled="localConfig.transcription.transcription_profile !== 'sv_whisper_patch'"
             @change="emitChange"
           />
@@ -359,14 +456,15 @@
           <span class="label-hint">llm_task</span>
         </div>
         <div class="setting-control">
-          <select
+          <el-select
             v-model="localConfig.refinement.llm_task"
             @change="emitChange"
+            size="small"
           >
-            <option value="off">Off - 关闭</option>
-            <option value="proofread">Proofread - 校对</option>
-            <option value="translate">Translate - 翻译</option>
-          </select>
+            <el-option value="off" label="Off - 关闭" />
+            <el-option value="proofread" label="Proofread - 校对" />
+            <el-option value="translate" label="Translate - 翻译" />
+          </el-select>
         </div>
       </div>
 
@@ -380,14 +478,15 @@
           <span class="label-hint">llm_scope</span>
         </div>
         <div class="setting-control">
-          <select
+          <el-select
             v-model="localConfig.refinement.llm_scope"
             :disabled="localConfig.refinement.llm_task === 'off'"
             @change="emitChange"
+            size="small"
           >
-            <option value="sparse">Sparse - 稀疏模式</option>
-            <option value="global">Global - 全局模式</option>
-          </select>
+            <el-option value="sparse" label="Sparse - 稀疏模式" />
+            <el-option value="global" label="Global - 全局模式" />
+          </el-select>
         </div>
       </div>
 
@@ -401,12 +500,12 @@
           <span class="label-hint">sparse_threshold (0.0-1.0)</span>
         </div>
         <div class="setting-control slider-control">
-          <input
-            type="range"
-            min="0"
-            max="1"
-            step="0.05"
-            v-model.number="localConfig.refinement.sparse_threshold"
+          <el-slider
+            v-model="localConfig.refinement.sparse_threshold"
+            :min="0"
+            :max="1"
+            :step="0.05"
+            :show-tooltip="false"
             :disabled="localConfig.refinement.llm_task === 'off' || localConfig.refinement.llm_scope !== 'sparse'"
             @change="emitChange"
           />
@@ -424,16 +523,17 @@
           <span class="label-hint">target_language</span>
         </div>
         <div class="setting-control">
-          <select
+          <el-select
             v-model="localConfig.refinement.target_language"
             :disabled="localConfig.refinement.llm_task !== 'translate'"
             @change="emitChange"
+            size="small"
           >
-            <option value="zh">中文</option>
-            <option value="en">English</option>
-            <option value="ja">日本语</option>
-            <option value="ko">韩语</option>
-          </select>
+            <el-option value="zh" label="中文" />
+            <el-option value="en" label="English" />
+            <el-option value="ja" label="日本语" />
+            <el-option value="ko" label="韩语" />
+          </el-select>
         </div>
       </div>
 
@@ -447,14 +547,15 @@
           <span class="label-hint">llm_provider</span>
         </div>
         <div class="setting-control">
-          <select
+          <el-select
             v-model="localConfig.refinement.llm_provider"
             :disabled="localConfig.refinement.llm_task === 'off'"
             @change="emitChange"
+            size="small"
           >
-            <option value="openai_compatible">OpenAI Compatible</option>
-            <option value="local_ollama">Local Ollama</option>
-          </select>
+            <el-option value="openai_compatible" label="OpenAI Compatible" />
+            <el-option value="local_ollama" label="Local Ollama" />
+          </el-select>
         </div>
       </div>
 
@@ -468,12 +569,12 @@
           <span class="label-hint">llm_model_name</span>
         </div>
         <div class="setting-control">
-          <input
-            type="text"
+          <el-input
             v-model="localConfig.refinement.llm_model_name"
             :disabled="localConfig.refinement.llm_task === 'off'"
             @input="emitChange"
             placeholder="gpt-4o-mini"
+            size="small"
           />
         </div>
       </div>
@@ -492,14 +593,15 @@
           <span class="label-hint">concurrency_strategy</span>
         </div>
         <div class="setting-control">
-          <select
+          <el-select
             v-model="localConfig.compute.concurrency_strategy"
             @change="emitChange"
+            size="small"
           >
-            <option value="auto">Auto - 自动</option>
-            <option value="parallel">Parallel - 并行</option>
-            <option value="serial">Serial - 串行</option>
-          </select>
+            <el-option value="auto" label="Auto - 自动" />
+            <el-option value="parallel" label="Parallel - 并行" />
+            <el-option value="serial" label="Serial - 串行" />
+          </el-select>
         </div>
       </div>
 
@@ -510,12 +612,14 @@
           <span class="label-hint">gpu_id</span>
         </div>
         <div class="setting-control">
-          <input
-            type="number"
-            min="0"
-            max="7"
-            v-model.number="localConfig.compute.gpu_id"
-            @input="emitChange"
+          <el-input-number
+            v-model="localConfig.compute.gpu_id"
+            :min="0"
+            :max="7"
+            :step="1"
+            controls-position="right"
+            @change="emitChange"
+            size="small"
           />
         </div>
       </div>
@@ -527,13 +631,14 @@
           <span class="label-hint">temp_file_policy</span>
         </div>
         <div class="setting-control">
-          <select
+          <el-select
             v-model="localConfig.compute.temp_file_policy"
             @change="emitChange"
+            size="small"
           >
-            <option value="delete_on_complete">完成后删除</option>
-            <option value="keep">保留 (Debug)</option>
-          </select>
+            <el-option value="delete_on_complete" label="完成后删除" />
+            <el-option value="keep" label="保留 (Debug)" />
+          </el-select>
         </div>
       </div>
     </div>
@@ -541,28 +646,59 @@
 </template>
 
 <script setup>
-import { ref, watch } from 'vue'
+import { computed, onUnmounted, ref, watch } from 'vue'
+import {
+  buildShortcutComboFromKeyboardEvent,
+  EDITOR_SHORTCUT_FIELDS,
+  getEditorShortcutComboLabel,
+  DEFAULT_EDITOR_SHORTCUT_CONFIG,
+  normalizeEditorShortcutConfig,
+} from '@/utils/editorShortcuts'
 
 const props = defineProps({
   modelValue: {
     type: Object,
     required: true
+  },
+  enableShortcutCustomization: {
+    type: Boolean,
+    default: false
   }
 })
 
-const emit = defineEmits(['update:modelValue', 'change'])
+const emit = defineEmits(['update:modelValue', 'change', 'open-about'])
 
 /* 当前激活的 Tab */
 const activeTab = ref('general')
 
 /* Tab 定义 */
-const tabs = [
-  { id: 'general', label: '常规' },
-  { id: 'audio', label: 'Audio' },
-  { id: 'asr', label: 'ASR' },
-  { id: 'llm', label: 'LLM' },
-  { id: 'system', label: 'System' }
-]
+const tabs = computed(() => {
+  const baseTabs = [
+    { id: 'general', label: '常规' },
+    { id: 'audio', label: 'Audio' },
+    { id: 'asr', label: 'ASR' },
+    { id: 'llm', label: 'LLM' },
+    { id: 'system', label: 'System' }
+  ]
+  if (props.enableShortcutCustomization) {
+    baseTabs.push({ id: 'shortcuts', label: '快捷键' })
+  }
+  baseTabs.push({ id: 'about', label: '关于' })
+  return baseTabs
+})
+
+// V3.2.4+dev.20260303.04: 点击"关于"Tab 时 emit 事件，不切换面板
+function handleTabClick(tabId) {
+  if (tabId === 'about') {
+    emit('open-about')
+    return
+  }
+  activeTab.value = tabId
+}
+
+const enableShortcutCustomization = computed(() => props.enableShortcutCustomization)
+const editorShortcutFields = EDITOR_SHORTCUT_FIELDS
+const recordingActionKey = ref('')
 
 function normalizeConfig(config) {
   const normalized = JSON.parse(JSON.stringify(config))
@@ -572,6 +708,20 @@ function normalizeConfig(config) {
   if (normalized.general.subtitle_follow_auto_resume === undefined) {
     normalized.general.subtitle_follow_auto_resume = true
   }
+  if (normalized.general.enable_shortcuts === undefined) {
+    normalized.general.enable_shortcuts = true
+  }
+  if (normalized.general.hide_timeline_scale === undefined) {
+    normalized.general.hide_timeline_scale = false
+  }
+  // V3.2.4+dev.20260302.02: 合并分隔符默认值
+  if (!normalized.general.merge_separator) {
+    normalized.general.merge_separator = 'space'
+  }
+  if (normalized.general.merge_separator_custom === undefined) {
+    normalized.general.merge_separator_custom = ''
+  }
+  normalized.shortcuts = normalizeEditorShortcutConfig(normalized.shortcuts)
   return normalized
 }
 
@@ -588,76 +738,171 @@ function emitChange() {
   // 只有点击"保存"按钮才真正应用
 }
 
+function getShortcutDisplay(combo) {
+  return getEditorShortcutComboLabel(combo)
+}
+
+function startShortcutRecording(actionKey) {
+  if (recordingActionKey.value === actionKey) {
+    recordingActionKey.value = ''
+    return
+  }
+  recordingActionKey.value = actionKey
+}
+
+function resetShortcutToDefault(actionKey) {
+  const defaults = normalizeEditorShortcutConfig(DEFAULT_EDITOR_SHORTCUT_CONFIG)
+  localConfig.value.shortcuts[actionKey] = defaults[actionKey]
+  recordingActionKey.value = ''
+  emitChange()
+}
+
+function resetAllShortcutsToDefault() {
+  localConfig.value.shortcuts = normalizeEditorShortcutConfig(DEFAULT_EDITOR_SHORTCUT_CONFIG)
+  recordingActionKey.value = ''
+  emitChange()
+}
+
+function handleShortcutRecording(event) {
+  if (!recordingActionKey.value) return
+  event.preventDefault()
+  event.stopPropagation()
+
+  if (event.key === 'Escape') {
+    recordingActionKey.value = ''
+    return
+  }
+
+  const combo = buildShortcutComboFromKeyboardEvent(event)
+  if (!combo) return
+
+  localConfig.value.shortcuts[recordingActionKey.value] = combo
+  recordingActionKey.value = ''
+  emitChange()
+}
+
 /* 监听外部值变化 */
 watch(() => props.modelValue, (newVal) => {
   localConfig.value = normalizeConfig(newVal)
 }, { deep: true })
+
+watch(recordingActionKey, (nextValue) => {
+  if (nextValue) {
+    window.addEventListener('keydown', handleShortcutRecording, true)
+    return
+  }
+  window.removeEventListener('keydown', handleShortcutRecording, true)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('keydown', handleShortcutRecording, true)
+})
 </script>
 
 <style scoped>
+/* V3.2.4+dev.20260303.02: 全面替换原生控件为 Element Plus 组件 */
+
+/* 组件本地变量 */
 .advanced-settings {
+  --control-min-width: 180px;
+
   display: flex;
   flex-direction: column;
   gap: 12px;
 }
 
-/* Tab 页切换 */
+/* ==========================================
+   Tab 页切换 — 胶囊浮起风格
+   ========================================== */
 .settings-tabs {
   display: flex;
   gap: 4px;
-  padding: 4px;
-  background: var(--af-bg-secondary);
+  padding: 3px;
+  background: rgba(var(--af-text-on-dark-rgb), 0.04);
   border-radius: var(--af-radius-md);
 }
 
 .settings-tabs .tab-btn {
   flex: 1;
-  padding: 6px 12px;
+  padding: 7px 14px;
   background: transparent;
+  border: none;
   border-radius: var(--af-radius-sm);
   color: var(--af-text-muted);
   font-size: 11px;
   font-weight: 500;
-  transition: all var(--af-transition-fast);
+  cursor: pointer;
+  transition: all 0.2s ease;
 }
 
 .settings-tabs .tab-btn:hover {
-  background: var(--af-bg-tertiary);
   color: var(--af-text-normal);
+  background: rgba(var(--af-text-on-dark-rgb), 0.04);
 }
 
 .settings-tabs .tab-btn.active {
-  background: var(--af-bg-tertiary);
+  background: var(--af-bg-elevated);
   color: var(--af-accent-primary);
+  box-shadow:
+    0 1px 3px rgba(0, 0, 0, 0.15),
+    0 0 0 1px rgba(var(--af-text-on-dark-rgb), 0.04) inset;
 }
 
-/* 设置面板 */
+/* ==========================================
+   设置面板 — 去框，内容为主
+   ========================================== */
 .settings-panel {
-  padding: 12px;
-  background: var(--af-bg-secondary);
-  border: 1px solid var(--af-border-default);
-  border-radius: var(--af-radius-md);
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 0;
 }
 
 .settings-panel .panel-header {
-  margin-bottom: 12px;
-  padding-bottom: 8px;
-  border-bottom: 1px solid var(--af-border-default);
+  margin-bottom: 10px;
+  padding-bottom: 0;
+  border-bottom: none;
 }
 
 .settings-panel .panel-header .panel-title {
-  color: var(--af-text-normal);
-  font-size: 12px;
-  font-weight: 500;
+  color: var(--af-text-secondary);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
-/* 设置行 */
+/* ==========================================
+   设置分组 — 常规 Tab 子分组
+   ========================================== */
+.setting-group + .setting-group {
+  margin-top: 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--af-border-subtle);
+}
+
+.setting-group .group-header {
+  margin-bottom: 4px;
+}
+
+.setting-group .group-header .group-title {
+  color: var(--af-text-secondary);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* ==========================================
+   设置行 — 精细间距 + 虚线分隔
+   ========================================== */
 .setting-row {
   display: flex;
   justify-content: space-between;
   align-items: center;
   padding: 8px 0;
-  border-bottom: 1px solid var(--af-border-default);
+  border-bottom: 1px dashed var(--af-border-muted);
+  transition: opacity 0.2s ease, filter 0.2s ease;
 }
 
 .setting-row:last-child {
@@ -668,118 +913,237 @@ watch(() => props.modelValue, (newVal) => {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  flex-shrink: 0;
+  min-width: 100px;
 }
 
+/* V3.2.4+dev.20260303.02: 标题字号从 12px 增大到 13px */
 .setting-row .setting-label .label-text {
   color: var(--af-text-normal);
-  font-size: 12px;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.4;
 }
 
 .setting-row .setting-label .label-hint {
   color: var(--af-text-muted);
   font-size: 10px;
   font-family: var(--af-font-mono);
+  line-height: 1.3;
 }
 
 .setting-row .setting-control {
-  min-width: 140px;
+  min-width: var(--control-min-width);
 }
 
-.setting-row.disabled {
-  opacity: 0.5;
-  pointer-events: none;
-}
-
-.setting-row.disabled .setting-control {
-  opacity: 0.6;
-}
-
-.setting-row .setting-control select,
-.setting-row .setting-control input[type="text"],
-.setting-row .setting-control input[type="number"] {
-  width: 100%;
-  padding: 6px 10px;
-  background: var(--af-bg-tertiary);
-  border: 1px solid var(--af-border-default);
-  border-radius: var(--af-radius-sm);
-  color: var(--af-text-normal);
-  font-size: 11px;
-}
-
-.setting-row .setting-control select:focus,
-.setting-row .setting-control input[type="text"]:focus,
-.setting-row .setting-control input[type="number"]:focus {
-  border-color: var(--af-accent-primary);
-  outline: none;
-}
-
-.setting-row .setting-control select:disabled,
-.setting-row .setting-control input[type="text"]:disabled,
-.setting-row .setting-control input[type="number"]:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.setting-row .setting-control.slider-control {
+.setting-row .setting-control.shortcut-control {
   display: flex;
   align-items: center;
   gap: 8px;
 }
 
-.setting-row .setting-control.slider-control input[type="range"] {
+.setting-row .setting-control.shortcut-control :deep(.el-input) {
   flex: 1;
-  height: 4px;
-  accent-color: var(--af-accent-primary);
 }
 
+/* 禁用态 */
+.setting-row.disabled {
+  opacity: 0.4;
+  filter: grayscale(0.3);
+  pointer-events: none;
+}
+
+/* ==========================================
+   el-select 下拉框样式适配
+   原因：el-select 的内部 DOM 需要 :deep() 穿透设置尺寸和背景
+   参考：theme-chalk/src/select.scss
+   ========================================== */
+.setting-row .setting-control :deep(.el-select) {
+  width: 100%;
+}
+
+.setting-row .setting-control :deep(.el-select .el-input__wrapper) {
+  background-color: var(--af-bg-tertiary);
+  box-shadow: 0 0 0 1px var(--af-border-default) inset;
+  border-radius: var(--af-radius-sm);
+  padding: 2px 8px;
+  transition: box-shadow 0.15s ease;
+}
+
+.setting-row .setting-control :deep(.el-select .el-input__wrapper:hover) {
+  box-shadow: 0 0 0 1px var(--af-border-default) inset,
+    0 0 0 1px rgba(var(--af-accent-primary-rgb), 0.1);
+}
+
+.setting-row .setting-control :deep(.el-select .el-input.is-focus .el-input__wrapper) {
+  box-shadow: 0 0 0 1px var(--af-accent-primary) inset;
+}
+
+.setting-row .setting-control :deep(.el-select .el-input__inner) {
+  color: var(--af-text-normal);
+  font-size: 12px;
+}
+
+.setting-row .setting-control :deep(.el-select .el-input__suffix .el-icon) {
+  color: var(--af-text-muted);
+  font-size: 12px;
+}
+
+.setting-row .setting-control :deep(.el-select.is-disabled .el-input__wrapper) {
+  background-color: var(--af-bg-tertiary);
+  cursor: not-allowed;
+}
+
+/* ==========================================
+   el-slider 滑块样式适配
+   原因：el-slider 内部 DOM 需要 :deep() 穿透自定义轨道和滑块样式
+   参考：theme-chalk/src/slider.scss
+   ========================================== */
+.setting-row .setting-control.slider-control {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.setting-row .setting-control.slider-control :deep(.el-slider) {
+  flex: 1;
+}
+
+.setting-row .setting-control.slider-control :deep(.el-slider__runway) {
+  height: 4px;
+  background-color: var(--af-bg-tertiary);
+  border-radius: 2px;
+}
+
+.setting-row .setting-control.slider-control :deep(.el-slider__bar) {
+  height: 4px;
+  background-color: var(--af-accent-primary);
+  border-radius: 2px;
+}
+
+.setting-row .setting-control.slider-control :deep(.el-slider__button) {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--af-accent-primary);
+  background-color: var(--af-bg-secondary);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.setting-row .setting-control.slider-control :deep(.el-slider__button:hover) {
+  transform: scale(1.15);
+  box-shadow: 0 0 0 3px rgba(var(--af-accent-primary-rgb), 0.2);
+}
+
+.setting-row .setting-control.slider-control :deep(.el-slider.is-disabled .el-slider__bar) {
+  background-color: var(--af-text-disabled);
+}
+
+.setting-row .setting-control.slider-control :deep(.el-slider.is-disabled .el-slider__button) {
+  border-color: var(--af-text-disabled);
+}
+
+/* 滑块数值标签 */
 .setting-row .setting-control.slider-control .slider-value {
-  min-width: 36px;
+  min-width: 40px;
+  padding: 3px 6px;
+  background: var(--af-bg-tertiary);
+  border-radius: var(--af-radius-xs);
   color: var(--af-text-secondary);
   font-size: 11px;
   font-family: var(--af-font-mono);
-  text-align: right;
+  text-align: center;
+  line-height: 1.3;
 }
 
-/* Toggle 开关 */
-.toggle-switch {
-  position: relative;
-  display: inline-block;
-  width: 36px;
-  height: 20px;
+/* ==========================================
+   el-input 输入框样式适配
+   原因：el-input 内部 DOM 需要 :deep() 穿透设置背景和边框
+   参考：theme-chalk/src/input.scss
+   ========================================== */
+.setting-row .setting-control :deep(.el-input) {
+  width: 100%;
 }
 
-.toggle-switch input {
-  width: 0;
-  height: 0;
-  opacity: 0;
+.setting-row .setting-control :deep(.el-input .el-input__wrapper) {
+  background-color: var(--af-bg-tertiary);
+  box-shadow: 0 0 0 1px var(--af-border-default) inset;
+  border-radius: var(--af-radius-sm);
+  padding: 2px 8px;
+  transition: box-shadow 0.15s ease;
 }
 
-.toggle-switch .toggle-slider {
-  position: absolute;
-  inset: 0;
-  background-color: var(--af-bg-elevated);
-  border-radius: 10px;
-  transition: all var(--af-transition-fast);
-  cursor: pointer;
+.setting-row .setting-control :deep(.el-input .el-input__wrapper:hover) {
+  box-shadow: 0 0 0 1px var(--af-border-default) inset,
+    0 0 0 1px rgba(var(--af-accent-primary-rgb), 0.1);
 }
 
-.toggle-switch .toggle-slider::before {
-  position: absolute;
-  bottom: 2px;
-  left: 2px;
-  width: 16px;
-  height: 16px;
-  background-color: var(--af-text-inverse);
-  border-radius: 50%;
-  transition: all var(--af-transition-fast);
-  content: "";
+.setting-row .setting-control :deep(.el-input.is-focus .el-input__wrapper),
+.setting-row .setting-control :deep(.el-input .el-input__wrapper.is-focus) {
+  box-shadow: 0 0 0 1px var(--af-accent-primary) inset;
 }
 
-.toggle-switch input:checked + .toggle-slider {
-  background-color: var(--af-accent-primary);
+.setting-row .setting-control :deep(.el-input .el-input__inner) {
+  color: var(--af-text-normal);
+  font-size: 12px;
 }
 
-.toggle-switch input:checked + .toggle-slider::before {
-  transform: translateX(16px);
+.setting-row .setting-control :deep(.el-input.is-disabled .el-input__wrapper) {
+  background-color: var(--af-bg-tertiary);
+  cursor: not-allowed;
+}
+
+/* ==========================================
+   el-input-number 数字输入框样式适配
+   原因：el-input-number 包裹 el-input，需要统一宽度和边框
+   参考：theme-chalk/src/input-number.scss
+   ========================================== */
+.setting-row .setting-control :deep(.el-input-number) {
+  width: 100%;
+}
+
+.setting-row .setting-control :deep(.el-input-number .el-input__wrapper) {
+  background-color: var(--af-bg-tertiary);
+  box-shadow: 0 0 0 1px var(--af-border-default) inset;
+  border-radius: var(--af-radius-sm);
+  padding: 2px 8px;
+}
+
+.setting-row .setting-control :deep(.el-input-number .el-input-number__increase),
+.setting-row .setting-control :deep(.el-input-number .el-input-number__decrease) {
+  background-color: transparent;
+  color: var(--af-text-muted);
+  border-color: var(--af-border-default);
+}
+
+.setting-row .setting-control :deep(.el-input-number .el-input-number__increase:hover),
+.setting-row .setting-control :deep(.el-input-number .el-input-number__decrease:hover) {
+  color: var(--af-accent-primary);
+}
+
+/* ==========================================
+   el-switch 开关样式适配
+   原因：el-switch 需要 :deep() 穿透微调尺寸和边框
+   参考：theme-chalk/src/switch.scss
+   ========================================== */
+.setting-row .setting-control :deep(.el-switch) {
+  --el-switch-on-color: var(--af-accent-primary);
+  --el-switch-off-color: var(--af-bg-elevated);
+  height: 22px;
+}
+
+.setting-row .setting-control :deep(.el-switch .el-switch__core) {
+  min-width: 38px;
+  height: 22px;
+  border: 1px solid var(--af-border-default);
+  border-radius: 11px;
+}
+
+.setting-row .setting-control :deep(.el-switch.is-checked .el-switch__core) {
+  border-color: var(--af-accent-primary);
+}
+
+.setting-row .setting-control :deep(.el-switch .el-switch__core .el-switch__action) {
+  width: 18px;
+  height: 18px;
 }
 </style>

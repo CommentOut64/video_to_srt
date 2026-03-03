@@ -94,6 +94,16 @@ class ProjectAPI {
     return unwrapEnvelope(response, null)
   }
 
+  // V3.2.4+dev.20260303.01: undo/redo 批量同步
+  // 不走 unwrapEnvelope，保留完整 {success, data} envelope 供调用方判断业务失败
+  async batchSyncSubtitles(projectId, diff) {
+    const response = await apiClient.post(
+      `/api/projects/${projectId}/subtitles/batch-sync`,
+      diff
+    )
+    return response
+  }
+
   async exportSubtitles(projectId, format = 'srt') {
     const response = await apiClient.get(`/api/projects/${projectId}/export`, {
       params: { format },
