@@ -171,15 +171,24 @@
                     @keyup.enter="$emit('finish-edit-title', task)"
                     @keyup.esc="$emit('cancel-edit-title')"
                   />
-                  <button
+                  <el-popover
                     v-else
-                    class="task-title task-title-link"
-                    :title="getTaskDisplayName(task) + ' (点击查看，双击重命名)'"
-                    @click="$emit('title-click', task)"
-                    @dblclick.prevent="$emit('start-edit-title', task)"
+                    :content="getTaskDisplayName(task) + ' (点击查看，双击重命名)'"
+                    placement="top"
+                    trigger="hover"
+                    popper-class="hint-popover-compact"
+                    :show-after="500"
                   >
-                    {{ getTaskDisplayName(task) }}
-                  </button>
+                    <template #reference>
+                      <button
+                        class="task-title task-title-link"
+                        @click="$emit('title-click', task)"
+                        @dblclick.prevent="$emit('start-edit-title', task)"
+                      >
+                        {{ getTaskDisplayName(task) }}
+                      </button>
+                    </template>
+                  </el-popover>
                 </div>
                 <span class="row-status">{{ getStatusText(task.status) }}</span>
                 <span class="row-time">{{ formatDate(getTaskTime(task)) }}</span>
@@ -320,15 +329,24 @@
                 @keyup.enter="$emit('finish-edit-title', task)"
                 @keyup.esc="$emit('cancel-edit-title')"
               />
-              <button
+              <el-popover
                 v-else
-                class="task-title task-title-link"
-                :title="getTaskDisplayName(task) + ' (点击查看，双击重命名)'"
-                @click="$emit('title-click', task)"
-                @dblclick.prevent="$emit('start-edit-title', task)"
+                :content="getTaskDisplayName(task) + ' (点击查看，双击重命名)'"
+                placement="top"
+                trigger="hover"
+                popper-class="hint-popover-compact"
+                :show-after="500"
               >
-                {{ getTaskDisplayName(task) }}
-              </button>
+                <template #reference>
+                  <button
+                    class="task-title task-title-link"
+                    @click="$emit('title-click', task)"
+                    @dblclick.prevent="$emit('start-edit-title', task)"
+                  >
+                    {{ getTaskDisplayName(task) }}
+                  </button>
+                </template>
+              </el-popover>
             </div>
             <span class="row-status">{{ getStatusText(task.status) }}</span>
             <span class="row-time">{{ formatDate(getTaskTime(task)) }}</span>
