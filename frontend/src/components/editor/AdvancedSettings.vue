@@ -148,6 +148,47 @@
           </label>
         </div>
       </div>
+
+      <!-- V3.2.4+dev.20260302.02: 字幕合并分隔符 -->
+      <div class="setting-row">
+        <div class="setting-label">
+          <span class="label-text">字幕合并分隔符</span>
+          <span class="label-hint">merge_separator</span>
+        </div>
+        <div class="setting-control">
+          <select
+            v-model="localConfig.general.merge_separator"
+            @change="emitChange"
+          >
+            <option value="space">空格 (默认)</option>
+            <option value="comma-full">全角逗号 ，</option>
+            <option value="comma-half">半角逗号 ,</option>
+            <option value="period-full">全角句号 。</option>
+            <option value="period-half">半角句号 .</option>
+            <option value="custom">自定义</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- 自定义分隔符输入（仅当选择"自定义"时显示） -->
+      <div
+        class="setting-row"
+        v-if="localConfig.general.merge_separator === 'custom'"
+      >
+        <div class="setting-label">
+          <span class="label-text">自定义分隔符</span>
+          <span class="label-hint">merge_separator_custom</span>
+        </div>
+        <div class="setting-control">
+          <input
+            type="text"
+            v-model="localConfig.general.merge_separator_custom"
+            @input="emitChange"
+            placeholder="输入自定义分隔符"
+            maxlength="10"
+          />
+        </div>
+      </div>
     </div>
 
     <!-- 分组一: 预处理与音频 -->
@@ -571,6 +612,13 @@ function normalizeConfig(config) {
   }
   if (normalized.general.subtitle_follow_auto_resume === undefined) {
     normalized.general.subtitle_follow_auto_resume = true
+  }
+  // V3.2.4+dev.20260302.02: 合并分隔符默认值
+  if (!normalized.general.merge_separator) {
+    normalized.general.merge_separator = 'space'
+  }
+  if (normalized.general.merge_separator_custom === undefined) {
+    normalized.general.merge_separator_custom = ''
   }
   return normalized
 }

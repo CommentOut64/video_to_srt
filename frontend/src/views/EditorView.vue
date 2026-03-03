@@ -240,6 +240,7 @@ import { legacyApi, mediaApi, projectApi, transcriptionApi } from '@/services/ap
 import sseChannelManager from '@/services/sseChannelManager'
 import { useShortcuts } from '@/hooks/useShortcuts'
 import { useProxyVideo } from '@/composables/useProxyVideo'
+import { useUndoRedoSync } from '@/composables'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { repairSubtitleOverlaps } from '@/utils/subtitleUtils'
 import { ElMessage } from 'element-plus'
@@ -293,6 +294,9 @@ const forceSyncNow = subtitleDocumentStore.forceSyncNow
 // V3.2.4+dev.20260224.01: project 模式也需要接入媒体状态，避免 progressiveUrl 为空导致视频无法加载
 const proxyVideo = useProxyVideo(identityRef)
 
+// V3.2.4+dev.20260303.01: undo/redo 后端增量同步
+const { undoWithSync, redoWithSync, flushSync: flushUndoRedoSync } = useUndoRedoSync()
+
 // Refs
 const videoStageRef = ref(null)
 const waveformRef = ref(null)
@@ -319,6 +323,8 @@ const advancedConfig = ref({
     preview_font_size: 24,
     enable_shortcuts: true,
     subtitle_follow_auto_resume: true,
+    merge_separator: 'space',
+    merge_separator_custom: '',
   },
   preprocessing: {
     demucs_strategy: 'auto',
@@ -1912,11 +1918,12 @@ async function cancelTranscription() {
 
 // ========== 撤销/重做 ==========
 
+// V3.2.4+dev.20260303.01: undo/redo 通过 useUndoRedoSync 同步后端
 function undo() {
-  if (canUndo.value) projectStore.undo()
+  undoWithSync()
 }
 function redo() {
-  if (canRedo.value) projectStore.redo()
+  redoWithSync()
 }
 
 // ========== 导出功能 ==========
@@ -1980,6 +1987,9 @@ async function handleExport(format) {
 
 async function fetchLatestSegments() {
   await forceSyncNow()
+  // V3.2.4+dev.20260303.01: 等待 undo/redo 增量同步完成
+  // 如果同步失败，flushSync 会 throw，由 handleExport 的 catch 捕获并 alert
+  await flushUndoRedoSync()
 
   const pending = subtitleDocumentStore.pendingCount()
   const syncErrors = subtitleDocumentStore.syncErrors
@@ -2133,6 +2143,18 @@ function loadEditorInteractionPreferences() {
   const resolved = savedAutoResume === null ? true : savedAutoResume === 'true'
   subtitleFollowAutoResumeEnabled.value = resolved
   advancedConfig.value.general.subtitle_follow_auto_resume = resolved
+
+  // V3.2.4+dev.20260302.02: 加载合并分隔符设置
+  try {
+    const savedSeparator = localStorage.getItem('editor-merge-separator')
+    if (savedSeparator) {
+      const config = JSON.parse(savedSeparator)
+      advancedConfig.value.general.merge_separator = config.type || 'space'
+      advancedConfig.value.general.merge_separator_custom = config.custom || ''
+    }
+  } catch {
+    // 解析失败使用默认值
+  }
 }
 
 function resolveCapabilitySnapshot(snapshot = null) {
@@ -2163,10 +2185,17 @@ async function handleSaveAdvancedSettings() {
     // 1. 应用到前端 projectStore
     projectStore.setSubtitleOffset(offset)
 
-    // 1.1 应用并持久化“字幕手动滚动后自动恢复跟随”偏好
+    // 1.1 应用并持久化”字幕手动滚动后自动恢复跟随”偏好
     const followAutoResume = advancedConfig.value.general.subtitle_follow_auto_resume !== false
     subtitleFollowAutoResumeEnabled.value = followAutoResume
     localStorage.setItem(SUBTITLE_FOLLOW_AUTO_RESUME_PREF_KEY, String(followAutoResume))
+
+    // 1.2 V3.2.4+dev.20260302.02: 持久化合并分隔符设置
+    const separatorConfig = {
+      type: advancedConfig.value.general.merge_separator || 'space',
+      custom: advancedConfig.value.general.merge_separator_custom || ''
+    }
+    localStorage.setItem('editor-merge-separator', JSON.stringify(separatorConfig))
 
     // 2. 保存到后端
     if (projectStore.meta.jobId) {

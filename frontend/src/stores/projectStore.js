@@ -961,6 +961,118 @@ export const useProjectStore = defineStore("project", () => {
     };
   }
 
+  /**
+   * V3.2.4+dev.20260302.02: 读取合并分隔符设置
+   * 从 localStorage 读取用户配置的字幕合并分隔符
+   * @returns {string} 分隔符字符串
+   */
+  function getMergeSeparator() {
+    try {
+      const raw = localStorage.getItem('editor-merge-separator');
+      if (!raw) return ' ';
+      const config = JSON.parse(raw);
+      const map = {
+        'space': ' ',
+        'comma-full': '\uff0c',
+        'comma-half': ',',
+        'period-full': '\u3002',
+        'period-half': '.',
+      };
+      if (config.type === 'custom') return config.custom || '';
+      return map[config.type] ?? ' ';
+    } catch {
+      return ' ';
+    }
+  }
+
+  /**
+   * 合并相邻字幕（核心方法）
+   *
+   * 支持两个方向：
+   * 1. prev - 与前字幕合并：保留前一条 identity，删除当前条
+   * 2. next - 与后字幕合并：保留当前条 identity，删除后一条
+   *
+   * 合并规则：
+   * - 文本：按时间顺序拼接（前 + 分隔符 + 后）
+   * - 时间戳：start = min(两者), end = max(两者)
+   * - 索引：数组 splice 后 Vue 自动重渲染序号
+   *
+   * @param {string} id - 当前右键的字幕 ID
+   * @param {'prev'|'next'} direction - 合并方向
+   * @returns {Object} { success, keptSubtitle, removedSubtitle, error }
+   */
+  function mergeSubtitles(id, direction) {
+    // 1. 查找当前字幕
+    const index = subtitles.value.findIndex((s) => s.id === id);
+    if (index === -1) {
+      return { success: false, error: '字幕不存在' };
+    }
+
+    const current = subtitles.value[index];
+
+    // 2. 前置校验
+    if (current.isDraft) {
+      return { success: false, error: '草稿字幕不允许合并' };
+    }
+
+    // 3. 确定目标字幕
+    const targetIndex = direction === 'prev' ? index - 1 : index + 1;
+    if (targetIndex < 0 || targetIndex >= subtitles.value.length) {
+      return { success: false, error: '没有可合并的相邻字幕' };
+    }
+
+    const target = subtitles.value[targetIndex];
+    if (target.isDraft) {
+      return { success: false, error: '目标字幕为草稿，不允许合并' };
+    }
+
+    // 4. 确定合并顺序（时间上靠前的 + 靠后的）
+    const first = direction === 'prev' ? target : current;
+    const second = direction === 'prev' ? current : target;
+
+    // 5. 合并文本和时间戳（使用可配置分隔符）
+    const separator = getMergeSeparator();
+    const mergedText = first.text + separator + second.text;
+    const mergedStart = Math.min(first.start, second.start);
+    const mergedEnd = Math.max(first.end, second.end);
+
+    // 6. 确定保留方和删除方
+    //    merge-prev: 保留 prev(targetIndex)，删除 current(index)
+    //    merge-next: 保留 current(index)，删除 next(targetIndex)
+    const keptIndex = direction === 'prev' ? targetIndex : index;
+    const removedIndex = direction === 'prev' ? index : targetIndex;
+    const kept = subtitles.value[keptIndex];
+    const removed = subtitles.value[removedIndex];
+
+    // 保存删除方信息（splice 前）
+    const removedSnapshot = { ...removed };
+
+    // 7. 原子操作：单次 splice 替换两条为一条（确保 useRefHistory 只生成一条历史记录）
+    //    keptIndex 始终是较小索引，splice(keptIndex, 2, merged) 一次完成
+    const mergedSubtitle = {
+      ...kept,
+      text: mergedText,
+      start: mergedStart,
+      end: mergedEnd,
+      words: [], // 合并后字级时间戳失效
+      isDirty: true,
+      isModified: true,
+    };
+    subtitles.value.splice(keptIndex, 2, mergedSubtitle);
+
+    // 8. 标记项目已修改
+    meta.value.isDirty = true;
+
+    const keptAfterSplice = subtitles.value.find((s) => s.id === kept.id);
+    console.log(`[ProjectStore] 字幕合并成功: ${first.id} + ${second.id} -> ${kept.id}`);
+
+    return {
+      success: true,
+      keptSubtitle: keptAfterSplice,
+      removedSubtitle: removedSnapshot,
+    };
+  }
+
   // ========== Phase 5: 双模态架构专用方法 ==========
 
   /**
@@ -1797,6 +1909,7 @@ export const useProjectStore = defineStore("project", () => {
     markSentenceDeleted,
     isSentenceDeleted,
     splitSubtitle,  // 字幕切分
+    mergeSubtitles, // 字幕合并
     generateSRT,
     seekTo,
     saveProject,

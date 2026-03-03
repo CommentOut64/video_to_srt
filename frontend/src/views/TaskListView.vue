@@ -314,6 +314,8 @@ const advancedGeneral = ref({
   auto_save_interval: 60,
   preview_font_size: 24,
   enable_shortcuts: true,
+  merge_separator: 'space',
+  merge_separator_custom: '',
 })
 const advancedConfig = ref(buildAdvancedConfig())
 
@@ -996,6 +998,13 @@ async function handleSaveAdvancedSettings() {
       global_time_offset: normalizedOffset,
     }
     saveJsonStorage(ADVANCED_GENERAL_KEY, advancedGeneral.value)
+
+    // V3.2.4+dev.20260302.02: 同步合并分隔符到独立 key（projectStore 从此 key 读取）
+    const separatorConfig = {
+      type: advancedConfig.value.general.merge_separator || 'space',
+      custom: advancedConfig.value.general.merge_separator_custom || ''
+    }
+    saveJsonStorage('editor-merge-separator', separatorConfig)
 
     transcriptionPresetStore.applyTaskConfig({
       preset_id: advancedConfig.value.preset_id || taskConfig.value.preset_id,
