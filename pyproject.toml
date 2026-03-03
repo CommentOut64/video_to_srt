@@ -24,7 +24,6 @@ keywords = ["video", "subtitle", "srt", "asr", "whisper", "gpu", "cuda"]
 dependencies = [
     # --- 核心工具 ---
     "python-dateutil",
-    "tqdm",
     "click",
     "colorama",
     "filelock",
@@ -32,11 +31,7 @@ dependencies = [
     "loguru>=0.7.0",  # 增强日志系统
     "setuptools<78",  # pkg_resources 运行时依赖 (78+ 已移除)
 
-    # --- 数值计算 (Lite 保留最小集合) ---
-    "numpy==1.26.4",  # 必须 < 2.0.0 以保证生态兼容性
-
-    # --- 文本标准化 (ITN/TN) ---
-    "wetext>=0.1.2",
+    # --- 文本与同音检索 (Lite 必需) ---
     "pypinyin>=0.53.0",  # 中文同音检索读音编码
     "sudachipy>=0.6.10",  # 日语同音分词
     "sudachidict-core>=20241021",  # Sudachi 核心词典
@@ -45,14 +40,12 @@ dependencies = [
 
     # --- 媒体处理 (Lite 可用) ---
     "ffmpeg-python>=0.2.0",
-    "av>=10.0.0",
 
     # --- Web 服务 ---
     "fastapi>=0.104.0",
     "uvicorn[standard]>=0.24.0",
     "python-multipart>=0.0.6",
     "sse-starlette>=1.8.0",
-    "prometheus-client>=0.19.0",
 
     # --- 数据验证 ---
     "pydantic>=2.0.0,<3.0.0",
@@ -68,8 +61,10 @@ dependencies = [
 # Full 增量依赖（GPU 推理栈）
 full = [
     # --- 数值计算（Full 管线） ---
+    "numpy==1.26.4",  # Lite 可达链不依赖，迁移到 Full 增量层
     "scipy>=1.11.0,<2.0.0",
     "sympy>=1.12",
+    "tqdm",
     "intel-openmp",  # fbgemm.dll 需要的 OpenMP 运行时
 
     # --- PyTorch 生态 (CUDA 12.8) ---
@@ -83,11 +78,13 @@ full = [
     "onnxruntime-gpu==1.23.2",  # Python 3.10 可用的最新 1.x GPU 版
 
     # --- 标点恢复/分词 ---
+    "wetext>=0.1.2",
     "punctuators>=0.0.7",
     "sentencepiece>=0.2.0",
     "tokenizers>=0.20.0",
 
     # --- 音频处理（Full） ---
+    "av>=10.0.0",
     "librosa>=0.10.0",
     "soundfile>=0.12.0",
     "pydub>=0.25.0",
@@ -102,6 +99,7 @@ full = [
     # --- 声纹识别/语言识别 ---
     "speechbrain==1.0.3",
     "huggingface-hub>=0.24.0,<1.0.0",
+    "prometheus-client>=0.19.0",
 ]
 
 # 开发环境额外运行时依赖
