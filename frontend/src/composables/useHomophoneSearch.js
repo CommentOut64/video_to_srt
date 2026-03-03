@@ -111,12 +111,14 @@ function escapeRegExp(text) {
 /**
  * 同音检索与批量替换 Composable
  * @param {Object} options - 配置选项
- * @param {Ref<string>} options.jobId - 当前项目主身份（project_id，兼容 legacy job_id）
+ * @param {Ref<string>} options.projectId - 当前项目主身份（project_id）
  * @param {Ref<Array>} options.subtitles - 字幕列表引用
  * @returns {Object} 同音搜索相关状态和方法
  */
 export function useHomophoneSearch(options = {}) {
-  const { jobId, subtitles } = options
+  // 兼容旧参数名 jobId，内部统一使用 projectId 语义。
+  const projectId = options.projectId ?? options.jobId
+  const { subtitles } = options
 
   // ========================
   // 核心状态
@@ -298,10 +300,10 @@ export function useHomophoneSearch(options = {}) {
    * 检查索引状态
    */
   async function checkIndexStatus() {
-    if (!jobId?.value) return
+    if (!projectId?.value) return
 
     try {
-      const result = await transcriptionApi.getHomophoneIndexStatus(jobId.value)
+      const result = await transcriptionApi.getHomophoneIndexStatus(projectId.value)
       const payload = result?.data || {}
       indexStatus.value = payload.status || IndexStatus.UNKNOWN
       indexProgress.value = 100
@@ -316,7 +318,7 @@ export function useHomophoneSearch(options = {}) {
    * 执行搜索
    */
   async function executeSearch() {
-    if (!canSearch.value || !jobId?.value) return
+    if (!canSearch.value || !projectId?.value) return
 
     isSearching.value = true
     searchError.value = null
@@ -331,7 +333,7 @@ export function useHomophoneSearch(options = {}) {
           is_ignore_punctuation: isIgnorePunctuation.value,
           limit: 2000,
         }
-        const result = await transcriptionApi.homophoneFind(jobId.value, payload)
+        const result = await transcriptionApi.homophoneFind(projectId.value, payload)
         parseHomophoneSearchResult(result?.data || {})
       } else {
         parseTextSearchResult({
@@ -531,7 +533,7 @@ export function useHomophoneSearch(options = {}) {
    * @returns {Promise<{success: boolean, count: number, indices: number[]}>}
    */
   async function executeBatchReplace() {
-    if (!jobId?.value || selectedSubtitleIds.value.size === 0) {
+    if (!projectId?.value || selectedSubtitleIds.value.size === 0) {
       return { success: false, count: 0, indices: [] }
     }
 
@@ -543,7 +545,7 @@ export function useHomophoneSearch(options = {}) {
       const queryInput = isHomophoneMode.value
         ? (searchReading.value?.trim() || searchText.value.trim())
         : searchText.value.trim()
-      const result = await transcriptionApi.homophoneBatchReplace(jobId.value, {
+      const result = await transcriptionApi.homophoneBatchReplace(projectId.value, {
         mode: searchMode.value,
         query_text: queryInput,
         replace_text: replaceText.value,
@@ -586,8 +588,8 @@ export function useHomophoneSearch(options = {}) {
     }
   })
 
-  // jobId 变化时重置状态
-  watch(() => jobId?.value, () => {
+  // projectId 变化时重置状态
+  watch(() => projectId?.value, () => {
     resetSearch()
     indexStatus.value = IndexStatus.UNKNOWN
   })

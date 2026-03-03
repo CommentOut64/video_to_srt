@@ -222,10 +222,27 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   function normalizeCapabilitySnapshot(snapshot) {
-    if (!snapshot || typeof snapshot !== 'object') {
+    if (!snapshot) {
       return null;
     }
-    return snapshot;
+    if (Array.isArray(snapshot)) {
+      // 后端旧格式 capability_snapshot(List[str]) 不参与能力合并，统一回退运行时基线
+      console.debug("[normalizeCapabilitySnapshot] 忽略数组快照格式，回退默认能力");
+      return null;
+    }
+    if (typeof snapshot !== "object") {
+      console.warn("[normalizeCapabilitySnapshot] 非对象快照，已忽略:", typeof snapshot);
+      return null;
+    }
+    if (
+      snapshot.capabilities
+      && typeof snapshot.capabilities === "object"
+      && !Array.isArray(snapshot.capabilities)
+    ) {
+      return snapshot;
+    }
+    console.warn("[normalizeCapabilitySnapshot] 非标准快照结构，已忽略");
+    return null;
   }
 
   // ========== 6.2 Phase 1: 状态写入口收口 ==========

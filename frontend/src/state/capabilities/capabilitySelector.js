@@ -13,18 +13,57 @@ const DEFAULT_CAPABILITY_SNAPSHOT = Object.freeze({
   taskSwitcherMode: 'legacy',
 })
 
+const ALLOWED_TOP_KEYS = new Set([
+  'profile',
+  'flavor',
+  'isLite',
+  'version',
+  'capabilities',
+  'routeVisibility',
+  // 技术债字段：暂保留顶层兼容，后续再归并到 capabilities
+  'canShowEditorProgress',
+  'canUseTaskMonitor',
+  'taskSwitcherMode',
+])
+
+function mergeObjectWithBooleanUpperBound(baseObject, overrideObject = {}) {
+  const mergedObject = {
+    ...baseObject,
+    ...(overrideObject || {}),
+  }
+  // 治理规则：运行时基线为 false 的布尔能力不可被外部快照提升为 true
+  for (const key of Object.keys(baseObject || {})) {
+    if (typeof baseObject[key] === 'boolean' && baseObject[key] === false) {
+      mergedObject[key] = false
+    }
+  }
+  return mergedObject
+}
+
 function mergeSnapshot(snapshot = {}) {
+  const normalizedSnapshot = (
+    snapshot
+    && typeof snapshot === 'object'
+    && !Array.isArray(snapshot)
+  ) ? snapshot : {}
+  const filtered = {}
+  for (const key of Object.keys(normalizedSnapshot)) {
+    if (ALLOWED_TOP_KEYS.has(key)) {
+      filtered[key] = normalizedSnapshot[key]
+    }
+  }
+
   return {
     ...DEFAULT_CAPABILITY_SNAPSHOT,
-    ...snapshot,
-    capabilities: {
-      ...DEFAULT_CAPABILITY_SNAPSHOT.capabilities,
-      ...(snapshot.capabilities || {}),
-    },
-    routeVisibility: {
-      ...DEFAULT_CAPABILITY_SNAPSHOT.routeVisibility,
-      ...(snapshot.routeVisibility || {}),
-    },
+    ...filtered,
+    capabilities: mergeObjectWithBooleanUpperBound(
+      DEFAULT_CAPABILITY_SNAPSHOT.capabilities,
+      filtered.capabilities || {},
+    ),
+    routeVisibility: mergeObjectWithBooleanUpperBound(
+      DEFAULT_CAPABILITY_SNAPSHOT.routeVisibility,
+      filtered.routeVisibility || {},
+    ),
   }
 }
 

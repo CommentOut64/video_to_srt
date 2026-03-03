@@ -1,9 +1,9 @@
 # ============================================================
 # anchor-flux - 项目配置
 # ============================================================
-# 统一依赖管理：生产环境依赖 + 可选开发依赖
+# 统一依赖管理：Lite 核心依赖 + Full 可选依赖 + 开发依赖
 # CUDA 版本: 12.8 统一方案 (PyTorch cu128 内置所有 CUDA 库)
-# 更新时间: 2026-02-11
+# 更新时间: 2026-03-03
 # ============================================================
 
 [project]
@@ -19,7 +19,7 @@ authors = [
 keywords = ["video", "subtitle", "srt", "asr", "whisper", "gpu", "cuda"]
 
 # ============================================================
-# 核心依赖 (生产环境必需)
+# 核心依赖 (Lite 基线，生产环境必需)
 # ============================================================
 dependencies = [
     # --- 核心工具 ---
@@ -29,29 +29,11 @@ dependencies = [
     "colorama",
     "filelock",
     "psutil",
-    "intel-openmp",  # fbgemm.dll 需要的 OpenMP 运行时
     "loguru>=0.7.0",  # 增强日志系统
     "setuptools<78",  # pkg_resources 运行时依赖 (78+ 已移除)
 
-    # --- 数值计算 (严格版本控制) ---
+    # --- 数值计算 (Lite 保留最小集合) ---
     "numpy==1.26.4",  # 必须 < 2.0.0 以保证生态兼容性
-    "scipy>=1.11.0,<2.0.0",
-    "sympy>=1.12",
-
-    # --- PyTorch 生态 (CUDA 12.8) ---
-    # cu128 自带完整的 CUDA 12.8 运行时能力，无需额外安装 nvidia-* 包
-    "torch==2.8.0",
-    "torchaudio==2.8.0",
-
-    # --- AI 推理引擎 ---
-    "faster-whisper==1.2.1",
-    "ctranslate2>=4.5.0",  # 4.5.0+ 支持新 CUDA/cuDNN 运行时
-    "onnxruntime-gpu==1.23.2",  # Python 3.10 可用的最新 1.x GPU 版
-
-    # --- 标点恢复/分词 ---
-    "punctuators>=0.0.7",
-    "sentencepiece>=0.2.0",
-    "tokenizers>=0.20.0",
 
     # --- 文本标准化 (ITN/TN) ---
     "wetext>=0.1.2",
@@ -61,23 +43,9 @@ dependencies = [
     "cmudict>=1.0.32",  # 英语读音词典
     "phonemizer>=3.3.0",  # 英语 OOV 读音回退（需系统 espeak 支持）
 
-    # --- 音频处理 ---
-    "librosa>=0.10.0",
-    "soundfile>=0.12.0",
+    # --- 媒体处理 (Lite 可用) ---
     "ffmpeg-python>=0.2.0",
     "av>=10.0.0",
-    "pydub>=0.25.0",
-
-    # --- 人声分离 ---
-    "demucs==4.0.1",
-
-    # --- VAD & 语音分析 ---
-    "silero-vad>=5.0.0",
-    "pyannote.audio==4.0.0",
-
-    # --- 声纹识别/语言识别 ---
-    "speechbrain==1.0.3",
-    "huggingface-hub>=0.24.0,<1.0.0",
 
     # --- Web 服务 ---
     "fastapi>=0.104.0",
@@ -94,9 +62,48 @@ dependencies = [
 ]
 
 # ============================================================
-# 可选依赖 (开发/测试/文档)
+# 可选依赖 (Full / 开发 / 测试 / 文档)
 # ============================================================
 [project.optional-dependencies]
+# Full 增量依赖（GPU 推理栈）
+full = [
+    # --- 数值计算（Full 管线） ---
+    "scipy>=1.11.0,<2.0.0",
+    "sympy>=1.12",
+    "intel-openmp",  # fbgemm.dll 需要的 OpenMP 运行时
+
+    # --- PyTorch 生态 (CUDA 12.8) ---
+    # cu128 自带完整的 CUDA 12.8 运行时能力，无需额外安装 nvidia-* 包
+    "torch==2.8.0",
+    "torchaudio==2.8.0",
+
+    # --- AI 推理引擎 ---
+    "faster-whisper==1.2.1",
+    "ctranslate2>=4.5.0",  # 4.5.0+ 支持新 CUDA/cuDNN 运行时
+    "onnxruntime-gpu==1.23.2",  # Python 3.10 可用的最新 1.x GPU 版
+
+    # --- 标点恢复/分词 ---
+    "punctuators>=0.0.7",
+    "sentencepiece>=0.2.0",
+    "tokenizers>=0.20.0",
+
+    # --- 音频处理（Full） ---
+    "librosa>=0.10.0",
+    "soundfile>=0.12.0",
+    "pydub>=0.25.0",
+
+    # --- 人声分离 ---
+    "demucs==4.0.1",
+
+    # --- VAD & 语音分析 ---
+    "silero-vad>=5.0.0",
+    "pyannote.audio==4.0.0",
+
+    # --- 声纹识别/语言识别 ---
+    "speechbrain==1.0.3",
+    "huggingface-hub>=0.24.0,<1.0.0",
+]
+
 # 开发环境额外运行时依赖
 dev-runtime = [
     "pandas>=2.0.0",  # 数据分析
@@ -287,11 +294,14 @@ Issues = "https://github.com/CommentOut64/video-to-srt/issues"
 # 安装指南
 # ============================================================
 #
-# 生产环境:
+# Lite 运行环境（默认）:
 #   uv sync
 #
+# Full 运行环境（包含 GPU 推理栈）:
+#   uv sync --extra full
+#
 # 开发环境 (包含所有开发工具):
-#   uv sync --extra dev-runtime --extra dev --extra test --extra docs
+#   uv sync --extra full --extra dev-runtime --extra dev --extra test --extra docs
 #   或简写:
 #   uv sync --all-extras
 #

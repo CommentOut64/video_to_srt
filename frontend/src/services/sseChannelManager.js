@@ -387,6 +387,16 @@ class SSEChannelManager extends EventEmitter {
         console.log(`[SSE Job ${jobId}] Proxy 完成:`, data)
         handlers.onProxyComplete?.(data)
       },
+      // H264 归一化进度（Electron 主路径）
+      normalize_progress: (data) => {
+        console.log(`[SSE Job ${jobId}] normalize_h264 进度:`, data.progress)
+        handlers.onNormalizeProgress?.(data)
+      },
+      // H264 归一化完成
+      normalize_complete: (data) => {
+        console.log(`[SSE Job ${jobId}] normalize_h264 完成:`, data)
+        handlers.onNormalizeComplete?.(data)
+      },
 
       // === 连接和心跳 ===
       connected: (data) => {

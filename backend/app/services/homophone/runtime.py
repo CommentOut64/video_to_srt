@@ -47,7 +47,7 @@ class HomophoneRuntime:
     def index_chunk_async(
         self,
         *,
-        job_id: str,
+        project_id: str,
         revision: int,
         chunk_index: int,
         language_hint: str,
@@ -57,7 +57,7 @@ class HomophoneRuntime:
         language = self._normalize_language(language_hint, sentence_list)
         return self._executor.submit(
             self._index_chunk_safe,
-            job_id,
+            project_id,
             revision,
             chunk_index,
             language,
@@ -66,7 +66,7 @@ class HomophoneRuntime:
 
     def _index_chunk_safe(
         self,
-        job_id: str,
+        project_id: str,
         revision: int,
         chunk_index: int,
         language: Language,
@@ -74,7 +74,7 @@ class HomophoneRuntime:
     ) -> None:
         try:
             self._service.index_chunk(
-                job_id=job_id,
+                project_id=project_id,
                 revision=revision,
                 chunk_index=chunk_index,
                 language=language,
@@ -85,7 +85,7 @@ class HomophoneRuntime:
             # 设计说明：此处显式标记失败状态，避免索引中断后出现“ready”假象。
             self._db.upsert_index_state(
                 IndexState(
-                    job_id=job_id,
+                    project_id=project_id,
                     revision=revision,
                     status="failed",
                     last_committed_chunk=max(-1, chunk_index - 1),
@@ -94,8 +94,8 @@ class HomophoneRuntime:
                 )
             )
             logger.exception(
-                "同音索引异步构建失败: job_id=%s revision=%s chunk_index=%s",
-                job_id,
+                "同音索引异步构建失败: project_id=%s revision=%s chunk_index=%s",
+                project_id,
                 revision,
                 chunk_index,
             )
@@ -149,14 +149,14 @@ def get_homophone_service() -> HomophoneService:
 
 def index_chunk_async(
     *,
-    job_id: str,
+    project_id: str,
     revision: int,
     chunk_index: int,
     language_hint: str,
     sentences: Iterable[SentenceRecord],
 ) -> Future[None]:
     return get_homophone_runtime().index_chunk_async(
-        job_id=job_id,
+        project_id=project_id,
         revision=revision,
         chunk_index=chunk_index,
         language_hint=language_hint,
