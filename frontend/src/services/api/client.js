@@ -59,6 +59,10 @@ apiClient.interceptors.response.use(
     return response.data
   },
   (error) => {
+    if (error?.code === 'ECONNABORTED') {
+      throw new NetworkError('请求超时，请检查媒体文件体积后重试')
+    }
+
     if (error.response) {
       // HTTP 错误响应 (4xx, 5xx)
       const { status, data } = error.response

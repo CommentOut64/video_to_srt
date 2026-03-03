@@ -9,6 +9,13 @@
 import { apiClient } from './client'
 import { FLAVOR } from '@/config/flavor'
 
+const DEFAULT_IMPORT_UPLOAD_TIMEOUT_MS = 10 * 60 * 1000
+const ENV_IMPORT_UPLOAD_TIMEOUT_MS = Number(import.meta.env.VITE_IMPORT_UPLOAD_TIMEOUT_MS)
+const IMPORT_UPLOAD_TIMEOUT_MS =
+  Number.isFinite(ENV_IMPORT_UPLOAD_TIMEOUT_MS) && ENV_IMPORT_UPLOAD_TIMEOUT_MS > 0
+    ? ENV_IMPORT_UPLOAD_TIMEOUT_MS
+    : DEFAULT_IMPORT_UPLOAD_TIMEOUT_MS
+
 function unwrapEnvelope(response, fallback = null) {
   if (response && typeof response === 'object' && 'data' in response) {
     return response.data ?? fallback
@@ -31,6 +38,7 @@ class ProjectAPI {
 
     const response = await apiClient.post('/api/projects/import', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: IMPORT_UPLOAD_TIMEOUT_MS,
     })
     return unwrapEnvelope(response, null)
   }

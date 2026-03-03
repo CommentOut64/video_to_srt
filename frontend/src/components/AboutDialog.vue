@@ -20,7 +20,12 @@
       </div>
 
       <!-- 应用名称 -->
-      <h2 class="app-name">AnchorFlux</h2>
+      <h2 class="app-name">
+        <span class="brand-name">
+          AnchorFlux
+          <span v-if="isLite" class="lite-badge">Lite</span>
+        </span>
+      </h2>
 
       <!-- 版本号 -->
       <div class="version">版本 {{ version }}</div>
@@ -95,6 +100,7 @@ import { ref, watch, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useAppUpdateStore } from '@/stores/appUpdateStore'
 import systemApi from '@/services/api/systemApi'
+import { IS_LITE } from '@/config/flavor'
 import UpdateDialog from './UpdateDialog.vue'
 
 const visible = defineModel({ type: Boolean, default: false })
@@ -110,6 +116,7 @@ const pendingUpdateInfo = ref(null)
 const appUpdateStore = useAppUpdateStore()
 appUpdateStore.initialize()
 const checkForUpdate = appUpdateStore.checkForUpdate
+const isLite = IS_LITE
 
 // 获取版本号
 async function fetchVersion() {
@@ -196,6 +203,26 @@ onMounted(() => {
   color: var(--af-text-primary);
   font-size: 22px;
   font-weight: 600;
+}
+
+.brand-name {
+  position: relative;
+  display: inline-flex;
+  line-height: 1;
+}
+
+.lite-badge {
+  position: absolute;
+  top: -9px;
+  right: -24px;
+  padding: 1px 4px;
+  border: 1px solid var(--af-accent-primary);
+  border-radius: 10px;
+  color: var(--af-accent-primary);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  line-height: 1.2;
 }
 
 .version {

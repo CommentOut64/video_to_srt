@@ -53,12 +53,16 @@ export async function unregisterClient(clientId) {
  * @param {Object} options - 关闭选项
  * @param {boolean} [options.cleanup_temp=false] - 是否清理临时文件
  * @param {boolean} [options.force=false] - 是否强制关闭
+ * @param {number} [options.timeout_ms=12000] - 请求超时时间（毫秒）
  * @returns {Promise<{success: boolean, message: string, cleanup_report: Object}>}
  */
 export async function shutdownSystem(options = {}) {
+  const timeoutMs = Number(options.timeout_ms || 12000)
   return apiClient.post('/api/system/shutdown', {
     cleanup_temp: options.cleanup_temp || false,
     force: options.force || false
+  }, {
+    timeout: Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 12000
   })
 }
 
