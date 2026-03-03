@@ -191,7 +191,7 @@
 
     <!-- 分组零点五: 快捷键 -->
     <div
-      v-if="enableShortcutCustomization"
+      v-if="canShowShortcutTab"
       v-show="activeTab === 'shortcuts'"
       class="settings-panel"
     >
@@ -647,6 +647,7 @@
 
 <script setup>
 import { computed, onUnmounted, ref, watch } from 'vue'
+import { IS_LITE } from '@/config/flavor'
 import {
   buildShortcutComboFromKeyboardEvent,
   EDITOR_SHORTCUT_FIELDS,
@@ -670,9 +671,19 @@ const emit = defineEmits(['update:modelValue', 'change', 'open-about'])
 
 /* 当前激活的 Tab */
 const activeTab = ref('general')
+const isLiteMode = computed(() => IS_LITE)
+const canShowShortcutTab = computed(() => isLiteMode.value || props.enableShortcutCustomization)
 
 /* Tab 定义 */
 const tabs = computed(() => {
+  if (isLiteMode.value) {
+    return [
+      { id: 'general', label: '常规' },
+      { id: 'shortcuts', label: '快捷键' },
+      { id: 'about', label: '关于' }
+    ]
+  }
+
   const baseTabs = [
     { id: 'general', label: '常规' },
     { id: 'audio', label: 'Audio' },
@@ -680,7 +691,7 @@ const tabs = computed(() => {
     { id: 'llm', label: 'LLM' },
     { id: 'system', label: 'System' }
   ]
-  if (props.enableShortcutCustomization) {
+  if (canShowShortcutTab.value) {
     baseTabs.push({ id: 'shortcuts', label: '快捷键' })
   }
   baseTabs.push({ id: 'about', label: '关于' })
@@ -696,7 +707,6 @@ function handleTabClick(tabId) {
   activeTab.value = tabId
 }
 
-const enableShortcutCustomization = computed(() => props.enableShortcutCustomization)
 const editorShortcutFields = EDITOR_SHORTCUT_FIELDS
 const recordingActionKey = ref('')
 
@@ -785,6 +795,13 @@ function handleShortcutRecording(event) {
 watch(() => props.modelValue, (newVal) => {
   localConfig.value = normalizeConfig(newVal)
 }, { deep: true })
+
+watch(tabs, (nextTabs) => {
+  const currentExists = nextTabs.some((tab) => tab.id === activeTab.value)
+  if (!currentExists) {
+    activeTab.value = 'general'
+  }
+}, { immediate: true })
 
 watch(recordingActionKey, (nextValue) => {
   if (nextValue) {
