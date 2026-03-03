@@ -34,6 +34,9 @@ jobs/
 uploads/
 /models/
 
+# 运行时数据（用户预设、锁文件等）
+data/
+
 # 日志文件
 *.log
 logs/
