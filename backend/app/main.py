@@ -82,7 +82,7 @@ def _resolve_ui_mode_from_env() -> str:
     raw_ui_mode = str(os.environ.get("ANCHORFLUX_UI_MODE", "browser")).strip().lower()
     if raw_ui_mode in VALID_UI_MODES:
         return raw_ui_mode
-    logger.warning("未知 ANCHORFLUX_UI_MODE=%s，回退为 browser", raw_ui_mode)
+    logger.warning(f"未知 ANCHORFLUX_UI_MODE={raw_ui_mode}，回退为 browser")
     return "browser"
 
 
@@ -98,9 +98,9 @@ def _disable_full_runtime(reason: str, exc=None):
     FULL_RUNTIME_ENABLED = False
     FULL_RUNTIME_DISABLE_REASON = reason
     if exc is not None:
-        logger.warning("Full 能力降级为 Lite：%s（%s）", reason, exc)
+        logger.warning(f"Full 能力降级为 Lite：{reason}（{exc}）")
     else:
-        logger.warning("Full 能力降级为 Lite：%s", reason)
+        logger.warning(f"Full 能力降级为 Lite：{reason}")
 
 
 def cleanup_old_processes():
@@ -284,8 +284,7 @@ if not FULL_RUNTIME_ENABLED:
         logger.info("Lite 模式启动：已禁用 Full 专属路由。")
     else:
         logger.warning(
-            "检测到 Full 运行时依赖不完整，已按 Lite 能力集启动。原因: %s",
-            FULL_RUNTIME_DISABLE_REASON or "未知原因",
+            f"检测到 Full 运行时依赖不完整，已按 Lite 能力集启动。原因: {FULL_RUNTIME_DISABLE_REASON or '未知原因'}"
         )
 
 @app.on_event("startup")
@@ -397,30 +396,23 @@ async def startup_event():
                 )
                 updated_jobs.extend(list(dir_report.get("updated_jobs", [])))
                 logger.info(
-                    (
-                        "Project 目录命名迁移结果: dry_run=%s scanned=%s renamed=%s "
-                        "skipped=%s failed=%s updated_jobs=%s updated_task_rows=%s"
-                    ),
-                    bool(dir_report.get("dry_run", False)),
-                    dir_report.get("scanned", 0),
-                    dir_report.get("renamed", 0),
-                    dir_report.get("skipped", 0),
-                    dir_report.get("failed", 0),
-                    len(dir_report.get("updated_jobs", [])),
-                    dir_report.get("updated_task_rows", 0),
+                    "Project 目录命名迁移结果: "
+                    f"dry_run={bool(dir_report.get('dry_run', False))} "
+                    f"scanned={dir_report.get('scanned', 0)} "
+                    f"renamed={dir_report.get('renamed', 0)} "
+                    f"skipped={dir_report.get('skipped', 0)} "
+                    f"failed={dir_report.get('failed', 0)} "
+                    f"updated_jobs={len(dir_report.get('updated_jobs', []))} "
+                    f"updated_task_rows={dir_report.get('updated_task_rows', 0)}"
                 )
                 dir_failures = list(dir_report.get("failures", []))
                 for failure in dir_failures[:10]:
                     logger.warning(
-                        "Project 目录命名迁移失败: dir=%s error=%s",
-                        failure.get("dir", ""),
-                        failure.get("error", ""),
+                        f"Project 目录命名迁移失败: dir={failure.get('dir', '')} "
+                        f"error={failure.get('error', '')}"
                     )
                 if len(dir_failures) > 10:
-                    logger.warning(
-                        "Project 目录命名迁移失败项过多，已截断展示: remaining=%s",
-                        len(dir_failures) - 10,
-                    )
+                    logger.warning(f"Project 目录命名迁移失败项过多，已截断展示: remaining={len(dir_failures) - 10}")
             else:
                 logger.info("Project 目录命名迁移已禁用（PROJECT_DIR_MIGRATION_ENABLED）")
 
@@ -441,37 +433,30 @@ async def startup_event():
                         persisted_jobs += 1
                         continue
                     logger.warning(
-                        "Project 迁移后任务元信息回写失败: job_id=%s project_id=%s",
-                        getattr(runtime_job, "job_id", ""),
-                        getattr(runtime_job, "project_id", ""),
+                        f"Project 迁移后任务元信息回写失败: "
+                        f"job_id={getattr(runtime_job, 'job_id', '')} "
+                        f"project_id={getattr(runtime_job, 'project_id', '')}"
                     )
 
             logger.info(
-                (
-                    "Project workspace 迁移结果: scanned=%s resolved=%s "
-                    "migrated_alias=%s failed=%s updated_jobs=%s persisted=%s"
-                ),
-                migration_report.get("scanned", 0),
-                migration_report.get("resolved", 0),
-                migration_report.get("migrated_alias", 0),
-                migration_report.get("failed", 0),
-                len(updated_jobs),
-                persisted_jobs,
+                "Project workspace 迁移结果: "
+                f"scanned={migration_report.get('scanned', 0)} "
+                f"resolved={migration_report.get('resolved', 0)} "
+                f"migrated_alias={migration_report.get('migrated_alias', 0)} "
+                f"failed={migration_report.get('failed', 0)} "
+                f"updated_jobs={len(updated_jobs)} "
+                f"persisted={persisted_jobs}"
             )
             failures = list(migration_report.get("failures", []))
             for failure in failures[:10]:
                 logger.warning(
-                    "Project workspace 迁移失败: identifier=%s error=%s",
-                    failure.get("identifier", ""),
-                    failure.get("error", ""),
+                    f"Project workspace 迁移失败: identifier={failure.get('identifier', '')} "
+                    f"error={failure.get('error', '')}"
                 )
             if len(failures) > 10:
-                logger.warning(
-                    "Project workspace 迁移失败项过多，已截断展示: remaining=%s",
-                    len(failures) - 10,
-                )
+                logger.warning(f"Project workspace 迁移失败项过多，已截断展示: remaining={len(failures) - 10}")
         except Exception as migration_exc:
-            logger.warning("Project workspace 迁移检查失败: %s", migration_exc)
+            logger.warning(f"Project workspace 迁移检查失败: {migration_exc}")
 
         # 5.7. 启动补齐 project 元数据（重点补齐 task_mode，防止前端任务模式漂移）
         logger.info("执行 Project 元数据完整性检查...")
@@ -480,18 +465,17 @@ async def startup_event():
 
             normalized_projects = get_project_service().list_projects()
             logger.info(
-                "Project 元数据完整性检查完成: total=%s",
-                len(normalized_projects),
+                f"Project 元数据完整性检查完成: total={len(normalized_projects)}",
             )
         except Exception as metadata_exc:
-            logger.warning("Project 元数据完整性检查失败: %s", metadata_exc)
+            logger.warning(f"Project 元数据完整性检查失败: {metadata_exc}")
 
         # 5.6. 可选：启动阶段执行 Project 单语义强闸（默认关闭）
         strict_guard_enabled = str(os.getenv("PROJECT_SEMANTIC_GUARD_STRICT", "")).strip().lower()
         if strict_guard_enabled in {"1", "true", "yes", "on"}:
             strict_all_enabled = str(os.getenv("PROJECT_SEMANTIC_GUARD_STRICT_ALL", "")).strip().lower()
             is_strict_all = strict_all_enabled in {"1", "true", "yes", "on"}
-            logger.info("Project 单语义强闸已启用: strict_all=%s", is_strict_all)
+            logger.info(f"Project 单语义强闸已启用: strict_all={is_strict_all}")
             try:
                 repo_root = Path(__file__).resolve().parents[2]
                 guard_script = repo_root / "scripts" / "check_project_semantic_guard.py"
@@ -518,15 +502,15 @@ async def startup_event():
                 guard_stdout = str(guard_result.stdout or "").strip()
                 guard_stderr = str(guard_result.stderr or "").strip()
                 if guard_stdout:
-                    logger.info("Project 单语义强闸输出:\n%s", guard_stdout)
+                    logger.info(f"Project 单语义强闸输出:\n{guard_stdout}")
                 if guard_stderr:
-                    logger.warning("Project 单语义强闸 stderr:\n%s", guard_stderr)
+                    logger.warning(f"Project 单语义强闸 stderr:\n{guard_stderr}")
                 if guard_result.returncode != 0:
                     raise RuntimeError(
                         "Project 单语义强闸失败，请先修复新增 job 语义违例再启动。"
                     )
             except Exception as guard_exc:
-                logger.error("Project 单语义强闸失败: %s", guard_exc)
+                logger.error(f"Project 单语义强闸失败: {guard_exc}")
                 raise
 
         # 不在启动时预加载模型，等待前端就绪后通过API调用
@@ -968,9 +952,17 @@ async def open_browser_if_needed():
 # 开发模式应使用 npm run dev (localhost:5173)，生产模式使用后端托管
 DEV_MODE = os.environ.get('DEV_MODE', '').lower() in ('true', '1', 'yes')
 FRONTEND_DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "frontend", "dist")
+_serve_frontend_raw = str(os.environ.get("ANCHORFLUX_SERVE_FRONTEND", "")).strip().lower()
+if _serve_frontend_raw:
+    SERVE_FRONTEND = _serve_frontend_raw in {"true", "1", "yes", "on"}
+else:
+    # 默认保持兼容：browser/electron 模式仍由后端托管 dist，可通过环境变量显式关闭以实现前后端解耦。
+    SERVE_FRONTEND = _resolve_ui_mode_from_env() in {"browser", "electron"}
 
 if DEV_MODE:
     logger.info("开发模式: 静态文件托管已禁用，请使用 http://localhost:5173 访问前端")
+elif not SERVE_FRONTEND:
+    logger.info("前端静态文件托管已关闭（ANCHORFLUX_SERVE_FRONTEND=false）")
 elif os.path.exists(FRONTEND_DIST):
     # 托管静态资源 (js, css, images等)
     app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST, "assets")), name="static-assets")

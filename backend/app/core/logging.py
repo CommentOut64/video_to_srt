@@ -12,6 +12,7 @@ import logging
 import sys
 import json
 import time
+import os
 from typing import Optional, Dict, Any
 from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
@@ -167,7 +168,10 @@ def setup_logging(
 
     # 创建根日志处理器
     root_logger = logging.getLogger()
-    log_level = getattr(logging, config.LOG_LEVEL)
+    log_level = getattr(logging, str(config.LOG_LEVEL).upper(), logging.INFO)
+    is_dev_mode = str(os.environ.get("DEV_MODE", "")).strip().lower() in ("true", "1", "yes")
+    file_log_level = logging.DEBUG if is_dev_mode else log_level
+    file_log_level_name = logging.getLevelName(file_log_level)
     root_logger.setLevel(logging.DEBUG)  # 设置根logger为DEBUG，让处理器来控制级别
 
     # 清除已有的处理器
@@ -183,7 +187,7 @@ def setup_logging(
     console_handler.addFilter(ThirdPartyFilter())
     root_logger.addHandler(console_handler)
 
-    # 文件输出：固定 DEBUG 级别（给开发者看）
+    # 文件输出：开发模式写 DEBUG，生产模式跟随 LOG_LEVEL（默认 INFO）
     if enable_rotation:
         # 使用轮转文件处理器
         file_handler = RotatingFileHandler(
@@ -196,7 +200,7 @@ def setup_logging(
         # 使用普通文件处理器
         file_handler = logging.FileHandler(config.LOG_FILE, encoding='utf-8')
 
-    file_handler.setLevel(logging.DEBUG)
+    file_handler.setLevel(file_log_level)
     file_handler.setFormatter(console_formatter)
     file_handler.addFilter(ThirdPartyFilter())
     root_logger.addHandler(file_handler)
@@ -217,7 +221,7 @@ def setup_logging(
 
     # 设置第三方库日志级别为WARNING
     third_party_loggers = [
-        'urllib3', 'multipart', 'transformers',
+        'urllib3', 'multipart', 'python_multipart', 'python_multipart.multipart', 'multipart.multipart', 'transformers',
         'faster_whisper', 'ctranslate2',  # Faster-Whisper 及其底层库
         'silero', 'torch', 'pytorch_lightning', 'pyannote',
         'speechbrain', 'whisper', 'onnxruntime',
@@ -240,7 +244,7 @@ def setup_logging(
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
     logger = logging.getLogger(__name__)
-    logger.info(f"日志系统已初始化 - 控制台: INFO, 文件: DEBUG")
+    logger.info(f"日志系统已初始化 - 控制台: INFO, 文件: {file_log_level_name}")
     logger.info(f"日志文件: {config.LOG_FILE}")
     if enable_rotation:
         logger.info(f"日志轮转已启用 - 最大: {max_bytes // (1024*1024)}MB, 备份: {backup_count}个")
@@ -250,6 +254,7 @@ def setup_logging(
     # V3.2.0+dev.20260203.10: Loguru 迁移准备（分层推进）
     _configure_loguru_if_available(
         level=config.LOG_LEVEL,
+        file_level=file_log_level_name,
         max_bytes=max_bytes,
         backup_count=backup_count,
     )
@@ -259,6 +264,7 @@ def setup_logging(
 
 def _configure_loguru_if_available(
     level: str,
+    file_level: str,
     max_bytes: int,
     backup_count: int,
 ) -> None:
@@ -286,7 +292,7 @@ def _configure_loguru_if_available(
     loguru_text_file = log_text_dir / f"loguru_{config.LOG_FILE.stem}.log"
     loguru_logger.add(
         loguru_text_file,
-        level="DEBUG",
+        level=file_level,
         rotation=max_bytes,
         retention=backup_count,
         enqueue=True,
@@ -298,7 +304,7 @@ def _configure_loguru_if_available(
     loguru_json_file = log_json_dir / f"loguru_{config.LOG_FILE.stem}.jsonl"
     loguru_logger.add(
         loguru_json_file,
-        level="DEBUG",
+        level=file_level,
         rotation=max_bytes,
         retention=backup_count,
         enqueue=True,
