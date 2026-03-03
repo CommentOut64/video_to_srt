@@ -124,10 +124,6 @@ function Prepare-ElectronBuildResources {
     }
 
     $iconTarget = Join-Path $electronBuildDir "icon.ico"
-    $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
-    if ($null -eq $pythonCmd) {
-        throw "未找到 python，可执行文件不存在，无法生成 Electron 图标"
-    }
 
     $iconBuildScript = @"
 from PIL import Image
@@ -142,7 +138,17 @@ image.save(
     sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)],
 )
 "@
-    $iconBuildScript | & $pythonCmd.Source -
+    $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+    if ($null -ne $pythonCmd) {
+        $iconBuildScript | & $pythonCmd.Source -
+    }
+    else {
+        $pyLauncher = Get-Command py -ErrorAction SilentlyContinue
+        if ($null -eq $pyLauncher) {
+            throw "未找到 python 或 py 启动器，无法生成 Electron 图标"
+        }
+        $iconBuildScript | & $pyLauncher.Source -3 -
+    }
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $iconTarget)) {
         throw "生成 Electron 图标失败: $iconTarget"
     }
@@ -151,12 +157,18 @@ image.save(
 function Build-GoStub {
     param(
         [string]$ProjectRoot,
-        [string]$OutputExePath
+        [string]$OutputExePath,
+        [switch]$HideConsole
     )
     New-Item -ItemType Directory -Force -Path (Split-Path $OutputExePath -Parent) | Out-Null
     Push-Location (Join-Path $ProjectRoot "stub")
     try {
-        & go build -o $OutputExePath .
+        if ($HideConsole -and $IsWindows) {
+            & go build -ldflags "-H=windowsgui" -o $OutputExePath .
+        }
+        else {
+            & go build -o $OutputExePath .
+        }
         if ($LASTEXITCODE -ne 0) {
             throw "Go Stub 构建失败"
         }
@@ -345,7 +357,7 @@ Invoke-Checked -Label "构建 Electron Shell (win-unpacked)" -Action {
 
 $stubExePath = Join-Path $buildDir "AnchorFlux.exe"
 Invoke-Checked -Label "构建 Go Stub" -Action {
-    Build-GoStub -ProjectRoot $projectRoot -OutputExePath $stubExePath
+    Build-GoStub -ProjectRoot $projectRoot -OutputExePath $stubExePath -HideConsole:($flavor -eq "lite")
 }
 
 Invoke-Checked -Label "构建 Python 运行时" -Action {

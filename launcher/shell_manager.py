@@ -45,27 +45,27 @@ def wait_backend_ready(base_url: str, timeout_sec: int = 60) -> bool:
     return False
 
 
-def launch_electron(shell_path: Path) -> bool:
+def launch_electron(shell_path: Path) -> Optional[subprocess.Popen]:
     """
     拉起 Electron Shell。
 
     设计取舍：
-    - 失败时仅返回 False，不中断启动器主流程，交由调用方决定回退行为。
+    - 失败时返回 None，不中断启动器主流程，交由调用方决定回退行为。
     """
     if not shell_path.exists():
         logger.error("Electron Shell 不存在: %s", shell_path)
-        return False
+        return None
 
     try:
-        subprocess.Popen(
+        process = subprocess.Popen(
             [str(shell_path)],
             cwd=str(shell_path.parent),
         )
-        logger.info("Electron Shell 已启动: %s", shell_path)
-        return True
+        logger.info("Electron Shell 已启动: %s (PID=%s)", shell_path, process.pid)
+        return process
     except OSError as exc:
         logger.error("启动 Electron Shell 失败: %s", exc)
-        return False
+        return None
 
 
 def open_browser_fallback(url: str) -> bool:

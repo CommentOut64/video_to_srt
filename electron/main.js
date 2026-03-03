@@ -1,6 +1,8 @@
 const path = require("path");
-const { app, BrowserWindow } = require("electron");
+const { app, BrowserWindow, nativeTheme } = require("electron");
 const fs = require("fs");
+const http = require("http");
+const https = require("https");
 
 const BACKEND_BASE_URL =
   process.env.ANCHORFLUX_BACKEND_URL || "http://127.0.0.1:8000";
@@ -11,52 +13,82 @@ const READY_INTERVAL_MS = 1000;
 const SHUTDOWN_REQUEST_TIMEOUT_MS = Number(
   process.env.ANCHORFLUX_SHUTDOWN_REQUEST_TIMEOUT_MS || 4000
 );
-const SHUTDOWN_RETRY_INTERVAL_MS = Number(
-  process.env.ANCHORFLUX_SHUTDOWN_RETRY_INTERVAL_MS || 600
-);
-const SHUTDOWN_GRACE_PERIOD_MS = Number(
-  process.env.ANCHORFLUX_SHUTDOWN_GRACE_PERIOD_MS || 12000
+const SHELL_FORCE_EXIT_MS = Number(
+  process.env.ANCHORFLUX_SHELL_FORCE_EXIT_MS || 15000
 );
 const WINDOW_BG_COLOR = "#0b1220";
-const TITLEBAR_BG_COLOR = "#111827";
-const TITLEBAR_SYMBOL_COLOR = "#e5e7eb";
 
 let mainWindow = null;
 let isBackendShutdownTriggered = false;
+let isAppExitInProgress = false;
 
-async function requestBackendShutdown(reason = "window-all-closed") {
+function requestBackendShutdown() {
   if (isBackendShutdownTriggered) {
-    return;
+    return Promise.resolve(true);
   }
   isBackendShutdownTriggered = true;
-  const deadline = Date.now() + SHUTDOWN_GRACE_PERIOD_MS;
-  while (Date.now() < deadline) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(
-      () => controller.abort(),
-      SHUTDOWN_REQUEST_TIMEOUT_MS
-    );
+  return new Promise((resolve) => {
+    let isResolved = false;
+    const done = (success) => {
+      if (isResolved) return;
+      isResolved = true;
+      resolve(Boolean(success));
+    };
+
     try {
-      const response = await fetch(SHUTDOWN_ENDPOINT, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        cache: "no-store",
-        signal: controller.signal,
-        body: JSON.stringify({
-          cleanup_temp: false,
-          force: false,
-        }),
+      const target = new URL(SHUTDOWN_ENDPOINT);
+      const payload = JSON.stringify({
+        cleanup_temp: false,
+        force: false,
       });
-      if (response && response.ok) {
-        return;
-      }
+      const client = target.protocol === "https:" ? https : http;
+      const req = client.request(
+        {
+          protocol: target.protocol,
+          hostname: target.hostname,
+          port: target.port || (target.protocol === "https:" ? 443 : 80),
+          path: `${target.pathname}${target.search}`,
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(payload),
+          },
+        },
+        (response) => {
+          response.resume();
+          done(true);
+        }
+      );
+      req.on("error", () => done(false));
+      req.setTimeout(SHUTDOWN_REQUEST_TIMEOUT_MS, () => {
+        req.destroy(new Error("shutdown request timeout"));
+        done(false);
+      });
+      req.write(payload);
+      req.end();
     } catch (_) {
-      // 后端可能仍在启动中，稍后重试。
-    } finally {
-      clearTimeout(timeoutId);
+      // 关闭链路不抛异常，避免阻断壳进程退出。
+      done(false);
     }
-    await sleep(SHUTDOWN_RETRY_INTERVAL_MS);
+  });
+}
+
+function exitAppWithGuard() {
+  if (isAppExitInProgress) {
+    return;
   }
+  isAppExitInProgress = true;
+
+  const forceExitTimer = setTimeout(() => {
+    app.exit(0);
+  }, SHELL_FORCE_EXIT_MS);
+
+  requestBackendShutdown()
+    .catch(() => false)
+    .finally(() => {
+      clearTimeout(forceExitTimer);
+      app.exit(0);
+    });
 }
 
 function resolveWindowIconPath() {
@@ -136,16 +168,7 @@ function createMainWindow() {
     show: false,
     backgroundColor: WINDOW_BG_COLOR,
     ...(iconPath ? { icon: iconPath } : {}),
-    ...(process.platform === "win32"
-      ? {
-          titleBarStyle: "hidden",
-          titleBarOverlay: {
-            color: TITLEBAR_BG_COLOR,
-            symbolColor: TITLEBAR_SYMBOL_COLOR,
-            height: 34,
-          },
-        }
-      : {}),
+    ...(process.platform === "win32" ? { titleBarStyle: "default" } : {}),
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -199,7 +222,10 @@ if (!gotSingleInstanceLock) {
       startShell();
     }
   });
-  app.whenReady().then(startShell);
+  app.whenReady().then(() => {
+    nativeTheme.themeSource = "dark";
+    startShell();
+  });
 }
 
 app.on("window-all-closed", () => {
@@ -207,9 +233,7 @@ app.on("window-all-closed", () => {
     app.exit(0);
     return;
   }
-  requestBackendShutdown().finally(() => {
-    app.exit(0);
-  });
+  exitAppWithGuard();
 });
 
 app.on("activate", () => {

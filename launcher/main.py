@@ -19,6 +19,8 @@ import logging
 import subprocess
 from pathlib import Path
 from typing import Optional
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 from .config import (
     VERSION, APP_NAME, LauncherConfig,
@@ -120,8 +122,11 @@ class ProcessManager:
     def __init__(self):
         self.backend_process: Optional[subprocess.Popen] = None
         self.frontend_process: Optional[subprocess.Popen] = None
+        self.shell_process: Optional[subprocess.Popen] = None
         self._shutdown_requested = False
         self._cleanup_done = False  # 标记是否已清理过
+        self._backend_port: Optional[int] = None
+        self._frontend_port: Optional[int] = None
 
     def _find_pid_on_port(self, port: int) -> Optional[int]:
         """
@@ -198,6 +203,7 @@ class ProcessManager:
     def start_backend(self, config: LauncherConfig) -> bool:
         """启动后端服务"""
         logger.info(f"启动后端服务 (端口 {config.backend_port})...")
+        self._backend_port = config.backend_port
 
         backend_dir = config.project_root / "backend"
 
@@ -235,16 +241,22 @@ class ProcessManager:
         ]
 
         try:
-            if config.dev_mode and os.name == 'nt':
-                creationflags = subprocess.CREATE_NEW_CONSOLE
-                self.backend_process = subprocess.Popen(
-                    cmd, cwd=str(backend_dir), env=env,
-                    creationflags=creationflags
-                )
-            else:
-                self.backend_process = subprocess.Popen(
-                    cmd, cwd=str(backend_dir), env=env
-                )
+            creationflags = 0
+            if os.name == 'nt':
+                if config.dev_mode:
+                    creationflags = subprocess.CREATE_NEW_CONSOLE
+                elif config.flavor == 'lite':
+                    # Lite 打包版要求无命令行窗口，后端进程改为无窗口模式。
+                    creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+
+            popen_kwargs = {
+                'cwd': str(backend_dir),
+                'env': env,
+            }
+            if creationflags:
+                popen_kwargs['creationflags'] = creationflags
+
+            self.backend_process = subprocess.Popen(cmd, **popen_kwargs)
 
             logger.info(f"后端已启动: PID={self.backend_process.pid}")
             logger.info(
@@ -269,6 +281,7 @@ class ProcessManager:
         """启动前端服务（仅开发模式）"""
         if not config.dev_mode:
             return True
+        self._frontend_port = config.frontend_port
 
         frontend_dir = config.project_root / "frontend"
 
@@ -317,6 +330,92 @@ class ProcessManager:
             return False
         return self.backend_process.poll() is None
 
+    def request_backend_shutdown(self, backend_port: int, timeout_sec: int = 3) -> bool:
+        """
+        请求后端执行优雅关闭。
+
+        设计取舍：
+        - 不抛异常，返回布尔值给上层决定是否进入强制清理。
+        - 超时控制较短，避免启动器在“后端已阻塞”场景下长期等待。
+        """
+        shutdown_url = f"http://127.0.0.1:{backend_port}/api/system/shutdown"
+        payload = b'{"cleanup_temp": false, "force": false}'
+        req = urllib_request.Request(
+            shutdown_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib_request.urlopen(req, timeout=timeout_sec) as response:
+                if response.status < 500:
+                    logger.info("已向后端发送关闭请求: %s", shutdown_url)
+                    return True
+        except (urllib_error.URLError, TimeoutError) as exc:
+            logger.warning("发送后端关闭请求失败: %s", exc)
+        except Exception as exc:  # pragma: no cover - 防御性兜底
+            logger.warning("发送后端关闭请求异常: %s", exc)
+        return False
+
+    def attach_shell_process(self, process: Optional[subprocess.Popen]) -> None:
+        """记录当前 Electron Shell 进程句柄。"""
+        self.shell_process = process
+
+    def _force_cleanup_residual_processes(self) -> None:
+        """
+        强制清理残留进程（兜底层）。
+
+        清理范围：
+        - 启动器已知后端/前端/Shell 进程句柄；
+        - 后端端口与前端端口占用进程（若可解析）；
+        - 常见残留 ffmpeg/ffprobe 进程。
+        """
+        if os.name != "nt":
+            return
+
+        # 1) 先按已知句柄强杀
+        for name, proc in (
+            ("Shell", self.shell_process),
+            ("前端", self.frontend_process),
+            ("后端", self.backend_process),
+        ):
+            if proc is None:
+                continue
+            try:
+                if proc.poll() is None:
+                    logger.warning("%s进程仍存活，执行强制终止 PID=%s", name, proc.pid)
+                    proc.kill()
+            except Exception as exc:
+                logger.debug("强制终止%s进程失败: %s", name, exc)
+
+        # 2) 再按端口兜底
+        for port in (self._backend_port, self._frontend_port):
+            if not port:
+                continue
+            pid = self._find_pid_on_port(port)
+            if not pid:
+                continue
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/PID", str(pid), "/T"],
+                    capture_output=True,
+                    timeout=3,
+                )
+                logger.warning("按端口兜底终止进程: port=%s pid=%s", port, pid)
+            except Exception as exc:
+                logger.debug("按端口强制终止失败: port=%s error=%s", port, exc)
+
+        # 3) ffmpeg 残留兜底
+        for image_name in ("ffmpeg.exe", "ffprobe.exe"):
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/IM", image_name],
+                    capture_output=True,
+                    timeout=3,
+                )
+            except Exception:
+                pass
+
     def terminate_all(self):
         """
         终止所有进程（优化版）
@@ -330,11 +429,17 @@ class ProcessManager:
         if self.frontend_process and self.frontend_process.poll() is None:
             processes_to_terminate.append(("前端", self.frontend_process))
 
+        if self.shell_process and self.shell_process.poll() is None:
+            processes_to_terminate.append(("Shell", self.shell_process))
+
         if self.backend_process and self.backend_process.poll() is None:
             processes_to_terminate.append(("后端", self.backend_process))
 
         if not processes_to_terminate:
-            return  # 没有需要终止的进程
+            # 句柄为空不代表系统无残留（可能句柄丢失但端口仍被占用）。
+            self._force_cleanup_residual_processes()
+            self.shell_process = None
+            return
 
         # 并行发送 terminate 信号
         for name, proc in processes_to_terminate:
@@ -358,6 +463,10 @@ class ProcessManager:
                 logger.warning(f"{name}进程未响应，强制终止")
                 proc.kill()
 
+        # 兜底：按端口/进程名做一次强制残留清理，避免僵尸进程滞留。
+        self._force_cleanup_residual_processes()
+        self.shell_process = None
+
 
 class Launcher:
     """主启动器"""
@@ -371,6 +480,7 @@ class Launcher:
         self.instance_guard: Optional[SingleInstanceGuard] = None
         self._exit_code_override: Optional[int] = None
         self._running = True
+        self._shell_process: Optional[subprocess.Popen] = None
 
     def _signal_handler(self, signum, frame):
         """信号处理"""
@@ -405,7 +515,7 @@ class Launcher:
         if normalized_ui_mode == "electron":
             wait_backend_ready(backend_url, timeout_sec=8)
             target_shell_path = resolve_shell_path(self.project_root, shell_path)
-            if launch_electron(target_shell_path):
+            if launch_electron(target_shell_path) is not None:
                 return
             logger.warning("激活 Electron 失败，回退浏览器")
             open_browser_fallback(browser_url)
@@ -610,9 +720,76 @@ class Launcher:
             return
 
         shell_path = resolve_shell_path(self.project_root, self.config.shell_path)
-        if not launch_electron(shell_path):
+        self._shell_process = launch_electron(shell_path)
+        if self.process_manager:
+            self.process_manager.attach_shell_process(self._shell_process)
+        if self._shell_process is None:
             logger.warning("Electron Shell 启动失败，回退浏览器。")
             open_browser_fallback(browser_url)
+
+    def _wait_backend_exit_with_electron_guard(self) -> int:
+        """
+        等待后端退出，并在 Electron 先退出后执行超时强清理。
+
+        设计取舍：
+        - Electron 退出被视为用户离开桌面端，Launcher 需主动推进后端退出；
+        - 若优雅关闭超过阈值，直接执行强制清理，保证无残留进程。
+        """
+        if self.process_manager is None or self.config is None:
+            return -1
+        if self.process_manager.backend_process is None:
+            return -1
+
+        raw_timeout = str(os.environ.get("ANCHORFLUX_ELECTRON_EXIT_FORCE_TIMEOUT_SEC", "15")).strip()
+        try:
+            force_timeout_sec = max(5, min(120, int(raw_timeout)))
+        except ValueError:
+            force_timeout_sec = 15
+
+        shutdown_requested_at: Optional[float] = None
+
+        while True:
+            backend_proc = self.process_manager.backend_process
+            if backend_proc is None:
+                return -1
+
+            exit_code = backend_proc.poll()
+            if exit_code is not None:
+                return int(exit_code)
+
+            # Shell 未启动（例如启动失败回退浏览器）时走普通等待。
+            if self._shell_process is None:
+                time.sleep(0.2)
+                continue
+
+            shell_exit_code = self._shell_process.poll()
+            if shell_exit_code is None:
+                time.sleep(0.2)
+                continue
+
+            if shutdown_requested_at is None:
+                logger.warning(
+                    "检测到 Electron 已退出（code=%s），触发后端关闭请求",
+                    shell_exit_code,
+                )
+                self.process_manager.request_backend_shutdown(
+                    backend_port=self.config.backend_port,
+                    timeout_sec=3,
+                )
+                shutdown_requested_at = time.time()
+                time.sleep(0.2)
+                continue
+
+            if time.time() - shutdown_requested_at >= force_timeout_sec:
+                logger.error(
+                    "Electron 退出后等待后端关闭超时（%ss），执行强制清理",
+                    force_timeout_sec,
+                )
+                self.process_manager.terminate_all()
+                final_code = backend_proc.poll()
+                return int(final_code) if final_code is not None else -9
+
+            time.sleep(0.2)
 
     def run(self) -> int:
         """运行主循环"""
@@ -641,6 +818,8 @@ class Launcher:
                     if not self.process_manager.start_frontend(self.config):
                         logger.warning("前端启动失败，继续运行...")
 
+                self._shell_process = None
+                self.process_manager.attach_shell_process(None)
                 self._launch_ui()
 
                 # 显示启动信息
@@ -657,8 +836,11 @@ class Launcher:
                 logger.info("按 Ctrl+C 停止，或使用应用内的「退出系统」按钮")
                 logger.info("=" * 50)
 
-                # 等待后端退出
-                exit_code = self.process_manager.wait_for_backend_exit()
+                # 等待后端退出（Electron 模式附加强制清理守卫）
+                if self.config.ui_mode == "electron":
+                    exit_code = self._wait_backend_exit_with_electron_guard()
+                else:
+                    exit_code = self.process_manager.wait_for_backend_exit()
                 logger.info(f"后端退出，代码: {exit_code}")
 
                 # 检查更新信号

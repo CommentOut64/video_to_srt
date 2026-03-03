@@ -1,6 +1,10 @@
 appId: com.anchorflux.shell
 productName: AnchorFluxShell
 asar: true
+electronLanguages:
+  - en-US
+  - zh-CN
+  - ja
 
 directories:
   output: dist-shell

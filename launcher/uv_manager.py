@@ -67,6 +67,33 @@ class UvManager:
         """检查 uv 是否可用"""
         return self.uv_exec is not None
 
+    def _windows_no_window_kwargs(self) -> Dict[str, Any]:
+        """
+        Windows 下返回“无控制台窗口”子进程参数。
+
+        设计取舍：
+        - 仅在生产模式启用，开发模式保留默认行为便于调试。
+        - 统一用于 run/Popen，避免 uv/python 探针偶发闪窗。
+        """
+        if os.name != "nt" or self.dev_mode:
+            return {}
+
+        kwargs: Dict[str, Any] = {}
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        if creationflags:
+            kwargs["creationflags"] = creationflags
+
+        startupinfo_cls = getattr(subprocess, "STARTUPINFO", None)
+        startf_use_showwindow = getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+        sw_hide = getattr(subprocess, "SW_HIDE", 0)
+        if startupinfo_cls and startf_use_showwindow:
+            startupinfo = startupinfo_cls()
+            startupinfo.dwFlags |= startf_use_showwindow
+            startupinfo.wShowWindow = sw_hide
+            kwargs["startupinfo"] = startupinfo
+
+        return kwargs
+
     def check_sync_status(self) -> UvResult:
         """
         检查依赖同步状态
@@ -89,7 +116,8 @@ class UvManager:
                 cmd,
                 cwd=str(self.project_root),
                 capture_output=True,
-                timeout=60
+                timeout=60,
+                **self._windows_no_window_kwargs(),
             )
 
             if result.returncode == 0:
@@ -158,7 +186,8 @@ class UvManager:
                 stderr=subprocess.STDOUT,
                 text=True,
                 encoding='utf-8',
-                errors='replace'
+                errors='replace',
+                **self._windows_no_window_kwargs(),
             )
 
             output_lines = []
@@ -252,7 +281,8 @@ class UvManager:
                 cmd,
                 cwd=str(self.project_root),
                 capture_output=True,
-                timeout=120
+                timeout=120,
+                **self._windows_no_window_kwargs(),
             )
 
             if result.returncode == 0:
@@ -334,6 +364,7 @@ class UvManager:
                 errors="replace",
                 timeout=30,
                 env=self._build_python_runtime_env(site_packages),
+                **self._windows_no_window_kwargs(),
             )
         except Exception as exc:
             return OnnxRuntimeProviderStatus(
@@ -388,6 +419,7 @@ class UvManager:
                 encoding="utf-8",
                 errors="replace",
                 timeout=15,
+                **self._windows_no_window_kwargs(),
             )
         except Exception as exc:
             logger.warning("读取包版本失败: package=%s error=%s", package_name, exc)
@@ -424,6 +456,7 @@ class UvManager:
                 encoding="utf-8",
                 errors="replace",
                 timeout=180,
+                **self._windows_no_window_kwargs(),
             )
         except Exception as exc:
             return UvResult(success=False, message=f"执行 ORT-GPU 自动修正异常: {exc}")
