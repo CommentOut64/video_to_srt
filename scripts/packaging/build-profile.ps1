@@ -138,16 +138,30 @@ image.save(
     sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)],
 )
 "@
+    # 防御性处理：某些终端/编码组合下，管道给 python - 会注入 BOM，触发 SyntaxError(U+FEFF)。
+    # 改为写入 UTF-8 无 BOM 的临时脚本文件再执行。
+    $iconBuildScript = $iconBuildScript.TrimStart([char]0xFEFF)
+    $tempIconScript = Join-Path $env:TEMP ("anchorflux-icon-build-" + [guid]::NewGuid().ToString("N") + ".py")
+    [System.IO.File]::WriteAllText(
+        $tempIconScript,
+        $iconBuildScript,
+        (New-Object System.Text.UTF8Encoding($false))
+    )
     $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
-    if ($null -ne $pythonCmd) {
-        $iconBuildScript | & $pythonCmd.Source -
-    }
-    else {
-        $pyLauncher = Get-Command py -ErrorAction SilentlyContinue
-        if ($null -eq $pyLauncher) {
-            throw "未找到 python 或 py 启动器，无法生成 Electron 图标"
+    try {
+        if ($null -ne $pythonCmd) {
+            & $pythonCmd.Source $tempIconScript
         }
-        $iconBuildScript | & $pyLauncher.Source -3 -
+        else {
+            $pyLauncher = Get-Command py -ErrorAction SilentlyContinue
+            if ($null -eq $pyLauncher) {
+                throw "未找到 python 或 py 启动器，无法生成 Electron 图标"
+            }
+            & $pyLauncher.Source -3 $tempIconScript
+        }
+    }
+    finally {
+        Remove-Item -Path $tempIconScript -Force -ErrorAction SilentlyContinue
     }
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $iconTarget)) {
         throw "生成 Electron 图标失败: $iconTarget"
@@ -163,7 +177,8 @@ function Build-GoStub {
     New-Item -ItemType Directory -Force -Path (Split-Path $OutputExePath -Parent) | Out-Null
     Push-Location (Join-Path $ProjectRoot "stub")
     try {
-        if ($HideConsole -and $IsWindows) {
+        $isWindowsPlatform = ($env:OS -eq "Windows_NT")
+        if ($HideConsole -and $isWindowsPlatform) {
             & go build -ldflags "-H=windowsgui" -o $OutputExePath .
         }
         else {

@@ -1,4 +1,5 @@
 !include "MUI2.nsh"
+!include "LogicLib.nsh"
 
 !ifndef SOURCE_DIR
   !error "SOURCE_DIR 未定义"
@@ -8,18 +9,24 @@
 !endif
 
 !define APP_NAME "AnchorFlux"
+!define APP_REG_KEY "Software\AnchorFlux"
+!define APP_UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\AnchorFlux"
 !define MUI_FINISHPAGE_RUN "$INSTDIR\AnchorFlux.exe"
 !define MUI_FINISHPAGE_RUN_TEXT "安装完成后启动 AnchorFlux"
 !define MUI_FINISHPAGE_RUN_NOTCHECKED
+!define MUI_FINISHPAGE_SHOWREADME
+!define MUI_FINISHPAGE_SHOWREADME_TEXT "创建桌面快捷方式"
+!define MUI_FINISHPAGE_SHOWREADME_FUNCTION CreateDesktopShortcut
+!define MUI_FINISHPAGE_SHOWREADME_NOTCHECKED
 
 Name "${APP_NAME}"
 OutFile "${OUT_FILE}"
 InstallDir "$PROGRAMFILES64\AnchorFlux"
+InstallDirRegKey HKLM "${APP_REG_KEY}" "InstallDir"
 RequestExecutionLevel admin
 Unicode true
 
 !insertmacro MUI_PAGE_WELCOME
-!insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
@@ -43,14 +50,17 @@ Section "主程序（必选）" SecMain
   CreateDirectory "$INSTDIR\logs"
   CreateDirectory "$INSTDIR\data"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
+  WriteRegStr HKLM "${APP_REG_KEY}" "InstallDir" "$INSTDIR"
+  WriteRegStr HKLM "${APP_UNINSTALL_KEY}" "DisplayName" "${APP_NAME}"
+  !ifdef APP_VERSION
+    WriteRegStr HKLM "${APP_UNINSTALL_KEY}" "DisplayVersion" "${APP_VERSION}"
+  !endif
+  WriteRegStr HKLM "${APP_UNINSTALL_KEY}" "InstallLocation" "$INSTDIR"
+  WriteRegStr HKLM "${APP_UNINSTALL_KEY}" "UninstallString" '"$INSTDIR\Uninstall.exe"'
+  WriteRegDWORD HKLM "${APP_UNINSTALL_KEY}" "NoModify" 1
+  WriteRegDWORD HKLM "${APP_UNINSTALL_KEY}" "NoRepair" 1
   CreateDirectory "$SMPROGRAMS\AnchorFlux"
   CreateShortcut "$SMPROGRAMS\AnchorFlux\AnchorFlux.lnk" "$INSTDIR\AnchorFlux.exe"
-  ; 桌面快捷方式改为可选组件，默认不创建
-  Delete "$DESKTOP\AnchorFlux.lnk"
-SectionEnd
-
-Section /o "创建桌面快捷方式" SecDesktop
-  CreateShortcut "$DESKTOP\AnchorFlux.lnk" "$INSTDIR\AnchorFlux.exe"
 SectionEnd
 
 Section "Uninstall"
@@ -59,8 +69,41 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\AnchorFlux\AnchorFlux.lnk"
   RMDir "$SMPROGRAMS\AnchorFlux"
   Call un.CleanupProgramFilesOnly
+  DeleteRegKey HKLM "${APP_UNINSTALL_KEY}"
+  DeleteRegKey HKLM "${APP_REG_KEY}"
   RMDir "$INSTDIR"
 SectionEnd
+
+Function .onInit
+  Call DetectExistingInstallDir
+FunctionEnd
+
+Function DetectExistingInstallDir
+  ReadRegStr $0 HKLM "${APP_REG_KEY}" "InstallDir"
+  ${If} $0 != ""
+    IfFileExists "$0\AnchorFlux.exe" 0 +2
+      StrCpy $INSTDIR "$0"
+  ${EndIf}
+
+  IfFileExists "$INSTDIR\AnchorFlux.exe" 0 +2
+    Return
+
+  ReadRegStr $1 HKLM "${APP_UNINSTALL_KEY}" "InstallLocation"
+  ${If} $1 != ""
+    IfFileExists "$1\AnchorFlux.exe" 0 +2
+      StrCpy $INSTDIR "$1"
+  ${EndIf}
+
+  IfFileExists "$INSTDIR\AnchorFlux.exe" 0 +2
+    Return
+
+  IfFileExists "$PROGRAMFILES64\AnchorFlux\AnchorFlux.exe" 0 +2
+    StrCpy $INSTDIR "$PROGRAMFILES64\AnchorFlux"
+FunctionEnd
+
+Function CreateDesktopShortcut
+  CreateShortcut "$DESKTOP\AnchorFlux.lnk" "$INSTDIR\AnchorFlux.exe"
+FunctionEnd
 
 Function CleanupProgramFilesOnly
   Delete "$INSTDIR\AnchorFlux.exe"
