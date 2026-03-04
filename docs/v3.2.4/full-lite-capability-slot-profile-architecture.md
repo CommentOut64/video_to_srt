@@ -1,8 +1,8 @@
 # Full/Lite 能力系统架构
 
 > Type: Architecture | Status: Active
-> Version: V3.2.4+dev.20260303.01
-> Last Updated: 2026-03-03
+> Version: V3.2.4+dev.20260304.11
+> Last Updated: 2026-03-04
 
 ## 1. Summary
 
@@ -42,13 +42,13 @@ TaskListView / EditorHeader / EditorView (v-if 消费)
 ```
 [共享层 — Lite 基线]                      [Full 增量层]
   fastapi / uvicorn / pydantic              torch==2.8.0 / torchaudio==2.8.0
-  numpy==1.26.4                             faster-whisper==1.2.1
-  ffmpeg-python / av                        ctranslate2 / onnxruntime-gpu
+  ffmpeg-python                             faster-whisper==1.2.1
   pypinyin / sudachipy / cmudict            demucs==4.0.1
   wave / struct (stdlib)                    pyannote.audio / speechbrain
-  customtkinter                             librosa / scipy
+  customtkinter                             numpy / av / wetext
+                                            librosa / scipy
                                             punctuators / sentencepiece
-                                            silero-vad
+                                            silero-vad / prometheus-client / tqdm
 ```
 
 ### 2.3 后端模块耦合图
@@ -123,6 +123,16 @@ TaskListView / EditorHeader / EditorView (v-if 消费)
 
 **不依赖 librosa / scipy / numpy 做波形**。这使得 Lite 可以安全排除这三个库，依赖体积从 ~400MB 进一步降至 ~200-250MB。
 
+### 4.4 Lite 高级设置 UI 收敛
+
+Lite 模式下高级设置仅保留三个 Tab：
+
+- `常规`
+- `快捷键`
+- `关于`
+
+`Audio / ASR / LLM / System` 仅在 Full 模式显示。该规则在 `AdvancedSettings.vue` 内按 flavor 统一门控，避免不同入口（Task/Editor）出现不一致。
+
 ## 5. 依赖分离策略
 
 ### 5.1 方案：pyproject.toml 可选依赖组
@@ -130,15 +140,17 @@ TaskListView / EditorHeader / EditorView (v-if 消费)
 ```toml
 # 核心依赖（Lite 基线，~200-250MB）
 [project.dependencies]
-  numpy, fastapi, uvicorn, pydantic,
-  ffmpeg-python, av, pypinyin, sudachipy, cmudict,
+  fastapi, uvicorn, pydantic,
+  ffmpeg-python, pypinyin, sudachipy, cmudict,
   customtkinter, loguru, psutil, filelock, ...
 
 # Full 增量依赖（~4GB）
 [project.optional-dependencies]
 full = [
+  "numpy==1.26.4",
   "torch==2.8.0",
   "torchaudio==2.8.0",
+  "av>=10.0.0",
   "faster-whisper==1.2.1",
   "ctranslate2>=4.5.0",
   "onnxruntime-gpu==1.23.2",
@@ -150,6 +162,9 @@ full = [
   "silero-vad>=5.0.0",
   "punctuators>=0.0.7",
   "sentencepiece>=0.2.0",
+  "wetext>=0.1.2",
+  "prometheus-client>=0.19.0",
+  "tqdm",
   "pydub>=0.25.0",
   "soundfile>=0.12.0",
 ]
@@ -167,7 +182,7 @@ full = [
 
 | 层 | 包含内容 | 磁盘占用 |
 |----|---------|---------|
-| Lite 核心 | FastAPI 栈 + numpy + FFmpeg 绑定 + 同音检索 + 启动器 | ~200-250MB |
+| Lite 核心 | FastAPI 栈 + FFmpeg 绑定 + 同音检索 + 启动器 | ~200-250MB |
 | Full 增量 | PyTorch + 推理引擎 + 音频分析 + VAD/声纹 | ~4GB |
 | **Full 总计** | | **~4.5GB** |
 
