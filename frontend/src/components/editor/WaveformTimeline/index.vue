@@ -83,6 +83,10 @@ import WaveformHeader from './WaveformHeader.vue'
 import WaveformScrollbar from './WaveformScrollbar.vue'
 import { logWaveformDragDiagnostics } from '@/composables/waveformDragDiagnostics.js'
 import {
+  createRuntimeHealthSampler,
+  recordRuntimeHealthCounter,
+} from '@/composables/runtimeHealthDiagnostics.js'
+import {
   useWaveformZoom,
   useWaveformScroll,
   useWaveformCursorDrag,
@@ -198,6 +202,49 @@ const isVirtualTimelineMode = ref(false)
 const isTimelineInteractive = computed(() => isMediaReady.value || isVirtualTimelineMode.value)
 let virtualClockRafId = null
 let virtualClockLastTs = 0
+let mediaKeydownElement = null
+let scrollListenerElement = null
+let stopRuntimeHealthSampler = null
+
+function handleMediaElementKeydown(e) {
+  if (e.code === 'Space') {
+    e.preventDefault()
+    e.stopPropagation()
+  }
+}
+
+function detachWaveformDomListeners() {
+  if (mediaKeydownElement) {
+    mediaKeydownElement.removeEventListener('keydown', handleMediaElementKeydown)
+    mediaKeydownElement = null
+    recordRuntimeHealthCounter('waveform.media_keydown.unbind')
+  }
+  if (scrollListenerElement) {
+    scrollListenerElement.removeEventListener('scroll', updateScrollbarThumb)
+    scrollListenerElement = null
+    recordRuntimeHealthCounter('waveform.scroll_listener.unbind')
+  }
+}
+
+function bindWaveformDomListeners(ws) {
+  detachWaveformDomListeners()
+
+  const audioElement = ws.getMediaElement?.()
+  if (audioElement) {
+    audioElement.setAttribute('tabindex', '-1')
+    audioElement.addEventListener('keydown', handleMediaElementKeydown)
+    mediaKeydownElement = audioElement
+    recordRuntimeHealthCounter('waveform.media_keydown.bind')
+  }
+
+  const wrapper = ws.getWrapper?.()
+  const scrollContainer = wrapper?.parentElement
+  if (scrollContainer) {
+    scrollContainer.addEventListener('scroll', updateScrollbarThumb)
+    scrollListenerElement = scrollContainer
+    recordRuntimeHealthCounter('waveform.scroll_listener.bind')
+  }
+}
 
 function resolveFallbackDuration() {
   const subtitleMaxEnd = projectStore.subtitles.reduce((maxEnd, subtitle) => {
@@ -494,6 +541,8 @@ function handleWaveformContextMenu(e) {
 
 // ============ WaveSurfer 初始化 ============
 let peaksCheckTimer = null
+let loadRetryTimer = null
+let lateReadyRenderTimer = null
 
 async function initWavesurfer() {
   if (!waveformRef.value) return
@@ -573,17 +622,6 @@ function setupWavesurferEvents() {
     isReady.value = true
     retryCount.value = 0
 
-    // 防止 WaveSurfer audio 元素响应空格键
-    const audioElement = ws.getMediaElement()
-    if (audioElement) {
-      audioElement.setAttribute('tabindex', '-1')
-      audioElement.addEventListener('keydown', (e) => {
-        if (e.code === 'Space') {
-          e.preventDefault()
-          e.stopPropagation()
-        }
-      })
-    }
     applyWaveformMediaState()
 
     // 根据实际时长重新调整配置
@@ -619,11 +657,7 @@ function setupWavesurferEvents() {
     nextTick(() => {
       updateScrollbarThumb()
       applyTimelineVisibility(hideTimelineScale.value)
-      const wrapper = ws.getWrapper()
-      const scrollContainer = wrapper?.parentElement
-      if (scrollContainer) {
-        scrollContainer.addEventListener('scroll', updateScrollbarThumb)
-      }
+      bindWaveformDomListeners(ws)
     })
   })
 
@@ -658,11 +692,7 @@ function setupWavesurferEvents() {
         nextTick(() => {
           updateScrollbarThumb()
           applyTimelineVisibility(hideTimelineScale.value)
-          const wrapper = ws.getWrapper()
-          const scrollContainer = wrapper?.parentElement
-          if (scrollContainer) {
-            scrollContainer.addEventListener('scroll', updateScrollbarThumb)
-          }
+          bindWaveformDomListeners(ws)
         })
       }
       return
@@ -680,7 +710,15 @@ function setupWavesurferEvents() {
 
     if (retryCount.value < maxRetries) {
       retryCount.value++
-      setTimeout(() => loadAudioData(), 1000)
+      if (loadRetryTimer) {
+        clearTimeout(loadRetryTimer)
+        recordRuntimeHealthCounter('waveform.retry_timer.clear_before_reset')
+      }
+      recordRuntimeHealthCounter('waveform.retry_timer.set')
+      loadRetryTimer = setTimeout(() => {
+        loadRetryTimer = null
+        loadAudioData()
+      }, 1000)
     } else {
       // 错误兜底时仍需可编辑、可 seek、可模拟播放，统一进入虚拟时钟。
       loadFallbackBaseline('wavesurfer_error_max_retries', { virtualTimeline: true })
@@ -788,6 +826,11 @@ function retryLoad() {
   errorMessage.value = ''
   isLoading.value = true
   retryCount.value = 0
+  if (loadRetryTimer) {
+    clearTimeout(loadRetryTimer)
+    loadRetryTimer = null
+    recordRuntimeHealthCounter('waveform.retry_timer.clear_on_retry')
+  }
   stopPeaksPolling()
   loadAudioData()
 }
@@ -879,7 +922,13 @@ watch(
     }
 
     if (!isReady.value) {
-      setTimeout(() => {
+      if (lateReadyRenderTimer) {
+        clearTimeout(lateReadyRenderTimer)
+        recordRuntimeHealthCounter('waveform.late_ready_timer.clear_before_reset')
+      }
+      recordRuntimeHealthCounter('waveform.late_ready_timer.set')
+      lateReadyRenderTimer = setTimeout(() => {
+        lateReadyRenderTimer = null
         if (isReady.value && projectStore.subtitles.length > 0) {
           scheduleRegionRender(0, 'late-ready')
         }
@@ -1069,12 +1118,43 @@ onMounted(async () => {
   await nextTick()
   setupRegionPointerGuards(waveformRef)
   await initWavesurfer()
+  stopRuntimeHealthSampler = createRuntimeHealthSampler(
+    'WaveformTimeline',
+    () => ({
+      subtitlesCount: projectStore.subtitles.length,
+      isReady: Boolean(isReady.value),
+      isLoading: Boolean(isLoading.value),
+      hasError: Boolean(hasError.value),
+      hasLoadRetryTimer: Boolean(loadRetryTimer),
+      hasLateReadyRenderTimer: Boolean(lateReadyRenderTimer),
+      hasPeaksPolling: Boolean(peaksCheckTimer),
+      hasMediaKeydownListener: Boolean(mediaKeydownElement),
+      hasScrollListener: Boolean(scrollListenerElement),
+      isVirtualTimelineMode: Boolean(isVirtualTimelineMode.value),
+      currentTime: Number(playbackStore.currentTime || 0),
+      duration: Number(projectStore.meta.duration || 0),
+    })
+  )
   containerRef.value?.addEventListener('wheel', handleWheel, { passive: false })
 })
 
 onUnmounted(() => {
   containerRef.value?.removeEventListener('wheel', handleWheel)
   if (zoomRafId) cancelAnimationFrame(zoomRafId)
+  if (loadRetryTimer) {
+    clearTimeout(loadRetryTimer)
+    loadRetryTimer = null
+    recordRuntimeHealthCounter('waveform.retry_timer.clear_on_unmount')
+  }
+  if (lateReadyRenderTimer) {
+    clearTimeout(lateReadyRenderTimer)
+    lateReadyRenderTimer = null
+    recordRuntimeHealthCounter('waveform.late_ready_timer.clear_on_unmount')
+  }
+  if (stopRuntimeHealthSampler) {
+    stopRuntimeHealthSampler()
+    stopRuntimeHealthSampler = null
+  }
   stopVirtualClock()
   clearScheduledRegionRender()
   clearTimeout(durationReloadTimer)
@@ -1086,6 +1166,7 @@ onUnmounted(() => {
   cleanupCursorDrag()
   cleanupRegions()
   teardownRegionPointerGuards()
+  detachWaveformDomListeners()
 
   playbackManager.setVirtualTimelineActive(false)
   playbackManager.unregisterWaveSurfer()

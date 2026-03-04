@@ -132,6 +132,7 @@ import { useSubtitleDocumentStore } from '@/stores/subtitleDocumentStore'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { useHomophoneSearch, SortMode } from '@/composables'
 import projectApi from '@/services/api/projectApi'
+import { useStructuralSyncStore } from '@/stores/structuralSyncStore'
 // 导入组件
 import SubtitleItem from './SubtitleItem.vue'
 import SearchToolbar from './SearchToolbar.vue'
@@ -151,6 +152,7 @@ const emit = defineEmits(['subtitle-click', 'subtitle-edit', 'subtitle-delete', 
 // Store
 const projectStore = useProjectStore()
 const subtitleDocumentStore = useSubtitleDocumentStore()
+const structuralSyncStore = useStructuralSyncStore()
 
 // 全局播放管理器
 const playbackManager = usePlaybackManager()
@@ -242,7 +244,7 @@ function updateTime(id, field, value) {
 
   // 2. V3.2.0+dev.20260124.01: 同步到后端（防抖）
   const subtitle = projectStore.subtitles.find(s => s.id === id)
-  const syncKey = subtitle?.segment_id || subtitle?.sentenceIndex
+  const syncKey = subtitle?.segment_id ?? subtitle?.sentenceIndex ?? subtitle?.id
   if (syncKey !== undefined && syncKey !== null) {
     onSubtitleEdit(syncKey, {
       [field]: value
@@ -257,7 +259,7 @@ function updateText(id, text) {
 
   // 2. V3.2.0+dev.20260124.01: 同步到后端（防抖）
   const subtitle = projectStore.subtitles.find(s => s.id === id)
-  const syncKey = subtitle?.segment_id || subtitle?.sentenceIndex
+  const syncKey = subtitle?.segment_id ?? subtitle?.sentenceIndex ?? subtitle?.id
   if (syncKey !== undefined && syncKey !== null) {
     onSubtitleEdit(syncKey, {
       text
@@ -274,7 +276,8 @@ async function deleteSubtitle(id) {
     return
   }
 
-  try {
+  // V3.2.4+dev.20260304.01: 结构性操作追踪
+  const syncPromise = (async () => {
     if (!projectStore.meta.projectId) {
       throw new Error('缺少 project_id，禁止走 job 字幕删除分支')
     }
@@ -282,6 +285,11 @@ async function deleteSubtitle(id) {
       throw new Error(`缺少 segment_id，无法删除字幕（id=${id}）`)
     }
     await projectApi.deleteSubtitle(projectStore.meta.projectId, subtitle.segment_id)
+  })()
+  structuralSyncStore.trackOperation('delete', syncPromise)
+
+  try {
+    await syncPromise
   } catch (error) {
     console.warn('[SubtitleList] 删除字幕同步失败:', error)
   }
@@ -298,24 +306,25 @@ async function addNewSubtitle() {
     isModified: true,
     source: 'manual'
   })
+  const localSubtitleId = projectStore.subtitles[insertIndex]?.id
   nextTick(() => {
     scrollToBottom()
   })
   emit('subtitle-add', subtitles.value.length - 1)
 
-  try {
+  // V3.2.4+dev.20260304.01: 结构性操作追踪
+  const syncPromise = (async () => {
     const baseStart = projectStore.toBaseTime(newStart)
     const baseEnd = projectStore.toBaseTime(newStart + 3)
-    let data = null
     if (!projectStore.meta.projectId) {
       throw new Error('缺少 project_id，禁止走 job 字幕新增分支')
     }
-    data = await projectApi.createSubtitle(projectStore.meta.projectId, {
+    const data = await projectApi.createSubtitle(projectStore.meta.projectId, {
       text: '',
       start: baseStart,
       end: baseEnd
     })
-    const newSubtitle = projectStore.subtitles[insertIndex]
+    const newSubtitle = projectStore.subtitles.find((item) => item.id === localSubtitleId)
     if (newSubtitle) {
       projectStore.updateSubtitle(newSubtitle.id, {
         sentenceIndex: data?.index ?? data?.legacy_index ?? newSubtitle.sentenceIndex,
@@ -324,11 +333,18 @@ async function addNewSubtitle() {
         source: data?.source || data?.source_type || 'manual'
       }, { isUserEdit: true })
     }
+  })()
+  const opId = structuralSyncStore.trackOperation('insert', syncPromise)
+
+  try {
+    await syncPromise
   } catch (error) {
-    const rollbackTarget = projectStore.subtitles[insertIndex]
+    const rollbackTarget = projectStore.subtitles.find((item) => item.id === localSubtitleId)
     if (rollbackTarget) {
       projectStore.removeSubtitle(rollbackTarget.id, { isUserEdit: true })
     }
+    // 回滚后本地与后端一致，清除错误
+    structuralSyncStore.clearError(opId)
     console.warn('[SubtitleList] 新增字幕同步失败:', error)
   }
 }
@@ -339,7 +355,8 @@ function insertBefore(index) {
   const start = prev ? prev.end : Math.max(0, current.start - 3)
   const end = current.start
   projectStore.addSubtitle(index, { start, end, text: '', isModified: true, source: 'manual' })
-  syncInsertedSubtitle(index, start, end, '')
+  const localSubtitleId = projectStore.subtitles[index]?.id
+  syncInsertedSubtitle(localSubtitleId, start, end, '')
 }
 
 function insertAfter(index) {
@@ -348,23 +365,24 @@ function insertAfter(index) {
   const start = current.end
   const end = next ? next.start : current.end + 3
   projectStore.addSubtitle(index + 1, { start, end, text: '', isModified: true, source: 'manual' })
-  syncInsertedSubtitle(index + 1, start, end, '')
+  const localSubtitleId = projectStore.subtitles[index + 1]?.id
+  syncInsertedSubtitle(localSubtitleId, start, end, '')
 }
 
-async function syncInsertedSubtitle(insertIndex, start, end, text) {
-  try {
+async function syncInsertedSubtitle(localSubtitleId, start, end, text) {
+  // V3.2.4+dev.20260304.01: 结构性操作追踪
+  const syncPromise = (async () => {
     const baseStart = projectStore.toBaseTime(start)
     const baseEnd = projectStore.toBaseTime(end)
-    let data = null
     if (!projectStore.meta.projectId) {
       throw new Error('缺少 project_id，禁止走 job 字幕新增分支')
     }
-    data = await projectApi.createSubtitle(projectStore.meta.projectId, {
+    const data = await projectApi.createSubtitle(projectStore.meta.projectId, {
       text,
       start: baseStart,
       end: baseEnd
     })
-    const newSubtitle = projectStore.subtitles[insertIndex]
+    const newSubtitle = projectStore.subtitles.find((item) => item.id === localSubtitleId)
     if (newSubtitle) {
       projectStore.updateSubtitle(newSubtitle.id, {
         sentenceIndex: data?.index ?? data?.legacy_index ?? newSubtitle.sentenceIndex,
@@ -373,12 +391,19 @@ async function syncInsertedSubtitle(insertIndex, start, end, text) {
         source: data?.source || data?.source_type || 'manual'
       }, { isUserEdit: true })
     }
+  })()
+  const opId = structuralSyncStore.trackOperation('insert', syncPromise)
+
+  try {
+    await syncPromise
   } catch (error) {
-    const rollbackTarget = projectStore.subtitles[insertIndex]
+    const rollbackTarget = projectStore.subtitles.find((item) => item.id === localSubtitleId)
     if (rollbackTarget) {
       projectStore.removeSubtitle(rollbackTarget.id, { isUserEdit: true })
     }
-    console.warn('[SubtitleList] 插入字幕同步失败:', error)
+    // 回滚后本地与后端一致，清除错误
+    structuralSyncStore.clearError(opId)
+    console.warn('[SubtitleList] 新增字幕同步失败:', error)
   }
 }
 
