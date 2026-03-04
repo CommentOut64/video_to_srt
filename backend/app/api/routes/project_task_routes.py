@@ -590,6 +590,32 @@ def create_project_task_router(transcription_service: Optional[Any] = None) -> A
         queue_status["running_project_id"] = running_project_id
         return queue_status
 
+    @router.get("/tasks/runtime-diagnostics")
+    async def get_project_task_runtime_diagnostics():
+        """获取任务队列运行时诊断快照（压测/观测用途）。"""
+        if not runtime_enabled or transcription_service is None:
+            return {
+                "runtime_enabled": False,
+                "queue_length": 0,
+                "jobs_count": 0,
+                "pending_cancel_count": 0,
+                "orphan_execution_count": 0,
+                "runner_thread_count": 0,
+                "runner_alive_count": 0,
+                "pending_physical_delete_count": 0,
+                "logically_removed_count": 0,
+                "cancellation_token_count": 0,
+                "sse_publisher_cache_count": 0,
+                "is_gpu_busy_override": False,
+                "is_runner_gate_blocking": False,
+            }
+
+        runtime_service = _require_runtime_service()
+        queue_service = _get_queue_service(runtime_service)
+        diagnostics = queue_service.get_runtime_diagnostics()
+        diagnostics["runtime_enabled"] = True
+        return diagnostics
+
     @router.get("/tasks/sync")
     async def sync_project_tasks():
         """

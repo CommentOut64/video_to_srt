@@ -376,8 +376,8 @@ def _compose_runtime_segments_with_user_edits(
         if int(index) in deleted_indices:
             continue
         text = str(edit_entry.get("text", "") or "")
-        if not text.strip():
-            continue
+        # 手动新增字幕允许空文本（仅时间块占位）。
+        # 若这里过滤空文本，会导致“新增后立即导出”丢块，与前端强制保存栅栏语义不一致。
         start = _safe_float(edit_entry.get("start"), 0.0)
         end = _safe_float(edit_entry.get("end"), start)
         if end < start:
