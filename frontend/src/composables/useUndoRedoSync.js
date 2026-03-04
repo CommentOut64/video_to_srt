@@ -12,11 +12,13 @@
 import { ref, toRaw } from 'vue'
 import projectApi from '@/services/api/projectApi'
 import { useProjectStore } from '@/stores/projectStore'
+import { useStructuralSyncStore } from '@/stores/structuralSyncStore'
 
 const DEBOUNCE_MS = 300
 
 export function useUndoRedoSync() {
   const projectStore = useProjectStore()
+  const structuralSyncStore = useStructuralSyncStore()
   let initialSnapshot = null // 连续操作中第一次的 before 快照
   let debounceTimer = null
   let inflightSyncPromise = null
@@ -119,6 +121,10 @@ export function useUndoRedoSync() {
           const errMsg = (result?.errors || []).join('; ') || '部分操作失败'
           lastSyncError.value = errMsg
           console.warn('[UndoRedoSync] 后端部分操作失败:', errMsg)
+        } else {
+          // V3.2.4+dev.20260304.01: batch-sync 成功意味着后端已被全量快照重新对账，
+          // 先前的结构性操作失败不再相关
+          structuralSyncStore.clearAllErrors()
         }
       } catch (error) {
         lastSyncError.value = error?.message || '撤销/重做同步失败'

@@ -16,14 +16,22 @@ import {
  */
 function debounce(fn, delay) {
   let timer = null
-  return function (...args) {
+  const debounced = function (...args) {
     if (timer) {
       clearTimeout(timer)
     }
     timer = setTimeout(() => {
+      timer = null
       fn.apply(this, args)
     }, delay)
   }
+  debounced.cancel = () => {
+    if (timer) {
+      clearTimeout(timer)
+      timer = null
+    }
+  }
+  return debounced
 }
 
 /**
@@ -54,6 +62,8 @@ export function useWaveformRegions(
   let regionUpdateTimer = null
   let pendingRegionCommitTimer = null
   const pendingRegionCommits = new Map()
+  let overlapCacheDirty = true
+  let overlapCacheIds = new Set()
 
   function logDiag(eventName, payload = {}) {
     logWaveformDragDiagnostics(eventName, payload)
@@ -81,6 +91,19 @@ export function useWaveformRegions(
       return fallbackMinLength
     }
     return Math.max(0, rawValue)
+  }
+
+  function markOverlapCacheDirty() {
+    overlapCacheDirty = true
+  }
+
+  function getOverlappingIds(options = {}) {
+    const { forceRefresh = false } = options
+    if (forceRefresh || overlapCacheDirty) {
+      overlapCacheIds = detectOverlappingSubtitles(projectStore.subtitles)
+      overlapCacheDirty = false
+    }
+    return overlapCacheIds
   }
 
   // 节流的 Region 同步
@@ -132,7 +155,7 @@ export function useWaveformRegions(
       { isUserEdit: true }
     )
 
-    const syncKey = subtitle?.segment_id || subtitle?.sentenceIndex
+    const syncKey = subtitle?.segment_id ?? subtitle?.sentenceIndex ?? subtitle?.id
     if (syncKey !== undefined && syncKey !== null) {
       debouncedRegionSync(syncKey, nextStart, nextEnd)
     }
@@ -150,7 +173,8 @@ export function useWaveformRegions(
     })
 
     // 拖拽结束后检测并标记重叠区域
-    checkAndMarkOverlaps()
+    markOverlapCacheDirty()
+    checkAndMarkOverlaps({ forceRefresh: true })
     return true
   }
 
@@ -256,7 +280,7 @@ export function useWaveformRegions(
     })
 
     regionsPlugin.on('region-in', (region) => {
-      const overlappingIds = detectOverlappingSubtitles(projectStore.subtitles)
+      const overlappingIds = getOverlappingIds()
       if (overlappingIds.has(region.id)) {
         region.setOptions({ color: 'rgba(248, 81, 73, 0.5)' })
       } else {
@@ -265,7 +289,7 @@ export function useWaveformRegions(
     })
 
     regionsPlugin.on('region-out', (region) => {
-      const overlappingIds = detectOverlappingSubtitles(projectStore.subtitles)
+      const overlappingIds = getOverlappingIds()
       const isSelected = region.id === getSelectedSubtitleId()
 
       if (overlappingIds.has(region.id)) {
@@ -281,11 +305,12 @@ export function useWaveformRegions(
   /**
    * 检测并标记重叠区域
    */
-  function checkAndMarkOverlaps() {
+  function checkAndMarkOverlaps(options = {}) {
+    const { forceRefresh = false } = options
     const regionsPlugin = regionsPluginRef.value
     if (!regionsPlugin || !isReady.value) return
 
-    const overlappingIds = detectOverlappingSubtitles(projectStore.subtitles)
+    const overlappingIds = getOverlappingIds({ forceRefresh })
     const regions = regionsPlugin.getRegions()
 
     if (!regions || regions.length === 0) return
@@ -360,7 +385,8 @@ export function useWaveformRegions(
     }
 
     // 预先检测重叠区域
-    const overlappingIds = detectOverlappingSubtitles(projectStore.subtitles)
+    markOverlapCacheDirty()
+    const overlappingIds = getOverlappingIds({ forceRefresh: true })
 
     isUpdatingRegions.value = true
     try {
@@ -464,6 +490,9 @@ export function useWaveformRegions(
     regionUpdateTimer = null
     pendingRegionCommitTimer = null
     pendingRegionCommits.clear()
+    overlapCacheIds.clear()
+    overlapCacheDirty = true
+    debouncedRegionSync.cancel?.()
   }
 
   return {
