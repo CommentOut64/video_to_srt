@@ -709,3 +709,12 @@ def remove_sse_publisher(job_id: str) -> None:
     if job_id in _sse_publishers:
         del _sse_publishers[job_id]
         logger.debug(f"[SSEPublisher] 移除: {job_id}")
+
+
+def get_sse_publisher_cache_snapshot() -> Dict[str, Any]:
+    """获取 SSE 发布器缓存快照（观测用途，不参与业务逻辑）。"""
+    job_ids = list(_sse_publishers.keys())
+    return {
+        "count": len(job_ids),
+        "job_ids": job_ids,
+    }
