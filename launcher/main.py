@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 AnchorFlux Launcher - 主入口
-V3.2.4+dev.20260303.04
+V3.2.4+dev.20260306.02
 
 新架构启动器，特性：
-- uv 依赖管理（替代 pip，智能检测依赖状态）
+- uv 依赖管理（替代 pip，智能检测依赖状态；仅开发模式）
 - Go Stub + onedir 打包方案（快速启动）
 - 自更新系统（支持启动器自身更新）
 - CustomTkinter 更新界面（轻量美观）
@@ -18,7 +18,7 @@ import signal
 import logging
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
@@ -45,6 +45,104 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 logger = logging.getLogger("launcher")
+
+
+def _is_http_ready(url: str, timeout_sec: float = 1.5) -> bool:
+    """轻量探测 HTTP 端点是否已可访问。"""
+    try:
+        req = urllib_request.Request(url, method="GET")
+        with urllib_request.urlopen(req, timeout=timeout_sec) as response:
+            return 200 <= int(getattr(response, "status", 200)) < 500
+    except Exception:
+        return False
+
+
+def _can_prompt_for_exit() -> bool:
+    """仅在真实交互终端中等待用户确认，避免 pythonw 隐式卡死。"""
+    stdin = getattr(sys, "stdin", None)
+    if stdin is None:
+        return False
+    try:
+        return bool(stdin.isatty())
+    except Exception:
+        return False
+
+
+def _prompt_before_exit() -> None:
+    """失败场景下的退出提示。"""
+    if not _can_prompt_for_exit():
+        logger.info("当前为无控制台模式，跳过 Enter 等待")
+        return
+    try:
+        input("按 Enter 键退出...")
+    except EOFError:
+        logger.info("输入流不可用，跳过 Enter 等待")
+
+
+def _resolve_dev_python_runtime_paths(python_exec: Path) -> List[str]:
+    """
+    解析开发模式 venv 基解释器的 DLL 搜索路径。
+
+    背景：
+    - 当前 .venv 可能基于 Conda Python 创建；
+    - 直接从资源管理器启动时，外部 PATH 不含 Conda 的 `DLLs/Library/bin`；
+    - 这会导致 `_sqlite3` 等扩展模块导入失败，后端在启动早期直接崩溃。
+    """
+    cfg_path = python_exec.parent.parent / "pyvenv.cfg"
+    if not cfg_path.exists():
+        return []
+
+    try:
+        raw_text = cfg_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raw_text = cfg_path.read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        logger.debug("读取 pyvenv.cfg 失败: %s", exc)
+        return []
+
+    home_dir: Optional[Path] = None
+    for line in raw_text.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip().lower() == "home":
+            candidate = Path(value.strip())
+            if candidate.exists():
+                home_dir = candidate
+            break
+
+    if home_dir is None:
+        return []
+
+    ordered_candidates = [
+        home_dir,
+        home_dir / "DLLs",
+        home_dir / "Library" / "bin",
+        home_dir / "Scripts",
+    ]
+
+    conda_pkgs_dir = home_dir / "pkgs"
+    library_bin = home_dir / "Library" / "bin"
+    if conda_pkgs_dir.exists() and not (library_bin / "sqlite3.dll").exists():
+        sqlite_pkg_bins = sorted(
+            (
+                candidate / "Library" / "bin"
+                for candidate in conda_pkgs_dir.glob("sqlite-*")
+                if (candidate / "Library" / "bin" / "sqlite3.dll").exists()
+            ),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
+        if sqlite_pkg_bins:
+            ordered_candidates.append(sqlite_pkg_bins[0])
+
+    resolved_paths: List[str] = []
+    for candidate in ordered_candidates:
+        if candidate.exists():
+            normalized = str(candidate)
+            if normalized not in resolved_paths:
+                resolved_paths.append(normalized)
+    return resolved_paths
 
 
 def _windows_hidden_subprocess_kwargs() -> Dict[str, Any]:
@@ -281,24 +379,47 @@ class ProcessManager:
         env['ANCHORFLUX_FLAVOR'] = config.flavor
         env['ANCHORFLUX_LITE'] = 'true' if config.flavor == 'lite' else 'false'
 
-        # 设置 PATH（PyTorch DLL 等）
+        # V3.2.4+dev.20260306.02: 生产模式使用嵌入式 Python site-packages
+        if not config.dev_mode and config.site_packages:
+            env['PYTHONPATH'] = str(config.site_packages)
+
+        # 设置 PATH（PyTorch DLL、Conda/venv 运行时 DLL 等）
+        path_additions = []
         if config.site_packages:
             torch_lib = config.site_packages / "torch" / "lib"
-            path_additions = []
             if torch_lib.exists():
                 path_additions.append(str(torch_lib))
             if config.tools_dir and config.tools_dir.exists():
                 path_additions.append(str(config.tools_dir))
-            if path_additions:
-                env['PATH'] = ';'.join(path_additions) + ';' + env.get('PATH', '')
+        if config.dev_mode:
+            path_additions = _resolve_dev_python_runtime_paths(config.python_exec) + path_additions
+        if path_additions:
+            deduped_paths = []
+            for item in path_additions:
+                if item not in deduped_paths:
+                    deduped_paths.append(item)
+            env['PATH'] = ';'.join(deduped_paths) + ';' + env.get('PATH', '')
 
-        cmd = [
-            str(config.python_exec),
-            '-m', 'uvicorn',
-            'app.main:app',
-            '--host', '0.0.0.0',
-            '--port', str(config.backend_port)
-        ]
+        if config.dev_mode:
+            dll_paths = _resolve_dev_python_runtime_paths(config.python_exec)
+            bootstrap_script = (
+                "import os\n"
+                "import uvicorn\n"
+                f"dll_paths = {dll_paths!r}\n"
+                "for path in dll_paths:\n"
+                "    if hasattr(os, 'add_dll_directory') and os.path.isdir(path):\n"
+                "        os.add_dll_directory(path)\n"
+                f"uvicorn.run('app.main:app', host='0.0.0.0', port={int(config.backend_port)})\n"
+            )
+            cmd = [str(config.python_exec), '-c', bootstrap_script]
+        else:
+            cmd = [
+                str(config.python_exec),
+                '-m', 'uvicorn',
+                'app.main:app',
+                '--host', '0.0.0.0',
+                '--port', str(config.backend_port)
+            ]
 
         try:
             popen_kwargs = {
@@ -558,11 +679,8 @@ class Launcher:
     ) -> None:
         """激活已运行实例的界面，不重启后端。"""
         backend_url = f"http://127.0.0.1:{backend_port}"
-        browser_url = (
-            f"http://127.0.0.1:{frontend_port}"
-            if dev_mode
-            else backend_url
-        )
+        frontend_url = f"http://127.0.0.1:{frontend_port}"
+        browser_url = frontend_url if dev_mode else backend_url
         normalized_ui_mode = normalize_ui_mode(ui_mode)
 
         logger.info("检测到已运行实例，尝试激活现有窗口...")
@@ -576,7 +694,17 @@ class Launcher:
             if launch_electron(target_shell_path) is not None:
                 return
             logger.warning("激活 Electron 失败，回退浏览器")
-            open_browser_fallback(browser_url)
+            if _is_http_ready(browser_url, timeout_sec=2.0):
+                open_browser_fallback(browser_url)
+            else:
+                logger.warning("已有实例未就绪，跳过打开浏览器: %s", browser_url)
+            return
+
+        if dev_mode and not _is_http_ready(frontend_url, timeout_sec=2.0):
+            if _is_http_ready(backend_url, timeout_sec=2.0):
+                logger.warning("检测到已有实例仅后端就绪，前端 Vite 尚未监听: %s", frontend_url)
+            else:
+                logger.warning("检测到锁被占用，但前后端均未就绪，疑似上次启动失败未退出")
             return
 
         open_browser_fallback(browser_url)
@@ -649,37 +777,41 @@ class Launcher:
         # 初始化 uv 管理器
         self.uv_manager = UvManager(self.project_root, dev_mode)
 
-        if not self.uv_manager.is_available():
-            logger.error("uv 未安装或不可用！请安装 uv: https://docs.astral.sh/uv/")
-            return False
+        # V3.2.4+dev.20260306.02: 生产模式使用嵌入式 Python，跳过 uv 依赖检查
+        if dev_mode:
+            if not self.uv_manager.is_available():
+                logger.error("uv 未安装或不可用！请安装 uv: https://docs.astral.sh/uv/")
+                return False
 
-        logger.info(f"uv 路径: {self.uv_manager.uv_exec}")
+            logger.info(f"uv 路径: {self.uv_manager.uv_exec}")
 
-        # 检查依赖状态
-        sync_result = self.uv_manager.check_sync_status()
+            # 检查依赖状态
+            sync_result = self.uv_manager.check_sync_status()
 
-        if sync_result.needs_sync:
-            logger.info("依赖需要同步...")
+            if sync_result.needs_sync:
+                logger.info("依赖需要同步...")
 
-            # 尝试使用 GUI
-            from .ui import is_gui_available, run_dependency_sync_gui
+                # 尝试使用 GUI
+                from .ui import is_gui_available, run_dependency_sync_gui
 
-            if is_gui_available():
-                # 使用 GUI 显示进度
-                def sync_func(progress_callback):
-                    return self.uv_manager.sync_dependencies(progress_callback)
+                if is_gui_available():
+                    # 使用 GUI 显示进度
+                    def sync_func(progress_callback):
+                        return self.uv_manager.sync_dependencies(progress_callback)
 
-                run_dependency_sync_gui(sync_func)
+                    run_dependency_sync_gui(sync_func)
+                else:
+                    # 命令行模式
+                    result = self.uv_manager.sync_dependencies(
+                        lambda msg, prog: logger.info(f"[{int(prog*100):3d}%] {msg}")
+                    )
+                    if not result.success:
+                        logger.error(f"依赖同步失败: {result.message}")
+                        return False
             else:
-                # 命令行模式
-                result = self.uv_manager.sync_dependencies(
-                    lambda msg, prog: logger.info(f"[{int(prog*100):3d}%] {msg}")
-                )
-                if not result.success:
-                    logger.error(f"依赖同步失败: {result.message}")
-                    return False
+                logger.info("依赖已同步 (快速启动模式)")
         else:
-            logger.info("依赖已同步 (快速启动模式)")
+            logger.info("生产模式：使用打包环境，跳过依赖检查")
 
         # 获取 Python 路径
         python_exec = self.uv_manager.get_python_path()
@@ -688,6 +820,9 @@ class Launcher:
         if not python_exec:
             logger.error("未找到 Python 环境！")
             return False
+        if not dev_mode and not site_packages:
+            logger.error("生产环境缺少嵌入式依赖目录（tools/python/Lib/site-packages）")
+            return False
 
         logger.info(f"Python: {python_exec}")
 
@@ -695,25 +830,26 @@ class Launcher:
         if site_packages:
             fix_pytorch_dll(site_packages)
 
-        # ONNX Runtime GPU 自动修正：
-        # 在 uv sync 后（或快速启动）做 provider 探针，必要时重装 onnxruntime-gpu，
-        # 规避 Windows 下 onnxruntime/onnxruntime-gpu 覆盖顺序导致的 CUDA Provider 丢失。
-        ort_fix_result = self.uv_manager.ensure_onnxruntime_gpu_runtime(
-            python_exec=python_exec,
-            site_packages=site_packages,
-        )
-        if ort_fix_result.success:
-            logger.info(ort_fix_result.message)
-        else:
-            # 不阻断启动：允许 CPU 回退，同时给出明确告警供排查。
-            logger.warning("ONNX Runtime GPU 自动修正失败，将继续启动（可回退 CPU）: %s", ort_fix_result.message)
+        if dev_mode:
+            # ONNX Runtime GPU 自动修正：
+            # 在 uv sync 后（或快速启动）做 provider 探针，必要时重装 onnxruntime-gpu，
+            # 规避 Windows 下 onnxruntime/onnxruntime-gpu 覆盖顺序导致的 CUDA Provider 丢失。
+            ort_fix_result = self.uv_manager.ensure_onnxruntime_gpu_runtime(
+                python_exec=python_exec,
+                site_packages=site_packages,
+            )
+            if ort_fix_result.success:
+                logger.info(ort_fix_result.message)
+            else:
+                # 不阻断启动：允许 CPU 回退，同时给出明确告警供排查。
+                logger.warning("ONNX Runtime GPU 自动修正失败，将继续启动（可回退 CPU）: %s", ort_fix_result.message)
 
         # 创建配置
         self.config = LauncherConfig(
             project_root=self.project_root,
             dev_mode=dev_mode,
             python_exec=python_exec,
-            python_mode="venv",
+            python_mode="venv" if dev_mode else "embedded",
             site_packages=site_packages,
             tools_dir=self.project_root / "tools",
             hf_mirror=env_config.get('USE_HF_MIRROR', 'true').lower() == 'true',
@@ -855,7 +991,7 @@ class Launcher:
             if not self.initialize():
                 if self._exit_code_override is not None:
                     return self._exit_code_override
-                input("按 Enter 键退出...")
+                _prompt_before_exit()
                 return 1
 
             while self._running:
@@ -868,7 +1004,7 @@ class Launcher:
                 # 启动后端
                 if not self.process_manager.start_backend(self.config):
                     logger.error("后端启动失败")
-                    input("按 Enter 键退出...")
+                    _prompt_before_exit()
                     return 1
 
                 # 启动前端（开发模式）

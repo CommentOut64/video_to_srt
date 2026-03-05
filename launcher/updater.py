@@ -88,7 +88,7 @@ class SelfUpdater:
         'tools/python', '.venv', 'node_modules', '.git',
         'backend/models', 'backend/app/assets', 'data'
     }
-    DEFAULT_EXCLUDE_FILES = {'.env', 'uv.lock'}
+    DEFAULT_EXCLUDE_FILES = {'.env'}
 
     def __init__(self, project_root: Path):
         self.project_root = project_root
@@ -180,9 +180,8 @@ class SelfUpdater:
 
         for path in (".venv", "tools", "tools/python"):
             exclude_dirs.discard(path)
-        exclude_files.discard("uv.lock")
         logger.info(
-            "按 profile 更新排除策略已启用: profile=%s channel=%s，允许更新 .venv/tools/uv.lock",
+            "按 profile 更新排除策略已启用: profile=%s channel=%s，允许更新 .venv/tools",
             profile or "<unknown>",
             channel or "<unknown>",
         )
