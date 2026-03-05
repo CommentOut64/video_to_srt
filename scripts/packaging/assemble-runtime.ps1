@@ -89,9 +89,6 @@ function Write-PackagedEnvFile {
     $liteFlag = if ($isLiteFlavor) { "true" } else { "false" }
 
     $lines = @(
-        "UV_LINK_MODE=copy",
-        "UV_PROJECT_ENVIRONMENT=.venv",
-        "",
         "# 打包产物运行配置（由打包脚本生成）",
         "DEV_MODE=false",
         "ANCHORFLUX_PROFILE=$ProfileValue",
@@ -130,27 +127,10 @@ Copy-Item -Path (Join-Path $FrontendDistDir "*") -Destination $frontendTarget -R
 $shellTarget = Join-Path $appRoot "core\shell"
 Copy-Tree -Source $ShellDir -Destination $shellTarget
 
-# 4) 运行时（.venv/_vendor/tools/元文件）
-$venvSource = Join-Path $RuntimeDir ".venv"
-if (Test-Path $venvSource) {
-    Copy-Tree -Source $venvSource -Destination (Join-Path $appRoot ".venv")
-}
-
-$vendorSource = Join-Path $RuntimeDir "_vendor"
-if (Test-Path $vendorSource) {
-    Copy-Tree -Source $vendorSource -Destination (Join-Path $appRoot "_vendor")
-}
-
+# 4) 运行时（嵌入式 Python + 工具）
 $toolsSource = Join-Path $RuntimeDir "tools"
 if (Test-Path $toolsSource) {
     Copy-Tree -Source $toolsSource -Destination (Join-Path $appRoot "tools")
-}
-
-foreach ($metaFile in @("pyproject.toml", "uv.lock")) {
-    $metaPath = Join-Path $RuntimeDir $metaFile
-    if (Test-Path $metaPath) {
-        Copy-Item -Path $metaPath -Destination (Join-Path $appRoot $metaFile) -Force
-    }
 }
 
 # 5) 常用配置文件
@@ -177,7 +157,7 @@ Get-ChildItem -Path $appRoot -Recurse -Directory -ErrorAction SilentlyContinue |
     Remove-Item -Path $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-$sitePackagesPath = Join-Path $appRoot ".venv\Lib\site-packages"
+$sitePackagesPath = Join-Path $appRoot "tools\python\Lib\site-packages"
 if ($ExcludePackages.Count -gt 0) {
     Remove-LiteExcludedPackages -SitePackagesPath $sitePackagesPath -Names $ExcludePackages
 }

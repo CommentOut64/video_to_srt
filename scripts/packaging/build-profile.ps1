@@ -27,38 +27,204 @@ function Invoke-Checked {
     & $Action
 }
 
-function Get-UvExecutable {
-    param([string]$ProjectRoot)
-    $bundled = Join-Path $ProjectRoot "tools\uv.exe"
-    if (Test-Path $bundled) {
-        return $bundled
+function Resolve-EmbeddedPythonVersion {
+    param([pscustomobject]$PythonConfig)
+    $hasEmbeddedVersion = $false
+    if ($null -ne $PythonConfig) {
+        $hasEmbeddedVersion = $PythonConfig.PSObject.Properties.Name -contains "embeddedVersion"
     }
-    $uvCmd = Get-Command uv -ErrorAction SilentlyContinue
-    if ($null -ne $uvCmd) {
-        return $uvCmd.Source
+    if ($hasEmbeddedVersion -and -not [string]::IsNullOrWhiteSpace([string]$PythonConfig.embeddedVersion)) {
+        return [string]$PythonConfig.embeddedVersion
     }
-    throw "未找到 uv 可执行文件（tools\\uv.exe 或 PATH 中的 uv）"
+    $rawVersion = [string]$PythonConfig.version
+    if ($rawVersion -match "^\d+\.\d+\.\d+$") {
+        return $rawVersion
+    }
+    if ($rawVersion -match "^\d+\.\d+$") {
+        if ($rawVersion -eq "3.10") { return "3.10.11" }
+        if ($rawVersion -eq "3.11") { return "3.11.9" }
+    }
+    throw "无法解析嵌入式 Python 版本，请在 profile manifest 中设置 python.embeddedVersion"
 }
 
-function Test-UvPipWheelSupport {
-    param([string]$UvExe)
-    $output = & $UvExe pip --help 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        return $false
-    }
-    return (($output | Out-String) -match "(?m)^\s*wheel\s")
+function Get-EmbeddedPythonDownloadUrl {
+    param([string]$Version)
+    return "https://www.python.org/ftp/python/$Version/python-$Version-embed-amd64.zip"
 }
 
-function Get-ExtraArgsFromSyncArgs {
+function Download-EmbeddedPython {
+    param(
+        [string]$Version,
+        [string]$RuntimeDir
+    )
+    $pythonRoot = Join-Path $RuntimeDir "tools\python"
+    New-Item -ItemType Directory -Force -Path $pythonRoot | Out-Null
+
+    $zipPath = Join-Path $RuntimeDir ("python-embed-" + $Version + ".zip")
+    $downloadUrl = Get-EmbeddedPythonDownloadUrl -Version $Version
+
+    Write-Host "[step] 下载嵌入式 Python: $downloadUrl"
+    Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath
+    Expand-Archive -Path $zipPath -DestinationPath $pythonRoot -Force
+    Remove-Item -Path $zipPath -Force -ErrorAction SilentlyContinue
+
+    $pythonExe = Join-Path $pythonRoot "python.exe"
+    if (-not (Test-Path $pythonExe)) {
+        throw "嵌入式 Python 解压失败: $pythonExe"
+    }
+    return $pythonRoot
+}
+
+function Enable-EmbeddedPythonSitePackages {
+    param([string]$PythonRoot)
+    $pthFile = Get-ChildItem -Path $PythonRoot -Filter "python*._pth" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $pthFile) {
+        throw "未找到嵌入式 Python ._pth 文件，无法启用 site-packages"
+    }
+    # V3.2.4+dev.20260306.01: 移除 BOM 并修正路径
+    $content = [System.IO.File]::ReadAllText($pthFile.FullName, [System.Text.Encoding]::UTF8)
+    $content = $content.TrimStart([char]0xFEFF)
+    $lines = $content -split "`r?`n"
+
+    $updated = @()
+    $hasSitePackages = $false
+    $hasImportSite = $false
+    $hasDot = $false
+    foreach ($line in $lines) {
+        $trimmed = $line.Trim()
+        if ($trimmed -eq "Lib\\site-packages") {
+            $hasSitePackages = $true
+        }
+        if ($trimmed -eq ".") {
+            $hasDot = $true
+        }
+        if ($trimmed -match "^\s*#?\s*import\s+site\s*$") {
+            $updated += "import site"
+            $hasImportSite = $true
+            continue
+        }
+        $updated += $line
+    }
+    if (-not $hasDot) {
+        $updated += "."
+    }
+    if (-not $hasSitePackages) {
+        $updated += "Lib\\site-packages"
+    }
+    if (-not $hasImportSite) {
+        $updated += "import site"
+    }
+    [System.IO.File]::WriteAllText($pthFile.FullName, ($updated -join "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Get-ExtrasFromSyncArgs {
     param([object[]]$SyncArgs)
     $result = @()
     for ($i = 0; $i -lt $SyncArgs.Count; $i++) {
         if ($SyncArgs[$i] -eq "--extra" -and $i + 1 -lt $SyncArgs.Count) {
-            $result += @("--extra", [string]$SyncArgs[$i + 1])
+            $result += [string]$SyncArgs[$i + 1]
             $i++
         }
     }
     return $result
+}
+
+function Install-EmbeddedPythonDependencies {
+    param(
+        [string]$ProjectRoot,
+        [string]$PythonRoot,
+        [pscustomobject]$Manifest
+    )
+    $pythonExe = Join-Path $PythonRoot "python.exe"
+    if (-not (Test-Path $pythonExe)) {
+        throw "未找到嵌入式 Python: $pythonExe"
+    }
+    $sitePackages = Join-Path $PythonRoot "Lib\\site-packages"
+    New-Item -ItemType Directory -Force -Path $sitePackages | Out-Null
+
+    $pythonConfig = $Manifest.python
+    $syncArgs = @([string[]]$pythonConfig.syncArgs)
+    $extras = @(Get-ExtrasFromSyncArgs -SyncArgs $syncArgs)
+
+    $packageSpec = "."
+    if ($extras.Count -gt 0) {
+        $packageSpec = ".[" + ($extras -join ",") + "]"
+    }
+
+    $pipEnv = @{
+        "PIP_DISABLE_PIP_VERSION_CHECK" = "1"
+        "PIP_NO_INPUT" = "1"
+        "PYTHONIOENCODING" = "utf-8"
+        "PYTHONUTF8" = "1"
+    }
+
+    $indexUrl = [string]$env:ANCHORFLUX_PIP_INDEX_URL
+    if ([string]::IsNullOrWhiteSpace($indexUrl)) {
+        $indexUrl = [string]$env:PIP_INDEX_URL
+    }
+    if ([string]::IsNullOrWhiteSpace($indexUrl)) {
+        $indexUrl = "https://pypi.tuna.tsinghua.edu.cn/simple"
+    }
+    $pipEnv["PIP_INDEX_URL"] = $indexUrl
+
+    $extraIndexUrl = [string]$env:ANCHORFLUX_PIP_EXTRA_INDEX_URL
+    if ([string]::IsNullOrWhiteSpace($extraIndexUrl) -and ($extras -contains "full")) {
+        $extraIndexUrl = "https://download.pytorch.org/whl/cu128"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($extraIndexUrl)) {
+        $pipEnv["PIP_EXTRA_INDEX_URL"] = $extraIndexUrl
+    }
+
+    $envBackup = @{}
+    foreach ($entry in $pipEnv.GetEnumerator()) {
+        $envBackup[$entry.Key] = [Environment]::GetEnvironmentVariable($entry.Key, "Process")
+        [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+    }
+
+    try {
+        Write-Host "[step] 初始化嵌入式 Python pip"
+        & $pythonExe -m ensurepip --upgrade
+        if ($LASTEXITCODE -ne 0) {
+            $getPipUrl = "https://bootstrap.pypa.io/get-pip.py"
+            $getPipPath = Join-Path $env:TEMP ("anchorflux-get-pip-" + [guid]::NewGuid().ToString("N") + ".py")
+            Write-Host "[step] ensurepip 不可用，改用 get-pip.py"
+            Invoke-WebRequest -Uri $getPipUrl -OutFile $getPipPath
+            & $pythonExe $getPipPath
+            Remove-Item -Path $getPipPath -Force -ErrorAction SilentlyContinue
+        }
+        if ($LASTEXITCODE -ne 0) {
+            throw "pip 初始化失败"
+        }
+        & $pythonExe -m pip install --upgrade pip
+        if ($LASTEXITCODE -ne 0) {
+            throw "pip 升级失败"
+        }
+
+        Write-Host "[step] 安装构建后端(hatchling)"
+        & $pythonExe -m pip install --no-warn-script-location --no-cache-dir hatchling
+        if ($LASTEXITCODE -ne 0) {
+            throw "hatchling 安装失败"
+        }
+
+        Write-Host "[step] 安装依赖到嵌入式 Python: $packageSpec"
+        Push-Location $ProjectRoot
+        try {
+            & $pythonExe -m pip install --no-warn-script-location --no-cache-dir --no-build-isolation $packageSpec
+            if ($LASTEXITCODE -ne 0) {
+                throw "pip 安装依赖失败"
+            }
+        }
+        finally {
+            Pop-Location
+        }
+
+        & $pythonExe -m pip uninstall -y hatchling | Out-Host
+    }
+    finally {
+        foreach ($entry in $envBackup.GetEnumerator()) {
+            [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+        }
+    }
 }
 
 function Build-Frontend {
@@ -147,17 +313,25 @@ image.save(
         $iconBuildScript,
         (New-Object System.Text.UTF8Encoding($false))
     )
-    $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+
+    # V3.2.4+dev.20260306.01: 使用项目 Python 而非系统 Python
+    $projectPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
     try {
-        if ($null -ne $pythonCmd) {
-            & $pythonCmd.Source $tempIconScript
+        if (Test-Path $projectPython) {
+            & $projectPython $tempIconScript
         }
         else {
-            $pyLauncher = Get-Command py -ErrorAction SilentlyContinue
-            if ($null -eq $pyLauncher) {
-                throw "未找到 python 或 py 启动器，无法生成 Electron 图标"
+            $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+            if ($null -ne $pythonCmd) {
+                & $pythonCmd.Source $tempIconScript
             }
-            & $pyLauncher.Source -3 $tempIconScript
+            else {
+                $pyLauncher = Get-Command py -ErrorAction SilentlyContinue
+                if ($null -eq $pyLauncher) {
+                    throw "未找到 python，无法生成 Electron 图标"
+                }
+                & $pyLauncher.Source -3 $tempIconScript
+            }
         }
     }
     finally {
@@ -199,80 +373,26 @@ function Build-PythonRuntime {
         [pscustomobject]$Manifest,
         [string]$RuntimeDir
     )
-    $uvExe = Get-UvExecutable -ProjectRoot $ProjectRoot
+    # V3.2.4+dev.20260306.02: 生产打包不再使用 uv，改为嵌入式 Python + pip 安装依赖
     Remove-Item -Recurse -Force -Path $RuntimeDir -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
 
     $pythonConfig = $Manifest.python
-    $venvDir = Join-Path $RuntimeDir ".venv"
-    $pythonExe = Join-Path $venvDir "Scripts\python.exe"
-    $syncArgs = @([string[]]$pythonConfig.syncArgs)
+    $embeddedVersion = Resolve-EmbeddedPythonVersion -PythonConfig $pythonConfig
+    $pythonRoot = Download-EmbeddedPython -Version $embeddedVersion -RuntimeDir $RuntimeDir
+    Enable-EmbeddedPythonSitePackages -PythonRoot $pythonRoot
+    Install-EmbeddedPythonDependencies -ProjectRoot $ProjectRoot -PythonRoot $pythonRoot -Manifest $Manifest
 
-    $savedUvProjectEnv = [Environment]::GetEnvironmentVariable("UV_PROJECT_ENVIRONMENT", "Process")
-    try {
-        # 强制 uv 指向打包产物的 .venv，避免受开发机 .env 中 UV_PROJECT_ENVIRONMENT 干扰。
-        [Environment]::SetEnvironmentVariable("UV_PROJECT_ENVIRONMENT", $venvDir, "Process")
-
-        & $uvExe venv $venvDir --python ([string]$pythonConfig.version)
-        if ($LASTEXITCODE -ne 0) {
-            throw "创建 .venv 失败"
-        }
-
-        $syncCommand = @("sync") + $syncArgs + @("--no-install-project", "--project", $ProjectRoot, "--python", $pythonExe)
-        & $uvExe @syncCommand
-        if ($LASTEXITCODE -ne 0) {
-            throw "uv sync 失败"
-        }
-    }
-    finally {
-        [Environment]::SetEnvironmentVariable("UV_PROJECT_ENVIRONMENT", $savedUvProjectEnv, "Process")
+    $sitePackagesPath = Join-Path $pythonRoot "Lib\site-packages"
+    if (Test-Path $sitePackagesPath) {
+        Get-ChildItem -Path $sitePackagesPath -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        Get-ChildItem -Path $sitePackagesPath -Recurse -Directory -ErrorAction SilentlyContinue | Where-Object {
+            $_.Name -in @("tests", "test")
+        } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    Get-ChildItem -Path $venvDir -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-    Get-ChildItem -Path (Join-Path $venvDir "Lib\site-packages") -Recurse -Directory -ErrorAction SilentlyContinue | Where-Object {
-        $_.Name -in @("tests", "test")
-    } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-
-    if ([bool]$pythonConfig.precompilePyc) {
-        & $pythonExe -m compileall -q (Join-Path $venvDir "Lib\site-packages")
-    }
-
-    $extraArgs = Get-ExtraArgsFromSyncArgs -SyncArgs $syncArgs
-    if ([bool]$pythonConfig.includeWheelCache) {
-        $vendorDir = Join-Path $RuntimeDir "_vendor"
-        $wheelsDir = Join-Path $vendorDir "wheels"
-        New-Item -ItemType Directory -Force -Path $wheelsDir | Out-Null
-
-        $requirementsPath = Join-Path $vendorDir "requirements.txt"
-        $exportArgs = @("export", "--frozen", "--no-dev", "--no-emit-project") + $extraArgs + @("--format", "requirements-txt", "-o", $requirementsPath)
-        & $uvExe @exportArgs
-        if ($LASTEXITCODE -ne 0) {
-            throw "导出 requirements 失败"
-        }
-
-        if (Test-UvPipWheelSupport -UvExe $uvExe) {
-            $wheelArgs = @("pip", "wheel", "-r", $requirementsPath, "--wheel-dir", $wheelsDir)
-            & $uvExe @wheelArgs
-            if ($LASTEXITCODE -ne 0) {
-                throw "构建 wheel 缓存失败"
-            }
-        }
-        else {
-            $notice = Join-Path $vendorDir "WHEEL_CACHE_DISABLED.txt"
-            "当前 uv 版本不支持 'uv pip wheel'，已跳过 wheel 缓存生成。" | Set-Content -Path $notice -Encoding UTF8
-            Write-Warning "当前 uv 版本不支持 pip wheel，已跳过 _vendor/wheels 生成。"
-        }
-    }
-
-    if ([bool]$pythonConfig.includeUvBinary) {
-        $runtimeToolsDir = Join-Path $RuntimeDir "tools"
-        New-Item -ItemType Directory -Force -Path $runtimeToolsDir | Out-Null
-        if (Test-Path (Join-Path $ProjectRoot "tools\uv.exe")) {
-            Copy-Item -Path (Join-Path $ProjectRoot "tools\uv.exe") -Destination (Join-Path $runtimeToolsDir "uv.exe") -Force
-        }
-        else {
-            Copy-Item -Path $uvExe -Destination (Join-Path $runtimeToolsDir "uv.exe") -Force
-        }
+    if ([bool]$pythonConfig.precompilePyc -and (Test-Path $sitePackagesPath)) {
+        & (Join-Path $pythonRoot "python.exe") -m compileall -q $sitePackagesPath
     }
 
     foreach ($toolName in @("ffmpeg.exe", "ffprobe.exe")) {
@@ -283,8 +403,6 @@ function Build-PythonRuntime {
         }
     }
 
-    Copy-Item -Path (Join-Path $ProjectRoot "pyproject.toml") -Destination (Join-Path $RuntimeDir "pyproject.toml") -Force
-    Copy-Item -Path (Join-Path $ProjectRoot "uv.lock") -Destination (Join-Path $RuntimeDir "uv.lock") -Force
 }
 
 function Get-Channel {

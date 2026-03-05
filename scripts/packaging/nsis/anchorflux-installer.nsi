@@ -107,8 +107,6 @@ FunctionEnd
 
 Function CleanupProgramFilesOnly
   Delete "$INSTDIR\AnchorFlux.exe"
-  Delete "$INSTDIR\pyproject.toml"
-  Delete "$INSTDIR\uv.lock"
   Delete "$INSTDIR\user_config.json"
   Delete "$INSTDIR\model_runtime_config.json"
   Delete "$INSTDIR\.env"
@@ -125,8 +123,6 @@ FunctionEnd
 
 Function un.CleanupProgramFilesOnly
   Delete "$INSTDIR\AnchorFlux.exe"
-  Delete "$INSTDIR\pyproject.toml"
-  Delete "$INSTDIR\uv.lock"
   Delete "$INSTDIR\user_config.json"
   Delete "$INSTDIR\model_runtime_config.json"
   Delete "$INSTDIR\.env"
