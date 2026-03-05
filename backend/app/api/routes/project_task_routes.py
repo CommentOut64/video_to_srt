@@ -15,6 +15,13 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException
 from app.models.project_models import infer_task_mode
+from app.services.model_task_guard_service import (
+    enforce_required_models_ready,
+    resolve_model_task_guard_mode_from_env,
+    resolve_model_task_guard_poll_sec_from_env,
+    resolve_model_task_guard_timeout_sec_from_env,
+    resolve_required_model_ids_for_job_settings,
+)
 
 
 def _get_queue_service(transcription_service):
@@ -40,6 +47,44 @@ def create_project_task_router(transcription_service: Optional[Any] = None) -> A
         if runtime_enabled and transcription_service is not None:
             return transcription_service
         raise HTTPException(status_code=422, detail="Lite 模式不支持该任务队列操作")
+
+    async def _guard_models_before_enqueue(job_settings: Optional[Any] = None) -> None:
+        guard_mode = resolve_model_task_guard_mode_from_env()
+        if guard_mode == "off":
+            return
+
+        try:
+            from app.services.model_manager_v2 import get_model_manager_v2
+            from app.services.model_bootstrap_service import get_model_bootstrap_service
+        except Exception:
+            return
+
+        model_manager = get_model_manager_v2()
+        bootstrap_service = get_model_bootstrap_service(model_manager=model_manager)
+        timeout_sec = resolve_model_task_guard_timeout_sec_from_env(guard_mode)
+        poll_sec = resolve_model_task_guard_poll_sec_from_env()
+        required_ids = resolve_required_model_ids_for_job_settings(
+            model_manager=model_manager,
+            bootstrap_service=bootstrap_service,
+            job_settings=job_settings,
+        )
+        decision = await enforce_required_models_ready(
+            model_manager=model_manager,
+            bootstrap_service=bootstrap_service,
+            mode=guard_mode,
+            timeout_sec=timeout_sec,
+            poll_sec=poll_sec,
+            required_model_ids=required_ids,
+        )
+        if not bool(decision.get("is_ready")):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "MODEL_NOT_READY",
+                    "message": "必需模型未就绪，请等待模型下载/修复完成后再启动任务",
+                    **decision,
+                },
+            )
 
     def _resolve_project_identity(identifier: str):
         from app.services.project_id_resolver import get_project_id_resolver
@@ -400,6 +445,7 @@ def create_project_task_router(transcription_service: Optional[Any] = None) -> A
         identity, runtime_job = _resolve_runtime_job_or_404(project_id)
         runtime_job_id = str(getattr(runtime_job, "job_id", "") or "")
         queue_service = _get_queue_service(runtime_service)
+        await _guard_models_before_enqueue(getattr(runtime_job, "settings", None))
         ok = queue_service.resume_job(runtime_job_id)
         if not ok:
             raise HTTPException(status_code=400, detail="无法恢复任务（任务未暂停或不存在）")

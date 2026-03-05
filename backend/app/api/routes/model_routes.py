@@ -3,19 +3,41 @@
 """
 
 import logging
-from typing import List
+import os
+from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 
 from app.services.model_manager_v2 import get_model_manager_v2
 from app.services.sse_service import get_sse_manager
 from app.services.model_download_event_bus import get_model_download_event_bus
+from app.services.model_bootstrap_service import get_model_bootstrap_service
 
 router = APIRouter(prefix="/api/models", tags=["models"])
 logger = logging.getLogger(__name__)
 
 model_manager = get_model_manager_v2()
+
+
+def _resolve_bootstrap_mode_for_api() -> str:
+    raw_mode = str(os.getenv("MODEL_BOOTSTRAP_MODE", "")).strip().lower()
+    if raw_mode in {"strict", "background", "off"}:
+        return raw_mode
+    legacy_auto = str(os.getenv("MODEL_BOOTSTRAP_AUTO", "")).strip().lower()
+    if legacy_auto:
+        if legacy_auto in {"0", "false", "no", "off"}:
+            return "off"
+        return "background"
+    return "background"
+
+
+class BootstrapTriggerRequest(BaseModel):
+    """后台模型自愈触发请求。"""
+
+    model_ids: Optional[List[str]] = Field(default=None, description="可选：只触发指定模型")
+    is_force: bool = Field(default=False, alias="force", description="是否强制修复已就绪模型")
 
 
 @router.get("/", response_model=List[dict])
@@ -26,6 +48,39 @@ async def list_models():
         return list(status.values())
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取模型状态失败: {str(e)}")
+
+
+@router.get("/bootstrap/status")
+async def get_bootstrap_status():
+    """获取模型后台自愈状态。"""
+    try:
+        bootstrap_service = get_model_bootstrap_service(model_manager=model_manager)
+        return {
+            "success": True,
+            "mode": _resolve_bootstrap_mode_for_api(),
+            "required_models": bootstrap_service.resolve_required_model_ids(),
+            **bootstrap_service.get_status(),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取后台自愈状态失败: {str(e)}")
+
+
+@router.post("/bootstrap/trigger")
+async def trigger_bootstrap(req: BootstrapTriggerRequest):
+    """手动触发后台模型自愈。"""
+    try:
+        bootstrap_service = get_model_bootstrap_service(model_manager=model_manager)
+        is_started = bootstrap_service.start_non_blocking(
+            model_ids=req.model_ids,
+            is_force=req.is_force,
+        )
+        return {
+            "success": True,
+            "started": is_started,
+            "status": bootstrap_service.get_status(),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"触发后台自愈失败: {str(e)}")
 
 
 @router.post("/{model_id}/ensure")

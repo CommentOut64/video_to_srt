@@ -73,6 +73,7 @@ from app.services.ffmpeg_manager import get_ffmpeg_manager
 # 配置日志（在其他初始化之前）
 logger = setup_logging()
 VALID_UI_MODES = {"browser", "electron", "none"}
+VALID_MODEL_BOOTSTRAP_MODES = {"strict", "background", "off"}
 FULL_RUNTIME_ENABLED = not IS_LITE
 FULL_RUNTIME_DISABLE_REASON = ""
 
@@ -105,6 +106,29 @@ def _resolve_ui_mode_from_env() -> str:
         return raw_ui_mode
     logger.warning(f"未知 ANCHORFLUX_UI_MODE={raw_ui_mode}，回退为 browser")
     return "browser"
+
+
+def _resolve_model_bootstrap_mode_from_env() -> str:
+    """
+    解析模型自愈模式。
+
+    - strict: 启动阶段同步校验必需模型，失败直接阻断启动；
+    - background: 启动后后台自愈，不阻塞启动；
+    - off: 关闭自动自愈。
+    """
+    raw_mode = str(os.getenv("MODEL_BOOTSTRAP_MODE", "")).strip().lower()
+    if raw_mode in VALID_MODEL_BOOTSTRAP_MODES:
+        return raw_mode
+
+    # 兼容旧变量 MODEL_BOOTSTRAP_AUTO
+    legacy_auto = str(os.getenv("MODEL_BOOTSTRAP_AUTO", "")).strip().lower()
+    if legacy_auto:
+        if legacy_auto in {"0", "false", "no", "off"}:
+            return "off"
+        return "background"
+
+    # 默认不阻塞启动：后台自愈（可用 MODEL_BOOTSTRAP_MODE=strict 强制启动前校验）
+    return "background"
 
 
 def _disable_full_runtime(reason: str, exc=None):
@@ -321,12 +345,15 @@ if not FULL_RUNTIME_ENABLED:
 @app.on_event("startup")
 async def startup_event():
     """应用启动事件 - 初始化模型管理器和FFmpeg检测"""
+    bootstrap_mode = _resolve_model_bootstrap_mode_from_env()
+    is_strict_bootstrap_mode = bootstrap_mode == "strict"
     try:
         transcription_service_instance = None
 
         logger.info("="  * 60)
         logger.info("服务启动中...")
         logger.info("=" * 60)
+        logger.info(f"模型自愈模式: {bootstrap_mode}")
 
         # 1. 设置SSE事件循环引用（必须在模型管理器初始化之前！）
         logger.info("步骤 1/4: 设置SSE事件循环...")
@@ -359,8 +386,56 @@ async def startup_event():
                 # 3. 初始化模型管理器（此时事件循环已设置，后台验证可以正常推送SSE）
                 logger.info("步骤 3/4: 初始化模型管理器...")
                 from app.services.model_manager_v2 import get_model_manager_v2
+                from app.services.model_bootstrap_service import get_model_bootstrap_service
                 model_manager = get_model_manager_v2()
                 logger.info("模型管理器初始化成功 (V2)")
+
+                # 3.5 模型自愈策略（strict/background/off）
+                bootstrap_service = get_model_bootstrap_service(model_manager=model_manager)
+                if bootstrap_mode == "strict":
+                    required_model_ids = bootstrap_service.resolve_required_model_ids()
+                    logger.info(
+                        "模型自愈模式=strict，启动阶段同步校验必需模型: count=%d",
+                        len(required_model_ids),
+                    )
+                    summary = await bootstrap_service.run_once(
+                        model_ids=required_model_ids,
+                        is_force=False,
+                        is_required_on_boot=True,
+                    )
+                    failed_models = list(summary.get("failed_models") or [])
+                    if failed_models:
+                        raise RuntimeError(
+                            f"严格模式模型校验失败，无法启动。失败模型: {failed_models}"
+                        )
+                    logger.info("严格模式必需模型校验通过")
+
+                    # 可选：必需模型之外的模型转为后台自愈，不阻塞启动。
+                    all_model_ids = [spec.id for spec in model_manager.registry.list()]
+                    background_ids = [
+                        model_id
+                        for model_id in all_model_ids
+                        if model_id not in set(required_model_ids)
+                    ]
+                    if background_ids:
+                        is_started = bootstrap_service.start_non_blocking(
+                            model_ids=background_ids,
+                            is_force=False,
+                            is_required_on_boot=False,
+                        )
+                        if is_started:
+                            logger.info(
+                                "严格模式下已启动非必需模型后台自愈: count=%d",
+                                len(background_ids),
+                            )
+                elif bootstrap_mode == "background":
+                    is_bootstrap_started = bootstrap_service.start_non_blocking()
+                    if is_bootstrap_started:
+                        logger.info("模型后台自愈任务已启动（非阻塞）")
+                    else:
+                        logger.info("模型后台自愈任务已在运行，跳过重复启动")
+                else:
+                    logger.info("模型后台自愈任务已禁用（MODEL_BOOTSTRAP_MODE=off）")
 
                 # 4. 初始化队列服务（新增）
                 logger.info("步骤 4/4: 初始化任务队列服务...")
@@ -563,6 +638,8 @@ async def startup_event():
 
     except Exception as e:
         logger.error(f"启动初始化失败: {str(e)}", exc_info=True)
+        if is_strict_bootstrap_mode:
+            raise
 
 
 @app.on_event("shutdown")
@@ -578,6 +655,14 @@ async def shutdown_event():
             pass
 
         if FULL_RUNTIME_ENABLED:
+            # 停止模型后台自愈任务
+            try:
+                from app.services.model_bootstrap_service import get_model_bootstrap_service
+                get_model_bootstrap_service().cancel_background()
+                logger.info("模型后台自愈任务已停止")
+            except Exception:
+                pass
+
             # 停止队列服务（新增）
             from app.services.job_queue_service import get_queue_service
             try:
