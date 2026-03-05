@@ -239,20 +239,6 @@
   features: {languages: [zh, yue]}
   fallback: []
 
-
-- id: punct-edge-punct-en
-  kind: punct
-  framework: onnx
-  format: onnx
-  default_device: cpu
-  compute_type: int8
-  source:
-    local_path: backend/models/pretrained/punctuation/edge_punct_casing_en
-    files: [model.onnx, model.int8.onnx, config.json, vocab.txt]
-  resources: {cpu_threads: 1}
-  features: {languages: [en]}
-  fallback: []
-
 - id: punct-distilbert-en
   kind: punct
   framework: onnx
@@ -274,19 +260,6 @@
   features: {languages: [en], model_file: model_int8.onnx}
   fallback: []
 
-- id: punct-char-bert-ja
-  kind: punct
-  framework: onnx
-  format: onnx
-  default_device: cpu
-  compute_type: int8
-  source:
-    local_path: backend/models/pretrained/punctuation/char_bert_ja
-    files: [model.onnx, config.json, vocab.txt]
-  resources: {cpu_threads: 1}
-  features: {languages: [ja]}
-  fallback: []
-
 - id: punct-pcs-47lang
   kind: punct
   framework: onnx
@@ -303,18 +276,3 @@
       ]
   resources: {cpu_threads: 1}
   features: {languages: [ja]}
-  fallback: [punct-char-bert-ja]
-  fallback: [punct-distilbert-multi]
-
-- id: punct-distilbert-multi
-  kind: punct
-  framework: onnx
-  format: onnx
-  default_device: cpu
-  compute_type: int8
-  source:
-    local_path: backend/models/pretrained/punctuation/distilbert_multilang
-    files: [model.onnx, config.json, vocab.txt]
-  resources: {cpu_threads: 1}
-  features: {languages: [auto, multi]}
-  fallback: []

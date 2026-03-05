@@ -172,7 +172,8 @@ class ModelManagerV2:
         allow_download = bool(effective.get("allow_download")) if downloader is None else downloader.allow_download
         self.downloader = downloader or ModelDownloader(
             allow_download=allow_download,
-            local_files_only=True,
+            # 允许下载时必须关闭 local_files_only，否则会永远只查本地缓存。
+            local_files_only=not allow_download,
             base_dir=base,  # V3.2.0+dev.20260116.02: 传递基准路径
         )
         # Metrics
@@ -259,6 +260,7 @@ class ModelManagerV2:
         allow_download = effective.get("allow_download")
         if allow_download is not None:
             self.downloader.allow_download = bool(allow_download)
+            self.downloader.local_files_only = not bool(allow_download)
 
         resident = self._runtime_service.get_resident_models().get("models", [])
         self.set_force_resident_models(resident)
@@ -615,10 +617,26 @@ class ModelManagerV2:
         specs = self.registry.list(kind=kind) if kind else self.registry.list()
         return {spec.id: self.model_status(spec.id) for spec in specs}
 
-    def ensure_available(self, model_id: str) -> str:
-        """确保模型可用，必要时下载。"""
+    def ensure_available(
+        self,
+        model_id: str,
+        is_allow_download_override: Optional[bool] = None,
+        is_local_files_only_override: Optional[bool] = None,
+    ) -> str:
+        """
+        确保模型可用，必要时下载。
+
+        Args:
+            model_id: 模型 ID。
+            is_allow_download_override: 可选下载开关覆盖。
+            is_local_files_only_override: 可选本地模式覆盖。
+        """
         spec = self.registry.get(model_id)
-        local_path = self.downloader.ensure_local(spec)
+        downloader = self._build_request_downloader(
+            is_allow_download_override=is_allow_download_override,
+            is_local_files_only_override=is_local_files_only_override,
+        )
+        local_path = downloader.ensure_local(spec)
         logger.info(
             "ModelManagerV2 ensure_available 成功: %s framework=%s path=%s",
             spec.id,
@@ -626,6 +644,30 @@ class ModelManagerV2:
             local_path,
         )
         return local_path
+
+    def _build_request_downloader(
+        self,
+        *,
+        is_allow_download_override: Optional[bool],
+        is_local_files_only_override: Optional[bool],
+    ) -> ModelDownloader:
+        """按请求生成下载器实例，避免修改全局 downloader 状态。"""
+        if is_allow_download_override is None and is_local_files_only_override is None:
+            return self.downloader
+
+        return ModelDownloader(
+            allow_download=(
+                self.downloader.allow_download
+                if is_allow_download_override is None
+                else bool(is_allow_download_override)
+            ),
+            local_files_only=(
+                self.downloader.local_files_only
+                if is_local_files_only_override is None
+                else bool(is_local_files_only_override)
+            ),
+            base_dir=self.downloader.base_dir,
+        )
 
     def delete_model(self, model_id: str) -> bool:
         """删除本地模型目录（若存在）。"""

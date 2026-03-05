@@ -1,7 +1,7 @@
 """
 模型下载与校验流水线。
 默认优先使用本地路径；当允许下载且存在 repo_id 时调用 Hugging Face snapshot_download。
-V3.2.0+dev.20260116.04: 区分自带模型和需下载模型
+V3.2.4+dev.20260304.14: 移除“pretrained 必须随包内置”限制，缺失时可按策略自动修复。
 """
 
 from __future__ import annotations
@@ -33,62 +33,37 @@ class ModelDownloader:
         self.local_files_only = local_files_only
         self.base_dir = base_dir  # V3.2.0+dev.20260116.02: 添加上下文支持
 
-    def _is_bundled_model(self, spec: ModelSpec) -> bool:
-        """
-        判断模型是否为自带模型（无需下载）。
-
-        V3.2.0+dev.20260116.04: 区分自带模型和需下载模型
-        - backend/models/pretrained/ 下的模型是自带的
-        - 根目录 models/ 下的模型需要下载
-
-        Args:
-            spec: 模型规格
-
-        Returns:
-            bool: True 表示自带模型，False 表示需下载
-        """
-        if not spec.source.local_path:
-            return False
-
-        local_path = spec.source.local_path
-
-        # 判断是否在 backend/models/pretrained/ 下
-        if local_path.startswith("backend/models/pretrained/") or \
-           local_path.startswith("backend\\models\\pretrained\\"):
-            return True
-
-        return False
-
     def ensure_local(self, spec: ModelSpec) -> str:
         """
         确保模型在本地可用，必要时触发下载。
 
-        V3.2.0+dev.20260116.04: 自带模型缺失时报错，不尝试下载
+        规则：
+        - 本地完整 -> 直接返回；
+        - 本地不完整 -> 若可下载则自动修复，否则报错；
+        - 本地缺失 -> 若可下载则下载，否则报错。
 
         Returns: 本地路径字符串。
         """
         event_bus = get_model_download_event_bus()
         local = self.find_local(spec)
         if local:
-            self._validate_files(spec, local)
-            event_bus.cache_hit(spec.id, str(local), spec.source.repo_id)
-            return str(local)
-
-        # V3.2.0+dev.20260116.04: 自带模型缺失时直接报错
-        if self._is_bundled_model(spec):
-            event_bus.error(spec.id, "自带模型缺失", spec.source.repo_id)
-            raise FileNotFoundError(
-                f"自带模型缺失: {spec.id} 路径={spec.source.local_path}\n"
-                f"请确保模型文件已正确放置在整合包中"
-            )
+            try:
+                self._validate_files(spec, local)
+            except FileNotFoundError as exc:
+                logger.warning("本地模型不完整，将尝试自动修复: model=%s error=%s", spec.id, exc)
+                if not spec.source.repo_id:
+                    event_bus.error(spec.id, str(exc), spec.source.repo_id)
+                    raise
+                local = None
+            else:
+                event_bus.cache_hit(spec.id, str(local), spec.source.repo_id)
+                return str(local)
 
         if not spec.source.repo_id:
             event_bus.error(spec.id, "模型未提供本地路径或仓库", spec.source.repo_id)
             raise FileNotFoundError(f"模型未提供本地路径或仓库: {spec.id}")
 
-        # V3.2.0+dev.20260116.03: Whisper 模型允许自动下载
-        is_whisper = spec.kind == "asr" and "whisper" in spec.id.lower()
-        if not self.allow_download and not is_whisper:
+        if not self.allow_download:
             event_bus.error(spec.id, "模型缺失且未允许下载", spec.source.repo_id)
             raise FileNotFoundError(f"模型缺失且未允许下载: {spec.id} repo={spec.source.repo_id}")
 
@@ -146,14 +121,20 @@ class ModelDownloader:
         event_bus.start(spec.id, spec.source.repo_id)
         cache_dir = Path(config.HF_CACHE_DIR)
         cache_dir.mkdir(parents=True, exist_ok=True)
+        download_kwargs = {
+            "repo_id": spec.source.repo_id,
+            "cache_dir": cache_dir.as_posix(),
+            "local_files_only": self.local_files_only,
+            "max_workers": 8,
+            "tqdm_class": _ModelDownloadTqdmFactory(event_bus, spec.id, spec.source.repo_id),
+        }
         try:
-            local_path = snapshot_download(
-                repo_id=spec.source.repo_id,
-                cache_dir=cache_dir.as_posix(),
-                resume_download=True,
-                local_files_only=self.local_files_only,
-                tqdm_class=_ModelDownloadTqdmFactory(event_bus, spec.id, spec.source.repo_id),
-            )
+            try:
+                local_path = snapshot_download(**download_kwargs)
+            except TypeError:
+                # 兼容旧版 huggingface_hub（缺少 max_workers 参数）。
+                download_kwargs.pop("max_workers", None)
+                local_path = snapshot_download(**download_kwargs)
         except Exception as exc:
             event_bus.error(spec.id, str(exc), spec.source.repo_id)
             raise
