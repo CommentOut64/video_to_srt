@@ -20,6 +20,12 @@ from app.services.runtime_param_resolver import get_yamnet_runtime_params
 logger = logging.getLogger(__name__)
 
 
+def _get_model_manager_v2():
+    from app.services.model_manager_v2 import get_model_manager_v2
+
+    return get_model_manager_v2()
+
+
 @dataclass
 class YAMNetClassificationResult:
     """YAMNet 分类结果"""
@@ -190,11 +196,9 @@ class YAMNetClassifier:
         初始化 YAMNet 分类器
 
         Args:
-            model_path: ONNX 模型路径，默认为 backend/models/pretrained/yamnet/model.onnx
+            model_path: ONNX 模型路径；未指定时通过 ModelManagerV2 解析 `yamnet` 模型目录
         """
-        if model_path is None:
-            model_path = Path(__file__).parent.parent.parent / "models" / "pretrained" / "yamnet" / "model.onnx"
-        self.model_path = Path(model_path)
+        self.model_path = self._resolve_model_path(model_path)
 
         self.session = None
         self.preprocessor = YAMNetPreprocessor()
@@ -228,6 +232,20 @@ class YAMNetClassifier:
         self._probe_window_count = int(runtime.get("probe_window_count", 3))
         duration_sec = float(runtime.get("probe_window_duration_sec", 0.975))
         self.window_samples = max(1, int(self.sample_rate * duration_sec))
+
+    @staticmethod
+    def _resolve_model_path(model_path: Optional[str]) -> Path:
+        if model_path:
+            return Path(model_path)
+
+        default_path = Path(__file__).parent.parent.parent / "models" / "pretrained" / "yamnet" / "model.onnx"
+        try:
+            manager = _get_model_manager_v2()
+            local_dir = Path(manager.ensure_available("yamnet"))
+            return local_dir / "model.onnx"
+        except Exception as exc:
+            logger.warning("YAMNet 模型管理解析失败，回退默认路径: %s", exc)
+            return default_path
     def _init_model(self):
         """初始化 ONNX 模型（固定 CPU 执行）"""
         try:

@@ -191,17 +191,14 @@ def resolve_required_model_ids_for_job_settings(
         required = [
             mid
             for mid in required
-            if mid not in {"pyannote-segmentation-3-0", "pyannote-speaker-diarization-community-1"}
+            if mid != "pyannote-speaker-diarization-community-1"
         ]
 
-    # Whisper：仅在 patch/dual 模式需要
+    # Whisper：不纳入“任务创建前必须就绪”的集合。
+    # Why: WhisperService 在真正执行到慢流/复核阶段时会自行 ensure_available，实现按需下载；
+    # 若在此提前守卫，会把可选模型误变成创建任务时的阻断项。
     transcription = getattr(job_settings, "transcription", None) if job_settings is not None else None
     transcription_profile = str(getattr(transcription, "transcription_profile", "sensevoice_only") or "sensevoice_only").strip()
-    if transcription_profile in {"sv_whisper_patch", "sv_whisper_dual"}:
-        whisper_model = str(getattr(transcription, "whisper_model", "medium") or "medium").strip()
-        whisper_id = f"whisper-{whisper_model.replace('.', '-')}"
-        if whisper_id in known_ids:
-            required.append(whisper_id)
 
     # 去重且保持顺序
     deduped: List[str] = []

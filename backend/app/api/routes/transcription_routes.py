@@ -361,12 +361,7 @@ def create_transcription_router(
         """根据 task_config 生成 JobSettings。"""
         if not task_config:
             return JobSettings()
-        # 临时策略：任务级 whisper_model 覆盖停用，统一回退 .env。
         normalized_task_config = dict(task_config)
-        transcription_payload = dict(normalized_task_config.get("transcription") or {})
-        if "whisper_model" in transcription_payload:
-            transcription_payload.pop("whisper_model", None)
-            normalized_task_config["transcription"] = transcription_payload
 
         preset_id = str(normalized_task_config.get("preset_id", "balanced") or "balanced")
         has_custom_groups = any(
