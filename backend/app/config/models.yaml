@@ -6,8 +6,24 @@
   compute_type: int8
   source:
     local_path: backend/models/pretrained/sensevoice
-    repo_id: FunAudioLLM/SenseVoiceSmall
-    files: [model_quant.onnx, tokens.json]
+    repo_id: anchor-flux/sensevoice-small-onnx
+    install_mode: mirror
+    allow_patterns:
+      [
+        model_quant.onnx,
+        tokens.json,
+        configuration.json,
+        config.yaml,
+        chn_jpn_yue_eng_ko_spectok.bpe.model,
+      ]
+    files:
+      [
+        model_quant.onnx,
+        tokens.json,
+        configuration.json,
+        config.yaml,
+        chn_jpn_yue_eng_ko_spectok.bpe.model,
+      ]
     mirrors: []
   resources: {vram_mb: 800, cpu_threads: 8}
   features: {languages: [zh, en, yue, ja, ko], timestamps: char}
@@ -122,19 +138,6 @@
   resources: {vram_mb: 4000}
   features: {timestamps: word, languages: multi}
 
-- id: brouhaha-quality
-  kind: quality
-  framework: torch
-  format: pth
-  default_device: auto
-  compute_type: fp32
-  source:
-    local_path: backend/models/pretrained/brouhaha
-    repo_id: pyannote/brouhaha
-    files: [pytorch_model.bin, config.yaml]
-  env:
-    pip: ["pyannote.audio==3.1.1", "torch==2.1.2"]
-  resources: {vram_mb: 1000}
 
 - id: dnsmos-quality
   kind: quality
@@ -144,6 +147,9 @@
   compute_type: fp32
   source:
     local_path: backend/models/pretrained/dnsmos
+    repo_id: anchor-flux/dnsmos-onnx
+    install_mode: mirror
+    allow_patterns: [sig_bak_ovr.onnx, model_v8.onnx]
     files: [sig_bak_ovr.onnx, model_v8.onnx]
   resources: {cpu_threads: 2, vram_mb: 0}
 
@@ -154,7 +160,10 @@
   default_device: cuda
   compute_type: fp32
   source:
-    local_path: backend/models/pretrained
+    local_path: backend/models/pretrained/demucs-htdemucs
+    repo_id: anchor-flux/demucs-htdemucs
+    install_mode: mirror
+    allow_patterns: [htdemucs.th]
     files: [htdemucs.th]
   features:
     model_name: htdemucs
@@ -168,6 +177,9 @@
   compute_type: int8
   source:
     local_path: backend/models/pretrained/silero-vad
+    repo_id: anchor-flux/silero-vad-onnx
+    install_mode: mirror
+    allow_patterns: [silero_vad.onnx]
     files: [silero_vad.onnx]
   resources: {cpu_threads: 4}
 
@@ -180,7 +192,17 @@
   compute_type: fp32
   source:
     local_path: backend/models/pretrained/lang-id-voxlingua107-ecapa
-    repo_id: speechbrain/lang-id-voxlingua107-ecapa
+    repo_id: anchor-flux/lang-id-voxlingua107-ecapa
+    install_mode: mirror
+    allow_patterns:
+      [
+        classifier.ckpt,
+        embedding_model.ckpt,
+        normalizer.ckpt,
+        hyperparams.yaml,
+        label_encoder.txt,
+        config.json,
+      ]
     files:
       [
         classifier.ckpt,
@@ -192,19 +214,6 @@
       ]
   resources: {cpu_threads: 4, vram_mb: 200}
 
-- id: pyannote-segmentation-3-0
-  kind: speaker
-  framework: torch
-  format: pth
-  default_device: cuda
-  compute_type: fp32
-  source:
-    local_path: backend/models/pretrained/segmentation-3.0
-    files: [config.yaml, pytorch_model.bin]
-  resources: {vram_mb: 1200, cpu_threads: 4}
-  features:
-    role: segmentation
-
 - id: pyannote-speaker-diarization-community-1
   kind: speaker
   framework: torch
@@ -213,6 +222,16 @@
   compute_type: fp32
   source:
     local_path: backend/models/pretrained/speaker-diarization-community-1
+    repo_id: anchor-flux/pyannote-speaker-diarization-community-1
+    install_mode: mirror
+    allow_patterns:
+      [
+        config.yaml,
+        segmentation/pytorch_model.bin,
+        embedding/pytorch_model.bin,
+        plda/plda.npz,
+        plda/xvec_transform.npz,
+      ]
     files:
       [
         config.yaml,
@@ -226,6 +245,23 @@
     role: diarization
     provider: pyannote-community
 
+- id: yamnet
+  kind: quality
+  framework: onnx
+  format: onnx
+  default_device: cpu
+  compute_type: fp32
+  source:
+    local_path: backend/models/pretrained/yamnet
+    repo_id: anchor-flux/yamnet-onnx
+    install_mode: mirror
+    allow_patterns: [model.onnx, model.data, yamnet_class_map.csv]
+    files: [model.onnx, model.data, yamnet_class_map.csv]
+  resources: {cpu_threads: 2, vram_mb: 0}
+  features:
+    role: semantic-audio-classifier
+    sample_rate: 16000
+
 - id: punct-ct-transformer-zh
   kind: punct
   framework: onnx
@@ -234,7 +270,10 @@
   compute_type: int8
   source:
     local_path: backend/models/pretrained/punctuation/ct_transformer_zh
-    files: [model.onnx, config.json, tokens.json, vocab.txt]
+    repo_id: anchor-flux/punct-ct-transformer-zh
+    install_mode: mirror
+    allow_patterns: [model.onnx, config.json, config.yaml, tokens.json, vocab.txt]
+    files: [model.onnx, config.json, config.yaml, tokens.json, vocab.txt]
   resources: {cpu_threads: 1}
   features: {languages: [zh, yue]}
   fallback: []
@@ -247,6 +286,17 @@
   compute_type: int8
   source:
     local_path: backend/models/pretrained/punctuation/distilbert_punctuator_en
+    repo_id: anchor-flux/punct-distilbert-en
+    install_mode: mirror
+    allow_patterns:
+      [
+        model_int8.onnx,
+        config.json,
+        tokenizer.json,
+        tokenizer_config.json,
+        special_tokens_map.json,
+        vocab.txt,
+      ]
     files:
       [
         model_int8.onnx,
@@ -268,6 +318,14 @@
   compute_type: int8
   source:
     local_path: backend/models/pretrained/punctuation/punct_cap_seg_47_language
+    repo_id: anchor-flux/punct-pcs-47lang
+    install_mode: mirror
+    allow_patterns:
+      [
+        punct_cap_seg_47lang_int8.onnx,
+        spe_unigram_64k_lowercase_47lang.model,
+        config.yaml,
+      ]
     files:
       [
         punct_cap_seg_47lang_int8.onnx,
