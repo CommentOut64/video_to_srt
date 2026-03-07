@@ -106,7 +106,7 @@ class ProjectConfig:
         os.environ['HF_HUB_CACHE'] = str(self.HF_CACHE_DIR / "hub")
         
         # HuggingFace 镜像源配置（解决国内访问问题）
-        # 默认启用镜像源，可通过环境变量 USE_HF_MIRROR=false 禁用
+        # 默认启用镜像优先策略，可通过环境变量 USE_HF_MIRROR=false 改为官方优先
         use_mirror = os.getenv('USE_HF_MIRROR', 'true').lower() == 'true'
 
         if use_mirror:
@@ -114,14 +114,14 @@ class ProjectConfig:
             self.HF_ENDPOINT = 'https://hf-mirror.com'
             os.environ['HF_ENDPOINT'] = self.HF_ENDPOINT
             print(f"HuggingFace 镜像源: {self.HF_ENDPOINT}")
-            print("提示：如需使用官方源，请设置环境变量 USE_HF_MIRROR=false")
+            print("提示：下载器默认优先镜像，失败时会自动回退官方源；如需官方优先，请设置 USE_HF_MIRROR=false")
         else:
             # 使用官方源
             self.HF_ENDPOINT = 'https://huggingface.co'
             if 'HF_ENDPOINT' in os.environ:
                 del os.environ['HF_ENDPOINT']
             print(f"使用 HuggingFace 官方源: {self.HF_ENDPOINT}")
-            print("提示：如遇访问问题，可设置环境变量 USE_HF_MIRROR=true 使用镜像源")
+            print("提示：当前为官方优先；如需镜像优先并在失败后自动回退官方，可设置 USE_HF_MIRROR=true")
 
         # 确保目录存在（tools目录不自动创建，需用户手动准备）
         for dir_path in [
