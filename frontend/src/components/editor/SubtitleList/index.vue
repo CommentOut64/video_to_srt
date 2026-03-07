@@ -27,7 +27,7 @@
     />
 
     <!-- 字幕列表 (使用 SubtitleItem 组件) -->
-    <div class="list-container tw-flex-1 tw-overflow-y-auto tw-p-1.5 tw-relative" ref="listRef">
+    <div class="list-host tw-flex-1 tw-min-h-0 tw-relative">
       <div v-if="filteredSubtitles.length === 0 && !homophoneSearch.isSearchActive" class="empty-state tw-flex tw-flex-col tw-items-center tw-justify-center tw-px-4 tw-py-8 tw-text-text-muted">
         <svg viewBox="0 0 24 24" fill="currentColor" class="tw-w-12 tw-h-12 tw-mb-3 tw-opacity-50">
           <path d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H4V6h16v12zM6 10h2v2H6v-2zm0 4h8v2H6v-2zm10 0h2v2h-2v-2zm0-4h2v2h-2v-2zm-4 4h2v2h-2v-2zm0-4h2v2h-2v-2z"/>
@@ -41,31 +41,46 @@
         <p class="tw-text-[13px]">未找到匹配结果</p>
       </div>
 
-      <!-- 分组模式渲染 -->
-      <template v-else-if="homophoneSearch.isSearchActive && homophoneSearch.sortMode === SortMode.GROUPED">
-        <template v-for="group in homophoneSearch.groupedViewItems" :key="group.clusterId">
-          <GroupHeader
-            :reading-label="group.readingLabel"
-            :color="group.color"
-            :item-count="group.items.length"
-            :is-collapsed="collapsedGroups.has(group.clusterId)"
-            :is-group-all-selected="isGroupAllSelected(group)"
-            :is-group-indeterminate="isGroupIndeterminate(group)"
-            @toggle-collapse="toggleGroupCollapse(group.clusterId)"
-            @group-select-change="(checked) => handleGroupSelectChange(group, checked)"
-          />
-          <template v-if="!collapsedGroups.has(group.clusterId)">
+      <DynamicScroller
+        v-else-if="isGroupedSearchMode"
+        ref="listRef"
+        class="list-container tw-flex-1 tw-p-1.5"
+        :items="groupedVirtualItems"
+        key-field="key"
+        :min-item-size="48"
+        :buffer="600"
+      >
+        <template #default="{ item, index, active }">
+          <DynamicScrollerItem
+            :item="item"
+            :active="active"
+            :size-dependencies="item.type === 'group-header'
+              ? [item.clusterId, item.itemCount, item.isCollapsed]
+              : [item.subtitle.text, item.subtitle.start, item.subtitle.end, item.subtitle.isDraft, item.subtitle.warning_type, item.isSelected, item.isCurrent, item.isActive, item.clusterColor]"
+            :data-index="index"
+          >
+            <GroupHeader
+              v-if="item.type === 'group-header'"
+              :reading-label="item.readingLabel"
+              :color="item.color"
+              :item-count="item.itemCount"
+              :is-collapsed="item.isCollapsed"
+              :is-group-all-selected="isGroupAllSelected(item.group)"
+              :is-group-indeterminate="isGroupIndeterminate(item.group)"
+              @toggle-collapse="toggleGroupCollapse(item.clusterId)"
+              @group-select-change="(checked) => handleGroupSelectChange(item.group, checked)"
+            />
             <SubtitleItem
-              v-for="item in group.items"
-              :key="item.subtitle.id"
+              v-else
               :subtitle="item.subtitle"
               :index="item.index"
-              :is-active="activeSubtitleId === item.subtitle.id"
-              :is-current="currentSubtitleId === item.subtitle.id"
+              :is-active="item.isActive"
+              :is-current="item.isCurrent"
               :editable="props.editable"
               :match-spans="item.matchSpans"
               :is-selected="item.isSelected"
               :is-selectable="true"
+              :cluster-color="item.clusterColor"
               @click="onSubtitleClick"
               @update-time="updateTime"
               @update-text="updateText"
@@ -74,63 +89,93 @@
               @insert-after="insertAfter(item.index)"
               @select-change="handleItemSelectChange"
             />
-          </template>
+          </DynamicScrollerItem>
         </template>
-      </template>
+      </DynamicScroller>
 
-      <!-- 时间线模式渲染（搜索激活） -->
-      <template v-else-if="homophoneSearch.isSearchActive && homophoneSearch.sortMode === SortMode.TIMELINE">
-        <SubtitleItem
-          v-for="item in homophoneSearch.timelineViewItems"
-          :key="item.subtitle.id"
-          :subtitle="item.subtitle"
-          :index="item.index"
-          :is-active="activeSubtitleId === item.subtitle.id"
-          :is-current="currentSubtitleId === item.subtitle.id"
-          :editable="props.editable"
-          :match-spans="item.matchSpans"
-          :is-selected="item.isSelected"
-          :is-selectable="true"
-          :cluster-color="item.clusterColor"
-          @click="onSubtitleClick"
-          @update-time="updateTime"
-          @update-text="updateText"
-          @delete="deleteSubtitle"
-          @insert-before="insertBefore(item.index)"
-          @insert-after="insertAfter(item.index)"
-          @select-change="handleItemSelectChange"
-        />
-      </template>
+      <DynamicScroller
+        v-else-if="isTimelineSearchMode"
+        ref="listRef"
+        class="list-container tw-flex-1 tw-p-1.5"
+        :items="homophoneSearch.timelineViewItems"
+        key-field="index"
+        :min-item-size="96"
+        :buffer="800"
+      >
+        <template #default="{ item, index, active }">
+          <DynamicScrollerItem
+            :item="item"
+            :active="active"
+            :size-dependencies="[item.subtitle.text, item.subtitle.start, item.subtitle.end, item.subtitle.isDraft, item.subtitle.warning_type, item.isSelected, item.clusterColor]"
+            :data-index="index"
+          >
+            <SubtitleItem
+              :subtitle="item.subtitle"
+              :index="item.index"
+              :is-active="activeSubtitleId === item.subtitle.id"
+              :is-current="currentSubtitleId === item.subtitle.id"
+              :editable="props.editable"
+              :match-spans="item.matchSpans"
+              :is-selected="item.isSelected"
+              :is-selectable="true"
+              :cluster-color="item.clusterColor"
+              @click="onSubtitleClick"
+              @update-time="updateTime"
+              @update-text="updateText"
+              @delete="deleteSubtitle"
+              @insert-before="insertBefore(item.index)"
+              @insert-after="insertAfter(item.index)"
+              @select-change="handleItemSelectChange"
+            />
+          </DynamicScrollerItem>
+        </template>
+      </DynamicScroller>
 
-      <!-- 默认模式渲染（无搜索） -->
-      <TransitionGroup v-else :name="animationEnabled ? 'subtitle-list' : ''" tag="div">
-        <SubtitleItem
-          v-for="(subtitle, index) in filteredSubtitles"
-          :key="subtitle.id"
-          :subtitle="subtitle"
-          :index="index"
-          :is-active="activeSubtitleId === subtitle.id"
-          :is-current="currentSubtitleId === subtitle.id"
-          :editable="props.editable"
-          @click="onSubtitleClick"
-          @update-time="updateTime"
-          @update-text="updateText"
-          @delete="deleteSubtitle"
-          @insert-before="insertBefore(index)"
-          @insert-after="insertAfter(index)"
-        />
-      </TransitionGroup>
+      <DynamicScroller
+        v-else
+        ref="listRef"
+        class="list-container tw-flex-1 tw-p-1.5"
+        :items="filteredSubtitles"
+        key-field="id"
+        :min-item-size="96"
+        :buffer="800"
+      >
+        <template #default="{ item, index, active }">
+          <DynamicScrollerItem
+            :item="item"
+            :active="active"
+            :size-dependencies="[item.text, item.start, item.end, item.isDraft, item.warning_type, activeSubtitleId === item.id, currentSubtitleId === item.id]"
+            :data-index="index"
+          >
+            <SubtitleItem
+              :subtitle="item"
+              :index="index"
+              :is-active="activeSubtitleId === item.id"
+              :is-current="currentSubtitleId === item.id"
+              :editable="props.editable"
+              @click="onSubtitleClick"
+              @update-time="updateTime"
+              @update-text="updateText"
+              @delete="deleteSubtitle"
+              @insert-before="insertBefore(index)"
+              @insert-after="insertAfter(index)"
+            />
+          </DynamicScrollerItem>
+        </template>
+      </DynamicScroller>
     </div>
   </div>
 </template>
 
 <script setup>
 import { ref, reactive, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
+import { DynamicScroller, DynamicScrollerItem } from 'vue-virtual-scroller'
 import { ElMessage } from 'element-plus'
 import { useProjectStore } from '@/stores/projectStore'
 import { useSubtitleDocumentStore } from '@/stores/subtitleDocumentStore'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { useHomophoneSearch, SortMode } from '@/composables'
+import { useEditBufferStore } from '@/core/editor/editBufferStore'
 import projectApi from '@/services/api/projectApi'
 import { useStructuralSyncStore } from '@/stores/structuralSyncStore'
 // 导入组件
@@ -153,6 +198,7 @@ const emit = defineEmits(['subtitle-click', 'subtitle-edit', 'subtitle-delete', 
 const projectStore = useProjectStore()
 const subtitleDocumentStore = useSubtitleDocumentStore()
 const structuralSyncStore = useStructuralSyncStore()
+const editBufferStore = useEditBufferStore()
 
 // 全局播放管理器
 const playbackManager = usePlaybackManager()
@@ -181,6 +227,7 @@ const USER_SCROLL_AUTO_RESUME_DELAY_MS = 6000
 const PROGRAMMATIC_SCROLL_GUARD_MS = 900
 let followResumeTimer = null
 let programmaticScrollGuardUntil = 0
+let boundListElement = null
 
 // State
 const quickSearchText = ref('')     // 快速搜索文本（简单过滤）
@@ -196,11 +243,116 @@ const activeSubtitleId = computed(() => subtitleDocumentStore.selectedSubtitleId
 // 草稿计数
 const draftCount = computed(() => projectStore.draftSubtitleCount)
 
+const isGroupedSearchMode = computed(
+  () => homophoneSearch.isSearchActive && homophoneSearch.sortMode === SortMode.GROUPED
+)
+const isTimelineSearchMode = computed(
+  () => homophoneSearch.isSearchActive && homophoneSearch.sortMode === SortMode.TIMELINE
+)
+const groupedVirtualItems = computed(() => {
+  if (!isGroupedSearchMode.value) return []
+
+  return homophoneSearch.groupedViewItems.flatMap((group) => {
+    const items = [{
+      type: 'group-header',
+      key: `group-${group.clusterId}`,
+      clusterId: group.clusterId,
+      readingLabel: group.readingLabel,
+      color: group.color,
+      itemCount: group.items.length,
+      isCollapsed: collapsedGroups.value.has(group.clusterId),
+      group,
+    }]
+
+    if (collapsedGroups.value.has(group.clusterId)) {
+      return items
+    }
+
+    group.items.forEach((item) => {
+      items.push({
+        type: 'subtitle',
+        key: `subtitle-${item.subtitle.id}`,
+        subtitle: item.subtitle,
+        index: item.index,
+        matchSpans: item.matchSpans,
+        isSelected: item.isSelected,
+        clusterColor: item.clusterColor,
+        isActive: activeSubtitleId.value === item.subtitle.id,
+        isCurrent: currentSubtitleId.value === item.subtitle.id,
+      })
+    })
+
+    return items
+  })
+})
+
 const filteredSubtitles = computed(() => {
   if (!quickSearchText.value) return subtitles.value
   const search = quickSearchText.value.toLowerCase()
   return subtitles.value.filter(sub => sub.text.toLowerCase().includes(search))
 })
+
+function getListScrollElement() {
+  return listRef.value?.$el ?? listRef.value ?? null
+}
+
+function bindListInteractionListeners() {
+  const nextElement = getListScrollElement()
+  if (boundListElement === nextElement) {
+    return
+  }
+
+  if (boundListElement) {
+    boundListElement.removeEventListener('scroll', handleListScroll)
+    boundListElement.removeEventListener('wheel', handleListWheel)
+    boundListElement.removeEventListener('touchmove', handleListTouchMove)
+  }
+
+  boundListElement = nextElement
+  if (!boundListElement) {
+    return
+  }
+
+  boundListElement.addEventListener('scroll', handleListScroll, { passive: true })
+  boundListElement.addEventListener('wheel', handleListWheel, { passive: true })
+  boundListElement.addEventListener('touchmove', handleListTouchMove, { passive: true })
+}
+
+function unbindListInteractionListeners() {
+  if (!boundListElement) {
+    return
+  }
+
+  boundListElement.removeEventListener('scroll', handleListScroll)
+  boundListElement.removeEventListener('wheel', handleListWheel)
+  boundListElement.removeEventListener('touchmove', handleListTouchMove)
+  boundListElement = null
+}
+
+function findSubtitleVirtualIndex(subtitleId) {
+  if (!subtitleId) return -1
+
+  if (isGroupedSearchMode.value) {
+    return groupedVirtualItems.value.findIndex(
+      (item) => item.type === 'subtitle' && item.subtitle.id === subtitleId
+    )
+  }
+
+  if (isTimelineSearchMode.value) {
+    return homophoneSearch.timelineViewItems.findIndex(
+      (item) => item.subtitle.id === subtitleId
+    )
+  }
+
+  return filteredSubtitles.value.findIndex((subtitle) => subtitle.id === subtitleId)
+}
+
+function scrollToSubtitleId(subtitleId) {
+  const index = findSubtitleVirtualIndex(subtitleId)
+  if (index !== -1) {
+    scrollToItem(index)
+  }
+}
 
 watch(
   () => identityId.value,
@@ -240,10 +392,16 @@ function updateTime(id, field, value) {
 
   // 1. 乐观更新本地状态
   projectStore.updateSubtitle(id, { [field]: value }, { isUserEdit: true })
+  const subtitle = projectStore.subtitles.find(s => s.id === id)
+  if (subtitle) {
+    editBufferStore.syncCommittedTime(id, {
+      start: subtitle.start,
+      end: subtitle.end,
+    })
+  }
   emit('subtitle-edit', id, field, value)
 
   // 2. V3.2.0+dev.20260124.01: 同步到后端（防抖）
-  const subtitle = projectStore.subtitles.find(s => s.id === id)
   const syncKey = subtitle?.segment_id ?? subtitle?.sentenceIndex ?? subtitle?.id
   if (syncKey !== undefined && syncKey !== null) {
     onSubtitleEdit(syncKey, {
@@ -255,6 +413,7 @@ function updateTime(id, field, value) {
 function updateText(id, text) {
   // 1. 乐观更新本地状态
   projectStore.updateSubtitle(id, { text }, { isUserEdit: true })
+  editBufferStore.syncCommittedText(id, text)
   emit('subtitle-edit', id, 'text', text)
 
   // 2. V3.2.0+dev.20260124.01: 同步到后端（防抖）
@@ -299,14 +458,14 @@ async function addNewSubtitle() {
   const lastSubtitle = subtitles.value[subtitles.value.length - 1]
   const newStart = lastSubtitle ? lastSubtitle.end : 0
   const insertIndex = subtitles.value.length
-  projectStore.addSubtitle(insertIndex, {
+  const newSubtitle = projectStore.addSubtitle(insertIndex, {
     start: newStart,
     end: newStart + 3,
     text: '',
     isModified: true,
     source: 'manual'
   })
-  const localSubtitleId = projectStore.subtitles[insertIndex]?.id
+  const localSubtitleId = newSubtitle?.id
   nextTick(() => {
     scrollToBottom()
   })
@@ -354,8 +513,8 @@ function insertBefore(index) {
   const prev = subtitles.value[index - 1]
   const start = prev ? prev.end : Math.max(0, current.start - 3)
   const end = current.start
-  projectStore.addSubtitle(index, { start, end, text: '', isModified: true, source: 'manual' })
-  const localSubtitleId = projectStore.subtitles[index]?.id
+  const newSubtitle = projectStore.addSubtitle(index, { start, end, text: '', isModified: true, source: 'manual' })
+  const localSubtitleId = newSubtitle?.id
   syncInsertedSubtitle(localSubtitleId, start, end, '')
 }
 
@@ -364,8 +523,8 @@ function insertAfter(index) {
   const next = subtitles.value[index + 1]
   const start = current.end
   const end = next ? next.start : current.end + 3
-  projectStore.addSubtitle(index + 1, { start, end, text: '', isModified: true, source: 'manual' })
-  const localSubtitleId = projectStore.subtitles[index + 1]?.id
+  const newSubtitle = projectStore.addSubtitle(index + 1, { start, end, text: '', isModified: true, source: 'manual' })
+  const localSubtitleId = newSubtitle?.id
   syncInsertedSubtitle(localSubtitleId, start, end, '')
 }
 
@@ -408,14 +567,23 @@ async function syncInsertedSubtitle(localSubtitleId, start, end, text) {
 }
 
 function scrollToBottom() {
-  if (listRef.value) {
-    markProgrammaticScroll()
-    listRef.value.scrollTop = listRef.value.scrollHeight
-  }
+  const element = getListScrollElement()
+  if (!element) return
+
+  markProgrammaticScroll()
+  element.scrollTop = element.scrollHeight
 }
 
 function scrollToItem(index) {
-  const items = listRef.value?.querySelectorAll('.subtitle-item')
+  if (!Number.isInteger(index) || index < 0) return
+
+  if (typeof listRef.value?.scrollToItem === 'function') {
+    markProgrammaticScroll()
+    listRef.value.scrollToItem(index)
+    return
+  }
+
+  const items = getListScrollElement()?.querySelectorAll('.subtitle-item')
   if (items && items[index]) {
     markProgrammaticScroll()
     items[index].scrollIntoView({ behavior: 'smooth', block: 'center' })
@@ -469,10 +637,7 @@ function handleListTouchMove() {
 watch(currentSubtitleId, (id) => {
   if (!props.autoScroll || !id) return
   if (isFollowPausedByUser.value) return
-  const index = filteredSubtitles.value.findIndex(s => s.id === id)
-  if (index !== -1) {
-    nextTick(() => scrollToItem(index))
-  }
+  nextTick(() => scrollToSubtitleId(id))
 })
 
 watch(
@@ -517,19 +682,21 @@ watch(subtitles, (newList) => {
   previousSubtitleCount = newCount
 }, { flush: 'pre' })  // pre: 在 DOM 更新前触发
 
+watch(
+  () => `${isGroupedSearchMode.value}:${isTimelineSearchMode.value}:${filteredSubtitles.value.length}:${groupedVirtualItems.value.length}:${homophoneSearch.matchCount}`,
+  () => {
+    nextTick(() => bindListInteractionListeners())
+  },
+  { flush: 'post' }
+)
+
 onMounted(() => {
-  if (!listRef.value) return
-  listRef.value.addEventListener('scroll', handleListScroll, { passive: true })
-  listRef.value.addEventListener('wheel', handleListWheel, { passive: true })
-  listRef.value.addEventListener('touchmove', handleListTouchMove, { passive: true })
+  nextTick(() => bindListInteractionListeners())
 })
 
 onUnmounted(() => {
   clearFollowResumeTimer()
-  if (!listRef.value) return
-  listRef.value.removeEventListener('scroll', handleListScroll)
-  listRef.value.removeEventListener('wheel', handleListWheel)
-  listRef.value.removeEventListener('touchmove', handleListTouchMove)
+  unbindListInteractionListeners()
 })
 
 // ========================

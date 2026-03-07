@@ -32,7 +32,7 @@
         <input
           type="text"
           class="time-input"
-          :value="formatTime(subtitle.start)"
+          :value="formatTime(bufferedStartTime)"
           :readonly="subtitle.isDraft"
           @change="e => updateTime('start', parseTime(e.target.value))"
         />
@@ -44,11 +44,11 @@
         <input
           type="text"
           class="time-input"
-          :value="formatTime(subtitle.end)"
+          :value="formatTime(bufferedEndTime)"
           :readonly="subtitle.isDraft"
           @change="e => updateTime('end', parseTime(e.target.value))"
         />
-        <span class="duration-tag">{{ formatDuration(subtitle.end - subtitle.start) }}</span>
+        <span class="duration-tag">{{ formatDuration(bufferedEndTime - bufferedStartTime) }}</span>
 
         <!-- 草稿状态指示器 -->
         <span v-if="subtitle.isDraft" class="draft-indicator">
@@ -181,12 +181,13 @@
  * 2. 高亮预览模式: isDraft=false & 非编辑, 显示置信度高亮
  * 3. 编辑模式: isDraft=false & 编辑中, 可编辑文本
  */
-import { ref, computed, nextTick, onUnmounted } from 'vue'
+import { ref, computed, nextTick, onUnmounted, watch } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
 import { usePlaybackStore } from '@/stores/playbackStore'
 import projectApi from '@/services/api/projectApi'
 import { useStructuralSyncStore } from '@/stores/structuralSyncStore'
 import ContextMenu from '@/components/editor/ContextMenu.vue'
+import { useEditBufferStore } from '@/core/editor/editBufferStore'
 
 const props = defineProps({
   subtitle: { type: Object, required: true },
@@ -215,15 +216,15 @@ const emit = defineEmits([
 const projectStore = useProjectStore()
 const playbackStore = usePlaybackStore()
 const structuralSyncStore = useStructuralSyncStore()
+const editBufferStore = useEditBufferStore()
 
 // 编辑状态
-const isEditing = ref(false)
 const editTextarea = ref(null)
-const originalText = ref('')
-const editingText = ref('')
-const isComposing = ref(false)
-let textCommitTimer = null
 const TEXT_COMMIT_DEBOUNCE_MS = 250
+const isEditing = computed(() => editBufferStore.isTextEditing(props.subtitle.id))
+const editingText = computed(() => editBufferStore.getTextDraft(props.subtitle.id, props.subtitle.text))
+const bufferedStartTime = computed(() => editBufferStore.getBufferedTime(props.subtitle.id, 'start', props.subtitle.start))
+const bufferedEndTime = computed(() => editBufferStore.getBufferedTime(props.subtitle.id, 'end', props.subtitle.end))
 
 // 删除确认状态
 const isDeleteConfirming = ref(false)
@@ -297,6 +298,25 @@ const warningMessage = computed(() => {
   return messages[type] || ''
 })
 
+watch(
+  () => props.subtitle.text,
+  (textValue) => {
+    editBufferStore.syncCommittedText(props.subtitle.id, textValue)
+  },
+  { immediate: true }
+)
+
+watch(
+  () => [props.subtitle.start, props.subtitle.end],
+  ([startValue, endValue]) => {
+    editBufferStore.syncCommittedTime(props.subtitle.id, {
+      start: startValue,
+      end: endValue,
+    })
+  },
+  { immediate: true }
+)
+
 // 点击处理
 function handleClick() {
   // 点击字幕块时重置删除确认状态
@@ -345,8 +365,7 @@ function getTextOffsetFromPoint(container, clientX, clientY) {
 // 开始编辑
 function startEditing(event) {
   if (!props.editable || props.subtitle.isDraft) return
-  originalText.value = props.subtitle.text
-  editingText.value = props.subtitle.text
+  editBufferStore.beginTextEdit(props.subtitle.id, props.subtitle.text)
 
   // 在切换到 textarea 之前，从预览 div 的点击位置推算光标偏移
   let clickOffset = -1
@@ -354,7 +373,6 @@ function startEditing(event) {
     clickOffset = getTextOffsetFromPoint(event.currentTarget, event.clientX, event.clientY)
   }
 
-  isEditing.value = true
   nextTick(() => {
     if (editTextarea.value) {
       editTextarea.value.focus()
@@ -368,31 +386,43 @@ function startEditing(event) {
   })
 }
 
+function emitBufferedTextCommit(nextText) {
+  if (nextText !== props.subtitle.text) {
+    emit('update-text', props.subtitle.id, nextText)
+  }
+}
+
 // 停止编辑
 function stopEditing() {
   // 右键菜单打开时不触发停止编辑，防止菜单项消失
   if (isContextMenuOpen.value) {
     return
   }
-  flushTextCommit(true)
-  isEditing.value = false
+  editBufferStore.flushTextCommit(props.subtitle.id, {
+    immediate: true,
+    getCommittedText: () => props.subtitle.text,
+    onCommit: emitBufferedTextCommit,
+  })
+  editBufferStore.endTextEdit(props.subtitle.id)
 }
 
 // 取消编辑（恢复原文）
 function cancelEditing() {
-  clearTextCommitTimer()
-  editingText.value = originalText.value
-  if (originalText.value !== props.subtitle.text) {
-    emit('update-text', props.subtitle.id, originalText.value)
+  const restoredText = editBufferStore.cancelTextEdit(props.subtitle.id, props.subtitle.text)
+  if (restoredText !== props.subtitle.text) {
+    emit('update-text', props.subtitle.id, restoredText)
   }
-  isEditing.value = false
 }
 
 // 文本输入处理
 function handleTextInput(text) {
-  editingText.value = text
-  if (!isComposing.value) {
-    scheduleTextCommit()
+  editBufferStore.updateTextDraft(props.subtitle.id, text)
+  if (!editBufferStore.isTextComposing(props.subtitle.id)) {
+    editBufferStore.scheduleTextCommit(props.subtitle.id, {
+      delay: TEXT_COMMIT_DEBOUNCE_MS,
+      getCommittedText: () => props.subtitle.text,
+      onCommit: emitBufferedTextCommit,
+    })
   }
   // 输入时自动调整高度
   nextTick(() => {
@@ -401,45 +431,28 @@ function handleTextInput(text) {
 }
 
 function handleCompositionStart() {
-  isComposing.value = true
+  editBufferStore.setTextComposing(props.subtitle.id, true)
 }
 
 function handleCompositionEnd() {
-  isComposing.value = false
-  scheduleTextCommit()
-}
-
-function commitTextIfNeeded() {
-  const text = editingText.value
-  if (text !== props.subtitle.text) {
-    emit('update-text', props.subtitle.id, text)
-  }
-}
-
-function clearTextCommitTimer() {
-  if (textCommitTimer) {
-    clearTimeout(textCommitTimer)
-    textCommitTimer = null
-  }
-}
-
-function scheduleTextCommit() {
-  clearTextCommitTimer()
-  textCommitTimer = setTimeout(() => {
-    textCommitTimer = null
-    commitTextIfNeeded()
-  }, TEXT_COMMIT_DEBOUNCE_MS)
-}
-
-function flushTextCommit(immediate = false) {
-  clearTextCommitTimer()
-  if (immediate) {
-    commitTextIfNeeded()
-  }
+  editBufferStore.setTextComposing(props.subtitle.id, false)
+  editBufferStore.scheduleTextCommit(props.subtitle.id, {
+    delay: TEXT_COMMIT_DEBOUNCE_MS,
+    getCommittedText: () => props.subtitle.text,
+    onCommit: emitBufferedTextCommit,
+  })
 }
 
 onUnmounted(() => {
-  clearTextCommitTimer()
+  if (editBufferStore.isTextEditing(props.subtitle.id)) {
+    editBufferStore.flushTextCommit(props.subtitle.id, {
+      immediate: true,
+      getCommittedText: () => props.subtitle.text,
+      onCommit: emitBufferedTextCommit,
+    })
+    editBufferStore.endTextEdit(props.subtitle.id)
+  }
+  editBufferStore.clearTextCommitTimer(props.subtitle.id)
 })
 
 // 删除处理

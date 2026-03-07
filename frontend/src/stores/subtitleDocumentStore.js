@@ -8,11 +8,17 @@ import { useProjectStore } from './projectStore'
 import { useTaskRuntimeStore } from './taskRuntimeStore'
 
 const EDIT_QUEUE_PREFIX = 'subtitle-edit-queue-'
+const EMERGENCY_QUEUE_PREFIX = 'subtitle-edit-emergency-'
+const QUEUE_PERSIST_DELAY_MS = 1200
 const TERMINAL_STATUSES = new Set(['finished', 'canceled', 'force_canceled', 'removed', 'failed'])
 let beforeUnloadRegistered = false
 
 function getQueueKey(identityId) {
   return `${EDIT_QUEUE_PREFIX}${identityId}`
+}
+
+function getEmergencyQueueKey(identityId) {
+  return `${EMERGENCY_QUEUE_PREFIX}${identityId}`
 }
 
 function normalizeQueueKey(rawKey) {
@@ -39,6 +45,65 @@ function debounce(fn, delay) {
   }
 }
 
+
+function serializeQueue(queue) {
+  const payload = {}
+  queue.forEach((value, key) => {
+    const rawValue = toRaw(value)
+    if (!rawValue || typeof rawValue !== 'object') {
+      payload[String(key)] = rawValue
+      return
+    }
+
+    const sanitized = {}
+    if (Object.prototype.hasOwnProperty.call(rawValue, 'text')) {
+      sanitized.text = rawValue.text
+    }
+    if (Object.prototype.hasOwnProperty.call(rawValue, 'start')) {
+      sanitized.start = rawValue.start
+    }
+    if (Object.prototype.hasOwnProperty.call(rawValue, 'end')) {
+      sanitized.end = rawValue.end
+    }
+    payload[String(key)] = sanitized
+  })
+  return payload
+}
+
+function readEmergencyQueue(identityId) {
+  if (!identityId || typeof window === 'undefined' || !window.localStorage) return new Map()
+
+  try {
+    const raw = window.localStorage.getItem(getEmergencyQueueKey(identityId))
+    if (!raw) return new Map()
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object') return new Map()
+
+    return new Map(
+      Object.entries(parsed)
+        .map(([key, value]) => [normalizeQueueKey(key), value])
+        .filter(([key]) => key !== null)
+    )
+  } catch (error) {
+    console.warn('[SubtitleDocumentStore] 读取紧急同步队列失败:', error)
+    return new Map()
+  }
+}
+
+function writeEmergencyQueue(identityId, queue) {
+  if (!identityId || typeof window === 'undefined' || !window.localStorage) return
+
+  try {
+    const storageKey = getEmergencyQueueKey(identityId)
+    if (!queue || queue.size === 0) {
+      window.localStorage.removeItem(storageKey)
+      return
+    }
+    window.localStorage.setItem(storageKey, JSON.stringify(serializeQueue(queue)))
+  } catch (error) {
+    console.warn('[SubtitleDocumentStore] 写入紧急同步队列失败:', error)
+  }
+}
 export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
   const projectStore = useProjectStore()
   const taskRuntimeStore = useTaskRuntimeStore()
@@ -51,6 +116,7 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
   const isSyncing = ref(false)
   const syncErrors = ref(new Map())
   let inflightProcessQueuePromise = null
+  let persistQueueTimer = null
 
   const subtitles = computed(() => projectStore.subtitles)
   const timeOffsetSec = computed(() => projectStore.subtitleOffset)
@@ -161,49 +227,73 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
     if (!identityId) return new Map()
     try {
       const saved = await localforage.getItem(getQueueKey(identityId))
-      if (!saved || typeof saved !== 'object') return new Map()
-      const entries = Object.entries(saved)
-        .map(([key, value]) => [normalizeQueueKey(key), value])
-        .filter(([key]) => key !== null)
-      return new Map(entries)
+      const persistedEntries = !saved || typeof saved !== 'object'
+        ? []
+        : Object.entries(saved)
+            .map(([key, value]) => [normalizeQueueKey(key), value])
+            .filter(([key]) => key !== null)
+      const mergedQueue = new Map(persistedEntries)
+      const emergencyQueue = readEmergencyQueue(identityId)
+      emergencyQueue.forEach((value, key) => {
+        mergedQueue.set(key, value)
+      })
+      return mergedQueue
     } catch (error) {
       console.warn('[SubtitleDocumentStore] 读取本地同步队列失败:', error)
-      return new Map()
+      return readEmergencyQueue(identityId)
     }
   }
 
   async function saveQueue(identityId, queue) {
     if (!identityId) return
-    try {
-      const payload = {}
-      queue.forEach((value, key) => {
-        const rawValue = toRaw(value)
-        if (!rawValue || typeof rawValue !== 'object') {
-          payload[String(key)] = rawValue
-          return
-        }
 
-        const sanitized = {}
-        if (Object.prototype.hasOwnProperty.call(rawValue, 'text')) {
-          sanitized.text = rawValue.text
-        }
-        if (Object.prototype.hasOwnProperty.call(rawValue, 'start')) {
-          sanitized.start = rawValue.start
-        }
-        if (Object.prototype.hasOwnProperty.call(rawValue, 'end')) {
-          sanitized.end = rawValue.end
-        }
-        payload[String(key)] = sanitized
-      })
-      await localforage.setItem(getQueueKey(identityId), payload)
+    writeEmergencyQueue(identityId, queue)
+
+    try {
+      if (!queue || queue.size === 0) {
+        await localforage.removeItem(getQueueKey(identityId))
+        return
+      }
+      await localforage.setItem(getQueueKey(identityId), serializeQueue(queue))
     } catch (error) {
       console.warn('[SubtitleDocumentStore] 保存本地同步队列失败:', error)
     }
   }
 
+  function scheduleQueuePersistence(identityId = getActiveIdentity()) {
+    if (!identityId) return
+
+    if (persistQueueTimer) {
+      clearTimeout(persistQueueTimer)
+    }
+
+    persistQueueTimer = setTimeout(() => {
+      persistQueueTimer = null
+      void saveQueue(identityId, pendingUpdates.value)
+    }, QUEUE_PERSIST_DELAY_MS)
+  }
+
+  async function flushQueuePersistenceNow(identityId = getActiveIdentity()) {
+    if (persistQueueTimer) {
+      clearTimeout(persistQueueTimer)
+      persistQueueTimer = null
+    }
+    if (!identityId) return
+    await saveQueue(identityId, pendingUpdates.value)
+  }
+
   async function bindSyncIdentity(identityId) {
     const resolvedIdentityId = getActiveIdentity(identityId)
+
+    if (persistQueueTimer) {
+      clearTimeout(persistQueueTimer)
+      persistQueueTimer = null
+    }
+
     if (!resolvedIdentityId) {
+      if (currentSyncIdentityId.value) {
+        await saveQueue(currentSyncIdentityId.value, pendingUpdates.value)
+      }
       currentSyncIdentityId.value = null
       pendingUpdates.value = new Map()
       syncErrors.value.clear()
@@ -211,6 +301,10 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
     }
     if (currentSyncIdentityId.value === resolvedIdentityId) {
       return
+    }
+
+    if (currentSyncIdentityId.value) {
+      await saveQueue(currentSyncIdentityId.value, pendingUpdates.value)
     }
 
     await migrateSubtitleSyncQueue(resolvedIdentityId)
@@ -360,12 +454,14 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
 
     pendingUpdates.value.set(queueKey, update)
     if (identityId) {
-      saveQueue(identityId, pendingUpdates.value)
+      writeEmergencyQueue(identityId, pendingUpdates.value)
+      scheduleQueuePersistence(identityId)
     }
     debouncedProcessQueue()
   }
 
   async function forceSyncNow() {
+    await flushQueuePersistenceNow()
     await processQueue()
   }
 
@@ -424,9 +520,9 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
   function registerBeforeUnloadIfNeeded() {
     if (beforeUnloadRegistered || typeof window === 'undefined') return
     const handleBeforeUnload = () => {
-      if (pendingUpdates.value.size > 0) {
-        processQueue()
-      }
+      const identityId = getActiveIdentity()
+      if (!identityId || pendingUpdates.value.size === 0) return
+      writeEmergencyQueue(identityId, pendingUpdates.value)
     }
     window.addEventListener('beforeunload', handleBeforeUnload)
     beforeUnloadRegistered = true

@@ -75,6 +75,7 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, inject } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
 import { usePlaybackStore } from '@/stores/playbackStore'
+import { getSubtitlesInTimeWindow } from '@/utils/subtitleViewport'
 import { useSubtitleDocumentStore } from '@/stores/subtitleDocumentStore'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { mediaApi } from '@/services/api'
@@ -182,15 +183,18 @@ function normalizeRegionTimeForSignature(time) {
   return value.toFixed(3)
 }
 
+const visibleRegionWindow = ref({ start: 0, end: Number.POSITIVE_INFINITY })
+
 const regionRenderSignature = computed(() => {
   const selectedId = subtitleDocumentStore.selectedSubtitleId ?? ''
-  const subtitlesSnapshot = projectStore.subtitles
+  const { start, end } = visibleRegionWindow.value
+  const subtitlesSnapshot = getSubtitlesInTimeWindow(projectStore.subtitles, start, end)
     .map(
       (subtitle) =>
         `${subtitle.id}:${normalizeRegionTimeForSignature(subtitle.start)}:${normalizeRegionTimeForSignature(subtitle.end)}`
     )
     .join('|')
-  return `${subtitlesSnapshot}#selected:${selectedId}#color:${props.regionColor}`
+  return `${normalizeRegionTimeForSignature(start)}-${normalizeRegionTimeForSignature(end)}#${subtitlesSnapshot}#selected:${selectedId}#color:${props.regionColor}`
 })
 
 // 滚动条轨道 ref（从子组件获取）
@@ -204,6 +208,7 @@ let virtualClockRafId = null
 let virtualClockLastTs = 0
 let mediaKeydownElement = null
 let scrollListenerElement = null
+let visibleRegionWindowRafId = null
 let stopRuntimeHealthSampler = null
 
 function handleMediaElementKeydown(e) {
@@ -213,6 +218,57 @@ function handleMediaElementKeydown(e) {
   }
 }
 
+function scheduleVisibleRegionWindowUpdate() {
+  if (visibleRegionWindowRafId !== null) {
+    return
+  }
+
+  visibleRegionWindowRafId = requestAnimationFrame(() => {
+    visibleRegionWindowRafId = null
+    updateVisibleRegionWindow()
+  })
+}
+
+function resolveVisibleRegionWindow() {
+  const ws = wavesurferRef.value
+  const fallbackEnd = resolveFallbackDuration()
+  if (!ws) {
+    return { start: 0, end: fallbackEnd }
+  }
+
+  const wrapper = ws.getWrapper?.()
+  const scrollContainer = wrapper?.parentElement
+  const effectiveDuration = resolveWaveformDuration(ws)
+  if (!wrapper || !scrollContainer || effectiveDuration <= 0) {
+    return { start: 0, end: fallbackEnd }
+  }
+
+  const scrollWidth = Number(wrapper.scrollWidth) || 0
+  const clientWidth = Number(scrollContainer.clientWidth) || 0
+  if (scrollWidth <= 0 || clientWidth <= 0) {
+    return { start: 0, end: effectiveDuration }
+  }
+
+  const secondsPerPixel = effectiveDuration / scrollWidth
+  const visibleStart = Math.max(0, scrollContainer.scrollLeft * secondsPerPixel)
+  const visibleDuration = Math.max(1, clientWidth * secondsPerPixel)
+  const bufferDuration = Math.max(8, visibleDuration * 0.75)
+
+  return {
+    start: Math.max(0, visibleStart - bufferDuration),
+    end: Math.min(effectiveDuration, visibleStart + visibleDuration + bufferDuration),
+  }
+}
+
+function updateVisibleRegionWindow() {
+  visibleRegionWindow.value = resolveVisibleRegionWindow()
+}
+
+function handleWaveformScroll() {
+  updateScrollbarThumb()
+  scheduleVisibleRegionWindowUpdate()
+}
+
 function detachWaveformDomListeners() {
   if (mediaKeydownElement) {
     mediaKeydownElement.removeEventListener('keydown', handleMediaElementKeydown)
@@ -220,7 +276,7 @@ function detachWaveformDomListeners() {
     recordRuntimeHealthCounter('waveform.media_keydown.unbind')
   }
   if (scrollListenerElement) {
-    scrollListenerElement.removeEventListener('scroll', updateScrollbarThumb)
+    scrollListenerElement.removeEventListener('scroll', handleWaveformScroll)
     scrollListenerElement = null
     recordRuntimeHealthCounter('waveform.scroll_listener.unbind')
   }
@@ -240,7 +296,7 @@ function bindWaveformDomListeners(ws) {
   const wrapper = ws.getWrapper?.()
   const scrollContainer = wrapper?.parentElement
   if (scrollContainer) {
-    scrollContainer.addEventListener('scroll', updateScrollbarThumb)
+    scrollContainer.addEventListener('scroll', handleWaveformScroll)
     scrollListenerElement = scrollContainer
     recordRuntimeHealthCounter('waveform.scroll_listener.bind')
   }
@@ -523,6 +579,8 @@ const {
   onSubtitleEdit,
   playbackManager,
   subtitleDocumentStore,
+  () => visibleRegionWindow.value,
+  () => isRegionPointerDragging.value,
   emit
 )
 
@@ -643,6 +701,7 @@ function setupWavesurferEvents() {
       ws.setOptions(barConfig)
     }
 
+    updateVisibleRegionWindow()
     renderSubtitleRegions()
     emit('ready')
     playbackManager.registerWaveSurfer(ws, identityRef.value)
@@ -658,6 +717,7 @@ function setupWavesurferEvents() {
       updateScrollbarThumb()
       applyTimelineVisibility(hideTimelineScale.value)
       bindWaveformDomListeners(ws)
+      scheduleVisibleRegionWindowUpdate()
     })
   })
 
@@ -665,7 +725,10 @@ function setupWavesurferEvents() {
     const newZoom = Math.round((minPxPerSec / ZOOM_BASE_PX_PER_SEC) * 100)
     zoomLevel.value = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, newZoom))
     emit('zoom', zoomLevel.value)
-    nextTick(() => updateScrollbarThumb())
+    nextTick(() => {
+      updateScrollbarThumb()
+      scheduleVisibleRegionWindowUpdate()
+    })
   })
 
   ws.on('error', async (error) => {
@@ -681,6 +744,7 @@ function setupWavesurferEvents() {
       if (!isReady.value) {
         isReady.value = true
         applyWaveformMediaState()
+        updateVisibleRegionWindow()
         renderSubtitleRegions()
         playbackManager.registerWaveSurfer(ws, identityRef.value)
         emit('ready')
@@ -906,6 +970,16 @@ watch(
     await loadAudioData()
   },
   { immediate: true }
+)
+
+
+watch(
+  () => [zoomLevel.value, isReady.value, duration.value, mediaCapability.value].join(':'),
+  () => {
+    if (!isReady.value) return
+    nextTick(() => scheduleVisibleRegionWindowUpdate())
+  },
+  { flush: 'post' }
 )
 
 watch(
@@ -1154,6 +1228,10 @@ onUnmounted(() => {
   if (stopRuntimeHealthSampler) {
     stopRuntimeHealthSampler()
     stopRuntimeHealthSampler = null
+  }
+  if (visibleRegionWindowRafId !== null) {
+    cancelAnimationFrame(visibleRegionWindowRafId)
+    visibleRegionWindowRafId = null
   }
   stopVirtualClock()
   clearScheduledRegionRender()

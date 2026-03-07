@@ -14,6 +14,7 @@
  */
 
 import localforage from "localforage";
+import { toRaw } from "vue";
 
 // 保存策略枚举
 export const SaveStrategy = {
@@ -44,6 +45,7 @@ const CONFIG = {
   MAX_BACKUP_COUNT: 5, // 最多保留5个备份
   BACKUP_WARNING_THRESHOLD: 0.8, // 配额使用超过80%时警告
   MAX_CONSECUTIVE_FAILURES: 3, // 最大连续失败次数后禁用备份
+  WORKER_SERIALIZE_TIMEOUT: 4000, // Worker 序列化超时后回退主线程
 };
 
 class SmartSaver {
@@ -60,7 +62,9 @@ class SmartSaver {
 
     // Worker 相关（预留）
     this.worker = null;
-    this.useWorker = false; // 是否启用 Worker 模式
+    this.workerRequestId = 0;
+    this.pendingWorkerRequests = new Map();
+    this.useWorker = typeof Worker !== "undefined"; // 是否启用 Worker 模式
 
     // 回调
     this.onSaveSuccess = null;
@@ -221,6 +225,108 @@ class SmartSaver {
     }
   }
 
+  _canUseWorker() {
+    return typeof Worker !== 'undefined'
+  }
+
+  _ensureWorker() {
+    if (!this.useWorker || !this._canUseWorker()) {
+      return null
+    }
+
+    if (!this.worker) {
+      try {
+        this.worker = new Worker(
+          new URL('../workers/editorPersistence.worker.js', import.meta.url),
+          { type: 'module' }
+        )
+      } catch (error) {
+        console.warn('[SmartSaver] Worker 初始化失败，降级为主线程序列化:', error)
+        this.useWorker = false
+        this.worker = null
+        return null
+      }
+
+      this.worker.onmessage = (event) => {
+        const message = event.data || {}
+        const { type, requestId, payload, error } = message
+        const pendingRequest = this.pendingWorkerRequests.get(requestId)
+        if (!pendingRequest) {
+          return
+        }
+        this.pendingWorkerRequests.delete(requestId)
+        if (type === 'serialize:result') {
+          pendingRequest.resolve(payload)
+          return
+        }
+        pendingRequest.reject(new Error(error?.message || 'Worker 序列化失败'))
+      }
+      this.worker.onerror = (error) => {
+        console.error('[SmartSaver] Worker 运行失败:', error)
+        this.pendingWorkerRequests.forEach(({ reject }) => {
+          reject(error instanceof Error ? error : new Error('Worker 运行失败'))
+        })
+        this.pendingWorkerRequests.clear()
+        this.worker?.terminate()
+        this.worker = null
+        this.useWorker = false
+      }
+    }
+
+    return this.worker
+  }
+
+  _buildSerializablePayload(data) {
+    return {
+      subtitles: toRaw(data.subtitles),
+      meta: toRaw(data.meta),
+      savedAt: Date.now(),
+    }
+  }
+
+  async _serializePayload(data) {
+    const payload = this._buildSerializablePayload(data)
+    const worker = this._ensureWorker()
+    if (!worker) {
+      return JSON.parse(JSON.stringify(payload))
+    }
+
+    const requestId = `serialize-${Date.now()}-${this.workerRequestId++}`
+
+    try {
+      return await new Promise((resolve, reject) => {
+        const timeoutId = setTimeout(() => {
+          this.pendingWorkerRequests.delete(requestId)
+          reject(new Error('Worker 序列化超时'))
+        }, CONFIG.WORKER_SERIALIZE_TIMEOUT)
+
+        this.pendingWorkerRequests.set(requestId, {
+          resolve: (value) => {
+            clearTimeout(timeoutId)
+            resolve(value)
+          },
+          reject: (error) => {
+            clearTimeout(timeoutId)
+            reject(error)
+          },
+        })
+
+        worker.postMessage({
+          type: 'serialize',
+          requestId,
+          payload,
+        })
+      })
+    } catch (error) {
+      console.warn('[SmartSaver] Worker 序列化失败，降级为主线程序列化:', error)
+      this.pendingWorkerRequests.delete(requestId)
+      this.worker?.terminate()
+      this.worker = null
+      this.useWorker = false
+      return JSON.parse(JSON.stringify(payload))
+    }
+  }
+
   /**
    * 评估应使用的保存策略
    */
@@ -325,18 +431,12 @@ class SmartSaver {
   }
 
   /**
-   * Worker 保存（预留实现）
-   * TODO: 实现 Web Worker 异步保存
+   * Worker 保存策略
+   *
+   * Why:
+   * - 当前阶段仅将重序列化迁出主线程，真正的 Worker 持久化留到后续命令日志阶段
    */
   _workerSave(data) {
-    // 当前降级到空闲保存
-    // 未来实现：
-    // 1. 懒加载 Worker
-    // 2. 计算增量 Diff
-    // 3. 使用 Transferable 传输数据
-    // 4. Worker 内直接写 IndexedDB
-
-    console.log("[SmartSaver] Worker 模式暂未实现，降级到 IDLE 模式");
     this._idleSave(data);
   }
 
@@ -362,7 +462,7 @@ class SmartSaver {
 
     try {
       const key = `${CONFIG.PROJECT_PREFIX}${data.jobId}`;
-      const plain = this._toPlainObject(data.subtitles, data.meta);
+      const plain = await this._serializePayload(data);
 
       await localforage.setItem(key, plain);
 
@@ -416,8 +516,8 @@ class SmartSaver {
   _toPlainObject(subtitles, meta) {
     return JSON.parse(
       JSON.stringify({
-        subtitles,
-        meta,
+        subtitles: toRaw(subtitles),
+        meta: toRaw(meta),
         savedAt: Date.now(),
       })
     );
@@ -494,6 +594,10 @@ class SmartSaver {
       this.worker.terminate();
       this.worker = null;
     }
+    this.pendingWorkerRequests.forEach(({ reject }) => {
+      reject(new Error('SmartSaver 已销毁'));
+    });
+    this.pendingWorkerRequests.clear();
   }
 }
 

@@ -6,6 +6,8 @@
  */
 import { ref } from 'vue'
 import { detectOverlappingSubtitles, OVERLAP_COLORS } from '@/utils/subtitleUtils'
+import { getSubtitlesInTimeWindow } from '@/utils/subtitleViewport'
+import { useEditBufferStore } from '@/core/editor/editBufferStore'
 import {
   getWaveformDragDiagnosticsConfig,
   logWaveformDragDiagnostics,
@@ -53,10 +55,13 @@ export function useWaveformRegions(
   onSubtitleEdit,
   playbackManager,
   subtitleDocumentStore,
+  resolveVisibleTimeRange,
+  isRegionPointerDragging,
   emit
 ) {
   // ============ 状态 ============
   const isUpdatingRegions = ref(false)
+  const editBufferStore = useEditBufferStore()
 
   // ============ 私有状态 ============
   let regionUpdateTimer = null
@@ -84,6 +89,13 @@ export function useWaveformRegions(
     subtitleDocumentStore.setSelectedSubtitleId(subtitleId)
   }
 
+  function isRegionDraggingActive() {
+    if (typeof isRegionPointerDragging === 'function') {
+      return Boolean(isRegionPointerDragging())
+    }
+    return Boolean(resolveMaybeRefValue(isRegionPointerDragging))
+  }
+
   function resolveRegionMinLength() {
     const fallbackMinLength = 0.05
     const rawValue = Number(props.regionMinLength)
@@ -97,10 +109,24 @@ export function useWaveformRegions(
     overlapCacheDirty = true
   }
 
+  function getRenderableSubtitles() {
+    const subtitles = Array.isArray(projectStore.subtitles) ? projectStore.subtitles : []
+    if (typeof resolveVisibleTimeRange !== 'function') {
+      return subtitles
+    }
+
+    const visibleTimeRange = resolveVisibleTimeRange()
+    if (!visibleTimeRange || visibleTimeRange.start === undefined || visibleTimeRange.end === undefined) {
+      return subtitles
+    }
+
+    return getSubtitlesInTimeWindow(subtitles, visibleTimeRange.start, visibleTimeRange.end)
+  }
+
   function getOverlappingIds(options = {}) {
     const { forceRefresh = false } = options
     if (forceRefresh || overlapCacheDirty) {
-      overlapCacheIds = detectOverlappingSubtitles(projectStore.subtitles)
+      overlapCacheIds = detectOverlappingSubtitles(getRenderableSubtitles())
       overlapCacheDirty = false
     }
     return overlapCacheIds
@@ -133,16 +159,21 @@ export function useWaveformRegions(
     if (!regionId) return false
 
     const subtitle = projectStore.subtitles.find((s) => s.id === regionId)
-    if (!subtitle) return false
+    if (!subtitle) {
+      editBufferStore.clearTimeDraft(regionId)
+      return false
+    }
 
-    const nextStart = resolveFiniteTime(regionSnapshot.start, resolveFiniteTime(subtitle.start, 0))
-    const nextEnd = resolveFiniteTime(regionSnapshot.end, resolveFiniteTime(subtitle.end, nextStart))
+    const timeDraft = editBufferStore.getTimeDraft(regionId)
+    const nextStart = resolveFiniteTime(timeDraft?.start ?? regionSnapshot.start, resolveFiniteTime(subtitle.start, 0))
+    const nextEnd = resolveFiniteTime(timeDraft?.end ?? regionSnapshot.end, resolveFiniteTime(subtitle.end, nextStart))
     const currentStart = resolveFiniteTime(subtitle.start, 0)
     const currentEnd = resolveFiniteTime(subtitle.end, currentStart)
     const hasTimeChanged =
       Math.abs(currentStart - nextStart) > 0.0005 || Math.abs(currentEnd - nextEnd) > 0.0005
 
     if (!hasTimeChanged) {
+      editBufferStore.clearTimeDraft(regionId)
       return false
     }
 
@@ -171,6 +202,8 @@ export function useWaveformRegions(
       syncKey: syncKey ?? null,
       deferred: regionSnapshot.deferred === true,
     })
+
+    editBufferStore.clearTimeDraft(regionId)
 
     // 拖拽结束后检测并标记重叠区域
     markOverlapCacheDirty()
@@ -204,7 +237,7 @@ export function useWaveformRegions(
   function flushPendingRegionCommits(options = {}) {
     const { force = false } = options
     if (pendingRegionCommits.size === 0) return 0
-    if (!force && isUpdatingRegions.value) {
+    if (!force && (isUpdatingRegions.value || isRegionDraggingActive())) {
       scheduleFlushPendingRegionCommits(16)
       return 0
     }
@@ -238,6 +271,14 @@ export function useWaveformRegions(
     if (!regionsPlugin) return
 
     regionsPlugin.on('region-update', (region, side) => {
+      if (isRegionDraggingActive()) {
+        editBufferStore.setTimeDraft(region.id, {
+          start: region.start,
+          end: region.end,
+          mode: 'drag',
+        })
+      }
+
       const diagConfig = getWaveformDragDiagnosticsConfig()
       if (!diagConfig.logRegionUpdateFlow) return
       logDiag('regions-plugin-region-update', {
@@ -255,7 +296,7 @@ export function useWaveformRegions(
         start: region.start,
         end: region.end,
       })
-      if (isUpdatingRegions.value) {
+      if (isUpdatingRegions.value || isRegionDraggingActive()) {
         queuePendingRegionCommit(region, side)
         return
       }
@@ -375,7 +416,8 @@ export function useWaveformRegions(
       return
     }
 
-    const subtitleCount = projectStore.subtitles.length
+    const renderableSubtitles = getRenderableSubtitles()
+    const subtitleCount = renderableSubtitles.length
 
     // 无字幕时清空所有 regions
     if (subtitleCount === 0) {
@@ -401,7 +443,7 @@ export function useWaveformRegions(
       let addedCount = 0
       let updatedCount = 0
 
-      projectStore.subtitles.forEach((subtitle) => {
+      renderableSubtitles.forEach((subtitle) => {
         if (subtitle.start === undefined || subtitle.end === undefined) {
           console.warn(`[WaveformRegions] 跳过无效字幕: id=${subtitle.id}`)
           return
@@ -489,6 +531,9 @@ export function useWaveformRegions(
     clearTimeout(pendingRegionCommitTimer)
     regionUpdateTimer = null
     pendingRegionCommitTimer = null
+    pendingRegionCommits.forEach((snapshot) => {
+      editBufferStore.clearTimeDraft(snapshot.id)
+    })
     pendingRegionCommits.clear()
     overlapCacheIds.clear()
     overlapCacheDirty = true

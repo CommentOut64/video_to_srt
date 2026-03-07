@@ -10,6 +10,7 @@ import { useRefHistory } from "@vueuse/core";
 import localforage from "localforage";
 import smartSaver from "@/services/SmartSaver";
 import { repairSubtitleOverlaps } from "@/utils/subtitleUtils";
+import { createLocalSubtitleId, createSplitSubtitleIds } from "@/utils/subtitleId";
 
 export const useProjectStore = defineStore("project", () => {
   // ========== 1. 项目元数据 ==========
@@ -87,7 +88,7 @@ export const useProjectStore = defineStore("project", () => {
     deep: true,
     capacity: 50, // 限制历史记录步数
     clone: true, // 深拷贝，确保历史记录独立
-    flush: 'sync', // 同步记录，避免一次操作产生多个历史记录
+    flush: 'post', // 推迟到当前交互提交后记录，减少输入/拖拽主线程阻塞
   });
 
   // ========== 4. 播放器全局状态 ==========
@@ -412,7 +413,7 @@ export const useProjectStore = defineStore("project", () => {
         meta: meta.value,
       });
     },
-    { deep: true }
+    { deep: true, flush: 'post' }
   );
 
   // ========== 8. Actions ==========
@@ -426,7 +427,7 @@ export const useProjectStore = defineStore("project", () => {
   function importSRT(srtContent, metadata) {
     const parsed = parseSRT(srtContent);
     subtitles.value = parsed.map((item, idx) => ({
-      id: `subtitle-${Date.now()}-${idx}`,
+      id: createLocalSubtitleId(`imported-${idx}`),
       sentenceIndex: idx,  // V3.1.2: 添加 sentenceIndex 以支持 SSE 匹配
       start: toDisplayTime(item.start),
       end: toDisplayTime(item.end),
@@ -684,7 +685,7 @@ export const useProjectStore = defineStore("project", () => {
    */
   function addSubtitle(insertIndex, payload) {
     const newSubtitle = {
-      id: `subtitle-${Date.now()}`,
+      id: createLocalSubtitleId(),
       sentenceIndex: payload.sentenceIndex,  // V3.1.2: 全局句子索引
       start: payload.start || 0,
       end: payload.end || 0,
@@ -704,6 +705,7 @@ export const useProjectStore = defineStore("project", () => {
     };
     subtitles.value.splice(insertIndex, 0, newSubtitle);
     meta.value.isDirty = true;
+    return newSubtitle;
   }
 
   /**
@@ -791,9 +793,7 @@ export const useProjectStore = defineStore("project", () => {
     const { left, right } = splitResult;
 
     // 4. 生成新字幕 ID
-    const timestamp = Date.now();
-    const leftId = `${id}-split-L-${timestamp}`;
-    const rightId = `${id}-split-R-${timestamp}`;
+    const { leftId, rightId } = createSplitSubtitleIds(id);
 
     // 5. 构建新字幕对象
     const leftSubtitle = {
