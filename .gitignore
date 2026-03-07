@@ -99,6 +99,9 @@ htmlcov/
 # 本地测试文件（不上传，ci_tests/ 除外）
 tests/
 backend/tests/
+frontend/src/**/__tests__/
+frontend/src/**/*.spec.js
+frontend/src/**/*.test.js
 
 llmdoc/
 
