@@ -29,6 +29,7 @@ from app.services.model_residency_policy import (
     ModelResidencyEntry,
     QueueSnapshot,
 )
+from app.services.model_scope_service import is_on_demand_model
 
 try:
     from app.core.asr.loaders.onnx_loader import OnnxLoader
@@ -501,7 +502,7 @@ class ModelManagerV2:
         plan = LoadPlan(
             device=resolved_device,
             compute_type=resolved_compute_type,
-            local_path=self.downloader.ensure_local(spec),
+            local_path=self._ensure_local_for_spec(spec),
             runtime=runtime_payload,
         )
         logger.info(
@@ -632,11 +633,11 @@ class ModelManagerV2:
             is_local_files_only_override: 可选本地模式覆盖。
         """
         spec = self.registry.get(model_id)
-        downloader = self._build_request_downloader(
+        local_path = self._ensure_local_for_spec(
+            spec,
             is_allow_download_override=is_allow_download_override,
             is_local_files_only_override=is_local_files_only_override,
         )
-        local_path = downloader.ensure_local(spec)
         logger.info(
             "ModelManagerV2 ensure_available 成功: %s framework=%s path=%s",
             spec.id,
@@ -644,6 +645,42 @@ class ModelManagerV2:
             local_path,
         )
         return local_path
+
+    def _ensure_local_for_spec(
+        self,
+        spec: ModelSpec,
+        *,
+        is_allow_download_override: Optional[bool] = None,
+        is_local_files_only_override: Optional[bool] = None,
+    ) -> str:
+        """按模型边界解析下载策略，并确保模型文件在本地可用。"""
+        downloader = self._build_effective_downloader_for_spec(
+            spec,
+            is_allow_download_override=is_allow_download_override,
+            is_local_files_only_override=is_local_files_only_override,
+        )
+        return downloader.ensure_local(spec)
+
+    def _build_effective_downloader_for_spec(
+        self,
+        spec: ModelSpec,
+        *,
+        is_allow_download_override: Optional[bool],
+        is_local_files_only_override: Optional[bool],
+    ) -> ModelDownloader:
+        """为单个模型解析最终下载策略。"""
+        if is_allow_download_override is None and is_local_files_only_override is None and is_on_demand_model(spec):
+            # 设计说明：非预置模型不参与启动自愈，必须在首次真正使用时允许下载。
+            logger.info("ModelManagerV2 对按需模型启用运行期下载: %s", spec.id)
+            return self._build_request_downloader(
+                is_allow_download_override=True,
+                is_local_files_only_override=False,
+            )
+
+        return self._build_request_downloader(
+            is_allow_download_override=is_allow_download_override,
+            is_local_files_only_override=is_local_files_only_override,
+        )
 
     def _build_request_downloader(
         self,

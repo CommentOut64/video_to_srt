@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Literal, Optional, TYPE_CHECKING
 
 from app.core.config import config
 from app.services.model_state_store import ModelStateStore
+from app.services.model_scope_service import is_bootstrap_required_model
 from app.services.sse_service import get_sse_manager
 
 if TYPE_CHECKING:
@@ -223,29 +224,12 @@ class ModelBootstrapService:
             if selected:
                 return selected
 
-        # 默认必需模型：以 backend/models/pretrained 为“必须随包提供”的强约束边界。
-        # Why: 用户已经准备好 pretrained，则不应因为 whisper-* 等可选模型缺失而阻断启动/任务入队。
-        pretrained_root = (Path(config.BASE_DIR) / "backend" / "models" / "pretrained").resolve()
-
-        def is_under_pretrained(local_path: Optional[str]) -> bool:
-            if not local_path:
-                return False
-            candidate = Path(str(local_path))
-            if not candidate.is_absolute():
-                candidate = (Path(config.BASE_DIR) / candidate).resolve()
-            else:
-                candidate = candidate.resolve()
-            if not candidate.exists():
-                return False
-            root_parts = pretrained_root.parts
-            cand_parts = candidate.parts
-            return len(cand_parts) >= len(root_parts) and cand_parts[: len(root_parts)] == root_parts
-
+        # 默认必需模型：以 backend/models/pretrained 为“启动时需要自动自愈”的强约束边界。
+        # Why: 这些模型属于主流程预置模型，即使首启时目录尚未下载出来，也应在启动自愈阶段处理；
+        # Whisper-* 等非预置模型必须继续保持“用到时再下载”。
         selected: List[str] = []
         for spec in known_specs:
-            # 只把“预置模型（pretrained）”纳入默认必需集合。
-            local_path = getattr(getattr(spec, "source", None), "local_path", None)
-            if not is_under_pretrained(local_path):
+            if not is_bootstrap_required_model(spec):
                 continue
             if spec.id not in selected:
                 selected.append(spec.id)
