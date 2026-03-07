@@ -727,7 +727,7 @@ _PARAM_SCHEMA: Dict[str, Any] = {
         "timeline": {
             "enabled": {"type": "bool", "default": True},
             "device": {"type": "enum", "enum": ["auto", "cuda", "cpu"], "default": "cuda"},
-            "diarization_enabled": {"type": "bool", "default": False},
+            "diarization_enabled": {"type": "bool", "default": True},
             "diarization_model_id": {"type": "string", "default": "pyannote-speaker-diarization-community-1"},
             "diarization_local_path": {"type": "string", "default": ""},
             "diarization_hf_token": {"type": "string", "default": None},

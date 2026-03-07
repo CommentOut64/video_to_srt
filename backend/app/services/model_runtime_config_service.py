@@ -391,7 +391,7 @@ class ModelRuntimeConfigService:
                 "min_total_duration": 2.0,
                 "merge_similarity_threshold": 0.88,
                 "long_pause_cut_sec": 1.8,
-                "diarization_enabled": False,
+                "diarization_enabled": True,
                 "diarization_model_id": "pyannote-speaker-diarization-community-1",
                 "diarization_local_path": "",
                 "diarization_hf_token": None,
