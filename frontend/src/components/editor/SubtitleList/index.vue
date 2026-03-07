@@ -279,7 +279,7 @@ const groupedVirtualItems = computed(() => {
         clusterColor: item.clusterColor,
         isActive: activeSubtitleId.value === item.subtitle.id,
         isCurrent: currentSubtitleId.value === item.subtitle.id,
-      })
+      }, { isUserEdit: false })
     })
 
     return items
@@ -464,7 +464,7 @@ async function addNewSubtitle() {
     text: '',
     isModified: true,
     source: 'manual'
-  })
+  }, { isUserEdit: true })
   const localSubtitleId = newSubtitle?.id
   nextTick(() => {
     scrollToBottom()
@@ -490,7 +490,7 @@ async function addNewSubtitle() {
         segment_id: data?.segment_id ?? newSubtitle.segment_id,
         isModified: true,
         source: data?.source || data?.source_type || 'manual'
-      }, { isUserEdit: true })
+      }, { isUserEdit: false })
     }
   })()
   const opId = structuralSyncStore.trackOperation('insert', syncPromise)
@@ -513,7 +513,7 @@ function insertBefore(index) {
   const prev = subtitles.value[index - 1]
   const start = prev ? prev.end : Math.max(0, current.start - 3)
   const end = current.start
-  const newSubtitle = projectStore.addSubtitle(index, { start, end, text: '', isModified: true, source: 'manual' })
+  const newSubtitle = projectStore.addSubtitle(index, { start, end, text: '', isModified: true, source: 'manual' }, { isUserEdit: true })
   const localSubtitleId = newSubtitle?.id
   syncInsertedSubtitle(localSubtitleId, start, end, '')
 }
@@ -523,7 +523,7 @@ function insertAfter(index) {
   const next = subtitles.value[index + 1]
   const start = current.end
   const end = next ? next.start : current.end + 3
-  const newSubtitle = projectStore.addSubtitle(index + 1, { start, end, text: '', isModified: true, source: 'manual' })
+  const newSubtitle = projectStore.addSubtitle(index + 1, { start, end, text: '', isModified: true, source: 'manual' }, { isUserEdit: true })
   const localSubtitleId = newSubtitle?.id
   syncInsertedSubtitle(localSubtitleId, start, end, '')
 }
@@ -548,7 +548,7 @@ async function syncInsertedSubtitle(localSubtitleId, start, end, text) {
         segment_id: data?.segment_id ?? newSubtitle.segment_id,
         isModified: true,
         source: data?.source || data?.source_type || 'manual'
-      }, { isUserEdit: true })
+      }, { isUserEdit: false })
     }
   })()
   const opId = structuralSyncStore.trackOperation('insert', syncPromise)
