@@ -176,8 +176,9 @@ import { useSubtitleDocumentStore } from '@/stores/subtitleDocumentStore'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { useHomophoneSearch, SortMode } from '@/composables'
 import { useEditBufferStore } from '@/core/editor/editBufferStore'
+import { applyBatchReplaceUpdatedSegments } from '@/core/sync/batchReplaceProjection'
 import projectApi from '@/services/api/projectApi'
-import { useStructuralSyncStore } from '@/stores/structuralSyncStore'
+import { useSyncCoordinatorStore } from '@/core/sync/syncCoordinator'
 // 导入组件
 import SubtitleItem from './SubtitleItem.vue'
 import SearchToolbar from './SearchToolbar.vue'
@@ -197,7 +198,7 @@ const emit = defineEmits(['subtitle-click', 'subtitle-edit', 'subtitle-delete', 
 // Store
 const projectStore = useProjectStore()
 const subtitleDocumentStore = useSubtitleDocumentStore()
-const structuralSyncStore = useStructuralSyncStore()
+const syncCoordinator = useSyncCoordinatorStore()
 const editBufferStore = useEditBufferStore()
 
 // 全局播放管理器
@@ -427,7 +428,7 @@ function updateText(id, text) {
 }
 
 async function deleteSubtitle(id) {
-  const subtitle = projectStore.subtitles.find(s => s.id === id)
+  const subtitle = projectStore.subtitles.find((s) => s.id === id)
   projectStore.removeSubtitle(id, { isUserEdit: true })
   emit('subtitle-delete', id)
 
@@ -435,22 +436,36 @@ async function deleteSubtitle(id) {
     return
   }
 
-  // V3.2.4+dev.20260304.01: 结构性操作追踪
-  const syncPromise = (async () => {
-    if (!projectStore.meta.projectId) {
-      throw new Error('缺少 project_id，禁止走 job 字幕删除分支')
-    }
-    if (!subtitle.segment_id) {
-      throw new Error(`缺少 segment_id，无法删除字幕（id=${id}）`)
-    }
-    await projectApi.deleteSubtitle(projectStore.meta.projectId, subtitle.segment_id)
-  })()
-  structuralSyncStore.trackOperation('delete', syncPromise)
+  if (!projectStore.meta.projectId) {
+    throw new Error('缺少 project_id，禁止走 job 字幕删除分支')
+  }
+  if (!subtitle.segment_id) {
+    throw new Error(`缺少 segment_id，无法删除字幕（id=${id}）`)
+  }
+
+  const { promise } = syncCoordinator.submitStructuralCommands('delete', [
+    {
+      type: 'remove_subtitle',
+      command_id: syncCoordinator.nextCommandId('remove-subtitle'),
+      segment_id: subtitle.segment_id,
+    },
+  ])
 
   try {
-    await syncPromise
+    await promise
   } catch (error) {
     console.warn('[SubtitleList] 删除字幕同步失败:', error)
+  }
+}
+
+function buildAddSubtitleCommand(localSubtitleId, start, end, text = '') {
+  return {
+    type: 'add_subtitle',
+    command_id: syncCoordinator.nextCommandId('add-subtitle'),
+    local_id: localSubtitleId == null ? null : String(localSubtitleId),
+    text,
+    start: projectStore.toBaseTime(start),
+    end: projectStore.toBaseTime(end),
   }
 }
 
@@ -470,42 +485,7 @@ async function addNewSubtitle() {
     scrollToBottom()
   })
   emit('subtitle-add', subtitles.value.length - 1)
-
-  // V3.2.4+dev.20260304.01: 结构性操作追踪
-  const syncPromise = (async () => {
-    const baseStart = projectStore.toBaseTime(newStart)
-    const baseEnd = projectStore.toBaseTime(newStart + 3)
-    if (!projectStore.meta.projectId) {
-      throw new Error('缺少 project_id，禁止走 job 字幕新增分支')
-    }
-    const data = await projectApi.createSubtitle(projectStore.meta.projectId, {
-      text: '',
-      start: baseStart,
-      end: baseEnd
-    })
-    const newSubtitle = projectStore.subtitles.find((item) => item.id === localSubtitleId)
-    if (newSubtitle) {
-      projectStore.updateSubtitle(newSubtitle.id, {
-        sentenceIndex: data?.index ?? data?.legacy_index ?? newSubtitle.sentenceIndex,
-        segment_id: data?.segment_id ?? newSubtitle.segment_id,
-        isModified: true,
-        source: data?.source || data?.source_type || 'manual'
-      }, { isUserEdit: false })
-    }
-  })()
-  const opId = structuralSyncStore.trackOperation('insert', syncPromise)
-
-  try {
-    await syncPromise
-  } catch (error) {
-    const rollbackTarget = projectStore.subtitles.find((item) => item.id === localSubtitleId)
-    if (rollbackTarget) {
-      projectStore.removeSubtitle(rollbackTarget.id, { isUserEdit: true })
-    }
-    // 回滚后本地与后端一致，清除错误
-    structuralSyncStore.clearError(opId)
-    console.warn('[SubtitleList] 新增字幕同步失败:', error)
-  }
+  await syncInsertedSubtitle(localSubtitleId, newStart, newStart + 3, '')
 }
 
 function insertBefore(index) {
@@ -515,7 +495,7 @@ function insertBefore(index) {
   const end = current.start
   const newSubtitle = projectStore.addSubtitle(index, { start, end, text: '', isModified: true, source: 'manual' }, { isUserEdit: true })
   const localSubtitleId = newSubtitle?.id
-  syncInsertedSubtitle(localSubtitleId, start, end, '')
+  void syncInsertedSubtitle(localSubtitleId, start, end, '')
 }
 
 function insertAfter(index) {
@@ -525,43 +505,26 @@ function insertAfter(index) {
   const end = next ? next.start : current.end + 3
   const newSubtitle = projectStore.addSubtitle(index + 1, { start, end, text: '', isModified: true, source: 'manual' }, { isUserEdit: true })
   const localSubtitleId = newSubtitle?.id
-  syncInsertedSubtitle(localSubtitleId, start, end, '')
+  void syncInsertedSubtitle(localSubtitleId, start, end, '')
 }
 
 async function syncInsertedSubtitle(localSubtitleId, start, end, text) {
-  // V3.2.4+dev.20260304.01: 结构性操作追踪
-  const syncPromise = (async () => {
-    const baseStart = projectStore.toBaseTime(start)
-    const baseEnd = projectStore.toBaseTime(end)
-    if (!projectStore.meta.projectId) {
-      throw new Error('缺少 project_id，禁止走 job 字幕新增分支')
-    }
-    const data = await projectApi.createSubtitle(projectStore.meta.projectId, {
-      text,
-      start: baseStart,
-      end: baseEnd
-    })
-    const newSubtitle = projectStore.subtitles.find((item) => item.id === localSubtitleId)
-    if (newSubtitle) {
-      projectStore.updateSubtitle(newSubtitle.id, {
-        sentenceIndex: data?.index ?? data?.legacy_index ?? newSubtitle.sentenceIndex,
-        segment_id: data?.segment_id ?? newSubtitle.segment_id,
-        isModified: true,
-        source: data?.source || data?.source_type || 'manual'
-      }, { isUserEdit: false })
-    }
-  })()
-  const opId = structuralSyncStore.trackOperation('insert', syncPromise)
+  if (!projectStore.meta.projectId) {
+    throw new Error('缺少 project_id，禁止走 job 字幕新增分支')
+  }
+
+  const { opId, promise } = syncCoordinator.submitStructuralCommands('insert', [
+    buildAddSubtitleCommand(localSubtitleId, start, end, text),
+  ])
 
   try {
-    await syncPromise
+    await promise
   } catch (error) {
     const rollbackTarget = projectStore.subtitles.find((item) => item.id === localSubtitleId)
     if (rollbackTarget) {
       projectStore.removeSubtitle(rollbackTarget.id, { isUserEdit: true })
     }
-    // 回滚后本地与后端一致，清除错误
-    structuralSyncStore.clearError(opId)
+    syncCoordinator.clearStructuralError(opId)
     console.warn('[SubtitleList] 新增字幕同步失败:', error)
   }
 }
@@ -721,76 +684,78 @@ function handleQuickSearch(text) {
 
 // 批量替换
 async function handleBatchReplace() {
+  if (!projectStore.meta.projectId) {
+    ElMessage.error('缺少 project_id，无法执行批量替换回写；请从任务列表重新进入项目编辑器')
+    return
+  }
+
+  try {
+    await syncCoordinator.flushAllSync()
+  } catch (error) {
+    console.error('批量替换前同步失败:', error)
+    ElMessage.error(`替换前同步失败：${error?.message || '请稍后重试'}`)
+    return
+  }
+
   const result = await homophoneSearch.executeBatchReplace()
-  if (result.success) {
-    ElMessage.success(`成功替换 ${result.count} 处`)
-    // 仅增量回填被替换字幕，避免整表 import 覆写快流草稿/切分状态。
-    // 设计说明：此前整量 importSegments 会将 isDraft/chunk_id 等运行态信息重置，
-    // 在 processing 阶段可能让快流表现为“未切分”。
-    if (projectStore.meta.projectId) {
-      try {
-        await forceSyncNow()
-        let segments = []
-        const projectSegments = await projectApi.getSubtitles(projectStore.meta.projectId)
-        if (Array.isArray(projectSegments)) {
-          segments = projectSegments.map((segment, index) => ({
-            id: segment.legacy_index ?? segment.sentence_index ?? index,
+  if (!result.success) {
+    ElMessage.error('替换失败')
+    return
+  }
+
+  ElMessage.success(`成功替换 ${result.count} 处`)
+
+  try {
+    let patchedCount = applyBatchReplaceUpdatedSegments(projectStore, result.updatedSegments)
+    const expectedCount = Array.isArray(result?.updatedSegments)
+      ? result.updatedSegments.length
+      : 0
+
+    if (patchedCount >= expectedCount && patchedCount > 0) {
+      return
+    }
+
+    let segments = []
+    const projectSegments = await projectApi.getSubtitles(projectStore.meta.projectId)
+    if (Array.isArray(projectSegments)) {
+      segments = projectSegments.map((segment, index) => ({
+        sentence_index: segment.legacy_index ?? segment.sentence_index ?? index,
+        start: segment.start,
+        end: segment.end,
+        text: segment.text,
+        is_modified: segment.is_modified,
+        original_text: segment.original_text,
+      }))
+    }
+
+    if (Array.isArray(segments) && segments.length > 0) {
+      patchedCount = applyBatchReplaceUpdatedSegments(projectStore, segments)
+
+      // 兜底：若本地列表为空，再执行整量导入，避免新打开页面时仍看不到结果。
+      if (patchedCount === 0 && projectStore.subtitles.length === 0) {
+        projectStore.importSegments(
+          segments.map((segment) => ({
+            id: segment.sentence_index,
             start: segment.start,
             end: segment.end,
             text: segment.text,
             is_modified: segment.is_modified,
             original_text: segment.original_text,
-          }))
-        }
-        if (Array.isArray(segments) && segments.length > 0) {
-          const segmentMap = new Map(
-            segments.map((segment) => [Number(segment.id), segment])
-          )
-
-          let patchedCount = 0
-          const updatedIndices = Array.isArray(result?.indices)
-            ? result.indices
-            : []
-
-          for (const sentenceIndex of updatedIndices) {
-            const idx = Number(sentenceIndex)
-            const segment = segmentMap.get(idx)
-            if (!segment) continue
-
-            const subtitle = projectStore.subtitles.find(
-              (item) => Number(item.sentenceIndex) === idx
-            )
-            if (!subtitle) continue
-
-            projectStore.updateSubtitle(subtitle.id, {
-              text: String(segment.text ?? subtitle.text ?? ''),
-              isModified: Boolean(segment.is_modified ?? subtitle.isModified),
-              originalText: segment.original_text ?? subtitle.originalText,
-            })
-            patchedCount += 1
+          })),
+          {
+            jobId: projectId.value,
+            filename: projectStore.meta.filename,
+            duration: projectStore.meta.duration,
+            videoPath: projectStore.meta.videoPath,
+            audioPath: projectStore.meta.audioPath,
+            subtitleOffset: projectStore.subtitleOffset,
           }
-
-          // 兜底：若增量回填未命中本地字幕（如刚打开页面本地列表为空），再执行整量导入。
-          if (patchedCount === 0 && projectStore.subtitles.length === 0) {
-            projectStore.importSegments(segments, {
-              jobId: projectId.value,
-              filename: projectStore.meta.filename,
-              duration: projectStore.meta.duration,
-              videoPath: projectStore.meta.videoPath,
-              audioPath: projectStore.meta.audioPath,
-              subtitleOffset: projectStore.subtitleOffset,
-            })
-          }
-        }
-      } catch (error) {
-        console.error('刷新字幕失败:', error)
-        ElMessage.warning('替换成功，但刷新失败，请手动刷新页面')
+        )
       }
-    } else {
-      ElMessage.error('缺少 project_id，无法执行批量替换回写；请从任务列表重新进入项目编辑器')
     }
-  } else {
-    ElMessage.error('替换失败')
+  } catch (error) {
+    console.error('刷新字幕失败:', error)
+    ElMessage.warning('替换成功，但本地回填失败，请手动刷新页面')
   }
 }
 

@@ -259,13 +259,14 @@
  * - 智能进度显示和多任务管理
  */
 import { ref, computed, onMounted, onUnmounted, provide, watch } from 'vue'
-import { onBeforeRouteLeave, useRouter } from 'vue-router'
+import { onBeforeRouteLeave, onBeforeRouteUpdate, useRouter } from 'vue-router'
 import { useProjectStore } from '@/stores/projectStore'
 import { usePlaybackStore } from '@/stores/playbackStore'
 import { useTaskRuntimeStore } from '@/stores/taskRuntimeStore'
 import { useEditorSessionStore } from '@/stores/editorSessionStore'
 import { useSubtitleDocumentStore } from '@/stores/subtitleDocumentStore'
 import { useStructuralSyncStore } from '@/stores/structuralSyncStore'
+import { useSyncCoordinatorStore } from '@/core/sync/syncCoordinator'
 import { legacyApi, mediaApi, projectApi, transcriptionApi } from '@/services/api'
 import sseChannelManager from '@/services/sseChannelManager'
 import { useShortcuts } from '@/hooks/useShortcuts'
@@ -318,6 +319,7 @@ const taskStore = useTaskRuntimeStore()
 const editorSessionStore = useEditorSessionStore()
 const subtitleDocumentStore = useSubtitleDocumentStore()
 const structuralSyncStore = useStructuralSyncStore()
+const syncCoordinator = useSyncCoordinatorStore()
 const router = useRouter()
 
 // 全局播放管理器
@@ -328,14 +330,13 @@ const activeJobId = computed(() => props.jobId || null)
 const mediaIdentityId = computed(() => props.projectId || props.jobId || null)
 const playbackSessionId = computed(() => props.projectId || props.jobId || '')
 const identityRef = computed(() => mediaIdentityId.value)
-const forceSyncNow = subtitleDocumentStore.forceSyncNow
 
 // Proxy 视频加载状态（新重构版本）
 // V3.2.4+dev.20260224.01: project 模式也需要接入媒体状态，避免 progressiveUrl 为空导致视频无法加载
 const proxyVideo = useProxyVideo(identityRef)
 
 // V3.2.4+dev.20260303.01: undo/redo 后端增量同步
-const { undoWithSync, redoWithSync, flushSync: flushUndoRedoSync } = useUndoRedoSync()
+const { undoWithSync, redoWithSync } = useUndoRedoSync()
 
 // Refs
 const videoStageRef = ref(null)
@@ -487,6 +488,31 @@ watch(
   },
   { deep: true }
 )
+
+onBeforeRouteUpdate(async (to, from) => {
+  const nextProjectId = String(to.params.projectId || '').trim()
+  const nextJobId = String(to.params.jobId || '').trim()
+  const previousProjectId = String(from.params.projectId || '').trim()
+  const previousJobId = String(from.params.jobId || '').trim()
+
+  if (nextProjectId === previousProjectId && nextJobId === previousJobId) {
+    return
+  }
+
+  playbackManager.pause()
+  try {
+    await runEditorSessionSwitchBarrier({
+      previousIdentityId: previousProjectId || previousJobId,
+      syncCoordinator,
+      projectStore,
+      isDirty: isDirty.value,
+    })
+  } catch (error) {
+    console.error('[EditorView] 会话切换前同步/保存失败:', error)
+    const answer = window.confirm('同步或保存失败，确定要切换吗? 未保存的修改可能会丢失。')
+    if (!answer) return false
+  }
+})
 
 // 监听路由身份变化，重新加载项目
 watch([() => rawProps.projectId, () => rawProps.jobId], async ([newProjectId, newJobId], [oldProjectId, oldJobId]) => {
@@ -2037,14 +2063,7 @@ async function handleExport(format) {
 }
 
 async function fetchLatestSegments() {
-  // 第一轮：清空文本/时间防抖队列与 undo/redo 防抖同步
-  await forceSyncNow()
-  await flushUndoRedoSync()
-  // 等待结构性操作（删除/插入/切分/合并）飞行中请求落地
-  await structuralSyncStore.waitAll()
-  // 第二轮：结构性操作落地后再次冲洗，覆盖“新增后立刻编辑”的补写场景
-  await forceSyncNow()
-  await flushUndoRedoSync()
+  await syncCoordinator.flushAllSync()
 
   const pending = subtitleDocumentStore.pendingCount()
   const syncErrors = subtitleDocumentStore.syncErrors
@@ -2434,14 +2453,16 @@ onUnmounted(() => {
 
 onBeforeRouteLeave(async (to, from) => {
   playbackManager.pause()
-  if (isDirty.value) {
-    try {
-      await projectStore.saveProject()
-    } catch (error) {
-      console.error('[EditorView] 离开前保存失败:', error)
-      const answer = window.confirm('保存失败，确定要离开吗? 未保存的修改可能会丢失。')
-      if (!answer) return false
-    }
+  try {
+    await runEditorLeaveBarrier({
+      syncCoordinator,
+      projectStore,
+      isDirty: isDirty.value,
+    })
+  } catch (error) {
+    console.error('[EditorView] 离开前同步/保存失败:', error)
+    const answer = window.confirm('同步或保存失败，确定要离开吗? 未保存的修改可能会丢失。')
+    if (!answer) return false
   }
 })
 </script>

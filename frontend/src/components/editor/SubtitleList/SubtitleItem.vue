@@ -184,8 +184,7 @@
 import { ref, computed, nextTick, onUnmounted, watch } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
 import { usePlaybackStore } from '@/stores/playbackStore'
-import projectApi from '@/services/api/projectApi'
-import { useStructuralSyncStore } from '@/stores/structuralSyncStore'
+import { useSyncCoordinatorStore } from '@/core/sync/syncCoordinator'
 import ContextMenu from '@/components/editor/ContextMenu.vue'
 import { useEditBufferStore } from '@/core/editor/editBufferStore'
 
@@ -215,7 +214,7 @@ const emit = defineEmits([
 // Store
 const projectStore = useProjectStore()
 const playbackStore = usePlaybackStore()
-const structuralSyncStore = useStructuralSyncStore()
+const syncCoordinator = useSyncCoordinatorStore()
 const editBufferStore = useEditBufferStore()
 
 // 编辑状态
@@ -579,6 +578,28 @@ async function handleContextMenuSelect(key) {
   }
 }
 
+function buildUpdateCommand(type, subtitle) {
+  return {
+    type: 'update_subtitle',
+    command_id: syncCoordinator.nextCommandId(type),
+    segment_id: subtitle.segment_id,
+    text: subtitle.text,
+    start: projectStore.toBaseTime(subtitle.start),
+    end: projectStore.toBaseTime(subtitle.end),
+  }
+}
+
+function buildAddCommand(type, subtitle) {
+  return {
+    type: 'add_subtitle',
+    command_id: syncCoordinator.nextCommandId(type),
+    local_id: subtitle?.id == null ? null : String(subtitle.id),
+    text: subtitle.text,
+    start: projectStore.toBaseTime(subtitle.start),
+    end: projectStore.toBaseTime(subtitle.end),
+  }
+}
+
 // V3.2.4+dev.20260304.01: 切分同步 — structuralSyncStore 飞行追踪
 async function syncSplitSubtitles(result) {
   const projectId = projectStore.meta.projectId
@@ -589,49 +610,17 @@ async function syncSplitSubtitles(result) {
   const { leftSubtitle, rightSubtitle } = result
   if (!leftSubtitle || !rightSubtitle) return
 
-  const syncPromise = (async () => {
-    const leftSegmentId = leftSubtitle.segment_id || props.subtitle.segment_id
-    if (!leftSegmentId) {
-      throw new Error('切分左半字幕缺少 segment_id，无法同步到 project 字幕真源')
-    }
+  const commands = []
+  if (leftSubtitle.segment_id) {
+    commands.push(buildUpdateCommand('split-left', leftSubtitle))
+  } else {
+    commands.push(buildAddCommand('split-left', leftSubtitle))
+  }
+  commands.push(buildAddCommand('split-right', rightSubtitle))
 
-    const updatedLeft = await projectApi.updateSubtitle(projectId, leftSegmentId, {
-      text: leftSubtitle.text,
-      start: projectStore.toBaseTime(leftSubtitle.start),
-      end: projectStore.toBaseTime(leftSubtitle.end)
-    })
-    projectStore.pauseHistory()
-    try {
-      projectStore.updateSubtitle(leftSubtitle.id, {
-        sentenceIndex: updatedLeft?.legacy_index ?? leftSubtitle.sentenceIndex,
-        segment_id: updatedLeft?.segment_id ?? leftSegmentId,
-        isModified: true,
-        source: updatedLeft?.source_type || 'split'
-      }, { isUserEdit: false })
-    } finally {
-      projectStore.resumeHistory()
-    }
-
-    const rightData = await projectApi.createSubtitle(projectId, {
-      text: rightSubtitle.text,
-      start: projectStore.toBaseTime(rightSubtitle.start),
-      end: projectStore.toBaseTime(rightSubtitle.end)
-    })
-    projectStore.pauseHistory()
-    try {
-      projectStore.updateSubtitle(rightSubtitle.id, {
-        sentenceIndex: rightData?.legacy_index ?? rightSubtitle.sentenceIndex,
-        segment_id: rightData?.segment_id ?? rightSubtitle.segment_id,
-        isModified: true,
-        source: rightData?.source_type || 'manual'
-      }, { isUserEdit: false })
-    } finally {
-      projectStore.resumeHistory()
-    }
-  })()
-  structuralSyncStore.trackOperation('split', syncPromise)
+  const { promise } = syncCoordinator.submitStructuralCommands('split', commands)
   try {
-    await syncPromise
+    await promise
   } catch (error) {
     console.warn('[SubtitleItem] 切分同步失败:', error)
   }
@@ -647,36 +636,27 @@ async function syncMergeSubtitles(result) {
   const { keptSubtitle, removedSubtitle } = result
   if (!keptSubtitle || !removedSubtitle) return
 
-  const syncPromise = (async () => {
-    // 1. 更新保留的字幕（文本+时间戳）
-    if (keptSubtitle.segment_id) {
-      const updatedKept = await projectApi.updateSubtitle(projectId, keptSubtitle.segment_id, {
-        text: keptSubtitle.text,
-        start: projectStore.toBaseTime(keptSubtitle.start),
-        end: projectStore.toBaseTime(keptSubtitle.end)
-      })
-      // 仅同步赋值期间 pause，窗口极小
-      projectStore.pauseHistory()
-      try {
-        projectStore.updateSubtitle(keptSubtitle.id, {
-          sentenceIndex: updatedKept?.legacy_index ?? keptSubtitle.sentenceIndex,
-          segment_id: updatedKept?.segment_id ?? keptSubtitle.segment_id,
-          isModified: true,
-          source: updatedKept?.source_type || 'merge'
-        }, { isUserEdit: false })
-      } finally {
-        projectStore.resumeHistory()
-      }
-    }
+  const commands = []
+  if (keptSubtitle.segment_id) {
+    commands.push(buildUpdateCommand('merge-kept', keptSubtitle))
+  } else {
+    commands.push(buildAddCommand('merge-kept', keptSubtitle))
+  }
+  if (removedSubtitle.segment_id) {
+    commands.push({
+      type: 'remove_subtitle',
+      command_id: syncCoordinator.nextCommandId('merge-removed'),
+      segment_id: removedSubtitle.segment_id,
+    })
+  }
 
-    // 2. 删除被合并的字幕
-    if (removedSubtitle.segment_id) {
-      await projectApi.deleteSubtitle(projectId, removedSubtitle.segment_id)
-    }
-  })()
-  structuralSyncStore.trackOperation('merge', syncPromise)
+  if (commands.length === 0) {
+    return
+  }
+
+  const { promise } = syncCoordinator.submitStructuralCommands('merge', commands)
   try {
-    await syncPromise
+    await promise
   } catch (error) {
     console.warn('[SubtitleItem] 合并同步失败:', error)
   }

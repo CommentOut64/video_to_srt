@@ -1,12 +1,11 @@
 /**
  * useWaveformContextMenu - 右键菜单逻辑 Composable
  *
- * 职责：右键切分、后端同步
+ * 职责：右键切分、统一命令同步
  * 提取自 WaveformTimeline/index.vue L1391-1520
  */
 import { ref, computed } from 'vue'
-import projectApi from '@/services/api/projectApi'
-import { useStructuralSyncStore } from '@/stores/structuralSyncStore'
+import { useSyncCoordinatorStore } from '@/core/sync/syncCoordinator'
 
 /**
  * 右键菜单 Composable
@@ -14,7 +13,7 @@ import { useStructuralSyncStore } from '@/stores/structuralSyncStore'
  */
 export function useWaveformContextMenu(projectStore) {
   // ============ 状态 ============
-  const structuralSyncStore = useStructuralSyncStore()
+  const syncCoordinator = useSyncCoordinatorStore()
   const contextMenuRef = ref(null)
   const contextMenuTarget = ref(null) // 右键点击的目标字幕ID
   const contextMenuTime = ref(0) // 右键点击的时间点
@@ -32,6 +31,28 @@ export function useWaveformContextMenu(projectStore) {
 
     return items
   })
+
+  function buildUpdateCommand(type, subtitle) {
+    return {
+      type: 'update_subtitle',
+      command_id: syncCoordinator.nextCommandId(type),
+      segment_id: subtitle.segment_id,
+      text: subtitle.text,
+      start: projectStore.toBaseTime(subtitle.start),
+      end: projectStore.toBaseTime(subtitle.end),
+    }
+  }
+
+  function buildAddCommand(type, subtitle) {
+    return {
+      type: 'add_subtitle',
+      command_id: syncCoordinator.nextCommandId(type),
+      local_id: subtitle?.id == null ? null : String(subtitle.id),
+      text: subtitle.text,
+      start: projectStore.toBaseTime(subtitle.start),
+      end: projectStore.toBaseTime(subtitle.end),
+    }
+  }
 
   // ============ 方法 ============
 
@@ -86,58 +107,23 @@ export function useWaveformContextMenu(projectStore) {
   }
 
   /**
-   * V3.2.4+dev.20260304.01: 波形切分结果同步到后端 — structuralSyncStore 飞行追踪
+   * 波形切分结果统一走 editor-ops:apply，避免组件层继续分散调用旧 API。
    */
   async function syncSplitSubtitles(result) {
-    const projectId = projectStore.meta.projectId
-    if (!projectId) {
-      throw new Error('缺少 project_id，禁止走 job 字幕切分分支')
-    }
-
     const { leftSubtitle, rightSubtitle } = result || {}
     if (!leftSubtitle || !rightSubtitle) return
 
-    const syncPromise = (async () => {
-      const leftSegmentId = leftSubtitle.segment_id
-      if (!leftSegmentId) {
-        throw new Error('切分左半字幕缺少 segment_id，无法同步到 project 字幕真源')
-      }
+    const commands = []
+    if (leftSubtitle.segment_id) {
+      commands.push(buildUpdateCommand('waveform-split-left', leftSubtitle))
+    } else {
+      commands.push(buildAddCommand('waveform-split-left', leftSubtitle))
+    }
+    commands.push(buildAddCommand('waveform-split-right', rightSubtitle))
 
-      const updatedLeft = await projectApi.updateSubtitle(projectId, leftSegmentId, {
-        text: leftSubtitle.text,
-        start: projectStore.toBaseTime(leftSubtitle.start),
-        end: projectStore.toBaseTime(leftSubtitle.end),
-      })
-      projectStore.updateSubtitle(
-        leftSubtitle.id,
-        {
-          sentenceIndex: updatedLeft?.legacy_index ?? leftSubtitle.sentenceIndex,
-          segment_id: updatedLeft?.segment_id ?? leftSegmentId,
-          isModified: true,
-          source: updatedLeft?.source_type || 'split',
-        },
-        { isUserEdit: true }
-      )
-
-      const rightData = await projectApi.createSubtitle(projectId, {
-        text: rightSubtitle.text,
-        start: projectStore.toBaseTime(rightSubtitle.start),
-        end: projectStore.toBaseTime(rightSubtitle.end),
-      })
-      projectStore.updateSubtitle(
-        rightSubtitle.id,
-        {
-          sentenceIndex: rightData?.legacy_index ?? rightSubtitle.sentenceIndex,
-          segment_id: rightData?.segment_id ?? rightSubtitle.segment_id,
-          isModified: true,
-          source: rightData?.source_type || 'manual',
-        },
-        { isUserEdit: true }
-      )
-    })()
-    structuralSyncStore.trackOperation('split', syncPromise)
+    const { promise } = syncCoordinator.submitStructuralCommands('waveform-split', commands)
     try {
-      await syncPromise
+      await promise
     } catch (error) {
       console.warn('[WaveformContextMenu] 切分同步失败:', error)
     }
