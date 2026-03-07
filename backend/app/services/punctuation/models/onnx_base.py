@@ -69,9 +69,8 @@ class OnnxPunctuationAdapter(PunctuationModelAdapter):
             return self._session
         try:
             manager = get_model_manager_v2()
+            self._model_dir = Path(manager.ensure_available(self.model_id))
             session = manager.acquire(self.model_id, device=self._device)
-            spec = manager.registry.get(self.model_id)
-            self._model_dir = Path(manager.downloader.ensure_local(spec))
             self._session = session
             self._loaded = True
             return self._session

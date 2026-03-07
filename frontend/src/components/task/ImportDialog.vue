@@ -63,7 +63,7 @@
           <input
             ref="mediaInputRef"
             type="file"
-            accept="video/*,audio/*"
+            accept=".mp4,.avi,.mkv,.mov,.wmv,.flv,.webm,.m4v,.mp3,.wav,.flac,.aac,.ogg,.m4a,.wma,video/*,audio/*"
             style="display: none"
             @change="handleMediaFileChange"
           />

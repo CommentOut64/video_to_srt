@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 uv 依赖管理模块
-V3.2.0+dev.20260209.01
+V3.2.4+dev.20260306.02
 
-使用 uv 替代 pip 进行依赖管理，特性：
+使用 uv 替代 pip 进行依赖管理（仅开发模式），特性：
 - uv sync --check 智能检测依赖状态
 - 开发模式使用 --all-extras
 - 生产模式使用基础依赖
@@ -63,9 +63,151 @@ class UvManager:
 
         return None
 
+    def _find_embedded_python(self) -> Optional[Path]:
+        """
+        查找项目嵌入式 Python。
+
+        V3.2.4+dev.20260305.01: 生产模式优先使用嵌入式 Python
+        """
+        embedded_python = self.project_root / "tools" / "python" / "python.exe"
+        if embedded_python.exists():
+            return embedded_python
+        return None
+
     def is_available(self) -> bool:
         """检查 uv 是否可用"""
         return self.uv_exec is not None
+
+    def _windows_no_window_kwargs(self) -> Dict[str, Any]:
+        """
+        Windows 下返回“无控制台窗口”子进程参数。
+
+        设计取舍：
+        - 仅在生产模式启用，开发模式保留默认行为便于调试。
+        - 统一用于 run/Popen，避免 uv/python 探针偶发闪窗。
+        """
+        if os.name != "nt" or self.dev_mode:
+            return {}
+
+        kwargs: Dict[str, Any] = {}
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        if creationflags:
+            kwargs["creationflags"] = creationflags
+
+        startupinfo_cls = getattr(subprocess, "STARTUPINFO", None)
+        startf_use_showwindow = getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+        sw_hide = getattr(subprocess, "SW_HIDE", 0)
+        if startupinfo_cls and startf_use_showwindow:
+            startupinfo = startupinfo_cls()
+            startupinfo.dwFlags |= startf_use_showwindow
+            startupinfo.wShowWindow = sw_hide
+            kwargs["startupinfo"] = startupinfo
+
+        return kwargs
+
+    def _build_uv_env(self) -> Dict[str, str]:
+        """
+        构建 uv 命令所需环境变量。
+
+        设计取舍：
+        - 强制锁定项目内 `.venv`，避免使用用户目录中的 uv 环境。
+        - 生产模式默认使用 copy 链接，避免 .venv 依赖用户缓存路径。
+        """
+        env = os.environ.copy()
+        venv_dir = self.project_root / ".venv"
+        env.setdefault("UV_PROJECT_ENVIRONMENT", str(venv_dir))
+        if not self.dev_mode:
+            env.setdefault("UV_LINK_MODE", "copy")
+        return env
+
+    def _build_uv_python_args(self) -> Tuple[str, ...]:
+        """
+        为 uv 命令构建 --python 参数。
+
+        V3.2.4+dev.20260305.01: 生产模式优先使用嵌入式 Python
+        """
+        if not self.dev_mode:
+            embedded_python = self._find_embedded_python()
+            if embedded_python:
+                return ("--python", str(embedded_python))
+
+        python_exec = self.get_python_path()
+        if python_exec:
+            return ("--python", str(python_exec))
+        return ()
+
+    def _ensure_local_python_home(self) -> None:
+        """
+        修正 pyvenv.cfg 中的 Python 基路径，避免指向用户缓存目录。
+
+        适配场景：打包产物携带 tools/python 时，优先使用本地 Python。
+        """
+        venv_dir = self.project_root / ".venv"
+        cfg_path = venv_dir / "pyvenv.cfg"
+        if not cfg_path.exists():
+            return
+
+        local_home = self.project_root / "tools" / "python"
+        if not local_home.exists():
+            return
+
+        try:
+            text = cfg_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            text = cfg_path.read_text(encoding="utf-8-sig")
+        except OSError as exc:
+            logger.warning("读取 pyvenv.cfg 失败: %s", exc)
+            return
+
+        lines = text.splitlines()
+        if not lines:
+            return
+
+        updated_lines = []
+        updated = False
+        local_home_str = str(local_home)
+        local_python_exe = local_home / "python.exe"
+
+        def _should_rewrite(value: str) -> bool:
+            if not value:
+                return False
+            if value == local_home_str:
+                return False
+            if "uv\\python" in value.lower():
+                return True
+            return not Path(value).exists()
+
+        for line in lines:
+            if "=" not in line:
+                updated_lines.append(line)
+                continue
+            key, raw_value = line.split("=", 1)
+            key_name = key.strip().lower()
+            value = raw_value.strip()
+            if key_name in {"home", "base-prefix", "base-exec-prefix"}:
+                if _should_rewrite(value):
+                    updated_lines.append(f"{key.strip()} = {local_home_str}")
+                    updated = True
+                else:
+                    updated_lines.append(line)
+                continue
+            if key_name == "base-executable":
+                if _should_rewrite(value) and local_python_exe.exists():
+                    updated_lines.append(f"{key.strip()} = {local_python_exe}")
+                    updated = True
+                else:
+                    updated_lines.append(line)
+                continue
+            updated_lines.append(line)
+
+        if not updated:
+            return
+
+        try:
+            cfg_path.write_text("\n".join(updated_lines), encoding="utf-8")
+            logger.info("已修复 pyvenv.cfg Python 基路径: %s", local_home_str)
+        except OSError as exc:
+            logger.warning("写入 pyvenv.cfg 失败: %s", exc)
 
     def check_sync_status(self) -> UvResult:
         """
@@ -75,6 +217,12 @@ class UvManager:
         - 返回码 0：环境已同步，无需操作
         - 返回码 1：环境过期，需要运行 uv sync
         """
+        if not self.dev_mode:
+            return UvResult(
+                success=True,
+                message="生产模式跳过 uv 依赖检查",
+                needs_sync=False,
+            )
         if not self.is_available():
             return UvResult(
                 success=False,
@@ -83,13 +231,24 @@ class UvManager:
             )
 
         try:
-            cmd = [str(self.uv_exec), "sync", "--check", "--quiet"]
+            self._ensure_local_python_home()
+            python_args = self._build_uv_python_args()
+            cmd = [
+                str(self.uv_exec),
+                "sync",
+                "--check",
+                "--quiet",
+                "--no-install-project",
+                *python_args,
+            ]
 
             result = subprocess.run(
                 cmd,
                 cwd=str(self.project_root),
                 capture_output=True,
-                timeout=60
+                timeout=60,
+                env=self._build_uv_env(),
+                **self._windows_no_window_kwargs(),
             )
 
             if result.returncode == 0:
@@ -128,14 +287,19 @@ class UvManager:
         Returns:
             UvResult: 同步结果
         """
+        if not self.dev_mode:
+            return UvResult(success=True, message="生产模式跳过 uv 依赖同步")
         if not self.is_available():
             return UvResult(
                 success=False,
                 message="uv 未安装或不可用"
             )
 
+        self._ensure_local_python_home()
+
         # 构建命令
-        cmd = [str(self.uv_exec), "sync"]
+        python_args = self._build_uv_python_args()
+        cmd = [str(self.uv_exec), "sync", "--no-install-project", *python_args]
 
         if self.dev_mode:
             # 开发模式：安装所有可选依赖
@@ -158,7 +322,9 @@ class UvManager:
                 stderr=subprocess.STDOUT,
                 text=True,
                 encoding='utf-8',
-                errors='replace'
+                errors='replace',
+                env=self._build_uv_env(),
+                **self._windows_no_window_kwargs(),
             )
 
             output_lines = []
@@ -203,7 +369,17 @@ class UvManager:
             )
 
     def get_python_path(self) -> Optional[Path]:
-        """获取 uv 管理的 Python 路径"""
+        """
+        获取 Python 路径。
+
+        V3.2.4+dev.20260306.02: 生产模式仅使用嵌入式 Python
+        """
+        # 生产模式：仅使用嵌入式 Python
+        if not self.dev_mode:
+            embedded_python = self._find_embedded_python()
+            return embedded_python
+
+        # 开发模式：使用 venv Python
         venv_python = self.project_root / ".venv" / "Scripts" / "python.exe"
         if venv_python.exists():
             return venv_python
@@ -217,7 +393,14 @@ class UvManager:
 
     def get_site_packages(self) -> Optional[Path]:
         """获取 site-packages 路径"""
-        # Windows
+        # 生产模式：嵌入式 Python
+        if not self.dev_mode:
+            embedded_site = self.project_root / "tools" / "python" / "Lib" / "site-packages"
+            if embedded_site.exists():
+                return embedded_site
+            return None
+
+        # 开发模式：venv
         site_packages = self.project_root / ".venv" / "Lib" / "site-packages"
         if site_packages.exists():
             return site_packages
@@ -234,8 +417,15 @@ class UvManager:
         return None
 
     def ensure_venv(self) -> UvResult:
-        """确保虚拟环境存在"""
+        """
+        确保虚拟环境存在。
+
+        V3.2.4+dev.20260306.02: 仅开发模式允许创建 venv
+        """
         venv_dir = self.project_root / ".venv"
+
+        if not self.dev_mode:
+            return UvResult(success=False, message="生产模式禁止创建虚拟环境")
 
         if venv_dir.exists():
             return UvResult(success=True, message="虚拟环境已存在")
@@ -248,11 +438,18 @@ class UvManager:
 
         try:
             cmd = [str(self.uv_exec), "venv", str(venv_dir)]
+            if not self.dev_mode:
+                embedded_python = self._find_embedded_python()
+                if embedded_python:
+                    cmd.extend(["--python", str(embedded_python)])
+
             result = subprocess.run(
                 cmd,
                 cwd=str(self.project_root),
                 capture_output=True,
-                timeout=120
+                timeout=120,
+                env=self._build_uv_env(),
+                **self._windows_no_window_kwargs(),
             )
 
             if result.returncode == 0:
@@ -269,7 +466,7 @@ class UvManager:
         构建运行 Python 探针脚本时的环境变量。
 
         设计考虑：
-        - 优先将 `.venv/Lib/site-packages/torch/lib` 注入 PATH，减少 Windows 下 DLL 搜索歧义。
+        - 优先将 site-packages 下的 torch/lib 注入 PATH，减少 Windows 下 DLL 搜索歧义。
         - 保持与启动器主流程一致，仅做最小必要补充，不覆盖用户已有 PATH。
         """
         env = os.environ.copy()
@@ -334,6 +531,7 @@ class UvManager:
                 errors="replace",
                 timeout=30,
                 env=self._build_python_runtime_env(site_packages),
+                **self._windows_no_window_kwargs(),
             )
         except Exception as exc:
             return OnnxRuntimeProviderStatus(
@@ -388,6 +586,7 @@ class UvManager:
                 encoding="utf-8",
                 errors="replace",
                 timeout=15,
+                **self._windows_no_window_kwargs(),
             )
         except Exception as exc:
             logger.warning("读取包版本失败: package=%s error=%s", package_name, exc)
@@ -424,6 +623,8 @@ class UvManager:
                 encoding="utf-8",
                 errors="replace",
                 timeout=180,
+                env=self._build_uv_env(),
+                **self._windows_no_window_kwargs(),
             )
         except Exception as exc:
             return UvResult(success=False, message=f"执行 ORT-GPU 自动修正异常: {exc}")
@@ -451,6 +652,9 @@ class UvManager:
         - 不尝试从依赖图移除 `onnxruntime`（上游包强依赖，风险高）。
         - 采用“uv sync 后重装 onnxruntime-gpu（无依赖）+ provider 探针”稳定结果。
         """
+        if not self.dev_mode:
+            return UvResult(success=True, message="生产模式跳过 ONNX Runtime GPU 自动修正")
+
         gpu_version = self._get_installed_distribution_version(python_exec, "onnxruntime-gpu")
         if not gpu_version:
             return UvResult(success=True, message="未检测到 onnxruntime-gpu，跳过自动修正")

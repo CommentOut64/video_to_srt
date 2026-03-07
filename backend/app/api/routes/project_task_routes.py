@@ -9,11 +9,19 @@ Project 语义任务控制路由。
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException
 from app.models.project_models import infer_task_mode
+from app.services.model_task_guard_service import (
+    enforce_required_models_ready,
+    resolve_model_task_guard_mode_from_env,
+    resolve_model_task_guard_poll_sec_from_env,
+    resolve_model_task_guard_timeout_sec_from_env,
+    resolve_required_model_ids_for_job_settings,
+)
 
 
 def _get_queue_service(transcription_service):
@@ -27,9 +35,56 @@ def _get_project_service():
     return get_project_service()
 
 
-def create_project_task_router(transcription_service) -> APIRouter:
+def create_project_task_router(transcription_service: Optional[Any] = None) -> APIRouter:
     """创建 Project 语义任务控制路由。"""
     router = APIRouter(prefix="/api/projects", tags=["project-tasks"])
+    runtime_enabled = (
+        transcription_service is not None
+        and getattr(transcription_service, "job_lifecycle", None) is not None
+    )
+
+    def _require_runtime_service() -> Any:
+        if runtime_enabled and transcription_service is not None:
+            return transcription_service
+        raise HTTPException(status_code=422, detail="Lite 模式不支持该任务队列操作")
+
+    async def _guard_models_before_enqueue(job_settings: Optional[Any] = None) -> None:
+        guard_mode = resolve_model_task_guard_mode_from_env()
+        if guard_mode == "off":
+            return
+
+        try:
+            from app.services.model_manager_v2 import get_model_manager_v2
+            from app.services.model_bootstrap_service import get_model_bootstrap_service
+        except Exception:
+            return
+
+        model_manager = get_model_manager_v2()
+        bootstrap_service = get_model_bootstrap_service(model_manager=model_manager)
+        timeout_sec = resolve_model_task_guard_timeout_sec_from_env(guard_mode)
+        poll_sec = resolve_model_task_guard_poll_sec_from_env()
+        required_ids = resolve_required_model_ids_for_job_settings(
+            model_manager=model_manager,
+            bootstrap_service=bootstrap_service,
+            job_settings=job_settings,
+        )
+        decision = await enforce_required_models_ready(
+            model_manager=model_manager,
+            bootstrap_service=bootstrap_service,
+            mode=guard_mode,
+            timeout_sec=timeout_sec,
+            poll_sec=poll_sec,
+            required_model_ids=required_ids,
+        )
+        if not bool(decision.get("is_ready")):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "MODEL_NOT_READY",
+                    "message": "必需模型未就绪，请等待模型下载/修复完成后再启动任务",
+                    **decision,
+                },
+            )
 
     def _resolve_project_identity(identifier: str):
         from app.services.project_id_resolver import get_project_id_resolver
@@ -47,6 +102,8 @@ def create_project_task_router(transcription_service) -> APIRouter:
         *,
         legacy_job_id: Optional[str] = None,
     ) -> Optional[Any]:
+        if not runtime_enabled or transcription_service is None:
+            return None
         runtime_job = transcription_service.get_job(project_id)
         if runtime_job is not None:
             return runtime_job
@@ -99,6 +156,8 @@ def create_project_task_router(transcription_service) -> APIRouter:
         )
 
     def _find_repo_task_for_identifiers(identifiers: set[str]) -> Optional[Any]:
+        if not runtime_enabled or transcription_service is None:
+            return None
         lifecycle = getattr(transcription_service, "job_lifecycle", None)
         state_repo = getattr(lifecycle, "state_repo", None)
         if state_repo is None:
@@ -298,12 +357,15 @@ def create_project_task_router(transcription_service) -> APIRouter:
         result["task_mode"] = runtime_task_mode
         result["is_project_only"] = runtime_task_mode == "subtitle_edit"
 
-        queue_state = transcription_service.job_lifecycle.state_repo.load_queue_state()
-        if queue_state:
-            if runtime_job_id in queue_state.queue:
-                result["queue_position"] = queue_state.queue.index(runtime_job_id) + 1
-            elif runtime_job_id == queue_state.running_job_id:
-                result["queue_position"] = 0
+        if runtime_enabled and transcription_service is not None:
+            queue_state = transcription_service.job_lifecycle.state_repo.load_queue_state()
+            if queue_state:
+                if runtime_job_id in queue_state.queue:
+                    result["queue_position"] = queue_state.queue.index(runtime_job_id) + 1
+                elif runtime_job_id == queue_state.running_job_id:
+                    result["queue_position"] = 0
+                else:
+                    result["queue_position"] = -1
             else:
                 result["queue_position"] = -1
         else:
@@ -356,15 +418,16 @@ def create_project_task_router(transcription_service) -> APIRouter:
     @router.post("/{project_id}/tasks/pause")
     async def pause_project_task(project_id: str):
         """暂停任务。"""
+        runtime_service = _require_runtime_service()
         identity, runtime_job = _resolve_runtime_job_or_404(project_id)
         runtime_job_id = str(getattr(runtime_job, "job_id", "") or "")
-        queue_service = _get_queue_service(transcription_service)
+        queue_service = _get_queue_service(runtime_service)
         ok = queue_service.pause_job(runtime_job_id)
         if not ok:
             raise HTTPException(status_code=404, detail="任务未找到")
 
         job_snapshot = None
-        persisted_job = transcription_service.job_lifecycle.state_repo.get_task(runtime_job_id)
+        persisted_job = runtime_service.job_lifecycle.state_repo.get_task(runtime_job_id)
         if persisted_job is not None:
             persisted_job.project_id = identity.project_id
             job_snapshot = _build_task_snapshot(persisted_job)
@@ -378,9 +441,11 @@ def create_project_task_router(transcription_service) -> APIRouter:
     @router.post("/{project_id}/tasks/resume")
     async def resume_project_task(project_id: str):
         """恢复任务。"""
+        runtime_service = _require_runtime_service()
         identity, runtime_job = _resolve_runtime_job_or_404(project_id)
         runtime_job_id = str(getattr(runtime_job, "job_id", "") or "")
-        queue_service = _get_queue_service(transcription_service)
+        queue_service = _get_queue_service(runtime_service)
+        await _guard_models_before_enqueue(getattr(runtime_job, "settings", None))
         ok = queue_service.resume_job(runtime_job_id)
         if not ok:
             raise HTTPException(status_code=400, detail="无法恢复任务（任务未暂停或不存在）")
@@ -389,7 +454,7 @@ def create_project_task_router(transcription_service) -> APIRouter:
         if runtime_job_id in queue_service.queue:
             queue_position = list(queue_service.queue).index(runtime_job_id) + 1
         job_snapshot = None
-        persisted_job = transcription_service.job_lifecycle.state_repo.get_task(runtime_job_id)
+        persisted_job = runtime_service.job_lifecycle.state_repo.get_task(runtime_job_id)
         if persisted_job is not None:
             persisted_job.project_id = identity.project_id
             job_snapshot = _build_task_snapshot(persisted_job)
@@ -408,6 +473,33 @@ def create_project_task_router(transcription_service) -> APIRouter:
         requested_identifier = str(project_id or "").strip()
         if not requested_identifier:
             raise HTTPException(status_code=404, detail="任务未找到")
+
+        if not runtime_enabled or transcription_service is None:
+            if not delete_data:
+                raise HTTPException(status_code=422, detail="Lite 模式仅支持删除项目数据")
+            identity = _resolve_project_identity(project_id)
+            project_dir = Path(identity.project_dir)
+            if not project_dir.exists():
+                raise HTTPException(status_code=404, detail="任务目录不存在")
+            try:
+                shutil.rmtree(project_dir)
+            except PermissionError as exc:
+                raise HTTPException(status_code=423, detail="当前有进程占用，请稍后再试") from exc
+            except OSError as exc:
+                raise HTTPException(status_code=400, detail=f"删除失败: {exc}") from exc
+            return {
+                "project_id": identity.project_id,
+                "job_id": identity.project_id,
+                "canceled": True,
+                "data_deleted": True,
+                "success": True,
+                "status": "removed",
+                "reason_code": "delete_immediate",
+                "message": "项目已删除",
+                "pending_delete": False,
+                "state_seq": 0,
+                "task": None,
+            }
 
         identity = None
         runtime_job = None
@@ -442,7 +534,8 @@ def create_project_task_router(transcription_service) -> APIRouter:
                 # 兜底到请求标识，复用 queue_service.cancel_job(delete_data=True) 的幂等删除能力。
                 runtime_job_id = requested_identifier
 
-        queue_service = _get_queue_service(transcription_service)
+        runtime_service = _require_runtime_service()
+        queue_service = _get_queue_service(runtime_service)
         result = queue_service.cancel_job(runtime_job_id, delete_data=delete_data)
         if not result.success:
             status_code = _map_cancel_error_status(
@@ -455,7 +548,7 @@ def create_project_task_router(transcription_service) -> APIRouter:
             )
 
         job_snapshot = None
-        persisted_job = transcription_service.job_lifecycle.state_repo.get_task(runtime_job_id)
+        persisted_job = runtime_service.job_lifecycle.state_repo.get_task(runtime_job_id)
         if persisted_job is not None:
             persisted_project_id = str(getattr(persisted_job, "project_id", "") or "").strip()
             if persisted_project_id:
@@ -479,9 +572,10 @@ def create_project_task_router(transcription_service) -> APIRouter:
     @router.post("/{project_id}/tasks/prioritize")
     async def prioritize_project_task(project_id: str, mode: Optional[str] = None):
         """插队任务。"""
+        runtime_service = _require_runtime_service()
         identity, runtime_job = _resolve_runtime_job_or_404(project_id)
         runtime_job_id = str(getattr(runtime_job, "job_id", "") or "")
-        queue_service = _get_queue_service(transcription_service)
+        queue_service = _get_queue_service(runtime_service)
         result = queue_service.prioritize_job(runtime_job_id, mode=mode)
         if not bool(result.get("success")):
             raise HTTPException(status_code=400, detail=result.get("error", "无法优先此任务"))
@@ -508,7 +602,18 @@ def create_project_task_router(transcription_service) -> APIRouter:
     @router.get("/tasks/queue-status")
     async def get_project_task_queue_status():
         """获取队列状态（增加 project 语义镜像字段）。"""
-        queue_service = _get_queue_service(transcription_service)
+        if not runtime_enabled or transcription_service is None:
+            return {
+                "queue": [],
+                "running": None,
+                "queue_length": 0,
+                "jobs": {},
+                "queue_project_ids": [],
+                "running_project_id": None,
+            }
+
+        runtime_service = _require_runtime_service()
+        queue_service = _get_queue_service(runtime_service)
         queue_status = queue_service.get_queue_status()
 
         queue_job_ids = list(queue_status.get("queue", []))
@@ -530,6 +635,32 @@ def create_project_task_router(transcription_service) -> APIRouter:
         queue_status["queue_project_ids"] = queue_project_ids
         queue_status["running_project_id"] = running_project_id
         return queue_status
+
+    @router.get("/tasks/runtime-diagnostics")
+    async def get_project_task_runtime_diagnostics():
+        """获取任务队列运行时诊断快照（压测/观测用途）。"""
+        if not runtime_enabled or transcription_service is None:
+            return {
+                "runtime_enabled": False,
+                "queue_length": 0,
+                "jobs_count": 0,
+                "pending_cancel_count": 0,
+                "orphan_execution_count": 0,
+                "runner_thread_count": 0,
+                "runner_alive_count": 0,
+                "pending_physical_delete_count": 0,
+                "logically_removed_count": 0,
+                "cancellation_token_count": 0,
+                "sse_publisher_cache_count": 0,
+                "is_gpu_busy_override": False,
+                "is_runner_gate_blocking": False,
+            }
+
+        runtime_service = _require_runtime_service()
+        queue_service = _get_queue_service(runtime_service)
+        diagnostics = queue_service.get_runtime_diagnostics()
+        diagnostics["runtime_enabled"] = True
+        return diagnostics
 
     @router.get("/tasks/sync")
     async def sync_project_tasks():
@@ -565,8 +696,30 @@ def create_project_task_router(transcription_service) -> APIRouter:
                 return incoming_is_canonical
             return incoming_id > existing_id
 
-        lifecycle = transcription_service.job_lifecycle
         project_service = _get_project_service()
+        if not runtime_enabled or transcription_service is None:
+            tasks: list[Dict[str, Any]] = []
+            for project in project_service.list_projects():
+                if not _is_project_only_project(project):
+                    continue
+                tasks.append(_build_project_only_task_snapshot(project))
+            tasks.sort(
+                key=lambda item: float(item.get("updated_at") or item.get("created_time") or 0.0),
+                reverse=True,
+            )
+            return {
+                "success": True,
+                "tasks": tasks,
+                "count": len(tasks),
+                "queue": [],
+                "queue_project_ids": [],
+                "running_job_id": None,
+                "running_project_id": None,
+                "queue_updated_at": None,
+            }
+
+        runtime_service = _require_runtime_service()
+        lifecycle = runtime_service.job_lifecycle
         tasks = lifecycle.list_tasks_summary()
         existing_project_ids: set[str] = set()
         for task in tasks:

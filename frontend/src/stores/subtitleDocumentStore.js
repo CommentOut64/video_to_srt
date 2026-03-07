@@ -50,6 +50,7 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
   const pendingUpdates = ref(new Map())
   const isSyncing = ref(false)
   const syncErrors = ref(new Map())
+  let inflightProcessQueuePromise = null
 
   const subtitles = computed(() => projectStore.subtitles)
   const timeOffsetSec = computed(() => projectStore.subtitleOffset)
@@ -108,6 +109,10 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
       )
       if (bySentenceIndex) return bySentenceIndex
     }
+    const byLocalId = projectStore.subtitles.find(
+      (item) => String(item.id || '') === target
+    )
+    if (byLocalId) return byLocalId
     return null
   }
 
@@ -211,6 +216,7 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
     await migrateSubtitleSyncQueue(resolvedIdentityId)
     pendingUpdates.value = await loadQueue(resolvedIdentityId)
     currentSyncIdentityId.value = resolvedIdentityId
+    syncErrors.value.clear()
   }
 
   async function restoreFromServer(segments = [], metadata = {}) {
@@ -231,7 +237,9 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
     let appliedCount = 0
     pendingUpdates.value.forEach((update, index) => {
       const subtitle = targetStore.subtitles.find(
-        (item) => item.sentenceIndex === index || String(item.segment_id ?? '') === String(index)
+        (item) => item.sentenceIndex === index
+          || String(item.segment_id ?? '') === String(index)
+          || String(item.id ?? '') === String(index)
       )
       if (!subtitle || !update || typeof update !== 'object') return
 
@@ -249,7 +257,7 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
     return appliedCount
   }
 
-  async function processQueue() {
+  async function runProcessQueuePass() {
     if (pendingUpdates.value.size === 0) return
     const identityId = getActiveIdentity()
     if (!identityId) return
@@ -271,6 +279,16 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
             const staleSubtitle = findSubtitleByQueueKey(queueKey)
             if (!staleSubtitle) {
               // 队列里残留了已不存在的字幕键，直接丢弃避免阻塞后续导出。
+              syncErrors.value.delete(queueKey)
+              continue
+            }
+            const isWaitingSegmentBinding = !staleSubtitle.segment_id
+              && (staleSubtitle.sentenceIndex === undefined || staleSubtitle.sentenceIndex === null)
+            if (isWaitingSegmentBinding) {
+              // 本地新增字幕尚未拿到 segment_id：保留队列等待结构性创建落地后再同步。
+              if (!pendingUpdates.value.has(queueKey)) {
+                pendingUpdates.value.set(queueKey, data)
+              }
               syncErrors.value.delete(queueKey)
               continue
             }
@@ -301,6 +319,24 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
       await saveQueue(identityId, pendingUpdates.value)
     } finally {
       isSyncing.value = false
+    }
+  }
+
+  async function processQueue() {
+    // 已有同步在飞行时，先等待，避免 forceSyncNow 提前返回。
+    if (inflightProcessQueuePromise) {
+      await inflightProcessQueuePromise
+    }
+    if (pendingUpdates.value.size === 0) return
+
+    const currentPassPromise = runProcessQueuePass()
+    inflightProcessQueuePromise = currentPassPromise
+    try {
+      await currentPassPromise
+    } finally {
+      if (inflightProcessQueuePromise === currentPassPromise) {
+        inflightProcessQueuePromise = null
+      }
     }
   }
 

@@ -1326,23 +1326,11 @@ class MediaPrepService:
             except Exception as e:
                 logger.debug(f"[MediaPrep] 卸载 Demucs 模型失败（可能未加载）: {e}")
 
-            # 4. 卸载 Brouhaha 模型 (V3.1.1+dev.20260108.04)
-            # V3.1.2+dev.20260113.01: 避免触发不必要的模型加载
-            try:
-                from app.services import brouhaha_service
-                # 只有当单例已存在时才卸载，避免触发初始化加载
-                if brouhaha_service._brouhaha_instance is not None:
-                    if brouhaha_service._brouhaha_instance.is_available():
-                        brouhaha_service._brouhaha_instance.unload()
-                        logger.info("[MediaPrep] 已卸载 Brouhaha 模型")
-            except Exception as e:
-                logger.debug(f"[MediaPrep] 卸载 Brouhaha 模型失败（可能未加载）: {e}")
-
-            # 5. 清理 CUDA 缓存（Lite 下自动跳过）
+            # 4. 清理 CUDA 缓存（Lite 下自动跳过）
             gc.collect()
             self._clear_cuda_cache_if_available()
 
-            # 6. 等待资源释放
+            # 5. 等待资源释放
             import time
             time.sleep(1)
 

@@ -64,6 +64,7 @@ from app.api.routes import config_routes  # 新增：用户配置路由
 from app.api.routes import debug_routes  # 新增：调试路由
 from app.api.routes import presets_routes  # V3.2.4: 自定义预设路由
 from app.api.routes.homophone_routes import create_homophone_router  # 同音检索路由（Full/Lite 共用）
+from app.api.routes.project_task_routes import create_project_task_router  # Project 任务路由（Full/Lite 共用）
 from app.services.file_service import FileManagementService
 
 # 导入FFmpeg管理器
@@ -71,6 +72,80 @@ from app.services.ffmpeg_manager import get_ffmpeg_manager
 
 # 配置日志（在其他初始化之前）
 logger = setup_logging()
+VALID_UI_MODES = {"browser", "electron", "none"}
+VALID_MODEL_BOOTSTRAP_MODES = {"strict", "background", "off"}
+FULL_RUNTIME_ENABLED = not IS_LITE
+FULL_RUNTIME_DISABLE_REASON = ""
+
+
+def _windows_hidden_subprocess_kwargs() -> dict:
+    """Windows 下子进程无窗口参数。"""
+    if os.name != "nt":
+        return {}
+
+    kwargs = {}
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if creationflags:
+        kwargs["creationflags"] = creationflags
+
+    startupinfo_cls = getattr(subprocess, "STARTUPINFO", None)
+    startf_use_showwindow = getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+    sw_hide = getattr(subprocess, "SW_HIDE", 0)
+    if startupinfo_cls and startf_use_showwindow:
+        startupinfo = startupinfo_cls()
+        startupinfo.dwFlags |= startf_use_showwindow
+        startupinfo.wShowWindow = sw_hide
+        kwargs["startupinfo"] = startupinfo
+    return kwargs
+
+
+def _resolve_ui_mode_from_env() -> str:
+    """解析 UI 模式，未知值回退到 browser。"""
+    raw_ui_mode = str(os.environ.get("ANCHORFLUX_UI_MODE", "browser")).strip().lower()
+    if raw_ui_mode in VALID_UI_MODES:
+        return raw_ui_mode
+    logger.warning(f"未知 ANCHORFLUX_UI_MODE={raw_ui_mode}，回退为 browser")
+    return "browser"
+
+
+def _resolve_model_bootstrap_mode_from_env() -> str:
+    """
+    解析模型自愈模式。
+
+    - strict: 启动阶段同步校验必需模型，失败直接阻断启动；
+    - background: 启动后后台自愈，不阻塞启动；
+    - off: 关闭自动自愈。
+    """
+    raw_mode = str(os.getenv("MODEL_BOOTSTRAP_MODE", "")).strip().lower()
+    if raw_mode in VALID_MODEL_BOOTSTRAP_MODES:
+        return raw_mode
+
+    # 兼容旧变量 MODEL_BOOTSTRAP_AUTO
+    legacy_auto = str(os.getenv("MODEL_BOOTSTRAP_AUTO", "")).strip().lower()
+    if legacy_auto:
+        if legacy_auto in {"0", "false", "no", "off"}:
+            return "off"
+        return "background"
+
+    # 默认不阻塞启动：后台自愈（可用 MODEL_BOOTSTRAP_MODE=strict 强制启动前校验）
+    return "background"
+
+
+def _disable_full_runtime(reason: str, exc=None):
+    """
+    关闭 Full 专属能力，回退为 Lite 能力集运行。
+
+    设计取舍：
+    - 当 flavor 判定为 full 但运行时依赖缺失时，优先保证服务可启动；
+    - 降级后仅禁用 Full 路由与初始化，不影响 Lite 编辑链路。
+    """
+    global FULL_RUNTIME_ENABLED, FULL_RUNTIME_DISABLE_REASON
+    FULL_RUNTIME_ENABLED = False
+    FULL_RUNTIME_DISABLE_REASON = reason
+    if exc is not None:
+        logger.warning(f"Full 能力降级为 Lite：{reason}（{exc}）")
+    else:
+        logger.warning(f"Full 能力降级为 Lite：{reason}")
 
 
 def cleanup_old_processes():
@@ -173,22 +248,32 @@ def cleanup_old_processes():
         logger.warning("psutil 未安装，使用备选方案清理进程")
         # 回退到 taskkill 方案
         try:
-            # 使用 netstat 和 taskkill
             result = subprocess.run(
-                'netstat -ano | findstr ":8000" | findstr "LISTENING"',
-                shell=True,
+                ["netstat", "-ano", "-p", "tcp"],
                 capture_output=True,
-                timeout=5
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+                **_windows_hidden_subprocess_kwargs(),
             )
             if result.returncode == 0 and result.stdout:
-                # V3.1.0+dev.20260104.01: 修复 Windows 编码问题
-                lines = result.stdout.decode('utf-8', errors='replace').strip().split('\n')
+                lines = result.stdout.strip().split('\n')
                 for line in lines:
+                    if ':8000' not in line:
+                        continue
+                    if "LISTENING" not in line.upper() and "侦听" not in line:
+                        continue
                     parts = line.split()
                     if len(parts) >= 5:
                         pid = parts[-1]
                         if pid != str(current_pid):
-                            subprocess.run(['taskkill', '/F', '/PID', pid], capture_output=True, timeout=3)
+                            subprocess.run(
+                                ['taskkill', '/F', '/PID', pid],
+                                capture_output=True,
+                                timeout=3,
+                                **_windows_hidden_subprocess_kwargs(),
+                            )
                             cleaned_count += 1
                             logger.info(f"已清理端口 8000 上的旧进程 (PID: {pid})")
         except Exception as e:
@@ -234,27 +319,41 @@ app.include_router(legacy_router)  # Task6: legacy 兼容路由
 app.include_router(stream_router)  # Task6: 项目级 SSE 路由
 
 # 注册仅 Full 模式可用的路由
-if not IS_LITE:
-    from app.api.routes import model_routes
-    from app.api.routes import model_runtime_routes
-    from app.api.routes.demucs_routes import create_demucs_router
+if FULL_RUNTIME_ENABLED:
+    try:
+        from app.api.routes import model_routes
+        from app.api.routes import model_runtime_routes
+        from app.api.routes.demucs_routes import create_demucs_router
+    except ModuleNotFoundError as import_exc:
+        _disable_full_runtime("模型/分离路由依赖缺失", import_exc)
+    else:
+        app.include_router(model_routes.router)
+        app.include_router(model_runtime_routes.router)
 
-    app.include_router(model_routes.router)
-    app.include_router(model_runtime_routes.router)
+        # 注册Demucs配置路由（需要在转录路由之前注册）
+        demucs_router = create_demucs_router()
+        app.include_router(demucs_router)
 
-    # 注册Demucs配置路由（需要在转录路由之前注册）
-    demucs_router = create_demucs_router()
-    app.include_router(demucs_router)
+if not FULL_RUNTIME_ENABLED:
+    if IS_LITE:
+        logger.info("Lite 模式启动：已禁用 Full 专属路由。")
+    else:
+        logger.warning(
+            f"检测到 Full 运行时依赖不完整，已按 Lite 能力集启动。原因: {FULL_RUNTIME_DISABLE_REASON or '未知原因'}"
+        )
 
 @app.on_event("startup")
 async def startup_event():
     """应用启动事件 - 初始化模型管理器和FFmpeg检测"""
+    bootstrap_mode = _resolve_model_bootstrap_mode_from_env()
+    is_strict_bootstrap_mode = bootstrap_mode == "strict"
     try:
         transcription_service_instance = None
 
         logger.info("="  * 60)
         logger.info("服务启动中...")
         logger.info("=" * 60)
+        logger.info(f"模型自愈模式: {bootstrap_mode}")
 
         # 1. 设置SSE事件循环引用（必须在模型管理器初始化之前！）
         logger.info("步骤 1/4: 设置SSE事件循环...")
@@ -282,20 +381,73 @@ async def startup_event():
             logger.warning(f"FFmpeg检测失败: {e}")
             logger.warning("转录功能可能无法使用，请手动安装FFmpeg")
 
-        if not IS_LITE:
-            # 3. 初始化模型管理器（此时事件循环已设置，后台验证可以正常推送SSE）
-            logger.info("步骤 3/4: 初始化模型管理器...")
-            from app.services.model_manager_v2 import get_model_manager_v2
-            model_manager = get_model_manager_v2()
-            logger.info("模型管理器初始化成功 (V2)")
+        if FULL_RUNTIME_ENABLED:
+            try:
+                # 3. 初始化模型管理器（此时事件循环已设置，后台验证可以正常推送SSE）
+                logger.info("步骤 3/4: 初始化模型管理器...")
+                from app.services.model_manager_v2 import get_model_manager_v2
+                from app.services.model_bootstrap_service import get_model_bootstrap_service
+                model_manager = get_model_manager_v2()
+                logger.info("模型管理器初始化成功 (V2)")
 
-            # 4. 初始化队列服务（新增）
-            logger.info("步骤 4/4: 初始化任务队列服务...")
-            from app.services.job_queue_service import get_queue_service
-            from app.services.transcription_service import get_transcription_service
-            transcription_service_instance = get_transcription_service(str(config.JOBS_DIR))
-            queue_service = get_queue_service(transcription_service_instance)
-            logger.info("任务队列服务已启动")
+                # 3.5 模型自愈策略（strict/background/off）
+                bootstrap_service = get_model_bootstrap_service(model_manager=model_manager)
+                if bootstrap_mode == "strict":
+                    required_model_ids = bootstrap_service.resolve_required_model_ids()
+                    logger.info(
+                        "模型自愈模式=strict，启动阶段同步校验必需模型: count=%d",
+                        len(required_model_ids),
+                    )
+                    summary = await bootstrap_service.run_once(
+                        model_ids=required_model_ids,
+                        is_force=False,
+                        is_required_on_boot=True,
+                    )
+                    failed_models = list(summary.get("failed_models") or [])
+                    if failed_models:
+                        raise RuntimeError(
+                            f"严格模式模型校验失败，无法启动。失败模型: {failed_models}"
+                        )
+                    logger.info("严格模式必需模型校验通过")
+
+                    # 可选：必需模型之外的模型转为后台自愈，不阻塞启动。
+                    all_model_ids = [spec.id for spec in model_manager.registry.list()]
+                    background_ids = [
+                        model_id
+                        for model_id in all_model_ids
+                        if model_id not in set(required_model_ids)
+                    ]
+                    if background_ids:
+                        is_started = bootstrap_service.start_non_blocking(
+                            model_ids=background_ids,
+                            is_force=False,
+                            is_required_on_boot=False,
+                        )
+                        if is_started:
+                            logger.info(
+                                "严格模式下已启动非必需模型后台自愈: count=%d",
+                                len(background_ids),
+                            )
+                elif bootstrap_mode == "background":
+                    is_bootstrap_started = bootstrap_service.start_non_blocking()
+                    if is_bootstrap_started:
+                        logger.info("模型后台自愈任务已启动（非阻塞）")
+                    else:
+                        logger.info("模型后台自愈任务已在运行，跳过重复启动")
+                else:
+                    logger.info("模型后台自愈任务已禁用（MODEL_BOOTSTRAP_MODE=off）")
+
+                # 4. 初始化队列服务（新增）
+                logger.info("步骤 4/4: 初始化任务队列服务...")
+                from app.services.job_queue_service import get_queue_service
+                from app.services.transcription_service import get_transcription_service
+                transcription_service_instance = get_transcription_service(str(config.JOBS_DIR))
+                queue_service = get_queue_service(transcription_service_instance)
+                logger.info("任务队列服务已启动")
+            except ModuleNotFoundError as import_exc:
+                _disable_full_runtime("启动阶段 Full 依赖缺失", import_exc)
+                transcription_service_instance = None
+                logger.info("已回退为 Lite 能力集启动（保留编辑与项目能力）。")
         else:
             logger.info("Lite 模式启动: 跳过模型管理与转录队列初始化")
 
@@ -350,30 +502,23 @@ async def startup_event():
                 )
                 updated_jobs.extend(list(dir_report.get("updated_jobs", [])))
                 logger.info(
-                    (
-                        "Project 目录命名迁移结果: dry_run=%s scanned=%s renamed=%s "
-                        "skipped=%s failed=%s updated_jobs=%s updated_task_rows=%s"
-                    ),
-                    bool(dir_report.get("dry_run", False)),
-                    dir_report.get("scanned", 0),
-                    dir_report.get("renamed", 0),
-                    dir_report.get("skipped", 0),
-                    dir_report.get("failed", 0),
-                    len(dir_report.get("updated_jobs", [])),
-                    dir_report.get("updated_task_rows", 0),
+                    "Project 目录命名迁移结果: "
+                    f"dry_run={bool(dir_report.get('dry_run', False))} "
+                    f"scanned={dir_report.get('scanned', 0)} "
+                    f"renamed={dir_report.get('renamed', 0)} "
+                    f"skipped={dir_report.get('skipped', 0)} "
+                    f"failed={dir_report.get('failed', 0)} "
+                    f"updated_jobs={len(dir_report.get('updated_jobs', []))} "
+                    f"updated_task_rows={dir_report.get('updated_task_rows', 0)}"
                 )
                 dir_failures = list(dir_report.get("failures", []))
                 for failure in dir_failures[:10]:
                     logger.warning(
-                        "Project 目录命名迁移失败: dir=%s error=%s",
-                        failure.get("dir", ""),
-                        failure.get("error", ""),
+                        f"Project 目录命名迁移失败: dir={failure.get('dir', '')} "
+                        f"error={failure.get('error', '')}"
                     )
                 if len(dir_failures) > 10:
-                    logger.warning(
-                        "Project 目录命名迁移失败项过多，已截断展示: remaining=%s",
-                        len(dir_failures) - 10,
-                    )
+                    logger.warning(f"Project 目录命名迁移失败项过多，已截断展示: remaining={len(dir_failures) - 10}")
             else:
                 logger.info("Project 目录命名迁移已禁用（PROJECT_DIR_MIGRATION_ENABLED）")
 
@@ -394,37 +539,30 @@ async def startup_event():
                         persisted_jobs += 1
                         continue
                     logger.warning(
-                        "Project 迁移后任务元信息回写失败: job_id=%s project_id=%s",
-                        getattr(runtime_job, "job_id", ""),
-                        getattr(runtime_job, "project_id", ""),
+                        f"Project 迁移后任务元信息回写失败: "
+                        f"job_id={getattr(runtime_job, 'job_id', '')} "
+                        f"project_id={getattr(runtime_job, 'project_id', '')}"
                     )
 
             logger.info(
-                (
-                    "Project workspace 迁移结果: scanned=%s resolved=%s "
-                    "migrated_alias=%s failed=%s updated_jobs=%s persisted=%s"
-                ),
-                migration_report.get("scanned", 0),
-                migration_report.get("resolved", 0),
-                migration_report.get("migrated_alias", 0),
-                migration_report.get("failed", 0),
-                len(updated_jobs),
-                persisted_jobs,
+                "Project workspace 迁移结果: "
+                f"scanned={migration_report.get('scanned', 0)} "
+                f"resolved={migration_report.get('resolved', 0)} "
+                f"migrated_alias={migration_report.get('migrated_alias', 0)} "
+                f"failed={migration_report.get('failed', 0)} "
+                f"updated_jobs={len(updated_jobs)} "
+                f"persisted={persisted_jobs}"
             )
             failures = list(migration_report.get("failures", []))
             for failure in failures[:10]:
                 logger.warning(
-                    "Project workspace 迁移失败: identifier=%s error=%s",
-                    failure.get("identifier", ""),
-                    failure.get("error", ""),
+                    f"Project workspace 迁移失败: identifier={failure.get('identifier', '')} "
+                    f"error={failure.get('error', '')}"
                 )
             if len(failures) > 10:
-                logger.warning(
-                    "Project workspace 迁移失败项过多，已截断展示: remaining=%s",
-                    len(failures) - 10,
-                )
+                logger.warning(f"Project workspace 迁移失败项过多，已截断展示: remaining={len(failures) - 10}")
         except Exception as migration_exc:
-            logger.warning("Project workspace 迁移检查失败: %s", migration_exc)
+            logger.warning(f"Project workspace 迁移检查失败: {migration_exc}")
 
         # 5.7. 启动补齐 project 元数据（重点补齐 task_mode，防止前端任务模式漂移）
         logger.info("执行 Project 元数据完整性检查...")
@@ -433,18 +571,17 @@ async def startup_event():
 
             normalized_projects = get_project_service().list_projects()
             logger.info(
-                "Project 元数据完整性检查完成: total=%s",
-                len(normalized_projects),
+                f"Project 元数据完整性检查完成: total={len(normalized_projects)}",
             )
         except Exception as metadata_exc:
-            logger.warning("Project 元数据完整性检查失败: %s", metadata_exc)
+            logger.warning(f"Project 元数据完整性检查失败: {metadata_exc}")
 
         # 5.6. 可选：启动阶段执行 Project 单语义强闸（默认关闭）
         strict_guard_enabled = str(os.getenv("PROJECT_SEMANTIC_GUARD_STRICT", "")).strip().lower()
         if strict_guard_enabled in {"1", "true", "yes", "on"}:
             strict_all_enabled = str(os.getenv("PROJECT_SEMANTIC_GUARD_STRICT_ALL", "")).strip().lower()
             is_strict_all = strict_all_enabled in {"1", "true", "yes", "on"}
-            logger.info("Project 单语义强闸已启用: strict_all=%s", is_strict_all)
+            logger.info(f"Project 单语义强闸已启用: strict_all={is_strict_all}")
             try:
                 repo_root = Path(__file__).resolve().parents[2]
                 guard_script = repo_root / "scripts" / "check_project_semantic_guard.py"
@@ -467,26 +604,33 @@ async def startup_event():
                     check=False,
                     encoding="utf-8",
                     errors="replace",
+                    **_windows_hidden_subprocess_kwargs(),
                 )
                 guard_stdout = str(guard_result.stdout or "").strip()
                 guard_stderr = str(guard_result.stderr or "").strip()
                 if guard_stdout:
-                    logger.info("Project 单语义强闸输出:\n%s", guard_stdout)
+                    logger.info(f"Project 单语义强闸输出:\n{guard_stdout}")
                 if guard_stderr:
-                    logger.warning("Project 单语义强闸 stderr:\n%s", guard_stderr)
+                    logger.warning(f"Project 单语义强闸 stderr:\n{guard_stderr}")
                 if guard_result.returncode != 0:
                     raise RuntimeError(
                         "Project 单语义强闸失败，请先修复新增 job 语义违例再启动。"
                     )
             except Exception as guard_exc:
-                logger.error("Project 单语义强闸失败: %s", guard_exc)
+                logger.error(f"Project 单语义强闸失败: {guard_exc}")
                 raise
 
         # 不在启动时预加载模型，等待前端就绪后通过API调用
         logger.info("后端服务已就绪，等待前端启动后进行模型预加载")
 
-        # 6. 延迟检查并打开浏览器（如果没有活跃客户端）
-        asyncio.create_task(open_browser_if_needed())
+        # 6. 根据 ui_mode 决定是否自动打开浏览器
+        ui_mode = _resolve_ui_mode_from_env()
+        if ui_mode == "browser":
+            asyncio.create_task(open_browser_if_needed())
+        elif ui_mode == "electron":
+            logger.info("UI 模式为 electron，跳过后端自动打开浏览器。")
+        else:
+            logger.info("UI 模式为 none，跳过所有自动 UI 行为。")
 
         logger.info("=" * 60)
         logger.info("服务启动完成")
@@ -494,6 +638,8 @@ async def startup_event():
 
     except Exception as e:
         logger.error(f"启动初始化失败: {str(e)}", exc_info=True)
+        if is_strict_bootstrap_mode:
+            raise
 
 
 @app.on_event("shutdown")
@@ -508,7 +654,15 @@ async def shutdown_event():
         except:
             pass
 
-        if not IS_LITE:
+        if FULL_RUNTIME_ENABLED:
+            # 停止模型后台自愈任务
+            try:
+                from app.services.model_bootstrap_service import get_model_bootstrap_service
+                get_model_bootstrap_service().cancel_background()
+                logger.info("模型后台自愈任务已停止")
+            except Exception:
+                pass
+
             # 停止队列服务（新增）
             from app.services.job_queue_service import get_queue_service
             try:
@@ -535,9 +689,13 @@ TEMP_DIR = str(config.TEMP_DIR)
 
 # 初始化转录服务（仅 Full 模式）
 transcription_service = None
-if not IS_LITE:
-    from app.services.transcription_service import get_transcription_service
-    transcription_service = get_transcription_service(JOBS_DIR)
+if FULL_RUNTIME_ENABLED:
+    try:
+        from app.services.transcription_service import get_transcription_service
+        transcription_service = get_transcription_service(JOBS_DIR)
+    except ModuleNotFoundError as import_exc:
+        _disable_full_runtime("转录服务依赖缺失", import_exc)
+        transcription_service = None
 
 # 初始化文件管理服务
 file_service = FileManagementService(INPUT_DIR, OUTPUT_DIR)
@@ -550,22 +708,26 @@ app.include_router(file_router)
 homophone_router = create_homophone_router()
 app.include_router(homophone_router)
 
-# 注册转录路由（包含暂停、恢复等新功能）
-if not IS_LITE:
-    from app.api.routes.transcription_routes import create_transcription_router
-    from app.api.routes.project_task_routes import create_project_task_router
-    from app.api.routes.speaker_routes import create_speaker_router
+# 注册 project 任务路由（Full/Lite 共用，Lite 提供同步/删除能力）
+project_task_router = create_project_task_router(transcription_service)
+app.include_router(project_task_router)
 
-    transcription_router = create_transcription_router(transcription_service, file_service, OUTPUT_DIR)
-    project_task_router = create_project_task_router(transcription_service)
-    app.include_router(transcription_router)
-    app.include_router(project_task_router)
+# 注册转录路由（仅 Full 模式）
+if FULL_RUNTIME_ENABLED and transcription_service is not None:
+    try:
+        from app.api.routes.transcription_routes import create_transcription_router
+        from app.api.routes.speaker_routes import create_speaker_router
+    except ModuleNotFoundError as import_exc:
+        _disable_full_runtime("转录路由依赖缺失", import_exc)
+    else:
+        transcription_router = create_transcription_router(transcription_service, file_service, OUTPUT_DIR)
+        app.include_router(transcription_router)
 
-    # 注册 speaker 路由（说话人 profile/改绑/合并）
-    speaker_router = create_speaker_router(transcription_service)
-    app.include_router(speaker_router)
+        # 注册 speaker 路由（说话人 profile/改绑/合并）
+        speaker_router = create_speaker_router(transcription_service)
+        app.include_router(speaker_router)
 else:
-    logger.info("Lite 模式启动: 跳过 transcription/speaker 路由注册")
+    logger.info("Lite 模式启动: 保留 project-task 路由，跳过 transcription/speaker 路由注册")
 
 ModelPreloadConfig.print_config()
 
@@ -770,7 +932,7 @@ async def get_hardware_status():
 @app.post("/api/models/cache/clear")
 async def clear_models_cache():
     """清空模型缓存（ModelManager V2）。"""
-    if IS_LITE:
+    if not FULL_RUNTIME_ENABLED:
         raise HTTPException(status_code=422, detail="Lite 模式不支持模型缓存管理")
     try:
         from app.services.model_manager_v2 import get_model_manager_v2
@@ -792,7 +954,7 @@ async def clear_models_cache():
 @app.post("/api/models/cache/unload")
 async def unload_model(request: dict):
     """卸载指定模型（使用 ModelManager V2）。"""
-    if IS_LITE:
+    if not FULL_RUNTIME_ENABLED:
         raise HTTPException(status_code=422, detail="Lite 模式不支持模型缓存管理")
     try:
         model_id = request.get("model_id")
@@ -814,7 +976,7 @@ async def shutdown_server():
         logger.info("收到关闭服务器请求")
 
         # 清理资源
-        if not IS_LITE:
+        if FULL_RUNTIME_ENABLED:
             from app.services.model_manager_v2 import get_model_manager_v2
             model_manager = get_model_manager_v2()
             if model_manager:
@@ -907,9 +1069,17 @@ async def open_browser_if_needed():
 # 开发模式应使用 npm run dev (localhost:5173)，生产模式使用后端托管
 DEV_MODE = os.environ.get('DEV_MODE', '').lower() in ('true', '1', 'yes')
 FRONTEND_DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "frontend", "dist")
+_serve_frontend_raw = str(os.environ.get("ANCHORFLUX_SERVE_FRONTEND", "")).strip().lower()
+if _serve_frontend_raw:
+    SERVE_FRONTEND = _serve_frontend_raw in {"true", "1", "yes", "on"}
+else:
+    # 默认保持兼容：browser/electron 模式仍由后端托管 dist，可通过环境变量显式关闭以实现前后端解耦。
+    SERVE_FRONTEND = _resolve_ui_mode_from_env() in {"browser", "electron"}
 
 if DEV_MODE:
     logger.info("开发模式: 静态文件托管已禁用，请使用 http://localhost:5173 访问前端")
+elif not SERVE_FRONTEND:
+    logger.info("前端静态文件托管已关闭（ANCHORFLUX_SERVE_FRONTEND=false）")
 elif os.path.exists(FRONTEND_DIST):
     # 托管静态资源 (js, css, images等)
     app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST, "assets")), name="static-assets")

@@ -30,6 +30,13 @@ from app.services.transcription_recovery_utils import (
     force_finalize_segments_when_finished,
     force_finalize_snapshot_when_finished,
 )
+from app.services.model_task_guard_service import (
+    enforce_required_models_ready,
+    resolve_model_task_guard_mode_from_env,
+    resolve_model_task_guard_poll_sec_from_env,
+    resolve_model_task_guard_timeout_sec_from_env,
+    resolve_required_model_ids_for_job_settings,
+)
 
 
 # ========== v3.5 新版 API 模型 ==========
@@ -204,6 +211,51 @@ def create_transcription_router(
             return dict(payload["task_config"])
         return payload
 
+    async def _guard_models_before_enqueue(job_settings: Optional[JobSettings] = None) -> None:
+        """
+        任务启动前模型守卫：
+        - MODEL_TASK_GUARD_MODE=409: 未就绪直接 409
+        - MODEL_TASK_GUARD_MODE=wait: 等待就绪（带超时）
+        - MODEL_TASK_GUARD_MODE=off: 不拦截
+        """
+        guard_mode = resolve_model_task_guard_mode_from_env()
+        if guard_mode == "off":
+            return
+
+        try:
+            from app.services.model_manager_v2 import get_model_manager_v2
+            from app.services.model_bootstrap_service import get_model_bootstrap_service
+        except Exception:
+            # Lite / Full 依赖缺失时，转录入口本就不可用或会走降级，这里不再额外阻断。
+            return
+
+        model_manager = get_model_manager_v2()
+        bootstrap_service = get_model_bootstrap_service(model_manager=model_manager)
+        timeout_sec = resolve_model_task_guard_timeout_sec_from_env(guard_mode)
+        poll_sec = resolve_model_task_guard_poll_sec_from_env()
+        required_ids = resolve_required_model_ids_for_job_settings(
+            model_manager=model_manager,
+            bootstrap_service=bootstrap_service,
+            job_settings=job_settings,
+        )
+        decision = await enforce_required_models_ready(
+            model_manager=model_manager,
+            bootstrap_service=bootstrap_service,
+            mode=guard_mode,
+            timeout_sec=timeout_sec,
+            poll_sec=poll_sec,
+            required_model_ids=required_ids,
+        )
+        if not bool(decision.get("is_ready")):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "MODEL_NOT_READY",
+                    "message": "必需模型未就绪，请等待模型下载/修复完成后再启动任务",
+                    **decision,
+                },
+            )
+
     def _resolve_project_identity(identifier: Optional[str]):
         normalized_identifier = str(identifier or "").strip()
         if not normalized_identifier:
@@ -309,12 +361,7 @@ def create_transcription_router(
         """根据 task_config 生成 JobSettings。"""
         if not task_config:
             return JobSettings()
-        # 临时策略：任务级 whisper_model 覆盖停用，统一回退 .env。
         normalized_task_config = dict(task_config)
-        transcription_payload = dict(normalized_task_config.get("transcription") or {})
-        if "whisper_model" in transcription_payload:
-            transcription_payload.pop("whisper_model", None)
-            normalized_task_config["transcription"] = transcription_payload
 
         preset_id = str(normalized_task_config.get("preset_id", "balanced") or "balanced")
         has_custom_groups = any(
@@ -538,6 +585,8 @@ def create_transcription_router(
 
             # 🔥 新增: 加入队列（而非直接启动）
             queue_service = get_queue_service(transcription_service)
+            # 模型未就绪时不要把任务推进队列，避免 Runner 直接失败。
+            await _guard_models_before_enqueue(job.settings)
             queue_service.add_job(job)
 
             return {
@@ -626,6 +675,7 @@ def create_transcription_router(
                     project_id = str(getattr(job, "project_id", None) or job.job_id)
 
                     # 加入队列
+                    await _guard_models_before_enqueue(job.settings)
                     queue_service.add_job(job)
 
                     jobs.append({
@@ -704,6 +754,9 @@ def create_transcription_router(
             else:
                 if not isinstance(job.settings, JobSettings):
                     job.settings = JobSettings()
+
+            # 在 settings 最终确定之后再做模型守卫（否则可能误判 whisper 需求）。
+            await _guard_models_before_enqueue(job.settings)
 
             # 🔥 关键改动: 如果任务不在队列中，加入队列
             with queue_service.lock:

@@ -265,6 +265,7 @@ import { usePlaybackStore } from '@/stores/playbackStore'
 import { useTaskRuntimeStore } from '@/stores/taskRuntimeStore'
 import { useEditorSessionStore } from '@/stores/editorSessionStore'
 import { useSubtitleDocumentStore } from '@/stores/subtitleDocumentStore'
+import { useStructuralSyncStore } from '@/stores/structuralSyncStore'
 import { legacyApi, mediaApi, projectApi, transcriptionApi } from '@/services/api'
 import sseChannelManager from '@/services/sseChannelManager'
 import { useShortcuts } from '@/hooks/useShortcuts'
@@ -316,6 +317,7 @@ const playbackStore = usePlaybackStore()
 const taskStore = useTaskRuntimeStore()
 const editorSessionStore = useEditorSessionStore()
 const subtitleDocumentStore = useSubtitleDocumentStore()
+const structuralSyncStore = useStructuralSyncStore()
 const router = useRouter()
 
 // 全局播放管理器
@@ -762,6 +764,7 @@ async function loadProject() {
 
   // 先重置项目状态，确保不同任务数据隔离
   projectStore.resetProject()
+  structuralSyncStore.$reset()
 
   try {
     await resolveIdentity()
@@ -2034,15 +2037,21 @@ async function handleExport(format) {
 }
 
 async function fetchLatestSegments() {
+  // 第一轮：清空文本/时间防抖队列与 undo/redo 防抖同步
   await forceSyncNow()
-  // V3.2.4+dev.20260303.01: 等待 undo/redo 增量同步完成
-  // 如果同步失败，flushSync 会 throw，由 handleExport 的 catch 捕获并 alert
+  await flushUndoRedoSync()
+  // 等待结构性操作（删除/插入/切分/合并）飞行中请求落地
+  await structuralSyncStore.waitAll()
+  // 第二轮：结构性操作落地后再次冲洗，覆盖“新增后立刻编辑”的补写场景
+  await forceSyncNow()
   await flushUndoRedoSync()
 
   const pending = subtitleDocumentStore.pendingCount()
   const syncErrors = subtitleDocumentStore.syncErrors
   const syncErrorCount = Number(syncErrors?.size || 0)
-  if (pending > 0 || syncErrorCount > 0) {
+  // 合并结构性操作错误计数
+  const structuralErrorCount = structuralSyncStore.errorCount
+  if (pending > 0 || syncErrorCount > 0 || structuralErrorCount > 0) {
     let firstErrorDetail = ''
     if (syncErrorCount > 0 && typeof syncErrors?.entries === 'function') {
       const firstError = syncErrors.entries().next().value
@@ -2050,13 +2059,21 @@ async function fetchLatestSegments() {
         firstErrorDetail = `，首条错误: [${firstError[0]}] ${firstError[1]}`
       }
     }
-    throw new Error(`仍有未同步修改（待同步 ${pending} 条，错误 ${syncErrorCount} 条${firstErrorDetail}）`)
+    if (structuralErrorCount > 0 && !firstErrorDetail) {
+      const firstStructErr = structuralSyncStore.syncErrors.entries().next().value
+      if (firstStructErr) {
+        firstErrorDetail = `，首条结构性错误: [${firstStructErr[1].type}] ${firstStructErr[1].error}`
+      }
+    }
+    throw new Error(`仍有未同步修改（待同步 ${pending} 条，错误 ${syncErrorCount + structuralErrorCount} 条${firstErrorDetail}）`)
   }
 
   const projectId = props.projectId || projectStore.meta.projectId
   if (!projectId) {
     throw new Error('缺少 project_id：无法导出，请从任务列表重新打开并完成任务到项目转换')
   }
+  // 导出前执行强制保存，确保本地快照与导出动作一致。
+  await projectStore.saveProject()
   const segments = await projectApi.getSubtitles(projectId)
   return Array.isArray(segments)
     ? segments.map((segment, index) => ({

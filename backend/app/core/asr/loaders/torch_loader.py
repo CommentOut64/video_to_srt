@@ -43,7 +43,7 @@ class TorchLoader(ModelLoader):
         try:
             return torch.load(weight_file, map_location=map_location)
         except Exception:
-            # 针对 pyannote/brouhaha 等 HuggingFace 格式，尝试 Model.from_pretrained
+            # 针对 pyannote 等目录化 Hugging Face 权重，尝试 Model.from_pretrained
             try:
                 from pyannote.audio import Model  # 延迟导入，避免无依赖环境报错
 

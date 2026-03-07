@@ -414,8 +414,7 @@ class JobSettings:
             transcription=TranscriptionConfig(
                 transcription_profile=transcription_data.get("transcription_profile", "sensevoice_only"),
                 sensevoice_device=transcription_data.get("sensevoice_device", "auto"),
-                # 临时禁用任务级 whisper_model 覆盖，统一读取 .env。
-                whisper_model=resolve_default_whisper_model(),
+                whisper_model=transcription_data.get("whisper_model", resolve_default_whisper_model()),
                 patching_threshold=transcription_data.get("patching_threshold", 0.60),
             ),
             refinement=RefinementConfig(
@@ -482,8 +481,7 @@ class JobSettings:
             transcription=TranscriptionConfig(
                 transcription_profile=preset.transcription.transcription_profile,
                 sensevoice_device=preset.transcription.sensevoice_device,
-                # 临时禁用预设内 whisper_model 覆盖，统一读取 .env。
-                whisper_model=resolve_default_whisper_model(),
+                whisper_model=preset.transcription.whisper_model or resolve_default_whisper_model(),
                 patching_threshold=preset.transcription.patching_threshold,
             ),
             refinement=RefinementConfig(

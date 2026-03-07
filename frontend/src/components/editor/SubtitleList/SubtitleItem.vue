@@ -35,7 +35,6 @@
           :value="formatTime(subtitle.start)"
           :readonly="subtitle.isDraft"
           @change="e => updateTime('start', parseTime(e.target.value))"
-          @focus="e => e.target.select()"
         />
         <span class="time-arrow">
           <svg viewBox="0 0 24 24" fill="currentColor">
@@ -48,7 +47,6 @@
           :value="formatTime(subtitle.end)"
           :readonly="subtitle.isDraft"
           @change="e => updateTime('end', parseTime(e.target.value))"
-          @focus="e => e.target.select()"
         />
         <span class="duration-tag">{{ formatDuration(subtitle.end - subtitle.start) }}</span>
 
@@ -90,7 +88,7 @@
           v-else-if="!isEditing"
           class="text-display text-preview"
           :class="{ 'can-edit': editable }"
-          @click.stop="startEditing"
+          @click.stop="startEditing($event)"
           v-html="renderTextWithHighlight()"
         ></div>
 
@@ -99,8 +97,10 @@
           v-else
           ref="editTextarea"
           class="text-input"
-          :value="subtitle.text"
+          :value="editingText"
           @input="e => handleTextInput(e.target.value)"
+          @compositionstart="handleCompositionStart"
+          @compositionend="handleCompositionEnd"
           @blur="stopEditing"
           @keydown.enter.ctrl="stopEditing"
           @keydown.escape="cancelEditing"
@@ -110,7 +110,7 @@
         ></textarea>
 
         <span class="char-count">
-          {{ subtitle.text.length }}
+          {{ (isEditing ? editingText : subtitle.text).length }}
         </span>
       </div>
 
@@ -181,10 +181,11 @@
  * 2. 高亮预览模式: isDraft=false & 非编辑, 显示置信度高亮
  * 3. 编辑模式: isDraft=false & 编辑中, 可编辑文本
  */
-import { ref, computed, nextTick, watch } from 'vue'
+import { ref, computed, nextTick, onUnmounted } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
 import { usePlaybackStore } from '@/stores/playbackStore'
 import projectApi from '@/services/api/projectApi'
+import { useStructuralSyncStore } from '@/stores/structuralSyncStore'
 import ContextMenu from '@/components/editor/ContextMenu.vue'
 
 const props = defineProps({
@@ -213,11 +214,16 @@ const emit = defineEmits([
 // Store
 const projectStore = useProjectStore()
 const playbackStore = usePlaybackStore()
+const structuralSyncStore = useStructuralSyncStore()
 
 // 编辑状态
 const isEditing = ref(false)
 const editTextarea = ref(null)
 const originalText = ref('')
+const editingText = ref('')
+const isComposing = ref(false)
+let textCommitTimer = null
+const TEXT_COMMIT_DEBOUNCE_MS = 250
 
 // 删除确认状态
 const isDeleteConfirming = ref(false)
@@ -229,6 +235,10 @@ const isContextMenuOpen = ref(false)  // 防止菜单打开时 blur 触发 stopE
 
 // 播放状态
 const isPlaying = computed(() => playbackStore.isPlaying)
+let highlightCacheText = null
+let highlightCacheWords = null
+let highlightCacheMatchSpans = null
+let highlightCacheHtml = ''
 
 // 计算属性
 const itemClasses = computed(() => ({
@@ -315,15 +325,43 @@ function autoResizeTextarea() {
   editTextarea.value.style.height = `${newHeight}px`
 }
 
+// 从点击位置推算纯文本偏移（遍历预览 div 中的文本节点）
+function getTextOffsetFromPoint(container, clientX, clientY) {
+  const range = document.caretRangeFromPoint?.(clientX, clientY)
+  if (!range) return -1
+
+  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT)
+  let offset = 0
+  let node
+  while ((node = walker.nextNode())) {
+    if (node === range.startContainer) {
+      return offset + range.startOffset
+    }
+    offset += node.textContent.length
+  }
+  return -1
+}
+
 // 开始编辑
-function startEditing() {
+function startEditing(event) {
   if (!props.editable || props.subtitle.isDraft) return
   originalText.value = props.subtitle.text
+  editingText.value = props.subtitle.text
+
+  // 在切换到 textarea 之前，从预览 div 的点击位置推算光标偏移
+  let clickOffset = -1
+  if (event) {
+    clickOffset = getTextOffsetFromPoint(event.currentTarget, event.clientX, event.clientY)
+  }
+
   isEditing.value = true
   nextTick(() => {
     if (editTextarea.value) {
       editTextarea.value.focus()
-      editTextarea.value.select()
+      // 将光标定位到用户点击的位置，而非全选
+      if (clickOffset >= 0 && clickOffset <= props.subtitle.text.length) {
+        editTextarea.value.setSelectionRange(clickOffset, clickOffset)
+      }
       // 自动调整高度
       autoResizeTextarea()
     }
@@ -336,11 +374,14 @@ function stopEditing() {
   if (isContextMenuOpen.value) {
     return
   }
+  flushTextCommit(true)
   isEditing.value = false
 }
 
 // 取消编辑（恢复原文）
 function cancelEditing() {
+  clearTextCommitTimer()
+  editingText.value = originalText.value
   if (originalText.value !== props.subtitle.text) {
     emit('update-text', props.subtitle.id, originalText.value)
   }
@@ -349,12 +390,57 @@ function cancelEditing() {
 
 // 文本输入处理
 function handleTextInput(text) {
-  emit('update-text', props.subtitle.id, text)
+  editingText.value = text
+  if (!isComposing.value) {
+    scheduleTextCommit()
+  }
   // 输入时自动调整高度
   nextTick(() => {
     autoResizeTextarea()
   })
 }
+
+function handleCompositionStart() {
+  isComposing.value = true
+}
+
+function handleCompositionEnd() {
+  isComposing.value = false
+  scheduleTextCommit()
+}
+
+function commitTextIfNeeded() {
+  const text = editingText.value
+  if (text !== props.subtitle.text) {
+    emit('update-text', props.subtitle.id, text)
+  }
+}
+
+function clearTextCommitTimer() {
+  if (textCommitTimer) {
+    clearTimeout(textCommitTimer)
+    textCommitTimer = null
+  }
+}
+
+function scheduleTextCommit() {
+  clearTextCommitTimer()
+  textCommitTimer = setTimeout(() => {
+    textCommitTimer = null
+    commitTextIfNeeded()
+  }, TEXT_COMMIT_DEBOUNCE_MS)
+}
+
+function flushTextCommit(immediate = false) {
+  clearTextCommitTimer()
+  if (immediate) {
+    commitTextIfNeeded()
+  }
+}
+
+onUnmounted(() => {
+  clearTextCommitTimer()
+})
 
 // 删除处理
 function handleDelete() {
@@ -480,7 +566,7 @@ async function handleContextMenuSelect(key) {
   }
 }
 
-// V3.2.4+dev.20260303.01: 切分同步 — pauseHistory 仅包裹同步赋值，不包裹 await
+// V3.2.4+dev.20260304.01: 切分同步 — structuralSyncStore 飞行追踪
 async function syncSplitSubtitles(result) {
   const projectId = projectStore.meta.projectId
   if (!projectId) {
@@ -490,7 +576,7 @@ async function syncSplitSubtitles(result) {
   const { leftSubtitle, rightSubtitle } = result
   if (!leftSubtitle || !rightSubtitle) return
 
-  try {
+  const syncPromise = (async () => {
     const leftSegmentId = leftSubtitle.segment_id || props.subtitle.segment_id
     if (!leftSegmentId) {
       throw new Error('切分左半字幕缺少 segment_id，无法同步到 project 字幕真源')
@@ -529,12 +615,16 @@ async function syncSplitSubtitles(result) {
     } finally {
       projectStore.resumeHistory()
     }
+  })()
+  structuralSyncStore.trackOperation('split', syncPromise)
+  try {
+    await syncPromise
   } catch (error) {
     console.warn('[SubtitleItem] 切分同步失败:', error)
   }
 }
 
-// V3.2.4+dev.20260303.01: 合并同步 — pauseHistory 仅包裹同步赋值，不包裹 await
+// V3.2.4+dev.20260304.01: 合并同步 — structuralSyncStore 飞行追踪
 async function syncMergeSubtitles(result) {
   const projectId = projectStore.meta.projectId
   if (!projectId) {
@@ -544,7 +634,7 @@ async function syncMergeSubtitles(result) {
   const { keptSubtitle, removedSubtitle } = result
   if (!keptSubtitle || !removedSubtitle) return
 
-  try {
+  const syncPromise = (async () => {
     // 1. 更新保留的字幕（文本+时间戳）
     if (keptSubtitle.segment_id) {
       const updatedKept = await projectApi.updateSubtitle(projectId, keptSubtitle.segment_id, {
@@ -570,6 +660,10 @@ async function syncMergeSubtitles(result) {
     if (removedSubtitle.segment_id) {
       await projectApi.deleteSubtitle(projectId, removedSubtitle.segment_id)
     }
+  })()
+  structuralSyncStore.trackOperation('merge', syncPromise)
+  try {
+    await syncPromise
   } catch (error) {
     console.warn('[SubtitleItem] 合并同步失败:', error)
   }
@@ -582,18 +676,38 @@ function handleContextMenuClose() {
 
 // 渲染带置信度高亮的文本
 function renderTextWithHighlight() {
-  const text = props.subtitle.text
+  const text = props.subtitle.text || ''
+  const matchSpans = props.matchSpans
+  const words = props.subtitle.words
 
-  // 如果有同音搜索匹配区域，优先使用匹配高亮
-  if (props.matchSpans && props.matchSpans.length > 0) {
-    return renderMatchHighlight(text, props.matchSpans)
+  if (
+    highlightCacheText === text
+    && highlightCacheWords === words
+    && highlightCacheMatchSpans === matchSpans
+  ) {
+    return highlightCacheHtml
   }
 
-  const words = props.subtitle.words
+  let html = ''
+
+  // 如果有同音搜索匹配区域，优先使用匹配高亮
+  if (matchSpans && matchSpans.length > 0) {
+    html = renderMatchHighlight(text, matchSpans)
+    highlightCacheText = text
+    highlightCacheWords = words
+    highlightCacheMatchSpans = matchSpans
+    highlightCacheHtml = html
+    return html
+  }
 
   // 如果没有字级数据，直接返回文本
   if (!words || words.length === 0) {
-    return escapeHtml(text)
+    html = escapeHtml(text)
+    highlightCacheText = text
+    highlightCacheWords = words
+    highlightCacheMatchSpans = matchSpans
+    highlightCacheHtml = html
+    return html
   }
 
   // SenseVoice 有时会返回整句作为一个词（常见于中文），此时直接去掉高亮，避免整句着色
@@ -604,7 +718,12 @@ function renderTextWithHighlight() {
     const isFullWidthPunc = (char) => /[，。！？、《》【】（）…]/.test(char)
     const shouldBypassHighlight = raw.length > 4 && chars.every(ch => isCJKChar(ch) || isFullWidthPunc(ch))
     if (shouldBypassHighlight) {
-      return escapeHtml(text)
+      html = escapeHtml(text)
+      highlightCacheText = text
+      highlightCacheWords = words
+      highlightCacheMatchSpans = matchSpans
+      highlightCacheHtml = html
+      return html
     }
   }
 
@@ -629,7 +748,7 @@ function renderTextWithHighlight() {
 
   const processedWords = words.flatMap(word => expandWords(word))
 
-  let html = ''
+  html = ''
   for (let i = 0; i < processedWords.length; i++) {
     const word = processedWords[i]
     const rawConf = word.confidence_display_raw ?? word.confidence
@@ -659,6 +778,10 @@ function renderTextWithHighlight() {
       }
     }
   }
+  highlightCacheText = text
+  highlightCacheWords = words
+  highlightCacheMatchSpans = matchSpans
+  highlightCacheHtml = html
   return html
 }
 

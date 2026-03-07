@@ -6,6 +6,7 @@
  */
 import { ref, computed } from 'vue'
 import projectApi from '@/services/api/projectApi'
+import { useStructuralSyncStore } from '@/stores/structuralSyncStore'
 
 /**
  * 右键菜单 Composable
@@ -13,6 +14,7 @@ import projectApi from '@/services/api/projectApi'
  */
 export function useWaveformContextMenu(projectStore) {
   // ============ 状态 ============
+  const structuralSyncStore = useStructuralSyncStore()
   const contextMenuRef = ref(null)
   const contextMenuTarget = ref(null) // 右键点击的目标字幕ID
   const contextMenuTime = ref(0) // 右键点击的时间点
@@ -84,7 +86,7 @@ export function useWaveformContextMenu(projectStore) {
   }
 
   /**
-   * 波形切分结果同步到后端
+   * V3.2.4+dev.20260304.01: 波形切分结果同步到后端 — structuralSyncStore 飞行追踪
    */
   async function syncSplitSubtitles(result) {
     const projectId = projectStore.meta.projectId
@@ -95,7 +97,7 @@ export function useWaveformContextMenu(projectStore) {
     const { leftSubtitle, rightSubtitle } = result || {}
     if (!leftSubtitle || !rightSubtitle) return
 
-    try {
+    const syncPromise = (async () => {
       const leftSegmentId = leftSubtitle.segment_id
       if (!leftSegmentId) {
         throw new Error('切分左半字幕缺少 segment_id，无法同步到 project 字幕真源')
@@ -132,6 +134,10 @@ export function useWaveformContextMenu(projectStore) {
         },
         { isUserEdit: true }
       )
+    })()
+    structuralSyncStore.trackOperation('split', syncPromise)
+    try {
+      await syncPromise
     } catch (error) {
       console.warn('[WaveformContextMenu] 切分同步失败:', error)
     }

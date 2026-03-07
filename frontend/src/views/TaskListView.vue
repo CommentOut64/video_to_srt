@@ -276,7 +276,6 @@ import {
 } from '@element-plus/icons-vue'
 import { useTaskRuntimeStore } from '@/stores/taskRuntimeStore'
 import { useTranscriptionPresetStore } from '@/stores/transcriptionPresetStore'
-import { selectCapabilities } from '@/state/capabilities/capabilitySelector'
 import { transcriptionApi, projectApi, systemApi, presetsApi } from '@/services/api'
 import AboutDialog from '@/components/AboutDialog.vue'
 import TaskListHeader from '@/components/task/TaskListHeader.vue'
@@ -301,8 +300,6 @@ const route = useRoute()
 const taskStore = useTaskRuntimeStore()
 const transcriptionPresetStore = useTranscriptionPresetStore()
 const { taskConfig } = storeToRefs(transcriptionPresetStore)
-const capabilities = selectCapabilities()
-
 const showAboutDialog = ref(false)
 const showImportDialog = ref(false)
 const showAdvancedSettings = ref(false)
@@ -315,11 +312,11 @@ const taskModeFilter = ref('all')
 const groupCollapseState = ref({
   workspace: false,
   interrupted: false,
-  completed: true,
+  completed: false,
 })
 
 const showCanceledTasks = ref(true)
-const collapseCompletedByDefault = ref(true)
+const collapseCompletedByDefault = ref(false)
 const autoExpandInterrupted = ref(true)
 
 // 内联重命名相关
@@ -593,9 +590,15 @@ function loadTaskUiPreferences() {
     }
   }
   if (savedSidebarSettings && typeof savedSidebarSettings === 'object') {
-    showCanceledTasks.value = savedSidebarSettings.showCanceledTasks !== false
-    collapseCompletedByDefault.value = savedSidebarSettings.collapseCompletedByDefault !== false
-    autoExpandInterrupted.value = savedSidebarSettings.autoExpandInterrupted !== false
+    if (typeof savedSidebarSettings.showCanceledTasks === 'boolean') {
+      showCanceledTasks.value = savedSidebarSettings.showCanceledTasks
+    }
+    if (typeof savedSidebarSettings.collapseCompletedByDefault === 'boolean') {
+      collapseCompletedByDefault.value = savedSidebarSettings.collapseCompletedByDefault
+    }
+    if (typeof savedSidebarSettings.autoExpandInterrupted === 'boolean') {
+      autoExpandInterrupted.value = savedSidebarSettings.autoExpandInterrupted
+    }
   }
   if (savedAdvancedGeneral && typeof savedAdvancedGeneral === 'object') {
     advancedGeneral.value = {
@@ -754,8 +757,11 @@ loadCustomPresets()
 
 onMounted(() => {
   loadTaskUiPreferences()
-  if (!capabilities.canTranscribe || route.query.action === 'import') {
+  if (route.query.action === 'import') {
     showImportDialog.value = true
+    const nextQuery = { ...route.query }
+    delete nextQuery.action
+    router.replace({ query: nextQuery }).catch(() => {})
   }
 })
 
@@ -1072,32 +1078,22 @@ async function handleExit() {
     let cleanupReport = null
 
     try {
-      // 调用后端 shutdown API，设置超时
-      const controller = new AbortController()
-      const timeoutId = setTimeout(() => controller.abort(), 10000) // 10秒超时
+      const response = await systemApi.shutdownSystem({
+        cleanup_temp: false, // 不清理临时文件，保留断点数据
+        force: false,
+        timeout_ms: 10000,
+      })
 
-      try {
-        const response = await systemApi.shutdownSystem({
-          cleanup_temp: false, // 不清理临时文件，保留断点数据
-          force: false,
-        })
+      shutdownSuccess = response?.success || false
+      cleanupReport = response?.cleanup_report || null
 
-        clearTimeout(timeoutId)
-        shutdownSuccess = response?.success || false
-        cleanupReport = response?.cleanup_report || null
-
-        if (cleanupReport) {
-          console.log('[Exit] 清理报告:', cleanupReport)
-        }
-      } catch (e) {
-        clearTimeout(timeoutId)
-        // 请求可能因后端关闭而失败，这是预期行为
-        console.log('[Exit] 后端已关闭或请求超时:', e.message || e)
-        shutdownSuccess = true // 如果后端已关闭，认为成功
+      if (cleanupReport) {
+        console.log('[Exit] 清理报告:', cleanupReport)
       }
     } catch (e) {
-      console.log('[Exit] 关闭请求异常:', e)
-      shutdownSuccess = true // 即使异常也认为成功（后端可能已关闭）
+      // 请求可能因后端已关闭/超时被中断，视作进入关闭流程。
+      console.log('[Exit] 后端已关闭或请求超时:', e.message || e)
+      shutdownSuccess = true
     }
 
     loading.close()
