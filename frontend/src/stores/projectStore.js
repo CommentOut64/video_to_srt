@@ -4,7 +4,7 @@
  * 负责管理字幕编辑器的核心数据，包括字幕数据、播放器状态、视图配置等
  * 实现了撤销/重做、自动保存、智能问题检测等功能
  */
-import { defineStore } from "pinia";
+import { defineStore, storeToRefs } from "pinia";
 import { ref, computed, watch, toRaw } from "vue";
 import localforage from "localforage";
 import smartSaver from "@/services/SmartSaver";
@@ -162,15 +162,13 @@ export const useProjectStore = defineStore("project", () => {
   //   2. restoreProject() - 从缓存/存储恢复项目时
   //   3. resetProject() - 重置项目时
   const editorHistoryStore = useEditorHistoryStore();
-  const history = editorHistoryStore.history;
+  // 这里必须通过 storeToRefs 保持响应式桥接；直接取值会把 canUndo/canRedo 冻结为初始化快照。
+  const { history, canUndo, canRedo, isHistoryTracking } = storeToRefs(editorHistoryStore);
   const undo = editorHistoryStore.undo;
   const redo = editorHistoryStore.redo;
-  const canUndo = editorHistoryStore.canUndo;
-  const canRedo = editorHistoryStore.canRedo;
   const clearHistory = editorHistoryStore.clearHistory;
   const pauseHistory = editorHistoryStore.pauseHistory;
   const resumeHistory = editorHistoryStore.resumeHistory;
-  const isHistoryTracking = editorHistoryStore.isHistoryTracking;
 
   // ========== 4. 播放器全局状态 ==========
   const player = ref({

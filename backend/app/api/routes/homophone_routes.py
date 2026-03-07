@@ -470,6 +470,7 @@ def create_homophone_router() -> APIRouter:
                     "project_id": normalized_project_id,
                     "updated_count": 0,
                     "updated_indices": [],
+                    "updated_segments": [],
                 },
             }
 
@@ -500,6 +501,7 @@ def create_homophone_router() -> APIRouter:
 
         subtitle_manager = get_streaming_subtitle_manager_if_exists(normalized_project_id)
         updated_indices: List[int] = []
+        updated_segments: List[Dict[str, Any]] = []
 
         for sentence_index in sorted(selected_indices):
             source_text = str(segment_map.get(sentence_index, {}).get("text", ""))
@@ -556,6 +558,16 @@ def create_homophone_router() -> APIRouter:
                 },
             )
             updated_indices.append(sentence_index)
+            updated_segments.append(
+                {
+                    "sentence_index": sentence_index,
+                    "text": replaced_text,
+                    "start": float(segment_map.get(sentence_index, {}).get("start", 0.0)),
+                    "end": float(segment_map.get(sentence_index, {}).get("end", 0.0)),
+                    "is_modified": True,
+                    "original_text": source_text,
+                }
+            )
 
         return {
             "success": True,
@@ -563,6 +575,7 @@ def create_homophone_router() -> APIRouter:
                 "project_id": normalized_project_id,
                 "updated_count": len(updated_indices),
                 "updated_indices": updated_indices,
+                "updated_segments": updated_segments,
             },
         }
 

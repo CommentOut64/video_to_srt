@@ -77,6 +77,7 @@ class BatchSyncCreateItem(BaseModel):
     start: float = Field(..., ge=0.0)
     end: float = Field(..., ge=0.0)
     restore_segment_id: Optional[str] = Field(default=None)
+    local_id: Optional[str] = Field(default=None)
 
 
 class BatchSyncDeleteItem(BaseModel):
@@ -87,6 +88,29 @@ class BatchSyncRequest(BaseModel):
     updates: list[BatchSyncUpdateItem] = Field(default_factory=list)
     creates: list[BatchSyncCreateItem] = Field(default_factory=list)
     deletes: list[BatchSyncDeleteItem] = Field(default_factory=list)
+
+
+class EditorOpBatchReplaceItem(BaseModel):
+    segment_id: str = Field(..., min_length=1)
+    text: str = Field(default="")
+    start: Optional[float] = Field(default=None, ge=0.0)
+    end: Optional[float] = Field(default=None, ge=0.0)
+
+
+class EditorOpCommand(BaseModel):
+    type: Literal["update_subtitle", "add_subtitle", "remove_subtitle", "batch_replace"]
+    command_id: str = Field(..., min_length=1)
+    segment_id: Optional[str] = Field(default=None)
+    local_id: Optional[str] = Field(default=None)
+    text: Optional[str] = Field(default=None)
+    start: Optional[float] = Field(default=None, ge=0.0)
+    end: Optional[float] = Field(default=None, ge=0.0)
+    restore_segment_id: Optional[str] = Field(default=None)
+    replacements: list[EditorOpBatchReplaceItem] = Field(default_factory=list)
+
+
+class EditorOpsApplyRequest(BaseModel):
+    commands: list[EditorOpCommand] = Field(default_factory=list)
 
 
 class ProjectSubtitleTimeOffsetRequest(BaseModel):
@@ -1088,6 +1112,87 @@ async def batch_sync_project_subtitles(project_id: str, body: BatchSyncRequest):
     }
 
 
+@router.post("/{project_id}/editor-ops:apply")
+async def apply_project_editor_ops(project_id: str, body: EditorOpsApplyRequest):
+    """编辑命令批量入口，当前阶段复用 batch-sync 存储逻辑保持向后兼容。"""
+    batch_request = BatchSyncRequest()
+    command_errors: list[str] = []
+
+    for command in body.commands:
+        if command.type == "update_subtitle":
+            if not command.segment_id:
+                command_errors.append(f"{command.command_id}: update_subtitle 缺少 segment_id")
+                continue
+            update_payload: dict[str, Any] = {"segment_id": command.segment_id}
+            if command.text is not None:
+                update_payload["text"] = command.text
+            if command.start is not None:
+                update_payload["start"] = float(command.start)
+            if command.end is not None:
+                update_payload["end"] = float(command.end)
+            if len(update_payload) == 1:
+                continue
+            batch_request.updates.append(BatchSyncUpdateItem(**update_payload))
+            continue
+
+        if command.type == "add_subtitle":
+            if command.start is None or command.end is None:
+                command_errors.append(f"{command.command_id}: add_subtitle 缺少 start/end")
+                continue
+            batch_request.creates.append(
+                BatchSyncCreateItem(
+                    text=command.text or "",
+                    start=float(command.start),
+                    end=float(command.end),
+                    restore_segment_id=command.restore_segment_id,
+                    local_id=command.local_id,
+                )
+            )
+            continue
+
+        if command.type == "remove_subtitle":
+            if not command.segment_id:
+                command_errors.append(f"{command.command_id}: remove_subtitle 缺少 segment_id")
+                continue
+            batch_request.deletes.append(BatchSyncDeleteItem(segment_id=command.segment_id))
+            continue
+
+        if command.type == "batch_replace":
+            for item in command.replacements:
+                update_payload: dict[str, Any] = {
+                    "segment_id": item.segment_id,
+                    "text": item.text,
+                }
+                if item.start is not None:
+                    update_payload["start"] = float(item.start)
+                if item.end is not None:
+                    update_payload["end"] = float(item.end)
+                batch_request.updates.append(BatchSyncUpdateItem(**update_payload))
+            continue
+
+        command_errors.append(f"{command.command_id}: 不支持的命令类型 {command.type}")
+
+    if not batch_request.updates and not batch_request.creates and not batch_request.deletes:
+        return {
+            "success": False,
+            "data": {
+                "updated": 0,
+                "created": 0,
+                "deleted": 0,
+                "created_segments": [],
+                "errors": command_errors or ["没有可应用的编辑命令"],
+            },
+        }
+
+    result = await batch_sync_project_subtitles(project_id, batch_request)
+    if command_errors:
+        data = result.get("data", {})
+        data["errors"] = command_errors + list(data.get("errors", []))
+        result["data"] = data
+        result["success"] = False
+    return result
+
+
 def _batch_sync_runtime(
     project_id: str,
     project_dir: Path,
@@ -1188,6 +1293,7 @@ def _batch_sync_runtime(
                 "text": segment["text"],
                 "start": segment["start"],
                 "end": segment["end"],
+                "local_id": item.local_id,
             })
             results["created"] += 1
             _publish_project_subtitle_event(
@@ -1238,6 +1344,7 @@ def _handle_runtime_restore(
                 "text": segment["text"],
                 "start": segment["start"],
                 "end": segment["end"],
+                "local_id": item.local_id,
             })
             results["created"] += 1
             _publish_project_subtitle_event(
@@ -1289,6 +1396,7 @@ def _handle_runtime_restore(
             "text": restored_text,
             "start": restored_start,
             "end": restored_end,
+            "local_id": item.local_id,
         })
         results["created"] += 1
         _publish_project_subtitle_event(
@@ -1378,6 +1486,7 @@ def _batch_sync_subtitle_doc(
                 "text": new_seg.get("text"),
                 "start": new_seg.get("start"),
                 "end": new_seg.get("end"),
+                "local_id": item.local_id,
             })
             results["created"] += 1
             _publish_project_subtitle_event(
@@ -1425,6 +1534,7 @@ def _handle_subtitle_doc_restore(
                 "text": segment["text"],
                 "start": segment["start"],
                 "end": segment["end"],
+                "local_id": item.local_id,
             })
             results["created"] += 1
             _publish_project_subtitle_event(
@@ -1469,6 +1579,7 @@ def _handle_subtitle_doc_restore(
                 "text": restored_text,
                 "start": restored_start,
                 "end": restored_end,
+                "local_id": item.local_id,
             })
             results["created"] += 1
             _publish_project_subtitle_event(

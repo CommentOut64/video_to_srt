@@ -530,15 +530,15 @@ export function useHomophoneSearch(options = {}) {
 
   /**
    * 执行批量替换
-   * @returns {Promise<{success: boolean, count: number, indices: number[]}>}
+   * @returns {Promise<{success: boolean, count: number, indices: number[], updatedSegments: Array<object>}>}
    */
   async function executeBatchReplace() {
     if (!projectId?.value || selectedSubtitleIds.value.size === 0) {
-      return { success: false, count: 0, indices: [] }
+      return { success: false, count: 0, indices: [], updatedSegments: [] }
     }
 
     if (!replaceText.value) {
-      return { success: false, count: 0, indices: [] }
+      return { success: false, count: 0, indices: [], updatedSegments: [] }
     }
 
     try {
@@ -569,10 +569,13 @@ export function useHomophoneSearch(options = {}) {
         indices: Array.isArray(result?.data?.updated_indices)
           ? result.data.updated_indices.map((item) => Number(item))
           : [],
+        updatedSegments: Array.isArray(result?.data?.updated_segments)
+          ? result.data.updated_segments
+          : [],
       }
     } catch (error) {
       console.error('批量替换失败:', error)
-      return { success: false, count: 0, indices: [] }
+      return { success: false, count: 0, indices: [], updatedSegments: [] }
     }
   }
 

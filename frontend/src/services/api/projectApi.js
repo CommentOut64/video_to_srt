@@ -112,6 +112,14 @@ class ProjectAPI {
     return response
   }
 
+  async applyEditorOps(projectId, payload) {
+    const response = await apiClient.post(
+      `/api/projects/${projectId}/editor-ops:apply`,
+      payload
+    )
+    return response
+  }
+
   async exportSubtitles(projectId, format = 'srt') {
     const response = await apiClient.get(`/api/projects/${projectId}/export`, {
       params: { format },
