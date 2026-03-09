@@ -27,7 +27,8 @@ from .config import (
     get_project_root, load_env_config, detect_dev_mode,
     DEFAULT_UI_MODE, DEFAULT_RUNTIME_POLICY, DEFAULT_FLAVOR,
     DEFAULT_BACKEND_PORT, DEFAULT_FRONTEND_PORT,
-    normalize_ui_mode, normalize_runtime_policy, normalize_flavor
+    normalize_ui_mode, normalize_runtime_policy, normalize_flavor,
+    resolve_media_profile, resolve_gpu_mode,
 )
 from .uv_manager import UvManager, fix_pytorch_dll
 from .updater import SelfUpdater
@@ -378,6 +379,8 @@ class ProcessManager:
         env['ANCHORFLUX_RUNTIME_POLICY'] = config.runtime_policy
         env['ANCHORFLUX_FLAVOR'] = config.flavor
         env['ANCHORFLUX_LITE'] = 'true' if config.flavor == 'lite' else 'false'
+        env['ANCHORFLUX_MEDIA_PROFILE'] = config.media_profile
+        env['ANCHORFLUX_GPU_MODE'] = config.gpu_mode
 
         # V3.2.4+dev.20260306.02: 生产模式使用嵌入式 Python site-packages
         if not config.dev_mode and config.site_packages:
@@ -668,6 +671,18 @@ class Launcher:
         if self.process_manager:
             self.process_manager.terminate_all()
 
+    def _build_shell_env(self, config: LauncherConfig, backend_url: str) -> Dict[str, str]:
+        """构造 Electron Shell 运行时环境变量。"""
+        env = os.environ.copy()
+        env['ANCHORFLUX_BACKEND_URL'] = backend_url
+        env['ANCHORFLUX_UI_MODE'] = config.ui_mode
+        env['ANCHORFLUX_RUNTIME_POLICY'] = config.runtime_policy
+        env['ANCHORFLUX_FLAVOR'] = config.flavor
+        env['ANCHORFLUX_LITE'] = 'true' if config.flavor == 'lite' else 'false'
+        env['ANCHORFLUX_MEDIA_PROFILE'] = config.media_profile
+        env['ANCHORFLUX_GPU_MODE'] = config.gpu_mode
+        return env
+
     def _activate_running_instance(
         self,
         *,
@@ -676,6 +691,10 @@ class Launcher:
         backend_port: int,
         frontend_port: int,
         shell_path: Optional[Path],
+        runtime_policy: str,
+        flavor: str,
+        media_profile: str,
+        gpu_mode: str,
     ) -> None:
         """激活已运行实例的界面，不重启后端。"""
         backend_url = f"http://127.0.0.1:{backend_port}"
@@ -691,7 +710,22 @@ class Launcher:
         if normalized_ui_mode == "electron":
             wait_backend_ready(backend_url, timeout_sec=8)
             target_shell_path = resolve_shell_path(self.project_root, shell_path)
-            if launch_electron(target_shell_path) is not None:
+            shell_env = self._build_shell_env(
+                LauncherConfig(
+                    project_root=self.project_root,
+                    dev_mode=dev_mode,
+                    backend_port=backend_port,
+                    frontend_port=frontend_port,
+                    ui_mode=normalized_ui_mode,
+                    runtime_policy=normalize_runtime_policy(runtime_policy),
+                    flavor=normalize_flavor(flavor),
+                    shell_path=target_shell_path,
+                    media_profile=media_profile,
+                    gpu_mode=gpu_mode,
+                ),
+                backend_url,
+            )
+            if launch_electron(target_shell_path, env=shell_env) is not None:
                 return
             logger.warning("激活 Electron 失败，回退浏览器")
             if _is_http_ready(browser_url, timeout_sec=2.0):
@@ -755,6 +789,14 @@ class Launcher:
             "ANCHORFLUX_SHELL_PATH",
             env_config.get("ANCHORFLUX_SHELL_PATH", ""),
         ).strip()
+        raw_media_profile = os.environ.get(
+            "ANCHORFLUX_MEDIA_PROFILE",
+            env_config.get("ANCHORFLUX_MEDIA_PROFILE", ""),
+        )
+        raw_gpu_mode = os.environ.get(
+            "ANCHORFLUX_GPU_MODE",
+            env_config.get("ANCHORFLUX_GPU_MODE", ""),
+        )
         shell_path: Optional[Path] = None
         if raw_shell_path:
             shell_path = Path(raw_shell_path)
@@ -764,12 +806,18 @@ class Launcher:
         # 单实例守卫：第二次启动仅激活已有实例，不抢占也不重启。
         self.instance_guard = SingleInstanceGuard(self.project_root / "data" / "launcher.lock")
         if not self.instance_guard.acquire():
+            resolved_media_profile = resolve_media_profile(raw_ui_mode, raw_flavor, dev_mode, raw_media_profile)
+            resolved_gpu_mode = resolve_gpu_mode(raw_ui_mode, raw_flavor, resolved_media_profile, raw_gpu_mode)
             self._activate_running_instance(
                 ui_mode=raw_ui_mode,
                 dev_mode=dev_mode,
                 backend_port=DEFAULT_BACKEND_PORT,
                 frontend_port=DEFAULT_FRONTEND_PORT,
                 shell_path=shell_path,
+                runtime_policy=raw_runtime_policy,
+                flavor=raw_flavor,
+                media_profile=resolved_media_profile,
+                gpu_mode=resolved_gpu_mode,
             )
             self._exit_code_override = 0
             return False
@@ -845,6 +893,22 @@ class Launcher:
                 logger.warning("ONNX Runtime GPU 自动修正失败，将继续启动（可回退 CPU）: %s", ort_fix_result.message)
 
         # 创建配置
+        resolved_ui_mode = normalize_ui_mode(raw_ui_mode)
+        resolved_runtime_policy = normalize_runtime_policy(raw_runtime_policy)
+        resolved_flavor = normalize_flavor(raw_flavor)
+        resolved_media_profile = resolve_media_profile(
+            resolved_ui_mode,
+            resolved_flavor,
+            dev_mode,
+            raw_media_profile,
+        )
+        resolved_gpu_mode = resolve_gpu_mode(
+            resolved_ui_mode,
+            resolved_flavor,
+            resolved_media_profile,
+            raw_gpu_mode,
+        )
+
         self.config = LauncherConfig(
             project_root=self.project_root,
             dev_mode=dev_mode,
@@ -854,16 +918,20 @@ class Launcher:
             tools_dir=self.project_root / "tools",
             hf_mirror=env_config.get('USE_HF_MIRROR', 'true').lower() == 'true',
             log_level='DEBUG' if dev_mode else 'INFO',
-            ui_mode=normalize_ui_mode(raw_ui_mode),
-            runtime_policy=normalize_runtime_policy(raw_runtime_policy),
-            flavor=normalize_flavor(raw_flavor),
+            ui_mode=resolved_ui_mode,
+            runtime_policy=resolved_runtime_policy,
+            flavor=resolved_flavor,
             shell_path=shell_path,
+            media_profile=resolved_media_profile,
+            gpu_mode=resolved_gpu_mode,
         )
         logger.info(
-            "启动器配置: flavor=%s ui_mode=%s runtime_policy=%s shell_path=%s",
+            "启动器配置: flavor=%s ui_mode=%s runtime_policy=%s media_profile=%s gpu_mode=%s shell_path=%s",
             self.config.flavor,
             self.config.ui_mode,
             self.config.runtime_policy,
+            self.config.media_profile,
+            self.config.gpu_mode,
             self.config.shell_path or "<default>",
         )
 
@@ -914,7 +982,8 @@ class Launcher:
             return
 
         shell_path = resolve_shell_path(self.project_root, self.config.shell_path)
-        self._shell_process = launch_electron(shell_path)
+        shell_env = self._build_shell_env(self.config, backend_url)
+        self._shell_process = launch_electron(shell_path, env=shell_env)
         if self.process_manager:
             self.process_manager.attach_shell_process(self._shell_process)
         if self._shell_process is None:

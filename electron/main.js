@@ -1,8 +1,13 @@
 const path = require("path");
-const { app, BrowserWindow, nativeTheme, shell } = require("electron");
+const { app, BrowserWindow, nativeTheme, shell, ipcMain } = require("electron");
 const fs = require("fs");
 const http = require("http");
 const https = require("https");
+const { resolveGpuPolicy, applyGpuPolicy } = require("./bootstrap/gpuPolicy");
+const {
+  buildBaseRuntimeInfo,
+  collectRuntimeDiagnostics,
+} = require("./bootstrap/runtimeDiagnostics");
 
 const BACKEND_BASE_URL =
   process.env.ANCHORFLUX_BACKEND_URL || "http://127.0.0.1:8000";
@@ -18,6 +23,8 @@ const SHELL_FORCE_EXIT_MS = Number(
 );
 const WINDOW_BG_COLOR = "#0b1220";
 
+const gpuPolicy = applyGpuPolicy(app, resolveGpuPolicy(process.env));
+let runtimeInfoCache = buildBaseRuntimeInfo(gpuPolicy);
 let mainWindow = null;
 let isBackendShutdownTriggered = false;
 let isAppExitInProgress = false;
@@ -45,6 +52,19 @@ function openExternalUrl(rawUrl) {
     return;
   }
   shell.openExternal(rawUrl).catch(() => {});
+}
+
+function pushRuntimeInfo() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return;
+  }
+  mainWindow.webContents.send("shell:runtime-info", runtimeInfoCache);
+}
+
+async function refreshRuntimeDiagnostics() {
+  runtimeInfoCache = await collectRuntimeDiagnostics(app, gpuPolicy);
+  pushRuntimeInfo();
+  return runtimeInfoCache;
 }
 
 function requestBackendShutdown() {
@@ -92,7 +112,6 @@ function requestBackendShutdown() {
       req.write(payload);
       req.end();
     } catch (_) {
-      // 关闭链路不抛异常，避免阻断壳进程退出。
       done(false);
     }
   });
@@ -175,7 +194,6 @@ async function waitBackendReady() {
         }
       }
     } catch (_) {
-      // 启动期连接失败属于预期，继续轮询
     }
     pushStatus("waiting", "后端启动中，请稍候...");
     await sleep(READY_INTERVAL_MS);
@@ -205,6 +223,10 @@ function createMainWindow() {
   mainWindow.removeMenu();
   mainWindow.loadFile(path.join(__dirname, "loading.html"));
 
+  mainWindow.webContents.on("did-finish-load", () => {
+    pushRuntimeInfo();
+  });
+
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (isInternalUrl(url)) {
       return { action: "allow" };
@@ -228,6 +250,7 @@ function createMainWindow() {
 
 async function startShell() {
   if (focusMainWindow()) {
+    pushRuntimeInfo();
     return;
   }
   createMainWindow();
@@ -243,6 +266,7 @@ async function startShell() {
 
   try {
     await mainWindow.loadURL(BACKEND_BASE_URL);
+    pushRuntimeInfo();
     focusMainWindow();
   } catch (error) {
     pushStatus(
@@ -253,6 +277,8 @@ async function startShell() {
   }
 }
 
+ipcMain.handle("shell:get-runtime-info", async () => runtimeInfoCache);
+
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 
 if (!gotSingleInstanceLock) {
@@ -261,10 +287,16 @@ if (!gotSingleInstanceLock) {
   app.on("second-instance", () => {
     if (!focusMainWindow() && app.isReady()) {
       startShell();
+    } else {
+      pushRuntimeInfo();
     }
   });
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
     nativeTheme.themeSource = "dark";
+    await refreshRuntimeDiagnostics();
+    app.on("gpu-info-update", () => {
+      void refreshRuntimeDiagnostics();
+    });
     startShell();
   });
 }
@@ -282,5 +314,6 @@ app.on("activate", () => {
     startShell();
   } else {
     focusMainWindow();
+    pushRuntimeInfo();
   }
 });

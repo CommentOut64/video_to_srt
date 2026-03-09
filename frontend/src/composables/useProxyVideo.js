@@ -56,6 +56,8 @@ export function useProxyVideo(identityIdInput) {
   const autoTrigger720p = ref(true)  // V3.1.2+dev.20260113.02: 是否启用自动触发720p
   const version = ref(0) // V3.1.2+dev.20260114.08: 状态版本号，避免旧快照覆盖新状态
   const mediaProfile = ref('browser_compat')
+  const preferredPlayableUrl = ref(null)
+  const preferredPlayableResolution = ref(null)
 
   const urls = ref({
     preview360p: null,
@@ -66,6 +68,26 @@ export function useProxyVideo(identityIdInput) {
 
   // 待替换的720p URL（用于延迟替换）
   const pending720pUrl = ref(null)
+
+  function resetPreferredPlayable() {
+    preferredPlayableUrl.value = null
+    preferredPlayableResolution.value = null
+  }
+
+  function applyBestPlayableHint(snapshot) {
+    preferredPlayableUrl.value = snapshot?.best_playable_url || null
+    preferredPlayableResolution.value = snapshot?.best_playable_resolution || null
+
+    if (
+      mediaProfile.value !== 'lite_safe'
+      && !urls.value.proxy720p
+      && preferredPlayableUrl.value
+      && !['source', '360p'].includes(preferredPlayableResolution.value)
+    ) {
+      pending720pUrl.value = preferredPlayableUrl.value
+      urls.value.proxy720p = preferredPlayableUrl.value
+    }
+  }
 
   // ========== 计算属性 ==========
 
@@ -109,11 +131,12 @@ export function useProxyVideo(identityIdInput) {
    * 注意：如果正在转码中，返回 null，避免加载不兼容的源视频
    */
   const currentUrl = computed(() => {
+    if (mediaProfile.value === 'lite_safe' && preferredPlayableUrl.value) {
+      return preferredPlayableUrl.value
+    }
     if (urls.value.proxy720p) return urls.value.proxy720p
     if (urls.value.preview360p) return urls.value.preview360p
-    // 如果正在转码，不返回 source URL（避免加载不兼容的视频）
     if (isTranscoding.value) return null
-    // 否则返回 source URL（可直接播放的视频）
     return urls.value.source
   })
 
@@ -121,6 +144,9 @@ export function useProxyVideo(identityIdInput) {
    * 当前分辨率标识
    */
   const currentResolution = computed(() => {
+    if (mediaProfile.value === 'lite_safe' && preferredPlayableResolution.value) {
+      return preferredPlayableResolution.value
+    }
     if (urls.value.proxy720p) return '720p'
     if (urls.value.preview360p) return '360p'
     if (state.value === ProxyState.DIRECT_PLAY) return 'source'
@@ -141,9 +167,13 @@ export function useProxyVideo(identityIdInput) {
    */
   const statusText = computed(() => {
     const transcoding720Text =
-      mediaProfile.value === 'electron_native' ? '生成 H264 兼容版本...' : '生成 720p 高清...'
+      mediaProfile.value === 'lite_safe'
+        ? '生成安全播放版本...'
+        : (mediaProfile.value === 'electron_native' ? '生成 H264 兼容版本...' : '生成 720p 高清...')
     const ready720Text =
-      mediaProfile.value === 'electron_native' ? 'H264 兼容版本就绪' : '高清就绪'
+      mediaProfile.value === 'lite_safe'
+        ? '安全播放版本就绪'
+        : (mediaProfile.value === 'electron_native' ? 'H264 兼容版本就绪' : '高清就绪')
     const texts = {
       [ProxyState.IDLE]: "",
       [ProxyState.ANALYZING]: "分析视频中...",
@@ -188,8 +218,12 @@ export function useProxyVideo(identityIdInput) {
     onRemuxComplete: (data) => {
       state.value = ProxyState.READY_720P;
       const canonicalId = resolvedProjectId.value || identityId.value;
-      urls.value.proxy720p =
-        data.video_url || `/api/media/${canonicalId}/video`;
+      const nextUrl = data.video_url || `/api/media/${canonicalId}/video`;
+      urls.value.proxy720p = nextUrl;
+      if (mediaProfile.value === 'lite_safe') {
+        preferredPlayableUrl.value = nextUrl;
+        preferredPlayableResolution.value = 'remux';
+      }
       progress.value = 100;
     },
 
@@ -203,8 +237,12 @@ export function useProxyVideo(identityIdInput) {
     onPreview360pComplete: (data) => {
       state.value = ProxyState.READY_360P;
       const canonicalId = resolvedProjectId.value || identityId.value;
-      urls.value.preview360p =
-        data.video_url || `/api/media/${canonicalId}/video/preview`;
+      const nextUrl = data.video_url || `/api/media/${canonicalId}/video/preview`;
+      urls.value.preview360p = nextUrl;
+      if (mediaProfile.value === 'lite_safe') {
+        preferredPlayableUrl.value = nextUrl;
+        preferredPlayableResolution.value = '360p';
+      }
       progress.value = 0; // 重置进度，准备 720p
 
       // 自动开始 720p（状态会由后续 SSE 事件更新）
@@ -245,7 +283,12 @@ export function useProxyVideo(identityIdInput) {
     // H264 归一化完成
     onNormalizeComplete: (data) => {
       const canonicalId = resolvedProjectId.value || identityId.value;
-      urls.value.proxy720p = data.video_url || `/api/media/${canonicalId}/video`;
+      const nextUrl = data.video_url || `/api/media/${canonicalId}/video`;
+      urls.value.proxy720p = nextUrl;
+      if (mediaProfile.value === 'lite_safe') {
+        preferredPlayableUrl.value = nextUrl;
+        preferredPlayableResolution.value = 'normalized_h264';
+      }
       state.value = ProxyState.READY_720P;
       progress.value = 100;
     },
@@ -298,6 +341,7 @@ export function useProxyVideo(identityIdInput) {
       const status = response.data || response;
       resolvedProjectId.value = status.project_id || identityId.value;
       mediaProfile.value = status.media_profile || mediaProfile.value;
+      resetPreferredPlayable();
 
       // 恢复 URLs（先恢复URL，用于判断是否有可播放视频）
       if (status.urls) {
@@ -308,11 +352,7 @@ export function useProxyVideo(identityIdInput) {
           source: status.urls.source || null,
         };
       }
-      // V3.1.2+dev.20260114.21: 若后端提供最佳可播放URL，作为候选直接使用
-      if (!urls.value.proxy720p && status.best_playable_url) {
-        pending720pUrl.value = status.best_playable_url;
-        urls.value.proxy720p = status.best_playable_url;
-      }
+      applyBestPlayableHint(status)
 
       // V3.1.2+dev.20260113.03: 静默转码逻辑
       // 如果后端返回 transcoding_720 但已有360p可用，保持 ready_360p 状态
@@ -395,9 +435,16 @@ export function useProxyVideo(identityIdInput) {
     pending720pUrl.value = null;
     urls.value.proxy720p = null;
     if (urls.value.preview360p) {
+      if (mediaProfile.value === 'lite_safe') {
+        preferredPlayableUrl.value = urls.value.preview360p
+        preferredPlayableResolution.value = '360p'
+      } else {
+        resetPreferredPlayable()
+      }
       state.value = ProxyState.READY_360P;
       error.value = null;
     } else {
+      resetPreferredPlayable()
       state.value = ProxyState.ERROR;
       error.value = reason || "视频加载失败";
     }
@@ -413,6 +460,8 @@ export function useProxyVideo(identityIdInput) {
       progress.value = 0;
       error.value = null;
       urls.value = { preview360p: null, proxy720p: null, source: null };
+      resetPreferredPlayable();
+      pending720pUrl.value = null;
       resolvedProjectId.value = null;
     }
     if (newId) {
@@ -430,6 +479,8 @@ export function useProxyVideo(identityIdInput) {
     urls,
     autoTrigger720p,  // V3.1.2+dev.20260113.02: 自动触发720p配置
     mediaProfile,
+    preferredPlayableUrl,
+    preferredPlayableResolution,
 
     // 计算属性
     isReady,
@@ -461,6 +512,7 @@ export function useProxyVideo(identityIdInput) {
       if (proxyState.media_profile) {
         mediaProfile.value = proxyState.media_profile;
       }
+      applyBestPlayableHint(proxyState)
       let nextState = proxyState.state || state.value;
       let nextError = proxyState.error || null;
       const pausedErr = typeof nextError === 'string' && nextError.includes('paused_for_new_job');
@@ -480,6 +532,10 @@ export function useProxyVideo(identityIdInput) {
           proxy720p: proxyState.urls["720p"] || normalizeUrl,
           source: proxyState.urls.source || null,
         };
+        if (mediaProfile.value === 'lite_safe' && !preferredPlayableUrl.value && urls.value.preview360p) {
+          preferredPlayableUrl.value = urls.value.preview360p
+          preferredPlayableResolution.value = '360p'
+        }
       }
     },
 

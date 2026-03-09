@@ -365,3 +365,35 @@ def test_media_info_uses_normalize_progress_as_primary(tmp_path: Path, monkeypat
     assert payload["video"]["proxy_progress"] == 31
     assert payload["video"]["normalize_generating"] is True
     assert payload["video"]["normalize_progress"] == 31
+
+
+def test_get_video_in_lite_safe_profile_prefers_preview_over_normalized(tmp_path: Path, monkeypatch) -> None:
+    client, _, project_dir = _build_client(tmp_path, monkeypatch, profile="lite_safe")
+    (project_dir / "source.mp4").write_bytes(b"source")
+    (project_dir / "preview_360p.mp4").write_bytes(b"preview")
+    (project_dir / "normalized_h264.mp4").write_bytes(b"normalized")
+
+    resp = client.get("/api/media/project-1/video")
+
+    assert resp.status_code == 200
+    assert resp.json()["served_name"] == "preview_360p.mp4"
+
+
+def test_proxy_status_in_lite_safe_profile_exposes_best_playable_preview(tmp_path: Path, monkeypatch) -> None:
+    client, _, project_dir = _build_client(tmp_path, monkeypatch, profile="lite_safe")
+    (project_dir / "source.mp4").write_bytes(b"source")
+    (project_dir / "preview_360p.mp4").write_bytes(b"preview")
+
+    monkeypatch.setattr(
+        "app.api.routes.media_routes._analyze_transcode_requirement",
+        lambda _video: (True, "编码不兼容", "transcode_full"),
+    )
+
+    resp = client.get("/api/media/project-1/proxy-status")
+    payload = resp.json()
+
+    assert resp.status_code == 200
+    assert payload["media_profile"] == "lite_safe"
+    assert payload["auto_trigger_720p"] is False
+    assert payload["best_playable_url"] == "/api/media/project-1/video/preview"
+    assert payload["best_playable_resolution"] == "360p"

@@ -16,7 +16,12 @@ logger = logging.getLogger(__name__)
 
 MEDIA_PROFILE_BROWSER_COMPAT = "browser_compat"
 MEDIA_PROFILE_ELECTRON_NATIVE = "electron_native"
-_MEDIA_PROFILE_VALUES = {MEDIA_PROFILE_BROWSER_COMPAT, MEDIA_PROFILE_ELECTRON_NATIVE}
+MEDIA_PROFILE_LITE_SAFE = "lite_safe"
+_MEDIA_PROFILE_VALUES = {
+    MEDIA_PROFILE_BROWSER_COMPAT,
+    MEDIA_PROFILE_ELECTRON_NATIVE,
+    MEDIA_PROFILE_LITE_SAFE,
+}
 
 
 def load_env_file(env_path: Path) -> None:
@@ -54,9 +59,10 @@ def _resolve_media_profile_from_env() -> str:
     解析媒体预处理 profile。
 
     优先级：
-    1. ANCHORFLUX_MEDIA_PROFILE=browser_compat|electron_native
+    1. ANCHORFLUX_MEDIA_PROFILE=browser_compat|electron_native|lite_safe
     2. DEV_MODE=true|1|yes -> browser_compat
-    3. 默认 electron_native
+    3. Lite + Electron 建议由 Launcher 显式传入 lite_safe
+    4. 默认 electron_native
     """
     raw_profile = str(os.environ.get("ANCHORFLUX_MEDIA_PROFILE", "")).strip().lower()
     if raw_profile in _MEDIA_PROFILE_VALUES:
@@ -210,7 +216,7 @@ class ProjectConfig:
         self._ffmpeg_cpu_threads_cache = None  # 延迟计算缓存
         self.PROXY_CONFIG = {
             # V3.1.2+dev.20260113.02: 720p自动触发配置（默认启用）
-            # browser_compat 启用；electron_native 关闭
+            # browser_compat 启用；electron_native / lite_safe 关闭
             "auto_trigger_720p": self.MEDIA_PROFILE == MEDIA_PROFILE_BROWSER_COMPAT,
             # FFmpeg CPU 线程配置（避免使用全部核心导致降频）
             # 注意: 实际值通过 get_ffmpeg_cpu_threads() 方法获取（延迟计算）
@@ -397,6 +403,14 @@ class ProjectConfig:
     def is_browser_compat_media_profile(self) -> bool:
         """是否启用浏览器兼容 profile（保留 360p/720p 渐进 proxy）。"""
         return self.MEDIA_PROFILE == MEDIA_PROFILE_BROWSER_COMPAT
+
+    def is_lite_safe_media_profile(self) -> bool:
+        """是否启用 Lite 安全 profile（优先低负载可播放版本，关闭 720p 自动升级）。"""
+        return self.MEDIA_PROFILE == MEDIA_PROFILE_LITE_SAFE
+
+    def is_browser_like_media_profile(self) -> bool:
+        """是否属于浏览器样式的渐进媒体 profile。"""
+        return self.MEDIA_PROFILE in {MEDIA_PROFILE_BROWSER_COMPAT, MEDIA_PROFILE_LITE_SAFE}
 
     def is_electron_native_media_profile(self) -> bool:
         """是否启用 Electron 原生 profile（禁用 360p/720p 渐进 proxy）。"""

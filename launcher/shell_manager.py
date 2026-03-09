@@ -67,7 +67,7 @@ def wait_backend_ready(base_url: str, timeout_sec: int = 60) -> bool:
     return False
 
 
-def launch_electron(shell_path: Path) -> Optional[subprocess.Popen]:
+def launch_electron(shell_path: Path, env: Optional[Dict[str, str]] = None) -> Optional[subprocess.Popen]:
     """
     拉起 Electron Shell。
 
@@ -82,6 +82,7 @@ def launch_electron(shell_path: Path) -> Optional[subprocess.Popen]:
         process = subprocess.Popen(
             [str(shell_path)],
             cwd=str(shell_path.parent),
+            env=env or os.environ.copy(),
         )
         logger.info("Electron Shell 已启动: %s (PID=%s)", shell_path, process.pid)
         return process

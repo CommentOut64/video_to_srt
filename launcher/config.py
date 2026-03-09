@@ -22,9 +22,13 @@ DEFAULT_FRONTEND_PORT = 5173
 DEFAULT_UI_MODE = "browser"
 DEFAULT_RUNTIME_POLICY = "offline"
 DEFAULT_FLAVOR = "full"
+DEFAULT_MEDIA_PROFILE = "electron_native"
+DEFAULT_GPU_MODE = "auto"
 VALID_UI_MODES = ("browser", "electron", "none")
 VALID_RUNTIME_POLICIES = ("offline", "hybrid")
 VALID_FLAVORS = ("full", "lite")
+VALID_MEDIA_PROFILES = ("browser_compat", "electron_native", "lite_safe")
+VALID_GPU_MODES = ("auto", "prefer_dgpu", "prefer_igpu", "safe")
 
 # 信号文件
 UPDATE_SIGNAL_FILE = "update_signal.json"
@@ -96,6 +100,8 @@ class LauncherConfig:
     runtime_policy: str = DEFAULT_RUNTIME_POLICY
     flavor: str = DEFAULT_FLAVOR
     shell_path: Optional[Path] = None
+    media_profile: str = DEFAULT_MEDIA_PROFILE
+    gpu_mode: str = DEFAULT_GPU_MODE
 
     def __post_init__(self):
         """初始化后处理"""
@@ -104,6 +110,8 @@ class LauncherConfig:
         self.ui_mode = normalize_ui_mode(self.ui_mode)
         self.runtime_policy = normalize_runtime_policy(self.runtime_policy)
         self.flavor = normalize_flavor(self.flavor)
+        self.media_profile = normalize_media_profile(self.media_profile)
+        self.gpu_mode = normalize_gpu_mode(self.gpu_mode)
 
 
 def load_env_config(project_root: Path) -> Dict[str, str]:
@@ -144,12 +152,49 @@ def normalize_runtime_policy(raw_value: str) -> str:
     return DEFAULT_RUNTIME_POLICY
 
 
-def normalize_flavor(raw_value: str) -> str:
-    """归一化 flavor 值。"""
+def normalize_media_profile(raw_value: str) -> str:
+    """归一化媒体 profile。"""
     normalized = str(raw_value or "").strip().lower()
-    if normalized in VALID_FLAVORS:
+    if normalized in VALID_MEDIA_PROFILES:
         return normalized
-    return DEFAULT_FLAVOR
+    return DEFAULT_MEDIA_PROFILE
+
+
+def normalize_gpu_mode(raw_value: str) -> str:
+    """归一化 GPU 模式。"""
+    normalized = str(raw_value or "").strip().lower()
+    legacy_aliases = {
+        "prefer_hardware": "prefer_dgpu",
+        "off": "safe",
+    }
+    normalized = legacy_aliases.get(normalized, normalized)
+    if normalized in VALID_GPU_MODES:
+        return normalized
+    return DEFAULT_GPU_MODE
+
+
+def resolve_media_profile(ui_mode: str, flavor: str, dev_mode: bool, raw_value: str = "") -> str:
+    """根据运行模式解析默认媒体 profile。"""
+    normalized = normalize_media_profile(raw_value)
+    if str(raw_value or "").strip():
+        return normalized
+    if dev_mode or normalize_ui_mode(ui_mode) != "electron":
+        return "browser_compat"
+    if normalize_flavor(flavor) == "lite":
+        return "lite_safe"
+    return "electron_native"
+
+
+def resolve_gpu_mode(ui_mode: str, flavor: str, media_profile: str, raw_value: str = "") -> str:
+    """根据运行模式解析默认 GPU 模式。"""
+    normalized = normalize_gpu_mode(raw_value)
+    if str(raw_value or "").strip():
+        return normalized
+    if normalize_ui_mode(ui_mode) != "electron":
+        return "auto"
+    # 设计取舍：Lite 默认通过 lite_safe 媒体链降低解码压力，GPU 模式仍保持 auto，
+    # 只有用户显式选择 safe 时才彻底关闭硬件加速，避免默认策略过于保守。
+    return "auto"
 
 
 def detect_dev_mode(project_root: Path) -> bool:
