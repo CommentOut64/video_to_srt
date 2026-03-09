@@ -641,12 +641,79 @@
           </el-select>
         </div>
       </div>
+
+      <div class="setting-group diagnostics-group">
+        <div class="group-header diagnostics-header">
+          <div>
+            <span class="group-title">运行时诊断</span>
+            <div class="diagnostics-meta">
+              <span>Shell: {{ shellBridgeAvailable ? '已连接' : '不可用' }}</span>
+              <span>队列诊断: {{ queueDiagnosticsEnabled ? '已启用' : '未启用' }}</span>
+              <span>更新时间: {{ lastUpdatedAt || '未获取' }}</span>
+            </div>
+          </div>
+          <div class="diagnostics-actions">
+            <el-button size="small" :loading="diagnosticsLoading" @click="refreshDiagnostics()">刷新</el-button>
+            <el-button size="small" :loading="diagnosticsCopying" @click="copySnapshot">复制快照</el-button>
+          </div>
+        </div>
+
+        <div v-if="diagnosticsErrorMessage" class="diagnostics-error">
+          {{ diagnosticsErrorMessage }}
+        </div>
+
+        <div class="diagnostics-grid">
+          <div class="diagnostics-card">
+            <div class="diagnostics-card-title">Electron / GPU</div>
+            <div class="diagnostics-card-body">
+              <div v-for="item in shellGpuSummaryRows" :key="item.label" class="diagnostics-row">
+                <span class="diagnostics-label">{{ item.label }}</span>
+                <span class="diagnostics-value">{{ item.value }}</span>
+              </div>
+              <div class="diagnostics-row diagnostics-row-multiline">
+                <span class="diagnostics-label">策略备注</span>
+                <span class="diagnostics-value">{{ shellRuntimeInfo?.policy?.notes?.join('；') || '-' }}</span>
+              </div>
+              <div class="diagnostics-row diagnostics-row-multiline">
+                <span class="diagnostics-label">已追加开关</span>
+                <span class="diagnostics-value">{{ shellRuntimeInfo?.policy?.appliedSwitches?.join(', ') || '-' }}</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="diagnostics-card">
+            <div class="diagnostics-card-title">任务运行时</div>
+            <div class="diagnostics-card-body">
+              <div v-for="item in queueSummaryRows" :key="item.label" class="diagnostics-row">
+                <span class="diagnostics-label">{{ item.label }}</span>
+                <span class="diagnostics-value">{{ item.value }}</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="diagnostics-card">
+            <div class="diagnostics-card-title">播放链路</div>
+            <div class="diagnostics-card-body">
+              <div v-for="item in playbackSummaryRows" :key="item.label" class="diagnostics-row">
+                <span class="diagnostics-label">{{ item.label }}</span>
+                <span class="diagnostics-value">{{ item.value }}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="diagnostics-card diagnostics-json-card">
+          <div class="diagnostics-card-title">诊断快照 JSON</div>
+          <pre class="diagnostics-json">{{ diagnosticsSnapshotText }}</pre>
+        </div>
+      </div>
     </div>
   </div>
 </template>
 
 <script setup>
 import { computed, onUnmounted, ref, watch } from 'vue'
+import { useShellRuntimeDiagnostics } from '@/composables/useShellRuntimeDiagnostics'
 import { IS_LITE } from '@/config/flavor'
 import {
   buildShortcutComboFromKeyboardEvent,
@@ -679,6 +746,7 @@ const tabs = computed(() => {
   if (isLiteMode.value) {
     return [
       { id: 'general', label: '常规' },
+      { id: 'system', label: '系统' },
       { id: 'shortcuts', label: '快捷键' },
       { id: 'about', label: '关于' }
     ]
@@ -708,6 +776,97 @@ function handleTabClick(tabId) {
 }
 
 const editorShortcutFields = EDITOR_SHORTCUT_FIELDS
+const {
+  shellRuntimeInfo,
+  queueRuntimeInfo,
+  playbackSummary,
+  shellPolicy,
+  gpuFeatureStatus,
+  shellBridgeAvailable,
+  queueDiagnosticsEnabled,
+  isLoading: diagnosticsLoading,
+  isCopying: diagnosticsCopying,
+  errorMessage: diagnosticsErrorMessage,
+  lastUpdatedAt,
+  refreshDiagnostics,
+  copySnapshot,
+  safeJsonStringify,
+} = useShellRuntimeDiagnostics()
+
+const shellGpuSummaryRows = computed(() => {
+  const runtimeInfo = shellRuntimeInfo.value || {}
+  const featureStatus = gpuFeatureStatus.value || {}
+  const policy = shellPolicy.value || {}
+  return [
+    { label: '媒体 Profile', value: policy.mediaProfile || runtimeInfo.policy?.mediaProfile || '-' },
+    { label: 'GPU 策略', value: policy.effectiveMode || runtimeInfo.policy?.effectiveMode || '-' },
+    { label: '激活 GPU 类型', value: runtimeInfo.activeGpuType || '-' },
+    { label: '硬件加速', value: runtimeInfo.hardwareAccelerationEnabled === true ? '开启' : (runtimeInfo.hardwareAccelerationEnabled === false ? '关闭' : '-') },
+    { label: 'video_decode', value: featureStatus.video_decode || '-' },
+    { label: 'gpu_compositing', value: featureStatus.gpu_compositing || '-' },
+    { label: '平台', value: [runtimeInfo.platform, runtimeInfo.arch].filter(Boolean).join(' / ') || '-' },
+    { label: 'Electron', value: runtimeInfo.versions?.electron || '-' },
+  ]
+})
+
+const queueSummaryRows = computed(() => {
+  const queueInfo = queueRuntimeInfo.value || {}
+  return [
+    { label: '运行时诊断', value: queueInfo.runtime_enabled === true ? '已启用' : '未启用' },
+    { label: '队列长度', value: queueInfo.queue_length ?? '-' },
+    { label: '任务数', value: queueInfo.jobs_count ?? '-' },
+    { label: '孤儿执行', value: queueInfo.orphan_execution_count ?? '-' },
+    { label: 'Runner 线程', value: queueInfo.runner_thread_count ?? '-' },
+    { label: '存活 Runner', value: queueInfo.runner_alive_count ?? '-' },
+    { label: 'GPU Busy Override', value: queueInfo.is_gpu_busy_override === true ? '是' : '否' },
+    { label: 'Gate Blocking', value: queueInfo.is_runner_gate_blocking === true ? '是' : '否' },
+  ]
+})
+
+function formatDiagnosticMs(value) {
+  return Number.isFinite(Number(value)) ? `${Math.round(Number(value))} ms` : '-'
+}
+
+function formatFrameSummary(dropped, total) {
+  const droppedValue = Number.isFinite(Number(dropped)) ? Number(dropped) : null
+  const totalValue = Number.isFinite(Number(total)) ? Number(total) : null
+  if (droppedValue === null && totalValue === null) {
+    return '-'
+  }
+  if (droppedValue === null) {
+    return `- / ${totalValue}`
+  }
+  if (totalValue === null) {
+    return `${droppedValue}`
+  }
+  return `${droppedValue} / ${totalValue}`
+}
+const playbackSummaryRows = computed(() => {
+  const playbackInfo = playbackSummary.value || {}
+  return [
+    { label: '视频来源', value: playbackInfo.media_source_kind || '-' },
+    { label: '媒体 Profile', value: playbackInfo.media_profile || '-' },
+    { label: '当前分辨率', value: playbackInfo.current_resolution || '-' },
+    { label: '首帧耗时', value: formatDiagnosticMs(playbackInfo.video_first_frame_ms) },
+    { label: 'Seek 耗时', value: formatDiagnosticMs(playbackInfo.video_seek_latency_ms) },
+    { label: '卡顿次数', value: playbackInfo.video_stall_count ?? 0 },
+    { label: '卡顿总时长', value: formatDiagnosticMs(playbackInfo.video_stall_total_ms) },
+    { label: '最近卡顿', value: formatDiagnosticMs(playbackInfo.video_last_stall_ms) },
+    { label: '掉帧 / 总帧', value: formatFrameSummary(playbackInfo.video_decode_drop_count, playbackInfo.video_total_frame_count) },
+    { label: '最近错误', value: playbackInfo.last_error_message || '-' },
+    { label: '采样更新时间', value: playbackInfo.last_updated_at || '-' },
+  ]
+})
+
+const diagnosticsSnapshotText = computed(() => {
+  return safeJsonStringify({
+    shell_runtime: shellRuntimeInfo.value,
+    queue_runtime: queueRuntimeInfo.value,
+    playback_runtime: playbackSummary.value,
+    updated_at: lastUpdatedAt.value,
+  })
+})
+
 const recordingActionKey = ref('')
 
 function normalizeConfig(config) {
@@ -820,6 +979,108 @@ onUnmounted(() => {
 /* V3.2.4+dev.20260303.02: 全面替换原生控件为 Element Plus 组件 */
 
 /* 组件本地变量 */
+.diagnostics-group {
+  margin-top: 12px;
+}
+
+.diagnostics-header {
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.diagnostics-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--af-text-secondary);
+}
+
+.diagnostics-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.diagnostics-error {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  color: var(--af-text-on-dark);
+  background: rgba(var(--af-danger-rgb, 220, 38, 38), 0.28);
+}
+
+.diagnostics-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.diagnostics-card {
+  padding: 12px;
+  border: 1px solid rgba(var(--af-text-muted-rgb), 0.18);
+  border-radius: 10px;
+  background: rgba(var(--af-text-on-dark-rgb), 0.04);
+}
+
+.diagnostics-card-title {
+  margin-bottom: 10px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--af-text-primary);
+}
+
+.diagnostics-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.diagnostics-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+}
+
+.diagnostics-row-multiline {
+  align-items: flex-start;
+}
+
+.diagnostics-label {
+  color: var(--af-text-secondary);
+  flex: 0 0 112px;
+}
+
+.diagnostics-value {
+  color: var(--af-text-primary);
+  text-align: right;
+  word-break: break-word;
+  flex: 1;
+}
+
+.diagnostics-json-card {
+  margin-top: 12px;
+}
+
+.diagnostics-json {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--af-text-normal);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+@media (max-width: 900px) {
+  .diagnostics-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 .advanced-settings {
   --control-min-width: 180px;
 

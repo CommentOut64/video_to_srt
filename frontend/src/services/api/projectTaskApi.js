@@ -78,6 +78,14 @@ class ProjectTaskAPI {
   async syncTasks() {
     return apiClient.get('/api/projects/tasks/sync')
   }
+
+  /**
+   * 获取任务运行时诊断快照。
+   * @returns {Promise<Object>}
+   */
+  async getRuntimeDiagnostics() {
+    return apiClient.get('/api/projects/tasks/runtime-diagnostics')
+  }
 }
 
 export default new ProjectTaskAPI()

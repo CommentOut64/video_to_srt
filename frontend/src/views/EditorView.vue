@@ -59,6 +59,7 @@
             :upgrade-progress="proxyVideo.progress.value"
             :proxy-state="proxyVideo.state.value"
             :proxy-error="proxyVideo.error.value"
+            :media-profile="proxyVideo.mediaProfile.value"
             :auto-trigger-720p="proxyVideo.autoTrigger720p.value"
             @error="handleVideoError"
             @check-status="handleCheckVideoStatus"

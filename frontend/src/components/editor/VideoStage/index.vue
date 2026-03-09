@@ -52,6 +52,7 @@
         @canplay="onCanPlay"
         @playing="onPlaying"
         @progress="onProgress"
+        @stalled="onStalled"
       />
 
       <!-- 字幕覆盖层 - 可拖动版本 -->
@@ -165,6 +166,7 @@ import { useProjectStore } from '@/stores/projectStore'
 import { usePlaybackStore } from '@/stores/playbackStore'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { ProxyState } from '@/composables/useProxyVideo'
+import { useVideoPlaybackDiagnostics } from '@/composables/useVideoPlaybackDiagnostics'
 
 // Props
 const props = defineProps({
@@ -183,6 +185,7 @@ const props = defineProps({
   // Proxy 状态（来自 useProxyVideo）
   proxyState: { type: String, default: null },      // ProxyState 枚举值
   proxyError: { type: String, default: null },      // Proxy 错误信息
+  mediaProfile: { type: String, default: 'browser_compat' }, // 当前媒体 profile
   autoTrigger720p: { type: Boolean, default: true } // V3.1.2+dev.20260113.02: 是否启用自动触发720p
 })
 
@@ -195,6 +198,7 @@ const playbackStore = usePlaybackStore()
 
 // 全局播放管理器（单例）
 const playbackManager = usePlaybackManager()
+const playbackDiagnostics = useVideoPlaybackDiagnostics()
 
 // 编辑器上下文（用于纯音频场景放开播放控制）
 const editorContext = inject('editorContext', {
@@ -411,6 +415,15 @@ const transcodingProgress = computed(() => {
   return props.upgradeProgress || 0
 })
 
+function syncPlaybackDiagnosticsContext(sourceUrl = effectiveVideoSource.value) {
+  playbackDiagnostics.updatePlaybackContext({
+    mediaId: mediaId.value,
+    mediaProfile: props.mediaProfile,
+    resolution: props.currentResolution,
+    sourceUrl,
+  })
+}
+
 // 显示状态提示
 function showHint(type, text = '') {
   stateHintType.value = type
@@ -574,9 +587,8 @@ watch(() => playbackStore.isPlaying, async (playing) => {
 
 // 【重要】监听 videoRef 变化，确保 Video 元素注册到 PlaybackManager
 watch(videoRef, (video) => {
-  if (video) {
-    playbackManager.registerVideo(video, mediaId.value)
-  }
+  playbackManager.registerVideo(video || null, mediaId.value)
+  playbackDiagnostics.registerVideoElement(video || null, mediaId.value)
 }, { immediate: true })
 
 watch(
@@ -599,6 +611,7 @@ watch(() => playbackStore.volume, (volume) => {
 
 // 监听 effectiveVideoSource 变化
 watch(effectiveVideoSource, (newUrl, oldUrl) => {
+  syncPlaybackDiagnosticsContext(newUrl)
   if (!newUrl) {
     setBuffering(false, 'source-cleared')
     hasError.value = false
@@ -610,7 +623,7 @@ watch(effectiveVideoSource, (newUrl, oldUrl) => {
   if (newUrl !== oldUrl) {
     setBuffering(true, 'source-changed')
   }
-})
+}, { immediate: true })
 
 // 监听转码状态变化（刷新后恢复时清除错误状态）
 watch(() => props.isUpgrading, (isUpgrading) => {
@@ -621,6 +634,14 @@ watch(() => props.isUpgrading, (isUpgrading) => {
     retryCount.value = 0
   }
 })
+
+watch(
+  () => [props.currentResolution, props.mediaProfile],
+  () => {
+    syncPlaybackDiagnosticsContext()
+  },
+  { immediate: true }
+)
 
 // V3.1.2+dev.20260113.01: 监听分辨率变化，触发badge显示
 watch(() => props.currentResolution, (newRes, oldRes) => {
@@ -759,6 +780,7 @@ function onMetadataLoaded(event) {
   if (!video) {
     return
   }
+  playbackDiagnostics.recordLoadedMetadata({ video, duration: video.duration })
   projectStore.setProjectDuration(video.duration)
   video.playbackRate = playbackStore.playbackRate
   video.volume = playbackStore.volume
@@ -769,6 +791,7 @@ function onMetadataLoaded(event) {
 }
 
 function onLoadedData() {
+  playbackDiagnostics.recordLoadedData({ video: videoRef.value })
   setBuffering(false, 'loadeddata')
 }
 
@@ -781,8 +804,7 @@ function onTimeUpdate(event) {
   if (!Number.isFinite(currentTime)) {
     return
   }
-  // 【重要】时间更新由 PlaybackManager 内部通过事件监听处理
-  // 这里只负责发射事件通知外部
+  playbackDiagnostics.recordTimeUpdate({ video, currentTime })
   emit('timeupdate', currentTime)
 }
 
@@ -802,27 +824,41 @@ function onEnded() {
 }
 
 function onProgress() {
-  // 可以计算缓冲进度
+  playbackDiagnostics.sampleVideoQuality(videoRef.value)
 }
 
 function onWaiting() {
+  playbackDiagnostics.recordWaiting({ video: videoRef.value })
   setBuffering(true, 'waiting')
 }
 
 function onCanPlay() {
+  playbackDiagnostics.recordCanPlay({ video: videoRef.value })
   setBuffering(false, 'canplay')
 }
 
 function onPlaying() {
+  playbackDiagnostics.recordPlaying({ video: videoRef.value })
   setBuffering(false, 'playing')
 }
 
 function onSeeking() {
-  // PlaybackManager 内部处理
+  playbackDiagnostics.recordSeeking({
+    video: videoRef.value,
+    currentTime: Number(videoRef.value?.currentTime),
+  })
 }
 
 function onSeeked() {
-  // PlaybackManager 内部处理
+  playbackDiagnostics.recordSeeked({
+    video: videoRef.value,
+    currentTime: Number(videoRef.value?.currentTime),
+  })
+}
+
+function onStalled() {
+  playbackDiagnostics.recordStalled({ video: videoRef.value })
+  setBuffering(true, 'stalled')
 }
 
 function onError() {
@@ -849,6 +885,8 @@ function onError() {
       default: errorMessage.value = '未知错误'; canRetry.value = true
     }
   }
+
+  playbackDiagnostics.recordError({ code: error?.code, message: errorMessage.value })
 
   console.error('[VideoStage] 视频加载错误:', error?.code, errorMessage.value)
 
@@ -1104,6 +1142,8 @@ onMounted(() => {
   // 【关键】注册 Video 元素到 PlaybackManager
   if (videoRef.value) {
     playbackManager.registerVideo(videoRef.value, mediaId.value)
+    playbackDiagnostics.registerVideoElement(videoRef.value, mediaId.value)
+    syncPlaybackDiagnosticsContext()
   }
 
   // V3.1.2+dev.20260113.01: 初始化时显示分辨率标志
@@ -1138,6 +1178,13 @@ onUnmounted(() => {
 
   // 【关键】注销 Video 元素
   playbackManager.unregisterVideo()
+  playbackDiagnostics.registerVideoElement(null, mediaId.value)
+  playbackDiagnostics.updatePlaybackContext({
+    mediaId: mediaId.value,
+    mediaProfile: props.mediaProfile,
+    resolution: props.currentResolution,
+    sourceUrl: null,
+  })
 })
 </script>
 
