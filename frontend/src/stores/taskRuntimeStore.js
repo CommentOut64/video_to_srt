@@ -10,6 +10,7 @@ import { defineStore } from 'pinia'
 import { ref, computed, watch, reactive } from 'vue'
 import { useRouter } from 'vue-router'
 import { useProjectStore } from './projectStore'
+import { useEditorSessionStore } from './editorSessionStore'
 import { normalizeTimestamp } from '@/utils/timestamp'
 import { navigateToEditor } from '@/utils/editorNavigation'
 
@@ -1040,9 +1041,9 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
       return
     }
 
-    // 调用 ProjectStore 的保存逻辑
-    const projectStore = useProjectStore()
-    await projectStore.saveProject()
+    // 统一走编辑会话保存逻辑，避免 projectStore 继续承担会话快照职责
+    const editorSessionStore = useEditorSessionStore()
+    await editorSessionStore.saveWorkingCopy()
 
     currentTask.value.isDirty = false
     console.log(`[TaskRuntimeStore] 当前任务已保存: ${currentTask.value.job_id}`)

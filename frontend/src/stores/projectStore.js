@@ -5,9 +5,7 @@
  * 实现了撤销/重做、自动保存、智能问题检测等功能
  */
 import { defineStore, storeToRefs } from "pinia";
-import { ref, computed, watch, toRaw } from "vue";
-import localforage from "localforage";
-import smartSaver from "@/services/SmartSaver";
+import { ref, computed, toRaw } from "vue";
 import { repairSubtitleOverlaps } from "@/utils/subtitleUtils";
 import { createLocalSubtitleId, createSplitSubtitleIds } from "@/utils/subtitleId";
 import { useSubtitleHotStore } from "@/core/editor/subtitleHotStore";
@@ -15,6 +13,7 @@ import { useSubtitleColdStore } from "@/core/editor/subtitleColdStore";
 import { useSubtitleIndexStore } from "@/core/editor/subtitleIndexStore";
 import { buildSubtitleProjection } from "@/core/editor/subtitleKernelUtils";
 import { useEditorHistoryStore } from "@/core/editor/historyStore";
+import { useEditorTimingStore } from "@/stores/editorTimingStore";
 import { createUpdateSubtitleCommand } from "@/core/editor/commands/updateSubtitleCommand";
 import { createAddSubtitleCommand } from "@/core/editor/commands/addSubtitleCommand";
 import { createRemoveSubtitleCommand } from "@/core/editor/commands/removeSubtitleCommand";
@@ -52,6 +51,7 @@ export const useProjectStore = defineStore("project", () => {
   const subtitleHotStore = useSubtitleHotStore();
   const subtitleColdStore = useSubtitleColdStore();
   const subtitleIndexStore = useSubtitleIndexStore();
+  const editorTimingStore = useEditorTimingStore();
   const TRACKED_SUBTITLE_ARRAY = Symbol("trackedSubtitleArray");
   const mutatingArrayMethods = new Set(["copyWithin", "fill", "pop", "push", "reverse", "shift", "sort", "splice", "unshift"]);
   let isReplacingTrackedSubtitles = false;
@@ -128,9 +128,6 @@ export const useProjectStore = defineStore("project", () => {
       .filter(Boolean);
   });
 
-  // V3.2.0+dev.20260130.09: 字幕全局时间偏移（秒，正值延后，负值提前）
-  const subtitleOffset = ref(0);
-
   // 用户删除的字幕索引集合（用于阻止 SSE 回补）
   const deletedSentenceIndices = ref(new Set());
 
@@ -159,11 +156,10 @@ export const useProjectStore = defineStore("project", () => {
   //   - 用户编辑时通过命令对象记录（updateSubtitle, addSubtitle, removeSubtitle, split, merge）
   // - 以下情况会清除历史记录以建立"基线"：
   //   1. importSRT() - 导入转录结果时
-  //   2. restoreProject() - 从缓存/存储恢复项目时
+  //   2. applyWorkingCopySnapshot() - 从会话快照恢复项目时
   //   3. resetProject() - 重置项目时
   const editorHistoryStore = useEditorHistoryStore();
-  // 这里必须通过 storeToRefs 保持响应式桥接；直接取值会把 canUndo/canRedo 冻结为初始化快照。
-  const { history, canUndo, canRedo, isHistoryTracking } = storeToRefs(editorHistoryStore);
+  const { history } = storeToRefs(editorHistoryStore);
   const undo = editorHistoryStore.undo;
   const redo = editorHistoryStore.redo;
   const clearHistory = editorHistoryStore.clearHistory;
@@ -179,15 +175,7 @@ export const useProjectStore = defineStore("project", () => {
     isSeeking: false, // 全局Seek锁：标记用户是否正在主动跳转（解决进度条拖动循环问题）
   });
 
-  // ========== 5. 视图状态 ==========
-  const view = ref({
-    theme: "dark", // 'dark' | 'light'
-    zoomLevel: 100, // 波形缩放比例（%）
-    autoScroll: true, // 列表自动跟随播放
-    selectedSubtitleId: null, // 当前选中的字幕ID
-  });
-
-  // ========== 6. 计算属性 ==========
+  // ========== 5. 计算属性 ==========
   const primaryId = computed(() => meta.value.projectId || meta.value.jobId || null);
   const totalSubtitles = computed(() => projectedSubtitles.value.length);
 
@@ -199,18 +187,7 @@ export const useProjectStore = defineStore("project", () => {
   });
 
   // ========== 6.1 字幕偏移辅助函数 ==========
-  function clampSubtitleOffset(value) {
-    const num = Number(value) || 0;
-    return Math.min(10, Math.max(-10, num));
-  }
-
-  function toDisplayTime(baseTime) {
-    return (Number(baseTime) || 0) + subtitleOffset.value;
-  }
-
-  function toBaseTime(displayTime) {
-    return (Number(displayTime) || 0) - subtitleOffset.value;
-  }
+  const subtitleOffset = computed(() => editorTimingStore.subtitleOffset);
 
   function shiftWords(words, delta) {
     if (!Array.isArray(words) || words.length === 0) return [];
@@ -243,30 +220,27 @@ export const useProjectStore = defineStore("project", () => {
     });
   }
 
+  editorTimingStore.bindRuntime({
+    applyOffsetDelta,
+    writeMetaSubtitleOffset: (value) => {
+      meta.value.subtitleOffset = value;
+    },
+  });
+
+  function toDisplayTime(baseTime) {
+    return editorTimingStore.toDisplayTime(baseTime);
+  }
+
+  function toBaseTime(displayTime) {
+    return editorTimingStore.toBaseTime(displayTime);
+  }
+
   function applyOffsetToSentenceData(sentenceData) {
-    if (!sentenceData) return sentenceData;
-    const delta = subtitleOffset.value;
-    const start = toDisplayTime(sentenceData.start ?? 0);
-    const end = toDisplayTime(sentenceData.end ?? 0);
-    return {
-      ...sentenceData,
-      start: Math.max(0, start),
-      end: Math.max(Math.max(0, start), end),
-      words: shiftWords(sentenceData.words, delta),
-    };
+    return editorTimingStore.applyOffsetToSentenceData(sentenceData);
   }
 
   function applyOffsetToSegments(segments) {
-    if (!Array.isArray(segments)) return [];
-    return segments.map((segment) => {
-      const start = toDisplayTime(segment.start ?? 0);
-      const end = toDisplayTime(segment.end ?? 0);
-      return {
-        ...segment,
-        start: Math.max(0, start),
-        end: Math.max(Math.max(0, start), end),
-      };
-    });
+    return editorTimingStore.applyOffsetToSegments(segments);
   }
 
   function normalizeSpeakerFields(source = {}, options = {}) {
@@ -291,14 +265,7 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   function setSubtitleOffset(value, options = {}) {
-    const { applyDelta = true } = options;
-    const normalized = Math.round(clampSubtitleOffset(value) * 1000) / 1000;
-    const previous = subtitleOffset.value;
-    subtitleOffset.value = normalized;
-    meta.value.subtitleOffset = normalized;
-    if (applyDelta) {
-      applyOffsetDelta(normalized - previous);
-    }
+    return editorTimingStore.setSubtitleOffset(value, options);
   }
 
   function normalizeCapabilitySnapshot(snapshot) {
@@ -384,15 +351,6 @@ export const useProjectStore = defineStore("project", () => {
 
   function setCurrentResolution(resolution) {
     patchMeta({ currentResolution: resolution || null });
-  }
-
-  function setZoomLevel(level) {
-    const normalized = Number(level);
-    view.value.zoomLevel = Number.isFinite(normalized) ? normalized : view.value.zoomLevel;
-  }
-
-  function setSelectedSubtitleId(subtitleId) {
-    view.value.selectedSubtitleId = subtitleId || null;
   }
 
   function setPlayerVolume(volume) {
@@ -503,69 +461,48 @@ export const useProjectStore = defineStore("project", () => {
   // 旧的字幕检查系统已移除，保留空数组以兼容现有引用
   const validationErrors = computed(() => []);
 
-  // ========== 7. 智能保存系统 ==========
-  // 内存缓存（热数据）
-  const memoryCache = new Map();
-  const MAX_MEMORY_CACHE = 10; // 最多缓存10个任务的数据
+  // ========== 7. 工作副本快照 ==========
+  // 仅提供通用导入/导出能力；具体缓存策略由 editorSessionStore 负责。
+  function createWorkingCopySnapshot() {
+    return {
+      subtitles: cloneSubtitleSnapshot(),
+      meta: {
+        ...toRaw(meta.value),
+        subtitleOffset: subtitleOffset.value,
+      },
+    };
+  }
 
-  // 标记是否正在进行保存后的状态更新（避免循环触发）
-  let isUpdatingAfterSave = false;
+  function applyWorkingCopySnapshot(snapshot = {}) {
+    const normalizedSubtitles = Array.isArray(snapshot?.subtitles)
+      ? snapshot.subtitles.map((subtitle) => ({ ...subtitle }))
+      : [];
+    const cachedMeta = snapshot?.meta && typeof snapshot.meta === "object"
+      ? snapshot.meta
+      : {};
 
-  // 配置智能保存回调
-  smartSaver.onSaveSuccess = (jobId) => {
-    console.log("[ProjectStore] 自动保存成功:", jobId);
-    // 使用标记避免循环触发 watch
-    isUpdatingAfterSave = true;
+    subtitles.value = normalizedSubtitles;
+    meta.value = {
+      ...meta.value,
+      ...cachedMeta,
+      capabilitySnapshot: normalizeCapabilitySnapshot(cachedMeta?.capabilitySnapshot),
+    };
+    if (cachedMeta?.subtitleOffset !== undefined) {
+      setSubtitleOffset(cachedMeta.subtitleOffset, { applyDelta: false });
+    }
 
-    // 暂停历史记录追踪，避免 isDirty 重置创建历史记录
-    pauseHistory();
+    clearHistory();
+    console.log("[ProjectStore] 工作副本快照已恢复");
+  }
 
+  function markWorkingCopySaved() {
     meta.value.lastSaved = Date.now();
     meta.value.isDirty = false;
-    // 重置每个字幕的 isDirty 标记
-    subtitles.value.forEach((s) => (s.isDirty = false));
+    subtitles.value.forEach((subtitle) => {
+      subtitle.isDirty = false;
+    });
     syncKernelFromShadow();
-
-    // 恢复历史记录追踪
-    resumeHistory();
-
-    isUpdatingAfterSave = false;
-  };
-
-  smartSaver.onSaveError = (error, jobId) => {
-    console.error("[ProjectStore] 自动保存失败:", jobId, error);
-  };
-
-  // 监听数据变化，触发智能保存
-  watch(
-    [subtitles, meta],
-    () => {
-      // 跳过保存后的状态更新触发
-      if (isUpdatingAfterSave) return;
-      const cacheKey = meta.value.projectId || meta.value.jobId;
-      if (!cacheKey) return;
-
-      // 更新内存缓存
-      memoryCache.set(cacheKey, {
-        subtitles: cloneSubtitleSnapshot(),
-        meta: toRaw(meta.value),
-      });
-
-      // 限制内存缓存大小（LRU淘汰）
-      if (memoryCache.size > MAX_MEMORY_CACHE) {
-        const firstKey = memoryCache.keys().next().value;
-        memoryCache.delete(firstKey);
-      }
-
-      // 触发智能保存
-      smartSaver.save({
-        jobId: cacheKey,
-        subtitles: cloneSubtitleSnapshot(),
-        meta: meta.value,
-      });
-    },
-    { deep: true, flush: 'post' }
-  );
+  }
 
   // ========== 8. Actions ==========
 
@@ -726,54 +663,6 @@ export const useProjectStore = defineStore("project", () => {
     chunkSubtitleMap.value.clear();
     speakerProfiles.value = new Map();
     deletedSentenceIndices.value.clear();
-  }
-
-  /**
-   * 从缓存/存储恢复项目
-   */
-  async function restoreProject(identityId) {
-    if (!identityId) {
-      return false;
-    }
-    try {
-      // 优先从内存缓存获取
-      if (memoryCache.has(identityId)) {
-        const cached = memoryCache.get(identityId);
-        subtitles.value = cached.subtitles;
-        meta.value = {
-          ...cached.meta,
-          capabilitySnapshot: normalizeCapabilitySnapshot(cached?.meta?.capabilitySnapshot),
-        };
-        if (cached?.meta?.subtitleOffset !== undefined) {
-          setSubtitleOffset(cached.meta.subtitleOffset, { applyDelta: false });
-        }
-        // 恢复后清除历史记录，防止撤回到转录期间的状态
-        clearHistory();
-        console.log("[ProjectStore] 项目已从内存缓存恢复");
-        return true;
-      }
-
-      // 使用智能保存系统恢复（支持 IndexedDB + localStorage 备份）
-      const saved = await smartSaver.restoreFromBackup(identityId);
-      if (saved) {
-        subtitles.value = saved.subtitles;
-        meta.value = {
-          ...saved.meta,
-          capabilitySnapshot: normalizeCapabilitySnapshot(saved?.meta?.capabilitySnapshot),
-        };
-        if (saved?.meta?.subtitleOffset !== undefined) {
-          setSubtitleOffset(saved.meta.subtitleOffset, { applyDelta: false });
-        }
-        // 恢复后清除历史记录，防止撤回到转录期间的状态
-        clearHistory();
-        console.log("[ProjectStore] 项目已从存储恢复");
-        return true;
-      }
-      return false;
-    } catch (error) {
-      console.error("[ProjectStore] 恢复项目失败:", error);
-      return false;
-    }
   }
 
   /**
@@ -1577,19 +1466,6 @@ export const useProjectStore = defineStore("project", () => {
       `[ProjectStore] 取消收敛完成，草稿转定稿并去重: removed=${removedIds.size}`
     );
 
-    // 关键路径使用同步备份 + 立即持久化，避免取消后用户立刻刷新导致数据丢失
-    const cacheKey = primaryId.value;
-    if (cacheKey) {
-      try {
-        await smartSaver.forceSaveCritical({
-          jobId: cacheKey,
-          subtitles: cloneSubtitleSnapshot(),
-          meta: meta.value,
-        });
-      } catch (error) {
-        console.error("[ProjectStore] 取消收敛后关键保存失败:", error);
-      }
-    }
     resumeHistory();
   }
 
@@ -1972,33 +1848,6 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   /**
-   * 保存项目（持久化到后端 + 本地强制保存）
-   */
-  async function saveProject() {
-    // TODO: 调用后端API保存编辑后的字幕
-    const srtContent = generateSRT();
-    // await api.saveSubtitle(meta.value.jobId, srtContent)
-
-    const cacheKey = primaryId.value;
-    if (!cacheKey) {
-      return;
-    }
-
-    // 强制立即保存到本地存储
-    await smartSaver.forceSave({
-      jobId: cacheKey,
-      subtitles: cloneSubtitleSnapshot(),
-      meta: meta.value,
-    });
-
-    meta.value.lastSaved = Date.now();
-    meta.value.isDirty = false;
-    subtitles.value.forEach((s) => (s.isDirty = false));
-    syncKernelFromShadow();
-    console.log("[ProjectStore] 项目已保存");
-  }
-
-  /**
    * 重置项目状态
    */
   function resetProject() {
@@ -2102,8 +1951,6 @@ export const useProjectStore = defineStore("project", () => {
     meta,
     subtitles: projectedSubtitles,
     player,
-    view,
-    subtitleOffset,
 
     // Phase 5: 双模态架构状态
     chunkSubtitleMap,
@@ -2121,15 +1968,6 @@ export const useProjectStore = defineStore("project", () => {
     draftSubtitleCount,
     finalizedSubtitleCount,
 
-    // 历史记录
-    canUndo,
-    canRedo,
-    undo,
-    redo,
-    clearHistory,
-    pauseHistory, // 暂停历史记录（用于 SSE 推送等系统操作）
-    resumeHistory, // 恢复历史记录
-
     // 操作方法
     patchMeta,
     setIdentity,
@@ -2137,8 +1975,6 @@ export const useProjectStore = defineStore("project", () => {
     setProjectTitle,
     setProjectDuration,
     setCurrentResolution,
-    setZoomLevel,
-    setSelectedSubtitleId,
     setPlayerVolume,
     setPlaybackRate,
     setIsPlaying,
@@ -2148,7 +1984,8 @@ export const useProjectStore = defineStore("project", () => {
     importSRT,
     importSegments,
     loadFromProjectData,
-    restoreProject,
+    createWorkingCopySnapshot,
+    applyWorkingCopySnapshot,
     updateSubtitle,
     addSubtitle,
     removeSubtitle,
@@ -2158,7 +1995,7 @@ export const useProjectStore = defineStore("project", () => {
     mergeSubtitles, // 字幕合并
     generateSRT,
     seekTo,
-    saveProject,
+    markWorkingCopySaved,
     resetProject,
 
     // Phase 5: 双模态架构方法
@@ -2172,11 +2009,6 @@ export const useProjectStore = defineStore("project", () => {
     updateDualStreamProgressFromSSE,  // V3.1.0: 从 SSE 更新双流进度
 
     // 辅助方法
-    setSubtitleOffset,
-    toBaseTime,
-    toDisplayTime,
-    applyOffsetToSegments,
-    applyOffsetToSentenceData,
     formatTimestamp,
     parseTimestamp,
   };
