@@ -26,8 +26,8 @@
       @quick-search="handleQuickSearch"
     />
 
-    <!-- 字幕列表 (使用 SubtitleItem 组件) -->
-    <div class="list-host tw-flex-1 tw-min-h-0 tw-relative">
+    <!-- 字幕列表（虚拟列表实现） -->
+    <div class="list-host tw-flex tw-flex-col tw-flex-1 tw-min-h-0 tw-overflow-hidden tw-relative">
       <div v-if="filteredSubtitles.length === 0 && !homophoneSearch.isSearchActive" class="empty-state tw-flex tw-flex-col tw-items-center tw-justify-center tw-px-4 tw-py-8 tw-text-text-muted">
         <svg viewBox="0 0 24 24" fill="currentColor" class="tw-w-12 tw-h-12 tw-mb-3 tw-opacity-50">
           <path d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H4V6h16v12zM6 10h2v2H6v-2zm0 4h8v2H6v-2zm10 0h2v2h-2v-2zm0-4h2v2h-2v-2zm-4 4h2v2h-2v-2zm0-4h2v2h-2v-2z"/>
@@ -70,7 +70,7 @@
               @toggle-collapse="toggleGroupCollapse(item.clusterId)"
               @group-select-change="(checked) => handleGroupSelectChange(item.group, checked)"
             />
-            <SubtitleItem
+            <SubtitleRow
               v-else
               :subtitle="item.subtitle"
               :index="item.index"
@@ -109,7 +109,7 @@
             :size-dependencies="[item.subtitle.text, item.subtitle.start, item.subtitle.end, item.subtitle.isDraft, item.subtitle.warning_type, item.isSelected, item.clusterColor]"
             :data-index="index"
           >
-            <SubtitleItem
+            <SubtitleRow
               :subtitle="item.subtitle"
               :index="item.index"
               :is-active="activeSubtitleId === item.subtitle.id"
@@ -147,7 +147,7 @@
             :size-dependencies="[item.text, item.start, item.end, item.isDraft, item.warning_type, activeSubtitleId === item.id, currentSubtitleId === item.id]"
             :data-index="index"
           >
-            <SubtitleItem
+            <SubtitleRow
               :subtitle="item"
               :index="index"
               :is-active="activeSubtitleId === item.id"
@@ -172,7 +172,8 @@ import { ref, reactive, computed, watch, nextTick, onMounted, onUnmounted } from
 import { DynamicScroller, DynamicScrollerItem } from 'vue-virtual-scroller'
 import { ElMessage } from 'element-plus'
 import { useProjectStore } from '@/stores/projectStore'
-import { useSubtitleDocumentStore } from '@/stores/subtitleDocumentStore'
+import { useEditorUiStore } from '@/stores/editorUiStore'
+import { useEditorTimingStore } from '@/stores/editorTimingStore'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { useHomophoneSearch, SortMode } from '@/composables'
 import { useEditBufferStore } from '@/core/editor/editBufferStore'
@@ -180,7 +181,7 @@ import { applyBatchReplaceUpdatedSegments } from '@/core/sync/batchReplaceProjec
 import projectApi from '@/services/api/projectApi'
 import { useSyncCoordinatorStore } from '@/core/sync/syncCoordinator'
 // 导入组件
-import SubtitleItem from './SubtitleItem.vue'
+import SubtitleRow from './SubtitleRow.vue'
 import SearchToolbar from './SearchToolbar.vue'
 import GroupHeader from './GroupHeader.vue'
 
@@ -197,7 +198,8 @@ const emit = defineEmits(['subtitle-click', 'subtitle-edit', 'subtitle-delete', 
 
 // Store
 const projectStore = useProjectStore()
-const subtitleDocumentStore = useSubtitleDocumentStore()
+const editorUiStore = useEditorUiStore()
+const editorTimingStore = useEditorTimingStore()
 const syncCoordinator = useSyncCoordinatorStore()
 const editBufferStore = useEditBufferStore()
 
@@ -207,10 +209,10 @@ const playbackManager = usePlaybackManager()
 const identityId = computed(() => projectStore.primaryId)
 // 统一使用 project 主身份，兼容旧任务时可回退到 legacy job_id。
 const projectId = computed(() => projectStore.primaryId)
-const onSubtitleEdit = subtitleDocumentStore.onSubtitleEdit
-const applyPendingEditsToStore = subtitleDocumentStore.applyPendingEditsToStore
-const forceSyncNow = subtitleDocumentStore.forceSyncNow
-const pendingCount = subtitleDocumentStore.pendingCount
+const onSubtitleEdit = syncCoordinator.enqueueSubtitleEdit
+const applyPendingEditsToStore = syncCoordinator.applyPendingEditsToStore
+const forceSyncNow = syncCoordinator.forceSyncNow
+const pendingCount = () => Number(syncCoordinator.pendingCount || 0)
 
 // 同音搜索 composable（用 reactive 包裹，使模板 v-model 能正确写入 ref.value）
 const homophoneSearch = reactive(useHomophoneSearch({
@@ -240,7 +242,7 @@ const hasAppliedPending = ref(false)
 const subtitles = computed(() => projectStore.subtitles)
 const totalSubtitles = computed(() => projectStore.totalSubtitles)
 const currentSubtitleId = computed(() => projectStore.currentSubtitle?.id)
-const activeSubtitleId = computed(() => subtitleDocumentStore.selectedSubtitleId)
+const activeSubtitleId = computed(() => editorUiStore.selectedSubtitleId)
 // 草稿计数
 const draftCount = computed(() => projectStore.draftSubtitleCount)
 
@@ -358,7 +360,7 @@ function scrollToSubtitleId(subtitleId) {
 watch(
   () => identityId.value,
   async (identity) => {
-    await subtitleDocumentStore.bindSyncIdentity(identity)
+    await syncCoordinator.bindSyncIdentity(identity)
     hasAppliedPending.value = false
     if (pendingCount() > 0) {
       await forceSyncNow()
@@ -382,7 +384,7 @@ watch(
 
 // Methods
 function onSubtitleClick(subtitle) {
-  subtitleDocumentStore.setSelectedSubtitleId(subtitle.id)
+  editorUiStore.setSelectedSubtitleId(subtitle.id)
   // 使用 PlaybackManager 进行跳转，确保视频和波形同步
   playbackManager.seekTo(subtitle.start)
   emit('subtitle-click', subtitle)
@@ -464,8 +466,8 @@ function buildAddSubtitleCommand(localSubtitleId, start, end, text = '') {
     command_id: syncCoordinator.nextCommandId('add-subtitle'),
     local_id: localSubtitleId == null ? null : String(localSubtitleId),
     text,
-    start: projectStore.toBaseTime(start),
-    end: projectStore.toBaseTime(end),
+    start: editorTimingStore.toBaseTime(start),
+    end: editorTimingStore.toBaseTime(end),
   }
 }
 
@@ -748,7 +750,7 @@ async function handleBatchReplace() {
             duration: projectStore.meta.duration,
             videoPath: projectStore.meta.videoPath,
             audioPath: projectStore.meta.audioPath,
-            subtitleOffset: projectStore.subtitleOffset,
+            subtitleOffset: editorTimingStore.subtitleOffset,
           }
         )
       }
@@ -827,52 +829,12 @@ defineExpose({
   background: var(--af-bg-primary);
 }
 
-/* SVG 选择器 - 按特异性从低到高排列 */
-svg {
-  width: 14px;
-  height: 14px;
-}
-
-.empty-state svg {
-  width: 48px;
-  height: 48px;
-  margin-bottom: 12px;
-  opacity: 0.5;
-}
-
-.time-row .time-arrow svg {
-  width: 14px;
-  height: 14px;
-}
-
-.item-actions .action-btn svg {
-  width: 14px;
-  height: 14px;
-}
-
-/* 列表容器 */
+/* 列表容器 (DynamicScroller 根元素) */
 .list-container {
   position: relative;
   flex: 1;
+  min-height: 0;
   padding: 6px;
-  overflow-y: auto;
-}
-
-.list-container::-webkit-scrollbar {
-  width: 6px;
-}
-
-.list-container::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-.list-container::-webkit-scrollbar-thumb {
-  background: var(--af-border-default);
-  border-radius: 3px;
-}
-
-.list-container::-webkit-scrollbar-thumb:hover {
-  background: var(--af-text-muted);
 }
 
 /* 空状态 */
@@ -904,261 +866,34 @@ svg {
 .empty-state .add-first-btn:hover {
   background: var(--af-accent-primary-hover);
 }
+</style>
 
-/* 字幕项 - 紧凑布局 */
-.subtitle-item {
-  display: flex;
-  gap: 10px;
-  padding: 10px;
-  margin-bottom: 6px;
-  background: var(--af-bg-secondary);
-  border: 1px solid transparent;
-  border-radius: var(--af-radius-md);
-  transition: all var(--af-transition-fast);
-  cursor: pointer;
+<!-- V3.2.4+dev.20260310.02: 非 scoped — 穿透第三方虚拟列表组件边界 -->
+<style>
+/*
+ * 虚拟列表 item 间距
+ * ResizeObserver 监听 DynamicScrollerItem 渲染的 div（__item-view 的直接子元素），
+ * 而非 __item-view 本身。padding 必须加在被监听的那层才能被高度计算感知。
+ */
+.subtitle-list .vue-recycle-scroller__item-view > * {
+  padding-bottom: 6px;
 }
 
-.subtitle-item:hover {
-  background: var(--af-bg-tertiary);
+/* 滚动条暗色 — 与 develop 分支 .list-container 完全一致 */
+.subtitle-list .vue-recycle-scroller::-webkit-scrollbar {
+  width: 6px;
 }
 
-.subtitle-item.is-active {
-  border-color: var(--af-accent-primary);
-  background: rgb(var(--af-accent-primary-rgb), 0.08);
+.subtitle-list .vue-recycle-scroller::-webkit-scrollbar-track {
+  background: transparent;
 }
 
-.subtitle-item.is-current {
-  border-color: var(--af-accent-success);
-  background: rgb(var(--af-accent-success-rgb), 0.08);
+.subtitle-list .vue-recycle-scroller::-webkit-scrollbar-thumb {
+  background: var(--af-border-default);
+  border-radius: 3px;
 }
 
-/* 置信度警告高亮样式 */
-.subtitle-item.warning-low-confidence {
-  border-color: var(--af-accent-warning);
-  background: rgb(var(--af-accent-warning-rgb), 0.06);
-}
-
-.subtitle-item.warning-high-perplexity {
-  border-color: var(--af-status-warning);
-  background: rgb(var(--af-status-warning-rgb), 0.06);
-}
-
-.subtitle-item.warning-both {
-  border-color: var(--af-accent-danger);
-  background: rgb(var(--af-accent-danger-rgb), 0.08);
-  border-width: 2px;
-}
-
-/* 序号 - 缩小尺寸 */
-.item-index {
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  width: 28px;
-  height: 28px;
-  background: var(--af-bg-tertiary);
-  border-radius: var(--af-radius-sm);
-  color: var(--af-text-secondary);
-  font-size: 11px;
-  font-weight: 600;
-  flex-shrink: 0;
-}
-
-.subtitle-item.is-current .item-index {
-  background: var(--af-accent-success);
-  color: var(--af-text-inverse);
-}
-
-.subtitle-item.warning-low-confidence .item-index {
-  background: var(--af-accent-warning);
-  color: var(--af-text-inverse);
-}
-
-.subtitle-item.warning-high-perplexity .item-index {
-  background: var(--af-status-warning);
-  color: var(--af-text-inverse);
-}
-
-.subtitle-item.warning-both .item-index {
-  background: var(--af-accent-danger);
-  color: var(--af-text-inverse);
-}
-
-/* 内容区 */
-.item-content {
-  flex: 1;
-  min-width: 0;
-}
-
-/* 时间行 - 优化间距 */
-.time-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-  margin-bottom: 6px;
-}
-
-.time-row .time-input {
-  width: 75px;
-  padding: 3px 6px;
-  background: var(--af-bg-tertiary);
-  border: 1px solid transparent;
-  border-radius: var(--af-radius-sm);
-  color: var(--af-text-normal);
-  font-size: 11px;
-  font-family: var(--af-font-mono);
-  text-align: center;
-}
-
-.time-row .time-input:focus {
-  border-color: var(--af-accent-primary);
-  outline: none;
-}
-
-.time-row .time-arrow {
-  color: var(--af-text-muted);
-}
-
-.time-row .duration-tag {
-  padding: 2px 6px;
-  background: var(--af-bg-tertiary);
-  border-radius: var(--af-radius-full);
-  color: var(--af-text-muted);
-  font-size: 10px;
-  font-family: var(--af-font-mono);
-}
-
-/* 文本行 - 优化尺寸（支持 Toggle Mode） */
-.text-row {
-  position: relative;
-}
-
-/* 只读高亮视图 */
-.text-row .text-display {
-  width: 100%;
-  padding: 6px 35px 6px 8px;
-  background: var(--af-bg-tertiary);
-  border: 1px solid transparent;
-  border-radius: var(--af-radius-sm);
-  color: var(--af-text-normal);
-  font-size: 12px;
-  min-height: 45px;
-  line-height: 1.4;
-  white-space: pre-wrap;
-  overflow-wrap: break-word;
-  cursor: default;
-}
-
-.text-row .text-display.can-edit {
-  cursor: text;
-}
-
-.text-row .text-display.can-edit:hover {
-  border-color: var(--af-accent-primary);
-  background: var(--af-bg-secondary);
-}
-
-/* 字级警告高亮样式 */
-.text-row .text-display :deep(.word-warning) {
-  background-color: rgb(var(--af-accent-warning-rgb), 0.25);
-  border-bottom: 2px solid var(--af-accent-warning);
-  padding: 0 2px;
-  border-radius: 2px;
-}
-
-.text-row .text-display :deep(.word-critical) {
-  background-color: rgb(var(--af-accent-danger-rgb), 0.25);
-  border-bottom: 2px solid var(--af-accent-danger);
-  padding: 0 2px;
-  border-radius: 2px;
-  font-weight: 500;
-}
-
-.text-row .text-input {
-  width: 100%;
-  padding: 6px 8px;
-  background: var(--af-bg-tertiary);
-  border: 1px solid transparent;
-  border-radius: var(--af-radius-sm);
-  color: var(--af-text-normal);
-  font-size: 12px;
-  padding-right: 35px;
-  resize: none;
-  line-height: 1.4;
-}
-
-.text-row .text-input:focus {
-  border-color: var(--af-accent-primary);
-  outline: none;
-}
-
-.text-row .text-input::placeholder {
-  color: var(--af-text-muted);
-}
-
-.text-row .char-count {
-  position: absolute;
-  right: 6px;
-  bottom: 6px;
-  color: var(--af-text-muted);
-  font-size: 10px;
-  font-family: var(--af-font-mono);
-}
-
-/* 操作按钮 - 始终可见，更小尺寸 */
-.item-actions {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  opacity: 1;
-}
-
-.subtitle-item:hover .item-actions {
-  opacity: 1;
-}
-
-.item-actions .action-btn {
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  width: 24px;
-  height: 24px;
-  border-radius: var(--af-radius-sm);
-  color: var(--af-text-muted);
-  transition: all var(--af-transition-fast);
-}
-
-.item-actions .action-btn:hover {
-  background: var(--af-bg-tertiary);
-  color: var(--af-text-normal);
-}
-
-.item-actions .action-btn-danger:hover {
-  background: rgb(var(--af-accent-danger-rgb), 0.15);
-  color: var(--af-accent-danger);
-}
-
-/* 字幕切分动画 */
-.subtitle-list-move {
-  transition: transform 0.3s ease;
-}
-
-.subtitle-list-enter-active,
-.subtitle-list-leave-active {
-  transition: all 0.2s ease;
-}
-
-.subtitle-list-enter-from,
-.subtitle-list-leave-to {
-  opacity: 0;
-  transform: scaleY(0.3);
-  margin-top: 0;
-  margin-bottom: 0;
-}
-
-.subtitle-list-leave-active {
-  position: absolute;
-  width: calc(100% - 32px);
+.subtitle-list .vue-recycle-scroller::-webkit-scrollbar-thumb:hover {
+  background: var(--af-text-muted);
 }
 </style>

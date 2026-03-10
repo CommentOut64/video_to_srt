@@ -174,7 +174,7 @@
 
 <script setup>
 /**
- * SubtitleItem - 字幕列表单项组件
+ * SubtitleRow - 虚拟字幕列表单项组件
  *
  * Phase 5 双模态架构: 实现三态视图
  * 1. 草稿锁定模式: isDraft=true, 灰色斜体, 只读
@@ -183,8 +183,10 @@
  */
 import { ref, computed, nextTick, onUnmounted, watch } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
+import { useEditorTimingStore } from '@/stores/editorTimingStore'
 import { usePlaybackStore } from '@/stores/playbackStore'
 import { useSyncCoordinatorStore } from '@/core/sync/syncCoordinator'
+import { ElMessage } from 'element-plus'
 import ContextMenu from '@/components/editor/ContextMenu.vue'
 import { useEditBufferStore } from '@/core/editor/editBufferStore'
 
@@ -556,7 +558,7 @@ async function handleContextMenuSelect(key) {
     })
 
     if (!result.success) {
-      console.error('[SubtitleItem] 切分失败:', result.error)
+      console.error('[SubtitleRow] 切分失败:', result.error)
     } else {
       await syncSplitSubtitles(result)
       // 切分成功后退出编辑模式
@@ -569,7 +571,7 @@ async function handleContextMenuSelect(key) {
     const result = projectStore.mergeSubtitles(props.subtitle.id, direction)
 
     if (!result.success) {
-      console.error('[SubtitleItem] 合并失败:', result.error)
+      console.error('[SubtitleRow] 合并失败:', result.error)
     } else {
       await syncMergeSubtitles(result)
       // 合并成功后退出编辑模式
@@ -584,8 +586,8 @@ function buildUpdateCommand(type, subtitle) {
     command_id: syncCoordinator.nextCommandId(type),
     segment_id: subtitle.segment_id,
     text: subtitle.text,
-    start: projectStore.toBaseTime(subtitle.start),
-    end: projectStore.toBaseTime(subtitle.end),
+    start: editorTimingStore.toBaseTime(subtitle.start),
+    end: editorTimingStore.toBaseTime(subtitle.end),
   }
 }
 
@@ -595,12 +597,12 @@ function buildAddCommand(type, subtitle) {
     command_id: syncCoordinator.nextCommandId(type),
     local_id: subtitle?.id == null ? null : String(subtitle.id),
     text: subtitle.text,
-    start: projectStore.toBaseTime(subtitle.start),
-    end: projectStore.toBaseTime(subtitle.end),
+    start: editorTimingStore.toBaseTime(subtitle.start),
+    end: editorTimingStore.toBaseTime(subtitle.end),
   }
 }
 
-// V3.2.4+dev.20260304.01: 切分同步 — structuralSyncStore 飞行追踪
+// V3.2.4+dev.20260304.01: 切分同步 — syncCoordinator 结构性命令追踪
 async function syncSplitSubtitles(result) {
   const projectId = projectStore.meta.projectId
   if (!projectId) {
@@ -622,11 +624,12 @@ async function syncSplitSubtitles(result) {
   try {
     await promise
   } catch (error) {
-    console.warn('[SubtitleItem] 切分同步失败:', error)
+    console.warn('[SubtitleRow] 切分同步失败:', error)
+    ElMessage.warning('切分同步失败，请重试')
   }
 }
 
-// V3.2.4+dev.20260304.01: 合并同步 — structuralSyncStore 飞行追踪
+// V3.2.4+dev.20260310.01: 合并同步 — 等待结构性操作 + segment_id 缓存补偿
 async function syncMergeSubtitles(result) {
   const projectId = projectStore.meta.projectId
   if (!projectId) {
@@ -636,17 +639,33 @@ async function syncMergeSubtitles(result) {
   const { keptSubtitle, removedSubtitle } = result
   if (!keptSubtitle || !removedSubtitle) return
 
+  // 如果被移除字幕缺少 segment_id（如刚切分产生的新字幕），
+  // 先等待飞行中的结构性操作完成，再尝试从缓存补偿
+  let resolvedRemovedSegmentId = removedSubtitle.segment_id
+  if (!resolvedRemovedSegmentId) {
+    await syncCoordinator.waitAllStructuralOperations()
+    // 等待后 patchCreatedSegmentIds 可能已回写到 store，重新查找
+    const freshSubtitle = projectStore.subtitles.find(
+      s => String(s.id) === String(removedSubtitle.id)
+    )
+    resolvedRemovedSegmentId = freshSubtitle?.segment_id
+      || syncCoordinator.resolveSegmentIdFromCache(removedSubtitle.id)
+    if (!resolvedRemovedSegmentId) {
+      console.warn('[SubtitleRow] 被移除字幕无 segment_id，跳过 remove 命令')
+    }
+  }
+
   const commands = []
   if (keptSubtitle.segment_id) {
     commands.push(buildUpdateCommand('merge-kept', keptSubtitle))
   } else {
     commands.push(buildAddCommand('merge-kept', keptSubtitle))
   }
-  if (removedSubtitle.segment_id) {
+  if (resolvedRemovedSegmentId) {
     commands.push({
       type: 'remove_subtitle',
       command_id: syncCoordinator.nextCommandId('merge-removed'),
-      segment_id: removedSubtitle.segment_id,
+      segment_id: resolvedRemovedSegmentId,
     })
   }
 
@@ -658,7 +677,8 @@ async function syncMergeSubtitles(result) {
   try {
     await promise
   } catch (error) {
-    console.warn('[SubtitleItem] 合并同步失败:', error)
+    console.warn('[SubtitleRow] 合并同步失败:', error)
+    ElMessage.warning('合并同步失败，请重试')
   }
 }
 
@@ -860,7 +880,6 @@ function formatDuration(seconds) {
   display: flex;
   gap: 10px;
   padding: 10px;
-  margin-bottom: 6px;
   background: var(--af-bg-secondary);
   border: 1px solid transparent;
   border-radius: var(--af-radius-md);
@@ -874,12 +893,12 @@ function formatDuration(seconds) {
 
 .subtitle-item.is-active {
   border-color: var(--af-accent-primary);
-  background: rgb(var(--af-accent-primary-rgb), 0.8);
+  background: rgb(var(--af-accent-primary-rgb), 0.08);
 }
 
 .subtitle-item.is-current {
   border-color: var(--af-accent-success);
-  background: rgb(var(--af-accent-success-rgb), 0.8);
+  background: rgb(var(--af-accent-success-rgb), 0.08);
 }
 
 /* 暂停时显示呼吸灯动画 */
@@ -897,17 +916,17 @@ function formatDuration(seconds) {
 /* 置信度警告高亮样式 */
 .subtitle-item.warning-low-confidence {
   border-color: var(--af-accent-warning);
-  background: rgb(var(--af-accent-warning-rgb), 0.6);
+  background: rgb(var(--af-accent-warning-rgb), 0.06);
 }
 
 .subtitle-item.warning-high-perplexity {
   border-color: var(--af-status-warning);
-  background: rgb(var(--af-status-warning-rgb), 0.6);
+  background: rgb(var(--af-status-warning-rgb), 0.06);
 }
 
 .subtitle-item.warning-both {
   border-color: var(--af-accent-danger);
-  background: rgb(var(--af-accent-danger-rgb), 0.8);
+  background: rgb(var(--af-accent-danger-rgb), 0.08);
   border-width: 2px;
 }
 

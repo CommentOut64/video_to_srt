@@ -74,10 +74,11 @@
  */
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, inject } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
+import { useEditorUiStore } from '@/stores/editorUiStore'
 import { usePlaybackStore } from '@/stores/playbackStore'
 import { getSubtitlesInTimeWindow } from '@/utils/subtitleViewport'
-import { useSubtitleDocumentStore } from '@/stores/subtitleDocumentStore'
 import { usePlaybackManager } from '@/services/PlaybackManager'
+import { useSyncCoordinatorStore } from '@/core/sync/syncCoordinator'
 import { mediaApi } from '@/services/api'
 import ContextMenu from '@/components/editor/ContextMenu.vue'
 import WaveformHeader from './WaveformHeader.vue'
@@ -91,7 +92,6 @@ import {
   useWaveformZoom,
   useWaveformScroll,
   useWaveformCursorDrag,
-  useWaveformRegions,
   useWaveformContextMenu,
   calculateWaveformConfig,
   ZOOM_MIN,
@@ -99,6 +99,7 @@ import {
   ZOOM_WHEEL_STEP,
   ZOOM_BASE_PX_PER_SEC,
 } from '@/composables'
+import { useTimelineRegionController } from '@/core/editor/timelineRegionController'
 
 // ============ Props & Emits ============
 const props = defineProps({
@@ -119,11 +120,12 @@ const emit = defineEmits(['ready', 'region-update', 'region-click', 'seek', 'zoo
 
 // ============ Store & Services ============
 const projectStore = useProjectStore()
+const editorUiStore = useEditorUiStore()
 const playbackStore = usePlaybackStore()
-const subtitleDocumentStore = useSubtitleDocumentStore()
+const syncCoordinator = useSyncCoordinatorStore()
 const playbackManager = usePlaybackManager()
 const identityRef = computed(() => props.mediaId || projectStore.primaryId)
-const onSubtitleEdit = subtitleDocumentStore.onSubtitleEdit
+const onSubtitleEdit = syncCoordinator.enqueueSubtitleEdit
 
 // 编辑器上下文
 const editorContext = inject('editorContext', {
@@ -186,7 +188,7 @@ function normalizeRegionTimeForSignature(time) {
 const visibleRegionWindow = ref({ start: 0, end: Number.POSITIVE_INFINITY })
 
 const regionRenderSignature = computed(() => {
-  const selectedId = subtitleDocumentStore.selectedSubtitleId ?? ''
+  const selectedId = editorUiStore.selectedSubtitleId ?? ''
   const { start, end } = visibleRegionWindow.value
   const subtitlesSnapshot = getSubtitlesInTimeWindow(projectStore.subtitles, start, end)
     .map(
@@ -571,14 +573,13 @@ const {
   renderSubtitleRegions,
   flushPendingRegionCommits,
   cleanup: cleanupRegions,
-} = useWaveformRegions(
+} = useTimelineRegionController(
   regionsPluginRef,
   projectStore,
   props,
   isReady,
   onSubtitleEdit,
   playbackManager,
-  subtitleDocumentStore,
   () => visibleRegionWindow.value,
   () => isRegionPointerDragging.value,
   emit
@@ -954,7 +955,7 @@ function scheduleRegionRender(delay = 80, reason = 'unknown') {
 watch(
   () => identityRef.value,
   async (identityId, oldIdentityId) => {
-    subtitleDocumentStore.bindSyncIdentity(identityId)
+    syncCoordinator.bindSyncIdentity(identityId)
     playbackManager.bindSession(identityId, { force: true, resetPosition: false })
 
     if (identityId === oldIdentityId || !wavesurferRef.value) {

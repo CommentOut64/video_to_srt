@@ -190,7 +190,7 @@ const props = defineProps({
 })
 
 // V3.1.2+dev.20260113.02: 添加 upgrade-started 和 upgrade-failed 事件
-const emit = defineEmits(['loaded', 'error', 'play', 'pause', 'timeupdate', 'ended', 'resolution-change', 'retry', 'upgrade-started', 'upgrade-failed'])
+const emit = defineEmits(['loaded', 'error', 'play', 'pause', 'timeupdate', 'ended', 'resolution-change', 'retry', 'upgrade-started', 'upgrade-failed', 'check-status'])
 
 // Store
 const projectStore = useProjectStore()

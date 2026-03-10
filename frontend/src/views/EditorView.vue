@@ -1,4 +1,4 @@
-<template>
+﻿<template>
   <div class="editor-view">
     <!-- 顶部导航栏 - 使用新的 EditorHeader 组件 -->
     <EditorHeader
@@ -265,8 +265,8 @@ import { useProjectStore } from '@/stores/projectStore'
 import { usePlaybackStore } from '@/stores/playbackStore'
 import { useTaskRuntimeStore } from '@/stores/taskRuntimeStore'
 import { useEditorSessionStore } from '@/stores/editorSessionStore'
-import { useSubtitleDocumentStore } from '@/stores/subtitleDocumentStore'
-import { useStructuralSyncStore } from '@/stores/structuralSyncStore'
+import { useEditorTimingStore } from '@/stores/editorTimingStore'
+import { useEditorHistoryStore } from '@/core/editor/historyStore'
 import { useSyncCoordinatorStore } from '@/core/sync/syncCoordinator'
 import { legacyApi, mediaApi, projectApi, transcriptionApi } from '@/services/api'
 import sseChannelManager from '@/services/sseChannelManager'
@@ -293,7 +293,7 @@ import {
 import EditorHeader from '@/components/editor/EditorHeader.vue'
 import PlaybackControls from '@/components/editor/PlaybackControls/index.vue'
 import VideoStage from '@/components/editor/VideoStage/index.vue'
-import SubtitleList from '@/components/editor/SubtitleList/index.vue'
+import SubtitleList from '@/components/editor/VirtualSubtitleList/index.vue'
 import WaveformTimeline from '@/components/editor/WaveformTimeline/index.vue'
 import AdvancedSettings from '@/components/editor/AdvancedSettings.vue'
 import AboutDialog from '@/components/AboutDialog.vue'
@@ -318,8 +318,8 @@ const projectStore = useProjectStore()
 const playbackStore = usePlaybackStore()
 const taskStore = useTaskRuntimeStore()
 const editorSessionStore = useEditorSessionStore()
-const subtitleDocumentStore = useSubtitleDocumentStore()
-const structuralSyncStore = useStructuralSyncStore()
+const editorTimingStore = useEditorTimingStore()
+const editorHistoryStore = useEditorHistoryStore()
 const syncCoordinator = useSyncCoordinatorStore()
 const router = useRouter()
 
@@ -360,7 +360,7 @@ const showAdvancedSettings = ref(false)
 const showAboutDialog = ref(false)
 const advancedConfig = ref({
   general: {
-    global_time_offset: projectStore.subtitleOffset, // 从 store 初始化
+    global_time_offset: editorTimingStore.subtitleOffset, // 从 store 初始化
     duration_adjust: 0,
     auto_save_interval: 60,
     preview_font_size: 24,
@@ -436,19 +436,42 @@ let cancelTimeoutTimer = null
 let isRealtimeFinalSyncInFlight = false
 let hasRealtimeFinalSyncPending = false
 let realtimeFinalSyncReason = null
+const TERMINAL_TASK_STATUSES = new Set(['finished', 'canceled', 'force_canceled', 'removed', 'failed'])
+const convergedTerminalStatus = ref(new Map())
+
+async function finalizeDraftSubtitlesOnTerminal(reason = 'terminal_status') {
+  const hasDraft = projectStore.subtitles.some((item) => item.isDraft)
+  if (!hasDraft) return false
+  await projectStore.finalizeDraftSubtitlesOnCancel()
+  editorSessionStore.captureWorkingCopy()
+  console.log(`[EditorView] 终态草稿收敛已执行: ${reason}`)
+  return true
+}
 
 watch(
-  () => activeJobId.value,
-  (jobId) => {
-    subtitleDocumentStore.bindTask(jobId)
+  () => taskStatus.value,
+  async (status) => {
+    const jobId = activeJobId.value
+    if (!jobId) return
+
+    if (!TERMINAL_TASK_STATUSES.has(status)) {
+      convergedTerminalStatus.value.delete(jobId)
+      return
+    }
+
+    const lastStatus = convergedTerminalStatus.value.get(jobId)
+    if (lastStatus === status) return
+
+    await finalizeDraftSubtitlesOnTerminal(`watch:${status}`)
+    convergedTerminalStatus.value.set(jobId, status)
   },
-  { immediate: true }
+  { flush: 'post' }
 )
 
 watch(
   () => identityRef.value,
   (identityId) => {
-    subtitleDocumentStore.bindSyncIdentity(identityId)
+    syncCoordinator.bindSyncIdentity(identityId)
   },
   { immediate: true }
 )
@@ -505,7 +528,7 @@ onBeforeRouteUpdate(async (to, from) => {
     await runEditorSessionSwitchBarrier({
       previousIdentityId: previousProjectId || previousJobId,
       syncCoordinator,
-      projectStore,
+      editorSessionStore,
       isDirty: isDirty.value,
     })
   } catch (error) {
@@ -626,8 +649,8 @@ const currentSubtitleIndex = computed(() =>
 )
 
 // 撤销/重做
-const canUndo = computed(() => projectStore.canUndo)
-const canRedo = computed(() => projectStore.canRedo)
+const canUndo = computed(() => editorHistoryStore.canUndo)
+const canRedo = computed(() => editorHistoryStore.canRedo)
 
 // 队列进度计算
 const queueCompleted = computed(() => taskStore.tasks.filter((t) => t.status === 'finished').length)
@@ -729,16 +752,16 @@ function notifyMissingVideoOnce() {
 // V3.2.0+dev.20260130.10: 读取任务级字幕时间偏移（无则回退全局）
 async function loadSubtitleOffset() {
   if (!activeJobId.value) {
-    projectStore.setSubtitleOffset(0)
+    editorTimingStore.setSubtitleOffset(0)
     return
   }
   try {
     const response = await transcriptionApi.getJobSubtitleTimeOffset(activeJobId.value)
     const offset = response?.offset ?? 0
-    projectStore.setSubtitleOffset(offset)
+    editorTimingStore.setSubtitleOffset(offset)
   } catch (error) {
     console.warn('[EditorView] 读取字幕偏移失败，使用默认值 0:', error)
-    projectStore.setSubtitleOffset(0)
+    editorTimingStore.setSubtitleOffset(0)
   }
 }
 
@@ -791,7 +814,7 @@ async function loadProject() {
 
   // 先重置项目状态，确保不同任务数据隔离
   projectStore.resetProject()
-  structuralSyncStore.$reset()
+  syncCoordinator.resetStructuralState()
 
   try {
     await resolveIdentity()
@@ -853,7 +876,7 @@ async function loadProject() {
         mode: project?.mode || 'normal',
         taskMode: project?.task_mode || 'subtitle_edit',
       })
-      const restored = await projectStore.restoreProject(projectId)
+      const restored = await editorSessionStore.restoreWorkingCopy(projectId)
       // 恢复缓存后再次覆盖媒体路径，防止旧缓存 videoPath 误导为“有视频”。
       applyMediaPaths({ project })
       if (!restored || projectStore.subtitles.length === 0) {
@@ -925,7 +948,7 @@ async function loadProject() {
     }
 
     const restoreKey = projectId
-    const restored = restoreKey ? await projectStore.restoreProject(restoreKey) : false
+    const restored = restoreKey ? await editorSessionStore.restoreWorkingCopy(restoreKey) : false
     // 恢复缓存后再次覆盖媒体路径，避免历史缓存导致 videoPath 误判。
     applyMediaPaths({ project: projectMeta, mediaStatus: jobStatus.media_status })
     const hasLocalRestore = restored && projectStore.subtitles.length > 0
@@ -937,7 +960,7 @@ async function loadProject() {
       if (['canceled', 'force_canceled'].includes(jobStatus.status)) {
         const hasDraft = projectStore.subtitles.some((s) => s.isDraft)
         if (hasDraft) {
-          await subtitleDocumentStore.finalizeDraftSubtitlesOnTerminal('load_project_terminal')
+          await finalizeDraftSubtitlesOnTerminal('load_project_terminal')
         }
       }
     }
@@ -1008,6 +1031,7 @@ async function loadTranscribingSegments() {
         videoPath: projectStore.meta.videoPath,
         audioPath: projectStore.meta.audioPath,
       })
+      syncCoordinator.applyPendingEditsToStore(projectStore)
     }
     return Array.isArray(segments) ? segments.length : 0
   } catch (error) {
@@ -1090,8 +1114,8 @@ function normalizeProjectSegmentEvent(data) {
     segmentId: String(segmentId),
     sentenceIndex: legacyIndex,
     text: String(segment?.text ?? ''),
-    start: projectStore.toDisplayTime(safeStart),
-    end: projectStore.toDisplayTime(safeEnd),
+    start: editorTimingStore.toDisplayTime(safeStart),
+    end: editorTimingStore.toDisplayTime(safeEnd),
     isModified: Boolean(segment?.is_modified),
     originalText: segment?.original_text ?? null,
     words: Array.isArray(segment?.words) ? segment.words : [],
@@ -1133,7 +1157,7 @@ function handleProjectSubtitleUpsert(data) {
     isFinalized: true,
   }
 
-  projectStore.pauseHistory()
+  editorHistoryStore.pauseHistory()
   try {
     if (existingIndex >= 0) {
       const existingId = projectStore.subtitles[existingIndex].id
@@ -1165,7 +1189,7 @@ function handleProjectSubtitleUpsert(data) {
     }
     projectStore.insertSubtitleAt(finalIndex, nextSubtitle)
   } finally {
-    projectStore.resumeHistory()
+    editorHistoryStore.resumeHistory()
   }
 }
 
@@ -1178,11 +1202,11 @@ function handleProjectSubtitleDelete(data) {
   if (index < 0) {
     return
   }
-  projectStore.pauseHistory()
+  editorHistoryStore.pauseHistory()
   try {
     projectStore.removeSubtitleAt(index)
   } finally {
-    projectStore.resumeHistory()
+    editorHistoryStore.resumeHistory()
   }
 }
 
@@ -1562,7 +1586,7 @@ function handleStreamingSubtitle(data) {
   }
 
   // 暂停历史记录，SSE 推送的内容不应被撤销
-  projectStore.pauseHistory()
+  editorHistoryStore.pauseHistory()
 
   // 更新或添加字幕到 store
   const existingIndex = projectStore.subtitles.findIndex((s) => s.sentenceIndex === sentenceIndex)
@@ -1581,7 +1605,7 @@ function handleStreamingSubtitle(data) {
     isModified: sentence.is_modified ?? false,
     originalText: sentence.original_text ?? null,
   }
-  const normalized = projectStore.applyOffsetToSentenceData(subtitleData)
+  const normalized = editorTimingStore.applyOffsetToSentenceData(subtitleData)
 
   if (existingIndex >= 0) {
     // V3.1.2+dev.20260112.01: 修复 - 传入正确的 id 而非索引
@@ -1597,7 +1621,7 @@ function handleStreamingSubtitle(data) {
   }
 
   // 恢复历史记录
-  projectStore.resumeHistory()
+  editorHistoryStore.resumeHistory()
 
 }
 
@@ -1724,16 +1748,16 @@ function handleSubtitleEdited(data) {
   const hasStart = sentence.start !== undefined && sentence.start !== null
   const hasEnd = sentence.end !== undefined && sentence.end !== null
   if (hasStart) {
-    patch.start = projectStore.toDisplayTime(sentence.start)
+    patch.start = editorTimingStore.toDisplayTime(sentence.start)
   }
   if (hasEnd) {
-    patch.end = projectStore.toDisplayTime(sentence.end)
+    patch.end = editorTimingStore.toDisplayTime(sentence.end)
   }
 
   if (Array.isArray(sentence.words) && sentence.words.length > 0) {
-    const normalized = projectStore.applyOffsetToSentenceData({
-      start: hasStart ? sentence.start : projectStore.toBaseTime(target.start),
-      end: hasEnd ? sentence.end : projectStore.toBaseTime(target.end),
+    const normalized = editorTimingStore.applyOffsetToSentenceData({
+      start: hasStart ? sentence.start : editorTimingStore.toBaseTime(target.start),
+      end: hasEnd ? sentence.end : editorTimingStore.toBaseTime(target.end),
       words: sentence.words,
     })
     patch.words = normalized.words
@@ -1903,7 +1927,7 @@ async function saveProject() {
       const srtContent = projectStore.generateSRT()
       await mediaApi.saveSRTContent(mediaIdentityId.value, srtContent)
     }
-    await projectStore.saveProject()
+    await editorSessionStore.saveWorkingCopy()
     lastSaved.value = Date.now()
   } catch (error) {
     console.error('[EditorView] 保存失败:', error)
@@ -2029,7 +2053,7 @@ async function handleExport(format) {
     alert(`导出失败：${reason}`)
     return
   }
-  const displaySegments = projectStore.applyOffsetToSegments(segments || [])
+  const displaySegments = editorTimingStore.applyOffsetToSegments(segments || [])
   if (!displaySegments || displaySegments.length === 0) {
     alert('导出失败：后端未返回字幕数据')
     return
@@ -2066,11 +2090,11 @@ async function handleExport(format) {
 async function fetchLatestSegments() {
   await syncCoordinator.flushAllSync()
 
-  const pending = subtitleDocumentStore.pendingCount()
-  const syncErrors = subtitleDocumentStore.syncErrors
+  const pending = Number(syncCoordinator.pendingCount || 0)
+  const syncErrors = syncCoordinator.editSyncErrors
   const syncErrorCount = Number(syncErrors?.size || 0)
-  // 合并结构性操作错误计数
-  const structuralErrorCount = structuralSyncStore.errorCount
+  const structuralErrors = syncCoordinator.structuralSyncErrors
+  const structuralErrorCount = Number(structuralErrors?.size || 0)
   if (pending > 0 || syncErrorCount > 0 || structuralErrorCount > 0) {
     let firstErrorDetail = ''
     if (syncErrorCount > 0 && typeof syncErrors?.entries === 'function') {
@@ -2080,7 +2104,7 @@ async function fetchLatestSegments() {
       }
     }
     if (structuralErrorCount > 0 && !firstErrorDetail) {
-      const firstStructErr = structuralSyncStore.syncErrors.entries().next().value
+      const firstStructErr = structuralErrors.entries().next().value
       if (firstStructErr) {
         firstErrorDetail = `，首条结构性错误: [${firstStructErr[1].type}] ${firstStructErr[1].error}`
       }
@@ -2093,7 +2117,7 @@ async function fetchLatestSegments() {
     throw new Error('缺少 project_id：无法导出，请从任务列表重新打开并完成任务到项目转换')
   }
   // 导出前执行强制保存，确保本地快照与导出动作一致。
-  await projectStore.saveProject()
+  await editorSessionStore.saveWorkingCopy()
   const segments = await projectApi.getSubtitles(projectId)
   return Array.isArray(segments)
     ? segments.map((segment, index) => ({
@@ -2274,9 +2298,9 @@ function resolveCapabilitySnapshot(snapshot = null) {
 }
 
 // ========== 字幕全局偏移设置 ==========
-// 同步 projectStore.subtitleOffset 到高级设置
+// 同步 editorTimingStore.subtitleOffset 到高级设置
 watch(
-  () => projectStore.subtitleOffset,
+  () => editorTimingStore.subtitleOffset,
   (value) => {
     advancedConfig.value.general.global_time_offset = value
   }
@@ -2313,7 +2337,7 @@ async function handleSaveAdvancedSettings() {
     }
 
     // 1. 应用到前端 projectStore
-    projectStore.setSubtitleOffset(offset)
+    editorTimingStore.setSubtitleOffset(offset)
 
     // 1.1 应用并持久化快捷键开关与映射（保存后立即生效）
     const isShortcutOn = advancedConfig.value.general.enable_shortcuts !== false
@@ -2457,7 +2481,7 @@ onBeforeRouteLeave(async (to, from) => {
   try {
     await runEditorLeaveBarrier({
       syncCoordinator,
-      projectStore,
+      editorSessionStore,
       isDirty: isDirty.value,
     })
   } catch (error) {
@@ -2872,3 +2896,4 @@ onBeforeRouteLeave(async (to, from) => {
   color: var(--af-border-default);
 }
 </style>
+
