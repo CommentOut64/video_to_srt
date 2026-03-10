@@ -152,6 +152,14 @@ def normalize_runtime_policy(raw_value: str) -> str:
     return DEFAULT_RUNTIME_POLICY
 
 
+def normalize_flavor(raw_value: str) -> str:
+    """归一化产品形态值。"""
+    normalized = str(raw_value or "").strip().lower()
+    if normalized in VALID_FLAVORS:
+        return normalized
+    return DEFAULT_FLAVOR
+
+
 def normalize_media_profile(raw_value: str) -> str:
     """归一化媒体 profile。"""
     normalized = str(raw_value or "").strip().lower()
