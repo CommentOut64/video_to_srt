@@ -12,7 +12,7 @@ import { runEditorLeaveBarrier } from './leaveBarrier'
 export async function runEditorSessionSwitchBarrier({
   previousIdentityId = '',
   syncCoordinator,
-  projectStore,
+  editorSessionStore,
   isDirty = false,
 }) {
   const normalizedPreviousIdentityId = String(previousIdentityId || '').trim()
@@ -22,7 +22,7 @@ export async function runEditorSessionSwitchBarrier({
 
   await runEditorLeaveBarrier({
     syncCoordinator,
-    projectStore,
+    editorSessionStore,
     isDirty,
   })
 }

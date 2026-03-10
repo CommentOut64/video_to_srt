@@ -5,6 +5,7 @@
  * 提取自 WaveformTimeline/index.vue L720-920
  */
 import { ref, computed } from 'vue'
+import { useEditorUiStore } from '@/stores/editorUiStore'
 
 // ============ 缩放配置常量 ============
 export const ZOOM_MIN = 20 // 最小缩放 20%
@@ -65,19 +66,20 @@ export function calculateWaveformConfig(videoDuration, containerWidth) {
  * 波形缩放 Composable
  * @param {Ref<object>} wavesurferRef - WaveSurfer 实例引用
  * @param {Ref<HTMLElement>} containerRef - 容器 DOM 引用
- * @param {object} projectStore - Pinia store
+ * @param {object} _projectStore - 兼容占位参数（已不再使用）
  * @param {object} playbackStore - 播放状态 store
  * @param {Function} updateScrollbarThumb - 更新滚动条回调
  */
 export function useWaveformZoom(
   wavesurferRef,
   containerRef,
-  projectStore,
+  _projectStore,
   playbackStore,
   updateScrollbarThumb
 ) {
   // ============ 状态 ============
-  const zoomLevel = ref(100)
+  const editorUiStore = useEditorUiStore()
+  const zoomLevel = ref(editorUiStore.zoomLevel || 100)
 
   // ============ DOM 缓存 ============
   let cachedWrapper = null
@@ -187,7 +189,7 @@ export function useWaveformZoom(
     const newPxPerSec = (clampedZoom / 100) * ZOOM_BASE_PX_PER_SEC
 
     ws.zoom(newPxPerSec)
-    projectStore.setZoomLevel(clampedZoom)
+    editorUiStore.setZoomLevel(clampedZoom)
 
     // 动态柱子宽度
     const newBarConfig = getAdaptiveBarConfig(newPxPerSec)
@@ -246,7 +248,7 @@ export function useWaveformZoom(
     zoomLevel.value = clampedValue
     const minPxPerSec = (clampedValue / 100) * ZOOM_BASE_PX_PER_SEC
     ws.zoom(minPxPerSec)
-    projectStore.setZoomLevel(clampedValue)
+    editorUiStore.setZoomLevel(clampedValue)
   }
 
   /**

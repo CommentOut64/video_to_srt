@@ -1,3 +1,5 @@
+import { useEditorHistoryStore } from '@/core/editor/historyStore'
+
 ﻿export function normalizeBatchReplaceUpdatedSegments(updatedSegments = []) {
   if (!Array.isArray(updatedSegments)) {
     return []
@@ -32,9 +34,8 @@ export function applyBatchReplaceUpdatedSegments(projectStore, updatedSegments =
     return 0
   }
 
-  if (typeof projectStore.pauseHistory === 'function') {
-    projectStore.pauseHistory()
-  }
+  const editorHistoryStore = useEditorHistoryStore()
+  editorHistoryStore.pauseHistory()
 
   let patchedCount = 0
   try {
@@ -58,9 +59,7 @@ export function applyBatchReplaceUpdatedSegments(projectStore, updatedSegments =
       patchedCount += 1
     }
   } finally {
-    if (typeof projectStore.resumeHistory === 'function') {
-      projectStore.resumeHistory()
-    }
+    editorHistoryStore.resumeHistory()
   }
 
   return patchedCount

@@ -3,6 +3,8 @@ import { computed, ref, toRaw } from 'vue'
 import { legacyApi } from '@/services/api'
 import projectApi from '@/services/api/projectApi'
 import { useProjectStore } from '@/stores/projectStore'
+import { useEditorHistoryStore } from '@/core/editor/historyStore'
+import { useEditorTimingStore } from '@/stores/editorTimingStore'
 import persistenceClient from '@/core/persistence/persistenceClient'
 import {
   findSubtitleByQueueKey,
@@ -18,9 +20,13 @@ const UNDO_REDO_SYNC_DEBOUNCE_MS = 300
 let structuralOpSeq = 0
 let editorCommandSeq = 0
 let browserGuardsRegistered = false
+// local_id -> segment_id 缓存，用于 undo/redo 和 merge 补偿缺失的 segment_id
+const createdSegmentIdCache = new Map()
 
 export const useSyncCoordinatorStore = defineStore('syncCoordinator', () => {
   const projectStore = useProjectStore()
+  const editorHistoryStore = useEditorHistoryStore()
+  const editorTimingStore = useEditorTimingStore()
 
   const currentSyncIdentityId = ref(null)
   const pendingUpdates = ref(new Map())
@@ -148,6 +154,7 @@ export const useSyncCoordinatorStore = defineStore('syncCoordinator', () => {
     pendingUpdates.value = await persistenceClient.loadQueue(resolvedIdentityId)
     currentSyncIdentityId.value = resolvedIdentityId
     editSyncErrors.value.clear()
+    createdSegmentIdCache.clear()
     registerBrowserGuards()
   }
 
@@ -290,8 +297,8 @@ export const useSyncCoordinatorStore = defineStore('syncCoordinator', () => {
 
     const update = {}
     if (text !== undefined) update.text = text
-    if (start !== undefined) update.start = projectStore.toBaseTime(start)
-    if (end !== undefined) update.end = projectStore.toBaseTime(end)
+    if (start !== undefined) update.start = editorTimingStore.toBaseTime(start)
+    if (end !== undefined) update.end = editorTimingStore.toBaseTime(end)
 
     mergePendingUpdate(queueKey, update)
     if (identityId) {
@@ -404,8 +411,8 @@ export const useSyncCoordinatorStore = defineStore('syncCoordinator', () => {
         segment_id: subtitle.segment_id || null,
         sentenceIndex: subtitle.sentenceIndex,
         text: subtitle.text,
-        start: projectStore.toBaseTime(subtitle.start),
-        end: projectStore.toBaseTime(subtitle.end),
+        start: editorTimingStore.toBaseTime(subtitle.start),
+        end: editorTimingStore.toBaseTime(subtitle.end),
       })
     }
     return snapshot
@@ -414,6 +421,11 @@ export const useSyncCoordinatorStore = defineStore('syncCoordinator', () => {
   function patchCreatedSegmentIds(createdSegments) {
     for (const created of createdSegments) {
       if (!created.segment_id) continue
+
+      // 缓存 local_id -> segment_id，供 undo/redo diff 和 merge 补偿使用
+      if (created.local_id != null) {
+        createdSegmentIdCache.set(String(created.local_id), created.segment_id)
+      }
 
       let match = null
       if (created.local_id !== undefined && created.local_id !== null) {
@@ -432,14 +444,14 @@ export const useSyncCoordinatorStore = defineStore('syncCoordinator', () => {
         match = projectStore.subtitles.find((subtitle) => {
           if (subtitle.segment_id) return false
           const textEqual = (subtitle.text || '') === (created.text || '')
-          const startDiff = Math.abs(projectStore.toBaseTime(subtitle.start) - Number(created.start))
-          const endDiff = Math.abs(projectStore.toBaseTime(subtitle.end) - Number(created.end))
+          const startDiff = Math.abs(editorTimingStore.toBaseTime(subtitle.start) - Number(created.start))
+          const endDiff = Math.abs(editorTimingStore.toBaseTime(subtitle.end) - Number(created.end))
           return textEqual && startDiff < 0.01 && endDiff < 0.01
         })
       }
 
       if (match) {
-        projectStore.pauseHistory()
+        editorHistoryStore.pauseHistory()
         try {
           const payload = { segment_id: created.segment_id }
           if (
@@ -451,7 +463,7 @@ export const useSyncCoordinatorStore = defineStore('syncCoordinator', () => {
           }
           projectStore.updateSubtitle(match.id, payload, { isUserEdit: false })
         } finally {
-          projectStore.resumeHistory()
+          editorHistoryStore.resumeHistory()
         }
       }
     }
@@ -466,6 +478,19 @@ export const useSyncCoordinatorStore = defineStore('syncCoordinator', () => {
     if (!projectStore.meta.projectId) {
       initialUndoRedoSnapshot = null
       return
+    }
+
+    // 等待飞行中的结构性操作（split/merge）完成，确保 segment_id 已回写
+    await waitAllStructuralOperations()
+
+    // 补偿 initialUndoRedoSnapshot 中缺失的 segment_id
+    // 场景：split 产生新字幕 → 用户立即 undo → 新字幕从 store 移除 →
+    // patchCreatedSegmentIds 找不到目标 → 但缓存中有 local_id → segment_id 映射
+    for (const [, entry] of initialUndoRedoSnapshot) {
+      if (!entry.segment_id && entry.localId != null) {
+        const cached = createdSegmentIdCache.get(String(entry.localId))
+        if (cached) entry.segment_id = cached
+      }
     }
 
     const finalSnapshot = captureSnapshot()
@@ -525,21 +550,30 @@ export const useSyncCoordinatorStore = defineStore('syncCoordinator', () => {
   }
 
   function undoWithSync() {
-    if (!projectStore.canUndo) return
+    if (!editorHistoryStore.canUndo) return
     if (!initialUndoRedoSnapshot) {
       initialUndoRedoSnapshot = captureSnapshot()
     }
-    projectStore.undo()
+    editorHistoryStore.undo()
     scheduleUndoRedoSync()
   }
 
   function redoWithSync() {
-    if (!projectStore.canRedo) return
+    if (!editorHistoryStore.canRedo) return
     if (!initialUndoRedoSnapshot) {
       initialUndoRedoSnapshot = captureSnapshot()
     }
-    projectStore.redo()
+    editorHistoryStore.redo()
     scheduleUndoRedoSync()
+  }
+
+  /**
+   * 通过 local_id 查询缓存中的 segment_id
+   * 用于 merge 等场景下补偿尚未回写到 store 的 segment_id
+   */
+  function resolveSegmentIdFromCache(localId) {
+    if (localId == null) return null
+    return createdSegmentIdCache.get(String(localId)) || null
   }
 
   return {
@@ -571,5 +605,6 @@ export const useSyncCoordinatorStore = defineStore('syncCoordinator', () => {
     flushUndoRedoSync,
     flushAllSync,
     writeEmergencyBuffer,
+    resolveSegmentIdFromCache,
   }
 })

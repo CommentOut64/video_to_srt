@@ -5,7 +5,9 @@
  * 提取自 WaveformTimeline/index.vue L1391-1520
  */
 import { ref, computed } from 'vue'
+import { ElMessage } from 'element-plus'
 import { useSyncCoordinatorStore } from '@/core/sync/syncCoordinator'
+import { useEditorTimingStore } from '@/stores/editorTimingStore'
 
 /**
  * 右键菜单 Composable
@@ -14,6 +16,7 @@ import { useSyncCoordinatorStore } from '@/core/sync/syncCoordinator'
 export function useWaveformContextMenu(projectStore) {
   // ============ 状态 ============
   const syncCoordinator = useSyncCoordinatorStore()
+  const editorTimingStore = useEditorTimingStore()
   const contextMenuRef = ref(null)
   const contextMenuTarget = ref(null) // 右键点击的目标字幕ID
   const contextMenuTime = ref(0) // 右键点击的时间点
@@ -38,8 +41,8 @@ export function useWaveformContextMenu(projectStore) {
       command_id: syncCoordinator.nextCommandId(type),
       segment_id: subtitle.segment_id,
       text: subtitle.text,
-      start: projectStore.toBaseTime(subtitle.start),
-      end: projectStore.toBaseTime(subtitle.end),
+      start: editorTimingStore.toBaseTime(subtitle.start),
+      end: editorTimingStore.toBaseTime(subtitle.end),
     }
   }
 
@@ -49,8 +52,8 @@ export function useWaveformContextMenu(projectStore) {
       command_id: syncCoordinator.nextCommandId(type),
       local_id: subtitle?.id == null ? null : String(subtitle.id),
       text: subtitle.text,
-      start: projectStore.toBaseTime(subtitle.start),
-      end: projectStore.toBaseTime(subtitle.end),
+      start: editorTimingStore.toBaseTime(subtitle.start),
+      end: editorTimingStore.toBaseTime(subtitle.end),
     }
   }
 
@@ -126,6 +129,7 @@ export function useWaveformContextMenu(projectStore) {
       await promise
     } catch (error) {
       console.warn('[WaveformContextMenu] 切分同步失败:', error)
+      ElMessage.warning('切分同步失败，请重试')
     }
   }
 

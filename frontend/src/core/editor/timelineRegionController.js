@@ -1,17 +1,21 @@
 /**
- * useWaveformRegions - Region 管理逻辑 Composable
+ * timelineRegionController - 时间轴 Region 控制器
  *
- * 职责：Region 渲染、重叠检测、事件绑定、同步节流
- * 提取自 WaveformTimeline/index.vue L507-601, L667-729
+ * 职责：承载 WaveformTimeline 的 Region 渲染、重叠检测、事件绑定与提交节流
+ *
+ * 设计取舍：
+ * - Phase 5 起不再把该模块作为通用 composable 暴露，避免旧热路径继续从公共出口被复用
+ * - 保留现有实现语义，仅调整归属到 `core/editor`，让时间轴 Region 逻辑与编辑器内核处于同一层级
  */
 import { ref } from 'vue'
 import { detectOverlappingSubtitles, OVERLAP_COLORS } from '@/utils/subtitleUtils'
 import { getSubtitlesInTimeWindow } from '@/utils/subtitleViewport'
 import { useEditBufferStore } from '@/core/editor/editBufferStore'
+import { useEditorUiStore } from '@/stores/editorUiStore'
 import {
   getWaveformDragDiagnosticsConfig,
   logWaveformDragDiagnostics,
-} from './waveformDragDiagnostics.js'
+} from '@/composables/waveformDragDiagnostics.js'
 
 /**
  * 简单防抖工具
@@ -44,17 +48,15 @@ function debounce(fn, delay) {
  * @param {Ref<boolean>} isReady - 波形是否就绪
  * @param {Function} onSubtitleEdit - 字幕编辑回调
  * @param {object} playbackManager - PlaybackManager 实例
- * @param {object} subtitleDocumentStore - 字幕文档 store
  * @param {Function} emit - 事件发射函数
  */
-export function useWaveformRegions(
+export function useTimelineRegionController(
   regionsPluginRef,
   projectStore,
   props,
   isReady,
   onSubtitleEdit,
   playbackManager,
-  subtitleDocumentStore,
   resolveVisibleTimeRange,
   isRegionPointerDragging,
   emit
@@ -62,6 +64,7 @@ export function useWaveformRegions(
   // ============ 状态 ============
   const isUpdatingRegions = ref(false)
   const editBufferStore = useEditBufferStore()
+  const editorUiStore = useEditorUiStore()
 
   // ============ 私有状态 ============
   let regionUpdateTimer = null
@@ -82,11 +85,11 @@ export function useWaveformRegions(
   }
 
   function getSelectedSubtitleId() {
-    return resolveMaybeRefValue(subtitleDocumentStore?.selectedSubtitleId) ?? null
+    return resolveMaybeRefValue(editorUiStore?.selectedSubtitleId) ?? null
   }
 
   function setSelectedSubtitleId(subtitleId) {
-    subtitleDocumentStore.setSelectedSubtitleId(subtitleId)
+    editorUiStore.setSelectedSubtitleId(subtitleId)
   }
 
   function isRegionDraggingActive() {

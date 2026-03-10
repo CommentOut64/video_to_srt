@@ -7,17 +7,17 @@
  * - `flushAllSync()` 必须无条件执行，不能仅依赖 `isDirty`，因为待上送队列/结构性请求
  *   与本地脏标记并不总是严格等价。
  */
-export async function runEditorLeaveBarrier({ syncCoordinator, projectStore, isDirty = false }) {
+export async function runEditorLeaveBarrier({ syncCoordinator, editorSessionStore, isDirty = false }) {
   if (!syncCoordinator || typeof syncCoordinator.flushAllSync !== 'function') {
     throw new Error('缺少 syncCoordinator.flushAllSync，无法执行离开栅栏')
   }
-  if (!projectStore || typeof projectStore.saveProject !== 'function') {
-    throw new Error('缺少 projectStore.saveProject，无法执行离开栅栏')
+  if (!editorSessionStore || typeof editorSessionStore.saveWorkingCopy !== 'function') {
+    throw new Error('缺少 editorSessionStore.saveWorkingCopy，无法执行离开栅栏')
   }
 
   await syncCoordinator.flushAllSync()
 
   if (isDirty) {
-    await projectStore.saveProject()
+    await editorSessionStore.saveWorkingCopy()
   }
 }
