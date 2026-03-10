@@ -74,7 +74,8 @@ class RuntimeMediaPolicyService:
         if variant == "preview_360p":
             return f"/api/media/{project_id}/video/preview"
         if variant == "source":
-            return f"/api/media/{project_id}/video/source"
+            # 复用主视频端点，该端点已内置 direct_play 回退逻辑
+            return f"/api/media/{project_id}/video"
         return f"/api/media/{project_id}/video"
 
     def describe_variant_resolution(self, variant: Optional[str]) -> Optional[str]:

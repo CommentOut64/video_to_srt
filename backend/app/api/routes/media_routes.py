@@ -1349,7 +1349,7 @@ async def check_proxy_status(identifier: str):
     urls = {
         "360p": f"/api/media/{project_id}/video/preview" if preview_360p.exists() else None,
         "720p": f"/api/media/{project_id}/video" if has_primary_video_output else None,
-        "source": f"/api/media/{project_id}/video/source" if source_video else None,
+        "source": f"/api/media/{project_id}/video" if source_video else None,
         "normalize": f"/api/media/{project_id}/video" if normalized_h264.exists() else None,
     }
 
