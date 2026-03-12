@@ -48,6 +48,9 @@ export const useSyncCoordinatorStore = defineStore('syncCoordinator', () => {
   let initialUndoRedoSnapshot = null
   let undoRedoDebounceTimer = null
   let inflightUndoRedoPromise = null
+  let undoRedoApplyChain = Promise.resolve()
+  let editFlushBarrier = Promise.resolve()
+  let structuralBarrier = Promise.resolve()
 
   function getActiveIdentity(candidateIdentityId = null) {
     return candidateIdentityId || currentSyncIdentityId.value || projectStore.primaryId || null
@@ -214,6 +217,10 @@ export const useSyncCoordinatorStore = defineStore('syncCoordinator', () => {
 
       for (const [queueKey, data] of batch.entries()) {
         try {
+          const payload = { ...(data || {}) }
+          const clientRevision = payload.clientRevision
+          delete payload.clientRevision
+
           let segmentId = resolveProjectSegmentId(projectStore, queueKey)
           if (!segmentId) {
             segmentId = await resolveProjectSegmentIdFromServer({
@@ -239,7 +246,24 @@ export const useSyncCoordinatorStore = defineStore('syncCoordinator', () => {
             throw new Error(`无法解析 segment_id，同步键=${queueKey}`)
           }
 
-          await projectApi.updateSubtitle(projectId, segmentId, data)
+          if (Object.keys(payload).length === 0) {
+            editSyncErrors.value.delete(queueKey)
+            continue
+          }
+
+          await projectApi.updateSubtitle(projectId, segmentId, payload)
+
+          // V3.2.5+dev.20260311.01: 版本号冲突检测 - 跳过过期回填
+          const subtitle = findSubtitleByQueueKey(projectStore, queueKey)
+          if (subtitle && clientRevision !== undefined) {
+            const currentRevision = subtitle.revision || 0
+            if (currentRevision > clientRevision) {
+              console.warn(`[SyncCoordinator] 跳过过期回填: queueKey=${queueKey}, current=${currentRevision} > synced=${clientRevision}`)
+              editSyncErrors.value.delete(queueKey)
+              continue
+            }
+          }
+
           editSyncErrors.value.delete(queueKey)
         } catch (error) {
           if (error?.status === 404) {
@@ -266,6 +290,7 @@ export const useSyncCoordinatorStore = defineStore('syncCoordinator', () => {
 
     const currentPromise = runProcessQueuePass()
     inflightEditSyncPromise = currentPromise
+    editFlushBarrier = currentPromise
     try {
       await currentPromise
     } finally {
@@ -273,6 +298,15 @@ export const useSyncCoordinatorStore = defineStore('syncCoordinator', () => {
         inflightEditSyncPromise = null
       }
     }
+  }
+
+  async function flushEditQueue() {
+    if (processQueueTimer) {
+      clearTimeout(processQueueTimer)
+      processQueueTimer = null
+    }
+    await processQueue()
+    await editFlushBarrier
   }
 
   function scheduleEditSync() {
@@ -290,12 +324,17 @@ export const useSyncCoordinatorStore = defineStore('syncCoordinator', () => {
     let queueKey = normalizeQueueKey(index)
     if (queueKey === null) return
 
+    const subtitle = findSubtitleByQueueKey(projectStore, queueKey)
+    if (!subtitle) return
+
     const segmentId = resolveProjectSegmentId(projectStore, queueKey)
     if (segmentId) {
       queueKey = segmentId
     }
 
-    const update = {}
+    const clientRevision = subtitle.revision || 0
+
+    const update = { clientRevision }
     if (text !== undefined) update.text = text
     if (start !== undefined) update.start = editorTimingStore.toBaseTime(start)
     if (end !== undefined) update.end = editorTimingStore.toBaseTime(end)
@@ -310,7 +349,7 @@ export const useSyncCoordinatorStore = defineStore('syncCoordinator', () => {
 
   async function forceSyncNow() {
     await flushQueuePersistence()
-    await processQueue()
+    await flushEditQueue()
   }
 
   function trackStructuralOperation(type, promise) {
@@ -369,9 +408,11 @@ export const useSyncCoordinatorStore = defineStore('syncCoordinator', () => {
       }
     }
 
+    console.log('[executeEditorCommands] 发送命令:', commands.length, '条')
     const projectId = await ensureProjectContext()
     const payload = { commands }
     const envelope = await projectApi.applyEditorOps(projectId, payload)
+    console.log('[executeEditorCommands] 收到响应:', { success: envelope?.success, result: envelope?.data })
     const result = envelope?.data || {}
     const success = envelope?.success
 
@@ -381,23 +422,41 @@ export const useSyncCoordinatorStore = defineStore('syncCoordinator', () => {
 
     if (success === false || (Array.isArray(result?.errors) && result.errors.length > 0)) {
       const message = (result?.errors || []).join('; ') || '批量命令同步失败'
+      console.error('[executeEditorCommands] 同步失败:', message)
       throw new Error(message)
     }
 
+    console.log('[executeEditorCommands] 同步成功')
     return result
   }
 
   function submitStructuralCommands(type, commands = []) {
-    const promise = executeEditorCommands(commands)
+    console.log('[submitStructuralCommands] 开始:', { type, commandCount: commands.length })
+
+    const previousBarrier = structuralBarrier
+
+    const promise = (async () => {
+      console.log('[submitStructuralCommands] 等待 flushEditQueue...')
+      await flushEditQueue()
+      console.log('[submitStructuralCommands] 等待 previousBarrier...')
+      await previousBarrier
+      console.log('[submitStructuralCommands] 开始执行命令...')
+      const result = await executeEditorCommands(commands)
+      console.log('[submitStructuralCommands] 执行完成')
+      return result
+    })()
+
+    structuralBarrier = promise.catch(() => {})
     const opId = trackStructuralOperation(type, promise)
+    console.log('[submitStructuralCommands] 返回 opId:', opId)
     return { opId, promise }
   }
 
   async function flushAllSync() {
-    await forceSyncNow()
+    await flushEditQueue()
     await flushUndoRedoSync()
     await waitAllStructuralOperations()
-    await forceSyncNow()
+    await flushEditQueue()
     await flushUndoRedoSync()
   }
 
@@ -418,9 +477,27 @@ export const useSyncCoordinatorStore = defineStore('syncCoordinator', () => {
     return snapshot
   }
 
+  function hydrateSnapshotSegmentIdsFromCache(snapshot) {
+    if (!(snapshot instanceof Map)) {
+      return
+    }
+    for (const [, entry] of snapshot) {
+      if (!entry || entry.segment_id || entry.localId == null) {
+        continue
+      }
+      const cached = createdSegmentIdCache.get(String(entry.localId))
+      if (cached) {
+        entry.segment_id = cached
+      }
+    }
+  }
+
   function patchCreatedSegmentIds(createdSegments) {
+    console.log('[patchCreatedSegmentIds] 开始回填，收到:', createdSegments.length, '条记录')
     for (const created of createdSegments) {
       if (!created.segment_id) continue
+
+      console.log('[patchCreatedSegmentIds] 处理:', { local_id: created.local_id, segment_id: created.segment_id })
 
       // 缓存 local_id -> segment_id，供 undo/redo diff 和 merge 补偿使用
       if (created.local_id != null) {
@@ -430,14 +507,16 @@ export const useSyncCoordinatorStore = defineStore('syncCoordinator', () => {
       let match = null
       if (created.local_id !== undefined && created.local_id !== null) {
         match = projectStore.subtitles.find(
-          (subtitle) => !subtitle.segment_id && String(subtitle.id) === String(created.local_id)
+          (subtitle) => String(subtitle.id) === String(created.local_id)
         )
+        console.log('[patchCreatedSegmentIds] 通过 local_id 匹配:', match ? `找到 ${match.id}, 已有 segment_id: ${match.segment_id}` : '未找到')
       }
 
       if (!match) {
         match = projectStore.subtitles.find(
           (subtitle) => !subtitle.segment_id && subtitle.sentenceIndex === created.legacy_index
         )
+        console.log('[patchCreatedSegmentIds] 通过 legacy_index 匹配:', match ? `找到 ${match.id}` : '未找到')
       }
 
       if (!match && created.start !== undefined && created.end !== undefined) {
@@ -448,23 +527,28 @@ export const useSyncCoordinatorStore = defineStore('syncCoordinator', () => {
           const endDiff = Math.abs(editorTimingStore.toBaseTime(subtitle.end) - Number(created.end))
           return textEqual && startDiff < 0.01 && endDiff < 0.01
         })
+        console.log('[patchCreatedSegmentIds] 通过时间+文本匹配:', match ? `找到 ${match.id}` : '未找到')
       }
 
       if (match) {
+        console.log('[patchCreatedSegmentIds] 准备回填 segment_id:', { localId: match.id, segment_id: created.segment_id })
         editorHistoryStore.pauseHistory()
         try {
           const payload = { segment_id: created.segment_id }
           if (
             created.legacy_index !== undefined
             && created.legacy_index !== null
-            && match.sentenceIndex === undefined
+            && (match.sentenceIndex === undefined || match.sentenceIndex === null)
           ) {
             payload.sentenceIndex = created.legacy_index
           }
           projectStore.updateSubtitle(match.id, payload, { isUserEdit: false })
+          console.log('[patchCreatedSegmentIds] 回填完成:', match.id)
         } finally {
           editorHistoryStore.resumeHistory()
         }
+      } else {
+        console.warn('[patchCreatedSegmentIds] 未找到匹配的字幕:', created)
       }
     }
   }
@@ -483,17 +567,12 @@ export const useSyncCoordinatorStore = defineStore('syncCoordinator', () => {
     // 等待飞行中的结构性操作（split/merge）完成，确保 segment_id 已回写
     await waitAllStructuralOperations()
 
-    // 补偿 initialUndoRedoSnapshot 中缺失的 segment_id
-    // 场景：split 产生新字幕 → 用户立即 undo → 新字幕从 store 移除 →
-    // patchCreatedSegmentIds 找不到目标 → 但缓存中有 local_id → segment_id 映射
-    for (const [, entry] of initialUndoRedoSnapshot) {
-      if (!entry.segment_id && entry.localId != null) {
-        const cached = createdSegmentIdCache.get(String(entry.localId))
-        if (cached) entry.segment_id = cached
-      }
-    }
+    // 补偿快照中缺失的 segment_id（含 initial/final 两端），
+    // 避免撤销 split/merge 时误把“恢复旧段”降级为“新建段”。
+    hydrateSnapshotSegmentIdsFromCache(initialUndoRedoSnapshot)
 
     const finalSnapshot = captureSnapshot()
+    hydrateSnapshotSegmentIdsFromCache(finalSnapshot)
     const diff = computeSubtitleSnapshotDiff(initialUndoRedoSnapshot, finalSnapshot)
     initialUndoRedoSnapshot = null
     const commands = buildEditorCommandsFromDiff(diff, nextCommandId, 'undo-redo')
@@ -534,6 +613,7 @@ export const useSyncCoordinatorStore = defineStore('syncCoordinator', () => {
   }
 
   async function flushUndoRedoSync() {
+    await undoRedoApplyChain.catch(() => {})
     if (undoRedoDebounceTimer) {
       clearTimeout(undoRedoDebounceTimer)
       undoRedoDebounceTimer = null
@@ -549,22 +629,48 @@ export const useSyncCoordinatorStore = defineStore('syncCoordinator', () => {
     }
   }
 
+  async function waitForUndoRedoStructuralBarrier() {
+    // undo/redo 必须在结构性操作稳定后执行，避免 merge/split 回推覆盖本地撤销结果。
+    await waitAllStructuralOperations()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+
+  async function queueUndoRedoApply(action) {
+    undoRedoApplyChain = undoRedoApplyChain
+      .catch((error) => {
+        console.warn('[SyncCoordinator] 上一次 undo/redo 串行任务异常，继续后续请求:', error)
+      })
+      .then(async () => {
+        await waitForUndoRedoStructuralBarrier()
+        const canApply = action === 'undo'
+          ? Boolean(editorHistoryStore.canUndo)
+          : Boolean(editorHistoryStore.canRedo)
+        if (!canApply) {
+          return
+        }
+        if (!initialUndoRedoSnapshot) {
+          initialUndoRedoSnapshot = captureSnapshot()
+        }
+        if (action === 'undo') {
+          editorHistoryStore.undo()
+        } else {
+          editorHistoryStore.redo()
+        }
+        scheduleUndoRedoSync()
+      })
+      .catch((error) => {
+        undoRedoLastError.value = error?.message || '撤销/重做执行失败'
+        console.error('[SyncCoordinator] queueUndoRedoApply 异常:', error)
+      })
+    return undoRedoApplyChain
+  }
+
   function undoWithSync() {
-    if (!editorHistoryStore.canUndo) return
-    if (!initialUndoRedoSnapshot) {
-      initialUndoRedoSnapshot = captureSnapshot()
-    }
-    editorHistoryStore.undo()
-    scheduleUndoRedoSync()
+    void queueUndoRedoApply('undo')
   }
 
   function redoWithSync() {
-    if (!editorHistoryStore.canRedo) return
-    if (!initialUndoRedoSnapshot) {
-      initialUndoRedoSnapshot = captureSnapshot()
-    }
-    editorHistoryStore.redo()
-    scheduleUndoRedoSync()
+    void queueUndoRedoApply('redo')
   }
 
   /**
@@ -592,6 +698,7 @@ export const useSyncCoordinatorStore = defineStore('syncCoordinator', () => {
     applyPendingEditsToStore,
     enqueueSubtitleEdit,
     forceSyncNow,
+    flushEditQueue,
     trackStructuralOperation,
     waitAllStructuralOperations,
     clearAllStructuralErrors,

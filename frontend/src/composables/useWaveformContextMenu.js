@@ -113,6 +113,11 @@ export function useWaveformContextMenu(projectStore) {
    * 波形切分结果统一走 editor-ops:apply，避免组件层继续分散调用旧 API。
    */
   async function syncSplitSubtitles(result) {
+    const projectId = projectStore.meta.projectId
+    if (!projectId) {
+      throw new Error('缺少 project_id，禁止走 job 字幕切分分支')
+    }
+
     const { leftSubtitle, rightSubtitle } = result || {}
     if (!leftSubtitle || !rightSubtitle) return
 
@@ -129,7 +134,7 @@ export function useWaveformContextMenu(projectStore) {
       await promise
     } catch (error) {
       console.warn('[WaveformContextMenu] 切分同步失败:', error)
-      ElMessage.warning('切分同步失败，请重试')
+      ElMessage.warning(`切分同步失败：${error?.message || '请重试'}`)
     }
   }
 

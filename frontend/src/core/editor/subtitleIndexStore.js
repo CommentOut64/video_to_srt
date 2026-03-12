@@ -50,6 +50,52 @@ export const useSubtitleIndexStore = defineStore("subtitleIndex", () => {
     bySentenceIndex.value = new Map();
   }
 
+  // V3.2.4+dev.20260311.03: 重新设计 insert，接收 hotRecords 用于排序
+  function insert(localId, startMs, segmentId, sentenceIndex, hotRecords) {
+    const newByLocalId = new Map(byLocalId.value);
+    const newBySegmentId = new Map(bySegmentId.value);
+    const newBySentenceIndex = new Map(bySentenceIndex.value);
+
+    newByLocalId.set(localId, localId);
+    if (segmentId) {
+      newBySegmentId.set(String(segmentId), localId);
+    }
+    if (Number.isFinite(Number(sentenceIndex))) {
+      newBySentenceIndex.set(Number(sentenceIndex), localId);
+    }
+
+    const orderEntries = orderedLocalIds.value.map((id) => {
+      const hot = hotRecords?.get(id);
+      return { localId: id, startMs: hot?.startMs || 0 };
+    });
+    orderEntries.push({ localId, startMs: Number(startMs) || 0 });
+    orderEntries.sort(compareOrder);
+
+    orderedLocalIds.value = orderEntries.map((e) => e.localId);
+    byLocalId.value = newByLocalId;
+    bySegmentId.value = newBySegmentId;
+    bySentenceIndex.value = newBySentenceIndex;
+  }
+
+  function remove(localId) {
+    const newByLocalId = new Map(byLocalId.value);
+    const newBySegmentId = new Map(bySegmentId.value);
+    const newBySentenceIndex = new Map(bySentenceIndex.value);
+
+    newByLocalId.delete(localId);
+    for (const [key, value] of newBySegmentId.entries()) {
+      if (value === localId) newBySegmentId.delete(key);
+    }
+    for (const [key, value] of newBySentenceIndex.entries()) {
+      if (value === localId) newBySentenceIndex.delete(key);
+    }
+
+    orderedLocalIds.value = orderedLocalIds.value.filter((id) => id !== localId);
+    byLocalId.value = newByLocalId;
+    bySegmentId.value = newBySegmentId;
+    bySentenceIndex.value = newBySentenceIndex;
+  }
+
   return {
     orderedLocalIds,
     byLocalId,
@@ -57,5 +103,7 @@ export const useSubtitleIndexStore = defineStore("subtitleIndex", () => {
     bySentenceIndex,
     replaceAll,
     clear,
+    insert,
+    remove,
   };
 });

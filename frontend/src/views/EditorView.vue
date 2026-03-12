@@ -268,6 +268,9 @@ import { useEditorSessionStore } from '@/stores/editorSessionStore'
 import { useEditorTimingStore } from '@/stores/editorTimingStore'
 import { useEditorHistoryStore } from '@/core/editor/historyStore'
 import { useSyncCoordinatorStore } from '@/core/sync/syncCoordinator'
+import { runEditorLeaveBarrier } from '@/core/sync/leaveBarrier'
+import { runEditorSessionSwitchBarrier } from '@/core/sync/sessionSwitchBarrier'
+import { createSaveCoordinator } from '@/core/sync/saveCoordinator'
 import { legacyApi, mediaApi, projectApi, transcriptionApi } from '@/services/api'
 import sseChannelManager from '@/services/sseChannelManager'
 import { useShortcuts } from '@/hooks/useShortcuts'
@@ -283,7 +286,7 @@ import {
   getEditorShortcutComboLabel,
   normalizeEditorShortcutConfig,
 } from '@/utils/editorShortcuts'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   buildDefaultCapabilitySnapshot,
   selectFlavor,
@@ -322,6 +325,12 @@ const editorTimingStore = useEditorTimingStore()
 const editorHistoryStore = useEditorHistoryStore()
 const syncCoordinator = useSyncCoordinatorStore()
 const router = useRouter()
+const saveCoordinator = createSaveCoordinator({
+  projectStore,
+  syncCoordinator,
+  editorSessionStore,
+  projectApi,
+})
 
 // 全局播放管理器
 const playbackManager = usePlaybackManager()
@@ -344,7 +353,7 @@ const videoStageRef = ref(null)
 const waveformRef = ref(null)
 const subtitleListRef = ref(null)
 const activeTab = ref('subtitles')
-const saving = ref(false)
+const saving = saveCoordinator.isSaving
 const lastSaved = ref(null)
 
 // 布局状态
@@ -426,6 +435,7 @@ const dualStreamProgress = computed(() => {
 let sseUnsubscribe = null
 let progressPollTimer = null
 let proxyPollTimer = null
+let autoSaveTimer = null
 const isCancelPending = ref(false)
 let missingVideoWarnedIdentity = null
 const isVideoAbsenceConfirmed = ref(false)
@@ -527,14 +537,15 @@ onBeforeRouteUpdate(async (to, from) => {
   try {
     await runEditorSessionSwitchBarrier({
       previousIdentityId: previousProjectId || previousJobId,
+      saveCoordinator,
       syncCoordinator,
       editorSessionStore,
       isDirty: isDirty.value,
     })
   } catch (error) {
     console.error('[EditorView] 会话切换前同步/保存失败:', error)
-    const answer = window.confirm('同步或保存失败，确定要切换吗? 未保存的修改可能会丢失。')
-    if (!answer) return false
+    await showForceSaveBlockedError('切换项目前强制保存失败，已阻止切换。', error)
+    return false
   }
 })
 
@@ -1127,6 +1138,51 @@ function normalizeProjectSegmentEvent(data) {
   }
 }
 
+function findOptimisticSubtitleIndexForProjectUpsert(normalized) {
+  if (!normalized) return -1
+
+  // 1) 优先用 sentenceIndex 命中本地待绑定字幕
+  if (normalized.sentenceIndex !== null && normalized.sentenceIndex !== undefined) {
+    const bySentenceIndex = projectStore.subtitles.findIndex(
+      (item) => !item.segment_id && item.sentenceIndex === normalized.sentenceIndex
+    )
+    if (bySentenceIndex >= 0) {
+      return bySentenceIndex
+    }
+  }
+
+  // 2) 回退：按 text + 时间窗近似匹配（处理 split/insert 等本地先建、后端回推 segment_id 场景）
+  const timeTolerance = 0.03
+  return projectStore.subtitles.findIndex((item) => {
+    if (item.segment_id) return false
+    const textEqual = String(item.text || '') === String(normalized.text || '')
+    if (!textEqual) return false
+
+    const itemStart = Number(item.start)
+    const itemEnd = Number(item.end)
+    const nextStart = Number(normalized.start)
+    const nextEnd = Number(normalized.end)
+    if (!Number.isFinite(itemStart) || !Number.isFinite(itemEnd) || !Number.isFinite(nextStart) || !Number.isFinite(nextEnd)) {
+      return false
+    }
+    return Math.abs(itemStart - nextStart) <= timeTolerance && Math.abs(itemEnd - nextEnd) <= timeTolerance
+  })
+}
+
+function pruneDuplicatedSegmentRows(segmentId, keepSubtitleId) {
+  const duplicatedIndexes = []
+  projectStore.subtitles.forEach((item, index) => {
+    if (item.segment_id !== segmentId) return
+    if (String(item.id) === String(keepSubtitleId)) return
+    duplicatedIndexes.push(index)
+  })
+  duplicatedIndexes
+    .sort((a, b) => b - a)
+    .forEach((index) => {
+      projectStore.removeSubtitleAt(index)
+    })
+}
+
 function handleProjectSubtitleUpsert(data) {
   const normalized = normalizeProjectSegmentEvent(data)
   if (!normalized) {
@@ -1136,11 +1192,14 @@ function handleProjectSubtitleUpsert(data) {
   const existingIndex = projectStore.subtitles.findIndex(
     (item) => item.segment_id === normalized.segmentId
   )
+  const optimisticIndex = existingIndex >= 0
+    ? existingIndex
+    : findOptimisticSubtitleIndexForProjectUpsert(normalized)
 
   const payload = {
     sentenceIndex:
       normalized.sentenceIndex
-      ?? (existingIndex >= 0 ? projectStore.subtitles[existingIndex].sentenceIndex : undefined),
+      ?? (optimisticIndex >= 0 ? projectStore.subtitles[optimisticIndex].sentenceIndex : undefined),
     segment_id: normalized.segmentId,
     text: normalized.text,
     start: normalized.start,
@@ -1159,9 +1218,10 @@ function handleProjectSubtitleUpsert(data) {
 
   editorHistoryStore.pauseHistory()
   try {
-    if (existingIndex >= 0) {
-      const existingId = projectStore.subtitles[existingIndex].id
+    if (optimisticIndex >= 0) {
+      const existingId = projectStore.subtitles[optimisticIndex].id
       projectStore.updateSubtitle(existingId, payload)
+      pruneDuplicatedSegmentRows(normalized.segmentId, existingId)
       return
     }
 
@@ -1188,9 +1248,14 @@ function handleProjectSubtitleUpsert(data) {
       isFinalized: true,
     }
     projectStore.insertSubtitleAt(finalIndex, nextSubtitle)
+    pruneDuplicatedSegmentRows(normalized.segmentId, nextSubtitle.id)
   } finally {
     editorHistoryStore.resumeHistory()
   }
+}
+
+function isProjectSegmentEvent(data) {
+  return Boolean(data?.segment_id || data?.segment?.segment_id)
 }
 
 function handleProjectSubtitleDelete(data) {
@@ -1431,14 +1496,26 @@ function subscribeSSE() {
     },
 
     onSubtitleAdded(data) {
+      if (isProjectSegmentEvent(data)) {
+        handleProjectSubtitleUpsert(data)
+        return
+      }
       handleStreamingSubtitle(data)
     },
 
     onSubtitleDeleted(data) {
+      if (isProjectSegmentEvent(data)) {
+        handleProjectSubtitleDelete(data)
+        return
+      }
       handleSubtitleDeleted(data)
     },
 
     onSubtitleEdited(data) {
+      if (isProjectSegmentEvent(data)) {
+        handleProjectSubtitleUpsert(data)
+        return
+      }
       handleSubtitleEdited(data)
     },
 
@@ -1565,18 +1642,19 @@ function handleStreamingSubtitle(data) {
   // 解析字幕数据格式
   // 兼容两种格式: 直接字段(sv_sentence) 和 嵌套sentence对象(whisper_patch/llm_proof等)
   const sentence = data.sentence || {}
-  const sentenceIndex = data.sentence_index ?? data.index ?? sentence.index
-  const text = sentence.text ?? data.text ?? data.content
-  const start = sentence.start ?? data.start_time ?? data.start
-  const end = sentence.end ?? data.end_time ?? data.end
-  const warningType = sentence.warning_type ?? data.warning_type ?? 'none'
-  const source = data.source ?? data.event_type ?? 'unknown'
+  const segment = data.segment || {}
+  const sentenceIndex = data.sentence_index ?? data.index ?? sentence.index ?? segment.legacy_index ?? segment.sentence_index
+  const text = sentence.text ?? data.text ?? data.content ?? segment.text
+  const start = sentence.start ?? data.start_time ?? data.start ?? segment.start
+  const end = sentence.end ?? data.end_time ?? data.end ?? segment.end
+  const warningType = sentence.warning_type ?? data.warning_type ?? segment.warning_type ?? 'none'
+  const source = data.source ?? data.event_type ?? segment.source_type ?? segment.source ?? 'unknown'
   // V3.1.2+dev.20260111.01: 提取 display_confidence 和 confidence_source
-  const confidence = sentence.confidence ?? data.confidence
-  const displayConfidence = sentence.display_confidence ?? data.display_confidence
-  const confidenceSource = sentence.confidence_source ?? data.confidence_source
+  const confidence = sentence.confidence ?? data.confidence ?? segment.confidence
+  const displayConfidence = sentence.display_confidence ?? data.display_confidence ?? segment.display_confidence
+  const confidenceSource = sentence.confidence_source ?? data.confidence_source ?? segment.confidence_source
 
-  if (sentenceIndex === undefined || !text) {
+  if (sentenceIndex === undefined || sentenceIndex === null || text === undefined || text === null) {
     console.warn('[EditorView] 无效的字幕数据:', data)
     return
   }
@@ -1917,23 +1995,64 @@ function stopProxyPolling() {
   }
 }
 
+function resolveAutoSaveIntervalMs() {
+  const rawSeconds = Number(advancedConfig.value.general.auto_save_interval)
+  if (!Number.isFinite(rawSeconds)) {
+    return 60000
+  }
+  const clampedSeconds = Math.max(10, Math.min(600, rawSeconds))
+  return Math.round(clampedSeconds * 1000)
+}
+
+async function runAutoSaveTick(reason = 'interval') {
+  try {
+    const result = await saveCoordinator.runAutoSave(reason)
+    if (result?.ok && !result.skipped) {
+      lastSaved.value = Date.now()
+    }
+  } catch (error) {
+    console.warn('[EditorView] 自动保存失败:', error)
+  }
+}
+
+function startAutoSaveLoop() {
+  stopAutoSaveLoop()
+  autoSaveTimer = setInterval(() => {
+    void runAutoSaveTick('interval')
+  }, resolveAutoSaveIntervalMs())
+}
+
+function stopAutoSaveLoop() {
+  if (autoSaveTimer) {
+    clearInterval(autoSaveTimer)
+    autoSaveTimer = null
+  }
+}
+
+async function showForceSaveBlockedError(prefix, error) {
+  const message = error?.message || '未知错误'
+  try {
+    await ElMessageBox.alert(`${prefix}\n${message}`, '强制保存失败', {
+      type: 'error',
+      confirmButtonText: '我知道了',
+    })
+  } catch {
+    // 用户关闭弹窗不影响阻断语义
+  }
+}
+
 // ========== 保存功能 ==========
 
 async function saveProject() {
-  if (saving.value) return
-  saving.value = true
   try {
-    if (mediaIdentityId.value) {
-      const srtContent = projectStore.generateSRT()
-      await mediaApi.saveSRTContent(mediaIdentityId.value, srtContent)
+    const result = await saveCoordinator.runManualSave('ctrl-s')
+    if (result?.ok) {
+      lastSaved.value = Date.now()
+      ElMessage.success('保存成功')
     }
-    await editorSessionStore.saveWorkingCopy()
-    lastSaved.value = Date.now()
   } catch (error) {
     console.error('[EditorView] 保存失败:', error)
-    alert('保存失败: ' + (error.message || '未知错误'))
-  } finally {
-    saving.value = false
+    ElMessage.error('保存失败: ' + (error.message || '未知错误'))
   }
 }
 
@@ -2049,8 +2168,7 @@ async function handleExport(format) {
   try {
     segments = await fetchLatestSegments()
   } catch (error) {
-    const reason = error?.message || '字幕同步未完成，请稍后重试'
-    alert(`导出失败：${reason}`)
+    await showForceSaveBlockedError('导出前强制保存失败，已阻止导出。', error)
     return
   }
   const displaySegments = editorTimingStore.applyOffsetToSegments(segments || [])
@@ -2068,7 +2186,7 @@ async function handleExport(format) {
       filename += '.srt'
       break
     case 'ass':
-      await handleASSExport(displaySegments)
+      await handleASSExport()
       return
     case 'vtt':
       content = generateVTTFromSegments(displaySegments)
@@ -2088,37 +2206,13 @@ async function handleExport(format) {
 }
 
 async function fetchLatestSegments() {
-  await syncCoordinator.flushAllSync()
-
-  const pending = Number(syncCoordinator.pendingCount || 0)
-  const syncErrors = syncCoordinator.editSyncErrors
-  const syncErrorCount = Number(syncErrors?.size || 0)
-  const structuralErrors = syncCoordinator.structuralSyncErrors
-  const structuralErrorCount = Number(structuralErrors?.size || 0)
-  if (pending > 0 || syncErrorCount > 0 || structuralErrorCount > 0) {
-    let firstErrorDetail = ''
-    if (syncErrorCount > 0 && typeof syncErrors?.entries === 'function') {
-      const firstError = syncErrors.entries().next().value
-      if (firstError) {
-        firstErrorDetail = `，首条错误: [${firstError[0]}] ${firstError[1]}`
-      }
-    }
-    if (structuralErrorCount > 0 && !firstErrorDetail) {
-      const firstStructErr = structuralErrors.entries().next().value
-      if (firstStructErr) {
-        firstErrorDetail = `，首条结构性错误: [${firstStructErr[1].type}] ${firstStructErr[1].error}`
-      }
-    }
-    throw new Error(`仍有未同步修改（待同步 ${pending} 条，错误 ${syncErrorCount + structuralErrorCount} 条${firstErrorDetail}）`)
+  const forceResult = await saveCoordinator.runForceSave('export', {
+    needBackendSnapshot: true,
+  })
+  if (forceResult?.ok) {
+    lastSaved.value = Date.now()
   }
-
-  const projectId = props.projectId || projectStore.meta.projectId
-  if (!projectId) {
-    throw new Error('缺少 project_id：无法导出，请从任务列表重新打开并完成任务到项目转换')
-  }
-  // 导出前执行强制保存，确保本地快照与导出动作一致。
-  await editorSessionStore.saveWorkingCopy()
-  const segments = await projectApi.getSubtitles(projectId)
+  const segments = forceResult?.backendSegments
   return Array.isArray(segments)
     ? segments.map((segment, index) => ({
         id: segment.legacy_index ?? index,
@@ -2129,9 +2223,8 @@ async function fetchLatestSegments() {
     : []
 }
 
-async function handleASSExport(segments) {
+async function handleASSExport() {
   try {
-    const srtContent = segmentsToSRT(segments)
     const projectId = props.projectId || projectStore.meta.projectId
     if (!projectId) {
       throw new Error('缺少 project_id：无法导出 ASS，请从任务列表重新打开并完成任务到项目转换')
@@ -2369,6 +2462,7 @@ async function handleSaveAdvancedSettings() {
     }
 
     ElMessage.success('高级设置已保存')
+    startAutoSaveLoop()
     // V3.2.4+dev.20260303.04: 保存后不关闭窗口，允许用户继续修改
   } catch (error) {
     console.error('[EditorView] 保存高级设置失败:', error)
@@ -2455,11 +2549,13 @@ onMounted(() => {
     sidebarWidth.value = parseInt(savedWidth)
   }
   loadEditorInteractionPreferences()
+  startAutoSaveLoop()
 
   loadProject()
 })
 
 onUnmounted(() => {
+  stopAutoSaveLoop()
   playbackManager.pause()
   if (!activeJobId.value && props.projectId) {
     // 纯 project 模式无后台任务续跑需求，卸载时应主动释放连接，避免悬挂订阅。
@@ -2480,14 +2576,16 @@ onBeforeRouteLeave(async (to, from) => {
   playbackManager.pause()
   try {
     await runEditorLeaveBarrier({
+      saveCoordinator,
       syncCoordinator,
       editorSessionStore,
       isDirty: isDirty.value,
+      reason: 'route-leave',
     })
   } catch (error) {
     console.error('[EditorView] 离开前同步/保存失败:', error)
-    const answer = window.confirm('同步或保存失败，确定要离开吗? 未保存的修改可能会丢失。')
-    if (!answer) return false
+    await showForceSaveBlockedError('离开编辑器前强制保存失败，已阻止离开。', error)
+    return false
   }
 })
 </script>

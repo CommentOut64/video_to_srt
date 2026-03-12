@@ -73,7 +73,7 @@
             <SubtitleRow
               v-else
               :subtitle="item.subtitle"
-              :index="item.index"
+              :index="resolveRowIndex(item.subtitle?.id, item.index)"
               :is-active="item.isActive"
               :is-current="item.isCurrent"
               :editable="props.editable"
@@ -85,8 +85,8 @@
               @update-time="updateTime"
               @update-text="updateText"
               @delete="deleteSubtitle"
-              @insert-before="insertBefore(item.index)"
-              @insert-after="insertAfter(item.index)"
+              @insert-before="insertBefore(resolveRowIndex(item.subtitle?.id, item.index))"
+              @insert-after="insertAfter(resolveRowIndex(item.subtitle?.id, item.index))"
               @select-change="handleItemSelectChange"
             />
           </DynamicScrollerItem>
@@ -111,7 +111,7 @@
           >
             <SubtitleRow
               :subtitle="item.subtitle"
-              :index="item.index"
+              :index="resolveRowIndex(item.subtitle?.id, item.index)"
               :is-active="activeSubtitleId === item.subtitle.id"
               :is-current="currentSubtitleId === item.subtitle.id"
               :editable="props.editable"
@@ -123,8 +123,8 @@
               @update-time="updateTime"
               @update-text="updateText"
               @delete="deleteSubtitle"
-              @insert-before="insertBefore(item.index)"
-              @insert-after="insertAfter(item.index)"
+              @insert-before="insertBefore(resolveRowIndex(item.subtitle?.id, item.index))"
+              @insert-after="insertAfter(resolveRowIndex(item.subtitle?.id, item.index))"
               @select-change="handleItemSelectChange"
             />
           </DynamicScrollerItem>
@@ -149,7 +149,7 @@
           >
             <SubtitleRow
               :subtitle="item"
-              :index="index"
+              :index="resolveRowIndex(item?.id, index)"
               :is-active="activeSubtitleId === item.id"
               :is-current="currentSubtitleId === item.id"
               :editable="props.editable"
@@ -157,8 +157,8 @@
               @update-time="updateTime"
               @update-text="updateText"
               @delete="deleteSubtitle"
-              @insert-before="insertBefore(index)"
-              @insert-after="insertAfter(index)"
+              @insert-before="insertBefore(resolveRowIndex(item?.id, index))"
+              @insert-after="insertAfter(resolveRowIndex(item?.id, index))"
             />
           </DynamicScrollerItem>
         </template>
@@ -282,12 +282,24 @@ const groupedVirtualItems = computed(() => {
         clusterColor: item.clusterColor,
         isActive: activeSubtitleId.value === item.subtitle.id,
         isCurrent: currentSubtitleId.value === item.subtitle.id,
-      }, { isUserEdit: false })
+      })
     })
 
     return items
   })
 })
+
+function resolveRowIndex(subtitleId, candidateIndex) {
+  const normalizedIndex = Number(candidateIndex)
+  if (Number.isInteger(normalizedIndex) && normalizedIndex >= 0) {
+    return normalizedIndex
+  }
+
+  const fallbackIndex = subtitles.value.findIndex(
+    (subtitle) => String(subtitle?.id) === String(subtitleId)
+  )
+  return fallbackIndex >= 0 ? fallbackIndex : 0
+}
 
 const filteredSubtitles = computed(() => {
   if (!quickSearchText.value) return subtitles.value

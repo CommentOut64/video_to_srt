@@ -192,7 +192,7 @@ import { useEditBufferStore } from '@/core/editor/editBufferStore'
 
 const props = defineProps({
   subtitle: { type: Object, required: true },
-  index: { type: Number, required: true },
+  index: { type: Number, default: 0 },
   isActive: { type: Boolean, default: false },
   isCurrent: { type: Boolean, default: false },
   editable: { type: Boolean, default: true },
@@ -216,6 +216,7 @@ const emit = defineEmits([
 // Store
 const projectStore = useProjectStore()
 const playbackStore = usePlaybackStore()
+const editorTimingStore = useEditorTimingStore()
 const syncCoordinator = useSyncCoordinatorStore()
 const editBufferStore = useEditBufferStore()
 
@@ -552,6 +553,11 @@ async function handleContextMenuSelect(key) {
   // 重置菜单打开标志
   isContextMenuOpen.value = false
 
+  // 在结构性操作前强制收敛编辑态，避免文本草稿丢失与 computed 只读写入告警。
+  if (isEditing.value) {
+    stopEditing()
+  }
+
   if (key === 'split') {
     const result = projectStore.splitSubtitle(props.subtitle.id, {
       cursorPosition: cursorPosition.value
@@ -561,8 +567,6 @@ async function handleContextMenuSelect(key) {
       console.error('[SubtitleRow] 切分失败:', result.error)
     } else {
       await syncSplitSubtitles(result)
-      // 切分成功后退出编辑模式
-      isEditing.value = false
     }
   }
 
@@ -574,8 +578,6 @@ async function handleContextMenuSelect(key) {
       console.error('[SubtitleRow] 合并失败:', result.error)
     } else {
       await syncMergeSubtitles(result)
-      // 合并成功后退出编辑模式
-      isEditing.value = false
     }
   }
 }
@@ -604,12 +606,15 @@ function buildAddCommand(type, subtitle) {
 
 // V3.2.4+dev.20260304.01: 切分同步 — syncCoordinator 结构性命令追踪
 async function syncSplitSubtitles(result) {
+  console.log('[SubtitleRow.syncSplitSubtitles] 开始同步切分结果')
   const projectId = projectStore.meta.projectId
   if (!projectId) {
     throw new Error('缺少 project_id，禁止走 job 字幕切分分支')
   }
 
   const { leftSubtitle, rightSubtitle } = result
+  console.log('[SubtitleRow.syncSplitSubtitles] 左字幕:', { id: leftSubtitle?.id, segment_id: leftSubtitle?.segment_id })
+  console.log('[SubtitleRow.syncSplitSubtitles] 右字幕:', { id: rightSubtitle?.id, segment_id: rightSubtitle?.segment_id })
   if (!leftSubtitle || !rightSubtitle) return
 
   const commands = []
@@ -620,12 +625,14 @@ async function syncSplitSubtitles(result) {
   }
   commands.push(buildAddCommand('split-right', rightSubtitle))
 
+  console.log('[SubtitleRow.syncSplitSubtitles] 准备提交命令:', commands)
   const { promise } = syncCoordinator.submitStructuralCommands('split', commands)
   try {
     await promise
+    console.log('[SubtitleRow.syncSplitSubtitles] 同步成功')
   } catch (error) {
     console.warn('[SubtitleRow] 切分同步失败:', error)
-    ElMessage.warning('切分同步失败，请重试')
+    ElMessage.warning(`切分同步失败：${error?.message || '请重试'}`)
   }
 }
 
@@ -678,7 +685,7 @@ async function syncMergeSubtitles(result) {
     await promise
   } catch (error) {
     console.warn('[SubtitleRow] 合并同步失败:', error)
-    ElMessage.warning('合并同步失败，请重试')
+    ElMessage.warning(`合并同步失败：${error?.message || '请重试'}`)
   }
 }
 

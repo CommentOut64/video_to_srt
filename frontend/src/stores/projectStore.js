@@ -11,7 +11,7 @@ import { createLocalSubtitleId, createSplitSubtitleIds } from "@/utils/subtitleI
 import { useSubtitleHotStore } from "@/core/editor/subtitleHotStore";
 import { useSubtitleColdStore } from "@/core/editor/subtitleColdStore";
 import { useSubtitleIndexStore } from "@/core/editor/subtitleIndexStore";
-import { buildSubtitleProjection } from "@/core/editor/subtitleKernelUtils";
+import { buildColdSubtitleRecord, buildHotSubtitleRecord, buildSubtitleProjection } from "@/core/editor/subtitleKernelUtils";
 import { useEditorHistoryStore } from "@/core/editor/historyStore";
 import { useEditorTimingStore } from "@/stores/editorTimingStore";
 import { createUpdateSubtitleCommand } from "@/core/editor/commands/updateSubtitleCommand";
@@ -111,13 +111,7 @@ export const useProjectStore = defineStore("project", () => {
 
   replaceTrackedSubtitles([]);
 
-  const subtitles = computed({
-    get: () => subtitlesState.value,
-    set: (nextValue) => {
-      replaceTrackedSubtitles(nextValue || []);
-    },
-  });
-
+  // V3.2.4+dev.20260311.01: 反转数据流，subtitles 现在从新内核投影
   const projectedSubtitles = computed(() => {
     const orderedLocalIds = subtitleIndexStore.orderedLocalIds;
     const hotRecords = subtitleHotStore.records;
@@ -126,6 +120,13 @@ export const useProjectStore = defineStore("project", () => {
     return orderedLocalIds
       .map((localId) => buildSubtitleProjection(hotRecords.get(localId), coldRecords.get(localId)))
       .filter(Boolean);
+  });
+
+  const subtitles = computed({
+    get: () => projectedSubtitles.value,
+    set: (nextValue) => {
+      replaceTrackedSubtitles(nextValue || []);
+    },
   });
 
   // 用户删除的字幕索引集合（用于阻止 SSE 回补）
@@ -369,18 +370,99 @@ export const useProjectStore = defineStore("project", () => {
     player.value.playbackRate = Math.max(0.25, Math.min(4, normalized));
   }
 
+  function normalizeKernelSubtitleSnapshot(subtitleSnapshot = {}, fallbackLocalId = null) {
+    const rawSnapshot = toRaw(subtitleSnapshot) || {};
+    const localId = String(rawSnapshot.id ?? rawSnapshot.localId ?? fallbackLocalId ?? createLocalSubtitleId());
+    const sentenceIndexValue = rawSnapshot.sentenceIndex ?? rawSnapshot.sentence_index;
+    const normalizedSnapshot = {
+      ...rawSnapshot,
+      id: localId,
+      localId,
+    };
+    if (sentenceIndexValue !== undefined) {
+      normalizedSnapshot.sentenceIndex = sentenceIndexValue;
+      normalizedSnapshot.sentence_index = sentenceIndexValue;
+    }
+    const hotData = buildHotSubtitleRecord(normalizedSnapshot);
+    const coldData = buildColdSubtitleRecord(normalizedSnapshot);
+    hotData.localId = localId;
+    coldData.localId = localId;
+    return { localId, hotData, coldData };
+  }
+
+  function resolveSubtitleLocalId(rawId) {
+    if (rawId === undefined || rawId === null) {
+      return null;
+    }
+    const normalizedId = String(rawId);
+    const bySegmentId = subtitleIndexStore.bySegmentId.get(normalizedId);
+    if (bySegmentId) {
+      return bySegmentId;
+    }
+    if (subtitleHotStore.get(normalizedId)) {
+      return normalizedId;
+    }
+    const numericId = Number(rawId);
+    if (Number.isFinite(numericId)) {
+      return subtitleIndexStore.bySentenceIndex.get(numericId) || normalizedId;
+    }
+    return normalizedId;
+  }
+
+  function removeSubtitleLocalId(localId) {
+    if (!localId) {
+      return null;
+    }
+    const hot = subtitleHotStore.get(localId);
+    const cold = subtitleColdStore.get(localId);
+    if (!hot) {
+      return null;
+    }
+    subtitleHotStore.remove(localId);
+    subtitleColdStore.remove(localId);
+    subtitleIndexStore.remove(localId);
+    return buildSubtitleProjection(hot, cold);
+  }
+
+  function upsertKernelSubtitle(subtitleSnapshot = {}, fallbackLocalId = null) {
+    console.log('[upsertKernelSubtitle] 输入:', { id: subtitleSnapshot.id, text: subtitleSnapshot.text?.substring(0, 20), fallbackLocalId });
+    const { localId, hotData, coldData } = normalizeKernelSubtitleSnapshot(subtitleSnapshot, fallbackLocalId);
+    console.log('[upsertKernelSubtitle] 规范化后:', { localId, startMs: hotData.startMs, endMs: hotData.endMs });
+
+    const existing = subtitleHotStore.get(localId);
+    if (existing) {
+      console.log('[upsertKernelSubtitle] 删除旧记录:', localId);
+      subtitleHotStore.remove(localId);
+      subtitleColdStore.remove(localId);
+      subtitleIndexStore.remove(localId);
+    }
+
+    subtitleHotStore.insert(localId, hotData);
+    subtitleColdStore.insert(localId, coldData);
+    subtitleIndexStore.insert(
+      localId,
+      hotData.startMs,
+      coldData.segmentId,
+      coldData.sentenceIndex,
+      subtitleHotStore.records
+    );
+    console.log('[upsertKernelSubtitle] 插入完成，当前总数:', subtitleIndexStore.orderedLocalIds.length);
+    return localId;
+  }
+
   function insertSubtitleAt(index, subtitle) {
     const insertIndex = Math.max(0, Math.min(index, subtitles.value.length));
-    subtitles.value.splice(insertIndex, 0, subtitle);
+    upsertKernelSubtitle(subtitle, subtitle?.id || subtitle?.localId || createLocalSubtitleId());
     return insertIndex;
   }
 
   function removeSubtitleAt(index) {
-    if (index < 0 || index >= subtitles.value.length) {
+    const currentIds = subtitleIndexStore.orderedLocalIds;
+    if (index < 0 || index >= currentIds.length) {
       return null;
     }
-    const removed = subtitles.value.splice(index, 1);
-    return removed[0] || null;
+    const localId = currentIds[index];
+    return removeSubtitleLocalId(localId);
   }
 
   const isDirty = computed(() => {
@@ -401,40 +483,44 @@ export const useProjectStore = defineStore("project", () => {
     return editorHistoryStore.recordCommand(command);
   }
 
+  // V3.2.4+dev.20260311.01: 重写为操作新内核
   function replaceSubtitleSnapshot(id, subtitleSnapshot) {
-    const index = subtitles.value.findIndex((subtitle) => subtitle.id === id);
-    if (index === -1) {
-      return false;
-    }
-    subtitles.value[index] = cloneHistoryValue(subtitleSnapshot);
+    const resolvedLocalId = resolveSubtitleLocalId(id) || String(id);
+    upsertKernelSubtitle(subtitleSnapshot, resolvedLocalId);
     return true;
   }
 
   function insertSubtitleSnapshotAt(index, subtitleSnapshot) {
-    const insertIndex = Math.max(0, Math.min(index, subtitles.value.length));
-    subtitles.value.splice(insertIndex, 0, cloneHistoryValue(subtitleSnapshot));
-    return insertIndex;
+    upsertKernelSubtitle(subtitleSnapshot, subtitleSnapshot?.id || subtitleSnapshot?.localId || createLocalSubtitleId());
+    return index;
   }
 
   function removeSubtitleById(id) {
-    const index = subtitles.value.findIndex((subtitle) => subtitle.id === id);
-    if (index === -1) {
-      return null;
-    }
-    const removed = subtitles.value.splice(index, 1);
-    return removed[0] || null;
+    const localId = resolveSubtitleLocalId(id);
+    return removeSubtitleLocalId(localId);
   }
 
   function replaceSubtitleRange(index, deleteCount, nextSubtitles = [], nextMetaIsDirty = undefined) {
-    const normalizedIndex = Math.max(0, Math.min(index, subtitles.value.length));
-    const normalizedSubtitles = Array.isArray(nextSubtitles)
-      ? nextSubtitles.map((subtitle) => cloneHistoryValue(subtitle))
-      : [];
-    subtitles.value.splice(normalizedIndex, deleteCount, ...normalizedSubtitles);
+    console.log('[replaceSubtitleRange] 开始:', { index, deleteCount, nextCount: nextSubtitles.length });
+    const currentIds = subtitleIndexStore.orderedLocalIds;
+    const toRemove = currentIds.slice(index, index + deleteCount);
+    console.log('[replaceSubtitleRange] 待删除:', toRemove);
+
+    toRemove.forEach((localId) => {
+      removeSubtitleLocalId(localId);
+    });
+
+    console.log('[replaceSubtitleRange] 开始插入', nextSubtitles.length, '条字幕');
+    nextSubtitles.forEach((subtitle, idx) => {
+      console.log(`[replaceSubtitleRange] 插入 ${idx}:`, { id: subtitle.id, text: subtitle.text?.substring(0, 20) });
+      upsertKernelSubtitle(subtitle, subtitle?.id || subtitle?.localId || createLocalSubtitleId());
+    });
+
+    console.log('[replaceSubtitleRange] 完成，当前总数:', subtitleIndexStore.orderedLocalIds.length);
     if (typeof nextMetaIsDirty === "boolean") {
       meta.value.isDirty = nextMetaIsDirty;
     }
-    return normalizedIndex;
+    return index;
   }
 
   function setSentenceDeletedState(sentenceIndex, isDeleted) {
@@ -465,7 +551,7 @@ export const useProjectStore = defineStore("project", () => {
   // 仅提供通用导入/导出能力；具体缓存策略由 editorSessionStore 负责。
   function createWorkingCopySnapshot() {
     return {
-      subtitles: cloneSubtitleSnapshot(),
+      subtitles: subtitles.value.map((subtitle) => ({ ...toRaw(subtitle) })),
       meta: {
         ...toRaw(meta.value),
         subtitleOffset: subtitleOffset.value,
@@ -714,7 +800,8 @@ export const useProjectStore = defineStore("project", () => {
       isDirty: isUserEdit ? true : current.isDirty,
     };
 
-    subtitles.value[index] = nextSubtitle;
+    // V3.2.4+dev.20260311.05: 使用 replaceSubtitleSnapshot 操作新内核
+    replaceSubtitleSnapshot(id, nextSubtitle);
     if (isUserEdit) {
       meta.value.isDirty = true;
       const touchedKeys = Object.keys(sanitizedPayload);
@@ -764,7 +851,8 @@ export const useProjectStore = defineStore("project", () => {
       warning_type: payload.warning_type || "none",
       source: payload.source || "manual",
     };
-    subtitles.value.splice(insertIndex, 0, newSubtitle);
+    // V3.2.4+dev.20260311.05: 使用 insertSubtitleAt 操作新内核
+    insertSubtitleAt(insertIndex, newSubtitle);
     meta.value.isDirty = true;
     if (isUserEdit) {
       recordEditorCommand(
@@ -813,7 +901,8 @@ export const useProjectStore = defineStore("project", () => {
         list.filter((item) => item !== subtitle.id)
       );
     }
-    subtitles.value.splice(index, 1);
+    // V3.2.4+dev.20260311.05: 使用 removeSubtitleById 操作新内核
+    removeSubtitleById(id);
     meta.value.isDirty = true;
 
     if (isUserEdit) {
@@ -907,6 +996,8 @@ export const useProjectStore = defineStore("project", () => {
       id: leftId,
       start: left.start,
       end: left.end,
+      startMs: Math.round(left.start * 1000),
+      endMs: Math.round(left.end * 1000),
       text: left.text,
       words: left.words || [],
       isDirty: true,
@@ -919,6 +1010,8 @@ export const useProjectStore = defineStore("project", () => {
       id: rightId,
       start: right.start,
       end: right.end,
+      startMs: Math.round(right.start * 1000),
+      endMs: Math.round(right.end * 1000),
       text: right.text,
       words: right.words || [],
       isDirty: true,
@@ -930,7 +1023,8 @@ export const useProjectStore = defineStore("project", () => {
     rightSubtitle.originalText = null;
 
     console.log('[ProjectStore] 切分前历史记录数:', history.value.length);
-    subtitles.value.splice(index, 1, leftSubtitle, rightSubtitle);
+    // V3.2.4+dev.20260311.04: 使用 replaceSubtitleRange 操作新内核
+    replaceSubtitleRange(index, 1, [leftSubtitle, rightSubtitle], true);
     console.log('[ProjectStore] 切分后历史记录数:', history.value.length);
 
     meta.value.isDirty = true;
@@ -1171,24 +1265,29 @@ export const useProjectStore = defineStore("project", () => {
     const kept = subtitles.value[keptIndex];
     const removed = subtitles.value[removedIndex];
 
+    // V3.2.4+dev.20260311.02: 在 splice 前克隆快照，避免引用被修改
+    const keptSnapshot = { ...kept };
     const removedSnapshot = { ...removed };
     const mergedSubtitle = {
       ...kept,
       text: mergedText,
       start: mergedStart,
       end: mergedEnd,
+      startMs: Math.round(mergedStart * 1000),
+      endMs: Math.round(mergedEnd * 1000),
       words: [],
       isDirty: true,
       isModified: true,
     };
-    subtitles.value.splice(keptIndex, 2, mergedSubtitle);
+    // V3.2.4+dev.20260311.04: 使用 replaceSubtitleRange 操作新内核
+    replaceSubtitleRange(keptIndex, 2, [mergedSubtitle], true);
 
     meta.value.isDirty = true;
     if (isUserEdit) {
       recordEditorCommand(
         createMergeSubtitlesCommand({
           index: keptIndex,
-          beforeSubtitles: [kept, removed],
+          beforeSubtitles: [keptSnapshot, removedSnapshot],
           afterSubtitle: mergedSubtitle,
           beforeMetaIsDirty,
           afterMetaIsDirty: meta.value.isDirty,
@@ -1276,13 +1375,14 @@ export const useProjectStore = defineStore("project", () => {
     };
 
     if (existingIndex >= 0) {
-      // 更新现有草稿
-      subtitles.value[existingIndex] = subtitleData;
+      // V3.2.4+dev.20260311.05: 使用 replaceSubtitleSnapshot 更新
+      const existingId = subtitles.value[existingIndex].id;
+      replaceSubtitleSnapshot(existingId, subtitleData);
       console.log(`[ProjectStore] 更新草稿字幕: ${subtitleId}`);
     } else {
-      // 按时间顺序插入
+      // V3.2.4+dev.20260311.05: 使用 insertSubtitleAt 插入
       const insertIndex = findInsertIndex(normalized.start);
-      subtitles.value.splice(insertIndex, 0, subtitleData);
+      insertSubtitleAt(insertIndex, subtitleData);
 
       // 更新 Chunk 映射
       if (!chunkSubtitleMap.value.has(chunk_id)) {
@@ -1365,9 +1465,9 @@ export const useProjectStore = defineStore("project", () => {
         ...normalizeSpeakerFields(sentence, { stripSpeaker: false }),
       };
 
-      // 按时间顺序插入
+      // V3.2.4+dev.20260311.05: 使用 insertSubtitleAt 插入
       const insertIndex = findInsertIndex(normalized.start);
-      subtitles.value.splice(insertIndex, 0, subtitleData);
+      insertSubtitleAt(insertIndex, subtitleData);
       newSubtitleIds.push(subtitleId);
     });
 
@@ -1543,9 +1643,9 @@ export const useProjectStore = defineStore("project", () => {
         ...normalizeSpeakerFields(sentence, { stripSpeaker: Boolean(sentence.is_draft ?? false) }),
       };
 
-      // 按时间顺序插入
+      // V3.2.4+dev.20260311.05: 使用 insertSubtitleAt 插入
       const insertIndex = findInsertIndex(normalized.start);
-      subtitles.value.splice(insertIndex, 0, subtitleData);
+      insertSubtitleAt(insertIndex, subtitleData);
       newSubtitleIds.push(subtitleId);
     });
 
@@ -1614,7 +1714,7 @@ export const useProjectStore = defineStore("project", () => {
 
       if (existingIndex >= 0) {
         const current = subtitles.value[existingIndex];
-        subtitles.value[existingIndex] = {
+        const updated = {
           ...current,
           ...(revision.text !== undefined ? { text: revision.text } : {}),
           ...normalizedTiming,
@@ -1625,6 +1725,8 @@ export const useProjectStore = defineStore("project", () => {
           sentenceIndex,
           ...speakerFields,
         };
+        // V3.2.4+dev.20260311.05: 使用 replaceSubtitleSnapshot 更新
+        replaceSubtitleSnapshot(current.id, updated);
       } else {
         const normalized = applyOffsetToSentenceData({
           start: revision.start ?? 0,
@@ -1651,8 +1753,9 @@ export const useProjectStore = defineStore("project", () => {
           source: revision.source || "revised",
           ...speakerFields,
         };
+        // V3.2.4+dev.20260311.05: 使用 insertSubtitleAt 插入
         const insertIndex = findInsertIndex(normalized.start);
-        subtitles.value.splice(insertIndex, 0, newSubtitle);
+        insertSubtitleAt(insertIndex, newSubtitle);
       }
       revisedCount += 1;
     });

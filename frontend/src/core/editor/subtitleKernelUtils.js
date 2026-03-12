@@ -21,10 +21,18 @@ function normalizeNullable(value) {
   return value === undefined ? null : value;
 }
 
+function hasFiniteNumber(value) {
+  return Number.isFinite(Number(value));
+}
+
 export function buildHotSubtitleRecord(subtitle = {}) {
   const rawSubtitle = toRaw(subtitle) || {};
-  const startMs = rawSubtitle.startMs ?? secondsToMs(rawSubtitle.start ?? 0);
-  const endMs = rawSubtitle.endMs ?? secondsToMs(rawSubtitle.end ?? 0);
+  const startMs = hasFiniteNumber(rawSubtitle.start)
+    ? secondsToMs(rawSubtitle.start)
+    : (hasFiniteNumber(rawSubtitle.startMs) ? Number(rawSubtitle.startMs) : 0);
+  const endMs = hasFiniteNumber(rawSubtitle.end)
+    ? secondsToMs(rawSubtitle.end)
+    : (hasFiniteNumber(rawSubtitle.endMs) ? Number(rawSubtitle.endMs) : startMs);
 
   return {
     localId: normalizeString(rawSubtitle.id ?? rawSubtitle.localId),
@@ -32,14 +40,14 @@ export function buildHotSubtitleRecord(subtitle = {}) {
     startMs,
     endMs,
     flags: {
-      isDirty: Boolean(rawSubtitle.isDirty),
-      isModified: Boolean(rawSubtitle.isModified),
-      isDraft: Boolean(rawSubtitle.isDraft),
-      isFinalized: rawSubtitle.isFinalized ?? !Boolean(rawSubtitle.isDraft),
+      isDirty: Boolean(rawSubtitle.isDirty ?? rawSubtitle.is_dirty),
+      isModified: Boolean(rawSubtitle.isModified ?? rawSubtitle.is_modified),
+      isDraft: Boolean(rawSubtitle.isDraft ?? rawSubtitle.is_draft),
+      isFinalized: rawSubtitle.isFinalized ?? rawSubtitle.is_finalized ?? !Boolean(rawSubtitle.isDraft ?? rawSubtitle.is_draft),
       warningType: rawSubtitle.warning_type || "none",
     },
-    originalText: normalizeNullable(rawSubtitle.originalText),
-    chunkId: normalizeNullable(rawSubtitle.chunk_id),
+    originalText: normalizeNullable(rawSubtitle.originalText ?? rawSubtitle.original_text),
+    chunkId: normalizeNullable(rawSubtitle.chunk_id ?? rawSubtitle.chunkId),
     source: rawSubtitle.source || "manual",
     revision: Number.isFinite(Number(rawSubtitle.revision)) ? Number(rawSubtitle.revision) : 0,
   };
@@ -47,10 +55,11 @@ export function buildHotSubtitleRecord(subtitle = {}) {
 
 export function buildColdSubtitleRecord(subtitle = {}) {
   const rawSubtitle = toRaw(subtitle) || {};
+  const sentenceIndexValue = rawSubtitle.sentenceIndex ?? rawSubtitle.sentence_index;
   return {
     localId: normalizeString(rawSubtitle.id ?? rawSubtitle.localId),
     segmentId: normalizeNullable(rawSubtitle.segment_id),
-    sentenceIndex: Number.isFinite(Number(rawSubtitle.sentenceIndex)) ? Number(rawSubtitle.sentenceIndex) : null,
+    sentenceIndex: Number.isFinite(Number(sentenceIndexValue)) ? Number(sentenceIndexValue) : null,
     words: Array.isArray(rawSubtitle.words) ? rawSubtitle.words : [],
     confidence: rawSubtitle.confidence ?? null,
     displayConfidence: rawSubtitle.display_confidence ?? null,
@@ -60,7 +69,7 @@ export function buildColdSubtitleRecord(subtitle = {}) {
     speakerColor: rawSubtitle.speaker_color ?? null,
     speakerLocked: Boolean(rawSubtitle.speaker_locked),
     speakerConfidence: rawSubtitle.speaker_confidence ?? null,
-    sourceMeta: rawSubtitle.source_meta ?? null,
+    sourceMeta: rawSubtitle.source_meta ?? rawSubtitle.sourceMeta ?? null,
   };
 }
 
@@ -86,6 +95,7 @@ export function buildSubtitleProjection(hotRecord, coldRecord = null) {
     revision: hotRecord.revision ?? 0,
     segment_id: coldRecord?.segmentId ?? null,
     sentenceIndex: coldRecord?.sentenceIndex ?? null,
+    sentence_index: coldRecord?.sentenceIndex ?? null,
     words: Array.isArray(coldRecord?.words) ? coldRecord.words : [],
     confidence: coldRecord?.confidence ?? null,
     display_confidence: coldRecord?.displayConfidence ?? null,

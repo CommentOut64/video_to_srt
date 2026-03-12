@@ -11,6 +11,7 @@ import { runEditorLeaveBarrier } from './leaveBarrier'
  */
 export async function runEditorSessionSwitchBarrier({
   previousIdentityId = '',
+  saveCoordinator = null,
   syncCoordinator,
   editorSessionStore,
   isDirty = false,
@@ -21,8 +22,10 @@ export async function runEditorSessionSwitchBarrier({
   }
 
   await runEditorLeaveBarrier({
+    saveCoordinator,
     syncCoordinator,
     editorSessionStore,
     isDirty,
+    reason: 'session-switch',
   })
 }

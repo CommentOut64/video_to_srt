@@ -169,6 +169,26 @@ export const useEditBufferStore = defineStore('editBuffer', () => {
     return textSessions.value.get(normalizedId)?.draftText ?? String(fallbackText ?? '')
   }
 
+  function getPendingTextDraftEntries() {
+    const entries = []
+    textSessions.value.forEach((session, subtitleId) => {
+      const hasPendingTimer = textCommitTimers.has(subtitleId)
+      const isDirtyDraft = session.draftText !== session.originalText
+      if (!session.isEditing && !session.isComposing && !hasPendingTimer && !isDirtyDraft) {
+        return
+      }
+      entries.push({
+        subtitleId,
+        draftText: session.draftText,
+        originalText: session.originalText,
+        isEditing: session.isEditing,
+        isComposing: session.isComposing,
+        hasPendingTimer,
+      })
+    })
+    return entries
+  }
+
   function setTimeDraft(subtitleId, payload = {}) {
     const normalizedId = normalizeId(subtitleId)
     if (!normalizedId) return null
@@ -231,6 +251,13 @@ export const useEditBufferStore = defineStore('editBuffer', () => {
     timeDrafts.value.delete(normalizedId)
   }
 
+  function getPendingTimeDraftEntries() {
+    return Array.from(timeDrafts.value.entries()).map(([subtitleId, payload]) => ({
+      subtitleId,
+      ...cloneTimeDraftPayload(payload),
+    }))
+  }
+
   return {
     beginTextEdit,
     endTextEdit,
@@ -244,11 +271,13 @@ export const useEditBufferStore = defineStore('editBuffer', () => {
     isTextEditing,
     isTextComposing,
     getTextDraft,
+    getPendingTextDraftEntries,
     setTimeDraft,
     getTimeDraft,
     getBufferedTime,
     syncCommittedTime,
     clearTimeDraft,
     clearAllDrafts,
+    getPendingTimeDraftEntries,
   }
 })
