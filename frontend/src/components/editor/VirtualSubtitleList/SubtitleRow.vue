@@ -1,0 +1,276 @@
+<!-- V3.2.5+dev.20260314.03: SubtitleRow - 虚拟列表行组件（行级 selector + v-memo） -->
+<template>
+  <div
+    v-memo="[entity?.text, entity?.startMs, entity?.endMs, entity?.isModified, isSelected, isActive]"
+    class="subtitle-row"
+    :class="{
+      'is-selected': isSelected,
+      'is-active': isActive,
+      'is-draft': entity?.isDraft,
+      'is-modified': entity?.isModified
+    }"
+    @click="handleClick"
+  >
+    <!-- 时间轴 -->
+    <div class="time-row">
+      <input
+        type="text"
+        class="time-input"
+        :value="formatTime(entity?.startMs)"
+        @blur="handleTimeUpdate('start', $event.target.value)"
+        @keydown.enter="$event.target.blur()"
+      />
+      <span class="time-separator">→</span>
+      <input
+        type="text"
+        class="time-input"
+        :value="formatTime(entity?.endMs)"
+        @blur="handleTimeUpdate('end', $event.target.value)"
+        @keydown.enter="$event.target.blur()"
+      />
+    </div>
+
+    <!-- 文本行 -->
+    <div class="text-row">
+      <div
+        v-if="!isEditing"
+        class="text-display"
+        :class="{ 'can-edit': true }"
+        @dblclick="startEditing"
+      >
+        {{ displayText }}
+      </div>
+      <textarea
+        v-else
+        ref="textareaRef"
+        class="text-input"
+        :value="editingText"
+        @input="editingText = $event.target.value"
+        @blur="stopEditing"
+        @keydown.enter.ctrl="stopEditing"
+        @keydown.escape="cancelEditing"
+      />
+      <span class="char-count">{{ displayText.length }}</span>
+    </div>
+  </div>
+</template>
+
+<script setup>
+// V3.2.5+dev.20260314.03: 行级 selector，只订阅当前行的版本令牌
+import { computed, ref, nextTick } from 'vue'
+import { useEditorDocumentStore } from '@/stores/editor/editorDocumentStore'
+import { useEditorCommandBus } from '@/stores/editor/editorCommandBus'
+import { useEditorDraftStore } from '@/stores/editor/editorDraftStore'
+
+const props = defineProps({
+  localId: { type: String, required: true },
+  isSelected: { type: Boolean, default: false },
+  isActive: { type: Boolean, default: false }
+})
+
+const emit = defineEmits(['click'])
+
+const docStore = useEditorDocumentStore()
+const commandBus = useEditorCommandBus()
+const draftStore = useEditorDraftStore()
+
+// 行级 selector：只订阅当前行的版本令牌
+const entity = computed(() => {
+  const token = docStore.entityVersionTokens.get(props.localId)
+  if (token) {
+    token.value // 建立响应式依赖
+  }
+  return docStore.entities.get(props.localId)
+})
+
+// 草稿优先显示
+const displayText = computed(() => {
+  const draft = draftStore.activeTextDraft
+  if (draft?.localId === props.localId) {
+    return draft.text
+  }
+  return entity.value?.text || ''
+})
+
+// 编辑状态
+const isEditing = ref(false)
+const editingText = ref('')
+const textareaRef = ref(null)
+
+function startEditing() {
+  if (entity.value?.isDraft) return
+  isEditing.value = true
+  editingText.value = displayText.value
+  nextTick(() => {
+    textareaRef.value?.focus()
+  })
+}
+
+function stopEditing() {
+  if (!isEditing.value) return
+  const newText = editingText.value.trim()
+  if (newText && newText !== entity.value?.text) {
+    commandBus.dispatch({
+      type: 'update_text',
+      localId: props.localId,
+      before: { text: entity.value?.text },
+      after: { text: newText },
+      source: 'user'
+    })
+  }
+  isEditing.value = false
+}
+
+function cancelEditing() {
+  isEditing.value = false
+  editingText.value = ''
+}
+
+function formatTime(ms) {
+  if (!ms && ms !== 0) return '00:00.000'
+  const totalSeconds = Math.floor(ms / 1000)
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  const milliseconds = ms % 1000
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}.${String(milliseconds).padStart(3, '0')}`
+}
+
+function parseTime(timeStr) {
+  const match = timeStr.match(/(\d+):(\d+)\.(\d+)/)
+  if (!match) return null
+  const [, minutes, seconds, milliseconds] = match
+  return parseInt(minutes) * 60000 + parseInt(seconds) * 1000 + parseInt(milliseconds)
+}
+
+function handleTimeUpdate(type, value) {
+  const newMs = parseTime(value)
+  if (newMs === null) return
+
+  const before = { startMs: entity.value?.startMs, endMs: entity.value?.endMs }
+  const after = { ...before }
+  if (type === 'start') after.startMs = newMs
+  else after.endMs = newMs
+
+  commandBus.dispatch({
+    type: 'update_timing',
+    localId: props.localId,
+    before,
+    after,
+    source: 'user'
+  })
+}
+
+function handleClick() {
+  emit('click', props.localId)
+}
+</script>
+
+<style scoped>
+.subtitle-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--af-border-primary);
+  background: var(--af-bg-primary);
+  transition: background var(--af-transition-fast);
+  cursor: pointer;
+  min-height: 60px;
+}
+
+.subtitle-row:hover {
+  background: var(--af-bg-secondary);
+}
+
+.subtitle-row.is-active {
+  border-left: 3px solid var(--af-accent-primary);
+  padding-left: 9px;
+}
+
+.subtitle-row.is-selected {
+  background: rgb(var(--af-accent-primary-rgb), 0.1);
+}
+
+.subtitle-row.is-draft {
+  opacity: 0.6;
+}
+
+.time-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-family: var(--af-font-mono);
+}
+
+.time-input {
+  width: 80px;
+  padding: 2px 6px;
+  background: var(--af-bg-tertiary);
+  border: 1px solid var(--af-border-secondary);
+  border-radius: var(--af-radius-sm);
+  color: var(--af-text-normal);
+  font-size: 11px;
+  font-family: var(--af-font-mono);
+}
+
+.time-input:focus {
+  outline: none;
+  border-color: var(--af-accent-primary);
+}
+
+.time-separator {
+  color: var(--af-text-muted);
+}
+
+.text-row {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.text-display {
+  padding: 6px 8px;
+  background: var(--af-bg-secondary);
+  border: 1px solid transparent;
+  border-radius: var(--af-radius-sm);
+  color: var(--af-text-normal);
+  font-size: 12px;
+  line-height: 1.4;
+  min-height: 32px;
+  word-break: break-word;
+}
+
+.text-display.can-edit:hover {
+  border-color: var(--af-accent-primary);
+  background: var(--af-bg-tertiary);
+}
+
+.text-input {
+  width: 100%;
+  padding: 6px 8px;
+  background: var(--af-bg-tertiary);
+  border: 1px solid var(--af-accent-primary);
+  border-radius: var(--af-radius-sm);
+  color: var(--af-text-normal);
+  font-size: 12px;
+  min-height: 32px;
+  resize: none;
+  line-height: 1.4;
+  outline: none;
+}
+
+.char-count {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  color: var(--af-text-muted);
+  font-size: 10px;
+  font-family: var(--af-font-mono);
+}
+
+.subtitle-row.is-draft .text-display {
+  color: var(--af-text-secondary);
+  font-style: italic;
+}
+</style>
