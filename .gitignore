@@ -95,10 +95,12 @@ tests_output/
 artifacts/
 htmlcov/
 .coverage
+coverage/
 
 # 本地测试文件（不上传，ci_tests/ 除外）
 tests/
 backend/tests/
+frontend/src/**/__tests__/
 
 llmdoc/
 
