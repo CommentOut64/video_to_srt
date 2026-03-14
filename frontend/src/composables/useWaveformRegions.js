@@ -1,4 +1,5 @@
 /**
+ * @deprecated V3.2.5: 使用 TimelineViewport 替代
  * useWaveformRegions - Region 管理逻辑 Composable
  *
  * 职责：Region 渲染、重叠检测、事件绑定、同步节流

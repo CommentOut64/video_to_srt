@@ -142,7 +142,10 @@
         <!-- 标签页内容 -->
         <div class="tab-content">
           <div v-show="activeTab === 'subtitles'" class="tab-pane">
+            <!-- V3.2.5+dev.20260315.01: Feature flag 控制新旧列表 -->
+            <VirtualSubtitleList v-if="useEditorV2" />
             <SubtitleList
+              v-else
               ref="subtitleListRef"
               :auto-scroll="true"
               :enable-auto-resume-follow="subtitleFollowAutoResumeEnabled"
@@ -292,9 +295,12 @@ import EditorHeader from '@/components/editor/EditorHeader.vue'
 import PlaybackControls from '@/components/editor/PlaybackControls/index.vue'
 import VideoStage from '@/components/editor/VideoStage/index.vue'
 import SubtitleList from '@/components/editor/SubtitleList/index.vue'
+import VirtualSubtitleList from '@/components/editor/VirtualSubtitleList/index.vue'
 import WaveformTimeline from '@/components/editor/WaveformTimeline/index.vue'
 import AdvancedSettings from '@/components/editor/AdvancedSettings.vue'
 import AboutDialog from '@/components/AboutDialog.vue'
+import { isFeatureEnabled } from '@/config/featureFlags'
+import { initEditorCore } from '@/stores/editor/editorCore'
 
 // Props
 const rawProps = defineProps({
@@ -319,6 +325,10 @@ const editorSessionStore = useEditorSessionStore()
 const subtitleDocumentStore = useSubtitleDocumentStore()
 const structuralSyncStore = useStructuralSyncStore()
 const router = useRouter()
+
+// V3.2.5+dev.20260315.01: Feature flag 控制新旧内核
+const useEditorV2 = isFeatureEnabled('USE_EDITOR_V2')
+console.log('[EditorView] useEditorV2:', useEditorV2)
 
 // 全局播放管理器
 const playbackManager = usePlaybackManager()
@@ -759,6 +769,7 @@ async function resolveIdentity() {
 
 // 加载项目数据
 async function loadProject() {
+  console.log('[loadProject] 开始执行，useEditorV2:', useEditorV2)
   isLoading.value = true
   loadError.value = null
 
@@ -852,6 +863,16 @@ async function loadProject() {
         applyMediaPaths({ project })
       }
       subscribeSSE()
+
+      // V3.2.5+dev.20260315.01: 初始化新编辑器内核（project 模式）
+      console.log('[loadProject-project] useEditorV2:', useEditorV2)
+      if (useEditorV2) {
+        console.log('[loadProject-project] 进入新内核分支')
+        const { loadSubtitlesFromBackend } = await import('@/stores/editor/editorCore')
+        initEditorCore(projectId, activeJobId.value)
+        await loadSubtitlesFromBackend(projectId)
+      }
+
       if (!proxyVideo.isReady.value) {
         startProxyPolling()
       }
@@ -958,6 +979,15 @@ async function loadProject() {
       }
     } else {
       loadError.value = error.message || '加载失败'
+    }
+
+    // V3.2.5+dev.20260315.01: 初始化新编辑器内核
+    console.log('[loadProject] useEditorV2:', useEditorV2)
+    if (useEditorV2) {
+      console.log('[loadProject] 进入新内核分支')
+      const { loadSubtitlesFromBackend } = await import('@/stores/editor/editorCore')
+      initEditorCore(projectId, activeJobId.value)
+      await loadSubtitlesFromBackend(projectId)
     }
   } finally {
     isLoading.value = false

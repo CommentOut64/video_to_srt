@@ -1,3 +1,4 @@
+<!-- @deprecated V3.2.5: 使用 VirtualSubtitleList 替代 -->
 <template>
   <div class="subtitle-list tw-flex tw-flex-col tw-h-full tw-bg-bg-primary">
     <!-- 搜索工具栏（整合原 list-toolbar） -->
