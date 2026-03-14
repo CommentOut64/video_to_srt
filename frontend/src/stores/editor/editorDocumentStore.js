@@ -104,7 +104,15 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
   // ─── 原子写操作（仅由 reducer 调用） ───
   function _applyInsert(localId, hot, cold, afterLocalId) {
     entities.set(localId, hot)
-    if (cold) coldEntities.set(localId, markRaw(cold))
+    if (cold) {
+      coldEntities.set(localId, markRaw(cold))
+      if (cold.segmentId) {
+        bindingBySegmentId.set(cold.segmentId, localId)
+      }
+      if (cold.sentenceIndex !== null && cold.sentenceIndex !== undefined) {
+        bindingBySentenceIndex.set(cold.sentenceIndex, localId)
+      }
+    }
 
     const pos = afterLocalId !== null && afterLocalId !== undefined
       ? (indexById.get(afterLocalId) ?? -1) + 1
@@ -193,6 +201,10 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     return true
   }
 
+  function updateColdBinding(localId, segmentId) {
+    return _applyBinding(localId, segmentId)
+  }
+
   function _applyColdUpdate(localId, coldPatch) {
     const cold = coldEntities.get(localId)
     if (!cold) return false
@@ -219,11 +231,13 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
 
   function takeSnapshot() {
     const entitiesArray = Array.from(entities.entries()).map(([id, e]) => e)
+    const coldEntitiesArray = Array.from(coldEntities.entries()).map(([id, c]) => ({ localId: id, ...c }))
     const bindings = Array.from(bindingBySegmentId.entries()).map(([segmentId, localId]) => ({ localId, segmentId }))
     const sentenceBindings = Array.from(bindingBySentenceIndex.entries()).map(([sentenceIndex, localId]) => ({ localId, sentenceIndex }))
     return {
       revision: revision.value,
       entities: entitiesArray,
+      coldEntities: coldEntitiesArray,
       order: order.value,
       bindings,
       sentenceBindings,
@@ -242,6 +256,12 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     dirtySet.clear()
 
     snapshot.entities.forEach(e => entities.set(e.localId, e))
+    if (snapshot.coldEntities) {
+      snapshot.coldEntities.forEach(c => {
+        const { localId, ...cold } = c
+        coldEntities.set(localId, markRaw(cold))
+      })
+    }
     order.value = snapshot.order
     rebuildIndexById()
     snapshot.bindings.forEach(b => bindingBySegmentId.set(b.segmentId, b.localId))
@@ -257,6 +277,8 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     revision,
     tombstones,
     entityVersionTokens,
+    bindingBySegmentId,
+    bindingBySentenceIndex,
     getEntity,
     getCold,
     getBySegmentId,
@@ -275,6 +297,7 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     _applyColdUpdate,
     _applyBatchReplace,
     _applyServerReplace,
+    updateColdBinding,
     takeSnapshot,
     restoreFromSnapshot,
   }

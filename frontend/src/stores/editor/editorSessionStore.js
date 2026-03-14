@@ -78,6 +78,11 @@ export const useEditorSessionStore = defineStore('editorSession', () => {
     }
   }
 
+  // ─── 时间转换工具 ───
+  function secondsToMs(seconds) {
+    return Math.round(seconds * 1000)
+  }
+
   return {
     projectId,
     jobId,
@@ -97,5 +102,6 @@ export const useEditorSessionStore = defineStore('editorSession', () => {
     markDirty,
     markSaved,
     requestSave,
+    secondsToMs,
   }
 })

@@ -58,6 +58,9 @@ export function editorReducer(docStore, command) {
         command.entity.endMs
       )
       hot.isModified = true
+      if (command.entity.isDraft !== undefined) {
+        hot.isDraft = command.entity.isDraft
+      }
 
       const cold = command.coldInit
         ? { ...createSubtitleColdEntity(command.localId), ...command.coldInit }
@@ -248,6 +251,18 @@ export function editorReducer(docStore, command) {
           docStore._applyColdUpdate(u.localId, u.cold)
         }
       }
+      return { success: true, undoCommand: null }
+    }
+
+    case 'finalize_draft_chunk': {
+      for (const localId of command.localIds) {
+        docStore._applyUpdate(localId, { isDraft: false })
+      }
+      return { success: true, undoCommand: null }
+    }
+
+    case 'apply_server_replace': {
+      docStore._applyServerReplace(command.oldLocalIds, command.newEntities)
       return { success: true, undoCommand: null }
     }
 
