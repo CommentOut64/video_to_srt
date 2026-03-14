@@ -10,6 +10,7 @@ import { useRefHistory } from "@vueuse/core";
 import localforage from "localforage";
 import smartSaver from "@/services/SmartSaver";
 import { repairSubtitleOverlaps } from "@/utils/subtitleUtils";
+import { FEATURE_FLAGS } from "@/config/featureFlags";
 
 export const useProjectStore = defineStore("project", () => {
   // ========== 1. 项目元数据 ==========
@@ -73,6 +74,9 @@ export const useProjectStore = defineStore("project", () => {
   //   1. importSRT() - 导入转录结果时
   //   2. restoreProject() - 从缓存/存储恢复项目时
   //   3. resetProject() - 重置项目时
+  // V3.2.5+dev.20260315.01: 新内核启用时禁用深拷贝历史
+  const useDeepHistory = !FEATURE_FLAGS.USE_EDITOR_V2
+
   const {
     history,
     undo,
@@ -84,10 +88,10 @@ export const useProjectStore = defineStore("project", () => {
     resume: resumeHistory,
     isTracking: isHistoryTracking,
   } = useRefHistory(subtitles, {
-    deep: true,
-    capacity: 50, // 限制历史记录步数
-    clone: true, // 深拷贝，确保历史记录独立
-    flush: 'sync', // 同步记录，避免一次操作产生多个历史记录
+    deep: useDeepHistory,
+    capacity: 50,
+    clone: useDeepHistory,
+    flush: 'sync',
   });
 
   // ========== 4. 播放器全局状态 ==========

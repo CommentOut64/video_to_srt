@@ -366,6 +366,9 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
   }
 
   async function forceSyncNow() {
+    // V3.2.5+dev.20260315.01: 新内核接管后禁用旧落盘
+    const { isFeatureEnabled } = await import('@/config/featureFlags')
+    if (isFeatureEnabled('USE_EDITOR_V2')) return
     await processQueue()
   }
 
