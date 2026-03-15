@@ -2,3 +2,4 @@
 export { useEditorSearch } from './useEditorSearch.js'
 export { useEditorGroup } from './useEditorGroup.js'
 export { useHomophoneSearch } from './useHomophoneSearch.js'
+export { useEditorPlayback } from './useEditorPlayback.js'

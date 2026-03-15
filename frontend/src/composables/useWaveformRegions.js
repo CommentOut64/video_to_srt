@@ -6,6 +6,13 @@
  * 提取自 WaveformTimeline/index.vue L507-601, L667-729
  */
 import { ref } from 'vue'
+import { isFeatureEnabled } from '@/config/featureFlags'
+import { useEditorDocumentStore } from '@/stores/editor/editorDocumentStore'
+import { useEditorCommandBus } from '@/stores/editor/editorCommandBus'
+import {
+  createMoveBoundaryCommand,
+  createUpdateTimingCommand,
+} from '@/stores/editor/editorCommandFactory'
 import { detectOverlappingSubtitles, OVERLAP_COLORS } from '@/utils/subtitleUtils'
 import {
   getWaveformDragDiagnosticsConfig,
@@ -58,6 +65,9 @@ export function useWaveformRegions(
 ) {
   // ============ 状态 ============
   const isUpdatingRegions = ref(false)
+  const useEditorV2 = isFeatureEnabled('USE_EDITOR_V2')
+  const docStore = useEditorV2 ? useEditorDocumentStore() : null
+  const commandBus = useEditorV2 ? useEditorCommandBus() : null
 
   // ============ 私有状态 ============
   let regionUpdateTimer = null
@@ -81,12 +91,56 @@ export function useWaveformRegions(
     return resolveMaybeRefValue(subtitleDocumentStore?.selectedSubtitleId) ?? null
   }
 
+  function buildEditorV2SubtitleList() {
+    if (!useEditorV2 || !docStore) {
+      return []
+    }
+
+    return docStore.order
+      .map((localId) => {
+        const entity = docStore.getEntity(localId)
+        if (!entity || entity.isDeleted) {
+          return null
+        }
+
+        const cold = docStore.getCold(localId)
+        const start = Math.max(0, projectStore.toDisplayTime(entity.startMs / 1000))
+        const end = Math.max(start, projectStore.toDisplayTime(entity.endMs / 1000))
+
+        return {
+          id: localId,
+          segment_id: cold?.segmentId ?? null,
+          sentenceIndex: cold?.sentenceIndex ?? null,
+          start,
+          end,
+        }
+      })
+      .filter(Boolean)
+  }
+
   function getSubtitleList() {
+    if (useEditorV2 && docStore) {
+      return buildEditorV2SubtitleList()
+    }
+
     const subtitles = resolveMaybeRefValue(subtitleDocumentStore?.subtitles)
     if (Array.isArray(subtitles)) {
       return subtitles
     }
     return Array.isArray(projectStore?.subtitles) ? projectStore.subtitles : []
+  }
+
+  function resolveEditorV2LocalId(regionId) {
+    if (!useEditorV2 || !docStore || regionId === undefined || regionId === null) {
+      return null
+    }
+
+    if (docStore.getEntity(regionId)) {
+      return regionId
+    }
+
+    const target = String(regionId)
+    return docStore.order.find((localId) => String(localId) === target) ?? null
   }
 
   function findMirroredProjectSubtitle(subtitle) {
@@ -143,6 +197,94 @@ export function useWaveformRegions(
     return Number.isFinite(normalized) ? normalized : fallback
   }
 
+  function toBaseMs(displaySeconds) {
+    return Math.round(projectStore.toBaseTime(displaySeconds) * 1000)
+  }
+
+  function normalizeTimingRange(startMs, endMs) {
+    const normalizedStart = Math.max(0, Math.round(startMs))
+    const normalizedEnd = Math.max(normalizedStart + 1, Math.round(endMs))
+    return {
+      startMs: normalizedStart,
+      endMs: normalizedEnd,
+    }
+  }
+
+  function hasSharedBoundary(leftMs, rightMs) {
+    return Math.abs(Number(leftMs) - Number(rightMs)) <= 1
+  }
+
+  function createBoundaryMoveCommand(localId, side, nextTiming) {
+    if (!useEditorV2 || !docStore || !commandBus || !side) {
+      return null
+    }
+
+    const entity = docStore.getEntity(localId)
+    if (!entity) {
+      return null
+    }
+
+    const neighbors = docStore.getNeighbors(localId)
+
+    if (side === 'start' && neighbors.prev) {
+      const upper = docStore.getEntity(neighbors.prev)
+      if (!upper || !hasSharedBoundary(upper.endMs, entity.startMs)) {
+        return null
+      }
+
+      const minBoundaryMs = upper.startMs + 1
+      const maxBoundaryMs = entity.endMs - 1
+      if (minBoundaryMs > maxBoundaryMs) {
+        return null
+      }
+
+      const boundaryMs = Math.min(maxBoundaryMs, Math.max(minBoundaryMs, nextTiming.startMs))
+      return createMoveBoundaryCommand({
+        upperLocalId: neighbors.prev,
+        lowerLocalId: localId,
+        before: {
+          upperEndMs: upper.endMs,
+          lowerStartMs: entity.startMs,
+        },
+        after: {
+          upperEndMs: boundaryMs,
+          lowerStartMs: boundaryMs,
+        },
+        source: 'user',
+      })
+    }
+
+    if (side === 'end' && neighbors.next) {
+      const lower = docStore.getEntity(neighbors.next)
+      if (!lower || !hasSharedBoundary(entity.endMs, lower.startMs)) {
+        return null
+      }
+
+      const minBoundaryMs = entity.startMs + 1
+      const maxBoundaryMs = lower.endMs - 1
+      if (minBoundaryMs > maxBoundaryMs) {
+        return null
+      }
+
+      const boundaryMs = Math.min(maxBoundaryMs, Math.max(minBoundaryMs, nextTiming.endMs))
+      return createMoveBoundaryCommand({
+        upperLocalId: localId,
+        lowerLocalId: neighbors.next,
+        before: {
+          upperEndMs: entity.endMs,
+          lowerStartMs: lower.startMs,
+        },
+        after: {
+          upperEndMs: boundaryMs,
+          lowerStartMs: boundaryMs,
+        },
+        source: 'user',
+      })
+    }
+
+    return null
+  }
+
   function scheduleFlushPendingRegionCommits(delay = 16) {
     if (pendingRegionCommitTimer) {
       clearTimeout(pendingRegionCommitTimer)
@@ -157,41 +299,80 @@ export function useWaveformRegions(
     const regionId = regionSnapshot?.id
     if (!regionId) return false
 
-    const subtitle = getSubtitleList().find((s) => s.id === regionId)
-    if (!subtitle) return false
+    let nextStart = null
+    let nextEnd = null
+    let syncKey = null
+    if (useEditorV2 && docStore && commandBus) {
+      const localId = resolveEditorV2LocalId(regionId)
+      const entity = localId ? docStore.getEntity(localId) : null
+      if (!entity) {
+        return false
+      }
 
-    const nextStart = resolveFiniteTime(regionSnapshot.start, resolveFiniteTime(subtitle.start, 0))
-    const nextEnd = resolveFiniteTime(regionSnapshot.end, resolveFiniteTime(subtitle.end, nextStart))
-    const currentStart = resolveFiniteTime(subtitle.start, 0)
-    const currentEnd = resolveFiniteTime(subtitle.end, currentStart)
-    const hasTimeChanged =
-      Math.abs(currentStart - nextStart) > 0.0005 || Math.abs(currentEnd - nextEnd) > 0.0005
+      const currentStart = Math.max(0, projectStore.toDisplayTime(entity.startMs / 1000))
+      const currentEnd = Math.max(currentStart, projectStore.toDisplayTime(entity.endMs / 1000))
+      nextStart = resolveFiniteTime(regionSnapshot.start, currentStart)
+      nextEnd = resolveFiniteTime(regionSnapshot.end, currentEnd)
+      const hasTimeChanged =
+        Math.abs(currentStart - nextStart) > 0.0005 || Math.abs(currentEnd - nextEnd) > 0.0005
 
-    if (!hasTimeChanged) {
-      return false
-    }
+      if (!hasTimeChanged) {
+        return false
+      }
 
-    const mirroredSubtitle = findMirroredProjectSubtitle(subtitle)
-    if (mirroredSubtitle) {
-      projectStore.updateSubtitle(
-        mirroredSubtitle.id,
-        {
-          start: nextStart,
-          end: nextEnd,
-        },
-        { isUserEdit: true }
-      )
-    }
+      const nextTiming = normalizeTimingRange(toBaseMs(nextStart), toBaseMs(nextEnd))
+      const command = createBoundaryMoveCommand(localId, regionSnapshot?.side, nextTiming)
+        || createUpdateTimingCommand({
+          localId,
+          before: {
+            startMs: entity.startMs,
+            endMs: entity.endMs,
+          },
+          after: nextTiming,
+          source: 'user',
+        })
 
-    const syncKey = subtitle?.segment_id ?? subtitle?.sentenceIndex ?? subtitle?.id
-    if (syncKey !== undefined && syncKey !== null) {
-      debouncedRegionSync(syncKey, nextStart, nextEnd)
+      const result = commandBus.dispatch(command)
+      if (!result?.success) {
+        return false
+      }
+    } else {
+      const subtitle = getSubtitleList().find((s) => s.id === regionId)
+      if (!subtitle) return false
+
+      nextStart = resolveFiniteTime(regionSnapshot.start, resolveFiniteTime(subtitle.start, 0))
+      nextEnd = resolveFiniteTime(regionSnapshot.end, resolveFiniteTime(subtitle.end, nextStart))
+      const currentStart = resolveFiniteTime(subtitle.start, 0)
+      const currentEnd = resolveFiniteTime(subtitle.end, currentStart)
+      const hasTimeChanged =
+        Math.abs(currentStart - nextStart) > 0.0005 || Math.abs(currentEnd - nextEnd) > 0.0005
+
+      if (!hasTimeChanged) {
+        return false
+      }
+
+      const mirroredSubtitle = findMirroredProjectSubtitle(subtitle)
+      if (mirroredSubtitle) {
+        projectStore.updateSubtitle(
+          mirroredSubtitle.id,
+          {
+            start: nextStart,
+            end: nextEnd,
+          },
+          { isUserEdit: true }
+        )
+      }
+
+      syncKey = subtitle?.segment_id ?? subtitle?.sentenceIndex ?? subtitle?.id
+      if (syncKey !== undefined && syncKey !== null) {
+        debouncedRegionSync(syncKey, nextStart, nextEnd)
+      }
     }
 
     const emittedRegion = regionSnapshot.region ?? {
       id: regionId,
-      start: nextStart,
-      end: nextEnd,
+      start: nextStart ?? resolveFiniteTime(regionSnapshot?.start, 0),
+      end: nextEnd ?? resolveFiniteTime(regionSnapshot?.end, nextStart ?? 0),
     }
     emit('region-update', emittedRegion)
     logDiag('regions-emit-region-update', {

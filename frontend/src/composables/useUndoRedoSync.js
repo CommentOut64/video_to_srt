@@ -9,21 +9,53 @@
  * - batchSyncSubtitles 保留完整 envelope（不走 unwrapEnvelope），按 errors 判断业务失败
  */
 
-import { ref, toRaw } from 'vue'
+import { computed, ref, toRaw } from 'vue'
+import { isFeatureEnabled } from '@/config/featureFlags'
 import projectApi from '@/services/api/projectApi'
 import { useProjectStore } from '@/stores/projectStore'
 import { useStructuralSyncStore } from '@/stores/structuralSyncStore'
+import { useEditorCommandBus } from '@/stores/editor/editorCommandBus'
+import { useEditorSyncEngine } from '@/stores/editor/editorSyncEngine'
 
 const DEBOUNCE_MS = 300
 
 export function useUndoRedoSync() {
+  const useEditorV2 = isFeatureEnabled('USE_EDITOR_V2')
   const projectStore = useProjectStore()
   const structuralSyncStore = useStructuralSyncStore()
+  const editorCommandBus = useEditorV2 ? useEditorCommandBus() : null
+  const editorSyncEngine = useEditorV2 ? useEditorSyncEngine() : null
   let initialSnapshot = null // 连续操作中第一次的 before 快照
   let debounceTimer = null
   let inflightSyncPromise = null
-  const isSyncing = ref(false)
+  const isSyncing = useEditorV2
+    ? computed(() => Boolean(editorSyncEngine?.isSyncing))
+    : ref(false)
   const lastSyncError = ref(null)
+
+  if (useEditorV2 && editorCommandBus && editorSyncEngine) {
+    async function flushSyncV2() {
+      try {
+        await editorSyncEngine.flush()
+        lastSyncError.value = null
+      } catch (error) {
+        lastSyncError.value = error?.message || '新编辑器同步失败'
+        throw error
+      }
+    }
+
+    return {
+      undoWithSync() {
+        return editorCommandBus.undo()
+      },
+      redoWithSync() {
+        return editorCommandBus.redo()
+      },
+      flushSync: flushSyncV2,
+      isSyncing,
+      lastSyncError,
+    }
+  }
 
   /**
    * 拍摄当前字幕列表快照（以 segment_id 为主键，base time）。
