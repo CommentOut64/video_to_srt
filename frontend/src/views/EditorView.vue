@@ -267,6 +267,8 @@ import { useProjectStore } from '@/stores/projectStore'
 import { usePlaybackStore } from '@/stores/playbackStore'
 import { useTaskRuntimeStore } from '@/stores/taskRuntimeStore'
 import { useEditorSessionStore } from '@/stores/editor/editorSessionStore'
+import { useEditorProjectionBridge } from '@/stores/editor/editorProjectionBridge'
+import { useEditorEventProjector } from '@/stores/editor/editorEventProjector'
 import { useSubtitleDocumentStore } from '@/stores/subtitleDocumentStore'
 import { useStructuralSyncStore } from '@/stores/structuralSyncStore'
 import { legacyApi, mediaApi, projectApi, transcriptionApi } from '@/services/api'
@@ -322,6 +324,8 @@ const projectStore = useProjectStore()
 const playbackStore = usePlaybackStore()
 const taskStore = useTaskRuntimeStore()
 const editorSessionStore = useEditorSessionStore()
+const editorProjectionBridge = useEditorProjectionBridge()
+const editorEventProjector = useEditorEventProjector()
 const subtitleDocumentStore = useSubtitleDocumentStore()
 const structuralSyncStore = useStructuralSyncStore()
 const router = useRouter()
@@ -446,6 +450,10 @@ let cancelTimeoutTimer = null
 let isRealtimeFinalSyncInFlight = false
 let hasRealtimeFinalSyncPending = false
 let realtimeFinalSyncReason = null
+let editorCoreSessionKey = null
+let isEditorProjectionReloadInFlight = false
+let hasEditorProjectionReloadPending = false
+let editorProjectionReloadReason = null
 
 watch(
   () => activeJobId.value,
@@ -471,7 +479,7 @@ const isMediaReady = computed(() => {
     hasVideoSource.value
     || !!projectStore.meta.audioPath
     || proxyVideo.isReady.value
-    || projectStore.subtitles.length > 0
+    || (useEditorV2 ? editorProjectionBridge.totalSubtitles > 0 : projectStore.subtitles.length > 0)
   )
 })
 
@@ -513,6 +521,7 @@ watch([() => rawProps.projectId, () => rawProps.jobId], async ([newProjectId, ne
 
   // 重置项目状态
   projectStore.resetProject()
+  editorCoreSessionKey = null
 
   // 重新加载项目
   await loadProject()
@@ -602,11 +611,23 @@ const projectName = computed(() => {
 
 // 基础状态
 const isDirty = computed(() => projectStore.isDirty)
-const totalSubtitles = computed(() => projectStore.totalSubtitles)
-const currentSubtitle = computed(() => projectStore.currentSubtitle)
+const totalSubtitles = computed(() => (
+  useEditorV2
+    ? editorProjectionBridge.totalSubtitles
+    : projectStore.totalSubtitles
+))
+const currentSubtitle = computed(() => (
+  useEditorV2
+    ? editorProjectionBridge.currentSubtitle
+    : projectStore.currentSubtitle
+))
 const currentSubtitleIndex = computed(() =>
   currentSubtitle.value
-    ? projectStore.subtitles.findIndex((s) => s.id === currentSubtitle.value.id)
+    ? (
+      useEditorV2
+        ? editorProjectionBridge.findSubtitleIndexById(currentSubtitle.value.id)
+        : projectStore.subtitles.findIndex((s) => s.id === currentSubtitle.value.id)
+    )
     : -1
 )
 
@@ -623,7 +644,11 @@ const activeTasks = computed(
 
 // 问题检查计数（统计有警告的字幕数量）
 const errorCount = computed(
-  () => projectStore.subtitles.filter((s) => s.warning_type && s.warning_type !== 'none').length
+  () => (
+    useEditorV2
+      ? editorProjectionBridge.warningCount
+      : projectStore.subtitles.filter((s) => s.warning_type && s.warning_type !== 'none').length
+  )
 )
 
 // Grid 布局样式
@@ -689,6 +714,49 @@ function applyMediaPaths({ project = null, mediaStatus = null } = {}) {
     videoPath: hasVideo ? mediaApi.getVideoUrl(identity) : null,
     audioPath: hasAudio ? mediaApi.getAudioUrl(identity) : null,
   })
+}
+
+async function reloadEditorProjectionFromBackend(projectId, reason = 'unknown') {
+  void reason
+  if (!useEditorV2 || !projectId) {
+    return 0
+  }
+
+  const nextSessionKey = `${projectId}::${activeJobId.value || ''}`
+  if (editorCoreSessionKey !== nextSessionKey) {
+    initEditorCore(projectId, activeJobId.value)
+    editorCoreSessionKey = nextSessionKey
+  }
+
+  const { loadSubtitlesFromBackend } = await import('@/stores/editor/editorCore')
+  await loadSubtitlesFromBackend(projectId)
+  return editorProjectionBridge.totalSubtitles
+}
+
+async function scheduleEditorProjectionReload(projectId, reason = 'unknown') {
+  if (!useEditorV2 || !projectId) {
+    return 0
+  }
+
+  editorProjectionReloadReason = reason
+  if (isEditorProjectionReloadInFlight) {
+    hasEditorProjectionReloadPending = true
+    return editorProjectionBridge.totalSubtitles
+  }
+
+  isEditorProjectionReloadInFlight = true
+  try {
+    do {
+      const currentReason = editorProjectionReloadReason || reason
+      hasEditorProjectionReloadPending = false
+      editorProjectionReloadReason = null
+      await reloadEditorProjectionFromBackend(projectId, currentReason)
+    } while (hasEditorProjectionReloadPending)
+  } finally {
+    isEditorProjectionReloadInFlight = false
+  }
+
+  return editorProjectionBridge.totalSubtitles
 }
 
 function notifyMissingVideoOnce() {
@@ -845,37 +913,33 @@ async function loadProject() {
         mode: project?.mode || 'normal',
         taskMode: project?.task_mode || 'subtitle_edit',
       })
-      const restored = await projectStore.restoreProject(projectId)
-      // 恢复缓存后再次覆盖媒体路径，防止旧缓存 videoPath 误导为“有视频”。
-      applyMediaPaths({ project })
-      if (!restored || projectStore.subtitles.length === 0) {
-        const segments = await projectApi.getSubtitles(projectId)
-        // 过渡期仍保持旧 projectStore 镜像，避免页脚/媒体依赖失效。
-        projectStore.loadFromProjectData(segments, {
-          projectId,
-          jobId: project?.job_id || null,
-          mode: project?.mode || 'normal',
-          taskMode: project?.task_mode || 'subtitle_edit',
-          flavor: project?.flavor || selectFlavor(projectStore.meta.capabilitySnapshot),
-          capabilitySnapshot: projectStore.meta.capabilitySnapshot,
-          title: project?.title || '',
-          filename: project?.title || '项目字幕',
-          videoPath: projectStore.meta.videoPath,
-          audioPath: projectStore.meta.audioPath,
-        })
-        // loadFromProjectData 会更新 meta，确保媒体路径继续以本次判定为准。
+      if (useEditorV2) {
+        await scheduleEditorProjectionReload(projectId, 'load_project_project_mode')
         applyMediaPaths({ project })
+      } else {
+        const restored = await projectStore.restoreProject(projectId)
+        // 恢复缓存后再次覆盖媒体路径，防止旧缓存 videoPath 误导为“有视频”。
+        applyMediaPaths({ project })
+        if (!restored || projectStore.subtitles.length === 0) {
+          const segments = await projectApi.getSubtitles(projectId)
+          // 过渡期仍保持旧 projectStore 镜像，避免页脚/媒体依赖失效。
+          projectStore.loadFromProjectData(segments, {
+            projectId,
+            jobId: project?.job_id || null,
+            mode: project?.mode || 'normal',
+            taskMode: project?.task_mode || 'subtitle_edit',
+            flavor: project?.flavor || selectFlavor(projectStore.meta.capabilitySnapshot),
+            capabilitySnapshot: projectStore.meta.capabilitySnapshot,
+            title: project?.title || '',
+            filename: project?.title || '项目字幕',
+            videoPath: projectStore.meta.videoPath,
+            audioPath: projectStore.meta.audioPath,
+          })
+          // loadFromProjectData 会更新 meta，确保媒体路径继续以本次判定为准。
+          applyMediaPaths({ project })
+        }
       }
       subscribeSSE()
-
-      // V3.2.5+dev.20260315.01: 初始化新编辑器内核（project 模式）
-      console.log('[loadProject-project] useEditorV2:', useEditorV2)
-      if (useEditorV2) {
-        console.log('[loadProject-project] 进入新内核分支')
-        const { loadSubtitlesFromBackend } = await import('@/stores/editor/editorCore')
-        initEditorCore(projectId, activeJobId.value)
-        await loadSubtitlesFromBackend(projectId)
-      }
 
       if (!proxyVideo.isReady.value) {
         startProxyPolling()
@@ -922,39 +986,44 @@ async function loadProject() {
       console.warn('[EditorView] 刷新 Proxy 状态失败（初始阶段，忽略）:', e)
     }
 
-    const restoreKey = projectId
-    const restored = restoreKey ? await projectStore.restoreProject(restoreKey) : false
-    // 恢复缓存后再次覆盖媒体路径，避免历史缓存导致 videoPath 误判。
-    applyMediaPaths({ project: projectMeta, mediaStatus: jobStatus.media_status })
-    const hasLocalRestore = restored && projectStore.subtitles.length > 0
-    if (hasLocalRestore) {
-      const hasValidFormat = projectStore.subtitles.every((s) => s.sentenceIndex !== undefined)
-      if (!hasValidFormat) {
-        await loadTranscribingSegments()
-      }
-      if (['canceled', 'force_canceled'].includes(jobStatus.status)) {
-        const hasDraft = projectStore.subtitles.some((s) => s.isDraft)
-        if (hasDraft) {
-          await subtitleDocumentStore.finalizeDraftSubtitlesOnTerminal('load_project_terminal')
+    if (!useEditorV2) {
+      const restoreKey = projectId
+      const restored = restoreKey ? await projectStore.restoreProject(restoreKey) : false
+      // 恢复缓存后再次覆盖媒体路径，避免历史缓存导致 videoPath 误判。
+      applyMediaPaths({ project: projectMeta, mediaStatus: jobStatus.media_status })
+      const hasLocalRestore = restored && projectStore.subtitles.length > 0
+      if (hasLocalRestore) {
+        const hasValidFormat = projectStore.subtitles.every((s) => s.sentenceIndex !== undefined)
+        if (!hasValidFormat) {
+          await loadTranscribingSegments('load_project_restore_invalid_format')
+        }
+        if (['canceled', 'force_canceled'].includes(jobStatus.status)) {
+          const hasDraft = projectStore.subtitles.some((s) => s.isDraft)
+          if (hasDraft) {
+            await subtitleDocumentStore.finalizeDraftSubtitlesOnTerminal('load_project_terminal')
+          }
         }
       }
+    } else {
+      // V2 下不再恢复旧字幕缓存，避免首屏出现旧真源与新真源双装载。
+      applyMediaPaths({ project: projectMeta, mediaStatus: jobStatus.media_status })
     }
 
     await loadSubtitleOffset()
 
     if (jobStatus.status === 'finished') {
-      await loadTranscribingSegments()
+      await loadTranscribingSegments('load_project_finished')
       if (!proxyVideo.isReady.value) {
         subscribeSSE()
         startProxyPolling()
       }
     } else if (['processing', 'queued'].includes(jobStatus.status)) {
-      await loadTranscribingSegments()
+      await loadTranscribingSegments(`load_project_${jobStatus.status}`)
       subscribeSSE()
       startProgressPolling()
       startProxyPolling()
     } else if (jobStatus.status === 'paused') {
-      await loadTranscribingSegments()
+      await loadTranscribingSegments('load_project_paused')
       subscribeSSE()
       refreshTaskProgress()
       startProxyPolling()
@@ -966,19 +1035,10 @@ async function loadProject() {
         reason: 'load_project_canceled_terminal',
       })
     } else if (jobStatus.status === 'failed') {
-      await loadTranscribingSegments()
+      await loadTranscribingSegments('load_project_failed')
     }
 
     notifyMissingVideoOnce()
-
-    // V3.2.5+dev.20260315.01: 初始化新编辑器内核（转录态）
-    console.log('[loadProject-job] useEditorV2:', useEditorV2)
-    if (useEditorV2) {
-      console.log('[loadProject-job] 进入新内核分支')
-      const { loadSubtitlesFromBackend } = await import('@/stores/editor/editorCore')
-      initEditorCore(projectId, activeJobId.value)
-      await loadSubtitlesFromBackend(projectId)
-    }
   } catch (error) {
     console.error('[EditorView] 加载项目失败:', error)
 
@@ -999,10 +1059,13 @@ async function loadProject() {
 }
 
 // 加载转录中的 segments
-async function loadTranscribingSegments() {
+async function loadTranscribingSegments(reason = 'unknown') {
   const projectId = props.projectId || projectStore.meta.projectId
   if (!projectId) {
     throw new Error('缺少 project_id，无法拉取字幕真源')
+  }
+  if (useEditorV2) {
+    return scheduleEditorProjectionReload(projectId, reason)
   }
   try {
     const segments = await projectApi.getSubtitles(projectId)
@@ -1025,8 +1088,7 @@ async function loadTranscribingSegments() {
 
 // V3.2.4+dev.20260222.14: 终态同步必须以后端为唯一数据源
 async function syncSegmentsFromBackendAsSource({ reason = 'unknown' } = {}) {
-  void reason
-  await loadTranscribingSegments()
+  await loadTranscribingSegments(reason)
 }
 
 // V3.2.4+dev.20260222.15: 每次定稿事件都立即触发后端回拉，且高频事件合并为“当前1次+补1次”
@@ -1174,6 +1236,13 @@ function handleProjectSubtitleUpsert(data) {
   } finally {
     projectStore.resumeHistory()
   }
+
+  if (useEditorV2 && projectStore.meta.projectId) {
+    void scheduleEditorProjectionReload(
+      projectStore.meta.projectId,
+      `project_segment_upsert_${normalized.segmentId}`
+    )
+  }
 }
 
 function handleProjectSubtitleDelete(data) {
@@ -1190,6 +1259,13 @@ function handleProjectSubtitleDelete(data) {
     projectStore.removeSubtitleAt(index)
   } finally {
     projectStore.resumeHistory()
+  }
+
+  if (useEditorV2 && projectStore.meta.projectId) {
+    void scheduleEditorProjectionReload(
+      projectStore.meta.projectId,
+      `project_segment_delete_${segmentId}`
+    )
   }
 }
 
@@ -1640,6 +1716,10 @@ function handleDraftSubtitle(data) {
   // 调用 projectStore 的草稿处理方法，传递两个参数
   projectStore.appendOrUpdateDraft(chunkIndex, sentenceData)
 
+  if (useEditorV2) {
+    editorEventProjector.projectDraft(data)
+  }
+
 }
 
 // Phase 5: 处理替换 Chunk（慢流/Whisper）
@@ -1647,6 +1727,9 @@ function handleReplaceChunk(data) {
   if (!data) return
 
   const chunkIndex = data.chunk_index
+  if (useEditorV2) {
+    editorEventProjector.projectReplaceChunk(data)
+  }
   void scheduleRealtimeFinalSync(`subtitle_replace_chunk_${chunkIndex ?? 'unknown'}`)
 }
 
@@ -1689,6 +1772,13 @@ function handleRestoredChunk(data) {
 
   // 调用 projectStore 的恢复方法
   projectStore.restoreChunk(chunkIndex, formattedSentences)
+
+  if (useEditorV2 && projectStore.meta.projectId) {
+    void scheduleEditorProjectionReload(
+      projectStore.meta.projectId,
+      `subtitle_restored_${chunkIndex ?? 'unknown'}`
+    )
+  }
 
 }
 
@@ -1782,6 +1872,10 @@ function handleRevisedSubtitle(data) {
     }))
   }
   projectStore.applyRevisedSubtitle(revisedPayload)
+
+  if (useEditorV2 && projectStore.meta.projectId) {
+    void scheduleEditorProjectionReload(projectStore.meta.projectId, 'subtitle_revised')
+  }
 }
 
 function handleSpeakerProfiles(data) {

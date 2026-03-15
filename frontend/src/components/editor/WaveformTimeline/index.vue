@@ -123,6 +123,7 @@ const subtitleDocumentStore = useSubtitleDocumentStore()
 const playbackManager = usePlaybackManager()
 const identityRef = computed(() => props.mediaId || projectStore.primaryId)
 const onSubtitleEdit = subtitleDocumentStore.onSubtitleEdit
+const subtitleEntries = computed(() => subtitleDocumentStore.subtitles || [])
 
 // 编辑器上下文
 const editorContext = inject('editorContext', {
@@ -184,7 +185,7 @@ function normalizeRegionTimeForSignature(time) {
 
 const regionRenderSignature = computed(() => {
   const selectedId = subtitleDocumentStore.selectedSubtitleId ?? ''
-  const subtitlesSnapshot = projectStore.subtitles
+  const subtitlesSnapshot = subtitleEntries.value
     .map(
       (subtitle) =>
         `${subtitle.id}:${normalizeRegionTimeForSignature(subtitle.start)}:${normalizeRegionTimeForSignature(subtitle.end)}`
@@ -247,7 +248,7 @@ function bindWaveformDomListeners(ws) {
 }
 
 function resolveFallbackDuration() {
-  const subtitleMaxEnd = projectStore.subtitles.reduce((maxEnd, subtitle) => {
+  const subtitleMaxEnd = subtitleEntries.value.reduce((maxEnd, subtitle) => {
     const end = Number(subtitle?.end)
     return Number.isFinite(end) ? Math.max(maxEnd, end) : maxEnd
   }, 0)
@@ -532,7 +533,7 @@ const {
   contextMenuItems,
   handleWaveformContextMenu: onContextMenu,
   handleContextMenuSelect,
-} = useWaveformContextMenu(projectStore)
+} = useWaveformContextMenu(projectStore, subtitleDocumentStore)
 
 // 包装右键菜单处理（需要传递额外参数）
 function handleWaveformContextMenu(e) {
@@ -880,7 +881,7 @@ function scheduleRegionRender(delay = 80, reason = 'unknown') {
     flushPendingRegionCommits({ force: true })
     logWaveformDragDiagnostics('timeline-region-render-commit', {
       reason,
-      subtitlesCount: projectStore.subtitles.length,
+      subtitlesCount: subtitleEntries.value.length,
     })
     renderSubtitleRegions()
     hasDeferredRegionRender = false
@@ -915,7 +916,7 @@ watch(
       clearScheduledRegionRender()
       hasDeferredRegionRender = true
       logWaveformDragDiagnostics('timeline-skip-render-while-region-dragging', {
-        subtitlesCount: projectStore.subtitles.length,
+        subtitlesCount: subtitleEntries.value.length,
         reason: 'builtin-guard',
       })
       return
@@ -929,7 +930,7 @@ watch(
       recordRuntimeHealthCounter('waveform.late_ready_timer.set')
       lateReadyRenderTimer = setTimeout(() => {
         lateReadyRenderTimer = null
-        if (isReady.value && projectStore.subtitles.length > 0) {
+        if (isReady.value && subtitleEntries.value.length > 0) {
           scheduleRegionRender(0, 'late-ready')
         }
       }, 500)
@@ -1121,7 +1122,7 @@ onMounted(async () => {
   stopRuntimeHealthSampler = createRuntimeHealthSampler(
     'WaveformTimeline',
     () => ({
-      subtitlesCount: projectStore.subtitles.length,
+      subtitlesCount: subtitleEntries.value.length,
       isReady: Boolean(isReady.value),
       isLoading: Boolean(isLoading.value),
       hasError: Boolean(hasError.value),

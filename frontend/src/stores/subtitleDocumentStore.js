@@ -4,8 +4,11 @@ import localforage from 'localforage'
 import { legacyApi } from '@/services/api'
 import projectApi from '@/services/api/projectApi'
 import { migrateSubtitleSyncQueue } from '@/state/migrations/migrateSubtitleSyncQueue'
+import { isFeatureEnabled } from '@/config/featureFlags'
 import { useProjectStore } from './projectStore'
 import { useTaskRuntimeStore } from './taskRuntimeStore'
+import { useEditorDocumentStore } from './editor/editorDocumentStore'
+import { useEditorProjectionBridge } from './editor/editorProjectionBridge'
 
 const EDIT_QUEUE_PREFIX = 'subtitle-edit-queue-'
 const TERMINAL_STATUSES = new Set(['finished', 'canceled', 'force_canceled', 'removed', 'failed'])
@@ -42,6 +45,9 @@ function debounce(fn, delay) {
 export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
   const projectStore = useProjectStore()
   const taskRuntimeStore = useTaskRuntimeStore()
+  const docStore = useEditorDocumentStore()
+  const editorProjectionBridge = useEditorProjectionBridge()
+  const useEditorV2 = isFeatureEnabled('USE_EDITOR_V2')
 
   const activeJobId = ref(null)
   const convergedTerminalStatus = ref(new Map())
@@ -52,9 +58,17 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
   const syncErrors = ref(new Map())
   let inflightProcessQueuePromise = null
 
-  const subtitles = computed(() => projectStore.subtitles)
+  const subtitles = computed(() => (
+    useEditorV2
+      ? editorProjectionBridge.subtitles
+      : projectStore.subtitles
+  ))
   const timeOffsetSec = computed(() => projectStore.subtitleOffset)
-  const selectedSubtitleId = computed(() => projectStore.view.selectedSubtitleId)
+  const selectedSubtitleId = computed(() => (
+    useEditorV2
+      ? editorProjectionBridge.selectedSubtitleId
+      : projectStore.view.selectedSubtitleId
+  ))
 
   const activeTaskStatus = computed(() => {
     if (!activeJobId.value) return 'idle'
@@ -97,19 +111,21 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
   function findSubtitleByQueueKey(queueKey) {
     if (queueKey === undefined || queueKey === null) return null
     const target = String(queueKey)
-    const bySegmentId = projectStore.subtitles.find(
+    const subtitleList = subtitles.value
+
+    const bySegmentId = subtitleList.find(
       (item) => String(item.segment_id || '') === target
     )
     if (bySegmentId) return bySegmentId
 
     const numericKey = Number(queueKey)
     if (Number.isFinite(numericKey)) {
-      const bySentenceIndex = projectStore.subtitles.find(
+      const bySentenceIndex = subtitleList.find(
         (item) => Number(item.sentenceIndex) === numericKey
       )
       if (bySentenceIndex) return bySentenceIndex
     }
-    const byLocalId = projectStore.subtitles.find(
+    const byLocalId = subtitleList.find(
       (item) => String(item.id || '') === target
     )
     if (byLocalId) return byLocalId
@@ -133,6 +149,10 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
     if (!segmentId) return false
     const subtitle = findSubtitleByQueueKey(queueKey)
     if (!subtitle || subtitle.segment_id === segmentId) return false
+    if (useEditorV2) {
+      docStore.updateColdBinding(subtitle.id, String(segmentId))
+      return true
+    }
     projectStore.updateSubtitle(subtitle.id, { segment_id: String(segmentId) })
     return true
   }
@@ -367,8 +387,7 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
 
   async function forceSyncNow() {
     // V3.2.5+dev.20260315.01: 新内核接管后禁用旧落盘
-    const { isFeatureEnabled } = await import('@/config/featureFlags')
-    if (isFeatureEnabled('USE_EDITOR_V2')) return
+    if (useEditorV2) return
     await processQueue()
   }
 
@@ -377,8 +396,12 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
   }
 
   async function finalizeDraftSubtitlesOnTerminal(reason = 'terminal_status') {
-    const hasDraft = projectStore.subtitles.some((item) => item.isDraft)
+    const hasDraft = subtitles.value.some((item) => item.isDraft)
     if (!hasDraft) return false
+    if (useEditorV2) {
+      console.log(`[SubtitleDocumentStore] 新内核模式跳过旧草稿收敛: ${reason}`)
+      return true
+    }
     await projectStore.finalizeDraftSubtitlesOnCancel()
     console.log(`[SubtitleDocumentStore] 终态草稿收敛已执行: ${reason}`)
     return true
@@ -421,6 +444,10 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
   }
 
   function setSelectedSubtitleId(subtitleId) {
+    if (useEditorV2) {
+      editorProjectionBridge.setSelectedSubtitleId(subtitleId)
+      return
+    }
     projectStore.setSelectedSubtitleId(subtitleId)
   }
 

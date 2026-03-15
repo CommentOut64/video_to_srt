@@ -81,6 +81,30 @@ export function useWaveformRegions(
     return resolveMaybeRefValue(subtitleDocumentStore?.selectedSubtitleId) ?? null
   }
 
+  function getSubtitleList() {
+    const subtitles = resolveMaybeRefValue(subtitleDocumentStore?.subtitles)
+    if (Array.isArray(subtitles)) {
+      return subtitles
+    }
+    return Array.isArray(projectStore?.subtitles) ? projectStore.subtitles : []
+  }
+
+  function findMirroredProjectSubtitle(subtitle) {
+    if (!subtitle) return null
+
+    const projectSubtitles = Array.isArray(projectStore?.subtitles) ? projectStore.subtitles : []
+    return (
+      projectSubtitles.find((item) => item.id === subtitle.id)
+      || projectSubtitles.find(
+        (item) => subtitle.segment_id && item.segment_id === subtitle.segment_id
+      )
+      || projectSubtitles.find(
+        (item) => subtitle.sentenceIndex !== undefined && item.sentenceIndex === subtitle.sentenceIndex
+      )
+      || null
+    )
+  }
+
   function setSelectedSubtitleId(subtitleId) {
     subtitleDocumentStore.setSelectedSubtitleId(subtitleId)
   }
@@ -101,7 +125,7 @@ export function useWaveformRegions(
   function getOverlappingIds(options = {}) {
     const { forceRefresh = false } = options
     if (forceRefresh || overlapCacheDirty) {
-      overlapCacheIds = detectOverlappingSubtitles(projectStore.subtitles)
+      overlapCacheIds = detectOverlappingSubtitles(getSubtitleList())
       overlapCacheDirty = false
     }
     return overlapCacheIds
@@ -133,7 +157,7 @@ export function useWaveformRegions(
     const regionId = regionSnapshot?.id
     if (!regionId) return false
 
-    const subtitle = projectStore.subtitles.find((s) => s.id === regionId)
+    const subtitle = getSubtitleList().find((s) => s.id === regionId)
     if (!subtitle) return false
 
     const nextStart = resolveFiniteTime(regionSnapshot.start, resolveFiniteTime(subtitle.start, 0))
@@ -147,14 +171,17 @@ export function useWaveformRegions(
       return false
     }
 
-    projectStore.updateSubtitle(
-      regionId,
-      {
-        start: nextStart,
-        end: nextEnd,
-      },
-      { isUserEdit: true }
-    )
+    const mirroredSubtitle = findMirroredProjectSubtitle(subtitle)
+    if (mirroredSubtitle) {
+      projectStore.updateSubtitle(
+        mirroredSubtitle.id,
+        {
+          start: nextStart,
+          end: nextEnd,
+        },
+        { isUserEdit: true }
+      )
+    }
 
     const syncKey = subtitle?.segment_id ?? subtitle?.sentenceIndex ?? subtitle?.id
     if (syncKey !== undefined && syncKey !== null) {
@@ -366,6 +393,7 @@ export function useWaveformRegions(
    */
   function renderSubtitleRegions() {
     const regionsPlugin = regionsPluginRef.value
+    const subtitleList = getSubtitleList()
 
     if (!isReady.value) {
       console.warn('[WaveformRegions] renderSubtitleRegions: 波形未就绪，跳过渲染')
@@ -376,7 +404,7 @@ export function useWaveformRegions(
       return
     }
 
-    const subtitleCount = projectStore.subtitles.length
+    const subtitleCount = subtitleList.length
 
     // 无字幕时清空所有 regions
     if (subtitleCount === 0) {
@@ -402,7 +430,7 @@ export function useWaveformRegions(
       let addedCount = 0
       let updatedCount = 0
 
-      projectStore.subtitles.forEach((subtitle) => {
+      subtitleList.forEach((subtitle) => {
         if (subtitle.start === undefined || subtitle.end === undefined) {
           console.warn(`[WaveformRegions] 跳过无效字幕: id=${subtitle.id}`)
           return

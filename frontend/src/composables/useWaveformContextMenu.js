@@ -11,13 +11,44 @@ import { useStructuralSyncStore } from '@/stores/structuralSyncStore'
 /**
  * 右键菜单 Composable
  * @param {object} projectStore - Pinia store
+ * @param {object} subtitleDocumentStore - 字幕文档 store
  */
-export function useWaveformContextMenu(projectStore) {
+export function useWaveformContextMenu(projectStore, subtitleDocumentStore) {
   // ============ 状态 ============
   const structuralSyncStore = useStructuralSyncStore()
   const contextMenuRef = ref(null)
   const contextMenuTarget = ref(null) // 右键点击的目标字幕ID
   const contextMenuTime = ref(0) // 右键点击的时间点
+
+  function resolveMaybeRefValue(valueOrRef) {
+    if (valueOrRef && typeof valueOrRef === 'object' && 'value' in valueOrRef) {
+      return valueOrRef.value
+    }
+    return valueOrRef
+  }
+
+  function getSubtitleList() {
+    const subtitles = resolveMaybeRefValue(subtitleDocumentStore?.subtitles)
+    if (Array.isArray(subtitles)) {
+      return subtitles
+    }
+    return Array.isArray(projectStore?.subtitles) ? projectStore.subtitles : []
+  }
+
+  function findMirroredProjectSubtitle(targetSubtitle) {
+    if (!targetSubtitle) return null
+
+    return (
+      projectStore.subtitles.find((item) => item.id === targetSubtitle.id)
+      || projectStore.subtitles.find(
+        (item) => targetSubtitle.segment_id && item.segment_id === targetSubtitle.segment_id
+      )
+      || projectStore.subtitles.find(
+        (item) => targetSubtitle.sentenceIndex !== undefined && item.sentenceIndex === targetSubtitle.sentenceIndex
+      )
+      || null
+    )
+  }
 
   // ============ 计算属性 ============
   const contextMenuItems = computed(() => {
@@ -52,13 +83,14 @@ export function useWaveformContextMenu(projectStore) {
     const clickTime = getTimeFromClientX(e.clientX)
 
     // 查找点击位置对应的字幕
-    const targetSubtitle = projectStore.subtitles.find(
+    const targetSubtitle = getSubtitleList().find(
       (s) => clickTime >= s.start && clickTime < s.end
     )
+    const editableTarget = findMirroredProjectSubtitle(targetSubtitle)
 
     // 只有在字幕范围内才显示菜单
-    if (targetSubtitle && !targetSubtitle.isDraft) {
-      contextMenuTarget.value = targetSubtitle.id
+    if (targetSubtitle && editableTarget && !targetSubtitle.isDraft) {
+      contextMenuTarget.value = editableTarget.id
       contextMenuTime.value = clickTime
       contextMenuRef.value?.show(e.clientX, e.clientY)
     }
