@@ -61,15 +61,20 @@ export async function loadSubtitlesFromBackend(projectId) {
   const docStore = useEditorDocumentStore()
   const { projectApi } = await import('@/services/api')
 
+  // 先清空文档，避免重复插入
+  docStore.clearDocument()
+
   const segments = await projectApi.getSubtitles(projectId)
   console.log('[editorCore] 获取到字幕数量:', segments.length)
 
   segments.forEach((seg) => {
+    const startMs = seg.start_ms ?? Math.round(Number(seg.start ?? 0) * 1000)
+    const endMs = seg.end_ms ?? Math.round(Number(seg.end ?? 0) * 1000)
     const hot = {
       localId: seg.segment_id,
       text: seg.text,
-      startMs: seg.start,
-      endMs: seg.end,
+      startMs,
+      endMs,
       isDraft: false,
       isModified: false,
       isDeleted: false,
@@ -84,7 +89,7 @@ export async function loadSubtitlesFromBackend(projectId) {
     docStore._applyInsert(hot.localId, hot, cold, null)
   })
 
-  console.log('[editorCore] 字幕加载完成，docStore.order:', docStore.order.value.length)
+  console.log('[editorCore] 字幕加载完成，docStore.order:', docStore.order.length)
 }
 
 export function destroyEditorCore() {

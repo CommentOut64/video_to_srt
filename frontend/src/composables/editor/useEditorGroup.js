@@ -15,7 +15,7 @@ export function useEditorGroup() {
 
     groupIndex = {
       entities: docStore.entities,
-      order: docStore.order.value
+      order: docStore.order
     }
 
     isActive.value = true

@@ -270,6 +270,20 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     revision.value = snapshot.revision
   }
 
+  // V3.2.5+dev.20260315.01: 清空文档（切换项目时使用）
+  function clearDocument() {
+    entities.clear()
+    coldEntities.clear()
+    indexById.clear()
+    bindingBySegmentId.clear()
+    bindingBySentenceIndex.clear()
+    entityVersionTokens.clear()
+    dirtySet.clear()
+    order.value = []
+    tombstones.value = []
+    revision.value = 0
+  }
+
   return {
     entities,
     coldEntities,
@@ -300,5 +314,6 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     updateColdBinding,
     takeSnapshot,
     restoreFromSnapshot,
+    clearDocument,
   }
 })

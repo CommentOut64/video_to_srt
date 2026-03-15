@@ -100,7 +100,7 @@ export function editorReducer(docStore, command) {
         createdAt: Date.now(),
         localId: command.localId,
         entity: { text: entity.text, startMs: entity.startMs, endMs: entity.endMs },
-        afterLocalId: orderIndex > 0 ? docStore.order.value[orderIndex - 1] : null,
+        afterLocalId: orderIndex > 0 ? docStore.order[orderIndex - 1] : null,
         coldInit: cold || undefined,
       }
 

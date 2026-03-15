@@ -1,24 +1,39 @@
-<!-- V3.2.5+dev.20260314.03: VirtualSubtitleList - 虚拟滚动字幕列表 -->
+<!-- V3.2.5+dev.20260315.04: VirtualSubtitleList - 虚拟滚动字幕列表 -->
 <template>
   <div class="virtual-subtitle-list">
-    <RecycleScroller
+    <!-- 工具栏 -->
+    <SearchToolbar
+      :total-subtitles="visibleIds.length"
+      :draft-count="0"
+      @add-subtitle="handleAddSubtitle"
+    />
+
+    <DynamicScroller
       v-if="visibleIds.length > 0"
       :items="visibleIds"
-      :item-size="60"
-      key-field="id"
+      :min-item-size="98"
       class="scroller"
       @keydown="handleKeydown"
       tabindex="0"
     >
-      <template #default="{ item }">
-        <SubtitleRow
-          :local-id="item"
-          :is-selected="selection.has(item)"
-          :is-active="activeId === item"
-          @click="handleRowClick"
-        />
+      <template #default="{ item, index, active }">
+        <DynamicScrollerItem
+          :item="item"
+          :index="index"
+          :active="active"
+        >
+          <div class="row-shell">
+            <SubtitleRow
+              :local-id="item"
+              :row-index="index"
+              :is-selected="selection.has(item)"
+              :is-active="activeId === item"
+              @click="handleRowClick"
+            />
+          </div>
+        </DynamicScrollerItem>
       </template>
-    </RecycleScroller>
+    </DynamicScroller>
 
     <div v-else class="empty-state">
       <p>暂无字幕</p>
@@ -27,11 +42,12 @@
 </template>
 
 <script setup>
-// V3.2.5+dev.20260314.03: 只传 localId[]，避免每次 order 变化都重建整表对象数组
+// V3.2.5+dev.20260315.04: simpleArray 模式必须传 index，间距也必须计入被测量高度
 import { computed, ref } from 'vue'
-import { RecycleScroller } from 'vue-virtual-scroller'
+import { DynamicScroller, DynamicScrollerItem } from 'vue-virtual-scroller'
 import 'vue-virtual-scroller/dist/vue-virtual-scroller.css'
 import SubtitleRow from './SubtitleRow.vue'
+import SearchToolbar from '@/components/editor/SubtitleList/SearchToolbar.vue'
 import { useEditorDocumentStore } from '@/stores/editor/editorDocumentStore'
 import { useEditorCommandBus } from '@/stores/editor/editorCommandBus'
 
@@ -43,11 +59,17 @@ const selection = ref(new Set())
 
 // 只传 localId[]，不传整个 entity
 const visibleIds = computed(() => {
-  if (!docStore.order.value) return []
-  return docStore.order.value.filter(id => {
+  console.log('[VirtualSubtitleList] 计算 visibleIds, docStore.order:', docStore.order)
+  if (!Array.isArray(docStore.order)) {
+    console.log('[VirtualSubtitleList] order 不是数组，返回空')
+    return []
+  }
+  const filtered = docStore.order.filter(id => {
     const entity = docStore.entities.get(id)
     return entity && !entity.isDeleted
   })
+  console.log('[VirtualSubtitleList] 过滤后数量:', filtered.length)
+  return filtered
 })
 
 function handleRowClick(localId) {
@@ -57,19 +79,19 @@ function handleRowClick(localId) {
 function handleKeydown(e) {
   if (!activeId.value) return
 
-  const currentIndex = docStore.order.value.indexOf(activeId.value)
+  const currentIndex = docStore.order.indexOf(activeId.value)
 
   switch (e.key) {
     case 'ArrowUp':
       e.preventDefault()
       if (currentIndex > 0) {
-        activeId.value = docStore.order.value[currentIndex - 1]
+        activeId.value = docStore.order[currentIndex - 1]
       }
       break
     case 'ArrowDown':
       e.preventDefault()
-      if (currentIndex < docStore.order.value.length - 1) {
-        activeId.value = docStore.order.value[currentIndex + 1]
+      if (currentIndex < docStore.order.length - 1) {
+        activeId.value = docStore.order[currentIndex + 1]
       }
       break
     case 'Delete':
@@ -90,6 +112,14 @@ function handleKeydown(e) {
       break
   }
 }
+
+function handleAddSubtitle() {
+  commandBus.dispatch({
+    type: 'insert_subtitle',
+    afterLocalId: null,
+    source: 'user'
+  })
+}
 </script>
 
 <style scoped>
@@ -103,11 +133,34 @@ function handleKeydown(e) {
 .scroller {
   flex: 1;
   overflow-y: auto;
+  padding: 6px;
 }
 
-/* 重置 vue-virtual-scroller 默认样式 */
 .scroller :deep(.vue-recycle-scroller__item-wrapper) {
   overflow: visible;
+}
+
+.row-shell {
+  padding-bottom: 6px;
+  box-sizing: border-box;
+}
+
+/* 暗色滚动条 */
+.scroller::-webkit-scrollbar {
+  width: 6px;
+}
+
+.scroller::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.scroller::-webkit-scrollbar-thumb {
+  background: var(--af-border-default);
+  border-radius: 3px;
+}
+
+.scroller::-webkit-scrollbar-thumb:hover {
+  background: var(--af-text-muted);
 }
 
 .empty-state {

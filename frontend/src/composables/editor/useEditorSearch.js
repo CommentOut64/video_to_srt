@@ -17,7 +17,7 @@ export function useEditorSearch() {
     // 懒加载搜索索引模块
     searchIndex = {
       entities: docStore.entities,
-      order: docStore.order.value
+      order: docStore.order
     }
 
     isActive.value = true

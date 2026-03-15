@@ -88,7 +88,7 @@
       <div class="resizer" @mousedown="startResize" :class="{ active: isResizing }"></div>
 
       <!-- 右侧边栏 -->
-      <aside class="sidebar-column">
+      <aside class="sidebar-column" :class="{ 'is-resizing': isResizing }">
         <!-- 标签页导航 -->
         <div class="tab-nav">
           <button
@@ -266,7 +266,7 @@ import { onBeforeRouteLeave, useRouter } from 'vue-router'
 import { useProjectStore } from '@/stores/projectStore'
 import { usePlaybackStore } from '@/stores/playbackStore'
 import { useTaskRuntimeStore } from '@/stores/taskRuntimeStore'
-import { useEditorSessionStore } from '@/stores/editorSessionStore'
+import { useEditorSessionStore } from '@/stores/editor/editorSessionStore'
 import { useSubtitleDocumentStore } from '@/stores/subtitleDocumentStore'
 import { useStructuralSyncStore } from '@/stores/structuralSyncStore'
 import { legacyApi, mediaApi, projectApi, transcriptionApi } from '@/services/api'
@@ -358,6 +358,8 @@ const lastSaved = ref(null)
 // 布局状态
 const sidebarWidth = ref(350)
 const isResizing = ref(false)
+let sidebarResizeFrameId = 0
+let pendingSidebarWidth = null
 
 // 加载状态
 const isLoading = ref(true)
@@ -774,15 +776,19 @@ async function loadProject() {
   loadError.value = null
 
   // 先重置项目状态，确保不同任务数据隔离
+  console.log('[loadProject] 重置项目状态')
   projectStore.resetProject()
   structuralSyncStore.$reset()
 
   try {
+    console.log('[loadProject] 开始 resolveIdentity')
     await resolveIdentity()
+    console.log('[loadProject] resolveIdentity 完成')
     const projectId = props.projectId
     if (!projectId) {
       throw new Error('缺少 project_id，无法进入编辑器（job 转 project 失败）')
     }
+    console.log('[loadProject] projectId:', projectId)
 
     const initialCapabilitySnapshot = resolveCapabilitySnapshot()
     projectStore.setIdentity({
@@ -817,7 +823,9 @@ async function loadProject() {
     applyMediaPaths({ project: projectMeta })
 
     // 纯项目模式（Lite 导入）: 跳过任务状态，改走 project 频道同步
+    console.log('[loadProject] 检查模式，activeJobId:', activeJobId.value, 'projectId:', projectId)
     if (!activeJobId.value && projectId) {
+      console.log('[loadProject] 进入纯项目模式分支')
       try {
         await proxyVideo.refresh()
       } catch (e) {
@@ -842,22 +850,18 @@ async function loadProject() {
       applyMediaPaths({ project })
       if (!restored || projectStore.subtitles.length === 0) {
         const segments = await projectApi.getSubtitles(projectId)
-        await editorSessionStore.restoreSession({
-          identity: {
-            projectId,
-            jobId: project?.job_id || null,
-            mode: project?.mode || 'normal',
-            taskMode: project?.task_mode || 'subtitle_edit',
-            flavor: project?.flavor || selectFlavor(projectStore.meta.capabilitySnapshot),
-            capabilitySnapshot: projectStore.meta.capabilitySnapshot,
-          },
-          metaPayload: {
-            title: project?.title || '',
-            filename: project?.title || '项目字幕',
-            videoPath: projectStore.meta.videoPath,
-            audioPath: projectStore.meta.audioPath,
-          },
-          segments,
+        // 过渡期仍保持旧 projectStore 镜像，避免页脚/媒体依赖失效。
+        projectStore.loadFromProjectData(segments, {
+          projectId,
+          jobId: project?.job_id || null,
+          mode: project?.mode || 'normal',
+          taskMode: project?.task_mode || 'subtitle_edit',
+          flavor: project?.flavor || selectFlavor(projectStore.meta.capabilitySnapshot),
+          capabilitySnapshot: projectStore.meta.capabilitySnapshot,
+          title: project?.title || '',
+          filename: project?.title || '项目字幕',
+          videoPath: projectStore.meta.videoPath,
+          audioPath: projectStore.meta.audioPath,
         })
         // loadFromProjectData 会更新 meta，确保媒体路径继续以本次判定为准。
         applyMediaPaths({ project })
@@ -966,6 +970,15 @@ async function loadProject() {
     }
 
     notifyMissingVideoOnce()
+
+    // V3.2.5+dev.20260315.01: 初始化新编辑器内核（转录态）
+    console.log('[loadProject-job] useEditorV2:', useEditorV2)
+    if (useEditorV2) {
+      console.log('[loadProject-job] 进入新内核分支')
+      const { loadSubtitlesFromBackend } = await import('@/stores/editor/editorCore')
+      initEditorCore(projectId, activeJobId.value)
+      await loadSubtitlesFromBackend(projectId)
+    }
   } catch (error) {
     console.error('[EditorView] 加载项目失败:', error)
 
@@ -979,15 +992,6 @@ async function loadProject() {
       }
     } else {
       loadError.value = error.message || '加载失败'
-    }
-
-    // V3.2.5+dev.20260315.01: 初始化新编辑器内核
-    console.log('[loadProject] useEditorV2:', useEditorV2)
-    if (useEditorV2) {
-      console.log('[loadProject] 进入新内核分支')
-      const { loadSubtitlesFromBackend } = await import('@/stores/editor/editorCore')
-      initEditorCore(projectId, activeJobId.value)
-      await loadSubtitlesFromBackend(projectId)
     }
   } finally {
     isLoading.value = false
@@ -2168,6 +2172,7 @@ function downloadFile(content, filename) {
 // ========== 拖拽调整宽度 ==========
 
 function startResize(e) {
+  e.preventDefault()
   isResizing.value = true
   document.addEventListener('mousemove', onResize)
   document.addEventListener('mouseup', stopResize)
@@ -2175,14 +2180,30 @@ function startResize(e) {
 
 function onResize(e) {
   if (!isResizing.value) return
-  const newWidth = window.innerWidth - e.clientX
-  sidebarWidth.value = Math.max(280, Math.min(600, newWidth))
+  pendingSidebarWidth = Math.max(280, Math.min(600, window.innerWidth - e.clientX))
+  if (sidebarResizeFrameId !== 0) return
+
+  sidebarResizeFrameId = requestAnimationFrame(() => {
+    sidebarResizeFrameId = 0
+    if (pendingSidebarWidth !== null) {
+      sidebarWidth.value = pendingSidebarWidth
+      pendingSidebarWidth = null
+    }
+  })
 }
 
 function stopResize() {
   isResizing.value = false
   document.removeEventListener('mousemove', onResize)
   document.removeEventListener('mouseup', stopResize)
+  if (sidebarResizeFrameId !== 0) {
+    cancelAnimationFrame(sidebarResizeFrameId)
+    sidebarResizeFrameId = 0
+  }
+  if (pendingSidebarWidth !== null) {
+    sidebarWidth.value = pendingSidebarWidth
+    pendingSidebarWidth = null
+  }
   // 保存用户偏好
   localStorage.setItem('editor-sidebar-width', sidebarWidth.value.toString())
 }
@@ -2446,6 +2467,10 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  if (sidebarResizeFrameId !== 0) {
+    cancelAnimationFrame(sidebarResizeFrameId)
+    sidebarResizeFrameId = 0
+  }
   playbackManager.pause()
   if (!activeJobId.value && props.projectId) {
     // 纯 project 模式无后台任务续跑需求，卸载时应主动释放连接，避免悬挂订阅。
@@ -2634,6 +2659,12 @@ onBeforeRouteLeave(async (to, from) => {
   min-width: 280px;
   max-width: 600px;
   overflow: hidden;
+}
+
+.sidebar-column.is-resizing :deep(.subtitle-row),
+.sidebar-column.is-resizing :deep(.subtitle-row .action-btn),
+.sidebar-column.is-resizing :deep(.subtitle-row .delete-btn) {
+  transition: none;
 }
 
 /* 标签页导航 */

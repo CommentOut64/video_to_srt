@@ -35,7 +35,7 @@ const activeId = ref(null)
 
 // 二分查找可见字幕
 const visibleRegions = computed(() => {
-  const order = docStore.order.value
+  const order = docStore.order
   const entities = docStore.entities
 
   const bufferMs = 5000

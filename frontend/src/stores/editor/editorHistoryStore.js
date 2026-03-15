@@ -24,12 +24,12 @@ export const useEditorHistoryStore = defineStore('editorHistory', () => {
     lastMergeKey = doCommand.mergeKey || null
 
     const entry = {
-      entryId: `he_${String(docStore.revision.value).padStart(5, '0')}`,
+      entryId: `he_${String(docStore.revision).padStart(5, '0')}`,
       type: doCommand.type,
       doCommands: [doCommand],
       undoCommands: undoCommand ? [undoCommand] : [],
-      revisionBefore: docStore.revision.value - 1,
-      revisionAfter: docStore.revision.value,
+      revisionBefore: docStore.revision - 1,
+      revisionAfter: docStore.revision,
       createdAt: Date.now(),
     }
 
@@ -56,7 +56,7 @@ export const useEditorHistoryStore = defineStore('editorHistory', () => {
     const newEntry = {
       ...lastEntry,
       doCommands: [newDo],
-      revisionAfter: docStore.revision.value,
+      revisionAfter: docStore.revision,
       createdAt: Date.now(),
     }
 
