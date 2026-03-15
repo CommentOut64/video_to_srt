@@ -231,11 +231,17 @@ export function useEditorEventProjector() {
     scheduleFlush()
   }
 
+  function reset() {
+    pendingCommands = []
+    flushScheduled = false
+  }
+
   return {
     projectDraft,
     projectReplaceChunk,
     projectFinalized,
     projectRevised,
-    projectServerSnapshot
+    projectServerSnapshot,
+    reset,
   }
 }

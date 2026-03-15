@@ -1,4 +1,4 @@
-// V3.2.5+dev.20260314.01: 字幕文档唯一真源
+// V3.2.5+dev.20260315.21: 字幕文档唯一真源（热实体更新改为不可变替换）
 import { defineStore } from 'pinia'
 import { shallowReactive, shallowRef, ref, markRaw } from 'vue'
 
@@ -101,22 +101,46 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     })
   }
 
+  function ensureEntityVersionToken(localId, entity) {
+    if (!entity) return null
+
+    let token = entityVersionTokens.get(localId)
+    if (!token) {
+      token = shallowRef(entity.revision ?? 0)
+      entityVersionTokens.set(localId, token)
+      return token
+    }
+
+    token.value = entity.revision ?? 0
+    return token
+  }
+
   // ─── 原子写操作（仅由 reducer 调用） ───
   function _applyInsert(localId, hot, cold, afterLocalId) {
-    entities.set(localId, hot)
+    const nextHot = {
+      ...hot,
+      localId,
+    }
+
+    entities.set(localId, nextHot)
+    ensureEntityVersionToken(localId, nextHot)
     if (cold) {
-      coldEntities.set(localId, markRaw(cold))
-      if (cold.segmentId) {
-        bindingBySegmentId.set(cold.segmentId, localId)
+      const nextCold = markRaw({
+        ...cold,
+        localId,
+      })
+      coldEntities.set(localId, nextCold)
+      if (nextCold.segmentId) {
+        bindingBySegmentId.set(nextCold.segmentId, localId)
       }
-      if (cold.sentenceIndex !== null && cold.sentenceIndex !== undefined) {
-        bindingBySentenceIndex.set(cold.sentenceIndex, localId)
+      if (nextCold.sentenceIndex !== null && nextCold.sentenceIndex !== undefined) {
+        bindingBySentenceIndex.set(nextCold.sentenceIndex, localId)
       }
     }
 
     const pos = afterLocalId !== null && afterLocalId !== undefined
       ? (indexById.get(afterLocalId) ?? -1) + 1
-      : findInsertPosition(hot.startMs)
+      : findInsertPosition(nextHot.startMs)
 
     const newOrder = [...order.value]
     newOrder.splice(pos, 0, localId)
@@ -162,16 +186,17 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     const entity = entities.get(localId)
     if (!entity) return false
 
-    Object.assign(entity, patch)
-    entity.revision++
-
-    let token = entityVersionTokens.get(localId)
-    if (!token) {
-      token = shallowRef(entity.revision)
-      entityVersionTokens.set(localId, token)
-    } else {
-      token.value = entity.revision
+    // 不能原地变异：下游组件会通过 computed 缓存实体引用，
+    // 若引用不变，Vue 会把它视为“等值”并吞掉文本/时间戳刷新。
+    const nextEntity = {
+      ...entity,
+      ...patch,
+      localId,
+      revision: (entity.revision ?? 0) + 1,
     }
+
+    entities.set(localId, nextEntity)
+    ensureEntityVersionToken(localId, nextEntity)
 
     dirtySet.add(localId)
     revision.value++
@@ -196,8 +221,19 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
   function _applyBinding(localId, segmentId) {
     const cold = coldEntities.get(localId)
     if (!cold) return false
-    cold.segmentId = segmentId
-    bindingBySegmentId.set(segmentId, localId)
+    if (cold.segmentId && cold.segmentId !== segmentId) {
+      bindingBySegmentId.delete(cold.segmentId)
+    }
+    const nextCold = markRaw({
+      ...cold,
+      localId,
+      segmentId,
+    })
+    coldEntities.set(localId, nextCold)
+    if (segmentId) {
+      bindingBySegmentId.set(segmentId, localId)
+    }
+    revision.value++
     return true
   }
 
@@ -208,7 +244,13 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
   function _applyColdUpdate(localId, coldPatch) {
     const cold = coldEntities.get(localId)
     if (!cold) return false
-    Object.assign(cold, coldPatch)
+    const nextCold = markRaw({
+      ...cold,
+      ...coldPatch,
+      localId,
+    })
+    coldEntities.set(localId, nextCold)
+    revision.value++
     return true
   }
 
@@ -230,7 +272,7 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
   }
 
   function takeSnapshot() {
-    const entitiesArray = Array.from(entities.entries()).map(([id, e]) => e)
+    const entitiesArray = Array.from(entities.entries()).map(([id, e]) => ({ ...e, localId: id }))
     const coldEntitiesArray = Array.from(coldEntities.entries()).map(([id, c]) => ({ localId: id, ...c }))
     const bindings = Array.from(bindingBySegmentId.entries()).map(([segmentId, localId]) => ({ localId, segmentId }))
     const sentenceBindings = Array.from(bindingBySentenceIndex.entries()).map(([sentenceIndex, localId]) => ({ localId, sentenceIndex }))
@@ -238,10 +280,10 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
       revision: revision.value,
       entities: entitiesArray,
       coldEntities: coldEntitiesArray,
-      order: order.value,
+      order: [...order.value],
       bindings,
       sentenceBindings,
-      tombstones: tombstones.value,
+      tombstones: [...tombstones.value],
       createdAt: Date.now(),
     }
   }
@@ -255,19 +297,29 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     entityVersionTokens.clear()
     dirtySet.clear()
 
-    snapshot.entities.forEach(e => entities.set(e.localId, e))
+    snapshot.entities.forEach((e) => {
+      const nextEntity = {
+        ...e,
+        localId: e.localId,
+      }
+      entities.set(e.localId, nextEntity)
+      ensureEntityVersionToken(e.localId, nextEntity)
+    })
     if (snapshot.coldEntities) {
       snapshot.coldEntities.forEach(c => {
         const { localId, ...cold } = c
-        coldEntities.set(localId, markRaw(cold))
+        coldEntities.set(localId, markRaw({
+          ...cold,
+          localId,
+        }))
       })
     }
-    order.value = snapshot.order
+    order.value = Array.isArray(snapshot.order) ? [...snapshot.order] : []
     rebuildIndexById()
-    snapshot.bindings.forEach(b => bindingBySegmentId.set(b.segmentId, b.localId))
-    snapshot.sentenceBindings.forEach(b => bindingBySentenceIndex.set(b.sentenceIndex, b.localId))
-    tombstones.value = snapshot.tombstones || []
-    revision.value = snapshot.revision
+    ;(snapshot.bindings || []).forEach(b => bindingBySegmentId.set(b.segmentId, b.localId))
+    ;(snapshot.sentenceBindings || []).forEach(b => bindingBySentenceIndex.set(b.sentenceIndex, b.localId))
+    tombstones.value = Array.isArray(snapshot.tombstones) ? [...snapshot.tombstones] : []
+    revision.value = Number.isFinite(snapshot.revision) ? snapshot.revision : 0
   }
 
   // V3.2.5+dev.20260315.01: 清空文档（切换项目时使用）

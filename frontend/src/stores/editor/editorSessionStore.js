@@ -14,7 +14,7 @@ export const useEditorSessionStore = defineStore('editorSession', () => {
   const commandCounter = ref(0)
 
   // ─── 保存状态 ───
-  const ackedRevision = ref(0)
+  const ackedRevision = ref(null)
   const isSaving = ref(false)
   const isDirty = ref(false)
 
@@ -45,7 +45,7 @@ export const useEditorSessionStore = defineStore('editorSession', () => {
 
     idCounter.value = 0
     commandCounter.value = 0
-    ackedRevision.value = 0
+    ackedRevision.value = null
     isSaving.value = false
     isDirty.value = false
     isClosed.value = false

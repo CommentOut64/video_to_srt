@@ -128,6 +128,12 @@ export const useEditorDraftStore = defineStore('editorDraft', () => {
     activeTimingDraft.value = null
   }
 
+  function reset() {
+    cancelIdleCommit()
+    activeTextDraft.value = null
+    activeTimingDraft.value = null
+  }
+
   return {
     activeTextDraft,
     activeTimingDraft,
@@ -141,5 +147,6 @@ export const useEditorDraftStore = defineStore('editorDraft', () => {
     commitTimingDraft,
     cancelTimingDraft,
     flushAll,
+    reset,
   }
 })

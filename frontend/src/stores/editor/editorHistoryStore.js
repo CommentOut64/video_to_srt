@@ -97,5 +97,10 @@ export const useEditorHistoryStore = defineStore('editorHistory', () => {
     lastMergeKey = null
   }
 
-  return { past, future, canUndo, canRedo, push, undo, redo, clear, closeTransaction }
+  function reset() {
+    clear()
+    closeTransaction()
+  }
+
+  return { past, future, canUndo, canRedo, push, undo, redo, clear, closeTransaction, reset }
 })

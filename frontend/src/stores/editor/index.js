@@ -15,6 +15,7 @@ export {
   createDeleteSubtitleCommand,
   createSplitSubtitleCommand,
   createMergeSubtitlesCommand,
+  createMoveBoundaryCommand,
   createBatchReplaceCommand,
   normalizeEditorCommand,
 } from './editorCommandFactory'

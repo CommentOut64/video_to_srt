@@ -101,6 +101,10 @@ export function createMergeSubtitlesCommand(overrides = {}) {
   return createBaseCommand('merge_subtitles', overrides)
 }
 
+export function createMoveBoundaryCommand(overrides = {}) {
+  return createBaseCommand('move_boundary', overrides)
+}
+
 export function createBatchReplaceCommand(overrides = {}) {
   return createBaseCommand('batch_replace', {
     replacements: Array.isArray(overrides.replacements) ? overrides.replacements : [],
@@ -126,6 +130,8 @@ export function normalizeEditorCommand(command) {
       return createSplitSubtitleCommand(command)
     case 'merge_subtitles':
       return createMergeSubtitlesCommand(command)
+    case 'move_boundary':
+      return createMoveBoundaryCommand(command)
     case 'batch_replace':
       return createBatchReplaceCommand(command)
     default:
