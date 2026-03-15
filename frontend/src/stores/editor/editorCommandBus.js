@@ -3,15 +3,22 @@ import { defineStore } from 'pinia'
 import { useEditorDocumentStore } from './editorDocumentStore'
 import { useEditorSessionStore } from './editorSessionStore'
 import { useEditorHistoryStore } from './editorHistoryStore'
+import { normalizeEditorCommand } from './editorCommandFactory'
 import { editorReducer } from './editorReducer'
 
 export const useEditorCommandBus = defineStore('editorCommandBus', () => {
   const listeners = []
 
-  function dispatch(command) {
+  function dispatch(rawCommand) {
     const docStore = useEditorDocumentStore()
     const sessionStore = useEditorSessionStore()
     const historyStore = useEditorHistoryStore()
+    const command = normalizeEditorCommand(rawCommand)
+
+    if (!command?.type) {
+      console.warn('[CommandBus] 收到无效命令，已忽略:', rawCommand)
+      return { success: false, reason: 'invalid_command' }
+    }
 
     // 执行 reducer
     const result = editorReducer(docStore, command)

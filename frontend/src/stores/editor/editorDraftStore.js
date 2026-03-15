@@ -2,7 +2,7 @@
 import { defineStore } from 'pinia'
 import { shallowRef } from 'vue'
 import { useEditorCommandBus } from './editorCommandBus'
-import { useEditorSessionStore } from './editorSessionStore'
+import { createUpdateTextCommand, createUpdateTimingCommand } from './editorCommandFactory'
 
 export const useEditorDraftStore = defineStore('editorDraft', () => {
   const activeTextDraft = shallowRef(null)
@@ -51,18 +51,12 @@ export const useEditorDraftStore = defineStore('editorDraft', () => {
     cancelIdleCommit()
 
     const commandBus = useEditorCommandBus()
-    const sessionStore = useEditorSessionStore()
-
-    const command = {
-      type: 'update_text',
-      commandId: sessionStore.nextCommandId(),
-      source: 'user',
-      createdAt: Date.now(),
+    const command = createUpdateTextCommand({
       localId: activeTextDraft.value.localId,
       before: { text: activeTextDraft.value.originalText },
       after: { text: activeTextDraft.value.text },
       mergeKey: `text_${activeTextDraft.value.localId}_${activeTextDraft.value.startedAt}`,
-    }
+    })
 
     commandBus.dispatch(command)
     activeTextDraft.value.originalText = activeTextDraft.value.text
@@ -99,17 +93,11 @@ export const useEditorDraftStore = defineStore('editorDraft', () => {
     }
 
     const commandBus = useEditorCommandBus()
-    const sessionStore = useEditorSessionStore()
-
-    const command = {
-      type: 'update_timing',
-      commandId: sessionStore.nextCommandId(),
-      source: 'user',
-      createdAt: Date.now(),
+    const command = createUpdateTimingCommand({
       localId,
       before: { startMs: dragOrigin.startMs, endMs: dragOrigin.endMs },
       after: { startMs, endMs },
-    }
+    })
 
     commandBus.dispatch(command)
     activeTimingDraft.value = null

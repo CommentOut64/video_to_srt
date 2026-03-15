@@ -1,5 +1,20 @@
-// V3.2.5+dev.20260314.01: 命令 Reducer - 统一执行所有编辑操作
+// V3.2.5+dev.20260315.05: 命令 Reducer - 统一执行所有编辑操作
 import { createSubtitleHotEntity, createSubtitleColdEntity } from './models'
+
+function cloneColdEntity(cold, localId, overrides = {}) {
+  return {
+    ...createSubtitleColdEntity(localId),
+    ...(cold ? { ...cold } : {}),
+    localId,
+    ...overrides,
+  }
+}
+
+function getPreviousLocalId(docStore, localId) {
+  const orderIndex = docStore.getOrderIndex(localId)
+  if (orderIndex <= 0) return null
+  return docStore.order[orderIndex - 1] ?? null
+}
 
 /**
  * 纯函数风格的 reducer
@@ -14,8 +29,9 @@ export function editorReducer(docStore, command) {
 
       const undoCommand = {
         ...command,
-        commandId: command.commandId + '_undo',
+        commandId: `${command.commandId}_undo`,
         source: 'undo_redo',
+        createdAt: Date.now(),
         before: command.after,
         after: command.before,
       }
@@ -34,8 +50,9 @@ export function editorReducer(docStore, command) {
 
       const undoCommand = {
         ...command,
-        commandId: command.commandId + '_undo',
+        commandId: `${command.commandId}_undo`,
         source: 'undo_redo',
+        createdAt: Date.now(),
         before: command.after,
         after: command.before,
       }
@@ -57,20 +74,20 @@ export function editorReducer(docStore, command) {
         command.entity.startMs,
         command.entity.endMs
       )
-      hot.isModified = true
+      hot.isModified = command.source !== 'system'
       if (command.entity.isDraft !== undefined) {
         hot.isDraft = command.entity.isDraft
       }
 
       const cold = command.coldInit
-        ? { ...createSubtitleColdEntity(command.localId), ...command.coldInit }
+        ? cloneColdEntity(command.coldInit, command.localId)
         : createSubtitleColdEntity(command.localId)
 
       docStore._applyInsert(command.localId, hot, cold, command.afterLocalId)
 
       const undoCommand = {
         type: 'delete_subtitle',
-        commandId: command.commandId + '_undo',
+        commandId: `${command.commandId}_undo`,
         source: 'undo_redo',
         createdAt: Date.now(),
         localId: command.localId,
@@ -91,17 +108,20 @@ export function editorReducer(docStore, command) {
       if (!entity) return { success: false, reason: 'entity_not_found' }
 
       const cold = docStore.getCold(command.localId)
-      const orderIndex = docStore.getOrderIndex(command.localId)
-
       const undoCommand = {
         type: 'insert_subtitle',
-        commandId: command.commandId + '_undo',
+        commandId: `${command.commandId}_undo`,
         source: 'undo_redo',
         createdAt: Date.now(),
         localId: command.localId,
-        entity: { text: entity.text, startMs: entity.startMs, endMs: entity.endMs },
-        afterLocalId: orderIndex > 0 ? docStore.order[orderIndex - 1] : null,
-        coldInit: cold || undefined,
+        entity: {
+          text: entity.text,
+          startMs: entity.startMs,
+          endMs: entity.endMs,
+          isDraft: entity.isDraft,
+        },
+        afterLocalId: getPreviousLocalId(docStore, command.localId),
+        coldInit: cold ? cloneColdEntity(cold, command.localId) : undefined,
       }
 
       docStore._applyDelete(command.localId)
@@ -111,6 +131,15 @@ export function editorReducer(docStore, command) {
     case 'split_subtitle': {
       const entity = docStore.getEntity(command.sourceLocalId)
       if (!entity) return { success: false, reason: 'entity_not_found' }
+
+      const sourceCold = docStore.getCold(command.sourceLocalId)
+      const createdCold = command.createdColdInit
+        ? cloneColdEntity(command.createdColdInit, command.createdLocalId)
+        : cloneColdEntity(sourceCold, command.createdLocalId, {
+            segmentId: null,
+            sentenceIndex: null,
+            originalText: null,
+          })
 
       docStore._applyUpdate(command.sourceLocalId, {
         text: command.afterKept.text,
@@ -131,13 +160,13 @@ export function editorReducer(docStore, command) {
       docStore._applyInsert(
         command.createdLocalId,
         newHot,
-        createSubtitleColdEntity(command.createdLocalId),
+        createdCold,
         command.sourceLocalId
       )
 
       const undoCommand = {
         type: 'merge_subtitles',
-        commandId: command.commandId + '_undo',
+        commandId: `${command.commandId}_undo`,
         source: 'undo_redo',
         createdAt: Date.now(),
         keptLocalId: command.sourceLocalId,
@@ -146,7 +175,7 @@ export function editorReducer(docStore, command) {
         beforeKept: command.afterKept,
         beforeRemoved: command.afterCreated,
         after: command.before,
-        removedColdSnapshot: null,
+        removedColdSnapshot: cloneColdEntity(createdCold, command.createdLocalId),
       }
 
       return { success: true, undoCommand }
@@ -156,6 +185,10 @@ export function editorReducer(docStore, command) {
       const kept = docStore.getEntity(command.keptLocalId)
       const removed = docStore.getEntity(command.removedLocalId)
       if (!kept || !removed) return { success: false, reason: 'entity_not_found' }
+
+      const removedCold = command.removedColdSnapshot
+        ? cloneColdEntity(command.removedColdSnapshot, command.removedLocalId)
+        : cloneColdEntity(docStore.getCold(command.removedLocalId), command.removedLocalId)
 
       docStore._applyUpdate(command.keptLocalId, {
         text: command.after.text,
@@ -168,7 +201,7 @@ export function editorReducer(docStore, command) {
 
       const undoCommand = {
         type: 'split_subtitle',
-        commandId: command.commandId + '_undo',
+        commandId: `${command.commandId}_undo`,
         source: 'undo_redo',
         createdAt: Date.now(),
         sourceLocalId: command.keptLocalId,
@@ -178,6 +211,7 @@ export function editorReducer(docStore, command) {
         before: command.after,
         afterKept: command.beforeKept,
         afterCreated: command.beforeRemoved,
+        createdColdInit: removedCold,
       }
 
       return { success: true, undoCommand }
@@ -190,34 +224,44 @@ export function editorReducer(docStore, command) {
 
       const undoCommand = {
         ...command,
-        commandId: command.commandId + '_undo',
+        commandId: `${command.commandId}_undo`,
         source: 'undo_redo',
+        createdAt: Date.now(),
         before: command.after,
         after: command.before,
       }
 
-      docStore._applyUpdate(command.upperLocalId, { endMs: command.after.upperEndMs, isModified: true })
-      docStore._applyUpdate(command.lowerLocalId, { startMs: command.after.lowerStartMs, isModified: true })
+      docStore._applyUpdate(command.upperLocalId, {
+        endMs: command.after.upperEndMs,
+        isModified: true,
+      })
+      docStore._applyUpdate(command.lowerLocalId, {
+        startMs: command.after.lowerStartMs,
+        isModified: true,
+      })
+      docStore._applyReorder(command.upperLocalId)
+      docStore._applyReorder(command.lowerLocalId)
 
       return { success: true, undoCommand }
     }
 
     case 'batch_replace': {
       const undoReplacements = []
-      for (const r of command.replacements) {
-        const entity = docStore.getEntity(r.localId)
+      for (const replacement of command.replacements) {
+        const entity = docStore.getEntity(replacement.localId)
         if (!entity) continue
         undoReplacements.push({
-          localId: r.localId,
-          before: r.after,
-          after: r.before,
+          localId: replacement.localId,
+          before: replacement.after,
+          after: replacement.before,
         })
-        docStore._applyUpdate(r.localId, { text: r.after.text, isModified: true })
       }
+
+      docStore._applyBatchReplace(command.replacements)
 
       const undoCommand = {
         type: 'batch_replace',
-        commandId: command.commandId + '_undo',
+        commandId: `${command.commandId}_undo`,
         source: 'undo_redo',
         createdAt: Date.now(),
         replacements: undoReplacements,
@@ -227,8 +271,8 @@ export function editorReducer(docStore, command) {
     }
 
     case 'bind_segment_id': {
-      for (const b of command.bindings) {
-        docStore._applyBinding(b.localId, b.segmentId)
+      for (const binding of command.bindings) {
+        docStore._applyBinding(binding.localId, binding.segmentId)
       }
       return { success: true, undoCommand: null }
     }
@@ -239,30 +283,24 @@ export function editorReducer(docStore, command) {
     }
 
     case 'finalize_draft_chunk': {
-      for (const u of command.updates) {
-        docStore._applyUpdate(u.localId, {
-          text: u.text,
-          startMs: u.startMs,
-          endMs: u.endMs,
-          isDraft: false,
-        })
-        docStore._applyReorder(u.localId)
-        if (u.cold) {
-          docStore._applyColdUpdate(u.localId, u.cold)
+      if (Array.isArray(command.updates) && command.updates.length > 0) {
+        for (const update of command.updates) {
+          docStore._applyUpdate(update.localId, {
+            text: update.text,
+            startMs: update.startMs,
+            endMs: update.endMs,
+            isDraft: false,
+          })
+          docStore._applyReorder(update.localId)
+          if (update.cold) {
+            docStore._applyColdUpdate(update.localId, update.cold)
+          }
+        }
+      } else {
+        for (const localId of command.localIds || []) {
+          docStore._applyUpdate(localId, { isDraft: false })
         }
       }
-      return { success: true, undoCommand: null }
-    }
-
-    case 'finalize_draft_chunk': {
-      for (const localId of command.localIds) {
-        docStore._applyUpdate(localId, { isDraft: false })
-      }
-      return { success: true, undoCommand: null }
-    }
-
-    case 'apply_server_replace': {
-      docStore._applyServerReplace(command.oldLocalIds, command.newEntities)
       return { success: true, undoCommand: null }
     }
 

@@ -1,13 +1,12 @@
 // V3.2.4+dev.20260314.03: 新旧编辑器桥接适配器
 import { useEditorDocumentStore } from './editorDocumentStore'
 import { useEditorCommandBus } from './editorCommandBus'
-import { useEditorSessionStore } from './editorSessionStore'
 import { useEditorEventProjector } from './editorEventProjector'
+import { createUpdateTextCommand, createUpdateTimingCommand } from './editorCommandFactory'
 
 export function createEditorBridge() {
   const docStore = useEditorDocumentStore()
   const commandBus = useEditorCommandBus()
-  const sessionStore = useEditorSessionStore()
   const projector = useEditorEventProjector()
 
   return {
@@ -30,30 +29,22 @@ export function createEditorBridge() {
 
     // 兼容旧 API：更新文本
     updateText(localId, text) {
-      commandBus.dispatch({
-        type: 'update_text',
-        commandId: sessionStore.nextCommandId(),
-        source: 'user',
-        createdAt: Date.now(),
+      commandBus.dispatch(createUpdateTextCommand({
         localId,
         before: { text: docStore.getEntity(localId)?.text || '' },
         after: { text },
-        mergeKey: null
-      })
+        mergeKey: null,
+      }))
     },
 
     // 兼容旧 API：更新时间
     updateTiming(localId, startMs, endMs) {
       const entity = docStore.getEntity(localId)
-      commandBus.dispatch({
-        type: 'update_timing',
-        commandId: sessionStore.nextCommandId(),
-        source: 'user',
-        createdAt: Date.now(),
+      commandBus.dispatch(createUpdateTimingCommand({
         localId,
         before: { startMs: entity.startMs, endMs: entity.endMs },
-        after: { startMs, endMs }
-      })
+        after: { startMs, endMs },
+      }))
     },
 
     // SSE 事件入口

@@ -8,6 +8,16 @@ export { useEditorDraftStore } from './editorDraftStore'
 export { useEditorPersistenceClient } from './editorPersistenceClient'
 export { useEditorSyncEngine } from './editorSyncEngine'
 export { useEditorEventProjector } from './editorEventProjector'
+export {
+  createUpdateTextCommand,
+  createUpdateTimingCommand,
+  createInsertSubtitleCommand,
+  createDeleteSubtitleCommand,
+  createSplitSubtitleCommand,
+  createMergeSubtitlesCommand,
+  createBatchReplaceCommand,
+  normalizeEditorCommand,
+} from './editorCommandFactory'
 export { editorReducer } from './editorReducer'
 export { createSubtitleHotEntity, createSubtitleColdEntity } from './models'
 export { initEditorCore, destroyEditorCore } from './editorCore'
