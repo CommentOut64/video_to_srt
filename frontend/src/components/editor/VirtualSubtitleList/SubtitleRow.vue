@@ -1,11 +1,11 @@
-<!-- V3.2.5+dev.20260315.04: SubtitleRow - 虚拟列表行组件（行级 selector + v-memo） -->
+<!-- V3.2.5+dev.20260315.21: SubtitleRow - 虚拟列表行组件（移除行级 memo 缓存） -->
 <template>
   <div
-    v-memo="[entity?.text, entity?.startMs, entity?.endMs, entity?.isModified, isSelected, isActive]"
     class="subtitle-row"
     :class="{
       'is-selected': isSelected,
       'is-active': isActive,
+      'is-current': isCurrent,
       'is-draft': entity?.isDraft,
       'is-modified': entity?.isModified
     }"
@@ -101,18 +101,20 @@
 </template>
 
 <script setup>
-// V3.2.5+dev.20260314.03: 行级 selector，只订阅当前行的版本令牌
+// V3.2.5+dev.20260315.21: 行级 selector，依赖不可变实体替换触发刷新
 import { computed, ref, nextTick } from 'vue'
 import { useEditorDocumentStore } from '@/stores/editor/editorDocumentStore'
 import { useEditorCommandBus } from '@/stores/editor/editorCommandBus'
 import { useEditorDraftStore } from '@/stores/editor/editorDraftStore'
+import { useProjectStore } from '@/stores/projectStore'
 import { createUpdateTextCommand, createUpdateTimingCommand } from '@/stores/editor/editorCommandFactory'
 
 const props = defineProps({
   localId: { type: String, required: true },
   rowIndex: { type: Number, required: true },
   isSelected: { type: Boolean, default: false },
-  isActive: { type: Boolean, default: false }
+  isActive: { type: Boolean, default: false },
+  isCurrent: { type: Boolean, default: false }
 })
 
 const emit = defineEmits(['click', 'insert-before', 'insert-after', 'delete'])
@@ -120,6 +122,7 @@ const emit = defineEmits(['click', 'insert-before', 'insert-after', 'delete'])
 const docStore = useEditorDocumentStore()
 const commandBus = useEditorCommandBus()
 const draftStore = useEditorDraftStore()
+const projectStore = useProjectStore()
 
 // 行级 selector：只订阅当前行的版本令牌
 const entity = computed(() => {
@@ -174,7 +177,7 @@ function cancelEditing() {
 
 function formatTime(ms) {
   if (!ms && ms !== 0) return '00:00.000'
-  const totalSeconds = ms / 1000
+  const totalSeconds = projectStore.toDisplayTime(ms / 1000)
   const minutes = Math.floor(totalSeconds / 60)
   const seconds = Math.floor(totalSeconds % 60)
   const milliseconds = Math.round((totalSeconds % 1) * 1000)
@@ -194,13 +197,19 @@ function parseTime(timeStr) {
 }
 
 function handleTimeUpdate(type, value) {
-  const newMs = parseTime(value)
-  if (newMs === null) return
+  const displayMs = parseTime(value)
+  if (displayMs === null) return
+
+  const newMs = Math.round(projectStore.toBaseTime(displayMs / 1000) * 1000)
 
   const before = { startMs: entity.value?.startMs, endMs: entity.value?.endMs }
   const after = { ...before }
   if (type === 'start') after.startMs = newMs
   else after.endMs = newMs
+
+  if (after.startMs === before.startMs && after.endMs === before.endMs) {
+    return
+  }
 
   commandBus.dispatch(createUpdateTimingCommand({
     localId: props.localId,
@@ -236,13 +245,14 @@ function handleClick() {
   background: var(--af-bg-tertiary);
 }
 
-.subtitle-row.is-active {
+.subtitle-row.is-active:not(.is-current) {
   border-color: var(--af-accent-primary);
   background: rgb(var(--af-accent-primary-rgb), 0.08);
 }
 
-.subtitle-row.is-selected {
-  background: rgb(var(--af-accent-primary-rgb), 0.1);
+.subtitle-row.is-current {
+  border-color: var(--af-accent-success);
+  background: rgb(var(--af-accent-success-rgb), 0.08);
 }
 
 .subtitle-row.is-draft {
@@ -270,6 +280,16 @@ function handleClick() {
 .subtitle-row.is-draft .item-index {
   background: var(--af-text-muted);
   color: var(--af-text-on-dark);
+}
+
+.subtitle-row.is-current .item-index {
+  background: var(--af-accent-success);
+  color: var(--af-text-inverse);
+}
+
+.subtitle-row.is-active:not(.is-current) .item-index {
+  background: var(--af-accent-primary);
+  color: var(--af-text-inverse);
 }
 
 /* 内容区 */
