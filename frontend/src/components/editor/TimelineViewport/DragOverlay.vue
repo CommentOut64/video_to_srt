@@ -17,6 +17,7 @@
 import { ref, computed } from 'vue'
 import { useEditorDraftStore } from '@/stores/editor/editorDraftStore'
 import { useEditorCommandBus } from '@/stores/editor/editorCommandBus'
+import { createUpdateTimingCommand } from '@/stores/editor/editorCommandFactory'
 
 const props = defineProps({
   localId: { type: String, required: true },
@@ -50,13 +51,12 @@ function handlePointerUp(e) {
 
   const draft = draftStore.activeTimingDraft
   if (draft) {
-    commandBus.dispatch({
-      type: 'update_timing',
+    commandBus.dispatch(createUpdateTimingCommand({
       localId: props.localId,
       before: { startMs: draft.originalStartMs, endMs: draft.originalEndMs },
       after: { startMs: draft.startMs, endMs: draft.endMs },
-      source: 'user'
-    })
+      source: 'user',
+    }))
   }
 
   emit('drag-end')

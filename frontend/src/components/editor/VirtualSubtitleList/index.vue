@@ -50,6 +50,7 @@ import SubtitleRow from './SubtitleRow.vue'
 import SearchToolbar from '@/components/editor/SubtitleList/SearchToolbar.vue'
 import { useEditorDocumentStore } from '@/stores/editor/editorDocumentStore'
 import { useEditorCommandBus } from '@/stores/editor/editorCommandBus'
+import { createDeleteSubtitleCommand, createInsertSubtitleCommand } from '@/stores/editor/editorCommandFactory'
 
 const docStore = useEditorDocumentStore()
 const commandBus = useEditorCommandBus()
@@ -96,29 +97,26 @@ function handleKeydown(e) {
       break
     case 'Delete':
       e.preventDefault()
-      commandBus.dispatch({
-        type: 'delete_subtitle',
+      commandBus.dispatch(createDeleteSubtitleCommand({
         localId: activeId.value,
-        source: 'user'
-      })
+        source: 'user',
+      }))
       break
     case 'Enter':
       e.preventDefault()
-      commandBus.dispatch({
-        type: 'insert_subtitle',
+      commandBus.dispatch(createInsertSubtitleCommand({
         afterLocalId: activeId.value,
-        source: 'user'
-      })
+        source: 'user',
+      }))
       break
   }
 }
 
 function handleAddSubtitle() {
-  commandBus.dispatch({
-    type: 'insert_subtitle',
+  commandBus.dispatch(createInsertSubtitleCommand({
     afterLocalId: null,
-    source: 'user'
-  })
+    source: 'user',
+  }))
 }
 </script>
 

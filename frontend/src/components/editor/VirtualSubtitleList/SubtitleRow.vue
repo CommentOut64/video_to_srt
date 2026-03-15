@@ -106,6 +106,7 @@ import { computed, ref, nextTick } from 'vue'
 import { useEditorDocumentStore } from '@/stores/editor/editorDocumentStore'
 import { useEditorCommandBus } from '@/stores/editor/editorCommandBus'
 import { useEditorDraftStore } from '@/stores/editor/editorDraftStore'
+import { createUpdateTextCommand, createUpdateTimingCommand } from '@/stores/editor/editorCommandFactory'
 
 const props = defineProps({
   localId: { type: String, required: true },
@@ -156,13 +157,12 @@ function stopEditing() {
   if (!isEditing.value) return
   const newText = editingText.value.trim()
   if (newText && newText !== entity.value?.text) {
-    commandBus.dispatch({
-      type: 'update_text',
+    commandBus.dispatch(createUpdateTextCommand({
       localId: props.localId,
       before: { text: entity.value?.text },
       after: { text: newText },
-      source: 'user'
-    })
+      source: 'user',
+    }))
   }
   isEditing.value = false
 }
@@ -202,13 +202,12 @@ function handleTimeUpdate(type, value) {
   if (type === 'start') after.startMs = newMs
   else after.endMs = newMs
 
-  commandBus.dispatch({
-    type: 'update_timing',
+  commandBus.dispatch(createUpdateTimingCommand({
     localId: props.localId,
     before,
     after,
-    source: 'user'
-  })
+    source: 'user',
+  }))
 }
 
 function handleClick() {
