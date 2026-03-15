@@ -20,6 +20,10 @@ function preserveOrCreateLocalId(docStore, segmentId) {
   return docStore.bindingBySegmentId.get(segmentId) || segmentId
 }
 
+function resolveBaseRevision(sessionStore) {
+  return Number.isInteger(sessionStore.ackedRevision) ? sessionStore.ackedRevision : null
+}
+
 function toServerSegmentSnapshot(segment) {
   const segmentId = String(segment?.segment_id || '')
   return {
@@ -27,12 +31,20 @@ function toServerSegmentSnapshot(segment) {
     text: String(segment?.text ?? ''),
     startMs: segment?.start_ms ?? toMs(segment?.start ?? 0),
     endMs: segment?.end_ms ?? toMs(segment?.end ?? 0),
+    isDraft: Boolean(segment?.is_draft),
+    isModified: Boolean(segment?.is_modified),
     sentenceIndex: segment?.legacy_index ?? segment?.sentence_index ?? null,
     confidence: segment?.confidence ?? null,
     displayConfidence: segment?.display_confidence ?? null,
     confidenceSource: segment?.confidence_source ?? null,
     warningType: segment?.warning_type || 'none',
     sourceType: segment?.source_type ?? segment?.source ?? null,
+    originalText: segment?.original_text ?? null,
+    speakerId: segment?.speaker_id ?? null,
+    speakerLabel: segment?.speaker_label ?? null,
+    speakerColorKey: segment?.speaker_color_key ?? null,
+    turnId: segment?.turn_id ?? null,
+    bindingSource: segment?.binding_source ?? null,
     words: Array.isArray(segment?.words)
       ? segment.words.map((word) => ({
           startMs: word?.start_ms ?? toMs(word?.start ?? 0),
@@ -41,6 +53,149 @@ function toServerSegmentSnapshot(segment) {
         }))
       : null,
   }
+}
+
+function buildReplayCommands(commands = []) {
+  return commands.map((command) => ({
+    ...command,
+    source: 'reconcile_replay',
+  }))
+}
+
+function syncSnapshotColdState(docStore, localId, snapshot, existingCold) {
+  if (existingCold?.segmentId && existingCold.segmentId !== snapshot.segmentId) {
+    docStore.bindingBySegmentId.delete(existingCold.segmentId)
+  }
+  if (
+    existingCold?.sentenceIndex !== null
+    && existingCold?.sentenceIndex !== undefined
+    && existingCold.sentenceIndex !== snapshot.sentenceIndex
+  ) {
+    docStore.bindingBySentenceIndex.delete(existingCold.sentenceIndex)
+  }
+
+  if (existingCold) {
+    docStore._applyColdUpdate(localId, {
+      segmentId: snapshot.segmentId,
+      sentenceIndex: snapshot.sentenceIndex,
+      confidence: snapshot.confidence,
+      displayConfidence: snapshot.displayConfidence,
+      confidenceSource: snapshot.confidenceSource,
+      warningType: snapshot.warningType,
+      sourceType: snapshot.sourceType,
+      originalText: snapshot.originalText,
+      speakerId: snapshot.speakerId,
+      speakerLabel: snapshot.speakerLabel,
+      speakerColorKey: snapshot.speakerColorKey,
+      turnId: snapshot.turnId,
+      bindingSource: snapshot.bindingSource,
+      words: snapshot.words,
+    })
+  }
+
+  if (snapshot.segmentId) {
+    docStore.bindingBySegmentId.set(snapshot.segmentId, localId)
+  }
+  if (snapshot.sentenceIndex !== null && snapshot.sentenceIndex !== undefined) {
+    docStore.bindingBySentenceIndex.set(snapshot.sentenceIndex, localId)
+  }
+}
+
+function applyAuthoritativeSegmentsToDocument(docStore, serverSegments, replayCommands = []) {
+  const normalizedSegments = Array.isArray(serverSegments) ? serverSegments : []
+  const preservedTombstones = [...docStore.tombstones]
+
+  // 1. 先移除所有尚未拿到 segment_id 的乐观本地实体，后续依赖 replay 恢复。
+  for (const localId of [...docStore.order]) {
+    const cold = docStore.getCold(localId)
+    if (!cold?.segmentId) {
+      docStore._applyDelete(localId)
+    }
+  }
+
+  // 2. 用服务端权威快照覆盖所有已绑定实体，同时尽量保留现有 localId。
+  const seenSegmentIds = new Set()
+  for (const rawSegment of normalizedSegments) {
+    const snapshot = toServerSegmentSnapshot(rawSegment)
+    if (!snapshot.segmentId) continue
+
+    seenSegmentIds.add(snapshot.segmentId)
+    const localId = preserveOrCreateLocalId(docStore, snapshot.segmentId)
+    const existingEntity = docStore.getEntity(localId)
+    const existingCold = docStore.getCold(localId)
+
+    if (existingEntity && existingCold) {
+      docStore._applyUpdate(localId, {
+        text: snapshot.text,
+        startMs: snapshot.startMs,
+        endMs: snapshot.endMs,
+        isDraft: snapshot.isDraft,
+        isModified: snapshot.isModified,
+        isDeleted: false,
+      })
+      docStore._applyReorder(localId)
+      syncSnapshotColdState(docStore, localId, snapshot, existingCold)
+      continue
+    }
+
+    if (existingEntity && !existingCold) {
+      docStore._applyDelete(localId)
+    }
+
+    docStore._applyInsert(
+      localId,
+      {
+        localId,
+        text: snapshot.text,
+        startMs: snapshot.startMs,
+        endMs: snapshot.endMs,
+        isDraft: snapshot.isDraft,
+        isModified: snapshot.isModified,
+        isDeleted: false,
+        revision: 0,
+      },
+      {
+        localId,
+        segmentId: snapshot.segmentId,
+        sentenceIndex: snapshot.sentenceIndex,
+        chunkId: null,
+        words: snapshot.words,
+        confidence: snapshot.confidence,
+        displayConfidence: snapshot.displayConfidence,
+        confidenceSource: snapshot.confidenceSource,
+        speakerId: snapshot.speakerId,
+        speakerLabel: snapshot.speakerLabel,
+        speakerColorKey: snapshot.speakerColorKey,
+        turnId: snapshot.turnId,
+        bindingSource: snapshot.bindingSource,
+        sourceType: snapshot.sourceType,
+        warningType: snapshot.warningType,
+        originalText: snapshot.originalText,
+      },
+      null
+    )
+  }
+
+  // 3. 删除服务端快照中已不存在的旧绑定实体。
+  for (const localId of [...docStore.order]) {
+    const cold = docStore.getCold(localId)
+    if (cold?.segmentId && !seenSegmentIds.has(cold.segmentId)) {
+      docStore._applyDelete(localId)
+    }
+  }
+
+  // 4. 恢复 tombstone，避免权威回拉污染删除同步语义。
+  docStore.tombstones = preservedTombstones
+
+  // 5. 在权威快照上重放未确认命令，确保本地未同步编辑不被旧快照覆盖。
+  for (const command of replayCommands) {
+    const result = editorReducer(docStore, command)
+    if (!result.success) {
+      console.warn('[SyncEngine] 权威快照回放命令失败，已跳过:', command.type, result.reason)
+    }
+  }
+
+  return normalizedSegments.length
 }
 
 export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
@@ -82,7 +237,8 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
     }, SYNC_INTERVAL_MS)
   }
 
-  async function pushToBackend() {
+  async function pushToBackend(options = {}) {
+    const { allowConflictRetry = true } = options
     if (isSyncing.value || pendingCommands.value.length === 0) return true
 
     const sessionStore = useEditorSessionStore()
@@ -113,7 +269,7 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
         },
         body: JSON.stringify({
           session_id: sessionStore.sessionId,
-          base_revision: sessionStore.ackedRevision,
+          base_revision: resolveBaseRevision(sessionStore),
           ops,
         }),
       })
@@ -123,7 +279,11 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
       if (!response.ok) {
         if (response.status === 409) {
           await reconcile(payload?.server_revision ?? null)
-          return true
+          if (allowConflictRetry) {
+            return pushToBackend({ allowConflictRetry: false })
+          }
+          scheduleRetry()
+          return false
         }
         throw new Error(payload?.message || `HTTP ${response.status}`)
       }
@@ -180,6 +340,20 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
     }
   }
 
+  function reset() {
+    if (syncTimer) {
+      clearTimeout(syncTimer)
+      syncTimer = null
+    }
+    if (retryTimer) {
+      clearTimeout(retryTimer)
+      retryTimer = null
+    }
+    pendingCommands.value = []
+    isSyncing.value = false
+    lastSyncTime.value = 0
+  }
+
   function applyBindings(bindings) {
     const docStore = useEditorDocumentStore()
     for (const binding of bindings) {
@@ -209,9 +383,32 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
     }
   }
 
-  async function reconcile(serverRevision = null) {
+  function applyAuthoritativeSegments(serverSegments, options = {}) {
+    const {
+      serverRevision = null,
+      preservePendingCommands = true,
+    } = options
     const sessionStore = useEditorSessionStore()
     const docStore = useEditorDocumentStore()
+    const replayCommands = preservePendingCommands
+      ? buildReplayCommands(pendingCommands.value)
+      : []
+
+    const appliedCount = applyAuthoritativeSegmentsToDocument(
+      docStore,
+      serverSegments,
+      replayCommands
+    )
+
+    if (serverRevision !== null && serverRevision !== undefined) {
+      sessionStore.ackedRevision = serverRevision
+    }
+
+    return appliedCount
+  }
+
+  async function reconcile(serverRevision = null) {
+    const sessionStore = useEditorSessionStore()
     const projectId = sessionStore.projectId
     if (!projectId) {
       throw new Error('缺少 projectId，无法执行对账')
@@ -219,107 +416,10 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
 
     console.warn('[SyncEngine] Revision conflict, reconciling...')
     const serverSegments = await projectApi.getSubtitles(projectId)
-    const replayCommands = pendingCommands.value.map((command) => ({
-      ...command,
-      source: 'reconcile_replay',
-    }))
-    const preservedTombstones = [...docStore.tombstones]
-
-    // 1. 移除所有尚未绑定 segment_id 的乐观本地实体，后续靠 replay 恢复。
-    for (const localId of [...docStore.order]) {
-      const cold = docStore.getCold(localId)
-      if (!cold?.segmentId) {
-        docStore._applyDelete(localId)
-      }
-    }
-
-    // 2. 用服务端权威快照覆盖所有已绑定实体。
-    const seenSegmentIds = new Set()
-    for (const rawSegment of serverSegments) {
-      const snapshot = toServerSegmentSnapshot(rawSegment)
-      if (!snapshot.segmentId) continue
-
-      seenSegmentIds.add(snapshot.segmentId)
-      const localId = preserveOrCreateLocalId(docStore, snapshot.segmentId)
-      const existingEntity = docStore.getEntity(localId)
-      const existingCold = docStore.getCold(localId)
-
-      if (existingEntity) {
-        docStore._applyUpdate(localId, {
-          text: snapshot.text,
-          startMs: snapshot.startMs,
-          endMs: snapshot.endMs,
-          isDraft: false,
-          isModified: existingEntity.isModified,
-        })
-        docStore._applyReorder(localId)
-        if (existingCold) {
-          docStore._applyColdUpdate(localId, {
-            segmentId: snapshot.segmentId,
-            sentenceIndex: snapshot.sentenceIndex,
-            confidence: snapshot.confidence,
-            displayConfidence: snapshot.displayConfidence,
-            confidenceSource: snapshot.confidenceSource,
-            warningType: snapshot.warningType,
-            sourceType: snapshot.sourceType,
-            words: snapshot.words,
-          })
-          docStore.updateColdBinding(localId, snapshot.segmentId)
-        }
-      } else {
-        docStore._applyInsert(
-          localId,
-          {
-            localId,
-            text: snapshot.text,
-            startMs: snapshot.startMs,
-            endMs: snapshot.endMs,
-            isDraft: false,
-            isModified: false,
-            isDeleted: false,
-            revision: 0,
-          },
-          {
-            localId,
-            segmentId: snapshot.segmentId,
-            sentenceIndex: snapshot.sentenceIndex,
-            chunkId: null,
-            words: snapshot.words,
-            confidence: snapshot.confidence,
-            displayConfidence: snapshot.displayConfidence,
-            confidenceSource: snapshot.confidenceSource,
-            speakerId: null,
-            sourceType: snapshot.sourceType,
-            warningType: snapshot.warningType,
-            originalText: null,
-          },
-          null
-        )
-      }
-    }
-
-    // 3. 删除服务端快照中已不存在的旧绑定实体。
-    for (const localId of [...docStore.order]) {
-      const cold = docStore.getCold(localId)
-      if (cold?.segmentId && !seenSegmentIds.has(cold.segmentId)) {
-        docStore._applyDelete(localId)
-      }
-    }
-
-    // 4. 恢复 tombstone，避免对账过程污染删除同步语义。
-    docStore.tombstones = preservedTombstones
-
-    // 5. 在权威快照上重放未确认命令，但不进入 history/sync/persistence。
-    for (const command of replayCommands) {
-      const result = editorReducer(docStore, command)
-      if (!result.success) {
-        console.warn('[SyncEngine] 对账回放命令失败，已跳过:', command.type, result.reason)
-      }
-    }
-
-    if (serverRevision !== null && serverRevision !== undefined) {
-      sessionStore.ackedRevision = serverRevision
-    }
+    applyAuthoritativeSegments(serverSegments, {
+      serverRevision,
+      preservePendingCommands: true,
+    })
   }
 
   function commandToEditorOp(command) {
@@ -493,7 +593,9 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
     lastSyncTime,
     enqueue,
     flush,
+    reset,
     applyBindings,
+    applyAuthoritativeSegments,
     reconcile,
     commandToEditorOp,
   }

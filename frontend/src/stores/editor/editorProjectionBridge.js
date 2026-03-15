@@ -38,6 +38,11 @@ export const useEditorProjectionBridge = defineStore('editorProjectionBridge', (
   const selectedSubtitleIdState = ref(null)
 
   const subtitles = computed(() => {
+    // 显式依赖文档修订号，确保 startMs/endMs 等热字段原地更新后投影仍会刷新。
+    const documentRevision = docStore.revision
+    if (documentRevision) {
+      documentRevision.value
+    }
     const offsetSec = Number(projectStore.subtitleOffset) || 0
 
     return docStore.order

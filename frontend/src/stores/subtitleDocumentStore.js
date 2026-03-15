@@ -9,6 +9,7 @@ import { useProjectStore } from './projectStore'
 import { useTaskRuntimeStore } from './taskRuntimeStore'
 import { useEditorDocumentStore } from './editor/editorDocumentStore'
 import { useEditorProjectionBridge } from './editor/editorProjectionBridge'
+import { useEditorSyncEngine } from './editor/editorSyncEngine'
 
 const EDIT_QUEUE_PREFIX = 'subtitle-edit-queue-'
 const TERMINAL_STATUSES = new Set(['finished', 'canceled', 'force_canceled', 'removed', 'failed'])
@@ -47,6 +48,7 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
   const taskRuntimeStore = useTaskRuntimeStore()
   const docStore = useEditorDocumentStore()
   const editorProjectionBridge = useEditorProjectionBridge()
+  const syncEngine = useEditorSyncEngine()
   const useEditorV2 = isFeatureEnabled('USE_EDITOR_V2')
 
   const activeJobId = ref(null)
@@ -240,7 +242,14 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
   }
 
   async function restoreFromServer(segments = [], metadata = {}) {
+    if (useEditorV2) {
+      void metadata
+      return syncEngine.applyAuthoritativeSegments(segments, {
+        preservePendingCommands: true,
+      })
+    }
     projectStore.loadFromProjectData(segments, metadata)
+    return Array.isArray(segments) ? segments.length : 0
   }
 
   async function applyLocalEditQueue(identityId = null) {
@@ -248,10 +257,16 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
     if (!resolvedIdentityId) return 0
 
     await bindSyncIdentity(resolvedIdentityId)
+    if (useEditorV2) {
+      return 0
+    }
     return applyPendingEditsToStore(projectStore)
   }
 
   function applyPendingEditsToStore(targetStore = projectStore) {
+    if (useEditorV2) {
+      return 0
+    }
     if (!targetStore || pendingUpdates.value.size === 0) return 0
 
     let appliedCount = 0
