@@ -6,6 +6,60 @@ import { useEditorCommandBus } from './editorCommandBus'
 let pendingCommands = []
 let flushScheduled = false
 
+function secondsToMs(sessionStore, value) {
+  return sessionStore.secondsToMs(value || 0)
+}
+
+function normalizeChunkId(data) {
+  return data?.chunk_uid ?? data?.chunk_id ?? data?.chunk_index ?? null
+}
+
+function mapWords(words, sessionStore) {
+  if (!Array.isArray(words)) {
+    return null
+  }
+
+  return words.map((word) => ({
+    startMs: secondsToMs(sessionStore, word?.start),
+    endMs: secondsToMs(sessionStore, word?.end ?? word?.start),
+    text: word?.text || word?.word || '',
+  }))
+}
+
+function buildServerEntity(sentence, sessionStore, options = {}) {
+  const {
+    localId,
+    sentenceIndex = null,
+    chunkId = null,
+    isDraft = false,
+    fallbackSource = 'unknown',
+  } = options
+
+  return {
+    localId,
+    text: sentence?.text || '',
+    startMs: secondsToMs(sessionStore, sentence?.start),
+    endMs: secondsToMs(sessionStore, sentence?.end),
+    cold: {
+      segmentId: sentence?.segment_id ?? null,
+      sentenceIndex,
+      chunkId,
+      sourceType: sentence?.source || sentence?.source_type || fallbackSource,
+      confidence: sentence?.confidence ?? null,
+      displayConfidence: sentence?.display_confidence ?? null,
+      confidenceSource: sentence?.confidence_source ?? null,
+      words: mapWords(sentence?.words, sessionStore),
+      warningType: sentence?.warning_type || 'none',
+      originalText: sentence?.original_text ?? sentence?.text ?? null,
+      speakerId: isDraft ? null : (sentence?.speaker_id ?? null),
+      speakerLabel: isDraft ? null : (sentence?.speaker_label ?? null),
+      speakerColorKey: isDraft ? null : (sentence?.speaker_color_key ?? null),
+      turnId: isDraft ? null : (sentence?.turn_id ?? null),
+      bindingSource: isDraft ? null : (sentence?.binding_source ?? null),
+    },
+  }
+}
+
 export function useEditorEventProjector() {
 
   function scheduleFlush() {
@@ -51,28 +105,18 @@ export function useEditorEventProjector() {
         localId,
         entity: {
           text: sentence.text || '',
-          startMs: sessionStore.secondsToMs(sentence.start || 0),
-          endMs: sessionStore.secondsToMs(sentence.end || 0),
+          startMs: secondsToMs(sessionStore, sentence.start),
+          endMs: secondsToMs(sessionStore, sentence.end),
           isDraft: true
         },
         afterLocalId: null,
-        coldInit: {
+        coldInit: buildServerEntity(sentence, sessionStore, {
           localId,
-          segmentId: null,
           sentenceIndex,
-          chunkId: data.chunk_uid || null,
-          sourceType: sentence.source || 'sensevoice',
-          confidence: sentence.confidence ?? null,
-          words: sentence.words
-            ? sentence.words.map(w => ({
-                startMs: sessionStore.secondsToMs(w.start || 0),
-                endMs: sessionStore.secondsToMs(w.end || 0),
-                text: w.text || ''
-              }))
-            : null,
-          warningType: 'none',
-          originalText: sentence.text || null
-        }
+          chunkId: normalizeChunkId(data),
+          isDraft: true,
+          fallbackSource: 'sensevoice',
+        }).cold,
       }
       pendingCommands.push(cmd)
     }
@@ -83,36 +127,21 @@ export function useEditorEventProjector() {
   function projectReplaceChunk(data) {
     const sessionStore = useEditorSessionStore()
     const docStore = useEditorDocumentStore()
+    const chunkId = normalizeChunkId(data)
 
     const oldLocalIds = (data.old_indices || [])
       .map(idx => docStore.bindingBySentenceIndex.get(idx))
       .filter(Boolean)
 
     const newEntities = data.sentences.map((sentence, i) => {
-      const localId = sessionStore.nextLocalId()
       const sentenceIndex = data.new_indices[i]
-      return {
+      const localId = docStore.bindingBySentenceIndex.get(sentenceIndex) || sessionStore.nextLocalId()
+      return buildServerEntity(sentence, sessionStore, {
         localId,
-        text: sentence.text || '',
-        startMs: sessionStore.secondsToMs(sentence.start || 0),
-        endMs: sessionStore.secondsToMs(sentence.end || 0),
-        cold: {
-          segmentId: null,
-          sentenceIndex,
-          chunkId: data.chunk_uid || null,
-          sourceType: sentence.source || 'sensevoice',
-          confidence: sentence.confidence ?? null,
-          words: sentence.words
-            ? sentence.words.map(w => ({
-                startMs: sessionStore.secondsToMs(w.start || 0),
-                endMs: sessionStore.secondsToMs(w.end || 0),
-                text: w.text || ''
-              }))
-            : null,
-          warningType: 'none',
-          originalText: sentence.text || null
-        }
-      }
+        sentenceIndex,
+        chunkId,
+        fallbackSource: 'sensevoice',
+      })
     })
 
     pendingCommands.push({
@@ -125,6 +154,52 @@ export function useEditorEventProjector() {
     })
 
     scheduleFlush()
+  }
+
+  function projectRestored(data) {
+    const sessionStore = useEditorSessionStore()
+    const docStore = useEditorDocumentStore()
+    const sentences = Array.isArray(data?.sentences) ? data.sentences : []
+    if (sentences.length === 0) {
+      return false
+    }
+
+    const chunkId = normalizeChunkId(data)
+    const oldLocalIds = chunkId === null
+      ? []
+      : docStore.order.filter((localId) => docStore.getCold(localId)?.chunkId === chunkId)
+    const fallbackReplaceIds = sentences
+      .map((sentence) => docStore.bindingBySentenceIndex.get(sentence?.index))
+      .filter(Boolean)
+    const replaceIds = [...new Set(oldLocalIds.length > 0 ? oldLocalIds : fallbackReplaceIds)]
+
+    const newEntities = sentences.map((sentence) => {
+      const sentenceIndex = sentence?.index ?? null
+      const boundLocalId = sentenceIndex === null
+        ? null
+        : docStore.bindingBySentenceIndex.get(sentenceIndex)
+      const localId = boundLocalId || sessionStore.nextLocalId()
+
+      return buildServerEntity(sentence, sessionStore, {
+        localId,
+        sentenceIndex,
+        chunkId,
+        isDraft: Boolean(sentence?.is_draft),
+        fallbackSource: 'restored',
+      })
+    })
+
+    pendingCommands.push({
+      type: 'apply_server_replace',
+      commandId: sessionStore.nextCommandId(),
+      source: 'system',
+      createdAt: Date.now(),
+      oldLocalIds: replaceIds,
+      newEntities,
+    })
+
+    scheduleFlush()
+    return true
   }
 
   function projectFinalized(data) {
@@ -239,6 +314,7 @@ export function useEditorEventProjector() {
   return {
     projectDraft,
     projectReplaceChunk,
+    projectRestored,
     projectFinalized,
     projectRevised,
     projectServerSnapshot,

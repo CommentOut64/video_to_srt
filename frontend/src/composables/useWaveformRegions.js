@@ -336,6 +336,8 @@ export function useWaveformRegions(
       if (!result?.success) {
         return false
       }
+
+      setSelectedSubtitleId(localId)
     } else {
       const subtitle = getSubtitleList().find((s) => s.id === regionId)
       if (!subtitle) return false
@@ -367,6 +369,8 @@ export function useWaveformRegions(
       if (syncKey !== undefined && syncKey !== null) {
         debouncedRegionSync(syncKey, nextStart, nextEnd)
       }
+
+      setSelectedSubtitleId(subtitle.id)
     }
 
     const emittedRegion = regionSnapshot.region ?? {

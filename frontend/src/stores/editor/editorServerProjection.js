@@ -18,6 +18,26 @@ function resolveSentenceIndex(rawSegment) {
   return Number.isFinite(numeric) ? numeric : null
 }
 
+function resolvePatchLocalId(docStore, rawSentence) {
+  const sentenceIndex = resolveSentenceIndex(rawSentence)
+  if (sentenceIndex !== null) {
+    const localId = docStore.bindingBySentenceIndex.get(sentenceIndex)
+    if (localId) {
+      return localId
+    }
+  }
+
+  const segmentId = normalizeSegmentId(rawSentence?.segment_id)
+  if (segmentId) {
+    const localId = docStore.bindingBySegmentId.get(segmentId)
+    if (localId) {
+      return localId
+    }
+  }
+
+  return null
+}
+
 function normalizeWords(words) {
   if (!Array.isArray(words)) {
     return null
@@ -173,12 +193,7 @@ export function applySentencePatch(docStore, rawSentence) {
     return false
   }
 
-  const sentenceIndex = resolveSentenceIndex(rawSentence)
-  if (sentenceIndex === null) {
-    return false
-  }
-
-  const localId = docStore.bindingBySentenceIndex.get(sentenceIndex)
+  const localId = resolvePatchLocalId(docStore, rawSentence)
   if (!localId) {
     return false
   }
@@ -220,9 +235,13 @@ export function applySentencePatch(docStore, rawSentence) {
     return Object.keys(hotPatch).length > 0
   }
 
+  const sentenceIndex = resolveSentenceIndex(rawSentence) ?? currentCold.sentenceIndex ?? null
   const coldPatch = {}
   if (rawSentence.segment_id !== undefined) {
     coldPatch.segmentId = normalizeSegmentId(rawSentence.segment_id) || null
+  }
+  if (rawSentence.chunk_id !== undefined || rawSentence.chunk_uid !== undefined) {
+    coldPatch.chunkId = rawSentence.chunk_id ?? rawSentence.chunk_uid ?? null
   }
   if (Array.isArray(rawSentence.words)) {
     coldPatch.words = normalizeWords(rawSentence.words)

@@ -245,6 +245,11 @@ function handleClick() {
   background: var(--af-bg-tertiary);
 }
 
+.subtitle-row.is-selected:not(.is-active):not(.is-current) {
+  border-color: rgb(var(--af-accent-primary-rgb), 0.35);
+  background: rgb(var(--af-accent-primary-rgb), 0.04);
+}
+
 .subtitle-row.is-active:not(.is-current) {
   border-color: var(--af-accent-primary);
   background: rgb(var(--af-accent-primary-rgb), 0.08);
@@ -285,6 +290,11 @@ function handleClick() {
 .subtitle-row.is-current .item-index {
   background: var(--af-accent-success);
   color: var(--af-text-inverse);
+}
+
+.subtitle-row.is-selected:not(.is-active):not(.is-current) .item-index {
+  background: rgb(var(--af-accent-primary-rgb), 0.16);
+  color: var(--af-accent-primary);
 }
 
 .subtitle-row.is-active:not(.is-current) .item-index {

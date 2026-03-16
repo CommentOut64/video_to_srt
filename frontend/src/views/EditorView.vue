@@ -1796,7 +1796,8 @@ function handleRestoredChunk(data) {
   if (!data) return
 
   if (useEditorV2) {
-    if (projectStore.meta.projectId) {
+    const applied = editorEventProjector.projectRestored(data)
+    if (!applied && projectStore.meta.projectId) {
       void scheduleEditorProjectionReload(
         projectStore.meta.projectId,
         `subtitle_restored_${data.chunk_index ?? 'unknown'}`
@@ -1850,16 +1851,22 @@ function handleRestoredChunk(data) {
 function handleSubtitleDeleted(data) {
   if (!data) return
   const sentenceIndex = data.index ?? data.sentence_index
-  if (sentenceIndex === undefined || sentenceIndex === null) return
   if (useEditorV2) {
+    if (data.segment_id) {
+      const deleted = deleteServerSegment(editorDocumentStore, data.segment_id)
+      if (deleted) {
+        return
+      }
+    }
     if (projectStore.meta.projectId) {
       void scheduleEditorProjectionReload(
         projectStore.meta.projectId,
-        `subtitle_deleted_${sentenceIndex}`
+        `subtitle_deleted_${sentenceIndex ?? data.segment_id ?? 'unknown'}`
       )
     }
     return
   }
+  if (sentenceIndex === undefined || sentenceIndex === null) return
   projectStore.markSentenceDeleted(sentenceIndex)
   const target = projectStore.subtitles.find((s) => s.sentenceIndex === sentenceIndex)
   if (target) {
@@ -1872,18 +1879,24 @@ function handleSubtitleEdited(data) {
 
   const sentence = data.sentence || {}
   const sentenceIndex = data.index ?? data.sentence_index ?? sentence.index
-  if (sentenceIndex === undefined || sentenceIndex === null) return
+  const segmentId = data.segment_id ?? sentence.segment_id
+  if ((sentenceIndex === undefined || sentenceIndex === null) && !segmentId) return
 
   if (useEditorV2) {
     const applied = applySentencePatch(editorDocumentStore, {
       ...sentence,
-      index: sentenceIndex,
-      sentence_index: sentenceIndex,
+      ...(sentenceIndex !== undefined && sentenceIndex !== null
+        ? {
+            index: sentenceIndex,
+            sentence_index: sentenceIndex,
+          }
+        : {}),
+      ...(segmentId ? { segment_id: segmentId } : {}),
     })
     if (!applied && projectStore.meta.projectId) {
       void scheduleEditorProjectionReload(
         projectStore.meta.projectId,
-        `subtitle_edited_${sentenceIndex}`
+        `subtitle_edited_${sentenceIndex ?? segmentId ?? 'unknown'}`
       )
     }
     return

@@ -27,7 +27,7 @@
             <SubtitleRow
               :local-id="item"
               :row-index="index"
-              :is-selected="false"
+              :is-selected="selectedLocalId === item"
               :is-active="activeId === item"
               :is-current="currentSubtitleId === item"
               @click="handleRowClick"
