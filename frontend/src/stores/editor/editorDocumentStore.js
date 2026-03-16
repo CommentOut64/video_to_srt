@@ -115,6 +115,22 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     return token
   }
 
+  function clearMatchingTombstones({ localId = null, segmentId = null } = {}) {
+    if (!localId && !segmentId) {
+      return
+    }
+
+    tombstones.value = tombstones.value.filter((item) => {
+      if (localId && item.localId === localId) {
+        return false
+      }
+      if (segmentId && item.segmentId === segmentId) {
+        return false
+      }
+      return true
+    })
+  }
+
   // ─── 原子写操作（仅由 reducer 调用） ───
   function _applyInsert(localId, hot, cold, afterLocalId) {
     const nextHot = {
@@ -128,6 +144,10 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
       const nextCold = markRaw({
         ...cold,
         localId,
+      })
+      clearMatchingTombstones({
+        localId,
+        segmentId: nextCold.segmentId ?? null,
       })
       coldEntities.set(localId, nextCold)
       if (nextCold.segmentId) {
@@ -158,6 +178,10 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
 
     const cold = coldEntities.get(localId)
     if (cold?.segmentId) {
+      clearMatchingTombstones({
+        localId,
+        segmentId: cold.segmentId,
+      })
       tombstones.value = [...tombstones.value, {
         localId,
         segmentId: cold.segmentId,
@@ -231,6 +255,10 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     })
     coldEntities.set(localId, nextCold)
     if (segmentId) {
+      clearMatchingTombstones({
+        localId,
+        segmentId,
+      })
       bindingBySegmentId.set(segmentId, localId)
     }
     revision.value++

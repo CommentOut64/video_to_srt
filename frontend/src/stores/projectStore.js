@@ -79,8 +79,8 @@ export const useProjectStore = defineStore("project", () => {
 
   const {
     history,
-    undo,
-    redo,
+    undo: rawUndo,
+    redo: rawRedo,
     canUndo,
     canRedo,
     clear: clearHistory,
@@ -93,6 +93,25 @@ export const useProjectStore = defineStore("project", () => {
     clone: useDeepHistory,
     flush: 'sync',
   });
+
+  function assertLegacySubtitleMutationAllowed(methodName) {
+    if (!FEATURE_FLAGS.USE_EDITOR_V2) {
+      return;
+    }
+    throw new Error(
+      `[ProjectStore] ${methodName} 在 USE_EDITOR_V2 下已禁用；请改走 editorCommandBus / editorDocumentStore 新链路`
+    );
+  }
+
+  function undo() {
+    assertLegacySubtitleMutationAllowed("undo");
+    rawUndo();
+  }
+
+  function redo() {
+    assertLegacySubtitleMutationAllowed("redo");
+    rawRedo();
+  }
 
   // ========== 4. 播放器全局状态 ==========
   const player = ref({
@@ -632,6 +651,7 @@ export const useProjectStore = defineStore("project", () => {
    * 更新字幕内容
    */
   function updateSubtitle(id, payload, options = {}) {
+    assertLegacySubtitleMutationAllowed("updateSubtitle");
     const index = subtitles.value.findIndex((s) => s.id === id);
     if (index === -1) return;
 
@@ -687,6 +707,7 @@ export const useProjectStore = defineStore("project", () => {
    * V3.1.2+dev.20260112.01: 补齐 sentenceIndex、display_confidence、confidence_source 字段
    */
   function addSubtitle(insertIndex, payload) {
+    assertLegacySubtitleMutationAllowed("addSubtitle");
     const newSubtitle = {
       id: `subtitle-${Date.now()}`,
       sentenceIndex: payload.sentenceIndex,  // V3.1.2: 全局句子索引
@@ -714,6 +735,7 @@ export const useProjectStore = defineStore("project", () => {
    * 删除字幕
    */
   function removeSubtitle(id, options = {}) {
+    assertLegacySubtitleMutationAllowed("removeSubtitle");
     const index = subtitles.value.findIndex((s) => s.id === id);
     if (index !== -1) {
       const subtitle = subtitles.value[index];
@@ -761,6 +783,7 @@ export const useProjectStore = defineStore("project", () => {
    * @returns {Object|null} 切分结果 { success, leftId, rightId, error }
    */
   function splitSubtitle(id, options = {}) {
+    assertLegacySubtitleMutationAllowed("splitSubtitle");
     const { splitTime, cursorPosition } = options;
 
     // 1. 查找目标字幕
@@ -1023,6 +1046,7 @@ export const useProjectStore = defineStore("project", () => {
    * @returns {Object} { success, keptSubtitle, removedSubtitle, error }
    */
   function mergeSubtitles(id, direction) {
+    assertLegacySubtitleMutationAllowed("mergeSubtitles");
     // 1. 查找当前字幕
     const index = subtitles.value.findIndex((s) => s.id === id);
     if (index === -1) {

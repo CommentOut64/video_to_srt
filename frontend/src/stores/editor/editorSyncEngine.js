@@ -208,7 +208,12 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
   let inflightPushPromise = null
 
   function enqueue(command) {
-    if (command.source === 'system' || command.source === 'rehydrate' || command.source === 'reconcile_replay') {
+    if (
+      command.source === 'system'
+      || command.source === 'rehydrate'
+      || command.source === 'reconcile_replay'
+      || command.source === 'undo_redo'
+    ) {
       return
     }
 
@@ -532,7 +537,7 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
           op_id: command.commandId,
           type: 'split_subtitle',
           client_ref_id: command.sourceLocalId,
-          segment_id: cold?.segmentId || null,
+          segment_id: command.sourceSegmentId ?? cold?.segmentId ?? null,
           created_client_ref_id: command.createdLocalId,
           split_at_ms: command.splitAtMs,
           split_at_text_offset: command.splitAtTextOffset,
@@ -562,8 +567,8 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
           type: 'merge_subtitle',
           kept_client_ref_id: command.keptLocalId,
           removed_client_ref_id: command.removedLocalId,
-          kept_segment_id: keptCold?.segmentId || null,
-          removed_segment_id: removedCold?.segmentId || null,
+          kept_segment_id: command.keptSegmentId ?? keptCold?.segmentId ?? null,
+          removed_segment_id: command.removedSegmentId ?? removedCold?.segmentId ?? null,
           before_kept: {
             text: command.beforeKept.text,
             start_ms: command.beforeKept.startMs,
