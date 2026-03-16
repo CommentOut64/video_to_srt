@@ -94,7 +94,7 @@
                 </button>
               </template>
             </el-popover>
-            <!-- R1C4: 忽略标点（同音模式显示，否则隐藏占位） -->
+            <!-- R1C4: 忽略标点（近音模式显示，否则隐藏占位） -->
             <el-popover
               :content="isIgnorePunctuation ? '取消忽略标点' : '忽略标点'"
               placement="top"
@@ -184,7 +184,12 @@
 
 import { ref, computed, watch } from 'vue'
 import { Filter } from '@element-plus/icons-vue'
-import { SearchMode, SortMode, IndexStatus } from '@/composables/useHomophoneSearch'
+import {
+  SearchMode,
+  SortMode,
+  IndexStatus,
+  normalizeVisibleSearchMode,
+} from '@/composables/useHomophoneSearch'
 
 const props = defineProps({
   totalSubtitles: { type: Number, default: 0 },
@@ -236,8 +241,8 @@ watch(
 
 // 可写计算属性
 const searchMode = computed({
-  get: () => props.searchMode,
-  set: (val) => emit('update:searchMode', val),
+  get: () => normalizeVisibleSearchMode(props.searchMode),
+  set: (val) => emit('update:searchMode', normalizeVisibleSearchMode(val)),
 })
 
 const replaceText = computed({
@@ -254,22 +259,19 @@ const isIgnorePunctuation = computed({
 const isLiteralMode = computed(() => props.searchMode === SearchMode.LITERAL)
 
 const isHomophoneMode = computed(() => {
-  return (
-    props.searchMode === SearchMode.HOMOPHONE_STRICT ||
-    props.searchMode === SearchMode.HOMOPHONE_FUZZY
-  )
+  return normalizeVisibleSearchMode(props.searchMode) === SearchMode.HOMOPHONE_FUZZY
 })
 
 const currentModeLabel = computed(() => {
-  const option = searchModeOptions.find((o) => o.value === props.searchMode)
+  const currentMode = normalizeVisibleSearchMode(props.searchMode)
+  const option = searchModeOptions.find((o) => o.value === currentMode)
   return option ? `搜索模式: ${option.label}` : '搜索模式'
 })
 
 const searchPlaceholder = computed(() => {
-  switch (props.searchMode) {
+  switch (normalizeVisibleSearchMode(props.searchMode)) {
     case SearchMode.REGEX:
       return '正则表达式...'
-    case SearchMode.HOMOPHONE_STRICT:
     case SearchMode.HOMOPHONE_FUZZY:
       return '文字或拼音...'
     default:
@@ -280,13 +282,12 @@ const searchPlaceholder = computed(() => {
 const searchModeOptions = [
   { label: '精确', value: SearchMode.LITERAL },
   { label: '正则', value: SearchMode.REGEX },
-  { label: '同音', value: SearchMode.HOMOPHONE_STRICT },
   { label: '近音', value: SearchMode.HOMOPHONE_FUZZY },
 ]
 
 // 事件处理
 function handleModeChange(mode) {
-  emit('update:searchMode', mode)
+  emit('update:searchMode', normalizeVisibleSearchMode(mode))
   modePopoverRef.value?.hide?.()
 }
 
@@ -296,7 +297,7 @@ function toggleIgnorePunctuation() {
 
 function handleSearch() {
   emit('update:searchText', localSearchText.value)
-  // 统一进入“搜索命中态”，保证精确/正则/同音三类模式都可执行批量替换。
+  // 统一进入“搜索命中态”，保证精确/正则/近音三类模式都可执行批量替换。
   emit('search')
 }
 

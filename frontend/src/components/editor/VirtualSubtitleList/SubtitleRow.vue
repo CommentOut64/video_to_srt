@@ -1,4 +1,4 @@
-<!-- V3.2.5+dev.20260315.21: SubtitleRow - 虚拟列表行组件（移除行级 memo 缓存） -->
+<!-- V3.2.5+dev.20260316.01: SubtitleRow - 接入搜索高亮、warning 与词级高亮 -->
 <template>
   <div
     class="subtitle-row"
@@ -7,16 +7,30 @@
       'is-active': isActive,
       'is-current': isCurrent,
       'is-draft': entity?.isDraft,
-      'is-modified': entity?.isModified
+      'is-modified': entity?.isModified,
+      'is-match-selected': isMatchSelected,
+      'has-cluster-color': Boolean(clusterColor),
     }"
     @click="handleClick"
   >
-    <!-- 序号 -->
+    <div
+      v-if="clusterColor"
+      class="cluster-color-bar"
+      :style="{ backgroundColor: clusterColor }"
+    />
+
+    <el-checkbox
+      v-if="isSelectable"
+      :model-value="isMatchSelected"
+      size="small"
+      class="item-checkbox"
+      @click.stop
+      @change="handleSelectChange"
+    />
+
     <div class="item-index">{{ rowIndex + 1 }}</div>
 
-    <!-- 主内容 -->
     <div class="item-content">
-      <!-- 时间行 -->
       <div class="time-row">
         <input
           type="text"
@@ -41,23 +55,34 @@
         />
         <span class="duration-tag">{{ formatDuration(entity?.endMs - entity?.startMs) }}</span>
 
-        <!-- 草稿状态指示器 -->
         <span v-if="entity?.isDraft" class="draft-indicator">
           <span class="spinner"></span>
           <span class="draft-text">生成中</span>
         </span>
+
+        <el-tooltip
+          v-if="showConfidenceBadge"
+          :content="`准确率: ${displayConfidenceText}（来源: ${confidenceSourceText}）`"
+          placement="top"
+          :show-after="500"
+        >
+          <span
+            class="confidence-badge"
+            :class="confidenceBadgeClass"
+          >
+            {{ displayConfidenceText }}
+          </span>
+        </el-tooltip>
       </div>
 
-      <!-- 文本行 -->
       <div class="text-row">
         <div
           v-if="!isEditing"
           class="text-display"
           :class="{ 'can-edit': !entity?.isDraft }"
           @click.stop="startEditing"
-        >
-          {{ displayText }}
-        </div>
+          v-html="renderTextWithHighlight()"
+        ></div>
         <textarea
           v-else
           ref="textareaRef"
@@ -69,11 +94,14 @@
           @keydown.escape="cancelEditing"
           placeholder="输入字幕文本..."
         />
-        <span class="char-count">{{ displayText.length }}</span>
+        <span class="char-count">{{ (isEditing ? editingText : displayText).length }}</span>
+      </div>
+
+      <div v-if="showWarning" class="warning-banner">
+        <span class="warning-text">{{ warningMessage }}</span>
       </div>
     </div>
 
-    <!-- 操作按钮 -->
     <div v-if="!entity?.isDraft" class="item-actions" @click.stop>
       <button class="action-btn" @click="$emit('insert-before')">
         <svg viewBox="0 0 24 24" fill="currentColor">
@@ -87,7 +115,6 @@
       </button>
     </div>
 
-    <!-- 删除按钮 -->
     <button
       v-if="!entity?.isDraft"
       class="delete-btn"
@@ -101,39 +128,44 @@
 </template>
 
 <script setup>
-// V3.2.5+dev.20260315.21: 行级 selector，依赖不可变实体替换触发刷新
-import { computed, ref, nextTick } from 'vue'
-import { useEditorDocumentStore } from '@/stores/editor/editorDocumentStore'
+import { computed, nextTick, ref } from 'vue'
 import { useEditorCommandBus } from '@/stores/editor/editorCommandBus'
+import { useEditorDocumentStore } from '@/stores/editor/editorDocumentStore'
 import { useEditorDraftStore } from '@/stores/editor/editorDraftStore'
-import { useProjectStore } from '@/stores/projectStore'
+import { useEditorProjectionBridge } from '@/stores/editor/editorProjectionBridge'
 import { createUpdateTextCommand, createUpdateTimingCommand } from '@/stores/editor/editorCommandFactory'
+import { useProjectStore } from '@/stores/projectStore'
 
 const props = defineProps({
   localId: { type: String, required: true },
   rowIndex: { type: Number, required: true },
   isSelected: { type: Boolean, default: false },
   isActive: { type: Boolean, default: false },
-  isCurrent: { type: Boolean, default: false }
+  isCurrent: { type: Boolean, default: false },
+  matchSpans: { type: Array, default: () => [] },
+  isMatchSelected: { type: Boolean, default: false },
+  isSelectable: { type: Boolean, default: false },
+  clusterColor: { type: String, default: null },
 })
 
-const emit = defineEmits(['click', 'insert-before', 'insert-after', 'delete'])
+const emit = defineEmits(['click', 'insert-before', 'insert-after', 'delete', 'select-change'])
 
-const docStore = useEditorDocumentStore()
 const commandBus = useEditorCommandBus()
+const docStore = useEditorDocumentStore()
 const draftStore = useEditorDraftStore()
+const editorProjectionBridge = useEditorProjectionBridge()
 const projectStore = useProjectStore()
 
-// 行级 selector：只订阅当前行的版本令牌
 const entity = computed(() => {
   const token = docStore.entityVersionTokens.get(props.localId)
   if (token) {
-    token.value // 建立响应式依赖
+    token.value
   }
   return docStore.entities.get(props.localId)
 })
 
-// 草稿优先显示
+const subtitle = computed(() => editorProjectionBridge.findSubtitleById(props.localId))
+
 const displayText = computed(() => {
   const draft = draftStore.activeTextDraft
   if (draft?.localId === props.localId) {
@@ -142,10 +174,52 @@ const displayText = computed(() => {
   return entity.value?.text || ''
 })
 
-// 编辑状态
 const isEditing = ref(false)
 const editingText = ref('')
 const textareaRef = ref(null)
+let highlightCacheText = null
+let highlightCacheWords = null
+let highlightCacheMatchSpans = null
+let highlightCacheHtml = ''
+
+const showConfidenceBadge = computed(() => {
+  return subtitle.value?.display_confidence !== undefined && subtitle.value?.display_confidence !== null
+})
+
+const confidenceBadgeClass = computed(() => {
+  const conf = subtitle.value?.display_confidence
+  if (conf >= 0.85) return 'badge-good'
+  if (conf >= 0.68) return 'badge-warning'
+  return 'badge-danger'
+})
+
+const displayConfidenceText = computed(() => {
+  const conf = subtitle.value?.display_confidence
+  if (conf === undefined || conf === null) return ''
+  return `${Math.round(conf * 100)}%`
+})
+
+const confidenceSourceText = computed(() => {
+  const source = subtitle.value?.confidence_source
+  if (source === 'whisper') return 'Whisper'
+  if (source === 'sensevoice') return 'SenseVoice'
+  if (source === 'manual') return '手动编辑'
+  if (source === 'srt_fallback') return '导入文件'
+  return source || '未知'
+})
+
+const showWarning = computed(() => {
+  return subtitle.value?.warning_type && subtitle.value.warning_type !== 'none'
+})
+
+const warningMessage = computed(() => {
+  const messages = {
+    low_confidence: '低置信度，建议人工审核',
+    high_perplexity: 'LLM 困惑度较高，可能有语法问题',
+    both: '低置信度 + 高困惑度，强烈建议审核',
+  }
+  return messages[subtitle.value?.warning_type] || ''
+})
 
 function startEditing() {
   if (entity.value?.isDraft) return
@@ -186,14 +260,14 @@ function formatTime(ms) {
 
 function formatDuration(ms) {
   if (!ms || ms < 0) return '0.0s'
-  return (ms / 1000).toFixed(1) + 's'
+  return `${(ms / 1000).toFixed(1)}s`
 }
 
 function parseTime(timeStr) {
   const match = timeStr.match(/(\d+):(\d+)\.(\d+)/)
   if (!match) return null
   const [, minutes, seconds, milliseconds] = match
-  return parseInt(minutes) * 60000 + parseInt(seconds) * 1000 + parseInt(milliseconds)
+  return parseInt(minutes, 10) * 60000 + parseInt(seconds, 10) * 1000 + parseInt(milliseconds, 10)
 }
 
 function handleTimeUpdate(type, value) {
@@ -201,7 +275,6 @@ function handleTimeUpdate(type, value) {
   if (displayMs === null) return
 
   const newMs = Math.round(projectStore.toBaseTime(displayMs / 1000) * 1000)
-
   const before = { startMs: entity.value?.startMs, endMs: entity.value?.endMs }
   const after = { ...before }
   if (type === 'start') after.startMs = newMs
@@ -222,10 +295,152 @@ function handleTimeUpdate(type, value) {
 function handleClick() {
   emit('click', props.localId)
 }
+
+function handleSelectChange(checked) {
+  emit('select-change', checked)
+}
+
+function renderTextWithHighlight() {
+  const text = displayText.value || ''
+  const matchSpans = props.matchSpans
+  const words = subtitle.value?.words
+
+  if (
+    highlightCacheText === text
+    && highlightCacheWords === words
+    && highlightCacheMatchSpans === matchSpans
+  ) {
+    return highlightCacheHtml
+  }
+
+  let html = ''
+
+  if (matchSpans && matchSpans.length > 0) {
+    html = renderMatchHighlight(text, matchSpans)
+    highlightCacheText = text
+    highlightCacheWords = words
+    highlightCacheMatchSpans = matchSpans
+    highlightCacheHtml = html
+    return html
+  }
+
+  if (!words || words.length === 0) {
+    html = escapeHtml(text)
+    highlightCacheText = text
+    highlightCacheWords = words
+    highlightCacheMatchSpans = matchSpans
+    highlightCacheHtml = html
+    return html
+  }
+
+  if (words.length === 1) {
+    const raw = words[0].word || ''
+    const chars = [...raw]
+    const isCjkChar = (char) => /[\u4e00-\u9fff]/.test(char)
+    const isFullWidthPunctuation = (char) => /[，。！？、《》【】（）…]/.test(char)
+    const shouldBypassHighlight = raw.length > 4 && chars.every(
+      (char) => isCjkChar(char) || isFullWidthPunctuation(char)
+    )
+    if (shouldBypassHighlight) {
+      html = escapeHtml(text)
+      highlightCacheText = text
+      highlightCacheWords = words
+      highlightCacheMatchSpans = matchSpans
+      highlightCacheHtml = html
+      return html
+    }
+  }
+
+  const warnThreshold = 0.5
+  const criticalThreshold = 0.3
+  const expandWords = (wordItem) => {
+    const raw = wordItem.word || ''
+    const chars = [...raw]
+    const isCjkChar = (char) => /[\u4e00-\u9fff]/.test(char)
+    const isFullWidthPunctuation = (char) => /[，。！？、《》【】（）…]/.test(char)
+    const shouldSplit = raw.length > 1 && chars.every(
+      (char) => isCjkChar(char) || isFullWidthPunctuation(char)
+    )
+    if (!shouldSplit) {
+      return [wordItem]
+    }
+    return chars.map((char) => ({
+      ...wordItem,
+      word: char,
+    }))
+  }
+
+  const processedWords = words.flatMap((word) => expandWords(word))
+  html = ''
+  for (let index = 0; index < processedWords.length; index += 1) {
+    const word = processedWords[index]
+    const rawConfidence = word.confidence_display_raw ?? word.confidence
+    const confidence = rawConfidence !== undefined && rawConfidence !== null ? rawConfidence : 1.0
+    const wordText = escapeHtml(word.word)
+
+    if (confidence < criticalThreshold) {
+      html += `<span class="word-critical">${wordText}</span>`
+    } else if (confidence < warnThreshold) {
+      html += `<span class="word-warning">${wordText}</span>`
+    } else {
+      html += wordText
+    }
+
+    if (index < processedWords.length - 1) {
+      const nextWord = processedWords[index + 1].word
+      const isChinese = (char) => char && /[\u4e00-\u9fff]/.test(char)
+      const isPunctuation = (char) => char && /[,.!?;:'"()[\]{}，。！？；：""''（）【】《》、]/.test(char)
+      if (!isChinese(word.word?.slice(-1)) && !isChinese(nextWord?.[0]) && !isPunctuation(nextWord?.[0])) {
+        html += ' '
+      }
+    }
+  }
+
+  highlightCacheText = text
+  highlightCacheWords = words
+  highlightCacheMatchSpans = matchSpans
+  highlightCacheHtml = html
+  return html
+}
+
+function renderMatchHighlight(text, spans) {
+  if (!text || !spans || spans.length === 0) {
+    return escapeHtml(text)
+  }
+
+  const sortedSpans = [...spans].sort((left, right) => left.start - right.start)
+  let html = ''
+  let lastEnd = 0
+
+  for (const span of sortedSpans) {
+    const { start, end } = span
+    if (start < lastEnd || start >= text.length) continue
+
+    if (start > lastEnd) {
+      html += escapeHtml(text.slice(lastEnd, start))
+    }
+
+    const matchText = text.slice(start, Math.min(end, text.length))
+    html += `<mark class="match-highlight">${escapeHtml(matchText)}</mark>`
+    lastEnd = Math.min(end, text.length)
+  }
+
+  if (lastEnd < text.length) {
+    html += escapeHtml(text.slice(lastEnd))
+  }
+
+  return html
+}
+
+function escapeHtml(text) {
+  if (!text) return ''
+  const div = document.createElement('div')
+  div.textContent = text
+  return div.innerHTML
+}
 </script>
 
 <style scoped>
-/* 字幕行 */
 .subtitle-row {
   position: relative;
   display: flex;
@@ -245,6 +460,24 @@ function handleClick() {
   background: var(--af-bg-tertiary);
 }
 
+.subtitle-row.has-cluster-color {
+  padding-left: 14px;
+}
+
+.cluster-color-bar {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  border-radius: var(--af-radius-md) 0 0 var(--af-radius-md);
+}
+
+.item-checkbox {
+  flex-shrink: 0;
+  margin-right: 4px;
+}
+
 .subtitle-row.is-selected:not(.is-active):not(.is-current) {
   border-color: rgb(var(--af-accent-primary-rgb), 0.35);
   background: rgb(var(--af-accent-primary-rgb), 0.04);
@@ -260,6 +493,11 @@ function handleClick() {
   background: rgb(var(--af-accent-success-rgb), 0.08);
 }
 
+.subtitle-row.is-match-selected:not(.is-active):not(.is-current) {
+  border-color: rgb(var(--af-accent-primary-rgb), 0.35);
+  background: rgb(var(--af-accent-primary-rgb), 0.05);
+}
+
 .subtitle-row.is-draft {
   background: rgb(var(--af-text-muted-rgb), 0.05);
   border-color: rgb(var(--af-text-muted-rgb), 0.20);
@@ -267,7 +505,6 @@ function handleClick() {
   opacity: 0.6;
 }
 
-/* 序号 */
 .item-index {
   display: flex;
   justify-content: center;
@@ -284,7 +521,7 @@ function handleClick() {
 
 .subtitle-row.is-draft .item-index {
   background: var(--af-text-muted);
-  color: var(--af-text-on-dark);
+  color: var(--af-text-inverse);
 }
 
 .subtitle-row.is-current .item-index {
@@ -292,7 +529,8 @@ function handleClick() {
   color: var(--af-text-inverse);
 }
 
-.subtitle-row.is-selected:not(.is-active):not(.is-current) .item-index {
+.subtitle-row.is-selected:not(.is-active):not(.is-current) .item-index,
+.subtitle-row.is-match-selected:not(.is-active):not(.is-current) .item-index {
   background: rgb(var(--af-accent-primary-rgb), 0.16);
   color: var(--af-accent-primary);
 }
@@ -302,13 +540,11 @@ function handleClick() {
   color: var(--af-text-inverse);
 }
 
-/* 内容区 */
 .item-content {
   flex: 1;
   min-width: 0;
 }
 
-/* 时间行 */
 .time-row {
   display: flex;
   flex-wrap: wrap;
@@ -357,7 +593,6 @@ function handleClick() {
   font-family: var(--af-font-mono);
 }
 
-/* 草稿状态指示器 */
 .draft-indicator {
   display: flex;
   align-items: center;
@@ -386,7 +621,29 @@ function handleClick() {
   to { transform: rotate(360deg); }
 }
 
-/* 文本行 */
+.confidence-badge {
+  padding: 2px 6px;
+  border-radius: var(--af-radius-full);
+  font-size: 10px;
+  font-family: var(--af-font-mono);
+  font-weight: 600;
+}
+
+.confidence-badge.badge-good {
+  background: rgb(var(--af-accent-success-rgb), 0.15);
+  color: var(--af-accent-success);
+}
+
+.confidence-badge.badge-warning {
+  background: rgb(var(--af-accent-warning-rgb), 0.15);
+  color: var(--af-accent-warning);
+}
+
+.confidence-badge.badge-danger {
+  background: rgb(var(--af-accent-danger-rgb), 0.15);
+  color: var(--af-accent-danger);
+}
+
 .text-row {
   position: relative;
 }
@@ -414,6 +671,29 @@ function handleClick() {
 .text-display.can-edit:hover {
   border-color: var(--af-accent-primary);
   background: var(--af-bg-secondary);
+}
+
+.text-display :deep(.word-warning) {
+  background-color: rgb(var(--af-confidence-warning-rgb), 0.25);
+  border-bottom: 2px solid var(--af-confidence-warning);
+  padding: 0 2px;
+  border-radius: 2px;
+}
+
+.text-display :deep(.word-critical) {
+  background-color: rgb(var(--af-confidence-critical-rgb), 0.25);
+  border-bottom: 2px solid var(--af-confidence-critical);
+  padding: 0 2px;
+  border-radius: 2px;
+  font-weight: 500;
+}
+
+.text-display :deep(.match-highlight) {
+  background-color: rgb(var(--af-accent-warning-rgb), 0.35);
+  color: var(--af-text-primary);
+  padding: 1px 2px;
+  border-radius: 2px;
+  font-weight: 500;
 }
 
 .text-input {
@@ -455,7 +735,19 @@ function handleClick() {
   font-style: italic;
 }
 
-/* 操作按钮 */
+.warning-banner {
+  margin-top: 6px;
+  padding: 4px 8px;
+  background: rgb(var(--af-accent-warning-rgb), 0.10);
+  border-left: 3px solid var(--af-accent-warning);
+  border-radius: var(--af-radius-sm);
+}
+
+.warning-banner .warning-text {
+  color: var(--af-accent-warning);
+  font-size: 11px;
+}
+
 .item-actions {
   display: flex;
   flex-direction: column;
@@ -494,7 +786,6 @@ function handleClick() {
   opacity: 1;
 }
 
-/* 删除按钮 */
 .delete-btn {
   position: absolute;
   right: 12px;

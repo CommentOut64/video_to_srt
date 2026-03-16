@@ -143,11 +143,12 @@
         <div class="tab-content">
           <div v-show="activeTab === 'subtitles'" class="tab-pane">
             <!-- V3.2.5+dev.20260315.01: Feature flag 控制新旧列表 -->
-            <VirtualSubtitleList
-              v-if="useEditorV2"
-              :auto-scroll="true"
-              :enable-auto-resume-follow="true"
-            />
+              <VirtualSubtitleList
+                v-if="useEditorV2"
+                ref="subtitleListRef"
+                :auto-scroll="true"
+                :enable-auto-resume-follow="true"
+              />
             <SubtitleList
               v-else
               ref="subtitleListRef"
