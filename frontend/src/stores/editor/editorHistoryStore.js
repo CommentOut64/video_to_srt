@@ -39,6 +39,40 @@ export const useEditorHistoryStore = defineStore('editorHistory', () => {
     future.value = []
   }
 
+  function pushTransaction({
+    type = 'transaction',
+    doCommands = [],
+    undoCommands = [],
+    createdAt = Date.now(),
+    revisionBefore = null,
+    revisionAfter = null,
+  } = {}) {
+    const normalizedDoCommands = Array.isArray(doCommands)
+      ? doCommands.filter(Boolean)
+      : []
+    if (normalizedDoCommands.length === 0) {
+      return
+    }
+
+    const docStore = useEditorDocumentStore()
+    lastMergeKey = null
+
+    const entry = {
+      entryId: `he_${String(docStore.revision).padStart(5, '0')}`,
+      type,
+      doCommands: normalizedDoCommands,
+      undoCommands: Array.isArray(undoCommands) ? undoCommands.filter(Boolean) : [],
+      revisionBefore: revisionBefore ?? Math.max(0, docStore.revision - normalizedDoCommands.length),
+      revisionAfter: revisionAfter ?? docStore.revision,
+      createdAt,
+    }
+
+    const newPast = [...past.value, entry]
+    if (newPast.length > LIMIT) newPast.shift()
+    past.value = newPast
+    future.value = []
+  }
+
   function tryMergeWithPrevious(command) {
     if (past.value.length === 0) return false
     const lastEntry = past.value[past.value.length - 1]
@@ -102,5 +136,17 @@ export const useEditorHistoryStore = defineStore('editorHistory', () => {
     closeTransaction()
   }
 
-  return { past, future, canUndo, canRedo, push, undo, redo, clear, closeTransaction, reset }
+  return {
+    past,
+    future,
+    canUndo,
+    canRedo,
+    push,
+    pushTransaction,
+    undo,
+    redo,
+    clear,
+    closeTransaction,
+    reset,
+  }
 })

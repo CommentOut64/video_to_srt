@@ -9,6 +9,10 @@ import { editorReducer } from './editorReducer'
 export const useEditorCommandBus = defineStore('editorCommandBus', () => {
   const listeners = []
 
+  function notifyListeners(command, result) {
+    listeners.forEach((fn) => fn(command, result))
+  }
+
   function materializeHistoryReplayCommands(commands = []) {
     const sessionStore = useEditorSessionStore()
     const replayCreatedAt = Date.now()
@@ -55,10 +59,68 @@ export const useEditorCommandBus = defineStore('editorCommandBus', () => {
       sessionStore.markDirty()
     }
 
-    // 通知订阅者
-    listeners.forEach(fn => fn(command, result))
+    notifyListeners(command, result)
 
     return result
+  }
+
+  function dispatchTransaction(rawCommands, options = {}) {
+    const commands = Array.isArray(rawCommands)
+      ? rawCommands.map(normalizeEditorCommand).filter((command) => command?.type)
+      : []
+    if (commands.length === 0) {
+      return { success: false, reason: 'empty_transaction', results: [] }
+    }
+
+    const docStore = useEditorDocumentStore()
+    const sessionStore = useEditorSessionStore()
+    const historyStore = useEditorHistoryStore()
+    const revisionBefore = docStore.revision
+    const executedCommands = []
+    const undoCommands = []
+    const results = []
+    let shouldMarkDirty = false
+
+    for (const command of commands) {
+      const result = editorReducer(docStore, command)
+      if (!result.success) {
+        console.warn(`[CommandBus] Transaction command ${command.type} failed:`, result.reason)
+        return {
+          success: false,
+          reason: result.reason || 'transaction_command_failed',
+          failedCommand: command,
+          results,
+        }
+      }
+
+      executedCommands.push(command)
+      if (result.undoCommand) {
+        undoCommands.unshift(result.undoCommand)
+      }
+      results.push(result)
+
+      if (!['rehydrate', 'reconcile_replay'].includes(command.source)) {
+        shouldMarkDirty = true
+      }
+
+      notifyListeners(command, result)
+    }
+
+    if (executedCommands.some((command) => command.source === 'user')) {
+      historyStore.pushTransaction({
+        type: options.historyType || executedCommands[0]?.type || 'transaction',
+        doCommands: executedCommands,
+        undoCommands,
+        revisionBefore,
+        revisionAfter: docStore.revision,
+      })
+    }
+
+    if (shouldMarkDirty) {
+      sessionStore.markDirty()
+    }
+
+    return { success: true, results }
   }
 
   function undo() {
@@ -92,5 +154,5 @@ export const useEditorCommandBus = defineStore('editorCommandBus', () => {
     }
   }
 
-  return { dispatch, dispatchBatch, undo, redo, onCommandApplied }
+  return { dispatch, dispatchBatch, dispatchTransaction, undo, redo, onCommandApplied }
 })

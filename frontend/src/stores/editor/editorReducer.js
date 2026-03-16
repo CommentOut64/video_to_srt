@@ -147,6 +147,9 @@ export function editorReducer(docStore, command) {
         endMs: command.afterKept.endMs,
         isModified: true,
       })
+      if (command.keptColdPatch) {
+        docStore._applyColdUpdate(command.sourceLocalId, command.keptColdPatch)
+      }
       docStore._applyReorder(command.sourceLocalId)
 
       const newHot = createSubtitleHotEntity(
@@ -175,6 +178,7 @@ export function editorReducer(docStore, command) {
         beforeKept: command.afterKept,
         beforeRemoved: command.afterCreated,
         after: command.before,
+        keptColdPatch: sourceCold ? cloneColdEntity(sourceCold, command.sourceLocalId) : undefined,
         removedColdSnapshot: cloneColdEntity(createdCold, command.createdLocalId),
       }
 
@@ -186,6 +190,7 @@ export function editorReducer(docStore, command) {
       const removed = docStore.getEntity(command.removedLocalId)
       if (!kept || !removed) return { success: false, reason: 'entity_not_found' }
 
+      const keptColdBeforeMerge = cloneColdEntity(docStore.getCold(command.keptLocalId), command.keptLocalId)
       const removedCold = command.removedColdSnapshot
         ? cloneColdEntity(command.removedColdSnapshot, command.removedLocalId)
         : cloneColdEntity(docStore.getCold(command.removedLocalId), command.removedLocalId)
@@ -196,6 +201,9 @@ export function editorReducer(docStore, command) {
         endMs: command.after.endMs,
         isModified: true,
       })
+      if (command.keptColdPatch) {
+        docStore._applyColdUpdate(command.keptLocalId, command.keptColdPatch)
+      }
       docStore._applyReorder(command.keptLocalId)
       docStore._applyDelete(command.removedLocalId)
 
@@ -211,6 +219,7 @@ export function editorReducer(docStore, command) {
         before: command.after,
         afterKept: command.beforeKept,
         afterCreated: command.beforeRemoved,
+        keptColdPatch: keptColdBeforeMerge,
         createdColdInit: removedCold,
       }
 
