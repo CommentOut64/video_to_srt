@@ -97,6 +97,9 @@ htmlcov/
 .coverage
 coverage/
 
+# 忽略所有 test.js 后缀测试文件
+*.test.js
+
 # 本地测试文件（不上传，ci_tests/ 除外）
 tests/
 backend/tests/
