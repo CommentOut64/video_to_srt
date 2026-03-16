@@ -302,11 +302,19 @@ export function useWaveformRegions(
     let nextStart = null
     let nextEnd = null
     let syncKey = null
-    if (useEditorV2 && docStore && commandBus) {
+    if (useEditorV2) {
+      if (!docStore || !commandBus) {
+        throw new Error('[WaveformRegions] Phase F-0 缺少 V2 命令上下文，禁止回退旧时间编辑链')
+      }
+
       const localId = resolveEditorV2LocalId(regionId)
-      const entity = localId ? docStore.getEntity(localId) : null
+      if (!localId) {
+        throw new Error(`[WaveformRegions] 未找到 region 对应的 localId（regionId=${regionId}）`)
+      }
+
+      const entity = docStore.getEntity(localId)
       if (!entity) {
-        return false
+        throw new Error(`[WaveformRegions] 未找到 localId 对应实体（localId=${localId}）`)
       }
 
       const currentStart = Math.max(0, projectStore.toDisplayTime(entity.startMs / 1000))
@@ -334,7 +342,9 @@ export function useWaveformRegions(
 
       const result = commandBus.dispatch(command)
       if (!result?.success) {
-        return false
+        throw new Error(
+          `[WaveformRegions] 时间命令执行失败（localId=${localId}，reason=${result?.reason || '未知原因'}）`
+        )
       }
 
       setSelectedSubtitleId(localId)

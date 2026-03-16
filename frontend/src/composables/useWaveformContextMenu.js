@@ -6,8 +6,6 @@
  */
 import { ref, computed } from 'vue'
 import { isFeatureEnabled } from '@/config/featureFlags'
-import projectApi from '@/services/api/projectApi'
-import { useStructuralSyncStore } from '@/stores/structuralSyncStore'
 import { useEditorCommandBus } from '@/stores/editor/editorCommandBus'
 import { useEditorDocumentStore } from '@/stores/editor/editorDocumentStore'
 import { useEditorSessionStore } from '@/stores/editor/editorSessionStore'
@@ -21,7 +19,6 @@ import { createSplitSubtitleCommand } from '@/stores/editor/editorCommandFactory
 export function useWaveformContextMenu(projectStore, subtitleDocumentStore) {
   // ============ 状态 ============
   const useEditorV2 = isFeatureEnabled('USE_EDITOR_V2')
-  const structuralSyncStore = useStructuralSyncStore()
   const docStore = useEditorV2 ? useEditorDocumentStore() : null
   const commandBus = useEditorV2 ? useEditorCommandBus() : null
   const sessionStore = useEditorV2 ? useEditorSessionStore() : null
@@ -168,6 +165,7 @@ export function useWaveformContextMenu(projectStore, subtitleDocumentStore) {
       success: true,
       command: createSplitSubtitleCommand({
         sourceLocalId: localId,
+        sourceSegmentId: cold?.segmentId ?? null,
         createdLocalId,
         splitAtMs: toBaseMs(splitResult.splitAtTime),
         splitAtTextOffset: splitResult.splitAtTextOffset,
@@ -252,90 +250,26 @@ export function useWaveformContextMenu(projectStore, subtitleDocumentStore) {
    */
   async function handleContextMenuSelect(key) {
     if (key === 'split' && contextMenuTarget.value) {
-      if (useEditorV2 && commandBus) {
-        const result = buildV2SplitCommand(contextMenuTarget.value, contextMenuTime.value)
-        if (!result.success) {
-          console.error('[WaveformContextMenu] 切分失败:', result.error)
-        } else {
-          const dispatchResult = commandBus.dispatch(result.command)
-          if (!dispatchResult?.success) {
-            console.error('[WaveformContextMenu] 切分命令执行失败:', dispatchResult?.reason)
-          }
-        }
-      } else {
-        const result = projectStore.splitSubtitle(contextMenuTarget.value, {
-          splitTime: contextMenuTime.value,
-        })
+      if (!useEditorV2 || !commandBus) {
+        throw new Error('[WaveformContextMenu] Phase F-0 已禁用旧波形切分链路')
+      }
 
-        if (!result.success) {
-          console.error('[WaveformContextMenu] 切分失败:', result.error)
-        } else {
-          await syncSplitSubtitles(result)
-        }
+      const result = buildV2SplitCommand(contextMenuTarget.value, contextMenuTime.value)
+      if (!result.success) {
+        throw new Error(`[WaveformContextMenu] 切分失败: ${result.error}`)
+      }
+
+      const dispatchResult = commandBus.dispatch(result.command)
+      if (!dispatchResult?.success) {
+        throw new Error(
+          `[WaveformContextMenu] 切分命令执行失败: ${dispatchResult?.reason || '未知原因'}`
+        )
       }
     }
 
     // 清空状态
     contextMenuTarget.value = null
     contextMenuTime.value = 0
-  }
-
-  /**
-   * V3.2.4+dev.20260304.01: 波形切分结果同步到后端 — structuralSyncStore 飞行追踪
-   */
-  async function syncSplitSubtitles(result) {
-    const projectId = projectStore.meta.projectId
-    if (!projectId) {
-      throw new Error('缺少 project_id，禁止走 job 字幕切分分支')
-    }
-
-    const { leftSubtitle, rightSubtitle } = result || {}
-    if (!leftSubtitle || !rightSubtitle) return
-
-    const syncPromise = (async () => {
-      const leftSegmentId = leftSubtitle.segment_id
-      if (!leftSegmentId) {
-        throw new Error('切分左半字幕缺少 segment_id，无法同步到 project 字幕真源')
-      }
-
-      const updatedLeft = await projectApi.updateSubtitle(projectId, leftSegmentId, {
-        text: leftSubtitle.text,
-        start: projectStore.toBaseTime(leftSubtitle.start),
-        end: projectStore.toBaseTime(leftSubtitle.end),
-      })
-      projectStore.updateSubtitle(
-        leftSubtitle.id,
-        {
-          sentenceIndex: updatedLeft?.legacy_index ?? leftSubtitle.sentenceIndex,
-          segment_id: updatedLeft?.segment_id ?? leftSegmentId,
-          isModified: true,
-          source: updatedLeft?.source_type || 'split',
-        },
-        { isUserEdit: true }
-      )
-
-      const rightData = await projectApi.createSubtitle(projectId, {
-        text: rightSubtitle.text,
-        start: projectStore.toBaseTime(rightSubtitle.start),
-        end: projectStore.toBaseTime(rightSubtitle.end),
-      })
-      projectStore.updateSubtitle(
-        rightSubtitle.id,
-        {
-          sentenceIndex: rightData?.legacy_index ?? rightSubtitle.sentenceIndex,
-          segment_id: rightData?.segment_id ?? rightSubtitle.segment_id,
-          isModified: true,
-          source: rightData?.source_type || 'manual',
-        },
-        { isUserEdit: true }
-      )
-    })()
-    structuralSyncStore.trackOperation('split', syncPromise)
-    try {
-      await syncPromise
-    } catch (error) {
-      console.warn('[WaveformContextMenu] 切分同步失败:', error)
-    }
   }
 
   return {
