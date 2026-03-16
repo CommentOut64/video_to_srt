@@ -27,6 +27,12 @@
   </Teleport>
 </template>
 
+<script>
+// 模块级单例：确保全局只有一个右键菜单同时可见
+// 必须放在 <script>（非 setup）中，否则每个实例各持一份副本，无法互斥
+let activeMenuController = null;
+</script>
+
 <script setup>
 /**
  * ContextMenu - 通用右键菜单组件
@@ -60,8 +66,13 @@ const menuStyle = computed(() => {
 
 // 显示菜单
 function show(x, y) {
+  if (activeMenuController && activeMenuController !== menuController) {
+    activeMenuController.hide();
+  }
+
   position.value = { x, y };
   visible.value = true;
+  activeMenuController = menuController;
 
   // 下一帧调整位置，防止超出视口
   nextTick(() => {
@@ -87,20 +98,25 @@ function show(x, y) {
 
 // 隐藏菜单
 function hide() {
+  if (!visible.value) {
+    if (activeMenuController === menuController) {
+      activeMenuController = null;
+    }
+    return;
+  }
   visible.value = false;
+  if (activeMenuController === menuController) {
+    activeMenuController = null;
+  }
   emit("close");
 }
 
 // 处理菜单项点击
 function handleClick(item) {
-  console.log("[ContextMenu] 菜单项被点击:", item);
   if (item.disabled) {
-    console.log("[ContextMenu] 菜单项被禁用，忽略点击");
     return;
   }
-  console.log("[ContextMenu] 发送 select 事件:", item.key);
   emit("select", item.key);
-  console.log("[ContextMenu] 隐藏菜单");
   hide();
 }
 
@@ -128,7 +144,15 @@ onUnmounted(() => {
   document.removeEventListener("click", handleClickOutside);
   document.removeEventListener("contextmenu", handleClickOutside);
   document.removeEventListener("keydown", handleKeydown);
+  if (activeMenuController === menuController) {
+    activeMenuController = null;
+  }
 });
+
+const menuController = {
+  show,
+  hide,
+};
 
 // 暴露方法给父组件
 defineExpose({ show, hide });

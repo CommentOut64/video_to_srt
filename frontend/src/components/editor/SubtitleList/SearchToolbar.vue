@@ -158,8 +158,24 @@
       </div>
     </div>
 
-    <!-- 右侧：添加字幕按钮 -->
+    <!-- 右侧：批量删除 + 添加字幕 -->
     <div class="toolbar-right tw-flex tw-items-center tw-flex-shrink-0">
+      <el-popover
+        v-if="multiSelectedCount > 0"
+        :content="`删除已选中的 ${multiSelectedCount} 条字幕`"
+        placement="top"
+        trigger="hover"
+        popper-class="hint-popover-compact"
+        :show-after="500"
+      >
+        <template #reference>
+          <button class="toolbar-btn" @click="handleBatchDelete">
+            <svg viewBox="0 0 24 24" fill="currentColor">
+              <path d="M9 3h6l1 2h5v2H3V5h5l1-2zm1 6h2v8h-2V9zm4 0h2v8h-2V9zM7 9h2v8H7V9z" />
+            </svg>
+          </button>
+        </template>
+      </el-popover>
       <el-popover content="添加字幕" placement="top" trigger="hover" popper-class="hint-popover-compact" :show-after="500">
         <template #reference>
           <button class="toolbar-btn" @click="handleAddSubtitle">
@@ -208,6 +224,7 @@ const props = defineProps({
   selectedCount: { type: Number, default: 0 },
   isAllSelected: { type: Boolean, default: false },
   isIndeterminate: { type: Boolean, default: false },
+  multiSelectedCount: { type: Number, default: 0 },
 })
 
 const emit = defineEmits([
@@ -220,6 +237,7 @@ const emit = defineEmits([
   'search',
   'reset',
   'batch-replace',
+  'batch-delete',
   'toggle-select-all',
   'add-subtitle',
   'quick-search',
@@ -312,6 +330,10 @@ function handleClearSearch() {
 
 function handleBatchReplace() {
   emit('batch-replace')
+}
+
+function handleBatchDelete() {
+  emit('batch-delete')
 }
 
 function handleToggleSelectAll() {
