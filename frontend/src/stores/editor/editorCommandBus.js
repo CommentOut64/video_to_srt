@@ -9,6 +9,23 @@ import { editorReducer } from './editorReducer'
 export const useEditorCommandBus = defineStore('editorCommandBus', () => {
   const listeners = []
 
+  function materializeHistoryReplayCommands(commands = []) {
+    const sessionStore = useEditorSessionStore()
+    const replayCreatedAt = Date.now()
+
+    return commands
+      .filter(Boolean)
+      .map((command, index) => {
+        const { skipSync, ...rest } = command
+        return {
+          ...rest,
+          commandId: sessionStore.nextCommandId(),
+          source: 'undo_redo',
+          createdAt: replayCreatedAt + index,
+        }
+      })
+  }
+
   function dispatch(rawCommand) {
     const docStore = useEditorDocumentStore()
     const sessionStore = useEditorSessionStore()
@@ -48,7 +65,8 @@ export const useEditorCommandBus = defineStore('editorCommandBus', () => {
     const historyStore = useEditorHistoryStore()
     const commands = historyStore.undo()
     if (!commands) return false
-    commands.forEach(cmd => dispatch(cmd))
+    historyStore.closeTransaction()
+    materializeHistoryReplayCommands(commands).forEach(cmd => dispatch(cmd))
     return true
   }
 
@@ -56,7 +74,8 @@ export const useEditorCommandBus = defineStore('editorCommandBus', () => {
     const historyStore = useEditorHistoryStore()
     const commands = historyStore.redo()
     if (!commands) return false
-    commands.forEach(cmd => dispatch(cmd))
+    historyStore.closeTransaction()
+    materializeHistoryReplayCommands(commands).forEach(cmd => dispatch(cmd))
     return true
   }
 

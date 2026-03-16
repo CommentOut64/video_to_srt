@@ -19,6 +19,12 @@ export const SearchMode = {
   HOMOPHONE_FUZZY: 'homophone_fuzzy',    // 同音模糊（包含近音）
 }
 
+export function normalizeVisibleSearchMode(mode) {
+  return mode === SearchMode.HOMOPHONE_STRICT
+    ? SearchMode.HOMOPHONE_FUZZY
+    : mode
+}
+
 // 排序模式枚举
 export const SortMode = {
   GROUPED: 'grouped',   // 按读音簇分组
@@ -32,6 +38,17 @@ export const IndexStatus = {
   BUILDING: 'building',
   FAILED: 'failed',
   MISSING: 'missing',
+}
+
+function buildSubtitleMutationSignature(subtitleList) {
+  const source = Array.isArray(subtitleList) ? subtitleList : []
+  return source
+    .map((item) => {
+      const sentenceIndex = item?.sentenceIndex ?? item?.legacyIndex ?? item?.id ?? item?.localId ?? ''
+      const text = String(item?.text || '')
+      return `${sentenceIndex}:${text}`
+    })
+    .join('\u0001')
 }
 
 // 6 色调色板（用于读音簇可视化）
@@ -75,7 +92,7 @@ function detectLanguage(text) {
 /**
  * 根据当前字幕内容推断主语言。
  * 设计说明：
- * - 同音模式下，用户可能输入拼音/罗马音（纯字母）。
+ * - 近音模式下，用户可能输入拼音/罗马音（纯字母）。
  * - 若仅按查询词判断，会将中文拼音误判为英文，导致后端走错语言索引。
  * @param {Array} subtitleList
  * @returns {'zh' | 'ja' | 'en'}
@@ -125,14 +142,20 @@ export function useHomophoneSearch(options = {}) {
   // ========================
 
   // 搜索/替换模式
-  const searchMode = ref(SearchMode.LITERAL)
+  const rawSearchMode = ref(SearchMode.LITERAL)
+  const searchMode = computed({
+    get: () => normalizeVisibleSearchMode(rawSearchMode.value),
+    set: (value) => {
+      rawSearchMode.value = normalizeVisibleSearchMode(value)
+    },
+  })
   const sortMode = ref(SortMode.TIMELINE)
   const isSearchActive = ref(false)      // 是否处于搜索状态
   const isReplaceMode = ref(false)       // 是否展开替换面板
 
   // 搜索输入
   const searchText = ref('')
-  const searchReading = ref('')          // 仅同音模式可用
+  const searchReading = ref('')          // 仅近音模式可用
   const isIgnorePunctuation = ref(false)
   const replaceText = ref('')
 
@@ -167,9 +190,12 @@ export function useHomophoneSearch(options = {}) {
     }
     return indexMap
   })
+  const subtitleMutationSignature = computed(() => {
+    return buildSubtitleMutationSignature(subtitles?.value || [])
+  })
 
   /**
-   * 解析同音查询语言。
+   * 解析近音查询语言。
    * 规则：
    * 1) 查询词本身若包含中/日字符，优先按查询词判断；
    * 2) 查询词为拼音/罗马音等字母串时，按当前字幕主语言判断。
@@ -188,10 +214,9 @@ export function useHomophoneSearch(options = {}) {
   // 计算属性
   // ========================
 
-  // 是否为同音搜索模式
+  // 是否为近音搜索模式
   const isHomophoneMode = computed(() => {
-    return searchMode.value === SearchMode.HOMOPHONE_STRICT ||
-           searchMode.value === SearchMode.HOMOPHONE_FUZZY
+    return searchMode.value === SearchMode.HOMOPHONE_FUZZY
   })
 
   // 是否可以执行搜索
@@ -358,7 +383,7 @@ export function useHomophoneSearch(options = {}) {
   }
 
   /**
-   * 解析同音搜索结果（后端结构）。
+   * 解析近音搜索结果（后端结构）。
    * @param {Object} data - 后端返回的 data 字段
    */
   function parseHomophoneSearchResult(data) {
@@ -410,7 +435,7 @@ export function useHomophoneSearch(options = {}) {
 
   /**
    * 解析文本/正则搜索结果（前端本地匹配）。
-   * 说明：后端 find 当前仅支持同音模式，文本/正则在前端本地做筛选与高亮。
+   * 说明：后端 find 当前仅支持近音模式，文本/正则在前端本地做筛选与高亮。
    * @param {Object} options
    * @param {'literal'|'regex'} options.mode
    * @param {string} options.queryText
@@ -486,6 +511,18 @@ export function useHomophoneSearch(options = {}) {
     replaceText.value = ''
     isReplaceMode.value = false
     clearSearchResult()
+  }
+
+  function invalidateSearchForSubtitleMutation() {
+    const shouldInvalidateIndex = isHomophoneMode.value
+      || indexStatus.value === IndexStatus.READY
+      || indexStatus.value === IndexStatus.FAILED
+
+    clearSearchResult()
+    if (shouldInvalidateIndex) {
+      indexStatus.value = IndexStatus.MISSING
+      indexMessage.value = '字幕已变更，近音索引待刷新'
+    }
   }
 
   /**
@@ -580,10 +617,9 @@ export function useHomophoneSearch(options = {}) {
   // 副作用
   // ========================
 
-  // 搜索模式切换时，如果切换到同音模式，检查索引状态
+  // 搜索模式切换时，如果切换到近音模式，检查索引状态
   watch(searchMode, (newMode) => {
-    if (newMode === SearchMode.HOMOPHONE_STRICT ||
-        newMode === SearchMode.HOMOPHONE_FUZZY) {
+    if (newMode === SearchMode.HOMOPHONE_FUZZY) {
       checkIndexStatus()
     }
   })
@@ -592,6 +628,16 @@ export function useHomophoneSearch(options = {}) {
   watch(() => projectId?.value, () => {
     resetSearch()
     indexStatus.value = IndexStatus.UNKNOWN
+  })
+
+  watch(subtitleMutationSignature, (newSignature, oldSignature) => {
+    if (oldSignature === undefined || newSignature === oldSignature) {
+      return
+    }
+    if (!isHomophoneMode.value && !isSearchActive.value) {
+      return
+    }
+    invalidateSearchForSubtitleMutation()
   })
 
   // ========================
@@ -639,6 +685,7 @@ export function useHomophoneSearch(options = {}) {
     executeSearch,
     clearSearchResult,
     resetSearch,
+    invalidateSearchForSubtitleMutation,
     toggleSelect,
     selectAll,
     deselectAll,

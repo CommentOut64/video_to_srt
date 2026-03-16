@@ -205,9 +205,14 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
 
   let syncTimer = null
   let retryTimer = null
+  let inflightPushPromise = null
 
   function enqueue(command) {
     if (command.source === 'system' || command.source === 'rehydrate' || command.source === 'reconcile_replay') {
+      return
+    }
+
+    if (command.skipSync === true) {
       return
     }
 
@@ -237,9 +242,9 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
     }, SYNC_INTERVAL_MS)
   }
 
-  async function pushToBackend(options = {}) {
+  async function executePushToBackend(options = {}) {
     const { allowConflictRetry = true } = options
-    if (isSyncing.value || pendingCommands.value.length === 0) return true
+    if (pendingCommands.value.length === 0) return true
 
     const sessionStore = useEditorSessionStore()
     const projectId = sessionStore.projectId
@@ -280,7 +285,7 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
         if (response.status === 409) {
           await reconcile(payload?.server_revision ?? null)
           if (allowConflictRetry) {
-            return pushToBackend({ allowConflictRetry: false })
+            return executePushToBackend({ allowConflictRetry: false })
           }
           scheduleRetry()
           return false
@@ -313,6 +318,25 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
     }
   }
 
+  function pushToBackend(options = {}) {
+    if (pendingCommands.value.length === 0) {
+      return Promise.resolve(true)
+    }
+
+    if (inflightPushPromise) {
+      return inflightPushPromise
+    }
+
+    const currentPromise = executePushToBackend(options)
+      .finally(() => {
+        if (inflightPushPromise === currentPromise) {
+          inflightPushPromise = null
+        }
+      })
+    inflightPushPromise = currentPromise
+    return currentPromise
+  }
+
   function scheduleRetry() {
     if (retryTimer) return
     retryTimer = setTimeout(() => {
@@ -326,16 +350,25 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
       clearTimeout(syncTimer)
       syncTimer = null
     }
+    if (retryTimer) {
+      clearTimeout(retryTimer)
+      retryTimer = null
+    }
 
-    let attempts = 0
+    let stagnantRounds = 0
     while (pendingCommands.value.length > 0) {
-      attempts += 1
-      if (attempts > pendingCommands.value.length + 5) {
-        throw new Error('同步重试次数过多，已停止 flush')
-      }
+      const beforeCount = pendingCommands.value.length
       const success = await pushToBackend()
       if (!success) {
         throw new Error('同步失败，flush 已中止')
+      }
+      if (pendingCommands.value.length < beforeCount) {
+        stagnantRounds = 0
+        continue
+      }
+      stagnantRounds += 1
+      if (stagnantRounds > 3) {
+        throw new Error('同步重试次数过多，已停止 flush')
       }
     }
   }
@@ -352,6 +385,7 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
     pendingCommands.value = []
     isSyncing.value = false
     lastSyncTime.value = 0
+    inflightPushPromise = null
   }
 
   function applyBindings(bindings) {
