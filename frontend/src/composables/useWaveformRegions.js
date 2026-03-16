@@ -52,6 +52,7 @@ function debounce(fn, delay) {
  * @param {object} playbackManager - PlaybackManager 实例
  * @param {object} subtitleDocumentStore - 字幕文档 store
  * @param {Function} emit - 事件发射函数
+ * @param {Ref<Array>|null} regionItemsRef - Region 渲染快照
  */
 export function useWaveformRegions(
   regionsPluginRef,
@@ -61,7 +62,8 @@ export function useWaveformRegions(
   onSubtitleEdit,
   playbackManager,
   subtitleDocumentStore,
-  emit
+  emit,
+  regionItemsRef = null
 ) {
   // ============ 状态 ============
   const isUpdatingRegions = ref(false)
@@ -119,6 +121,11 @@ export function useWaveformRegions(
   }
 
   function getSubtitleList() {
+    const regionItems = resolveMaybeRefValue(regionItemsRef)
+    if (Array.isArray(regionItems)) {
+      return regionItems
+    }
+
     if (useEditorV2 && docStore) {
       return buildEditorV2SubtitleList()
     }
@@ -574,21 +581,37 @@ export function useWaveformRegions(
     return props.regionColor
   }
 
+  function addSubtitleRegion(regionsPlugin, subtitle, color) {
+    return regionsPlugin.addRegion({
+      id: subtitle.id,
+      start: subtitle.start,
+      end: subtitle.end,
+      color,
+      minLength: resolveRegionMinLength(),
+      drag: props.dragEnabled,
+      resize: props.resizeEnabled,
+    })
+  }
+
   /**
    * 渲染字幕区域（增量更新算法，避免闪烁）
    *
    * 算法策略：
    * 1. 获取现有 regions 构建 Map
    * 2. 遍历字幕数据，对比现有 region：
-   *    - 存在且时间/颜色变化 → setOptions 更新
+   *    - 命中强制重建或时间变化 → remove + addRegion 重建
+   *    - 仅颜色变化 → setOptions({ color }) 轻量更新
    *    - 不存在 → addRegion 添加
    * 3. 删除不再存在的 regions
    *
    * 优势：避免 clearRegions() 导致的视觉闪烁
    */
-  function renderSubtitleRegions() {
+  function renderSubtitleRegions(subtitleListOverride = null, options = {}) {
+    const { forceRecreateAll = false } = options
     const regionsPlugin = regionsPluginRef.value
-    const subtitleList = getSubtitleList()
+    const subtitleList = Array.isArray(subtitleListOverride)
+      ? subtitleListOverride
+      : getSubtitleList()
 
     if (!isReady.value) {
       console.warn('[WaveformRegions] renderSubtitleRegions: 波形未就绪，跳过渲染')
@@ -609,8 +632,9 @@ export function useWaveformRegions(
     }
 
     // 预先检测重叠区域
-    markOverlapCacheDirty()
-    const overlappingIds = getOverlappingIds({ forceRefresh: true })
+    overlapCacheIds = detectOverlappingSubtitles(subtitleList)
+    overlapCacheDirty = false
+    const overlappingIds = overlapCacheIds
 
     isUpdatingRegions.value = true
     try {
@@ -643,13 +667,14 @@ export function useWaveformRegions(
             Math.abs(existing.start - subtitle.start) > 0.001 ||
             Math.abs(existing.end - subtitle.end) > 0.001
           // 注意：region.color 可能是 undefined，需要通过 element style 获取
-          // 简化处理：每次都更新颜色（setOptions 内部会做优化）
-          if (needsTimeUpdate) {
-            existing.setOptions({
-              start: subtitle.start,
-              end: subtitle.end,
-              color: targetColor,
-            })
+          // wavesurfer regions 插件只会在 addRegion/saveRegion 时重跑 virtualAppend；
+          // 纯 setOptions 不会重新把已脱挂的 Region DOM 挂回容器。
+          // 结构性编辑（merge/split/undo/redo）恰好会让保留字幕的时间范围大幅变化，
+          // 继续复用旧 Region 会出现“数据已更新，但 Region DOM 丢失”的假活状态。
+          // 因此只要时间变更，就必须 remove + add 触发插件完整重建。
+          if (forceRecreateAll || needsTimeUpdate) {
+            existing.remove()
+            addSubtitleRegion(regionsPlugin, subtitle, targetColor)
             updatedCount++
           } else {
             // 仅更新颜色（选中状态变化等）
@@ -657,15 +682,7 @@ export function useWaveformRegions(
           }
         } else {
           // 新增：添加 region
-          regionsPlugin.addRegion({
-            id: subtitle.id,
-            start: subtitle.start,
-            end: subtitle.end,
-            color: targetColor,
-            minLength: resolveRegionMinLength(),
-            drag: props.dragEnabled,
-            resize: props.resizeEnabled,
-          })
+          addSubtitleRegion(regionsPlugin, subtitle, targetColor)
           addedCount++
         }
       })
