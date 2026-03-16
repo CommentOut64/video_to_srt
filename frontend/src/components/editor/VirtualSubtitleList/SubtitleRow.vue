@@ -12,6 +12,7 @@
       'has-cluster-color': Boolean(clusterColor),
     }"
     @click="handleClick"
+    @contextmenu.prevent="handleItemContextMenu"
   >
     <div
       v-if="clusterColor"
@@ -80,7 +81,7 @@
           v-if="!isEditing"
           class="text-display"
           :class="{ 'can-edit': !entity?.isDraft }"
-          @click.stop="startEditing"
+          @click.stop="startEditing($event)"
           v-html="renderTextWithHighlight()"
         ></div>
         <textarea
@@ -88,13 +89,20 @@
           ref="textareaRef"
           class="text-input"
           :value="editingText"
-          @input="editingText = $event.target.value"
+          @input="handleTextareaInput"
+          @click="updateCursorPosition"
+          @keyup="updateCursorPosition"
+          @select="updateCursorPosition"
+          @contextmenu.prevent.stop="handleTextareaContextMenu"
           @blur="stopEditing"
           @keydown.enter.ctrl="stopEditing"
           @keydown.escape="cancelEditing"
           placeholder="输入字幕文本..."
+          rows="2"
         />
-        <span class="char-count">{{ (isEditing ? editingText : displayText).length }}</span>
+        <div class="text-meta">
+          <span class="char-count">{{ (isEditing ? editingText : displayText).length }}</span>
+        </div>
       </div>
 
       <div v-if="showWarning" class="warning-banner">
@@ -124,11 +132,19 @@
         <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
       </svg>
     </button>
+
+    <ContextMenu
+      ref="contextMenuRef"
+      :items="contextMenuItems"
+      @select="handleContextMenuSelect"
+      @close="handleContextMenuClose"
+    />
   </div>
 </template>
 
 <script setup>
 import { computed, nextTick, ref } from 'vue'
+import ContextMenu from '@/components/editor/ContextMenu.vue'
 import { useEditorCommandBus } from '@/stores/editor/editorCommandBus'
 import { useEditorDocumentStore } from '@/stores/editor/editorDocumentStore'
 import { useEditorDraftStore } from '@/stores/editor/editorDraftStore'
@@ -146,9 +162,20 @@ const props = defineProps({
   isMatchSelected: { type: Boolean, default: false },
   isSelectable: { type: Boolean, default: false },
   clusterColor: { type: String, default: null },
+  canMergePrev: { type: Boolean, default: false },
+  canMergeNext: { type: Boolean, default: false },
 })
 
-const emit = defineEmits(['click', 'insert-before', 'insert-after', 'delete', 'select-change'])
+const emit = defineEmits([
+  'click',
+  'insert-before',
+  'insert-after',
+  'delete',
+  'select-change',
+  'split',
+  'merge-prev',
+  'merge-next',
+])
 
 const commandBus = useEditorCommandBus()
 const docStore = useEditorDocumentStore()
@@ -175,12 +202,49 @@ const displayText = computed(() => {
 })
 
 const isEditing = ref(false)
+const originalText = ref('')
 const editingText = ref('')
 const textareaRef = ref(null)
+const cursorPosition = ref(null)
+const contextMenuRef = ref(null)
+const isContextMenuOpen = ref(false)
+const pendingBlurWhileContextMenuOpen = ref(false)
 let highlightCacheText = null
 let highlightCacheWords = null
 let highlightCacheMatchSpans = null
 let highlightCacheHtml = ''
+
+const canSplitAtCursor = computed(() => {
+  return isEditing.value
+    && Number.isInteger(cursorPosition.value)
+    && cursorPosition.value > 0
+    && cursorPosition.value < editingText.value.length
+})
+
+const contextMenuItems = computed(() => {
+  if (entity.value?.isDraft) {
+    return []
+  }
+
+  const items = []
+  if (isEditing.value) {
+    items.push({
+      key: 'split',
+      label: '从此处切分',
+    })
+  }
+  items.push({
+    key: 'merge-prev',
+    label: '与前字幕合并',
+    disabled: !props.canMergePrev,
+  })
+  items.push({
+    key: 'merge-next',
+    label: '与后字幕合并',
+    disabled: !props.canMergeNext,
+  })
+  return items.filter((item) => !item.disabled)
+})
 
 const showConfidenceBadge = computed(() => {
   return subtitle.value?.display_confidence !== undefined && subtitle.value?.display_confidence !== null
@@ -221,17 +285,33 @@ const warningMessage = computed(() => {
   return messages[subtitle.value?.warning_type] || ''
 })
 
-function startEditing() {
+function startEditing(event) {
   if (entity.value?.isDraft) return
+  originalText.value = displayText.value
   isEditing.value = true
   editingText.value = displayText.value
+  let clickOffset = -1
+  if (event) {
+    clickOffset = getTextOffsetFromPoint(event.currentTarget, event.clientX, event.clientY)
+  }
   nextTick(() => {
-    textareaRef.value?.focus()
+    const textarea = textareaRef.value
+    textarea?.focus()
+    const cursor = clickOffset >= 0 ? clickOffset : editingText.value.length
+    if (textarea && typeof textarea.setSelectionRange === 'function') {
+      textarea.setSelectionRange(cursor, cursor)
+    }
+    cursorPosition.value = cursor
+    autoResizeTextarea()
   })
 }
 
 function stopEditing() {
   if (!isEditing.value) return
+  if (isContextMenuOpen.value) {
+    pendingBlurWhileContextMenuOpen.value = true
+    return
+  }
   const newText = editingText.value.trim()
   if (newText && newText !== entity.value?.text) {
     commandBus.dispatch(createUpdateTextCommand({
@@ -242,11 +322,15 @@ function stopEditing() {
     }))
   }
   isEditing.value = false
+  cursorPosition.value = null
+  pendingBlurWhileContextMenuOpen.value = false
 }
 
 function cancelEditing() {
   isEditing.value = false
-  editingText.value = ''
+  editingText.value = originalText.value
+  cursorPosition.value = null
+  pendingBlurWhileContextMenuOpen.value = false
 }
 
 function formatTime(ms) {
@@ -292,12 +376,115 @@ function handleTimeUpdate(type, value) {
   }))
 }
 
-function handleClick() {
-  emit('click', props.localId)
+function updateCursorPosition(event) {
+  const textarea = event?.target || textareaRef.value
+  if (!textarea || typeof textarea.selectionStart !== 'number') {
+    cursorPosition.value = null
+    return
+  }
+  cursorPosition.value = textarea.selectionStart
+}
+
+function handleClick(event) {
+  emit('click', props.localId, event)
 }
 
 function handleSelectChange(checked) {
   emit('select-change', checked)
+}
+
+function autoResizeTextarea() {
+  const textarea = textareaRef.value
+  if (!textarea) return
+  textarea.style.height = 'auto'
+  textarea.style.height = `${Math.max(45, textarea.scrollHeight)}px`
+}
+
+function getTextOffsetFromPoint(container, clientX, clientY) {
+  const range = document.caretRangeFromPoint?.(clientX, clientY)
+  if (!range) return -1
+
+  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT)
+  let offset = 0
+  let node
+  while ((node = walker.nextNode())) {
+    if (node === range.startContainer) {
+      return offset + range.startOffset
+    }
+    offset += node.textContent.length
+  }
+  return -1
+}
+
+function handleTextareaInput(event) {
+  editingText.value = event.target.value
+  updateCursorPosition(event)
+  nextTick(() => {
+    autoResizeTextarea()
+  })
+}
+
+function handleTextareaContextMenu(event) {
+  if (!isEditing.value || entity.value?.isDraft || !contextMenuItems.value.length) {
+    return
+  }
+  event.preventDefault()
+  event.stopPropagation()
+  updateCursorPosition(event)
+  isContextMenuOpen.value = true
+  pendingBlurWhileContextMenuOpen.value = false
+  contextMenuRef.value?.show(event.clientX, event.clientY)
+}
+
+function handleItemContextMenu(event) {
+  if (entity.value?.isDraft || !contextMenuItems.value.length) {
+    return
+  }
+  event.preventDefault()
+  event.stopPropagation()
+  isContextMenuOpen.value = true
+  pendingBlurWhileContextMenuOpen.value = false
+  contextMenuRef.value?.show(event.clientX, event.clientY)
+}
+
+function handleContextMenuSelect(key) {
+  isContextMenuOpen.value = false
+  pendingBlurWhileContextMenuOpen.value = false
+  if (key === 'split') {
+    if (!canSplitAtCursor.value) {
+      return
+    }
+    isEditing.value = false
+    emit('split', {
+      localId: props.localId,
+      cursorPosition: cursorPosition.value,
+      text: editingText.value,
+    })
+    cursorPosition.value = null
+    return
+  }
+  if (key === 'merge-prev') {
+    isEditing.value = false
+    cursorPosition.value = null
+    emit('merge-prev')
+    return
+  }
+  if (key === 'merge-next') {
+    isEditing.value = false
+    cursorPosition.value = null
+    emit('merge-next')
+  }
+}
+
+function handleContextMenuClose() {
+  isContextMenuOpen.value = false
+  if (!pendingBlurWhileContextMenuOpen.value) {
+    return
+  }
+  pendingBlurWhileContextMenuOpen.value = false
+  nextTick(() => {
+    stopEditing()
+  })
 }
 
 function renderTextWithHighlight() {
@@ -648,6 +835,16 @@ function escapeHtml(text) {
   position: relative;
 }
 
+.text-meta {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+}
+
 .text-display {
   width: 100%;
   padding: 6px 35px 6px 8px;
@@ -722,9 +919,6 @@ function escapeHtml(text) {
 }
 
 .char-count {
-  position: absolute;
-  right: 6px;
-  bottom: 6px;
   color: var(--af-text-muted);
   font-size: 10px;
   font-family: var(--af-font-mono);
