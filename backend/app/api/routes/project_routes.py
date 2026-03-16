@@ -325,6 +325,24 @@ def _collect_project_segments(project_dir: Path) -> list[dict]:
     return get_subtitle_doc_service().load_segments(project_dir)
 
 
+def _sync_homophone_index_for_project_change(
+    *,
+    project_id: str,
+    project_dir: Path,
+    updated_sentence_indices: list[int] | None = None,
+    removed_sentence_indices: list[int] | None = None,
+) -> None:
+    """在 ready 索引存在时按句增量同步；无索引时静默跳过。"""
+    from app.services.homophone.project_sync import sync_project_index_delta
+
+    sync_project_index_delta(
+        project_id=project_id,
+        segments=_collect_project_segments(project_dir),
+        updated_sentence_indices=updated_sentence_indices or [],
+        removed_sentence_indices=removed_sentence_indices or [],
+    )
+
+
 def _normalize_editor_segment_id(value: Any) -> str:
     return str(value or "").strip()
 
@@ -1574,6 +1592,11 @@ async def create_project_subtitle(project_id: str, body: SubtitleCreateRequest):
             "is_modified": True,
             "original_text": entry.get("original_text"),
         }
+        _sync_homophone_index_for_project_change(
+            project_id=project_id,
+            project_dir=project_dir,
+            updated_sentence_indices=[int(legacy_index)],
+        )
         _publish_project_subtitle_event(
             project_id,
             "added",
@@ -1586,6 +1609,11 @@ async def create_project_subtitle(project_id: str, body: SubtitleCreateRequest):
         text=body.text,
         start=body.start,
         end=body.end,
+    )
+    _sync_homophone_index_for_project_change(
+        project_id=project_id,
+        project_dir=project_dir,
+        updated_sentence_indices=[int(segment.get("legacy_index", 0))],
     )
     _publish_project_subtitle_event(
         project_id,
@@ -1637,6 +1665,11 @@ async def update_project_subtitle(
         segment = _find_segment_by_segment_id(composed_after, segment_id)
         if segment is None:
             raise HTTPException(status_code=404, detail="字幕段不存在")
+        _sync_homophone_index_for_project_change(
+            project_id=project_id,
+            project_dir=project_dir,
+            updated_sentence_indices=[target_index],
+        )
         _publish_project_subtitle_event(
             project_id,
             "edited",
@@ -1654,6 +1687,11 @@ async def update_project_subtitle(
         raise HTTPException(status_code=404, detail="字幕段不存在")
 
     segment = subtitle_doc_service.get_segment(project_dir, segment_id)
+    _sync_homophone_index_for_project_change(
+        project_id=project_id,
+        project_dir=project_dir,
+        updated_sentence_indices=[int(segment.get("legacy_index", 0))] if segment else [],
+    )
     _publish_project_subtitle_event(
         project_id,
         "edited",
@@ -1684,6 +1722,11 @@ async def delete_project_subtitle(project_id: str, segment_id: str):
             raise HTTPException(status_code=404, detail="字幕段不存在")
         target_index = int(current_segment.get("legacy_index", 0))
         add_deletion(project_dir, target_index)
+        _sync_homophone_index_for_project_change(
+            project_id=project_id,
+            project_dir=project_dir,
+            removed_sentence_indices=[target_index],
+        )
         _publish_project_subtitle_event(
             project_id,
             "deleted",
@@ -1691,10 +1734,16 @@ async def delete_project_subtitle(project_id: str, segment_id: str):
         )
         return {"success": True, "data": {"segment_id": segment_id, "is_deleted": True}}
 
+    segment = subtitle_doc_service.get_segment(project_dir, segment_id)
     is_success = subtitle_doc_service.delete_segment(project_dir, segment_id)
     if not is_success:
         raise HTTPException(status_code=404, detail="字幕段不存在")
 
+    _sync_homophone_index_for_project_change(
+        project_id=project_id,
+        project_dir=project_dir,
+        removed_sentence_indices=[int(segment.get("legacy_index", 0))] if segment else [],
+    )
     _publish_project_subtitle_event(
         project_id,
         "deleted",
@@ -1933,6 +1982,8 @@ def _batch_sync_runtime(
 ) -> None:
     """Runtime 路径批量同步。"""
     composed = _compose_runtime_segments_with_user_edits(project_dir, runtime_segments)
+    updated_indices: set[int] = set()
+    removed_indices: set[int] = set()
 
     # 1. updates
     for item in body.updates:
@@ -1954,6 +2005,7 @@ def _batch_sync_runtime(
                 payload,
                 original_text=str(seg.get("text", "")),
             )
+            updated_indices.add(int(seg["legacy_index"]))
             results["updated"] += 1
             composed_after = _compose_runtime_segments_with_user_edits(
                 project_dir, runtime_segments
@@ -1984,6 +2036,7 @@ def _batch_sync_runtime(
             remove_manual_entry(project_dir, idx)
         else:
             add_deletion(project_dir, idx)
+        removed_indices.add(idx)
         results["deleted"] += 1
         _publish_project_subtitle_event(
             project_id,
@@ -1998,9 +2051,11 @@ def _batch_sync_runtime(
     # 3. creates
     for item in body.creates:
         if item.restore_segment_id:
-            _handle_runtime_restore(
+            restored_index = _handle_runtime_restore(
                 project_id, project_dir, item, runtime_segments, results
             )
+            if restored_index is not None:
+                updated_indices.add(int(restored_index))
         else:
             new_index, entry = create_manual_entry(
                 project_dir, item.text or "", float(item.start), float(item.end)
@@ -2025,12 +2080,20 @@ def _batch_sync_runtime(
                 "start": segment["start"],
                 "end": segment["end"],
             })
+            updated_indices.add(int(new_index))
             results["created"] += 1
             _publish_project_subtitle_event(
                 project_id,
                 "added",
                 {"segment": segment, "source": "project_api", "is_update": True},
             )
+
+    _sync_homophone_index_for_project_change(
+        project_id=project_id,
+        project_dir=project_dir,
+        updated_sentence_indices=sorted(updated_indices),
+        removed_sentence_indices=sorted(removed_indices),
+    )
 
 
 def _handle_runtime_restore(
@@ -2039,11 +2102,11 @@ def _handle_runtime_restore(
     item: BatchSyncCreateItem,
     runtime_segments: list[dict],
     results: dict[str, Any],
-) -> None:
+) -> int | None:
     """Runtime 路径恢复已删除字幕。"""
     seg_id = item.restore_segment_id
     if not seg_id:
-        return
+        return None
 
     # 区分正索引（runtime 基线）与负索引（手动新增）
     if seg_id.startswith("manual-"):
@@ -2051,7 +2114,7 @@ def _handle_runtime_restore(
             original_index = -int(seg_id.split("-", 1)[1])
         except (ValueError, IndexError):
             results["errors"].append(f"restore: {seg_id} 索引解析失败")
-            return
+            return None
         ok = restore_manual_entry(
             project_dir, original_index, item.text or "", float(item.start), float(item.end)
         )
@@ -2081,13 +2144,15 @@ def _handle_runtime_restore(
                 "added",
                 {"segment": segment, "source": "project_api", "is_update": True},
             )
+            return int(original_index)
         else:
             results["errors"].append(f"restore: {seg_id} 手动字幕恢复失败")
+            return None
     else:
         target = _find_segment_by_segment_id(runtime_segments, seg_id)
         if not target:
             results["errors"].append(f"restore: {seg_id} 未找到")
-            return
+            return None
         idx = int(target["legacy_index"])
         remove_deletion(project_dir, idx)
         # 如果内容有变，补存编辑
@@ -2146,6 +2211,8 @@ def _handle_runtime_restore(
                 "is_update": True,
             },
         )
+        return idx
+    return None
 
 
 def _batch_sync_subtitle_doc(
@@ -2156,6 +2223,8 @@ def _batch_sync_subtitle_doc(
     results: dict[str, Any],
 ) -> None:
     """Subtitle Doc 路径批量同步。"""
+    updated_indices: set[int] = set()
+    removed_indices: set[int] = set()
     # 1. updates
     for item in body.updates:
         payload = {
@@ -2168,6 +2237,7 @@ def _batch_sync_subtitle_doc(
             results["updated"] += 1
             segment = subtitle_doc_service.get_segment(project_dir, item.segment_id)
             if segment is not None:
+                updated_indices.add(int(segment.get("legacy_index", 0)))
                 _publish_project_subtitle_event(
                     project_id,
                     "edited",
@@ -2183,9 +2253,12 @@ def _batch_sync_subtitle_doc(
 
     # 2. deletes
     for item in body.deletes:
+        segment = subtitle_doc_service.get_segment(project_dir, item.segment_id)
         ok = subtitle_doc_service.delete_segment(project_dir, item.segment_id)
         if ok:
             results["deleted"] += 1
+            if segment is not None:
+                removed_indices.add(int(segment.get("legacy_index", 0)))
             _publish_project_subtitle_event(
                 project_id,
                 "deleted",
@@ -2201,9 +2274,11 @@ def _batch_sync_subtitle_doc(
     # 3. creates
     for item in body.creates:
         if item.restore_segment_id:
-            _handle_subtitle_doc_restore(
+            restored_index = _handle_subtitle_doc_restore(
                 project_id, project_dir, item, subtitle_doc_service, results
             )
+            if restored_index is not None:
+                updated_indices.add(int(restored_index))
         else:
             new_seg = subtitle_doc_service.create_segment(
                 project_dir, item.text or "", float(item.start), float(item.end)
@@ -2215,12 +2290,20 @@ def _batch_sync_subtitle_doc(
                 "start": new_seg.get("start"),
                 "end": new_seg.get("end"),
             })
+            updated_indices.add(int(new_seg.get("legacy_index", 0)))
             results["created"] += 1
             _publish_project_subtitle_event(
                 project_id,
                 "added",
                 {"segment": new_seg, "source": "project_api", "is_update": True},
             )
+
+    _sync_homophone_index_for_project_change(
+        project_id=project_id,
+        project_dir=project_dir,
+        updated_sentence_indices=sorted(updated_indices),
+        removed_sentence_indices=sorted(removed_indices),
+    )
 
 
 def _handle_subtitle_doc_restore(
@@ -2229,18 +2312,18 @@ def _handle_subtitle_doc_restore(
     item: BatchSyncCreateItem,
     subtitle_doc_service: Any,
     results: dict[str, Any],
-) -> None:
+) -> int | None:
     """Subtitle Doc 路径恢复已删除字幕（通过 tombstone 映射）。"""
     seg_id = item.restore_segment_id
     if not seg_id:
-        return
+        return None
 
     if seg_id.startswith("manual-"):
         try:
             original_index = -int(seg_id.split("-", 1)[1])
         except (ValueError, IndexError):
             results["errors"].append(f"restore: {seg_id} 索引解析失败")
-            return
+            return None
         ok = restore_manual_entry(
             project_dir, original_index, item.text or "", float(item.start), float(item.end)
         )
@@ -2268,8 +2351,10 @@ def _handle_subtitle_doc_restore(
                 "added",
                 {"segment": segment, "source": "project_api", "is_update": True},
             )
+            return int(original_index)
         else:
             results["errors"].append(f"restore: {seg_id} 手动字幕恢复失败")
+            return None
     else:
         # 通过 tombstone 恢复：restore_segment 查询 _deleted_segment_map
         update: dict[str, Any] = {}
@@ -2326,8 +2411,11 @@ def _handle_subtitle_doc_restore(
                     "is_update": True,
                 },
             )
+            return int(restored_index)
         else:
             results["errors"].append(f"restore: {seg_id} tombstone 中未找到")
+            return None
+    return None
 
 
 @router.patch("/{project_id}/subtitles/legacy/{sentence_index}")
