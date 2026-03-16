@@ -142,19 +142,11 @@
         <!-- 标签页内容 -->
         <div class="tab-content">
           <div v-show="activeTab === 'subtitles'" class="tab-pane">
-            <!-- V3.2.5+dev.20260315.01: Feature flag 控制新旧列表 -->
-              <VirtualSubtitleList
-                v-if="useEditorV2"
-                ref="subtitleListRef"
-                :auto-scroll="true"
-                :enable-auto-resume-follow="true"
-              />
-            <SubtitleList
-              v-else
+            <!-- V3.2.5+dev.20260316.04: Phase F-0 运行时硬切换，仅挂载新字幕列表 -->
+            <VirtualSubtitleList
               ref="subtitleListRef"
               :auto-scroll="true"
-              :enable-auto-resume-follow="subtitleFollowAutoResumeEnabled"
-              :editable="true"
+              :enable-auto-resume-follow="true"
             />
           </div>
 
@@ -289,7 +281,6 @@ import { legacyApi, mediaApi, projectApi, transcriptionApi } from '@/services/ap
 import sseChannelManager from '@/services/sseChannelManager'
 import { useShortcuts } from '@/hooks/useShortcuts'
 import { useProxyVideo } from '@/composables/useProxyVideo'
-import { useUndoRedoSync } from '@/composables'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { repairSubtitleOverlaps } from '@/utils/subtitleUtils'
 import {
@@ -310,7 +301,6 @@ import {
 import EditorHeader from '@/components/editor/EditorHeader.vue'
 import PlaybackControls from '@/components/editor/PlaybackControls/index.vue'
 import VideoStage from '@/components/editor/VideoStage/index.vue'
-import SubtitleList from '@/components/editor/SubtitleList/index.vue'
 import VirtualSubtitleList from '@/components/editor/VirtualSubtitleList/index.vue'
 import WaveformTimeline from '@/components/editor/WaveformTimeline/index.vue'
 import AdvancedSettings from '@/components/editor/AdvancedSettings.vue'
@@ -365,9 +355,6 @@ const forceSyncNow = subtitleDocumentStore.forceSyncNow
 // Proxy 视频加载状态（新重构版本）
 // V3.2.4+dev.20260224.01: project 模式也需要接入媒体状态，避免 progressiveUrl 为空导致视频无法加载
 const proxyVideo = useProxyVideo(identityRef)
-
-// V3.2.4+dev.20260303.01: undo/redo 后端增量同步
-const { undoWithSync, redoWithSync, flushSync: flushUndoRedoSync } = useUndoRedoSync()
 
 // Refs
 const videoStageRef = ref(null)
@@ -1202,18 +1189,23 @@ function normalizeProjectSegmentEvent(data) {
   }
 }
 
-function handleProjectSubtitleUpsert(data) {
+function handleProjectSubtitleUpsert(data, eventType = 'subtitle.project_upsert') {
   if (useEditorV2) {
     const rawSegment = data?.segment
     if (!rawSegment || typeof rawSegment !== 'object') {
-      return
+      throw new Error(`[EditorView] ${eventType} 缺少 segment 载荷`)
     }
 
-    upsertServerSegment(editorDocumentStore, {
+    const applied = upsertServerSegment(editorDocumentStore, {
       ...rawSegment,
       segment_id: data?.segment_id || rawSegment.segment_id,
     })
-    return
+    if (!applied) {
+      throw new Error(
+        `[EditorView] ${eventType} 无法投影到 editorDocumentStore（segment_id=${data?.segment_id || rawSegment.segment_id || 'unknown'}）`
+      )
+    }
+    return true
   }
 
   const normalized = normalizeProjectSegmentEvent(data)
@@ -1250,7 +1242,7 @@ function handleProjectSubtitleUpsert(data) {
     if (existingIndex >= 0) {
       const existingId = projectStore.subtitles[existingIndex].id
       projectStore.updateSubtitle(existingId, payload)
-      return
+      return true
     }
 
     const insertIndex = projectStore.subtitles.findIndex((item) => item.start > payload.start)
@@ -1279,17 +1271,21 @@ function handleProjectSubtitleUpsert(data) {
   } finally {
     projectStore.resumeHistory()
   }
+  return true
 }
 
 function handleProjectSubtitleDelete(data) {
-  const segmentId = data?.segment_id
+  const segmentId = data?.segment_id ?? data?.segment?.segment_id
   if (!segmentId) {
-    return
+    throw new Error('[EditorView] subtitle.project_delete 缺少 segment_id')
   }
 
   if (useEditorV2) {
-    deleteServerSegment(editorDocumentStore, segmentId)
-    return
+    const deleted = deleteServerSegment(editorDocumentStore, segmentId)
+    if (!deleted) {
+      throw new Error(`[EditorView] subtitle.project_delete 未命中本地绑定（segment_id=${segmentId}）`)
+    }
+    return true
   }
 
   const index = projectStore.subtitles.findIndex((item) => item.segment_id === segmentId)
@@ -1302,6 +1298,7 @@ function handleProjectSubtitleDelete(data) {
   } finally {
     projectStore.resumeHistory()
   }
+  return true
 }
 
 // ========== SSE 实时更新 ==========
@@ -1321,10 +1318,10 @@ function subscribeSSE() {
   if (!jobId && projectId) {
     sseUnsubscribe = sseChannelManager.subscribeProject(projectId, {
       onSubtitleUpdated(data) {
-        handleProjectSubtitleUpsert(data)
+        handleProjectSubtitleUpsert(data, 'subtitle.edited.project')
       },
       onSubtitleAdded(data) {
-        handleProjectSubtitleUpsert(data)
+        handleProjectSubtitleUpsert(data, 'subtitle.added.project')
       },
       onSubtitleDeleted(data) {
         handleProjectSubtitleDelete(data)
@@ -1525,7 +1522,7 @@ function subscribeSSE() {
     },
 
     onSubtitleAdded(data) {
-      handleStreamingSubtitle(data)
+      handleSubtitleAdded(data)
     },
 
     onSubtitleDeleted(data) {
@@ -1660,18 +1657,17 @@ function handleStreamingSubtitle(data) {
     const sentence = data.sentence || {}
     const sentenceIndex = data.sentence_index ?? data.index ?? sentence.index
     if (sentenceIndex === undefined || sentenceIndex === null) {
-      if (projectStore.meta.projectId) {
-        void scheduleEditorProjectionReload(projectStore.meta.projectId, 'subtitle_update_legacy_fallback')
-      }
-      return
+      throw new Error('[EditorView] subtitle.legacy_update 在 V2 下缺少 sentence_index')
     }
     const applied = applySentencePatch(editorDocumentStore, {
       ...sentence,
       index: sentenceIndex,
       sentence_index: sentenceIndex,
     })
-    if (!applied && projectStore.meta.projectId) {
-      void scheduleEditorProjectionReload(projectStore.meta.projectId, 'subtitle_update_legacy_fallback')
+    if (!applied) {
+      throw new Error(
+        `[EditorView] subtitle.legacy_update 未命中本地字幕（sentence_index=${sentenceIndex}）`
+      )
     }
     return
   }
@@ -1789,6 +1785,25 @@ function handleReplaceChunk(data) {
   void scheduleRealtimeFinalSync(`subtitle_replace_chunk_${chunkIndex ?? 'unknown'}`)
 }
 
+function handleSubtitleAdded(data) {
+  if (!data) return
+
+  if (useEditorV2) {
+    if (data?.segment && typeof data.segment === 'object') {
+      handleProjectSubtitleUpsert(data, 'subtitle.added')
+      return
+    }
+
+    const applied = upsertServerSegment(editorDocumentStore, data)
+    if (!applied) {
+      throw new Error('[EditorView] subtitle.added 无法投影到 editorDocumentStore')
+    }
+    return
+  }
+
+  handleStreamingSubtitle(data)
+}
+
 /**
  * V3.1.0: 处理恢复的字幕（断点续传后恢复）
  * 后端数据格式: { chunk_index, sentences: [...], is_restore: true }
@@ -1798,10 +1813,9 @@ function handleRestoredChunk(data) {
 
   if (useEditorV2) {
     const applied = editorEventProjector.projectRestored(data)
-    if (!applied && projectStore.meta.projectId) {
-      void scheduleEditorProjectionReload(
-        projectStore.meta.projectId,
-        `subtitle_restored_${data.chunk_index ?? 'unknown'}`
+    if (!applied) {
+      throw new Error(
+        `[EditorView] subtitle.restored 未能应用到新内核（chunk_index=${data.chunk_index ?? 'unknown'}）`
       )
     }
     return
@@ -1852,19 +1866,12 @@ function handleRestoredChunk(data) {
 function handleSubtitleDeleted(data) {
   if (!data) return
   const sentenceIndex = data.index ?? data.sentence_index
+  const segmentId = data.segment_id ?? data.segment?.segment_id
   if (useEditorV2) {
-    if (data.segment_id) {
-      const deleted = deleteServerSegment(editorDocumentStore, data.segment_id)
-      if (deleted) {
-        return
-      }
+    if (!segmentId) {
+      throw new Error('[EditorView] subtitle.deleted 在 V2 下缺少 segment_id')
     }
-    if (projectStore.meta.projectId) {
-      void scheduleEditorProjectionReload(
-        projectStore.meta.projectId,
-        `subtitle_deleted_${sentenceIndex ?? data.segment_id ?? 'unknown'}`
-      )
-    }
+    handleProjectSubtitleDelete(data)
     return
   }
   if (sentenceIndex === undefined || sentenceIndex === null) return
@@ -1878,10 +1885,20 @@ function handleSubtitleDeleted(data) {
 function handleSubtitleEdited(data) {
   if (!data) return
 
+  if (useEditorV2 && data?.segment && typeof data.segment === 'object') {
+    handleProjectSubtitleUpsert(data, 'subtitle.edited')
+    return
+  }
+
   const sentence = data.sentence || {}
   const sentenceIndex = data.index ?? data.sentence_index ?? sentence.index
   const segmentId = data.segment_id ?? sentence.segment_id
-  if ((sentenceIndex === undefined || sentenceIndex === null) && !segmentId) return
+  if ((sentenceIndex === undefined || sentenceIndex === null) && !segmentId) {
+    if (useEditorV2) {
+      throw new Error('[EditorView] subtitle.edited 在 V2 下缺少 sentence_index/segment_id')
+    }
+    return
+  }
 
   if (useEditorV2) {
     const applied = applySentencePatch(editorDocumentStore, {
@@ -1894,10 +1911,9 @@ function handleSubtitleEdited(data) {
         : {}),
       ...(segmentId ? { segment_id: segmentId } : {}),
     })
-    if (!applied && projectStore.meta.projectId) {
-      void scheduleEditorProjectionReload(
-        projectStore.meta.projectId,
-        `subtitle_edited_${sentenceIndex ?? segmentId ?? 'unknown'}`
+    if (!applied) {
+      throw new Error(
+        `[EditorView] subtitle.edited 未命中新内核字幕（key=${sentenceIndex ?? segmentId ?? 'unknown'}）`
       )
     }
     return
@@ -1983,8 +1999,8 @@ function handleRevisedSubtitle(data) {
       })
     }
 
-    if (!applied && projectStore.meta.projectId) {
-      void scheduleEditorProjectionReload(projectStore.meta.projectId, 'subtitle_revised')
+    if (!applied) {
+      throw new Error('[EditorView] subtitle.revised 未能应用到新内核')
     }
     return
   }
@@ -2237,20 +2253,11 @@ async function cancelTranscription() {
 
 // ========== 撤销/重做 ==========
 
-// V3.2.4+dev.20260303.01: undo/redo 通过 useUndoRedoSync 同步后端
 function undo() {
-  if (useEditorV2) {
-    editorCommandBus.undo()
-    return
-  }
-  undoWithSync()
+  editorCommandBus.undo()
 }
 function redo() {
-  if (useEditorV2) {
-    editorCommandBus.redo()
-    return
-  }
-  redoWithSync()
+  editorCommandBus.redo()
 }
 
 // ========== 导出功能 ==========
@@ -2324,14 +2331,12 @@ async function fetchLatestSegments() {
       ? editorSyncEngine.pendingCommands.length
       : Number(editorSyncEngine.pendingCommands?.value?.length || 0)
   } else {
-    // 第一轮：清空文本/时间防抖队列与 undo/redo 防抖同步
+    // 旧链路仍保留给非 V2 模式；Phase F-0 运行时不再使用旧 undo/redo 同步。
     await forceSyncNow()
-    await flushUndoRedoSync()
     // 等待结构性操作（删除/插入/切分/合并）飞行中请求落地
     await structuralSyncStore.waitAll()
     // 第二轮：结构性操作落地后再次冲洗，覆盖“新增后立刻编辑”的补写场景
     await forceSyncNow()
-    await flushUndoRedoSync()
 
     pending = subtitleDocumentStore.pendingCount()
     syncErrors = subtitleDocumentStore.syncErrors

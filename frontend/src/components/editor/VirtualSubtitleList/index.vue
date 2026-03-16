@@ -681,6 +681,7 @@ function handleSplitFromCursor({ localId, cursorPosition, text }) {
   const rightWords = normalizeProjectionWordsToCold(splitResult.right.words, projectStore)
   const dispatchResult = commandBus.dispatch(createSplitSubtitleCommand({
     sourceLocalId: localId,
+    sourceSegmentId: cold?.segmentId ?? null,
     createdLocalId,
     splitAtMs: Math.round(projectStore.toBaseTime(splitResult.splitAtTime) * 1000),
     splitAtTextOffset: splitResult.splitAtTextOffset,
@@ -739,6 +740,8 @@ function handleMerge(localId, direction) {
   const removedSubtitle = editorProjectionBridge.findSubtitleById(removedLocalId)
   const keptEntity = docStore.getEntity(keptLocalId)
   const removedEntity = docStore.getEntity(removedLocalId)
+  const keptCold = docStore.getCold(keptLocalId)
+  const removedCold = docStore.getCold(removedLocalId)
   if (!keptSubtitle || !removedSubtitle || !keptEntity || !removedEntity) {
     ElMessage.error('字幕不存在，无法合并')
     return
@@ -748,6 +751,8 @@ function handleMerge(localId, direction) {
   const dispatchResult = commandBus.dispatch(createMergeSubtitlesCommand({
     keptLocalId,
     removedLocalId,
+    keptSegmentId: keptCold?.segmentId ?? null,
+    removedSegmentId: removedCold?.segmentId ?? null,
     separator,
     beforeKept: {
       text: keptEntity.text,
