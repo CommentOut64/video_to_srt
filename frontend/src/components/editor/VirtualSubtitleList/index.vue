@@ -76,8 +76,8 @@
               :can-merge-next="canMergeNext(item.subtitle.localId)"
               @click="handleRowClick"
               @split="handleSplitFromCursor"
-              @merge-prev="handleMerge(item.subtitle.localId, 'prev')"
-              @merge-next="handleMerge(item.subtitle.localId, 'next')"
+              @merge-prev="(payload) => handleMerge(item.subtitle.localId, 'prev', payload)"
+              @merge-next="(payload) => handleMerge(item.subtitle.localId, 'next', payload)"
               @insert-before="handleInsertBefore(item.subtitle.localId)"
               @insert-after="handleInsertAfter(item.subtitle.localId)"
               @delete="handleDelete(item.subtitle.localId)"
@@ -91,7 +91,7 @@
     <DynamicScroller
       v-else
       ref="scrollerRef"
-      :items="virtualVisibleIds"
+      :items="virtualVisibleRows"
       :min-item-size="98"
       class="scroller"
       tabindex="0"
@@ -102,29 +102,29 @@
           :item="item"
           :index="index"
           :active="active"
-          :size-dependencies="resolveRowSizeDependencies(item, index)"
+          :size-dependencies="[item.sizeKey]"
         >
-          <div class="row-shell" :data-local-id="item">
+          <div class="row-shell" :data-local-id="item.localId">
             <SubtitleRow
-              :local-id="item"
-              :row-index="resolveRowMeta(item, index).rowIndex"
-              :is-selected="selectionStore.isMultiSelected(item)"
-              :is-active="activeId === item"
-              :is-current="currentSubtitleId === item"
-              :match-spans="resolveRowMeta(item, index).matchSpans"
-              :is-match-selected="resolveRowMeta(item, index).isMatchSelected"
-              :is-selectable="resolveRowMeta(item, index).isSelectable"
-              :cluster-color="resolveRowMeta(item, index).clusterColor"
-              :can-merge-prev="canMergePrev(item)"
-              :can-merge-next="canMergeNext(item)"
+              :local-id="item.localId"
+              :row-index="item.rowIndex"
+              :is-selected="selectionStore.isMultiSelected(item.localId)"
+              :is-active="activeId === item.localId"
+              :is-current="currentSubtitleId === item.localId"
+              :match-spans="item.matchSpans"
+              :is-match-selected="item.isMatchSelected"
+              :is-selectable="item.isSelectable"
+              :cluster-color="item.clusterColor"
+              :can-merge-prev="canMergePrev(item.localId)"
+              :can-merge-next="canMergeNext(item.localId)"
               @click="handleRowClick"
               @split="handleSplitFromCursor"
-              @merge-prev="handleMerge(item, 'prev')"
-              @merge-next="handleMerge(item, 'next')"
-              @insert-before="handleInsertBefore(item)"
-              @insert-after="handleInsertAfter(item)"
-              @delete="handleDelete(item)"
-              @select-change="(checked) => handleItemSelectChange(resolveRowMeta(item, index).selectionIndex, checked)"
+              @merge-prev="(payload) => handleMerge(item.localId, 'prev', payload)"
+              @merge-next="(payload) => handleMerge(item.localId, 'next', payload)"
+              @insert-before="handleInsertBefore(item.localId)"
+              @insert-after="handleInsertAfter(item.localId)"
+              @delete="handleDelete(item.localId)"
+              @select-change="(checked) => handleItemSelectChange(item.selectionIndex, checked)"
             />
           </div>
         </DynamicScrollerItem>
@@ -165,6 +165,7 @@ import {
   normalizeProjectionWordsToCold,
   splitSubtitleByCursor,
 } from './structuralEdit'
+import { resolveMergeSideSnapshot } from './mergeSnapshot'
 
 const props = defineProps({
   autoScroll: { type: Boolean, default: true },
@@ -227,10 +228,6 @@ const filteredSubtitles = computed(() => {
   })
 })
 
-const defaultVisibleIds = computed(() => {
-  return filteredSubtitles.value.map((subtitle) => subtitle.localId)
-})
-
 const groupedVisibleIds = computed(() => {
   return homophoneSearch.groupedViewItems.flatMap((group) => {
     if (collapsedGroups.value.has(group.clusterId)) {
@@ -256,6 +253,14 @@ const timelineRowMetaByLocalId = computed(() => {
   )
 })
 
+const defaultVisibleRows = computed(() => {
+  return filteredSubtitles.value.map((subtitle, index) => buildVirtualRow(subtitle.localId, index))
+})
+
+const defaultVisibleIds = computed(() => {
+  return defaultVisibleRows.value.map((row) => row.localId)
+})
+
 const rowMeasurementKeyByLocalId = computed(() => {
   const measurementMap = new Map()
   projectionSubtitles.value.forEach((subtitle) => {
@@ -271,21 +276,25 @@ const rowMeasurementKeyByLocalId = computed(() => {
   return measurementMap
 })
 
-const virtualVisibleIds = computed(() => {
+const timelineVisibleRows = computed(() => {
+  return homophoneSearch.timelineViewItems.map((item) => buildVirtualRow(item.subtitle.localId, item.index))
+})
+
+const virtualVisibleRows = computed(() => {
   if (homophoneSearch.isSearchActive && homophoneSearch.sortMode === SortMode.TIMELINE) {
-    return homophoneSearch.timelineViewItems.map((item) => item.subtitle.localId)
+    return timelineVisibleRows.value
   }
-  return defaultVisibleIds.value
+  return defaultVisibleRows.value
 })
 
 const orderedVisibleIds = computed(() => {
   return isGroupedMode.value
     ? groupedVisibleIds.value
-    : virtualVisibleIds.value
+    : virtualVisibleRows.value.map((row) => row.localId)
 })
 
 const showNoSubtitles = computed(() => {
-  return !homophoneSearch.isSearchActive && defaultVisibleIds.value.length === 0
+  return !homophoneSearch.isSearchActive && defaultVisibleRows.value.length === 0
 })
 
 const showNoMatches = computed(() => {
@@ -312,13 +321,25 @@ function localIdKey(subtitle) {
   return subtitle?.localId ?? subtitle?.id ?? ''
 }
 
-function resolveRowSizeDependencies(localId, fallbackIndex) {
+function buildVirtualRow(localId, fallbackIndex) {
   const rowMeta = resolveRowMeta(localId, fallbackIndex)
-  return [
-    rowMeasurementKeyByLocalId.value.get(localId) || '',
-    rowMeta.matchSpans.length,
-    rowMeta.isSelectable ? 'search' : 'normal',
-  ]
+  const resolvedRowIndex = Number.isFinite(rowMeta.rowIndex) ? rowMeta.rowIndex : fallbackIndex
+
+  return {
+    id: localId,
+    localId,
+    rowIndex: Number.isFinite(resolvedRowIndex) ? resolvedRowIndex : 0,
+    matchSpans: Array.isArray(rowMeta.matchSpans) ? rowMeta.matchSpans : [],
+    isMatchSelected: Boolean(rowMeta.isMatchSelected),
+    isSelectable: Boolean(rowMeta.isSelectable),
+    clusterColor: rowMeta.clusterColor ?? null,
+    selectionIndex: Number.isFinite(rowMeta.selectionIndex) ? rowMeta.selectionIndex : null,
+    sizeKey: [
+      rowMeasurementKeyByLocalId.value.get(localId) || '',
+      Array.isArray(rowMeta.matchSpans) ? rowMeta.matchSpans.length : 0,
+      rowMeta.isSelectable ? 'search' : 'normal',
+    ].join('|'),
+  }
 }
 
 function handleRowClick(localId, event) {
@@ -727,7 +748,7 @@ function handleSplitFromCursor({ localId, cursorPosition, text }) {
   subtitleDocumentStore.setSelectedSubtitleId(createdLocalId)
 }
 
-function handleMerge(localId, direction) {
+function handleMerge(localId, direction, mergePayload = null) {
   const neighbors = docStore.getNeighbors(localId)
   const keptLocalId = direction === 'prev' ? neighbors.prev : localId
   const removedLocalId = direction === 'prev' ? localId : neighbors.next
@@ -747,6 +768,8 @@ function handleMerge(localId, direction) {
     return
   }
 
+  const keptSnapshot = resolveMergeSideSnapshot(keptLocalId, keptEntity, mergePayload)
+  const removedSnapshot = resolveMergeSideSnapshot(removedLocalId, removedEntity, mergePayload)
   const separator = getMergeSeparator()
   const dispatchResult = commandBus.dispatch(createMergeSubtitlesCommand({
     keptLocalId,
@@ -754,20 +777,12 @@ function handleMerge(localId, direction) {
     keptSegmentId: keptCold?.segmentId ?? null,
     removedSegmentId: removedCold?.segmentId ?? null,
     separator,
-    beforeKept: {
-      text: keptEntity.text,
-      startMs: keptEntity.startMs,
-      endMs: keptEntity.endMs,
-    },
-    beforeRemoved: {
-      text: removedEntity.text,
-      startMs: removedEntity.startMs,
-      endMs: removedEntity.endMs,
-    },
+    beforeKept: keptSnapshot,
+    beforeRemoved: removedSnapshot,
     after: {
-      text: `${keptEntity.text}${separator}${removedEntity.text}`,
-      startMs: Math.min(keptEntity.startMs, removedEntity.startMs),
-      endMs: Math.max(keptEntity.endMs, removedEntity.endMs),
+      text: `${keptSnapshot.text}${separator}${removedSnapshot.text}`,
+      startMs: Math.min(keptSnapshot.startMs, removedSnapshot.startMs),
+      endMs: Math.max(keptSnapshot.endMs, removedSnapshot.endMs),
     },
     keptColdPatch: {
       words: [],
@@ -1003,7 +1018,7 @@ onUnmounted(() => {
 })
 
 watch(
-  [scrollerRef, listContainerRef, isGroupedMode, () => virtualVisibleIds.value.length],
+  [scrollerRef, listContainerRef, isGroupedMode, () => virtualVisibleRows.value.length],
   () => {
     nextTick(() => {
       bindScrollerListeners()

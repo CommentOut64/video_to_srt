@@ -73,9 +73,11 @@
  * 原文件行数：2252 行 → 重构后：~550 行
  */
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, inject } from 'vue'
+import { isFeatureEnabled } from '@/config/featureFlags'
 import { useProjectStore } from '@/stores/projectStore'
 import { usePlaybackStore } from '@/stores/playbackStore'
 import { useSubtitleDocumentStore } from '@/stores/subtitleDocumentStore'
+import { useEditorCommandBus } from '@/stores/editor/editorCommandBus'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { mediaApi } from '@/services/api'
 import ContextMenu from '@/components/editor/ContextMenu.vue'
@@ -121,6 +123,8 @@ const projectStore = useProjectStore()
 const playbackStore = usePlaybackStore()
 const subtitleDocumentStore = useSubtitleDocumentStore()
 const playbackManager = usePlaybackManager()
+const useEditorV2 = isFeatureEnabled('USE_EDITOR_V2')
+const editorCommandBus = useEditorV2 ? useEditorCommandBus() : null
 const identityRef = computed(() => props.mediaId || projectStore.primaryId)
 const onSubtitleEdit = subtitleDocumentStore.onSubtitleEdit
 const subtitleEntries = computed(() => subtitleDocumentStore.subtitles || [])
@@ -183,9 +187,28 @@ function normalizeRegionTimeForSignature(time) {
   return value.toFixed(3)
 }
 
+const regionItems = computed(() => {
+  return subtitleEntries.value
+    .map((subtitle) => {
+      const start = Number(subtitle?.start)
+      const normalizedStart = Number.isFinite(start) ? Math.max(0, start) : 0
+      const end = Number(subtitle?.end)
+      const normalizedEnd = Number.isFinite(end) ? Math.max(normalizedStart, end) : normalizedStart
+
+      return {
+        id: subtitle?.id ?? subtitle?.localId ?? '',
+        segment_id: subtitle?.segment_id ?? null,
+        sentenceIndex: subtitle?.sentenceIndex ?? null,
+        start: normalizedStart,
+        end: normalizedEnd,
+      }
+    })
+    .filter((subtitle) => Boolean(subtitle.id))
+})
+
 const regionRenderSignature = computed(() => {
   const selectedId = subtitleDocumentStore.selectedSubtitleId ?? ''
-  const subtitlesSnapshot = subtitleEntries.value
+  const subtitlesSnapshot = regionItems.value
     .map(
       (subtitle) =>
         `${subtitle.id}:${normalizeRegionTimeForSignature(subtitle.start)}:${normalizeRegionTimeForSignature(subtitle.end)}`
@@ -524,7 +547,8 @@ const {
   onSubtitleEdit,
   playbackManager,
   subtitleDocumentStore,
-  emit
+  emit,
+  regionItems
 )
 
 // 右键菜单逻辑
@@ -865,6 +889,39 @@ function handleWheel(e) {
 let regionUpdateTimer = null
 let lastSyncTime = 0
 let hasDeferredRegionRender = false
+let pendingRegionRenderReason = 'unknown'
+let stopUndoRedoRegionListener = null
+const shouldForceRecreateRegions = ref(false)
+
+function isUndoRedoStructuralCommand(command) {
+  if (!command || command.source !== 'undo_redo') {
+    return false
+  }
+  return command.type === 'split_subtitle' || command.type === 'merge_subtitles'
+}
+
+function setupUndoRedoRegionRebuildGuard() {
+  if (!editorCommandBus || stopUndoRedoRegionListener) {
+    return
+  }
+
+  stopUndoRedoRegionListener = editorCommandBus.onCommandApplied((command) => {
+    if (!isUndoRedoStructuralCommand(command)) {
+      return
+    }
+    shouldForceRecreateRegions.value = true
+    hasDeferredRegionRender = true
+    scheduleRegionRender('history-undo-redo')
+  })
+}
+
+function teardownUndoRedoRegionRebuildGuard() {
+  if (!stopUndoRedoRegionListener) {
+    return
+  }
+  stopUndoRedoRegionListener()
+  stopUndoRedoRegionListener = null
+}
 
 function clearScheduledRegionRender() {
   if (regionUpdateTimer) {
@@ -873,19 +930,27 @@ function clearScheduledRegionRender() {
   }
 }
 
-function scheduleRegionRender(delay = 80, reason = 'unknown') {
-  if (!isReady.value) return
-  clearScheduledRegionRender()
+function scheduleRegionRender(reason = 'unknown') {
+  hasDeferredRegionRender = true
+  pendingRegionRenderReason = reason
+  if (regionUpdateTimer) {
+    return
+  }
   regionUpdateTimer = setTimeout(() => {
     regionUpdateTimer = null
+    if (!isReady.value || isRegionPointerDragging.value || isUpdatingRegions.value) {
+      return
+    }
     flushPendingRegionCommits({ force: true })
     logWaveformDragDiagnostics('timeline-region-render-commit', {
-      reason,
-      subtitlesCount: subtitleEntries.value.length,
+      reason: pendingRegionRenderReason,
+      subtitlesCount: regionItems.value.length,
     })
-    renderSubtitleRegions()
+    const forceRecreateAll = shouldForceRecreateRegions.value
+    renderSubtitleRegions(regionItems.value, { forceRecreateAll })
+    shouldForceRecreateRegions.value = false
     hasDeferredRegionRender = false
-  }, Math.max(0, delay))
+  }, 0)
 }
 
 watch(
@@ -916,24 +981,14 @@ watch(
       clearScheduledRegionRender()
       hasDeferredRegionRender = true
       logWaveformDragDiagnostics('timeline-skip-render-while-region-dragging', {
-        subtitlesCount: subtitleEntries.value.length,
+        subtitlesCount: regionItems.value.length,
         reason: 'builtin-guard',
       })
       return
     }
 
     if (!isReady.value) {
-      if (lateReadyRenderTimer) {
-        clearTimeout(lateReadyRenderTimer)
-        recordRuntimeHealthCounter('waveform.late_ready_timer.clear_before_reset')
-      }
-      recordRuntimeHealthCounter('waveform.late_ready_timer.set')
-      lateReadyRenderTimer = setTimeout(() => {
-        lateReadyRenderTimer = null
-        if (isReady.value && subtitleEntries.value.length > 0) {
-          scheduleRegionRender(0, 'late-ready')
-        }
-      }, 500)
+      hasDeferredRegionRender = true
       return
     }
 
@@ -942,9 +997,19 @@ watch(
       return
     }
 
-    scheduleRegionRender(80, 'signature-change')
+    scheduleRegionRender('signature-change')
   },
   { flush: 'post' }
+)
+
+watch(
+  () => isReady.value,
+  (ready) => {
+    if (!ready || !hasDeferredRegionRender) {
+      return
+    }
+    scheduleRegionRender('ready')
+  }
 )
 
 watch(
@@ -960,7 +1025,7 @@ watch(
     if (!isReady.value) return
 
     flushPendingRegionCommits({ force: true })
-    scheduleRegionRender(0, 'drag-end-replay')
+    scheduleRegionRender('drag-end-replay')
   }
 )
 
@@ -970,7 +1035,7 @@ watch(
     if (isUpdating || !wasUpdating) return
     if (!hasDeferredRegionRender) return
     if (isRegionPointerDragging.value || !isReady.value) return
-    scheduleRegionRender(0, 'regions-lock-released')
+    scheduleRegionRender('regions-lock-released')
   }
 )
 
@@ -1117,6 +1182,7 @@ watch(hideTimelineScale, (hidden) => {
 // ============ 生命周期 ============
 onMounted(async () => {
   await nextTick()
+  setupUndoRedoRegionRebuildGuard()
   setupRegionPointerGuards(waveformRef)
   await initWavesurfer()
   stopRuntimeHealthSampler = createRuntimeHealthSampler(
@@ -1140,6 +1206,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  teardownUndoRedoRegionRebuildGuard()
   containerRef.value?.removeEventListener('wheel', handleWheel)
   if (zoomRafId) cancelAnimationFrame(zoomRafId)
   if (loadRetryTimer) {

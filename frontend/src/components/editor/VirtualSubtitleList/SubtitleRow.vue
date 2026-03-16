@@ -448,6 +448,9 @@ function handleItemContextMenu(event) {
 }
 
 function handleContextMenuSelect(key) {
+  const hasDraftOverride = isEditing.value
+  const draftText = hasDraftOverride ? editingText.value : null
+
   isContextMenuOpen.value = false
   pendingBlurWhileContextMenuOpen.value = false
   if (key === 'split') {
@@ -466,13 +469,23 @@ function handleContextMenuSelect(key) {
   if (key === 'merge-prev') {
     isEditing.value = false
     cursorPosition.value = null
-    emit('merge-prev')
+    emit('merge-prev', {
+      localId: props.localId,
+      draftText,
+      hasDraftOverride,
+      originalText: originalText.value,
+    })
     return
   }
   if (key === 'merge-next') {
     isEditing.value = false
     cursorPosition.value = null
-    emit('merge-next')
+    emit('merge-next', {
+      localId: props.localId,
+      draftText,
+      hasDraftOverride,
+      originalText: originalText.value,
+    })
   }
 }
 
