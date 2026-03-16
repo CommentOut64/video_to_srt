@@ -1,5 +1,12 @@
 // V3.2.5+dev.20260315.05: 命令 Reducer - 统一执行所有编辑操作
 import { createSubtitleHotEntity, createSubtitleColdEntity } from './models'
+import {
+  createDeleteSubtitleCommand,
+  createInsertSubtitleCommand,
+  createMergeSubtitlesCommand,
+  createMoveBoundaryCommand,
+  createSplitSubtitleCommand,
+} from './editorCommandFactory'
 
 function cloneColdEntity(cold, localId, overrides = {}) {
   return {
@@ -86,18 +93,23 @@ export function editorReducer(docStore, command) {
       docStore._applyInsert(command.localId, hot, cold, command.afterLocalId)
 
       const undoCommand = {
-        type: 'delete_subtitle',
+        ...createDeleteSubtitleCommand({
+          localId: command.localId,
+          segmentId: cold?.segmentId ?? null,
+          beforeClientRefId: command.beforeClientRefId ?? getPreviousLocalId(docStore, command.localId),
+          afterClientRefId: command.afterClientRefId ?? docStore.getNeighbors(command.localId).next ?? null,
+          snapshot: {
+            text: hot.text,
+            startMs: hot.startMs,
+            endMs: hot.endMs,
+            orderIndex: docStore.getOrderIndex(command.localId),
+            isDraft: hot.isDraft,
+          },
+          coldSnapshot: cold,
+        }),
         commandId: `${command.commandId}_undo`,
         source: 'undo_redo',
         createdAt: Date.now(),
-        localId: command.localId,
-        snapshot: {
-          text: hot.text,
-          startMs: hot.startMs,
-          endMs: hot.endMs,
-          orderIndex: docStore.getOrderIndex(command.localId),
-        },
-        coldSnapshot: cold,
       }
 
       return { success: true, undoCommand }
@@ -108,20 +120,24 @@ export function editorReducer(docStore, command) {
       if (!entity) return { success: false, reason: 'entity_not_found' }
 
       const cold = docStore.getCold(command.localId)
+      const neighbors = docStore.getNeighbors(command.localId)
       const undoCommand = {
-        type: 'insert_subtitle',
+        ...createInsertSubtitleCommand({
+          localId: command.localId,
+          entity: {
+            text: entity.text,
+            startMs: entity.startMs,
+            endMs: entity.endMs,
+            isDraft: entity.isDraft,
+          },
+          afterLocalId: neighbors.prev,
+          beforeClientRefId: neighbors.prev ?? null,
+          afterClientRefId: neighbors.next ?? null,
+          coldInit: cold ? cloneColdEntity(cold, command.localId) : undefined,
+        }),
         commandId: `${command.commandId}_undo`,
         source: 'undo_redo',
         createdAt: Date.now(),
-        localId: command.localId,
-        entity: {
-          text: entity.text,
-          startMs: entity.startMs,
-          endMs: entity.endMs,
-          isDraft: entity.isDraft,
-        },
-        afterLocalId: getPreviousLocalId(docStore, command.localId),
-        coldInit: cold ? cloneColdEntity(cold, command.localId) : undefined,
       }
 
       docStore._applyDelete(command.localId)
@@ -168,18 +184,21 @@ export function editorReducer(docStore, command) {
       )
 
       const undoCommand = {
-        type: 'merge_subtitles',
+        ...createMergeSubtitlesCommand({
+          keptLocalId: command.sourceLocalId,
+          removedLocalId: command.createdLocalId,
+          keptSegmentId: sourceCold?.segmentId ?? null,
+          removedSegmentId: createdCold?.segmentId ?? null,
+          separator: '',
+          beforeKept: command.afterKept,
+          beforeRemoved: command.afterCreated,
+          after: command.before,
+          keptColdPatch: sourceCold ? cloneColdEntity(sourceCold, command.sourceLocalId) : undefined,
+          removedColdSnapshot: cloneColdEntity(createdCold, command.createdLocalId),
+        }),
         commandId: `${command.commandId}_undo`,
         source: 'undo_redo',
         createdAt: Date.now(),
-        keptLocalId: command.sourceLocalId,
-        removedLocalId: command.createdLocalId,
-        separator: '',
-        beforeKept: command.afterKept,
-        beforeRemoved: command.afterCreated,
-        after: command.before,
-        keptColdPatch: sourceCold ? cloneColdEntity(sourceCold, command.sourceLocalId) : undefined,
-        removedColdSnapshot: cloneColdEntity(createdCold, command.createdLocalId),
       }
 
       return { success: true, undoCommand }
@@ -208,19 +227,26 @@ export function editorReducer(docStore, command) {
       docStore._applyDelete(command.removedLocalId)
 
       const undoCommand = {
-        type: 'split_subtitle',
+        ...createSplitSubtitleCommand({
+          sourceLocalId: command.keptLocalId,
+          sourceSegmentId: keptColdBeforeMerge?.segmentId ?? null,
+          createdLocalId: command.removedLocalId,
+          splitAtMs: command.beforeRemoved.startMs,
+          splitAtTextOffset: command.beforeKept.text.length,
+          before: command.after,
+          afterKept: command.beforeKept,
+          afterCreated: command.beforeRemoved,
+          keptColdPatch: keptColdBeforeMerge,
+          createdColdInit: cloneColdEntity(removedCold, command.removedLocalId, {
+            // merge 已在服务端删除 removed 段；撤销 merge 时，本地恢复出的后半字幕
+            // 必须视为“待 split 回包重新绑定”的乐观实体，不能继续沿用已失效的旧 binding。
+            segmentId: null,
+            sentenceIndex: null,
+          }),
+        }),
         commandId: `${command.commandId}_undo`,
         source: 'undo_redo',
         createdAt: Date.now(),
-        sourceLocalId: command.keptLocalId,
-        createdLocalId: command.removedLocalId,
-        splitAtMs: command.beforeRemoved.startMs,
-        splitAtTextOffset: command.beforeKept.text.length,
-        before: command.after,
-        afterKept: command.beforeKept,
-        afterCreated: command.beforeRemoved,
-        keptColdPatch: keptColdBeforeMerge,
-        createdColdInit: removedCold,
       }
 
       return { success: true, undoCommand }
@@ -232,7 +258,9 @@ export function editorReducer(docStore, command) {
       if (!upper || !lower) return { success: false, reason: 'entity_not_found' }
 
       const undoCommand = {
-        ...command,
+        ...createMoveBoundaryCommand({
+          ...command,
+        }),
         commandId: `${command.commandId}_undo`,
         source: 'undo_redo',
         createdAt: Date.now(),

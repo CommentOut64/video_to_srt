@@ -60,6 +60,12 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
   const syncErrors = ref(new Map())
   let inflightProcessQueuePromise = null
 
+  function assertLegacyQueueDisabled(apiName) {
+    if (useEditorV2) {
+      throw new Error(`[SubtitleDocumentStore] ${apiName} 在 USE_EDITOR_V2 下已禁用`)
+    }
+  }
+
   const subtitles = computed(() => (
     useEditorV2
       ? editorProjectionBridge.subtitles
@@ -257,16 +263,12 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
     if (!resolvedIdentityId) return 0
 
     await bindSyncIdentity(resolvedIdentityId)
-    if (useEditorV2) {
-      return 0
-    }
+    assertLegacyQueueDisabled('applyLocalEditQueue')
     return applyPendingEditsToStore(projectStore)
   }
 
   function applyPendingEditsToStore(targetStore = projectStore) {
-    if (useEditorV2) {
-      return 0
-    }
+    assertLegacyQueueDisabled('applyPendingEditsToStore')
     if (!targetStore || pendingUpdates.value.size === 0) return 0
 
     let appliedCount = 0
@@ -401,8 +403,7 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
   }
 
   async function forceSyncNow() {
-    // V3.2.5+dev.20260315.01: 新内核接管后禁用旧落盘
-    if (useEditorV2) return
+    assertLegacyQueueDisabled('forceSyncNow')
     await processQueue()
   }
 

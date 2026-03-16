@@ -355,17 +355,23 @@ def _resolve_editor_segment_id(
     segment_field: str,
     client_ref_field: str,
 ) -> Optional[str]:
-    explicit_segment_id = _normalize_editor_segment_id(op.get(segment_field))
-    if explicit_segment_id:
-        return explicit_segment_id
-
+    current_segments = _collect_project_segments(project_dir)
     client_ref_id = _normalize_editor_segment_id(op.get(client_ref_field))
     if client_ref_id and client_ref_id in request_bindings:
         return request_bindings[client_ref_id]
 
+    explicit_segment_id = _normalize_editor_segment_id(op.get(segment_field))
+    if explicit_segment_id:
+        existing_segment = _find_segment_by_segment_id(
+            current_segments,
+            explicit_segment_id,
+        )
+        if existing_segment is not None:
+            return explicit_segment_id
+
     if client_ref_id:
         existing_segment = _find_segment_by_segment_id(
-            _collect_project_segments(project_dir),
+            current_segments,
             client_ref_id,
         )
         if existing_segment is not None:
@@ -1909,7 +1915,9 @@ async def apply_editor_ops(project_id: str, body: EditorOpsApplyRequest):
             event_type = _normalize_editor_segment_id(event.get("event_type"))
             data = event.get("data")
             if event_type and isinstance(data, dict):
-                _publish_project_subtitle_event(project_id, event_type, data)
+                event_payload = dict(data)
+                event_payload["editor_session_id"] = body.session_id
+                _publish_project_subtitle_event(project_id, event_type, event_payload)
 
     return {
         "success": True,

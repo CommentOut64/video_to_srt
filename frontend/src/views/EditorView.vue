@@ -271,8 +271,13 @@ import { useEditorSyncEngine } from '@/stores/editor/editorSyncEngine'
 import { useEditorProjectionBridge } from '@/stores/editor/editorProjectionBridge'
 import { useEditorEventProjector } from '@/stores/editor/editorEventProjector'
 import {
+  scheduleAuthoritativeReloadForRealtimeEvent,
+  shouldScheduleAuthoritativeReloadForProjectModeEvent,
+} from '@/stores/editor/editorRealtimeSyncPolicy'
+import {
   applySentencePatch,
   deleteServerSegment,
+  shouldIgnoreProjectAckEvent,
   upsertServerSegment,
 } from '@/stores/editor/editorServerProjection'
 import { useSubtitleDocumentStore } from '@/stores/subtitleDocumentStore'
@@ -776,6 +781,17 @@ async function scheduleEditorProjectionReload(projectId, reason = 'unknown') {
   return editorProjectionBridge.totalSubtitles
 }
 
+function scheduleV2RealtimeAuthoritativeReload(reason) {
+  scheduleAuthoritativeReloadForRealtimeEvent({
+    useEditorV2,
+    projectId: props.projectId || projectStore.meta.projectId,
+    reason,
+    scheduleReload: (projectId, reloadReason) => {
+      void scheduleEditorProjectionReload(projectId, reloadReason)
+    },
+  })
+}
+
 function notifyMissingVideoOnce() {
   const identity = mediaIdentityId.value || props.projectId || activeJobId.value
   if (!identity) {
@@ -1110,6 +1126,11 @@ async function syncSegmentsFromBackendAsSource({ reason = 'unknown' } = {}) {
 
 // V3.2.4+dev.20260222.15: 每次定稿事件都立即触发后端回拉，且高频事件合并为“当前1次+补1次”
 async function scheduleRealtimeFinalSync(reason = 'subtitle_final_event') {
+  if (useEditorV2) {
+    scheduleV2RealtimeAuthoritativeReload(reason)
+    return
+  }
+
   realtimeFinalSyncReason = reason
   if (isRealtimeFinalSyncInFlight) {
     hasRealtimeFinalSyncPending = true
@@ -1190,6 +1211,10 @@ function normalizeProjectSegmentEvent(data) {
 }
 
 function handleProjectSubtitleUpsert(data, eventType = 'subtitle.project_upsert') {
+  if (shouldIgnoreProjectAckEvent(data, editorSessionStore.sessionId)) {
+    return true
+  }
+
   if (useEditorV2) {
     const rawSegment = data?.segment
     if (!rawSegment || typeof rawSegment !== 'object') {
@@ -1203,6 +1228,14 @@ function handleProjectSubtitleUpsert(data, eventType = 'subtitle.project_upsert'
     if (!applied) {
       throw new Error(
         `[EditorView] ${eventType} 无法投影到 editorDocumentStore（segment_id=${data?.segment_id || rawSegment.segment_id || 'unknown'}）`
+      )
+    }
+    if (shouldScheduleAuthoritativeReloadForProjectModeEvent({
+      useEditorV2,
+      activeJobId: activeJobId.value,
+    })) {
+      scheduleV2RealtimeAuthoritativeReload(
+        `${eventType}_${data?.segment_id || rawSegment.segment_id || 'unknown'}`
       )
     }
     return true
@@ -1275,6 +1308,10 @@ function handleProjectSubtitleUpsert(data, eventType = 'subtitle.project_upsert'
 }
 
 function handleProjectSubtitleDelete(data) {
+  if (shouldIgnoreProjectAckEvent(data, editorSessionStore.sessionId)) {
+    return true
+  }
+
   const segmentId = data?.segment_id ?? data?.segment?.segment_id
   if (!segmentId) {
     throw new Error('[EditorView] subtitle.project_delete 缺少 segment_id')
@@ -1283,7 +1320,16 @@ function handleProjectSubtitleDelete(data) {
   if (useEditorV2) {
     const deleted = deleteServerSegment(editorDocumentStore, segmentId)
     if (!deleted) {
+      if (data?.source === 'project_api' && data?.is_update === true) {
+        return true
+      }
       throw new Error(`[EditorView] subtitle.project_delete 未命中本地绑定（segment_id=${segmentId}）`)
+    }
+    if (shouldScheduleAuthoritativeReloadForProjectModeEvent({
+      useEditorV2,
+      activeJobId: activeJobId.value,
+    })) {
+      scheduleV2RealtimeAuthoritativeReload(`subtitle.deleted.project_${segmentId}`)
     }
     return true
   }
@@ -1780,7 +1826,12 @@ function handleReplaceChunk(data) {
 
   const chunkIndex = data.chunk_index
   if (useEditorV2) {
-    editorEventProjector.projectReplaceChunk(data)
+    const applied = editorEventProjector.projectReplaceChunk(data)
+    if (!applied) {
+      throw new Error(
+        `[EditorView] subtitle.replace_chunk 未能应用到新内核（chunk_index=${chunkIndex ?? 'unknown'}）`
+      )
+    }
   }
   void scheduleRealtimeFinalSync(`subtitle_replace_chunk_${chunkIndex ?? 'unknown'}`)
 }
@@ -1818,6 +1869,7 @@ function handleRestoredChunk(data) {
         `[EditorView] subtitle.restored 未能应用到新内核（chunk_index=${data.chunk_index ?? 'unknown'}）`
       )
     }
+    scheduleV2RealtimeAuthoritativeReload(`subtitle_restored_${data.chunk_index ?? 'unknown'}`)
     return
   }
 
@@ -1853,13 +1905,6 @@ function handleRestoredChunk(data) {
 
   // 调用 projectStore 的恢复方法
   projectStore.restoreChunk(chunkIndex, formattedSentences)
-
-  if (useEditorV2 && projectStore.meta.projectId) {
-    void scheduleEditorProjectionReload(
-      projectStore.meta.projectId,
-      `subtitle_restored_${chunkIndex ?? 'unknown'}`
-    )
-  }
 
 }
 
@@ -1972,7 +2017,12 @@ function handleFinalizedSubtitle(data) {
   const chunkIndex = data.chunk_index
   const sentenceIndex = data.index
   if (useEditorV2) {
-    editorEventProjector.projectFinalized(data)
+    const applied = editorEventProjector.projectFinalized(data)
+    if (!applied) {
+      throw new Error(
+        `[EditorView] subtitle.finalized 未能应用到新内核（key=${chunkIndex ?? sentenceIndex ?? 'unknown'}）`
+      )
+    }
   }
   void scheduleRealtimeFinalSync(`subtitle_finalized_${chunkIndex ?? sentenceIndex ?? 'unknown'}`)
 }
@@ -2002,6 +2052,7 @@ function handleRevisedSubtitle(data) {
     if (!applied) {
       throw new Error('[EditorView] subtitle.revised 未能应用到新内核')
     }
+    scheduleV2RealtimeAuthoritativeReload('subtitle_revised')
     return
   }
 
@@ -2020,9 +2071,6 @@ function handleRevisedSubtitle(data) {
   }
   projectStore.applyRevisedSubtitle(revisedPayload)
 
-  if (useEditorV2 && projectStore.meta.projectId) {
-    void scheduleEditorProjectionReload(projectStore.meta.projectId, 'subtitle_revised')
-  }
 }
 
 function handleSpeakerProfiles(data) {

@@ -62,6 +62,16 @@ function buildReplayCommands(commands = []) {
   }))
 }
 
+function assertCommandHasOwnField(command, fieldName) {
+  if (!Object.prototype.hasOwnProperty.call(command, fieldName)) {
+    throw new Error(`[SyncEngine] ${command.type} 缺少冻结字段：${fieldName}`)
+  }
+}
+
+function normalizeCommandList(commands) {
+  return Array.isArray(commands) ? commands.filter(Boolean) : []
+}
+
 function syncSnapshotColdState(docStore, localId, snapshot, existingCold) {
   if (existingCold?.segmentId && existingCold.segmentId !== snapshot.segmentId) {
     docStore.bindingBySegmentId.delete(existingCold.segmentId)
@@ -206,6 +216,62 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
   let syncTimer = null
   let retryTimer = null
   let inflightPushPromise = null
+
+  function removePendingCommandsByIds(commandIds = []) {
+    const normalizedIds = commandIds.filter(Boolean)
+    if (normalizedIds.length === 0) {
+      return 0
+    }
+
+    const idSet = new Set(normalizedIds)
+    const beforeCount = pendingCommands.value.length
+    pendingCommands.value = pendingCommands.value.filter((command) => !idSet.has(command.commandId))
+    return beforeCount - pendingCommands.value.length
+  }
+
+  function areAllCommandsPending(commands = []) {
+    const normalizedCommands = normalizeCommandList(commands)
+    if (normalizedCommands.length === 0) {
+      return false
+    }
+
+    const pendingIdSet = new Set(pendingCommands.value.map((command) => command.commandId))
+    return normalizedCommands.every((command) => pendingIdSet.has(command.commandId))
+  }
+
+  function appendCommandsForSync(commands = []) {
+    const normalizedCommands = normalizeCommandList(commands)
+    if (normalizedCommands.length === 0) {
+      return 0
+    }
+
+    pendingCommands.value = [...pendingCommands.value, ...normalizedCommands]
+    schedulePush()
+    return normalizedCommands.length
+  }
+
+  function rewritePendingForHistory({ entry, replayCommands = [], direction } = {}) {
+    if (!entry || (direction !== 'undo' && direction !== 'redo')) {
+      return { mode: 'invalid' }
+    }
+
+    const pendingReplayCommands = normalizeCommandList(entry.pendingSyncCommands)
+    if (areAllCommandsPending(pendingReplayCommands)) {
+      removePendingCommandsByIds(pendingReplayCommands.map((command) => command.commandId))
+      entry.pendingSyncCommands = []
+      return { mode: 'compact_pending_replay' }
+    }
+
+    if (direction === 'undo' && areAllCommandsPending(entry.doCommands)) {
+      removePendingCommandsByIds(entry.doCommands.map((command) => command.commandId))
+      entry.pendingSyncCommands = []
+      return { mode: 'compact_original' }
+    }
+
+    appendCommandsForSync(replayCommands)
+    entry.pendingSyncCommands = [...normalizeCommandList(replayCommands)]
+    return { mode: 'enqueue_replay' }
+  }
 
   function enqueue(command) {
     if (
@@ -496,16 +562,15 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
       }
 
       case 'insert_subtitle': {
-        const nextLocalId = command.afterLocalId
-          ? docStore.getNeighbors(command.afterLocalId).next
-          : null
+        assertCommandHasOwnField(command, 'beforeClientRefId')
+        assertCommandHasOwnField(command, 'afterClientRefId')
         return {
           op_id: command.commandId,
           type: 'insert_subtitle',
           client_ref_id: command.localId,
           anchor: {
-            before_client_ref_id: command.afterLocalId ?? null,
-            after_client_ref_id: nextLocalId ?? null,
+            before_client_ref_id: command.beforeClientRefId ?? null,
+            after_client_ref_id: command.afterClientRefId ?? null,
           },
           after: {
             text: command.entity.text,
@@ -516,17 +581,17 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
       }
 
       case 'delete_subtitle': {
-        const cold = docStore.getCold(command.localId)
-        const entity = docStore.getEntity(command.localId)
+        assertCommandHasOwnField(command, 'segmentId')
+        assertCommandHasOwnField(command, 'snapshot')
         return {
           op_id: command.commandId,
           type: 'delete_subtitle',
           client_ref_id: command.localId,
-          segment_id: cold?.segmentId || null,
+          segment_id: command.segmentId ?? null,
           before: {
-            text: command.snapshot?.text ?? entity?.text ?? '',
-            start_ms: command.snapshot?.startMs ?? entity?.startMs ?? 0,
-            end_ms: command.snapshot?.endMs ?? entity?.endMs ?? 0,
+            text: command.snapshot.text ?? '',
+            start_ms: command.snapshot.startMs ?? 0,
+            end_ms: command.snapshot.endMs ?? 0,
           },
         }
       }
@@ -588,15 +653,15 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
       }
 
       case 'move_boundary': {
-        const upperCold = docStore.getCold(command.upperLocalId)
-        const lowerCold = docStore.getCold(command.lowerLocalId)
+        assertCommandHasOwnField(command, 'upperSegmentId')
+        assertCommandHasOwnField(command, 'lowerSegmentId')
         return {
           op_id: command.commandId,
           type: 'move_boundary',
           upper_client_ref_id: command.upperLocalId,
           lower_client_ref_id: command.lowerLocalId,
-          upper_segment_id: upperCold?.segmentId || null,
-          lower_segment_id: lowerCold?.segmentId || null,
+          upper_segment_id: command.upperSegmentId ?? null,
+          lower_segment_id: command.lowerSegmentId ?? null,
           before: {
             upper_end_ms: command.before.upperEndMs,
             lower_start_ms: command.before.lowerStartMs,
@@ -631,6 +696,7 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
     isSyncing,
     lastSyncTime,
     enqueue,
+    rewritePendingForHistory,
     flush,
     reset,
     applyBindings,

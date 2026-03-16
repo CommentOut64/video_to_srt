@@ -12,6 +12,26 @@ function normalizeSegmentId(value) {
   return String(value ?? '').trim()
 }
 
+export function shouldIgnoreProjectAckEvent(data, currentSessionId) {
+  const normalizedSessionId = String(currentSessionId ?? '').trim()
+  if (!normalizedSessionId) {
+    return false
+  }
+
+  if (data?.source !== 'project_api' || data?.is_update !== true) {
+    return false
+  }
+
+  const eventSessionId = String(
+    data?.editor_session_id
+    ?? data?.editorSessionId
+    ?? data?.session_id
+    ?? ''
+  ).trim()
+
+  return Boolean(eventSessionId) && eventSessionId === normalizedSessionId
+}
+
 function resolveSentenceIndex(rawSegment) {
   const rawIndex = rawSegment?.legacy_index ?? rawSegment?.sentence_index ?? rawSegment?.index
   const numeric = Number(rawIndex)
@@ -180,12 +200,21 @@ export function deleteServerSegment(docStore, segmentId) {
     return false
   }
 
-  const localId = docStore.bindingBySegmentId.get(normalizedSegmentId)
-  if (!localId) {
+  const matchedLocalIds = []
+  for (const [localId, cold] of docStore.coldEntities.entries()) {
+    if (cold?.segmentId === normalizedSegmentId) {
+      matchedLocalIds.push(localId)
+    }
+  }
+
+  if (matchedLocalIds.length === 0) {
     return false
   }
 
-  return docStore._applyDelete(localId)
+  matchedLocalIds.forEach((localId) => {
+    docStore._applyDelete(localId)
+  })
+  return true
 }
 
 export function applySentencePatch(docStore, rawSentence) {

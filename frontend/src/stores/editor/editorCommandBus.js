@@ -3,6 +3,7 @@ import { defineStore } from 'pinia'
 import { useEditorDocumentStore } from './editorDocumentStore'
 import { useEditorSessionStore } from './editorSessionStore'
 import { useEditorHistoryStore } from './editorHistoryStore'
+import { useEditorSyncEngine } from './editorSyncEngine'
 import { normalizeEditorCommand } from './editorCommandFactory'
 import { editorReducer } from './editorReducer'
 
@@ -13,14 +14,59 @@ export const useEditorCommandBus = defineStore('editorCommandBus', () => {
     listeners.forEach((fn) => fn(command, result))
   }
 
+  function enrichHistoryReplayCommand(command, docStore) {
+    if (!command) {
+      return command
+    }
+
+    const resolveCurrentSegmentId = (localId, fallbackSegmentId = null) => {
+      const currentSegmentId = localId ? docStore.getCold(localId)?.segmentId ?? null : null
+      return currentSegmentId ?? fallbackSegmentId ?? null
+    }
+
+    if (command.type === 'split_subtitle') {
+      return {
+        ...command,
+        sourceSegmentId: resolveCurrentSegmentId(command.sourceLocalId, command.sourceSegmentId),
+      }
+    }
+
+    if (command.type === 'merge_subtitles') {
+      return {
+        ...command,
+        keptSegmentId: resolveCurrentSegmentId(command.keptLocalId, command.keptSegmentId),
+        removedSegmentId: resolveCurrentSegmentId(command.removedLocalId, command.removedSegmentId),
+      }
+    }
+
+    if (command.type === 'delete_subtitle') {
+      return {
+        ...command,
+        segmentId: resolveCurrentSegmentId(command.localId, command.segmentId),
+      }
+    }
+
+    if (command.type === 'move_boundary') {
+      return {
+        ...command,
+        upperSegmentId: resolveCurrentSegmentId(command.upperLocalId, command.upperSegmentId),
+        lowerSegmentId: resolveCurrentSegmentId(command.lowerLocalId, command.lowerSegmentId),
+      }
+    }
+
+    return command
+  }
+
   function materializeHistoryReplayCommands(commands = []) {
     const sessionStore = useEditorSessionStore()
+    const docStore = useEditorDocumentStore()
     const replayCreatedAt = Date.now()
 
     return commands
       .filter(Boolean)
       .map((command, index) => {
-        const { skipSync, ...rest } = command
+        const enrichedCommand = enrichHistoryReplayCommand(command, docStore)
+        const { skipSync, ...rest } = enrichedCommand
         return {
           ...rest,
           commandId: sessionStore.nextCommandId(),
@@ -125,19 +171,33 @@ export const useEditorCommandBus = defineStore('editorCommandBus', () => {
 
   function undo() {
     const historyStore = useEditorHistoryStore()
-    const commands = historyStore.undo()
-    if (!commands) return false
+    const syncEngine = useEditorSyncEngine()
+    const entry = historyStore.undo()
+    if (!entry) return false
     historyStore.closeTransaction()
-    materializeHistoryReplayCommands(commands).forEach(cmd => dispatch(cmd))
+    const replayCommands = materializeHistoryReplayCommands(entry.undoCommands)
+    replayCommands.forEach(cmd => dispatch(cmd))
+    syncEngine.rewritePendingForHistory({
+      entry,
+      replayCommands,
+      direction: 'undo',
+    })
     return true
   }
 
   function redo() {
     const historyStore = useEditorHistoryStore()
-    const commands = historyStore.redo()
-    if (!commands) return false
+    const syncEngine = useEditorSyncEngine()
+    const entry = historyStore.redo()
+    if (!entry) return false
     historyStore.closeTransaction()
-    materializeHistoryReplayCommands(commands).forEach(cmd => dispatch(cmd))
+    const replayCommands = materializeHistoryReplayCommands(entry.doCommands)
+    replayCommands.forEach(cmd => dispatch(cmd))
+    syncEngine.rewritePendingForHistory({
+      entry,
+      replayCommands,
+      direction: 'redo',
+    })
     return true
   }
 

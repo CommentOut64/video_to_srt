@@ -4,6 +4,13 @@ import { useEditorDocumentStore } from './editorDocumentStore'
 
 const DEFAULT_INSERT_DURATION_MS = 3000
 const MIN_INSERT_DURATION_MS = 500
+const STRUCTURAL_COMMAND_TYPES = new Set([
+  'insert_subtitle',
+  'delete_subtitle',
+  'split_subtitle',
+  'merge_subtitles',
+  'move_boundary',
+])
 
 function createBaseCommand(type, overrides = {}) {
   const sessionStore = useEditorSessionStore()
@@ -41,6 +48,85 @@ function resolveInsertWindow(afterLocalId, docStore) {
   return { startMs, endMs }
 }
 
+function resolveInsertAnchor(afterLocalId, docStore) {
+  if (afterLocalId !== null && afterLocalId !== undefined) {
+    return {
+      beforeClientRefId: afterLocalId,
+      afterClientRefId: docStore.getNeighbors(afterLocalId).next ?? null,
+    }
+  }
+
+  return {
+    beforeClientRefId: null,
+    afterClientRefId: docStore.order[0] ?? null,
+  }
+}
+
+function assertHasOwnField(command, fieldName) {
+  if (!Object.prototype.hasOwnProperty.call(command, fieldName)) {
+    throw new Error(`[CommandFactory] ${command.type} 缺少必填字段：${fieldName}`)
+  }
+}
+
+function assertObjectField(command, fieldName) {
+  assertHasOwnField(command, fieldName)
+  const value = command[fieldName]
+  if (!value || typeof value !== 'object') {
+    throw new Error(`[CommandFactory] ${command.type} 字段必须是对象：${fieldName}`)
+  }
+}
+
+function validateStructuralCommand(command) {
+  if (!command || !STRUCTURAL_COMMAND_TYPES.has(command.type)) {
+    return command
+  }
+
+  switch (command.type) {
+    case 'insert_subtitle':
+      assertHasOwnField(command, 'localId')
+      assertHasOwnField(command, 'beforeClientRefId')
+      assertHasOwnField(command, 'afterClientRefId')
+      assertObjectField(command, 'entity')
+      break
+    case 'delete_subtitle':
+      assertHasOwnField(command, 'localId')
+      assertHasOwnField(command, 'segmentId')
+      assertObjectField(command, 'snapshot')
+      break
+    case 'split_subtitle':
+      assertHasOwnField(command, 'sourceLocalId')
+      assertHasOwnField(command, 'sourceSegmentId')
+      assertHasOwnField(command, 'createdLocalId')
+      assertHasOwnField(command, 'splitAtMs')
+      assertHasOwnField(command, 'splitAtTextOffset')
+      assertObjectField(command, 'before')
+      assertObjectField(command, 'afterKept')
+      assertObjectField(command, 'afterCreated')
+      break
+    case 'merge_subtitles':
+      assertHasOwnField(command, 'keptLocalId')
+      assertHasOwnField(command, 'removedLocalId')
+      assertHasOwnField(command, 'keptSegmentId')
+      assertHasOwnField(command, 'removedSegmentId')
+      assertObjectField(command, 'beforeKept')
+      assertObjectField(command, 'beforeRemoved')
+      assertObjectField(command, 'after')
+      break
+    case 'move_boundary':
+      assertHasOwnField(command, 'upperLocalId')
+      assertHasOwnField(command, 'lowerLocalId')
+      assertHasOwnField(command, 'upperSegmentId')
+      assertHasOwnField(command, 'lowerSegmentId')
+      assertObjectField(command, 'before')
+      assertObjectField(command, 'after')
+      break
+    default:
+      break
+  }
+
+  return command
+}
+
 export function createUpdateTextCommand(overrides = {}) {
   const docStore = useEditorDocumentStore()
   const entity = overrides.localId ? docStore.getEntity(overrides.localId) : null
@@ -74,10 +160,13 @@ export function createInsertSubtitleCommand(overrides = {}) {
   const localId = overrides.localId || sessionStore.nextLocalId()
   const afterLocalId = overrides.afterLocalId ?? null
   const fallbackWindow = resolveInsertWindow(afterLocalId, docStore)
+  const frozenAnchor = resolveInsertAnchor(afterLocalId, docStore)
 
-  return createBaseCommand('insert_subtitle', {
+  return validateStructuralCommand(createBaseCommand('insert_subtitle', {
     localId,
     afterLocalId,
+    beforeClientRefId: overrides.beforeClientRefId ?? frozenAnchor.beforeClientRefId,
+    afterClientRefId: overrides.afterClientRefId ?? frozenAnchor.afterClientRefId,
     entity: overrides.entity ?? {
       text: '',
       startMs: fallbackWindow.startMs,
@@ -86,23 +175,63 @@ export function createInsertSubtitleCommand(overrides = {}) {
     },
     coldInit: overrides.coldInit,
     ...overrides,
-  })
+  }))
 }
 
 export function createDeleteSubtitleCommand(overrides = {}) {
-  return createBaseCommand('delete_subtitle', overrides)
+  const docStore = useEditorDocumentStore()
+  const entity = overrides.localId ? docStore.getEntity(overrides.localId) : null
+  const cold = overrides.localId ? docStore.getCold(overrides.localId) : null
+  const neighbors = overrides.localId ? docStore.getNeighbors(overrides.localId) : { prev: null, next: null }
+
+  return validateStructuralCommand(createBaseCommand('delete_subtitle', {
+    segmentId: overrides.segmentId ?? cold?.segmentId ?? null,
+    snapshot: overrides.snapshot ?? {
+      text: entity?.text ?? '',
+      startMs: entity?.startMs ?? 0,
+      endMs: entity?.endMs ?? 0,
+      isDraft: entity?.isDraft ?? false,
+      orderIndex: overrides.localId ? docStore.getOrderIndex(overrides.localId) : -1,
+    },
+    coldSnapshot: overrides.coldSnapshot ?? (cold ? { ...cold } : undefined),
+    beforeClientRefId: overrides.beforeClientRefId ?? neighbors.prev ?? null,
+    afterClientRefId: overrides.afterClientRefId ?? neighbors.next ?? null,
+    ...overrides,
+  }))
 }
 
 export function createSplitSubtitleCommand(overrides = {}) {
-  return createBaseCommand('split_subtitle', overrides)
+  const docStore = useEditorDocumentStore()
+  const sourceCold = overrides.sourceLocalId ? docStore.getCold(overrides.sourceLocalId) : null
+
+  return validateStructuralCommand(createBaseCommand('split_subtitle', {
+    sourceSegmentId: overrides.sourceSegmentId ?? sourceCold?.segmentId ?? null,
+    ...overrides,
+  }))
 }
 
 export function createMergeSubtitlesCommand(overrides = {}) {
-  return createBaseCommand('merge_subtitles', overrides)
+  const docStore = useEditorDocumentStore()
+  const keptCold = overrides.keptLocalId ? docStore.getCold(overrides.keptLocalId) : null
+  const removedCold = overrides.removedLocalId ? docStore.getCold(overrides.removedLocalId) : null
+
+  return validateStructuralCommand(createBaseCommand('merge_subtitles', {
+    keptSegmentId: overrides.keptSegmentId ?? keptCold?.segmentId ?? null,
+    removedSegmentId: overrides.removedSegmentId ?? removedCold?.segmentId ?? null,
+    ...overrides,
+  }))
 }
 
 export function createMoveBoundaryCommand(overrides = {}) {
-  return createBaseCommand('move_boundary', overrides)
+  const docStore = useEditorDocumentStore()
+  const upperCold = overrides.upperLocalId ? docStore.getCold(overrides.upperLocalId) : null
+  const lowerCold = overrides.lowerLocalId ? docStore.getCold(overrides.lowerLocalId) : null
+
+  return validateStructuralCommand(createBaseCommand('move_boundary', {
+    upperSegmentId: overrides.upperSegmentId ?? upperCold?.segmentId ?? null,
+    lowerSegmentId: overrides.lowerSegmentId ?? lowerCold?.segmentId ?? null,
+    ...overrides,
+  }))
 }
 
 export function createBatchReplaceCommand(overrides = {}) {
@@ -135,6 +264,6 @@ export function normalizeEditorCommand(command) {
     case 'batch_replace':
       return createBatchReplaceCommand(command)
     default:
-      return createBaseCommand(command.type, command)
+      return validateStructuralCommand(createBaseCommand(command.type, command))
   }
 }

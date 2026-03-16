@@ -131,6 +131,39 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     })
   }
 
+  function collectLocalIdsBySegmentId(segmentId) {
+    if (!segmentId) {
+      return []
+    }
+
+    const matchedLocalIds = []
+    for (const [candidateLocalId, cold] of coldEntities.entries()) {
+      if (cold?.segmentId === segmentId) {
+        matchedLocalIds.push(candidateLocalId)
+      }
+    }
+    return matchedLocalIds
+  }
+
+  function enforceUniqueSegmentBinding(preferredLocalId, segmentId) {
+    if (!preferredLocalId || !segmentId) {
+      return
+    }
+
+    const duplicateLocalIds = collectLocalIdsBySegmentId(segmentId)
+      .filter((candidateLocalId) => candidateLocalId !== preferredLocalId)
+
+    for (const duplicateLocalId of duplicateLocalIds) {
+      _applyDelete(duplicateLocalId)
+    }
+
+    clearMatchingTombstones({
+      localId: preferredLocalId,
+      segmentId,
+    })
+    bindingBySegmentId.set(segmentId, preferredLocalId)
+  }
+
   // ─── 原子写操作（仅由 reducer 调用） ───
   function _applyInsert(localId, hot, cold, afterLocalId) {
     const nextHot = {
@@ -152,6 +185,7 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
       coldEntities.set(localId, nextCold)
       if (nextCold.segmentId) {
         bindingBySegmentId.set(nextCold.segmentId, localId)
+        enforceUniqueSegmentBinding(localId, nextCold.segmentId)
       }
       if (nextCold.sentenceIndex !== null && nextCold.sentenceIndex !== undefined) {
         bindingBySentenceIndex.set(nextCold.sentenceIndex, localId)
@@ -260,6 +294,7 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
         segmentId,
       })
       bindingBySegmentId.set(segmentId, localId)
+      enforceUniqueSegmentBinding(localId, segmentId)
     }
     revision.value++
     return true

@@ -2,6 +2,7 @@
 import { useEditorSessionStore } from './editorSessionStore'
 import { useEditorDocumentStore } from './editorDocumentStore'
 import { useEditorCommandBus } from './editorCommandBus'
+import { createInsertSubtitleCommand } from './editorCommandFactory'
 
 let pendingCommands = []
 let flushScheduled = false
@@ -60,6 +61,55 @@ function buildServerEntity(sentence, sessionStore, options = {}) {
   }
 }
 
+function resolveFinalizedIndices(data) {
+  if (Array.isArray(data?.indices)) {
+    return data.indices.filter((value) => value !== undefined && value !== null)
+  }
+
+  const singleIndex =
+    data?.index
+    ?? data?.sentence_index
+    ?? data?.sentence?.index
+    ?? data?.sentence?.sentence_index
+
+  return singleIndex === undefined || singleIndex === null
+    ? []
+    : [singleIndex]
+}
+
+function buildFinalizedSentenceMap(data, indices = []) {
+  const sentenceMap = new Map()
+
+  if (data?.sentence && typeof data.sentence === 'object') {
+    const sentenceIndex =
+      data?.index
+      ?? data?.sentence_index
+      ?? data?.sentence?.index
+      ?? data?.sentence?.sentence_index
+      ?? indices[0]
+
+    if (sentenceIndex !== undefined && sentenceIndex !== null) {
+      sentenceMap.set(sentenceIndex, data.sentence)
+    }
+  }
+
+  if (Array.isArray(data?.sentences)) {
+    data.sentences.forEach((sentence, index) => {
+      const sentenceIndex =
+        sentence?.index
+        ?? sentence?.sentence_index
+        ?? sentence?.sentenceIndex
+        ?? indices[index]
+
+      if (sentenceIndex !== undefined && sentenceIndex !== null) {
+        sentenceMap.set(sentenceIndex, sentence)
+      }
+    })
+  }
+
+  return sentenceMap
+}
+
 export function useEditorEventProjector() {
 
   function scheduleFlush() {
@@ -97,11 +147,8 @@ export function useEditorEventProjector() {
       pendingCommands.push(cmd)
     } else {
       const localId = sessionStore.nextLocalId()
-      const cmd = {
-        type: 'insert_subtitle',
-        commandId: sessionStore.nextCommandId(),
+      const cmd = createInsertSubtitleCommand({
         source: 'system',
-        createdAt: Date.now(),
         localId,
         entity: {
           text: sentence.text || '',
@@ -117,7 +164,7 @@ export function useEditorEventProjector() {
           isDraft: true,
           fallbackSource: 'sensevoice',
         }).cold,
-      }
+      })
       pendingCommands.push(cmd)
     }
 
@@ -128,13 +175,22 @@ export function useEditorEventProjector() {
     const sessionStore = useEditorSessionStore()
     const docStore = useEditorDocumentStore()
     const chunkId = normalizeChunkId(data)
+    const sentences = Array.isArray(data?.sentences) ? data.sentences : []
+    const newIndices = Array.isArray(data?.new_indices) ? data.new_indices : []
+
+    if (sentences.length === 0 || newIndices.length !== sentences.length) {
+      return false
+    }
 
     const oldLocalIds = (data.old_indices || [])
       .map(idx => docStore.bindingBySentenceIndex.get(idx))
       .filter(Boolean)
 
-    const newEntities = data.sentences.map((sentence, i) => {
-      const sentenceIndex = data.new_indices[i]
+    const newEntities = sentences.map((sentence, i) => {
+      const sentenceIndex = newIndices[i]
+      if (sentenceIndex === undefined || sentenceIndex === null) {
+        return null
+      }
       const localId = docStore.bindingBySentenceIndex.get(sentenceIndex) || sessionStore.nextLocalId()
       return buildServerEntity(sentence, sessionStore, {
         localId,
@@ -142,7 +198,11 @@ export function useEditorEventProjector() {
         chunkId,
         fallbackSource: 'sensevoice',
       })
-    })
+    }).filter(Boolean)
+
+    if (newEntities.length !== sentences.length) {
+      return false
+    }
 
     pendingCommands.push({
       type: 'apply_server_replace',
@@ -154,6 +214,7 @@ export function useEditorEventProjector() {
     })
 
     scheduleFlush()
+    return true
   }
 
   function projectRestored(data) {
@@ -205,29 +266,61 @@ export function useEditorEventProjector() {
   function projectFinalized(data) {
     const sessionStore = useEditorSessionStore()
     const docStore = useEditorDocumentStore()
+    const indices = resolveFinalizedIndices(data)
+    if (indices.length === 0) {
+      return false
+    }
+    const sentenceMap = buildFinalizedSentenceMap(data, indices)
+    const chunkId = normalizeChunkId(data)
 
     const localIds = []
-    for (const sentenceIndex of data.indices || []) {
+    const updates = []
+    for (const sentenceIndex of indices) {
       const localId = docStore.bindingBySentenceIndex.get(sentenceIndex)
       if (localId) {
         const entity = docStore.getEntity(localId)
-        if (entity?.isDraft) {
+        if (!entity) {
+          continue
+        }
+
+        const sentence = sentenceMap.get(sentenceIndex)
+        if (sentence) {
+          const finalizedEntity = buildServerEntity(sentence, sessionStore, {
+            localId,
+            sentenceIndex,
+            chunkId,
+            isDraft: false,
+            fallbackSource: 'finalized',
+          })
+          updates.push({
+            localId,
+            text: finalizedEntity.text,
+            startMs: finalizedEntity.startMs,
+            endMs: finalizedEntity.endMs,
+            cold: finalizedEntity.cold,
+          })
+          continue
+        }
+
+        if (entity.isDraft) {
           localIds.push(localId)
         }
       }
     }
 
-    if (localIds.length > 0) {
+    if (updates.length > 0 || localIds.length > 0) {
       pendingCommands.push({
         type: 'finalize_draft_chunk',
         commandId: sessionStore.nextCommandId(),
         source: 'system',
         createdAt: Date.now(),
-        localIds
+        localIds,
+        updates,
       })
     }
 
     scheduleFlush()
+    return true
   }
 
   function projectRevised(data) {
@@ -276,11 +369,8 @@ export function useEditorEventProjector() {
 
     for (const seg of segments) {
       const localId = sessionStore.nextLocalId()
-      pendingCommands.push({
-        type: 'insert_subtitle',
-        commandId: sessionStore.nextCommandId(),
+      pendingCommands.push(createInsertSubtitleCommand({
         source: 'rehydrate',
-        createdAt: Date.now(),
         localId,
         entity: {
           text: seg.text || '',
@@ -300,7 +390,7 @@ export function useEditorEventProjector() {
           warningType: 'none',
           originalText: null
         }
-      })
+      }))
     }
 
     scheduleFlush()

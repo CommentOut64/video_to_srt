@@ -24,3 +24,9 @@ export { editorReducer } from './editorReducer'
 export { createSubtitleHotEntity, createSubtitleColdEntity } from './models'
 export { initEditorCore, destroyEditorCore } from './editorCore'
 export { createEditorBridge } from './editorBridge'
+export {
+  applySentencePatch,
+  deleteServerSegment,
+  shouldIgnoreProjectAckEvent,
+  upsertServerSegment,
+} from './editorServerProjection'

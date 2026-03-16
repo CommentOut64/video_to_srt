@@ -109,7 +109,7 @@ export const useEditorHistoryStore = defineStore('editorHistory', () => {
     past.value = past.value.slice(0, -1)
     future.value = [...future.value, entry]
 
-    return entry.undoCommands
+    return entry
   }
 
   function redo() {
@@ -119,7 +119,7 @@ export const useEditorHistoryStore = defineStore('editorHistory', () => {
     future.value = future.value.slice(0, -1)
     past.value = [...past.value, entry]
 
-    return entry.doCommands
+    return entry
   }
 
   function clear() {
