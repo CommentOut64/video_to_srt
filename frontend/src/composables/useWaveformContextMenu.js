@@ -34,26 +34,51 @@ export function useWaveformContextMenu(projectStore, subtitleDocumentStore) {
   }
 
   function getSubtitleList() {
+    if (useEditorV2 && docStore) {
+      return docStore.order
+        .map((localId) => {
+          const entity = docStore.getEntity(localId)
+          if (!entity || entity.isDeleted) {
+            return null
+          }
+
+          const cold = docStore.getCold(localId)
+          const toDisplayTime = typeof projectStore?.toDisplayTime === 'function'
+            ? projectStore.toDisplayTime.bind(projectStore)
+            : (seconds) => seconds
+          const start = Math.max(0, toDisplayTime(entity.startMs / 1000))
+          const end = Math.max(start, toDisplayTime(entity.endMs / 1000))
+          return {
+            id: localId,
+            localId,
+            segment_id: cold?.segmentId ?? null,
+            sentenceIndex: cold?.sentenceIndex ?? null,
+            start,
+            end,
+            text: entity.text ?? '',
+            words: Array.isArray(cold?.words)
+              ? cold.words.map((word) => ({
+                ...word,
+                start: Number.isFinite(Number(word?.startMs))
+                  ? toDisplayTime(Number(word.startMs) / 1000)
+                  : word?.start,
+                end: Number.isFinite(Number(word?.endMs))
+                  ? toDisplayTime(Number(word.endMs) / 1000)
+                  : word?.end,
+                word: word?.word ?? word?.text ?? '',
+              }))
+              : [],
+            isDraft: Boolean(entity.isDraft),
+          }
+        })
+        .filter(Boolean)
+    }
+
     const subtitles = resolveMaybeRefValue(subtitleDocumentStore?.subtitles)
     if (Array.isArray(subtitles)) {
       return subtitles
     }
-    return Array.isArray(projectStore?.subtitles) ? projectStore.subtitles : []
-  }
-
-  function findMirroredProjectSubtitle(targetSubtitle) {
-    if (!targetSubtitle) return null
-
-    return (
-      projectStore.subtitles.find((item) => item.id === targetSubtitle.id)
-      || projectStore.subtitles.find(
-        (item) => targetSubtitle.segment_id && item.segment_id === targetSubtitle.segment_id
-      )
-      || projectStore.subtitles.find(
-        (item) => targetSubtitle.sentenceIndex !== undefined && item.sentenceIndex === targetSubtitle.sentenceIndex
-      )
-      || null
-    )
+    return []
   }
 
   function toBaseMs(displaySeconds) {
@@ -235,11 +260,10 @@ export function useWaveformContextMenu(projectStore, subtitleDocumentStore) {
     const targetSubtitle = getSubtitleList().find(
       (s) => clickTime >= s.start && clickTime < s.end
     )
-    const editableTarget = findMirroredProjectSubtitle(targetSubtitle)
 
     // 只有在字幕范围内才显示菜单
-    if (targetSubtitle && !targetSubtitle.isDraft && (useEditorV2 || editableTarget)) {
-      contextMenuTarget.value = useEditorV2 ? targetSubtitle.id : editableTarget.id
+    if (targetSubtitle && !targetSubtitle.isDraft) {
+      contextMenuTarget.value = targetSubtitle.id
       contextMenuTime.value = clickTime
       contextMenuRef.value?.show(e.clientX, e.clientY)
     }

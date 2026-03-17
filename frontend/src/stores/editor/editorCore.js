@@ -62,50 +62,6 @@ export function initEditorCore(projectId, jobId) {
   }
 }
 
-// V3.2.5+dev.20260315.01: 从旧 projectStore 迁移数据
-export function migrateFromProjectStore(projectStore) {
-  const docStore = useEditorDocumentStore()
-
-  projectStore.subtitles.forEach((subtitle, index) => {
-    const baseStart = projectStore.toBaseTime(subtitle.start ?? 0)
-    const baseEnd = projectStore.toBaseTime(subtitle.end ?? 0)
-    const hot = {
-      localId: subtitle.id,
-      text: subtitle.text,
-      startMs: Math.round(Number(baseStart) * 1000),
-      endMs: Math.round(Number(baseEnd) * 1000),
-      isDraft: subtitle.isDraft || false,
-      isModified: subtitle.isModified || false,
-      isDeleted: false,
-      revision: 0
-    }
-
-    const cold = {
-      localId: subtitle.id,
-      segmentId: subtitle.segment_id ?? null,
-      sentenceIndex: subtitle.sentenceIndex ?? null,
-      chunkId: subtitle.chunk_id ?? null,
-      words: Array.isArray(subtitle.words)
-        ? subtitle.words.map((word) => ({
-            ...word,
-            startMs: Math.round(Number(projectStore.toBaseTime(word.start ?? 0)) * 1000),
-            endMs: Math.round(Number(projectStore.toBaseTime(word.end ?? word.start ?? 0)) * 1000),
-            text: word.text ?? word.word ?? '',
-          }))
-        : null,
-      confidence: subtitle.confidence ?? null,
-      displayConfidence: subtitle.display_confidence ?? null,
-      confidenceSource: subtitle.confidence_source ?? null,
-      speakerId: subtitle.speaker_id ?? null,
-      sourceType: subtitle.source ?? null,
-      warningType: subtitle.warning_type || 'none',
-      originalText: subtitle.originalText ?? subtitle.original_text ?? null,
-    }
-
-    docStore._applyInsert(subtitle.id, hot, cold, index > 0 ? projectStore.subtitles[index - 1].id : null)
-  })
-}
-
 export function destroyEditorCore() {
   if (stopCommandBusBridge) {
     stopCommandBusBridge()

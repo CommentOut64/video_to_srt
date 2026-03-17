@@ -134,7 +134,7 @@ export function useWaveformRegions(
     if (Array.isArray(subtitles)) {
       return subtitles
     }
-    return Array.isArray(projectStore?.subtitles) ? projectStore.subtitles : []
+    return []
   }
 
   function resolveEditorV2LocalId(regionId) {
@@ -154,22 +154,6 @@ export function useWaveformRegions(
     }
 
     return docStore.order.find((localId) => String(localId) === normalizedRegionId) ?? null
-  }
-
-  function findMirroredProjectSubtitle(subtitle) {
-    if (!subtitle) return null
-
-    const projectSubtitles = Array.isArray(projectStore?.subtitles) ? projectStore.subtitles : []
-    return (
-      projectSubtitles.find((item) => item.id === subtitle.id)
-      || projectSubtitles.find(
-        (item) => subtitle.segment_id && item.segment_id === subtitle.segment_id
-      )
-      || projectSubtitles.find(
-        (item) => subtitle.sentenceIndex !== undefined && item.sentenceIndex === subtitle.sentenceIndex
-      )
-      || null
-    )
   }
 
   function setSelectedSubtitleId(subtitleId) {
@@ -406,18 +390,6 @@ export function useWaveformRegions(
 
       if (!hasTimeChanged) {
         return false
-      }
-
-      const mirroredSubtitle = findMirroredProjectSubtitle(subtitle)
-      if (mirroredSubtitle) {
-        projectStore.updateSubtitle(
-          mirroredSubtitle.id,
-          {
-            start: nextStart,
-            end: nextEnd,
-          },
-          { isUserEdit: true }
-        )
       }
 
       syncKey = subtitle?.segment_id ?? subtitle?.sentenceIndex ?? subtitle?.id

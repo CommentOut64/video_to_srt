@@ -355,12 +355,14 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   function insertSubtitleAt(index, subtitle) {
+    assertLegacySubtitleMutationAllowed("insertSubtitleAt");
     const insertIndex = Math.max(0, Math.min(index, subtitles.value.length));
     subtitles.value.splice(insertIndex, 0, subtitle);
     return insertIndex;
   }
 
   function removeSubtitleAt(index) {
+    assertLegacySubtitleMutationAllowed("removeSubtitleAt");
     if (index < 0 || index >= subtitles.value.length) {
       return null;
     }
@@ -547,6 +549,7 @@ export const useProjectStore = defineStore("project", () => {
    * @param {Object} metadata - 可选的附加 meta
    */
   function loadFromProjectData(payload, metadata = {}) {
+    assertLegacySubtitleMutationAllowed("loadFromProjectData");
     const segments = Array.isArray(payload) ? payload : payload?.segments || [];
     const docMeta = Array.isArray(payload) ? null : payload?.doc_meta || payload?.meta || null;
     const now = Date.now();
@@ -604,6 +607,9 @@ export const useProjectStore = defineStore("project", () => {
    * 从缓存/存储恢复项目
    */
   async function restoreProject(identityId) {
+    if (FEATURE_FLAGS.USE_EDITOR_V2) {
+      return false;
+    }
     if (!identityId) {
       return false;
     }
@@ -1897,7 +1903,7 @@ export const useProjectStore = defineStore("project", () => {
       .padStart(3, "0")}`;
   }
 
-  return {
+  const sharedApi = {
     // 状态
     meta,
     subtitles,
@@ -1943,19 +1949,10 @@ export const useProjectStore = defineStore("project", () => {
     setPlaybackRate,
     setIsPlaying,
     setPlayerSeeking,
-    insertSubtitleAt,
-    removeSubtitleAt,
     importSRT,
     importSegments,
-    loadFromProjectData,
-    restoreProject,
-    updateSubtitle,
-    addSubtitle,
-    removeSubtitle,
     markSentenceDeleted,
     isSentenceDeleted,
-    splitSubtitle,  // 字幕切分
-    mergeSubtitles, // 字幕合并
     generateSRT,
     seekTo,
     saveProject,
@@ -1979,5 +1976,22 @@ export const useProjectStore = defineStore("project", () => {
     applyOffsetToSentenceData,
     formatTimestamp,
     parseTimestamp,
+  };
+
+  if (FEATURE_FLAGS.USE_EDITOR_V2) {
+    return sharedApi;
+  }
+
+  return {
+    ...sharedApi,
+    insertSubtitleAt,
+    removeSubtitleAt,
+    loadFromProjectData,
+    restoreProject,
+    updateSubtitle,
+    addSubtitle,
+    removeSubtitle,
+    splitSubtitle,  // 字幕切分
+    mergeSubtitles, // 字幕合并
   };
 });

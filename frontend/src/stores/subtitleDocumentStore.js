@@ -10,6 +10,10 @@ import { useTaskRuntimeStore } from './taskRuntimeStore'
 import { useEditorDocumentStore } from './editor/editorDocumentStore'
 import { useEditorProjectionBridge } from './editor/editorProjectionBridge'
 import { useEditorSyncEngine } from './editor/editorSyncEngine'
+import {
+  patchLegacySubtitleSegmentId,
+  restoreLegacySubtitleSnapshot,
+} from './legacySubtitleProjectStoreBridge'
 
 const EDIT_QUEUE_PREFIX = 'subtitle-edit-queue-'
 const TERMINAL_STATUSES = new Set(['finished', 'canceled', 'force_canceled', 'removed', 'failed'])
@@ -161,8 +165,8 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
       docStore.updateColdBinding(subtitle.id, String(segmentId))
       return true
     }
-    projectStore.updateSubtitle(subtitle.id, { segment_id: String(segmentId) })
-    return true
+    // 仅 legacy 队列迁移链路会走到这里；旧 projectStore 方法查找已收敛到专用 bridge。
+    return patchLegacySubtitleSegmentId(projectStore, subtitle.id, segmentId)
   }
 
   async function resolveProjectSegmentIdFromServer(queueKey, cache) {
@@ -254,8 +258,8 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
         preservePendingCommands: true,
       })
     }
-    projectStore.loadFromProjectData(segments, metadata)
-    return Array.isArray(segments) ? segments.length : 0
+    // 仅 legacy 会话恢复链路仍保留旧快照载入；默认共享编辑器主路径不会触达这里。
+    return restoreLegacySubtitleSnapshot(projectStore, segments, metadata)
   }
 
   async function applyLocalEditQueue(identityId = null) {
@@ -480,7 +484,7 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
 
   registerBeforeUnloadIfNeeded()
 
-  return {
+  const sharedApi = {
     activeJobId,
     subtitles,
     timeOffsetSec,
@@ -489,15 +493,25 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
     syncErrors,
     bindTask,
     bindSyncIdentity,
-    restoreFromServer,
-    applyLocalEditQueue,
-    applyPendingEditsToStore,
     onSubtitleEdit,
-    forceSyncNow,
     pendingCount,
     finalizeDraftSubtitlesOnTerminal,
     clearTerminalConverged,
     setTimeOffset,
     setSelectedSubtitleId,
+  }
+
+  // Trade-off: V2 主路径只保留只读桥与必要同步桥，避免默认运行时继续“看得见” legacy 队列 API；
+  // 旧模式仍返回完整接口，供 legacy 会话恢复/导出前补写链路使用。
+  if (useEditorV2) {
+    return sharedApi
+  }
+
+  return {
+    ...sharedApi,
+    restoreFromServer,
+    applyLocalEditQueue,
+    applyPendingEditsToStore,
+    forceSyncNow,
   }
 })
