@@ -9,6 +9,9 @@ import { editorReducer } from './editorReducer'
 
 export const useEditorCommandBus = defineStore('editorCommandBus', () => {
   const listeners = []
+  const HISTORY_NOOP_FLAG = '__historyNoop'
+  const SNAPSHOT_STRICT_TIME_TOLERANCE_MS = 1
+  const SNAPSHOT_FUZZY_TIME_TOLERANCE_MS = 80
 
   function normalizeSegmentId(value) {
     const normalized = String(value ?? '').trim()
@@ -73,6 +76,9 @@ export const useEditorCommandBus = defineStore('editorCommandBus', () => {
     if (!command || !command.type) {
       return false
     }
+    if (command[HISTORY_NOOP_FLAG] === true) {
+      return true
+    }
 
     switch (command.type) {
       case 'update_text':
@@ -105,36 +111,151 @@ export const useEditorCommandBus = defineStore('editorCommandBus', () => {
       return command
     }
 
-    const resolveLocalIdBySnapshot = (snapshot) => {
-      if (!snapshot || typeof snapshot !== 'object') {
-        return null
-      }
+    const markHistoryNoop = (nextCommand, reason) => ({
+      ...nextCommand,
+      [HISTORY_NOOP_FLAG]: true,
+      __historyNoopReason: reason,
+    })
 
+    const isSnapshotEntityMatch = (entity, snapshot, options = {}) => {
+      if (!entity || !snapshot || typeof snapshot !== 'object') {
+        return false
+      }
+      const {
+        timeToleranceMs = SNAPSHOT_STRICT_TIME_TOLERANCE_MS,
+        ignoreTime = false,
+      } = options
       const hasText = Object.prototype.hasOwnProperty.call(snapshot, 'text')
       const hasStartMs = Object.prototype.hasOwnProperty.call(snapshot, 'startMs')
       const hasEndMs = Object.prototype.hasOwnProperty.call(snapshot, 'endMs')
       if (!hasText && !hasStartMs && !hasEndMs) {
+        return false
+      }
+      if (hasText && String(entity.text ?? '') !== String(snapshot.text ?? '')) {
+        return false
+      }
+      if (!ignoreTime && hasStartMs) {
+        const delta = Math.abs(Number(entity.startMs ?? 0) - Number(snapshot.startMs ?? 0))
+        if (delta > timeToleranceMs) {
+          return false
+        }
+      }
+      if (!ignoreTime && hasEndMs) {
+        const delta = Math.abs(Number(entity.endMs ?? 0) - Number(snapshot.endMs ?? 0))
+        if (delta > timeToleranceMs) {
+          return false
+        }
+      }
+      return true
+    }
+
+    const findSnapshotCandidates = (snapshot, options = {}) => {
+      if (!snapshot || typeof snapshot !== 'object') {
+        return []
+      }
+      const excludeLocalIdSet = new Set(
+        Array.isArray(options.excludeLocalIds) ? options.excludeLocalIds.filter(Boolean) : []
+      )
+      return docStore.order.filter((candidateLocalId) => {
+        if (excludeLocalIdSet.has(candidateLocalId)) {
+          return false
+        }
+        return isSnapshotEntityMatch(docStore.getEntity(candidateLocalId), snapshot, options)
+      })
+    }
+
+    const resolveLocalIdBySnapshot = (snapshot) => {
+      const strictCandidates = findSnapshotCandidates(snapshot, {
+        timeToleranceMs: SNAPSHOT_STRICT_TIME_TOLERANCE_MS,
+      })
+      if (strictCandidates.length === 1) {
+        return strictCandidates[0]
+      }
+      if (strictCandidates.length > 1) {
         return null
       }
 
-      const candidates = docStore.order.filter((candidateLocalId) => {
-        const entity = docStore.getEntity(candidateLocalId)
-        if (!entity) {
-          return false
-        }
-        if (hasText && String(entity.text ?? '') !== String(snapshot.text ?? '')) {
-          return false
-        }
-        if (hasStartMs && Math.abs(Number(entity.startMs ?? 0) - Number(snapshot.startMs ?? 0)) > 1) {
-          return false
-        }
-        if (hasEndMs && Math.abs(Number(entity.endMs ?? 0) - Number(snapshot.endMs ?? 0)) > 1) {
-          return false
-        }
-        return true
+      const fuzzyCandidates = findSnapshotCandidates(snapshot, {
+        timeToleranceMs: SNAPSHOT_FUZZY_TIME_TOLERANCE_MS,
       })
+      if (fuzzyCandidates.length === 1) {
+        return fuzzyCandidates[0]
+      }
+      if (fuzzyCandidates.length > 1) {
+        return null
+      }
 
-      return candidates.length === 1 ? candidates[0] : null
+      const hasText = snapshot && typeof snapshot === 'object'
+        && Object.prototype.hasOwnProperty.call(snapshot, 'text')
+      if (!hasText) {
+        return null
+      }
+
+      const textOnlyCandidates = findSnapshotCandidates(snapshot, {
+        ignoreTime: true,
+      })
+      if (textOnlyCandidates.length === 1) {
+        return textOnlyCandidates[0]
+      }
+
+      return null
+    }
+
+    const hasSnapshotCandidate = (snapshot, options = {}) => {
+      const strictCandidates = findSnapshotCandidates(snapshot, {
+        ...options,
+        timeToleranceMs: SNAPSHOT_STRICT_TIME_TOLERANCE_MS,
+      })
+      if (strictCandidates.length > 0) {
+        return true
+      }
+
+      const fuzzyCandidates = findSnapshotCandidates(snapshot, {
+        ...options,
+        timeToleranceMs: SNAPSHOT_FUZZY_TIME_TOLERANCE_MS,
+      })
+      if (fuzzyCandidates.length > 0) {
+        return true
+      }
+
+      const hasText = snapshot && typeof snapshot === 'object'
+        && Object.prototype.hasOwnProperty.call(snapshot, 'text')
+      if (!hasText) {
+        return false
+      }
+
+      return findSnapshotCandidates(snapshot, {
+        ...options,
+        ignoreTime: true,
+      }).length > 0
+    }
+
+    const isLocalIdMatchingSnapshot = (localId, snapshot, options = {}) => {
+      if (!localId) {
+        return false
+      }
+      const entity = docStore.getEntity(localId)
+      if (!entity) {
+        return false
+      }
+      const strictMatch = isSnapshotEntityMatch(entity, snapshot, {
+        ...options,
+        timeToleranceMs: SNAPSHOT_STRICT_TIME_TOLERANCE_MS,
+      })
+      if (strictMatch) {
+        return true
+      }
+      const fuzzyMatch = isSnapshotEntityMatch(entity, snapshot, {
+        ...options,
+        timeToleranceMs: SNAPSHOT_FUZZY_TIME_TOLERANCE_MS,
+      })
+      if (fuzzyMatch) {
+        return true
+      }
+      return isSnapshotEntityMatch(entity, snapshot, {
+        ...options,
+        ignoreTime: true,
+      })
     }
 
     const resolveReplayLocalId = (localId, segmentId = null, snapshots = []) => {
@@ -179,32 +300,32 @@ export const useEditorCommandBus = defineStore('editorCommandBus', () => {
       return currentSegmentId ?? fallbackSegmentId ?? null
     }
 
-    const shouldReuseSplitCreatedBinding = (splitCommand, candidateSegmentId) => {
+    const shouldReuseSplitCreatedBinding = (createdLocalId, candidateSegmentId) => {
       const normalizedSegmentId = normalizeSegmentId(candidateSegmentId)
       if (!normalizedSegmentId) {
         return false
       }
 
       const boundLocalId = docStore.bindingBySegmentId.get(normalizedSegmentId)
-      if (boundLocalId && boundLocalId !== splitCommand.createdLocalId) {
+      if (boundLocalId && boundLocalId !== createdLocalId) {
         return false
       }
 
       const hasPendingDelete = docStore.getTombstones().some((tombstone) => (
-        tombstone?.localId === splitCommand.createdLocalId
+        tombstone?.localId === createdLocalId
         && normalizeSegmentId(tombstone?.segmentId) === normalizedSegmentId
       ))
 
       const syncEngine = useEditorSyncEngine()
       const hasAckBinding = syncEngine.hasAckBinding(
-        splitCommand.createdLocalId,
+        createdLocalId,
         normalizedSegmentId
       )
       if (hasPendingDelete && hasAckBinding) {
         return true
       }
 
-      return boundLocalId === splitCommand.createdLocalId
+      return boundLocalId === createdLocalId
     }
 
     const resolveSplitCreatedFallbackSegmentId = (splitCommand, createdColdInit) => {
@@ -227,20 +348,34 @@ export const useEditorCommandBus = defineStore('editorCommandBus', () => {
       )
       const createdColdInit = command.createdColdInit
       if (!createdColdInit || typeof createdColdInit !== 'object') {
-        return {
+        const nextCommand = {
           ...command,
           sourceLocalId,
           sourceSegmentId: resolveCurrentSegmentId(sourceLocalId, command.sourceSegmentId),
         }
+        const sourceExists = Boolean(sourceLocalId && docStore.getEntity(sourceLocalId))
+        if (sourceExists && isLocalIdMatchingSnapshot(sourceLocalId, command.afterKept)) {
+          return markHistoryNoop(nextCommand, 'split_already_applied')
+        }
+        return nextCommand
       }
 
       const fallbackCreatedSegmentId = resolveSplitCreatedFallbackSegmentId(command, createdColdInit)
       const liveCreatedSegmentId = resolveCurrentSegmentId(command.createdLocalId, fallbackCreatedSegmentId)
-      const shouldKeepCreatedBinding = shouldReuseSplitCreatedBinding(command, liveCreatedSegmentId)
+      const createdLocalId = resolveReplayLocalId(
+        command.createdLocalId,
+        liveCreatedSegmentId,
+        [command.afterCreated]
+      )
+      const resolvedCreatedSegmentId = resolveCurrentSegmentId(createdLocalId, liveCreatedSegmentId)
+      const shouldKeepCreatedBinding = shouldReuseSplitCreatedBinding(
+        createdLocalId,
+        resolvedCreatedSegmentId
+      )
       const nextCreatedColdInit = shouldKeepCreatedBinding
         ? {
             ...createdColdInit,
-            segmentId: liveCreatedSegmentId,
+            segmentId: resolvedCreatedSegmentId,
           }
         : {
             ...createdColdInit,
@@ -248,12 +383,24 @@ export const useEditorCommandBus = defineStore('editorCommandBus', () => {
             sentenceIndex: null,
           }
 
-      return {
+      const nextCommand = {
         ...command,
         sourceLocalId,
+        createdLocalId,
         sourceSegmentId: resolveCurrentSegmentId(sourceLocalId, command.sourceSegmentId),
         createdColdInit: nextCreatedColdInit,
       }
+      const sourceExists = Boolean(sourceLocalId && docStore.getEntity(sourceLocalId))
+      const createdExists = Boolean(createdLocalId && docStore.getEntity(createdLocalId))
+      const alreadySplit = sourceExists
+        && createdExists
+        && !isLocalIdMatchingSnapshot(sourceLocalId, command.before)
+        && isLocalIdMatchingSnapshot(sourceLocalId, command.afterKept)
+        && isLocalIdMatchingSnapshot(createdLocalId, command.afterCreated)
+      if (alreadySplit) {
+        return markHistoryNoop(nextCommand, 'split_already_applied')
+      }
+      return nextCommand
     }
 
     if (command.type === 'merge_subtitles') {
@@ -262,27 +409,66 @@ export const useEditorCommandBus = defineStore('editorCommandBus', () => {
         command.keptSegmentId,
         [command.beforeKept, command.after]
       )
-      const removedLocalId = resolveReplayLocalId(
+      let removedLocalId = resolveReplayLocalId(
         command.removedLocalId,
         command.removedSegmentId,
         [command.beforeRemoved]
       )
-      return {
+      if ((!removedLocalId || !docStore.getEntity(removedLocalId)) && keptLocalId && docStore.getEntity(keptLocalId)) {
+        const keptOrderIndex = docStore.getOrderIndex(keptLocalId)
+        const adjacentLocalId = keptOrderIndex >= 0
+          ? docStore.order[keptOrderIndex + 1] ?? null
+          : null
+        if (adjacentLocalId && isLocalIdMatchingSnapshot(adjacentLocalId, command.beforeRemoved)) {
+          removedLocalId = adjacentLocalId
+        }
+      }
+      const nextCommand = {
         ...command,
         keptLocalId,
         removedLocalId,
         keptSegmentId: resolveCurrentSegmentId(keptLocalId, command.keptSegmentId),
         removedSegmentId: resolveCurrentSegmentId(removedLocalId, command.removedSegmentId),
       }
+      const keptExists = Boolean(keptLocalId && docStore.getEntity(keptLocalId))
+      const removedExists = Boolean(removedLocalId && docStore.getEntity(removedLocalId))
+      const normalizedRemovedSegmentId = normalizeSegmentId(nextCommand.removedSegmentId)
+      const removedSegmentBinding = normalizedRemovedSegmentId
+        ? docStore.bindingBySegmentId.get(normalizedRemovedSegmentId)
+        : null
+      const hasRemovedSegmentBinding = Boolean(
+        removedSegmentBinding
+        && removedSegmentBinding !== keptLocalId
+      )
+      const hasRemovedSnapshotCandidate = hasSnapshotCandidate(command.beforeRemoved, {
+        excludeLocalIds: [keptLocalId],
+      })
+      const alreadyMerged = keptExists
+        && !removedExists
+        && isLocalIdMatchingSnapshot(keptLocalId, command.after)
+        && !hasRemovedSegmentBinding
+        && !hasRemovedSnapshotCandidate
+      if (alreadyMerged) {
+        return markHistoryNoop(nextCommand, 'merge_already_applied')
+      }
+      return nextCommand
     }
 
     if (command.type === 'delete_subtitle') {
       const localId = resolveReplayLocalId(command.localId, command.segmentId, [command.snapshot])
-      return {
+      const nextCommand = {
         ...command,
         localId,
         segmentId: resolveCurrentSegmentId(localId, command.segmentId),
       }
+      const hasTarget = Boolean(localId && docStore.getEntity(localId))
+      const normalizedSegmentId = normalizeSegmentId(nextCommand.segmentId)
+      const boundLocalId = normalizedSegmentId ? docStore.bindingBySegmentId.get(normalizedSegmentId) : null
+      const hasSnapshotMatch = hasSnapshotCandidate(command.snapshot)
+      if (!hasTarget && !boundLocalId && !hasSnapshotMatch) {
+        return markHistoryNoop(nextCommand, 'already_deleted')
+      }
+      return nextCommand
     }
 
     if (command.type === 'move_boundary') {
@@ -298,7 +484,7 @@ export const useEditorCommandBus = defineStore('editorCommandBus', () => {
     }
 
     if (command.type === 'update_text' || command.type === 'update_timing') {
-      const localId = resolveReplayLocalId(command.localId, command.segmentId, [command.before])
+      const localId = resolveReplayLocalId(command.localId, command.segmentId, [command.before, command.after])
       return {
         ...command,
         localId,
@@ -448,6 +634,9 @@ export const useEditorCommandBus = defineStore('editorCommandBus', () => {
     historyStore.closeTransaction()
     let hasFailure = false
     replayCommands.forEach((cmd) => {
+      if (cmd[HISTORY_NOOP_FLAG] === true) {
+        return
+      }
       const result = dispatch(cmd)
       if (!result?.success) {
         hasFailure = true
@@ -478,6 +667,9 @@ export const useEditorCommandBus = defineStore('editorCommandBus', () => {
     historyStore.closeTransaction()
     let hasFailure = false
     replayCommands.forEach((cmd) => {
+      if (cmd[HISTORY_NOOP_FLAG] === true) {
+        return
+      }
       const result = dispatch(cmd)
       if (!result?.success) {
         hasFailure = true
