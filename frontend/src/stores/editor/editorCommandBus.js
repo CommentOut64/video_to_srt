@@ -514,6 +514,43 @@ export const useEditorCommandBus = defineStore('editorCommandBus', () => {
       })
   }
 
+  function buildHistoryReplayCommand(command, index, replayCreatedAt) {
+    const sessionStore = useEditorSessionStore()
+    const docStore = useEditorDocumentStore()
+    const enrichedCommand = enrichHistoryReplayCommand(command, docStore)
+    const { skipSync, ...rest } = enrichedCommand
+    return {
+      ...rest,
+      commandId: sessionStore.nextCommandId(),
+      source: 'undo_redo',
+      createdAt: replayCreatedAt + index,
+    }
+  }
+
+  function replayHistoryCommandsSequentially(commands = []) {
+    const replayCreatedAt = Date.now()
+    const docStore = useEditorDocumentStore()
+
+    // Trade-off: 多命令历史项若在回放前整批预物化，后续命令会拿到“前一条命令尚未生效”
+    // 的旧文档上下文，结构性编辑尤其容易把 localId/segmentId 解析错位。
+    // 这里改为逐条基于最新文档状态现算回放，牺牲掉伪原子式整批预检，换取更可靠的目标解析。
+    for (const [index, rawCommand] of commands.filter(Boolean).entries()) {
+      const replayCommand = buildHistoryReplayCommand(rawCommand, index, replayCreatedAt)
+      if (!canReplayCommand(replayCommand, docStore)) {
+        return false
+      }
+      if (replayCommand[HISTORY_NOOP_FLAG] === true) {
+        continue
+      }
+      const result = dispatch(replayCommand)
+      if (!result?.success) {
+        return false
+      }
+    }
+
+    return true
+  }
+
   function dispatch(rawCommand) {
     const docStore = useEditorDocumentStore()
     const sessionStore = useEditorSessionStore()
@@ -624,24 +661,36 @@ export const useEditorCommandBus = defineStore('editorCommandBus', () => {
     const docStore = useEditorDocumentStore()
     const candidateEntry = historyStore.peekUndo()
     if (!candidateEntry) return false
-    const replayCommands = materializeHistoryReplayCommands(candidateEntry.undoCommands)
-    if (!replayCommands.every((command) => canReplayCommand(command, docStore))) {
-      console.warn('[CommandBus] undo 预检失败，已拒绝回放，历史栈保持不变')
-      return false
+    const historyCommands = Array.isArray(candidateEntry.undoCommands)
+      ? candidateEntry.undoCommands.filter(Boolean)
+      : []
+    const useSequentialReplay = historyCommands.length > 1
+    if (!useSequentialReplay) {
+      const replayCommands = materializeHistoryReplayCommands(candidateEntry.undoCommands)
+      if (!replayCommands.every((command) => canReplayCommand(command, docStore))) {
+        console.warn('[CommandBus] undo 预检失败，已拒绝回放，历史栈保持不变')
+        return false
+      }
     }
 
     if (!historyStore.commitUndo()) return false
     historyStore.closeTransaction()
-    let hasFailure = false
-    replayCommands.forEach((cmd) => {
-      if (cmd[HISTORY_NOOP_FLAG] === true) {
-        return
-      }
-      const result = dispatch(cmd)
-      if (!result?.success) {
-        hasFailure = true
-      }
-    })
+    const hasFailure = useSequentialReplay
+      ? !replayHistoryCommandsSequentially(historyCommands)
+      : (() => {
+          const replayCommands = materializeHistoryReplayCommands(candidateEntry.undoCommands)
+          let failed = false
+          replayCommands.forEach((cmd) => {
+            if (cmd[HISTORY_NOOP_FLAG] === true) {
+              return
+            }
+            const result = dispatch(cmd)
+            if (!result?.success) {
+              failed = true
+            }
+          })
+          return failed
+        })()
     if (hasFailure) {
       // Trade-off: 回放失败后无法回滚已触发的外部副作用（监听器/持久化），
       // 这里至少回滚历史游标，避免 past/future 与文档状态持续漂移。
@@ -657,24 +706,36 @@ export const useEditorCommandBus = defineStore('editorCommandBus', () => {
     const docStore = useEditorDocumentStore()
     const candidateEntry = historyStore.peekRedo()
     if (!candidateEntry) return false
-    const replayCommands = materializeHistoryReplayCommands(candidateEntry.doCommands)
-    if (!replayCommands.every((command) => canReplayCommand(command, docStore))) {
-      console.warn('[CommandBus] redo 预检失败，已拒绝回放，历史栈保持不变')
-      return false
+    const historyCommands = Array.isArray(candidateEntry.doCommands)
+      ? candidateEntry.doCommands.filter(Boolean)
+      : []
+    const useSequentialReplay = historyCommands.length > 1
+    if (!useSequentialReplay) {
+      const replayCommands = materializeHistoryReplayCommands(candidateEntry.doCommands)
+      if (!replayCommands.every((command) => canReplayCommand(command, docStore))) {
+        console.warn('[CommandBus] redo 预检失败，已拒绝回放，历史栈保持不变')
+        return false
+      }
     }
 
     if (!historyStore.commitRedo()) return false
     historyStore.closeTransaction()
-    let hasFailure = false
-    replayCommands.forEach((cmd) => {
-      if (cmd[HISTORY_NOOP_FLAG] === true) {
-        return
-      }
-      const result = dispatch(cmd)
-      if (!result?.success) {
-        hasFailure = true
-      }
-    })
+    const hasFailure = useSequentialReplay
+      ? !replayHistoryCommandsSequentially(historyCommands)
+      : (() => {
+          const replayCommands = materializeHistoryReplayCommands(candidateEntry.doCommands)
+          let failed = false
+          replayCommands.forEach((cmd) => {
+            if (cmd[HISTORY_NOOP_FLAG] === true) {
+              return
+            }
+            const result = dispatch(cmd)
+            if (!result?.success) {
+              failed = true
+            }
+          })
+          return failed
+        })()
     if (hasFailure) {
       historyStore.commitUndo()
       console.warn('[CommandBus] redo 回放部分失败，已回滚历史游标')

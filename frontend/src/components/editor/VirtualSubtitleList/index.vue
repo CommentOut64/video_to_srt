@@ -29,6 +29,9 @@
     />
 
     <div v-if="showNoSubtitles" class="empty-state">
+      <svg class="empty-icon" viewBox="0 0 24 24" fill="currentColor">
+        <path d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H4V6h16v12zM6 10h2v2H6v-2zm0 4h8v2H6v-2zm10 0h2v2h-2v-2zm0-4h2v2h-2v-2zm-4 4h2v2h-2v-2zm0-4h2v2h-2v-2z"/>
+      </svg>
       <p>暂无字幕</p>
       <button class="empty-action-btn" @click="handleAddSubtitle">添加第一条字幕</button>
     </div>
@@ -1093,8 +1096,15 @@ defineExpose({
   align-items: center;
   justify-content: center;
   gap: 10px;
+  padding: 32px 16px;
   color: var(--af-text-muted);
   font-size: 13px;
+}
+
+.empty-icon {
+  width: 48px;
+  height: 48px;
+  opacity: 0.5;
 }
 
 .empty-action-btn {
