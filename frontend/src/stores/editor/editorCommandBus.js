@@ -3,6 +3,7 @@ import { defineStore } from 'pinia'
 import { useEditorDocumentStore } from './editorDocumentStore'
 import { useEditorSessionStore } from './editorSessionStore'
 import { useEditorHistoryStore } from './editorHistoryStore'
+import { useEditorSyncEngine } from './editorSyncEngine'
 import { normalizeEditorCommand } from './editorCommandFactory'
 import { editorReducer } from './editorReducer'
 
@@ -104,6 +105,75 @@ export const useEditorCommandBus = defineStore('editorCommandBus', () => {
       return command
     }
 
+    const resolveLocalIdBySnapshot = (snapshot) => {
+      if (!snapshot || typeof snapshot !== 'object') {
+        return null
+      }
+
+      const hasText = Object.prototype.hasOwnProperty.call(snapshot, 'text')
+      const hasStartMs = Object.prototype.hasOwnProperty.call(snapshot, 'startMs')
+      const hasEndMs = Object.prototype.hasOwnProperty.call(snapshot, 'endMs')
+      if (!hasText && !hasStartMs && !hasEndMs) {
+        return null
+      }
+
+      const candidates = docStore.order.filter((candidateLocalId) => {
+        const entity = docStore.getEntity(candidateLocalId)
+        if (!entity) {
+          return false
+        }
+        if (hasText && String(entity.text ?? '') !== String(snapshot.text ?? '')) {
+          return false
+        }
+        if (hasStartMs && Math.abs(Number(entity.startMs ?? 0) - Number(snapshot.startMs ?? 0)) > 1) {
+          return false
+        }
+        if (hasEndMs && Math.abs(Number(entity.endMs ?? 0) - Number(snapshot.endMs ?? 0)) > 1) {
+          return false
+        }
+        return true
+      })
+
+      return candidates.length === 1 ? candidates[0] : null
+    }
+
+    const resolveReplayLocalId = (localId, segmentId = null, snapshots = []) => {
+      if (localId && docStore.getEntity(localId)) {
+        return localId
+      }
+
+      const normalizedSegmentId = normalizeSegmentId(segmentId)
+      const normalizedLocalId = normalizeSegmentId(localId)
+      if (!normalizedSegmentId) {
+        if (normalizedLocalId) {
+          const boundLocalId = docStore.bindingBySegmentId.get(normalizedLocalId)
+          if (boundLocalId && docStore.getEntity(boundLocalId)) {
+            return boundLocalId
+          }
+        }
+
+        for (const snapshot of snapshots) {
+          const localIdFromSnapshot = resolveLocalIdBySnapshot(snapshot)
+          if (localIdFromSnapshot) {
+            return localIdFromSnapshot
+          }
+        }
+
+        return localId ?? null
+      }
+
+      const boundLocalId = docStore.bindingBySegmentId.get(normalizedSegmentId)
+      if (boundLocalId && docStore.getEntity(boundLocalId)) {
+        return boundLocalId
+      }
+
+      if (docStore.getEntity(normalizedSegmentId)) {
+        return normalizedSegmentId
+      }
+
+      return localId ?? null
+    }
+
     const resolveCurrentSegmentId = (localId, fallbackSegmentId = null) => {
       const currentSegmentId = localId ? docStore.getCold(localId)?.segmentId ?? null : null
       return currentSegmentId ?? fallbackSegmentId ?? null
@@ -124,7 +194,13 @@ export const useEditorCommandBus = defineStore('editorCommandBus', () => {
         tombstone?.localId === splitCommand.createdLocalId
         && normalizeSegmentId(tombstone?.segmentId) === normalizedSegmentId
       ))
-      if (hasPendingDelete) {
+
+      const syncEngine = useEditorSyncEngine()
+      const hasAckBinding = syncEngine.hasAckBinding(
+        splitCommand.createdLocalId,
+        normalizedSegmentId
+      )
+      if (hasPendingDelete && hasAckBinding) {
         return true
       }
 
@@ -144,11 +220,17 @@ export const useEditorCommandBus = defineStore('editorCommandBus', () => {
     }
 
     if (command.type === 'split_subtitle') {
+      const sourceLocalId = resolveReplayLocalId(
+        command.sourceLocalId,
+        command.sourceSegmentId,
+        [command.before, command.afterKept]
+      )
       const createdColdInit = command.createdColdInit
       if (!createdColdInit || typeof createdColdInit !== 'object') {
         return {
           ...command,
-          sourceSegmentId: resolveCurrentSegmentId(command.sourceLocalId, command.sourceSegmentId),
+          sourceLocalId,
+          sourceSegmentId: resolveCurrentSegmentId(sourceLocalId, command.sourceSegmentId),
         }
       }
 
@@ -168,31 +250,59 @@ export const useEditorCommandBus = defineStore('editorCommandBus', () => {
 
       return {
         ...command,
-        sourceSegmentId: resolveCurrentSegmentId(command.sourceLocalId, command.sourceSegmentId),
+        sourceLocalId,
+        sourceSegmentId: resolveCurrentSegmentId(sourceLocalId, command.sourceSegmentId),
         createdColdInit: nextCreatedColdInit,
       }
     }
 
     if (command.type === 'merge_subtitles') {
+      const keptLocalId = resolveReplayLocalId(
+        command.keptLocalId,
+        command.keptSegmentId,
+        [command.beforeKept, command.after]
+      )
+      const removedLocalId = resolveReplayLocalId(
+        command.removedLocalId,
+        command.removedSegmentId,
+        [command.beforeRemoved]
+      )
       return {
         ...command,
-        keptSegmentId: resolveCurrentSegmentId(command.keptLocalId, command.keptSegmentId),
-        removedSegmentId: resolveCurrentSegmentId(command.removedLocalId, command.removedSegmentId),
+        keptLocalId,
+        removedLocalId,
+        keptSegmentId: resolveCurrentSegmentId(keptLocalId, command.keptSegmentId),
+        removedSegmentId: resolveCurrentSegmentId(removedLocalId, command.removedSegmentId),
       }
     }
 
     if (command.type === 'delete_subtitle') {
+      const localId = resolveReplayLocalId(command.localId, command.segmentId, [command.snapshot])
       return {
         ...command,
-        segmentId: resolveCurrentSegmentId(command.localId, command.segmentId),
+        localId,
+        segmentId: resolveCurrentSegmentId(localId, command.segmentId),
       }
     }
 
     if (command.type === 'move_boundary') {
+      const upperLocalId = resolveReplayLocalId(command.upperLocalId, command.upperSegmentId)
+      const lowerLocalId = resolveReplayLocalId(command.lowerLocalId, command.lowerSegmentId)
       return {
         ...command,
-        upperSegmentId: resolveCurrentSegmentId(command.upperLocalId, command.upperSegmentId),
-        lowerSegmentId: resolveCurrentSegmentId(command.lowerLocalId, command.lowerSegmentId),
+        upperLocalId,
+        lowerLocalId,
+        upperSegmentId: resolveCurrentSegmentId(upperLocalId, command.upperSegmentId),
+        lowerSegmentId: resolveCurrentSegmentId(lowerLocalId, command.lowerSegmentId),
+      }
+    }
+
+    if (command.type === 'update_text' || command.type === 'update_timing') {
+      const localId = resolveReplayLocalId(command.localId, command.segmentId, [command.before])
+      return {
+        ...command,
+        localId,
+        segmentId: resolveCurrentSegmentId(localId, command.segmentId),
       }
     }
 

@@ -275,6 +275,18 @@ function buildServerEntityBeforeSnapshot(entity) {
   }
 }
 
+function collectAuthoritativeSegmentIds(serverSegments) {
+  const segmentIdSet = new Set()
+  const normalizedSegments = Array.isArray(serverSegments) ? serverSegments : []
+  for (const segment of normalizedSegments) {
+    const segmentId = toNormalizedSegmentId(segment?.segment_id)
+    if (segmentId) {
+      segmentIdSet.add(segmentId)
+    }
+  }
+  return segmentIdSet
+}
+
 export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
   // 为兼容旧 UI 统计面保留该字段，内部不再作为“命令队列真源”
   const pendingCommands = shallowRef([])
@@ -349,6 +361,17 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
       ackShadowByLocalId.set(localId, snapshot)
       ackLocalIdBySegmentId.set(snapshot.segmentId, localId)
     }
+  }
+
+  function hasAckBinding(localId, segmentId) {
+    if (!localId) {
+      return false
+    }
+    const normalizedSegmentId = toNormalizedSegmentId(segmentId)
+    if (!normalizedSegmentId) {
+      return false
+    }
+    return ackLocalIdBySegmentId.get(normalizedSegmentId) === localId
   }
 
   function repairUnboundLocalBindingsFromAckShadow(docStore) {
@@ -788,6 +811,7 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
     const docStore = useEditorDocumentStore()
 
     const preservedState = captureUnsyncedLocalState(docStore)
+    const authoritativeSegmentIds = collectAuthoritativeSegmentIds(serverSegments)
     const appliedCount = applyAuthoritativeSegmentsToDocument(
       docStore,
       serverSegments,
@@ -799,6 +823,17 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
 
     if (preserveLocalChanges) {
       for (const [localId, snapshot] of preservedState.dirtyLocalSnapshots.entries()) {
+        const replayCold = snapshot.cold
+          ? {
+              ...snapshot.cold,
+            }
+          : null
+        const replaySegmentId = toNormalizedSegmentId(replayCold?.segmentId)
+        if (replayCold && replaySegmentId && !authoritativeSegmentIds.has(replaySegmentId)) {
+          replayCold.segmentId = null
+          replayCold.sentenceIndex = null
+        }
+
         const existingEntity = docStore.getEntity(localId)
         if (existingEntity) {
           docStore._applyUpdate(localId, {
@@ -810,10 +845,22 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
             isDeleted: false,
           })
           docStore._applyReorder(localId)
-          if (snapshot.cold) {
-            docStore._applyColdUpdate(localId, snapshot.cold)
-            if (snapshot.cold.segmentId) {
-              docStore.updateColdBinding(localId, snapshot.cold.segmentId)
+          if (replayCold) {
+            const previousCold = docStore.getCold(localId)
+            docStore._applyColdUpdate(localId, replayCold)
+            docStore.updateColdBinding(localId, replayCold.segmentId ?? null)
+
+            const previousSentenceIndex = previousCold?.sentenceIndex
+            const nextSentenceIndex = replayCold.sentenceIndex
+            if (
+              previousSentenceIndex !== null
+              && previousSentenceIndex !== undefined
+              && previousSentenceIndex !== nextSentenceIndex
+            ) {
+              docStore.bindingBySentenceIndex.delete(previousSentenceIndex)
+            }
+            if (nextSentenceIndex !== null && nextSentenceIndex !== undefined) {
+              docStore.bindingBySentenceIndex.set(nextSentenceIndex, localId)
             }
           }
         } else {
@@ -823,9 +870,9 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
               ...snapshot.hot,
               localId,
             },
-            snapshot.cold
+            replayCold
               ? {
-                  ...snapshot.cold,
+                  ...replayCold,
                   localId,
                 }
               : null,
@@ -938,5 +985,6 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
     applyAuthoritativeSegments,
     reconcile,
     commandToEditorOp,
+    hasAckBinding,
   }
 })

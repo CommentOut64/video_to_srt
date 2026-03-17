@@ -38,12 +38,13 @@ export function initEditorCore(projectId, jobId) {
 
   persistenceClient.destroy()
   syncEngine.reset()
-  historyStore.reset()
+  historyStore.reset({ persist: false, unbindPersistence: true })
   draftStore.reset()
   eventProjector.reset()
   docStore.clearDocument()
 
   sessionStore.openSession(projectId, jobId)
+  historyStore.bindPersistenceSession(nextSessionKey)
   persistenceClient.init(projectId, sessionStore.sessionId)
 
   // 连接命令总线到持久化和同步
@@ -119,7 +120,7 @@ export function destroyEditorCore() {
   const syncEngine = useEditorSyncEngine()
   persistenceClient.destroy()
   syncEngine.reset()
-  historyStore.reset()
+  historyStore.reset({ persist: false, unbindPersistence: true })
   draftStore.reset()
   eventProjector.reset()
   docStore.clearDocument()

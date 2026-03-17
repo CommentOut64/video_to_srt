@@ -130,7 +130,9 @@ function validateStructuralCommand(command) {
 export function createUpdateTextCommand(overrides = {}) {
   const docStore = useEditorDocumentStore()
   const entity = overrides.localId ? docStore.getEntity(overrides.localId) : null
+  const cold = overrides.localId ? docStore.getCold(overrides.localId) : null
   return createBaseCommand('update_text', {
+    segmentId: overrides.segmentId ?? cold?.segmentId ?? null,
     before: overrides.before ?? { text: entity?.text ?? '' },
     after: overrides.after ?? { text: entity?.text ?? '' },
     mergeKey: overrides.mergeKey ?? null,
@@ -141,7 +143,9 @@ export function createUpdateTextCommand(overrides = {}) {
 export function createUpdateTimingCommand(overrides = {}) {
   const docStore = useEditorDocumentStore()
   const entity = overrides.localId ? docStore.getEntity(overrides.localId) : null
+  const cold = overrides.localId ? docStore.getCold(overrides.localId) : null
   return createBaseCommand('update_timing', {
+    segmentId: overrides.segmentId ?? cold?.segmentId ?? null,
     before: overrides.before ?? {
       startMs: entity?.startMs ?? 0,
       endMs: entity?.endMs ?? 0,
