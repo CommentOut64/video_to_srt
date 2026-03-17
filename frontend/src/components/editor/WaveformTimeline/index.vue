@@ -893,8 +893,8 @@ let pendingRegionRenderReason = 'unknown'
 let stopUndoRedoRegionListener = null
 const shouldForceRecreateRegions = ref(false)
 
-function isUndoRedoStructuralCommand(command) {
-  if (!command || command.source !== 'undo_redo') {
+function isStructuralRegionRebuildCommand(command) {
+  if (!command) {
     return false
   }
   return command.type === 'split_subtitle' || command.type === 'merge_subtitles'
@@ -906,12 +906,15 @@ function setupUndoRedoRegionRebuildGuard() {
   }
 
   stopUndoRedoRegionListener = editorCommandBus.onCommandApplied((command) => {
-    if (!isUndoRedoStructuralCommand(command)) {
+    if (!isStructuralRegionRebuildCommand(command)) {
       return
     }
     shouldForceRecreateRegions.value = true
     hasDeferredRegionRender = true
-    scheduleRegionRender('history-undo-redo')
+    const reason = command.source === 'undo_redo'
+      ? 'history-undo-redo'
+      : 'structural-command'
+    scheduleRegionRender(reason)
   })
 }
 

@@ -142,12 +142,18 @@ export function useWaveformRegions(
       return null
     }
 
-    if (docStore.getEntity(regionId)) {
-      return regionId
+    const normalizedRegionId = String(regionId)
+
+    if (docStore.getEntity(normalizedRegionId)) {
+      return normalizedRegionId
     }
 
-    const target = String(regionId)
-    return docStore.order.find((localId) => String(localId) === target) ?? null
+    const boundLocalId = docStore.bindingBySegmentId.get(normalizedRegionId)
+    if (boundLocalId && docStore.getEntity(boundLocalId)) {
+      return boundLocalId
+    }
+
+    return docStore.order.find((localId) => String(localId) === normalizedRegionId) ?? null
   }
 
   function findMirroredProjectSubtitle(subtitle) {
@@ -190,6 +196,35 @@ export function useWaveformRegions(
       overlapCacheDirty = false
     }
     return overlapCacheIds
+  }
+
+  function resolveRegionRenderId(subtitle) {
+    const segmentId = String(subtitle?.segment_id ?? '').trim()
+    if (segmentId) {
+      return segmentId
+    }
+    if (subtitle?.id === undefined || subtitle?.id === null) {
+      return null
+    }
+    return String(subtitle.id)
+  }
+
+  function isRegionSelected(regionId) {
+    const selectedSubtitleId = getSelectedSubtitleId()
+    if (selectedSubtitleId === null || selectedSubtitleId === undefined) {
+      return false
+    }
+
+    if (String(selectedSubtitleId) === String(regionId)) {
+      return true
+    }
+
+    if (useEditorV2) {
+      const localId = resolveEditorV2LocalId(regionId)
+      return Boolean(localId && String(selectedSubtitleId) === String(localId))
+    }
+
+    return false
   }
 
   // 节流的 Region 同步
@@ -356,7 +391,10 @@ export function useWaveformRegions(
 
       setSelectedSubtitleId(localId)
     } else {
-      const subtitle = getSubtitleList().find((s) => s.id === regionId)
+      const subtitle = getSubtitleList().find((s) => (
+        String(s.id) === String(regionId)
+        || String(s.segment_id ?? '') === String(regionId)
+      ))
       if (!subtitle) return false
 
       nextStart = resolveFiniteTime(regionSnapshot.start, resolveFiniteTime(subtitle.start, 0))
@@ -501,7 +539,12 @@ export function useWaveformRegions(
 
     regionsPlugin.on('region-clicked', (region, e) => {
       e.stopPropagation()
-      setSelectedSubtitleId(region.id)
+      if (useEditorV2) {
+        const localId = resolveEditorV2LocalId(region.id)
+        setSelectedSubtitleId(localId ?? region.id)
+      } else {
+        setSelectedSubtitleId(region.id)
+      }
       playbackManager.seekTo(region.start)
       // V3.2.4+dev.20260228.01: 通过 PlaybackManager 触发播放，
       // 由 WaveformTimeline 的 isPlaying watcher 决定使用真实播放或虚拟时钟
@@ -520,7 +563,7 @@ export function useWaveformRegions(
 
     regionsPlugin.on('region-out', (region) => {
       const overlappingIds = getOverlappingIds()
-      const isSelected = region.id === getSelectedSubtitleId()
+      const isSelected = isRegionSelected(region.id)
 
       if (overlappingIds.has(region.id)) {
         region.setOptions({ color: OVERLAP_COLORS.error })
@@ -547,7 +590,7 @@ export function useWaveformRegions(
 
     regions.forEach((region) => {
       const isOverlapping = overlappingIds.has(region.id)
-      const isSelected = region.id === getSelectedSubtitleId()
+      const isSelected = isRegionSelected(region.id)
 
       if (isOverlapping) {
         region.setOptions({ color: OVERLAP_COLORS.error })
@@ -573,17 +616,18 @@ export function useWaveformRegions(
    * @returns {string} 颜色值
    */
   function computeRegionColor(subtitle, overlappingIds) {
-    const isSelected = subtitle.id === getSelectedSubtitleId()
-    const isOverlapping = overlappingIds.has(subtitle.id)
+    const regionId = resolveRegionRenderId(subtitle)
+    const isSelected = isRegionSelected(regionId)
+    const isOverlapping = overlappingIds.has(regionId)
 
     if (isOverlapping) return OVERLAP_COLORS.error
     if (isSelected) return OVERLAP_COLORS.selected
     return props.regionColor
   }
 
-  function addSubtitleRegion(regionsPlugin, subtitle, color) {
+  function addSubtitleRegion(regionsPlugin, subtitle, color, regionId) {
     return regionsPlugin.addRegion({
-      id: subtitle.id,
+      id: regionId,
       start: subtitle.start,
       end: subtitle.end,
       color,
@@ -622,7 +666,20 @@ export function useWaveformRegions(
       return
     }
 
-    const subtitleCount = subtitleList.length
+    const normalizedSubtitles = subtitleList
+      .map((subtitle) => {
+        const regionId = resolveRegionRenderId(subtitle)
+        if (!regionId) {
+          return null
+        }
+        return {
+          ...subtitle,
+          regionId,
+        }
+      })
+      .filter(Boolean)
+
+    const subtitleCount = normalizedSubtitles.length
 
     // 无字幕时清空所有 regions
     if (subtitleCount === 0) {
@@ -632,7 +689,12 @@ export function useWaveformRegions(
     }
 
     // 预先检测重叠区域
-    overlapCacheIds = detectOverlappingSubtitles(subtitleList)
+    overlapCacheIds = detectOverlappingSubtitles(
+      normalizedSubtitles.map((subtitle) => ({
+        ...subtitle,
+        id: subtitle.regionId,
+      }))
+    )
     overlapCacheDirty = false
     const overlappingIds = overlapCacheIds
 
@@ -641,7 +703,7 @@ export function useWaveformRegions(
       // 构建现有 regions 的 Map（id → region）
       const existingRegions = new Map()
       regionsPlugin.getRegions().forEach((region) => {
-        existingRegions.set(region.id, region)
+        existingRegions.set(String(region.id), region)
       })
 
       // 记录本次需要保留的 region IDs
@@ -649,15 +711,15 @@ export function useWaveformRegions(
       let addedCount = 0
       let updatedCount = 0
 
-      subtitleList.forEach((subtitle) => {
+      normalizedSubtitles.forEach((subtitle) => {
         if (subtitle.start === undefined || subtitle.end === undefined) {
-          console.warn(`[WaveformRegions] 跳过无效字幕: id=${subtitle.id}`)
+          console.warn(`[WaveformRegions] 跳过无效字幕: id=${subtitle.regionId}`)
           return
         }
 
-        newSubtitleIds.add(subtitle.id)
+        newSubtitleIds.add(subtitle.regionId)
         const targetColor = computeRegionColor(subtitle, overlappingIds)
-        const existing = existingRegions.get(subtitle.id)
+        const existing = existingRegions.get(subtitle.regionId)
 
         if (existing) {
           // 与 addRegion 参数保持一致，避免历史 region 遗留旧的极小宽度阈值。
@@ -666,15 +728,16 @@ export function useWaveformRegions(
           const needsTimeUpdate =
             Math.abs(existing.start - subtitle.start) > 0.001 ||
             Math.abs(existing.end - subtitle.end) > 0.001
+          const isDomDetached = existing?.element?.isConnected === false
           // 注意：region.color 可能是 undefined，需要通过 element style 获取
           // wavesurfer regions 插件只会在 addRegion/saveRegion 时重跑 virtualAppend；
           // 纯 setOptions 不会重新把已脱挂的 Region DOM 挂回容器。
           // 结构性编辑（merge/split/undo/redo）恰好会让保留字幕的时间范围大幅变化，
           // 继续复用旧 Region 会出现“数据已更新，但 Region DOM 丢失”的假活状态。
-          // 因此只要时间变更，就必须 remove + add 触发插件完整重建。
-          if (forceRecreateAll || needsTimeUpdate) {
+          // 因此只要时间变更，或检测到 DOM 已脱挂，就必须 remove + add 完整重建。
+          if (forceRecreateAll || needsTimeUpdate || isDomDetached) {
             existing.remove()
-            addSubtitleRegion(regionsPlugin, subtitle, targetColor)
+            addSubtitleRegion(regionsPlugin, subtitle, targetColor, subtitle.regionId)
             updatedCount++
           } else {
             // 仅更新颜色（选中状态变化等）
@@ -682,7 +745,7 @@ export function useWaveformRegions(
           }
         } else {
           // 新增：添加 region
-          addSubtitleRegion(regionsPlugin, subtitle, targetColor)
+          addSubtitleRegion(regionsPlugin, subtitle, targetColor, subtitle.regionId)
           addedCount++
         }
       })
