@@ -464,6 +464,7 @@ let editorCoreSessionKey = null
 let isEditorProjectionReloadInFlight = false
 let hasEditorProjectionReloadPending = false
 let editorProjectionReloadReason = null
+let strictSyncInFlightPromise = null
 
 watch(
   () => activeJobId.value,
@@ -1175,6 +1176,128 @@ function formatSRTTime(seconds) {
   const s = Math.floor(seconds % 60)
   const ms = Math.round((seconds % 1) * 1000)
   return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')},${ms.toString().padStart(3, '0')}`
+}
+
+function toSafeMs(value) {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) {
+    return 0
+  }
+  return Math.round(numeric)
+}
+
+function toNormalizedSegmentId(value) {
+  const normalized = String(value ?? '').trim()
+  return normalized || null
+}
+
+function assertEditorV2SnapshotConsistency(serverSegments) {
+  if (!useEditorV2) {
+    return
+  }
+
+  const localBySegmentId = new Map()
+  for (const localId of editorDocumentStore.order) {
+    const entity = editorDocumentStore.getEntity(localId)
+    if (!entity || entity.isDeleted) {
+      continue
+    }
+    const segmentId = toNormalizedSegmentId(editorDocumentStore.getCold(localId)?.segmentId)
+    if (!segmentId) {
+      throw new Error(`本地仍存在未绑定字幕（localId=${localId}），请稍后重试导出`)
+    }
+    if (localBySegmentId.has(segmentId)) {
+      throw new Error(`本地存在重复 segment_id=${segmentId}，请刷新后重试`)
+    }
+    localBySegmentId.set(segmentId, {
+      text: String(entity.text ?? ''),
+      startMs: toSafeMs(entity.startMs),
+      endMs: toSafeMs(entity.endMs),
+    })
+  }
+
+  const serverBySegmentId = new Map()
+  for (const segment of (Array.isArray(serverSegments) ? serverSegments : [])) {
+    const segmentId = toNormalizedSegmentId(segment?.segment_id)
+    if (!segmentId) {
+      continue
+    }
+    if (serverBySegmentId.has(segmentId)) {
+      throw new Error(`后端返回重复 segment_id=${segmentId}，请稍后重试`)
+    }
+    serverBySegmentId.set(segmentId, {
+      text: String(segment?.text ?? ''),
+      startMs: toSafeMs(Number(segment?.start ?? 0) * 1000),
+      endMs: toSafeMs(Number(segment?.end ?? segment?.start ?? 0) * 1000),
+    })
+  }
+
+  const mismatches = []
+  if (localBySegmentId.size !== serverBySegmentId.size) {
+    mismatches.push(`数量不一致(local=${localBySegmentId.size}, server=${serverBySegmentId.size})`)
+  }
+
+  for (const [segmentId, localSnapshot] of localBySegmentId.entries()) {
+    const serverSnapshot = serverBySegmentId.get(segmentId)
+    if (!serverSnapshot) {
+      mismatches.push(`后端缺少 segment_id=${segmentId}`)
+      continue
+    }
+    const isTextMismatch = localSnapshot.text !== serverSnapshot.text
+    const isTimingMismatch = (
+      Math.abs(localSnapshot.startMs - serverSnapshot.startMs) > 1
+      || Math.abs(localSnapshot.endMs - serverSnapshot.endMs) > 1
+    )
+    if (isTextMismatch || isTimingMismatch) {
+      mismatches.push(`segment_id=${segmentId} 文本/时间不一致`)
+    }
+  }
+
+  for (const segmentId of serverBySegmentId.keys()) {
+    if (!localBySegmentId.has(segmentId)) {
+      mismatches.push(`本地缺少 segment_id=${segmentId}`)
+    }
+  }
+
+  if (mismatches.length > 0) {
+    const summary = mismatches.slice(0, 3).join('；')
+    throw new Error(`前后端字幕快照不一致：${summary}`)
+  }
+}
+
+async function runEditorSyncStrict() {
+  if (!useEditorV2) {
+    return true
+  }
+
+  if (strictSyncInFlightPromise) {
+    return strictSyncInFlightPromise
+  }
+
+  strictSyncInFlightPromise = (async () => {
+    // 兼容热更新/旧会话：若实例尚未拿到 flushStrict，则降级组合 flush + reconcile + flush。
+    if (typeof editorSyncEngine.flushStrict === 'function') {
+      return editorSyncEngine.flushStrict()
+    }
+    if (typeof editorSyncEngine.flush === 'function') {
+      const firstPass = await editorSyncEngine.flush()
+      if (!firstPass) {
+        return false
+      }
+      if (typeof editorSyncEngine.reconcile === 'function') {
+        await editorSyncEngine.reconcile()
+        return editorSyncEngine.flush()
+      }
+      return firstPass
+    }
+    throw new Error('同步引擎不可用：缺少 flush/flushStrict')
+  })()
+
+  try {
+    return await strictSyncInFlightPromise
+  } finally {
+    strictSyncInFlightPromise = null
+  }
 }
 
 function normalizeProjectSegmentEvent(data) {
@@ -2207,7 +2330,7 @@ async function saveProject() {
     if (!useEditorV2) {
       await projectStore.saveProject()
     } else {
-      await editorSyncEngine.flush()
+      await runEditorSyncStrict()
     }
     lastSaved.value = Date.now()
   } catch (error) {
@@ -2374,7 +2497,7 @@ async function fetchLatestSegments() {
   let structuralErrorCount = 0
 
   if (useEditorV2) {
-    await editorSyncEngine.flush()
+    await runEditorSyncStrict()
     pending = Array.isArray(editorSyncEngine.pendingCommands)
       ? editorSyncEngine.pendingCommands.length
       : Number(editorSyncEngine.pendingCommands?.value?.length || 0)
@@ -2418,6 +2541,9 @@ async function fetchLatestSegments() {
     await projectStore.saveProject()
   }
   const segments = await projectApi.getSubtitles(projectId)
+  if (useEditorV2) {
+    assertEditorV2SnapshotConsistency(segments)
+  }
   return Array.isArray(segments)
     ? segments.map((segment, index) => ({
         id: segment.legacy_index ?? index,
