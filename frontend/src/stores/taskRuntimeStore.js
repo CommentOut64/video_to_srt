@@ -1045,7 +1045,11 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
 
     if (useEditorV2) {
       const syncEngine = useEditorSyncEngine()
-      await syncEngine.flush()
+      if (typeof syncEngine.flushStrict === 'function') {
+        await syncEngine.flushStrict()
+      } else {
+        await syncEngine.flush()
+      }
     } else {
       const projectStore = useProjectStore()
       await projectStore.saveProject()
