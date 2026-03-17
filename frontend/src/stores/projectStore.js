@@ -411,6 +411,7 @@ export const useProjectStore = defineStore("project", () => {
   watch(
     [subtitles, meta],
     () => {
+      if (FEATURE_FLAGS.USE_EDITOR_V2) return;
       // 跳过保存后的状态更新触发
       if (isUpdatingAfterSave) return;
       const cacheKey = meta.value.projectId || meta.value.jobId;
