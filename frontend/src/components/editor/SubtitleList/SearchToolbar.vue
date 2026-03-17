@@ -162,16 +162,25 @@
     <div class="toolbar-right tw-flex tw-items-center tw-flex-shrink-0">
       <el-popover
         v-if="multiSelectedCount > 0"
-        :content="`删除已选中的 ${multiSelectedCount} 条字幕`"
-        placement="top"
+        :content="batchDeleteConfirm ? '再次点击确认删除' : `删除 ${multiSelectedCount} 条字幕`"
+        placement="left"
         trigger="hover"
         popper-class="hint-popover-compact"
         :show-after="500"
       >
         <template #reference>
-          <button class="toolbar-btn" @click="handleBatchDelete">
-            <svg viewBox="0 0 24 24" fill="currentColor">
-              <path d="M9 3h6l1 2h5v2H3V5h5l1-2zm1 6h2v8h-2V9zm4 0h2v8h-2V9zM7 9h2v8H7V9z" />
+          <button
+            class="toolbar-btn"
+            :style="batchDeleteConfirm ? 'color: var(--af-accent-danger);' : ''"
+            @click="handleBatchDeleteConfirm"
+            @blur="handleBatchDeleteBlur"
+            tabindex="0"
+          >
+            <svg v-if="!batchDeleteConfirm" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
+            </svg>
+            <svg v-else viewBox="0 0 24 24" fill="currentColor" style="color: var(--af-accent-danger);">
+              <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
             </svg>
           </button>
         </template>
@@ -247,6 +256,7 @@ const emit = defineEmits([
 const localSearchText = ref('')
 const isReplaceExpanded = ref(false)
 const modePopoverRef = ref(null)
+const batchDeleteConfirm = ref(false)
 
 // 同步 searchText -> localSearchText
 watch(
@@ -342,6 +352,18 @@ function handleToggleSelectAll() {
 
 function handleAddSubtitle() {
   emit('add-subtitle')
+}
+
+function handleBatchDeleteConfirm() {
+  if (!batchDeleteConfirm.value) {
+    batchDeleteConfirm.value = true
+  } else {
+    batchDeleteConfirm.value = false
+    handleBatchDelete()
+  }
+}
+function handleBatchDeleteBlur() {
+  batchDeleteConfirm.value = false
 }
 </script>
 

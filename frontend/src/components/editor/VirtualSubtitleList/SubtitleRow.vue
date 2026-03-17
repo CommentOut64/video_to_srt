@@ -6,10 +6,14 @@
       'is-selected': isSelected,
       'is-active': isActive,
       'is-current': isCurrent,
+      'is-current-paused': isCurrent && !isPlaying,
       'is-draft': entity?.isDraft,
       'is-modified': entity?.isModified,
       'is-match-selected': isMatchSelected,
       'has-cluster-color': Boolean(clusterColor),
+      'warning-low-confidence': subtitle?.warning_type === 'low_confidence',
+      'warning-high-perplexity': subtitle?.warning_type === 'high_perplexity',
+      'warning-both': subtitle?.warning_type === 'both',
     }"
     @click="handleClick"
     @contextmenu.prevent="handleItemContextMenu"
@@ -80,7 +84,7 @@
         <div
           v-if="!isEditing"
           class="text-display"
-          :class="{ 'can-edit': !entity?.isDraft }"
+          :class="{ 'can-edit': !entity?.isDraft, 'text-draft': entity?.isDraft }"
           @click.stop="startEditing($event)"
           v-html="renderTextWithHighlight()"
         ></div>
@@ -111,27 +115,41 @@
     </div>
 
     <div v-if="!entity?.isDraft" class="item-actions" @click.stop>
-      <button class="action-btn" @click="$emit('insert-before')">
-        <svg viewBox="0 0 24 24" fill="currentColor">
-          <path d="M7 14l5-5 5 5z"/>
-        </svg>
-      </button>
-      <button class="action-btn" @click="$emit('insert-after')">
-        <svg viewBox="0 0 24 24" fill="currentColor">
-          <path d="M7 10l5 5 5-5z"/>
-        </svg>
-      </button>
+      <el-tooltip content="在前面插入" placement="left" :show-after="500">
+        <button class="action-btn" @click="$emit('insert-before')">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M7 14l5-5 5 5z"/>
+          </svg>
+        </button>
+      </el-tooltip>
+      <el-tooltip content="在后面插入" placement="left" :show-after="500">
+        <button class="action-btn" @click="$emit('insert-after')">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M7 10l5 5 5-5z"/>
+          </svg>
+        </button>
+      </el-tooltip>
     </div>
 
-    <button
-      v-if="!entity?.isDraft"
-      class="delete-btn"
-      @click.stop="$emit('delete')"
+    <el-tooltip
+      :content="isDeleteConfirming ? '再次点击确认删除' : '删除'"
+      placement="left"
+      :show-after="500"
     >
-      <svg viewBox="0 0 24 24" fill="currentColor">
-        <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
-      </svg>
-    </button>
+      <button
+        v-if="!entity?.isDraft"
+        class="delete-btn"
+        :class="{ 'delete-btn-confirming': isDeleteConfirming }"
+        @click.stop="handleDeleteClick"
+      >
+        <svg v-if="!isDeleteConfirming" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
+        </svg>
+        <svg v-else viewBox="0 0 24 24" fill="currentColor">
+          <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
+        </svg>
+      </button>
+    </el-tooltip>
 
     <ContextMenu
       ref="contextMenuRef"
@@ -150,6 +168,7 @@ import { useEditorDocumentStore } from '@/stores/editor/editorDocumentStore'
 import { useEditorDraftStore } from '@/stores/editor/editorDraftStore'
 import { useEditorProjectionBridge } from '@/stores/editor/editorProjectionBridge'
 import { createUpdateTextCommand, createUpdateTimingCommand } from '@/stores/editor/editorCommandFactory'
+import { usePlaybackStore } from '@/stores/playbackStore'
 import { useProjectStore } from '@/stores/projectStore'
 
 const props = defineProps({
@@ -181,6 +200,7 @@ const commandBus = useEditorCommandBus()
 const docStore = useEditorDocumentStore()
 const draftStore = useEditorDraftStore()
 const editorProjectionBridge = useEditorProjectionBridge()
+const playbackStore = usePlaybackStore()
 const projectStore = useProjectStore()
 
 const entity = computed(() => {
@@ -209,6 +229,8 @@ const cursorPosition = ref(null)
 const contextMenuRef = ref(null)
 const isContextMenuOpen = ref(false)
 const pendingBlurWhileContextMenuOpen = ref(false)
+const isDeleteConfirming = ref(false)
+const isPlaying = computed(() => playbackStore.isPlaying)
 let highlightCacheText = null
 let highlightCacheWords = null
 let highlightCacheMatchSpans = null
@@ -386,7 +408,21 @@ function updateCursorPosition(event) {
 }
 
 function handleClick(event) {
+  resetDeleteConfirm()
   emit('click', props.localId, event)
+}
+
+function handleDeleteClick() {
+  if (!isDeleteConfirming.value) {
+    isDeleteConfirming.value = true
+    return
+  }
+  isDeleteConfirming.value = false
+  emit('delete')
+}
+
+function resetDeleteConfirm() {
+  isDeleteConfirming.value = false
 }
 
 function handleSelectChange(checked) {
@@ -396,8 +432,9 @@ function handleSelectChange(checked) {
 function autoResizeTextarea() {
   const textarea = textareaRef.value
   if (!textarea) return
-  textarea.style.height = 'auto'
-  textarea.style.height = `${Math.max(45, textarea.scrollHeight)}px`
+  textarea.style.height = '0'
+  // Trade-off: scrollHeight 在部分浏览器中会发生整数取整，+1 用于避免多行文本编辑态偶发比展示态矮 1px 的视觉抖动。
+  textarea.style.height = `${Math.max(45, textarea.scrollHeight + 1)}px`
 }
 
 function getTextOffsetFromPoint(container, clientX, clientY) {
@@ -685,12 +722,17 @@ function escapeHtml(text) {
 
 .subtitle-row.is-active:not(.is-current) {
   border-color: var(--af-accent-primary);
-  background: rgb(var(--af-accent-primary-rgb), 0.08);
+  background: rgba(var(--af-accent-primary-rgb), 0.08);
 }
 
 .subtitle-row.is-current {
   border-color: var(--af-accent-success);
-  background: rgb(var(--af-accent-success-rgb), 0.08);
+  background: rgba(var(--af-accent-success-rgb), 0.08);
+}
+
+/* 暂停时显示呼吸灯动画 */
+.subtitle-row.is-current-paused {
+  animation: breathing-border-green 3s ease-in-out infinite;
 }
 
 .subtitle-row.is-match-selected:not(.is-active):not(.is-current) {
@@ -699,10 +741,26 @@ function escapeHtml(text) {
 }
 
 .subtitle-row.is-draft {
-  background: rgb(var(--af-text-muted-rgb), 0.05);
-  border-color: rgb(var(--af-text-muted-rgb), 0.20);
+  background: rgba(var(--af-text-muted-rgb), 0.05);
+  border-color: rgba(var(--af-text-muted-rgb), 0.20);
   cursor: wait;
-  opacity: 0.6;
+}
+
+/* 置信度警告高亮样式 */
+.subtitle-row.warning-low-confidence {
+  border-color: var(--af-accent-warning);
+  background: rgba(var(--af-accent-warning-rgb), 0.06);
+}
+
+.subtitle-row.warning-high-perplexity {
+  border-color: var(--af-functional-status-warning);
+  background: rgba(var(--af-functional-status-warning-rgb), 0.06);
+}
+
+.subtitle-row.warning-both {
+  border-color: var(--af-accent-danger);
+  background: rgba(var(--af-accent-danger-rgb), 0.08);
+  border-width: 2px;
 }
 
 .item-index {
@@ -737,6 +795,21 @@ function escapeHtml(text) {
 
 .subtitle-row.is-active:not(.is-current) .item-index {
   background: var(--af-accent-primary);
+  color: var(--af-text-inverse);
+}
+
+.subtitle-row.warning-low-confidence .item-index {
+  background: var(--af-accent-warning);
+  color: var(--af-text-inverse);
+}
+
+.subtitle-row.warning-high-perplexity .item-index {
+  background: var(--af-functional-status-warning);
+  color: var(--af-text-inverse);
+}
+
+.subtitle-row.warning-both .item-index {
+  background: var(--af-accent-danger);
   color: var(--af-text-inverse);
 }
 
@@ -821,6 +894,18 @@ function escapeHtml(text) {
   to { transform: rotate(360deg); }
 }
 
+/* 绿色呼吸灯动画 — 边框颜色从透明到绿色再到透明 */
+@keyframes breathing-border-green {
+  0%, 100% {
+    border-color: transparent;
+  }
+
+  50% {
+    border-color: var(--af-accent-success);
+    box-shadow: 0 0 8px rgba(var(--af-accent-success-rgb), 0.50);
+  }
+}
+
 .confidence-badge {
   padding: 2px 6px;
   border-radius: var(--af-radius-full);
@@ -874,6 +959,14 @@ function escapeHtml(text) {
   cursor: default;
 }
 
+/* 草稿文本样式 */
+.text-display.text-draft {
+  background: rgba(var(--af-functional-draft-bg-rgb), 0.08);
+  color: var(--af-functional-draft-text);
+  font-style: italic;
+  cursor: wait;
+}
+
 .text-display.can-edit {
   cursor: text;
 }
@@ -885,39 +978,39 @@ function escapeHtml(text) {
 
 .text-display :deep(.word-warning) {
   background-color: rgb(var(--af-confidence-warning-rgb), 0.25);
-  border-bottom: 2px solid var(--af-confidence-warning);
-  padding: 0 2px;
+  box-shadow: inset 0 -2px 0 var(--af-confidence-warning);
   border-radius: 2px;
 }
 
 .text-display :deep(.word-critical) {
   background-color: rgb(var(--af-confidence-critical-rgb), 0.25);
-  border-bottom: 2px solid var(--af-confidence-critical);
-  padding: 0 2px;
+  box-shadow: inset 0 -2px 0 var(--af-confidence-critical);
   border-radius: 2px;
-  font-weight: 500;
 }
 
 .text-display :deep(.match-highlight) {
   background-color: rgb(var(--af-accent-warning-rgb), 0.35);
   color: var(--af-text-primary);
-  padding: 1px 2px;
   border-radius: 2px;
-  font-weight: 500;
 }
 
 .text-input {
+  box-sizing: border-box;
+  display: block;
+  margin: 0;
+  font-family: inherit;
   width: 100%;
-  padding: 6px 8px;
+  padding: 6px 35px 6px 8px;
   background: var(--af-bg-tertiary);
   border: 1px solid var(--af-accent-primary);
   border-radius: var(--af-radius-sm);
   color: var(--af-text-normal);
   font-size: 12px;
   min-height: 45px;
-  padding-right: 35px;
   resize: none;
   line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
   outline: none;
   overflow: hidden;
   scrollbar-width: none;
@@ -1021,5 +1114,15 @@ function escapeHtml(text) {
 .delete-btn:hover {
   opacity: 1;
   background: var(--af-bg-tertiary);
+}
+
+/* 确认状态 — 红色垃圾桶图标 */
+.delete-btn-confirming {
+  color: var(--af-accent-danger);
+  opacity: 1;
+}
+
+.delete-btn-confirming:hover {
+  background: rgba(var(--af-accent-danger-rgb), 0.10);
 }
 </style>
