@@ -608,6 +608,7 @@ async def _apply_editor_op(
         )
 
     if op_type == "delete_subtitle":
+        explicit_segment_id = _normalize_editor_segment_id(op.get("segment_id"))
         segment_id = _resolve_editor_segment_id(
             project_dir=project_dir,
             op=op,
@@ -616,8 +617,16 @@ async def _apply_editor_op(
             client_ref_field="client_ref_id",
         )
         if not segment_id:
+            if explicit_segment_id:
+                # 幂等删除：segment 已不存在时视为 no-op，避免重放路径被 404 阻断。
+                return _build_editor_op_result(op_id=op_id)
             raise HTTPException(status_code=404, detail="未找到 delete_subtitle 对应字幕")
-        await delete_project_subtitle(project_id, segment_id)
+        try:
+            await delete_project_subtitle(project_id, segment_id)
+        except HTTPException as exc:
+            if exc.status_code == 404 and explicit_segment_id:
+                return _build_editor_op_result(op_id=op_id)
+            raise
         return _build_editor_op_result(
             op_id=op_id,
             events=[
