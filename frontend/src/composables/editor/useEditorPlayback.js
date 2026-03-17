@@ -6,6 +6,7 @@ import { useProjectStore } from '@/stores/projectStore'
 import { useEditorDocumentStore } from '@/stores/editor/editorDocumentStore'
 
 const VIRTUAL_CENTER_MAX_ATTEMPTS = 8
+const FOLLOW_VIEWPORT_PADDING_RATIO = 0.2
 
 function toBaseMs(projectStore, displaySeconds) {
   return Math.round(projectStore.toBaseTime(displaySeconds) * 1000)
@@ -42,9 +43,9 @@ function findSubtitleIdByTime(docStore, targetMs) {
   return null
 }
 
-function centerTargetInScroller(rootElement, target, behavior = 'smooth') {
+function resolveTargetMetrics(rootElement, target) {
   if (!rootElement || !target) {
-    return false
+    return null
   }
 
   const rootRect = typeof rootElement.getBoundingClientRect === 'function'
@@ -65,8 +66,49 @@ function centerTargetInScroller(rootElement, target, behavior = 'smooth') {
     : target.offsetTop
   const nextTop = Math.max(
     0,
-    targetTop - ((scrollerHeight - targetHeight) / 2)
+    targetTop
   )
+
+  return {
+    targetHeight,
+    scrollerHeight,
+    targetTop,
+    targetBottom: targetTop + targetHeight,
+    scrollTop: rootElement.scrollTop ?? 0,
+  }
+}
+
+function followTargetInScroller(rootElement, target, behavior = 'auto') {
+  const metrics = resolveTargetMetrics(rootElement, target)
+  if (!metrics) {
+    return false
+  }
+
+  const {
+    targetTop,
+    targetBottom,
+    targetHeight,
+    scrollerHeight,
+    scrollTop,
+  } = metrics
+  const viewportPadding = scrollerHeight * FOLLOW_VIEWPORT_PADDING_RATIO
+  const followTopBoundary = scrollTop + viewportPadding
+  const followBottomBoundary = scrollTop + scrollerHeight - viewportPadding
+
+  // Trade-off: 不再强制“每次都居中”，而是仅在目标项逼近边缘时做最小位移纠正，
+  // 以换取播放跟随时更稳定的跟手感，同时保留虚拟列表延迟渲染后的 fallback 定位链路。
+  if (targetHeight < scrollerHeight) {
+    if (targetTop >= followTopBoundary && targetBottom <= followBottomBoundary) {
+      return true
+    }
+  }
+
+  let nextTop = scrollTop
+  if (targetTop < followTopBoundary) {
+    nextTop = Math.max(0, targetTop - viewportPadding)
+  } else if (targetBottom > followBottomBoundary) {
+    nextTop = Math.max(0, targetBottom - scrollerHeight + viewportPadding)
+  }
 
   if (typeof rootElement.scrollTo === 'function') {
     rootElement.scrollTo({
@@ -106,7 +148,7 @@ function retryCenterRenderedTarget(rootElement, selector, options = {}) {
 
   const target = rootElement?.querySelector?.(selector)
   if (target) {
-    const centered = centerTargetInScroller(rootElement, target, behavior)
+    const centered = followTargetInScroller(rootElement, target, behavior)
     if (centered) {
       onCentered?.()
       return true
@@ -142,7 +184,7 @@ function scrollToSubtitle(scroller, localId, fallbackIndex, options = {}) {
   const selector = `[data-local-id="${localId}"]`
   const target = rootElement.querySelector(selector)
   if (target) {
-    const centered = centerTargetInScroller(rootElement, target, 'smooth')
+    const centered = followTargetInScroller(rootElement, target, 'auto')
     if (centered) {
       options.onCentered?.()
       return true
