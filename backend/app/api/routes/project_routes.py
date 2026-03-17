@@ -497,13 +497,18 @@ async def _apply_editor_op(
             client_ref_field="client_ref_id",
         )
         if not segment_id:
-            raise HTTPException(status_code=404, detail="未找到 update_text 对应字幕")
+            raise HTTPException(status_code=409, detail="update_text 目标字幕缺失，请先对账后重试")
         updated_text = _require_text_field(op, "after")
-        response = await update_project_subtitle(
-            project_id,
-            segment_id,
-            SubtitleUpdateRequest(text=updated_text),
-        )
+        try:
+            response = await update_project_subtitle(
+                project_id,
+                segment_id,
+                SubtitleUpdateRequest(text=updated_text),
+            )
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                raise HTTPException(status_code=409, detail="update_text 目标字幕缺失，请先对账后重试") from exc
+            raise
         return _build_editor_op_result(
             op_id=op_id,
             updated_entities=[
@@ -534,17 +539,22 @@ async def _apply_editor_op(
             client_ref_field="client_ref_id",
         )
         if not segment_id:
-            raise HTTPException(status_code=404, detail="未找到 update_timing 对应字幕")
+            raise HTTPException(status_code=409, detail="update_timing 目标字幕缺失，请先对账后重试")
         start_ms = _require_ms_field(op, "after", "start_ms")
         end_ms = _require_ms_field(op, "after", "end_ms")
-        response = await update_project_subtitle(
-            project_id,
-            segment_id,
-            SubtitleUpdateRequest(
-                start=_ms_to_seconds(start_ms),
-                end=_ms_to_seconds(end_ms),
-            ),
-        )
+        try:
+            response = await update_project_subtitle(
+                project_id,
+                segment_id,
+                SubtitleUpdateRequest(
+                    start=_ms_to_seconds(start_ms),
+                    end=_ms_to_seconds(end_ms),
+                ),
+            )
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                raise HTTPException(status_code=409, detail="update_timing 目标字幕缺失，请先对账后重试") from exc
+            raise
         return _build_editor_op_result(
             op_id=op_id,
             updated_entities=[
