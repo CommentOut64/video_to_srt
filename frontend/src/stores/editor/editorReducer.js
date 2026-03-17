@@ -210,9 +210,20 @@ export function editorReducer(docStore, command) {
       if (!kept || !removed) return { success: false, reason: 'entity_not_found' }
 
       const keptColdBeforeMerge = cloneColdEntity(docStore.getCold(command.keptLocalId), command.keptLocalId)
-      const removedCold = command.removedColdSnapshot
+      const liveRemovedCold = cloneColdEntity(docStore.getCold(command.removedLocalId), command.removedLocalId)
+      const removedColdSnapshot = command.removedColdSnapshot
         ? cloneColdEntity(command.removedColdSnapshot, command.removedLocalId)
-        : cloneColdEntity(docStore.getCold(command.removedLocalId), command.removedLocalId)
+        : null
+      // Trade-off: 回放要尽量复用历史冻结字段，但如果 removed 字幕在历史期间已经拿到
+      // 新 segment 绑定，必须优先保留 live binding，否则 undo->redo 会把 binding 退化为 null。
+      const removedCold = cloneColdEntity(
+        removedColdSnapshot || liveRemovedCold,
+        command.removedLocalId,
+        {
+          segmentId: liveRemovedCold?.segmentId ?? removedColdSnapshot?.segmentId ?? null,
+          sentenceIndex: liveRemovedCold?.sentenceIndex ?? removedColdSnapshot?.sentenceIndex ?? null,
+        }
+      )
 
       docStore._applyUpdate(command.keptLocalId, {
         text: command.after.text,
@@ -237,12 +248,9 @@ export function editorReducer(docStore, command) {
           afterKept: command.beforeKept,
           afterCreated: command.beforeRemoved,
           keptColdPatch: keptColdBeforeMerge,
-          createdColdInit: cloneColdEntity(removedCold, command.removedLocalId, {
-            // merge 已在服务端删除 removed 段；撤销 merge 时，本地恢复出的后半字幕
-            // 必须视为“待 split 回包重新绑定”的乐观实体，不能继续沿用已失效的旧 binding。
-            segmentId: null,
-            sentenceIndex: null,
-          }),
+          // 先冻结 merge 前 removed 冷字段，是否复用旧 segmentId 交给
+          // history replay 物化阶段按“删除是否已落后端”实时判定。
+          createdColdInit: cloneColdEntity(removedCold, command.removedLocalId),
         }),
         commandId: `${command.commandId}_undo`,
         source: 'undo_redo',

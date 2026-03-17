@@ -11,7 +11,7 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
   const bindingBySegmentId = new Map()
   const bindingBySentenceIndex = new Map()
   const revision = ref(0)
-  const dirtySet = new Set()
+  const dirtyLocalIds = new Set()
   const tombstones = shallowRef([])
   const entityVersionTokens = new Map()
 
@@ -154,7 +154,7 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
       .filter((candidateLocalId) => candidateLocalId !== preferredLocalId)
 
     for (const duplicateLocalId of duplicateLocalIds) {
-      _applyDelete(duplicateLocalId)
+      _applyDelete(duplicateLocalId, { trackTombstone: false })
     }
 
     clearMatchingTombstones({
@@ -166,6 +166,21 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
 
   // ─── 原子写操作（仅由 reducer 调用） ───
   function _applyInsert(localId, hot, cold, afterLocalId) {
+    const existingCold = coldEntities.get(localId)
+    const existingSentenceIndex = existingCold?.sentenceIndex
+    const existingSegmentId = existingCold?.segmentId
+
+    if (existingSegmentId && (!cold || cold.segmentId !== existingSegmentId)) {
+      bindingBySegmentId.delete(existingSegmentId)
+    }
+    if (
+      existingSentenceIndex !== null
+      && existingSentenceIndex !== undefined
+      && (!cold || cold.sentenceIndex !== existingSentenceIndex)
+    ) {
+      bindingBySentenceIndex.delete(existingSentenceIndex)
+    }
+
     const nextHot = {
       ...hot,
       localId,
@@ -192,26 +207,47 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
       }
     }
 
-    const pos = afterLocalId !== null && afterLocalId !== undefined
-      ? (indexById.get(afterLocalId) ?? -1) + 1
-      : findInsertPosition(nextHot.startMs)
-
-    const newOrder = [...order.value]
+    const hasExistingOrderEntry = indexById.has(localId)
+    let newOrder = null
+    let pos = 0
+    if (!hasExistingOrderEntry) {
+      pos = afterLocalId !== null && afterLocalId !== undefined
+        ? (indexById.get(afterLocalId) ?? -1) + 1
+        : findInsertPosition(nextHot.startMs)
+      newOrder = [...order.value]
+    } else {
+      // Trade-off: 结构命令回放可能因并发对账导致同 localId 被重复插入；
+      // 仅在命中重复插入时做去重重排，普通插入保持原性能路径。
+      newOrder = order.value.filter((id) => id !== localId)
+      if (afterLocalId !== null && afterLocalId !== undefined) {
+        const anchorIndex = newOrder.indexOf(afterLocalId)
+        pos = anchorIndex >= 0 ? anchorIndex + 1 : newOrder.length
+      } else {
+        while (pos < newOrder.length) {
+          const candidate = entities.get(newOrder[pos])
+          if ((candidate?.startMs ?? 0) >= nextHot.startMs) {
+            break
+          }
+          pos += 1
+        }
+      }
+    }
     newOrder.splice(pos, 0, localId)
     order.value = newOrder
 
     rebuildIndexById()
-    dirtySet.add(localId)
+    dirtyLocalIds.add(localId)
     revision.value++
     return true
   }
 
-  function _applyDelete(localId) {
+  function _applyDelete(localId, options = {}) {
+    const { trackTombstone = true } = options
     const entity = entities.get(localId)
     if (!entity) return false
 
     const cold = coldEntities.get(localId)
-    if (cold?.segmentId) {
+    if (trackTombstone && cold?.segmentId) {
       clearMatchingTombstones({
         localId,
         segmentId: cold.segmentId,
@@ -220,7 +256,18 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
         localId,
         segmentId: cold.segmentId,
         deletedAt: Date.now(),
+        before: {
+          text: entity.text ?? '',
+          startMs: entity.startMs ?? 0,
+          endMs: entity.endMs ?? 0,
+          isDraft: Boolean(entity.isDraft),
+        },
       }]
+    } else {
+      clearMatchingTombstones({
+        localId,
+        segmentId: cold?.segmentId ?? null,
+      })
     }
 
     entities.delete(localId)
@@ -235,7 +282,7 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     if (cold && cold.sentenceIndex !== null && cold.sentenceIndex !== undefined) {
       bindingBySentenceIndex.delete(cold.sentenceIndex)
     }
-    dirtySet.delete(localId)
+    dirtyLocalIds.delete(localId)
     revision.value++
     return true
   }
@@ -256,7 +303,7 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     entities.set(localId, nextEntity)
     ensureEntityVersionToken(localId, nextEntity)
 
-    dirtySet.add(localId)
+    dirtyLocalIds.add(localId)
     revision.value++
     return true
   }
@@ -325,12 +372,98 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
   }
 
   function _applyServerReplace(oldLocalIds, newEntities) {
-    oldLocalIds.forEach(id => _applyDelete(id))
+    oldLocalIds.forEach(id => _applyDelete(id, { trackTombstone: false }))
     newEntities.forEach(e => {
       const hot = { localId: e.localId, text: e.text, startMs: e.startMs, endMs: e.endMs, isDraft: false, isModified: false, isDeleted: false, revision: 0 }
       const cold = e.cold ? { localId: e.localId, ...e.cold } : null
       _applyInsert(e.localId, hot, cold, null)
     })
+    return true
+  }
+
+  function markDirty(localId) {
+    if (!localId) return
+    dirtyLocalIds.add(localId)
+  }
+
+  function getDirtyLocalIds() {
+    return [...dirtyLocalIds]
+  }
+
+  function clearDirtyFlags(localIds = []) {
+    if (!Array.isArray(localIds) || localIds.length === 0) {
+      return
+    }
+    localIds.forEach((localId) => {
+      dirtyLocalIds.delete(localId)
+    })
+  }
+
+  function clearAllDirty() {
+    dirtyLocalIds.clear()
+  }
+
+  function getTombstones() {
+    return [...tombstones.value]
+  }
+
+  function clearTombstones({ localIds = [], segmentIds = [] } = {}) {
+    const localIdSet = new Set(localIds.filter(Boolean))
+    const segmentIdSet = new Set(segmentIds.filter(Boolean))
+    if (localIdSet.size === 0 && segmentIdSet.size === 0) {
+      return
+    }
+
+    tombstones.value = tombstones.value.filter((item) => {
+      if (localIdSet.has(item.localId)) {
+        return false
+      }
+      if (segmentIdSet.has(item.segmentId)) {
+        return false
+      }
+      return true
+    })
+  }
+
+  function replaceTombstones(nextTombstones = []) {
+    tombstones.value = Array.isArray(nextTombstones) ? [...nextTombstones] : []
+  }
+
+  function upsertTombstone(nextTombstone) {
+    if (!nextTombstone || typeof nextTombstone !== 'object') {
+      return false
+    }
+
+    const localId = nextTombstone.localId ?? null
+    const segmentId = nextTombstone.segmentId ?? null
+    if (!localId && !segmentId) {
+      return false
+    }
+
+    const tombstone = {
+      localId,
+      segmentId,
+      deletedAt: Number(nextTombstone.deletedAt ?? Date.now()),
+      before: {
+        text: String(nextTombstone?.before?.text ?? ''),
+        startMs: Number(nextTombstone?.before?.startMs ?? 0),
+        endMs: Number(nextTombstone?.before?.endMs ?? 0),
+        isDraft: Boolean(nextTombstone?.before?.isDraft),
+      },
+    }
+
+    const nextTombstones = tombstones.value.filter((item) => {
+      if (localId && item.localId === localId) {
+        return false
+      }
+      if (segmentId && item.segmentId === segmentId) {
+        return false
+      }
+      return true
+    })
+
+    nextTombstones.push(tombstone)
+    tombstones.value = nextTombstones
     return true
   }
 
@@ -358,7 +491,7 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     bindingBySegmentId.clear()
     bindingBySentenceIndex.clear()
     entityVersionTokens.clear()
-    dirtySet.clear()
+    dirtyLocalIds.clear()
 
     snapshot.entities.forEach((e) => {
       const nextEntity = {
@@ -393,7 +526,7 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     bindingBySegmentId.clear()
     bindingBySentenceIndex.clear()
     entityVersionTokens.clear()
-    dirtySet.clear()
+    dirtyLocalIds.clear()
     order.value = []
     tombstones.value = []
     revision.value = 0
@@ -427,6 +560,14 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     _applyBatchReplace,
     _applyServerReplace,
     updateColdBinding,
+    markDirty,
+    getDirtyLocalIds,
+    clearDirtyFlags,
+    clearAllDirty,
+    getTombstones,
+    clearTombstones,
+    replaceTombstones,
+    upsertTombstone,
     takeSnapshot,
     restoreFromSnapshot,
     clearDocument,

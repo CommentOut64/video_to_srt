@@ -1,10 +1,10 @@
-// V3.2.5+dev.20260315.05: 编辑器同步引擎 - 命令队列 + 乐观更新 + 最小对账
+// V3.2.5+dev.20260316.21: 编辑器同步引擎（BindingMap + AckShadow + Dirty/Tombstone Diff）
 import { defineStore } from 'pinia'
 import { ref, shallowRef } from 'vue'
 import projectApi from '@/services/api/projectApi'
 import { useEditorSessionStore } from './editorSessionStore'
 import { useEditorDocumentStore } from './editorDocumentStore'
-import { editorReducer } from './editorReducer'
+import { buildPrimitiveDiffEntries } from './editorDiffSyncBuilder'
 
 const SYNC_INTERVAL_MS = 2000
 const MAX_BATCH_SIZE = 50
@@ -16,16 +16,13 @@ function toMs(value) {
   return Math.round(numeric * 1000)
 }
 
-function preserveOrCreateLocalId(docStore, segmentId) {
-  return docStore.bindingBySegmentId.get(segmentId) || segmentId
-}
-
-function resolveBaseRevision(sessionStore) {
-  return Number.isInteger(sessionStore.ackedRevision) ? sessionStore.ackedRevision : null
+function toNormalizedSegmentId(value) {
+  const normalized = String(value ?? '').trim()
+  return normalized || null
 }
 
 function toServerSegmentSnapshot(segment) {
-  const segmentId = String(segment?.segment_id || '')
+  const segmentId = toNormalizedSegmentId(segment?.segment_id)
   return {
     segmentId,
     text: String(segment?.text ?? ''),
@@ -48,28 +45,11 @@ function toServerSegmentSnapshot(segment) {
     words: Array.isArray(segment?.words)
       ? segment.words.map((word) => ({
           startMs: word?.start_ms ?? toMs(word?.start ?? 0),
-          endMs: word?.end_ms ?? toMs(word?.end ?? 0),
+          endMs: word?.end_ms ?? toMs(word?.end ?? word?.start ?? 0),
           text: word?.text ?? word?.word ?? '',
         }))
       : null,
   }
-}
-
-function buildReplayCommands(commands = []) {
-  return commands.map((command) => ({
-    ...command,
-    source: 'reconcile_replay',
-  }))
-}
-
-function assertCommandHasOwnField(command, fieldName) {
-  if (!Object.prototype.hasOwnProperty.call(command, fieldName)) {
-    throw new Error(`[SyncEngine] ${command.type} 缺少冻结字段：${fieldName}`)
-  }
-}
-
-function normalizeCommandList(commands) {
-  return Array.isArray(commands) ? commands.filter(Boolean) : []
 }
 
 function syncSnapshotColdState(docStore, localId, snapshot, existingCold) {
@@ -104,33 +84,55 @@ function syncSnapshotColdState(docStore, localId, snapshot, existingCold) {
   }
 
   if (snapshot.segmentId) {
-    docStore.bindingBySegmentId.set(snapshot.segmentId, localId)
+    docStore.updateColdBinding(localId, snapshot.segmentId)
   }
   if (snapshot.sentenceIndex !== null && snapshot.sentenceIndex !== undefined) {
     docStore.bindingBySentenceIndex.set(snapshot.sentenceIndex, localId)
   }
 }
 
-function applyAuthoritativeSegmentsToDocument(docStore, serverSegments, replayCommands = []) {
-  const normalizedSegments = Array.isArray(serverSegments) ? serverSegments : []
-  const preservedTombstones = [...docStore.tombstones]
+function captureUnsyncedLocalState(docStore) {
+  const dirtyLocalIds = docStore.getDirtyLocalIds()
+  const dirtyLocalSnapshots = new Map()
 
-  // 1. 先移除所有尚未拿到 segment_id 的乐观本地实体，后续依赖 replay 恢复。
-  for (const localId of [...docStore.order]) {
+  for (const localId of dirtyLocalIds) {
+    const entity = docStore.getEntity(localId)
+    if (!entity) continue
+
     const cold = docStore.getCold(localId)
-    if (!cold?.segmentId) {
-      docStore._applyDelete(localId)
-    }
+    const neighbors = docStore.getNeighbors(localId)
+    dirtyLocalSnapshots.set(localId, {
+      hot: {
+        ...entity,
+        localId,
+      },
+      cold: cold
+        ? {
+            ...cold,
+            localId,
+          }
+        : null,
+      afterLocalId: neighbors.prev ?? null,
+    })
   }
 
-  // 2. 用服务端权威快照覆盖所有已绑定实体，同时尽量保留现有 localId。
+  return {
+    dirtyLocalIds: new Set(dirtyLocalIds),
+    dirtyLocalSnapshots,
+    tombstones: docStore.getTombstones(),
+  }
+}
+
+function applyAuthoritativeSegmentsToDocument(docStore, serverSegments, preserveDirtyLocalIds = new Set()) {
+  const normalizedSegments = Array.isArray(serverSegments) ? serverSegments : []
   const seenSegmentIds = new Set()
+
   for (const rawSegment of normalizedSegments) {
     const snapshot = toServerSegmentSnapshot(rawSegment)
     if (!snapshot.segmentId) continue
 
     seenSegmentIds.add(snapshot.segmentId)
-    const localId = preserveOrCreateLocalId(docStore, snapshot.segmentId)
+    const localId = docStore.bindingBySegmentId.get(snapshot.segmentId) || snapshot.segmentId
     const existingEntity = docStore.getEntity(localId)
     const existingCold = docStore.getCold(localId)
 
@@ -149,7 +151,7 @@ function applyAuthoritativeSegmentsToDocument(docStore, serverSegments, replayCo
     }
 
     if (existingEntity && !existingCold) {
-      docStore._applyDelete(localId)
+      docStore._applyDelete(localId, { trackTombstone: false })
     }
 
     docStore._applyInsert(
@@ -186,123 +188,201 @@ function applyAuthoritativeSegmentsToDocument(docStore, serverSegments, replayCo
     )
   }
 
-  // 3. 删除服务端快照中已不存在的旧绑定实体。
   for (const localId of [...docStore.order]) {
     const cold = docStore.getCold(localId)
-    if (cold?.segmentId && !seenSegmentIds.has(cold.segmentId)) {
-      docStore._applyDelete(localId)
+    if (!cold?.segmentId) {
+      continue
     }
-  }
-
-  // 4. 恢复 tombstone，避免权威回拉污染删除同步语义。
-  docStore.tombstones = preservedTombstones
-
-  // 5. 在权威快照上重放未确认命令，确保本地未同步编辑不被旧快照覆盖。
-  for (const command of replayCommands) {
-    const result = editorReducer(docStore, command)
-    if (!result.success) {
-      console.warn('[SyncEngine] 权威快照回放命令失败，已跳过:', command.type, result.reason)
+    if (seenSegmentIds.has(cold.segmentId)) {
+      continue
     }
+    if (preserveDirtyLocalIds.has(localId)) {
+      continue
+    }
+    docStore._applyDelete(localId, { trackTombstone: false })
   }
 
   return normalizedSegments.length
 }
 
+function extractCommandLocalIds(command) {
+  if (!command) return []
+
+  switch (command.type) {
+    case 'update_text':
+    case 'update_timing':
+    case 'insert_subtitle':
+    case 'delete_subtitle':
+      return command.localId ? [command.localId] : []
+    case 'split_subtitle':
+      return [command.sourceLocalId, command.createdLocalId].filter(Boolean)
+    case 'merge_subtitles':
+      return [command.keptLocalId, command.removedLocalId].filter(Boolean)
+    case 'move_boundary':
+      return [command.upperLocalId, command.lowerLocalId].filter(Boolean)
+    case 'batch_replace':
+      return Array.isArray(command.replacements)
+        ? command.replacements.map((item) => item.localId).filter(Boolean)
+        : []
+    case 'bind_segment_id':
+      return Array.isArray(command.bindings)
+        ? command.bindings.map((item) => item.localId).filter(Boolean)
+        : []
+    case 'apply_server_replace': {
+      const oldLocalIds = Array.isArray(command.oldLocalIds) ? command.oldLocalIds : []
+      const newLocalIds = Array.isArray(command.newEntities)
+        ? command.newEntities.map((item) => item.localId).filter(Boolean)
+        : []
+      return [...oldLocalIds, ...newLocalIds].filter(Boolean)
+    }
+    case 'finalize_draft_chunk': {
+      const updateLocalIds = Array.isArray(command.updates)
+        ? command.updates.map((item) => item.localId).filter(Boolean)
+        : []
+      const directLocalIds = Array.isArray(command.localIds) ? command.localIds : []
+      return [...updateLocalIds, ...directLocalIds].filter(Boolean)
+    }
+    default:
+      return []
+  }
+}
+
+function buildAckSnapshot(localId, docStore) {
+  const entity = docStore.getEntity(localId)
+  const cold = docStore.getCold(localId)
+  const segmentId = toNormalizedSegmentId(cold?.segmentId)
+  if (!entity || !segmentId) {
+    return null
+  }
+
+  return {
+    localId,
+    segmentId,
+    text: String(entity.text ?? ''),
+    startMs: Number(entity.startMs ?? 0),
+    endMs: Number(entity.endMs ?? 0),
+  }
+}
+
+function buildServerEntityBeforeSnapshot(entity) {
+  const startMs = entity?.start_ms ?? toMs(entity?.start ?? 0)
+  const endMs = entity?.end_ms ?? toMs(entity?.end ?? entity?.start ?? 0)
+  return {
+    text: String(entity?.text ?? ''),
+    startMs: Number(startMs ?? 0),
+    endMs: Number(endMs ?? startMs ?? 0),
+    isDraft: Boolean(entity?.is_draft),
+  }
+}
+
 export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
+  // 为兼容旧 UI 统计面保留该字段，内部不再作为“命令队列真源”
   const pendingCommands = shallowRef([])
   const isSyncing = ref(false)
   const lastSyncTime = ref(0)
+
+  const ackShadowByLocalId = new Map()
+  const ackLocalIdBySegmentId = new Map()
 
   let syncTimer = null
   let retryTimer = null
   let inflightPushPromise = null
 
-  function removePendingCommandsByIds(commandIds = []) {
-    const normalizedIds = commandIds.filter(Boolean)
-    if (normalizedIds.length === 0) {
-      return 0
-    }
-
-    const idSet = new Set(normalizedIds)
-    const beforeCount = pendingCommands.value.length
-    pendingCommands.value = pendingCommands.value.filter((command) => !idSet.has(command.commandId))
-    return beforeCount - pendingCommands.value.length
+  function updatePendingPreview() {
+    const docStore = useEditorDocumentStore()
+    const dirtyPreview = docStore.getDirtyLocalIds().map((localId) => ({
+      type: 'dirty',
+      localId,
+    }))
+    const tombstonePreview = docStore.getTombstones().map((item) => ({
+      type: 'delete_tombstone',
+      localId: item.localId ?? null,
+      segmentId: item.segmentId ?? null,
+    }))
+    pendingCommands.value = [...dirtyPreview, ...tombstonePreview]
   }
 
-  function areAllCommandsPending(commands = []) {
-    const normalizedCommands = normalizeCommandList(commands)
-    if (normalizedCommands.length === 0) {
-      return false
+  function upsertAckShadowForLocal(localId) {
+    if (!localId) return
+    const docStore = useEditorDocumentStore()
+    const snapshot = buildAckSnapshot(localId, docStore)
+    const previous = ackShadowByLocalId.get(localId)
+    if (previous?.segmentId && previous.segmentId !== snapshot?.segmentId) {
+      ackLocalIdBySegmentId.delete(previous.segmentId)
     }
 
-    const pendingIdSet = new Set(pendingCommands.value.map((command) => command.commandId))
-    return normalizedCommands.every((command) => pendingIdSet.has(command.commandId))
-  }
-
-  function appendCommandsForSync(commands = []) {
-    const normalizedCommands = normalizeCommandList(commands)
-    if (normalizedCommands.length === 0) {
-      return 0
-    }
-
-    pendingCommands.value = [...pendingCommands.value, ...normalizedCommands]
-    schedulePush()
-    return normalizedCommands.length
-  }
-
-  function rewritePendingForHistory({ entry, replayCommands = [], direction } = {}) {
-    if (!entry || (direction !== 'undo' && direction !== 'redo')) {
-      return { mode: 'invalid' }
-    }
-
-    const pendingReplayCommands = normalizeCommandList(entry.pendingSyncCommands)
-    if (areAllCommandsPending(pendingReplayCommands)) {
-      removePendingCommandsByIds(pendingReplayCommands.map((command) => command.commandId))
-      entry.pendingSyncCommands = []
-      return { mode: 'compact_pending_replay' }
-    }
-
-    if (direction === 'undo' && areAllCommandsPending(entry.doCommands)) {
-      removePendingCommandsByIds(entry.doCommands.map((command) => command.commandId))
-      entry.pendingSyncCommands = []
-      return { mode: 'compact_original' }
-    }
-
-    appendCommandsForSync(replayCommands)
-    entry.pendingSyncCommands = [...normalizeCommandList(replayCommands)]
-    return { mode: 'enqueue_replay' }
-  }
-
-  function enqueue(command) {
-    if (
-      command.source === 'system'
-      || command.source === 'rehydrate'
-      || command.source === 'reconcile_replay'
-      || command.source === 'undo_redo'
-    ) {
+    if (!snapshot) {
+      ackShadowByLocalId.delete(localId)
       return
     }
 
-    if (command.skipSync === true) {
-      return
+    ackShadowByLocalId.set(localId, snapshot)
+    ackLocalIdBySegmentId.set(snapshot.segmentId, localId)
+  }
+
+  function removeAckShadow(localId = null, segmentId = null) {
+    const normalizedSegmentId = toNormalizedSegmentId(segmentId)
+    if (localId) {
+      const snapshot = ackShadowByLocalId.get(localId)
+      ackShadowByLocalId.delete(localId)
+      if (snapshot?.segmentId) {
+        ackLocalIdBySegmentId.delete(snapshot.segmentId)
+      }
     }
 
-    const syncableTypes = [
-      'update_text',
-      'update_timing',
-      'insert_subtitle',
-      'delete_subtitle',
-      'split_subtitle',
-      'merge_subtitles',
-      'move_boundary',
-      'batch_replace',
-    ]
-    if (!syncableTypes.includes(command.type)) {
-      return
+    if (normalizedSegmentId) {
+      const mappedLocalId = ackLocalIdBySegmentId.get(normalizedSegmentId)
+      ackLocalIdBySegmentId.delete(normalizedSegmentId)
+      if (mappedLocalId) {
+        ackShadowByLocalId.delete(mappedLocalId)
+      }
+    }
+  }
+
+  function rebuildAckShadowFromDocument() {
+    const docStore = useEditorDocumentStore()
+    ackShadowByLocalId.clear()
+    ackLocalIdBySegmentId.clear()
+    for (const localId of docStore.order) {
+      const snapshot = buildAckSnapshot(localId, docStore)
+      if (!snapshot) continue
+      ackShadowByLocalId.set(localId, snapshot)
+      ackLocalIdBySegmentId.set(snapshot.segmentId, localId)
+    }
+  }
+
+  function repairUnboundLocalBindingsFromAckShadow(docStore) {
+    const repairedLocalIds = []
+    for (const localId of docStore.order) {
+      const entity = docStore.getEntity(localId)
+      if (!entity) {
+        continue
+      }
+
+      const cold = docStore.getCold(localId)
+      const currentSegmentId = toNormalizedSegmentId(cold?.segmentId)
+      if (currentSegmentId) {
+        continue
+      }
+
+      const ackSnapshot = ackShadowByLocalId.get(localId)
+      const ackSegmentId = toNormalizedSegmentId(ackSnapshot?.segmentId)
+      if (!ackSegmentId) {
+        continue
+      }
+
+      const boundLocalId = docStore.bindingBySegmentId.get(ackSegmentId)
+      if (boundLocalId && boundLocalId !== localId) {
+        throw new Error(
+          `[SyncEngine] 检测到 segment 绑定冲突：segment_id=${ackSegmentId} 已绑定到 ${boundLocalId}，无法自动修复 ${localId}`
+        )
+      }
+
+      docStore.updateColdBinding(localId, ackSegmentId)
+      repairedLocalIds.push(localId)
     }
 
-    pendingCommands.value = [...pendingCommands.value, command]
-    schedulePush()
+    return repairedLocalIds
   }
 
   function schedulePush() {
@@ -313,30 +393,134 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
     }, SYNC_INTERVAL_MS)
   }
 
+  function enqueue(command) {
+    if (!command) return
+
+    if (command.skipSync === true) {
+      const docStore = useEditorDocumentStore()
+      const affectedLocalIds = extractCommandLocalIds(command)
+      docStore.clearDirtyFlags(affectedLocalIds)
+      docStore.clearTombstones({ localIds: affectedLocalIds })
+      updatePendingPreview()
+      return
+    }
+
+    if (['system', 'rehydrate', 'reconcile_replay'].includes(command.source)) {
+      updatePendingPreview()
+      return
+    }
+
+    updatePendingPreview()
+    schedulePush()
+  }
+
+  function rewritePendingForHistory() {
+    // 硬切到 diff 同步后，历史回放不再驱动同步队列
+    return { mode: 'disabled_diff_sync' }
+  }
+
   async function executePushToBackend(options = {}) {
     const { allowConflictRetry = true } = options
-    if (pendingCommands.value.length === 0) return true
-
     const sessionStore = useEditorSessionStore()
+    const docStore = useEditorDocumentStore()
     const projectId = sessionStore.projectId
     if (!projectId) {
-      console.warn('[SyncEngine] 缺少 projectId，跳过本轮同步')
-      return false
+      updatePendingPreview()
+      return true
+    }
+
+    // 防御性自愈：若历史回放导致本地实体短暂丢失 segment 绑定，但 ackShadow 仍保留
+    // 已知服务端绑定，则先恢复绑定再计算 diff，避免 flush 误判“已收敛”。
+    const repairedLocalIds = repairUnboundLocalBindingsFromAckShadow(docStore)
+    if (repairedLocalIds.length > 0) {
+      updatePendingPreview()
+    }
+
+    const { entries, touchedDirtyLocalIds, touchedTombstones } = buildPrimitiveDiffEntries({
+      docStore,
+      sessionStore,
+      ackShadowByLocalId,
+      ackLocalIdBySegmentId,
+      maxOps: MAX_BATCH_SIZE,
+    })
+
+    const touchedDirtyLocalIdSet = new Set(touchedDirtyLocalIds.filter(Boolean))
+    const touchedTombstoneLocalIds = new Set()
+    const touchedTombstoneSegmentIds = new Set()
+    for (const tombstone of touchedTombstones) {
+      if (tombstone?.localId) {
+        touchedTombstoneLocalIds.add(tombstone.localId)
+      }
+      if (tombstone?.segmentId) {
+        touchedTombstoneSegmentIds.add(tombstone.segmentId)
+      }
+    }
+
+    if (entries.length === 0) {
+      if (touchedDirtyLocalIdSet.size > 0) {
+        const localIds = [...touchedDirtyLocalIdSet]
+        docStore.clearDirtyFlags(localIds)
+        for (const localId of localIds) {
+          upsertAckShadowForLocal(localId)
+        }
+      }
+      if (touchedTombstoneLocalIds.size > 0 || touchedTombstoneSegmentIds.size > 0) {
+        docStore.clearTombstones({
+          localIds: [...touchedTombstoneLocalIds],
+          segmentIds: [...touchedTombstoneSegmentIds],
+        })
+      }
+      for (const localId of touchedTombstoneLocalIds) {
+        removeAckShadow(localId, null)
+      }
+      for (const segmentId of touchedTombstoneSegmentIds) {
+        removeAckShadow(null, segmentId)
+      }
+      updatePendingPreview()
+      return true
+    }
+
+    const ops = entries.map((entry) => entry.op).filter(Boolean)
+    if (ops.length === 0) {
+      if (touchedDirtyLocalIdSet.size > 0) {
+        const localIds = [...touchedDirtyLocalIdSet]
+        docStore.clearDirtyFlags(localIds)
+        for (const localId of localIds) {
+          upsertAckShadowForLocal(localId)
+        }
+      }
+      if (touchedTombstoneLocalIds.size > 0 || touchedTombstoneSegmentIds.size > 0) {
+        docStore.clearTombstones({
+          localIds: [...touchedTombstoneLocalIds],
+          segmentIds: [...touchedTombstoneSegmentIds],
+        })
+      }
+      for (const localId of touchedTombstoneLocalIds) {
+        removeAckShadow(localId, null)
+      }
+      for (const segmentId of touchedTombstoneSegmentIds) {
+        removeAckShadow(null, segmentId)
+      }
+      updatePendingPreview()
+      return true
+    }
+
+    // V3.2.5+dev.20260317.01: 推送前冻结实体快照，防止 HTTP 在途期间
+    // 撤销/重做修改实体后，响应到达时用当前态（而非推送时态）污染 ackShadow。
+    const pushTimeSnapshots = new Map()
+    for (const localId of touchedDirtyLocalIdSet) {
+      const entity = docStore.getEntity(localId)
+      if (entity) {
+        pushTimeSnapshots.set(localId, {
+          text: String(entity.text ?? ''),
+          startMs: Number(entity.startMs ?? 0),
+          endMs: Number(entity.endMs ?? 0),
+        })
+      }
     }
 
     isSyncing.value = true
-    const batch = pendingCommands.value.slice(0, MAX_BATCH_SIZE)
-
     try {
-      const ops = batch
-        .map((command) => commandToEditorOp(command))
-        .filter(Boolean)
-
-      if (ops.length === 0) {
-        pendingCommands.value = pendingCommands.value.slice(batch.length)
-        return true
-      }
-
       const response = await fetch(`/api/projects/${projectId}/editor-ops:apply`, {
         method: 'POST',
         headers: {
@@ -345,75 +529,120 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
         },
         body: JSON.stringify({
           session_id: sessionStore.sessionId,
-          base_revision: resolveBaseRevision(sessionStore),
+          base_revision: Number.isInteger(sessionStore.ackedRevision) ? sessionStore.ackedRevision : null,
           ops,
         }),
       })
 
-      const payload = await response.json().catch(() => ({}))
+      let payload = {}
+      try {
+        payload = await response.json()
+      } catch {
+        payload = {}
+      }
 
       if (!response.ok) {
-        if (response.status === 409) {
+        const conflictByHttpCode = response.status === 409
+        const conflictByPayload = payload?.error_code === 'REVISION_CONFLICT'
+        if (allowConflictRetry && (conflictByHttpCode || conflictByPayload)) {
           await reconcile(payload?.server_revision ?? null)
-          if (allowConflictRetry) {
-            return executePushToBackend({ allowConflictRetry: false })
-          }
-          scheduleRetry()
-          return false
+          return executePushToBackend({ allowConflictRetry: false })
         }
-        throw new Error(payload?.message || `HTTP ${response.status}`)
+        const message = payload?.message || `同步失败(${response.status})`
+        throw new Error(message)
       }
 
-      if (payload.success) {
-        pendingCommands.value = pendingCommands.value.slice(batch.length)
-
-        if (payload.created_bindings?.length) {
-          applyBindings(payload.created_bindings)
-        }
-
-        if (payload.updated_entities?.length) {
-          applyNormalizedEntities(payload.updated_entities)
-        }
-
-        sessionStore.ackedRevision = payload.server_revision ?? sessionStore.ackedRevision
-        lastSyncTime.value = Date.now()
+      if (payload?.server_revision !== undefined && payload?.server_revision !== null) {
+        sessionStore.ackedRevision = payload.server_revision
       }
 
+      applyBindings(payload?.created_bindings || [])
+      applyNormalizedEntities(payload?.updated_entities || [])
+      compensateOrphanCreatedBindings(
+        payload?.created_bindings || [],
+        payload?.updated_entities || []
+      )
+
+      const dirtyLocalIdSet = new Set(touchedDirtyLocalIdSet)
+      const tombstoneLocalIds = new Set(touchedTombstoneLocalIds)
+      const tombstoneSegmentIds = new Set(touchedTombstoneSegmentIds)
+      for (const entry of entries) {
+        if (entry.kind === 'dirty') {
+          dirtyLocalIdSet.add(entry.localId)
+        } else if (entry.kind === 'tombstone') {
+          if (entry.localId) tombstoneLocalIds.add(entry.localId)
+          if (entry.segmentId) tombstoneSegmentIds.add(entry.segmentId)
+        }
+      }
+
+      // V3.2.5+dev.20260317.01: 仅对"推送后未被并发修改"的实体清除脏标记和更新 ackShadow。
+      // 若实体在 HTTP 在途期间被撤销/重做修改，保留脏标记让下轮 diff 捕获变更。
+      const dirtyLocalIds = [...dirtyLocalIdSet]
+      for (const localId of dirtyLocalIds) {
+        const pushSnapshot = pushTimeSnapshots.get(localId)
+        if (!pushSnapshot) {
+          // 仅 tombstone 路径产生的 localId，无推送快照，直接消化
+          docStore.clearDirtyFlags([localId])
+          upsertAckShadowForLocal(localId)
+          continue
+        }
+
+        const currentEntity = docStore.getEntity(localId)
+        if (!currentEntity) {
+          // 实体在途期间被删除（如 undo 触发 merge）→ 保留脏状态，由 tombstone 路径处理
+          continue
+        }
+
+        const isStale = (
+          String(currentEntity.text ?? '') !== pushSnapshot.text
+          || Number(currentEntity.startMs ?? 0) !== pushSnapshot.startMs
+          || Number(currentEntity.endMs ?? 0) !== pushSnapshot.endMs
+        )
+
+        if (isStale) {
+          // 实体在 HTTP 在途期间被修改 → 保留脏标记，下轮 diff 会捕获新变更
+          continue
+        }
+
+        docStore.clearDirtyFlags([localId])
+        upsertAckShadowForLocal(localId)
+      }
+
+      if (tombstoneLocalIds.size > 0 || tombstoneSegmentIds.size > 0) {
+        docStore.clearTombstones({
+          localIds: [...tombstoneLocalIds],
+          segmentIds: [...tombstoneSegmentIds],
+        })
+      }
+      for (const localId of tombstoneLocalIds) {
+        removeAckShadow(localId, null)
+      }
+      for (const segmentId of tombstoneSegmentIds) {
+        removeAckShadow(null, segmentId)
+      }
+
+      lastSyncTime.value = Date.now()
+      updatePendingPreview()
       return true
-    } catch (error) {
-      console.error('[SyncEngine] Push failed:', error)
-      scheduleRetry()
-      return false
     } finally {
       isSyncing.value = false
     }
   }
 
-  function pushToBackend(options = {}) {
-    if (pendingCommands.value.length === 0) {
-      return Promise.resolve(true)
-    }
-
+  async function pushToBackend(options = {}) {
     if (inflightPushPromise) {
       return inflightPushPromise
     }
 
-    const currentPromise = executePushToBackend(options)
-      .finally(() => {
-        if (inflightPushPromise === currentPromise) {
-          inflightPushPromise = null
-        }
-      })
-    inflightPushPromise = currentPromise
-    return currentPromise
-  }
+    inflightPushPromise = (async () => {
+      try {
+        return await executePushToBackend(options)
+      } finally {
+        inflightPushPromise = null
+      }
+    })()
 
-  function scheduleRetry() {
-    if (retryTimer) return
-    retryTimer = setTimeout(() => {
-      retryTimer = null
-      void pushToBackend()
-    }, RETRY_DELAY_MS)
+    return inflightPushPromise
   }
 
   async function flush() {
@@ -426,22 +655,40 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
       retryTimer = null
     }
 
-    let stagnantRounds = 0
-    while (pendingCommands.value.length > 0) {
-      const beforeCount = pendingCommands.value.length
+    while (true) {
       const success = await pushToBackend()
       if (!success) {
-        throw new Error('同步失败，flush 已中止')
+        return false
       }
-      if (pendingCommands.value.length < beforeCount) {
-        stagnantRounds = 0
-        continue
-      }
-      stagnantRounds += 1
-      if (stagnantRounds > 3) {
-        throw new Error('同步重试次数过多，已停止 flush')
+
+      const docStore = useEditorDocumentStore()
+      const { entries } = buildPrimitiveDiffEntries({
+        docStore,
+        sessionStore: useEditorSessionStore(),
+        ackShadowByLocalId,
+        ackLocalIdBySegmentId,
+        maxOps: MAX_BATCH_SIZE,
+      })
+      if (entries.length === 0) {
+        updatePendingPreview()
+        return true
       }
     }
+  }
+
+  async function flushStrict() {
+    const firstPass = await flush()
+    if (!firstPass) {
+      return false
+    }
+
+    const sessionStore = useEditorSessionStore()
+    if (!sessionStore.projectId) {
+      return true
+    }
+
+    await reconcile()
+    return flush()
   }
 
   function reset() {
@@ -457,11 +704,16 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
     isSyncing.value = false
     lastSyncTime.value = 0
     inflightPushPromise = null
+    ackShadowByLocalId.clear()
+    ackLocalIdBySegmentId.clear()
   }
 
   function applyBindings(bindings) {
     const docStore = useEditorDocumentStore()
     for (const binding of bindings) {
+      if (!binding?.client_ref_id) continue
+      // 实体可能在 HTTP 在途期间被 undo 删除，跳过已不存在的实体
+      if (!docStore.getCold(binding.client_ref_id)) continue
       docStore.updateColdBinding(binding.client_ref_id, binding.segment_id)
     }
   }
@@ -471,6 +723,8 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
     for (const entity of entities) {
       const localId = entity.client_ref_id || docStore.bindingBySegmentId.get(entity.segment_id)
       if (!localId) continue
+      // 实体可能在 HTTP 在途期间被 undo 删除，跳过已不存在的实体
+      if (!docStore.getEntity(localId)) continue
 
       const patch = {}
       if (entity.text !== undefined) patch.text = entity.text
@@ -488,27 +742,106 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
     }
   }
 
+  function compensateOrphanCreatedBindings(bindings, updatedEntities) {
+    const docStore = useEditorDocumentStore()
+    const normalizedBindings = Array.isArray(bindings) ? bindings : []
+    if (normalizedBindings.length === 0) {
+      return
+    }
+
+    const updatedEntityByLocalId = new Map()
+    if (Array.isArray(updatedEntities)) {
+      for (const entity of updatedEntities) {
+        const localId = entity?.client_ref_id ?? null
+        if (localId) {
+          updatedEntityByLocalId.set(localId, entity)
+        }
+      }
+    }
+
+    for (const binding of normalizedBindings) {
+      const localId = binding?.client_ref_id ?? null
+      const segmentId = toNormalizedSegmentId(binding?.segment_id)
+      if (!localId || !segmentId) {
+        continue
+      }
+      if (docStore.getEntity(localId)) {
+        continue
+      }
+
+      const updatedEntity = updatedEntityByLocalId.get(localId)
+      docStore.upsertTombstone({
+        localId,
+        segmentId,
+        deletedAt: Date.now(),
+        before: buildServerEntityBeforeSnapshot(updatedEntity),
+      })
+    }
+  }
+
   function applyAuthoritativeSegments(serverSegments, options = {}) {
     const {
       serverRevision = null,
-      preservePendingCommands = true,
+      preserveLocalChanges = true,
     } = options
     const sessionStore = useEditorSessionStore()
     const docStore = useEditorDocumentStore()
-    const replayCommands = preservePendingCommands
-      ? buildReplayCommands(pendingCommands.value)
-      : []
 
+    const preservedState = captureUnsyncedLocalState(docStore)
     const appliedCount = applyAuthoritativeSegmentsToDocument(
       docStore,
       serverSegments,
-      replayCommands
+      preserveLocalChanges ? preservedState.dirtyLocalIds : new Set()
     )
+
+    docStore.clearAllDirty()
+    rebuildAckShadowFromDocument()
+
+    if (preserveLocalChanges) {
+      for (const [localId, snapshot] of preservedState.dirtyLocalSnapshots.entries()) {
+        const existingEntity = docStore.getEntity(localId)
+        if (existingEntity) {
+          docStore._applyUpdate(localId, {
+            text: snapshot.hot.text,
+            startMs: snapshot.hot.startMs,
+            endMs: snapshot.hot.endMs,
+            isDraft: Boolean(snapshot.hot.isDraft),
+            isModified: Boolean(snapshot.hot.isModified),
+            isDeleted: false,
+          })
+          docStore._applyReorder(localId)
+          if (snapshot.cold) {
+            docStore._applyColdUpdate(localId, snapshot.cold)
+            if (snapshot.cold.segmentId) {
+              docStore.updateColdBinding(localId, snapshot.cold.segmentId)
+            }
+          }
+        } else {
+          docStore._applyInsert(
+            localId,
+            {
+              ...snapshot.hot,
+              localId,
+            },
+            snapshot.cold
+              ? {
+                  ...snapshot.cold,
+                  localId,
+                }
+              : null,
+            snapshot.afterLocalId
+          )
+        }
+        docStore.markDirty(localId)
+      }
+      docStore.replaceTombstones(preservedState.tombstones)
+    }
 
     if (serverRevision !== null && serverRevision !== undefined) {
       sessionStore.ackedRevision = serverRevision
     }
 
+    updatePendingPreview()
     return appliedCount
   }
 
@@ -519,176 +852,77 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
       throw new Error('缺少 projectId，无法执行对账')
     }
 
-    console.warn('[SyncEngine] Revision conflict, reconciling...')
     const serverSegments = await projectApi.getSubtitles(projectId)
     applyAuthoritativeSegments(serverSegments, {
       serverRevision,
-      preservePendingCommands: true,
+      preserveLocalChanges: true,
     })
   }
 
   function commandToEditorOp(command) {
-    const docStore = useEditorDocumentStore()
+    // 兼容旧调用方：硬切后仅保留 primitive op 映射
+    if (!command) return null
 
-    switch (command.type) {
-      case 'update_text': {
-        const cold = docStore.getCold(command.localId)
-        return {
-          op_id: command.commandId,
-          type: 'update_text',
-          client_ref_id: command.localId,
-          segment_id: cold?.segmentId || null,
-          before: { text: command.before?.text ?? '' },
-          after: { text: command.after.text },
-        }
+    if (command.type === 'insert_subtitle') {
+      return {
+        op_id: command.commandId,
+        type: 'insert_subtitle',
+        client_ref_id: command.localId,
+        anchor: {
+          before_client_ref_id: command.beforeClientRefId ?? null,
+          after_client_ref_id: command.afterClientRefId ?? null,
+        },
+        after: {
+          text: command.entity?.text ?? '',
+          start_ms: command.entity?.startMs ?? 0,
+          end_ms: command.entity?.endMs ?? 0,
+        },
       }
-
-      case 'update_timing': {
-        const cold = docStore.getCold(command.localId)
-        return {
-          op_id: command.commandId,
-          type: 'update_timing',
-          client_ref_id: command.localId,
-          segment_id: cold?.segmentId || null,
-          before: {
-            start_ms: command.before?.startMs ?? 0,
-            end_ms: command.before?.endMs ?? 0,
-          },
-          after: {
-            start_ms: command.after.startMs,
-            end_ms: command.after.endMs,
-          },
-        }
-      }
-
-      case 'insert_subtitle': {
-        assertCommandHasOwnField(command, 'beforeClientRefId')
-        assertCommandHasOwnField(command, 'afterClientRefId')
-        return {
-          op_id: command.commandId,
-          type: 'insert_subtitle',
-          client_ref_id: command.localId,
-          anchor: {
-            before_client_ref_id: command.beforeClientRefId ?? null,
-            after_client_ref_id: command.afterClientRefId ?? null,
-          },
-          after: {
-            text: command.entity.text,
-            start_ms: command.entity.startMs,
-            end_ms: command.entity.endMs,
-          },
-        }
-      }
-
-      case 'delete_subtitle': {
-        assertCommandHasOwnField(command, 'segmentId')
-        assertCommandHasOwnField(command, 'snapshot')
-        return {
-          op_id: command.commandId,
-          type: 'delete_subtitle',
-          client_ref_id: command.localId,
-          segment_id: command.segmentId ?? null,
-          before: {
-            text: command.snapshot.text ?? '',
-            start_ms: command.snapshot.startMs ?? 0,
-            end_ms: command.snapshot.endMs ?? 0,
-          },
-        }
-      }
-
-      case 'split_subtitle': {
-        const cold = docStore.getCold(command.sourceLocalId)
-        return {
-          op_id: command.commandId,
-          type: 'split_subtitle',
-          client_ref_id: command.sourceLocalId,
-          segment_id: command.sourceSegmentId ?? cold?.segmentId ?? null,
-          created_client_ref_id: command.createdLocalId,
-          split_at_ms: command.splitAtMs,
-          split_at_text_offset: command.splitAtTextOffset,
-          before: {
-            text: command.before.text,
-            start_ms: command.before.startMs,
-            end_ms: command.before.endMs,
-          },
-          after_kept: {
-            text: command.afterKept.text,
-            start_ms: command.afterKept.startMs,
-            end_ms: command.afterKept.endMs,
-          },
-          after_created: {
-            text: command.afterCreated.text,
-            start_ms: command.afterCreated.startMs,
-            end_ms: command.afterCreated.endMs,
-          },
-        }
-      }
-
-      case 'merge_subtitles': {
-        const keptCold = docStore.getCold(command.keptLocalId)
-        const removedCold = docStore.getCold(command.removedLocalId)
-        return {
-          op_id: command.commandId,
-          type: 'merge_subtitle',
-          kept_client_ref_id: command.keptLocalId,
-          removed_client_ref_id: command.removedLocalId,
-          kept_segment_id: command.keptSegmentId ?? keptCold?.segmentId ?? null,
-          removed_segment_id: command.removedSegmentId ?? removedCold?.segmentId ?? null,
-          before_kept: {
-            text: command.beforeKept.text,
-            start_ms: command.beforeKept.startMs,
-            end_ms: command.beforeKept.endMs,
-          },
-          before_removed: {
-            text: command.beforeRemoved.text,
-            start_ms: command.beforeRemoved.startMs,
-            end_ms: command.beforeRemoved.endMs,
-          },
-          after: {
-            text: command.after.text,
-            start_ms: command.after.startMs,
-            end_ms: command.after.endMs,
-          },
-        }
-      }
-
-      case 'move_boundary': {
-        assertCommandHasOwnField(command, 'upperSegmentId')
-        assertCommandHasOwnField(command, 'lowerSegmentId')
-        return {
-          op_id: command.commandId,
-          type: 'move_boundary',
-          upper_client_ref_id: command.upperLocalId,
-          lower_client_ref_id: command.lowerLocalId,
-          upper_segment_id: command.upperSegmentId ?? null,
-          lower_segment_id: command.lowerSegmentId ?? null,
-          before: {
-            upper_end_ms: command.before.upperEndMs,
-            lower_start_ms: command.before.lowerStartMs,
-          },
-          after: {
-            upper_end_ms: command.after.upperEndMs,
-            lower_start_ms: command.after.lowerStartMs,
-          },
-        }
-      }
-
-      case 'batch_replace': {
-        return {
-          op_id: command.commandId,
-          type: 'batch_replace',
-          replacements: command.replacements.map((replacement) => ({
-            client_ref_id: replacement.localId,
-            segment_id: docStore.getCold(replacement.localId)?.segmentId || null,
-            before: { text: replacement.before.text },
-            after: { text: replacement.after.text },
-          })),
-        }
-      }
-
-      default:
-        return null
     }
+
+    if (command.type === 'delete_subtitle') {
+      return {
+        op_id: command.commandId,
+        type: 'delete_subtitle',
+        client_ref_id: command.localId,
+        segment_id: command.segmentId ?? null,
+        before: {
+          text: command.snapshot?.text ?? '',
+          start_ms: command.snapshot?.startMs ?? 0,
+          end_ms: command.snapshot?.endMs ?? 0,
+        },
+      }
+    }
+
+    if (command.type === 'update_text') {
+      return {
+        op_id: command.commandId,
+        type: 'update_text',
+        client_ref_id: command.localId,
+        segment_id: command.segmentId ?? null,
+        before: { text: command.before?.text ?? '' },
+        after: { text: command.after?.text ?? '' },
+      }
+    }
+
+    if (command.type === 'update_timing') {
+      return {
+        op_id: command.commandId,
+        type: 'update_timing',
+        client_ref_id: command.localId,
+        segment_id: command.segmentId ?? null,
+        before: {
+          start_ms: command.before?.startMs ?? 0,
+          end_ms: command.before?.endMs ?? 0,
+        },
+        after: {
+          start_ms: command.after?.startMs ?? 0,
+          end_ms: command.after?.endMs ?? 0,
+        },
+      }
+    }
+
+    return null
   }
 
   return {
@@ -698,6 +932,7 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
     enqueue,
     rewritePendingForHistory,
     flush,
+    flushStrict,
     reset,
     applyBindings,
     applyAuthoritativeSegments,

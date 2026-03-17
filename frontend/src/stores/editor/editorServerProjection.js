@@ -174,6 +174,7 @@ export function upsertServerSegment(docStore, rawSegment, options = {}) {
 
   if (!currentEntity) {
     docStore._applyInsert(localId, nextHot, nextCold, options.afterLocalId ?? null)
+    docStore.clearDirtyFlags([localId])
     return localId
   }
 
@@ -187,6 +188,7 @@ export function upsertServerSegment(docStore, rawSegment, options = {}) {
   })
   docStore._applyReorder(localId)
   syncColdBindings(docStore, localId, currentCold, nextCold)
+  docStore.clearDirtyFlags([localId])
   return localId
 }
 
@@ -212,8 +214,9 @@ export function deleteServerSegment(docStore, segmentId) {
   }
 
   matchedLocalIds.forEach((localId) => {
-    docStore._applyDelete(localId)
+    docStore._applyDelete(localId, { trackTombstone: false })
   })
+  docStore.clearDirtyFlags(matchedLocalIds)
   return true
 }
 
@@ -317,6 +320,8 @@ export function applySentencePatch(docStore, rawSentence) {
       sentenceIndex,
     })
   }
+
+  docStore.clearDirtyFlags([localId])
 
   return Object.keys(hotPatch).length > 0 || Object.keys(coldPatch).length > 0
 }

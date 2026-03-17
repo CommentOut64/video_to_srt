@@ -3,15 +3,100 @@ import { defineStore } from 'pinia'
 import { useEditorDocumentStore } from './editorDocumentStore'
 import { useEditorSessionStore } from './editorSessionStore'
 import { useEditorHistoryStore } from './editorHistoryStore'
-import { useEditorSyncEngine } from './editorSyncEngine'
 import { normalizeEditorCommand } from './editorCommandFactory'
 import { editorReducer } from './editorReducer'
 
 export const useEditorCommandBus = defineStore('editorCommandBus', () => {
   const listeners = []
 
+  function normalizeSegmentId(value) {
+    const normalized = String(value ?? '').trim()
+    return normalized || null
+  }
+
+  function collectAffectedLocalIds(command) {
+    if (!command) return []
+
+    switch (command.type) {
+      case 'update_text':
+      case 'update_timing':
+      case 'insert_subtitle':
+      case 'delete_subtitle':
+        return command.localId ? [command.localId] : []
+      case 'split_subtitle':
+        return [command.sourceLocalId, command.createdLocalId].filter(Boolean)
+      case 'merge_subtitles':
+        return [command.keptLocalId, command.removedLocalId].filter(Boolean)
+      case 'move_boundary':
+        return [command.upperLocalId, command.lowerLocalId].filter(Boolean)
+      case 'batch_replace':
+        return Array.isArray(command.replacements)
+          ? command.replacements.map((item) => item.localId).filter(Boolean)
+          : []
+      case 'bind_segment_id':
+        return Array.isArray(command.bindings)
+          ? command.bindings.map((item) => item.localId).filter(Boolean)
+          : []
+      case 'apply_server_replace': {
+        const oldLocalIds = Array.isArray(command.oldLocalIds) ? command.oldLocalIds : []
+        const newLocalIds = Array.isArray(command.newEntities)
+          ? command.newEntities.map((item) => item.localId).filter(Boolean)
+          : []
+        return [...oldLocalIds, ...newLocalIds].filter(Boolean)
+      }
+      case 'finalize_draft_chunk': {
+        const updateLocalIds = Array.isArray(command.updates)
+          ? command.updates.map((item) => item.localId).filter(Boolean)
+          : []
+        const directLocalIds = Array.isArray(command.localIds) ? command.localIds : []
+        return [...updateLocalIds, ...directLocalIds].filter(Boolean)
+      }
+      default:
+        return []
+    }
+  }
+
+  function isSyncEligibleCommand(command) {
+    if (!command || command.skipSync === true) {
+      return false
+    }
+
+    return !['system', 'rehydrate', 'reconcile_replay'].includes(command.source)
+  }
+
   function notifyListeners(command, result) {
     listeners.forEach((fn) => fn(command, result))
+  }
+
+  function canReplayCommand(command, docStore) {
+    if (!command || !command.type) {
+      return false
+    }
+
+    switch (command.type) {
+      case 'update_text':
+      case 'update_timing':
+      case 'delete_subtitle':
+        return Boolean(command.localId && docStore.getEntity(command.localId))
+      case 'split_subtitle':
+        return Boolean(command.sourceLocalId && docStore.getEntity(command.sourceLocalId))
+      case 'merge_subtitles':
+        return Boolean(
+          command.keptLocalId
+          && command.removedLocalId
+          && docStore.getEntity(command.keptLocalId)
+          && docStore.getEntity(command.removedLocalId)
+        )
+      case 'move_boundary':
+        return Boolean(
+          command.upperLocalId
+          && command.lowerLocalId
+          && docStore.getEntity(command.upperLocalId)
+          && docStore.getEntity(command.lowerLocalId)
+        )
+      default:
+        return true
+    }
   }
 
   function enrichHistoryReplayCommand(command, docStore) {
@@ -24,10 +109,67 @@ export const useEditorCommandBus = defineStore('editorCommandBus', () => {
       return currentSegmentId ?? fallbackSegmentId ?? null
     }
 
+    const shouldReuseSplitCreatedBinding = (splitCommand, candidateSegmentId) => {
+      const normalizedSegmentId = normalizeSegmentId(candidateSegmentId)
+      if (!normalizedSegmentId) {
+        return false
+      }
+
+      const boundLocalId = docStore.bindingBySegmentId.get(normalizedSegmentId)
+      if (boundLocalId && boundLocalId !== splitCommand.createdLocalId) {
+        return false
+      }
+
+      const hasPendingDelete = docStore.getTombstones().some((tombstone) => (
+        tombstone?.localId === splitCommand.createdLocalId
+        && normalizeSegmentId(tombstone?.segmentId) === normalizedSegmentId
+      ))
+      if (hasPendingDelete) {
+        return true
+      }
+
+      return boundLocalId === splitCommand.createdLocalId
+    }
+
+    const resolveSplitCreatedFallbackSegmentId = (splitCommand, createdColdInit) => {
+      const directSegmentId = createdColdInit?.segmentId ?? null
+      if (normalizeSegmentId(directSegmentId)) {
+        return directSegmentId
+      }
+
+      const tombstoneSegmentId = docStore.getTombstones()
+        .find((tombstone) => tombstone?.localId === splitCommand.createdLocalId)
+        ?.segmentId ?? null
+      return normalizeSegmentId(tombstoneSegmentId) || null
+    }
+
     if (command.type === 'split_subtitle') {
+      const createdColdInit = command.createdColdInit
+      if (!createdColdInit || typeof createdColdInit !== 'object') {
+        return {
+          ...command,
+          sourceSegmentId: resolveCurrentSegmentId(command.sourceLocalId, command.sourceSegmentId),
+        }
+      }
+
+      const fallbackCreatedSegmentId = resolveSplitCreatedFallbackSegmentId(command, createdColdInit)
+      const liveCreatedSegmentId = resolveCurrentSegmentId(command.createdLocalId, fallbackCreatedSegmentId)
+      const shouldKeepCreatedBinding = shouldReuseSplitCreatedBinding(command, liveCreatedSegmentId)
+      const nextCreatedColdInit = shouldKeepCreatedBinding
+        ? {
+            ...createdColdInit,
+            segmentId: liveCreatedSegmentId,
+          }
+        : {
+            ...createdColdInit,
+            segmentId: null,
+            sentenceIndex: null,
+          }
+
       return {
         ...command,
         sourceSegmentId: resolveCurrentSegmentId(command.sourceLocalId, command.sourceSegmentId),
+        createdColdInit: nextCreatedColdInit,
       }
     }
 
@@ -99,10 +241,16 @@ export const useEditorCommandBus = defineStore('editorCommandBus', () => {
       historyStore.push(command, result.undoCommand)
     }
 
-    // 根据 source 决定是否标记 dirty
-    const shouldMarkDirty = !['rehydrate', 'reconcile_replay'].includes(command.source)
+    // 仅用户侧编辑和撤销重做标记脏会话
+    const shouldMarkDirty = ['user', 'undo_redo'].includes(command.source)
     if (shouldMarkDirty) {
       sessionStore.markDirty()
+    }
+
+    if (!isSyncEligibleCommand(command)) {
+      const affectedLocalIds = collectAffectedLocalIds(command)
+      docStore.clearDirtyFlags(affectedLocalIds)
+      docStore.clearTombstones({ localIds: affectedLocalIds })
     }
 
     notifyListeners(command, result)
@@ -145,8 +293,14 @@ export const useEditorCommandBus = defineStore('editorCommandBus', () => {
       }
       results.push(result)
 
-      if (!['rehydrate', 'reconcile_replay'].includes(command.source)) {
+      if (['user', 'undo_redo'].includes(command.source)) {
         shouldMarkDirty = true
+      }
+
+      if (!isSyncEligibleCommand(command)) {
+        const affectedLocalIds = collectAffectedLocalIds(command)
+        docStore.clearDirtyFlags(affectedLocalIds)
+        docStore.clearTombstones({ localIds: affectedLocalIds })
       }
 
       notifyListeners(command, result)
@@ -171,33 +325,59 @@ export const useEditorCommandBus = defineStore('editorCommandBus', () => {
 
   function undo() {
     const historyStore = useEditorHistoryStore()
-    const syncEngine = useEditorSyncEngine()
-    const entry = historyStore.undo()
-    if (!entry) return false
+    const docStore = useEditorDocumentStore()
+    const candidateEntry = historyStore.peekUndo()
+    if (!candidateEntry) return false
+    const replayCommands = materializeHistoryReplayCommands(candidateEntry.undoCommands)
+    if (!replayCommands.every((command) => canReplayCommand(command, docStore))) {
+      console.warn('[CommandBus] undo 预检失败，已拒绝回放，历史栈保持不变')
+      return false
+    }
+
+    if (!historyStore.commitUndo()) return false
     historyStore.closeTransaction()
-    const replayCommands = materializeHistoryReplayCommands(entry.undoCommands)
-    replayCommands.forEach(cmd => dispatch(cmd))
-    syncEngine.rewritePendingForHistory({
-      entry,
-      replayCommands,
-      direction: 'undo',
+    let hasFailure = false
+    replayCommands.forEach((cmd) => {
+      const result = dispatch(cmd)
+      if (!result?.success) {
+        hasFailure = true
+      }
     })
+    if (hasFailure) {
+      // Trade-off: 回放失败后无法回滚已触发的外部副作用（监听器/持久化），
+      // 这里至少回滚历史游标，避免 past/future 与文档状态持续漂移。
+      historyStore.commitRedo()
+      console.warn('[CommandBus] undo 回放部分失败，已回滚历史游标')
+      return false
+    }
     return true
   }
 
   function redo() {
     const historyStore = useEditorHistoryStore()
-    const syncEngine = useEditorSyncEngine()
-    const entry = historyStore.redo()
-    if (!entry) return false
+    const docStore = useEditorDocumentStore()
+    const candidateEntry = historyStore.peekRedo()
+    if (!candidateEntry) return false
+    const replayCommands = materializeHistoryReplayCommands(candidateEntry.doCommands)
+    if (!replayCommands.every((command) => canReplayCommand(command, docStore))) {
+      console.warn('[CommandBus] redo 预检失败，已拒绝回放，历史栈保持不变')
+      return false
+    }
+
+    if (!historyStore.commitRedo()) return false
     historyStore.closeTransaction()
-    const replayCommands = materializeHistoryReplayCommands(entry.doCommands)
-    replayCommands.forEach(cmd => dispatch(cmd))
-    syncEngine.rewritePendingForHistory({
-      entry,
-      replayCommands,
-      direction: 'redo',
+    let hasFailure = false
+    replayCommands.forEach((cmd) => {
+      const result = dispatch(cmd)
+      if (!result?.success) {
+        hasFailure = true
+      }
     })
+    if (hasFailure) {
+      historyStore.commitUndo()
+      console.warn('[CommandBus] redo 回放部分失败，已回滚历史游标')
+      return false
+    }
     return true
   }
 
