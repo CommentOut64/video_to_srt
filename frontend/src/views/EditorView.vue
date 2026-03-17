@@ -490,7 +490,7 @@ const isMediaReady = computed(() => {
     hasVideoSource.value
     || !!projectStore.meta.audioPath
     || proxyVideo.isReady.value
-    || (useEditorV2 ? editorProjectionBridge.totalSubtitles > 0 : projectStore.subtitles.length > 0)
+    || subtitleDocumentStore.subtitles.length > 0
   )
 })
 
@@ -621,42 +621,18 @@ const projectName = computed(() => {
 })
 
 // 基础状态
-const isDirty = computed(() => (
-  useEditorV2
-    ? editorSessionStore.isDirty
-    : projectStore.isDirty
-))
-const totalSubtitles = computed(() => (
-  useEditorV2
-    ? editorProjectionBridge.totalSubtitles
-    : projectStore.totalSubtitles
-))
-const currentSubtitle = computed(() => (
-  useEditorV2
-    ? editorProjectionBridge.currentSubtitle
-    : projectStore.currentSubtitle
-))
+const isDirty = computed(() => editorSessionStore.isDirty)
+const totalSubtitles = computed(() => editorProjectionBridge.totalSubtitles)
+const currentSubtitle = computed(() => editorProjectionBridge.currentSubtitle)
 const currentSubtitleIndex = computed(() =>
   currentSubtitle.value
-    ? (
-      useEditorV2
-        ? editorProjectionBridge.findSubtitleIndexById(currentSubtitle.value.id)
-        : projectStore.subtitles.findIndex((s) => s.id === currentSubtitle.value.id)
-    )
+    ? editorProjectionBridge.findSubtitleIndexById(currentSubtitle.value.id)
     : -1
 )
 
 // 撤销/重做
-const canUndo = computed(() => (
-  useEditorV2
-    ? editorHistoryStore.canUndo
-    : projectStore.canUndo
-))
-const canRedo = computed(() => (
-  useEditorV2
-    ? editorHistoryStore.canRedo
-    : projectStore.canRedo
-))
+const canUndo = computed(() => editorHistoryStore.canUndo)
+const canRedo = computed(() => editorHistoryStore.canRedo)
 
 // 队列进度计算
 const queueCompleted = computed(() => taskStore.tasks.filter((t) => t.status === 'finished').length)
@@ -666,13 +642,7 @@ const activeTasks = computed(
 )
 
 // 问题检查计数（统计有警告的字幕数量）
-const errorCount = computed(
-  () => (
-    useEditorV2
-      ? editorProjectionBridge.warningCount
-      : projectStore.subtitles.filter((s) => s.warning_type && s.warning_type !== 'none').length
-  )
-)
+const errorCount = computed(() => editorProjectionBridge.warningCount)
 
 // Grid 布局样式
 const gridStyle = computed(() => ({
@@ -947,32 +917,8 @@ async function loadProject() {
         mode: project?.mode || 'normal',
         taskMode: project?.task_mode || 'subtitle_edit',
       })
-      if (useEditorV2) {
-        await scheduleEditorProjectionReload(projectId, 'load_project_project_mode')
-        applyMediaPaths({ project })
-      } else {
-        const restored = await projectStore.restoreProject(projectId)
-        // 恢复缓存后再次覆盖媒体路径，防止旧缓存 videoPath 误导为“有视频”。
-        applyMediaPaths({ project })
-        if (!restored || projectStore.subtitles.length === 0) {
-          const segments = await projectApi.getSubtitles(projectId)
-          // 过渡期仍保持旧 projectStore 镜像，避免页脚/媒体依赖失效。
-          projectStore.loadFromProjectData(segments, {
-            projectId,
-            jobId: project?.job_id || null,
-            mode: project?.mode || 'normal',
-            taskMode: project?.task_mode || 'subtitle_edit',
-            flavor: project?.flavor || selectFlavor(projectStore.meta.capabilitySnapshot),
-            capabilitySnapshot: projectStore.meta.capabilitySnapshot,
-            title: project?.title || '',
-            filename: project?.title || '项目字幕',
-            videoPath: projectStore.meta.videoPath,
-            audioPath: projectStore.meta.audioPath,
-          })
-          // loadFromProjectData 会更新 meta，确保媒体路径继续以本次判定为准。
-          applyMediaPaths({ project })
-        }
-      }
+      await scheduleEditorProjectionReload(projectId, 'load_project_project_mode')
+      applyMediaPaths({ project })
       subscribeSSE()
 
       if (!proxyVideo.isReady.value) {
@@ -1020,28 +966,8 @@ async function loadProject() {
       console.warn('[EditorView] 刷新 Proxy 状态失败（初始阶段，忽略）:', e)
     }
 
-    if (!useEditorV2) {
-      const restoreKey = projectId
-      const restored = restoreKey ? await projectStore.restoreProject(restoreKey) : false
-      // 恢复缓存后再次覆盖媒体路径，避免历史缓存导致 videoPath 误判。
-      applyMediaPaths({ project: projectMeta, mediaStatus: jobStatus.media_status })
-      const hasLocalRestore = restored && projectStore.subtitles.length > 0
-      if (hasLocalRestore) {
-        const hasValidFormat = projectStore.subtitles.every((s) => s.sentenceIndex !== undefined)
-        if (!hasValidFormat) {
-          await loadTranscribingSegments('load_project_restore_invalid_format')
-        }
-        if (['canceled', 'force_canceled'].includes(jobStatus.status)) {
-          const hasDraft = projectStore.subtitles.some((s) => s.isDraft)
-          if (hasDraft) {
-            await subtitleDocumentStore.finalizeDraftSubtitlesOnTerminal('load_project_terminal')
-          }
-        }
-      }
-    } else {
-      // V2 下不再恢复旧字幕缓存，避免首屏出现旧真源与新真源双装载。
-      applyMediaPaths({ project: projectMeta, mediaStatus: jobStatus.media_status })
-    }
+    // V2 下不再恢复旧字幕缓存，避免首屏出现旧真源与新真源双装载。
+    applyMediaPaths({ project: projectMeta, mediaStatus: jobStatus.media_status })
 
     await loadSubtitleOffset()
 
@@ -1098,26 +1024,7 @@ async function loadTranscribingSegments(reason = 'unknown') {
   if (!projectId) {
     throw new Error('缺少 project_id，无法拉取字幕真源')
   }
-  if (useEditorV2) {
-    return scheduleEditorProjectionReload(projectId, reason)
-  }
-  try {
-    const segments = await projectApi.getSubtitles(projectId)
-    if (Array.isArray(segments) && segments.length > 0) {
-      projectStore.loadFromProjectData(segments, {
-        jobId: activeJobId.value,
-        projectId,
-        filename: projectStore.meta.filename,
-        duration: projectStore.meta.duration,
-        videoPath: projectStore.meta.videoPath,
-        audioPath: projectStore.meta.audioPath,
-      })
-    }
-    return Array.isArray(segments) ? segments.length : 0
-  } catch (error) {
-    console.warn('[EditorView] 拉取 project 字幕真源失败:', error)
-    return 0
-  }
+  return scheduleEditorProjectionReload(projectId, reason)
 }
 
 // V3.2.4+dev.20260222.14: 终态同步必须以后端为唯一数据源
@@ -1338,94 +1245,27 @@ function handleProjectSubtitleUpsert(data, eventType = 'subtitle.project_upsert'
     return true
   }
 
-  if (useEditorV2) {
-    const rawSegment = data?.segment
-    if (!rawSegment || typeof rawSegment !== 'object') {
-      throw new Error(`[EditorView] ${eventType} 缺少 segment 载荷`)
-    }
-
-    const applied = upsertServerSegment(editorDocumentStore, {
-      ...rawSegment,
-      segment_id: data?.segment_id || rawSegment.segment_id,
-    })
-    if (!applied) {
-      throw new Error(
-        `[EditorView] ${eventType} 无法投影到 editorDocumentStore（segment_id=${data?.segment_id || rawSegment.segment_id || 'unknown'}）`
-      )
-    }
-    if (shouldScheduleAuthoritativeReloadForProjectModeEvent({
-      useEditorV2,
-      activeJobId: activeJobId.value,
-    })) {
-      scheduleV2RealtimeAuthoritativeReload(
-        `${eventType}_${data?.segment_id || rawSegment.segment_id || 'unknown'}`
-      )
-    }
-    return true
+  const rawSegment = data?.segment
+  if (!rawSegment || typeof rawSegment !== 'object') {
+    throw new Error(`[EditorView] ${eventType} 缺少 segment 载荷`)
   }
 
-  const normalized = normalizeProjectSegmentEvent(data)
-  if (!normalized) {
-    return
+  const applied = upsertServerSegment(editorDocumentStore, {
+    ...rawSegment,
+    segment_id: data?.segment_id || rawSegment.segment_id,
+  })
+  if (!applied) {
+    throw new Error(
+      `[EditorView] ${eventType} 无法投影到 editorDocumentStore（segment_id=${data?.segment_id || rawSegment.segment_id || 'unknown'}）`
+    )
   }
-
-  const existingIndex = projectStore.subtitles.findIndex(
-    (item) => item.segment_id === normalized.segmentId
-  )
-
-  const payload = {
-    sentenceIndex:
-      normalized.sentenceIndex
-      ?? (existingIndex >= 0 ? projectStore.subtitles[existingIndex].sentenceIndex : undefined),
-    segment_id: normalized.segmentId,
-    text: normalized.text,
-    start: normalized.start,
-    end: normalized.end,
-    isModified: normalized.isModified,
-    originalText: normalized.originalText,
-    words: normalized.words,
-    confidence: normalized.confidence,
-    display_confidence: normalized.displayConfidence,
-    confidence_source: normalized.confidenceSource,
-    warning_type: normalized.warningType,
-    source: normalized.source,
-    isDraft: false,
-    isFinalized: true,
-  }
-
-  projectStore.pauseHistory()
-  try {
-    if (existingIndex >= 0) {
-      const existingId = projectStore.subtitles[existingIndex].id
-      projectStore.updateSubtitle(existingId, payload)
-      return true
-    }
-
-    const insertIndex = projectStore.subtitles.findIndex((item) => item.start > payload.start)
-    const finalIndex = insertIndex === -1 ? projectStore.subtitles.length : insertIndex
-    const nextSubtitle = {
-      id: `subtitle-${normalized.segmentId}`,
-      sentenceIndex: payload.sentenceIndex ?? finalIndex,
-      segment_id: normalized.segmentId,
-      start: payload.start,
-      end: payload.end,
-      text: payload.text,
-      isDirty: false,
-      isModified: payload.isModified,
-      originalText: payload.originalText,
-      chunk_id: null,
-      words: payload.words,
-      confidence: payload.confidence,
-      display_confidence: payload.display_confidence,
-      confidence_source: payload.confidence_source,
-      warning_type: payload.warning_type,
-      source: payload.source,
-      isDraft: false,
-      isFinalized: true,
-    }
-    projectStore.insertSubtitleAt(finalIndex, nextSubtitle)
-  } finally {
-    projectStore.resumeHistory()
+  if (shouldScheduleAuthoritativeReloadForProjectModeEvent({
+    useEditorV2,
+    activeJobId: activeJobId.value,
+  })) {
+    scheduleV2RealtimeAuthoritativeReload(
+      `${eventType}_${data?.segment_id || rawSegment.segment_id || 'unknown'}`
+    )
   }
   return true
 }
@@ -1440,32 +1280,18 @@ function handleProjectSubtitleDelete(data) {
     throw new Error('[EditorView] subtitle.project_delete 缺少 segment_id')
   }
 
-  if (useEditorV2) {
-    const deleted = deleteServerSegment(editorDocumentStore, segmentId)
-    if (!deleted) {
-      if (data?.source === 'project_api' && data?.is_update === true) {
-        return true
-      }
-      throw new Error(`[EditorView] subtitle.project_delete 未命中本地绑定（segment_id=${segmentId}）`)
+  const deleted = deleteServerSegment(editorDocumentStore, segmentId)
+  if (!deleted) {
+    if (data?.source === 'project_api' && data?.is_update === true) {
+      return true
     }
-    if (shouldScheduleAuthoritativeReloadForProjectModeEvent({
-      useEditorV2,
-      activeJobId: activeJobId.value,
-    })) {
-      scheduleV2RealtimeAuthoritativeReload(`subtitle.deleted.project_${segmentId}`)
-    }
-    return true
+    throw new Error(`[EditorView] subtitle.project_delete 未命中本地绑定（segment_id=${segmentId}）`)
   }
-
-  const index = projectStore.subtitles.findIndex((item) => item.segment_id === segmentId)
-  if (index < 0) {
-    return
-  }
-  projectStore.pauseHistory()
-  try {
-    projectStore.removeSubtitleAt(index)
-  } finally {
-    projectStore.resumeHistory()
+  if (shouldScheduleAuthoritativeReloadForProjectModeEvent({
+    useEditorV2,
+    activeJobId: activeJobId.value,
+  })) {
+    scheduleV2RealtimeAuthoritativeReload(`subtitle.deleted.project_${segmentId}`)
   }
   return true
 }
@@ -1822,86 +1648,32 @@ function startCancelTimeoutPolling() {
 function handleStreamingSubtitle(data) {
   if (!data) return
 
-  if (useEditorV2) {
-    const sentence = data.sentence || {}
-    const sentenceIndex = data.sentence_index ?? data.index ?? sentence.index
-    if (sentenceIndex === undefined || sentenceIndex === null) {
-      throw new Error('[EditorView] subtitle.legacy_update 在 V2 下缺少 sentence_index')
-    }
-    const applied = applySentencePatch(editorDocumentStore, {
-      ...sentence,
-      index: sentenceIndex,
-      sentence_index: sentenceIndex,
-    })
-    if (!applied) {
-      throw new Error(
-        `[EditorView] subtitle.legacy_update 未命中本地字幕（sentence_index=${sentenceIndex}）`
-      )
-    }
-    return
-  }
-
-  // 解析字幕数据格式
-  // 兼容两种格式: 直接字段(sv_sentence) 和 嵌套sentence对象(whisper_patch/llm_proof等)
   const sentence = data.sentence || {}
   const sentenceIndex = data.sentence_index ?? data.index ?? sentence.index
-  const text = sentence.text ?? data.text ?? data.content
-  const start = sentence.start ?? data.start_time ?? data.start
-  const end = sentence.end ?? data.end_time ?? data.end
-  const warningType = sentence.warning_type ?? data.warning_type ?? 'none'
-  const source = data.source ?? data.event_type ?? 'unknown'
-  // V3.1.2+dev.20260111.01: 提取 display_confidence 和 confidence_source
-  const confidence = sentence.confidence ?? data.confidence
-  const displayConfidence = sentence.display_confidence ?? data.display_confidence
-  const confidenceSource = sentence.confidence_source ?? data.confidence_source
-
-  if (sentenceIndex === undefined || !text) {
-    console.warn('[EditorView] 无效的字幕数据:', data)
-    return
+  if (sentenceIndex === undefined || sentenceIndex === null) {
+    throw new Error('[EditorView] subtitle.legacy_update 缺少 sentence_index')
   }
 
-  if (projectStore.isSentenceDeleted(sentenceIndex)) {
-    return
+  const applied = applySentencePatch(editorDocumentStore, {
+    ...sentence,
+    index: sentenceIndex,
+    sentence_index: sentenceIndex,
+    text: sentence.text ?? data.text ?? data.content,
+    start: sentence.start ?? data.start_time ?? data.start,
+    end: sentence.end ?? data.end_time ?? data.end,
+    confidence: sentence.confidence ?? data.confidence,
+    display_confidence: sentence.display_confidence ?? data.display_confidence,
+    confidence_source: sentence.confidence_source ?? data.confidence_source,
+    warning_type: sentence.warning_type ?? data.warning_type ?? 'none',
+    source: data.source ?? data.event_type ?? 'unknown',
+    is_modified: sentence.is_modified ?? false,
+    original_text: sentence.original_text ?? null,
+  })
+  if (!applied) {
+    throw new Error(
+      `[EditorView] subtitle.legacy_update 未命中新内核字幕（sentence_index=${sentenceIndex}）`
+    )
   }
-
-  // 暂停历史记录，SSE 推送的内容不应被撤销
-  projectStore.pauseHistory()
-
-  // 更新或添加字幕到 store
-  const existingIndex = projectStore.subtitles.findIndex((s) => s.sentenceIndex === sentenceIndex)
-
-  // V3.1.2+dev.20260112.01: 包含 display_confidence 和 confidence_source
-  const subtitleData = {
-    sentenceIndex,
-    text,
-    start: start ?? 0,
-    end: end ?? 0,
-    confidence,
-    display_confidence: displayConfidence,
-    confidence_source: confidenceSource,
-    warning_type: warningType,
-    source,
-    isModified: sentence.is_modified ?? false,
-    originalText: sentence.original_text ?? null,
-  }
-  const normalized = projectStore.applyOffsetToSentenceData(subtitleData)
-
-  if (existingIndex >= 0) {
-    // V3.1.2+dev.20260112.01: 修复 - 传入正确的 id 而非索引
-    const existingId = projectStore.subtitles[existingIndex].id
-    projectStore.updateSubtitle(existingId, normalized)
-  } else {
-    // 添加新字幕 - 按时间顺序找到插入位置
-    const insertIndex = projectStore.subtitles.findIndex((s) => s.start > (normalized.start ?? 0))
-    const finalIndex = insertIndex === -1 ? projectStore.subtitles.length : insertIndex
-    // V3.1.2: 添加 id 字段给新字幕
-    normalized.id = `sv_${sentenceIndex}`
-    projectStore.addSubtitle(finalIndex, normalized)
-  }
-
-  // 恢复历史记录
-  projectStore.resumeHistory()
-
 }
 
 // Phase 5: 处理草稿字幕（快流/SenseVoice）
@@ -1985,75 +1757,28 @@ function handleSubtitleAdded(data) {
 function handleRestoredChunk(data) {
   if (!data) return
 
-  if (useEditorV2) {
-    const applied = editorEventProjector.projectRestored(data)
-    if (!applied) {
-      throw new Error(
-        `[EditorView] subtitle.restored 未能应用到新内核（chunk_index=${data.chunk_index ?? 'unknown'}）`
-      )
-    }
-    scheduleV2RealtimeAuthoritativeReload(`subtitle_restored_${data.chunk_index ?? 'unknown'}`)
-    return
+  const applied = editorEventProjector.projectRestored(data)
+  if (!applied) {
+    throw new Error(
+      `[EditorView] subtitle.restored 未能应用到新内核（chunk_index=${data.chunk_index ?? 'unknown'}）`
+    )
   }
-
-  const chunkIndex = data.chunk_index
-  const sentences = Array.isArray(data.sentences) ? data.sentences : []
-
-  if (sentences.length === 0) {
-    return
-  }
-
-  // V3.1.2+dev.20260111.01: 转换为 projectStore 需要的格式，包含 display_confidence
-  const formattedSentences = sentences.map((sentence, idx) => ({
-    index: sentence.index ?? idx,
-    text: sentence.text || '',
-    start: sentence.start ?? 0,
-    end: sentence.end ?? 0,
-    confidence: sentence.confidence ?? null,
-    display_confidence: sentence.display_confidence, // V3.1.2: 映射后准确率
-    confidence_source: sentence.confidence_source, // V3.1.2: 置信度来源
-    words: sentence.words || [],
-    warning_type: sentence.warning_type || 'none',
-    source: sentence.source || 'restored',
-    is_draft: sentence.is_draft ?? false,
-    is_finalized: sentence.is_finalized ?? true,
-    is_modified: sentence.is_modified ?? false,
-    original_text: sentence.original_text ?? null,
-    speaker_id: sentence.speaker_id ?? null,
-    turn_id: sentence.turn_id ?? null,
-    speaker_label: sentence.speaker_label ?? null,
-    speaker_color_key: sentence.speaker_color_key ?? null,
-    binding_source: sentence.binding_source ?? null,
-  }))
-
-  // 调用 projectStore 的恢复方法
-  projectStore.restoreChunk(chunkIndex, formattedSentences)
-
+  scheduleV2RealtimeAuthoritativeReload(`subtitle_restored_${data.chunk_index ?? 'unknown'}`)
 }
 
 function handleSubtitleDeleted(data) {
   if (!data) return
-  const sentenceIndex = data.index ?? data.sentence_index
   const segmentId = data.segment_id ?? data.segment?.segment_id
-  if (useEditorV2) {
-    if (!segmentId) {
-      throw new Error('[EditorView] subtitle.deleted 在 V2 下缺少 segment_id')
-    }
-    handleProjectSubtitleDelete(data)
-    return
+  if (!segmentId) {
+    throw new Error('[EditorView] subtitle.deleted 缺少 segment_id')
   }
-  if (sentenceIndex === undefined || sentenceIndex === null) return
-  projectStore.markSentenceDeleted(sentenceIndex)
-  const target = projectStore.subtitles.find((s) => s.sentenceIndex === sentenceIndex)
-  if (target) {
-    projectStore.removeSubtitle(target.id)
-  }
+  handleProjectSubtitleDelete(data)
 }
 
 function handleSubtitleEdited(data) {
   if (!data) return
 
-  if (useEditorV2 && data?.segment && typeof data.segment === 'object') {
+  if (data?.segment && typeof data.segment === 'object') {
     handleProjectSubtitleUpsert(data, 'subtitle.edited')
     return
   }
@@ -2062,72 +1787,24 @@ function handleSubtitleEdited(data) {
   const sentenceIndex = data.index ?? data.sentence_index ?? sentence.index
   const segmentId = data.segment_id ?? sentence.segment_id
   if ((sentenceIndex === undefined || sentenceIndex === null) && !segmentId) {
-    if (useEditorV2) {
-      throw new Error('[EditorView] subtitle.edited 在 V2 下缺少 sentence_index/segment_id')
-    }
-    return
+    throw new Error('[EditorView] subtitle.edited 缺少 sentence_index/segment_id')
   }
 
-  if (useEditorV2) {
-    const applied = applySentencePatch(editorDocumentStore, {
-      ...sentence,
-      ...(sentenceIndex !== undefined && sentenceIndex !== null
-        ? {
-            index: sentenceIndex,
-            sentence_index: sentenceIndex,
-          }
-        : {}),
-      ...(segmentId ? { segment_id: segmentId } : {}),
-    })
-    if (!applied) {
-      throw new Error(
-        `[EditorView] subtitle.edited 未命中新内核字幕（key=${sentenceIndex ?? segmentId ?? 'unknown'}）`
-      )
-    }
-    return
+  const applied = applySentencePatch(editorDocumentStore, {
+    ...sentence,
+    ...(sentenceIndex !== undefined && sentenceIndex !== null
+      ? {
+          index: sentenceIndex,
+          sentence_index: sentenceIndex,
+        }
+      : {}),
+    ...(segmentId ? { segment_id: segmentId } : {}),
+  })
+  if (!applied) {
+    throw new Error(
+      `[EditorView] subtitle.edited 未命中新内核字幕（key=${sentenceIndex ?? segmentId ?? 'unknown'}）`
+    )
   }
-
-  const target = projectStore.subtitles.find((subtitle) => subtitle.sentenceIndex === sentenceIndex)
-  if (!target) {
-    console.warn('[EditorView] 编辑事件未命中本地字幕:', sentenceIndex)
-    return
-  }
-
-  const patch = {}
-
-  if (sentence.text !== undefined) {
-    patch.text = sentence.text
-  }
-  if (sentence.is_modified !== undefined) {
-    patch.isModified = sentence.is_modified
-  }
-  if (sentence.original_text !== undefined) {
-    patch.originalText = sentence.original_text
-  }
-
-  const hasStart = sentence.start !== undefined && sentence.start !== null
-  const hasEnd = sentence.end !== undefined && sentence.end !== null
-  if (hasStart) {
-    patch.start = projectStore.toDisplayTime(sentence.start)
-  }
-  if (hasEnd) {
-    patch.end = projectStore.toDisplayTime(sentence.end)
-  }
-
-  if (Array.isArray(sentence.words) && sentence.words.length > 0) {
-    const normalized = projectStore.applyOffsetToSentenceData({
-      start: hasStart ? sentence.start : projectStore.toBaseTime(target.start),
-      end: hasEnd ? sentence.end : projectStore.toBaseTime(target.end),
-      words: sentence.words,
-    })
-    patch.words = normalized.words
-  }
-
-  if (Object.keys(patch).length === 0) {
-    return
-  }
-
-  projectStore.updateSubtitle(target.id, patch)
 }
 
 /**

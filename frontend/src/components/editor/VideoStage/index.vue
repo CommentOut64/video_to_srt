@@ -163,7 +163,6 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, inject } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
 import { usePlaybackStore } from '@/stores/playbackStore'
-import { isFeatureEnabled } from '@/config/featureFlags'
 import { useEditorProjectionBridge } from '@/stores/editor/editorProjectionBridge'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { ProxyState } from '@/composables/useProxyVideo'
@@ -195,7 +194,6 @@ const emit = defineEmits(['loaded', 'error', 'play', 'pause', 'timeupdate', 'end
 const projectStore = useProjectStore()
 const playbackStore = usePlaybackStore()
 const editorProjectionBridge = useEditorProjectionBridge()
-const useEditorV2 = isFeatureEnabled('USE_EDITOR_V2')
 
 // 全局播放管理器（单例）
 const playbackManager = usePlaybackManager()
@@ -312,10 +310,7 @@ const canUpgrade = computed(() => {
 })
 
 const currentSubtitleText = computed(() => {
-  if (useEditorV2) {
-    return editorProjectionBridge.currentSubtitle?.text || ''
-  }
-  return projectStore.currentSubtitle?.text || ''
+  return editorProjectionBridge.currentSubtitle?.text || ''
 })
 const isPlaying = computed(() => playbackStore.isPlaying)
 
