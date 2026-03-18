@@ -8,7 +8,7 @@
 
 [project]
 name = "anchor-flux"
-version = "3.2.2"
+version = "3.2.5"
 description = "基于 GPU 加速的视频转字幕工具"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
@@ -134,9 +134,8 @@ dev = [
     "py-spy>=0.3.0",  # 性能分析工具
     "memory-profiler>=0.61.0",  # 内存分析
 
-    # --- 打包 ---
-    "pyinstaller>=6.0.0",  # 打包工具
-    "build>=1.0.0",  # 构建工具
+    # --- 构建工具 ---
+    "build>=1.0.0",
 ]
 
 # 测试依赖
@@ -347,7 +346,7 @@ Issues = "https://github.com/CommentOut64/video-to-srt/issues"
 #   py-spy record -o profile.svg -- python your_script.py
 #
 # 打包:
-#   pyinstaller AnchorFlux.spec
+#   pwsh scripts/packaging/build-profile.ps1 -Profile lite-offline -Artifacts all -Version 3.2.4+dev.20260306.02
 #
 # ============================================================
 
