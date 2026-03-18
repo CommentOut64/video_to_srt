@@ -9,7 +9,9 @@ Project 语义任务控制路由。
 
 from __future__ import annotations
 
+import gc
 import shutil
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -224,6 +226,48 @@ def create_project_task_router(transcription_service: Optional[Any] = None) -> A
         if normalized_reason == "cancel_not_found":
             return 404
         return 400
+
+    def _is_path_busy_error(exc: BaseException) -> bool:
+        if isinstance(exc, PermissionError):
+            return True
+        if not isinstance(exc, OSError):
+            return False
+        winerror = getattr(exc, "winerror", None)
+        errno_code = getattr(exc, "errno", None)
+        if winerror in {5, 32, 33}:
+            return True
+        if errno_code in {13, 16}:
+            return True
+        normalized_message = str(exc or "").lower()
+        return (
+            "used by another process" in normalized_message
+            or "另一个进程" in normalized_message
+            or "被占用" in normalized_message
+        )
+
+    def _remove_project_dir_with_retry(
+        project_dir: Path,
+        *,
+        max_retries: int = 6,
+        base_wait_sec: float = 0.15,
+    ) -> bool:
+        if max_retries < 1:
+            raise ValueError("max_retries 必须 >= 1")
+
+        gc.collect()
+        for attempt in range(1, max_retries + 1):
+            try:
+                shutil.rmtree(project_dir)
+                return True
+            except (PermissionError, OSError) as exc:
+                if not _is_path_busy_error(exc):
+                    raise
+                if attempt >= max_retries:
+                    return False
+                # Trade-off: 仅对“占用型错误”做短暂指数退避，兼顾 UI 响应速度和并发删除成功率。
+                wait_seconds = min(1.2, base_wait_sec * (2 ** (attempt - 1)))
+                time.sleep(wait_seconds)
+        return False
 
     def _build_project_only_task_snapshot(project: Any) -> Dict[str, Any]:
         """
@@ -482,9 +526,9 @@ def create_project_task_router(transcription_service: Optional[Any] = None) -> A
             if not project_dir.exists():
                 raise HTTPException(status_code=404, detail="任务目录不存在")
             try:
-                shutil.rmtree(project_dir)
-            except PermissionError as exc:
-                raise HTTPException(status_code=423, detail="当前有进程占用，请稍后再试") from exc
+                removed = _remove_project_dir_with_retry(project_dir)
+                if not removed:
+                    raise HTTPException(status_code=423, detail="当前有进程占用，请稍后再试")
             except OSError as exc:
                 raise HTTPException(status_code=400, detail=f"删除失败: {exc}") from exc
             return {
