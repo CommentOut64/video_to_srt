@@ -84,6 +84,7 @@
               @insert-before="handleInsertBefore(item.subtitle.localId)"
               @insert-after="handleInsertAfter(item.subtitle.localId)"
               @delete="handleDelete(item.subtitle.localId)"
+              @focus-row="handleRowFocus"
               @select-change="(checked) => handleItemSelectChange(item.index, checked)"
             />
           </div>
@@ -127,6 +128,7 @@
               @insert-before="handleInsertBefore(item.localId)"
               @insert-after="handleInsertAfter(item.localId)"
               @delete="handleDelete(item.localId)"
+              @focus-row="handleRowFocus"
               @select-change="(checked) => handleItemSelectChange(item.selectionIndex, checked)"
             />
           </div>
@@ -138,7 +140,7 @@
 
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElLoading } from 'element-plus'
 import { DynamicScroller, DynamicScrollerItem } from 'vue-virtual-scroller'
 import 'vue-virtual-scroller/dist/vue-virtual-scroller.css'
 import GroupHeader from '@/components/editor/SubtitleList/GroupHeader.vue'
@@ -146,6 +148,7 @@ import SearchToolbar from '@/components/editor/SubtitleList/SearchToolbar.vue'
 import { SortMode, useHomophoneSearch } from '@/composables/useHomophoneSearch'
 import SubtitleRow from './SubtitleRow.vue'
 import { buildBatchReplaceReplacements } from './searchBatchReplace'
+import { shouldIgnoreStructuralShortcut } from './keyboardSafety'
 import projectApi from '@/services/api/projectApi'
 import { useEditorPlayback } from '@/composables/editor/useEditorPlayback'
 import { useProjectStore } from '@/stores/projectStore'
@@ -169,11 +172,20 @@ import {
   splitSubtitleByCursor,
 } from './structuralEdit'
 import { resolveMergeSideSnapshot } from './mergeSnapshot'
+import {
+  buildVisibleFlipPlan,
+  captureVisibleSnapshot,
+  playVisibleFlip,
+  shouldSkipVisibleFlip,
+  waitForStableLayout,
+} from './visibleWindowFlip'
+import { focusRowForEditing, resolveDeleteFallbackId } from './rowFocusController'
 
 const props = defineProps({
   autoScroll: { type: Boolean, default: true },
   editable: { type: Boolean, default: true },
   enableAutoResumeFollow: { type: Boolean, default: true },
+  isResizing: { type: Boolean, default: false },
 })
 
 const docStore = useEditorDocumentStore()
@@ -215,6 +227,15 @@ let programmaticScrollGuardUntil = 0
 let programmaticScrollReleaseTimer = null
 let attachedScrollerElement = null
 let followRequestToken = 0
+
+// FLIP 动画运行时常量与引用
+const FLIP_DURATION_MS = 160
+const FLIP_MAX_ITEMS = 12
+const FLIP_ENTER_OFFSET_PX = 8
+const USER_SCROLL_FLIP_GUARD_MS = 120
+const lastManualListInteractionAt = ref(0)
+let cancelActiveFlipAnimation = null
+let flipRunToken = 0
 
 const filteredSubtitles = computed(() => {
   if (!quickSearchText.value) {
@@ -362,72 +383,88 @@ function handleRowClick(localId, event) {
   seekToSubtitle(localId)
 }
 
-function handleInsertBefore(localId) {
-  const currentIndex = defaultVisibleIds.value.indexOf(localId)
-  const previousLocalId = currentIndex > 0 ? defaultVisibleIds.value[currentIndex - 1] : null
-  const currentEntity = docStore.getEntity(localId)
-  const previousEntity = previousLocalId ? docStore.getEntity(previousLocalId) : null
-  const startMs = previousEntity?.endMs ?? Math.max(0, (currentEntity?.startMs ?? 3000) - 3000)
-  const candidateEndMs = currentEntity?.startMs ?? (startMs + 3000)
-  const endMs = candidateEndMs > startMs ? candidateEndMs : (startMs + 500)
+function handleRowFocus(localId) {
+  focusRowForEditing(localId, {
+    selectionStore,
+    subtitleDocumentStore,
+  })
+}
 
-  commandBus.dispatch(createInsertSubtitleCommand({
-    afterLocalId: previousLocalId,
-    entity: {
-      text: '',
-      startMs,
-      endMs,
-      isDraft: false,
-    },
-    source: 'user',
-  }))
+function handleInsertBefore(localId) {
+  runStructuralMutationWithFlip(() => {
+    const currentIndex = defaultVisibleIds.value.indexOf(localId)
+    const previousLocalId = currentIndex > 0 ? defaultVisibleIds.value[currentIndex - 1] : null
+    const currentEntity = docStore.getEntity(localId)
+    const previousEntity = previousLocalId ? docStore.getEntity(previousLocalId) : null
+    const startMs = previousEntity?.endMs ?? Math.max(0, (currentEntity?.startMs ?? 3000) - 3000)
+    const candidateEndMs = currentEntity?.startMs ?? (startMs + 3000)
+    const endMs = candidateEndMs > startMs ? candidateEndMs : (startMs + 500)
+
+    return commandBus.dispatch(createInsertSubtitleCommand({
+      afterLocalId: previousLocalId,
+      entity: {
+        text: '',
+        startMs,
+        endMs,
+        isDraft: false,
+      },
+      source: 'user',
+    }))
+  })
 }
 
 function handleInsertAfter(localId) {
-  const currentEntity = docStore.getEntity(localId)
-  const nextLocalId = docStore.getNeighbors(localId).next
-  const nextEntity = nextLocalId ? docStore.getEntity(nextLocalId) : null
-  const startMs = currentEntity?.endMs ?? 0
-  const candidateEndMs = nextEntity?.startMs ?? (startMs + 3000)
-  const endMs = candidateEndMs > startMs ? candidateEndMs : (startMs + 500)
+  runStructuralMutationWithFlip(() => {
+    const currentEntity = docStore.getEntity(localId)
+    const nextLocalId = docStore.getNeighbors(localId).next
+    const nextEntity = nextLocalId ? docStore.getEntity(nextLocalId) : null
+    const startMs = currentEntity?.endMs ?? 0
+    const candidateEndMs = nextEntity?.startMs ?? (startMs + 3000)
+    const endMs = candidateEndMs > startMs ? candidateEndMs : (startMs + 500)
 
-  commandBus.dispatch(createInsertSubtitleCommand({
-    afterLocalId: localId,
-    entity: {
-      text: '',
-      startMs,
-      endMs,
-      isDraft: false,
-    },
-    source: 'user',
-  }))
+    return commandBus.dispatch(createInsertSubtitleCommand({
+      afterLocalId: localId,
+      entity: {
+        text: '',
+        startMs,
+        endMs,
+        isDraft: false,
+      },
+      source: 'user',
+    }))
+  })
 }
 
 function handleDelete(localId) {
-  const result = commandBus.dispatch(createDeleteSubtitleCommand({
-    localId,
-    source: 'user',
-  }))
+  runStructuralMutationWithFlip(() => {
+    const result = commandBus.dispatch(createDeleteSubtitleCommand({
+      localId,
+      source: 'user',
+    }))
 
-  if (!result?.success) {
-    return
-  }
+    if (!result?.success) {
+      return result
+    }
 
-  if (selectionStore.isMultiSelected(localId)) {
-    selectionStore.toggleMultiSelection(localId, {
-      makeActive: false,
-      updateAnchor: false,
-    })
-  }
+    if (selectionStore.isMultiSelected(localId)) {
+      selectionStore.toggleMultiSelection(localId, {
+        makeActive: false,
+        updateAnchor: false,
+      })
+    }
 
-  if (selectedLocalId.value === localId) {
-    subtitleDocumentStore.setSelectedSubtitleId(null)
-  }
+    const fallbackId = resolveDeleteFallbackId(localId, orderedVisibleIds.value)
 
-  if (activeId.value === localId) {
-    const fallbackId = defaultVisibleIds.value.find((id) => id !== localId) ?? null
-    selectionStore.setActive(fallbackId, { updateAnchor: false })
-  }
+    if (selectedLocalId.value === localId) {
+      subtitleDocumentStore.setSelectedSubtitleId(fallbackId)
+    }
+
+    if (activeId.value === localId) {
+      selectionStore.setActive(fallbackId, { updateAnchor: false })
+    }
+
+    return result
+  })
 }
 
 function handleBatchDelete() {
@@ -446,25 +483,33 @@ function handleBatchDelete() {
   }
 
   const minIndex = Math.min(...selectedIds.map((localId) => docStore.getOrderIndex(localId)))
-  const commands = selectedIds.map((localId) => createDeleteSubtitleCommand({
-    localId,
-    source: 'user',
-  }))
-  const result = commandBus.dispatchTransaction(commands, {
-    historyType: 'batch_delete',
-  })
-  if (!result?.success) {
-    ElMessage.error('批量删除失败')
-    return
-  }
 
-  selectionStore.clearMultiSelection()
-  const fallbackId = docStore.order[minIndex] ?? docStore.order[minIndex - 1] ?? null
-  selectionStore.setActive(fallbackId, { updateAnchor: false })
-  subtitleDocumentStore.setSelectedSubtitleId(fallbackId)
+  runStructuralMutationWithFlip(() => {
+    const commands = selectedIds.map((localId) => createDeleteSubtitleCommand({
+      localId,
+      source: 'user',
+    }))
+    const result = commandBus.dispatchTransaction(commands, {
+      historyType: 'batch_delete',
+    })
+    if (!result?.success) {
+      ElMessage.error('批量删除失败')
+      return result
+    }
+
+    selectionStore.clearMultiSelection()
+    const fallbackId = docStore.order[minIndex] ?? docStore.order[minIndex - 1] ?? null
+    selectionStore.setActive(fallbackId, { updateAnchor: false })
+    subtitleDocumentStore.setSelectedSubtitleId(fallbackId)
+    return result
+  })
 }
 
 function handleKeydown(event) {
+  if (shouldIgnoreStructuralShortcut(event)) {
+    return
+  }
+
   if (!activeId.value) {
     return
   }
@@ -547,8 +592,17 @@ function handleQuickSearch(text) {
 }
 
 async function handleHomophoneSearch() {
-  await homophoneSearch.executeSearch()
-  selectionStore.setSearchSelection(Array.from(homophoneSearch.selectedSubtitleIds))
+  // 近音模式需要后端检索，耗时较长，显示全局加载提示
+  const needsLoading = homophoneSearch.isHomophoneMode
+  const loading = needsLoading
+    ? ElLoading.service({ text: '搜索中...', background: 'rgba(0, 0, 0, 0.4)' })
+    : null
+  try {
+    await homophoneSearch.executeSearch()
+    selectionStore.setSearchSelection(Array.from(homophoneSearch.selectedSubtitleIds))
+  } finally {
+    loading?.close()
+  }
 }
 
 function handleHomophoneReset() {
@@ -703,52 +757,56 @@ function handleSplitFromCursor({ localId, cursorPosition, text }) {
   const createdLocalId = sessionStore.nextLocalId()
   const leftWords = normalizeProjectionWordsToCold(splitResult.left.words, projectStore)
   const rightWords = normalizeProjectionWordsToCold(splitResult.right.words, projectStore)
-  const dispatchResult = commandBus.dispatch(createSplitSubtitleCommand({
-    sourceLocalId: localId,
-    sourceSegmentId: cold?.segmentId ?? null,
-    createdLocalId,
-    splitAtMs: Math.round(projectStore.toBaseTime(splitResult.splitAtTime) * 1000),
-    splitAtTextOffset: splitResult.splitAtTextOffset,
-    before: {
-      text: splitSourceSubtitle.text,
-      startMs: entity.startMs,
-      endMs: entity.endMs,
-    },
-    afterKept: {
-      text: splitResult.left.text,
-      startMs: Math.round(projectStore.toBaseTime(splitResult.left.start) * 1000),
-      endMs: Math.round(projectStore.toBaseTime(splitResult.left.end) * 1000),
-    },
-    afterCreated: {
-      text: splitResult.right.text,
-      startMs: Math.round(projectStore.toBaseTime(splitResult.right.start) * 1000),
-      endMs: Math.round(projectStore.toBaseTime(splitResult.right.end) * 1000),
-    },
-    keptColdPatch: {
-      words: leftWords,
-    },
-    createdColdInit: cold
-      ? {
-          ...cold,
-          localId: createdLocalId,
-          segmentId: null,
-          sentenceIndex: null,
-          originalText: null,
-          words: rightWords,
-        }
-      : {
-          words: rightWords,
-        },
-    source: 'user',
-  }))
 
-  if (!dispatchResult?.success) {
-    ElMessage.error('切分失败')
-    return
-  }
+  runStructuralMutationWithFlip(() => {
+    const dispatchResult = commandBus.dispatch(createSplitSubtitleCommand({
+      sourceLocalId: localId,
+      sourceSegmentId: cold?.segmentId ?? null,
+      createdLocalId,
+      splitAtMs: Math.round(projectStore.toBaseTime(splitResult.splitAtTime) * 1000),
+      splitAtTextOffset: splitResult.splitAtTextOffset,
+      before: {
+        text: splitSourceSubtitle.text,
+        startMs: entity.startMs,
+        endMs: entity.endMs,
+      },
+      afterKept: {
+        text: splitResult.left.text,
+        startMs: Math.round(projectStore.toBaseTime(splitResult.left.start) * 1000),
+        endMs: Math.round(projectStore.toBaseTime(splitResult.left.end) * 1000),
+      },
+      afterCreated: {
+        text: splitResult.right.text,
+        startMs: Math.round(projectStore.toBaseTime(splitResult.right.start) * 1000),
+        endMs: Math.round(projectStore.toBaseTime(splitResult.right.end) * 1000),
+      },
+      keptColdPatch: {
+        words: leftWords,
+      },
+      createdColdInit: cold
+        ? {
+            ...cold,
+            localId: createdLocalId,
+            segmentId: null,
+            sentenceIndex: null,
+            originalText: null,
+            words: rightWords,
+          }
+        : {
+            words: rightWords,
+          },
+      source: 'user',
+    }))
 
-  selectionStore.selectOnly(createdLocalId)
-  subtitleDocumentStore.setSelectedSubtitleId(createdLocalId)
+    if (!dispatchResult?.success) {
+      ElMessage.error('切分失败')
+      return dispatchResult
+    }
+
+    selectionStore.selectOnly(createdLocalId)
+    subtitleDocumentStore.setSelectedSubtitleId(createdLocalId)
+    return dispatchResult
+  })
 }
 
 function handleMerge(localId, direction, mergePayload = null) {
@@ -774,38 +832,42 @@ function handleMerge(localId, direction, mergePayload = null) {
   const keptSnapshot = resolveMergeSideSnapshot(keptLocalId, keptEntity, mergePayload)
   const removedSnapshot = resolveMergeSideSnapshot(removedLocalId, removedEntity, mergePayload)
   const separator = getMergeSeparator()
-  const dispatchResult = commandBus.dispatch(createMergeSubtitlesCommand({
-    keptLocalId,
-    removedLocalId,
-    keptSegmentId: keptCold?.segmentId ?? null,
-    removedSegmentId: removedCold?.segmentId ?? null,
-    separator,
-    beforeKept: keptSnapshot,
-    beforeRemoved: removedSnapshot,
-    after: {
-      text: `${keptSnapshot.text}${separator}${removedSnapshot.text}`,
-      startMs: Math.min(keptSnapshot.startMs, removedSnapshot.startMs),
-      endMs: Math.max(keptSnapshot.endMs, removedSnapshot.endMs),
-    },
-    keptColdPatch: {
-      words: [],
-      originalText: null,
-      confidence: null,
-      displayConfidence: null,
-      confidenceSource: 'manual',
-      warningType: 'none',
-      sourceType: 'merge',
-    },
-    source: 'user',
-  }))
 
-  if (!dispatchResult?.success) {
-    ElMessage.error('合并失败')
-    return
-  }
+  runStructuralMutationWithFlip(() => {
+    const dispatchResult = commandBus.dispatch(createMergeSubtitlesCommand({
+      keptLocalId,
+      removedLocalId,
+      keptSegmentId: keptCold?.segmentId ?? null,
+      removedSegmentId: removedCold?.segmentId ?? null,
+      separator,
+      beforeKept: keptSnapshot,
+      beforeRemoved: removedSnapshot,
+      after: {
+        text: `${keptSnapshot.text}${separator}${removedSnapshot.text}`,
+        startMs: Math.min(keptSnapshot.startMs, removedSnapshot.startMs),
+        endMs: Math.max(keptSnapshot.endMs, removedSnapshot.endMs),
+      },
+      keptColdPatch: {
+        words: [],
+        originalText: null,
+        confidence: null,
+        displayConfidence: null,
+        confidenceSource: 'manual',
+        warningType: 'none',
+        sourceType: 'merge',
+      },
+      source: 'user',
+    }))
 
-  selectionStore.selectOnly(keptLocalId)
-  subtitleDocumentStore.setSelectedSubtitleId(keptLocalId)
+    if (!dispatchResult?.success) {
+      ElMessage.error('合并失败')
+      return dispatchResult
+    }
+
+    selectionStore.selectOnly(keptLocalId)
+    subtitleDocumentStore.setSelectedSubtitleId(keptLocalId)
+    return dispatchResult
+  })
 }
 
 function getScrollerElement() {
@@ -895,16 +957,85 @@ function pauseFollowByUserScroll() {
   scheduleFollowAutoResume()
 }
 
+function markRecentUserListInteraction() {
+  lastManualListInteractionAt.value = Date.now()
+}
+
 function handleListScroll() {
+  markRecentUserListInteraction()
   pauseFollowByUserScroll()
 }
 
 function handleListWheel() {
+  markRecentUserListInteraction()
   pauseFollowByUserScroll()
 }
 
 function handleListTouchMove() {
+  markRecentUserListInteraction()
   pauseFollowByUserScroll()
+}
+
+function hasRecentUserScroll() {
+  return Date.now() - lastManualListInteractionAt.value < USER_SCROLL_FLIP_GUARD_MS
+}
+
+function resolveReducedMotionPreference() {
+  return window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false
+}
+
+// 结构性编辑事务包装器：采集前快照 -> 执行命令 -> 等布局稳定 -> 播放 FLIP
+async function runStructuralMutationWithFlip(mutate) {
+  // 新事务开始前先取消未完成的上一个动画
+  cancelActiveFlipAnimation?.()
+  cancelActiveFlipAnimation = null
+
+  const container = getScrollerElement()
+  const skipDecision = shouldSkipVisibleFlip({
+    isGroupedMode: isGroupedMode.value,
+    isResizing: props.isResizing,
+    isInProgrammaticScrollGuard: isInProgrammaticScrollGuard(),
+    hasRecentUserScroll: hasRecentUserScroll(),
+    prefersReducedMotion: resolveReducedMotionPreference(),
+  })
+
+  if (skipDecision.skip || !container) {
+    return await mutate()
+  }
+
+  const before = captureVisibleSnapshot(container)
+  const result = await mutate()
+
+  // FLIP 阶段与命令执行解耦：即使动画出错也不影响命令结果
+  try {
+    if (result?.success === false) {
+      return result
+    }
+
+    const runToken = ++flipRunToken
+    await nextTick()
+    const after = await waitForStableLayout({
+      capture: () => captureVisibleSnapshot(container),
+    })
+
+    // 如果在等待期间有新事务进入，放弃本次动画
+    if (runToken !== flipRunToken) {
+      return result
+    }
+
+    const plan = buildVisibleFlipPlan(before, after, {
+      maxAnimatedItems: FLIP_MAX_ITEMS,
+      enterOffsetPx: FLIP_ENTER_OFFSET_PX,
+    })
+
+    cancelActiveFlipAnimation = playVisibleFlip(plan, {
+      durationMs: FLIP_DURATION_MS,
+    })
+  } catch {
+    // Why: FLIP 是纯视觉增强，失败时静默降级，不阻断命令执行
+  }
+
+  return result
 }
 
 function scrollToLocalId(localId) {
@@ -1010,6 +1141,8 @@ onUnmounted(() => {
   clearFollowResumeTimer()
   clearProgrammaticScrollReleaseTimer()
   followRequestToken += 1
+  cancelActiveFlipAnimation?.()
+  cancelActiveFlipAnimation = null
   if (!attachedScrollerElement) {
     return
   }
@@ -1038,6 +1171,11 @@ defineExpose({
       ? SortMode.TIMELINE
       : SortMode.GROUPED
   },
+  // 供外部（如 EditorView 的 undo/redo）包裹结构性变更以触发 FLIP 动画
+  // 约束：FLIP 仅做视觉采快照-播动画，不干涉命令执行；异常时降级跳过
+  runWithFlip(mutate) {
+    return runStructuralMutationWithFlip(mutate)
+  },
 })
 </script>
 
@@ -1052,6 +1190,7 @@ defineExpose({
 .scroller {
   flex: 1;
   overflow-y: auto;
+  scrollbar-gutter: stable;
   padding: 6px;
 }
 

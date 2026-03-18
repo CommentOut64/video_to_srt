@@ -28,6 +28,7 @@ body {
   color: var(--af-text-normal);
   line-height: 1.5;
   min-height: 100vh;
+  overflow: hidden;
   user-select: none;
   -webkit-user-select: none;
   -moz-user-select: none;

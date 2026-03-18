@@ -147,6 +147,7 @@
               ref="subtitleListRef"
               :auto-scroll="true"
               :enable-auto-resume-follow="true"
+              :is-resizing="isResizing"
             />
           </div>
 
@@ -757,6 +758,7 @@ function scheduleV2RealtimeAuthoritativeReload(reason) {
     useEditorV2,
     projectId: props.projectId || projectStore.meta.projectId,
     reason,
+    activeJobId: activeJobId.value,
     scheduleReload: (projectId, reloadReason) => {
       void scheduleEditorProjectionReload(projectId, reloadReason)
     },
@@ -2102,10 +2104,12 @@ async function cancelTranscription() {
 // ========== 撤销/重做 ==========
 
 function undo() {
-  editorCommandBus.undo()
+  subtitleListRef.value?.runWithFlip?.(() => editorCommandBus.undo())
+    ?? editorCommandBus.undo()
 }
 function redo() {
-  editorCommandBus.redo()
+  subtitleListRef.value?.runWithFlip?.(() => editorCommandBus.redo())
+    ?? editorCommandBus.redo()
 }
 
 // ========== 导出功能 ==========
@@ -2871,7 +2875,7 @@ onBeforeRouteLeave(async (to, from) => {
 
 .tab-pane {
   height: 100%;
-  overflow: auto;
+  overflow: hidden;
 }
 
 /* 占位面板 */

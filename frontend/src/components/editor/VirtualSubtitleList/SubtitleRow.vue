@@ -42,6 +42,7 @@
           class="time-input"
           :value="formatTime(entity?.startMs)"
           :readonly="entity?.isDraft"
+          @focus="handleFocusRow"
           @blur="handleTimeUpdate('start', $event.target.value)"
           @keydown.enter="$event.target.blur()"
         />
@@ -55,6 +56,7 @@
           class="time-input"
           :value="formatTime(entity?.endMs)"
           :readonly="entity?.isDraft"
+          @focus="handleFocusRow"
           @blur="handleTimeUpdate('end', $event.target.value)"
           @keydown.enter="$event.target.blur()"
         />
@@ -93,6 +95,7 @@
           ref="textareaRef"
           class="text-input"
           :value="editingText"
+          @focus="handleFocusRow"
           @input="handleTextareaInput"
           @click="updateCursorPosition"
           @keyup="updateCursorPosition"
@@ -161,7 +164,7 @@
 </template>
 
 <script setup>
-import { computed, nextTick, ref } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import ContextMenu from '@/components/editor/ContextMenu.vue'
 import { useEditorCommandBus } from '@/stores/editor/editorCommandBus'
 import { useEditorDocumentStore } from '@/stores/editor/editorDocumentStore'
@@ -190,6 +193,7 @@ const emit = defineEmits([
   'insert-before',
   'insert-after',
   'delete',
+  'focus-row',
   'select-change',
   'split',
   'merge-prev',
@@ -230,6 +234,13 @@ const contextMenuRef = ref(null)
 const isContextMenuOpen = ref(false)
 const pendingBlurWhileContextMenuOpen = ref(false)
 const isDeleteConfirming = ref(false)
+
+// 焦点切到其他行时自动重置删除确认状态，避免回来时误触二次确认
+watch(() => props.isActive, (active) => {
+  if (!active && isDeleteConfirming.value) {
+    isDeleteConfirming.value = false
+  }
+})
 const isPlaying = computed(() => playbackStore.isPlaying)
 let highlightCacheText = null
 let highlightCacheWords = null
@@ -309,6 +320,7 @@ const warningMessage = computed(() => {
 
 function startEditing(event) {
   if (entity.value?.isDraft) return
+  handleFocusRow()
   originalText.value = displayText.value
   isEditing.value = true
   editingText.value = displayText.value
@@ -410,6 +422,10 @@ function updateCursorPosition(event) {
 function handleClick(event) {
   resetDeleteConfirm()
   emit('click', props.localId, event)
+}
+
+function handleFocusRow() {
+  emit('focus-row', props.localId)
 }
 
 function handleDeleteClick() {
@@ -686,6 +702,8 @@ function escapeHtml(text) {
   background: var(--af-bg-secondary);
   border: 1px solid transparent;
   border-radius: var(--af-radius-md);
+  /* 裁剪 cluster-color-bar，使其弧度与行的 border-radius 完全贴合 */
+  overflow: hidden;
   transition:
     background-color var(--af-transition-fast),
     border-color var(--af-transition-fast),
@@ -703,11 +721,10 @@ function escapeHtml(text) {
 
 .cluster-color-bar {
   position: absolute;
-  left: 0;
-  top: 0;
-  bottom: 0;
-  width: 4px;
-  border-radius: var(--af-radius-md) 0 0 var(--af-radius-md);
+  left: -1px;
+  top: -1px;
+  bottom: -1px;
+  width: 6px;
 }
 
 .item-checkbox {
