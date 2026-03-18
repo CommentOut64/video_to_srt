@@ -914,12 +914,11 @@ class JobQueueService:
 
     def _check_delete_blocked(self, job_id: str) -> tuple[bool, Optional[str]]:
         """删除前占用检测：命中占用时返回阻塞原因，禁止逻辑删除。"""
-        try:
-            from app.services.media_stream_tracker import get_active_streams
-
-            active_streams = int(get_active_streams(job_id) or 0)
-        except Exception:
-            active_streams = 0
+        active_streams = self._wait_active_streams_release(
+            job_id,
+            timeout_seconds=0.8,
+            poll_interval_seconds=0.08,
+        )
 
         if active_streams > 0:
             return True, f"当前有进程占用，请稍后再试 (active_streams={active_streams})"
@@ -953,6 +952,42 @@ class JobQueueService:
                 return True, f"当前有进程占用，请稍后再试 ({stage_name}={status_value})"
 
         return False, None
+
+    def _get_active_stream_count(self, job_id: str) -> int:
+        try:
+            from app.services.media_stream_tracker import get_active_streams
+
+            return max(0, int(get_active_streams(job_id) or 0))
+        except Exception:
+            return 0
+
+    def _wait_active_streams_release(
+        self,
+        job_id: str,
+        *,
+        timeout_seconds: float,
+        poll_interval_seconds: float,
+    ) -> int:
+        active_streams = self._get_active_stream_count(job_id)
+        if active_streams <= 0:
+            return 0
+
+        timeout = max(0.0, float(timeout_seconds or 0.0))
+        poll_interval = max(0.02, float(poll_interval_seconds or 0.0))
+        deadline = time.monotonic() + timeout
+
+        while active_streams > 0 and time.monotonic() < deadline:
+            time.sleep(poll_interval)
+            active_streams = self._get_active_stream_count(job_id)
+
+        if active_streams > 0:
+            logger.warning(
+                "[Lifecycle] 删除前媒体流仍占用: job=%s, active_streams=%s, waited=%.2fs",
+                job_id,
+                active_streams,
+                timeout,
+            )
+        return active_streams
 
     def _worker_loop(self):
         """
@@ -1302,12 +1337,11 @@ class JobQueueService:
         job_dir_value = str(payload.get("job_dir") or "")
         job_dir = Path(job_dir_value) if job_dir_value else (Path(config.JOBS_DIR) / job_id)
 
-        try:
-            from app.services.media_stream_tracker import get_active_streams
-
-            active_streams = int(get_active_streams(job_id) or 0)
-        except Exception:
-            active_streams = 0
+        active_streams = self._wait_active_streams_release(
+            job_id,
+            timeout_seconds=0.4,
+            poll_interval_seconds=0.08,
+        )
 
         if active_streams > 0:
             return False, f"当前有进程占用，请稍后再试 (active_streams={active_streams})"
