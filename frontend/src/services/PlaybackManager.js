@@ -185,6 +185,17 @@ function createPlaybackManager() {
         if (!videoElement.paused) {
           videoElement.pause();
         }
+        // Trade-off: 路由切换时仅 pause 可能无法立刻终止浏览器已建立的 Range 拉流，
+        // 主动清空 src 并 load 可触发媒体管线释放，降低后端 active_streams 残留窗口。
+        if (typeof videoElement.removeAttribute === "function") {
+          videoElement.removeAttribute("src");
+        }
+        if ("src" in videoElement) {
+          videoElement.src = "";
+        }
+        if (typeof videoElement.load === "function") {
+          videoElement.load();
+        }
       } catch {
         // 某些浏览器在元素销毁阶段可能抛异常，忽略并继续解绑
       }

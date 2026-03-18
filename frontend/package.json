@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "test": "vitest",
     "test:run": "vitest run",
-    "test:regression": "vitest run src/stores/__tests__/regression",
+    "test:regression": "vitest run tests/regression",
     "lint:style": "stylelint 'src/**/*.{vue,css}'",
     "lint:style:fix": "stylelint 'src/**/*.{vue,css}' --fix",
     "lint:style:fix-safe": "stylelint 'src/**/*.{vue,css}' --config .stylelintrc.safe-fix.cjs --fix",

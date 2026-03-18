@@ -7,8 +7,8 @@ export default mergeConfig(
     test: {
       globals: true,
       environment: 'node',
-      setupFiles: ['./src/stores/__tests__/setup/vitest.setup.js'],
-      include: ['src/**/*.{spec,test}.{js,ts}'],
+      setupFiles: ['./tests/setup/vitest.setup.js'],
+      include: ['tests/**/*.spec.{js,ts}'],
       clearMocks: true,
       restoreMocks: true,
     },
