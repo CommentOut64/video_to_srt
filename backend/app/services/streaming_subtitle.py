@@ -755,6 +755,7 @@ class StreamingSubtitleManager:
             # 删除旧的草稿句子（V3.2.0+dev.20260124.01: 保护用户编辑）
             old_indices = self.get_chunk_sentence_indices(chunk_key)
             protected_sentences = {}  # 保存被保护的用户编辑句子
+            new_sentence_pairs: list[tuple[int, SentenceSegment]] = []
 
             for old_index in old_indices:
                 if old_index in self.sentences:
@@ -780,6 +781,7 @@ class StreamingSubtitleManager:
                 self.sentences[index] = sentence_copy
                 self.sentence_count += 1
                 new_indices.append(index)
+                new_sentence_pairs.append((index, sentence_copy))
 
             # 合并保护的句子（保持原索引）
             for protected_index, protected_sentence in protected_sentences.items():
@@ -792,8 +794,7 @@ class StreamingSubtitleManager:
 
         # 推送 SSE 事件（批量替换）- 在锁外推送，避免死锁
         sentences_data: List[Dict[str, Any]] = []
-        for i, sentence in enumerate(visible_sentences):
-            sentence_index = new_indices[i] if i < len(new_indices) else None
+        for sentence_index, sentence in new_sentence_pairs:
             sentences_data.append(
                 self._build_sentence_payload(
                     sentence,
