@@ -3,6 +3,12 @@ const { app, BrowserWindow, nativeTheme, shell } = require("electron");
 const fs = require("fs");
 const http = require("http");
 const https = require("https");
+const {
+  resolveShellLogDir,
+  buildTimestampedLogPath,
+  ensureLogDir,
+  safeAppendLog,
+} = require("./shell_logging");
 
 const BACKEND_BASE_URL =
   process.env.ANCHORFLUX_BACKEND_URL || "http://127.0.0.1:8000";
@@ -17,6 +23,14 @@ const SHELL_FORCE_EXIT_MS = Number(
   process.env.ANCHORFLUX_SHELL_FORCE_EXIT_MS || 15000
 );
 const WINDOW_BG_COLOR = "#0b1220";
+const SHELL_LOG_DIR = resolveShellLogDir({
+  env: process.env,
+  execPath: process.execPath,
+  cwd: process.cwd(),
+});
+const SHELL_MAIN_LOG_PATH =
+  process.env.ANCHORFLUX_SHELL_MAIN_LOG ||
+  buildTimestampedLogPath(SHELL_LOG_DIR, "electron-main");
 
 let mainWindow = null;
 let isBackendShutdownTriggered = false;
@@ -24,9 +38,78 @@ let isAppExitInProgress = false;
 let appOrigin = null;
 
 try {
+  ensureLogDir(SHELL_LOG_DIR);
+} catch (_) {
+  // 日志目录创建失败时不阻断 UI 启动，避免排障工具反向造成不可用。
+}
+
+function writeShellLog(level, message, error = null) {
+  try {
+    safeAppendLog(SHELL_MAIN_LOG_PATH, level, message, error);
+  } catch (_) {
+    // 日志写入失败时保持静默，避免递归报错。
+  }
+}
+
+try {
   appOrigin = new URL(BACKEND_BASE_URL).origin;
 } catch (_) {
   appOrigin = null;
+}
+
+function setupDiagnostics() {
+  process.on("uncaughtException", (error) => {
+    writeShellLog("ERROR", "主进程 uncaughtException", error);
+  });
+  process.on("unhandledRejection", (reason) => {
+    writeShellLog("ERROR", "主进程 unhandledRejection", reason);
+  });
+
+  app.on("render-process-gone", (_, contents, details) => {
+    writeShellLog(
+      "ERROR",
+      `render-process-gone id=${contents?.id ?? "unknown"} reason=${details?.reason ?? "unknown"} exitCode=${details?.exitCode ?? "unknown"}`
+    );
+  });
+
+  app.on("child-process-gone", (_, details) => {
+    writeShellLog(
+      "ERROR",
+      `child-process-gone type=${details?.type ?? "unknown"} reason=${details?.reason ?? "unknown"} exitCode=${details?.exitCode ?? "unknown"}`
+    );
+  });
+
+  app.on("web-contents-created", (_, contents) => {
+    contents.on(
+      "did-fail-load",
+      (_, errorCode, errorDescription, validatedURL, isMainFrame) => {
+        if (!isMainFrame) {
+          return;
+        }
+        writeShellLog(
+          "ERROR",
+          `did-fail-load id=${contents.id} code=${errorCode} desc=${errorDescription} url=${validatedURL}`
+        );
+      }
+    );
+
+    contents.on("console-message", (_, level, message, line, sourceId) => {
+      if (level < 2) {
+        return;
+      }
+      writeShellLog(
+        "WARN",
+        `console-message id=${contents.id} level=${level} source=${sourceId}:${line} msg=${message}`
+      );
+    });
+
+    contents.on("unresponsive", () => {
+      writeShellLog("WARN", `webContents unresponsive id=${contents.id}`);
+    });
+    contents.on("responsive", () => {
+      writeShellLog("INFO", `webContents responsive id=${contents.id}`);
+    });
+  });
 }
 
 function isInternalUrl(rawUrl) {
@@ -44,7 +127,9 @@ function openExternalUrl(rawUrl) {
   if (!rawUrl || isInternalUrl(rawUrl)) {
     return;
   }
-  shell.openExternal(rawUrl).catch(() => {});
+  shell.openExternal(rawUrl).catch((error) => {
+    writeShellLog("WARN", `打开外部链接失败: ${rawUrl}`, error);
+  });
 }
 
 function requestBackendShutdown() {
@@ -204,6 +289,7 @@ function createMainWindow() {
 
   mainWindow.removeMenu();
   mainWindow.loadFile(path.join(__dirname, "loading.html"));
+  writeShellLog("INFO", "已加载 loading.html");
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (isInternalUrl(url)) {
@@ -222,17 +308,20 @@ function createMainWindow() {
   });
 
   mainWindow.on("closed", () => {
+    writeShellLog("INFO", "主窗口已关闭");
     mainWindow = null;
   });
 }
 
 async function startShell() {
   if (focusMainWindow()) {
+    writeShellLog("INFO", "检测到现有窗口，执行聚焦");
     return;
   }
   createMainWindow();
   const isReady = await waitBackendReady();
   if (!isReady) {
+    writeShellLog("ERROR", "等待后端就绪超时");
     pushStatus(
       "error",
       "后端启动超时，请关闭后重试；若问题持续，请检查日志。"
@@ -242,9 +331,12 @@ async function startShell() {
   }
 
   try {
+    writeShellLog("INFO", `准备加载主界面 URL: ${BACKEND_BASE_URL}`);
     await mainWindow.loadURL(BACKEND_BASE_URL);
+    writeShellLog("INFO", `主界面加载完成 URL: ${BACKEND_BASE_URL}`);
     focusMainWindow();
   } catch (error) {
+    writeShellLog("ERROR", "加载主界面失败", error);
     pushStatus(
       "error",
       `加载主界面失败：${error instanceof Error ? error.message : String(error)}`
@@ -254,6 +346,8 @@ async function startShell() {
 }
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
+setupDiagnostics();
+writeShellLog("INFO", `Shell 启动: backend=${BACKEND_BASE_URL}`);
 
 if (!gotSingleInstanceLock) {
   app.quit();

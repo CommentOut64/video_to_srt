@@ -11,6 +11,7 @@ import logging
 import os
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib import error, request
@@ -67,6 +68,28 @@ def wait_backend_ready(base_url: str, timeout_sec: int = 60) -> bool:
     return False
 
 
+def _resolve_shell_log_dir(shell_path: Path) -> Path:
+    """
+    解析 Electron Shell 日志目录。
+
+    设计取舍：
+    - 优先允许外部通过环境变量显式指定，便于排障时临时重定向。
+    - 未指定时按 `core/shell/AnchorFluxShell.exe` 反推应用根目录，统一落到 `<root>/logs`。
+    """
+    explicit_log_dir = os.environ.get("ANCHORFLUX_SHELL_LOG_DIR", "").strip()
+    if explicit_log_dir:
+        return Path(explicit_log_dir).resolve()
+
+    # 打包路径约定：<root>/core/shell/AnchorFluxShell.exe
+    app_root = shell_path.parent.parent.parent
+    return (app_root / "logs").resolve()
+
+
+def _build_chromium_log_path(log_dir: Path) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return log_dir / f"electron-chromium-{timestamp}.log"
+
+
 def launch_electron(shell_path: Path) -> Optional[subprocess.Popen]:
     """
     拉起 Electron Shell。
@@ -78,12 +101,35 @@ def launch_electron(shell_path: Path) -> Optional[subprocess.Popen]:
         logger.error("Electron Shell 不存在: %s", shell_path)
         return None
 
+    log_dir = _resolve_shell_log_dir(shell_path)
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("创建 Shell 日志目录失败，回退默认行为: %s", exc)
+        log_dir = shell_path.parent
+    chromium_log_path = _build_chromium_log_path(log_dir)
+
+    cmd = [
+        str(shell_path),
+        "--enable-logging",
+        f"--log-file={chromium_log_path}",
+    ]
+    child_env = os.environ.copy()
+    child_env["ANCHORFLUX_SHELL_LOG_DIR"] = str(log_dir)
+    child_env["ANCHORFLUX_SHELL_CHROMIUM_LOG"] = str(chromium_log_path)
+
     try:
         process = subprocess.Popen(
-            [str(shell_path)],
+            cmd,
             cwd=str(shell_path.parent),
+            env=child_env,
         )
-        logger.info("Electron Shell 已启动: %s (PID=%s)", shell_path, process.pid)
+        logger.info(
+            "Electron Shell 已启动: %s (PID=%s, chromium_log=%s)",
+            shell_path,
+            process.pid,
+            chromium_log_path,
+        )
         return process
     except OSError as exc:
         logger.error("启动 Electron Shell 失败: %s", exc)

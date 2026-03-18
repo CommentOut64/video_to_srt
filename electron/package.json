@@ -8,7 +8,8 @@
     "dev:shell": "electron .",
     "build:shell": "electron-builder --win --x64 --dir --config electron-builder.yml",
     "pack:shell": "electron-builder --win --x64 --config electron-builder.yml",
-    "build:shell:script": "node ./scripts/build-shell.mjs"
+    "build:shell:script": "node ./scripts/build-shell.mjs",
+    "test:shell": "node --test shell_logging.spec.js"
   },
   "devDependencies": {
     "electron": "^37.2.0",
