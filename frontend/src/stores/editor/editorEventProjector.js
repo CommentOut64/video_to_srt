@@ -15,6 +15,102 @@ function normalizeChunkId(data) {
   return data?.chunk_uid ?? data?.chunk_id ?? data?.chunk_index ?? null
 }
 
+function normalizeLogicalChunkKey(chunkId) {
+  if (chunkId === undefined || chunkId === null) {
+    return null
+  }
+
+  const raw = String(chunkId).trim()
+  if (!raw) {
+    return null
+  }
+
+  const withoutDedupSuffix = raw.split('#')[0]?.trim() || raw
+  if (!withoutDedupSuffix) {
+    return null
+  }
+
+  if (withoutDedupSuffix.startsWith('chunk-')) {
+    const suffix = withoutDedupSuffix.slice('chunk-'.length).trim()
+    if (/^-?\d+$/.test(suffix)) {
+      return Number(suffix)
+    }
+    return suffix || withoutDedupSuffix
+  }
+
+  if (/^-?\d+$/.test(withoutDedupSuffix)) {
+    return Number(withoutDedupSuffix)
+  }
+
+  return withoutDedupSuffix
+}
+
+function getLogicalChunkKeyFromData(data) {
+  return normalizeLogicalChunkKey(normalizeChunkId(data))
+}
+
+function isSameLogicalChunk(left, right) {
+  const leftKey = normalizeLogicalChunkKey(left)
+  const rightKey = normalizeLogicalChunkKey(right)
+  if (leftKey === null || rightKey === null) {
+    return false
+  }
+  return leftKey === rightKey
+}
+
+function hasFinalizedEntityForLogicalChunk(docStore, logicalChunkKey) {
+  if (logicalChunkKey === null || logicalChunkKey === undefined) {
+    return false
+  }
+
+  return docStore.order.some((localId) => {
+    const entity = docStore.getEntity(localId)
+    const cold = docStore.getCold(localId)
+    if (!entity || entity.isDraft) {
+      return false
+    }
+    return isSameLogicalChunk(cold?.chunkId, logicalChunkKey)
+  })
+}
+
+function collectLocalIdsForLogicalChunk(docStore, logicalChunkKey, options = {}) {
+  if (logicalChunkKey === null || logicalChunkKey === undefined) {
+    return []
+  }
+
+  const {
+    draftOnly = false,
+  } = options
+
+  return docStore.order.filter((localId) => {
+    const entity = docStore.getEntity(localId)
+    const cold = docStore.getCold(localId)
+    if (!entity) {
+      return false
+    }
+    if (draftOnly && !entity.isDraft) {
+      return false
+    }
+    return isSameLogicalChunk(cold?.chunkId, logicalChunkKey)
+  })
+}
+
+function uniqueLocalIds(localIds) {
+  return [...new Set((localIds || []).filter(Boolean))]
+}
+
+function takeReusableLocalId(reusableLocalIds, preferredLocalId = null) {
+  if (preferredLocalId) {
+    const preferredIndex = reusableLocalIds.indexOf(preferredLocalId)
+    if (preferredIndex >= 0) {
+      reusableLocalIds.splice(preferredIndex, 1)
+    }
+    return preferredLocalId
+  }
+
+  return reusableLocalIds.shift() || null
+}
+
 function mapWords(words, sessionStore) {
   if (!Array.isArray(words)) {
     return null
@@ -44,7 +140,7 @@ function buildServerEntity(sentence, sessionStore, options = {}) {
     cold: {
       segmentId: sentence?.segment_id ?? null,
       sentenceIndex,
-      chunkId,
+      chunkId: normalizeLogicalChunkKey(chunkId),
       sourceType: sentence?.source || sentence?.source_type || fallbackSource,
       confidence: sentence?.confidence ?? null,
       displayConfidence: sentence?.display_confidence ?? null,
@@ -111,17 +207,24 @@ function buildFinalizedSentenceMap(data, indices = []) {
 }
 
 export function useEditorEventProjector() {
+  function flushPendingCommandsNow() {
+    if (pendingCommands.length === 0) {
+      flushScheduled = false
+      return
+    }
+
+    const batch = pendingCommands
+    pendingCommands = []
+    flushScheduled = false
+    const commandBus = useEditorCommandBus()
+    commandBus.dispatchBatch(batch)
+  }
 
   function scheduleFlush() {
     if (flushScheduled) return
     flushScheduled = true
     queueMicrotask(() => {
-      flushScheduled = false
-      if (pendingCommands.length === 0) return
-      const batch = pendingCommands
-      pendingCommands = []
-      const commandBus = useEditorCommandBus()
-      commandBus.dispatchBatch(batch)
+      flushPendingCommandsNow()
     })
   }
 
@@ -131,8 +234,23 @@ export function useEditorEventProjector() {
 
     const sentence = data.sentence
     const sentenceIndex = data.index
+    const logicalChunkKey = getLogicalChunkKeyFromData(data)
 
     const existingLocalId = docStore.bindingBySentenceIndex.get(sentenceIndex)
+    const existingEntity = existingLocalId
+      ? docStore.getEntity(existingLocalId)
+      : null
+
+    // Why:
+    // - 双流中 draft 事件可能晚于 replace_chunk/finalized 到达；
+    // - 若该句或该逻辑 chunk 已定稿，再接收 draft 只会把草稿错误投影成“当前真相”。
+    if (existingEntity && !existingEntity.isDraft) {
+      return false
+    }
+    if (!existingEntity && hasFinalizedEntityForLogicalChunk(docStore, logicalChunkKey)) {
+      return false
+    }
+
     if (existingLocalId) {
       const cmd = {
         type: 'update_text',
@@ -169,12 +287,15 @@ export function useEditorEventProjector() {
     }
 
     scheduleFlush()
+    return true
   }
 
   function projectReplaceChunk(data) {
     const sessionStore = useEditorSessionStore()
     const docStore = useEditorDocumentStore()
+    flushPendingCommandsNow()
     const chunkId = normalizeChunkId(data)
+    const logicalChunkKey = getLogicalChunkKeyFromData(data)
     const sentences = Array.isArray(data?.sentences) ? data.sentences : []
     const newIndices = Array.isArray(data?.new_indices) ? data.new_indices : []
 
@@ -182,16 +303,26 @@ export function useEditorEventProjector() {
       return false
     }
 
-    const oldLocalIds = (data.old_indices || [])
+    const oldLocalIdsFromIndices = (data.old_indices || [])
       .map(idx => docStore.bindingBySentenceIndex.get(idx))
       .filter(Boolean)
+    const oldLocalIds = uniqueLocalIds([
+      ...oldLocalIdsFromIndices,
+      // Why:
+      // - 后端 replace_chunk 在极端恢复路径下可能缺失/漂移 old_indices；
+      // - 若这里只回收草稿，旧定稿会与新定稿并存，形成“标点差异重复”。
+      // 因此 fallback 必须按逻辑 chunk 整体替换，而不是仅替换草稿。
+      ...collectLocalIdsForLogicalChunk(docStore, logicalChunkKey),
+    ])
+    const reusableLocalIds = [...oldLocalIds]
 
     const newEntities = sentences.map((sentence, i) => {
       const sentenceIndex = newIndices[i]
       if (sentenceIndex === undefined || sentenceIndex === null) {
         return null
       }
-      const localId = docStore.bindingBySentenceIndex.get(sentenceIndex) || sessionStore.nextLocalId()
+      const boundLocalId = docStore.bindingBySentenceIndex.get(sentenceIndex) || null
+      const localId = takeReusableLocalId(reusableLocalIds, boundLocalId) || sessionStore.nextLocalId()
       return buildServerEntity(sentence, sessionStore, {
         localId,
         sentenceIndex,
@@ -220,6 +351,7 @@ export function useEditorEventProjector() {
   function projectRestored(data) {
     const sessionStore = useEditorSessionStore()
     const docStore = useEditorDocumentStore()
+    flushPendingCommandsNow()
     const sentences = Array.isArray(data?.sentences) ? data.sentences : []
     if (sentences.length === 0) {
       return false
@@ -266,45 +398,93 @@ export function useEditorEventProjector() {
   function projectFinalized(data) {
     const sessionStore = useEditorSessionStore()
     const docStore = useEditorDocumentStore()
+    flushPendingCommandsNow()
     const indices = resolveFinalizedIndices(data)
     if (indices.length === 0) {
       return false
     }
     const sentenceMap = buildFinalizedSentenceMap(data, indices)
     const chunkId = normalizeChunkId(data)
+    const logicalChunkKey = getLogicalChunkKeyFromData(data)
+    const draftLocalIdsForChunk = uniqueLocalIds(
+      collectLocalIdsForLogicalChunk(docStore, logicalChunkKey, { draftOnly: true })
+    )
+
+    if (sentenceMap.size === indices.length) {
+      const replaceLocalIds = uniqueLocalIds([
+        ...draftLocalIdsForChunk,
+        ...indices
+          .map((sentenceIndex) => docStore.bindingBySentenceIndex.get(sentenceIndex))
+          .filter((localId) => {
+            if (!localId) {
+              return false
+            }
+            const entity = docStore.getEntity(localId)
+            return Boolean(entity?.isDraft)
+          }),
+      ])
+      const reusableLocalIds = [...replaceLocalIds]
+
+      const newEntities = indices.map((sentenceIndex) => {
+        const sentence = sentenceMap.get(sentenceIndex)
+        const boundLocalId = docStore.bindingBySentenceIndex.get(sentenceIndex) || null
+        const localId = takeReusableLocalId(reusableLocalIds, boundLocalId) || sessionStore.nextLocalId()
+        return buildServerEntity(sentence, sessionStore, {
+          localId,
+          sentenceIndex,
+          chunkId,
+          isDraft: false,
+          fallbackSource: 'finalized',
+        })
+      })
+
+      pendingCommands.push({
+        type: 'apply_server_replace',
+        commandId: sessionStore.nextCommandId(),
+        source: 'system',
+        createdAt: Date.now(),
+        oldLocalIds: replaceLocalIds,
+        newEntities,
+      })
+
+      scheduleFlush()
+      return true
+    }
 
     const localIds = []
     const updates = []
     for (const sentenceIndex of indices) {
       const localId = docStore.bindingBySentenceIndex.get(sentenceIndex)
-      if (localId) {
-        const entity = docStore.getEntity(localId)
-        if (!entity) {
-          continue
-        }
+      if (!localId) {
+        continue
+      }
 
-        const sentence = sentenceMap.get(sentenceIndex)
-        if (sentence) {
-          const finalizedEntity = buildServerEntity(sentence, sessionStore, {
-            localId,
-            sentenceIndex,
-            chunkId,
-            isDraft: false,
-            fallbackSource: 'finalized',
-          })
-          updates.push({
-            localId,
-            text: finalizedEntity.text,
-            startMs: finalizedEntity.startMs,
-            endMs: finalizedEntity.endMs,
-            cold: finalizedEntity.cold,
-          })
-          continue
-        }
+      const entity = docStore.getEntity(localId)
+      if (!entity) {
+        continue
+      }
 
-        if (entity.isDraft) {
-          localIds.push(localId)
-        }
+      const sentence = sentenceMap.get(sentenceIndex)
+      if (sentence) {
+        const finalizedEntity = buildServerEntity(sentence, sessionStore, {
+          localId,
+          sentenceIndex,
+          chunkId,
+          isDraft: false,
+          fallbackSource: 'finalized',
+        })
+        updates.push({
+          localId,
+          text: finalizedEntity.text,
+          startMs: finalizedEntity.startMs,
+          endMs: finalizedEntity.endMs,
+          cold: finalizedEntity.cold,
+        })
+        continue
+      }
+
+      if (entity.isDraft) {
+        localIds.push(localId)
       }
     }
 
@@ -326,6 +506,7 @@ export function useEditorEventProjector() {
   function projectRevised(data) {
     const sessionStore = useEditorSessionStore()
     const docStore = useEditorDocumentStore()
+    flushPendingCommandsNow()
 
     const localId = docStore.bindingBySegmentId.get(data.segment_id)
     if (!localId) return

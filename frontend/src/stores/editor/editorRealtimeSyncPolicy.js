@@ -8,6 +8,7 @@ export function scheduleAuthoritativeReloadForRealtimeEvent({
   useEditorV2,
   projectId,
   reason,
+  activeJobId = null,
   scheduleReload,
 }) {
   if (!useEditorV2) {
@@ -20,6 +21,12 @@ export function scheduleAuthoritativeReloadForRealtimeEvent({
 
   if (typeof scheduleReload !== 'function') {
     throw new Error('[EditorRealtimeSyncPolicy] 缺少 scheduleReload 回调')
+  }
+
+  // 任务模式收敛到 SSE 单通道：实时字幕事件不再触发即时整表回拉。
+  // 权威回拉保留在冷启动、终态收口、断线恢复等显式屏障路径。
+  if (activeJobId && String(activeJobId).trim()) {
+    return false
   }
 
   scheduleReload(projectId, reason)

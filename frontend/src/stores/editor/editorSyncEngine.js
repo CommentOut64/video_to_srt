@@ -21,10 +21,41 @@ function toNormalizedSegmentId(value) {
   return normalized || null
 }
 
+function toNormalizedChunkId(value) {
+  if (value === undefined || value === null) {
+    return null
+  }
+
+  const raw = String(value).trim()
+  if (!raw) {
+    return null
+  }
+
+  const withoutDedupSuffix = raw.split('#')[0]?.trim() || raw
+  if (!withoutDedupSuffix) {
+    return null
+  }
+
+  if (withoutDedupSuffix.startsWith('chunk-')) {
+    const suffix = withoutDedupSuffix.slice('chunk-'.length).trim()
+    if (/^-?\d+$/.test(suffix)) {
+      return Number(suffix)
+    }
+    return suffix || withoutDedupSuffix
+  }
+
+  if (/^-?\d+$/.test(withoutDedupSuffix)) {
+    return Number(withoutDedupSuffix)
+  }
+
+  return withoutDedupSuffix
+}
+
 function toServerSegmentSnapshot(segment) {
   const segmentId = toNormalizedSegmentId(segment?.segment_id)
   return {
     segmentId,
+    chunkId: toNormalizedChunkId(segment?.chunk_id ?? segment?.chunk_uid ?? null),
     text: String(segment?.text ?? ''),
     startMs: segment?.start_ms ?? toMs(segment?.start ?? 0),
     endMs: segment?.end_ms ?? toMs(segment?.end ?? 0),
@@ -52,6 +83,40 @@ function toServerSegmentSnapshot(segment) {
   }
 }
 
+function resolveAuthoritativeLocalId(docStore, snapshot) {
+  const boundBySegmentId = docStore.bindingBySegmentId.get(snapshot.segmentId)
+  if (boundBySegmentId) {
+    return boundBySegmentId
+  }
+
+  const sentenceIndex = snapshot.sentenceIndex
+  if (sentenceIndex !== null && sentenceIndex !== undefined) {
+    const boundBySentenceIndex = docStore.bindingBySentenceIndex.get(sentenceIndex)
+    if (boundBySentenceIndex) {
+      const existingCold = docStore.getCold(boundBySentenceIndex)
+      const existingSegmentId = toNormalizedSegmentId(existingCold?.segmentId)
+      if (!existingSegmentId || existingSegmentId === snapshot.segmentId) {
+        return boundBySentenceIndex
+      }
+    }
+  }
+
+  return snapshot.segmentId
+}
+
+function isSameLogicalChunk(chunkId, chunkKeySet) {
+  if (!(chunkKeySet instanceof Set) || chunkKeySet.size === 0) {
+    return false
+  }
+
+  const normalizedChunkId = toNormalizedChunkId(chunkId)
+  if (normalizedChunkId === null) {
+    return false
+  }
+
+  return chunkKeySet.has(normalizedChunkId)
+}
+
 function syncSnapshotColdState(docStore, localId, snapshot, existingCold) {
   if (existingCold?.segmentId && existingCold.segmentId !== snapshot.segmentId) {
     docStore.bindingBySegmentId.delete(existingCold.segmentId)
@@ -68,6 +133,7 @@ function syncSnapshotColdState(docStore, localId, snapshot, existingCold) {
     docStore._applyColdUpdate(localId, {
       segmentId: snapshot.segmentId,
       sentenceIndex: snapshot.sentenceIndex,
+      chunkId: snapshot.chunkId,
       confidence: snapshot.confidence,
       displayConfidence: snapshot.displayConfidence,
       confidenceSource: snapshot.confidenceSource,
@@ -126,13 +192,22 @@ function captureUnsyncedLocalState(docStore) {
 function applyAuthoritativeSegmentsToDocument(docStore, serverSegments, preserveDirtyLocalIds = new Set()) {
   const normalizedSegments = Array.isArray(serverSegments) ? serverSegments : []
   const seenSegmentIds = new Set()
+  const finalizedChunkIds = new Set()
+  const finalizedSentenceIndices = new Set()
 
   for (const rawSegment of normalizedSegments) {
     const snapshot = toServerSegmentSnapshot(rawSegment)
     if (!snapshot.segmentId) continue
 
     seenSegmentIds.add(snapshot.segmentId)
-    const localId = docStore.bindingBySegmentId.get(snapshot.segmentId) || snapshot.segmentId
+    if (!snapshot.isDraft && snapshot.chunkId !== null) {
+      finalizedChunkIds.add(snapshot.chunkId)
+    }
+    if (!snapshot.isDraft && snapshot.sentenceIndex !== null && snapshot.sentenceIndex !== undefined) {
+      finalizedSentenceIndices.add(snapshot.sentenceIndex)
+    }
+
+    const localId = resolveAuthoritativeLocalId(docStore, snapshot)
     const existingEntity = docStore.getEntity(localId)
     const existingCold = docStore.getCold(localId)
 
@@ -170,7 +245,7 @@ function applyAuthoritativeSegmentsToDocument(docStore, serverSegments, preserve
         localId,
         segmentId: snapshot.segmentId,
         sentenceIndex: snapshot.sentenceIndex,
-        chunkId: null,
+        chunkId: snapshot.chunkId,
         words: snapshot.words,
         confidence: snapshot.confidence,
         displayConfidence: snapshot.displayConfidence,
@@ -188,6 +263,54 @@ function applyAuthoritativeSegmentsToDocument(docStore, serverSegments, preserve
     )
   }
 
+  // 权威定稿一旦回拉成功，同逻辑 chunk 的本地 draft 必须立即淘汰；
+  // 否则旧 draft 会与新定稿并存，或在后续 preserve/replay 时再次复活。
+  const droppedLocalIds = new Set()
+  if (finalizedChunkIds.size > 0) {
+    for (const localId of [...docStore.order]) {
+      const entity = docStore.getEntity(localId)
+      const cold = docStore.getCold(localId)
+      if (!entity?.isDraft) {
+        continue
+      }
+      if (!isSameLogicalChunk(cold?.chunkId, finalizedChunkIds)) {
+        continue
+      }
+      docStore._applyDelete(localId, { trackTombstone: false })
+      droppedLocalIds.add(localId)
+    }
+  }
+
+  // 对账兜底：若 SSE replace/finalized 事件缺少 segment_id，前端会产生“无主键定稿”。
+  // 当权威快照已确认该句/该 chunk 的 segment_id 后，必须强制清理此类孤儿条目，避免双份字幕并存。
+  if (finalizedChunkIds.size > 0 || finalizedSentenceIndices.size > 0) {
+    for (const localId of [...docStore.order]) {
+      const entity = docStore.getEntity(localId)
+      const cold = docStore.getCold(localId)
+      if (!entity || entity.isDraft) {
+        continue
+      }
+      if (cold?.segmentId) {
+        continue
+      }
+      if (preserveDirtyLocalIds.has(localId)) {
+        continue
+      }
+
+      const hitFinalizedChunk = isSameLogicalChunk(cold?.chunkId, finalizedChunkIds)
+      const sentenceIndex = cold?.sentenceIndex
+      const hitFinalizedSentence = sentenceIndex !== null
+        && sentenceIndex !== undefined
+        && finalizedSentenceIndices.has(sentenceIndex)
+      if (!hitFinalizedChunk && !hitFinalizedSentence) {
+        continue
+      }
+
+      docStore._applyDelete(localId, { trackTombstone: false })
+      droppedLocalIds.add(localId)
+    }
+  }
+
   for (const localId of [...docStore.order]) {
     const cold = docStore.getCold(localId)
     if (!cold?.segmentId) {
@@ -202,7 +325,11 @@ function applyAuthoritativeSegmentsToDocument(docStore, serverSegments, preserve
     docStore._applyDelete(localId, { trackTombstone: false })
   }
 
-  return normalizedSegments.length
+  return {
+    appliedCount: normalizedSegments.length,
+    finalizedChunkIds,
+    droppedLocalIds,
+  }
 }
 
 function extractCommandLocalIds(command) {
@@ -812,7 +939,11 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
 
     const preservedState = captureUnsyncedLocalState(docStore)
     const authoritativeSegmentIds = collectAuthoritativeSegmentIds(serverSegments)
-    const appliedCount = applyAuthoritativeSegmentsToDocument(
+    const {
+      appliedCount,
+      finalizedChunkIds,
+      droppedLocalIds,
+    } = applyAuthoritativeSegmentsToDocument(
       docStore,
       serverSegments,
       preserveLocalChanges ? preservedState.dirtyLocalIds : new Set()
@@ -823,6 +954,15 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
 
     if (preserveLocalChanges) {
       for (const [localId, snapshot] of preservedState.dirtyLocalSnapshots.entries()) {
+        if (droppedLocalIds.has(localId)) {
+          continue
+        }
+
+        const replayChunkId = snapshot.cold?.chunkId ?? null
+        if (Boolean(snapshot.hot?.isDraft) && isSameLogicalChunk(replayChunkId, finalizedChunkIds)) {
+          continue
+        }
+
         const replayCold = snapshot.cold
           ? {
               ...snapshot.cold,
