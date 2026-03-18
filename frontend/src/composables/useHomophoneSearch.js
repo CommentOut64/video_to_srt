@@ -175,6 +175,8 @@ export function useHomophoneSearch(options = {}) {
   const selectedSubtitleIds = ref(new Set())
   // matchSpansMap: subtitleIndex -> [{start, end, readingKey}]
   const matchSpansMap = ref(new Map())
+  // matchedTextSnapshot: subtitleIndex -> text（搜索时的文本快照，用于变更时比对匹配区域是否仍有效）
+  const matchedTextSnapshot = ref(new Map())
   // clusterMetaMap: subtitleIndex -> {clusterId, readingLabel, color}
   const clusterMetaMap = ref(new Map())
   // clustersInfo: 后端返回的完整 clusters 信息
@@ -431,6 +433,9 @@ export function useHomophoneSearch(options = {}) {
       uniqueSpans.sort((a, b) => a.start - b.start)
       matchSpansMap.value.set(idx, uniqueSpans)
     }
+
+    // 记录匹配字幕的文本快照，用于后续变更时判断匹配区域是否仍有效
+    captureMatchedTextSnapshot()
   }
 
   /**
@@ -488,6 +493,89 @@ export function useHomophoneSearch(options = {}) {
         color: pickClusterColor('_text_match'),
       })
     }
+
+    captureMatchedTextSnapshot()
+  }
+
+  /**
+   * 为所有当前匹配的字幕记录文本快照
+   */
+  function captureMatchedTextSnapshot() {
+    matchedTextSnapshot.value.clear()
+    for (const idx of matchedSubtitleIds.value) {
+      const subtitle = subtitleBySentenceIndexMap.value.get(idx)
+      if (subtitle) {
+        matchedTextSnapshot.value.set(idx, String(subtitle.text || ''))
+      }
+    }
+  }
+
+  /**
+   * 精细失效：保留未受影响的匹配，移除已删除/匹配区域被改动的条目
+   * 返回 true 表示仍有存活匹配
+   */
+  function pruneStaleMatches() {
+    const staleIds = []
+
+    for (const idx of matchedSubtitleIds.value) {
+      const subtitle = subtitleBySentenceIndexMap.value.get(idx)
+      if (!subtitle) {
+        // 字幕已被删除
+        staleIds.push(idx)
+        continue
+      }
+
+      const oldText = matchedTextSnapshot.value.get(idx)
+      const newText = String(subtitle.text || '')
+      if (oldText === newText) {
+        // 文本未变，匹配仍有效
+        continue
+      }
+
+      // 文本变了，逐 span 检查匹配区域的子串是否一致
+      const spans = matchSpansMap.value.get(idx)
+      if (!spans || spans.length === 0) {
+        staleIds.push(idx)
+        continue
+      }
+
+      const survivingSpans = spans.filter((span) => {
+        if (span.end > newText.length) return false
+        if (span.end > oldText.length) return false
+        return oldText.substring(span.start, span.end) === newText.substring(span.start, span.end)
+      })
+
+      if (survivingSpans.length === 0) {
+        staleIds.push(idx)
+      } else if (survivingSpans.length < spans.length) {
+        matchSpansMap.value.set(idx, survivingSpans)
+        // 更新快照为当前文本
+        matchedTextSnapshot.value.set(idx, newText)
+      } else {
+        // 所有 span 都存活，仅更新快照
+        matchedTextSnapshot.value.set(idx, newText)
+      }
+    }
+
+    // 清除失效条目
+    for (const idx of staleIds) {
+      matchedSubtitleIds.value.delete(idx)
+      matchSpansMap.value.delete(idx)
+      clusterMetaMap.value.delete(idx)
+      selectedSubtitleIds.value.delete(idx)
+      matchedTextSnapshot.value.delete(idx)
+    }
+
+    // 触发响应式更新
+    if (staleIds.length > 0) {
+      matchedSubtitleIds.value = new Set(matchedSubtitleIds.value)
+      selectedSubtitleIds.value = new Set(selectedSubtitleIds.value)
+      matchSpansMap.value = new Map(matchSpansMap.value)
+      clusterMetaMap.value = new Map(clusterMetaMap.value)
+      matchedTextSnapshot.value = new Map(matchedTextSnapshot.value)
+    }
+
+    return matchedSubtitleIds.value.size > 0
   }
 
   /**
@@ -497,6 +585,7 @@ export function useHomophoneSearch(options = {}) {
     matchedSubtitleIds.value.clear()
     selectedSubtitleIds.value.clear()
     matchSpansMap.value.clear()
+    matchedTextSnapshot.value.clear()
     clusterMetaMap.value.clear()
     clustersInfo.value = {}
     isSearchActive.value = false
@@ -514,14 +603,50 @@ export function useHomophoneSearch(options = {}) {
   }
 
   function invalidateSearchForSubtitleMutation() {
-    const shouldInvalidateIndex = isHomophoneMode.value
-      || indexStatus.value === IndexStatus.READY
-      || indexStatus.value === IndexStatus.FAILED
+    if (!isHomophoneMode.value) {
+      // 文本/正则模式：数据全在本地，直接重新匹配
+      const keyword = String(searchText.value || '').trim()
+      if (!keyword) {
+        clearSearchResult()
+        return
+      }
 
-    clearSearchResult()
-    if (shouldInvalidateIndex) {
-      indexStatus.value = IndexStatus.MISSING
-      indexMessage.value = '字幕已变更，近音索引待刷新'
+      // 先清旧匹配再重算，保持选中集与匹配集一致
+      matchedSubtitleIds.value.clear()
+      matchSpansMap.value.clear()
+      clusterMetaMap.value.clear()
+      clustersInfo.value = {}
+
+      parseTextSearchResult({
+        mode: searchMode.value,
+        queryText: searchText.value,
+      })
+
+      if (matchedSubtitleIds.value.size > 0) {
+        // 仍有匹配：保留搜索态，裁剪选中集（移除已不匹配的项）
+        const survivingSelected = new Set()
+        for (const idx of selectedSubtitleIds.value) {
+          if (matchedSubtitleIds.value.has(idx)) {
+            survivingSelected.add(idx)
+          }
+        }
+        selectedSubtitleIds.value = survivingSelected
+        isSearchActive.value = true
+      } else {
+        // 无匹配项：退出搜索
+        selectedSubtitleIds.value.clear()
+        isSearchActive.value = false
+      }
+      return
+    }
+
+    // 近音模式：精细裁剪，只移除已删除/匹配区域被改动的条目
+    const hasRemainingMatches = pruneStaleMatches()
+    // 标记索引过期，完整匹配集可能已变（新增字幕可能也匹配）
+    indexStatus.value = IndexStatus.MISSING
+    indexMessage.value = '字幕已变更，近音索引待刷新'
+    if (!hasRemainingMatches) {
+      isSearchActive.value = false
     }
   }
 
