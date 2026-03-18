@@ -57,8 +57,14 @@ _video_request_log_guard = threading.Lock()
 _video_request_log_windows: dict[str, Tuple[float, int]] = {}
 _transcode_cache_guard = threading.Lock()
 _transcode_decision_cache: dict[str, dict] = {}
+_thumbnail_lock_guard = threading.Lock()
+_thumbnail_generation_guard = threading.Lock()
+_thumbnail_locks: dict[str, asyncio.Lock] = {}
+_thumbnail_generation_tasks: dict[str, asyncio.Task] = {}
 _VIDEO_REQUEST_LOG_THROTTLE_SECONDS = 1.0
 _TRANSCODE_CACHE_TTL_SECONDS = 2.0
+TASK_CARD_THUMBNAIL_MAX_WIDTH = 640
+TASK_CARD_THUMBNAIL_FILENAME = "thumbnail.jpg"
 
 # 注意：旧的 _proxy_generation_status 已废弃，改用 MediaPrepService 管理状态
 
@@ -103,6 +109,145 @@ def _get_audio_extract_lock(job_dir: Path) -> threading.Lock:
             lock = threading.Lock()
             _audio_extract_locks[key] = lock
     return lock
+
+
+def _get_thumbnail_lock(job_dir: Path) -> asyncio.Lock:
+    """获取目录级缩略图锁，保证同一项目只会有一个生成流程。"""
+    key = str(job_dir.resolve())
+    with _thumbnail_lock_guard:
+        lock = _thumbnail_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _thumbnail_locks[key] = lock
+    return lock
+
+
+def _resolve_task_card_thumbnail_width(video_width: int) -> int:
+    normalized_width = int(video_width or 0)
+    if normalized_width <= 0:
+        return TASK_CARD_THUMBNAIL_MAX_WIDTH
+    return max(1, min(TASK_CARD_THUMBNAIL_MAX_WIDTH, normalized_width))
+
+
+def _read_cached_thumbnail_bytes(thumbnail_file: Path) -> Optional[bytes]:
+    try:
+        if thumbnail_file.exists():
+            with open(thumbnail_file, "rb") as file:
+                data = file.read()
+            if data:
+                return data
+    except OSError as exc:
+        logger.warning("[media] 读取缩略图缓存失败: file=%s, error=%s", thumbnail_file, exc)
+    return None
+
+
+def _write_cached_thumbnail_atomic(thumbnail_file: Path, thumbnail_bytes: bytes) -> None:
+    tmp_file = thumbnail_file.with_suffix(f"{thumbnail_file.suffix}.tmp")
+    try:
+        with open(tmp_file, "wb") as file:
+            file.write(thumbnail_bytes)
+        os.replace(tmp_file, thumbnail_file)
+    finally:
+        if tmp_file.exists():
+            tmp_file.unlink(missing_ok=True)
+
+
+def _encode_thumbnail_data_url(thumbnail_bytes: bytes) -> str:
+    import base64
+
+    return f"data:image/jpeg;base64,{base64.b64encode(thumbnail_bytes).decode('utf-8')}"
+
+
+async def _generate_task_card_thumbnail_bytes(video_file: Path) -> tuple[Optional[bytes], int]:
+    thumb_width = TASK_CARD_THUMBNAIL_MAX_WIDTH
+    try:
+        width, _ = await _get_video_resolution(video_file)
+        thumb_width = _resolve_task_card_thumbnail_width(width)
+        ffmpeg_cmd = config.get_ffmpeg_command()
+        cmd = [
+            ffmpeg_cmd,
+            "-ss",
+            "1",
+            "-i",
+            str(video_file),
+            "-vframes",
+            "1",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "-vf",
+            f"scale={thumb_width}:-1",
+            "-q:v",
+            "4",
+            "-",
+        ]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            timeout=10,
+        )
+        if result.returncode == 0 and result.stdout:
+            return result.stdout, thumb_width
+        logger.warning(
+            "[media] 生成任务卡片缩略图失败: video=%s, returncode=%s, stderr=%s",
+            video_file,
+            result.returncode,
+            (result.stderr or b"")[:200],
+        )
+    except Exception as exc:
+        logger.warning("[media] 生成任务卡片缩略图异常: video=%s, error=%s", video_file, exc)
+    return None, thumb_width
+
+
+async def _ensure_task_card_thumbnail_cached(
+    *,
+    project_id: str,
+    job_dir: Path,
+    video_file: Path,
+    thumbnail_file: Path,
+) -> tuple[Optional[bytes], int, bool]:
+    thumbnail_lock = _get_thumbnail_lock(job_dir)
+    async with thumbnail_lock:
+        cached_bytes = _read_cached_thumbnail_bytes(thumbnail_file)
+        if cached_bytes is not None:
+            return cached_bytes, 0, True
+
+        generated_bytes, thumb_width = await _generate_task_card_thumbnail_bytes(video_file)
+        if generated_bytes is None:
+            return None, thumb_width, False
+
+        try:
+            _write_cached_thumbnail_atomic(thumbnail_file, generated_bytes)
+            logger.info("[media] 缩略图已缓存: project=%s, width=%spx", project_id, thumb_width)
+        except OSError as exc:
+            logger.warning("[media] 缓存缩略图失败: project=%s, error=%s", project_id, exc)
+        return generated_bytes, thumb_width, False
+
+
+def _schedule_auto_thumbnail_generation(project_id: str, video_file: Path, thumbnail_file: Path) -> bool:
+    task_key = str(thumbnail_file.resolve())
+    with _thumbnail_generation_guard:
+        existing_task = _thumbnail_generation_tasks.get(task_key)
+        if existing_task is not None:
+            done_fn = getattr(existing_task, "done", None)
+            if not callable(done_fn) or not bool(done_fn()):
+                return False
+
+        task = asyncio.create_task(_auto_generate_thumbnail(project_id, video_file, thumbnail_file))
+        _thumbnail_generation_tasks[task_key] = task
+
+        add_done_callback = getattr(task, "add_done_callback", None)
+        if callable(add_done_callback):
+            def _cleanup(finished_task, key=task_key):  # noqa: ANN001
+                with _thumbnail_generation_guard:
+                    current_task = _thumbnail_generation_tasks.get(key)
+                    if current_task is finished_task:
+                        _thumbnail_generation_tasks.pop(key, None)
+
+            add_done_callback(_cleanup)
+    return True
 
 
 def _ensure_waveform_audio(job_dir: Path, identifier: str) -> Path:
@@ -1487,113 +1632,51 @@ async def get_thumbnail(identifier: str):
     """
     job_id = identifier
     try:
-        job_dir = _resolve_media_dir(job_id)
+        media_identity = _resolve_media_identity_or_404(job_id)
     except HTTPException as exc:
         if exc.status_code == 404:
-            return JSONResponse(
-                {
-                    "thumbnail": None,
-                    "message": "任务不存在",
-                }
-            )
+            return JSONResponse({"thumbnail": None, "message": "任务不存在"})
         raise
+
+    project_id = media_identity.project_id
+    job_dir = media_identity.project_dir
     if not job_dir.exists():
+        return JSONResponse({"thumbnail": None, "message": "任务不存在"})
+
+    cached_thumbnail = job_dir / TASK_CARD_THUMBNAIL_FILENAME
+    cached_bytes = _read_cached_thumbnail_bytes(cached_thumbnail)
+    if cached_bytes is not None:
         return JSONResponse(
             {
-                "thumbnail": None,
-                "message": "任务不存在",
+                "thumbnail": _encode_thumbnail_data_url(cached_bytes),
+                "cached": True,
             }
         )
 
-    # 检查缓存的缩略图文件
-    cached_thumbnail = job_dir / "thumbnail.jpg"
-    if cached_thumbnail.exists():
-        try:
-            import base64
-            with open(cached_thumbnail, 'rb') as f:
-                img_base64 = base64.b64encode(f.read()).decode('utf-8')
-            return JSONResponse({
-                "thumbnail": f"data:image/jpeg;base64,{img_base64}",
-                "cached": True
-            })
-        except:
-            pass  # 缓存读取失败，重新生成
-
-    try:
-        import base64
-
-        # 查找视频文件
-        video_file = _find_video_file(job_dir)
-        if not video_file:
-            proxy = job_dir / "proxy_720p.mp4"
-            if proxy.exists():
-                video_file = proxy
-            else:
-                return JSONResponse({
-                    "thumbnail": None,
-                    "message": "视频文件不存在"
-                })
-
-        # 获取视频分辨率（决定缩略图大小）
-        width, height = await _get_video_resolution(video_file)
-
-        # 计算缩略图尺寸：只有4K及以上视频才压缩，其他保持原分辨率（但限制最大1920px）
-        if width > 3840:  # 4K视频
-            thumb_width = 1920
-        elif width > 1920:  # 大于1080p但不到4K
-            thumb_width = width  # 保持原分辨率
-        elif width > 0:
-            thumb_width = width  # 保持原分辨率
+    video_file = _find_video_file(job_dir)
+    if not video_file:
+        proxy = job_dir / "proxy_720p.mp4"
+        if proxy.exists():
+            video_file = proxy
         else:
-            thumb_width = 1280  # 默认值（无法检测分辨率时）
+            return JSONResponse({"thumbnail": None, "message": "视频文件不存在"})
 
-        # 获取第一帧作为缩略图
-        ffmpeg_cmd = config.get_ffmpeg_command()
+    thumbnail_bytes, thumb_width, from_cache = await _ensure_task_card_thumbnail_cached(
+        project_id=project_id,
+        job_dir=job_dir,
+        video_file=video_file,
+        thumbnail_file=cached_thumbnail,
+    )
+    if thumbnail_bytes is None:
+        return JSONResponse({"thumbnail": None, "message": "无法生成缩略图"})
 
-        cmd = [
-            ffmpeg_cmd,
-            '-ss', '1',  # 从1秒开始（避免纯黑帧）
-            '-i', str(video_file),
-            '-vframes', '1',  # 只提取1帧
-            '-f', 'image2pipe',
-            '-vcodec', 'mjpeg',
-            '-vf', f'scale={thumb_width}:-1',  # 根据原视频分辨率设置宽度
-            '-q:v', '2',  # 高质量（2-5之间，数字越小质量越高）
-            '-'
-        ]
-
-        result = subprocess.run(
-            cmd, capture_output=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
-            timeout=10
-        )
-
-        if result.returncode == 0 and result.stdout:
-            # 缓存到文件系统
-            try:
-                with open(cached_thumbnail, 'wb') as f:
-                    f.write(result.stdout)
-                print(f"[media] 缩略图已缓存: {job_id} (宽度: {thumb_width}px)")
-            except Exception as e:
-                print(f"[media] 缓存缩略图失败: {e}")
-
-            img_base64 = base64.b64encode(result.stdout).decode('utf-8')
-            return JSONResponse({
-                "thumbnail": f"data:image/jpeg;base64,{img_base64}",
-                "width": thumb_width,
-                "cached": False
-            })
-        else:
-            return JSONResponse({
-                "thumbnail": None,
-                "message": "无法生成缩略图"
-            })
-
-    except Exception as e:
-        return JSONResponse({
-            "thumbnail": None,
-            "message": str(e)
-        })
+    payload = {
+        "thumbnail": _encode_thumbnail_data_url(thumbnail_bytes),
+        "cached": bool(from_cache),
+    }
+    if not from_cache:
+        payload["width"] = thumb_width
+    return JSONResponse(payload)
 
 
 @router.get("/{identifier}/thumbnails")
@@ -2344,7 +2427,7 @@ async def get_media_info(identifier: str, retry_missing: bool = True):
     peaks_caches = list(job_dir.glob("peaks_*_v*.json"))
     sprite_cache = job_dir / "sprite_10.json"
     thumbnails_cache = job_dir / "thumbnails_10.json"
-    thumbnail_single = job_dir / "thumbnail.jpg"
+    thumbnail_single = job_dir / TASK_CARD_THUMBNAIL_FILENAME
 
     srt_file = None
     for file in job_dir.iterdir():
@@ -2376,8 +2459,9 @@ async def get_media_info(identifier: str, retry_missing: bool = True):
         # 2. 如果缩略图缺失但视频文件存在，触发生成
         if not thumbnail_single.exists() and video_file:
             try:
-                print(f"[media] 检测到缩略图缺失，尝试生成: {job_id}")
-                asyncio.create_task(_auto_generate_thumbnail(project_id, video_file, thumbnail_single))
+                started = _schedule_auto_thumbnail_generation(project_id, video_file, thumbnail_single)
+                if started:
+                    print(f"[media] 检测到缩略图缺失，尝试生成: {job_id}")
             except Exception as e:
                 print(f"[media] 缩略图生成失败: {e}")
 
@@ -2533,43 +2617,16 @@ async def _auto_generate_peaks(job_id: str, audio_file: Path, peaks_cache: Path)
 async def _auto_generate_thumbnail(job_id: str, video_file: Path, thumbnail_file: Path):
     """自动生成缩略图（后台任务）"""
     try:
-        import base64
+        if thumbnail_file.exists() or not video_file.exists():
+            return
 
-        # 获取视频分辨率
-        width, height = await _get_video_resolution(video_file)
-
-        # 计算缩略图尺寸
-        if width > 3840:  # 4K视频
-            thumb_width = 1920
-        elif width > 1920:
-            thumb_width = width
-        elif width > 0:
-            thumb_width = width
-        else:
-            thumb_width = 1280
-
-        ffmpeg_cmd = config.get_ffmpeg_command()
-        cmd = [
-            ffmpeg_cmd,
-            '-ss', '1',
-            '-i', str(video_file),
-            '-vframes', '1',
-            '-f', 'image2pipe',
-            '-vcodec', 'mjpeg',
-            '-vf', f'scale={thumb_width}:-1',
-            '-q:v', '2',
-            '-'
-        ]
-
-        result = subprocess.run(
-            cmd, capture_output=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
-            timeout=10
+        generated_bytes, thumb_width, from_cache = await _ensure_task_card_thumbnail_cached(
+            project_id=job_id,
+            job_dir=thumbnail_file.parent,
+            video_file=video_file,
+            thumbnail_file=thumbnail_file,
         )
-
-        if result.returncode == 0 and result.stdout:
-            with open(thumbnail_file, 'wb') as f:
-                f.write(result.stdout)
+        if generated_bytes is not None and not from_cache:
             print(f"[media] 缩略图自动生成成功: {job_id} (宽度: {thumb_width}px)")
     except Exception as e:
         print(f"[media] 缩略图自动生成失败 [{job_id}]: {e}")

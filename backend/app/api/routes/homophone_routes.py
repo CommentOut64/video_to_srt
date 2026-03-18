@@ -18,6 +18,10 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.services.homophone.db import GlobalTermRule
+from app.services.homophone.project_sync import (
+    detect_language_from_segments,
+    sync_project_index_delta,
+)
 from app.services.homophone.runtime import get_homophone_service
 from app.services.homophone.service import SentenceRecord
 from app.services.project_id_resolver import get_project_id_resolver
@@ -102,15 +106,6 @@ def create_homophone_router() -> APIRouter:
             return get_project_id_resolver().resolve_or_fail(normalized_project_id)
         except Exception as exc:
             raise HTTPException(status_code=404, detail="项目未找到") from exc
-
-    def _detect_language_from_text(text: str) -> str:
-        if re.search(r"[ぁ-んァ-ン]", text):
-            return "ja"
-        if re.search(r"[\u4e00-\u9fff]", text):
-            return "zh"
-        if re.search(r"[A-Za-z]", text):
-            return "en"
-        return "zh"
 
     def _collect_segments_from_runtime_snapshot(project_dir: Path) -> List[Dict[str, Any]]:
         """
@@ -229,26 +224,23 @@ def create_homophone_router() -> APIRouter:
             return runtime_segments
         return _collect_segments_from_subtitle_doc(project_dir)
 
-    def _ensure_homophone_index_ready(
+    def _rebuild_homophone_index(
         *,
         project_id: str,
         requested_language: str,
         project_dir: Path,
+        revision: int,
     ) -> Optional[Any]:
-        """确保同音索引可查询。"""
+        """基于当前字幕真源重建同音索引。"""
         homophone_service = get_homophone_service()
-        state = homophone_service.get_index_status(project_id)
-        if state is not None:
-            return state
-
         segments = _collect_segments_for_project(project_dir)
         if not segments:
             return None
 
-        joined_text = "\n".join(str(item.get("text", "")) for item in segments)
-        language = requested_language or _detect_language_from_text(joined_text)
+        detected_language = detect_language_from_segments(segments)
+        language = requested_language if requested_language in {"zh", "ja", "en"} else detected_language
         if language not in {"zh", "ja", "en"}:
-            language = _detect_language_from_text(joined_text)
+            language = detected_language
 
         records = [
             SentenceRecord(
@@ -259,12 +251,32 @@ def create_homophone_router() -> APIRouter:
         ]
         homophone_service.index_chunk(
             project_id=project_id,
-            revision=1,
+            revision=max(1, int(revision)),
             chunk_index=0,
             language=language,
             sentences=records,
         )
         return homophone_service.get_index_status(project_id)
+
+    def _ensure_homophone_index_ready(
+        *,
+        project_id: str,
+        requested_language: str,
+        project_dir: Path,
+    ) -> Optional[Any]:
+        """确保同音索引可查询。"""
+        homophone_service = get_homophone_service()
+        state = homophone_service.get_index_status(project_id)
+        if state is not None and state.status == "ready":
+            return state
+
+        target_revision = state.revision if state is not None else 1
+        return _rebuild_homophone_index(
+            project_id=project_id,
+            requested_language=requested_language,
+            project_dir=project_dir,
+            revision=target_revision,
+        )
 
     @router.post("/projects/{project_id}/homophone/find")
     async def project_homophone_find(project_id: str, payload: HomophoneFindRequest):
@@ -323,39 +335,29 @@ def create_homophone_router() -> APIRouter:
         if not matches:
             segments = _collect_segments_for_project(identity.project_dir)
             if segments:
-                joined_text = "\n".join(str(item.get("text", "")) for item in segments)
-                detected_language = _detect_language_from_text(joined_text)
+                detected_language = detect_language_from_segments(segments)
                 if detected_language in {"zh", "ja", "en"} and detected_language != indexed_language:
-                    records = [
-                        SentenceRecord(
-                            index=int(item.get("id", 0)),
-                            text=str(item.get("text", "")),
-                        )
-                        for item in segments
-                    ]
-                    homophone_service.index_chunk(
+                    refreshed_state = _rebuild_homophone_index(
                         project_id=normalized_project_id,
+                        requested_language=detected_language,
+                        project_dir=identity.project_dir,
                         revision=state.revision,
-                        chunk_index=0,
-                        language=detected_language,
-                        sentences=records,
                     )
-                    refreshed_state = homophone_service.get_index_status(normalized_project_id)
                     if refreshed_state is not None:
                         state = refreshed_state
 
-                    fallback_matches = homophone_service.search_homophone(
-                        project_id=normalized_project_id,
-                        revision=state.revision,
-                        language=detected_language,
-                        query_text=payload.query_text,
-                        mode=payload.mode,
-                        is_ignore_punctuation=payload.is_ignore_punctuation,
-                        limit=payload.limit,
-                    )
-                    if fallback_matches:
-                        matches = fallback_matches
-                        indexed_language = detected_language
+                        fallback_matches = homophone_service.search_homophone(
+                            project_id=normalized_project_id,
+                            revision=state.revision,
+                            language=detected_language,
+                            query_text=payload.query_text,
+                            mode=payload.mode,
+                            is_ignore_punctuation=payload.is_ignore_punctuation,
+                            limit=payload.limit,
+                        )
+                        if fallback_matches:
+                            matches = fallback_matches
+                            indexed_language = detected_language
 
         return {
             "success": True,
@@ -482,7 +484,11 @@ def create_homophone_router() -> APIRouter:
         }
 
         homophone_service = get_homophone_service()
-        state = homophone_service.get_index_status(normalized_project_id)
+        state = _ensure_homophone_index_ready(
+            project_id=normalized_project_id,
+            requested_language=payload.language,
+            project_dir=identity.project_dir,
+        )
         homophone_matches: Dict[int, List[Any]] = {}
         if payload.mode in {"homophone_strict", "homophone_fuzzy"} and state is not None:
             query_matches = homophone_service.search_homophone(
@@ -556,6 +562,14 @@ def create_homophone_router() -> APIRouter:
                 },
             )
             updated_indices.append(sentence_index)
+
+        if updated_indices:
+            refreshed_segments = _collect_segments_for_project(identity.project_dir)
+            sync_project_index_delta(
+                project_id=normalized_project_id,
+                segments=refreshed_segments,
+                updated_sentence_indices=updated_indices,
+            )
 
         return {
             "success": True,

@@ -163,6 +163,7 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, inject } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
 import { usePlaybackStore } from '@/stores/playbackStore'
+import { useEditorProjectionBridge } from '@/stores/editor/editorProjectionBridge'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { ProxyState } from '@/composables/useProxyVideo'
 
@@ -192,6 +193,7 @@ const emit = defineEmits(['loaded', 'error', 'play', 'pause', 'timeupdate', 'end
 // Store
 const projectStore = useProjectStore()
 const playbackStore = usePlaybackStore()
+const editorProjectionBridge = useEditorProjectionBridge()
 
 // 全局播放管理器（单例）
 const playbackManager = usePlaybackManager()
@@ -307,7 +309,9 @@ const canUpgrade = computed(() => {
   return props.currentResolution === '360p' && !props.isUpgrading && !props.autoTrigger720p
 })
 
-const currentSubtitleText = computed(() => projectStore.currentSubtitle?.text || '')
+const currentSubtitleText = computed(() => {
+  return editorProjectionBridge.currentSubtitle?.text || ''
+})
 const isPlaying = computed(() => playbackStore.isPlaying)
 
 // 字幕样式（控制位置）

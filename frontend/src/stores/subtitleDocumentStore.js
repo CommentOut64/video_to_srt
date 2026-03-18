@@ -4,8 +4,16 @@ import localforage from 'localforage'
 import { legacyApi } from '@/services/api'
 import projectApi from '@/services/api/projectApi'
 import { migrateSubtitleSyncQueue } from '@/state/migrations/migrateSubtitleSyncQueue'
+import { isFeatureEnabled } from '@/config/featureFlags'
 import { useProjectStore } from './projectStore'
 import { useTaskRuntimeStore } from './taskRuntimeStore'
+import { useEditorDocumentStore } from './editor/editorDocumentStore'
+import { useEditorProjectionBridge } from './editor/editorProjectionBridge'
+import { useEditorSyncEngine } from './editor/editorSyncEngine'
+import {
+  patchLegacySubtitleSegmentId,
+  restoreLegacySubtitleSnapshot,
+} from './legacySubtitleProjectStoreBridge'
 
 const EDIT_QUEUE_PREFIX = 'subtitle-edit-queue-'
 const TERMINAL_STATUSES = new Set(['finished', 'canceled', 'force_canceled', 'removed', 'failed'])
@@ -42,6 +50,10 @@ function debounce(fn, delay) {
 export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
   const projectStore = useProjectStore()
   const taskRuntimeStore = useTaskRuntimeStore()
+  const docStore = useEditorDocumentStore()
+  const editorProjectionBridge = useEditorProjectionBridge()
+  const syncEngine = useEditorSyncEngine()
+  const useEditorV2 = isFeatureEnabled('USE_EDITOR_V2')
 
   const activeJobId = ref(null)
   const convergedTerminalStatus = ref(new Map())
@@ -52,9 +64,23 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
   const syncErrors = ref(new Map())
   let inflightProcessQueuePromise = null
 
-  const subtitles = computed(() => projectStore.subtitles)
+  function assertLegacyQueueDisabled(apiName) {
+    if (useEditorV2) {
+      throw new Error(`[SubtitleDocumentStore] ${apiName} 在 USE_EDITOR_V2 下已禁用`)
+    }
+  }
+
+  const subtitles = computed(() => (
+    useEditorV2
+      ? editorProjectionBridge.subtitles
+      : projectStore.subtitles
+  ))
   const timeOffsetSec = computed(() => projectStore.subtitleOffset)
-  const selectedSubtitleId = computed(() => projectStore.view.selectedSubtitleId)
+  const selectedSubtitleId = computed(() => (
+    useEditorV2
+      ? editorProjectionBridge.selectedSubtitleId
+      : projectStore.view.selectedSubtitleId
+  ))
 
   const activeTaskStatus = computed(() => {
     if (!activeJobId.value) return 'idle'
@@ -97,19 +123,21 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
   function findSubtitleByQueueKey(queueKey) {
     if (queueKey === undefined || queueKey === null) return null
     const target = String(queueKey)
-    const bySegmentId = projectStore.subtitles.find(
+    const subtitleList = subtitles.value
+
+    const bySegmentId = subtitleList.find(
       (item) => String(item.segment_id || '') === target
     )
     if (bySegmentId) return bySegmentId
 
     const numericKey = Number(queueKey)
     if (Number.isFinite(numericKey)) {
-      const bySentenceIndex = projectStore.subtitles.find(
+      const bySentenceIndex = subtitleList.find(
         (item) => Number(item.sentenceIndex) === numericKey
       )
       if (bySentenceIndex) return bySentenceIndex
     }
-    const byLocalId = projectStore.subtitles.find(
+    const byLocalId = subtitleList.find(
       (item) => String(item.id || '') === target
     )
     if (byLocalId) return byLocalId
@@ -133,8 +161,12 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
     if (!segmentId) return false
     const subtitle = findSubtitleByQueueKey(queueKey)
     if (!subtitle || subtitle.segment_id === segmentId) return false
-    projectStore.updateSubtitle(subtitle.id, { segment_id: String(segmentId) })
-    return true
+    if (useEditorV2) {
+      docStore.updateColdBinding(subtitle.id, String(segmentId))
+      return true
+    }
+    // 仅 legacy 队列迁移链路会走到这里；旧 projectStore 方法查找已收敛到专用 bridge。
+    return patchLegacySubtitleSegmentId(projectStore, subtitle.id, segmentId)
   }
 
   async function resolveProjectSegmentIdFromServer(queueKey, cache) {
@@ -220,7 +252,14 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
   }
 
   async function restoreFromServer(segments = [], metadata = {}) {
-    projectStore.loadFromProjectData(segments, metadata)
+    if (useEditorV2) {
+      void metadata
+      return syncEngine.applyAuthoritativeSegments(segments, {
+        preservePendingCommands: true,
+      })
+    }
+    // 仅 legacy 会话恢复链路仍保留旧快照载入；默认共享编辑器主路径不会触达这里。
+    return restoreLegacySubtitleSnapshot(projectStore, segments, metadata)
   }
 
   async function applyLocalEditQueue(identityId = null) {
@@ -228,10 +267,12 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
     if (!resolvedIdentityId) return 0
 
     await bindSyncIdentity(resolvedIdentityId)
+    assertLegacyQueueDisabled('applyLocalEditQueue')
     return applyPendingEditsToStore(projectStore)
   }
 
   function applyPendingEditsToStore(targetStore = projectStore) {
+    assertLegacyQueueDisabled('applyPendingEditsToStore')
     if (!targetStore || pendingUpdates.value.size === 0) return 0
 
     let appliedCount = 0
@@ -366,6 +407,7 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
   }
 
   async function forceSyncNow() {
+    assertLegacyQueueDisabled('forceSyncNow')
     await processQueue()
   }
 
@@ -374,8 +416,12 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
   }
 
   async function finalizeDraftSubtitlesOnTerminal(reason = 'terminal_status') {
-    const hasDraft = projectStore.subtitles.some((item) => item.isDraft)
+    const hasDraft = subtitles.value.some((item) => item.isDraft)
     if (!hasDraft) return false
+    if (useEditorV2) {
+      console.log(`[SubtitleDocumentStore] 新内核模式跳过旧草稿收敛: ${reason}`)
+      return true
+    }
     await projectStore.finalizeDraftSubtitlesOnCancel()
     console.log(`[SubtitleDocumentStore] 终态草稿收敛已执行: ${reason}`)
     return true
@@ -418,6 +464,10 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
   }
 
   function setSelectedSubtitleId(subtitleId) {
+    if (useEditorV2) {
+      editorProjectionBridge.setSelectedSubtitleId(subtitleId)
+      return
+    }
     projectStore.setSelectedSubtitleId(subtitleId)
   }
 
@@ -434,7 +484,7 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
 
   registerBeforeUnloadIfNeeded()
 
-  return {
+  const sharedApi = {
     activeJobId,
     subtitles,
     timeOffsetSec,
@@ -443,15 +493,25 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
     syncErrors,
     bindTask,
     bindSyncIdentity,
-    restoreFromServer,
-    applyLocalEditQueue,
-    applyPendingEditsToStore,
     onSubtitleEdit,
-    forceSyncNow,
     pendingCount,
     finalizeDraftSubtitlesOnTerminal,
     clearTerminalConverged,
     setTimeOffset,
     setSelectedSubtitleId,
+  }
+
+  // Trade-off: V2 主路径只保留只读桥与必要同步桥，避免默认运行时继续“看得见” legacy 队列 API；
+  // 旧模式仍返回完整接口，供 legacy 会话恢复/导出前补写链路使用。
+  if (useEditorV2) {
+    return sharedApi
+  }
+
+  return {
+    ...sharedApi,
+    restoreFromServer,
+    applyLocalEditQueue,
+    applyPendingEditsToStore,
+    forceSyncNow,
   }
 })

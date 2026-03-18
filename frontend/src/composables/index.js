@@ -28,6 +28,3 @@ export { useWaveformScroll } from './useWaveformScroll'
 export { useWaveformCursorDrag } from './useWaveformCursorDrag'
 export { useWaveformRegions } from './useWaveformRegions'
 export { useWaveformContextMenu } from './useWaveformContextMenu'
-
-// undo/redo 后端增量同步
-export { useUndoRedoSync } from './useUndoRedoSync'

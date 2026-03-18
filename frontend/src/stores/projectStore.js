@@ -10,6 +10,7 @@ import { useRefHistory } from "@vueuse/core";
 import localforage from "localforage";
 import smartSaver from "@/services/SmartSaver";
 import { repairSubtitleOverlaps } from "@/utils/subtitleUtils";
+import { FEATURE_FLAGS } from "@/config/featureFlags";
 
 export const useProjectStore = defineStore("project", () => {
   // ========== 1. 项目元数据 ==========
@@ -73,10 +74,13 @@ export const useProjectStore = defineStore("project", () => {
   //   1. importSRT() - 导入转录结果时
   //   2. restoreProject() - 从缓存/存储恢复项目时
   //   3. resetProject() - 重置项目时
+  // V3.2.5+dev.20260315.01: 新内核启用时禁用深拷贝历史
+  const useDeepHistory = !FEATURE_FLAGS.USE_EDITOR_V2
+
   const {
     history,
-    undo,
-    redo,
+    undo: rawUndo,
+    redo: rawRedo,
     canUndo,
     canRedo,
     clear: clearHistory,
@@ -84,11 +88,30 @@ export const useProjectStore = defineStore("project", () => {
     resume: resumeHistory,
     isTracking: isHistoryTracking,
   } = useRefHistory(subtitles, {
-    deep: true,
-    capacity: 50, // 限制历史记录步数
-    clone: true, // 深拷贝，确保历史记录独立
-    flush: 'sync', // 同步记录，避免一次操作产生多个历史记录
+    deep: useDeepHistory,
+    capacity: 50,
+    clone: useDeepHistory,
+    flush: 'sync',
   });
+
+  function assertLegacySubtitleMutationAllowed(methodName) {
+    if (!FEATURE_FLAGS.USE_EDITOR_V2) {
+      return;
+    }
+    throw new Error(
+      `[ProjectStore] ${methodName} 在 USE_EDITOR_V2 下已禁用；请改走 editorCommandBus / editorDocumentStore 新链路`
+    );
+  }
+
+  function undo() {
+    assertLegacySubtitleMutationAllowed("undo");
+    rawUndo();
+  }
+
+  function redo() {
+    assertLegacySubtitleMutationAllowed("redo");
+    rawRedo();
+  }
 
   // ========== 4. 播放器全局状态 ==========
   const player = ref({
@@ -332,12 +355,14 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   function insertSubtitleAt(index, subtitle) {
+    assertLegacySubtitleMutationAllowed("insertSubtitleAt");
     const insertIndex = Math.max(0, Math.min(index, subtitles.value.length));
     subtitles.value.splice(insertIndex, 0, subtitle);
     return insertIndex;
   }
 
   function removeSubtitleAt(index) {
+    assertLegacySubtitleMutationAllowed("removeSubtitleAt");
     if (index < 0 || index >= subtitles.value.length) {
       return null;
     }
@@ -388,6 +413,7 @@ export const useProjectStore = defineStore("project", () => {
   watch(
     [subtitles, meta],
     () => {
+      if (FEATURE_FLAGS.USE_EDITOR_V2) return;
       // 跳过保存后的状态更新触发
       if (isUpdatingAfterSave) return;
       const cacheKey = meta.value.projectId || meta.value.jobId;
@@ -523,6 +549,7 @@ export const useProjectStore = defineStore("project", () => {
    * @param {Object} metadata - 可选的附加 meta
    */
   function loadFromProjectData(payload, metadata = {}) {
+    assertLegacySubtitleMutationAllowed("loadFromProjectData");
     const segments = Array.isArray(payload) ? payload : payload?.segments || [];
     const docMeta = Array.isArray(payload) ? null : payload?.doc_meta || payload?.meta || null;
     const now = Date.now();
@@ -580,6 +607,9 @@ export const useProjectStore = defineStore("project", () => {
    * 从缓存/存储恢复项目
    */
   async function restoreProject(identityId) {
+    if (FEATURE_FLAGS.USE_EDITOR_V2) {
+      return false;
+    }
     if (!identityId) {
       return false;
     }
@@ -628,6 +658,7 @@ export const useProjectStore = defineStore("project", () => {
    * 更新字幕内容
    */
   function updateSubtitle(id, payload, options = {}) {
+    assertLegacySubtitleMutationAllowed("updateSubtitle");
     const index = subtitles.value.findIndex((s) => s.id === id);
     if (index === -1) return;
 
@@ -683,6 +714,7 @@ export const useProjectStore = defineStore("project", () => {
    * V3.1.2+dev.20260112.01: 补齐 sentenceIndex、display_confidence、confidence_source 字段
    */
   function addSubtitle(insertIndex, payload) {
+    assertLegacySubtitleMutationAllowed("addSubtitle");
     const newSubtitle = {
       id: `subtitle-${Date.now()}`,
       sentenceIndex: payload.sentenceIndex,  // V3.1.2: 全局句子索引
@@ -710,6 +742,7 @@ export const useProjectStore = defineStore("project", () => {
    * 删除字幕
    */
   function removeSubtitle(id, options = {}) {
+    assertLegacySubtitleMutationAllowed("removeSubtitle");
     const index = subtitles.value.findIndex((s) => s.id === id);
     if (index !== -1) {
       const subtitle = subtitles.value[index];
@@ -757,6 +790,7 @@ export const useProjectStore = defineStore("project", () => {
    * @returns {Object|null} 切分结果 { success, leftId, rightId, error }
    */
   function splitSubtitle(id, options = {}) {
+    assertLegacySubtitleMutationAllowed("splitSubtitle");
     const { splitTime, cursorPosition } = options;
 
     // 1. 查找目标字幕
@@ -1019,6 +1053,7 @@ export const useProjectStore = defineStore("project", () => {
    * @returns {Object} { success, keptSubtitle, removedSubtitle, error }
    */
   function mergeSubtitles(id, direction) {
+    assertLegacySubtitleMutationAllowed("mergeSubtitles");
     // 1. 查找当前字幕
     const index = subtitles.value.findIndex((s) => s.id === id);
     if (index === -1) {
@@ -1868,7 +1903,7 @@ export const useProjectStore = defineStore("project", () => {
       .padStart(3, "0")}`;
   }
 
-  return {
+  const sharedApi = {
     // 状态
     meta,
     subtitles,
@@ -1914,19 +1949,10 @@ export const useProjectStore = defineStore("project", () => {
     setPlaybackRate,
     setIsPlaying,
     setPlayerSeeking,
-    insertSubtitleAt,
-    removeSubtitleAt,
     importSRT,
     importSegments,
-    loadFromProjectData,
-    restoreProject,
-    updateSubtitle,
-    addSubtitle,
-    removeSubtitle,
     markSentenceDeleted,
     isSentenceDeleted,
-    splitSubtitle,  // 字幕切分
-    mergeSubtitles, // 字幕合并
     generateSRT,
     seekTo,
     saveProject,
@@ -1950,5 +1976,22 @@ export const useProjectStore = defineStore("project", () => {
     applyOffsetToSentenceData,
     formatTimestamp,
     parseTimestamp,
+  };
+
+  if (FEATURE_FLAGS.USE_EDITOR_V2) {
+    return sharedApi;
+  }
+
+  return {
+    ...sharedApi,
+    insertSubtitleAt,
+    removeSubtitleAt,
+    loadFromProjectData,
+    restoreProject,
+    updateSubtitle,
+    addSubtitle,
+    removeSubtitle,
+    splitSubtitle,  // 字幕切分
+    mergeSubtitles, // 字幕合并
   };
 });

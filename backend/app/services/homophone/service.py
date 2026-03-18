@@ -103,6 +103,112 @@ class HomophoneService:
             )
         )
 
+    def sync_sentences(
+        self,
+        *,
+        project_id: str,
+        revision: int,
+        language: Language,
+        sentences: Iterable[SentenceRecord],
+    ) -> None:
+        """按句增量同步索引，适用于少量字幕编辑。"""
+        normalized_sentences = list(sentences)
+        if not normalized_sentences:
+            return
+
+        now = self._now_iso()
+        self._db.upsert_index_state(
+            IndexState(
+                project_id=project_id,
+                revision=revision,
+                status="building",
+                last_committed_chunk=0,
+                heartbeat_at=now,
+                updated_at=now,
+            )
+        )
+
+        for sentence in normalized_sentences:
+            records = self._build_posting_records(
+                project_id=project_id,
+                revision=revision,
+                language=language,
+                chunk_index=0,
+                sentence=sentence,
+            )
+            self._db.replace_sentence_postings(
+                project_id=project_id,
+                revision=revision,
+                sentence_index=sentence.index,
+                records=records,
+            )
+
+        now_done = self._now_iso()
+        self._db.upsert_index_state(
+            IndexState(
+                project_id=project_id,
+                revision=revision,
+                status="ready",
+                last_committed_chunk=0,
+                heartbeat_at=now_done,
+                updated_at=now_done,
+            )
+        )
+
+    def remove_sentences(
+        self,
+        *,
+        project_id: str,
+        revision: int,
+        sentence_indices: Iterable[int],
+    ) -> None:
+        """按句删除索引，适用于字幕删除。"""
+        normalized_indices = sorted({int(item) for item in sentence_indices})
+        if not normalized_indices:
+            return
+
+        now = self._now_iso()
+        self._db.upsert_index_state(
+            IndexState(
+                project_id=project_id,
+                revision=revision,
+                status="building",
+                last_committed_chunk=0,
+                heartbeat_at=now,
+                updated_at=now,
+            )
+        )
+        self._db.delete_sentence_postings(
+            project_id=project_id,
+            revision=revision,
+            sentence_indices=normalized_indices,
+        )
+        now_done = self._now_iso()
+        self._db.upsert_index_state(
+            IndexState(
+                project_id=project_id,
+                revision=revision,
+                status="ready",
+                last_committed_chunk=0,
+                heartbeat_at=now_done,
+                updated_at=now_done,
+            )
+        )
+
+    def mark_index_failed(self, *, project_id: str, revision: int) -> None:
+        """显式标记索引失效，促使下次查询走全量重建。"""
+        now = self._now_iso()
+        self._db.upsert_index_state(
+            IndexState(
+                project_id=project_id,
+                revision=revision,
+                status="failed",
+                last_committed_chunk=0,
+                heartbeat_at=now,
+                updated_at=now,
+            )
+        )
+
     def search_homophone(
         self,
         *,
@@ -620,6 +726,37 @@ class HomophoneService:
 
     def get_index_status(self, project_id: str) -> Optional[IndexState]:
         return self._db.get_latest_index_state(project_id)
+
+    def _build_posting_records(
+        self,
+        *,
+        project_id: str,
+        revision: int,
+        language: Language,
+        chunk_index: int,
+        sentence: SentenceRecord,
+    ) -> List[PostingRecord]:
+        records: List[PostingRecord] = []
+        token_readings = self._tokenizer.tokenize(sentence.text, language)
+        for token_index, token in enumerate(token_readings):
+            records.append(
+                PostingRecord(
+                    project_id=project_id,
+                    revision=revision,
+                    language=language,
+                    chunk_index=chunk_index,
+                    sentence_index=sentence.index,
+                    token_index=token_index,
+                    token_text=token.token_text,
+                    reading_key=token.reading_key,
+                    reading_key_fuzzy=token.reading_key_fuzzy,
+                    reading_key_no_punct=token.reading_key_no_punct,
+                    reading_key_fuzzy_no_punct=token.reading_key_fuzzy_no_punct,
+                    char_start=token.char_start,
+                    char_end=token.char_end,
+                )
+            )
+        return records
 
     @staticmethod
     def _now_iso() -> str:

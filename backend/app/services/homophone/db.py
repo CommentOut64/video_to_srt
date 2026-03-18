@@ -304,6 +304,76 @@ class HomophoneDb:
                 ],
             )
 
+    def replace_sentence_postings(
+        self,
+        *,
+        project_id: str,
+        revision: int,
+        sentence_index: int,
+        records: Iterable[PostingRecord],
+    ) -> None:
+        """按句替换 postings，用于编辑后的增量同步。"""
+        rows = list(records)
+        with self.connect() as conn:
+            conn.execute(
+                """
+                DELETE FROM homophone_postings
+                WHERE project_id=? AND revision=? AND sentence_index=?
+                """,
+                (project_id, revision, sentence_index),
+            )
+            if not rows:
+                return
+            conn.executemany(
+                """
+                INSERT INTO homophone_postings(
+                    project_id, revision, language, chunk_index, sentence_index, token_index,
+                    token_text, reading_key, reading_key_fuzzy,
+                    reading_key_no_punct, reading_key_fuzzy_no_punct,
+                    char_start, char_end
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        rec.project_id,
+                        rec.revision,
+                        rec.language,
+                        rec.chunk_index,
+                        rec.sentence_index,
+                        rec.token_index,
+                        rec.token_text,
+                        rec.reading_key,
+                        rec.reading_key_fuzzy,
+                        rec.reading_key_no_punct,
+                        rec.reading_key_fuzzy_no_punct,
+                        rec.char_start,
+                        rec.char_end,
+                    )
+                    for rec in rows
+                ],
+            )
+
+    def delete_sentence_postings(
+        self,
+        *,
+        project_id: str,
+        revision: int,
+        sentence_indices: Iterable[int],
+    ) -> None:
+        """删除指定句子的 postings，用于删除字幕后的增量同步。"""
+        normalized_indices = sorted({int(item) for item in sentence_indices})
+        if not normalized_indices:
+            return
+        placeholders = ",".join("?" for _ in normalized_indices)
+        params: List[object] = [project_id, revision]
+        params.extend(normalized_indices)
+        sql = f"""
+            DELETE FROM homophone_postings
+            WHERE project_id=? AND revision=? AND sentence_index IN ({placeholders})
+        """
+        with self.connect() as conn:
+            conn.execute(sql, tuple(params))
+
     def query_postings(
         self,
         *,

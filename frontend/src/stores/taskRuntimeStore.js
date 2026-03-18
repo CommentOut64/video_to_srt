@@ -10,6 +10,8 @@ import { defineStore } from 'pinia'
 import { ref, computed, watch, reactive } from 'vue'
 import { useRouter } from 'vue-router'
 import { useProjectStore } from './projectStore'
+import { useEditorSyncEngine } from './editor/editorSyncEngine'
+import { isFeatureEnabled } from '@/config/featureFlags'
 import { normalizeTimestamp } from '@/utils/timestamp'
 import { navigateToEditor } from '@/utils/editorNavigation'
 
@@ -21,6 +23,7 @@ const TASK_MODE = {
   TRANSCRIBE: 'transcribe',
   SUBTITLE_EDIT: 'subtitle_edit',
 }
+const useEditorV2 = isFeatureEnabled('USE_EDITOR_V2')
 
 function clampPercent(value) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return 0
@@ -1040,9 +1043,17 @@ export const useTaskRuntimeStore = defineStore('taskRuntime', () => {
       return
     }
 
-    // 调用 ProjectStore 的保存逻辑
-    const projectStore = useProjectStore()
-    await projectStore.saveProject()
+    if (useEditorV2) {
+      const syncEngine = useEditorSyncEngine()
+      if (typeof syncEngine.flushStrict === 'function') {
+        await syncEngine.flushStrict()
+      } else {
+        await syncEngine.flush()
+      }
+    } else {
+      const projectStore = useProjectStore()
+      await projectStore.saveProject()
+    }
 
     currentTask.value.isDirty = false
     console.log(`[TaskRuntimeStore] 当前任务已保存: ${currentTask.value.job_id}`)
