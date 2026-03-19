@@ -12,6 +12,8 @@ directories:
 
 files:
   - main.js
+  - shell_logging.js
+  - shell_runtime_config.js
   - preload.js
   - loading.html
   - package.json

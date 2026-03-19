@@ -87,6 +87,10 @@ jobs:
           .\.venv\Scripts\python.exe -m pip install --upgrade pip
           .\.venv\Scripts\python.exe -m pip install -r requirements-ci.txt
 
+      - name: Run packaging pipeline guards
+        shell: pwsh
+        run: .\.venv\Scripts\python.exe ci_tests\quality\check_packaging_pipeline_guards.py
+
       - name: Run ruff (backend minimal)
         shell: pwsh
         run: .\.venv\Scripts\python.exe -m ruff check backend

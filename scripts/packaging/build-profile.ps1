@@ -27,6 +27,22 @@ function Invoke-Checked {
     & $Action
 }
 
+function Copy-Tree {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Source,
+        [Parameter(Mandatory = $true)]
+        [string]$Destination
+    )
+
+    if (-not (Test-Path $Source)) {
+        throw "复制源目录不存在: $Source"
+    }
+
+    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+    Copy-Item -Path (Join-Path $Source "*") -Destination $Destination -Recurse -Force
+}
+
 function Resolve-EmbeddedPythonVersion {
     param([pscustomobject]$PythonConfig)
     $hasEmbeddedVersion = $false
@@ -52,21 +68,154 @@ function Get-EmbeddedPythonDownloadUrl {
     return "https://www.python.org/ftp/python/$Version/python-$Version-embed-amd64.zip"
 }
 
+function Get-FileSha256OrEmpty {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) {
+        return ""
+    }
+    return (Get-FileHash -Path $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Get-Sha256FromText {
+    param([string]$Text)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+        $hashBytes = $sha.ComputeHash($bytes)
+        return ([System.BitConverter]::ToString($hashBytes)).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+function Get-DependencyInputDigests {
+    param([string]$ProjectRoot)
+
+    # 设计取舍：
+    # - pyproject.toml 定义直接依赖与 extras，必须纳入指纹。
+    # - uv.lock 代表已解析依赖集合；即便当前打包由 pip 执行，也要纳入失效输入，避免锁文件更新后复用旧缓存。
+    $trackedFiles = @(
+        "pyproject.toml",
+        "uv.lock"
+    )
+    $digests = [ordered]@{}
+    foreach ($relativePath in $trackedFiles) {
+        $absolutePath = Join-Path $ProjectRoot $relativePath
+        $digests[$relativePath] = Get-FileSha256OrEmpty -Path $absolutePath
+    }
+    return $digests
+}
+
+function Get-PipEnvironmentOverrides {
+    param(
+        [string]$ProjectRoot,
+        [string[]]$Extras
+    )
+    $pipEnv = [ordered]@{
+        "PIP_DISABLE_PIP_VERSION_CHECK" = "1"
+        "PIP_NO_INPUT" = "1"
+        "PYTHONIOENCODING" = "utf-8"
+        "PYTHONUTF8" = "1"
+    }
+
+    $indexUrl = [string]$env:ANCHORFLUX_PIP_INDEX_URL
+    if ([string]::IsNullOrWhiteSpace($indexUrl)) {
+        $indexUrl = [string]$env:PIP_INDEX_URL
+    }
+    if ([string]::IsNullOrWhiteSpace($indexUrl)) {
+        $indexUrl = "https://pypi.tuna.tsinghua.edu.cn/simple"
+    }
+    $pipEnv["PIP_INDEX_URL"] = $indexUrl
+
+    $extraIndexUrl = [string]$env:ANCHORFLUX_PIP_EXTRA_INDEX_URL
+    if ([string]::IsNullOrWhiteSpace($extraIndexUrl) -and ($Extras -contains "full")) {
+        $extraIndexUrl = "https://download.pytorch.org/whl/cu128"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($extraIndexUrl)) {
+        $pipEnv["PIP_EXTRA_INDEX_URL"] = $extraIndexUrl
+    }
+
+    $pipCacheDir = Join-Path $ProjectRoot "dist\cache\pip"
+    New-Item -ItemType Directory -Force -Path $pipCacheDir | Out-Null
+    $pipEnv["PIP_CACHE_DIR"] = $pipCacheDir
+
+    return $pipEnv
+}
+
+function Get-DependencyFingerprint {
+    param(
+        [string]$ProjectRoot,
+        [string]$EmbeddedVersion,
+        [string[]]$Extras,
+        [System.Collections.IDictionary]$PipEnvOverrides,
+        [System.Collections.IDictionary]$DependencyInputDigests
+    )
+
+    $extrasSorted = @($Extras | Sort-Object -Unique)
+    $payload = [ordered]@{
+        schema = "runtime-cache-v2"
+        embedded_version = $EmbeddedVersion
+        extras = $extrasSorted
+        dependency_inputs = $DependencyInputDigests
+        pyproject_sha256 = [string]$DependencyInputDigests["pyproject.toml"]
+        uv_lock_sha256 = [string]$DependencyInputDigests["uv.lock"]
+        pip_index_url = [string]$PipEnvOverrides["PIP_INDEX_URL"]
+        pip_extra_index_url = [string]$PipEnvOverrides["PIP_EXTRA_INDEX_URL"]
+    }
+    $payloadJson = $payload | ConvertTo-Json -Depth 8 -Compress
+    return Get-Sha256FromText -Text $payloadJson
+}
+
+function Get-EmbeddedPythonCacheZipPath {
+    param(
+        [string]$ProjectRoot,
+        [string]$Version
+    )
+    $cacheDir = Join-Path $ProjectRoot "dist\cache\python-embed"
+    New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+    return (Join-Path $cacheDir ("python-" + $Version + "-embed-amd64.zip"))
+}
+
+function Download-EmbeddedPythonZipToCache {
+    param(
+        [string]$ProjectRoot,
+        [string]$Version
+    )
+    $cachedZipPath = Get-EmbeddedPythonCacheZipPath -ProjectRoot $ProjectRoot -Version $Version
+    if (Test-Path $cachedZipPath) {
+        Write-Host "[cache] 命中嵌入式 Python 包缓存: $cachedZipPath"
+        return $cachedZipPath
+    }
+
+    $downloadUrl = Get-EmbeddedPythonDownloadUrl -Version $Version
+    $tmpZipPath = $cachedZipPath + ".tmp"
+    Remove-Item -Path $tmpZipPath -Force -ErrorAction SilentlyContinue
+    Write-Host "[step] 下载嵌入式 Python: $downloadUrl"
+    Invoke-WebRequest -Uri $downloadUrl -OutFile $tmpZipPath
+    Move-Item -Path $tmpZipPath -Destination $cachedZipPath -Force
+    return $cachedZipPath
+}
+
 function Download-EmbeddedPython {
     param(
+        [string]$ProjectRoot,
         [string]$Version,
         [string]$RuntimeDir
     )
     $pythonRoot = Join-Path $RuntimeDir "tools\python"
     New-Item -ItemType Directory -Force -Path $pythonRoot | Out-Null
 
-    $zipPath = Join-Path $RuntimeDir ("python-embed-" + $Version + ".zip")
-    $downloadUrl = Get-EmbeddedPythonDownloadUrl -Version $Version
-
-    Write-Host "[step] 下载嵌入式 Python: $downloadUrl"
-    Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath
-    Expand-Archive -Path $zipPath -DestinationPath $pythonRoot -Force
-    Remove-Item -Path $zipPath -Force -ErrorAction SilentlyContinue
+    $cachedZipPath = Download-EmbeddedPythonZipToCache -ProjectRoot $ProjectRoot -Version $Version
+    try {
+        Expand-Archive -Path $cachedZipPath -DestinationPath $pythonRoot -Force
+    }
+    catch {
+        Write-Host "[warn] 嵌入式 Python 缓存损坏，删除后重新下载: $cachedZipPath"
+        Remove-Item -Path $cachedZipPath -Force -ErrorAction SilentlyContinue
+        $cachedZipPath = Download-EmbeddedPythonZipToCache -ProjectRoot $ProjectRoot -Version $Version
+        Expand-Archive -Path $cachedZipPath -DestinationPath $pythonRoot -Force
+    }
 
     $pythonExe = Join-Path $pythonRoot "python.exe"
     if (-not (Test-Path $pythonExe)) {
@@ -117,16 +266,31 @@ function Enable-EmbeddedPythonSitePackages {
     [System.IO.File]::WriteAllText($pthFile.FullName, ($updated -join "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
 }
 
-function Get-ExtrasFromSyncArgs {
-    param([object[]]$SyncArgs)
-    $result = @()
-    for ($i = 0; $i -lt $SyncArgs.Count; $i++) {
-        if ($SyncArgs[$i] -eq "--extra" -and $i + 1 -lt $SyncArgs.Count) {
-            $result += [string]$SyncArgs[$i + 1]
-            $i++
-        }
+function Get-ExtrasFromPythonConfig {
+    param([pscustomobject]$PythonConfig)
+
+    $hasExtras = $PythonConfig.PSObject.Properties.Name -contains "extras"
+    if (-not $hasExtras) {
+        throw "profile manifest 缺少 python.extras 字段，请更新清单语义"
     }
-    return $result
+
+    $extrasValue = $PythonConfig.extras
+    if ($null -eq $extrasValue) {
+        return @()
+    }
+    if ($extrasValue -isnot [System.Collections.IEnumerable] -or $extrasValue -is [string]) {
+        throw "profile manifest 的 python.extras 必须是数组"
+    }
+
+    $extras = @()
+    foreach ($extra in $extrasValue) {
+        $normalized = [string]$extra
+        if ([string]::IsNullOrWhiteSpace($normalized)) {
+            continue
+        }
+        $extras += $normalized.Trim()
+    }
+    return $extras
 }
 
 function Install-EmbeddedPythonDependencies {
@@ -143,37 +307,9 @@ function Install-EmbeddedPythonDependencies {
     New-Item -ItemType Directory -Force -Path $sitePackages | Out-Null
 
     $pythonConfig = $Manifest.python
-    $syncArgs = @([string[]]$pythonConfig.syncArgs)
-    $extras = @(Get-ExtrasFromSyncArgs -SyncArgs $syncArgs)
+    $extras = @(Get-ExtrasFromPythonConfig -PythonConfig $pythonConfig)
 
-    $packageSpec = "."
-    if ($extras.Count -gt 0) {
-        $packageSpec = ".[" + ($extras -join ",") + "]"
-    }
-
-    $pipEnv = @{
-        "PIP_DISABLE_PIP_VERSION_CHECK" = "1"
-        "PIP_NO_INPUT" = "1"
-        "PYTHONIOENCODING" = "utf-8"
-        "PYTHONUTF8" = "1"
-    }
-
-    $indexUrl = [string]$env:ANCHORFLUX_PIP_INDEX_URL
-    if ([string]::IsNullOrWhiteSpace($indexUrl)) {
-        $indexUrl = [string]$env:PIP_INDEX_URL
-    }
-    if ([string]::IsNullOrWhiteSpace($indexUrl)) {
-        $indexUrl = "https://pypi.tuna.tsinghua.edu.cn/simple"
-    }
-    $pipEnv["PIP_INDEX_URL"] = $indexUrl
-
-    $extraIndexUrl = [string]$env:ANCHORFLUX_PIP_EXTRA_INDEX_URL
-    if ([string]::IsNullOrWhiteSpace($extraIndexUrl) -and ($extras -contains "full")) {
-        $extraIndexUrl = "https://download.pytorch.org/whl/cu128"
-    }
-    if (-not [string]::IsNullOrWhiteSpace($extraIndexUrl)) {
-        $pipEnv["PIP_EXTRA_INDEX_URL"] = $extraIndexUrl
-    }
+    $pipEnv = Get-PipEnvironmentOverrides -ProjectRoot $ProjectRoot -Extras $extras
 
     $envBackup = @{}
     foreach ($entry in $pipEnv.GetEnumerator()) {
@@ -201,17 +337,29 @@ function Install-EmbeddedPythonDependencies {
         }
 
         Write-Host "[step] 安装构建后端(hatchling)"
-        & $pythonExe -m pip install --no-warn-script-location --no-cache-dir hatchling
+        & $pythonExe -m pip install --no-warn-script-location hatchling
         if ($LASTEXITCODE -ne 0) {
             throw "hatchling 安装失败"
         }
 
-        Write-Host "[step] 安装依赖到嵌入式 Python: $packageSpec"
+        # 设计取舍：
+        # - 基线依赖（Lite/Full 共用）先安装，确保两种 profile 命中同一套 pip 缓存。
+        # - Full 再按 extras 做增量安装，避免每次都按 Full 全量下载。
         Push-Location $ProjectRoot
         try {
-            & $pythonExe -m pip install --no-warn-script-location --no-cache-dir --no-build-isolation $packageSpec
+            Write-Host "[step] 安装 Lite/Full 共用基线依赖: ."
+            & $pythonExe -m pip install --no-warn-script-location --no-build-isolation .
             if ($LASTEXITCODE -ne 0) {
-                throw "pip 安装依赖失败"
+                throw "pip 安装基线依赖失败"
+            }
+
+            if ($extras.Count -gt 0) {
+                $extraPackageSpec = ".[" + ($extras -join ",") + "]"
+                Write-Host "[step] 安装 Full 增量依赖: $extraPackageSpec"
+                & $pythonExe -m pip install --no-warn-script-location --no-build-isolation $extraPackageSpec
+                if ($LASTEXITCODE -ne 0) {
+                    throw "pip 安装增量依赖失败"
+                }
             }
         }
         finally {
@@ -378,8 +526,27 @@ function Build-PythonRuntime {
     New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
 
     $pythonConfig = $Manifest.python
+    $extras = @(Get-ExtrasFromPythonConfig -PythonConfig $pythonConfig)
     $embeddedVersion = Resolve-EmbeddedPythonVersion -PythonConfig $pythonConfig
-    $pythonRoot = Download-EmbeddedPython -Version $embeddedVersion -RuntimeDir $RuntimeDir
+    $pipEnvOverrides = Get-PipEnvironmentOverrides -ProjectRoot $ProjectRoot -Extras $extras
+    $dependencyInputDigests = Get-DependencyInputDigests -ProjectRoot $ProjectRoot
+    $dependencyFingerprint = Get-DependencyFingerprint `
+        -ProjectRoot $ProjectRoot `
+        -EmbeddedVersion $embeddedVersion `
+        -Extras $extras `
+        -PipEnvOverrides $pipEnvOverrides `
+        -DependencyInputDigests $dependencyInputDigests
+
+    $runtimeCacheRoot = Join-Path $ProjectRoot "dist\cache\python-runtime"
+    $runtimeCacheDir = Join-Path $runtimeCacheRoot $dependencyFingerprint
+    if (Test-Path $runtimeCacheDir) {
+        Write-Host "[cache] 命中 Python 运行时缓存: $runtimeCacheDir"
+        Copy-Tree -Source $runtimeCacheDir -Destination $RuntimeDir
+        return
+    }
+    Write-Host "[cache] 未命中 Python 运行时缓存，执行全量构建: $runtimeCacheDir"
+
+    $pythonRoot = Download-EmbeddedPython -ProjectRoot $ProjectRoot -Version $embeddedVersion -RuntimeDir $RuntimeDir
     Enable-EmbeddedPythonSitePackages -PythonRoot $pythonRoot
     Install-EmbeddedPythonDependencies -ProjectRoot $ProjectRoot -PythonRoot $pythonRoot -Manifest $Manifest
 
@@ -402,6 +569,27 @@ function Build-PythonRuntime {
             Copy-Item -Path $toolPath -Destination (Join-Path $RuntimeDir "tools\$toolName") -Force
         }
     }
+
+    New-Item -ItemType Directory -Force -Path $runtimeCacheRoot | Out-Null
+    $tmpRuntimeCacheDir = Join-Path $runtimeCacheRoot ("tmp-" + [guid]::NewGuid().ToString("N"))
+    Copy-Tree -Source $RuntimeDir -Destination $tmpRuntimeCacheDir
+    if (Test-Path $runtimeCacheDir) {
+        Remove-Item -Recurse -Force -Path $runtimeCacheDir -ErrorAction SilentlyContinue
+    }
+    Move-Item -Path $tmpRuntimeCacheDir -Destination $runtimeCacheDir -Force
+    $runtimeCacheMetadata = [ordered]@{
+        fingerprint = $dependencyFingerprint
+        generated_at = (Get-Date).ToUniversalTime().ToString("o")
+        embedded_version = $embeddedVersion
+        extras = @($extras | Sort-Object -Unique)
+        dependency_inputs = $dependencyInputDigests
+        pyproject_sha256 = [string]$dependencyInputDigests["pyproject.toml"]
+        uv_lock_sha256 = [string]$dependencyInputDigests["uv.lock"]
+        pip_index_url = [string]$pipEnvOverrides["PIP_INDEX_URL"]
+        pip_extra_index_url = [string]$pipEnvOverrides["PIP_EXTRA_INDEX_URL"]
+    }
+    $runtimeCacheMetadata | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $runtimeCacheDir "runtime-cache-meta.json") -Encoding UTF8
+    Write-Host "[cache] 已写入 Python 运行时缓存: $runtimeCacheDir"
 
 }
 
