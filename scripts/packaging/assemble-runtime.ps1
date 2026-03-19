@@ -76,6 +76,8 @@ function Write-PackagedEnvFile {
         [Parameter(Mandatory = $true)]
         [string]$TargetPath,
         [Parameter(Mandatory = $true)]
+        [string]$VersionValue,
+        [Parameter(Mandatory = $true)]
         [string]$ProfileValue,
         [Parameter(Mandatory = $true)]
         [string]$FlavorValue,
@@ -91,6 +93,7 @@ function Write-PackagedEnvFile {
     $lines = @(
         "# 打包产物运行配置（由打包脚本生成）",
         "DEV_MODE=false",
+        "ANCHORFLUX_BUILD_VERSION=$VersionValue",
         "ANCHORFLUX_PROFILE=$ProfileValue",
         "ANCHORFLUX_FLAVOR=$FlavorValue",
         "ANCHORFLUX_LITE=$liteFlag",
@@ -142,6 +145,7 @@ foreach ($optionalFile in @("user_config.json", "model_runtime_config.json")) {
 }
 Write-PackagedEnvFile `
     -TargetPath (Join-Path $appRoot ".env") `
+    -VersionValue $Version `
     -ProfileValue $Profile `
     -FlavorValue $Flavor `
     -UiModeValue $UiMode `

@@ -1,5 +1,11 @@
 const path = require("path");
-const { app, BrowserWindow, nativeTheme, shell } = require("electron");
+const {
+  app,
+  BrowserWindow,
+  ipcMain,
+  nativeTheme,
+  shell,
+} = require("electron");
 const fs = require("fs");
 const http = require("http");
 const https = require("https");
@@ -9,6 +15,9 @@ const {
   ensureLogDir,
   safeAppendLog,
 } = require("./shell_logging");
+const {
+  resolveShellRuntimeConfig,
+} = require("./shell_runtime_config");
 
 const BACKEND_BASE_URL =
   process.env.ANCHORFLUX_BACKEND_URL || "http://127.0.0.1:8000";
@@ -23,6 +32,9 @@ const SHELL_FORCE_EXIT_MS = Number(
   process.env.ANCHORFLUX_SHELL_FORCE_EXIT_MS || 15000
 );
 const WINDOW_BG_COLOR = "#0b1220";
+const SHELL_RUNTIME_CONFIG = resolveShellRuntimeConfig({ env: process.env });
+const DEBUG_FLAGS = SHELL_RUNTIME_CONFIG.debugFlags;
+const PERFORMANCE_FLAGS = SHELL_RUNTIME_CONFIG.performanceFlags;
 const SHELL_LOG_DIR = resolveShellLogDir({
   env: process.env,
   execPath: process.execPath,
@@ -49,6 +61,48 @@ function writeShellLog(level, message, error = null) {
   } catch (_) {
     // 日志写入失败时保持静默，避免递归报错。
   }
+}
+
+function buildDebugFlags() {
+  return {
+    nativeContextMenuEnabled: Boolean(DEBUG_FLAGS.nativeContextMenuEnabled),
+    devToolsEnabled: Boolean(DEBUG_FLAGS.devToolsEnabled),
+    rendererProfilingEnabled: Boolean(DEBUG_FLAGS.rendererProfilingEnabled),
+    openDevToolsOnLaunch: Boolean(DEBUG_FLAGS.openDevToolsOnLaunch),
+  };
+}
+
+async function collectRuntimeDiagnostics() {
+  const diagnostics = {
+    timestamp: Date.now(),
+    debugFlags: buildDebugFlags(),
+    performanceFlags: {
+      antiThrottlingEnabled: Boolean(PERFORMANCE_FLAGS.antiThrottlingEnabled),
+      metricsLoggingEnabled: Boolean(PERFORMANCE_FLAGS.metricsLoggingEnabled),
+      diagnosticsIntervalMs: PERFORMANCE_FLAGS.diagnosticsIntervalMs,
+    },
+    appMetrics:
+      typeof app.getAppMetrics === "function" ? app.getAppMetrics() : [],
+    mainWindow: null,
+  };
+
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return diagnostics;
+  }
+
+  const webContents = mainWindow.webContents;
+  diagnostics.mainWindow = {
+    id: webContents.id,
+    url: webContents.getURL(),
+    isCrashed:
+      typeof webContents.isCrashed === "function" ? webContents.isCrashed() : false,
+    isDevToolsOpened:
+      typeof webContents.isDevToolsOpened === "function"
+        ? webContents.isDevToolsOpened()
+        : false,
+  };
+
+  return diagnostics;
 }
 
 try {
@@ -284,6 +338,7 @@ function createMainWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      devTools: DEBUG_FLAGS.devToolsEnabled,
     },
   });
 
@@ -311,6 +366,28 @@ function createMainWindow() {
     writeShellLog("INFO", "主窗口已关闭");
     mainWindow = null;
   });
+
+  mainWindow.webContents.on("before-input-event", (event, input) => {
+    if (!DEBUG_FLAGS.devToolsEnabled) {
+      return;
+    }
+
+    const normalizedKey = String(input?.key || "").toLowerCase();
+    const shouldToggleDevTools =
+      normalizedKey === "f12"
+      || ((input?.control || input?.meta) && input?.shift && normalizedKey === "i");
+
+    if (!shouldToggleDevTools) {
+      return;
+    }
+
+    event.preventDefault();
+    if (mainWindow.webContents.isDevToolsOpened()) {
+      mainWindow.webContents.closeDevTools();
+      return;
+    }
+    mainWindow.webContents.openDevTools({ mode: "detach", activate: true });
+  });
 }
 
 async function startShell() {
@@ -334,6 +411,16 @@ async function startShell() {
     writeShellLog("INFO", `准备加载主界面 URL: ${BACKEND_BASE_URL}`);
     await mainWindow.loadURL(BACKEND_BASE_URL);
     writeShellLog("INFO", `主界面加载完成 URL: ${BACKEND_BASE_URL}`);
+    if (
+      DEBUG_FLAGS.devToolsEnabled
+      && DEBUG_FLAGS.openDevToolsOnLaunch
+      && !mainWindow.webContents.isDevToolsOpened()
+    ) {
+      mainWindow.webContents.openDevTools({
+        mode: "detach",
+        activate: false,
+      });
+    }
     focusMainWindow();
   } catch (error) {
     writeShellLog("ERROR", "加载主界面失败", error);
@@ -347,6 +434,16 @@ async function startShell() {
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 setupDiagnostics();
+ipcMain.handle("shell:get-debug-flags", async () => buildDebugFlags());
+ipcMain.handle("shell:get-runtime-diagnostics", async () => collectRuntimeDiagnostics());
+ipcMain.handle("shell:open-devtools", async () => {
+  if (!mainWindow || mainWindow.isDestroyed() || !DEBUG_FLAGS.devToolsEnabled) {
+    return { success: false, reason: "devtools-disabled" };
+  }
+
+  mainWindow.webContents.openDevTools({ mode: "detach", activate: true });
+  return { success: true };
+});
 writeShellLog("INFO", `Shell 启动: backend=${BACKEND_BASE_URL}`);
 
 if (!gotSingleInstanceLock) {
@@ -359,6 +456,7 @@ if (!gotSingleInstanceLock) {
   });
   app.whenReady().then(() => {
     nativeTheme.themeSource = "dark";
+    writeShellLog("INFO", `调试标志: ${JSON.stringify(buildDebugFlags())}`);
     startShell();
   });
 }

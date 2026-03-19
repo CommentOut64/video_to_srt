@@ -10,6 +10,7 @@ import { useEditorCommandBus } from '@/stores/editor/editorCommandBus'
 import { useEditorDocumentStore } from '@/stores/editor/editorDocumentStore'
 import { useEditorSessionStore } from '@/stores/editor/editorSessionStore'
 import { createSplitSubtitleCommand } from '@/stores/editor/editorCommandFactory'
+import { shouldUseNativeContextMenu } from '@/utils/shellDebug'
 
 /**
  * 右键菜单 Composable
@@ -246,6 +247,9 @@ export function useWaveformContextMenu(projectStore, subtitleDocumentStore) {
    * @param {Function} getTimeFromClientX - 获取时间的函数
    */
   function handleWaveformContextMenu(e, getTimeFromClientX) {
+    if (shouldUseNativeContextMenu()) {
+      return
+    }
     e.preventDefault()
     e.stopPropagation()
 
