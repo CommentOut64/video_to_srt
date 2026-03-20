@@ -196,7 +196,7 @@ const projectStore = useProjectStore()
 const sessionStore = useEditorSessionStore()
 const subtitleDocumentStore = useSubtitleDocumentStore()
 const syncEngine = useEditorSyncEngine()
-const { currentSubtitleId, seekToSubtitle, followCurrentSubtitle } = useEditorPlayback()
+const { currentSubtitleId, followSubtitleId, seekToSubtitle } = useEditorPlayback()
 
 const identityId = computed(() => projectStore.primaryId)
 const projectionSubtitles = computed(() => editorProjectionBridge.subtitles)
@@ -237,6 +237,14 @@ const USER_SCROLL_FLIP_GUARD_MS = 120
 const lastManualListInteractionAt = ref(0)
 let cancelActiveFlipAnimation = null
 let flipRunToken = 0
+
+// V3.2.5+dev.20260320.01: RAF lerp 平滑滚动引擎
+// 虚拟列表不兼容浏览器原生 smooth scroll（动画期间 item 被回收导致目标丢失），
+// 改用每帧直接赋值 scrollTop 实现平滑动画，与虚拟列表渲染周期完全兼容。
+let lerpTargetScrollTop = null
+let lerpRAF = null
+const LERP_FACTOR = 0.15
+const LERP_THRESHOLD = 1
 
 const {
   handleMenuClose: finalizeSharedContextMenuClose,
@@ -1030,6 +1038,7 @@ function pauseFollowByUserScroll() {
     return
   }
   isFollowPausedByUser.value = true
+  cancelLerpAnimation()
   scheduleFollowAutoResume()
 }
 
@@ -1114,6 +1123,54 @@ async function runStructuralMutationWithFlip(mutate) {
   return result
 }
 
+// V3.2.5+dev.20260320.01: 取消正在进行的 lerp 动画
+function cancelLerpAnimation() {
+  if (lerpRAF !== null) {
+    cancelAnimationFrame(lerpRAF)
+    lerpRAF = null
+  }
+  lerpTargetScrollTop = null
+}
+
+// 启动或更新 lerp 动画目标；若动画已在进行中，仅更新目标值，动画自动追踪
+function startLerpAnimation(targetScrollTop) {
+  lerpTargetScrollTop = targetScrollTop
+  if (lerpRAF !== null) return
+
+  function step() {
+    const el = getScrollerElement()
+    if (!el || lerpTargetScrollTop === null) {
+      lerpRAF = null
+      lerpTargetScrollTop = null
+      return
+    }
+
+    const current = el.scrollTop
+    const diff = lerpTargetScrollTop - current
+
+    if (Math.abs(diff) <= LERP_THRESHOLD) {
+      el.scrollTop = Math.round(lerpTargetScrollTop)
+      lerpRAF = null
+      lerpTargetScrollTop = null
+      extendProgrammaticScrollGuard()
+      return
+    }
+
+    el.scrollTop = current + diff * LERP_FACTOR
+    lerpRAF = requestAnimationFrame(step)
+  }
+
+  lerpRAF = requestAnimationFrame(step)
+}
+
+// 计算使 itemEl 居中于 scrollerEl 视口所需的 scrollTop
+function calculateCenterScrollTop(scrollerEl, itemEl) {
+  const scrollerRect = scrollerEl.getBoundingClientRect()
+  const itemRect = itemEl.getBoundingClientRect()
+  const itemTopInContent = itemRect.top - scrollerRect.top + scrollerEl.scrollTop
+  return Math.max(0, itemTopInContent - scrollerEl.clientHeight / 2 + itemRect.height / 2)
+}
+
 function scrollToLocalId(localId) {
   if (!localId) {
     return
@@ -1126,27 +1183,67 @@ function scrollToLocalId(localId) {
 
   const requestToken = ++followRequestToken
   beginProgrammaticScrollLock()
-  const didStartFollow = followCurrentSubtitle(scrollerRef.value, {
-    localId,
-    index: visibleIndex,
-    shouldAbort: () => requestToken !== followRequestToken,
-    onCentered: () => {
-      if (requestToken !== followRequestToken) {
-        return
-      }
-      extendProgrammaticScrollGuard()
-    },
-    onFailed: () => {
-      if (requestToken !== followRequestToken) {
-        return
-      }
-      releaseProgrammaticScrollLock()
-    },
-  })
 
-  if (!didStartFollow) {
+  const scroller = scrollerRef.value
+  const el = scroller?.$el ?? scroller
+  if (!el?.querySelector) {
     releaseProgrammaticScrollLock()
+    return
   }
+
+  const selector = `[data-local-id="${localId}"]`
+  const target = el.querySelector(selector)
+
+  if (target) {
+    const centerTop = calculateCenterScrollTop(el, target)
+    // 已接近居中位置则跳过动画
+    if (Math.abs(centerTop - el.scrollTop) < 2) {
+      extendProgrammaticScrollGuard()
+      return
+    }
+    startLerpAnimation(centerTop)
+    return
+  }
+
+  // 目标未渲染（超出虚拟视口）— 先用 scrollToItem 瞬间跳转使其进入渲染区
+  if (typeof scroller?.scrollToItem === 'function') {
+    scroller.scrollToItem(visibleIndex)
+    retryLerpCenter(el, selector, {
+      shouldAbort: () => requestToken !== followRequestToken,
+      onFailed: () => {
+        if (requestToken === followRequestToken) {
+          releaseProgrammaticScrollLock()
+        }
+      },
+    })
+    return
+  }
+
+  releaseProgrammaticScrollLock()
+}
+
+// scrollToItem 跳转后多帧重试，等待虚拟列表渲染出目标项再 lerp 居中
+function retryLerpCenter(el, selector, options, attempt = 0) {
+  if (options.shouldAbort?.()) {
+    options.onFailed?.()
+    return
+  }
+
+  const target = el.querySelector(selector)
+  if (target) {
+    const centerTop = calculateCenterScrollTop(el, target)
+    startLerpAnimation(centerTop)
+    return
+  }
+
+  if (attempt >= 8) {
+    options.onFailed?.()
+    return
+  }
+
+  requestAnimationFrame(() => {
+    retryLerpCenter(el, selector, options, attempt + 1)
+  })
 }
 
 watch(selectedLocalId, (localId) => {
@@ -1165,7 +1262,7 @@ watch(orderedVisibleIds, (ids) => {
   }
 }, { immediate: true })
 
-watch(currentSubtitleId, (localId) => {
+watch(followSubtitleId, (localId) => {
   if (!autoScrollEnabled.value || homophoneSearch.isSearchActive || !localId || isFollowPausedByUser.value) {
     return
   }
@@ -1178,6 +1275,7 @@ watch(currentSubtitleId, (localId) => {
 watch(autoScrollEnabled, (enabled) => {
   if (!enabled) {
     followRequestToken += 1
+    cancelLerpAnimation()
     clearFollowResumeTimer()
     releaseProgrammaticScrollLock()
     isFollowPausedByUser.value = false
@@ -1216,6 +1314,7 @@ onMounted(() => {
 onUnmounted(() => {
   clearFollowResumeTimer()
   clearProgrammaticScrollReleaseTimer()
+  cancelLerpAnimation()
   followRequestToken += 1
   cancelActiveFlipAnimation?.()
   cancelActiveFlipAnimation = null
