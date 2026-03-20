@@ -12,6 +12,14 @@ function toBaseMs(projectStore, displaySeconds) {
   return Math.round(projectStore.toBaseTime(displaySeconds) * 1000)
 }
 
+function resolveSubtitleIdByDisplaySeconds(docStore, projectStore, displaySeconds) {
+  if (!Number.isFinite(displaySeconds)) {
+    return null
+  }
+
+  return findSubtitleIdByTime(docStore, toBaseMs(projectStore, displaySeconds))
+}
+
 function findSubtitleIdByTime(docStore, targetMs) {
   const order = docStore.order
   let left = 0
@@ -182,9 +190,10 @@ function scrollToSubtitle(scroller, localId, fallbackIndex, options = {}) {
   }
 
   const selector = `[data-local-id="${localId}"]`
+  const behavior = options.behavior ?? 'auto'
   const target = rootElement.querySelector(selector)
   if (target) {
-    const centered = followTargetInScroller(rootElement, target, 'auto')
+    const centered = followTargetInScroller(rootElement, target, behavior)
     if (centered) {
       options.onCentered?.()
       return true
@@ -198,7 +207,7 @@ function scrollToSubtitle(scroller, localId, fallbackIndex, options = {}) {
     scroller.scrollToItem(fallbackIndex)
     return retryCenterRenderedTarget(rootElement, selector, {
       maxAttempts: options.maxAttempts,
-      behavior: 'auto',
+      behavior,
       shouldAbort: options.shouldAbort,
       onCentered: options.onCentered,
       onFailed: options.onFailed,
@@ -216,12 +225,25 @@ export function useEditorPlayback() {
   const playbackManager = usePlaybackManager()
 
   const currentSubtitleId = computed(() => {
-    const displaySeconds = Number(playbackStore.currentTimeRaw)
-    if (!Number.isFinite(displaySeconds)) {
-      return null
-    }
+    return resolveSubtitleIdByDisplaySeconds(
+      docStore,
+      projectStore,
+      Number(playbackStore.currentTimeRaw)
+    )
+  })
 
-    return findSubtitleIdByTime(docStore, toBaseMs(projectStore, displaySeconds))
+  const committedSubtitleId = computed(() => {
+    return resolveSubtitleIdByDisplaySeconds(
+      docStore,
+      projectStore,
+      Number(playbackStore.currentTime)
+    )
+  })
+
+  const followSubtitleId = computed(() => {
+    return playbackStore.isSeeking
+      ? committedSubtitleId.value
+      : currentSubtitleId.value
   })
 
   const currentSubtitle = computed(() => {
@@ -245,7 +267,7 @@ export function useEditorPlayback() {
   }
 
   function followCurrentSubtitle(scroller, options = {}) {
-    const targetLocalId = options.localId ?? currentSubtitleId.value
+    const targetLocalId = options.localId ?? followSubtitleId.value
     if (!targetLocalId) {
       return false
     }
@@ -259,6 +281,7 @@ export function useEditorPlayback() {
 
   return {
     currentSubtitleId,
+    followSubtitleId,
     currentSubtitle,
     seekToSubtitle,
     followCurrentSubtitle,
