@@ -16,6 +16,7 @@ const {
   safeAppendLog,
 } = require("./shell_logging");
 const {
+  getChromiumSwitches,
   parseBooleanEnvFlag,
   resolveShellRuntimeConfig,
 } = require("./shell_runtime_config");
@@ -371,6 +372,7 @@ function createMainWindow() {
       nodeIntegration: false,
       sandbox: true,
       devTools: DEBUG_FLAGS.devToolsEnabled,
+      backgroundThrottling: !PERFORMANCE_FLAGS.antiThrottlingEnabled,
     },
   });
 
@@ -466,6 +468,9 @@ async function startShell() {
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 applyGpuPreferenceSwitches();
+for (const sw of getChromiumSwitches(SHELL_RUNTIME_CONFIG)) {
+  app.commandLine.appendSwitch(sw);
+}
 setupDiagnostics();
 ipcMain.handle("shell:get-media-capabilities", async () => buildMediaCapabilities());
 ipcMain.handle("shell:get-debug-flags", async () => buildDebugFlags());
