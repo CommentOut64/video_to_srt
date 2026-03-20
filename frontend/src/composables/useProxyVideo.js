@@ -38,6 +38,88 @@ export const TranscodeDecision = {
   TRANSCODE_FULL: 'transcode_full'
 }
 
+function readAnchorfluxShell() {
+  if (typeof window === 'undefined') {
+    return null
+  }
+  return window.anchorfluxShell || null
+}
+
+export function getShellMediaCapabilitySnapshot() {
+  const shell = readAnchorfluxShell()
+  const snapshot = (
+    shell?.getMediaCapabilities?.()
+    || shell?.mediaCapabilities
+    || {}
+  )
+
+  return {
+    activeGpuPreference: snapshot.activeGpuPreference || 'unknown',
+    h264DirectPlay: snapshot.h264DirectPlay !== false,
+    hevcDirectPlay: snapshot.hevcDirectPlay === true,
+  }
+}
+
+export function resolvePlayableSource({
+  mediaProfile = 'browser_compat',
+  shellCapability = {},
+  sourceCodec = '',
+  state = ProxyState.IDLE,
+  urls = {},
+} = {}) {
+  const normalizedCodec = String(sourceCodec || '').trim().toLowerCase()
+  const normalizedShellCapability = {
+    h264DirectPlay: shellCapability?.h264DirectPlay !== false,
+    hevcDirectPlay: shellCapability?.hevcDirectPlay === true,
+  }
+
+  if (mediaProfile !== 'electron_native') {
+    if (urls.proxy720p) {
+      return { url: urls.proxy720p, mode: 'proxy_720p' }
+    }
+    if (urls.preview360p) {
+      return { url: urls.preview360p, mode: 'preview_360p' }
+    }
+    if ([
+      ProxyState.ANALYZING,
+      ProxyState.TRANSCODING_360,
+      ProxyState.TRANSCODING_720,
+      ProxyState.REMUXING,
+    ].includes(state)) {
+      return { url: null, mode: 'pending_proxy' }
+    }
+    return { url: urls.source || null, mode: urls.source ? 'direct_source' : 'unavailable' }
+  }
+
+  if (urls.proxy720p) {
+    return { url: urls.proxy720p, mode: 'software_proxy' }
+  }
+
+  const supportsSourceDirectPlay = (
+    !normalizedCodec
+    || normalizedCodec === 'h264'
+    || normalizedCodec === 'avc1'
+  )
+    ? normalizedShellCapability.h264DirectPlay
+    : ['hevc', 'h265'].includes(normalizedCodec)
+      ? normalizedShellCapability.hevcDirectPlay
+      : false
+
+  if (supportsSourceDirectPlay && urls.source) {
+    return { url: urls.source, mode: 'direct_source' }
+  }
+
+  if ([
+    ProxyState.ANALYZING,
+    ProxyState.TRANSCODING_720,
+    ProxyState.REMUXING,
+  ].includes(state)) {
+    return { url: null, mode: 'pending_proxy' }
+  }
+
+  return { url: null, mode: 'unavailable' }
+}
+
 /**
  * Proxy 视频管理 Composable
  * @param {Ref<string>|string} identityIdInput - 媒体身份 ID（可以是 ref 或普通值）
@@ -56,6 +138,7 @@ export function useProxyVideo(identityIdInput) {
   const autoTrigger720p = ref(true)  // V3.1.2+dev.20260113.02: 是否启用自动触发720p
   const version = ref(0) // V3.1.2+dev.20260114.08: 状态版本号，避免旧快照覆盖新状态
   const mediaProfile = ref('browser_compat')
+  const sourceCodec = ref('')
 
   const urls = ref({
     preview360p: null,
@@ -109,12 +192,14 @@ export function useProxyVideo(identityIdInput) {
    * 注意：如果正在转码中，返回 null，避免加载不兼容的源视频
    */
   const currentUrl = computed(() => {
-    if (urls.value.proxy720p) return urls.value.proxy720p
-    if (urls.value.preview360p) return urls.value.preview360p
-    // 如果正在转码，不返回 source URL（避免加载不兼容的视频）
-    if (isTranscoding.value) return null
-    // 否则返回 source URL（可直接播放的视频）
-    return urls.value.source
+    const resolved = resolvePlayableSource({
+      mediaProfile: mediaProfile.value,
+      shellCapability: getShellMediaCapabilitySnapshot(),
+      sourceCodec: sourceCodec.value,
+      state: state.value,
+      urls: urls.value,
+    })
+    return resolved.url
   })
 
   /**
@@ -298,6 +383,7 @@ export function useProxyVideo(identityIdInput) {
       const status = response.data || response;
       resolvedProjectId.value = status.project_id || identityId.value;
       mediaProfile.value = status.media_profile || mediaProfile.value;
+      sourceCodec.value = status.source_codec || '';
 
       // 恢复 URLs（先恢复URL，用于判断是否有可播放视频）
       if (status.urls) {
@@ -430,6 +516,7 @@ export function useProxyVideo(identityIdInput) {
     urls,
     autoTrigger720p,  // V3.1.2+dev.20260113.02: 自动触发720p配置
     mediaProfile,
+    sourceCodec,
 
     // 计算属性
     isReady,
@@ -460,6 +547,9 @@ export function useProxyVideo(identityIdInput) {
       }
       if (proxyState.media_profile) {
         mediaProfile.value = proxyState.media_profile;
+      }
+      if (proxyState.source_codec) {
+        sourceCodec.value = proxyState.source_codec;
       }
       let nextState = proxyState.state || state.value;
       let nextError = proxyState.error || null;

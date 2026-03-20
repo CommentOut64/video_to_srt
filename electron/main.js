@@ -16,6 +16,7 @@ const {
   safeAppendLog,
 } = require("./shell_logging");
 const {
+  parseBooleanEnvFlag,
   resolveShellRuntimeConfig,
 } = require("./shell_runtime_config");
 
@@ -32,6 +33,9 @@ const SHELL_FORCE_EXIT_MS = Number(
   process.env.ANCHORFLUX_SHELL_FORCE_EXIT_MS || 15000
 );
 const WINDOW_BG_COLOR = "#0b1220";
+const GPU_PREFERENCE = String(
+  process.env.ANCHORFLUX_GPU_PREFERENCE || "discrete"
+).trim().toLowerCase();
 const SHELL_RUNTIME_CONFIG = resolveShellRuntimeConfig({ env: process.env });
 const DEBUG_FLAGS = SHELL_RUNTIME_CONFIG.debugFlags;
 const PERFORMANCE_FLAGS = SHELL_RUNTIME_CONFIG.performanceFlags;
@@ -61,6 +65,32 @@ function writeShellLog(level, message, error = null) {
   } catch (_) {
     // 日志写入失败时保持静默，避免递归报错。
   }
+}
+
+function applyGpuPreferenceSwitches() {
+  if (GPU_PREFERENCE === "discrete") {
+    app.commandLine.appendSwitch("force_high_performance_gpu");
+  } else if (GPU_PREFERENCE === "integrated") {
+    app.commandLine.appendSwitch("force_low_power_gpu");
+  }
+}
+
+function buildMediaCapabilities() {
+  const gpuFeatureStatus =
+    typeof app.getGPUFeatureStatus === "function" ? app.getGPUFeatureStatus() : {};
+  return {
+    gpuFeatureStatus,
+    activeGpuPreference: GPU_PREFERENCE,
+    h264DirectPlay: parseBooleanEnvFlag(
+      process.env.ANCHORFLUX_SHELL_H264_DIRECT_PLAY,
+      true
+    ),
+    hevcDirectPlay: parseBooleanEnvFlag(
+      process.env.ANCHORFLUX_SHELL_HEVC_DIRECT_PLAY,
+      false
+    ),
+    fallbackOrder: ["discrete", "integrated", "software_proxy"],
+  };
 }
 
 function buildDebugFlags() {
@@ -95,7 +125,9 @@ async function collectRuntimeDiagnostics() {
     id: webContents.id,
     url: webContents.getURL(),
     isCrashed:
-      typeof webContents.isCrashed === "function" ? webContents.isCrashed() : false,
+      typeof webContents.isCrashed === "function"
+        ? webContents.isCrashed()
+        : false,
     isDevToolsOpened:
       typeof webContents.isDevToolsOpened === "function"
         ? webContents.isDevToolsOpened()
@@ -433,7 +465,9 @@ async function startShell() {
 }
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
+applyGpuPreferenceSwitches();
 setupDiagnostics();
+ipcMain.handle("shell:get-media-capabilities", async () => buildMediaCapabilities());
 ipcMain.handle("shell:get-debug-flags", async () => buildDebugFlags());
 ipcMain.handle("shell:get-runtime-diagnostics", async () => collectRuntimeDiagnostics());
 ipcMain.handle("shell:open-devtools", async () => {

@@ -19,6 +19,7 @@ import logging
 import threading
 from pathlib import Path
 from typing import Optional, Tuple
+from urllib.parse import urlencode
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
@@ -65,6 +66,11 @@ _VIDEO_REQUEST_LOG_THROTTLE_SECONDS = 1.0
 _TRANSCODE_CACHE_TTL_SECONDS = 2.0
 TASK_CARD_THUMBNAIL_MAX_WIDTH = 640
 TASK_CARD_THUMBNAIL_FILENAME = "thumbnail.jpg"
+_SHELL_CAPABILITY_QUERY_KEY_MAP = {
+    "shell_hevc_direct_play": "hevcDirectPlay",
+    "shell_h264_direct_play": "h264DirectPlay",
+    "shell_active_gpu_preference": "activeGpuPreference",
+}
 
 # 注意：旧的 _proxy_generation_status 已废弃，改用 MediaPrepService 管理状态
 
@@ -564,7 +570,48 @@ def _get_video_codec(video_path: Path) -> Optional[str]:
     return None
 
 
-def _analyze_transcode_requirement(video_file: Optional[Path]) -> Tuple[bool, str, Optional[str]]:
+def _parse_shell_media_capability(request: Optional[Request]) -> dict:
+    if request is None:
+        return {}
+
+    capability = {}
+    for query_key, field_name in _SHELL_CAPABILITY_QUERY_KEY_MAP.items():
+        raw_value = request.query_params.get(query_key)
+        if raw_value is None:
+            continue
+        normalized_value = str(raw_value).strip().lower()
+        if field_name == "activeGpuPreference":
+            if normalized_value:
+                capability[field_name] = normalized_value
+            continue
+        if normalized_value in {"1", "true", "yes", "on"}:
+            capability[field_name] = True
+        elif normalized_value in {"0", "false", "no", "off"}:
+            capability[field_name] = False
+    return capability
+
+
+def _append_shell_media_capability_to_url(url: Optional[str], shell_capability: Optional[dict]) -> Optional[str]:
+    if not url:
+        return url
+    normalized_capability = shell_capability if isinstance(shell_capability, dict) else {}
+    params = {}
+    for query_key, field_name in _SHELL_CAPABILITY_QUERY_KEY_MAP.items():
+        field_value = normalized_capability.get(field_name)
+        if isinstance(field_value, bool):
+            params[query_key] = "1" if field_value else "0"
+        elif field_name == "activeGpuPreference" and field_value:
+            params[query_key] = str(field_value)
+    if not params:
+        return url
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}{urlencode(params)}"
+
+
+def _analyze_transcode_requirement(
+    video_file: Optional[Path],
+    shell_capability: Optional[dict] = None,
+) -> Tuple[bool, str, Optional[str]]:
     """
     统一分析视频是否需要转码，避免多个接口判断口径不一致。
 
@@ -573,7 +620,9 @@ def _analyze_transcode_requirement(video_file: Optional[Path]) -> Tuple[bool, st
     """
     if video_file is None or not video_file.exists():
         return False, "", None
-    cache_key = str(video_file.resolve())
+    normalized_shell_capability = shell_capability if isinstance(shell_capability, dict) else {}
+    capability_cache_suffix = json.dumps(normalized_shell_capability, sort_keys=True, ensure_ascii=True)
+    cache_key = f"{video_file.resolve()}::{capability_cache_suffix}"
     file_size = 0
     file_mtime_ns = 0
     try:
@@ -597,7 +646,10 @@ def _analyze_transcode_requirement(video_file: Optional[Path]) -> Tuple[bool, st
         media_prep = get_media_prep_service()
         video_info = media_analyzer.analyze_sync(video_file)
         video_info["container"] = video_file.suffix.lower()
-        decision = media_prep.analyze_transcode_decision(video_info)
+        decision = media_prep.analyze_transcode_decision(
+            video_info,
+            shell_capability=normalized_shell_capability,
+        )
         decision_value = str(getattr(decision, "value", str(decision)))
 
         if decision == TranscodeDecision.DIRECT_PLAY:
@@ -625,7 +677,10 @@ def _analyze_transcode_requirement(video_file: Optional[Path]) -> Tuple[bool, st
         return result
     if suffix in BROWSER_COMPATIBLE_FORMATS:
         fallback_need_transcode_codecs = set(NEED_TRANSCODE_CODECS)
-        if _is_electron_native_profile():
+        if (
+            _is_electron_native_profile()
+            and normalized_shell_capability.get("hevcDirectPlay") is True
+        ):
             fallback_need_transcode_codecs.difference_update({"hevc", "h265"})
         codec = _get_video_codec(video_file)
         if codec and codec in fallback_need_transcode_codecs:
@@ -1135,6 +1190,7 @@ async def get_video(identifier: str, request: Request):
     media_identity = _resolve_media_identity_or_404(job_id)
     project_id = media_identity.project_id
     job_dir = media_identity.project_dir
+    shell_capability = _parse_shell_media_capability(request)
 
     _log_video_request(project_id=project_id, identifier=job_id, job_dir=job_dir)
 
@@ -1188,7 +1244,10 @@ async def get_video(identifier: str, request: Request):
     logger.debug(f"找到源视频: {video_file.name}, 扩展名: {video_file.suffix.lower()}")
 
     # 3. 检查是否需要生成Proxy（统一走转码决策，避免误判）
-    needs_transcode, transcode_reason, transcode_decision = _analyze_transcode_requirement(video_file)
+    needs_transcode, transcode_reason, transcode_decision = _analyze_transcode_requirement(
+        video_file,
+        shell_capability=shell_capability,
+    )
 
     if needs_transcode:
         logger.info(
@@ -1428,7 +1487,7 @@ async def get_audio_peaks(identifier: str, samples: int = 0, method: str = "auto
 
 
 @router.get("/{identifier}/proxy-status")
-async def check_proxy_status(identifier: str):
+async def check_proxy_status(identifier: str, request: Request):
     """
     获取 Proxy 视频完整状态（用于前端刷新后恢复）
 
@@ -1451,6 +1510,7 @@ async def check_proxy_status(identifier: str):
     media_identity = _resolve_media_identity_or_404(job_id)
     project_id = media_identity.project_id
     job_dir = media_identity.project_dir
+    shell_capability = _parse_shell_media_capability(request)
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
 
@@ -1472,11 +1532,24 @@ async def check_proxy_status(identifier: str):
         has_720_output = normalized_h264.exists() or remux_video.exists()
 
     urls = {
-        "360p": f"/api/media/{project_id}/video/preview" if (is_browser_profile and preview_360p.exists()) else None,
-        "720p": f"/api/media/{project_id}/video" if has_720_output else None,
-        "source": f"/api/media/{project_id}/video" if source_video else None,
-        "normalize": f"/api/media/{project_id}/video" if normalized_h264.exists() else None,
+        "360p": _append_shell_media_capability_to_url(
+            f"/api/media/{project_id}/video/preview" if (is_browser_profile and preview_360p.exists()) else None,
+            shell_capability,
+        ),
+        "720p": _append_shell_media_capability_to_url(
+            f"/api/media/{project_id}/video" if has_720_output else None,
+            shell_capability,
+        ),
+        "source": _append_shell_media_capability_to_url(
+            f"/api/media/{project_id}/video" if source_video else None,
+            shell_capability,
+        ),
+        "normalize": _append_shell_media_capability_to_url(
+            f"/api/media/{project_id}/video" if normalized_h264.exists() else None,
+            shell_capability,
+        ),
     }
+    source_codec = _get_video_codec(source_video) if source_video else None
 
     scheduler_state = {}
     scheduler_version = None
@@ -1505,7 +1578,10 @@ async def check_proxy_status(identifier: str):
                     pass
         elif source_video:
             try:
-                needs_transcode, _, decision = _analyze_transcode_requirement(source_video)
+                needs_transcode, _, decision = _analyze_transcode_requirement(
+                    source_video,
+                    shell_capability=shell_capability,
+                )
                 if not needs_transcode:
                     state = "direct_play"
                     progress = 100
@@ -1540,12 +1616,16 @@ async def check_proxy_status(identifier: str):
             "legacy_job_id": None,
             "media_profile": config.MEDIA_PROFILE,
             "normalize_h264": media_prep.get_normalize_status(project_id),
+            "source_codec": source_codec,
         })
 
     # 有状态时补偿触发缺失产物，防止意外退出后长期停滞
     if source_video:
         try:
-            needs_transcode, _, decision = _analyze_transcode_requirement(source_video)
+            needs_transcode, _, decision = _analyze_transcode_requirement(
+                source_video,
+                shell_capability=shell_capability,
+            )
             if needs_transcode:
                 remux_status = media_prep.get_remux_status(project_id)
                 remux_in_progress = remux_status and remux_status.get("status") in ["queued", "processing"]
@@ -1616,6 +1696,7 @@ async def check_proxy_status(identifier: str):
         "legacy_job_id": None,
         "media_profile": config.MEDIA_PROFILE,
         "normalize_h264": task_status.get("normalize_h264"),
+        "source_codec": source_codec,
     })
 
 
