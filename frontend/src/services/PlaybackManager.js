@@ -61,6 +61,7 @@ function createPlaybackManager() {
   let seekLockTimer = null;
   let timeUpdateTimer = null;
   let lastWaveSurferSyncAt = 0;
+  let pendingDeferredWaveSurferTime = null;
 
   function resetSeekLockTimeout() {
     if (seekLockTimer) {
@@ -367,7 +368,12 @@ function createPlaybackManager() {
    * @param {boolean} options.fromDrag - 是否来自拖拽操作
    */
   function seekTo(time, options = {}) {
-    const { fromDrag = false, sessionId = "", force = false } = options;
+    const {
+      fromDrag = false,
+      sessionId = "",
+      force = false,
+      waveSurferSync = "immediate",
+    } = options;
 
     if (!force && !isSessionMatched(sessionId)) {
       const playbackStore = getPlaybackStore();
@@ -393,21 +399,31 @@ function createPlaybackManager() {
     // 1. 更新 Store（单一数据源）
     const playbackStore = getPlaybackStore();
     playbackStore.updateCurrentTimeRaw(clampedTime);
-    playbackStore.commitCurrentTime(clampedTime);
 
     // 2. 直接更新 Video 元素
+    let hasPendingSeekClock = false;
     if (
       videoElement &&
       Math.abs(videoElement.currentTime - clampedTime) > CONFIG.SYNC_THRESHOLD
     ) {
       videoElement.currentTime = clampedTime;
+      hasPendingSeekClock = true;
     }
 
     // 3. 更新 WaveSurfer（如果已注册）
-    syncWaveSurfer(clampedTime);
+    if (waveSurferSync === "deferred" && hasPendingSeekClock) {
+      pendingDeferredWaveSurferTime = clampedTime;
+    } else {
+      pendingDeferredWaveSurferTime = null;
+      syncWaveSurfer(clampedTime);
+    }
+
+    if (!hasPendingSeekClock) {
+      commitStableTime(clampedTime);
+    }
 
     // 如果不是拖拽操作，延迟释放锁
-    if (!fromDrag) {
+    if (!fromDrag && !hasPendingSeekClock) {
       releaseLock(CONFIG.SEEK_PROTECTION_PERIOD);
     }
 
@@ -433,6 +449,10 @@ function createPlaybackManager() {
     } catch (e) {
       // WaveSurfer 可能未准备好
     }
+  }
+
+  function commitStableTime(time) {
+    getPlaybackStore().commitCurrentTime(time);
   }
 
   /**
@@ -555,7 +575,6 @@ function createPlaybackManager() {
       // 只有差异足够大时才更新
       if (diff > CONFIG.SYNC_THRESHOLD) {
         playbackStore.updateCurrentTimeRaw(latestVideoTime);
-        playbackStore.commitCurrentTime(latestVideoTime);
       }
     }, CONFIG.DEBOUNCE_DELAY);
   }
@@ -596,7 +615,6 @@ function createPlaybackManager() {
     const diff = Math.abs(currentTime - currentStoreTime);
     if (diff > CONFIG.SYNC_THRESHOLD) {
       playbackStore.updateCurrentTimeRaw(currentTime);
-      playbackStore.commitCurrentTime(currentTime);
     }
     resolveDuration(getStore());
   }
@@ -612,7 +630,23 @@ function createPlaybackManager() {
    * 处理 Video 的 seeked 事件
    */
   function handleVideoSeeked() {
-    // 可用于调试
+    if (!videoElement) {
+      return;
+    }
+
+    const currentTime = Number(videoElement.currentTime);
+    if (!Number.isFinite(currentTime)) {
+      return;
+    }
+
+    commitStableTime(currentTime);
+
+    if (pendingDeferredWaveSurferTime !== null) {
+      syncWaveSurfer(currentTime);
+      pendingDeferredWaveSurferTime = null;
+    }
+
+    releaseLock(CONFIG.SEEK_PROTECTION_PERIOD);
   }
 
   /**
@@ -646,6 +680,9 @@ function createPlaybackManager() {
    */
   function handleVideoPause() {
     const playbackStore = getPlaybackStore();
+    if (videoElement && Number.isFinite(videoElement.currentTime)) {
+      commitStableTime(videoElement.currentTime);
+    }
     if (Boolean(readStoreValue(playbackStore.isPlaying))) {
       playbackStore.setPlaying(false);
     }
@@ -662,6 +699,10 @@ function createPlaybackManager() {
       return;
     }
     const playbackStore = getPlaybackStore();
+    const currentTime = Number(wavesurferInstance?.getCurrentTime?.());
+    if (Number.isFinite(currentTime)) {
+      commitStableTime(currentTime);
+    }
     if (Boolean(readStoreValue(playbackStore.isPlaying))) {
       playbackStore.setPlaying(false);
     }
@@ -676,6 +717,10 @@ function createPlaybackManager() {
     }
     if (isVirtualTimelineActive) {
       return;
+    }
+    const duration = Number(wavesurferInstance?.getDuration?.());
+    if (Number.isFinite(duration)) {
+      commitStableTime(duration);
     }
     getPlaybackStore().setPlaying(false);
   }
@@ -702,6 +747,7 @@ function createPlaybackManager() {
       timeUpdateTimer = null;
     }
     lastWaveSurferSyncAt = 0;
+    pendingDeferredWaveSurferTime = null;
     if (resetSession) {
       activeSessionId = "";
     }

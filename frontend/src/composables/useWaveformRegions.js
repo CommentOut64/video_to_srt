@@ -468,6 +468,24 @@ export function useWaveformRegions(
     return committedCount
   }
 
+  function handleRegionClick(region) {
+    if (!region?.id) {
+      return false
+    }
+
+    if (useEditorV2) {
+      const localId = resolveEditorV2LocalId(region.id)
+      setSelectedSubtitleId(localId ?? region.id)
+    } else {
+      setSelectedSubtitleId(region.id)
+    }
+
+    playbackManager.seekTo(region.start)
+    playbackManager.play()
+    emit('region-click', region)
+    return true
+  }
+
   // ============ Region 事件 ============
 
   /**
@@ -511,17 +529,7 @@ export function useWaveformRegions(
 
     regionsPlugin.on('region-clicked', (region, e) => {
       e.stopPropagation()
-      if (useEditorV2) {
-        const localId = resolveEditorV2LocalId(region.id)
-        setSelectedSubtitleId(localId ?? region.id)
-      } else {
-        setSelectedSubtitleId(region.id)
-      }
-      playbackManager.seekTo(region.start)
-      // V3.2.4+dev.20260228.01: 通过 PlaybackManager 触发播放，
-      // 由 WaveformTimeline 的 isPlaying watcher 决定使用真实播放或虚拟时钟
-      playbackManager.play()
-      emit('region-click', region)
+      handleRegionClick(region)
     })
 
     regionsPlugin.on('region-in', (region) => {
@@ -780,6 +788,8 @@ export function useWaveformRegions(
     checkAndMarkOverlaps,
     scheduleRegionUpdate,
     flushPendingRegionCommits,
+    commitRegionTimeChange,
+    handleRegionClick,
     // 清理
     cleanup,
   }
