@@ -39,6 +39,7 @@
           :min-length-ms="Math.max(1, Math.round(props.regionMinLength * 1000))"
           :drag-enabled="props.dragEnabled"
           :resize-enabled="props.resizeEnabled"
+          :playback-active-ids="playbackActiveIds"
           @region-click="handleOverlayRegionClick"
           @region-commit="handleOverlayRegionCommit"
         />
@@ -184,7 +185,6 @@ const maxRetries = 3
 
 // WaveSurfer 实例
 const wavesurferRef = ref(null)
-const regionsPluginRef = ref(null)
 const timelinePluginRef = ref(null)
 
 // ============ Computed ============
@@ -492,7 +492,7 @@ const {
   zoomOut,
   fitToScreen,
   handleZoomInput,
-  handleZoomWithSmartAnchor,
+  queueWheelPreviewZoom,
   cleanup: cleanupZoom,
 } = useWaveformZoom(
   wavesurferRef,
@@ -522,6 +522,9 @@ const {
 
 const regionModelCache = createRegionModelCache()
 const visibleRegionModels = shallowRef([])
+
+// 播放光标进入/退出 region 的活跃集合（复刻 wavesurfer region-in/region-out）
+const playbackActiveIds = shallowRef(new Set())
 
 const waveformDomBindings = computed(() => {
   return resolveWaveformDomBindings({
@@ -604,10 +607,7 @@ const {
   handleRegionClick,
   cleanup: cleanupRegions,
 } = useWaveformRegions(
-  regionsPluginRef,
   projectStore,
-  props,
-  isReady,
   onSubtitleEdit,
   playbackManager,
   subtitleDocumentStore,
@@ -1040,29 +1040,11 @@ function retryLoad() {
   loadAudioData()
 }
 
-// ============ 滚轮缩放 ============
-let zoomRafId = null
-let pendingZoomDelta = 0
-
-function smoothZoom() {
-  if (pendingZoomDelta === 0) {
-    zoomRafId = null
-    return
-  }
-  const newZoom = zoomLevel.value + pendingZoomDelta
-  pendingZoomDelta = 0
-  handleZoomWithSmartAnchor(newZoom)
-  zoomRafId = null
-}
-
 function handleWheel(e) {
   if (!e.ctrlKey) return
   e.preventDefault()
   const delta = e.deltaY < 0 ? ZOOM_WHEEL_STEP : -ZOOM_WHEEL_STEP
-  pendingZoomDelta += delta
-  if (!zoomRafId) {
-    zoomRafId = requestAnimationFrame(smoothZoom)
-  }
+  queueWheelPreviewZoom(delta, e.clientX)
 }
 
 // ============ Watchers ============
@@ -1126,6 +1108,55 @@ watch(
 
     scheduleOverlayRefresh('drag-end-replay')
   }
+)
+
+// 播放光标进入/退出 region 检测（复刻 wavesurfer region-in/region-out）
+// 仅在活跃集合实际变化时更新 shallowRef，避免高频 timeupdate 引起不必要的 re-render
+watch(
+  () => playbackStore.currentTimeRaw,
+  (timeSeconds) => {
+    const regions = visibleRegionModels.value
+    if (!regions.length) {
+      if (playbackActiveIds.value.size > 0) {
+        playbackActiveIds.value = new Set()
+      }
+      return
+    }
+
+    const timeMs = timeSeconds * 1000
+    const prev = playbackActiveIds.value
+    let changed = false
+
+    // 先做快速判断：当前活跃集合是否仍然全部命中
+    for (const id of prev) {
+      const r = regions.find((m) => m.localId === id)
+      if (!r || timeMs < r.startMs || timeMs > r.endMs) {
+        changed = true
+        break
+      }
+    }
+
+    // 检查是否有新进入的 region
+    if (!changed) {
+      for (const r of regions) {
+        if (r.startMs <= timeMs && r.endMs >= timeMs && !prev.has(r.localId)) {
+          changed = true
+          break
+        }
+      }
+    }
+
+    if (!changed) return
+
+    const next = new Set()
+    for (const r of regions) {
+      if (r.startMs <= timeMs && r.endMs >= timeMs) {
+        next.add(r.localId)
+      }
+    }
+    playbackActiveIds.value = next
+  },
+  { flush: 'post' }
 )
 
 watch(
@@ -1294,7 +1325,6 @@ onMounted(async () => {
 
 onUnmounted(() => {
   containerRef.value?.removeEventListener('wheel', handleWheel)
-  if (zoomRafId) cancelAnimationFrame(zoomRafId)
   if (loadRetryTimer) {
     clearTimeout(loadRetryTimer)
     loadRetryTimer = null

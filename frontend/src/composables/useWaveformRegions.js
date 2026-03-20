@@ -2,7 +2,7 @@
  * @deprecated V3.2.5: 使用 TimelineViewport 替代
  * useWaveformRegions - Region 管理逻辑 Composable
  *
- * 职责：Region 渲染、重叠检测、事件绑定、同步节流
+ * 职责：Overlay Region 交互提交、点击跳转、时间同步节流
  * 提取自 WaveformTimeline/index.vue L507-601, L667-729
  */
 import { ref } from 'vue'
@@ -13,9 +13,7 @@ import {
   createMoveBoundaryCommand,
   createUpdateTimingCommand,
 } from '@/stores/editor/editorCommandFactory'
-import { detectOverlappingSubtitles, OVERLAP_COLORS } from '@/utils/subtitleUtils'
 import {
-  getWaveformDragDiagnosticsConfig,
   logWaveformDragDiagnostics,
 } from './waveformDragDiagnostics.js'
 
@@ -44,10 +42,7 @@ function debounce(fn, delay) {
 
 /**
  * Region 管理 Composable
- * @param {Ref<object>} regionsPluginRef - Regions 插件引用
  * @param {object} projectStore - Pinia store
- * @param {object} props - 组件 props
- * @param {Ref<boolean>} isReady - 波形是否就绪
  * @param {Function} onSubtitleEdit - 字幕编辑回调
  * @param {object} playbackManager - PlaybackManager 实例
  * @param {object} subtitleDocumentStore - 字幕文档 store
@@ -55,10 +50,7 @@ function debounce(fn, delay) {
  * @param {Ref<Array>|null} regionItemsRef - Region 渲染快照
  */
 export function useWaveformRegions(
-  regionsPluginRef,
   projectStore,
-  props,
-  isReady,
   onSubtitleEdit,
   playbackManager,
   subtitleDocumentStore,
@@ -72,11 +64,8 @@ export function useWaveformRegions(
   const commandBus = useEditorV2 ? useEditorCommandBus() : null
 
   // ============ 私有状态 ============
-  let regionUpdateTimer = null
   let pendingRegionCommitTimer = null
   const pendingRegionCommits = new Map()
-  let overlapCacheDirty = true
-  let overlapCacheIds = new Set()
 
   function logDiag(eventName, payload = {}) {
     logWaveformDragDiagnostics(eventName, payload)
@@ -87,10 +76,6 @@ export function useWaveformRegions(
       return valueOrRef.value
     }
     return valueOrRef
-  }
-
-  function getSelectedSubtitleId() {
-    return resolveMaybeRefValue(subtitleDocumentStore?.selectedSubtitleId) ?? null
   }
 
   function buildEditorV2SubtitleList() {
@@ -158,57 +143,6 @@ export function useWaveformRegions(
 
   function setSelectedSubtitleId(subtitleId) {
     subtitleDocumentStore.setSelectedSubtitleId(subtitleId)
-  }
-
-  function resolveRegionMinLength() {
-    const fallbackMinLength = 0.05
-    const rawValue = Number(props.regionMinLength)
-    if (!Number.isFinite(rawValue)) {
-      return fallbackMinLength
-    }
-    return Math.max(0, rawValue)
-  }
-
-  function markOverlapCacheDirty() {
-    overlapCacheDirty = true
-  }
-
-  function getOverlappingIds(options = {}) {
-    const { forceRefresh = false } = options
-    if (forceRefresh || overlapCacheDirty) {
-      overlapCacheIds = detectOverlappingSubtitles(getSubtitleList())
-      overlapCacheDirty = false
-    }
-    return overlapCacheIds
-  }
-
-  function resolveRegionRenderId(subtitle) {
-    const segmentId = String(subtitle?.segment_id ?? '').trim()
-    if (segmentId) {
-      return segmentId
-    }
-    if (subtitle?.id === undefined || subtitle?.id === null) {
-      return null
-    }
-    return String(subtitle.id)
-  }
-
-  function isRegionSelected(regionId) {
-    const selectedSubtitleId = getSelectedSubtitleId()
-    if (selectedSubtitleId === null || selectedSubtitleId === undefined) {
-      return false
-    }
-
-    if (String(selectedSubtitleId) === String(regionId)) {
-      return true
-    }
-
-    if (useEditorV2) {
-      const localId = resolveEditorV2LocalId(regionId)
-      return Boolean(localId && String(selectedSubtitleId) === String(localId))
-    }
-
-    return false
   }
 
   // 节流的 Region 同步
@@ -412,9 +346,6 @@ export function useWaveformRegions(
       deferred: regionSnapshot.deferred === true,
     })
 
-    // 拖拽结束后检测并标记重叠区域
-    markOverlapCacheDirty()
-    checkAndMarkOverlaps({ forceRefresh: true })
     return true
   }
 
@@ -486,296 +417,13 @@ export function useWaveformRegions(
     return true
   }
 
-  // ============ Region 事件 ============
-
-  /**
-   * 设置 Region 事件监听
-   */
-  function setupRegionEvents(wavesurferRef) {
-    const regionsPlugin = regionsPluginRef.value
-    if (!regionsPlugin) return
-
-    regionsPlugin.on('region-update', (region, side) => {
-      const diagConfig = getWaveformDragDiagnosticsConfig()
-      if (!diagConfig.logRegionUpdateFlow) return
-      logDiag('regions-plugin-region-update', {
-        regionId: region.id,
-        side: side || null,
-        start: region.start,
-        end: region.end,
-      })
-    })
-
-    regionsPlugin.on('region-updated', (region, side) => {
-      logDiag('regions-plugin-region-updated', {
-        regionId: region.id,
-        side: side || null,
-        start: region.start,
-        end: region.end,
-      })
-      if (isUpdatingRegions.value) {
-        queuePendingRegionCommit(region, side)
-        return
-      }
-      commitRegionTimeChange({
-        id: region.id,
-        start: region.start,
-        end: region.end,
-        side: side || null,
-        region,
-        deferred: false,
-      })
-    })
-
-    regionsPlugin.on('region-clicked', (region, e) => {
-      e.stopPropagation()
-      handleRegionClick(region)
-    })
-
-    regionsPlugin.on('region-in', (region) => {
-      const overlappingIds = getOverlappingIds()
-      if (overlappingIds.has(region.id)) {
-        region.setOptions({ color: 'rgba(248, 81, 73, 0.5)' })
-      } else {
-        region.setOptions({ color: OVERLAP_COLORS.hover })
-      }
-    })
-
-    regionsPlugin.on('region-out', (region) => {
-      const overlappingIds = getOverlappingIds()
-      const isSelected = isRegionSelected(region.id)
-
-      if (overlappingIds.has(region.id)) {
-        region.setOptions({ color: OVERLAP_COLORS.error })
-      } else if (isSelected) {
-        region.setOptions({ color: OVERLAP_COLORS.selected })
-      } else {
-        region.setOptions({ color: props.regionColor })
-      }
-    })
-  }
-
-  /**
-   * 检测并标记重叠区域
-   */
-  function checkAndMarkOverlaps(options = {}) {
-    const { forceRefresh = false } = options
-    const regionsPlugin = regionsPluginRef.value
-    if (!regionsPlugin || !isReady.value) return
-
-    const overlappingIds = getOverlappingIds({ forceRefresh })
-    const regions = regionsPlugin.getRegions()
-
-    if (!regions || regions.length === 0) return
-
-    regions.forEach((region) => {
-      const isOverlapping = overlappingIds.has(region.id)
-      const isSelected = isRegionSelected(region.id)
-
-      if (isOverlapping) {
-        region.setOptions({ color: OVERLAP_COLORS.error })
-      } else if (isSelected) {
-        region.setOptions({ color: OVERLAP_COLORS.selected })
-      } else {
-        region.setOptions({ color: props.regionColor })
-      }
-    })
-
-    if (overlappingIds.size > 0) {
-      console.warn(
-        `[WaveformRegions] 检测到 ${overlappingIds.size} 个重叠区域:`,
-        Array.from(overlappingIds)
-      )
-    }
-  }
-
-  /**
-   * 计算 Region 颜色
-   * @param {object} subtitle - 字幕对象
-   * @param {Set} overlappingIds - 重叠字幕 ID 集合
-   * @returns {string} 颜色值
-   */
-  function computeRegionColor(subtitle, overlappingIds) {
-    const regionId = resolveRegionRenderId(subtitle)
-    const isSelected = isRegionSelected(regionId)
-    const isOverlapping = overlappingIds.has(regionId)
-
-    if (isOverlapping) return OVERLAP_COLORS.error
-    if (isSelected) return OVERLAP_COLORS.selected
-    return props.regionColor
-  }
-
-  function addSubtitleRegion(regionsPlugin, subtitle, color, regionId) {
-    return regionsPlugin.addRegion({
-      id: regionId,
-      start: subtitle.start,
-      end: subtitle.end,
-      color,
-      minLength: resolveRegionMinLength(),
-      drag: props.dragEnabled,
-      resize: props.resizeEnabled,
-    })
-  }
-
-  /**
-   * 渲染字幕区域（增量更新算法，避免闪烁）
-   *
-   * 算法策略：
-   * 1. 获取现有 regions 构建 Map
-   * 2. 遍历字幕数据，对比现有 region：
-   *    - 命中强制重建或时间变化 → remove + addRegion 重建
-   *    - 仅颜色变化 → setOptions({ color }) 轻量更新
-   *    - 不存在 → addRegion 添加
-   * 3. 删除不再存在的 regions
-   *
-   * 优势：避免 clearRegions() 导致的视觉闪烁
-   */
-  function renderSubtitleRegions(subtitleListOverride = null, options = {}) {
-    const { forceRecreateAll = false } = options
-    const regionsPlugin = regionsPluginRef.value
-    const subtitleList = Array.isArray(subtitleListOverride)
-      ? subtitleListOverride
-      : getSubtitleList()
-
-    if (!isReady.value) {
-      console.warn('[WaveformRegions] renderSubtitleRegions: 波形未就绪，跳过渲染')
-      return
-    }
-    if (!regionsPlugin) {
-      console.warn('[WaveformRegions] renderSubtitleRegions: regions 插件未加载，跳过渲染')
-      return
-    }
-
-    const normalizedSubtitles = subtitleList
-      .map((subtitle) => {
-        const regionId = resolveRegionRenderId(subtitle)
-        if (!regionId) {
-          return null
-        }
-        return {
-          ...subtitle,
-          regionId,
-        }
-      })
-      .filter(Boolean)
-
-    const subtitleCount = normalizedSubtitles.length
-
-    // 无字幕时清空所有 regions
-    if (subtitleCount === 0) {
-      console.log('[WaveformRegions] renderSubtitleRegions: 无字幕数据，清除 regions')
-      regionsPlugin.clearRegions()
-      return
-    }
-
-    // 预先检测重叠区域
-    overlapCacheIds = detectOverlappingSubtitles(
-      normalizedSubtitles.map((subtitle) => ({
-        ...subtitle,
-        id: subtitle.regionId,
-      }))
-    )
-    overlapCacheDirty = false
-    const overlappingIds = overlapCacheIds
-
-    isUpdatingRegions.value = true
-    try {
-      // 构建现有 regions 的 Map（id → region）
-      const existingRegions = new Map()
-      regionsPlugin.getRegions().forEach((region) => {
-        existingRegions.set(String(region.id), region)
-      })
-
-      // 记录本次需要保留的 region IDs
-      const newSubtitleIds = new Set()
-      let addedCount = 0
-      let updatedCount = 0
-
-      normalizedSubtitles.forEach((subtitle) => {
-        if (subtitle.start === undefined || subtitle.end === undefined) {
-          console.warn(`[WaveformRegions] 跳过无效字幕: id=${subtitle.regionId}`)
-          return
-        }
-
-        newSubtitleIds.add(subtitle.regionId)
-        const targetColor = computeRegionColor(subtitle, overlappingIds)
-        const existing = existingRegions.get(subtitle.regionId)
-
-        if (existing) {
-          // 与 addRegion 参数保持一致，避免历史 region 遗留旧的极小宽度阈值。
-          existing.minLength = resolveRegionMinLength()
-          // 已存在：检查是否需要更新
-          const needsTimeUpdate =
-            Math.abs(existing.start - subtitle.start) > 0.001 ||
-            Math.abs(existing.end - subtitle.end) > 0.001
-          const isDomDetached = existing?.element?.isConnected === false
-          // 注意：region.color 可能是 undefined，需要通过 element style 获取
-          // wavesurfer regions 插件只会在 addRegion/saveRegion 时重跑 virtualAppend；
-          // 纯 setOptions 不会重新把已脱挂的 Region DOM 挂回容器。
-          // 结构性编辑（merge/split/undo/redo）恰好会让保留字幕的时间范围大幅变化，
-          // 继续复用旧 Region 会出现“数据已更新，但 Region DOM 丢失”的假活状态。
-          // 因此只要时间变更，或检测到 DOM 已脱挂，就必须 remove + add 完整重建。
-          if (forceRecreateAll || needsTimeUpdate || isDomDetached) {
-            existing.remove()
-            addSubtitleRegion(regionsPlugin, subtitle, targetColor, subtitle.regionId)
-            updatedCount++
-          } else {
-            // 仅更新颜色（选中状态变化等）
-            existing.setOptions({ color: targetColor })
-          }
-        } else {
-          // 新增：添加 region
-          addSubtitleRegion(regionsPlugin, subtitle, targetColor, subtitle.regionId)
-          addedCount++
-        }
-      })
-
-      // 删除已不存在的 regions
-      let removedCount = 0
-      existingRegions.forEach((region, id) => {
-        if (!newSubtitleIds.has(id)) {
-          region.remove()
-          removedCount++
-        }
-      })
-
-      if (addedCount > 0 || updatedCount > 0 || removedCount > 0) {
-        console.log(
-          `[WaveformRegions] 增量更新: +${addedCount} 新增, ~${updatedCount} 更新, -${removedCount} 删除`
-        )
-      }
-    } finally {
-      // 仅保持一个微任务周期的渲染锁，避免快速拖拽时吞掉 region-updated。
-      Promise.resolve().then(() => {
-        isUpdatingRegions.value = false
-        flushPendingRegionCommits()
-      })
-    }
-  }
-
-  /**
-   * 调度 Region 更新（带防抖）
-   */
-  function scheduleRegionUpdate() {
-    if (isReady.value && !isUpdatingRegions.value) {
-      clearTimeout(regionUpdateTimer)
-      regionUpdateTimer = setTimeout(() => {
-        renderSubtitleRegions()
-      }, 100)
-    }
-  }
-
   /**
    * 清理资源
    */
   function cleanup() {
-    clearTimeout(regionUpdateTimer)
     clearTimeout(pendingRegionCommitTimer)
-    regionUpdateTimer = null
     pendingRegionCommitTimer = null
     pendingRegionCommits.clear()
-    overlapCacheIds.clear()
-    overlapCacheDirty = true
     debouncedRegionSync.cancel?.()
   }
 
@@ -783,10 +431,6 @@ export function useWaveformRegions(
     // 状态
     isUpdatingRegions,
     // 方法
-    setupRegionEvents,
-    renderSubtitleRegions,
-    checkAndMarkOverlaps,
-    scheduleRegionUpdate,
     flushPendingRegionCommits,
     commitRegionTimeChange,
     handleRegionClick,

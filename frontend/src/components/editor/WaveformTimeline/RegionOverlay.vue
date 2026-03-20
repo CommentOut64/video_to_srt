@@ -10,6 +10,7 @@
         'is-dragging': activeSession?.localId === region.localId && activeSession?.mode === 'body',
         'is-resizing': activeSession?.localId === region.localId && activeSession?.mode !== 'body',
         'is-marker': isRegionMarker(region),
+        'is-playback-active': props.playbackActiveIds.has(region.localId),
       }"
       :style="getRegionStyle(region)"
       :part="getRegionPart(region)"
@@ -88,6 +89,10 @@ const props = defineProps({
     type: Boolean,
     default: true,
   },
+  playbackActiveIds: {
+    type: Set,
+    default: () => new Set(),
+  },
 })
 
 const emit = defineEmits(['region-click', 'region-commit', 'region-dblclick'])
@@ -125,7 +130,7 @@ const REGION_OVERLAY_SHADOW_STYLE_TEXT = `
   height: 100%;
   box-sizing: border-box;
   border-radius: 2px;
-  transition: background-color 0.2s ease;
+  transition: background-color 0.2s ease, box-shadow 0.15s ease;
   pointer-events: all;
   user-select: none;
   touch-action: none;
@@ -142,6 +147,14 @@ const REGION_OVERLAY_SHADOW_STYLE_TEXT = `
 
 .region-overlay__item:not(.is-dragging):not(.is-resizing):hover {
   box-shadow: inset 0 0 0 9999px rgba(255, 255, 255, 0.12);
+}
+
+.region-overlay__item.is-playback-active:not(.is-dragging):not(.is-resizing) {
+  box-shadow: inset 0 0 0 9999px rgba(255, 255, 255, 0.15);
+}
+
+.region-overlay__item.is-playback-active:not(.is-dragging):not(.is-resizing):hover {
+  box-shadow: inset 0 0 0 9999px rgba(255, 255, 255, 0.22);
 }
 
 .region-overlay__body {
@@ -607,7 +620,7 @@ onBeforeUnmount(() => {
   height: 100%;
   box-sizing: border-box;
   border-radius: 2px;
-  transition: background-color 0.2s ease;
+  transition: background-color 0.2s ease, box-shadow 0.15s ease;
   pointer-events: all;
   user-select: none;
   touch-action: none;
