@@ -116,8 +116,8 @@ function handleClick(item) {
   if (item.disabled) {
     return;
   }
-  emit("select", item.key);
   hide();
+  emit("select", item.key);
 }
 
 // 点击外部关闭菜单

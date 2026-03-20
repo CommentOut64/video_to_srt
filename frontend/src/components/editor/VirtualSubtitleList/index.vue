@@ -67,7 +67,6 @@
           >
             <SubtitleRow
               :local-id="item.subtitle.localId"
-              :row-index="item.index"
               :is-selected="selectionStore.isMultiSelected(item.subtitle.localId)"
               :is-active="activeId === item.subtitle.localId"
               :is-current="currentSubtitleId === item.subtitle.localId"
@@ -75,16 +74,12 @@
               :is-match-selected="item.isSelected"
               :is-selectable="true"
               :cluster-color="item.clusterColor"
-              :can-merge-prev="canMergePrev(item.subtitle.localId)"
-              :can-merge-next="canMergeNext(item.subtitle.localId)"
               @click="handleRowClick"
-              @split="handleSplitFromCursor"
-              @merge-prev="(payload) => handleMerge(item.subtitle.localId, 'prev', payload)"
-              @merge-next="(payload) => handleMerge(item.subtitle.localId, 'next', payload)"
               @insert-before="handleInsertBefore(item.subtitle.localId)"
               @insert-after="handleInsertAfter(item.subtitle.localId)"
               @delete="handleDelete(item.subtitle.localId)"
               @focus-row="handleRowFocus"
+              @open-context-menu="handleOpenContextMenu"
               @select-change="(checked) => handleItemSelectChange(item.index, checked)"
             />
           </div>
@@ -111,7 +106,6 @@
           <div class="row-shell" :data-local-id="item.localId">
             <SubtitleRow
               :local-id="item.localId"
-              :row-index="item.rowIndex"
               :is-selected="selectionStore.isMultiSelected(item.localId)"
               :is-active="activeId === item.localId"
               :is-current="currentSubtitleId === item.localId"
@@ -119,22 +113,25 @@
               :is-match-selected="item.isMatchSelected"
               :is-selectable="item.isSelectable"
               :cluster-color="item.clusterColor"
-              :can-merge-prev="canMergePrev(item.localId)"
-              :can-merge-next="canMergeNext(item.localId)"
               @click="handleRowClick"
-              @split="handleSplitFromCursor"
-              @merge-prev="(payload) => handleMerge(item.localId, 'prev', payload)"
-              @merge-next="(payload) => handleMerge(item.localId, 'next', payload)"
               @insert-before="handleInsertBefore(item.localId)"
               @insert-after="handleInsertAfter(item.localId)"
               @delete="handleDelete(item.localId)"
               @focus-row="handleRowFocus"
+              @open-context-menu="handleOpenContextMenu"
               @select-change="(checked) => handleItemSelectChange(item.selectionIndex, checked)"
             />
           </div>
         </DynamicScrollerItem>
       </template>
     </DynamicScroller>
+
+    <ContextMenu
+      ref="sharedContextMenuRef"
+      :items="sharedContextMenuItems"
+      @close="handleSharedContextMenuClose"
+      @select="handleSharedContextMenuSelect"
+    />
   </div>
 </template>
 
@@ -143,10 +140,13 @@ import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from
 import { ElMessage, ElLoading } from 'element-plus'
 import { DynamicScroller, DynamicScrollerItem } from 'vue-virtual-scroller'
 import 'vue-virtual-scroller/dist/vue-virtual-scroller.css'
+import ContextMenu from '@/components/editor/ContextMenu.vue'
 import GroupHeader from '@/components/editor/SubtitleList/GroupHeader.vue'
 import SearchToolbar from '@/components/editor/SubtitleList/SearchToolbar.vue'
 import { SortMode, useHomophoneSearch } from '@/composables/useHomophoneSearch'
 import SubtitleRow from './SubtitleRow.vue'
+import { createRowModelCache } from './rowModelCache'
+import { useSharedContextMenu } from './useSharedContextMenu'
 import { buildBatchReplaceReplacements } from './searchBatchReplace'
 import { shouldIgnoreStructuralShortcut } from './keyboardSafety'
 import projectApi from '@/services/api/projectApi'
@@ -209,6 +209,7 @@ const homophoneSearch = reactive(useHomophoneSearch({
 }))
 
 const scrollerRef = ref(null)
+const sharedContextMenuRef = ref(null)
 const listContainerRef = ref(null)
 const quickSearchText = ref('')
 const collapsedGroups = ref(new Set())
@@ -236,6 +237,17 @@ const USER_SCROLL_FLIP_GUARD_MS = 120
 const lastManualListInteractionAt = ref(0)
 let cancelActiveFlipAnimation = null
 let flipRunToken = 0
+
+const {
+  handleMenuClose: finalizeSharedContextMenuClose,
+  isOpen: isSharedContextMenuOpen,
+  items: sharedContextMenuItems,
+  openMenu: openSharedContextMenu,
+  selectMenuItem: selectSharedContextMenuItem,
+} = useSharedContextMenu({
+  onSelect: handleSharedContextMenuSelection,
+})
+const rowModelCache = createRowModelCache()
 
 const filteredSubtitles = computed(() => {
   if (!quickSearchText.value) {
@@ -277,14 +289,6 @@ const timelineRowMetaByLocalId = computed(() => {
   )
 })
 
-const defaultVisibleRows = computed(() => {
-  return filteredSubtitles.value.map((subtitle, index) => buildVirtualRow(subtitle.localId, index))
-})
-
-const defaultVisibleIds = computed(() => {
-  return defaultVisibleRows.value.map((row) => row.localId)
-})
-
 const rowMeasurementKeyByLocalId = computed(() => {
   const measurementMap = new Map()
   projectionSubtitles.value.forEach((subtitle) => {
@@ -300,8 +304,24 @@ const rowMeasurementKeyByLocalId = computed(() => {
   return measurementMap
 })
 
+const defaultVisibleRowEntries = computed(() => {
+  return filteredSubtitles.value.map((subtitle, index) => buildVirtualRowEntry(subtitle.localId, index))
+})
+
+const defaultVisibleRows = computed(() => {
+  return rowModelCache.rebuildVisibleRows(defaultVisibleRowEntries.value)
+})
+
+const defaultVisibleIds = computed(() => {
+  return defaultVisibleRows.value.map((row) => row.localId)
+})
+
+const timelineVisibleRowEntries = computed(() => {
+  return homophoneSearch.timelineViewItems.map((item) => buildVirtualRowEntry(item.subtitle.localId, item.index))
+})
+
 const timelineVisibleRows = computed(() => {
-  return homophoneSearch.timelineViewItems.map((item) => buildVirtualRow(item.subtitle.localId, item.index))
+  return rowModelCache.rebuildVisibleRows(timelineVisibleRowEntries.value)
 })
 
 const virtualVisibleRows = computed(() => {
@@ -345,23 +365,42 @@ function localIdKey(subtitle) {
   return subtitle?.localId ?? subtitle?.id ?? ''
 }
 
-function buildVirtualRow(localId, fallbackIndex) {
-  const rowMeta = resolveRowMeta(localId, fallbackIndex)
-  const resolvedRowIndex = Number.isFinite(rowMeta.rowIndex) ? rowMeta.rowIndex : fallbackIndex
+function buildMatchSpanSignature(matchSpans) {
+  if (!Array.isArray(matchSpans) || matchSpans.length === 0) {
+    return 'no-match'
+  }
 
-  return {
+  return matchSpans
+    .map((span) => `${span.start ?? 0}:${span.end ?? 0}`)
+    .join(',')
+}
+
+function buildVirtualRowEntry(localId, fallbackIndex) {
+  const rowMeta = resolveRowMeta(localId, fallbackIndex)
+  const matchSpans = Array.isArray(rowMeta.matchSpans) ? rowMeta.matchSpans : []
+  const payload = {
     id: localId,
     localId,
-    rowIndex: Number.isFinite(resolvedRowIndex) ? resolvedRowIndex : 0,
-    matchSpans: Array.isArray(rowMeta.matchSpans) ? rowMeta.matchSpans : [],
+    matchSpans,
     isMatchSelected: Boolean(rowMeta.isMatchSelected),
     isSelectable: Boolean(rowMeta.isSelectable),
     clusterColor: rowMeta.clusterColor ?? null,
     selectionIndex: Number.isFinite(rowMeta.selectionIndex) ? rowMeta.selectionIndex : null,
     sizeKey: [
       rowMeasurementKeyByLocalId.value.get(localId) || '',
-      Array.isArray(rowMeta.matchSpans) ? rowMeta.matchSpans.length : 0,
+      buildMatchSpanSignature(matchSpans),
       rowMeta.isSelectable ? 'search' : 'normal',
+    ].join('|'),
+  }
+
+  return {
+    localId,
+    payload,
+    signature: [
+      payload.sizeKey,
+      payload.isMatchSelected ? 'selected' : 'not-selected',
+      payload.clusterColor ?? 'no-cluster',
+      payload.selectionIndex ?? 'no-selection-index',
     ].join('|'),
   }
 }
@@ -388,6 +427,57 @@ function handleRowFocus(localId) {
     selectionStore,
     subtitleDocumentStore,
   })
+}
+
+function handleOpenContextMenu(payload) {
+  if (!payload || !Array.isArray(payload.items) || payload.items.length === 0) {
+    return
+  }
+
+  sharedContextMenuRef.value?.hide()
+  openSharedContextMenu(payload)
+
+  nextTick(() => {
+    if (!isSharedContextMenuOpen.value) {
+      return
+    }
+    sharedContextMenuRef.value?.show(payload.x, payload.y)
+  })
+}
+
+function handleSharedContextMenuClose() {
+  finalizeSharedContextMenuClose()
+}
+
+function handleSharedContextMenuSelect(key) {
+  selectSharedContextMenuItem(key)
+}
+
+function handleSharedContextMenuSelection({ key, context }) {
+  if (!context?.localId) {
+    return
+  }
+
+  if (key === 'split') {
+    if (!context.canSplitAtCursor) {
+      return
+    }
+    handleSplitFromCursor({
+      localId: context.localId,
+      cursorPosition: context.cursorPosition,
+      text: context.text,
+    })
+    return
+  }
+
+  if (key === 'merge-prev') {
+    handleMerge(context.localId, 'prev', context)
+    return
+  }
+
+  if (key === 'merge-next') {
+    handleMerge(context.localId, 'next', context)
+  }
 }
 
 function handleInsertBefore(localId) {
@@ -714,20 +804,6 @@ async function handleBatchReplace() {
     console.error('[VirtualSubtitleList] 批量替换失败:', error)
     ElMessage.error('批量替换失败')
   }
-}
-
-function canMergePrev(localId) {
-  const entity = docStore.getEntity(localId)
-  const prevLocalId = docStore.getNeighbors(localId).prev
-  const prevEntity = prevLocalId ? docStore.getEntity(prevLocalId) : null
-  return Boolean(entity && !entity.isDraft && prevEntity && !prevEntity.isDraft)
-}
-
-function canMergeNext(localId) {
-  const entity = docStore.getEntity(localId)
-  const nextLocalId = docStore.getNeighbors(localId).next
-  const nextEntity = nextLocalId ? docStore.getEntity(nextLocalId) : null
-  return Boolean(entity && !entity.isDraft && nextEntity && !nextEntity.isDraft)
 }
 
 function handleSplitFromCursor({ localId, cursorPosition, text }) {
