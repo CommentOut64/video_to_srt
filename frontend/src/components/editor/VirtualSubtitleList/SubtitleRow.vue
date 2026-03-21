@@ -166,6 +166,7 @@ import { createUpdateTextCommand, createUpdateTimingCommand } from '@/stores/edi
 import { usePlaybackStore } from '@/stores/playbackStore'
 import { useProjectStore } from '@/stores/projectStore'
 import { shouldUseNativeContextMenu } from '@/utils/shellDebug'
+import { resolveContextMenuCloseEditingAction } from './contextMenuClosePolicy'
 
 const props = defineProps({
   localId: { type: String, required: true },
@@ -383,6 +384,12 @@ function cancelEditing() {
   pendingBlurWhileContextMenuOpen.value = false
 }
 
+function finishEditingWithoutCommit() {
+  isEditing.value = false
+  cursorPosition.value = null
+  pendingBlurWhileContextMenuOpen.value = false
+}
+
 function formatTime(ms) {
   if (!ms && ms !== 0) return '00:00.000'
   const totalSeconds = projectStore.toDisplayTime(ms / 1000)
@@ -518,9 +525,20 @@ function handleItemContextMenu(event) {
   openSharedContextMenu(event)
 }
 
-function handleContextMenuClose() {
+function handleContextMenuClose(closeMeta = null) {
   isContextMenuOpen.value = false
-  if (!pendingBlurWhileContextMenuOpen.value) {
+
+  const nextAction = resolveContextMenuCloseEditingAction({
+    pendingBlurWhileContextMenuOpen: pendingBlurWhileContextMenuOpen.value,
+    closeMeta,
+  })
+
+  if (nextAction === 'discard_pending_blur') {
+    finishEditingWithoutCommit()
+    return
+  }
+
+  if (nextAction !== 'commit_pending_blur') {
     return
   }
   pendingBlurWhileContextMenuOpen.value = false

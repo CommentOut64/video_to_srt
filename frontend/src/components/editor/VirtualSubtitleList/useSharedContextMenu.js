@@ -31,23 +31,33 @@ export function useSharedContextMenu(options = {}) {
     activeCloseHandler = typeof onClose === 'function' ? onClose : null
   }
 
-  function handleMenuClose() {
+  function handleMenuClose(closeMeta = null) {
     const closeHandler = activeCloseHandler
+    const effectiveContext = context.value ?? lastClosedContext.value ?? null
+    const normalizedMeta = {
+      reason: closeMeta?.reason || 'dismiss',
+      key: closeMeta?.key ?? null,
+      context: closeMeta?.context ?? effectiveContext,
+    }
 
-    lastClosedContext.value = context.value
+    lastClosedContext.value = effectiveContext
     isOpen.value = false
     items.value = []
     context.value = null
     activeCloseHandler = null
 
-    closeHandler?.()
+    closeHandler?.(normalizedMeta)
   }
 
   function selectMenuItem(key) {
     const selectionContext = context.value ?? lastClosedContext.value
 
     if (isOpen.value) {
-      handleMenuClose()
+      handleMenuClose({
+        reason: 'selection',
+        key,
+        context: selectionContext,
+      })
     }
 
     if (!selectionContext) {

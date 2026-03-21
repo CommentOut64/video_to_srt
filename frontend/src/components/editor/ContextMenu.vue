@@ -97,7 +97,7 @@ function show(x, y) {
 }
 
 // 隐藏菜单
-function hide() {
+function hide(closeMeta = null) {
   if (!visible.value) {
     if (activeMenuController === menuController) {
       activeMenuController = null;
@@ -108,7 +108,7 @@ function hide() {
   if (activeMenuController === menuController) {
     activeMenuController = null;
   }
-  emit("close");
+  emit("close", closeMeta);
 }
 
 // 处理菜单项点击
@@ -116,7 +116,7 @@ function handleClick(item) {
   if (item.disabled) {
     return;
   }
-  hide();
+  hide({ reason: 'selection', key: item.key });
   emit("select", item.key);
 }
 
