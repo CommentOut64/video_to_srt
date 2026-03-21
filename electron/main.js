@@ -372,6 +372,7 @@ function createMainWindow() {
       nodeIntegration: false,
       sandbox: true,
       devTools: DEBUG_FLAGS.devToolsEnabled,
+      spellcheck: false,
       backgroundThrottling: !PERFORMANCE_FLAGS.antiThrottlingEnabled,
     },
   });
