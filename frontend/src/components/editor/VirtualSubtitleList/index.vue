@@ -469,8 +469,8 @@ function handleOpenContextMenu(payload) {
   })
 }
 
-function handleSharedContextMenuClose() {
-  finalizeSharedContextMenuClose()
+function handleSharedContextMenuClose(closeMeta) {
+  finalizeSharedContextMenuClose(closeMeta)
 }
 
 function handleSharedContextMenuSelect(key) {
@@ -1093,7 +1093,13 @@ function activateUserScrollOverride({ deferResume = false } = {}) {
   }
 }
 
-function startFollowAnimation(rootElement, targetTop) {
+// V3.2.5+dev.20260321.03: 修复虚拟列表跳转动画方向始终从上往下的问题
+// 当目标项不在 DOM 中时 scrollToItem 会瞬间跳转到顶部附近，
+// 居中调整总是向下滚动。通过记录跳转前的 scrollTop 并据此
+// 设定方向性的动画起点，使动画方向与实际跳转方向一致。
+const FOLLOW_DIRECTIONAL_RUNUP_RATIO = 0.35
+
+function startFollowAnimation(rootElement, targetTop, options = {}) {
   if (!rootElement) {
     return false
   }
@@ -1102,7 +1108,25 @@ function startFollowAnimation(rootElement, targetTop) {
     ? Math.max(0, rootElement.scrollHeight - rootElement.clientHeight)
     : Number.POSITIVE_INFINITY
   const clampedTargetTop = Math.max(0, Math.min(targetTop, maxScrollTop))
-  const startTop = rootElement.scrollTop ?? 0
+
+  // 确定动画起点：如果是虚拟滚动跳转场景，根据原始位置设置方向性助跑
+  let startTop = rootElement.scrollTop ?? 0
+  const { preVirtualScrollTop } = options
+  if (Number.isFinite(preVirtualScrollTop)) {
+    const viewportHeight = rootElement.clientHeight ?? 0
+    const runupDistance = Math.max(80, viewportHeight * FOLLOW_DIRECTIONAL_RUNUP_RATIO)
+    // 根据跳转前后位置关系判断方向
+    if (preVirtualScrollTop < clampedTargetTop) {
+      // 向下跳转：从目标上方开始向下滑入
+      startTop = Math.max(0, clampedTargetTop - runupDistance)
+    } else {
+      // 向上跳转：从目标下方开始向上滑入
+      startTop = Math.min(maxScrollTop, clampedTargetTop + runupDistance)
+    }
+    markProgrammaticScrollSuppression()
+    rootElement.scrollTop = startTop
+  }
+
   const diff = clampedTargetTop - startTop
 
   clearFollowAnimation()
@@ -1156,6 +1180,11 @@ function startFollowAnimation(rootElement, targetTop) {
   return true
 }
 
+// 查找虚拟列表内部 item-wrapper，用于跳转时临时隐藏防止闪烁
+function findItemWrapper(scrollerElement) {
+  return scrollerElement?.querySelector?.('.vue-recycle-scroller__item-wrapper') ?? null
+}
+
 function requestCenterFollow(localId) {
   if (
     !localId
@@ -1176,6 +1205,19 @@ function requestCenterFollow(localId) {
   clearFollowAnimation()
   const requestToken = ++followRequestToken
 
+  const scrollerElement = getScrollerElement()
+  const preScrollTop = scrollerElement?.scrollTop ?? null
+
+  // 用于虚拟跳转时隐藏列表内容、防止 scrollToItem 造成的闪烁
+  let hiddenWrapper = null
+
+  function restoreWrapperVisibility() {
+    if (hiddenWrapper) {
+      hiddenWrapper.style.visibility = ''
+      hiddenWrapper = null
+    }
+  }
+
   return resolveSubtitleScrollTarget(scrollerRef.value, {
     localId,
     index: visibleIndex,
@@ -1189,6 +1231,13 @@ function requestCenterFollow(localId) {
     ),
     onBeforeVirtualScroll: () => {
       markProgrammaticScrollSuppression()
+      // scrollToItem 会瞬间跳到估算位置（可能偏差很大），
+      // 在跳转前同步隐藏列表内容，防止用户看到跳转闪烁
+      const wrapper = findItemWrapper(scrollerElement)
+      if (wrapper) {
+        wrapper.style.visibility = 'hidden'
+        hiddenWrapper = wrapper
+      }
     },
     onResolved: (payload) => {
       if (
@@ -1198,9 +1247,19 @@ function requestCenterFollow(localId) {
         || isGroupedMode.value
         || isUserScrollOverride.value
       ) {
+        restoreWrapperVisibility()
         return
       }
-      startFollowAnimation(payload.rootElement, payload.top)
+      // 虚拟滚动跳转场景：先设置方向性起点，再恢复可见性并启动动画
+      const animOptions = payload.afterVirtualScroll
+        ? { preVirtualScrollTop: preScrollTop }
+        : {}
+      startFollowAnimation(payload.rootElement, payload.top, animOptions)
+      // 动画起点已就位，恢复可见性（此时用户看到的是正确的方向性起点位置）
+      restoreWrapperVisibility()
+    },
+    onFailed: () => {
+      restoreWrapperVisibility()
     },
   })
 }
