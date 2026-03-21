@@ -865,7 +865,8 @@ function escapeHtml(text) {
 }
 
 .time-input {
-  width: 75px;
+  width: 12ch;
+  min-width: 12ch;
   padding: 3px 6px;
   background: var(--af-bg-tertiary);
   border: 1px solid transparent;

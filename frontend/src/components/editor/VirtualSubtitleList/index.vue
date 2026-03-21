@@ -1751,6 +1751,7 @@ defineExpose({
   overflow-y: auto;
   scrollbar-gutter: stable;
   padding: 6px;
+  outline: none;
 }
 
 /* V3.2.5+dev.20260320.01: 滚动期间屏蔽子元素 pointer-events，
@@ -1765,6 +1766,7 @@ defineExpose({
 
 .grouped-container {
   position: relative;
+  outline: none;
 }
 
 .group-items {
