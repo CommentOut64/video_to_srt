@@ -90,6 +90,8 @@ function Write-PackagedEnvFile {
     $isLiteFlavor = $FlavorValue.ToLowerInvariant() -eq "lite"
     $liteFlag = if ($isLiteFlavor) { "true" } else { "false" }
 
+    # 打包产物始终关闭 DevTools 和原生右键菜单，
+    # 防止版本号含 "-dev" 时 isDevBuildVersion() 自动启用调试功能
     $lines = @(
         "# 打包产物运行配置（由打包脚本生成）",
         "DEV_MODE=false",
@@ -99,6 +101,9 @@ function Write-PackagedEnvFile {
         "ANCHORFLUX_LITE=$liteFlag",
         "ANCHORFLUX_UI_MODE=$UiModeValue",
         "ANCHORFLUX_RUNTIME_POLICY=$RuntimePolicyValue",
+        "ANCHORFLUX_ENABLE_DEVTOOLS=false",
+        "ANCHORFLUX_ENABLE_NATIVE_CONTEXT_MENU=false",
+        "ANCHORFLUX_OPEN_DEVTOOLS_ON_LAUNCH=false",
         "USE_HF_MIRROR=true"
     )
     $content = $lines -join [Environment]::NewLine

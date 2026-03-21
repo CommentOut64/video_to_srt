@@ -54,7 +54,9 @@ export function useWaveformScroll(
   }
 
   function getCurrentTimeSec() {
-    const value = Number(readPlaybackValue(playbackStore.currentTime))
+    // 必须读 currentTimeRaw（高频通道），而非 currentTime（正式态）。
+    // 自然播放期间 currentTime 不更新，会导致滚动跟随失效。
+    const value = Number(readPlaybackValue(playbackStore.currentTimeRaw))
     return Number.isFinite(value) ? value : 0
   }
 

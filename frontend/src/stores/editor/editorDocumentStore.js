@@ -11,9 +11,52 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
   const bindingBySegmentId = new Map()
   const bindingBySentenceIndex = new Map()
   const revision = ref(0)
+  const structureRevision = ref(0)
+  const timingRevision = ref(0)
+  const contentRevision = ref(0)
   const dirtyLocalIds = new Set()
   const tombstones = shallowRef([])
   const entityVersionTokens = new Map()
+
+  function bumpRevisions(options = {}) {
+    revision.value += 1
+    if (options.structure) {
+      structureRevision.value += 1
+    }
+    if (options.timing) {
+      timingRevision.value += 1
+    }
+    if (options.content) {
+      contentRevision.value += 1
+    }
+  }
+
+  function resolveUpdateRevisionKinds(patch = {}) {
+    const keys = Object.keys(patch)
+    const structuralKeys = new Set(['isDeleted'])
+    const timingKeys = new Set(['startMs', 'endMs'])
+    const nextKinds = {
+      structure: false,
+      timing: false,
+      content: false,
+    }
+
+    keys.forEach((key) => {
+      if (structuralKeys.has(key)) {
+        nextKinds.structure = true
+        return
+      }
+      if (timingKeys.has(key)) {
+        nextKinds.timing = true
+        return
+      }
+      if (!['localId', 'revision'].includes(key)) {
+        nextKinds.content = true
+      }
+    })
+
+    return nextKinds
+  }
 
   // ─── 只读查询 ───
   function getEntity(localId) {
@@ -237,7 +280,7 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
 
     rebuildIndexById()
     dirtyLocalIds.add(localId)
-    revision.value++
+    bumpRevisions({ structure: true })
     return true
   }
 
@@ -283,7 +326,7 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
       bindingBySentenceIndex.delete(cold.sentenceIndex)
     }
     dirtyLocalIds.delete(localId)
-    revision.value++
+    bumpRevisions({ structure: true })
     return true
   }
 
@@ -304,7 +347,7 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     ensureEntityVersionToken(localId, nextEntity)
 
     dirtyLocalIds.add(localId)
-    revision.value++
+    bumpRevisions(resolveUpdateRevisionKinds(patch))
     return true
   }
 
@@ -319,7 +362,7 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     })
     order.value = newOrder
     rebuildIndexById()
-    revision.value++
+    bumpRevisions({ structure: true, timing: true })
     return true
   }
 
@@ -343,7 +386,7 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
       bindingBySegmentId.set(segmentId, localId)
       enforceUniqueSegmentBinding(localId, segmentId)
     }
-    revision.value++
+    bumpRevisions({ structure: true })
     return true
   }
 
@@ -360,7 +403,7 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
       localId,
     })
     coldEntities.set(localId, nextCold)
-    revision.value++
+    bumpRevisions({ content: true })
     return true
   }
 
@@ -474,6 +517,9 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     const sentenceBindings = Array.from(bindingBySentenceIndex.entries()).map(([sentenceIndex, localId]) => ({ localId, sentenceIndex }))
     return {
       revision: revision.value,
+      structureRevision: structureRevision.value,
+      timingRevision: timingRevision.value,
+      contentRevision: contentRevision.value,
       entities: entitiesArray,
       coldEntities: coldEntitiesArray,
       order: [...order.value],
@@ -516,6 +562,15 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     ;(snapshot.sentenceBindings || []).forEach(b => bindingBySentenceIndex.set(b.sentenceIndex, b.localId))
     tombstones.value = Array.isArray(snapshot.tombstones) ? [...snapshot.tombstones] : []
     revision.value = Number.isFinite(snapshot.revision) ? snapshot.revision : 0
+    structureRevision.value = Number.isFinite(snapshot.structureRevision)
+      ? snapshot.structureRevision
+      : revision.value
+    timingRevision.value = Number.isFinite(snapshot.timingRevision)
+      ? snapshot.timingRevision
+      : revision.value
+    contentRevision.value = Number.isFinite(snapshot.contentRevision)
+      ? snapshot.contentRevision
+      : revision.value
   }
 
   // V3.2.5+dev.20260315.01: 清空文档（切换项目时使用）
@@ -530,6 +585,9 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     order.value = []
     tombstones.value = []
     revision.value = 0
+    structureRevision.value = 0
+    timingRevision.value = 0
+    contentRevision.value = 0
   }
 
   return {
@@ -537,6 +595,9 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     coldEntities,
     order,
     revision,
+    structureRevision,
+    timingRevision,
+    contentRevision,
     tombstones,
     entityVersionTokens,
     bindingBySegmentId,

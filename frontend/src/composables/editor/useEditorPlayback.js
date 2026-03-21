@@ -1,4 +1,4 @@
-// V3.2.5+dev.20260315.11: 虚拟列表跟随补齐多帧渲染后的稳定居中
+// V3.2.5+dev.20260321.02: 虚拟列表跟随改为“目标解析”和“滚动执行”解耦
 import { computed } from 'vue'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { usePlaybackStore } from '@/stores/playbackStore'
@@ -10,6 +10,14 @@ const FOLLOW_VIEWPORT_PADDING_RATIO = 0.2
 
 function toBaseMs(projectStore, displaySeconds) {
   return Math.round(projectStore.toBaseTime(displaySeconds) * 1000)
+}
+
+function resolveSubtitleIdByDisplaySeconds(docStore, projectStore, displaySeconds) {
+  if (!Number.isFinite(displaySeconds)) {
+    return null
+  }
+
+  return findSubtitleIdByTime(docStore, toBaseMs(projectStore, displaySeconds))
 }
 
 function findSubtitleIdByTime(docStore, targetMs) {
@@ -43,6 +51,16 @@ function findSubtitleIdByTime(docStore, targetMs) {
   return null
 }
 
+function clampScrollTop(rootElement, nextTop) {
+  const scrollHeight = rootElement?.scrollHeight
+  const clientHeight = rootElement?.clientHeight
+  if (!Number.isFinite(scrollHeight) || !Number.isFinite(clientHeight)) {
+    return Math.max(0, nextTop)
+  }
+  const maxScrollTop = Math.max(0, scrollHeight - clientHeight)
+  return Math.max(0, Math.min(nextTop, maxScrollTop))
+}
+
 function resolveTargetMetrics(rootElement, target) {
   if (!rootElement || !target) {
     return null
@@ -64,10 +82,6 @@ function resolveTargetMetrics(rootElement, target) {
   )
     ? (targetRect.top - rootRect.top + (rootElement.scrollTop ?? 0))
     : target.offsetTop
-  const nextTop = Math.max(
-    0,
-    targetTop
-  )
 
   return {
     targetHeight,
@@ -78,10 +92,16 @@ function resolveTargetMetrics(rootElement, target) {
   }
 }
 
-function followTargetInScroller(rootElement, target, behavior = 'auto') {
-  const metrics = resolveTargetMetrics(rootElement, target)
-  if (!metrics) {
-    return false
+function calculateCenterScrollTop(metrics) {
+  return Math.max(
+    0,
+    metrics.targetTop - metrics.scrollerHeight / 2 + metrics.targetHeight / 2
+  )
+}
+
+function calculateFollowScrollTop(metrics, alignment = 'band') {
+  if (alignment === 'center') {
+    return calculateCenterScrollTop(metrics)
   }
 
   const {
@@ -95,30 +115,59 @@ function followTargetInScroller(rootElement, target, behavior = 'auto') {
   const followTopBoundary = scrollTop + viewportPadding
   const followBottomBoundary = scrollTop + scrollerHeight - viewportPadding
 
-  // Trade-off: 不再强制“每次都居中”，而是仅在目标项逼近边缘时做最小位移纠正，
-  // 以换取播放跟随时更稳定的跟手感，同时保留虚拟列表延迟渲染后的 fallback 定位链路。
   if (targetHeight < scrollerHeight) {
     if (targetTop >= followTopBoundary && targetBottom <= followBottomBoundary) {
-      return true
+      return scrollTop
     }
   }
 
-  let nextTop = scrollTop
   if (targetTop < followTopBoundary) {
-    nextTop = Math.max(0, targetTop - viewportPadding)
-  } else if (targetBottom > followBottomBoundary) {
-    nextTop = Math.max(0, targetBottom - scrollerHeight + viewportPadding)
+    return Math.max(0, targetTop - viewportPadding)
+  }
+  if (targetBottom > followBottomBoundary) {
+    return Math.max(0, targetBottom - scrollerHeight + viewportPadding)
+  }
+  return scrollTop
+}
+
+function buildResolvedScrollTarget(rootElement, target, alignment = 'band') {
+  const metrics = resolveTargetMetrics(rootElement, target)
+  if (!metrics) {
+    return null
   }
 
-  if (typeof rootElement.scrollTo === 'function') {
-    rootElement.scrollTo({
-      top: nextTop,
+  const top = clampScrollTop(rootElement, calculateFollowScrollTop(metrics, alignment))
+  return {
+    rootElement,
+    target,
+    top,
+    scrollTop: metrics.scrollTop,
+    diff: top - metrics.scrollTop,
+    targetTop: metrics.targetTop,
+    targetHeight: metrics.targetHeight,
+    scrollerHeight: metrics.scrollerHeight,
+    alignment,
+  }
+}
+
+function applyResolvedScrollTarget(payload, behavior = 'auto') {
+  if (!payload?.rootElement) {
+    return false
+  }
+
+  if (Math.abs(payload.diff) < 0.5) {
+    return true
+  }
+
+  if (typeof payload.rootElement.scrollTo === 'function') {
+    payload.rootElement.scrollTo({
+      top: payload.top,
       behavior,
     })
     return true
   }
 
-  rootElement.scrollTop = nextTop
+  payload.rootElement.scrollTop = payload.top
   return true
 }
 
@@ -131,13 +180,13 @@ function scheduleAnimationFrame(callback) {
   setTimeout(callback, 16)
 }
 
-function retryCenterRenderedTarget(rootElement, selector, options = {}) {
+function retryResolveRenderedTarget(rootElement, selector, options = {}) {
   const {
     attempt = 0,
     maxAttempts = VIRTUAL_CENTER_MAX_ATTEMPTS,
-    behavior = 'auto',
+    alignment = 'band',
     shouldAbort,
-    onCentered,
+    onResolved,
     onFailed,
   } = options
 
@@ -148,9 +197,12 @@ function retryCenterRenderedTarget(rootElement, selector, options = {}) {
 
   const target = rootElement?.querySelector?.(selector)
   if (target) {
-    const centered = followTargetInScroller(rootElement, target, behavior)
-    if (centered) {
-      onCentered?.()
+    const payload = buildResolvedScrollTarget(rootElement, target, alignment)
+    if (payload) {
+      onResolved?.({
+        ...payload,
+        afterVirtualScroll: true,
+      })
       return true
     }
   }
@@ -161,52 +213,12 @@ function retryCenterRenderedTarget(rootElement, selector, options = {}) {
   }
 
   scheduleAnimationFrame(() => {
-    retryCenterRenderedTarget(rootElement, selector, {
+    retryResolveRenderedTarget(rootElement, selector, {
       ...options,
       attempt: attempt + 1,
     })
   })
   return true
-}
-
-function scrollToSubtitle(scroller, localId, fallbackIndex, options = {}) {
-  if (!scroller || !localId) {
-    options.onFailed?.()
-    return false
-  }
-
-  const rootElement = scroller.$el ?? scroller
-  if (!rootElement?.querySelector) {
-    options.onFailed?.()
-    return false
-  }
-
-  const selector = `[data-local-id="${localId}"]`
-  const target = rootElement.querySelector(selector)
-  if (target) {
-    const centered = followTargetInScroller(rootElement, target, 'auto')
-    if (centered) {
-      options.onCentered?.()
-      return true
-    }
-    options.onFailed?.()
-    return false
-  }
-
-  if (typeof scroller.scrollToItem === 'function' && Number.isInteger(fallbackIndex) && fallbackIndex >= 0) {
-    options.onBeforeVirtualScroll?.()
-    scroller.scrollToItem(fallbackIndex)
-    return retryCenterRenderedTarget(rootElement, selector, {
-      maxAttempts: options.maxAttempts,
-      behavior: 'auto',
-      shouldAbort: options.shouldAbort,
-      onCentered: options.onCentered,
-      onFailed: options.onFailed,
-    })
-  }
-
-  options.onFailed?.()
-  return false
 }
 
 export function useEditorPlayback() {
@@ -216,12 +228,25 @@ export function useEditorPlayback() {
   const playbackManager = usePlaybackManager()
 
   const currentSubtitleId = computed(() => {
-    const displaySeconds = Number(playbackStore.currentTimeRaw)
-    if (!Number.isFinite(displaySeconds)) {
-      return null
-    }
+    return resolveSubtitleIdByDisplaySeconds(
+      docStore,
+      projectStore,
+      Number(playbackStore.currentTimeRaw)
+    )
+  })
 
-    return findSubtitleIdByTime(docStore, toBaseMs(projectStore, displaySeconds))
+  const committedSubtitleId = computed(() => {
+    return resolveSubtitleIdByDisplaySeconds(
+      docStore,
+      projectStore,
+      Number(playbackStore.currentTime)
+    )
+  })
+
+  const followSubtitleId = computed(() => {
+    return playbackStore.isSeeking
+      ? committedSubtitleId.value
+      : currentSubtitleId.value
   })
 
   const currentSubtitle = computed(() => {
@@ -244,23 +269,79 @@ export function useEditorPlayback() {
     return true
   }
 
-  function followCurrentSubtitle(scroller, options = {}) {
-    const targetLocalId = options.localId ?? currentSubtitleId.value
-    if (!targetLocalId) {
+  function resolveSubtitleScrollTarget(scroller, options = {}) {
+    const targetLocalId = options.localId ?? followSubtitleId.value
+    if (!scroller || !targetLocalId) {
+      options.onFailed?.()
       return false
     }
 
     const fallbackIndex = Number.isInteger(options.index)
       ? options.index
       : docStore.getOrderIndex(targetLocalId)
+    const rootElement = scroller.$el ?? scroller
+    if (!rootElement?.querySelector) {
+      options.onFailed?.()
+      return false
+    }
 
-    return scrollToSubtitle(scroller, targetLocalId, fallbackIndex, options)
+    const selector = `[data-local-id="${targetLocalId}"]`
+    const alignment = options.alignment ?? 'band'
+    const target = rootElement.querySelector(selector)
+    if (target) {
+      const payload = buildResolvedScrollTarget(rootElement, target, alignment)
+      if (payload) {
+        options.onResolved?.({
+          ...payload,
+          afterVirtualScroll: false,
+        })
+        return true
+      }
+      options.onFailed?.()
+      return false
+    }
+
+    if (typeof scroller.scrollToItem === 'function' && Number.isInteger(fallbackIndex) && fallbackIndex >= 0) {
+      options.onBeforeVirtualScroll?.()
+      scroller.scrollToItem(fallbackIndex)
+      return retryResolveRenderedTarget(rootElement, selector, {
+        maxAttempts: options.maxAttempts,
+        alignment,
+        shouldAbort: options.shouldAbort,
+        onResolved: options.onResolved,
+        onFailed: options.onFailed,
+      })
+    }
+
+    options.onFailed?.()
+    return false
+  }
+
+  function followCurrentSubtitle(scroller, options = {}) {
+    const behavior = options.behavior ?? 'auto'
+    const virtualScrollBehavior = options.virtualScrollBehavior ?? 'auto'
+
+    return resolveSubtitleScrollTarget(scroller, {
+      ...options,
+      onResolved: (payload) => {
+        const nextBehavior = payload.afterVirtualScroll ? virtualScrollBehavior : behavior
+        const applied = applyResolvedScrollTarget(payload, nextBehavior)
+        if (applied) {
+          options.onCentered?.(payload)
+          return
+        }
+        options.onFailed?.()
+      },
+      onFailed: options.onFailed,
+    })
   }
 
   return {
     currentSubtitleId,
+    followSubtitleId,
     currentSubtitle,
     seekToSubtitle,
+    resolveSubtitleScrollTarget,
     followCurrentSubtitle,
   }
 }

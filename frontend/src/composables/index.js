@@ -28,3 +28,10 @@ export { useWaveformScroll } from './useWaveformScroll'
 export { useWaveformCursorDrag } from './useWaveformCursorDrag'
 export { useWaveformRegions } from './useWaveformRegions'
 export { useWaveformContextMenu } from './useWaveformContextMenu'
+export {
+  useWaveformViewport,
+  computeViewportState,
+  buildVisibleRegionSlice,
+  resolveViewportContentWidth,
+} from './useWaveformViewport'
+export { useWaveformOverlayScheduler, createOverlayScheduler } from './useWaveformOverlayScheduler'

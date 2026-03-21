@@ -31,7 +31,7 @@ class SSEChannelManager extends EventEmitter {
     this.UNSUBSCRIBE_DELAY = 2000
 
     // 基础 URL
-    this.baseURL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
+    this.baseURL = import.meta.env.VITE_API_BASE_URL || window.location.origin
 
     console.log('[SSEChannelManager] 频道管理器已初始化')
   }

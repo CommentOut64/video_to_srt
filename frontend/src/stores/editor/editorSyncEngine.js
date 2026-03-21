@@ -863,7 +863,13 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
     for (const binding of bindings) {
       if (!binding?.client_ref_id) continue
       // 实体可能在 HTTP 在途期间被 undo 删除，跳过已不存在的实体
-      if (!docStore.getCold(binding.client_ref_id)) continue
+      const currentCold = docStore.getCold(binding.client_ref_id)
+      if (!currentCold) continue
+
+      const currentSegmentId = toNormalizedSegmentId(currentCold.segmentId)
+      const nextSegmentId = toNormalizedSegmentId(binding.segment_id)
+      if (currentSegmentId === nextSegmentId) continue
+
       docStore.updateColdBinding(binding.client_ref_id, binding.segment_id)
     }
   }
@@ -874,7 +880,8 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
       const localId = entity.client_ref_id || docStore.bindingBySegmentId.get(entity.segment_id)
       if (!localId) continue
       // 实体可能在 HTTP 在途期间被 undo 删除，跳过已不存在的实体
-      if (!docStore.getEntity(localId)) continue
+      const currentEntity = docStore.getEntity(localId)
+      if (!currentEntity) continue
 
       const patch = {}
       if (entity.text !== undefined) patch.text = entity.text
@@ -883,11 +890,26 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
       if (entity.start !== undefined) patch.startMs = toMs(entity.start)
       if (entity.end !== undefined) patch.endMs = toMs(entity.end)
       if (Object.keys(patch).length > 0) {
-        docStore._applyUpdate(localId, patch)
-        docStore._applyReorder(localId)
+        const isTextChanged = patch.text !== undefined
+          && String(currentEntity.text ?? '') !== String(patch.text ?? '')
+        const isStartChanged = patch.startMs !== undefined
+          && Number(currentEntity.startMs ?? 0) !== Number(patch.startMs ?? 0)
+        const isEndChanged = patch.endMs !== undefined
+          && Number(currentEntity.endMs ?? 0) !== Number(patch.endMs ?? 0)
+
+        if (isTextChanged || isStartChanged || isEndChanged) {
+          docStore._applyUpdate(localId, patch)
+          if (isStartChanged || isEndChanged) {
+            docStore._applyReorder(localId)
+          }
+        }
       }
       if (entity.segment_id) {
-        docStore.updateColdBinding(localId, entity.segment_id)
+        const currentSegmentId = toNormalizedSegmentId(docStore.getCold(localId)?.segmentId)
+        const nextSegmentId = toNormalizedSegmentId(entity.segment_id)
+        if (currentSegmentId !== nextSegmentId) {
+          docStore.updateColdBinding(localId, entity.segment_id)
+        }
       }
     }
   }

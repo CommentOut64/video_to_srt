@@ -16,7 +16,7 @@
       'warning-both': subtitle?.warning_type === 'both',
     }"
     @click="handleClick"
-    @contextmenu.prevent="handleItemContextMenu"
+    @contextmenu="handleItemContextMenu"
   >
     <div
       v-if="clusterColor"
@@ -33,7 +33,7 @@
       @change="handleSelectChange"
     />
 
-    <div class="item-index">{{ rowIndex + 1 }}</div>
+    <div class="item-index">{{ displayRowIndex + 1 }}</div>
 
     <div class="item-content">
       <div class="time-row">
@@ -100,7 +100,7 @@
           @click="updateCursorPosition"
           @keyup="updateCursorPosition"
           @select="updateCursorPosition"
-          @contextmenu.prevent.stop="handleTextareaContextMenu"
+          @contextmenu.stop="handleTextareaContextMenu"
           @blur="stopEditing"
           @keydown.enter.ctrl="stopEditing"
           @keydown.escape="cancelEditing"
@@ -153,19 +153,11 @@
         </svg>
       </button>
     </el-tooltip>
-
-    <ContextMenu
-      ref="contextMenuRef"
-      :items="contextMenuItems"
-      @select="handleContextMenuSelect"
-      @close="handleContextMenuClose"
-    />
   </div>
 </template>
 
 <script setup>
 import { computed, nextTick, ref, watch } from 'vue'
-import ContextMenu from '@/components/editor/ContextMenu.vue'
 import { useEditorCommandBus } from '@/stores/editor/editorCommandBus'
 import { useEditorDocumentStore } from '@/stores/editor/editorDocumentStore'
 import { useEditorDraftStore } from '@/stores/editor/editorDraftStore'
@@ -173,10 +165,11 @@ import { useEditorProjectionBridge } from '@/stores/editor/editorProjectionBridg
 import { createUpdateTextCommand, createUpdateTimingCommand } from '@/stores/editor/editorCommandFactory'
 import { usePlaybackStore } from '@/stores/playbackStore'
 import { useProjectStore } from '@/stores/projectStore'
+import { shouldUseNativeContextMenu } from '@/utils/shellDebug'
+import { resolveContextMenuCloseEditingAction } from './contextMenuClosePolicy'
 
 const props = defineProps({
   localId: { type: String, required: true },
-  rowIndex: { type: Number, required: true },
   isSelected: { type: Boolean, default: false },
   isActive: { type: Boolean, default: false },
   isCurrent: { type: Boolean, default: false },
@@ -184,8 +177,6 @@ const props = defineProps({
   isMatchSelected: { type: Boolean, default: false },
   isSelectable: { type: Boolean, default: false },
   clusterColor: { type: String, default: null },
-  canMergePrev: { type: Boolean, default: false },
-  canMergeNext: { type: Boolean, default: false },
 })
 
 const emit = defineEmits([
@@ -195,9 +186,7 @@ const emit = defineEmits([
   'delete',
   'focus-row',
   'select-change',
-  'split',
-  'merge-prev',
-  'merge-next',
+  'open-context-menu',
 ])
 
 const commandBus = useEditorCommandBus()
@@ -230,7 +219,6 @@ const originalText = ref('')
 const editingText = ref('')
 const textareaRef = ref(null)
 const cursorPosition = ref(null)
-const contextMenuRef = ref(null)
 const isContextMenuOpen = ref(false)
 const pendingBlurWhileContextMenuOpen = ref(false)
 const isDeleteConfirming = ref(false)
@@ -246,6 +234,35 @@ let highlightCacheText = null
 let highlightCacheWords = null
 let highlightCacheMatchSpans = null
 let highlightCacheHtml = ''
+
+function touchDocumentRevision() {
+  const revision = docStore.revision
+  if (revision) {
+    revision.value
+  }
+}
+
+const displayRowIndex = computed(() => {
+  touchDocumentRevision()
+  const orderIndex = docStore.getOrderIndex(props.localId)
+  return orderIndex >= 0 ? orderIndex : 0
+})
+
+const canMergePrev = computed(() => {
+  touchDocumentRevision()
+  const currentEntity = entity.value
+  const prevLocalId = docStore.getNeighbors(props.localId).prev
+  const prevEntity = prevLocalId ? docStore.getEntity(prevLocalId) : null
+  return Boolean(currentEntity && !currentEntity.isDraft && prevEntity && !prevEntity.isDraft)
+})
+
+const canMergeNext = computed(() => {
+  touchDocumentRevision()
+  const currentEntity = entity.value
+  const nextLocalId = docStore.getNeighbors(props.localId).next
+  const nextEntity = nextLocalId ? docStore.getEntity(nextLocalId) : null
+  return Boolean(currentEntity && !currentEntity.isDraft && nextEntity && !nextEntity.isDraft)
+})
 
 const canSplitAtCursor = computed(() => {
   return isEditing.value
@@ -269,12 +286,12 @@ const contextMenuItems = computed(() => {
   items.push({
     key: 'merge-prev',
     label: '与前字幕合并',
-    disabled: !props.canMergePrev,
+    disabled: !canMergePrev.value,
   })
   items.push({
     key: 'merge-next',
     label: '与后字幕合并',
-    disabled: !props.canMergeNext,
+    disabled: !canMergeNext.value,
   })
   return items.filter((item) => !item.disabled)
 })
@@ -363,6 +380,12 @@ function stopEditing() {
 function cancelEditing() {
   isEditing.value = false
   editingText.value = originalText.value
+  cursorPosition.value = null
+  pendingBlurWhileContextMenuOpen.value = false
+}
+
+function finishEditingWithoutCommit() {
+  isEditing.value = false
   cursorPosition.value = null
   pendingBlurWhileContextMenuOpen.value = false
 }
@@ -481,75 +504,73 @@ function handleTextareaContextMenu(event) {
   if (!isEditing.value || entity.value?.isDraft || !contextMenuItems.value.length) {
     return
   }
+  if (shouldUseNativeContextMenu()) {
+    return
+  }
   event.preventDefault()
   event.stopPropagation()
   updateCursorPosition(event)
-  isContextMenuOpen.value = true
-  pendingBlurWhileContextMenuOpen.value = false
-  contextMenuRef.value?.show(event.clientX, event.clientY)
+  openSharedContextMenu(event)
 }
 
 function handleItemContextMenu(event) {
   if (entity.value?.isDraft || !contextMenuItems.value.length) {
     return
   }
+  if (shouldUseNativeContextMenu()) {
+    return
+  }
   event.preventDefault()
   event.stopPropagation()
-  isContextMenuOpen.value = true
-  pendingBlurWhileContextMenuOpen.value = false
-  contextMenuRef.value?.show(event.clientX, event.clientY)
+  openSharedContextMenu(event)
 }
 
-function handleContextMenuSelect(key) {
-  const hasDraftOverride = isEditing.value
-  const draftText = hasDraftOverride ? editingText.value : null
-
+function handleContextMenuClose(closeMeta = null) {
   isContextMenuOpen.value = false
-  pendingBlurWhileContextMenuOpen.value = false
-  if (key === 'split') {
-    if (!canSplitAtCursor.value) {
-      return
-    }
-    isEditing.value = false
-    emit('split', {
-      localId: props.localId,
-      cursorPosition: cursorPosition.value,
-      text: editingText.value,
-    })
-    cursorPosition.value = null
+
+  const nextAction = resolveContextMenuCloseEditingAction({
+    pendingBlurWhileContextMenuOpen: pendingBlurWhileContextMenuOpen.value,
+    closeMeta,
+  })
+
+  if (nextAction === 'discard_pending_blur') {
+    finishEditingWithoutCommit()
     return
   }
-  if (key === 'merge-prev') {
-    isEditing.value = false
-    cursorPosition.value = null
-    emit('merge-prev', {
-      localId: props.localId,
-      draftText,
-      hasDraftOverride,
-      originalText: originalText.value,
-    })
-    return
-  }
-  if (key === 'merge-next') {
-    isEditing.value = false
-    cursorPosition.value = null
-    emit('merge-next', {
-      localId: props.localId,
-      draftText,
-      hasDraftOverride,
-      originalText: originalText.value,
-    })
-  }
-}
 
-function handleContextMenuClose() {
-  isContextMenuOpen.value = false
-  if (!pendingBlurWhileContextMenuOpen.value) {
+  if (nextAction !== 'commit_pending_blur') {
     return
   }
   pendingBlurWhileContextMenuOpen.value = false
   nextTick(() => {
     stopEditing()
+  })
+}
+
+function buildContextMenuContext() {
+  const hasDraftOverride = isEditing.value
+
+  return {
+    canSplitAtCursor: canSplitAtCursor.value,
+    cursorPosition: cursorPosition.value,
+    draftText: hasDraftOverride ? editingText.value : null,
+    hasDraftOverride,
+    localId: props.localId,
+    originalText: originalText.value,
+    text: isEditing.value ? editingText.value : displayText.value,
+  }
+}
+
+function openSharedContextMenu(event) {
+  isContextMenuOpen.value = true
+  pendingBlurWhileContextMenuOpen.value = false
+
+  emit('open-context-menu', {
+    x: event.clientX,
+    y: event.clientY,
+    items: contextMenuItems.value,
+    context: buildContextMenuContext(),
+    onClose: handleContextMenuClose,
   })
 }
 
@@ -844,7 +865,8 @@ function escapeHtml(text) {
 }
 
 .time-input {
-  width: 75px;
+  width: 12ch;
+  min-width: 12ch;
   padding: 3px 6px;
   background: var(--af-bg-tertiary);
   border: 1px solid transparent;

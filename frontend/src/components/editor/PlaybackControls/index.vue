@@ -170,7 +170,9 @@ const dragProgressPercent = ref(0) // 拖动时的进度百分比
 const speedOptions = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2]
 
 // 从 Store 获取状态
-const currentTime = computed(() => playbackStore.currentTime)
+// V3.2.5+dev.20260320.01: 使用 currentTimeRaw 替代 currentTime 驱动进度条，
+// 消除 click-seek 时 isDraggingProgress=false 与 commitStableTime 之间的时间间隙导致的视觉回跳。
+const currentTime = computed(() => playbackStore.currentTimeRaw)
 const duration = computed(() => projectStore.meta.duration || 0)
 const isPlaying = computed(() => playbackStore.isPlaying)
 const playbackRate = computed(() => playbackStore.playbackRate)

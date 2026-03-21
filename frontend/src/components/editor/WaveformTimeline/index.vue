@@ -30,6 +30,21 @@
       <!-- WaveSurfer 波形 -->
       <div id="waveform" ref="waveformRef"></div>
 
+      <Teleport v-if="isReady && overlayMountTarget" :to="overlayMountTarget">
+        <RegionOverlay
+          :regions="visibleRegionModels"
+          :content-width="overlayContentWidth"
+          :pixels-per-ms="pixelsPerMs"
+          :duration-ms="Math.round(duration * 1000)"
+          :min-length-ms="Math.max(1, Math.round(props.regionMinLength * 1000))"
+          :drag-enabled="props.dragEnabled"
+          :resize-enabled="props.resizeEnabled"
+          :playback-active-ids="playbackActiveIds"
+          @region-click="handleOverlayRegionClick"
+          @region-commit="handleOverlayRegionCommit"
+        />
+      </Teleport>
+
       <!-- 加载状态 -->
       <div v-if="isLoading" class="waveform-loading">
         <div class="loading-spinner"></div>
@@ -72,27 +87,35 @@
  *
  * 原文件行数：2252 行 → 重构后：~550 行
  */
-import { ref, computed, watch, onMounted, onUnmounted, nextTick, inject } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, nextTick, inject, shallowRef } from 'vue'
 import { isFeatureEnabled } from '@/config/featureFlags'
 import { useProjectStore } from '@/stores/projectStore'
 import { usePlaybackStore } from '@/stores/playbackStore'
 import { useSubtitleDocumentStore } from '@/stores/subtitleDocumentStore'
-import { useEditorCommandBus } from '@/stores/editor/editorCommandBus'
+import { useEditorDocumentStore } from '@/stores/editor/editorDocumentStore'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { mediaApi } from '@/services/api'
 import ContextMenu from '@/components/editor/ContextMenu.vue'
 import WaveformHeader from './WaveformHeader.vue'
 import WaveformScrollbar from './WaveformScrollbar.vue'
+import RegionOverlay from './RegionOverlay.vue'
+import { createRegionModelCache, createRegionModelEntry } from './regionModelCache.js'
+import { resolveWaveformDomBindings } from './waveformDomBindings.js'
 import { logWaveformDragDiagnostics } from '@/composables/waveformDragDiagnostics.js'
 import {
   createRuntimeHealthSampler,
   recordRuntimeHealthCounter,
 } from '@/composables/runtimeHealthDiagnostics.js'
+import { detectOverlappingSubtitles, OVERLAP_COLORS } from '@/utils/subtitleUtils'
 import {
   useWaveformZoom,
   useWaveformScroll,
   useWaveformCursorDrag,
   useWaveformRegions,
+  useWaveformViewport,
+  useWaveformOverlayScheduler,
+  buildVisibleRegionSlice,
+  resolveViewportContentWidth,
   useWaveformContextMenu,
   calculateWaveformConfig,
   ZOOM_MIN,
@@ -124,7 +147,7 @@ const playbackStore = usePlaybackStore()
 const subtitleDocumentStore = useSubtitleDocumentStore()
 const playbackManager = usePlaybackManager()
 const useEditorV2 = isFeatureEnabled('USE_EDITOR_V2')
-const editorCommandBus = useEditorV2 ? useEditorCommandBus() : null
+const editorDocumentStore = useEditorV2 ? useEditorDocumentStore() : null
 const identityRef = computed(() => props.mediaId || projectStore.primaryId)
 const onSubtitleEdit = subtitleDocumentStore.onSubtitleEdit
 const subtitleEntries = computed(() => subtitleDocumentStore.subtitles || [])
@@ -162,7 +185,6 @@ const maxRetries = 3
 
 // WaveSurfer 实例
 const wavesurferRef = ref(null)
-const regionsPluginRef = ref(null)
 const timelinePluginRef = ref(null)
 
 // ============ Computed ============
@@ -178,14 +200,8 @@ const peaksSource = computed(() => {
   return projectStore.meta.peaksPath || ''
 })
 
-const currentTime = computed(() => playbackStore.currentTime)
+const currentTime = computed(() => playbackStore.currentTimeRaw)
 const duration = computed(() => projectStore.meta.duration || 0)
-
-function normalizeRegionTimeForSignature(time) {
-  const value = Number(time)
-  if (!Number.isFinite(value)) return '0.000'
-  return value.toFixed(3)
-}
 
 const regionItems = computed(() => {
   return subtitleEntries.value
@@ -204,17 +220,6 @@ const regionItems = computed(() => {
       }
     })
     .filter((subtitle) => Boolean(subtitle.id))
-})
-
-const regionRenderSignature = computed(() => {
-  const selectedId = subtitleDocumentStore.selectedSubtitleId ?? ''
-  const subtitlesSnapshot = regionItems.value
-    .map(
-      (subtitle) =>
-        `${subtitle.id}:${normalizeRegionTimeForSignature(subtitle.start)}:${normalizeRegionTimeForSignature(subtitle.end)}`
-    )
-    .join('|')
-  return `${subtitlesSnapshot}#selected:${selectedId}#color:${props.regionColor}`
 })
 
 // 滚动条轨道 ref（从子组件获取）
@@ -244,7 +249,11 @@ function detachWaveformDomListeners() {
     recordRuntimeHealthCounter('waveform.media_keydown.unbind')
   }
   if (scrollListenerElement) {
-    scrollListenerElement.removeEventListener('scroll', updateScrollbarThumb)
+    scrollListenerElement.removeEventListener(
+      'scroll',
+      scrollListenerElement.__waveformScrollHandler || updateScrollbarThumb
+    )
+    delete scrollListenerElement.__waveformScrollHandler
     scrollListenerElement = null
     recordRuntimeHealthCounter('waveform.scroll_listener.unbind')
   }
@@ -264,8 +273,13 @@ function bindWaveformDomListeners(ws) {
   const wrapper = ws.getWrapper?.()
   const scrollContainer = wrapper?.parentElement
   if (scrollContainer) {
-    scrollContainer.addEventListener('scroll', updateScrollbarThumb)
+    const handleWaveformScroll = () => {
+      updateScrollbarThumb()
+      scheduleViewportMeasure()
+    }
+    scrollContainer.addEventListener('scroll', handleWaveformScroll)
     scrollListenerElement = scrollContainer
+    scrollListenerElement.__waveformScrollHandler = handleWaveformScroll
     recordRuntimeHealthCounter('waveform.scroll_listener.bind')
   }
 }
@@ -478,7 +492,7 @@ const {
   zoomOut,
   fitToScreen,
   handleZoomInput,
-  handleZoomWithSmartAnchor,
+  queueWheelPreviewZoom,
   cleanup: cleanupZoom,
 } = useWaveformZoom(
   wavesurferRef,
@@ -505,6 +519,61 @@ const {
   playbackStore,
   isReady
 )
+
+const regionModelCache = createRegionModelCache()
+const visibleRegionModels = shallowRef([])
+
+// 播放光标进入/退出 region 的活跃集合（复刻 wavesurfer region-in/region-out）
+const playbackActiveIds = shallowRef(new Set())
+
+const waveformDomBindings = computed(() => {
+  return resolveWaveformDomBindings({
+    wrapper: wavesurferRef.value?.getWrapper?.() ?? null,
+    fallbackScrollContainer: waveformWrapperRef.value,
+    fallbackContentElement: waveformRef.value ?? waveformWrapperRef.value,
+  })
+})
+
+const waveformScrollContainerRef = computed(() => waveformDomBindings.value.scrollContainer)
+
+const overlayContentRef = computed(() => {
+  return waveformDomBindings.value.contentElement
+})
+
+const overlayMountTarget = computed(() => waveformDomBindings.value.overlayMountTarget)
+
+const fallbackPixelsPerSecond = computed(() => {
+  return (zoomLevel.value / 100) * ZOOM_BASE_PX_PER_SEC
+})
+
+const {
+  viewportStartMs,
+  viewportEndMs,
+  bufferMs,
+  pixelsPerMs,
+  pixelsPerSecond,
+  scheduleMeasure: scheduleViewportMeasure,
+  syncViewportNow,
+  cancelScheduledMeasure,
+} = useWaveformViewport({
+  scrollElementRef: waveformScrollContainerRef,
+  contentElementRef: overlayContentRef,
+  durationSecondsRef: duration,
+  fallbackPixelsPerSecondRef: fallbackPixelsPerSecond,
+})
+
+const overlayScheduler = useWaveformOverlayScheduler(() => {
+  rebuildVisibleRegionModels()
+})
+
+const overlayContentWidth = computed(() => {
+  const wrapperWidth = resolveViewportContentWidth({
+    contentElement: overlayContentRef.value,
+    scrollElement: waveformScrollContainerRef.value,
+  })
+  const derivedWidth = Math.max(0, Number(duration.value) * Number(pixelsPerSecond.value || fallbackPixelsPerSecond.value || 0))
+  return Math.max(wrapperWidth, derivedWidth)
+})
 
 // 光标拖拽逻辑
 const {
@@ -534,16 +603,11 @@ const {
 
 // Region 管理逻辑
 const {
-  isUpdatingRegions,
-  setupRegionEvents,
-  renderSubtitleRegions,
-  flushPendingRegionCommits,
+  commitRegionTimeChange,
+  handleRegionClick,
   cleanup: cleanupRegions,
 } = useWaveformRegions(
-  regionsPluginRef,
   projectStore,
-  props,
-  isReady,
   onSubtitleEdit,
   playbackManager,
   subtitleDocumentStore,
@@ -564,20 +628,124 @@ function handleWaveformContextMenu(e) {
   onContextMenu(e, getTimeFromClientX)
 }
 
+function createLegacyRegionSource() {
+  const order = []
+  const entities = new Map()
+
+  regionItems.value.forEach((subtitle) => {
+    const localId = String(subtitle.id)
+    order.push(localId)
+    entities.set(localId, {
+      localId,
+      startMs: Math.round(Number(subtitle.start || 0) * 1000),
+      endMs: Math.round(Number(subtitle.end || 0) * 1000),
+      text: '',
+      isDeleted: false,
+    })
+  })
+
+  return {
+    order,
+    entities,
+  }
+}
+
+function getWaveformRegionSource() {
+  if (useEditorV2 && editorDocumentStore) {
+    return {
+      order: editorDocumentStore.order,
+      entities: editorDocumentStore.entities,
+    }
+  }
+  return createLegacyRegionSource()
+}
+
+function rebuildVisibleRegionModels() {
+  if (!isReady.value) {
+    visibleRegionModels.value = []
+    return
+  }
+
+  const regionSource = getWaveformRegionSource()
+  const visibleEntities = buildVisibleRegionSlice({
+    rangeStartMs: viewportStartMs.value,
+    rangeEndMs: viewportEndMs.value,
+    bufferMs: bufferMs.value,
+    order: regionSource.order,
+    entities: regionSource.entities,
+  })
+
+  const overlapIds = detectOverlappingSubtitles(
+    visibleEntities.map((entity) => ({
+      id: entity.localId,
+      start: Number(entity.startMs || 0) / 1000,
+      end: Number(entity.endMs || 0) / 1000,
+    }))
+  )
+
+  const selectedId = subtitleDocumentStore.selectedSubtitleId ?? null
+  const entries = visibleEntities.map((entity) => {
+    const selected = selectedId !== null && String(selectedId) === String(entity.localId)
+    const overlapping = overlapIds.has(entity.localId)
+    const color = overlapping
+      ? OVERLAP_COLORS.error
+      : (selected ? OVERLAP_COLORS.selected : props.regionColor)
+    const entry = createRegionModelEntry(entity, {
+      selected,
+      overlapping,
+      color,
+    })
+    return entry
+  })
+
+  visibleRegionModels.value = regionModelCache.rebuildVisibleModels(entries)
+}
+
+function scheduleOverlayRefresh(reason = 'unknown') {
+  if (!isReady.value) {
+    return
+  }
+  overlayScheduler.invalidate(reason)
+}
+
+function handleOverlayRegionClick(region) {
+  const startSeconds = projectStore.toDisplayTime((Number(region.startMs) || 0) / 1000)
+  const endSeconds = projectStore.toDisplayTime((Number(region.endMs) || 0) / 1000)
+  handleRegionClick({
+    id: region.localId,
+    start: startSeconds,
+    end: endSeconds,
+  })
+}
+
+function handleOverlayRegionCommit(region) {
+  const startSeconds = projectStore.toDisplayTime((Number(region.startMs) || 0) / 1000)
+  const endSeconds = projectStore.toDisplayTime((Number(region.endMs) || 0) / 1000)
+  commitRegionTimeChange({
+    id: region.localId,
+    start: startSeconds,
+    end: endSeconds,
+    side: region.side,
+    region: {
+      id: region.localId,
+      start: startSeconds,
+      end: endSeconds,
+    },
+    deferred: false,
+  })
+  scheduleOverlayRefresh('region-commit')
+}
+
 // ============ WaveSurfer 初始化 ============
 let peaksCheckTimer = null
 let loadRetryTimer = null
-let lateReadyRenderTimer = null
 
 async function initWavesurfer() {
   if (!waveformRef.value) return
 
   try {
     const WaveSurfer = (await import('wavesurfer.js')).default
-    const RegionsPlugin = (await import('wavesurfer.js/dist/plugins/regions.js')).default
     const TimelinePlugin = (await import('wavesurfer.js/dist/plugins/timeline.js')).default
-
-    regionsPluginRef.value = RegionsPlugin.create()
 
     // TimelinePlugin 嵌入波形顶部，自动跟随滚动
     const timelinePlugin = TimelinePlugin.create({
@@ -590,6 +758,7 @@ async function initWavesurfer() {
       secondaryColor: 'var(--af-border-default)',
       primaryFontColor: 'var(--af-text-secondary)',
       secondaryFontColor: 'var(--af-text-muted)',
+      formatTimeCallback: () => '',
       style: { fontSize: '10px', fontFamily: 'var(--af-font-mono)' },
     })
     timelinePluginRef.value = timelinePlugin
@@ -610,7 +779,7 @@ async function initWavesurfer() {
       height: props.height,
       normalize: true,
       backend: 'MediaElement',
-      plugins: [regionsPluginRef.value, timelinePlugin],
+      plugins: [timelinePlugin],
       minPxPerSec: basePxPerSec,
       scrollParent: true,
       fillParent: false,
@@ -628,7 +797,6 @@ async function initWavesurfer() {
     zoomLevel.value = suggestedZoom
 
     setupWavesurferEvents()
-    setupRegionEvents(wavesurferRef)
     await loadAudioData()
   } catch (error) {
     console.error('初始化波形失败:', error)
@@ -668,7 +836,8 @@ function setupWavesurferEvents() {
       ws.setOptions(barConfig)
     }
 
-    renderSubtitleRegions()
+    syncViewportNow()
+    scheduleOverlayRefresh('wavesurfer-ready')
     emit('ready')
     playbackManager.registerWaveSurfer(ws, identityRef.value)
 
@@ -690,7 +859,18 @@ function setupWavesurferEvents() {
     const newZoom = Math.round((minPxPerSec / ZOOM_BASE_PX_PER_SEC) * 100)
     zoomLevel.value = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, newZoom))
     emit('zoom', zoomLevel.value)
-    nextTick(() => updateScrollbarThumb())
+    nextTick(() => {
+      updateScrollbarThumb()
+
+      const scheduleAfterWaveformLayout = typeof requestAnimationFrame === 'function'
+        ? requestAnimationFrame
+        : (callback) => setTimeout(() => callback(Date.now()), 16)
+
+      // wavesurfer zoom 事件早于内部 wrapper 宽度稳定；等一帧后再测量，避免 overlay 继续使用旧宽度。
+      scheduleAfterWaveformLayout(() => {
+        scheduleViewportMeasure()
+      })
+    })
   })
 
   ws.on('error', async (error) => {
@@ -706,7 +886,8 @@ function setupWavesurferEvents() {
       if (!isReady.value) {
         isReady.value = true
         applyWaveformMediaState()
-        renderSubtitleRegions()
+        syncViewportNow()
+        scheduleOverlayRefresh('virtual-ready')
         playbackManager.registerWaveSurfer(ws, identityRef.value)
         emit('ready')
 
@@ -860,101 +1041,15 @@ function retryLoad() {
   loadAudioData()
 }
 
-// ============ 滚轮缩放 ============
-let zoomRafId = null
-let pendingZoomDelta = 0
-
-function smoothZoom() {
-  if (pendingZoomDelta === 0) {
-    zoomRafId = null
-    return
-  }
-  const newZoom = zoomLevel.value + pendingZoomDelta
-  pendingZoomDelta = 0
-  handleZoomWithSmartAnchor(newZoom)
-  zoomRafId = null
-}
-
 function handleWheel(e) {
   if (!e.ctrlKey) return
   e.preventDefault()
   const delta = e.deltaY < 0 ? ZOOM_WHEEL_STEP : -ZOOM_WHEEL_STEP
-  pendingZoomDelta += delta
-  if (!zoomRafId) {
-    zoomRafId = requestAnimationFrame(smoothZoom)
-  }
+  queueWheelPreviewZoom(delta, e.clientX)
 }
 
 // ============ Watchers ============
-let regionUpdateTimer = null
 let lastSyncTime = 0
-let hasDeferredRegionRender = false
-let pendingRegionRenderReason = 'unknown'
-let stopUndoRedoRegionListener = null
-const shouldForceRecreateRegions = ref(false)
-
-function isStructuralRegionRebuildCommand(command) {
-  if (!command) {
-    return false
-  }
-  return command.type === 'split_subtitle' || command.type === 'merge_subtitles'
-}
-
-function setupUndoRedoRegionRebuildGuard() {
-  if (!editorCommandBus || stopUndoRedoRegionListener) {
-    return
-  }
-
-  stopUndoRedoRegionListener = editorCommandBus.onCommandApplied((command) => {
-    if (!isStructuralRegionRebuildCommand(command)) {
-      return
-    }
-    shouldForceRecreateRegions.value = true
-    hasDeferredRegionRender = true
-    const reason = command.source === 'undo_redo'
-      ? 'history-undo-redo'
-      : 'structural-command'
-    scheduleRegionRender(reason)
-  })
-}
-
-function teardownUndoRedoRegionRebuildGuard() {
-  if (!stopUndoRedoRegionListener) {
-    return
-  }
-  stopUndoRedoRegionListener()
-  stopUndoRedoRegionListener = null
-}
-
-function clearScheduledRegionRender() {
-  if (regionUpdateTimer) {
-    clearTimeout(regionUpdateTimer)
-    regionUpdateTimer = null
-  }
-}
-
-function scheduleRegionRender(reason = 'unknown') {
-  hasDeferredRegionRender = true
-  pendingRegionRenderReason = reason
-  if (regionUpdateTimer) {
-    return
-  }
-  regionUpdateTimer = setTimeout(() => {
-    regionUpdateTimer = null
-    if (!isReady.value || isRegionPointerDragging.value || isUpdatingRegions.value) {
-      return
-    }
-    flushPendingRegionCommits({ force: true })
-    logWaveformDragDiagnostics('timeline-region-render-commit', {
-      reason: pendingRegionRenderReason,
-      subtitlesCount: regionItems.value.length,
-    })
-    const forceRecreateAll = shouldForceRecreateRegions.value
-    renderSubtitleRegions(regionItems.value, { forceRecreateAll })
-    shouldForceRecreateRegions.value = false
-    hasDeferredRegionRender = false
-  }, 0)
-}
 
 watch(
   () => identityRef.value,
@@ -978,68 +1073,91 @@ watch(
 )
 
 watch(
-  () => regionRenderSignature.value,
+  () => [
+    isReady.value,
+    viewportStartMs.value,
+    viewportEndMs.value,
+    bufferMs.value,
+    overlayContentWidth.value,
+    useEditorV2 ? editorDocumentStore?.structureRevision : regionItems.value.length,
+    useEditorV2 ? editorDocumentStore?.timingRevision : 0,
+    subtitleDocumentStore.selectedSubtitleId ?? null,
+    props.regionColor,
+  ],
   () => {
-    if (isRegionPointerDragging.value) {
-      clearScheduledRegionRender()
-      hasDeferredRegionRender = true
-      logWaveformDragDiagnostics('timeline-skip-render-while-region-dragging', {
-        subtitlesCount: regionItems.value.length,
-        reason: 'builtin-guard',
-      })
-      return
-    }
-
     if (!isReady.value) {
-      hasDeferredRegionRender = true
+      visibleRegionModels.value = []
       return
     }
-
-    if (isUpdatingRegions.value) {
-      hasDeferredRegionRender = true
+    if (isRegionPointerDragging.value) {
       return
     }
-
-    scheduleRegionRender('signature-change')
+    scheduleOverlayRefresh('overlay-deps-change')
   },
   { flush: 'post' }
-)
-
-watch(
-  () => isReady.value,
-  (ready) => {
-    if (!ready || !hasDeferredRegionRender) {
-      return
-    }
-    scheduleRegionRender('ready')
-  }
 )
 
 watch(
   () => isRegionPointerDragging.value,
   (isDragging, wasDragging) => {
     if (isDragging) {
-      clearScheduledRegionRender()
-      hasDeferredRegionRender = true
       return
     }
 
     if (!wasDragging) return
     if (!isReady.value) return
 
-    flushPendingRegionCommits({ force: true })
-    scheduleRegionRender('drag-end-replay')
+    scheduleOverlayRefresh('drag-end-replay')
   }
 )
 
+// 播放光标进入/退出 region 检测（复刻 wavesurfer region-in/region-out）
+// 仅在活跃集合实际变化时更新 shallowRef，避免高频 timeupdate 引起不必要的 re-render
 watch(
-  () => isUpdatingRegions.value,
-  (isUpdating, wasUpdating) => {
-    if (isUpdating || !wasUpdating) return
-    if (!hasDeferredRegionRender) return
-    if (isRegionPointerDragging.value || !isReady.value) return
-    scheduleRegionRender('regions-lock-released')
-  }
+  () => playbackStore.currentTimeRaw,
+  (timeSeconds) => {
+    const regions = visibleRegionModels.value
+    if (!regions.length) {
+      if (playbackActiveIds.value.size > 0) {
+        playbackActiveIds.value = new Set()
+      }
+      return
+    }
+
+    const timeMs = timeSeconds * 1000
+    const prev = playbackActiveIds.value
+    let changed = false
+
+    // 先做快速判断：当前活跃集合是否仍然全部命中
+    for (const id of prev) {
+      const r = regions.find((m) => m.localId === id)
+      if (!r || timeMs < r.startMs || timeMs > r.endMs) {
+        changed = true
+        break
+      }
+    }
+
+    // 检查是否有新进入的 region
+    if (!changed) {
+      for (const r of regions) {
+        if (r.startMs <= timeMs && r.endMs >= timeMs && !prev.has(r.localId)) {
+          changed = true
+          break
+        }
+      }
+    }
+
+    if (!changed) return
+
+    const next = new Set()
+    for (const r of regions) {
+      if (r.startMs <= timeMs && r.endMs >= timeMs) {
+        next.add(r.localId)
+      }
+    }
+    playbackActiveIds.value = next
+  },
+  { flush: 'post' }
 )
 
 watch(
@@ -1072,7 +1190,7 @@ watch(
 )
 
 watch(
-  () => playbackStore.currentTime,
+  () => playbackStore.currentTimeRaw,
   (newTime) => {
     const ws = wavesurferRef.value
     if (!ws || !isReady.value) return
@@ -1185,8 +1303,7 @@ watch(hideTimelineScale, (hidden) => {
 // ============ 生命周期 ============
 onMounted(async () => {
   await nextTick()
-  setupUndoRedoRegionRebuildGuard()
-  setupRegionPointerGuards(waveformRef)
+  setupRegionPointerGuards(waveformWrapperRef)
   await initWavesurfer()
   stopRuntimeHealthSampler = createRuntimeHealthSampler(
     'WaveformTimeline',
@@ -1196,7 +1313,6 @@ onMounted(async () => {
       isLoading: Boolean(isLoading.value),
       hasError: Boolean(hasError.value),
       hasLoadRetryTimer: Boolean(loadRetryTimer),
-      hasLateReadyRenderTimer: Boolean(lateReadyRenderTimer),
       hasPeaksPolling: Boolean(peaksCheckTimer),
       hasMediaKeydownListener: Boolean(mediaKeydownElement),
       hasScrollListener: Boolean(scrollListenerElement),
@@ -1209,27 +1325,21 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
-  teardownUndoRedoRegionRebuildGuard()
   containerRef.value?.removeEventListener('wheel', handleWheel)
-  if (zoomRafId) cancelAnimationFrame(zoomRafId)
   if (loadRetryTimer) {
     clearTimeout(loadRetryTimer)
     loadRetryTimer = null
     recordRuntimeHealthCounter('waveform.retry_timer.clear_on_unmount')
-  }
-  if (lateReadyRenderTimer) {
-    clearTimeout(lateReadyRenderTimer)
-    lateReadyRenderTimer = null
-    recordRuntimeHealthCounter('waveform.late_ready_timer.clear_on_unmount')
   }
   if (stopRuntimeHealthSampler) {
     stopRuntimeHealthSampler()
     stopRuntimeHealthSampler = null
   }
   stopVirtualClock()
-  clearScheduledRegionRender()
   clearTimeout(durationReloadTimer)
   stopPeaksPolling()
+  cancelScheduledMeasure()
+  overlayScheduler.cancel()
 
   // 清理所有 composables
   cleanupZoom()

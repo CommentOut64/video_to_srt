@@ -11,6 +11,44 @@
 
 import { apiClient } from './client'
 
+function readShellMediaCapability() {
+  if (typeof window === 'undefined') {
+    return {}
+  }
+  const shell = window.anchorfluxShell || null
+  return (
+    shell?.getMediaCapabilities?.()
+    || shell?.mediaCapabilities
+    || {}
+  )
+}
+
+function buildShellMediaCapabilityParams() {
+  const capability = readShellMediaCapability()
+  const params = {}
+
+  if (typeof capability.hevcDirectPlay === 'boolean') {
+    params.shell_hevc_direct_play = capability.hevcDirectPlay ? '1' : '0'
+  }
+  if (typeof capability.h264DirectPlay === 'boolean') {
+    params.shell_h264_direct_play = capability.h264DirectPlay ? '1' : '0'
+  }
+  if (capability.activeGpuPreference) {
+    params.shell_active_gpu_preference = capability.activeGpuPreference
+  }
+  return params
+}
+
+function appendQueryParams(url, params) {
+  const entries = Object.entries(params || {}).filter(([, value]) => value !== undefined && value !== null && value !== '')
+  if (entries.length === 0) {
+    return url
+  }
+  const search = new URLSearchParams(entries)
+  const separator = url.includes('?') ? '&' : '?'
+  return `${url}${separator}${search.toString()}`
+}
+
 class MediaAPI {
   /**
    * 获取 API base URL（用于构建媒体资源 URL）
@@ -26,7 +64,10 @@ class MediaAPI {
    * @returns {string} 视频URL
    */
   getVideoUrl(identifier) {
-    return `${this._getBaseURL()}/api/media/${identifier}/video`
+    return appendQueryParams(
+      `${this._getBaseURL()}/api/media/${identifier}/video`,
+      buildShellMediaCapabilityParams()
+    )
   }
 
   /**
@@ -123,7 +164,9 @@ class MediaAPI {
    * }>}
    */
   async getProxyStatus(identifier) {
-    return apiClient.get(`/api/media/${identifier}/proxy-status`)
+    return apiClient.get(`/api/media/${identifier}/proxy-status`, {
+      params: buildShellMediaCapabilityParams()
+    })
   }
 
   /**
@@ -193,7 +236,10 @@ class MediaAPI {
    * @returns {string} 预览视频URL
    */
   getPreviewVideoUrl(jobId) {
-    return `${this._getBaseURL()}/api/media/${jobId}/video/preview`
+    return appendQueryParams(
+      `${this._getBaseURL()}/api/media/${jobId}/video/preview`,
+      buildShellMediaCapabilityParams()
+    )
   }
 
   /**

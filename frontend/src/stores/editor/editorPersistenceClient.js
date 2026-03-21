@@ -13,11 +13,23 @@ let worker = null
 let emergencyBuffer = []
 let commandsSinceSnapshot = 0
 let idleHandle = null
+let pendingCommandsBatch = []
+let appendFlushScheduled = false
+let emergencyCleanup = null
+
+function scheduleMicrotask(callback) {
+  if (typeof queueMicrotask === 'function') {
+    queueMicrotask(callback)
+    return
+  }
+  Promise.resolve().then(callback)
+}
 
 export function useEditorPersistenceClient() {
   const isReady = ref(false)
 
   function init(projectId, sessionId) {
+    destroy()
     worker = new Worker(
       new URL('../../workers/editorPersistence.worker.js', import.meta.url),
       { type: 'module' }
@@ -36,14 +48,38 @@ export function useEditorPersistenceClient() {
   }
 
   function appendCommands(commands) {
-    if (!worker || !isReady.value) return
+    if (!worker || !isReady.value || !Array.isArray(commands) || commands.length === 0) return
 
     for (const cmd of commands) {
       appendToEmergencyBuffer(cmd)
     }
 
-    worker.postMessage({ type: 'append_commands', commands })
+    pendingCommandsBatch.push(...commands)
+    scheduleAppendFlush()
     onCommandAppended(commands.length)
+  }
+
+  function scheduleAppendFlush() {
+    if (appendFlushScheduled) {
+      return
+    }
+
+    appendFlushScheduled = true
+    scheduleMicrotask(() => {
+      appendFlushScheduled = false
+      flushPendingCommands()
+    })
+  }
+
+  function flushPendingCommands() {
+    if (!worker || !isReady.value || pendingCommandsBatch.length === 0) {
+      return 0
+    }
+
+    const commands = pendingCommandsBatch
+    pendingCommandsBatch = []
+    worker.postMessage({ type: 'append_commands', commands })
+    return commands.length
   }
 
   function appendToEmergencyBuffer(command) {
@@ -55,6 +91,7 @@ export function useEditorPersistenceClient() {
 
   function saveSnapshot(snapshot) {
     if (!worker || !isReady.value) return
+    flushPendingCommands()
     worker.postMessage({ type: 'save_snapshot', snapshot })
   }
 
@@ -97,6 +134,8 @@ export function useEditorPersistenceClient() {
   }
 
   function setupEmergencyHandlers(projectId) {
+    emergencyCleanup?.()
+
     const handler = () => {
       const sessionStore = useEditorSessionStore()
       const draftStore = useEditorDraftStore()
@@ -105,7 +144,7 @@ export function useEditorPersistenceClient() {
       const data = {
         projectId,
         sessionId: sessionStore.sessionId,
-        commands: emergencyBuffer,
+        commands: [...emergencyBuffer],
         activeDraft: draftStore.activeTextDraft
           ? { ...draftStore.activeTextDraft }
           : null,
@@ -131,11 +170,19 @@ export function useEditorPersistenceClient() {
       }
     }
 
+    const visibilityHandler = () => {
+      if (document.visibilityState === 'hidden') handler()
+    }
+
     window.addEventListener('beforeunload', handler)
     window.addEventListener('pagehide', handler)
-    window.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'hidden') handler()
-    })
+    window.addEventListener('visibilitychange', visibilityHandler)
+    emergencyCleanup = () => {
+      window.removeEventListener('beforeunload', handler)
+      window.removeEventListener('pagehide', handler)
+      window.removeEventListener('visibilitychange', visibilityHandler)
+      emergencyCleanup = null
+    }
   }
 
   function cleanOldestEmergencyBackup() {
@@ -203,7 +250,13 @@ export function useEditorPersistenceClient() {
   }
 
   function destroy() {
-    if (idleHandle) cancelIdleCallback(idleHandle)
+    if (idleHandle && typeof cancelIdleCallback !== 'undefined') {
+      cancelIdleCallback(idleHandle)
+    }
+    idleHandle = null
+    appendFlushScheduled = false
+    pendingCommandsBatch = []
+    emergencyCleanup?.()
     worker?.terminate()
     worker = null
     isReady.value = false
@@ -213,6 +266,7 @@ export function useEditorPersistenceClient() {
     isReady,
     init,
     appendCommands,
+    flushPendingCommands,
     saveSnapshot,
     load,
     restoreProject,

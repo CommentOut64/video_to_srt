@@ -67,7 +67,6 @@
           >
             <SubtitleRow
               :local-id="item.subtitle.localId"
-              :row-index="item.index"
               :is-selected="selectionStore.isMultiSelected(item.subtitle.localId)"
               :is-active="activeId === item.subtitle.localId"
               :is-current="currentSubtitleId === item.subtitle.localId"
@@ -75,16 +74,12 @@
               :is-match-selected="item.isSelected"
               :is-selectable="true"
               :cluster-color="item.clusterColor"
-              :can-merge-prev="canMergePrev(item.subtitle.localId)"
-              :can-merge-next="canMergeNext(item.subtitle.localId)"
               @click="handleRowClick"
-              @split="handleSplitFromCursor"
-              @merge-prev="(payload) => handleMerge(item.subtitle.localId, 'prev', payload)"
-              @merge-next="(payload) => handleMerge(item.subtitle.localId, 'next', payload)"
               @insert-before="handleInsertBefore(item.subtitle.localId)"
               @insert-after="handleInsertAfter(item.subtitle.localId)"
               @delete="handleDelete(item.subtitle.localId)"
               @focus-row="handleRowFocus"
+              @open-context-menu="handleOpenContextMenu"
               @select-change="(checked) => handleItemSelectChange(item.index, checked)"
             />
           </div>
@@ -96,8 +91,10 @@
       v-else
       ref="scrollerRef"
       :items="virtualVisibleRows"
+      key-field="id"
       :min-item-size="98"
-      class="scroller"
+      :buffer="320"
+      :class="['scroller', { 'is-scrolling': isScrolling }]"
       tabindex="0"
       @keydown="handleKeydown"
     >
@@ -111,7 +108,6 @@
           <div class="row-shell" :data-local-id="item.localId">
             <SubtitleRow
               :local-id="item.localId"
-              :row-index="item.rowIndex"
               :is-selected="selectionStore.isMultiSelected(item.localId)"
               :is-active="activeId === item.localId"
               :is-current="currentSubtitleId === item.localId"
@@ -119,22 +115,25 @@
               :is-match-selected="item.isMatchSelected"
               :is-selectable="item.isSelectable"
               :cluster-color="item.clusterColor"
-              :can-merge-prev="canMergePrev(item.localId)"
-              :can-merge-next="canMergeNext(item.localId)"
               @click="handleRowClick"
-              @split="handleSplitFromCursor"
-              @merge-prev="(payload) => handleMerge(item.localId, 'prev', payload)"
-              @merge-next="(payload) => handleMerge(item.localId, 'next', payload)"
               @insert-before="handleInsertBefore(item.localId)"
               @insert-after="handleInsertAfter(item.localId)"
               @delete="handleDelete(item.localId)"
               @focus-row="handleRowFocus"
+              @open-context-menu="handleOpenContextMenu"
               @select-change="(checked) => handleItemSelectChange(item.selectionIndex, checked)"
             />
           </div>
         </DynamicScrollerItem>
       </template>
     </DynamicScroller>
+
+    <ContextMenu
+      ref="sharedContextMenuRef"
+      :items="sharedContextMenuItems"
+      @close="handleSharedContextMenuClose"
+      @select="handleSharedContextMenuSelect"
+    />
   </div>
 </template>
 
@@ -143,15 +142,20 @@ import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from
 import { ElMessage, ElLoading } from 'element-plus'
 import { DynamicScroller, DynamicScrollerItem } from 'vue-virtual-scroller'
 import 'vue-virtual-scroller/dist/vue-virtual-scroller.css'
+import ContextMenu from '@/components/editor/ContextMenu.vue'
 import GroupHeader from '@/components/editor/SubtitleList/GroupHeader.vue'
 import SearchToolbar from '@/components/editor/SubtitleList/SearchToolbar.vue'
 import { SortMode, useHomophoneSearch } from '@/composables/useHomophoneSearch'
 import SubtitleRow from './SubtitleRow.vue'
+import { createRowModelCache } from './rowModelCache'
+import { createWheelSmoother, shouldUseCustomWheelSmoothing } from './wheelSmoother'
+import { useSharedContextMenu } from './useSharedContextMenu'
 import { buildBatchReplaceReplacements } from './searchBatchReplace'
 import { shouldIgnoreStructuralShortcut } from './keyboardSafety'
 import projectApi from '@/services/api/projectApi'
 import { useEditorPlayback } from '@/composables/editor/useEditorPlayback'
 import { useProjectStore } from '@/stores/projectStore'
+import { usePlaybackStore } from '@/stores/playbackStore'
 import { useSubtitleDocumentStore } from '@/stores/subtitleDocumentStore'
 import { useEditorCommandBus } from '@/stores/editor/editorCommandBus'
 import {
@@ -193,10 +197,11 @@ const commandBus = useEditorCommandBus()
 const editorProjectionBridge = useEditorProjectionBridge()
 const selectionStore = useEditorSelectionStore()
 const projectStore = useProjectStore()
+const playbackStore = usePlaybackStore()
 const sessionStore = useEditorSessionStore()
 const subtitleDocumentStore = useSubtitleDocumentStore()
 const syncEngine = useEditorSyncEngine()
-const { currentSubtitleId, seekToSubtitle, followCurrentSubtitle } = useEditorPlayback()
+const { currentSubtitleId, followSubtitleId, seekToSubtitle, resolveSubtitleScrollTarget } = useEditorPlayback()
 
 const identityId = computed(() => projectStore.primaryId)
 const projectionSubtitles = computed(() => editorProjectionBridge.subtitles)
@@ -209,6 +214,7 @@ const homophoneSearch = reactive(useHomophoneSearch({
 }))
 
 const scrollerRef = ref(null)
+const sharedContextMenuRef = ref(null)
 const listContainerRef = ref(null)
 const quickSearchText = ref('')
 const collapsedGroups = ref(new Set())
@@ -219,14 +225,33 @@ const isGroupedMode = computed(() => {
   return homophoneSearch.isSearchActive && homophoneSearch.sortMode === SortMode.GROUPED
 })
 
-const isFollowPausedByUser = ref(false)
-const USER_SCROLL_AUTO_RESUME_DELAY_MS = 6000
-const PROGRAMMATIC_SCROLL_GUARD_MS = 900
-let followResumeTimer = null
-let programmaticScrollGuardUntil = 0
-let programmaticScrollReleaseTimer = null
 let attachedScrollerElement = null
+const USER_SCROLL_AUTO_RESUME_DELAY_MS = 6000
+const EDITABLE_LIST_TARGET_SELECTOR = [
+  'textarea',
+  'input:not([readonly]):not([disabled])',
+  'select:not([disabled])',
+  '[contenteditable=""]',
+  '[contenteditable="true"]',
+  '[role="textbox"]',
+].join(', ')
+const FOLLOW_ANIMATION_DURATION_MS = 220
+const FOLLOW_SNAP_THRESHOLD_PX = 18
+const PROGRAMMATIC_SCROLL_SUPPRESSION_MS = 180
+const isUserScrollOverride = ref(false)
+const isScrollbarThumbDrag = ref(false)
+let autoResumeTimer = null
+let activeFollowAnimationCancel = null
 let followRequestToken = 0
+let programmaticScrollSuppressionUntil = 0
+
+// V3.2.5+dev.20260320.01: 滚动态 pointer-events 屏蔽
+// Trace 分析显示 mouseenter/mouseleave 事件风暴是滚动卡顿的主因（861次 mouseenter, 累计 285ms），
+// 滚动期间在 scroller 上设置 pointer-events:none 阻断事件链，停止后恢复。
+const isScrolling = ref(false)
+let scrollingDebounceTimer = null
+const SCROLL_IDLE_DELAY_MS = 150
+const handledWheelEvents = new WeakSet()
 
 // FLIP 动画运行时常量与引用
 const FLIP_DURATION_MS = 160
@@ -236,6 +261,17 @@ const USER_SCROLL_FLIP_GUARD_MS = 120
 const lastManualListInteractionAt = ref(0)
 let cancelActiveFlipAnimation = null
 let flipRunToken = 0
+
+const {
+  handleMenuClose: finalizeSharedContextMenuClose,
+  isOpen: isSharedContextMenuOpen,
+  items: sharedContextMenuItems,
+  openMenu: openSharedContextMenu,
+  selectMenuItem: selectSharedContextMenuItem,
+} = useSharedContextMenu({
+  onSelect: handleSharedContextMenuSelection,
+})
+const rowModelCache = createRowModelCache()
 
 const filteredSubtitles = computed(() => {
   if (!quickSearchText.value) {
@@ -277,14 +313,6 @@ const timelineRowMetaByLocalId = computed(() => {
   )
 })
 
-const defaultVisibleRows = computed(() => {
-  return filteredSubtitles.value.map((subtitle, index) => buildVirtualRow(subtitle.localId, index))
-})
-
-const defaultVisibleIds = computed(() => {
-  return defaultVisibleRows.value.map((row) => row.localId)
-})
-
 const rowMeasurementKeyByLocalId = computed(() => {
   const measurementMap = new Map()
   projectionSubtitles.value.forEach((subtitle) => {
@@ -300,8 +328,24 @@ const rowMeasurementKeyByLocalId = computed(() => {
   return measurementMap
 })
 
+const defaultVisibleRowEntries = computed(() => {
+  return filteredSubtitles.value.map((subtitle, index) => buildVirtualRowEntry(subtitle.localId, index))
+})
+
+const defaultVisibleRows = computed(() => {
+  return rowModelCache.rebuildVisibleRows(defaultVisibleRowEntries.value)
+})
+
+const defaultVisibleIds = computed(() => {
+  return defaultVisibleRows.value.map((row) => row.localId)
+})
+
+const timelineVisibleRowEntries = computed(() => {
+  return homophoneSearch.timelineViewItems.map((item) => buildVirtualRowEntry(item.subtitle.localId, item.index))
+})
+
 const timelineVisibleRows = computed(() => {
-  return homophoneSearch.timelineViewItems.map((item) => buildVirtualRow(item.subtitle.localId, item.index))
+  return rowModelCache.rebuildVisibleRows(timelineVisibleRowEntries.value)
 })
 
 const virtualVisibleRows = computed(() => {
@@ -345,23 +389,42 @@ function localIdKey(subtitle) {
   return subtitle?.localId ?? subtitle?.id ?? ''
 }
 
-function buildVirtualRow(localId, fallbackIndex) {
-  const rowMeta = resolveRowMeta(localId, fallbackIndex)
-  const resolvedRowIndex = Number.isFinite(rowMeta.rowIndex) ? rowMeta.rowIndex : fallbackIndex
+function buildMatchSpanSignature(matchSpans) {
+  if (!Array.isArray(matchSpans) || matchSpans.length === 0) {
+    return 'no-match'
+  }
 
-  return {
+  return matchSpans
+    .map((span) => `${span.start ?? 0}:${span.end ?? 0}`)
+    .join(',')
+}
+
+function buildVirtualRowEntry(localId, fallbackIndex) {
+  const rowMeta = resolveRowMeta(localId, fallbackIndex)
+  const matchSpans = Array.isArray(rowMeta.matchSpans) ? rowMeta.matchSpans : []
+  const payload = {
     id: localId,
     localId,
-    rowIndex: Number.isFinite(resolvedRowIndex) ? resolvedRowIndex : 0,
-    matchSpans: Array.isArray(rowMeta.matchSpans) ? rowMeta.matchSpans : [],
+    matchSpans,
     isMatchSelected: Boolean(rowMeta.isMatchSelected),
     isSelectable: Boolean(rowMeta.isSelectable),
     clusterColor: rowMeta.clusterColor ?? null,
     selectionIndex: Number.isFinite(rowMeta.selectionIndex) ? rowMeta.selectionIndex : null,
     sizeKey: [
       rowMeasurementKeyByLocalId.value.get(localId) || '',
-      Array.isArray(rowMeta.matchSpans) ? rowMeta.matchSpans.length : 0,
+      buildMatchSpanSignature(matchSpans),
       rowMeta.isSelectable ? 'search' : 'normal',
+    ].join('|'),
+  }
+
+  return {
+    localId,
+    payload,
+    signature: [
+      payload.sizeKey,
+      payload.isMatchSelected ? 'selected' : 'not-selected',
+      payload.clusterColor ?? 'no-cluster',
+      payload.selectionIndex ?? 'no-selection-index',
     ].join('|'),
   }
 }
@@ -388,6 +451,57 @@ function handleRowFocus(localId) {
     selectionStore,
     subtitleDocumentStore,
   })
+}
+
+function handleOpenContextMenu(payload) {
+  if (!payload || !Array.isArray(payload.items) || payload.items.length === 0) {
+    return
+  }
+
+  sharedContextMenuRef.value?.hide()
+  openSharedContextMenu(payload)
+
+  nextTick(() => {
+    if (!isSharedContextMenuOpen.value) {
+      return
+    }
+    sharedContextMenuRef.value?.show(payload.x, payload.y)
+  })
+}
+
+function handleSharedContextMenuClose(closeMeta) {
+  finalizeSharedContextMenuClose(closeMeta)
+}
+
+function handleSharedContextMenuSelect(key) {
+  selectSharedContextMenuItem(key)
+}
+
+function handleSharedContextMenuSelection({ key, context }) {
+  if (!context?.localId) {
+    return
+  }
+
+  if (key === 'split') {
+    if (!context.canSplitAtCursor) {
+      return
+    }
+    handleSplitFromCursor({
+      localId: context.localId,
+      cursorPosition: context.cursorPosition,
+      text: context.text,
+    })
+    return
+  }
+
+  if (key === 'merge-prev') {
+    handleMerge(context.localId, 'prev', context)
+    return
+  }
+
+  if (key === 'merge-next') {
+    handleMerge(context.localId, 'next', context)
+  }
 }
 
 function handleInsertBefore(localId) {
@@ -716,20 +830,6 @@ async function handleBatchReplace() {
   }
 }
 
-function canMergePrev(localId) {
-  const entity = docStore.getEntity(localId)
-  const prevLocalId = docStore.getNeighbors(localId).prev
-  const prevEntity = prevLocalId ? docStore.getEntity(prevLocalId) : null
-  return Boolean(entity && !entity.isDraft && prevEntity && !prevEntity.isDraft)
-}
-
-function canMergeNext(localId) {
-  const entity = docStore.getEntity(localId)
-  const nextLocalId = docStore.getNeighbors(localId).next
-  const nextEntity = nextLocalId ? docStore.getEntity(nextLocalId) : null
-  return Boolean(entity && !entity.isDraft && nextEntity && !nextEntity.isDraft)
-}
-
 function handleSplitFromCursor({ localId, cursorPosition, text }) {
   const subtitle = editorProjectionBridge.findSubtitleById(localId)
   const entity = docStore.getEntity(localId)
@@ -877,6 +977,343 @@ function getScrollerElement() {
   return scrollerRef.value?.$el ?? scrollerRef.value ?? null
 }
 
+const wheelSmoother = createWheelSmoother({
+  getScrollerElement,
+  lerpFactor: 0.10,
+})
+
+function clearAutoResumeTimer() {
+  if (!autoResumeTimer) {
+    return
+  }
+  clearTimeout(autoResumeTimer)
+  autoResumeTimer = null
+}
+
+function clearFollowAnimation() {
+  if (!activeFollowAnimationCancel) {
+    return
+  }
+  activeFollowAnimationCancel()
+  activeFollowAnimationCancel = null
+}
+
+function cancelFollowRequest() {
+  followRequestToken += 1
+  clearFollowAnimation()
+}
+
+function cancelAllScrollMotion() {
+  cancelFollowRequest()
+  wheelSmoother.clear()
+}
+
+function markProgrammaticScrollSuppression(durationMs = PROGRAMMATIC_SCROLL_SUPPRESSION_MS) {
+  programmaticScrollSuppressionUntil = Date.now() + durationMs
+}
+
+function isProgrammaticScrollInFlight() {
+  return (
+    wheelSmoother.isAnimating()
+    || Boolean(activeFollowAnimationCancel)
+    || Date.now() < programmaticScrollSuppressionUntil
+  )
+}
+
+function isEditableListTarget(target) {
+  return target instanceof Element && target.closest(EDITABLE_LIST_TARGET_SELECTOR) !== null
+}
+
+function isListEditingActive() {
+  if (typeof document === 'undefined') {
+    return false
+  }
+
+  const scrollerElement = getScrollerElement()
+  const activeElement = document.activeElement
+  if (!scrollerElement || !(activeElement instanceof Element) || !scrollerElement.contains(activeElement)) {
+    return false
+  }
+
+  return isEditableListTarget(activeElement)
+}
+
+function canAutoResumeFollowNow() {
+  return (
+    props.enableAutoResumeFollow
+    && autoScrollEnabled.value
+    && !isScrollbarThumbDrag.value
+    && !homophoneSearch.isSearchActive
+    && !isGroupedMode.value
+    && playbackStore.isPlaying
+    && !isListEditingActive()
+    && !(typeof document !== 'undefined' && document.hidden)
+  )
+}
+
+function scheduleAutoResumeFollow() {
+  clearAutoResumeTimer()
+  if (!canAutoResumeFollowNow()) {
+    return
+  }
+
+  autoResumeTimer = setTimeout(() => {
+    autoResumeTimer = null
+    if (!canAutoResumeFollowNow()) {
+      return
+    }
+
+    isUserScrollOverride.value = false
+    const localId = followSubtitleId.value
+    if (!localId) {
+      return
+    }
+
+    nextTick(() => {
+      requestCenterFollow(localId)
+    })
+  }, USER_SCROLL_AUTO_RESUME_DELAY_MS)
+}
+
+function syncAutoResumeTimer() {
+  if (!isUserScrollOverride.value) {
+    clearAutoResumeTimer()
+    return
+  }
+
+  scheduleAutoResumeFollow()
+}
+
+function activateUserScrollOverride({ deferResume = false } = {}) {
+  cancelFollowRequest()
+  isUserScrollOverride.value = true
+  clearAutoResumeTimer()
+  if (!deferResume) {
+    syncAutoResumeTimer()
+  }
+}
+
+// V3.2.5+dev.20260321.03: 修复虚拟列表跳转动画方向始终从上往下的问题
+// 当目标项不在 DOM 中时 scrollToItem 会瞬间跳转到顶部附近，
+// 居中调整总是向下滚动。通过记录跳转前的 scrollTop 并据此
+// 设定方向性的动画起点，使动画方向与实际跳转方向一致。
+const FOLLOW_DIRECTIONAL_RUNUP_RATIO = 0.35
+
+function startFollowAnimation(rootElement, targetTop, options = {}) {
+  if (!rootElement) {
+    return false
+  }
+
+  const maxScrollTop = Number.isFinite(rootElement.scrollHeight) && Number.isFinite(rootElement.clientHeight)
+    ? Math.max(0, rootElement.scrollHeight - rootElement.clientHeight)
+    : Number.POSITIVE_INFINITY
+  const clampedTargetTop = Math.max(0, Math.min(targetTop, maxScrollTop))
+
+  // 确定动画起点：如果是虚拟滚动跳转场景，根据原始位置设置方向性助跑
+  let startTop = rootElement.scrollTop ?? 0
+  const { preVirtualScrollTop } = options
+  if (Number.isFinite(preVirtualScrollTop)) {
+    const viewportHeight = rootElement.clientHeight ?? 0
+    const runupDistance = Math.max(80, viewportHeight * FOLLOW_DIRECTIONAL_RUNUP_RATIO)
+    // 根据跳转前后位置关系判断方向
+    if (preVirtualScrollTop < clampedTargetTop) {
+      // 向下跳转：从目标上方开始向下滑入
+      startTop = Math.max(0, clampedTargetTop - runupDistance)
+    } else {
+      // 向上跳转：从目标下方开始向上滑入
+      startTop = Math.min(maxScrollTop, clampedTargetTop + runupDistance)
+    }
+    markProgrammaticScrollSuppression()
+    rootElement.scrollTop = startTop
+  }
+
+  const diff = clampedTargetTop - startTop
+
+  clearFollowAnimation()
+
+  if (Math.abs(diff) < FOLLOW_SNAP_THRESHOLD_PX || resolveReducedMotionPreference()) {
+    markProgrammaticScrollSuppression()
+    rootElement.scrollTop = clampedTargetTop
+    return true
+  }
+
+  let rafId = null
+  let startTime = null
+  let cancelled = false
+
+  const cancel = () => {
+    cancelled = true
+    if (rafId !== null) {
+      cancelAnimationFrame(rafId)
+      rafId = null
+    }
+  }
+  activeFollowAnimationCancel = cancel
+
+  const step = (timestamp) => {
+    if (cancelled) {
+      return
+    }
+
+    if (startTime === null) {
+      startTime = timestamp
+    }
+    const progress = Math.min(1, (timestamp - startTime) / FOLLOW_ANIMATION_DURATION_MS)
+    const eased = 1 - Math.pow(1 - progress, 3)
+
+    markProgrammaticScrollSuppression()
+    rootElement.scrollTop = startTop + diff * eased
+
+    if (progress < 1) {
+      rafId = requestAnimationFrame(step)
+      return
+    }
+
+    rootElement.scrollTop = clampedTargetTop
+    rafId = null
+    if (activeFollowAnimationCancel === cancel) {
+      activeFollowAnimationCancel = null
+    }
+  }
+
+  rafId = requestAnimationFrame(step)
+  return true
+}
+
+// 查找虚拟列表内部 item-wrapper，用于跳转时临时隐藏防止闪烁
+function findItemWrapper(scrollerElement) {
+  return scrollerElement?.querySelector?.('.vue-recycle-scroller__item-wrapper') ?? null
+}
+
+function requestCenterFollow(localId) {
+  if (
+    !localId
+    || !autoScrollEnabled.value
+    || homophoneSearch.isSearchActive
+    || isGroupedMode.value
+    || isUserScrollOverride.value
+  ) {
+    return false
+  }
+
+  const visibleIndex = defaultVisibleIds.value.indexOf(localId)
+  if (visibleIndex === -1) {
+    return false
+  }
+
+  wheelSmoother.clear()
+  clearFollowAnimation()
+  const requestToken = ++followRequestToken
+
+  const scrollerElement = getScrollerElement()
+  const preScrollTop = scrollerElement?.scrollTop ?? null
+
+  // 用于虚拟跳转时隐藏列表内容、防止 scrollToItem 造成的闪烁
+  let hiddenWrapper = null
+
+  function restoreWrapperVisibility() {
+    if (hiddenWrapper) {
+      hiddenWrapper.style.visibility = ''
+      hiddenWrapper = null
+    }
+  }
+
+  return resolveSubtitleScrollTarget(scrollerRef.value, {
+    localId,
+    index: visibleIndex,
+    alignment: 'center',
+    shouldAbort: () => (
+      requestToken !== followRequestToken
+      || !autoScrollEnabled.value
+      || homophoneSearch.isSearchActive
+      || isGroupedMode.value
+      || isUserScrollOverride.value
+    ),
+    onBeforeVirtualScroll: () => {
+      markProgrammaticScrollSuppression()
+      // scrollToItem 会瞬间跳到估算位置（可能偏差很大），
+      // 在跳转前同步隐藏列表内容，防止用户看到跳转闪烁
+      const wrapper = findItemWrapper(scrollerElement)
+      if (wrapper) {
+        wrapper.style.visibility = 'hidden'
+        hiddenWrapper = wrapper
+      }
+    },
+    onResolved: (payload) => {
+      if (
+        requestToken !== followRequestToken
+        || !autoScrollEnabled.value
+        || homophoneSearch.isSearchActive
+        || isGroupedMode.value
+        || isUserScrollOverride.value
+      ) {
+        restoreWrapperVisibility()
+        return
+      }
+      // 虚拟滚动跳转场景：先设置方向性起点，再恢复可见性并启动动画
+      const animOptions = payload.afterVirtualScroll
+        ? { preVirtualScrollTop: preScrollTop }
+        : {}
+      startFollowAnimation(payload.rootElement, payload.top, animOptions)
+      // 动画起点已就位，恢复可见性（此时用户看到的是正确的方向性起点位置）
+      restoreWrapperVisibility()
+    },
+    onFailed: () => {
+      restoreWrapperVisibility()
+    },
+  })
+}
+
+function isVerticalScrollbarMouseDown(event) {
+  const scrollerElement = getScrollerElement()
+  if (!scrollerElement || typeof event?.clientX !== 'number' || typeof event?.clientY !== 'number') {
+    return false
+  }
+  if (typeof event.button === 'number' && event.button !== 0) {
+    return false
+  }
+  if (scrollerElement.scrollHeight <= scrollerElement.clientHeight) {
+    return false
+  }
+
+  const gutterWidth = Math.max(0, (scrollerElement.offsetWidth ?? 0) - (scrollerElement.clientWidth ?? 0))
+  if (gutterWidth <= 0) {
+    return false
+  }
+
+  const rect = scrollerElement.getBoundingClientRect?.()
+  if (!rect) {
+    return false
+  }
+  if (event.clientY < rect.top || event.clientY > rect.bottom) {
+    return false
+  }
+
+  const isRtl = window.getComputedStyle?.(scrollerElement).direction === 'rtl'
+  if (isRtl) {
+    return event.clientX >= rect.left && event.clientX <= rect.left + gutterWidth
+  }
+  return event.clientX >= rect.right - gutterWidth && event.clientX <= rect.right
+}
+
+function handleGlobalManualGestureStart(event) {
+  if (!isVerticalScrollbarMouseDown(event)) {
+    return
+  }
+  markRecentUserListInteraction()
+  isScrollbarThumbDrag.value = true
+  wheelSmoother.clear()
+  activateUserScrollOverride({ deferResume: true })
+}
+
+function handleGlobalManualGestureEnd() {
+  if (!isScrollbarThumbDrag.value) {
+    return
+  }
+  isScrollbarThumbDrag.value = false
+  syncAutoResumeTimer()
+}
+
 function bindScrollerListeners() {
   const nextScrollerElement = getScrollerElement()
   if (attachedScrollerElement === nextScrollerElement) {
@@ -887,6 +1324,8 @@ function bindScrollerListeners() {
     attachedScrollerElement.removeEventListener('scroll', handleListScroll)
     attachedScrollerElement.removeEventListener('wheel', handleListWheel)
     attachedScrollerElement.removeEventListener('touchmove', handleListTouchMove)
+    attachedScrollerElement.removeEventListener('focusin', handleScrollerFocusChange, true)
+    attachedScrollerElement.removeEventListener('focusout', handleScrollerFocusChange, true)
   }
 
   attachedScrollerElement = nextScrollerElement
@@ -895,85 +1334,133 @@ function bindScrollerListeners() {
   }
 
   attachedScrollerElement.addEventListener('scroll', handleListScroll, { passive: true })
-  attachedScrollerElement.addEventListener('wheel', handleListWheel, { passive: true })
+  attachedScrollerElement.addEventListener('wheel', handleListWheel, { passive: false })
   attachedScrollerElement.addEventListener('touchmove', handleListTouchMove, { passive: true })
+  attachedScrollerElement.addEventListener('focusin', handleScrollerFocusChange, true)
+  attachedScrollerElement.addEventListener('focusout', handleScrollerFocusChange, true)
 }
 
-function clearFollowResumeTimer() {
-  if (!followResumeTimer) {
+function focusScrollerOnWindowResume() {
+  if (typeof document === 'undefined') {
     return
   }
-  clearTimeout(followResumeTimer)
-  followResumeTimer = null
-}
 
-function clearProgrammaticScrollReleaseTimer() {
-  if (!programmaticScrollReleaseTimer) {
+  const scrollerElement = getScrollerElement()
+  if (!scrollerElement || typeof scrollerElement.focus !== 'function') {
     return
   }
-  clearTimeout(programmaticScrollReleaseTimer)
-  programmaticScrollReleaseTimer = null
-}
 
-function beginProgrammaticScrollLock() {
-  clearProgrammaticScrollReleaseTimer()
-  programmaticScrollGuardUntil = Number.POSITIVE_INFINITY
-}
-
-function extendProgrammaticScrollGuard(durationMs = PROGRAMMATIC_SCROLL_GUARD_MS) {
-  clearProgrammaticScrollReleaseTimer()
-  programmaticScrollGuardUntil = Date.now() + durationMs
-  programmaticScrollReleaseTimer = setTimeout(() => {
-    programmaticScrollGuardUntil = 0
-    programmaticScrollReleaseTimer = null
-  }, durationMs)
-}
-
-function releaseProgrammaticScrollLock() {
-  clearProgrammaticScrollReleaseTimer()
-  programmaticScrollGuardUntil = 0
-}
-
-function isInProgrammaticScrollGuard() {
-  return Date.now() < programmaticScrollGuardUntil
-}
-
-function scheduleFollowAutoResume() {
-  clearFollowResumeTimer()
-  if (!props.enableAutoResumeFollow) {
+  const activeElement = document.activeElement
+  const isSafeToRestoreListFocus = (
+    !activeElement
+    || activeElement === document.body
+    || activeElement === document.documentElement
+  )
+  if (!isSafeToRestoreListFocus) {
     return
   }
-  followResumeTimer = setTimeout(() => {
-    isFollowPausedByUser.value = false
-    followResumeTimer = null
-  }, USER_SCROLL_AUTO_RESUME_DELAY_MS)
-}
 
-function pauseFollowByUserScroll() {
-  if (!autoScrollEnabled.value || isInProgrammaticScrollGuard()) {
-    return
-  }
-  isFollowPausedByUser.value = true
-  scheduleFollowAutoResume()
+  scrollerElement.focus({ preventScroll: true })
 }
 
 function markRecentUserListInteraction() {
   lastManualListInteractionAt.value = Date.now()
 }
 
-function handleListScroll() {
-  markRecentUserListInteraction()
-  pauseFollowByUserScroll()
+function markScrollingActive() {
+  if (!isScrolling.value) {
+    isScrolling.value = true
+  }
+  clearTimeout(scrollingDebounceTimer)
+  scrollingDebounceTimer = setTimeout(() => {
+    isScrolling.value = false
+    scrollingDebounceTimer = null
+  }, SCROLL_IDLE_DELAY_MS)
 }
 
-function handleListWheel() {
+function handleListScroll() {
+  markScrollingActive()
   markRecentUserListInteraction()
-  pauseFollowByUserScroll()
+  if (isProgrammaticScrollInFlight()) {
+    return
+  }
+  activateUserScrollOverride({ deferResume: isScrollbarThumbDrag.value })
+}
+
+function consumeListWheel(e, useCustomSmoothing = shouldUseCustomWheelSmoothing(e)) {
+  markRecentUserListInteraction()
+
+  if (!useCustomSmoothing) {
+    wheelSmoother.clear()
+    activateUserScrollOverride()
+    return false
+  }
+
+  e.preventDefault()
+  activateUserScrollOverride()
+  wheelSmoother.handleWheel(e)
+  return true
+}
+
+function handleListWheel(e) {
+  if (handledWheelEvents.has(e)) {
+    return
+  }
+  consumeListWheel(e)
+}
+
+function isWheelInsideScrollerBounds(event, scrollerElement) {
+  if (!scrollerElement || typeof event?.clientX !== 'number' || typeof event?.clientY !== 'number') {
+    return false
+  }
+
+  const rect = scrollerElement.getBoundingClientRect?.()
+  if (!rect) {
+    return false
+  }
+
+  return (
+    event.clientX >= rect.left
+    && event.clientX <= rect.right
+    && event.clientY >= rect.top
+    && event.clientY <= rect.bottom
+  )
+}
+
+function handleDocumentWheelCapture(e) {
+  if (handledWheelEvents.has(e)) {
+    return
+  }
+
+  const scrollerElement = getScrollerElement()
+  if (!scrollerElement) {
+    return
+  }
+
+  const insideBounds = isWheelInsideScrollerBounds(e, scrollerElement)
+  if (!insideBounds) {
+    return
+  }
+
+  const useCustomSmoothing = shouldUseCustomWheelSmoothing(e)
+  if (!useCustomSmoothing) {
+    return
+  }
+
+  handledWheelEvents.add(e)
+  consumeListWheel(e, true)
 }
 
 function handleListTouchMove() {
   markRecentUserListInteraction()
-  pauseFollowByUserScroll()
+  wheelSmoother.clear()
+  activateUserScrollOverride()
+}
+
+function handleScrollerFocusChange() {
+  queueMicrotask(() => {
+    syncAutoResumeTimer()
+  })
 }
 
 function hasRecentUserScroll() {
@@ -994,7 +1481,7 @@ async function runStructuralMutationWithFlip(mutate) {
   const skipDecision = shouldSkipVisibleFlip({
     isGroupedMode: isGroupedMode.value,
     isResizing: props.isResizing,
-    isInProgrammaticScrollGuard: isInProgrammaticScrollGuard(),
+    isInProgrammaticScrollGuard: isProgrammaticScrollInFlight(),
     hasRecentUserScroll: hasRecentUserScroll(),
     prefersReducedMotion: resolveReducedMotionPreference(),
   })
@@ -1038,39 +1525,59 @@ async function runStructuralMutationWithFlip(mutate) {
   return result
 }
 
-function scrollToLocalId(localId) {
+function handleWindowBlur() {
+  const hadScrollbarThumbDrag = isScrollbarThumbDrag.value
+  isScrollbarThumbDrag.value = false
+  clearAutoResumeTimer()
+  cancelAllScrollMotion()
+  if (hadScrollbarThumbDrag && isUserScrollOverride.value) {
+    // 拖拽滚动条过程中切后台视为本轮手势结束，重新启动恢复计时，避免永久停留在手动接管态。
+    syncAutoResumeTimer()
+  }
+}
+
+function handleWindowFocus() {
+  nextTick(() => {
+    bindScrollerListeners()
+    focusScrollerOnWindowResume()
+    if (isUserScrollOverride.value) {
+      syncAutoResumeTimer()
+    }
+  })
+}
+
+function handleVisibilityChange() {
+  if (document.hidden) {
+    handleWindowBlur()
+    return
+  }
+
+  nextTick(() => {
+    bindScrollerListeners()
+    focusScrollerOnWindowResume()
+  })
+
+  if (isUserScrollOverride.value) {
+    syncAutoResumeTimer()
+    return
+  }
+
+  if (
+    !autoScrollEnabled.value
+    || homophoneSearch.isSearchActive
+    || isGroupedMode.value
+  ) {
+    return
+  }
+
+  const localId = followSubtitleId.value
   if (!localId) {
     return
   }
 
-  const visibleIndex = defaultVisibleIds.value.indexOf(localId)
-  if (visibleIndex === -1) {
-    return
-  }
-
-  const requestToken = ++followRequestToken
-  beginProgrammaticScrollLock()
-  const didStartFollow = followCurrentSubtitle(scrollerRef.value, {
-    localId,
-    index: visibleIndex,
-    shouldAbort: () => requestToken !== followRequestToken,
-    onCentered: () => {
-      if (requestToken !== followRequestToken) {
-        return
-      }
-      extendProgrammaticScrollGuard()
-    },
-    onFailed: () => {
-      if (requestToken !== followRequestToken) {
-        return
-      }
-      releaseProgrammaticScrollLock()
-    },
+  nextTick(() => {
+    requestCenterFollow(localId)
   })
-
-  if (!didStartFollow) {
-    releaseProgrammaticScrollLock()
-  }
 }
 
 watch(selectedLocalId, (localId) => {
@@ -1089,35 +1596,62 @@ watch(orderedVisibleIds, (ids) => {
   }
 }, { immediate: true })
 
-watch(currentSubtitleId, (localId) => {
-  if (!autoScrollEnabled.value || homophoneSearch.isSearchActive || !localId || isFollowPausedByUser.value) {
+watch(followSubtitleId, (localId) => {
+  if (!autoScrollEnabled.value || homophoneSearch.isSearchActive || !localId || isUserScrollOverride.value) {
     return
   }
 
   nextTick(() => {
-    scrollToLocalId(localId)
+    requestCenterFollow(localId)
   })
 })
 
 watch(autoScrollEnabled, (enabled) => {
   if (!enabled) {
-    followRequestToken += 1
-    clearFollowResumeTimer()
-    releaseProgrammaticScrollLock()
-    isFollowPausedByUser.value = false
+    clearAutoResumeTimer()
+    isUserScrollOverride.value = false
+    isScrollbarThumbDrag.value = false
+    cancelAllScrollMotion()
+    return
   }
+
+  if (homophoneSearch.isSearchActive || isGroupedMode.value || isUserScrollOverride.value) {
+    syncAutoResumeTimer()
+    return
+  }
+
+  const localId = followSubtitleId.value
+  if (!localId) {
+    return
+  }
+
+  nextTick(() => {
+    requestCenterFollow(localId)
+  })
 })
 
 watch(
   () => props.enableAutoResumeFollow,
   (enabled) => {
-    if (enabled && isFollowPausedByUser.value) {
-      scheduleFollowAutoResume()
+    if (!enabled) {
+      clearAutoResumeTimer()
       return
     }
-    if (!enabled) {
-      clearFollowResumeTimer()
-    }
+    syncAutoResumeTimer()
+  }
+)
+
+watch(
+  () => playbackStore.isPlaying,
+  () => {
+    syncAutoResumeTimer()
+  }
+)
+
+watch(
+  [() => homophoneSearch.isSearchActive, isGroupedMode],
+  () => {
+    syncAutoResumeTimer()
   }
 )
 
@@ -1132,15 +1666,38 @@ watch(
 )
 
 onMounted(() => {
+  document.addEventListener('mousedown', handleGlobalManualGestureStart, true)
+  document.addEventListener('mouseup', handleGlobalManualGestureEnd, true)
+  document.addEventListener('wheel', handleDocumentWheelCapture, { passive: false, capture: true })
+  window.addEventListener('focus', handleWindowFocus, true)
+  window.addEventListener('blur', handleWindowBlur, true)
+  window.addEventListener('pagehide', handleWindowBlur, true)
+  document.addEventListener('visibilitychange', handleVisibilityChange)
   nextTick(() => {
     bindScrollerListeners()
+    if (
+      autoScrollEnabled.value
+      && !homophoneSearch.isSearchActive
+      && !isGroupedMode.value
+      && !isUserScrollOverride.value
+      && followSubtitleId.value
+    ) {
+      requestCenterFollow(followSubtitleId.value)
+    }
   })
 })
 
 onUnmounted(() => {
-  clearFollowResumeTimer()
-  clearProgrammaticScrollReleaseTimer()
-  followRequestToken += 1
+  document.removeEventListener('mousedown', handleGlobalManualGestureStart, true)
+  document.removeEventListener('mouseup', handleGlobalManualGestureEnd, true)
+  document.removeEventListener('wheel', handleDocumentWheelCapture, true)
+  window.removeEventListener('focus', handleWindowFocus, true)
+  window.removeEventListener('blur', handleWindowBlur, true)
+  window.removeEventListener('pagehide', handleWindowBlur, true)
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
+  clearTimeout(scrollingDebounceTimer)
+  clearAutoResumeTimer()
+  cancelAllScrollMotion()
   cancelActiveFlipAnimation?.()
   cancelActiveFlipAnimation = null
   if (!attachedScrollerElement) {
@@ -1150,6 +1707,8 @@ onUnmounted(() => {
   attachedScrollerElement.removeEventListener('scroll', handleListScroll)
   attachedScrollerElement.removeEventListener('wheel', handleListWheel)
   attachedScrollerElement.removeEventListener('touchmove', handleListTouchMove)
+  attachedScrollerElement.removeEventListener('focusin', handleScrollerFocusChange, true)
+  attachedScrollerElement.removeEventListener('focusout', handleScrollerFocusChange, true)
   attachedScrollerElement = null
 })
 
@@ -1192,6 +1751,13 @@ defineExpose({
   overflow-y: auto;
   scrollbar-gutter: stable;
   padding: 6px;
+  outline: none;
+}
+
+/* V3.2.5+dev.20260320.01: 滚动期间屏蔽子元素 pointer-events，
+   阻断 mouseenter/mouseleave 事件风暴（Trace 实测：861次 enter + 125次 leave = 285ms） */
+.scroller.is-scrolling :deep(.vue-recycle-scroller__item-wrapper) {
+  pointer-events: none;
 }
 
 .scroller :deep(.vue-recycle-scroller__item-wrapper) {
@@ -1200,6 +1766,7 @@ defineExpose({
 
 .grouped-container {
   position: relative;
+  outline: none;
 }
 
 .group-items {

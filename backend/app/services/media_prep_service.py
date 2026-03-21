@@ -420,7 +420,11 @@ class MediaPrepService:
                 "reason": "exception"
             }
 
-    def analyze_transcode_decision(self, video_info: dict) -> TranscodeDecision:
+    def analyze_transcode_decision(
+        self,
+        video_info: dict,
+        shell_capability: Optional[Dict[str, Any]] = None,
+    ) -> TranscodeDecision:
         """
         智能分析转码决策
 
@@ -437,6 +441,11 @@ class MediaPrepService:
             TranscodeDecision: 转码决策类型
         """
         compatibility = config.BROWSER_COMPATIBILITY
+        normalized_shell_capability = (
+            shell_capability
+            if isinstance(shell_capability, dict)
+            else {}
+        )
 
         # 获取编解码器信息
         video_codec = video_info.get('video', {}).get('codec', '').lower()
@@ -447,10 +456,13 @@ class MediaPrepService:
         compatible_video_codecs = set(compatibility.get("compatible_video_codecs", set()))
         need_transcode_codecs = set(compatibility.get("need_transcode_codecs", set()))
 
-        # Electron 原生 profile：放行 HEVC/H265 直播（MP4 直放，MKV 走 remux 分支）。
+        # Why: electron_native 只代表“允许尝试直放”的上界，不再默认等价于 HEVC 必然可直放。
+        # 如果运行态没有明确声明 HEVC 可直放，则保守进入 H264 兼容链，避免把解码失败扩大为编辑卡顿。
         if config.is_electron_native_media_profile():
-            compatible_video_codecs.update({"hevc", "h265"})
-            need_transcode_codecs.difference_update({"hevc", "h265"})
+            hevc_direct_play = normalized_shell_capability.get("hevcDirectPlay") is True
+            if hevc_direct_play:
+                compatible_video_codecs.update({"hevc", "h265"})
+                need_transcode_codecs.difference_update({"hevc", "h265"})
 
         # 确保容器格式以点号开头
         if container and not container.startswith('.'):

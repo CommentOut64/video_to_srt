@@ -1,7 +1,17 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("anchorfluxShell", {
+  mediaCapabilities: null,
   debugFlags: null,
+  getMediaCapabilities() {
+    return this.mediaCapabilities || {
+      activeGpuPreference: "unknown",
+      h264DirectPlay: true,
+      hevcDirectPlay: false,
+      fallbackOrder: ["discrete", "integrated", "software_proxy"],
+      gpuFeatureStatus: {},
+    };
+  },
   getDebugFlags() {
     return this.debugFlags || {
       nativeContextMenuEnabled: false,
@@ -27,6 +37,18 @@ contextBridge.exposeInMainWorld("anchorfluxShell", {
     };
   },
 });
+
+ipcRenderer.invoke("shell:get-media-capabilities")
+  .then((payload) => {
+    if (window.anchorfluxShell) {
+      window.anchorfluxShell.mediaCapabilities = payload || null;
+    }
+  })
+  .catch(() => {
+    if (window.anchorfluxShell) {
+      window.anchorfluxShell.mediaCapabilities = null;
+    }
+  });
 
 ipcRenderer.invoke("shell:get-debug-flags")
   .then((payload) => {
