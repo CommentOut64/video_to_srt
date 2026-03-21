@@ -758,6 +758,7 @@ async function initWavesurfer() {
       secondaryColor: 'var(--af-border-default)',
       primaryFontColor: 'var(--af-text-secondary)',
       secondaryFontColor: 'var(--af-text-muted)',
+      formatTimeCallback: () => '',
       style: { fontSize: '10px', fontFamily: 'var(--af-font-mono)' },
     })
     timelinePluginRef.value = timelinePlugin
