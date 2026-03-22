@@ -11,7 +11,13 @@ import numpy as np
 from app.services.alignment.types import PunctTrack, TextTrackBundle
 
 if TYPE_CHECKING:
-    from app.services.timeanchored_alignment.contracts import TimeBasePackage
+    from app.services.timeanchored_alignment.contracts import (
+        LanguageRun,
+        PronunciationPackage,
+        ProtectedSpan,
+        TextTruthPackage,
+        TimeBasePackage,
+    )
 
 @dataclass
 class ProcessingContext:
@@ -55,6 +61,12 @@ class ProcessingContext:
     finalization_metrics: Dict[str, Any] = field(default_factory=dict)  # V3.2.0+dev.20260203.03
     time_base_chunk: Optional["TimeBasePackage"] = None  # V3.3.0: 时间锚定主链时间基底
     time_base_report: Optional[Dict[str, Any]] = None  # V3.3.0: 时间基底构建报告（轻量）
+    text_truth: Optional["TextTruthPackage"] = None  # V3.3.0 Phase3: 文本真相包
+    protected_spans: List["ProtectedSpan"] = field(default_factory=list)  # V3.3.0 Phase3: 保护结构 span
+    language_runs: List["LanguageRun"] = field(default_factory=list)  # V3.3.0 Phase3: run级语言切分结果
+    pronunciation_package: Optional["PronunciationPackage"] = None  # V3.3.0 Phase3: 轻量发音前端产物
+    slow_window_meta: Dict[str, Any] = field(default_factory=dict)  # V3.3.0 Phase3: 组窗元数据
+    pronunciation_report: Dict[str, Any] = field(default_factory=dict)  # V3.3.0 Phase3: 发音前端报告
     slow_window_id: Optional[str] = None  # V3.3.0 Phase2: 组窗ID透传
     slow_window_flush_reason: Optional[str] = None  # V3.3.0 Phase2: 组窗flush原因透传
     slow_window_is_mixed: bool = False  # V3.3.0 Phase2: mixed窗口回退标记
@@ -65,3 +77,28 @@ class ProcessingContext:
 
     # 智能复核标记 (V3.10)
     whisper_skipped: bool = False         # SlowWorker 是否跳过（智能复核模式下 SenseVoice 质量足够高时跳过 Whisper）
+
+    def release_preparation_artifacts(self) -> None:
+        """
+        释放准备层中间对象，避免大型结构进入长期上下文。
+
+        约束：
+        - ctc_logits / top_candidates 不应在终稿提交后继续驻留。
+        - 文本真相、语言 run、发音前端中间对象可在收口后立即释放。
+        """
+        self.text_truth = None
+        self.protected_spans = []
+        self.language_runs = []
+        self.pronunciation_package = None
+        self.slow_window_meta = {}
+        self.pronunciation_report = {}
+
+        if isinstance(self.sv_result, dict):
+            for key in (
+                "ctc_logits",
+                "top_candidates",
+                "ctc_top_candidates",
+                "compact_trace",
+                "acoustic_trace",
+            ):
+                self.sv_result.pop(key, None)

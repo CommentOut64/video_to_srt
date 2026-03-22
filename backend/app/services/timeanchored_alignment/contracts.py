@@ -119,9 +119,85 @@ class TextTruthPackage:
     units: Tuple[TextTruthUnit, ...]
     quality: TextTruthQuality
     language: str
+    raw_text: str = ""
+    normalized_text: str = ""
+    is_hallucination: bool = False
+    quality_signals: Dict[str, float] = field(default_factory=dict)
+    source_metadata: Dict[str, Any] = field(default_factory=dict)
     source: str = "whisper"
     contract_version: str = CONTRACT_VERSION
     protected_spans: Tuple[ProtectedSpan, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class LanguageRun:
+    run_text: str
+    run_language: str
+    char_start: int
+    char_end: int
+    is_protected: bool = False
+    is_foreign_island: bool = False
+
+    def __post_init__(self) -> None:
+        if int(self.char_end) <= int(self.char_start):
+            raise ValueError(f"LanguageRun 非法：char_end({self.char_end}) 必须大于 char_start({self.char_start})")
+
+
+@dataclass(frozen=True)
+class LanguageRunPackage:
+    runs: Tuple[LanguageRun, ...]
+    dominant_language: str
+    window_kind: str
+    foreign_run_ratio: float
+    source_text: str = ""
+    contract_version: str = CONTRACT_VERSION
+
+    def __post_init__(self) -> None:
+        _ensure_probability("LanguageRunPackage.foreign_run_ratio", self.foreign_run_ratio)
+
+
+@dataclass(frozen=True)
+class TokenUnit:
+    token_text: str
+    language: str
+    char_start: int
+    char_end: int
+    is_protected: bool = False
+    is_foreign_island: bool = False
+
+    def __post_init__(self) -> None:
+        if int(self.char_end) <= int(self.char_start):
+            raise ValueError(f"TokenUnit 非法：char_end({self.char_end}) 必须大于 char_start({self.char_start})")
+
+
+@dataclass(frozen=True)
+class PhoneUnit:
+    phone_text: str
+    language: str
+    source: str = "homophone_tokenizer"
+
+
+@dataclass(frozen=True)
+class TokenToPhoneSpan:
+    token_index: int
+    phone_start: int
+    phone_end: int
+
+    def __post_init__(self) -> None:
+        if int(self.phone_end) < int(self.phone_start):
+            raise ValueError("TokenToPhoneSpan 非法：phone_end 必须 >= phone_start")
+
+
+@dataclass(frozen=True)
+class PronunciationPackage:
+    token_units: Tuple[TokenUnit, ...]
+    phone_units: Tuple[PhoneUnit, ...]
+    token_to_phone_spans: Tuple[TokenToPhoneSpan, ...]
+    frontend_source: str
+    dependency_mode: Dict[str, str]
+    language: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    contract_version: str = CONTRACT_VERSION
 
 
 @dataclass(frozen=True)
