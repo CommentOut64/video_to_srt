@@ -88,6 +88,11 @@ class TranscriptionSettingsAPI(BaseModel):
     whisper_model: Optional[str] = Field(default=None, description="Whisper 模型（临时停用任务级覆盖）")
     # 复核触发阈值: 0.0-1.0
     patching_threshold: float = Field(default=0.60, ge=0.0, le=1.0, description="复核触发阈值")
+    # 选边模式: auto/force_fast/force_slow
+    edge_selection_mode: Literal["auto", "force_fast", "force_slow"] = Field(
+        default="auto",
+        description="选边模式",
+    )
 
 
 class TaskSubtitleTimeOffsetRequest(BaseModel):

@@ -41,7 +41,8 @@ function buildDefaultTaskConfig() {
       transcription_profile: 'sv_whisper_patch',
       sensevoice_device: 'auto',
       whisper_model: 'medium',
-      patching_threshold: 0.6
+      patching_threshold: 0.6,
+      edge_selection_mode: 'auto'
     },
     refinement: {
       llm_task: 'proofread',

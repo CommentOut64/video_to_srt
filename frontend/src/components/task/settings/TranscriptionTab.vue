@@ -12,6 +12,17 @@
       </el-select>
     </SettingRow>
 
+    <SettingRow label="选边模式" hint="双流定稿选边策略">
+      <el-select
+        :model-value="modelValue.transcription.edge_selection_mode || 'auto'"
+        @update:model-value="updateField('transcription', 'edge_selection_mode', $event)"
+      >
+        <el-option value="auto" label="自动选边" />
+        <el-option value="force_fast" label="强制快流" />
+        <el-option value="force_slow" label="强制慢流" />
+      </el-select>
+    </SettingRow>
+
     <!-- 说话人检测 -->
     <SettingRow label="说话人检测" hint="说话人策略">
       <el-checkbox
