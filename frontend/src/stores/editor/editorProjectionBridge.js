@@ -104,7 +104,8 @@ export const useEditorProjectionBridge = defineStore('editorProjectionBridge', (
   })
 
   const currentSubtitleId = computed(() => {
-    const currentTime = Number(playbackStore.currentTime) || 0
+    // V3.2.5+dev.20260321.03: 使用高频 raw 通道，修复播放期间字幕预览不更新
+    const currentTime = Number(playbackStore.currentTimeRaw) || 0
     const matched = subtitles.value.find((subtitle) => {
       return currentTime >= subtitle.start && currentTime < subtitle.end
     })

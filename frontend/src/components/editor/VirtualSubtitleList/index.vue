@@ -189,6 +189,7 @@ const props = defineProps({
   autoScroll: { type: Boolean, default: true },
   editable: { type: Boolean, default: true },
   enableAutoResumeFollow: { type: Boolean, default: true },
+  autoResumeDelaySeconds: { type: Number, default: 5 },
   isResizing: { type: Boolean, default: false },
 })
 
@@ -226,7 +227,8 @@ const isGroupedMode = computed(() => {
 })
 
 let attachedScrollerElement = null
-const USER_SCROLL_AUTO_RESUME_DELAY_MS = 6000
+// V3.2.5+dev.20260322.01: 使用用户配置的自动恢复延迟
+const autoResumeDelayMs = computed(() => props.autoResumeDelaySeconds * 1000)
 const EDITABLE_LIST_TARGET_SELECTOR = [
   'textarea',
   'input:not([readonly]):not([disabled])',
@@ -1072,7 +1074,7 @@ function scheduleAutoResumeFollow() {
     nextTick(() => {
       requestCenterFollow(localId)
     })
-  }, USER_SCROLL_AUTO_RESUME_DELAY_MS)
+  }, autoResumeDelayMs.value)
 }
 
 function syncAutoResumeTimer() {

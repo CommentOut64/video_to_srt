@@ -108,12 +108,32 @@
         <div class="setting-row">
           <div class="setting-label">
             <span class="label-text">字幕跟随自动恢复</span>
-            <span class="label-hint">开启后字幕列表会在无滚动操作后5s自动恢复跟随</span>
+            <span class="label-hint">开启后字幕列表会在无滚动操作后自动恢复跟随</span>
           </div>
           <div class="setting-control">
             <el-switch
               v-model="localConfig.general.subtitle_follow_auto_resume"
               @change="emitChange"
+            />
+          </div>
+        </div>
+
+        <!-- V3.2.5+dev.20260322.01: 字幕跟随自动恢复时间 -->
+        <div v-if="localConfig.general.subtitle_follow_auto_resume" class="setting-row">
+          <div class="setting-label">
+            <span class="label-text">自动恢复延迟</span>
+            <span class="label-hint">停止滚动后多少秒自动恢复跟随（1-30秒）</span>
+          </div>
+          <div class="setting-control">
+            <el-input-number
+              v-model="localConfig.general.subtitle_follow_auto_resume_delay"
+              :min="1"
+              :max="30"
+              :step="1"
+              :precision="0"
+              :controls="false"
+              @change="emitChange"
+              size="small"
             />
           </div>
         </div>
@@ -717,6 +737,10 @@ function normalizeConfig(config) {
   }
   if (normalized.general.subtitle_follow_auto_resume === undefined) {
     normalized.general.subtitle_follow_auto_resume = true
+  }
+  // V3.2.5+dev.20260322.01: 自动恢复延迟默认值（秒）
+  if (normalized.general.subtitle_follow_auto_resume_delay === undefined) {
+    normalized.general.subtitle_follow_auto_resume_delay = 5
   }
   if (normalized.general.enable_shortcuts === undefined) {
     normalized.general.enable_shortcuts = true

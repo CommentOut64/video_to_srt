@@ -147,6 +147,7 @@
               ref="subtitleListRef"
               :auto-scroll="true"
               :enable-auto-resume-follow="true"
+              :auto-resume-delay-seconds="subtitleFollowAutoResumeDelay"
               :is-resizing="isResizing"
             />
           </div>
@@ -391,6 +392,7 @@ const advancedConfig = ref({
     preview_font_size: 24,
     enable_shortcuts: true,
     subtitle_follow_auto_resume: true,
+    subtitle_follow_auto_resume_delay: 5,
     hide_timeline_scale: false,
     merge_separator: 'space',
     merge_separator_custom: '',
@@ -424,10 +426,12 @@ const advancedConfig = ref({
   preset_id: 'default',
 })
 const SUBTITLE_FOLLOW_AUTO_RESUME_PREF_KEY = 'editor-subtitle-follow-auto-resume'
+const SUBTITLE_FOLLOW_AUTO_RESUME_DELAY_PREF_KEY = 'editor-subtitle-follow-auto-resume-delay'
 const HIDE_TIMELINE_SCALE_PREF_KEY = 'editor-hide-timeline-scale'
 const SHORTCUT_ENABLED_PREF_KEY = 'editor-shortcuts-enabled'
 const SHORTCUT_CONFIG_PREF_KEY = 'editor-shortcuts-config'
 const subtitleFollowAutoResumeEnabled = ref(true)
+const subtitleFollowAutoResumeDelay = ref(5)
 const hideTimelineScale = ref(false)
 const shortcutEnabled = ref(true)
 const shortcutConfig = ref({ ...DEFAULT_EDITOR_SHORTCUT_CONFIG })
@@ -2395,6 +2399,16 @@ function loadEditorInteractionPreferences() {
   subtitleFollowAutoResumeEnabled.value = resolved
   advancedConfig.value.general.subtitle_follow_auto_resume = resolved
 
+  // V3.2.5+dev.20260322.01: 加载字幕跟随自动恢复延迟
+  const savedAutoResumeDelay = localStorage.getItem(SUBTITLE_FOLLOW_AUTO_RESUME_DELAY_PREF_KEY)
+  if (savedAutoResumeDelay !== null) {
+    const parsedDelay = Number(savedAutoResumeDelay)
+    if (Number.isFinite(parsedDelay) && parsedDelay >= 1 && parsedDelay <= 30) {
+      subtitleFollowAutoResumeDelay.value = parsedDelay
+      advancedConfig.value.general.subtitle_follow_auto_resume_delay = parsedDelay
+    }
+  }
+
   // 加载隐藏波形刻度设置
   const savedHideScale = localStorage.getItem(HIDE_TIMELINE_SCALE_PREF_KEY)
   hideTimelineScale.value = savedHideScale === 'true'
@@ -2474,6 +2488,11 @@ async function handleSaveAdvancedSettings() {
     const followAutoResume = advancedConfig.value.general.subtitle_follow_auto_resume !== false
     subtitleFollowAutoResumeEnabled.value = followAutoResume
     localStorage.setItem(SUBTITLE_FOLLOW_AUTO_RESUME_PREF_KEY, String(followAutoResume))
+
+    // V3.2.5+dev.20260322.01: 持久化自动恢复延迟
+    const followAutoResumeDelay = Number(advancedConfig.value.general.subtitle_follow_auto_resume_delay) || 5
+    subtitleFollowAutoResumeDelay.value = followAutoResumeDelay
+    localStorage.setItem(SUBTITLE_FOLLOW_AUTO_RESUME_DELAY_PREF_KEY, String(followAutoResumeDelay))
 
     // 1.3 应用并持久化”隐藏波形刻度”偏好
     hideTimelineScale.value = advancedConfig.value.general.hide_timeline_scale === true
