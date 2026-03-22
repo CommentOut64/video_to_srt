@@ -6,7 +6,7 @@
 
 [![Chinese README](https://img.shields.io/badge/README-中文-blue.svg)](README.md)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Version](https://img.shields.io/badge/version-v3.2.4-brightgreen.svg)
+![Version](https://img.shields.io/badge/version-v3.2.5-brightgreen.svg)
 ![Vue](https://img.shields.io/badge/Vue-3.5+-4FC08D?logo=vue.js&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-009688?logo=fastapi&logoColor=white)
@@ -242,14 +242,6 @@ The core mechanism that maps slow-stream semantic text onto fast-stream time anc
 * **Coverage Gating:** Tracks alignment coverage and gap ratio in real time, and triggers degradation when quality falls below threshold
 
 ## Configuration Options
-
-### Preset Modes
-
-| Preset | Use Case | Description |
-|------|----------|------|
-| **Express** | Meeting recordings, podcasts | SenseVoice only, fastest speed |
-| **Balanced** | General videos | Dual stream alignment, balance speed and quality |
-| **Precise** | Films, documentaries | Full pipeline, highest quality |
 
 ### Port Configuration
 ```python

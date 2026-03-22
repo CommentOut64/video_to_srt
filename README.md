@@ -6,7 +6,7 @@
 
 [![English README](https://img.shields.io/badge/README-English-blue.svg)](README_en.md)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Version](https://img.shields.io/badge/version-v3.2.4-brightgreen.svg)
+![Version](https://img.shields.io/badge/version-v3.2.5-brightgreen.svg)
 ![Vue](https://img.shields.io/badge/Vue-3.5+-4FC08D?logo=vue.js&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-009688?logo=fastapi&logoColor=white)
@@ -242,14 +242,6 @@ flowchart TB
 * **覆盖率门控:** 实时计算对齐覆盖率与间隙占比，低质量时触发降级路径
 
 ## 配置选项
-
-### 预设模式
-
-| 预设 | 适用场景 | 说明 |
-|------|----------|------|
-| **极速** | 会议录音、播客 | 仅 SenseVoice，最快速度 |
-| **均衡** | 一般视频 | 双流对齐，平衡速度与质量 |
-| **精准** | 影视、纪录片 | 完整流水线，最高质量 |
 
 ### 端口配置
 ```python
