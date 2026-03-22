@@ -346,6 +346,7 @@ class SlowLoopService:
                 audio_chunk=None,
                 job_dir=job_dir,
                 debug_punctuation=host.debug_punctuation,
+                edge_selection_mode=getattr(host, "_edge_selection_mode", "auto"),
                 is_end=True,
                 error=exc,
             )
@@ -367,6 +368,7 @@ class SlowLoopService:
                 audio_chunk=None,
                 job_dir=job_dir,
                 debug_punctuation=host.debug_punctuation,
+                edge_selection_mode=getattr(host, "_edge_selection_mode", "auto"),
                 is_end=True,
                 error=exc,
             )

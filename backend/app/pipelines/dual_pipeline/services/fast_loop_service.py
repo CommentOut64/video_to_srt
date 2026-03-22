@@ -140,6 +140,7 @@ class FastLoopService:
                     audio_chunk=chunk,
                     job_dir=job_dir,
                     debug_punctuation=host.debug_punctuation,
+                    edge_selection_mode=getattr(host, "_edge_selection_mode", "auto"),
                     full_audio_array=full_audio_array,
                     full_audio_sr=full_audio_sr,
                 )
@@ -218,6 +219,7 @@ class FastLoopService:
                 audio_chunk=None,
                 job_dir=job_dir,
                 debug_punctuation=host.debug_punctuation,
+                edge_selection_mode=getattr(host, "_edge_selection_mode", "auto"),
                 is_end=True,
                 error=exc,
             )
@@ -240,6 +242,7 @@ class FastLoopService:
                 audio_chunk=None,
                 job_dir=job_dir,
                 debug_punctuation=host.debug_punctuation,
+                edge_selection_mode=getattr(host, "_edge_selection_mode", "auto"),
                 is_end=True,
                 error=exc,
             )
@@ -265,6 +268,7 @@ class FastLoopService:
                     audio_chunk=None,
                     job_dir=job_dir,
                     debug_punctuation=host.debug_punctuation,
+                    edge_selection_mode=getattr(host, "_edge_selection_mode", "auto"),
                     is_end=True,
                 )
                 await self._put_queue_inter_with_guard(

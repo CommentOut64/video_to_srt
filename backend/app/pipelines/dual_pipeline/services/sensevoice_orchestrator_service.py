@@ -56,6 +56,7 @@ class SensevoiceOrchestratorService:
                 audio_chunk=chunk,
                 job_dir=job_dir,
                 debug_punctuation=host.debug_punctuation,
+                edge_selection_mode=getattr(host, "_edge_selection_mode", "auto"),
                 full_audio_array=full_audio_array,
                 full_audio_sr=full_audio_sr,
             )

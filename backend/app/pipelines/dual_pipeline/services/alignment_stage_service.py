@@ -8,13 +8,29 @@
 from __future__ import annotations
 
 import copy
-from typing import Any, Dict, Optional
+from dataclasses import replace
+from typing import Any, Dict, Optional, Sequence
 
 from app.models.sensevoice_models import SentenceSegment, TextSource
 from app.pipelines.dual_pipeline.services.textflow_facade_service import Layer456RunResult
 from app.schemas.pipeline_context import ProcessingContext
 from app.services.alignment.types import PunctTrack
 from app.services.language_policy import build_language_policy_snapshot
+from app.services.timeanchored_alignment import (
+    ChunkProjector,
+    ChunkWindow,
+    EdgeSelector,
+    FailedSpan,
+    LanguageRunFrontend,
+    OutputAdapter,
+    PhoneticAligner,
+    PronunciationFrontend,
+    SentenceSegmenter,
+    SubtitleAssembler,
+    TextAligner,
+)
+from app.services.timeanchored_alignment.adapters.slow import WhisperTextAdapter
+from app.services.timeanchored_alignment.contracts import AlignmentItem, FinalAlignmentResult
 
 
 class AlignmentStageService:
@@ -22,6 +38,22 @@ class AlignmentStageService:
 
     def __init__(self, *, host: Any) -> None:
         self._host = host
+        self._timeanchored_whisper_adapter = WhisperTextAdapter(
+            sanitizer=getattr(host, "_whisper_sanitizer", None),
+            hallucination_detector=getattr(host, "_hallucination_detector", None),
+        )
+        self._timeanchored_language_frontend = LanguageRunFrontend()
+        self._timeanchored_pronunciation_frontend = PronunciationFrontend(
+            language_run_frontend=self._timeanchored_language_frontend,
+        )
+        self._timeanchored_text_aligner = TextAligner(
+            phonetic_aligner=PhoneticAligner(),
+        )
+        self._timeanchored_edge_selector = EdgeSelector()
+        self._timeanchored_subtitle_assembler = SubtitleAssembler()
+        self._timeanchored_sentence_segmenter = SentenceSegmenter()
+        self._timeanchored_chunk_projector = ChunkProjector()
+        self._timeanchored_output_adapter = OutputAdapter()
 
     async def run(self, ctx: ProcessingContext) -> None:
         """执行单个 chunk 的对齐阶段。"""
@@ -136,15 +168,12 @@ class AlignmentStageService:
         arbitration_result = arbitration_output.arbitration_result
         ctx.arbitration_result = arbitration_result
         tracks = host._ensure_text_tracks(ctx)
-        if arbitration_output.chosen_text_track:
-            tracks.chosen_track = arbitration_output.chosen_text_track
-        elif tracks.chosen_track is None:
-            fallback_track = tracks.sv_track or tracks.whisper_track
-            if fallback_track:
-                tracks.chosen_track = host._clone_text_track(
-                    fallback_track,
-                    source="chosen",
-                )
+        self._apply_arbitration_track_selection(
+            host=host,
+            chunk_index=ctx.chunk_index,
+            tracks=tracks,
+            arbitration_output=arbitration_output,
+        )
 
         chosen_text_clean = host._select_text_for_alignment(tracks.chosen_track)
         host._apply_arbitration_text(
@@ -221,6 +250,18 @@ class AlignmentStageService:
                 ctx.chunk_index,
                 language_hint,
             )
+
+        if self._is_timeanchored_main_chain_enabled(ctx):
+            if self._try_run_timeanchored_main_chain(
+                ctx=ctx,
+                tracks=tracks,
+                sv_result=sv_result,
+                whisper_result=whisper_result,
+                language_hint=language_hint,
+                speaker_id=speaker_id,
+                turn_id=turn_id,
+            ):
+                return
 
         legacy_run = host._run_collection_scoring_decision_once(
             tracks=tracks,
@@ -512,6 +553,238 @@ class AlignmentStageService:
         )
 
     @staticmethod
+    def _is_timeanchored_main_chain_enabled(ctx: ProcessingContext) -> bool:
+        if ctx.time_base_chunk is None:
+            return False
+        if ctx.whisper_result is None:
+            return False
+        return True
+
+    def _try_run_timeanchored_main_chain(
+        self,
+        *,
+        ctx: ProcessingContext,
+        tracks: Any,
+        sv_result: Dict[str, Any],
+        whisper_result: Dict[str, Any],
+        language_hint: str,
+        speaker_id: Optional[str],
+        turn_id: Optional[str],
+    ) -> bool:
+        host = self._host
+        chunk = ctx.audio_chunk
+        try:
+            base_language = str(language_hint or "auto")
+            text_truth = self._timeanchored_whisper_adapter.build_text_truth_package(
+                whisper_result=whisper_result,
+                default_language=base_language,
+            )
+            truth_text = str(text_truth.normalized_text or text_truth.raw_text or "").strip()
+            if not truth_text:
+                truth_text = self._resolve_text_fallback_content(
+                    chosen_text_clean=host._select_text_for_alignment(
+                        getattr(tracks, "chosen_track", None)
+                    ),
+                    tracks=tracks,
+                    whisper_result=whisper_result,
+                    sv_result=sv_result,
+                )
+                text_truth = replace(
+                    text_truth,
+                    raw_text=truth_text,
+                    normalized_text=truth_text,
+                )
+
+            from app.services.text_protection import extract_protected_spans
+
+            protected_spans = tuple(extract_protected_spans(truth_text))
+            text_truth = replace(text_truth, protected_spans=protected_spans)
+            language_runs = self._timeanchored_language_frontend.build_runs(
+                text=truth_text,
+                language_hint=base_language,
+            )
+            pronunciation = self._timeanchored_pronunciation_frontend.build_package(
+                text=truth_text,
+                language_hint=base_language,
+                language_runs=language_runs.runs,
+                dominant_language=language_runs.dominant_language,
+            )
+
+            ctx.text_truth = text_truth
+            ctx.protected_spans = list(text_truth.protected_spans)
+            ctx.language_runs = list(language_runs.runs)
+            ctx.pronunciation_package = pronunciation
+            ctx.pronunciation_report = {
+                "token_count": len(pronunciation.token_units),
+                "phone_count": len(pronunciation.phone_units),
+                "window_kind": language_runs.window_kind,
+                "foreign_run_ratio": float(language_runs.foreign_run_ratio),
+            }
+
+            text_result = self._timeanchored_text_aligner.align_window(
+                time_base=ctx.time_base_chunk,
+                text_truth=text_truth,
+                language_runs=language_runs,
+                pronunciation=pronunciation,
+            )
+            failed_spans = self._extract_failed_spans(text_result.items)
+            edge_mode = str(getattr(host, "_edge_selection_mode", "auto") or "auto")
+            edge_result = self._timeanchored_edge_selector.select(
+                time_base=ctx.time_base_chunk,
+                text_truth=text_truth,
+                failed_spans=failed_spans,
+                edge_selection_mode=edge_mode,
+            )
+            base_result = self._choose_timeanchored_base_result(
+                text_result=text_result,
+                edge_result=edge_result,
+            )
+            fallback_result = edge_result if base_result is text_result else None
+            final_stream = self._timeanchored_subtitle_assembler.assemble(
+                base_result=base_result,
+                fallback_result=fallback_result,
+                failed_spans=failed_spans,
+            )
+            if not final_stream and edge_result.items:
+                final_stream = tuple(edge_result.items)
+
+            final_sentences = self._timeanchored_sentence_segmenter.segment(
+                stream=final_stream,
+                language=base_language,
+                protected_spans=text_truth.protected_spans,
+            )
+            if not final_sentences:
+                fallback_text = "".join(item.text for item in final_stream).strip() or truth_text
+                fallback_confidence = self._resolve_text_fallback_confidence(
+                    chosen_source=str(getattr(ctx.arbitration_result, "chosen_source", "") or "slow"),
+                    whisper_result=whisper_result,
+                    sv_result=sv_result,
+                )
+                fallback_sentence = self._build_text_fallback_sentence(
+                    text=fallback_text,
+                    chunk=chunk,
+                    confidence=fallback_confidence,
+                )
+                if fallback_sentence is not None:
+                    final_sentences = [fallback_sentence]
+
+            for sentence in final_sentences:
+                if getattr(sentence, "speaker_id", None) is None:
+                    sentence.speaker_id = speaker_id
+                if getattr(sentence, "turn_id", None) is None:
+                    sentence.turn_id = turn_id
+
+            host._assign_sentence_identity_by_timeline_overlap(
+                final_sentences,
+                fallback_chunk=chunk,
+            )
+
+            chunk_start = float(getattr(chunk, "start", 0.0) or 0.0) if chunk is not None else 0.0
+            chunk_end = float(getattr(chunk, "end", chunk_start) or chunk_start) if chunk is not None else chunk_start
+            if chunk_end <= chunk_start:
+                chunk_end = chunk_start + 0.01
+            projections = self._timeanchored_chunk_projector.project(
+                sentence_segments=tuple(final_sentences),
+                chunk_windows=(
+                    ChunkWindow(
+                        chunk_ref=ctx.chunk_index,
+                        start=chunk_start,
+                        end=chunk_end,
+                    ),
+                ),
+            )
+            output_inputs = self._timeanchored_output_adapter.to_output_layer_inputs(
+                projections=projections,
+                language=base_language,
+                injection_report={
+                    "mapping_coverage": float(base_result.metrics.coverage),
+                    "error_code": str(base_result.error_code or ""),
+                },
+                segmentation_report={
+                    "route": "timeanchored",
+                    "text_route": text_result.route,
+                    "edge_route": edge_result.route,
+                    "error_code": str(base_result.error_code or ""),
+                },
+            )
+
+            output_error_count = 0
+            for output_input in output_inputs:
+                output_layer_result = host._emit_output_layer(
+                    chunk_index=output_input.chunk_index,
+                    sentence_segments=output_input.sentence_segments,
+                    language=output_input.language,
+                    injection_report=dict(output_input.injection_report or {}),
+                    segmentation_report=dict(output_input.segmentation_report or {}),
+                    output_traces=list(output_input.output_traces or []),
+                    default_trace_reason="timeanchored_chain",
+                )
+                output_error_count += len(output_layer_result.output_payload.get("errors", []))
+
+            ctx.final_sentences = list(final_sentences)
+            ctx.finalization_metrics = {
+                "coverage": float(base_result.metrics.coverage),
+                "gap_ratio": 0.0,
+                "alignment_score": float(base_result.metrics.route_confidence),
+                "gap_positions": [],
+                "gap_resolution": None,
+                "timeanchored_enabled": 1.0,
+                "timeanchored_text_route": text_result.route,
+                "timeanchored_edge_route": edge_result.route,
+                "timeanchored_final_route": base_result.route,
+                "timeanchored_item_count": float(len(final_stream)),
+                "timeanchored_sentence_count": float(len(final_sentences)),
+                "timeanchored_failed_span_count": float(len(failed_spans)),
+                "timeanchored_window_kind": language_runs.window_kind,
+                "timeanchored_foreign_run_ratio": float(language_runs.foreign_run_ratio),
+                "l7_error_count": float(output_error_count),
+            }
+            if ctx.arbitration_result:
+                ctx.arbitration_result.gap_positions = []
+
+            host.logger.debug(
+                "Chunk {}: timeanchored 主链完成 sentences={} route={}",
+                ctx.chunk_index,
+                len(final_sentences),
+                base_result.route,
+            )
+            return True
+        except Exception:
+            host.logger.exception(
+                "Chunk {}: timeanchored 主链失败，回退 legacy 四层",
+                ctx.chunk_index,
+            )
+            return False
+
+    @staticmethod
+    def _extract_failed_spans(items: Sequence[AlignmentItem]) -> tuple[FailedSpan, ...]:
+        spans: list[FailedSpan] = []
+        start: Optional[int] = None
+        for index, item in enumerate(items):
+            if item.status == "failed":
+                if start is None:
+                    start = index
+                continue
+            if start is not None:
+                spans.append(FailedSpan(start=start, end=index - 1))
+                start = None
+        if start is not None:
+            spans.append(FailedSpan(start=start, end=len(items) - 1))
+        return tuple(spans)
+
+    @staticmethod
+    def _choose_timeanchored_base_result(
+        *,
+        text_result: FinalAlignmentResult,
+        edge_result: FinalAlignmentResult,
+    ) -> FinalAlignmentResult:
+        if text_result.route in {"text", "phonetic"}:
+            return text_result
+        if edge_result.route != "error":
+            return edge_result
+        return text_result
+
+    @staticmethod
     def _resolve_text_fallback_content(
         *,
         chosen_text_clean: str,
@@ -584,4 +857,33 @@ class AlignmentStageService:
             is_draft=False,
             is_finalized=True,
         )
+
+    @staticmethod
+    def _apply_arbitration_track_selection(
+        *,
+        host: Any,
+        chunk_index: int,
+        tracks: Any,
+        arbitration_output: Any,
+    ) -> None:
+        arbitration_result = getattr(arbitration_output, "arbitration_result", None)
+        if arbitration_output.chosen_text_track:
+            tracks.chosen_track = arbitration_output.chosen_text_track
+            return
+        if (
+            arbitration_result is not None
+            and str(getattr(arbitration_result, "error_code", "") or "")
+            == "E_L2_ARBITRATION_FORCED_SOURCE_MISSING"
+        ):
+            forced_source = str(getattr(arbitration_result, "forced_source", "") or "")
+            raise ValueError(
+                f"Chunk {chunk_index}: 强制选边源缺失，终止本 chunk 定稿。forced_source={forced_source}"
+            )
+        if tracks.chosen_track is None:
+            fallback_track = tracks.sv_track or tracks.whisper_track
+            if fallback_track:
+                tracks.chosen_track = host._clone_text_track(
+                    fallback_track,
+                    source="chosen",
+                )
 

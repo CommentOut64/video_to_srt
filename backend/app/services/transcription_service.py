@@ -239,6 +239,9 @@ class TranscriptionService:
             speaker_count = max(0, int(getattr(preprocessing, "speaker_count", 0) or 0))
             speaker_min_count = max(0, int(getattr(preprocessing, "speaker_min_count", 0) or 0))
             speaker_max_count = max(0, int(getattr(preprocessing, "speaker_max_count", 0) or 0))
+            edge_selection_mode = str(
+                getattr(transcription, "edge_selection_mode", "auto") or "auto"
+            ).strip().lower()
 
             # 动态创建转录流水线
             transcription_pipeline = AsyncDualPipeline(
@@ -247,6 +250,7 @@ class TranscriptionService:
                 draft_engine=draft_engine,
                 patch_engine=patch_engine,
                 patching_threshold=patching_threshold,
+                edge_selection_mode=edge_selection_mode,
                 debug_punctuation=debug_punctuation,
                 is_enable_speaker_detection=is_enable_speaker_detection,
                 is_enable_speaker_guided_split=is_enable_speaker_guided_split,

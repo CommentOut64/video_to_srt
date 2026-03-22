@@ -261,6 +261,7 @@ class AsyncDualPipelineKernel:
         segmenter: Optional[DraftSegmenter] = None,
         aligner: Optional[DefaultAligner] = None,
         patching_threshold: Optional[ThresholdConfig] = None,
+        edge_selection_mode: str = "auto",
         enable_cross_chunk_merge: bool = True,
         bridge_controller: Optional[BridgeController] = None,
         debug_punctuation: bool = False,
@@ -294,6 +295,7 @@ class AsyncDualPipelineKernel:
             segmenter: 分句服务实例（可选）
             aligner: 对齐服务实例（可选）
             patching_threshold: 复核阈值配置（可选）
+            edge_selection_mode: 选边模式（auto/force_fast/force_slow）
             enable_cross_chunk_merge: 是否启用跨 chunk 合并
             bridge_controller: Bridge 控制器实例（可选）
             debug_punctuation: 是否启用标点调试输出
@@ -316,6 +318,7 @@ class AsyncDualPipelineKernel:
         self.draft_engine = draft_engine
         self.patch_engine = patch_engine
         self.patching_threshold = patching_threshold
+        self._edge_selection_mode = self._normalize_edge_selection_mode(edge_selection_mode)
         self.enable_cross_chunk_merge = enable_cross_chunk_merge
         self.debug_punctuation = debug_punctuation
         self.user_glossary = user_glossary
@@ -367,6 +370,7 @@ class AsyncDualPipelineKernel:
             self._speaker_min_count,
             self._speaker_max_count,
         )
+        self.logger.info("任务级选边模式: edge_selection_mode={}", self._edge_selection_mode)
         self.logger.info(
             "Whisper 提示词策略: {}",
             self._whisper_prompt_policy.describe_config(),
@@ -2609,8 +2613,16 @@ class AsyncDualPipelineKernel:
                 sv_track=tracks.sv_track,
                 whisper_track=tracks.whisper_track,
                 quality_signals=quality_signals,
+                edge_selection_mode=self._edge_selection_mode,
             )
         )
+
+    @staticmethod
+    def _normalize_edge_selection_mode(value: Any) -> str:
+        normalized = str(value or "auto").strip().lower()
+        if normalized in {"auto", "force_fast", "force_slow"}:
+            return normalized
+        return "auto"
 
     @staticmethod
     def _select_text_for_alignment(

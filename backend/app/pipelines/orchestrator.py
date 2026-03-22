@@ -202,12 +202,17 @@ class PipelineOrchestrator:
                 0,
                 int(getattr(preprocessing, "speaker_max_count", 0) or 0),
             )
+            transcription = getattr(job.settings, "transcription", None)
+            edge_selection_mode = str(
+                getattr(transcription, "edge_selection_mode", "auto") or "auto"
+            ).strip().lower()
             transcription_pipeline = AsyncDualPipeline(
                 job_id=job.job_id,
                 transcription_profile=profile_config.transcription_profile,
                 draft_engine=profile_config.draft_engine,
                 patch_engine=profile_config.patch_engine,
                 patching_threshold=profile_config.patching_threshold,
+                edge_selection_mode=edge_selection_mode,
                 debug_punctuation=debug_punctuation,
                 is_enable_speaker_detection=is_enable_speaker_detection,
                 is_enable_speaker_guided_split=is_enable_speaker_guided_split,

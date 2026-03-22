@@ -24,6 +24,9 @@ class ArbitrationResult:
     coverage: float
     error_code: Optional[str] = None
     gap_positions: List[int] = field(default_factory=list)
+    is_edge_selection_bypassed: bool = False
+    forced_source: Optional[str] = None
+    edge_selection_mode: str = "auto"
 
 
 class TextArbiterProcessor:
@@ -32,6 +35,7 @@ class TextArbiterProcessor:
     _DEFAULT_CONFIG: Dict[str, Any] = {
         "enable": True,
         "text_source_preference": "auto",
+        "edge_selection_mode": "auto",
         "min_length_ratio": 0.65,
         "max_length_ratio": 3.0,
         "low_confidence_threshold": 0.5,
@@ -68,11 +72,47 @@ class TextArbiterProcessor:
         quality = data.quality_signals
         config = self._resolve_config()
         preference = self._normalize_preference(config.get("text_source_preference"))
+        edge_selection_mode = self._normalize_edge_selection_mode(
+            data.edge_selection_mode or config.get("edge_selection_mode")
+        )
         is_enabled = bool(config.get("enable", True))
 
         sv_text = self._get_text(sv_track)
         wh_text = self._get_text(whisper_track)
         coverage = self._compute_coverage(sv_text, wh_text)
+
+        forced_source = self._resolve_forced_source(edge_selection_mode)
+        if forced_source is not None:
+            chosen_track = self._select_track(forced_source, sv_track, whisper_track)
+            chosen_text = self._get_text(chosen_track)
+            error_code = None
+            reason = f"forced_{forced_source}"
+            if not chosen_text:
+                chosen_track = None
+                reason = "forced_source_missing"
+                error_code = "E_L2_ARBITRATION_FORCED_SOURCE_MISSING"
+            else:
+                chosen_track = self._clone_track(chosen_track)
+                chosen_track.source = "chosen"
+            result = self._build_result(
+                chosen_source=forced_source,
+                reason=reason,
+                quality=quality,
+                coverage=coverage,
+                error_code=error_code,
+                is_edge_selection_bypassed=True,
+                forced_source=forced_source,
+                edge_selection_mode=edge_selection_mode,
+            )
+            self._log_result(
+                chosen_source=forced_source,
+                reason=reason,
+                sv_text=sv_text,
+                wh_text=wh_text,
+                chosen_text=self._get_text(chosen_track),
+                result=result,
+            )
+            return L2Output(chosen_text_track=chosen_track, arbitration_result=result)
 
         if not sv_track and not whisper_track:
             error_code = "E_L2_ARBITRATION_NO_TEXT"
@@ -82,6 +122,7 @@ class TextArbiterProcessor:
                 quality=quality,
                 coverage=coverage,
                 error_code=error_code,
+                edge_selection_mode=edge_selection_mode,
             )
             self._logger.warning("选文层缺失输入，回退 fast")
             return L2Output(chosen_text_track=None, arbitration_result=result)
@@ -121,6 +162,7 @@ class TextArbiterProcessor:
             quality=quality,
             coverage=coverage,
             error_code=error_code,
+            edge_selection_mode=edge_selection_mode,
         )
         self._log_result(
             chosen_source=chosen_source,
@@ -269,6 +311,23 @@ class TextArbiterProcessor:
         return "auto"
 
     @staticmethod
+    def _normalize_edge_selection_mode(value: Optional[str]) -> str:
+        if not value:
+            return "auto"
+        normalized = str(value).strip().lower()
+        if normalized in {"auto", "force_fast", "force_slow"}:
+            return normalized
+        return "auto"
+
+    @staticmethod
+    def _resolve_forced_source(edge_selection_mode: str) -> Optional[str]:
+        if edge_selection_mode == "force_fast":
+            return "fast"
+        if edge_selection_mode == "force_slow":
+            return "slow"
+        return None
+
+    @staticmethod
     def _select_track(
         source: str,
         sv_track: Optional[TextTrack],
@@ -323,6 +382,9 @@ class TextArbiterProcessor:
         quality: QualitySignals,
         coverage: float,
         error_code: Optional[str] = None,
+        is_edge_selection_bypassed: bool = False,
+        forced_source: Optional[str] = None,
+        edge_selection_mode: str = "auto",
     ) -> ArbitrationResult:
         return ArbitrationResult(
             chosen_source=chosen_source,
@@ -332,6 +394,9 @@ class TextArbiterProcessor:
             coverage=coverage,
             error_code=error_code,
             gap_positions=[],
+            is_edge_selection_bypassed=bool(is_edge_selection_bypassed),
+            forced_source=forced_source,
+            edge_selection_mode=edge_selection_mode,
         )
 
     def _log_result(
