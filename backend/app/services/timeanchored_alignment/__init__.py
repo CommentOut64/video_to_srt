@@ -35,6 +35,12 @@ from app.services.timeanchored_alignment.slow_window_assembler import (
     SlowWindowAssembler,
     SlowWindowAssemblerConfig,
 )
+from app.services.timeanchored_alignment.text_aligner import TextAligner, TextAlignerThresholds
+from app.services.timeanchored_alignment.text_alignment_scoring import (
+    TextAlignmentScoreBreakdown,
+    TextAlignmentScoreConfig,
+    TextAlignmentScorer,
+)
 from app.services.timeanchored_alignment.time_base_builder import TimeBaseBuilder
 from app.services.timeanchored_alignment.turn_group_adapter import TurnGroupAdapter
 from app.services.timeanchored_alignment.window_language_classifier import (
@@ -66,6 +72,11 @@ __all__ = [
     "HintBuilder",
     "LanguageRunFrontend",
     "PronunciationFrontend",
+    "TextAligner",
+    "TextAlignerThresholds",
+    "TextAlignmentScorer",
+    "TextAlignmentScoreConfig",
+    "TextAlignmentScoreBreakdown",
     "SlowWindowAssembler",
     "SlowWindowAssemblerConfig",
     "SlowInferenceWindow",
