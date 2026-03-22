@@ -16,6 +16,13 @@ from typing import List, Optional, Dict, Any
 from enum import Enum
 
 
+def _normalize_edge_selection_mode(value: Any) -> str:
+    normalized = str(value or "auto").strip().lower()
+    if normalized in {"auto", "force_fast", "force_slow"}:
+        return normalized
+    return "auto"
+
+
 # ========== 模块一: 人声分离 (Demucs) ==========
 
 class DemucsStrategy(Enum):
@@ -175,6 +182,8 @@ class TranscriptionSettings:
 
     # 复核触发阈值: 0.0-1.0, 低于此置信度的句子送给 Whisper 重跑
     patching_threshold: float = 0.60
+    # 选边模式: auto/force_fast/force_slow
+    edge_selection_mode: str = "auto"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -182,6 +191,7 @@ class TranscriptionSettings:
             "sensevoice_device": self.sensevoice_device,
             "whisper_model": self.whisper_model,
             "patching_threshold": self.patching_threshold,
+            "edge_selection_mode": self.edge_selection_mode,
         }
 
 
@@ -470,6 +480,9 @@ class TaskConfig:
                 sensevoice_device=transcription_data.get("sensevoice_device", "auto"),
                 whisper_model=transcription_data.get("whisper_model", "medium"),
                 patching_threshold=transcription_data.get("patching_threshold", 0.60),
+                edge_selection_mode=_normalize_edge_selection_mode(
+                    transcription_data.get("edge_selection_mode", "auto")
+                ),
             ),
             refinement=RefinementSettings(
                 llm_task=refinement_data.get("llm_task", "off"),
@@ -511,6 +524,9 @@ class TaskConfig:
                 sensevoice_device=preset.transcription.sensevoice_device,
                 whisper_model=preset.transcription.whisper_model,
                 patching_threshold=preset.transcription.patching_threshold,
+                edge_selection_mode=_normalize_edge_selection_mode(
+                    getattr(preset.transcription, "edge_selection_mode", "auto")
+                ),
             ),
             refinement=RefinementSettings(
                 llm_task=preset.refinement.llm_task,

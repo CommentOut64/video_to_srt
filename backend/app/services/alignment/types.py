@@ -146,6 +146,7 @@ class L2Input:
     sv_track: Optional[TextTrack]
     whisper_track: Optional[TextTrack]
     quality_signals: QualitySignals
+    edge_selection_mode: str = "auto"
 
 
 @dataclass

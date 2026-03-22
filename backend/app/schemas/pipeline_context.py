@@ -46,6 +46,7 @@ class ProcessingContext:
     audio_chunk: Any  # AudioChunk 对象
     job_dir: Optional[Path] = None
     debug_punctuation: bool = False
+    edge_selection_mode: str = "auto"
 
     # 音频上下文（用于 Audio Overlap）
     full_audio_array: Optional[np.ndarray] = None  # 完整音频数组（16kHz，单声道）

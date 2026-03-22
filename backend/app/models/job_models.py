@@ -4,8 +4,12 @@
 与 preset_models.py 中的 1+3 预设模式保持一致
 """
 import os
+import logging
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Optional, Any, Tuple
+
+
+_logger = logging.getLogger(__name__)
 
 
 def resolve_default_whisper_model() -> str:
@@ -18,6 +22,18 @@ def resolve_default_whisper_model() -> str:
     """
     model_name = str(os.environ.get("WHISPER_MODEL", "medium") or "").strip()
     return model_name or "medium"
+
+
+def normalize_edge_selection_mode(value: Any) -> str:
+    """规范化 edge_selection_mode，非法值回退 auto。"""
+    normalized = str(value or "auto").strip().lower()
+    if normalized in {"auto", "force_fast", "force_slow"}:
+        return normalized
+    _logger.warning(
+        "edge_selection_mode_invalid_fallback_auto field=task_config.transcription.edge_selection_mode value=%r",
+        value,
+    )
+    return "auto"
 
 
 # ========== 分组一: 预处理与音频设置 ==========
@@ -147,6 +163,8 @@ class TranscriptionConfig:
 
     # 复核触发阈值: 0.0-1.0
     patching_threshold: float = 0.60
+    # 选边模式：auto/force_fast/force_slow
+    edge_selection_mode: str = "auto"
 
 
 # ========== 分组三: 增强与润色设置 ==========
@@ -279,6 +297,7 @@ class JobSettings:
                 "sensevoice_device": self.transcription.sensevoice_device,
                 "whisper_model": self.transcription.whisper_model,
                 "patching_threshold": self.transcription.patching_threshold,
+                "edge_selection_mode": self.transcription.edge_selection_mode,
             },
             "refinement": {
                 "llm_task": self.refinement.llm_task,
@@ -416,6 +435,9 @@ class JobSettings:
                 sensevoice_device=transcription_data.get("sensevoice_device", "auto"),
                 whisper_model=transcription_data.get("whisper_model", resolve_default_whisper_model()),
                 patching_threshold=transcription_data.get("patching_threshold", 0.60),
+                edge_selection_mode=normalize_edge_selection_mode(
+                    transcription_data.get("edge_selection_mode", "auto")
+                ),
             ),
             refinement=RefinementConfig(
                 llm_task=refinement_data.get("llm_task", "off"),
@@ -483,6 +505,9 @@ class JobSettings:
                 sensevoice_device=preset.transcription.sensevoice_device,
                 whisper_model=preset.transcription.whisper_model or resolve_default_whisper_model(),
                 patching_threshold=preset.transcription.patching_threshold,
+                edge_selection_mode=normalize_edge_selection_mode(
+                    getattr(preset.transcription, "edge_selection_mode", "auto")
+                ),
             ),
             refinement=RefinementConfig(
                 llm_task=preset.refinement.llm_task,
