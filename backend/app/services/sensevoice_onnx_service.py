@@ -754,6 +754,11 @@ class SenseVoiceONNXService:
             # 【阶段一】清理特殊标记与 SentencePiece，并补偿时间偏移
             # 说明：纯标签会从时间轴扣除；嵌入标签仅剥离文本，不扣时间
             word_timestamps = self._clean_ctc_word_timestamps(word_timestamps)
+            ctc_compact_trace = self._build_ctc_compact_trace(
+                logits=logits,
+                word_timestamps=word_timestamps,
+                frame_stride=self.time_stride,
+            )
 
             # 4. 过滤未知情感标签（仅影响原始文本）
             if ban_emo_unk:
@@ -784,6 +789,8 @@ class SenseVoiceONNXService:
                 "text_clean": process_result["text_clean"],
                 "words": word_timestamps,
                 "raw_tokens": raw_tokens,
+                "ctc_compact_trace": ctc_compact_trace,
+                "ctc_frame_stride": self.time_stride,
                 "confidence": confidence,
                 "language": detected_language,
                 "emotion": process_result["tags"]["emotion"] if process_result["tags"] else None,
@@ -794,6 +801,8 @@ class SenseVoiceONNXService:
                     "confidence": sv_language_info.confidence,
                 } if sv_language_info.language else None
             }
+            if self._is_timeanchored_alignment_enabled():
+                result["ctc_logits"] = logits
 
             self.logger.debug(f"转录完成: {len(word_timestamps)} 个词/字, 置信度 {confidence:.3f}")
             return result
@@ -983,6 +992,101 @@ class SenseVoiceONNXService:
         logits = logits[0]  # [time_steps, vocab_size]
 
         return logits
+
+    def _is_timeanchored_alignment_enabled(self) -> bool:
+        """读取 alignment_pipeline flag，决定是否临时保留完整 ctc_logits。"""
+        try:
+            from app.services.model_runtime_config_service import get_model_runtime_config_service
+
+            runtime = get_model_runtime_config_service().get_effective_runtime_global()
+            effective = runtime.get("effective", {}) if isinstance(runtime, dict) else {}
+            override = runtime.get("override", {}) if isinstance(runtime, dict) else {}
+
+            group: Dict[str, Any] = {}
+            if isinstance(effective, dict):
+                effective_group = effective.get("alignment_pipeline", {})
+                if isinstance(effective_group, dict):
+                    group.update(effective_group)
+            if isinstance(override, dict):
+                override_group = override.get("alignment_pipeline", {})
+                if isinstance(override_group, dict):
+                    group.update(override_group)
+
+            version = str(group.get("version", "") or "").lower()
+            mode = str(group.get("mode", "") or "").lower()
+            enabled = bool(group.get("enabled") or group.get("enable") or group.get("enable_timeanchored"))
+            if version == "timeanchored":
+                return True
+            if mode in {"shadow", "active", "default", "timeanchored"}:
+                return True
+            return enabled
+        except Exception:
+            # 参数读取异常时保守关闭，避免默认携带大对象。
+            return False
+
+    def _build_ctc_compact_trace(
+        self,
+        *,
+        logits: np.ndarray,
+        word_timestamps: List[Dict[str, Any]],
+        frame_stride: float,
+        top_k: int = 3,
+        ambiguity_margin: float = 0.12,
+        low_conf_threshold: float = 0.75,
+    ) -> Dict[str, Any]:
+        """提取紧凑声学轨迹（统计 + 歧义位 top_candidates）。"""
+        probs = CTCDecoder._softmax(logits)
+        token_ids = np.argmax(probs, axis=-1)
+        max_probs = np.max(probs, axis=-1)
+
+        bounded_top_k = max(1, min(int(top_k), 3))
+        frame_count = probs.shape[0]
+        raw_tokens: List[Dict[str, Any]] = []
+
+        for token in word_timestamps:
+            item = dict(token)
+            if frame_count <= 0:
+                raw_tokens.append(item)
+                continue
+
+            start = float(item.get("start", 0.0) or 0.0)
+            end = float(item.get("end", start) or start)
+            start_idx = max(0, min(frame_count - 1, int(np.floor(start / frame_stride))))
+            end_idx = max(start_idx + 1, int(np.ceil(end / frame_stride)))
+            end_idx = min(frame_count, end_idx)
+            token_probs = probs[start_idx:end_idx]
+            if token_probs.size == 0:
+                raw_tokens.append(item)
+                continue
+
+            avg_probs = np.mean(token_probs, axis=0)
+            top_indices = np.argsort(avg_probs)[::-1][:bounded_top_k]
+            candidates = [
+                {
+                    "text": self.decoder.vocab.get(int(idx), "<unk>"),
+                    "score": float(avg_probs[int(idx)]),
+                    "token_id": int(idx),
+                }
+                for idx in top_indices
+            ]
+
+            keep_candidates = False
+            if len(candidates) >= 2:
+                keep_candidates = (candidates[0]["score"] - candidates[1]["score"]) <= ambiguity_margin
+            if float(item.get("confidence", 1.0) or 1.0) < low_conf_threshold:
+                keep_candidates = True
+            if keep_candidates:
+                item["top_candidates"] = candidates
+
+            raw_tokens.append(item)
+
+        return {
+            "blank_ratio": float(np.mean(token_ids == self.decoder.blank_id)) if token_ids.size else 0.0,
+            "avg_max_prob": float(np.mean(max_probs)) if max_probs.size else 0.0,
+            "low_prob_ratio": float(np.mean(max_probs < low_conf_threshold)) if max_probs.size else 0.0,
+            "raw_tokens": raw_tokens,
+            "top_k": bounded_top_k,
+        }
 
     def transcribe(
         self,

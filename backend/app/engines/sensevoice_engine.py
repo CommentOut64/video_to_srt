@@ -81,6 +81,11 @@ class SenseVoiceEngine(ASREngine):
                 "raw_tokens": raw_tokens,
                 # V3.2.2+dev.20260201.01: SenseVoice 语言标签置信度
                 "sv_language_info": result.get("sv_language_info"),
+                # V3.3.0: TimeBaseBuilder 需要的受控声学轨迹
+                "ctc_compact_trace": result.get("ctc_compact_trace"),
+                "ctc_frame_stride": result.get("ctc_frame_stride"),
+                # 默认不提供，仅在 flag 开启时由 service 注入
+                "ctc_logits": result.get("ctc_logits"),
             },
         )
 

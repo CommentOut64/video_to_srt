@@ -15,6 +15,8 @@ from app.core.logging import resolve_loguru_logger
 from app.schemas.pipeline_context import ProcessingContext
 from app.services.audio.chunk_engine import AudioChunk
 from app.services.model_runtime_config_service import get_model_runtime_config_service
+from app.services.timeanchored_alignment.adapters.fast import SenseVoiceTimeAdapter
+from app.services.timeanchored_alignment.time_base_builder import TimeBaseBuilder
 
 
 class FastWorker:
@@ -54,6 +56,7 @@ class FastWorker:
         if not draft_engine:
             raise ValueError("FastWorker 需要提供 draft_engine")
         self.draft_engine = draft_engine
+        self._time_base_builder: Optional[TimeBaseBuilder] = None
 
     async def process(self, ctx: ProcessingContext):
         """
@@ -73,6 +76,67 @@ class FastWorker:
 
         # V3.8 修复竞态条件：深拷贝 sv_result，避免下游修改影响其他协程
         ctx.sv_result = copy.deepcopy(sv_result)
+        self._maybe_build_time_base(ctx)
+
+    def _maybe_build_time_base(self, ctx: ProcessingContext) -> None:
+        """按 feature flag 构建时间基底，不影响现有快流主链。"""
+        if not self._is_timeanchored_alignment_enabled():
+            return
+
+        if self._time_base_builder is None:
+            self._time_base_builder = TimeBaseBuilder(adapter=self._build_time_adapter())
+
+        try:
+            ctx.time_base_chunk = self._time_base_builder.build(ctx)
+            ctx.time_base_report = {
+                "enabled": True,
+                "built": ctx.time_base_chunk is not None,
+                "chunk_index": ctx.chunk_index,
+            }
+        except Exception:
+            self.logger.exception("Chunk %s: 构建 time_base_chunk 失败，降级继续旧链路", ctx.chunk_index)
+            ctx.time_base_chunk = None
+            ctx.time_base_report = {
+                "enabled": True,
+                "built": False,
+                "error": "time_base_build_failed",
+            }
+
+    def _build_time_adapter(self) -> SenseVoiceTimeAdapter:
+        """尽力从 draft_engine 提取 vocab，无法提取时走紧凑轨迹回退。"""
+        vocab = None
+        blank_id = 0
+        service = getattr(self.draft_engine, "service", None)
+        decoder = getattr(service, "decoder", None)
+        if decoder is not None and hasattr(decoder, "vocab"):
+            vocab = getattr(decoder, "vocab", None)
+            blank_id = int(getattr(decoder, "blank_id", 0))
+        return SenseVoiceTimeAdapter(vocab=vocab, blank_id=blank_id)
+
+    def _is_timeanchored_alignment_enabled(self) -> bool:
+        """读取 alignment_pipeline flag。"""
+        runtime = get_model_runtime_config_service().get_effective_runtime_global()
+        effective = runtime.get("effective", {}) if isinstance(runtime, dict) else {}
+        override = runtime.get("override", {}) if isinstance(runtime, dict) else {}
+
+        group: Dict[str, Any] = {}
+        if isinstance(effective, dict):
+            value = effective.get("alignment_pipeline", {})
+            if isinstance(value, dict):
+                group.update(value)
+        if isinstance(override, dict):
+            value = override.get("alignment_pipeline", {})
+            if isinstance(value, dict):
+                group.update(value)
+
+        version = str(group.get("version", "") or "").lower()
+        mode = str(group.get("mode", "") or "").lower()
+        enabled = bool(group.get("enabled") or group.get("enable") or group.get("enable_timeanchored"))
+        if version == "timeanchored":
+            return True
+        if mode in {"shadow", "active", "default", "timeanchored"}:
+            return True
+        return enabled
 
     async def _run_sensevoice(self, chunk: AudioChunk) -> Dict[str, Any]:
         """
@@ -219,10 +283,17 @@ class FastWorker:
         sv_language_info = None
         if asr_result.metadata and asr_result.metadata.raw_tags:
             sv_language_info = asr_result.metadata.raw_tags.get("sv_language_info")
+        ctc_compact_trace = None
+        ctc_logits = None
+        ctc_frame_stride = None
+        if asr_result.metadata and asr_result.metadata.raw_tags:
+            ctc_compact_trace = asr_result.metadata.raw_tags.get("ctc_compact_trace")
+            ctc_logits = asr_result.metadata.raw_tags.get("ctc_logits")
+            ctc_frame_stride = asr_result.metadata.raw_tags.get("ctc_frame_stride")
 
         # V3.2.0+dev.20260203.10: L0 仅透传原始文本与置信度来源
         raw_text = asr_result.text if asr_result.text is not None else None
-        return {
+        result = {
             "raw_text": raw_text,
             "words": words,
             "raw_tokens": raw_tokens,
@@ -236,4 +307,11 @@ class FastWorker:
             "source": "fast",
             "segments": None,
         }
+        if ctc_compact_trace is not None:
+            result["ctc_compact_trace"] = ctc_compact_trace
+        if ctc_logits is not None:
+            result["ctc_logits"] = ctc_logits
+        if ctc_frame_stride is not None:
+            result["ctc_frame_stride"] = ctc_frame_stride
+        return result
 
