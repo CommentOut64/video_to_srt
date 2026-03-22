@@ -80,6 +80,7 @@ class AlignLoopService:
                     finalized_indices.add(chunk_index)
                     host._last_align_chunk_index = chunk_index
                     results.append(ctx)
+                    self._release_preparation_artifacts(ctx)
                     if host.progress_emitter and total_chunks > 0:
                         total_processed = len(finalized_indices)
                         host.progress_emitter.update_align(
@@ -115,6 +116,7 @@ class AlignLoopService:
                             "final_sentence_count": int(len(ctx.final_sentences or [])),
                         },
                     )
+                    self._release_preparation_artifacts(ctx)
 
                     if host.progress_emitter and total_chunks > 0:
                         total_processed = len(finalized_indices)
@@ -167,3 +169,16 @@ class AlignLoopService:
         finally:
             if pause_requested:
                 host.logger.debug("[V3.1.0] 对齐阶段已排空所有上下文，等待上层暂停")
+
+    def _release_preparation_artifacts(self, ctx: ProcessingContext) -> None:
+        """终稿提交后释放准备层中间对象，避免大对象泄漏到长期上下文。"""
+        if not hasattr(ctx, "release_preparation_artifacts"):
+            return
+        try:
+            ctx.release_preparation_artifacts()
+        except Exception as exc:
+            self._host.logger.warning(
+                "释放准备层中间对象失败，已降级继续: chunk_index=%s err=%s",
+                getattr(ctx, "chunk_index", "unknown"),
+                exc,
+            )
