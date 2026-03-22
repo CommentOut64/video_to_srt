@@ -31,6 +31,17 @@ from app.services.timeanchored_alignment.contracts import (
 from app.services.timeanchored_alignment.hint_builder import HintBuilder
 from app.services.timeanchored_alignment.language_run_frontend import LanguageRunFrontend
 from app.services.timeanchored_alignment.pronunciation_frontend import PronunciationFrontend
+from app.services.timeanchored_alignment.phonetic_aligner import (
+    PhoneticAligner,
+    PhoneticAlignerConfig,
+    PhoneticRescueResult,
+    PhoneticRescueTrace,
+)
+from app.services.timeanchored_alignment.phonetic_matchers import (
+    PhoneticAlignmentPair,
+    align_monotonic_sequences,
+    project_token_phone_keys,
+)
 from app.services.timeanchored_alignment.slow_window_assembler import (
     SlowWindowAssembler,
     SlowWindowAssemblerConfig,
@@ -72,6 +83,13 @@ __all__ = [
     "HintBuilder",
     "LanguageRunFrontend",
     "PronunciationFrontend",
+    "PhoneticAligner",
+    "PhoneticAlignerConfig",
+    "PhoneticRescueResult",
+    "PhoneticRescueTrace",
+    "PhoneticAlignmentPair",
+    "align_monotonic_sequences",
+    "project_token_phone_keys",
     "TextAligner",
     "TextAlignerThresholds",
     "TextAlignmentScorer",

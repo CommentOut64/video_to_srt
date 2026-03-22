@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Mapping, Optional, Sequence
 
 from app.models.confidence_models import AlignedWord, AlignmentStatus
 from app.services.alignment.gap_resolver import GapResolution, GapResolver
@@ -30,6 +30,9 @@ from app.services.timeanchored_alignment.text_alignment_scoring import (
     default_token_normalizer,
 )
 
+if TYPE_CHECKING:
+    from app.services.timeanchored_alignment.phonetic_aligner import PhoneticAligner, PhoneticRescueTrace
+
 
 @dataclass(frozen=True)
 class TextAlignerThresholds:
@@ -49,12 +52,24 @@ class TextAligner:
         nw_core: Optional[NeedlemanWunschV2Core] = None,
         gap_resolver: Optional[GapResolver] = None,
         scorer: Optional[TextAlignmentScorer] = None,
+        phonetic_aligner: Optional["PhoneticAligner"] = None,
     ) -> None:
         self._threshold_overrides = dict(threshold_overrides or {})
         self._nw_core = nw_core or NeedlemanWunschV2Core()
         self._gap_resolver = gap_resolver or GapResolver()
         self._scorer = scorer or TextAlignmentScorer()
         self._normalizer = default_token_normalizer
+        self._phonetic_aligner = phonetic_aligner
+        self._last_phonetic_report: dict[str, object] = {}
+        self._last_phonetic_traces: tuple["PhoneticRescueTrace", ...] = tuple()
+
+    @property
+    def last_phonetic_report(self) -> dict[str, object]:
+        return dict(self._last_phonetic_report)
+
+    @property
+    def last_phonetic_traces(self) -> tuple["PhoneticRescueTrace", ...]:
+        return tuple(self._last_phonetic_traces)
 
     def align_window(
         self,
@@ -64,19 +79,24 @@ class TextAligner:
         language_runs: LanguageRunPackage,
         pronunciation: PronunciationPackage,
     ) -> FinalAlignmentResult:
+        self._last_phonetic_report = {}
+        self._last_phonetic_traces = tuple()
         if language_runs.window_kind == WINDOW_KIND_TRUE_MIXED:
+            self._last_phonetic_report = {"skipped": True, "reason": "true_mixed_window"}
             return self._error_result(
                 route="mixed",
                 error_code="TRUE_MIXED_WINDOW",
                 item_count=len(text_truth.units),
             )
         if language_runs.window_kind not in {WINDOW_KIND_SINGLE_LANGUAGE, WINDOW_KIND_DOMINANT_WITH_ISLANDS}:
+            self._last_phonetic_report = {"skipped": True, "reason": "unsupported_window_kind"}
             return self._error_result(
                 route="error",
                 error_code="UNSUPPORTED_WINDOW_KIND",
                 item_count=len(text_truth.units),
             )
         if not text_truth.units:
+            self._last_phonetic_report = {"skipped": True, "reason": "empty_text_truth"}
             return self._error_result(route="error", error_code="EMPTY_TEXT_TRUTH", item_count=0)
 
         dominant_language = self._resolve_language(time_base, text_truth, language_runs, pronunciation)
@@ -85,6 +105,7 @@ class TextAligner:
             language_runs.window_kind == WINDOW_KIND_DOMINANT_WITH_ISLANDS
             and float(language_runs.foreign_run_ratio) > float(thresholds.foreign_run_max_ratio)
         ):
+            self._last_phonetic_report = {"skipped": True, "reason": "foreign_run_ratio_exceeded"}
             return self._error_result(
                 route="mixed",
                 error_code="FOREIGN_RUN_RATIO_EXCEEDED",
@@ -93,6 +114,7 @@ class TextAligner:
 
         time_units, error_code = self._select_time_units(time_base=time_base, language=dominant_language)
         if error_code:
+            self._last_phonetic_report = {"skipped": True, "reason": str(error_code).lower()}
             return self._error_result(route="error", error_code=error_code, item_count=len(text_truth.units))
 
         seq1 = [unit.text for unit in time_units]
@@ -241,7 +263,7 @@ class TextAligner:
             route = "error"
             error_code = "TEXT_ALIGNMENT_FAILED"
 
-        return FinalAlignmentResult(
+        text_result = FinalAlignmentResult(
             items=tuple(items),
             route=route,
             metrics=AlignmentMetrics(
@@ -252,6 +274,22 @@ class TextAligner:
             ),
             error_code=error_code,
         )
+        if self._phonetic_aligner is None:
+            self._last_phonetic_report = {"skipped": True, "reason": "phonetic_aligner_not_configured"}
+            return text_result
+        if not self._should_trigger_phonetic(text_result=text_result, thresholds=thresholds):
+            self._last_phonetic_report = {"skipped": True, "reason": "trigger_not_met"}
+            return text_result
+        rescue = self._phonetic_aligner.rescue_window(
+            text_alignment=text_result,
+            time_base=time_base,
+            text_truth=text_truth,
+            language_runs=language_runs,
+            pronunciation=pronunciation,
+        )
+        self._last_phonetic_report = dict(rescue.report or {})
+        self._last_phonetic_traces = tuple(rescue.traces or tuple())
+        return rescue.alignment
 
     def _resolve_thresholds(self, language: str) -> TextAlignerThresholds:
         snapshot = build_language_policy_snapshot(
@@ -390,6 +428,25 @@ class TextAligner:
             return float(value)
         except (TypeError, ValueError):
             return float(default)
+
+    @staticmethod
+    def _should_trigger_phonetic(
+        *,
+        text_result: FinalAlignmentResult,
+        thresholds: TextAlignerThresholds,
+    ) -> bool:
+        if not text_result.items:
+            return False
+        if all(item.status == "direct" for item in text_result.items):
+            return False
+        if any(item.status in {"failed", "estimated", "interpolated"} for item in text_result.items):
+            return True
+        for item in text_result.items:
+            if item.confidence is None:
+                continue
+            if float(item.confidence) < float(thresholds.pronunciation_evidence_min_score):
+                return True
+        return False
 
     @staticmethod
     def _is_ja_pronunciation_fallback(
