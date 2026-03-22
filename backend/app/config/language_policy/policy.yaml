@@ -40,6 +40,14 @@ languages:
       soft_cut_weak_punct_anchor_confidence: 0.60
       singleton_tail_max_gap_sec: 0.65
       singleton_tail_max_duration_sec: 0.95
+      text_direct_ratio_min: 0.65
+      text_estimated_ratio_max: 0.35
+      ctc_low_prob_ratio_max: 0.30
+      max_continuous_failure_span: 6.0
+      dominant_language_min_ratio: 0.55
+      foreign_run_max_ratio: 0.50
+      foreign_run_char_max: 24.0
+      pronunciation_evidence_min_score: 0.45
     carry_rules:
       short_tail: [0.45, 2.20]
       singleton_tail: [0.65, 0.95]
@@ -69,6 +77,14 @@ languages:
       soft_cut_weak_punct_anchor_confidence: 0.00
       singleton_tail_max_gap_sec: 0.60
       singleton_tail_max_duration_sec: 0.95
+      text_direct_ratio_min: 0.65
+      text_estimated_ratio_max: 0.35
+      ctc_low_prob_ratio_max: 0.30
+      max_continuous_failure_span: 6.0
+      dominant_language_min_ratio: 0.55
+      foreign_run_max_ratio: 0.50
+      foreign_run_char_max: 24.0
+      pronunciation_evidence_min_score: 0.45
     carry_rules:
       short_tail: [0.45, 2.20]
       singleton_tail: [0.60, 0.95]
@@ -98,6 +114,14 @@ languages:
       soft_cut_weak_punct_anchor_confidence: 0.60
       singleton_tail_max_gap_sec: 0.60
       singleton_tail_max_duration_sec: 0.95
+      text_direct_ratio_min: 0.65
+      text_estimated_ratio_max: 0.35
+      ctc_low_prob_ratio_max: 0.30
+      max_continuous_failure_span: 6.0
+      dominant_language_min_ratio: 0.55
+      foreign_run_max_ratio: 0.50
+      foreign_run_char_max: 24.0
+      pronunciation_evidence_min_score: 0.45
     carry_rules:
       short_tail: [0.45, 2.20]
       singleton_tail: [0.60, 0.95]
