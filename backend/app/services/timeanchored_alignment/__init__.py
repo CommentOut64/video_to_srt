@@ -46,11 +46,37 @@ from app.services.timeanchored_alignment.slow_window_assembler import (
     SlowWindowAssembler,
     SlowWindowAssemblerConfig,
 )
+from app.services.timeanchored_alignment.subtitle_assembler import (
+    FinalAlignedStream,
+    SubtitleAssembler,
+)
+from app.services.timeanchored_alignment.sentence_segmenter import (
+    SentenceSegmenter,
+    SentenceSegmenterConfig,
+)
+from app.services.timeanchored_alignment.chunk_projector import (
+    ChunkProjection,
+    ChunkProjector,
+    ChunkWindow,
+)
+from app.services.timeanchored_alignment.output_adapter import OutputAdapter
 from app.services.timeanchored_alignment.text_aligner import TextAligner, TextAlignerThresholds
 from app.services.timeanchored_alignment.text_alignment_scoring import (
     TextAlignmentScoreBreakdown,
     TextAlignmentScoreConfig,
     TextAlignmentScorer,
+)
+from app.services.timeanchored_alignment.hallucination_gate import (
+    BOTH_SIDES_UNAVAILABLE_ERROR,
+    GateDecision,
+    GateEvaluation,
+    HallucinationGate,
+    HallucinationGateConfig,
+)
+from app.services.timeanchored_alignment.edge_selector import (
+    EdgeSelector,
+    EdgeSelectorConfig,
+    FailedSpan,
 )
 from app.services.timeanchored_alignment.time_base_builder import TimeBaseBuilder
 from app.services.timeanchored_alignment.turn_group_adapter import TurnGroupAdapter
@@ -92,11 +118,27 @@ __all__ = [
     "project_token_phone_keys",
     "TextAligner",
     "TextAlignerThresholds",
+    "BOTH_SIDES_UNAVAILABLE_ERROR",
+    "GateDecision",
+    "GateEvaluation",
+    "HallucinationGate",
+    "HallucinationGateConfig",
+    "EdgeSelector",
+    "EdgeSelectorConfig",
+    "FailedSpan",
     "TextAlignmentScorer",
     "TextAlignmentScoreConfig",
     "TextAlignmentScoreBreakdown",
     "SlowWindowAssembler",
     "SlowWindowAssemblerConfig",
+    "FinalAlignedStream",
+    "SubtitleAssembler",
+    "SentenceSegmenter",
+    "SentenceSegmenterConfig",
+    "ChunkProjection",
+    "ChunkProjector",
+    "ChunkWindow",
+    "OutputAdapter",
     "SlowInferenceWindow",
     "SlowInferenceWindowEnvelope",
     "TextTruthPackage",
