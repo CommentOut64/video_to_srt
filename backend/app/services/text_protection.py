@@ -8,10 +8,12 @@
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence, Tuple
 
 from app.models.sensevoice_models import WordTimestamp
+from app.services.timeanchored_alignment.contracts import ProtectedSpan
 
 _DEFAULT_SENTENCE_END_CHARS = ("。", "！", "？", ".", "!", "?")
 
@@ -38,6 +40,9 @@ class BaseTextProtectionRule:
     def should_skip_raw_punctuation(self, text: str, index: int, char: str) -> bool:
         return False
 
+    def extract_protected_spans(self, text: str) -> Tuple[ProtectedSpan, ...]:
+        return tuple()
+
 
 class DecimalProtectionRule(BaseTextProtectionRule):
     """
@@ -52,6 +57,7 @@ class DecimalProtectionRule(BaseTextProtectionRule):
 
     rule_id = "decimal_protection"
     _DECIMAL_DOT_CHARS = {".", "。", "．"}
+    _DECIMAL_PATTERN = re.compile(r"(?<!\d)\d+[\.\u3002\uFF0E]\d+(?!\d)")
 
     @classmethod
     def is_decimal_dot_in_text(cls, text: str, index: int) -> bool:
@@ -159,6 +165,87 @@ class DecimalProtectionRule(BaseTextProtectionRule):
             return False
         return self.is_decimal_dot_in_text(text, index)
 
+    def extract_protected_spans(self, text: str) -> Tuple[ProtectedSpan, ...]:
+        spans: list[ProtectedSpan] = []
+        for matched in self._DECIMAL_PATTERN.finditer(text):
+            spans.append(
+                ProtectedSpan(
+                    start=matched.start(),
+                    end=matched.end(),
+                    kind="decimal",
+                    text=matched.group(0),
+                )
+            )
+        return tuple(spans)
+
+
+class RegexSpanProtectionRule(BaseTextProtectionRule):
+    """基于正则的保护 span 规则。"""
+
+    span_kind: str = "regex"
+    pattern: re.Pattern[str]
+
+    def extract_protected_spans(self, text: str) -> Tuple[ProtectedSpan, ...]:
+        spans: list[ProtectedSpan] = []
+        for matched in self.pattern.finditer(text):
+            spans.append(
+                ProtectedSpan(
+                    start=matched.start(),
+                    end=matched.end(),
+                    kind=self.span_kind,
+                    text=matched.group(0),
+                )
+            )
+        return tuple(spans)
+
+
+class VersionProtectionRule(RegexSpanProtectionRule):
+    span_kind = "version"
+    pattern = re.compile(r"\bv\d+(?:\.\d+)+\b", re.IGNORECASE)
+
+
+class AbbrevDotProtectionRule(RegexSpanProtectionRule):
+    span_kind = "abbrev_dot"
+    pattern = re.compile(r"\b(?:[A-Za-z]\.){2,}[A-Za-z]?\.?")
+
+
+class HyphenProtectionRule(RegexSpanProtectionRule):
+    span_kind = "hyphen"
+    pattern = re.compile(r"\b[A-Za-z]+(?:-[A-Za-z]+)+\b")
+
+
+class ApostropheProtectionRule(RegexSpanProtectionRule):
+    span_kind = "apostrophe"
+    pattern = re.compile(r"\b[A-Za-z]+(?:'[A-Za-z]+)+\b")
+
+
+class MiddleDotProtectionRule(RegexSpanProtectionRule):
+    span_kind = "middle_dot"
+    pattern = re.compile(r"・")
+
+
+class AlnumMixedProtectionRule(BaseTextProtectionRule):
+    """字母数字混合片段保护（如 RTX 4090 / OpenAI GPT-4o）。"""
+
+    _PATTERNS = (
+        re.compile(r"\b[A-Za-z]{2,}\s+\d+[A-Za-z0-9-]*\b"),
+        re.compile(r"\b[A-Za-z]{2,}\s+[A-Za-z]+-[A-Za-z0-9]+\b"),
+    )
+
+    def extract_protected_spans(self, text: str) -> Tuple[ProtectedSpan, ...]:
+        spans: list[ProtectedSpan] = []
+        for pattern in self._PATTERNS:
+            for matched in pattern.finditer(text):
+                spans.append(
+                    ProtectedSpan(
+                        start=matched.start(),
+                        end=matched.end(),
+                        kind="alnum_mixed",
+                        text=matched.group(0),
+                    )
+                )
+        return tuple(spans)
+
 
 @dataclass(frozen=True)
 class TextProtectionRuleSet:
@@ -188,10 +275,37 @@ class TextProtectionRuleSet:
     def should_skip_raw_punctuation(self, text: str, index: int, char: str) -> bool:
         return any(rule.should_skip_raw_punctuation(text, index, char) for rule in self.rules)
 
+    def extract_protected_spans(self, text: str) -> Tuple[ProtectedSpan, ...]:
+        if not text:
+            return tuple()
+        collected: list[ProtectedSpan] = []
+        for rule in self.rules:
+            collected.extend(rule.extract_protected_spans(text))
+        if not collected:
+            return tuple()
+        collected.sort(key=lambda item: (item.start, -(item.end - item.start)))
+
+        accepted: list[ProtectedSpan] = []
+        for item in collected:
+            if accepted and item.start < accepted[-1].end:
+                continue
+            accepted.append(item)
+        return tuple(accepted)
+
 
 def build_default_rule_set() -> TextProtectionRuleSet:
     """默认规则集入口；后续新增规则只需在这里注册。"""
-    return TextProtectionRuleSet(rules=(DecimalProtectionRule(),))
+    return TextProtectionRuleSet(
+        rules=(
+            DecimalProtectionRule(),
+            VersionProtectionRule(),
+            AbbrevDotProtectionRule(),
+            HyphenProtectionRule(),
+            ApostropheProtectionRule(),
+            MiddleDotProtectionRule(),
+            AlnumMixedProtectionRule(),
+        )
+    )
 
 
 _DEFAULT_RULE_SET = build_default_rule_set()
@@ -258,6 +372,15 @@ def should_skip_raw_punctuation(
 def is_decimal_dot_in_text(text: str, index: int) -> bool:
     """兼容入口：供外层按需直接查询小数点判定。"""
     return DecimalProtectionRule.is_decimal_dot_in_text(text, index)
+
+
+def extract_protected_spans(
+    text: str,
+    *,
+    rule_set: Optional[TextProtectionRuleSet] = None,
+) -> list[ProtectedSpan]:
+    active = rule_set or _DEFAULT_RULE_SET
+    return list(active.extract_protected_spans(text))
 
 
 def merge_protected_word_tokens(

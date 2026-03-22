@@ -143,6 +143,45 @@ class StaticLanguagePolicyProvider:
         )
 
 
+@dataclass
+class FallbackLanguagePolicyProvider:
+    """未知语言兜底 provider：复用默认语言配置，但保留请求语言标签。"""
+
+    requested_language: str
+    fallback_language: str
+
+    def build_snapshot(
+        self,
+        *,
+        language_hint: str,
+        runtime_overrides: Mapping[str, Any],
+    ) -> LanguagePolicySnapshot:
+        fallback_provider = StaticLanguagePolicyProvider(language_tag=self.fallback_language)
+        fallback_snapshot = fallback_provider.build_snapshot(
+            language_hint=language_hint,
+            runtime_overrides=runtime_overrides,
+        )
+        metadata = dict(fallback_snapshot.metadata or {})
+        metadata.update(
+            {
+                "provider": "fallback_language_policy_provider",
+                "requested_language": self.requested_language,
+                "fallback_language": self.fallback_language,
+            }
+        )
+        return LanguagePolicySnapshot(
+            policy_version=fallback_snapshot.policy_version,
+            language_tag=self.requested_language,
+            sentence_end_chars=fallback_snapshot.sentence_end_chars,
+            continuation_words=fallback_snapshot.continuation_words,
+            incomplete_endings=fallback_snapshot.incomplete_endings,
+            semantic_anchor_words=fallback_snapshot.semantic_anchor_words,
+            thresholds=dict(fallback_snapshot.thresholds),
+            carry_rules=dict(fallback_snapshot.carry_rules),
+            metadata=metadata,
+        )
+
+
 class LanguagePolicyRegistry:
     """语言策略注册表。"""
 
@@ -170,7 +209,23 @@ class LanguagePolicyRegistry:
             return self._default_language
         return self._alias_map.get(raw, raw)
 
-    def resolve(self, language_tag: str) -> LanguagePolicyProvider:
+    def resolve(
+        self,
+        language_tag: str,
+        *,
+        preserve_unknown: bool = False,
+    ) -> LanguagePolicyProvider:
+        if preserve_unknown:
+            raw_tag = str(language_tag or "").strip().lower()
+            raw_provider = self._providers.get(raw_tag)
+            if raw_provider is not None:
+                return raw_provider
+            if raw_tag:
+                return FallbackLanguagePolicyProvider(
+                    requested_language=raw_tag,
+                    fallback_language=self._default_language,
+                )
+
         normalized = self.normalize_tag(language_tag)
         provider = self._providers.get(normalized)
         if provider is not None:

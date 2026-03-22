@@ -8,7 +8,13 @@ from app.services.timeanchored_alignment.contracts import (
     AlignmentItem,
     AlignmentMetrics,
     FinalAlignmentResult,
+    LanguageRun,
+    LanguageRunPackage,
     LayerReport,
+    PhoneUnit,
+    PronunciationPackage,
+    TokenToPhoneSpan,
+    TokenUnit,
     PhoneticPackage,
     PhoneticUnit,
     PipelineReport,
@@ -23,6 +29,8 @@ from app.services.timeanchored_alignment.contracts import (
     TimeBaseUnit,
 )
 from app.services.timeanchored_alignment.hint_builder import HintBuilder
+from app.services.timeanchored_alignment.language_run_frontend import LanguageRunFrontend
+from app.services.timeanchored_alignment.pronunciation_frontend import PronunciationFrontend
 from app.services.timeanchored_alignment.slow_window_assembler import (
     SlowWindowAssembler,
     SlowWindowAssemblerConfig,
@@ -44,12 +52,20 @@ __all__ = [
     "AlignmentItem",
     "AlignmentMetrics",
     "FinalAlignmentResult",
+    "LanguageRun",
+    "LanguageRunPackage",
     "LayerReport",
+    "PhoneUnit",
+    "PronunciationPackage",
+    "TokenToPhoneSpan",
+    "TokenUnit",
     "PhoneticPackage",
     "PhoneticUnit",
     "PipelineReport",
     "ProtectedSpan",
     "HintBuilder",
+    "LanguageRunFrontend",
+    "PronunciationFrontend",
     "SlowWindowAssembler",
     "SlowWindowAssemblerConfig",
     "SlowInferenceWindow",
