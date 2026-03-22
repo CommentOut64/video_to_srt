@@ -5,10 +5,13 @@
 """
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, List, Any, Dict
+from typing import Optional, List, Any, Dict, TYPE_CHECKING
 import numpy as np
 
 from app.services.alignment.types import PunctTrack, TextTrackBundle
+
+if TYPE_CHECKING:
+    from app.services.timeanchored_alignment.contracts import TimeBasePackage
 
 @dataclass
 class ProcessingContext:
@@ -50,6 +53,8 @@ class ProcessingContext:
     text_tracks: Optional[TextTrackBundle] = None  # V3.2.0+dev.20260203.03: 三轨文本
     punct_track: Optional[PunctTrack] = None  # V3.2.0+dev.20260204.05: 标点前置域轨道
     finalization_metrics: Dict[str, Any] = field(default_factory=dict)  # V3.2.0+dev.20260203.03
+    time_base_chunk: Optional["TimeBasePackage"] = None  # V3.3.0: 时间锚定主链时间基底
+    time_base_report: Optional[Dict[str, Any]] = None  # V3.3.0: 时间基底构建报告（轻量）
 
     # 控制信号
     is_end: bool = False                  # 结束流标记
