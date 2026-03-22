@@ -120,6 +120,13 @@ from app.services.punctuation.semantic_buffer import (
     SemanticBufferInput,
     SemanticChunk,
 )
+from app.services.timeanchored_alignment.hint_builder import HintBuilder
+from app.services.timeanchored_alignment.slow_window_assembler import (
+    SlowWindowAssembler,
+    SlowWindowAssemblerConfig,
+)
+from app.services.timeanchored_alignment.turn_group_adapter import TurnGroupAdapter
+from app.services.timeanchored_alignment.window_language_classifier import WindowLanguageClassifier
 from app.services.text_protection import is_sentence_end_punct
 from app.pipelines.dual_pipeline.services import (
     AlignLoopService,
@@ -322,6 +329,14 @@ class AsyncDualPipelineKernel:
         self._enable_bridge_batches: bool = False
         self._consume_turn_groups_only: bool = True
         self._turn_group_builder = TurnGroupBuilder()
+        self._window_language_classifier = WindowLanguageClassifier()
+        self._window_hint_builder = HintBuilder()
+        self._slow_window_assembler = SlowWindowAssembler(
+            config=SlowWindowAssemblerConfig(),
+            classifier=self._window_language_classifier,
+            hint_builder=self._window_hint_builder,
+        )
+        self._turn_group_adapter = TurnGroupAdapter()
         self._runtime_checkpoint_service = None
         self._speaker_store_service: Optional["SpeakerStoreService"] = None
         self._context_cache: Dict[int, ProcessingContext] = {}
@@ -834,6 +849,19 @@ class AsyncDualPipelineKernel:
                     timeline_cfg.get("long_pause_cut_sec", 1.8) or 1.8
                 ),
             )
+        )
+        self._slow_window_assembler = SlowWindowAssembler(
+            config=SlowWindowAssemblerConfig(
+                first_window_target_sec=float(flush_cfg_raw.get("min_audio_sec", 6.0) or 6.0),
+                steady_window_target_sec=max(
+                    float(flush_cfg_raw.get("min_audio_sec", 6.0) or 6.0),
+                    float(flush_cfg_raw.get("steady_window_target_sec", 12.0) or 12.0),
+                ),
+                long_pause_cut_sec=float(timeline_cfg.get("long_pause_cut_sec", 1.8) or 1.8),
+                tail_idle_sec=float(flush_cfg_raw.get("tail_idle_sec", 1.0) or 1.0),
+            ),
+            classifier=self._window_language_classifier,
+            hint_builder=self._window_hint_builder,
         )
 
         runtime_checkpoint_service = None
@@ -1969,6 +1997,20 @@ class AsyncDualPipelineKernel:
                     speaker_id = self._resolve_speaker_id_for_chunk(source_chunk)
                     turn_id = self._resolve_turn_id_for_chunk(source_chunk)
 
+            if self._should_use_window_assembler():
+                window_envelopes = self._slow_window_assembler.add_chunk(
+                    chunk,
+                    speaker_id=speaker_id,
+                    turn_id=turn_id,
+                    slow_language_hint=chunk.language,
+                    now=time.time(),
+                )
+                for window_envelope in window_envelopes:
+                    await self._enqueue_turn_group(
+                        self._turn_group_adapter.to_turn_group_envelope(window_envelope)
+                    )
+                continue
+
             envelopes = self._turn_group_builder.add_chunk(
                 chunk,
                 speaker_id=speaker_id,
@@ -1980,9 +2022,33 @@ class AsyncDualPipelineKernel:
 
     async def _flush_bridge_controller(self) -> None:
         """强制刷新 Bridge 控制器缓冲。"""
+        if self._should_use_window_assembler():
+            window_envelope = self._slow_window_assembler.flush(reason="eof_flush")
+            if window_envelope:
+                await self._enqueue_turn_group(
+                    self._turn_group_adapter.to_turn_group_envelope(window_envelope)
+                )
+            return
+
         envelope = self._turn_group_builder.flush(reason="eof_flush")
         if envelope:
             await self._enqueue_turn_group(envelope)
+
+    def _flush_window_assembler_idle(self, *, now: float) -> Optional[TurnGroupEnvelope]:
+        """空闲时优先从异构窗口组装链 flush。"""
+        if self._should_use_window_assembler():
+            window_envelope = self._slow_window_assembler.flush_idle(now=now)
+            if not window_envelope:
+                return None
+            return self._turn_group_adapter.to_turn_group_envelope(window_envelope)
+        return self._turn_group_builder.flush_idle(now=now)
+
+    def _should_use_window_assembler(self) -> bool:
+        return bool(
+            self._enable_bridge_batches
+            and self._slow_window_assembler is not None
+            and self._turn_group_adapter is not None
+        )
 
     async def _enqueue_turn_group(self, envelope: TurnGroupEnvelope) -> None:
         """将 TurnGroup 送入 SlowWorker 队列。"""
@@ -2004,6 +2070,9 @@ class AsyncDualPipelineKernel:
             return False
 
         group = envelope.group
+        group_metadata = dict(getattr(group, "metadata", {}) or {})
+        window_id = str(group_metadata.get("window_id") or group.group_id)
+        is_mixed_window = bool(group_metadata.get("is_mixed_window", False))
         chunk_indices = self._parse_source_chunk_indices(group.source_chunks)
         if not chunk_indices:
             self.logger.warning("TurnGroup 缺少 source_chunks: group_id=%s", group.group_id)
@@ -2014,6 +2083,8 @@ class AsyncDualPipelineKernel:
                     "source_chunks": [],
                     "speaker_id": group.speaker_id,
                     "flush_reason": group.flush_reason,
+                    "window_id": window_id,
+                    "is_mixed_window": is_mixed_window,
                     "skipped": True,
                     "skip_reason": "missing_source_chunks",
                 },
@@ -2035,11 +2106,44 @@ class AsyncDualPipelineKernel:
                     "source_chunks": list(group.source_chunks),
                     "speaker_id": group.speaker_id,
                     "flush_reason": group.flush_reason,
+                    "window_id": window_id,
+                    "is_mixed_window": is_mixed_window,
                     "skipped": True,
                     "skip_reason": "missing_context_cache",
                 },
             )
             return False
+
+        for _, ctx in contexts:
+            ctx.slow_window_id = window_id
+            ctx.slow_window_flush_reason = str(group.flush_reason or "")
+            ctx.slow_window_is_mixed = is_mixed_window
+
+        if is_mixed_window:
+            self.logger.info("TurnGroup mixed 窗口回退快流: window_id=%s group_id=%s", window_id, group.group_id)
+            for _, ctx in contexts:
+                ctx.whisper_skipped = True
+                ctx.whisper_result = {}
+            self._record_turn_group_unit(
+                group=group,
+                status="committed",
+                payload={
+                    "source_chunks": list(group.source_chunks),
+                    "speaker_id": group.speaker_id,
+                    "flush_reason": group.flush_reason,
+                    "window_id": window_id,
+                    "is_mixed_window": True,
+                    "skipped": True,
+                    "skip_reason": "mixed_window_fallback",
+                },
+            )
+            return await self._push_batch_contexts(
+                contexts,
+                slow_processed_indices,
+                total_chunks=total_chunks,
+                job_dir=job_dir,
+                token=token,
+            )
 
         skip_map: Dict[int, bool] = {}
         if self.is_patching_mode:
@@ -2060,6 +2164,8 @@ class AsyncDualPipelineKernel:
                     "source_chunks": list(group.source_chunks),
                     "speaker_id": group.speaker_id,
                     "flush_reason": group.flush_reason,
+                    "window_id": window_id,
+                    "is_mixed_window": False,
                     "skipped": True,
                     "skip_reason": "all_skip_by_policy",
                 },
@@ -2084,6 +2190,8 @@ class AsyncDualPipelineKernel:
                     "source_chunks": list(group.source_chunks),
                     "speaker_id": group.speaker_id,
                     "flush_reason": group.flush_reason,
+                    "window_id": window_id,
+                    "is_mixed_window": False,
                     "skipped": True,
                     "skip_reason": "missing_full_audio",
                 },
@@ -2122,6 +2230,8 @@ class AsyncDualPipelineKernel:
                 "target_turn_ids": list(group.target_turn_ids),
                 "speaker_id": group.speaker_id,
                 "flush_reason": group.flush_reason,
+                "window_id": window_id,
+                "is_mixed_window": False,
             },
         )
 

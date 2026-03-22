@@ -6,6 +6,7 @@ Phase 0 仅定义输入输出契约，不绑定调度策略实现。
 
 from __future__ import annotations
 
+from typing import Any
 from dataclasses import dataclass, field
 
 
@@ -22,6 +23,7 @@ class TurnGroup:
     flush_reason: str = ""
     language: str = "auto"
     source_chunks: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def total_duration(self) -> float:

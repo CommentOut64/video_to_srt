@@ -143,7 +143,10 @@ class SlowLoopService:
                         host.queue_inter.qsize()
                     ):
                         await host._flush_bridge_controller()
-                    envelope = host._turn_group_builder.flush_idle(now=time.time())
+                    if hasattr(host, "_flush_window_assembler_idle"):
+                        envelope = host._flush_window_assembler_idle(now=time.time())
+                    else:
+                        envelope = host._turn_group_builder.flush_idle(now=time.time())
                     if envelope:
                         await host._enqueue_turn_group(envelope)
                     continue
@@ -162,6 +165,8 @@ class SlowLoopService:
                             "source_chunks": list(payload.group.source_chunks),
                             "speaker_id": payload.group.speaker_id,
                             "flush_reason": payload.group.flush_reason,
+                            "window_id": str(payload.group.metadata.get("window_id", "") or ""),
+                            "is_mixed_window": bool(payload.group.metadata.get("is_mixed_window", False)),
                         },
                     )
                     if await host._process_turn_group(

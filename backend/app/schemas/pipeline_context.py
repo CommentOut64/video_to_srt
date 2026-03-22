@@ -55,6 +55,9 @@ class ProcessingContext:
     finalization_metrics: Dict[str, Any] = field(default_factory=dict)  # V3.2.0+dev.20260203.03
     time_base_chunk: Optional["TimeBasePackage"] = None  # V3.3.0: 时间锚定主链时间基底
     time_base_report: Optional[Dict[str, Any]] = None  # V3.3.0: 时间基底构建报告（轻量）
+    slow_window_id: Optional[str] = None  # V3.3.0 Phase2: 组窗ID透传
+    slow_window_flush_reason: Optional[str] = None  # V3.3.0 Phase2: 组窗flush原因透传
+    slow_window_is_mixed: bool = False  # V3.3.0 Phase2: mixed窗口回退标记
 
     # 控制信号
     is_end: bool = False                  # 结束流标记

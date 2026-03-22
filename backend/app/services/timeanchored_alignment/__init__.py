@@ -22,7 +22,19 @@ from app.services.timeanchored_alignment.contracts import (
     TimeBaseQuality,
     TimeBaseUnit,
 )
+from app.services.timeanchored_alignment.hint_builder import HintBuilder
+from app.services.timeanchored_alignment.slow_window_assembler import (
+    SlowWindowAssembler,
+    SlowWindowAssemblerConfig,
+)
 from app.services.timeanchored_alignment.time_base_builder import TimeBaseBuilder
+from app.services.timeanchored_alignment.turn_group_adapter import TurnGroupAdapter
+from app.services.timeanchored_alignment.window_language_classifier import (
+    MAIN_CHAIN_DECISION_DOMAINS,
+    MIXED_DECISION_DOMAINS,
+    WindowLanguageClassifier,
+    WindowLanguageDecision,
+)
 
 __all__ = [
     "CONTRACT_VERSION",
@@ -37,13 +49,21 @@ __all__ = [
     "PhoneticUnit",
     "PipelineReport",
     "ProtectedSpan",
+    "HintBuilder",
+    "SlowWindowAssembler",
+    "SlowWindowAssemblerConfig",
     "SlowInferenceWindow",
     "SlowInferenceWindowEnvelope",
     "TextTruthPackage",
     "TextTruthQuality",
     "TextTruthUnit",
     "TimeBaseBuilder",
+    "TurnGroupAdapter",
     "TimeBasePackage",
     "TimeBaseQuality",
     "TimeBaseUnit",
+    "WindowLanguageClassifier",
+    "WindowLanguageDecision",
+    "MIXED_DECISION_DOMAINS",
+    "MAIN_CHAIN_DECISION_DOMAINS",
 ]
