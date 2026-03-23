@@ -15,6 +15,7 @@ from app.services.alignment.default_aligner import _strip_trailing_punct_smart
 from app.services.alignment.types import DecisionLayerInput, DecisionLayerOutput, OutputTrace
 from app.services.segmentation.boundary_mapper import WordBoundaryMapper
 from app.services.punctuation.final_splitter import FinalSplitter
+from app.services.textflow.segmentation_core import SegmentationCore
 from app.services.text_protection import (
     is_sentence_end_punct,
     merge_protected_word_tokens,
@@ -92,6 +93,7 @@ class SegmentationProcessor:
         self._pending_prefix_words_by_stream: Dict[str, List[WordTimestamp]] = {}
         self._boundary_mapper = WordBoundaryMapper()
         self._active_vad_intervals: List[Tuple[float, float]] = []
+        self._segmentation_core = SegmentationCore(process_impl=self._run_legacy_segmentation)
 
     def reset_state(self) -> None:
         """重置裁决层跨 chunk 状态（新任务开始时调用）。"""
@@ -105,7 +107,23 @@ class SegmentationProcessor:
         chunk_index: Optional[int] = None,
         is_last_chunk: bool = False,
     ) -> DecisionLayerOutput:
-        """执行裁决层单路径切分，并在层内执行一次跨 speaker 残留修复。"""
+        """统一切分主入口：委托给 SegmentationCore。"""
+        return self._segmentation_core.process(
+            data=data,
+            stream_id=stream_id,
+            chunk_index=chunk_index,
+            is_last_chunk=is_last_chunk,
+        )
+
+    def _run_legacy_segmentation(
+        self,
+        data: DecisionLayerInput,
+        *,
+        stream_id: str = "main",
+        chunk_index: Optional[int] = None,
+        is_last_chunk: bool = False,
+    ) -> DecisionLayerOutput:
+        """执行旧裁决层切分实现（由 SegmentationCore 委托调用）。"""
         annotated_words = data.annotated_words or []
         pending_prefix_words = self._consume_pending_prefix_words(stream_id)
         cut_plan = self._normalize_cut_plan(

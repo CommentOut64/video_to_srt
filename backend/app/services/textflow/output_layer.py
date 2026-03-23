@@ -5,13 +5,13 @@ V3.2.0+dev.20260215.24
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import re
 from typing import Any, Callable, Dict, Optional, Sequence
 
 from app.core.logging import resolve_loguru_logger
 from app.services.alignment.types import OutputLayerInput, OutputLayerOutput, OutputTrace
+from app.services.textflow.output_dispatch_adapter import OutputDispatchAdapter
 from app.services.subtitle_visibility import is_hidden_unknown_sentence
 from app.services.text_protection import is_decimal_dot_in_text
 
@@ -63,6 +63,11 @@ class OutputLayerProcessor:
             __name__,
             layer="输出层",
             processor_name="output_processor",
+        )
+        self._output_dispatch_adapter = OutputDispatchAdapter(
+            subtitle_manager=subtitle_manager,
+            speaker_store_service_getter=speaker_store_service_getter,
+            logger=logger,
         )
 
     @staticmethod
@@ -151,77 +156,13 @@ class OutputLayerProcessor:
             sentence_segments=sentence_segments,
             output_traces=output_traces,
         )
-        sentences_for_manager = copy.deepcopy(sentence_segments)
-        output_errors = []
-        replaced_sentence_indices = []
-        subtitle_channel_status = "ok"
-        speaker_store_channel_status = "skipped"
-        speaker_link_count = 0
-
-        try:
-            replaced_sentence_indices = list(
-                self._subtitle_manager.replace_chunk(data.chunk_index, sentences_for_manager)
-                or []
-            )
-        except Exception:
-            output_errors.append("E_OUTPUT_CHANNEL_FAIL")
-            subtitle_channel_status = "failed"
-            speaker_store_channel_status = "skipped_upstream_failed"
-            self._logger.exception(
-                "输出层分发失败: chunk_index={} sentences={}",
-                data.chunk_index,
-                len(sentence_segments),
-            )
-
-        if "E_OUTPUT_CHANNEL_FAIL" not in output_errors:
-            try:
-                speaker_store_channel_status, speaker_link_count = self._write_speaker_links(
-                    sentence_segments=sentence_segments,
-                    sentence_indices=replaced_sentence_indices,
-                )
-            except Exception:
-                output_errors.append("E_OUTPUT_SPEAKER_STORE_FAIL")
-                speaker_store_channel_status = "failed"
-                self._logger.exception(
-                    "输出层 speaker_store 写入失败: chunk_index={} sentences={}",
-                    data.chunk_index,
-                    len(sentence_segments),
-                )
-
-        segmentation_report = dict(data.segmentation_report or {})
-        segmentation_report["unknown_sentence_filtered_count"] = int(unknown_sentence_filtered_count)
-        payload: Dict[str, Any] = {
-            "chunk_index": self._try_parse_chunk_index(data.chunk_index),
-            "chunk_uid": str(data.chunk_index),
-            "sentence_count": int(len(sentence_segments)),
-            "sentence_segments": [
-                self._serialize_sentence_segment(item) for item in sentence_segments
-            ],
-            "transport_meta": {
-                "channels": [
-                    "streaming_subtitle.replace_chunk",
-                    "speaker_store.subtitle_speaker_links_upsert",
-                ],
-                "subtitle_channel": {
-                    "status": subtitle_channel_status,
-                    "replaced_sentence_count": int(len(replaced_sentence_indices)),
-                },
-                "speaker_store_channel": {
-                    "status": speaker_store_channel_status,
-                    "upsert_count": int(speaker_link_count),
-                },
-            },
-            "injection_report": dict(data.injection_report or {}),
-            "segmentation_report": segmentation_report,
-            "output_trace": [self._serialize_output_trace(item) for item in output_traces],
-            "errors": output_errors,
-        }
-        self._logger.info(
-            "输出层完成: chunk_index={} sentences={} filtered_unknown={} errors={}",
-            data.chunk_index,
-            len(sentence_segments),
-            int(unknown_sentence_filtered_count),
-            len(output_errors),
+        payload = self._output_dispatch_adapter.dispatch(
+            chunk_index=data.chunk_index,
+            sentence_segments=sentence_segments,
+            output_traces=output_traces,
+            injection_report=dict(data.injection_report or {}),
+            segmentation_report=dict(data.segmentation_report or {}),
+            unknown_sentence_filtered_count=int(unknown_sentence_filtered_count),
         )
         return OutputLayerOutput(
             output_payload=payload,
