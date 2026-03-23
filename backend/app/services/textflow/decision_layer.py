@@ -25,7 +25,11 @@ from app.services.alignment.types import (
 from app.services.segmentation.boundary_mapper import WordBoundaryMapper
 from app.services.punctuation.final_splitter import FinalSplitter
 from app.services.textflow.canonical_text_stream_adapter import CanonicalTextStreamAdapter
-from app.services.textflow.contracts import ConsumedBoundaryPunct, SegmentPlan, SegmentationResult
+from app.services.textflow.contracts import (
+    ConsumedBoundaryPunct,
+    SegmentPlan,
+    SegmentationResult,
+)
 from app.services.textflow.legacy_sentence_adapter import LegacySentenceAdapter
 from app.services.textflow.render_core import RenderCore
 from app.services.textflow.segmentation_core import SegmentationCore
@@ -84,6 +88,7 @@ class SegmentationProcessor:
     _UNKNOWN_PSEUDO_JUNK_PATTERN = re.compile(
         r"^[\s\|·•`~!@#$%^&*()_+\-=\[\]{};:'\",.<>/?\\，。！？：；、（）《》【】…—]+$"
     )
+    _CUT_BOUNDARY_WEAK_PUNCT = ",，、;；:："
     def __init__(
         self,
         *,
@@ -123,7 +128,7 @@ class SegmentationProcessor:
         chunk_index: Optional[int] = None,
         is_last_chunk: bool = False,
     ) -> DecisionLayerOutput:
-        """统一切分主入口：委托给 SegmentationCore。"""
+        """统一切分主入口：优先走统一渲染主链，失败时回退 legacy 链。"""
         legacy_output = self._segmentation_core.process(
             data=data,
             stream_id=stream_id,
@@ -139,14 +144,7 @@ class SegmentationProcessor:
         if upgraded_output is not None:
             return upgraded_output
 
-        # 兼容兜底：未接入渲染主链时保持旧行为（句末标点清理）。
-        if not self._is_keep_sentence_end_punct:
-            self._strip_sentence_end_punct(legacy_output.sentence_segments)
-            self._apply_output_traces_to_sentences(
-                sentence_segments=legacy_output.sentence_segments,
-                output_traces=legacy_output.output_traces,
-            )
-        return legacy_output
+        return self._finalize_legacy_fallback_output(legacy_output=legacy_output)
 
     def _try_render_with_unified_pipeline(
         self,
@@ -186,16 +184,21 @@ class SegmentationProcessor:
             if not rendered_sentences:
                 return None
             for sentence_index, sentence in enumerate(rendered_sentences):
+                if sentence_index < len(segmentation_result.segments):
+                    sentence.words = self._build_sentence_words_from_segment(
+                        canonical_stream=canonical_stream,
+                        segment=segmentation_result.segments[sentence_index],
+                    )
                 if sentence_index >= len(legacy_output.sentence_segments):
-                    break
+                    continue
                 legacy_sentence = legacy_output.sentence_segments[sentence_index]
-                sentence.words = list(getattr(legacy_sentence, "words", []) or [])
                 if getattr(sentence, "confidence", None) is None:
                     sentence.confidence = getattr(legacy_sentence, "confidence", None)
             self._apply_output_traces_to_sentences(
                 sentence_segments=rendered_sentences,
                 output_traces=rendered_traces,
             )
+            self._strip_boundary_residual_weak_punct(rendered_sentences)
 
             report = dict(legacy_output.segmentation_report or {})
             report["pipeline_route"] = "canonical_segmentation_render"
@@ -217,6 +220,35 @@ class SegmentationProcessor:
                 chunk_index,
             )
             return None
+
+    def _finalize_legacy_fallback_output(
+        self,
+        *,
+        legacy_output: DecisionLayerOutput,
+    ) -> DecisionLayerOutput:
+        self._mark_legacy_fallback_report(
+            legacy_output=legacy_output,
+            reason="unified_render_unavailable",
+        )
+        if not self._is_keep_sentence_end_punct:
+            self._strip_sentence_end_punct(legacy_output.sentence_segments)
+            self._apply_output_traces_to_sentences(
+                sentence_segments=legacy_output.sentence_segments,
+                output_traces=legacy_output.output_traces,
+            )
+        self._strip_boundary_residual_weak_punct(legacy_output.sentence_segments)
+        return legacy_output
+
+    @staticmethod
+    def _mark_legacy_fallback_report(
+        *,
+        legacy_output: DecisionLayerOutput,
+        reason: str,
+    ) -> None:
+        report = dict(legacy_output.segmentation_report or {})
+        report.setdefault("pipeline_route", "legacy_fallback")
+        report.setdefault("fallback_reason", str(reason or "unknown"))
+        legacy_output.segmentation_report = report
 
     def _build_canonical_stream_from_words(
         self,
@@ -345,6 +377,7 @@ class SegmentationProcessor:
         plans: List[SegmentPlan] = []
         boundary_traces: List[Dict[str, Any]] = []
         cursor = 0
+        chunk_ref = str(getattr(canonical_stream, "chunk_ref", "") or "chunk-unknown")
         for sentence_index, sentence in enumerate(list(sentence_segments or [])):
             token_start, token_end, cursor = self._resolve_segment_token_range(
                 tokens=tokens,
@@ -364,7 +397,7 @@ class SegmentationProcessor:
             )
             plans.append(
                 SegmentPlan(
-                    segment_id=f"{canonical_stream.stream_id}:seg:{sentence_index}",
+                    segment_id=f"{canonical_stream.stream_id}:{chunk_ref}:seg:{sentence_index}",
                     token_start=token_start,
                     token_end=token_end,
                     start=float(getattr(sentence, "start", 0.0) or 0.0),
@@ -472,6 +505,34 @@ class SegmentationProcessor:
             "mapping_quality": str(getattr(sentence, "mapping_quality", "") or ""),
             "mapping_reason": str(getattr(sentence, "mapping_reason", "") or ""),
         }
+
+    @staticmethod
+    def _build_sentence_words_from_segment(
+        *,
+        canonical_stream: Any,
+        segment: SegmentPlan,
+    ) -> List[WordTimestamp]:
+        token_by_index = {
+            int(getattr(token, "index", -1)): token
+            for token in list(getattr(canonical_stream, "tokens", ()) or ())
+        }
+        words: List[WordTimestamp] = []
+        for token_index in range(int(segment.token_start), int(segment.token_end) + 1):
+            token = token_by_index.get(token_index)
+            if token is None:
+                continue
+            word = WordTimestamp(
+                word=str(getattr(token, "text_core", "") or ""),
+                start=float(getattr(token, "start", 0.0) or 0.0),
+                end=float(getattr(token, "end", 0.0) or 0.0),
+                confidence=getattr(token, "confidence", None),
+                confidence_source=str(getattr(token, "source", "") or None),
+                is_pseudo=bool(getattr(token, "is_pseudo", False)),
+            )
+            setattr(word, "speaker_id", getattr(token, "speaker_id", None))
+            setattr(word, "turn_id", getattr(token, "turn_id", None))
+            words.append(word)
+        return words
 
     def _run_legacy_segmentation(
         self,
@@ -3083,6 +3144,51 @@ class SegmentationProcessor:
             text_clean = sentence.text_clean or sentence.text or ""
             sentence.text_clean = _strip_trailing_punct_smart(text_clean)
             sentence.text = sentence.text_clean
+
+    @classmethod
+    def _strip_boundary_residual_weak_punct(cls, sentences: Sequence[SentenceSegment]) -> None:
+        sentence_list = list(sentences or [])
+        if len(sentence_list) < 2:
+            return
+        for index in range(len(sentence_list) - 1):
+            cls._strip_sentence_trailing_weak_punct(sentence_list[index])
+            cls._strip_sentence_leading_weak_punct(sentence_list[index + 1])
+
+    @classmethod
+    def _strip_sentence_trailing_weak_punct(cls, sentence: SentenceSegment) -> None:
+        sentence.text = cls._rstrip_boundary_weak_punct(str(sentence.text or ""))
+        sentence.text_clean = cls._rstrip_boundary_weak_punct(
+            str(sentence.text_clean or sentence.text or "")
+        )
+        if sentence.words:
+            sentence.words[-1].word = cls._rstrip_boundary_weak_punct(
+                str(sentence.words[-1].word or "")
+            )
+
+    @classmethod
+    def _strip_sentence_leading_weak_punct(cls, sentence: SentenceSegment) -> None:
+        sentence.text = cls._lstrip_boundary_weak_punct(str(sentence.text or ""))
+        sentence.text_clean = cls._lstrip_boundary_weak_punct(
+            str(sentence.text_clean or sentence.text or "")
+        )
+        if sentence.words:
+            sentence.words[0].word = cls._lstrip_boundary_weak_punct(
+                str(sentence.words[0].word or "")
+            )
+
+    @classmethod
+    def _rstrip_boundary_weak_punct(cls, text: str) -> str:
+        normalized = str(text or "").rstrip()
+        while normalized and normalized[-1] in cls._CUT_BOUNDARY_WEAK_PUNCT:
+            normalized = normalized[:-1].rstrip()
+        return normalized
+
+    @classmethod
+    def _lstrip_boundary_weak_punct(cls, text: str) -> str:
+        normalized = str(text or "").lstrip()
+        while normalized and normalized[:1] in cls._CUT_BOUNDARY_WEAK_PUNCT:
+            normalized = normalized[1:].lstrip()
+        return normalized
 
     @staticmethod
     def _finalize_sentence_metadata(sentences: List[SentenceSegment]) -> None:
