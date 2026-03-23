@@ -16,7 +16,7 @@ def _build_processor() -> OutputLayerProcessor:
     return OutputLayerProcessor(subtitle_manager=_DummySubtitleManager())
 
 
-def test_output_layer_cjk_standardization_preserves_decimal_dot() -> None:
+def test_output_layer_keeps_decimal_text_when_render_not_involved() -> None:
     processor = _build_processor()
     sentence = SentenceSegment(
         text="低一瓶中的氰化钠总含量为1.4到1.6克.",
@@ -28,11 +28,11 @@ def test_output_layer_cjk_standardization_preserves_decimal_dot() -> None:
     )
 
     payload_sentence = result.output_payload["sentence_segments"][0]
-    assert payload_sentence["text"] == "低一瓶中的氰化钠总含量为1.4到1.6克。"
-    assert payload_sentence["text_clean"] == "低一瓶中的氰化钠总含量为1.4到1.6克。"
+    assert payload_sentence["text"] == "低一瓶中的氰化钠总含量为1.4到1.6克."
+    assert payload_sentence["text_clean"] == "低一瓶中的氰化钠总含量为1.4到1.6克."
 
 
-def test_output_layer_cjk_standardization_keeps_non_decimal_conversion() -> None:
+def test_output_layer_keeps_non_decimal_text_when_render_not_involved() -> None:
     processor = _build_processor()
     sentence = SentenceSegment(
         text="这是测试.",
@@ -44,5 +44,5 @@ def test_output_layer_cjk_standardization_keeps_non_decimal_conversion() -> None
     )
 
     payload_sentence = result.output_payload["sentence_segments"][0]
-    assert payload_sentence["text"] == "这是测试。"
-    assert payload_sentence["text_clean"] == "这是测试。"
+    assert payload_sentence["text"] == "这是测试."
+    assert payload_sentence["text_clean"] == "这是测试."

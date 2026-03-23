@@ -131,10 +131,6 @@ class OutputLayerProcessor:
     def process(self, data: OutputLayerInput) -> OutputLayerOutput:
         """执行输出层分发。"""
         sentence_segments = list(data.sentence_segments or [])
-        self._apply_language_punctuation_standardization(
-            sentence_segments=sentence_segments,
-            language=data.language,
-        )
         raw_output_traces = list(data.output_traces or [])
         filtered_sentences: list[Any] = []
         filtered_traces: list[OutputTrace] = []

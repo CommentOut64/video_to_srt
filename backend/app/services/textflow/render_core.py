@@ -155,7 +155,13 @@ class RenderCore:
 
         for fact in facts:
             if fact.punct_class == "sentence_end":
-                continue
+                if fact.normalized_text in {"。", "！", "？"}:
+                    continue
+                # 句中句末符（如英文缩写后的点）仍属于 inner 标点，句尾才交给 terminal 策略。
+                right_index = fact.right_token_index
+                is_terminal_like = right_index is None or int(right_index) > segment_token_end
+                if is_terminal_like:
+                    continue
             if not policy.show_inner_punctuation:
                 dropped_punct_facts.append({"fact_id": fact.fact_id, "reason": "inner_hidden_by_policy"})
                 continue
@@ -322,4 +328,3 @@ class RenderCore:
                 continue
             chars.append(self._HALF_TO_FULL_PUNCT.get(char, char))
         return "".join(chars)
-

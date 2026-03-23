@@ -12,9 +12,22 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tupl
 from app.core.logging import resolve_loguru_logger
 from app.models.sensevoice_models import SentenceSegment, TextSource, WordTimestamp
 from app.services.alignment.default_aligner import _strip_trailing_punct_smart
-from app.services.alignment.types import DecisionLayerInput, DecisionLayerOutput, OutputTrace
+from app.services.alignment.types import (
+    AlignedFacts,
+    AnnotatedWord,
+    CharMapping,
+    DecisionLayerInput,
+    DecisionLayerOutput,
+    OutputTrace,
+    TextTrack,
+    TextTrackBundle,
+)
 from app.services.segmentation.boundary_mapper import WordBoundaryMapper
 from app.services.punctuation.final_splitter import FinalSplitter
+from app.services.textflow.canonical_text_stream_adapter import CanonicalTextStreamAdapter
+from app.services.textflow.contracts import ConsumedBoundaryPunct, SegmentPlan, SegmentationResult
+from app.services.textflow.legacy_sentence_adapter import LegacySentenceAdapter
+from app.services.textflow.render_core import RenderCore
 from app.services.textflow.segmentation_core import SegmentationCore
 from app.services.text_protection import (
     is_sentence_end_punct,
@@ -94,6 +107,9 @@ class SegmentationProcessor:
         self._boundary_mapper = WordBoundaryMapper()
         self._active_vad_intervals: List[Tuple[float, float]] = []
         self._segmentation_core = SegmentationCore(process_impl=self._run_legacy_segmentation)
+        self._canonical_text_stream_adapter = CanonicalTextStreamAdapter()
+        self._render_core = RenderCore()
+        self._legacy_sentence_adapter = LegacySentenceAdapter()
 
     def reset_state(self) -> None:
         """重置裁决层跨 chunk 状态（新任务开始时调用）。"""
@@ -108,12 +124,354 @@ class SegmentationProcessor:
         is_last_chunk: bool = False,
     ) -> DecisionLayerOutput:
         """统一切分主入口：委托给 SegmentationCore。"""
-        return self._segmentation_core.process(
+        legacy_output = self._segmentation_core.process(
             data=data,
             stream_id=stream_id,
             chunk_index=chunk_index,
             is_last_chunk=is_last_chunk,
         )
+        upgraded_output = self._try_render_with_unified_pipeline(
+            legacy_output=legacy_output,
+            data=data,
+            stream_id=stream_id,
+            chunk_index=chunk_index,
+        )
+        if upgraded_output is not None:
+            return upgraded_output
+
+        # 兼容兜底：未接入渲染主链时保持旧行为（句末标点清理）。
+        if not self._is_keep_sentence_end_punct:
+            self._strip_sentence_end_punct(legacy_output.sentence_segments)
+            self._apply_output_traces_to_sentences(
+                sentence_segments=legacy_output.sentence_segments,
+                output_traces=legacy_output.output_traces,
+            )
+        return legacy_output
+
+    def _try_render_with_unified_pipeline(
+        self,
+        *,
+        legacy_output: DecisionLayerOutput,
+        data: DecisionLayerInput,
+        stream_id: str,
+        chunk_index: Optional[int],
+    ) -> Optional[DecisionLayerOutput]:
+        if not legacy_output.sentence_segments or not legacy_output.words_for_split:
+            return None
+        try:
+            canonical_stream = self._build_canonical_stream_from_words(
+                words=legacy_output.words_for_split,
+                data=data,
+                stream_id=stream_id,
+                chunk_index=chunk_index,
+            )
+            if not canonical_stream.tokens:
+                return None
+
+            segmentation_result = self._build_segmentation_result_from_legacy(
+                canonical_stream=canonical_stream,
+                sentence_segments=legacy_output.sentence_segments,
+                output_traces=legacy_output.output_traces,
+            )
+            if not segmentation_result.segments:
+                return None
+
+            render_result = self._render_core.render(
+                canonical_stream=canonical_stream,
+                segmentation_result=segmentation_result,
+            )
+            rendered_sentences, rendered_traces = self._legacy_sentence_adapter.to_legacy(
+                render_result=render_result,
+            )
+            if not rendered_sentences:
+                return None
+            for sentence_index, sentence in enumerate(rendered_sentences):
+                if sentence_index >= len(legacy_output.sentence_segments):
+                    break
+                legacy_sentence = legacy_output.sentence_segments[sentence_index]
+                sentence.words = list(getattr(legacy_sentence, "words", []) or [])
+                if getattr(sentence, "confidence", None) is None:
+                    sentence.confidence = getattr(legacy_sentence, "confidence", None)
+            self._apply_output_traces_to_sentences(
+                sentence_segments=rendered_sentences,
+                output_traces=rendered_traces,
+            )
+
+            report = dict(legacy_output.segmentation_report or {})
+            report["pipeline_route"] = "canonical_segmentation_render"
+            report["render_report"] = dict(render_result.render_report or {})
+            report["render_output_trace"] = list(render_result.output_trace or ())
+            report["output_trace"] = [self._serialize_output_trace(item) for item in rendered_traces]
+
+            return DecisionLayerOutput(
+                sentence_segments=rendered_sentences,
+                words_for_split=legacy_output.words_for_split,
+                segmentation_report=report,
+                applied_cut_plan=legacy_output.applied_cut_plan,
+                output_traces=rendered_traces,
+            )
+        except Exception:
+            self._logger.exception(
+                "统一切分主链渲染失败，回退 legacy 输出: stream_id={} chunk_index={}",
+                stream_id,
+                chunk_index,
+            )
+            return None
+
+    def _build_canonical_stream_from_words(
+        self,
+        *,
+        words: Sequence[WordTimestamp],
+        data: DecisionLayerInput,
+        stream_id: str,
+        chunk_index: Optional[int],
+    ):
+        language = self._resolve_language_from_decision_input(data)
+        synthetic_text, clean_to_word = self._build_synthetic_text_and_word_mapping(words=words)
+        char_mapping = [
+            CharMapping(raw_idx=index, clean_idx=index, punct=None)
+            for index in range(len(synthetic_text))
+        ]
+        chosen_track = TextTrack(
+            raw_text=synthetic_text,
+            text_itn_raw=synthetic_text,
+            text_clean=synthetic_text,
+            char_mapping=char_mapping,
+            raw_to_clean=list(range(len(synthetic_text))),
+            clean_to_raw=list(range(len(synthetic_text))),
+            language=language,
+            source="aligned",
+            clean_to_word=clean_to_word,
+            punct_positions=list(data.fallback_punctuation_positions or []),
+            mapping_coverage=1.0 if synthetic_text else 0.0,
+        )
+        tracks = TextTrackBundle(chosen_track=chosen_track)
+        aligned_facts = data.aligned_facts or self._build_synthetic_aligned_facts(words=words)
+        return self._canonical_text_stream_adapter.build(
+            stream_id=stream_id,
+            chunk_ref=str(chunk_index if chunk_index is not None else "chunk-unknown"),
+            tracks=tracks,
+            text_source=self._resolve_text_source_from_words(words=words),
+            language=language,
+            aligned_facts=aligned_facts,
+            metadata={
+                "builder": "decision_layer",
+                "phase": "6",
+            },
+        )
+
+    @staticmethod
+    def _build_synthetic_text_and_word_mapping(
+        *,
+        words: Sequence[WordTimestamp],
+    ) -> Tuple[str, List[Optional[int]]]:
+        chars: List[str] = []
+        clean_to_word: List[Optional[int]] = []
+        previous_char: str = ""
+        for word_index, word in enumerate(list(words or [])):
+            token = str(getattr(word, "word", "") or "")
+            if not token:
+                continue
+            if chars:
+                first_char = token[0]
+                if (
+                    previous_char
+                    and previous_char.isascii()
+                    and first_char.isascii()
+                    and previous_char.isalnum()
+                    and first_char.isalnum()
+                ):
+                    chars.append(" ")
+                    clean_to_word.append(None)
+            for char in token:
+                chars.append(char)
+                clean_to_word.append(word_index)
+            previous_char = token[-1]
+        return "".join(chars), clean_to_word
+
+    @staticmethod
+    def _build_synthetic_aligned_facts(
+        *,
+        words: Sequence[WordTimestamp],
+    ) -> AlignedFacts:
+        annotated_words = [
+            AnnotatedWord(
+                word=str(getattr(item, "word", "") or ""),
+                start=float(getattr(item, "start", 0.0) or 0.0),
+                end=float(getattr(item, "end", 0.0) or 0.0),
+                confidence=getattr(item, "confidence", None),
+                confidence_source=str(getattr(item, "confidence_source", "") or "unknown"),
+                is_pseudo=bool(getattr(item, "is_pseudo", False)),
+                speaker_id=getattr(item, "speaker_id", None),
+                turn_id=getattr(item, "turn_id", None),
+                track_id="decision_synthetic",
+            )
+            for item in list(words or [])
+        ]
+        return AlignedFacts(annotated_words=annotated_words)
+
+    @staticmethod
+    def _resolve_text_source_from_words(*, words: Sequence[WordTimestamp]) -> str:
+        source_count: Counter[str] = Counter()
+        for item in list(words or []):
+            source = str(getattr(item, "confidence_source", "") or "").strip().lower()
+            if source in {"fast", "slow", "aligned"}:
+                source_count[source] += 1
+            elif source == "merged":
+                source_count["aligned"] += 1
+        if not source_count:
+            return "aligned"
+        return source_count.most_common(1)[0][0]
+
+    @staticmethod
+    def _resolve_language_from_decision_input(data: DecisionLayerInput) -> str:
+        snapshot = getattr(data, "policy_snapshot", None)
+        language = str(getattr(snapshot, "language_tag", "") or getattr(snapshot, "language", "") or "")
+        if language:
+            return language
+        return "auto"
+
+    def _build_segmentation_result_from_legacy(
+        self,
+        *,
+        canonical_stream: Any,
+        sentence_segments: Sequence[SentenceSegment],
+        output_traces: Sequence[OutputTrace],
+    ) -> SegmentationResult:
+        tokens = list(canonical_stream.tokens or ())
+        if not tokens:
+            return SegmentationResult(segments=tuple())
+        facts = list(canonical_stream.punctuation_facts or ())
+        plans: List[SegmentPlan] = []
+        boundary_traces: List[Dict[str, Any]] = []
+        cursor = 0
+        for sentence_index, sentence in enumerate(list(sentence_segments or [])):
+            token_start, token_end, cursor = self._resolve_segment_token_range(
+                tokens=tokens,
+                sentence=sentence,
+                cursor=cursor,
+            )
+            if token_start is None or token_end is None:
+                continue
+            trace_payload = self._build_trace_payload(
+                sentence_index=sentence_index,
+                sentence=sentence,
+                output_traces=output_traces,
+            )
+            consumed_punct = self._resolve_consumed_boundary_punct(
+                facts=facts,
+                token_end=token_end,
+            )
+            plans.append(
+                SegmentPlan(
+                    segment_id=f"{canonical_stream.stream_id}:seg:{sentence_index}",
+                    token_start=token_start,
+                    token_end=token_end,
+                    start=float(getattr(sentence, "start", 0.0) or 0.0),
+                    end=float(getattr(sentence, "end", 0.0) or 0.0),
+                    boundary_reason=str(trace_payload.get("split_reason", "") or "legacy"),
+                    boundary_score=1.0 if trace_payload.get("split_reason") else 0.0,
+                    hard_boundary=False,
+                    consumed_boundary_punct=consumed_punct,
+                    trace=trace_payload,
+                )
+            )
+            boundary_traces.append(trace_payload)
+        return SegmentationResult(
+            segments=tuple(plans),
+            boundary_traces=tuple(boundary_traces),
+            segmentation_report={
+                "source": "legacy_bridge",
+                "segment_count": int(len(plans)),
+            },
+        )
+
+    @staticmethod
+    def _resolve_segment_token_range(
+        *,
+        tokens: Sequence[Any],
+        sentence: SentenceSegment,
+        cursor: int,
+        tolerance_sec: float = 0.001,
+    ) -> Tuple[Optional[int], Optional[int], int]:
+        if not tokens:
+            return None, None, cursor
+        sentence_start = float(getattr(sentence, "start", 0.0) or 0.0)
+        sentence_end = float(getattr(sentence, "end", sentence_start) or sentence_start)
+        matched_indices = [
+            idx
+            for idx, token in enumerate(tokens)
+            if idx >= cursor
+            and float(getattr(token, "end", 0.0) or 0.0) >= sentence_start - tolerance_sec
+            and float(getattr(token, "start", 0.0) or 0.0) <= sentence_end + tolerance_sec
+        ]
+        if matched_indices:
+            return matched_indices[0], matched_indices[-1], matched_indices[-1] + 1
+        if cursor < len(tokens):
+            return cursor, cursor, cursor + 1
+        last_idx = len(tokens) - 1
+        return last_idx, last_idx, len(tokens)
+
+    @staticmethod
+    def _resolve_consumed_boundary_punct(
+        *,
+        facts: Sequence[Any],
+        token_end: int,
+    ) -> Optional[ConsumedBoundaryPunct]:
+        candidates = [
+            fact
+            for fact in facts
+            if str(getattr(fact, "punct_class", "") or "") == "sentence_end"
+            and (
+                getattr(fact, "left_token_index", None) == token_end
+                or getattr(fact, "right_token_index", None) == token_end + 1
+            )
+        ]
+        if not candidates:
+            return None
+        chosen = sorted(
+            candidates,
+            key=lambda item: int(getattr(item, "priority", 0) or 0),
+            reverse=True,
+        )[0]
+        normalized_text = str(getattr(chosen, "normalized_text", "") or "")
+        render_hint = "drop_period_default" if normalized_text in {".", "。"} else "keep"
+        return ConsumedBoundaryPunct(
+            fact_id=str(getattr(chosen, "fact_id", "") or ""),
+            raw_text=str(getattr(chosen, "raw_text", "") or normalized_text),
+            normalized_text=normalized_text,
+            punct_class=str(getattr(chosen, "punct_class", "") or "sentence_end"),
+            source=str(getattr(chosen, "source", "") or "aligned"),
+            render_hint=render_hint,
+        )
+
+    @staticmethod
+    def _build_trace_payload(
+        *,
+        sentence_index: int,
+        sentence: SentenceSegment,
+        output_traces: Sequence[OutputTrace],
+    ) -> Dict[str, Any]:
+        if sentence_index < len(output_traces):
+            trace = output_traces[sentence_index]
+            return {
+                "split_reason": str(getattr(trace, "split_reason", "") or ""),
+                "split_risk": str(getattr(trace, "split_risk", "") or ""),
+                "window_id": str(getattr(trace, "window_id", "") or ""),
+                "pyannote_frame_time": getattr(trace, "pyannote_frame_time", None),
+                "mapped_cut_time": getattr(trace, "mapped_cut_time", None),
+                "mapping_quality": str(getattr(trace, "mapping_quality", "") or ""),
+                "mapping_reason": str(getattr(trace, "mapping_reason", "") or ""),
+            }
+        return {
+            "split_reason": str(getattr(sentence, "split_reason", "") or "legacy"),
+            "split_risk": str(getattr(sentence, "split_risk", "") or ""),
+            "window_id": str(getattr(sentence, "window_id", "") or ""),
+            "pyannote_frame_time": getattr(sentence, "pyannote_frame_time", None),
+            "mapped_cut_time": getattr(sentence, "mapped_cut_time", None),
+            "mapping_quality": str(getattr(sentence, "mapping_quality", "") or ""),
+            "mapping_reason": str(getattr(sentence, "mapping_reason", "") or ""),
+        }
 
     def _run_legacy_segmentation(
         self,
@@ -250,8 +608,6 @@ class SegmentationProcessor:
             self._pending_prefix_words_by_stream[stream_id] = self._clone_words(pending_prefix_words)
 
         # 后处理
-        if not self._is_keep_sentence_end_punct:
-            self._strip_sentence_end_punct(all_sentence_segments)
         self._normalize_carried_article_sentence_case(
             sentence_segments=all_sentence_segments,
             pending_in_word_count=pending_in_word_count,
