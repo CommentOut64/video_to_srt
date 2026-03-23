@@ -246,6 +246,46 @@ def test_alignment_stage_raises_when_time_base_missing_and_legacy_disabled(
     remove_streaming_subtitle_manager(job_id)
 
 
+def test_alignment_stage_force_fast_direct_path_without_time_base(
+    monkeypatch,
+) -> None:
+    job_id = "test_timeanchored_force_fast_direct_without_time_base"
+    pipeline = AsyncDualPipeline(
+        job_id=job_id,
+        draft_engine=DummyEngine(response_text="你好世界", latency_ms=0),
+        patch_engine=DummyEngine(response_text="你好世界", latency_ms=0),
+        transcription_profile="sv_whisper_dual",
+        edge_selection_mode="force_fast",
+        enable_cross_chunk_merge=False,
+        enable_semantic_buffer=False,
+        punctuation_service=Mock(),
+    )
+    pipeline._alignment_pipeline_mode = "default"
+
+    monkeypatch.setattr(
+        pipeline,
+        "_run_collection_scoring_decision_once",
+        Mock(side_effect=AssertionError("force_fast 直通不应进入 legacy 四层")),
+    )
+
+    ctx = ProcessingContext(
+        job_id=job_id,
+        chunk_index=0,
+        audio_chunk=_build_chunk(),
+        sv_result=_build_sv_result(),
+        whisper_result=_build_whisper_result(),
+        time_base_chunk=None,
+    )
+
+    asyncio.run(pipeline._run_alignment_stage(ctx))
+
+    assert ctx.final_sentences
+    assert ctx.finalization_metrics.get("fast_direct_enabled") == 1.0
+    assert ctx.finalization_metrics.get("alignment_pipeline_route") == "fast"
+
+    remove_streaming_subtitle_manager(job_id)
+
+
 def test_alignment_stage_raises_when_timeanchored_main_chain_fails(
     monkeypatch,
 ) -> None:
@@ -294,11 +334,12 @@ def test_alignment_stage_raises_when_timeanchored_main_chain_fails(
 @pytest.mark.parametrize(
     ("mode", "chosen_source", "expected_route"),
     [
-        ("force_fast", "fast", "fast"),
         ("force_slow", "slow", "slow"),
+        ("prefer_fast", "fast", "fast"),
+        ("prefer_slow", "slow", "slow"),
     ],
 )
-def test_alignment_stage_forwards_force_mode_to_timeanchored_edge_selector(
+def test_alignment_stage_forwards_edge_mode_to_timeanchored_edge_selector(
     monkeypatch,
     mode: str,
     chosen_source: str,
@@ -378,3 +419,18 @@ def test_alignment_stage_forwards_force_mode_to_timeanchored_edge_selector(
     assert ctx.finalization_metrics.get("timeanchored_edge_route") == expected_route
 
     remove_streaming_subtitle_manager(job_id)
+
+
+@pytest.mark.parametrize("input_mode", ("auto", "prefer_fast", "prefer_slow", "force_slow"))
+def test_sensevoice_only_always_overrides_edge_mode_to_force_fast(input_mode: str) -> None:
+    pipeline = AsyncDualPipeline(
+        job_id="test_sensevoice_only_edge_mode",
+        draft_engine=DummyEngine(response_text="你好世界", latency_ms=0),
+        patch_engine=None,
+        transcription_profile="sensevoice_only",
+        edge_selection_mode=input_mode,
+        enable_cross_chunk_merge=False,
+        enable_semantic_buffer=False,
+        punctuation_service=Mock(),
+    )
+    assert pipeline._edge_selection_mode == "force_fast"

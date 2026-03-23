@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from app.models.job_models import JobSettings, TranscriptionConfig
 
 
@@ -8,17 +10,21 @@ def test_transcription_settings_api_default_edge_selection_mode_is_auto() -> Non
     assert payload.edge_selection_mode == "auto"
 
 
-def test_job_settings_accepts_force_edge_selection_mode() -> None:
+@pytest.mark.parametrize(
+    "mode",
+    ("force_fast", "force_slow", "prefer_fast", "prefer_slow"),
+)
+def test_job_settings_accepts_supported_edge_selection_mode(mode: str) -> None:
     settings = JobSettings.from_dict(
         {
             "transcription": {
-                "edge_selection_mode": "force_fast",
+                "edge_selection_mode": mode,
             }
         }
     )
 
-    assert settings.transcription.edge_selection_mode == "force_fast"
-    assert settings.to_dict()["transcription"]["edge_selection_mode"] == "force_fast"
+    assert settings.transcription.edge_selection_mode == mode
+    assert settings.to_dict()["transcription"]["edge_selection_mode"] == mode
 
 
 def test_job_settings_invalid_edge_selection_mode_falls_back_to_auto() -> None:

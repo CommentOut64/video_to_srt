@@ -95,6 +95,62 @@ def test_force_fast_bypasses_gate() -> None:
     assert result.chosen_text_track.text_clean == "快流文本"
 
 
+def test_prefer_fast_adds_bias_and_selects_fast_on_close_confidence() -> None:
+    processor = TextArbiterProcessor(
+        config={
+            "hallucination_block": True,
+            "edge_prefer_fast_bias": 0.08,
+        }
+    )
+    result = processor.process(
+        L2Input(
+            sv_track=_build_track(text="快流文本", source="sv"),
+            whisper_track=_build_track(text="慢流文本", source="whisper"),
+            quality_signals=QualitySignals(
+                is_hallucination=False,
+                confidence_fast=0.78,
+                confidence_slow=0.83,
+            ),
+            edge_selection_mode="prefer_fast",
+        )
+    )
+
+    assert result.arbitration_result.chosen_source == "fast"
+    assert result.arbitration_result.reason == "edge_prefer_fast"
+    assert result.arbitration_result.is_edge_selection_bypassed is False
+    assert result.arbitration_result.forced_source is None
+    assert result.chosen_text_track is not None
+    assert result.chosen_text_track.text_clean == "快流文本"
+
+
+def test_prefer_slow_still_allows_fast_when_confidence_gap_large() -> None:
+    processor = TextArbiterProcessor(
+        config={
+            "hallucination_block": True,
+            "edge_prefer_slow_bias": 0.08,
+        }
+    )
+    result = processor.process(
+        L2Input(
+            sv_track=_build_track(text="快流文本", source="sv"),
+            whisper_track=_build_track(text="慢流文本", source="whisper"),
+            quality_signals=QualitySignals(
+                is_hallucination=False,
+                confidence_fast=0.95,
+                confidence_slow=0.70,
+            ),
+            edge_selection_mode="prefer_slow",
+        )
+    )
+
+    assert result.arbitration_result.chosen_source == "fast"
+    assert result.arbitration_result.reason == "edge_prefer_slow_fallback_fast"
+    assert result.arbitration_result.is_edge_selection_bypassed is False
+    assert result.arbitration_result.forced_source is None
+    assert result.chosen_text_track is not None
+    assert result.chosen_text_track.text_clean == "快流文本"
+
+
 def test_force_mode_missing_source_returns_error_without_fallback() -> None:
     processor = TextArbiterProcessor()
     result = processor.process(
