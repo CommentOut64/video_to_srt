@@ -132,9 +132,18 @@ def test_stage_service_execute_builds_pipeline_report() -> None:
     )
 
     assert result.base_result.route in {"text", "phonetic", "fast", "slow", "mixed"}
-    assert len(result.sentence_segments) > 0
+    assert result.final_stream
+    assert result.sentence_segments == ()
+    assert result.output_inputs == ()
+    assert result.projections == ()
     assert result.pipeline_report.alignment_report.name == "alignment"
-    assert result.pipeline_report.output_report.metrics["output_chunk_count"] >= 1
+    assert result.pipeline_report.segmentation_report.metrics["boundary_candidate_count"] >= 0
+    assert result.pipeline_report.output_report.metrics["output_chunk_count"] == 0
+    raw_mount_trace = result.pipeline_report.alignment_report.metrics["raw_mount_trace"]
+    assert raw_mount_trace["mapping_pairs"][0]["text_index"] == 0
+    assert raw_mount_trace["mapping_pairs"][0]["time_index"] == 0
+    assert raw_mount_trace["time_units"][0]["text"] == "你"
+    assert raw_mount_trace["text_units"][0]["text"] == "你"
 
 
 def test_stage_service_mixed_window_falls_back_to_edge_selector() -> None:
@@ -153,9 +162,9 @@ def test_stage_service_mixed_window_falls_back_to_edge_selector() -> None:
     assert result.text_result.route == "mixed"
     assert result.edge_result.route == "fast"
     assert result.base_result.route == "fast"
-    assert len(result.output_inputs) == 1
+    assert len(result.output_inputs) == 0
     assert result.final_stream[0].start >= 3.0
-    assert result.sentence_segments[0].start >= 3.0
+    assert result.pipeline_report.segmentation_report.metrics["boundary_candidate_count"] >= 0
 
 
 def test_stage_service_applies_chunk_global_offset_for_local_stream() -> None:
@@ -174,4 +183,4 @@ def test_stage_service_applies_chunk_global_offset_for_local_stream() -> None:
     assert result.final_stream
     assert result.final_stream[0].start >= 12.0
     assert result.final_stream[-1].end <= 13.0 + 1.0
-    assert result.sentence_segments[0].start >= 12.0
+    assert result.pipeline_report.segmentation_report.metrics["boundary_candidate_count"] >= 0

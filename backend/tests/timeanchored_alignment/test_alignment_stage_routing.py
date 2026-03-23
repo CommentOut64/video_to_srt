@@ -315,6 +315,7 @@ def test_should_accept_timeanchored_default_rejects_error_route() -> None:
         base_result=SimpleNamespace(route="error"),
         final_stream=(object(),),
         sentence_segments=(object(),),
+        boundary_evidences=(object(),),
     )
     accepted, reason = AlignmentStageService._should_accept_timeanchored_result(
         stage_result=stage_result,
@@ -325,11 +326,12 @@ def test_should_accept_timeanchored_default_rejects_error_route() -> None:
     assert reason == "default_gate_route_error"
 
 
-def test_should_accept_timeanchored_default_requires_non_empty_sentences() -> None:
+def test_should_accept_timeanchored_default_requires_non_empty_stream() -> None:
     stage_result = SimpleNamespace(
         base_result=SimpleNamespace(route="fast"),
-        final_stream=(object(),),
+        final_stream=tuple(),
         sentence_segments=tuple(),
+        boundary_evidences=tuple(),
     )
     accepted, reason = AlignmentStageService._should_accept_timeanchored_result(
         stage_result=stage_result,
@@ -337,14 +339,15 @@ def test_should_accept_timeanchored_default_requires_non_empty_sentences() -> No
     )
 
     assert accepted is False
-    assert reason == "default_gate_empty_sentences"
+    assert reason == "default_gate_empty_stream"
 
 
-def test_should_accept_timeanchored_default_accepts_valid_result() -> None:
+def test_should_accept_timeanchored_default_accepts_valid_result_without_final_sentences() -> None:
     stage_result = SimpleNamespace(
         base_result=SimpleNamespace(route="slow"),
         final_stream=(object(),),
-        sentence_segments=(object(),),
+        sentence_segments=tuple(),
+        boundary_evidences=(object(),),
     )
     accepted, reason = AlignmentStageService._should_accept_timeanchored_result(
         stage_result=stage_result,
