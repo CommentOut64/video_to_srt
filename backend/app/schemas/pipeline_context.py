@@ -13,6 +13,7 @@ from app.services.alignment.types import PunctTrack, TextTrackBundle
 if TYPE_CHECKING:
     from app.services.timeanchored_alignment.contracts import (
         LanguageRun,
+        PipelineReport,
         PronunciationPackage,
         ProtectedSpan,
         TextTruthPackage,
@@ -68,6 +69,9 @@ class ProcessingContext:
     pronunciation_package: Optional["PronunciationPackage"] = None  # V3.3.0 Phase3: 轻量发音前端产物
     slow_window_meta: Dict[str, Any] = field(default_factory=dict)  # V3.3.0 Phase3: 组窗元数据
     pronunciation_report: Dict[str, Any] = field(default_factory=dict)  # V3.3.0 Phase3: 发音前端报告
+    hetero_alignment_result: Optional[Dict[str, Any]] = None  # V3.3.0 Phase7: 新链运行摘要
+    hetero_alignment_report: Optional[Dict[str, Any]] = None  # V3.3.0 Phase7: 新链结构化报告
+    hetero_route: Optional[str] = None  # V3.3.0 Phase7: 新链路由结果
     slow_window_id: Optional[str] = None  # V3.3.0 Phase2: 组窗ID透传
     slow_window_flush_reason: Optional[str] = None  # V3.3.0 Phase2: 组窗flush原因透传
     slow_window_is_mixed: bool = False  # V3.3.0 Phase2: mixed窗口回退标记
