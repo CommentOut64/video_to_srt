@@ -83,6 +83,47 @@ def test_phase0_reality_gate_baseline_sensevoice_result_default_no_ctc_logits(mo
     assert "ctc_logits" not in result
 
 
+def test_phase0_reality_gate_sensevoice_result_keeps_ctc_logits_only_with_explicit_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.model_runtime_config_service as runtime_config_module
+    import app.services.text_normalizer as text_normalizer_module
+    import app.services.token_merge_service as token_merge_service_module
+
+    class _DummyRuntimeService:
+        @staticmethod
+        def get_effective_runtime_global() -> dict:
+            return {
+                "effective": {
+                    "alignment_pipeline": {
+                        "retain_ctc_logits": True,
+                    }
+                },
+                "override": {
+                    "alignment_pipeline": {
+                        "retain_ctc_logits": True,
+                    }
+                },
+            }
+
+    monkeypatch.setattr(text_normalizer_module, "get_text_normalizer", lambda: _DummyNormalizer())
+    monkeypatch.setattr(
+        token_merge_service_module,
+        "merge_tokens",
+        lambda tokens, language=None: _DummyMergeResult(words=list(tokens), raw_tokens=[dict(item) for item in tokens]),
+    )
+    monkeypatch.setattr(
+        runtime_config_module,
+        "get_model_runtime_config_service",
+        lambda: _DummyRuntimeService(),
+    )
+
+    service = _build_stub_sensevoice_service()
+    result = service.transcribe_audio_array(np.zeros(16000, dtype=np.float32), sample_rate=16000)
+
+    assert "ctc_logits" in result
+
+
 def test_phase0_reality_gate_language_policy_currently_aliases_mixed_to_zh() -> None:
     """阶段性现实基线：language_policy 仍存在 mixed -> zh 归一化。"""
     assert resolve_language_tag(language_hint="mixed", fallback="en") == "zh"
