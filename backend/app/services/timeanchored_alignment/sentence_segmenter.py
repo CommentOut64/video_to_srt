@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Iterable, Sequence
 
 from app.models.sensevoice_models import SentenceSegment, WordTimestamp
@@ -10,6 +11,12 @@ from app.services.timeanchored_alignment.contracts import AlignmentItem, Protect
 
 
 _STRONG_END_PUNCT = frozenset({"。", "！", "？", ".", "!", "?"})
+_CJK_LANGS = frozenset({"zh", "ja", "ko"})
+_CJK_CHAR_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]")
+_WORD_CHAR_RE = re.compile(r"[A-Za-z0-9]")
+_NO_SPACE_BEFORE = frozenset({",", ".", "!", "?", ";", ":", "%", ")", "]", "}", "。", "，", "！", "？", "；", "：", "）", "】", "》", "」", "』"})
+_NO_SPACE_AFTER = frozenset({"(", "[", "{", "（", "【", "《", "「", "『", "$", "#", "@", "¥", "£"})
+_FORCE_SPACE_AFTER = frozenset({",", ".", "!", "?", ";", ")", "]", "}", "，", "。", "！", "？", "；", "）", "】", "》", "」", "』"})
 
 
 @dataclass(frozen=True)
@@ -25,6 +32,15 @@ class SentenceSegmenter:
     def __init__(self, *, config: SentenceSegmenterConfig | None = None) -> None:
         self._config = config or SentenceSegmenterConfig()
 
+    def compose_text(
+        self,
+        *,
+        stream: Sequence[AlignmentItem],
+        language: str = "auto",
+    ) -> str:
+        text, _ = self._render_stream_text_and_boundaries(stream=stream, language=language)
+        return text
+
     def segment(
         self,
         *,
@@ -37,14 +53,13 @@ class SentenceSegmenter:
         if not stream:
             return []
 
-        text = "".join(item.text for item in stream)
+        text, boundary_chars = self._render_stream_text_and_boundaries(stream=stream, language=language)
         if protected_spans:
             resolved_spans = tuple(protected_spans)
         else:
             from app.services.text_protection import extract_protected_spans
 
             resolved_spans = tuple(extract_protected_spans(text))
-        boundary_chars = self._build_boundary_char_positions(stream)
         speaker_marks = tuple(float(v) for v in speaker_boundaries)
         blank_marks = tuple(float(v) for v in blank_valley_boundaries)
 
@@ -118,14 +133,95 @@ class SentenceSegmenter:
             return "token_budget"
         return None
 
-    @staticmethod
-    def _build_boundary_char_positions(stream: Sequence[AlignmentItem]) -> list[int]:
-        positions: list[int] = []
+    def _render_stream_text_and_boundaries(
+        self,
+        *,
+        stream: Sequence[AlignmentItem],
+        language: str,
+    ) -> tuple[str, list[int]]:
+        parts: list[str] = []
+        boundary_positions: list[int] = []
         cursor = 0
+        prev_token = ""
+        normalized_language = self._normalize_language_tag(language)
         for index, item in enumerate(stream):
-            cursor += len(str(item.text or ""))
+            token = str(item.text or "")
+            if index > 0 and self._should_insert_space(prev_token=prev_token, current_token=token, language=normalized_language):
+                parts.append(" ")
+                cursor += 1
+            parts.append(token)
+            cursor += len(token)
             if index < len(stream) - 1:
-                positions.append(cursor)
+                boundary_positions.append(cursor)
+            prev_token = token
+        return "".join(parts), boundary_positions
+
+    @staticmethod
+    def _normalize_language_tag(language: str) -> str:
+        value = str(language or "auto").strip().lower()
+        if not value:
+            return "auto"
+        if "-" in value:
+            value = value.split("-", 1)[0]
+        if "_" in value:
+            value = value.split("_", 1)[0]
+        return value or "auto"
+
+    @staticmethod
+    def _contains_cjk(token: str) -> bool:
+        return bool(_CJK_CHAR_RE.search(str(token or "")))
+
+    @staticmethod
+    def _has_word_char(token: str) -> bool:
+        return bool(_WORD_CHAR_RE.search(str(token or "")))
+
+    def _should_insert_space(
+        self,
+        *,
+        prev_token: str,
+        current_token: str,
+        language: str,
+    ) -> bool:
+        language = self._normalize_language_tag(language)
+        if language in _CJK_LANGS:
+            return False
+
+        prev = str(prev_token or "").strip()
+        curr = str(current_token or "").strip()
+        if not prev or not curr:
+            return False
+
+        prev_last = prev[-1]
+        curr_first = curr[0]
+
+        if curr_first in _NO_SPACE_BEFORE:
+            return False
+        if prev_last in _NO_SPACE_AFTER:
+            return False
+
+        # 时间表达（7:28）和版本号（v1.2）不插入空格。
+        if prev_last == ":" and curr_first.isdigit():
+            return False
+        if prev_last == "." and curr_first.isdigit() and any(ch.isdigit() for ch in prev):
+            return False
+
+        # 英文缩写收口：there 's -> there's
+        if curr_first in {"'", "’"} and self._has_word_char(prev):
+            return False
+
+        # CJK 邻接保留无空格，避免破坏中日文连写习惯。
+        if self._contains_cjk(prev) or self._contains_cjk(curr):
+            return False
+
+        if self._has_word_char(prev) and self._has_word_char(curr):
+            return True
+        if prev_last in _FORCE_SPACE_AFTER and (self._has_word_char(curr) or self._contains_cjk(curr)):
+            return True
+        return False
+
+    def _build_boundary_char_positions(self, stream: Sequence[AlignmentItem], *, language: str) -> list[int]:
+        positions: list[int] = []
+        _, positions = self._render_stream_text_and_boundaries(stream=stream, language=language)
         return positions
 
     @staticmethod
@@ -151,8 +247,8 @@ class SentenceSegmenter:
             return False
         return token[-1] in _STRONG_END_PUNCT
 
-    @staticmethod
     def _build_sentence(
+        self,
         items: Sequence[AlignmentItem],
         *,
         split_reason: str,
@@ -175,7 +271,7 @@ class SentenceSegmenter:
                 confidences.append(float(row.confidence))
 
         confidence = sum(confidences) / len(confidences) if confidences else 1.0
-        text = "".join(row.text for row in items)
+        text, _ = self._render_stream_text_and_boundaries(stream=items, language=language)
         return SentenceSegment(
             text=text,
             text_clean=text,

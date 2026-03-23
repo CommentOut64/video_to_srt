@@ -53,12 +53,18 @@ class SenseVoiceTimeAdapter:
         normalized_stride = float(frame_stride or 0.06)
 
         if ctc_logits is not None and self._decoder is not None:
-            return self._build_from_logits(
-                ctc_logits=ctc_logits,
-                language=normalized_language,
-                frame_stride=normalized_stride,
-                encoder_out_lens=encoder_out_lens,
-            )
+            try:
+                package = self._build_from_logits(
+                    ctc_logits=ctc_logits,
+                    language=normalized_language,
+                    frame_stride=normalized_stride,
+                    encoder_out_lens=encoder_out_lens,
+                )
+                if package.raw_units or package.word_units:
+                    return package
+            except Exception:
+                # logits 异常（空帧/NaN/解码失败）时回退 compact_trace，避免整 chunk 丢失。
+                pass
 
         return self._build_from_compact_trace(
             language=normalized_language,
@@ -83,15 +89,19 @@ class SenseVoiceTimeAdapter:
             logits = logits[0]
         if logits.ndim != 2:
             raise ValueError(f"ctc_logits 维度错误: {logits.shape}")
+        logits = np.nan_to_num(logits, nan=-1e4, posinf=1e4, neginf=-1e4)
         if encoder_out_lens is not None:
             logits = logits[: max(0, int(encoder_out_lens)), :]
+        if logits.size == 0:
+            raise ValueError("ctc_logits 为空")
 
         text, decoded_tokens, _confidence, _lang_info = self._decoder.decode(logits, time_stride=frame_stride)
         _ = text  # 保留变量，方便后续调试扩展
 
         probs = CTCDecoder._softmax(logits)
+        probs = np.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0)
         token_ids = np.argmax(probs, axis=-1)
-        max_probs = np.max(probs, axis=-1)
+        max_probs = np.nan_to_num(np.max(probs, axis=-1), nan=0.0, posinf=1.0, neginf=0.0)
 
         enriched_raw = self._attach_top_candidates(
             decoded_tokens=list(decoded_tokens),
@@ -104,9 +114,14 @@ class SenseVoiceTimeAdapter:
         word_units = tuple(self._raw_unit_from_token(token, token_type="word") for token in merge_result.words)
 
         low_prob_ratio = float(np.mean(max_probs < self._low_conf_threshold)) if max_probs.size else 0.0
+        avg_max_prob = float(np.mean(max_probs)) if max_probs.size else 0.0
+        avg_max_prob = float(max(0.0, min(1.0, avg_max_prob)))
+        blank_ratio = float(np.mean(token_ids == self._blank_id)) if token_ids.size else 0.0
+        blank_ratio = float(max(0.0, min(1.0, blank_ratio)))
+        low_prob_ratio = float(max(0.0, min(1.0, low_prob_ratio)))
         quality = TimeBaseQuality(
-            blank_ratio=float(np.mean(token_ids == self._blank_id)) if token_ids.size else 0.0,
-            avg_max_prob=float(np.mean(max_probs)) if max_probs.size else 0.0,
+            blank_ratio=blank_ratio,
+            avg_max_prob=avg_max_prob,
             low_prob_ratio=low_prob_ratio,
             unit_count=len(raw_units),
             word_count=len(word_units),
@@ -140,16 +155,29 @@ class SenseVoiceTimeAdapter:
         raw_units = tuple(self._raw_unit_from_token(token, token_type="raw") for token in source_tokens)
         word_units = tuple(self._raw_unit_from_token(token, token_type="word") for token in merge_result.words)
 
-        avg_conf = float(np.mean([float(item.get("confidence", 0.0)) for item in source_tokens])) if source_tokens else 0.0
+        token_confidences = [
+            self._sanitize_probability(item.get("confidence", 0.0), default=0.0)
+            for item in source_tokens
+        ]
+        avg_conf = float(np.mean(token_confidences)) if token_confidences else 0.0
         low_prob_ratio = (
-            float(np.mean([float(item.get("confidence", 0.0)) < self._low_conf_threshold for item in source_tokens]))
-            if source_tokens
+            float(np.mean([confidence < self._low_conf_threshold for confidence in token_confidences]))
+            if token_confidences
             else 0.0
         )
         quality = TimeBaseQuality(
-            blank_ratio=float(compact_acoustic_trace.get("blank_ratio", 0.0) or 0.0),
-            avg_max_prob=float(compact_acoustic_trace.get("avg_max_prob", avg_conf) or avg_conf),
-            low_prob_ratio=float(compact_acoustic_trace.get("low_prob_ratio", low_prob_ratio) or low_prob_ratio),
+            blank_ratio=self._sanitize_probability(
+                compact_acoustic_trace.get("blank_ratio"),
+                default=0.0,
+            ),
+            avg_max_prob=self._sanitize_probability(
+                compact_acoustic_trace.get("avg_max_prob"),
+                default=avg_conf,
+            ),
+            low_prob_ratio=self._sanitize_probability(
+                compact_acoustic_trace.get("low_prob_ratio"),
+                default=low_prob_ratio,
+            ),
             unit_count=len(raw_units),
             word_count=len(word_units),
         )
@@ -163,7 +191,7 @@ class SenseVoiceTimeAdapter:
             source="sensevoice",
             metadata={
                 "decoder": "compact_trace",
-                "top_k": int(compact_acoustic_trace.get("top_k", self._top_k) or self._top_k),
+                "top_k": self._sanitize_top_k(compact_acoustic_trace.get("top_k"), default=self._top_k),
                 "unit_source": "raw_tokens",
             },
         )
@@ -195,7 +223,7 @@ class SenseVoiceTimeAdapter:
             candidates = tuple(
                 AcousticCandidate(
                     text=self._decoder.vocab.get(int(index), "<unk>") if self._decoder is not None else "<unk>",
-                    score=float(avg_probs[int(index)]),
+                    score=self._sanitize_probability(avg_probs[int(index)], default=0.0),
                     token_id=int(index),
                 )
                 for index in top_indices
@@ -223,7 +251,7 @@ class SenseVoiceTimeAdapter:
         candidates: Tuple[AcousticCandidate, ...] = tuple(
             AcousticCandidate(
                 text=str(item.get("text", "") or ""),
-                score=float(item.get("score", 0.0) or 0.0),
+                score=SenseVoiceTimeAdapter._sanitize_probability(item.get("score", 0.0), default=0.0),
                 token_id=int(item.get("token_id")) if item.get("token_id") is not None else None,
             )
             for item in candidates_raw
@@ -233,8 +261,28 @@ class SenseVoiceTimeAdapter:
             text=str(token.get("word", "") or ""),
             start=float(token.get("start", 0.0) or 0.0),
             end=float(token.get("end", token.get("start", 0.0)) or 0.0),
-            confidence=float(token.get("confidence", 0.0) or 0.0),
+            confidence=SenseVoiceTimeAdapter._sanitize_probability(token.get("confidence", 0.0), default=0.0),
             token_type=token_type,
             top_candidates=candidates,
             source="sensevoice",
         )
+
+    @staticmethod
+    def _sanitize_probability(value: Any, *, default: float = 0.0) -> float:
+        candidate = default if value is None else value
+        try:
+            numeric = float(candidate)
+        except (TypeError, ValueError):
+            numeric = float(default)
+        if not np.isfinite(numeric):
+            numeric = float(default)
+        return float(max(0.0, min(1.0, numeric)))
+
+    @staticmethod
+    def _sanitize_top_k(value: Any, *, default: int) -> int:
+        candidate = default if value is None else value
+        try:
+            numeric = int(float(candidate))
+        except (TypeError, ValueError):
+            numeric = int(default)
+        return max(1, min(numeric, 3))

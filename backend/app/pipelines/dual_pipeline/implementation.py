@@ -605,6 +605,18 @@ class AsyncDualPipelineKernel:
         self._dual_time_active_min_boundary_f1 = float(
             self._alignment_layer_config.dual_time_active_min_boundary_f1
         )
+        alignment_pipeline_flags = self._resolve_alignment_pipeline_runtime_flags(
+            runtime=get_model_runtime_config_service().get_effective_runtime_global(),
+            legacy_dual_time_mode=self._dual_time_mode,
+        )
+        self._alignment_pipeline_version = str(alignment_pipeline_flags["version"])
+        self._alignment_pipeline_mode = str(alignment_pipeline_flags["mode"])
+        self._alignment_pipeline_shadow_sample_rate = float(
+            alignment_pipeline_flags["shadow_sample_rate"]
+        )
+        self._alignment_pipeline_write_debug_artifacts = bool(
+            alignment_pipeline_flags["write_debug_artifacts"]
+        )
         self._dual_time_compare_accumulator: Dict[str, Any] = {
             "chunk_count": 0,
             "boundary_precision_sum": 0.0,
@@ -630,6 +642,13 @@ class AsyncDualPipelineKernel:
                 self._dual_time_mode,
                 int(self._dual_time_boundary_tolerance_sec * 1000),
             )
+        self.logger.info(
+            "alignment_pipeline 灰度配置: version={} mode={} shadow_sample_rate={:.2f} write_debug_artifacts={}",
+            self._alignment_pipeline_version,
+            self._alignment_pipeline_mode,
+            self._alignment_pipeline_shadow_sample_rate,
+            self._alignment_pipeline_write_debug_artifacts,
+        )
         if self._is_m2_enabled:
             self.logger.info(
                 "M2阶段0观测开启: nw_v2_enable={} time_mapping_enable={} sample_rate={:.2f}",
@@ -2623,6 +2642,99 @@ class AsyncDualPipelineKernel:
         if normalized in {"auto", "force_fast", "force_slow"}:
             return normalized
         return "auto"
+
+    @staticmethod
+    def _resolve_alignment_pipeline_runtime_flags(
+        *,
+        runtime: Dict[str, Any],
+        legacy_dual_time_mode: str = "off",
+    ) -> Dict[str, Any]:
+        effective = runtime.get("effective", {}) if isinstance(runtime, dict) else {}
+        override = runtime.get("override", {}) if isinstance(runtime, dict) else {}
+
+        effective_alignment_pipeline = (
+            effective.get("alignment_pipeline", {}) if isinstance(effective, dict) else {}
+        )
+        override_alignment_pipeline = (
+            override.get("alignment_pipeline", {}) if isinstance(override, dict) else {}
+        )
+        effective_alignment = effective.get("alignment", {}) if isinstance(effective, dict) else {}
+        override_alignment = override.get("alignment", {}) if isinstance(override, dict) else {}
+
+        if not isinstance(effective_alignment_pipeline, dict):
+            effective_alignment_pipeline = {}
+        if not isinstance(override_alignment_pipeline, dict):
+            override_alignment_pipeline = {}
+        if not isinstance(effective_alignment, dict):
+            effective_alignment = {}
+        if not isinstance(override_alignment, dict):
+            override_alignment = {}
+
+        mode_raw = override_alignment_pipeline.get(
+            "mode",
+            effective_alignment_pipeline.get("mode"),
+        )
+        version_raw = override_alignment_pipeline.get(
+            "version",
+            effective_alignment_pipeline.get("version"),
+        )
+
+        version = AsyncDualPipelineKernel._normalize_alignment_pipeline_version(version_raw)
+        mode = AsyncDualPipelineKernel._normalize_alignment_pipeline_mode(mode_raw)
+
+        shim_mode = str(
+            override_alignment.get(
+                "dual_time_mode",
+                effective_alignment.get("dual_time_mode", legacy_dual_time_mode),
+            )
+            or legacy_dual_time_mode
+        ).strip().lower()
+        if shim_mode not in {"off", "shadow", "active"}:
+            shim_mode = "off"
+
+        if mode is None:
+            if shim_mode == "active":
+                mode = "active"
+            else:
+                mode = "default"
+        elif mode in {"legacy", "shadow"}:
+            mode = "default"
+
+        shadow_sample_rate_raw = override_alignment_pipeline.get(
+            "shadow_sample_rate",
+            effective_alignment_pipeline.get("shadow_sample_rate", 0.1),
+        )
+        write_debug_artifacts_raw = override_alignment_pipeline.get(
+            "write_debug_artifacts",
+            effective_alignment_pipeline.get("write_debug_artifacts", False),
+        )
+        try:
+            shadow_sample_rate = float(shadow_sample_rate_raw)
+        except (TypeError, ValueError):
+            shadow_sample_rate = 0.1
+        shadow_sample_rate = max(0.0, min(1.0, shadow_sample_rate))
+
+        return {
+            "version": version,
+            "mode": mode,
+            "shadow_sample_rate": shadow_sample_rate,
+            "write_debug_artifacts": bool(write_debug_artifacts_raw),
+        }
+
+    @staticmethod
+    def _normalize_alignment_pipeline_version(value: Any) -> str:
+        # 旧链路下线：版本统一收敛到 timeanchored。
+        _ = str(value or "timeanchored").strip().lower()
+        return "timeanchored"
+
+    @staticmethod
+    def _normalize_alignment_pipeline_mode(value: Any) -> Optional[str]:
+        normalized = str(value or "").strip().lower()
+        if normalized == "active":
+            return "active"
+        if normalized in {"legacy", "shadow", "default", "timeanchored", "off"}:
+            return "default"
+        return None
 
     @staticmethod
     def _select_text_for_alignment(

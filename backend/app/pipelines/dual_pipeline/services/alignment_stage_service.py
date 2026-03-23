@@ -8,8 +8,9 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import replace
-from typing import Any, Dict, Optional, Sequence
+import hashlib
+from dataclasses import asdict, replace
+from typing import Any, Dict, Optional
 
 from app.models.sensevoice_models import SentenceSegment, TextSource
 from app.pipelines.dual_pipeline.services.textflow_facade_service import Layer456RunResult
@@ -17,20 +18,20 @@ from app.schemas.pipeline_context import ProcessingContext
 from app.services.alignment.types import PunctTrack
 from app.services.language_policy import build_language_policy_snapshot
 from app.services.timeanchored_alignment import (
-    ChunkProjector,
     ChunkWindow,
+    ChunkProjector,
     EdgeSelector,
-    FailedSpan,
     LanguageRunFrontend,
     OutputAdapter,
     PhoneticAligner,
     PronunciationFrontend,
     SentenceSegmenter,
     SubtitleAssembler,
+    TimeanchoredAlignmentStageService,
+    TimeanchoredStageResult,
     TextAligner,
 )
 from app.services.timeanchored_alignment.adapters.slow import WhisperTextAdapter
-from app.services.timeanchored_alignment.contracts import AlignmentItem, FinalAlignmentResult
 
 
 class AlignmentStageService:
@@ -54,6 +55,14 @@ class AlignmentStageService:
         self._timeanchored_sentence_segmenter = SentenceSegmenter()
         self._timeanchored_chunk_projector = ChunkProjector()
         self._timeanchored_output_adapter = OutputAdapter()
+        self._timeanchored_stage_service = TimeanchoredAlignmentStageService(
+            text_aligner=self._timeanchored_text_aligner,
+            edge_selector=self._timeanchored_edge_selector,
+            subtitle_assembler=self._timeanchored_subtitle_assembler,
+            sentence_segmenter=self._timeanchored_sentence_segmenter,
+            chunk_projector=self._timeanchored_chunk_projector,
+            output_adapter=self._timeanchored_output_adapter,
+        )
 
     async def run(self, ctx: ProcessingContext) -> None:
         """执行单个 chunk 的对齐阶段。"""
@@ -251,17 +260,107 @@ class AlignmentStageService:
                 language_hint,
             )
 
-        if self._is_timeanchored_main_chain_enabled(ctx):
-            if self._try_run_timeanchored_main_chain(
-                ctx=ctx,
-                tracks=tracks,
-                sv_result=sv_result,
-                whisper_result=whisper_result,
-                language_hint=language_hint,
-                speaker_id=speaker_id,
-                turn_id=turn_id,
-            ):
-                return
+        alignment_pipeline_mode = self._resolve_alignment_pipeline_mode()
+        legacy_experiment_enabled = (
+            alignment_pipeline_mode == "legacy"
+            and bool(host._is_dual_time_experiment_enabled)
+        )
+        ctx.hetero_alignment_result = None
+        ctx.hetero_alignment_report = None
+        ctx.hetero_route = None
+
+        timeanchored_available = self._is_timeanchored_main_chain_enabled(ctx)
+        if alignment_pipeline_mode == "shadow":
+            if timeanchored_available and self._should_sample_alignment_pipeline_shadow(ctx):
+                stage_result = self._run_timeanchored_main_chain(
+                    ctx=ctx,
+                    tracks=tracks,
+                    sv_result=sv_result,
+                    whisper_result=whisper_result,
+                    language_hint=language_hint,
+                    speaker_id=speaker_id,
+                    turn_id=turn_id,
+                )
+                self._record_hetero_alignment_result(
+                    ctx=ctx,
+                    stage_result=stage_result,
+                    mode=alignment_pipeline_mode,
+                    selected=False,
+                    reason=(
+                        "shadow_observed"
+                        if stage_result is not None
+                        else "shadow_timeanchored_failed"
+                    ),
+                )
+            else:
+                shadow_reason = (
+                    "shadow_sample_skipped"
+                    if timeanchored_available
+                    else "shadow_time_base_unavailable"
+                )
+                self._record_hetero_alignment_result(
+                    ctx=ctx,
+                    stage_result=None,
+                    mode=alignment_pipeline_mode,
+                    selected=False,
+                    reason=shadow_reason,
+                )
+        elif alignment_pipeline_mode in {"active", "default"}:
+            if timeanchored_available:
+                stage_result = self._run_timeanchored_main_chain(
+                    ctx=ctx,
+                    tracks=tracks,
+                    sv_result=sv_result,
+                    whisper_result=whisper_result,
+                    language_hint=language_hint,
+                    speaker_id=speaker_id,
+                    turn_id=turn_id,
+                )
+                should_accept, reason = self._should_accept_timeanchored_result(
+                    stage_result=stage_result,
+                    mode=alignment_pipeline_mode,
+                )
+                if should_accept and stage_result is not None:
+                    self._commit_timeanchored_main_chain_result(
+                        ctx=ctx,
+                        stage_result=stage_result,
+                        whisper_result=whisper_result,
+                        sv_result=sv_result,
+                        speaker_id=speaker_id,
+                        turn_id=turn_id,
+                    )
+                    self._record_hetero_alignment_result(
+                        ctx=ctx,
+                        stage_result=stage_result,
+                        mode=alignment_pipeline_mode,
+                        selected=True,
+                        reason=reason,
+                    )
+                    return
+                self._record_hetero_alignment_result(
+                    ctx=ctx,
+                    stage_result=stage_result,
+                    mode=alignment_pipeline_mode,
+                    selected=False,
+                    reason=reason,
+                )
+            else:
+                self._record_hetero_alignment_result(
+                    ctx=ctx,
+                    stage_result=None,
+                    mode=alignment_pipeline_mode,
+                    selected=False,
+                    reason=f"{alignment_pipeline_mode}_time_base_unavailable",
+                )
+
+        # 旧四层 legacy 已下线：新主链未被接受时直接失败，避免静默回退。
+        hetero_reason = str(
+            (ctx.hetero_alignment_result or {}).get("reason")
+            or "timeanchored_not_selected"
+        )
+        raise RuntimeError(
+            f"Chunk {ctx.chunk_index}: legacy_alignment_pipeline_disabled reason={hetero_reason}"
+        )
 
         legacy_run = host._run_collection_scoring_decision_once(
             tracks=tracks,
@@ -283,7 +382,7 @@ class AlignmentStageService:
         )
         compare_payload: Optional[Dict[str, Any]] = None
 
-        if host._is_dual_time_experiment_enabled:
+        if legacy_experiment_enabled:
             # Shadow/Active 都采用串行后处理：先 legacy，再 experiment，不并行占用 GPU。
             experiment_run = host._run_collection_scoring_decision_once(
                 tracks=tracks,
@@ -546,6 +645,30 @@ class AlignmentStageService:
         ctx.finalization_metrics["l7_error_count"] = float(
             len(output_layer_result.output_payload.get("errors", []))
         )
+        if ctx.hetero_alignment_result is not None:
+            ctx.finalization_metrics["alignment_pipeline_mode"] = str(
+                ctx.hetero_alignment_result.get("mode", "")
+            )
+            ctx.finalization_metrics["alignment_pipeline_selected"] = (
+                1.0 if bool(ctx.hetero_alignment_result.get("selected")) else 0.0
+            )
+            ctx.finalization_metrics["alignment_pipeline_reason"] = str(
+                ctx.hetero_alignment_result.get("reason", "")
+            )
+        else:
+            ctx.hetero_route = "legacy"
+            ctx.hetero_alignment_result = {
+                "mode": "legacy",
+                "selected": True,
+                "reason": "legacy_only",
+                "route": "legacy",
+                "sentence_count": int(len(final_sentences)),
+                "failed_span_count": 0,
+            }
+            ctx.hetero_alignment_report = None
+            ctx.finalization_metrics["alignment_pipeline_mode"] = "legacy"
+            ctx.finalization_metrics["alignment_pipeline_selected"] = 1.0
+            ctx.finalization_metrics["alignment_pipeline_reason"] = "legacy_only"
 
         host.logger.debug(
             f"Chunk {ctx.chunk_index}: 定稿已推送 "
@@ -571,6 +694,42 @@ class AlignmentStageService:
         speaker_id: Optional[str],
         turn_id: Optional[str],
     ) -> bool:
+        stage_result = self._run_timeanchored_main_chain(
+            ctx=ctx,
+            tracks=tracks,
+            sv_result=sv_result,
+            whisper_result=whisper_result,
+            language_hint=language_hint,
+            speaker_id=speaker_id,
+            turn_id=turn_id,
+        )
+        should_accept, _ = self._should_accept_timeanchored_result(
+            stage_result=stage_result,
+            mode="default",
+        )
+        if not should_accept or stage_result is None:
+            return False
+        self._commit_timeanchored_main_chain_result(
+            ctx=ctx,
+            stage_result=stage_result,
+            whisper_result=whisper_result,
+            sv_result=sv_result,
+            speaker_id=speaker_id,
+            turn_id=turn_id,
+        )
+        return True
+
+    def _run_timeanchored_main_chain(
+        self,
+        *,
+        ctx: ProcessingContext,
+        tracks: Any,
+        sv_result: Dict[str, Any],
+        whisper_result: Dict[str, Any],
+        language_hint: str,
+        speaker_id: Optional[str],
+        turn_id: Optional[str],
+    ) -> Optional[TimeanchoredStageResult]:
         host = self._host
         chunk = ctx.audio_chunk
         try:
@@ -621,168 +780,219 @@ class AlignmentStageService:
                 "foreign_run_ratio": float(language_runs.foreign_run_ratio),
             }
 
-            text_result = self._timeanchored_text_aligner.align_window(
+            chunk_start = float(getattr(chunk, "start", 0.0) or 0.0) if chunk is not None else 0.0
+            chunk_end = (
+                float(getattr(chunk, "end", chunk_start) or chunk_start)
+                if chunk is not None
+                else chunk_start
+            )
+            if chunk_end <= chunk_start:
+                chunk_end = chunk_start + 0.01
+            ctx_edge_mode = str(getattr(ctx, "edge_selection_mode", "") or "").strip().lower()
+            host_edge_mode = str(getattr(host, "_edge_selection_mode", "auto") or "auto").strip().lower()
+            edge_mode = ctx_edge_mode if ctx_edge_mode in {"force_fast", "force_slow"} else host_edge_mode
+
+            return self._timeanchored_stage_service.execute(
                 time_base=ctx.time_base_chunk,
                 text_truth=text_truth,
                 language_runs=language_runs,
                 pronunciation=pronunciation,
-            )
-            failed_spans = self._extract_failed_spans(text_result.items)
-            edge_mode = str(getattr(host, "_edge_selection_mode", "auto") or "auto")
-            edge_result = self._timeanchored_edge_selector.select(
-                time_base=ctx.time_base_chunk,
-                text_truth=text_truth,
-                failed_spans=failed_spans,
-                edge_selection_mode=edge_mode,
-            )
-            base_result = self._choose_timeanchored_base_result(
-                text_result=text_result,
-                edge_result=edge_result,
-            )
-            fallback_result = edge_result if base_result is text_result else None
-            final_stream = self._timeanchored_subtitle_assembler.assemble(
-                base_result=base_result,
-                fallback_result=fallback_result,
-                failed_spans=failed_spans,
-            )
-            if not final_stream and edge_result.items:
-                final_stream = tuple(edge_result.items)
-
-            final_sentences = self._timeanchored_sentence_segmenter.segment(
-                stream=final_stream,
-                language=base_language,
-                protected_spans=text_truth.protected_spans,
-            )
-            if not final_sentences:
-                fallback_text = "".join(item.text for item in final_stream).strip() or truth_text
-                fallback_confidence = self._resolve_text_fallback_confidence(
-                    chosen_source=str(getattr(ctx.arbitration_result, "chosen_source", "") or "slow"),
-                    whisper_result=whisper_result,
-                    sv_result=sv_result,
-                )
-                fallback_sentence = self._build_text_fallback_sentence(
-                    text=fallback_text,
-                    chunk=chunk,
-                    confidence=fallback_confidence,
-                )
-                if fallback_sentence is not None:
-                    final_sentences = [fallback_sentence]
-
-            for sentence in final_sentences:
-                if getattr(sentence, "speaker_id", None) is None:
-                    sentence.speaker_id = speaker_id
-                if getattr(sentence, "turn_id", None) is None:
-                    sentence.turn_id = turn_id
-
-            host._assign_sentence_identity_by_timeline_overlap(
-                final_sentences,
-                fallback_chunk=chunk,
-            )
-
-            chunk_start = float(getattr(chunk, "start", 0.0) or 0.0) if chunk is not None else 0.0
-            chunk_end = float(getattr(chunk, "end", chunk_start) or chunk_start) if chunk is not None else chunk_start
-            if chunk_end <= chunk_start:
-                chunk_end = chunk_start + 0.01
-            projections = self._timeanchored_chunk_projector.project(
-                sentence_segments=tuple(final_sentences),
-                chunk_windows=(
-                    ChunkWindow(
-                        chunk_ref=ctx.chunk_index,
-                        start=chunk_start,
-                        end=chunk_end,
-                    ),
+                chunk_window=ChunkWindow(
+                    chunk_ref=ctx.chunk_index,
+                    start=chunk_start,
+                    end=chunk_end,
                 ),
-            )
-            output_inputs = self._timeanchored_output_adapter.to_output_layer_inputs(
-                projections=projections,
                 language=base_language,
-                injection_report={
-                    "mapping_coverage": float(base_result.metrics.coverage),
-                    "error_code": str(base_result.error_code or ""),
-                },
-                segmentation_report={
-                    "route": "timeanchored",
-                    "text_route": text_result.route,
-                    "edge_route": edge_result.route,
-                    "error_code": str(base_result.error_code or ""),
-                },
+                edge_selection_mode=edge_mode,
+                speaker_id=speaker_id,
+                turn_id=turn_id,
             )
-
-            output_error_count = 0
-            for output_input in output_inputs:
-                output_layer_result = host._emit_output_layer(
-                    chunk_index=output_input.chunk_index,
-                    sentence_segments=output_input.sentence_segments,
-                    language=output_input.language,
-                    injection_report=dict(output_input.injection_report or {}),
-                    segmentation_report=dict(output_input.segmentation_report or {}),
-                    output_traces=list(output_input.output_traces or []),
-                    default_trace_reason="timeanchored_chain",
-                )
-                output_error_count += len(output_layer_result.output_payload.get("errors", []))
-
-            ctx.final_sentences = list(final_sentences)
-            ctx.finalization_metrics = {
-                "coverage": float(base_result.metrics.coverage),
-                "gap_ratio": 0.0,
-                "alignment_score": float(base_result.metrics.route_confidence),
-                "gap_positions": [],
-                "gap_resolution": None,
-                "timeanchored_enabled": 1.0,
-                "timeanchored_text_route": text_result.route,
-                "timeanchored_edge_route": edge_result.route,
-                "timeanchored_final_route": base_result.route,
-                "timeanchored_item_count": float(len(final_stream)),
-                "timeanchored_sentence_count": float(len(final_sentences)),
-                "timeanchored_failed_span_count": float(len(failed_spans)),
-                "timeanchored_window_kind": language_runs.window_kind,
-                "timeanchored_foreign_run_ratio": float(language_runs.foreign_run_ratio),
-                "l7_error_count": float(output_error_count),
-            }
-            if ctx.arbitration_result:
-                ctx.arbitration_result.gap_positions = []
-
-            host.logger.debug(
-                "Chunk {}: timeanchored 主链完成 sentences={} route={}",
-                ctx.chunk_index,
-                len(final_sentences),
-                base_result.route,
-            )
-            return True
         except Exception:
             host.logger.exception(
-                "Chunk {}: timeanchored 主链失败，回退 legacy 四层",
+                "Chunk {}: timeanchored 主链失败（legacy 已下线）",
                 ctx.chunk_index,
             )
-            return False
+            return None
 
-    @staticmethod
-    def _extract_failed_spans(items: Sequence[AlignmentItem]) -> tuple[FailedSpan, ...]:
-        spans: list[FailedSpan] = []
-        start: Optional[int] = None
-        for index, item in enumerate(items):
-            if item.status == "failed":
-                if start is None:
-                    start = index
-                continue
-            if start is not None:
-                spans.append(FailedSpan(start=start, end=index - 1))
-                start = None
-        if start is not None:
-            spans.append(FailedSpan(start=start, end=len(items) - 1))
-        return tuple(spans)
-
-    @staticmethod
-    def _choose_timeanchored_base_result(
+    def _commit_timeanchored_main_chain_result(
+        self,
         *,
-        text_result: FinalAlignmentResult,
-        edge_result: FinalAlignmentResult,
-    ) -> FinalAlignmentResult:
-        if text_result.route in {"text", "phonetic"}:
-            return text_result
-        if edge_result.route != "error":
-            return edge_result
-        return text_result
+        ctx: ProcessingContext,
+        stage_result: TimeanchoredStageResult,
+        whisper_result: Dict[str, Any],
+        sv_result: Dict[str, Any],
+        speaker_id: Optional[str],
+        turn_id: Optional[str],
+    ) -> None:
+        host = self._host
+        final_sentences = list(stage_result.sentence_segments)
+        fallback_error_code = ""
+        if not final_sentences:
+            fallback_text = self._timeanchored_sentence_segmenter.compose_text(
+                stream=stage_result.final_stream,
+                language=str(
+                    getattr(ctx.text_truth, "language", "")
+                    or whisper_result.get("language")
+                    or "auto"
+                ),
+            ).strip()
+            if not fallback_text:
+                fallback_text = str(
+                    getattr(ctx.text_truth, "normalized_text", "")
+                    or getattr(ctx.text_truth, "raw_text", "")
+                    or ""
+                ).strip()
+            fallback_confidence = self._resolve_text_fallback_confidence(
+                chosen_source=str(getattr(ctx.arbitration_result, "chosen_source", "") or "slow"),
+                whisper_result=whisper_result,
+                sv_result=sv_result,
+            )
+            fallback_sentence = self._build_text_fallback_sentence(
+                text=fallback_text,
+                chunk=ctx.audio_chunk,
+                confidence=fallback_confidence,
+            )
+            if fallback_sentence is not None:
+                fallback_sentence.speaker_id = speaker_id
+                fallback_sentence.turn_id = turn_id
+                final_sentences = [fallback_sentence]
+                fallback_error_code = "E_TIMEANCHORED_SEGMENT_EMPTY_FALLBACK"
+
+        for sentence in final_sentences:
+            if getattr(sentence, "speaker_id", None) is None:
+                sentence.speaker_id = speaker_id
+            if getattr(sentence, "turn_id", None) is None:
+                sentence.turn_id = turn_id
+        host._assign_sentence_identity_by_timeline_overlap(
+            final_sentences,
+            fallback_chunk=ctx.audio_chunk,
+        )
+
+        output_layer_result = host._emit_output_layer(
+            chunk_index=ctx.chunk_index,
+            sentence_segments=final_sentences,
+            language=str(
+                getattr(ctx.text_truth, "language", "")
+                or whisper_result.get("language")
+                or "auto"
+            ),
+            injection_report={
+                "mapping_coverage": float(stage_result.base_result.metrics.coverage),
+                "error_code": str(stage_result.base_result.error_code or ""),
+            },
+            segmentation_report={
+                "route": "timeanchored",
+                "text_route": stage_result.text_result.route,
+                "edge_route": stage_result.edge_result.route,
+                "error_code": str(stage_result.base_result.error_code or fallback_error_code),
+            },
+            output_traces=[],
+            default_trace_reason="timeanchored_chain",
+        )
+        ctx.final_sentences = list(final_sentences)
+        ctx.finalization_metrics = {
+            "coverage": float(stage_result.base_result.metrics.coverage),
+            "gap_ratio": 0.0,
+            "alignment_score": float(stage_result.base_result.metrics.route_confidence),
+            "gap_positions": [],
+            "gap_resolution": None,
+            "timeanchored_enabled": 1.0,
+            "timeanchored_text_route": stage_result.text_result.route,
+            "timeanchored_edge_route": stage_result.edge_result.route,
+            "timeanchored_final_route": stage_result.base_result.route,
+            "timeanchored_item_count": float(len(stage_result.final_stream)),
+            "timeanchored_sentence_count": float(len(final_sentences)),
+            "timeanchored_failed_span_count": float(len(stage_result.failed_spans)),
+            "l7_error_count": float(len(output_layer_result.output_payload.get("errors", []))),
+        }
+        if fallback_error_code:
+            ctx.finalization_metrics["timeanchored_error_code"] = fallback_error_code
+        if ctx.arbitration_result:
+            ctx.arbitration_result.gap_positions = []
+        host.logger.debug(
+            "Chunk {}: timeanchored 主链完成 sentences={} route={}",
+            ctx.chunk_index,
+            len(final_sentences),
+            stage_result.base_result.route,
+        )
+
+    def _record_hetero_alignment_result(
+        self,
+        *,
+        ctx: ProcessingContext,
+        stage_result: Optional[TimeanchoredStageResult],
+        mode: str,
+        selected: bool,
+        reason: str,
+    ) -> None:
+        route = str(stage_result.base_result.route) if stage_result is not None else "unavailable"
+        ctx.hetero_route = route
+        ctx.hetero_alignment_result = {
+            "mode": str(mode),
+            "selected": bool(selected),
+            "reason": str(reason),
+            "route": route,
+            "sentence_count": (
+                int(len(stage_result.sentence_segments))
+                if stage_result is not None
+                else 0
+            ),
+            "failed_span_count": (
+                int(len(stage_result.failed_spans))
+                if stage_result is not None
+                else 0
+            ),
+        }
+        ctx.hetero_alignment_report = (
+            asdict(stage_result.pipeline_report)
+            if stage_result is not None
+            else None
+        )
+        ctx.finalization_metrics["alignment_pipeline_mode"] = str(mode)
+        ctx.finalization_metrics["alignment_pipeline_selected"] = 1.0 if selected else 0.0
+        ctx.finalization_metrics["alignment_pipeline_reason"] = str(reason)
+        ctx.finalization_metrics["alignment_pipeline_route"] = route
+
+    @staticmethod
+    def _should_accept_timeanchored_result(
+        *,
+        stage_result: Optional[TimeanchoredStageResult],
+        mode: str,
+    ) -> tuple[bool, str]:
+        if stage_result is None:
+            return False, f"{mode}_timeanchored_failed"
+        route = str(stage_result.base_result.route or "")
+        if route == "error":
+            return False, f"{mode}_gate_route_error"
+        if not stage_result.final_stream:
+            return False, f"{mode}_gate_empty_stream"
+        if not stage_result.sentence_segments:
+            return False, f"{mode}_gate_empty_sentences"
+        if mode == "default":
+            return True, "default_gate_pass"
+        return True, f"{mode}_gate_pass"
+
+    def _should_sample_alignment_pipeline_shadow(self, ctx: ProcessingContext) -> bool:
+        sample_rate = max(
+            0.0,
+            min(1.0, float(getattr(self._host, "_alignment_pipeline_shadow_sample_rate", 0.0))),
+        )
+        if sample_rate <= 0.0:
+            return False
+        if sample_rate >= 1.0:
+            return True
+        digest = hashlib.md5(f"{ctx.job_id}:{int(ctx.chunk_index)}".encode("utf-8")).digest()
+        bucket = int.from_bytes(digest[:4], byteorder="big", signed=False) % 10000
+        threshold = int(sample_rate * 10000)
+        return bucket < threshold
+
+    def _resolve_alignment_pipeline_mode(self) -> str:
+        mode = str(getattr(self._host, "_alignment_pipeline_mode", "default") or "default").strip().lower()
+        if mode == "active":
+            return "active"
+        if mode in {"default", "legacy", "shadow", "timeanchored", "off"}:
+            return "default"
+        return "default"
 
     @staticmethod
     def _resolve_text_fallback_content(

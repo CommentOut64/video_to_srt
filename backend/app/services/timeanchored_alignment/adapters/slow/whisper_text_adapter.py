@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Mapping, Optional
 
 from app.services.arbitration.hallucination_detector import HallucinationDetector
@@ -53,16 +54,17 @@ class WhisperTextAdapter:
             repetition_ratio=repetition_ratio,
             length_ratio=length_ratio,
         )
-        unit = TextTruthUnit(
-            text=base_text,
+        units, timestamp_mode = self._build_text_units(
+            whisper_result=whisper_result,
             normalized_text=normalized_text,
-            confidence=confidence,
+            fallback_text=base_text,
             language=language,
-            source="whisper",
+            default_confidence=confidence,
+            prompt=prompt,
         )
 
         return TextTruthPackage(
-            units=(unit,),
+            units=units,
             quality=quality,
             language=language,
             raw_text=raw_text,
@@ -78,6 +80,7 @@ class WhisperTextAdapter:
                 "raw_result": dict(whisper_result.get("raw_result") or {}),
                 "text_itn_raw": str(whisper_result.get("text_itn_raw") or ""),
                 "text_clean": str(whisper_result.get("text_clean") or ""),
+                "timestamp_mode": timestamp_mode,
             },
             source="whisper",
             protected_spans=tuple(),
@@ -128,3 +131,193 @@ class WhisperTextAdapter:
             if cleaned[index] == cleaned[index - 1]:
                 repeated_count += 1
         return max(0.0, min(1.0, repeated_count / max(len(cleaned), 1)))
+
+    def _build_text_units(
+        self,
+        *,
+        whisper_result: Mapping[str, Any],
+        normalized_text: str,
+        fallback_text: str,
+        language: str,
+        default_confidence: float,
+        prompt: Optional[str],
+    ) -> tuple[tuple[TextTruthUnit, ...], str]:
+        word_units = self._build_units_from_word_timestamps(
+            whisper_result=whisper_result,
+            language=language,
+            default_confidence=default_confidence,
+            prompt=prompt,
+        )
+        if word_units:
+            return tuple(word_units), "word"
+
+        segment_units = self._build_units_from_segments(
+            whisper_result=whisper_result,
+            language=language,
+            default_confidence=default_confidence,
+            prompt=prompt,
+        )
+        if segment_units:
+            return tuple(segment_units), "segment"
+
+        synthetic_units = self._build_synthetic_units(
+            text=normalized_text or fallback_text,
+            language=language,
+            confidence=default_confidence,
+        )
+        if synthetic_units:
+            return tuple(synthetic_units), "synthetic"
+
+        return tuple(), "none"
+
+    def _build_units_from_word_timestamps(
+        self,
+        *,
+        whisper_result: Mapping[str, Any],
+        language: str,
+        default_confidence: float,
+        prompt: Optional[str],
+    ) -> list[TextTruthUnit]:
+        units: list[TextTruthUnit] = []
+        for segment in self._iter_segments(whisper_result):
+            words = segment.get("words")
+            if not isinstance(words, list):
+                continue
+            for word in words:
+                if not isinstance(word, Mapping):
+                    continue
+                normalized = self._sanitize_fragment(str(word.get("word") or ""), prompt=prompt)
+                if not normalized:
+                    continue
+                span = self._resolve_time_span(start=word.get("start"), end=word.get("end"))
+                if span is None:
+                    continue
+                confidence = self._clamp_probability(word.get("probability"), default=default_confidence)
+                units.append(
+                    TextTruthUnit(
+                        text=normalized,
+                        normalized_text=normalized,
+                        confidence=confidence,
+                        language=language,
+                        start=span[0],
+                        end=span[1],
+                        source="whisper",
+                    )
+                )
+        return units
+
+    def _build_units_from_segments(
+        self,
+        *,
+        whisper_result: Mapping[str, Any],
+        language: str,
+        default_confidence: float,
+        prompt: Optional[str],
+    ) -> list[TextTruthUnit]:
+        units: list[TextTruthUnit] = []
+        for segment in self._iter_segments(whisper_result):
+            span = self._resolve_time_span(start=segment.get("start"), end=segment.get("end"))
+            if span is None:
+                continue
+            text = self._sanitize_fragment(str(segment.get("text") or ""), prompt=prompt, strip=False)
+            if not text:
+                continue
+            tokens = self._split_tokens(text=text, language=language)
+            if not tokens:
+                continue
+            confidence = self._clamp_probability(segment.get("confidence"), default=default_confidence)
+            duration = max(1e-3, float(span[1] - span[0]))
+            token_weights = [max(len(str(token).strip()), 1) for token in tokens]
+            total_weight = max(sum(token_weights), 1)
+            cursor = float(span[0])
+            for index, token in enumerate(tokens):
+                weight = token_weights[index]
+                token_duration = duration * float(weight) / float(total_weight)
+                token_end = float(span[1]) if index == len(tokens) - 1 else min(float(span[1]), cursor + token_duration)
+                if token_end <= cursor:
+                    token_end = cursor + 0.01
+                units.append(
+                    TextTruthUnit(
+                        text=token,
+                        normalized_text=token,
+                        confidence=confidence,
+                        language=language,
+                        start=cursor,
+                        end=token_end,
+                        source="whisper",
+                    )
+                )
+                cursor = token_end
+        return units
+
+    def _build_synthetic_units(
+        self,
+        *,
+        text: str,
+        language: str,
+        confidence: float,
+    ) -> list[TextTruthUnit]:
+        normalized = self._sanitize_fragment(text, prompt=None, strip=False)
+        tokens = self._split_tokens(text=normalized, language=language)
+        if not tokens:
+            return []
+        units: list[TextTruthUnit] = []
+        cursor = 0.0
+        for token in tokens:
+            end = cursor + 0.12
+            units.append(
+                TextTruthUnit(
+                    text=token,
+                    normalized_text=token,
+                    confidence=confidence,
+                    language=language,
+                    start=cursor,
+                    end=end,
+                    source="whisper",
+                )
+            )
+            cursor = end
+        return units
+
+    @staticmethod
+    def _iter_segments(whisper_result: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+        raw_result = whisper_result.get("raw_result")
+        segments_from_raw = raw_result.get("segments") if isinstance(raw_result, Mapping) else None
+        segments = whisper_result.get("segments") or segments_from_raw or []
+        if not isinstance(segments, list):
+            return []
+        return [item for item in segments if isinstance(item, Mapping)]
+
+    @staticmethod
+    def _resolve_time_span(*, start: Any, end: Any) -> tuple[float, float] | None:
+        try:
+            span_start = float(start)
+            span_end = float(end)
+        except (TypeError, ValueError):
+            return None
+        if span_end <= span_start:
+            span_end = span_start + 0.01
+        return span_start, span_end
+
+    def _sanitize_fragment(
+        self,
+        text: str,
+        *,
+        prompt: Optional[str],
+        strip: bool = True,
+    ) -> str:
+        cleaned = str(self._sanitizer.sanitize_minimal(str(text or ""), prompt=prompt) or "")
+        return cleaned.strip() if strip else cleaned
+
+    @staticmethod
+    def _split_tokens(*, text: str, language: str) -> list[str]:
+        normalized = str(text or "")
+        if not normalized:
+            return []
+        if language in {"zh", "ja", "ko"}:
+            return [char for char in normalized if not char.isspace()]
+        token_pattern = re.compile(
+            r"[A-Za-z0-9]+(?:[’'._-][A-Za-z0-9]+)*|[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]|[^\s]",
+            re.UNICODE,
+        )
+        return [token for token in token_pattern.findall(normalized) if str(token).strip()]

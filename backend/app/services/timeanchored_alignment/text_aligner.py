@@ -390,9 +390,6 @@ class TextAligner:
         source_text = str(text_truth.raw_text or "")
         cursor = 0
         for unit in text_truth.units:
-            if unit.start is not None and unit.end is not None:
-                spans.append((int(unit.start), int(unit.end)))
-                continue
             token = str(unit.text or "")
             if source_text and token:
                 found = source_text.find(token, cursor)

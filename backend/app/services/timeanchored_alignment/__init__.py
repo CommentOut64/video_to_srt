@@ -60,6 +60,10 @@ from app.services.timeanchored_alignment.chunk_projector import (
     ChunkWindow,
 )
 from app.services.timeanchored_alignment.output_adapter import OutputAdapter
+from app.services.timeanchored_alignment.stage_service import (
+    TimeanchoredAlignmentStageService,
+    TimeanchoredStageResult,
+)
 from app.services.timeanchored_alignment.text_aligner import TextAligner, TextAlignerThresholds
 from app.services.timeanchored_alignment.text_alignment_scoring import (
     TextAlignmentScoreBreakdown,
@@ -139,6 +143,8 @@ __all__ = [
     "ChunkProjector",
     "ChunkWindow",
     "OutputAdapter",
+    "TimeanchoredAlignmentStageService",
+    "TimeanchoredStageResult",
     "SlowInferenceWindow",
     "SlowInferenceWindowEnvelope",
     "TextTruthPackage",

@@ -114,7 +114,7 @@ class FastWorker:
         return SenseVoiceTimeAdapter(vocab=vocab, blank_id=blank_id)
 
     def _is_timeanchored_alignment_enabled(self) -> bool:
-        """读取 alignment_pipeline flag。"""
+        """读取 alignment_pipeline flag（legacy 下线后默认强制开启）。"""
         runtime = get_model_runtime_config_service().get_effective_runtime_global()
         effective = runtime.get("effective", {}) if isinstance(runtime, dict) else {}
         override = runtime.get("override", {}) if isinstance(runtime, dict) else {}
@@ -132,11 +132,18 @@ class FastWorker:
         version = str(group.get("version", "") or "").lower()
         mode = str(group.get("mode", "") or "").lower()
         enabled = bool(group.get("enabled") or group.get("enable") or group.get("enable_timeanchored"))
+        if version == "legacy" or mode in {"legacy", "off"}:
+            self.logger.warning(
+                "alignment_pipeline 收到 legacy/off 配置，legacy 已下线，强制启用 timeanchored time_base 构建"
+            )
+            return True
         if version == "timeanchored":
             return True
         if mode in {"shadow", "active", "default", "timeanchored"}:
             return True
-        return enabled
+        if enabled:
+            return True
+        return True
 
     async def _run_sensevoice(self, chunk: AudioChunk) -> Dict[str, Any]:
         """
