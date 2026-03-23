@@ -3452,25 +3452,9 @@ class AsyncDualPipelineKernel:
         words_by_chunk: Dict[int, List[Dict[str, Any]]],
         ordered_indices: Sequence[int],
     ) -> int:
-        if len(ordered_indices) <= 1:
-            return 0
-
-        moved_word_count = 0
-        for left_idx, right_idx in zip(ordered_indices[:-1], ordered_indices[1:]):
-            left_words = list(words_by_chunk.get(left_idx) or [])
-            right_words = list(words_by_chunk.get(right_idx) or [])
-            if not left_words or not right_words:
-                continue
-
-            move_count = cls._resolve_whisper_tail_move_count(left_words, right_words)
-            if move_count <= 0 or move_count > len(left_words):
-                continue
-
-            moved_words = left_words[-move_count:]
-            words_by_chunk[left_idx] = left_words[:-move_count]
-            words_by_chunk[right_idx] = moved_words + right_words
-            moved_word_count += move_count
-        return moved_word_count
+        # Why: 慢流整窗回切只做时间回投，不在这里做语言级尾词搬移。
+        _ = (words_by_chunk, ordered_indices)
+        return 0
 
     @classmethod
     def _resolve_fragment_local_time_range(
@@ -4487,6 +4471,36 @@ class AsyncDualPipelineKernel:
         Why: 通过门面服务统一四层路径，保持实现层只负责阶段调度。
         """
         return self._textflow_facade_service.finalize_sensevoice_only(ctx)
+
+    def _finalize_timeanchored_stream(
+        self,
+        *,
+        final_stream: Sequence[Any],
+        boundary_evidences: Sequence[Any],
+        detected_language: str,
+        chosen_text_clean: str,
+        punctuation_positions: Optional[List[PuncPosition]],
+        punctuation_clean_text: Optional[str],
+        speaker_id: Optional[str],
+        turn_id: Optional[str],
+        coverage: float,
+        route_confidence: float,
+        error_code: str,
+    ) -> Layer456RunResult:
+        """兼容入口：委派 timeanchored 词流到统一裁决层。"""
+        return self._textflow_facade_service.finalize_timeanchored_stream(
+            final_stream=final_stream,
+            boundary_evidences=boundary_evidences,
+            detected_language=detected_language,
+            chosen_text_clean=chosen_text_clean,
+            punctuation_positions=punctuation_positions,
+            punctuation_clean_text=punctuation_clean_text,
+            speaker_id=speaker_id,
+            turn_id=turn_id,
+            coverage=coverage,
+            route_confidence=route_confidence,
+            error_code=error_code,
+        )
 
     def _update_soft_cut_observability(
         self,

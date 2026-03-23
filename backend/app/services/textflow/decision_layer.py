@@ -190,6 +190,7 @@ class SegmentationProcessor:
             fallback_punctuation_positions=list(
                 getattr(data, "fallback_punctuation_positions", []) or []
             ),
+            allow_fast_draft_fallback=bool(getattr(data, "allow_fast_draft_fallback", True)),
         )
         self._apply_output_traces_to_sentences(
             sentence_segments=all_sentence_segments,
@@ -386,6 +387,7 @@ class SegmentationProcessor:
         policy_snapshot: Optional["LanguagePolicySnapshot"] = None,
         fallback_clean_text_ref: str = "",
         fallback_punctuation_positions: Optional[Sequence[Any]] = None,
+        allow_fast_draft_fallback: bool = True,
     ) -> Tuple[List[SentenceSegment], List[str], List[OutputTrace]]:
         """
         按 CutPlan 执行词流切分。
@@ -396,13 +398,14 @@ class SegmentationProcessor:
         """
         decisions = list(getattr(cut_plan, "decisions", []) or [])
         if len(words_for_split) <= 1 or not decisions:
-            fast_draft_fallback = self._try_split_by_fast_draft_cuts(
-                words_for_split=words_for_split,
-                aligned_facts=aligned_facts,
-                policy_snapshot=policy_snapshot,
-            )
-            if fast_draft_fallback is not None:
-                return fast_draft_fallback
+            if allow_fast_draft_fallback:
+                fast_draft_fallback = self._try_split_by_fast_draft_cuts(
+                    words_for_split=words_for_split,
+                    aligned_facts=aligned_facts,
+                    policy_snapshot=policy_snapshot,
+                )
+                if fast_draft_fallback is not None:
+                    return fast_draft_fallback
             sentence_segments = self._final_splitter.split(
                 words_for_split,
                 clean_text=fallback_clean_text_ref or None,
@@ -429,20 +432,21 @@ class SegmentationProcessor:
             split_to_mapping=split_to_mapping,
         )
         if not split_points:
-            fast_draft_decision_fallback = self._try_split_by_fast_draft_decisions(
-                words_for_split=words_for_split,
-                decisions=decisions,
-                policy_snapshot=policy_snapshot,
-            )
-            if fast_draft_decision_fallback is not None:
-                return fast_draft_decision_fallback
-            fast_draft_fallback = self._try_split_by_fast_draft_cuts(
-                words_for_split=words_for_split,
-                aligned_facts=aligned_facts,
-                policy_snapshot=policy_snapshot,
-            )
-            if fast_draft_fallback is not None:
-                return fast_draft_fallback
+            if allow_fast_draft_fallback:
+                fast_draft_decision_fallback = self._try_split_by_fast_draft_decisions(
+                    words_for_split=words_for_split,
+                    decisions=decisions,
+                    policy_snapshot=policy_snapshot,
+                )
+                if fast_draft_decision_fallback is not None:
+                    return fast_draft_decision_fallback
+                fast_draft_fallback = self._try_split_by_fast_draft_cuts(
+                    words_for_split=words_for_split,
+                    aligned_facts=aligned_facts,
+                    policy_snapshot=policy_snapshot,
+                )
+                if fast_draft_fallback is not None:
+                    return fast_draft_fallback
             sentence_segments = self._final_splitter.split(
                 words_for_split,
                 clean_text=fallback_clean_text_ref or None,

@@ -243,6 +243,27 @@ class AlignmentItem:
 
 
 @dataclass(frozen=True)
+class BoundaryEvidence:
+    split_idx: int
+    event_time: float
+    left_end: float
+    right_start: float
+    reason: str
+    score: float
+    hard_flag: bool = False
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if int(self.split_idx) < 0:
+            raise ValueError("BoundaryEvidence.split_idx 必须 >= 0")
+        _ensure_probability("BoundaryEvidence.score", self.score)
+        if float(self.event_time) < 0.0:
+            raise ValueError("BoundaryEvidence.event_time 必须 >= 0")
+        if float(self.left_end) < 0.0 or float(self.right_start) < 0.0:
+            raise ValueError("BoundaryEvidence.left_end/right_start 必须 >= 0")
+
+
+@dataclass(frozen=True)
 class AlignmentMetrics:
     coverage: float = 0.0
     duration_ratio: float = 1.0

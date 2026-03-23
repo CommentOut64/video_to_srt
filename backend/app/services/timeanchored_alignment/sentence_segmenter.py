@@ -7,7 +7,11 @@ import re
 from typing import Iterable, Sequence
 
 from app.models.sensevoice_models import SentenceSegment, WordTimestamp
-from app.services.timeanchored_alignment.contracts import AlignmentItem, ProtectedSpan
+from app.services.timeanchored_alignment.contracts import (
+    AlignmentItem,
+    BoundaryEvidence,
+    ProtectedSpan,
+)
 
 
 _STRONG_END_PUNCT = frozenset({"。", "！", "？", ".", "!", "?"})
@@ -27,7 +31,12 @@ class SentenceSegmenterConfig:
 
 
 class SentenceSegmenter:
-    """终稿切分器。"""
+    """时间锚辅助器。
+
+    说明：
+    - `segment()` 仅保留给独立单测/工具链使用；
+    - 主链应使用 `collect_boundary_evidences()` 产出候选边界，再交给后续统一切分层。
+    """
 
     def __init__(self, *, config: SentenceSegmenterConfig | None = None) -> None:
         self._config = config or SentenceSegmenterConfig()
@@ -89,6 +98,122 @@ class SentenceSegmenter:
         if bucket:
             sentences.append(self._build_sentence(bucket, split_reason="tail_flush", language=language))
         return sentences
+
+    def collect_boundary_evidences(
+        self,
+        *,
+        stream: Sequence[AlignmentItem],
+        language: str = "auto",
+        protected_spans: Sequence[ProtectedSpan] = (),
+        speaker_boundaries: Sequence[float] = (),
+        blank_valley_boundaries: Sequence[float] = (),
+    ) -> list[BoundaryEvidence]:
+        if len(stream) <= 1:
+            return []
+
+        text, boundary_chars = self._render_stream_text_and_boundaries(stream=stream, language=language)
+        if protected_spans:
+            resolved_spans = tuple(protected_spans)
+        else:
+            from app.services.text_protection import extract_protected_spans
+
+            resolved_spans = tuple(extract_protected_spans(text))
+        speaker_marks = tuple(float(v) for v in speaker_boundaries)
+        blank_marks = tuple(float(v) for v in blank_valley_boundaries)
+
+        evidences: list[BoundaryEvidence] = []
+        for index, current in enumerate(stream[:-1]):
+            next_item = stream[index + 1]
+            boundary_char = boundary_chars[index]
+            left_end = float(current.end)
+            right_start = float(next_item.start)
+            event_time = self._resolve_boundary_event_time(
+                left_end=left_end,
+                right_start=right_start,
+            )
+
+            if self._is_boundary_protected(boundary_char=boundary_char, protected_spans=resolved_spans):
+                evidences.append(
+                    BoundaryEvidence(
+                        split_idx=index,
+                        event_time=event_time,
+                        left_end=left_end,
+                        right_start=right_start,
+                        reason="protected_span_block",
+                        score=1.0,
+                        hard_flag=True,
+                        metadata={"constraint": "block"},
+                    )
+                )
+                continue
+
+            speaker_mark = self._first_boundary_time_mark(
+                marks=speaker_marks,
+                left=left_end,
+                right=right_start,
+            )
+            if speaker_mark is not None:
+                evidences.append(
+                    BoundaryEvidence(
+                        split_idx=index,
+                        event_time=speaker_mark,
+                        left_end=left_end,
+                        right_start=right_start,
+                        reason="speaker_change",
+                        score=1.0,
+                        hard_flag=True,
+                    )
+                )
+
+            blank_mark = self._first_boundary_time_mark(
+                marks=blank_marks,
+                left=left_end,
+                right=right_start,
+            )
+            if blank_mark is not None:
+                evidences.append(
+                    BoundaryEvidence(
+                        split_idx=index,
+                        event_time=blank_mark,
+                        left_end=left_end,
+                        right_start=right_start,
+                        reason="blank_valley",
+                        score=0.95,
+                        hard_flag=True,
+                    )
+                )
+
+            gap = max(0.0, right_start - left_end)
+            if gap > 0.0:
+                long_pause = max(float(self._config.long_pause_gap_sec), 1e-6)
+                gap_score = max(0.05, min(1.0, gap / long_pause))
+                evidences.append(
+                    BoundaryEvidence(
+                        split_idx=index,
+                        event_time=event_time,
+                        left_end=left_end,
+                        right_start=right_start,
+                        reason="gap_pause",
+                        score=gap_score,
+                        hard_flag=False,
+                        metadata={"gap_sec": gap},
+                    )
+                )
+
+            if self._is_strong_end(current.text):
+                evidences.append(
+                    BoundaryEvidence(
+                        split_idx=index,
+                        event_time=event_time,
+                        left_end=left_end,
+                        right_start=right_start,
+                        reason="strong_punct",
+                        score=0.85,
+                        hard_flag=False,
+                    )
+                )
+
+        return evidences
 
     def _resolve_split_reason(
         self,
@@ -239,6 +364,22 @@ class SentenceSegmenter:
             if low <= float(value) <= high:
                 return True
         return False
+
+    @staticmethod
+    def _first_boundary_time_mark(*, marks: Iterable[float], left: float, right: float) -> float | None:
+        low = min(left, right)
+        high = max(left, right)
+        for value in marks:
+            resolved = float(value)
+            if low <= resolved <= high:
+                return resolved
+        return None
+
+    @staticmethod
+    def _resolve_boundary_event_time(*, left_end: float, right_start: float) -> float:
+        if right_start < left_end:
+            return float(left_end)
+        return (float(left_end) + float(right_start)) / 2.0
 
     @staticmethod
     def _is_strong_end(text: str) -> bool:

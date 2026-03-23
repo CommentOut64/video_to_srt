@@ -14,6 +14,7 @@ from app.services.timeanchored_alignment.chunk_projector import (
 )
 from app.services.timeanchored_alignment.contracts import (
     AlignmentItem,
+    BoundaryEvidence,
     FinalAlignmentResult,
     LanguageRunPackage,
     LayerReport,
@@ -38,6 +39,7 @@ class TimeanchoredStageResult:
     base_result: FinalAlignmentResult
     failed_spans: tuple[FailedSpan, ...]
     final_stream: tuple[AlignmentItem, ...]
+    boundary_evidences: tuple[BoundaryEvidence, ...]
     sentence_segments: tuple[SentenceSegment, ...]
     projections: tuple[ChunkProjection, ...]
     output_inputs: tuple[OutputLayerInput, ...]
@@ -104,40 +106,16 @@ class TimeanchoredAlignmentStageService:
             chunk_window=chunk_window,
         )
 
-        sentence_segments = tuple(
-            self._sentence_segmenter.segment(
+        boundary_evidences = tuple(
+            self._sentence_segmenter.collect_boundary_evidences(
                 stream=final_stream,
                 language=language,
                 protected_spans=text_truth.protected_spans,
             )
         )
-        if speaker_id or turn_id:
-            for sentence in sentence_segments:
-                if speaker_id and getattr(sentence, "speaker_id", None) is None:
-                    sentence.speaker_id = speaker_id
-                if turn_id and getattr(sentence, "turn_id", None) is None:
-                    sentence.turn_id = turn_id
-
-        projections = self._chunk_projector.project(
-            sentence_segments=sentence_segments,
-            chunk_windows=(chunk_window,),
-        )
-        output_inputs = tuple(
-            self._output_adapter.to_output_layer_inputs(
-                projections=projections,
-                language=language,
-                injection_report={
-                    "mapping_coverage": float(base_result.metrics.coverage),
-                    "error_code": str(base_result.error_code or ""),
-                },
-                segmentation_report={
-                    "route": "timeanchored",
-                    "text_route": text_result.route,
-                    "edge_route": edge_result.route,
-                    "error_code": str(base_result.error_code or ""),
-                },
-            )
-        )
+        sentence_segments: tuple[SentenceSegment, ...] = tuple()
+        projections: tuple[ChunkProjection, ...] = tuple()
+        output_inputs: tuple[OutputLayerInput, ...] = tuple()
 
         return TimeanchoredStageResult(
             text_result=text_result,
@@ -145,6 +123,7 @@ class TimeanchoredAlignmentStageService:
             base_result=base_result,
             failed_spans=failed_spans,
             final_stream=tuple(final_stream),
+            boundary_evidences=boundary_evidences,
             sentence_segments=sentence_segments,
             projections=projections,
             output_inputs=output_inputs,
@@ -155,6 +134,7 @@ class TimeanchoredAlignmentStageService:
                 edge_result=edge_result,
                 base_result=base_result,
                 failed_spans=failed_spans,
+                boundary_evidences=boundary_evidences,
                 sentence_count=len(sentence_segments),
                 output_count=len(output_inputs),
             ),
@@ -197,6 +177,7 @@ class TimeanchoredAlignmentStageService:
         edge_result: FinalAlignmentResult,
         base_result: FinalAlignmentResult,
         failed_spans: Sequence[FailedSpan],
+        boundary_evidences: Sequence[BoundaryEvidence],
         sentence_count: int,
         output_count: int,
     ) -> PipelineReport:
@@ -210,6 +191,7 @@ class TimeanchoredAlignmentStageService:
 
         phonetic_report = dict(getattr(self._text_aligner, "last_phonetic_report", {}) or {})
         phonetic_report.setdefault("trace_count", len(getattr(self._text_aligner, "last_phonetic_traces", ())))
+        raw_mount_trace = dict(getattr(self._text_aligner, "last_mount_trace", {}) or {})
 
         return PipelineReport(
             time_base_report=LayerReport(
@@ -248,6 +230,8 @@ class TimeanchoredAlignmentStageService:
                     "failed_span_count": len(failed_spans),
                     "coverage": float(base_result.metrics.coverage),
                     "route_confidence": float(base_result.metrics.route_confidence),
+                    "raw_mount_trace": raw_mount_trace,
+                    "raw_mount_pair_count": int(len(raw_mount_trace.get("mapping_pairs", []) or [])),
                 },
                 errors=tuple(warnings),
             ),
@@ -256,6 +240,10 @@ class TimeanchoredAlignmentStageService:
                 status="ok",
                 metrics={
                     "sentence_count": int(sentence_count),
+                    "boundary_candidate_count": int(len(boundary_evidences)),
+                    "hard_boundary_count": int(
+                        sum(1 for item in boundary_evidences if bool(item.hard_flag))
+                    ),
                 },
             ),
             output_report=LayerReport(

@@ -11,10 +11,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
+from app.models.confidence_models import AlignmentStatus
 from app.models.sensevoice_models import SentenceSegment, TextSource, WordTimestamp
 from app.schemas.pipeline_context import ProcessingContext
 from app.services.language_policy import build_language_policy_snapshot
 from app.services.alignment.types import (
+    AlignedWord,
     AlignedFacts,
     AnnotatedWord,
     AlignmentResult,
@@ -30,6 +32,7 @@ from app.services.alignment.types import (
     TextTrackBundle,
 )
 from app.services.text_protection import is_sentence_end_punct
+from app.services.timeanchored_alignment.contracts import AlignmentItem, BoundaryEvidence
 
 if TYPE_CHECKING:
     from app.services.language_policy.types import LanguagePolicySnapshot
@@ -500,6 +503,167 @@ class TextflowFacadeService:
             detected_language=run_result.detected_language,
         )
 
+    def finalize_timeanchored_stream(
+        self,
+        *,
+        final_stream: Sequence[AlignmentItem],
+        boundary_evidences: Sequence[BoundaryEvidence],
+        detected_language: str,
+        chosen_text_clean: str,
+        punctuation_positions: Optional[List[PuncPosition]],
+        punctuation_clean_text: Optional[str],
+        speaker_id: Optional[str],
+        turn_id: Optional[str],
+        coverage: float,
+        route_confidence: float,
+        error_code: str,
+    ) -> Layer456RunResult:
+        """将 timeanchored 词流交给统一裁决层，避免时间锚层直接产出最终句子。"""
+        words_for_split = self._build_timeanchored_word_timestamps(final_stream)
+        aligned_words = self._build_timeanchored_aligned_words(final_stream)
+        alignment_result = AlignmentResult(
+            aligned_words=aligned_words,
+            alignment_score=float(route_confidence),
+            gap_ratio=0.0,
+            gap_positions=[],
+            resolution=None,
+            coverage=float(coverage),
+        )
+        policy_snapshot: Optional["LanguagePolicySnapshot"] = None
+        try:
+            policy_snapshot = build_language_policy_snapshot(language_hint=str(detected_language or "auto"))
+        except Exception:
+            self._host.logger.exception(
+                "timeanchored 定稿路径语言策略快照编译失败: language_hint={}",
+                detected_language,
+            )
+
+        self._host._final_splitter.set_language(detected_language)
+        is_cjk_language = self._is_cjk_language_tag(detected_language)
+        self._host._final_splitter.set_cjk_split_mode(
+            is_enable_weak_punct=not is_cjk_language,
+            is_enable_semantic=True,
+        )
+        self._host._final_splitter.set_semantic_anchor_words(
+            list(getattr(policy_snapshot, "semantic_anchor_words", []) or [])
+        )
+
+        punct_track = PunctTrack(
+            clean_text_ref=str(punctuation_clean_text or chosen_text_clean or ""),
+            positions=list(punctuation_positions or []),
+            source="timeanchored_finalize",
+            confidence_stats={},
+        )
+        scoring_output = self._host._scoring_processor.process(
+            ScoringLayerInput(
+                alignment_result=alignment_result,
+                punct_track=punct_track,
+                language=detected_language,
+                speaker_id=speaker_id,
+                turn_id=turn_id,
+                policy_snapshot=policy_snapshot,
+            )
+        )
+        annotated_words = list(scoring_output.annotated_words or [])
+        injection_report = dict(scoring_output.injection_report or {})
+
+        aligned_facts = self._host._fact_builder.build(
+            annotated_words=annotated_words,
+            alignment_result=alignment_result,
+            speaker_turns=self._collect_speaker_turn_facts_for_words(words_for_split),
+            fast_draft_cuts=self._collect_timeanchored_boundary_cuts(
+                evidences=boundary_evidences,
+                words=words_for_split,
+                detected_language=detected_language,
+            ),
+            pyannote_frame_times=self._collect_timeanchored_hard_boundary_times(boundary_evidences),
+        )
+        fused_evidence = self._build_timeanchored_fused_evidence(boundary_evidences)
+
+        decision_chunk_index = self._host._resolve_chunk_index_from_words(words=words_for_split)
+        decision_is_last_chunk = self._host._is_last_chunk_for_words(words=words_for_split)
+        decision_stream_id = f"timeanchored:{speaker_id or 'main'}:{turn_id or 'none'}"
+        decision_output = self._host._decision_processor.process(
+            DecisionLayerInput(
+                annotated_words=annotated_words,
+                vad_intervals=self._host._vad_intervals,
+                cut_plan=None,
+                aligned_facts=aligned_facts,
+                fused_evidence=fused_evidence,
+                fallback_clean_text_ref=str(punctuation_clean_text or chosen_text_clean or ""),
+                fallback_punctuation_positions=list(punctuation_positions or []),
+                policy_snapshot=policy_snapshot,
+                allow_fast_draft_fallback=False,
+            ),
+            stream_id=decision_stream_id,
+            chunk_index=decision_chunk_index,
+            is_last_chunk=decision_is_last_chunk,
+        )
+
+        final_sentences = list(decision_output.sentence_segments)
+        output_traces = list(decision_output.output_traces or [])
+        split_stats = dict(self._host._final_splitter.last_split_stats or {})
+        split_stats.update(dict(decision_output.segmentation_report.get("boundary_score_stats", {})))
+        split_stats.update(dict(decision_output.segmentation_report.get("soft_cut_stats", {})))
+        split_stats["timeanchored_boundary_candidate_count"] = int(len(boundary_evidences))
+        split_stats["timeanchored_boundary_hard_count"] = int(
+            sum(1 for item in boundary_evidences if bool(item.hard_flag))
+        )
+        split_stats["timeanchored_boundary_pause_count"] = int(
+            sum(1 for item in boundary_evidences if str(item.reason) == "gap_pause")
+        )
+        split_stats["timeanchored_boundary_punct_count"] = int(
+            sum(1 for item in boundary_evidences if str(item.reason) == "strong_punct")
+        )
+        if error_code and not split_stats.get("error_code"):
+            split_stats["error_code"] = str(error_code)
+
+        if self._host._final_grouper:
+            final_sentences = self._host._final_grouper.group(final_sentences)
+
+        matched_ratio = self._host._compute_matched_ratio(alignment_result.aligned_words)
+        for sentence in final_sentences:
+            sentence.source = TextSource.WHISPER_PATCH
+            sentence.is_finalized = True
+            sentence.is_draft = False
+            sentence.alignment_score = alignment_result.alignment_score
+            sentence.matched_ratio = matched_ratio
+            sentence.confidence_source = self._host._resolve_sentence_confidence_source(sentence.words)
+            if sentence.confidence_source == "unknown":
+                sentence.confidence_source = "merged" if sentence.words else "unknown"
+            if sentence.speaker_id is None:
+                sentence.speaker_id = speaker_id
+            if sentence.turn_id is None:
+                sentence.turn_id = turn_id
+
+        return Layer456RunResult(
+            alignment_result=alignment_result,
+            aligned_facts=aligned_facts,
+            fused_evidence=fused_evidence,
+            words_for_split=list(decision_output.words_for_split),
+            injection_stats={
+                "injection_positions_total": int(len(punctuation_positions or [])),
+                "injection_unmatched_total": int(injection_report.get("mismatch_count", 0.0) or 0),
+                "injection_miss_ratio": (
+                    float(injection_report.get("mismatch_count", 0.0) or 0.0)
+                    / max(len(punctuation_positions or []), 1)
+                ),
+                "injection_mapping_coverage": float(
+                    injection_report.get("mapping_coverage", coverage) or 0.0
+                ),
+                "injection_blocked": float(injection_report.get("blocked", 0.0) or 0.0),
+                "injection_error_code": str(
+                    injection_report.get("error_code", "") or error_code or ""
+                ),
+            },
+            split_stats=split_stats,
+            final_sentences=final_sentences,
+            output_traces=output_traces,
+            alignment_time_source="timeanchored",
+            alignment_time_word_count=len(words_for_split),
+            detected_language=str(detected_language or "auto"),
+        )
+
     def _resolve_alignment_time_words(
         self,
         *,
@@ -755,6 +919,171 @@ class TextflowFacadeService:
             if len(selected_times) >= max_candidate_count:
                 break
         return selected_times
+
+    @staticmethod
+    def _build_timeanchored_word_timestamps(
+        stream: Sequence[AlignmentItem],
+    ) -> List[WordTimestamp]:
+        words: List[WordTimestamp] = []
+        for item in stream:
+            confidence_source = TextflowFacadeService._normalize_timeanchored_confidence_source(
+                getattr(item, "source", None)
+            )
+            words.append(
+                WordTimestamp(
+                    word=str(item.text or ""),
+                    start=float(item.start),
+                    end=float(item.end),
+                    confidence=item.confidence,
+                    confidence_source=confidence_source,
+                    is_pseudo=str(item.status or "") in {"failed", "interpolated"},
+                )
+            )
+        return words
+
+    @staticmethod
+    def _build_timeanchored_aligned_words(
+        stream: Sequence[AlignmentItem],
+    ) -> List[AlignedWord]:
+        aligned_words: List[AlignedWord] = []
+        for item in stream:
+            status = AlignmentStatus.MATCHED
+            if str(item.status or "") in {"failed", "interpolated"}:
+                status = AlignmentStatus.PSEUDO
+            confidence_source = TextflowFacadeService._normalize_timeanchored_confidence_source(
+                getattr(item, "source", None)
+            )
+            aligned_words.append(
+                AlignedWord(
+                    word=str(item.text or ""),
+                    start=float(item.start),
+                    end=float(item.end),
+                    sv_confidence=item.confidence,
+                    whisper_confidence=None,
+                    final_confidence=item.confidence,
+                    confidence_source=confidence_source,
+                    alignment_status=status,
+                    is_pseudo=str(item.status or "") in {"failed", "interpolated"},
+                    sv_original=str(item.text or ""),
+                    whisper_original=str(item.text or ""),
+                )
+            )
+        return aligned_words
+
+    @staticmethod
+    def _build_timeanchored_annotated_words(
+        stream: Sequence[AlignmentItem],
+        *,
+        speaker_id: Optional[str],
+        turn_id: Optional[str],
+    ) -> List[AnnotatedWord]:
+        rows: List[AnnotatedWord] = []
+        for item in stream:
+            confidence_source = TextflowFacadeService._normalize_timeanchored_confidence_source(
+                getattr(item, "source", None)
+            )
+            rows.append(
+                AnnotatedWord(
+                    word=str(item.text or ""),
+                    start=float(item.start),
+                    end=float(item.end),
+                    confidence=item.confidence,
+                    confidence_source=confidence_source,
+                    is_pseudo=str(item.status or "") in {"failed", "interpolated"},
+                    speaker_id=speaker_id,
+                    turn_id=turn_id,
+                    track_id="timeanchored",
+                )
+            )
+        return rows
+
+    @staticmethod
+    def _normalize_timeanchored_confidence_source(source: Any) -> str:
+        normalized = str(source or "").strip().lower()
+        if not normalized:
+            return "unknown"
+        if "mixed" in normalized or "merged" in normalized:
+            return "merged"
+        if "timeanchored" in normalized or normalized == "alignment":
+            return "merged"
+        if "fast" in normalized or "sensevoice" in normalized:
+            return "fast"
+        if (
+            "slow" in normalized
+            or "whisper" in normalized
+            or "text_align" in normalized
+            or "phonetic" in normalized
+        ):
+            return "slow"
+        return "unknown"
+
+    @staticmethod
+    def _collect_timeanchored_boundary_cuts(
+        *,
+        evidences: Sequence[BoundaryEvidence],
+        words: Sequence[WordTimestamp],
+        detected_language: str,
+    ) -> List[float]:
+        cuts: List[float] = []
+        is_dense_cjk_stream = (
+            TextflowFacadeService._is_cjk_language_tag(detected_language)
+            and TextflowFacadeService._is_dense_cjk_char_stream(words)
+        )
+        for item in evidences or []:
+            reason = str(getattr(item, "reason", "") or "")
+            if reason == "protected_span_block":
+                continue
+            score = float(getattr(item, "score", 0.0) or 0.0)
+            if is_dense_cjk_stream and not bool(getattr(item, "hard_flag", False)):
+                if score < 0.60:
+                    continue
+            cuts.append(float(getattr(item, "event_time", 0.0) or 0.0))
+        return TextflowFacadeService._dedupe_sorted_fast_draft_cut_times(cuts)
+
+    @staticmethod
+    def _collect_timeanchored_hard_boundary_times(
+        evidences: Sequence[BoundaryEvidence],
+    ) -> List[float]:
+        hard_times = [
+            float(getattr(item, "event_time", 0.0) or 0.0)
+            for item in evidences or []
+            if bool(getattr(item, "hard_flag", False))
+            and str(getattr(item, "reason", "") or "") != "protected_span_block"
+        ]
+        return TextflowFacadeService._dedupe_sorted_fast_draft_cut_times(hard_times)
+
+    @staticmethod
+    def _build_timeanchored_fused_evidence(
+        evidences: Sequence[BoundaryEvidence],
+    ) -> FusedEvidence:
+        speaker_changes: List[Dict[str, Any]] = []
+        pause_anchors: List[Dict[str, Any]] = []
+        punctuation_anchors: List[Dict[str, Any]] = []
+        for item in evidences or []:
+            payload = {
+                "time": float(getattr(item, "event_time", 0.0) or 0.0),
+                "score": float(getattr(item, "score", 0.0) or 0.0),
+                "hard_flag": bool(getattr(item, "hard_flag", False)),
+                "reason": str(getattr(item, "reason", "") or ""),
+            }
+            reason = payload["reason"]
+            if reason == "speaker_change":
+                speaker_changes.append(payload)
+            elif reason == "gap_pause":
+                pause_anchors.append(payload)
+            elif reason == "strong_punct":
+                punctuation_anchors.append(payload)
+        return FusedEvidence(
+            speaker_changes=speaker_changes,
+            pause_anchors=pause_anchors,
+            semantic_anchors=[],
+            punctuation_anchors=punctuation_anchors,
+            evidence_report={
+                "source": "timeanchored_boundary_evidence",
+                "candidate_count": int(len(evidences or [])),
+                "hard_count": int(sum(1 for item in evidences or [] if bool(item.hard_flag))),
+            },
+        )
 
     @staticmethod
     def _is_dense_cjk_char_stream(

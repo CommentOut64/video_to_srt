@@ -293,6 +293,7 @@ class DecisionLayerInput:
     fallback_clean_text_ref: str = ""
     fallback_punctuation_positions: List[PuncPosition] = field(default_factory=list)
     policy_snapshot: Optional["LanguagePolicySnapshot"] = None
+    allow_fast_draft_fallback: bool = True
 
 
 @dataclass

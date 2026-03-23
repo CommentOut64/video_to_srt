@@ -837,23 +837,50 @@ class AlignmentStageService:
         turn_id: Optional[str],
     ) -> None:
         host = self._host
-        final_sentences = list(stage_result.sentence_segments)
+        language = str(
+            getattr(ctx.text_truth, "language", "")
+            or whisper_result.get("language")
+            or "auto"
+        )
+        chosen_text_clean = str(
+            getattr(ctx.text_truth, "normalized_text", "")
+            or getattr(ctx.text_truth, "raw_text", "")
+            or ""
+        ).strip()
+        if not chosen_text_clean:
+            chosen_text_clean = self._resolve_text_fallback_content(
+                chosen_text_clean="",
+                tracks=ctx.text_tracks,
+                whisper_result=whisper_result,
+                sv_result=sv_result,
+            )
+        punct_track = ctx.punct_track
+        run_result = host._finalize_timeanchored_stream(
+            final_stream=stage_result.final_stream,
+            boundary_evidences=stage_result.boundary_evidences,
+            detected_language=language,
+            chosen_text_clean=chosen_text_clean,
+            punctuation_positions=list(punct_track.positions) if punct_track and punct_track.positions else [],
+            punctuation_clean_text=(
+                str(punct_track.clean_text_ref or "")
+                if punct_track is not None
+                else chosen_text_clean
+            ),
+            speaker_id=speaker_id,
+            turn_id=turn_id,
+            coverage=float(stage_result.base_result.metrics.coverage),
+            route_confidence=float(stage_result.base_result.metrics.route_confidence),
+            error_code=str(stage_result.base_result.error_code or ""),
+        )
+        final_sentences = list(run_result.final_sentences)
         fallback_error_code = ""
         if not final_sentences:
-            fallback_text = self._timeanchored_sentence_segmenter.compose_text(
+            fallback_text = chosen_text_clean or self._timeanchored_sentence_segmenter.compose_text(
                 stream=stage_result.final_stream,
-                language=str(
-                    getattr(ctx.text_truth, "language", "")
-                    or whisper_result.get("language")
-                    or "auto"
-                ),
+                language=language,
             ).strip()
             if not fallback_text:
-                fallback_text = str(
-                    getattr(ctx.text_truth, "normalized_text", "")
-                    or getattr(ctx.text_truth, "raw_text", "")
-                    or ""
-                ).strip()
+                fallback_text = chosen_text_clean
             fallback_confidence = self._resolve_text_fallback_confidence(
                 chosen_source=str(getattr(ctx.arbitration_result, "chosen_source", "") or "slow"),
                 whisper_result=whisper_result,
@@ -879,35 +906,62 @@ class AlignmentStageService:
             final_sentences,
             fallback_chunk=ctx.audio_chunk,
         )
+        output_traces = host._normalize_output_traces_for_sentences(
+            final_sentences=final_sentences,
+            output_traces=list(run_result.output_traces or []),
+            default_reason="timeanchored_chain",
+        )
+
+        alignment_result = run_result.alignment_result
+        aligned_facts = run_result.aligned_facts
+        fused_evidence = run_result.fused_evidence
+        injection_stats = dict(run_result.injection_stats)
+        split_stats = dict(run_result.split_stats)
+        soft_cut_observe_snapshot = host._update_soft_cut_observability(
+            split_stats=split_stats,
+            chunk_index=ctx.chunk_index,
+            stage="timeanchored_alignment_stage",
+        )
 
         output_layer_result = host._emit_output_layer(
             chunk_index=ctx.chunk_index,
             sentence_segments=final_sentences,
-            language=str(
-                getattr(ctx.text_truth, "language", "")
-                or whisper_result.get("language")
-                or "auto"
-            ),
+            language=language,
             injection_report={
-                "mapping_coverage": float(stage_result.base_result.metrics.coverage),
-                "error_code": str(stage_result.base_result.error_code or ""),
+                "mapping_coverage": float(
+                    injection_stats.get("injection_mapping_coverage", 0.0)
+                ),
+                "mismatch_count": float(
+                    injection_stats.get("injection_unmatched_total", 0.0)
+                ),
+                "error_code": str(injection_stats.get("injection_error_code", "") or ""),
+                "blocked": float(injection_stats.get("injection_blocked", 0.0)),
             },
             segmentation_report={
+                "boundary_score_stats": dict(split_stats),
+                "forced_split_count": float(split_stats.get("force_split_count", 0.0)),
                 "route": "timeanchored",
                 "text_route": stage_result.text_result.route,
                 "edge_route": stage_result.edge_result.route,
-                "error_code": str(stage_result.base_result.error_code or fallback_error_code),
+                "error_code": str(
+                    split_stats.get("error_code", "")
+                    or stage_result.base_result.error_code
+                    or fallback_error_code
+                ),
             },
-            output_traces=[],
+            output_traces=output_traces,
             default_trace_reason="timeanchored_chain",
         )
         ctx.final_sentences = list(final_sentences)
         ctx.finalization_metrics = {
-            "coverage": float(stage_result.base_result.metrics.coverage),
-            "gap_ratio": 0.0,
-            "alignment_score": float(stage_result.base_result.metrics.route_confidence),
-            "gap_positions": [],
-            "gap_resolution": None,
+            "coverage": alignment_result.coverage,
+            "gap_ratio": alignment_result.gap_ratio,
+            "alignment_score": alignment_result.alignment_score,
+            "gap_positions": list(alignment_result.gap_positions),
+            "gap_resolution": (
+                alignment_result.resolution.value if alignment_result.resolution else None
+            ),
+            **injection_stats,
             "timeanchored_enabled": 1.0,
             "timeanchored_text_route": stage_result.text_result.route,
             "timeanchored_edge_route": stage_result.edge_result.route,
@@ -915,12 +969,32 @@ class AlignmentStageService:
             "timeanchored_item_count": float(len(stage_result.final_stream)),
             "timeanchored_sentence_count": float(len(final_sentences)),
             "timeanchored_failed_span_count": float(len(stage_result.failed_spans)),
+            "timeanchored_boundary_candidate_count": float(len(stage_result.boundary_evidences)),
             "l7_error_count": float(len(output_layer_result.output_payload.get("errors", []))),
         }
+        for key, value in split_stats.items():
+            ctx.finalization_metrics[f"split_{key}"] = value
+        for key, value in soft_cut_observe_snapshot.items():
+            ctx.finalization_metrics[f"soft_cut_obs_{key}"] = value
+        ctx.finalization_metrics["fact_word_count"] = float(len(aligned_facts.annotated_words))
+        ctx.finalization_metrics["fact_turn_count"] = float(len(aligned_facts.speaker_turns))
+        ctx.finalization_metrics["fact_mapping_count"] = float(len(aligned_facts.time_mappings))
+        ctx.finalization_metrics["evidence_speaker_change_count"] = float(
+            len(fused_evidence.speaker_changes)
+        )
+        ctx.finalization_metrics["evidence_pause_anchor_count"] = float(
+            len(fused_evidence.pause_anchors)
+        )
+        ctx.finalization_metrics["evidence_semantic_anchor_count"] = float(
+            len(fused_evidence.semantic_anchors)
+        )
+        ctx.finalization_metrics["evidence_punctuation_anchor_count"] = float(
+            len(fused_evidence.punctuation_anchors)
+        )
         if fallback_error_code:
             ctx.finalization_metrics["timeanchored_error_code"] = fallback_error_code
         if ctx.arbitration_result:
-            ctx.arbitration_result.gap_positions = []
+            ctx.arbitration_result.gap_positions = list(alignment_result.gap_positions)
         host.logger.debug(
             "Chunk {}: timeanchored 主链完成 sentences={} route={}",
             ctx.chunk_index,
@@ -946,10 +1020,34 @@ class AlignmentStageService:
         turn_id = host._resolve_turn_id_for_chunk(chunk)
         sv_words = host._build_sv_word_timestamps(sv_result, chunk)
         fast_stream = self._build_fast_direct_stream(words=sv_words)
-        final_sentences = self._timeanchored_sentence_segmenter.segment(
+        boundary_evidences = self._timeanchored_sentence_segmenter.collect_boundary_evidences(
             stream=fast_stream,
             language=language,
         )
+        run_result = host._finalize_timeanchored_stream(
+            final_stream=fast_stream,
+            boundary_evidences=boundary_evidences,
+            detected_language=language,
+            chosen_text_clean=str(
+                sv_result.get("text_clean")
+                or sv_result.get("text_itn_raw")
+                or sv_result.get("text")
+                or ""
+            ).strip(),
+            punctuation_positions=[],
+            punctuation_clean_text=str(
+                sv_result.get("text_clean")
+                or sv_result.get("text_itn_raw")
+                or sv_result.get("text")
+                or ""
+            ).strip(),
+            speaker_id=speaker_id,
+            turn_id=turn_id,
+            coverage=1.0 if fast_stream else 0.0,
+            route_confidence=1.0 if fast_stream else 0.0,
+            error_code="",
+        )
+        final_sentences = list(run_result.final_sentences)
 
         fallback_error_code = ""
         if not final_sentences:
@@ -991,22 +1089,43 @@ class AlignmentStageService:
             final_sentences,
             fallback_chunk=chunk,
         )
+        output_traces = host._normalize_output_traces_for_sentences(
+            final_sentences=final_sentences,
+            output_traces=list(run_result.output_traces or []),
+            default_reason="fast_direct",
+        )
+        split_stats = dict(run_result.split_stats)
+        soft_cut_observe_snapshot = host._update_soft_cut_observability(
+            split_stats=split_stats,
+            chunk_index=ctx.chunk_index,
+            stage="fast_direct_alignment_stage",
+        )
 
         output_layer_result = host._emit_output_layer(
             chunk_index=ctx.chunk_index,
             sentence_segments=final_sentences,
             language=language,
             injection_report={
-                "mapping_coverage": 1.0 if fast_stream else 0.0,
-                "error_code": fallback_error_code,
+                "mapping_coverage": float(
+                    run_result.injection_stats.get("injection_mapping_coverage", 0.0)
+                ),
+                "mismatch_count": float(
+                    run_result.injection_stats.get("injection_unmatched_total", 0.0)
+                ),
+                "error_code": str(
+                    run_result.injection_stats.get("injection_error_code", "") or fallback_error_code
+                ),
+                "blocked": float(run_result.injection_stats.get("injection_blocked", 0.0)),
             },
             segmentation_report={
+                "boundary_score_stats": dict(split_stats),
+                "forced_split_count": float(split_stats.get("force_split_count", 0.0)),
                 "route": "fast_direct",
                 "text_route": "fast_direct",
                 "edge_route": "fast",
-                "error_code": fallback_error_code,
+                "error_code": str(split_stats.get("error_code", "") or fallback_error_code),
             },
-            output_traces=[],
+            output_traces=output_traces,
             default_trace_reason="fast_direct",
         )
 
@@ -1020,10 +1139,10 @@ class AlignmentStageService:
         }
         ctx.hetero_alignment_report = dict(ctx.hetero_alignment_result)
         ctx.finalization_metrics = {
-            "coverage": 1.0 if fast_stream else 0.0,
-            "gap_ratio": 0.0,
-            "alignment_score": 1.0 if fast_stream else 0.0,
-            "gap_positions": [],
+            "coverage": run_result.alignment_result.coverage,
+            "gap_ratio": run_result.alignment_result.gap_ratio,
+            "alignment_score": run_result.alignment_result.alignment_score,
+            "gap_positions": list(run_result.alignment_result.gap_positions),
             "gap_resolution": None,
             "fast_direct_enabled": 1.0,
             "alignment_pipeline_mode": "fast_direct",
@@ -1037,8 +1156,15 @@ class AlignmentStageService:
             "timeanchored_item_count": float(len(fast_stream)),
             "timeanchored_sentence_count": float(len(final_sentences)),
             "timeanchored_failed_span_count": 0.0,
+            "timeanchored_boundary_candidate_count": float(len(boundary_evidences)),
             "l7_error_count": float(len(output_layer_result.output_payload.get("errors", []))),
         }
+        for key, value in run_result.injection_stats.items():
+            ctx.finalization_metrics[key] = value
+        for key, value in split_stats.items():
+            ctx.finalization_metrics[f"split_{key}"] = value
+        for key, value in soft_cut_observe_snapshot.items():
+            ctx.finalization_metrics[f"soft_cut_obs_{key}"] = value
         if fallback_error_code:
             ctx.finalization_metrics["timeanchored_error_code"] = fallback_error_code
 
@@ -1066,7 +1192,7 @@ class AlignmentStageService:
             "reason": str(reason),
             "route": route,
             "sentence_count": (
-                int(len(stage_result.sentence_segments))
+                int(len(stage_result.final_stream))
                 if stage_result is not None
                 else 0
             ),
@@ -1099,8 +1225,6 @@ class AlignmentStageService:
             return False, f"{mode}_gate_route_error"
         if not stage_result.final_stream:
             return False, f"{mode}_gate_empty_stream"
-        if not stage_result.sentence_segments:
-            return False, f"{mode}_gate_empty_sentences"
         if mode == "default":
             return True, "default_gate_pass"
         return True, f"{mode}_gate_pass"

@@ -230,6 +230,14 @@ class DiagnosticTraceService:
             ]
         )
         l0_batch_trace = getattr(ctx, "_trace_l0_batch_whisper", {}) or {}
+        hetero_alignment_report = getattr(ctx, "hetero_alignment_report", None)
+        timeanchored_alignment = hetero_alignment_report if isinstance(hetero_alignment_report, dict) else {}
+        timeanchored_alignment_report = timeanchored_alignment.get("alignment_report", {})
+        if not isinstance(timeanchored_alignment_report, dict):
+            timeanchored_alignment_report = {}
+        timeanchored_alignment_metrics = timeanchored_alignment_report.get("metrics", {})
+        if not isinstance(timeanchored_alignment_metrics, dict):
+            timeanchored_alignment_metrics = {}
         payload: Dict[str, Any] = {
             "job_id": ctx.job_id,
             "chunk_index": int(ctx.chunk_index),
@@ -310,6 +318,10 @@ class DiagnosticTraceService:
                 "split_stats": dict(split_stats),
                 "final_sentences": self._serialize_sentences(final_sentences),
                 "output_trace": self._serialize_output_traces(output_traces),
+            },
+            "timeanchored_alignment": {
+                "report": timeanchored_alignment,
+                "raw_mount_trace": dict(timeanchored_alignment_metrics.get("raw_mount_trace", {}) or {}),
             },
             "current_punct_track": {
                 "source": str(punct_track.source if punct_track else ""),

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence
 
 from app.models.confidence_models import AlignedWord, AlignmentStatus
 from app.services.alignment.gap_resolver import GapResolution, GapResolver
@@ -62,6 +62,7 @@ class TextAligner:
         self._phonetic_aligner = phonetic_aligner
         self._last_phonetic_report: dict[str, object] = {}
         self._last_phonetic_traces: tuple["PhoneticRescueTrace", ...] = tuple()
+        self._last_mount_trace: dict[str, object] = {}
 
     @property
     def last_phonetic_report(self) -> dict[str, object]:
@@ -70,6 +71,10 @@ class TextAligner:
     @property
     def last_phonetic_traces(self) -> tuple["PhoneticRescueTrace", ...]:
         return tuple(self._last_phonetic_traces)
+
+    @property
+    def last_mount_trace(self) -> dict[str, object]:
+        return dict(self._last_mount_trace)
 
     def align_window(
         self,
@@ -81,6 +86,7 @@ class TextAligner:
     ) -> FinalAlignmentResult:
         self._last_phonetic_report = {}
         self._last_phonetic_traces = tuple()
+        self._last_mount_trace = {}
         if language_runs.window_kind == WINDOW_KIND_TRUE_MIXED:
             self._last_phonetic_report = {"skipped": True, "reason": "true_mixed_window"}
             return self._error_result(
@@ -250,6 +256,12 @@ class TextAligner:
         direct_ratio = float(direct_count) / float(total)
         estimated_ratio = float(estimated_count) / float(total)
         coverage = float(total - failed_count) / float(total)
+        self._last_mount_trace = self._build_mount_trace(
+            time_units=time_units,
+            text_units=text_truth.units,
+            mapping=mapping,
+            items=items,
+        )
 
         route = "text"
         error_code = None
@@ -290,6 +302,64 @@ class TextAligner:
         self._last_phonetic_report = dict(rescue.report or {})
         self._last_phonetic_traces = tuple(rescue.traces or tuple())
         return rescue.alignment
+
+    @staticmethod
+    def _build_mount_trace(
+        *,
+        time_units: Sequence[TimeBaseUnit],
+        text_units: Sequence[Any],
+        mapping: Mapping[int, int],
+        items: Sequence[AlignmentItem],
+    ) -> dict[str, object]:
+        mapping_pairs = []
+        for text_index in sorted(mapping.keys()):
+            time_index = int(mapping[text_index])
+            time_unit = time_units[time_index]
+            text_unit = text_units[text_index]
+            aligned_item = items[text_index] if text_index < len(items) else None
+            mapping_pairs.append(
+                {
+                    "text_index": int(text_index),
+                    "time_index": int(time_index),
+                    "text": str(getattr(text_unit, "text", "") or ""),
+                    "time_text": str(getattr(time_unit, "text", "") or ""),
+                    "time_start": float(getattr(time_unit, "start", 0.0) or 0.0),
+                    "time_end": float(getattr(time_unit, "end", 0.0) or 0.0),
+                    "status": str(getattr(aligned_item, "status", "") or ""),
+                    "confidence": float(getattr(aligned_item, "confidence", 0.0) or 0.0),
+                }
+            )
+
+        return {
+            "time_units": [
+                {
+                    "index": int(index),
+                    "text": str(unit.text or ""),
+                    "start": float(unit.start),
+                    "end": float(unit.end),
+                    "confidence": float(unit.confidence),
+                    "token_type": str(unit.token_type or ""),
+                }
+                for index, unit in enumerate(time_units)
+            ],
+            "text_units": [
+                {
+                    "index": int(index),
+                    "text": str(getattr(unit, "text", "") or ""),
+                    "normalized_text": str(getattr(unit, "normalized_text", "") or ""),
+                    "start": getattr(unit, "start", None),
+                    "end": getattr(unit, "end", None),
+                    "confidence": float(getattr(unit, "confidence", 0.0) or 0.0),
+                }
+                for index, unit in enumerate(text_units)
+            ],
+            "mapping_pairs": mapping_pairs,
+            "unmapped_text_indices": [
+                int(index)
+                for index in range(len(text_units))
+                if index not in mapping
+            ],
+        }
 
     def _resolve_thresholds(self, language: str) -> TextAlignerThresholds:
         snapshot = build_language_policy_snapshot(
