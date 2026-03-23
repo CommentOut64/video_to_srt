@@ -243,3 +243,163 @@ def test_render_core_can_hide_inner_punctuation() -> None:
     )
 
     assert result.subtitles[0].text_display == "Hello world"
+
+
+def test_render_core_does_not_duplicate_consumed_terminal_question_mark() -> None:
+    core = RenderCore()
+    stream = CanonicalTextStream(
+        stream_id="s-en",
+        chunk_ref="chunk-en",
+        language="en",
+        text_source="slow",
+        tokens=(
+            CoreToken(
+                token_id="t0",
+                index=0,
+                text_core="Hello",
+                normalized_text="hello",
+                start=0.0,
+                end=0.5,
+                source="slow",
+            ),
+            CoreToken(
+                token_id="t1",
+                index=1,
+                text_core="world",
+                normalized_text="world",
+                start=0.5,
+                end=1.0,
+                source="slow",
+            ),
+        ),
+        punctuation_facts=(
+            PunctuationFact(
+                fact_id="pf-question",
+                left_token_index=1,
+                right_token_index=1,
+                attach_mode="trailing",
+                raw_text="?",
+                normalized_text="?",
+                punct_class="sentence_end",
+                source="slow",
+            ),
+        ),
+    )
+    segmentation = SegmentationResult(
+        segments=(
+            SegmentPlan(
+                segment_id="seg-question",
+                token_start=0,
+                token_end=1,
+                start=0.0,
+                end=1.0,
+                boundary_reason="punctuation",
+                boundary_score=0.9,
+                consumed_boundary_punct=ConsumedBoundaryPunct(
+                    fact_id="pf-question",
+                    raw_text="?",
+                    normalized_text="?",
+                    punct_class="sentence_end",
+                    source="slow",
+                    render_hint="keep",
+                ),
+            ),
+        )
+    )
+
+    result = core.render(
+        canonical_stream=stream,
+        segmentation_result=segmentation,
+        policy=RenderPolicy(),
+    )
+
+    assert result.subtitles[0].text_display == "Hello world?"
+
+
+def test_render_core_preserves_and_normalizes_time_expressions() -> None:
+    core = RenderCore()
+
+    assert core._standardize_english_punctuation("It's still only 7:28 PM") == "It's still only 7:28 PM"
+    assert core._standardize_english_punctuation("It's still only 7:28, PM") == "It's still only 7:28 PM"
+    assert core._standardize_english_punctuation("It's still only 7: 28, PM") == "It's still only 7:28 PM"
+    assert core._standardize_english_punctuation("Meet me at 07:28p.m. sharp") == "Meet me at 07:28 p.m. sharp"
+
+
+def test_render_core_normalizes_time_expression_from_split_tokens_and_punct_facts() -> None:
+    core = RenderCore()
+    stream = CanonicalTextStream(
+        stream_id="s-time",
+        chunk_ref="chunk-time",
+        language="en",
+        text_source="slow",
+        tokens=(
+            CoreToken(
+                token_id="t0",
+                index=0,
+                text_core="7",
+                normalized_text="7",
+                start=0.0,
+                end=0.1,
+                source="slow",
+            ),
+            CoreToken(
+                token_id="t1",
+                index=1,
+                text_core="28",
+                normalized_text="28",
+                start=0.1,
+                end=0.2,
+                source="slow",
+            ),
+            CoreToken(
+                token_id="t2",
+                index=2,
+                text_core="PM",
+                normalized_text="pm",
+                start=0.2,
+                end=0.3,
+                source="slow",
+            ),
+        ),
+        punctuation_facts=(
+            PunctuationFact(
+                fact_id="pf-colon",
+                left_token_index=0,
+                right_token_index=1,
+                attach_mode="between",
+                raw_text=":",
+                normalized_text=":",
+                punct_class="weak",
+                source="aligned",
+            ),
+            PunctuationFact(
+                fact_id="pf-comma",
+                left_token_index=1,
+                right_token_index=2,
+                attach_mode="between",
+                raw_text=",",
+                normalized_text=",",
+                punct_class="weak",
+                source="aligned",
+            ),
+        ),
+    )
+    segmentation = SegmentationResult(
+        segments=(
+            SegmentPlan(
+                segment_id="seg-time",
+                token_start=0,
+                token_end=2,
+                start=0.0,
+                end=0.3,
+            ),
+        )
+    )
+
+    result = core.render(
+        canonical_stream=stream,
+        segmentation_result=segmentation,
+        policy=RenderPolicy(),
+    )
+
+    assert result.subtitles[0].text_display == "7:28 PM"

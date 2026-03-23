@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Iterable, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Iterable, Optional, Sequence, Tuple
 
 from app.models.sensevoice_models import WordTimestamp
-from app.services.timeanchored_alignment.contracts import ProtectedSpan
+
+if TYPE_CHECKING:
+    from app.services.timeanchored_alignment.contracts import ProtectedSpan
 
 _DEFAULT_SENTENCE_END_CHARS = ("。", "！", "？", ".", "!", "?")
 
@@ -42,6 +44,17 @@ class BaseTextProtectionRule:
 
     def extract_protected_spans(self, text: str) -> Tuple[ProtectedSpan, ...]:
         return tuple()
+
+
+def _build_protected_span(*, start: int, end: int, kind: str, text: str = "") -> "ProtectedSpan":
+    from app.services.timeanchored_alignment.contracts import ProtectedSpan
+
+    return ProtectedSpan(
+        start=int(start),
+        end=int(end),
+        kind=str(kind or ""),
+        text=str(text or ""),
+    )
 
 
 class DecimalProtectionRule(BaseTextProtectionRule):
@@ -168,14 +181,69 @@ class DecimalProtectionRule(BaseTextProtectionRule):
     def extract_protected_spans(self, text: str) -> Tuple[ProtectedSpan, ...]:
         spans: list[ProtectedSpan] = []
         for matched in self._DECIMAL_PATTERN.finditer(text):
-            spans.append(
-                ProtectedSpan(
-                    start=matched.start(),
-                    end=matched.end(),
-                    kind="decimal",
-                    text=matched.group(0),
-                )
-            )
+            spans.append(_build_protected_span(
+                start=matched.start(),
+                end=matched.end(),
+                kind="decimal",
+                text=matched.group(0),
+            ))
+        return tuple(spans)
+
+
+class TimeExpressionProtectionRule(BaseTextProtectionRule):
+    """时间表达保护规则（如 7:28 PM / 07:28 p.m. / 7:28:09PM）。"""
+
+    rule_id = "time_expression_protection"
+    _TIME_PUNCT_CHARS = {":", "：", "."}
+    _TIME_CORE_PATTERN = re.compile(r"^\d{1,2}(?:[:：][0-5]\d){1,2}$")
+    _MERIDIEM_PATTERN = re.compile(r"^(?:[AaPp][Mm]|[AaPp]\.[Mm]\.)$")
+    _TIME_PATTERN = re.compile(
+        r"\b\d{1,2}(?:[:：][0-5]\d){1,2}(?:\s*(?:[AaPp][Mm]|[AaPp]\.[Mm]\.))?(?=$|[\s,，;；:：!?.])"
+    )
+
+    @classmethod
+    def _normalize_token(cls, token: str) -> str:
+        return str(token or "").replace("▁", " ").strip()
+
+    @classmethod
+    def _trim_boundary_weak_punct(cls, token: str) -> str:
+        return cls._normalize_token(token).strip(",，;；")
+
+    def can_merge_word_tokens(self, left_token: str, right_token: str) -> bool:
+        left = self._trim_boundary_weak_punct(left_token)
+        right = self._trim_boundary_weak_punct(right_token)
+        if not left or not right:
+            return False
+        return bool(
+            self._TIME_CORE_PATTERN.fullmatch(left)
+            and self._MERIDIEM_PATTERN.fullmatch(right.replace(" ", ""))
+        )
+
+    @classmethod
+    def is_time_punctuation_in_text(cls, text: str, index: int) -> bool:
+        if index < 0 or index >= len(text):
+            return False
+        if text[index] not in cls._TIME_PUNCT_CHARS:
+            return False
+        for matched in cls._TIME_PATTERN.finditer(str(text or "")):
+            if matched.start() <= index < matched.end():
+                return True
+        return False
+
+    def should_skip_raw_punctuation(self, text: str, index: int, char: str) -> bool:
+        if char not in self._TIME_PUNCT_CHARS:
+            return False
+        return self.is_time_punctuation_in_text(text, index)
+
+    def extract_protected_spans(self, text: str) -> Tuple[ProtectedSpan, ...]:
+        spans: list[ProtectedSpan] = []
+        for matched in self._TIME_PATTERN.finditer(text):
+            spans.append(_build_protected_span(
+                start=matched.start(),
+                end=matched.end(),
+                kind="time_expr",
+                text=matched.group(0),
+            ))
         return tuple(spans)
 
 
@@ -188,14 +256,12 @@ class RegexSpanProtectionRule(BaseTextProtectionRule):
     def extract_protected_spans(self, text: str) -> Tuple[ProtectedSpan, ...]:
         spans: list[ProtectedSpan] = []
         for matched in self.pattern.finditer(text):
-            spans.append(
-                ProtectedSpan(
-                    start=matched.start(),
-                    end=matched.end(),
-                    kind=self.span_kind,
-                    text=matched.group(0),
-                )
-            )
+            spans.append(_build_protected_span(
+                start=matched.start(),
+                end=matched.end(),
+                kind=self.span_kind,
+                text=matched.group(0),
+            ))
         return tuple(spans)
 
 
@@ -236,14 +302,12 @@ class AlnumMixedProtectionRule(BaseTextProtectionRule):
         spans: list[ProtectedSpan] = []
         for pattern in self._PATTERNS:
             for matched in pattern.finditer(text):
-                spans.append(
-                    ProtectedSpan(
-                        start=matched.start(),
-                        end=matched.end(),
-                        kind="alnum_mixed",
-                        text=matched.group(0),
-                    )
-                )
+                spans.append(_build_protected_span(
+                    start=matched.start(),
+                    end=matched.end(),
+                    kind="alnum_mixed",
+                    text=matched.group(0),
+                ))
         return tuple(spans)
 
 
@@ -283,14 +347,40 @@ class TextProtectionRuleSet:
             collected.extend(rule.extract_protected_spans(text))
         if not collected:
             return tuple()
-        collected.sort(key=lambda item: (item.start, -(item.end - item.start)))
+        collected.sort(
+            key=lambda item: (
+                item.start,
+                -self._span_priority(item.kind),
+                -(item.end - item.start),
+            )
+        )
 
         accepted: list[ProtectedSpan] = []
         for item in collected:
             if accepted and item.start < accepted[-1].end:
+                previous = accepted[-1]
+                if (
+                    self._span_priority(item.kind) > self._span_priority(previous.kind)
+                    and (item.end - item.start) >= (previous.end - previous.start)
+                ):
+                    accepted[-1] = item
                 continue
             accepted.append(item)
         return tuple(accepted)
+
+    @staticmethod
+    def _span_priority(kind: str) -> int:
+        priority_map = {
+            "time_expr": 100,
+            "decimal": 90,
+            "version": 80,
+            "abbrev_dot": 70,
+            "hyphen": 60,
+            "apostrophe": 50,
+            "middle_dot": 40,
+            "alnum_mixed": 10,
+        }
+        return int(priority_map.get(str(kind or ""), 0))
 
 
 def build_default_rule_set() -> TextProtectionRuleSet:
@@ -298,6 +388,7 @@ def build_default_rule_set() -> TextProtectionRuleSet:
     return TextProtectionRuleSet(
         rules=(
             DecimalProtectionRule(),
+            TimeExpressionProtectionRule(),
             VersionProtectionRule(),
             AbbrevDotProtectionRule(),
             HyphenProtectionRule(),
@@ -372,6 +463,11 @@ def should_skip_raw_punctuation(
 def is_decimal_dot_in_text(text: str, index: int) -> bool:
     """兼容入口：供外层按需直接查询小数点判定。"""
     return DecimalProtectionRule.is_decimal_dot_in_text(text, index)
+
+
+def is_time_punctuation_in_text(text: str, index: int) -> bool:
+    """兼容入口：供外层按需直接查询时间表达内标点判定。"""
+    return TimeExpressionProtectionRule.is_time_punctuation_in_text(text, index)
 
 
 def extract_protected_spans(

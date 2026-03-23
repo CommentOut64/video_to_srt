@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Sequence
 
-from app.services.text_protection import is_decimal_dot_in_text
+from app.services.text_protection import is_decimal_dot_in_text, is_time_punctuation_in_text
 from app.services.textflow.contracts import (
     CanonicalTextStream,
     PunctuationFact,
@@ -46,6 +46,9 @@ class RenderCore:
     )
     _EN_RIGHT_PUNCT = {",", ".", "!", "?", ";", ":", ")", "]", "}"}
     _EN_LEFT_PUNCT = {"(", "[", "{"}
+    _TIME_WITH_MERIDIEM_PATTERN = re.compile(
+        r"(?P<clock>\b\d{1,2}(?::[0-5]\d){1,2})\s*[,;:]?\s*(?P<meridiem>(?:[AaPp][Mm]|[AaPp]\.[Mm]\.))(?=$|[\s,;:!?.])"
+    )
 
     def render(
         self,
@@ -81,6 +84,9 @@ class RenderCore:
                 facts=facts,
                 segment_token_start=int(segment.token_start),
                 segment_token_end=int(segment.token_end),
+                consumed_boundary_fact_id=str(
+                    getattr(segment.consumed_boundary_punct, "fact_id", "") or ""
+                ),
                 language=language,
                 policy=render_policy,
                 dropped_punct_facts=dropped_punct_facts,
@@ -146,6 +152,7 @@ class RenderCore:
         facts: Sequence[PunctuationFact],
         segment_token_start: int,
         segment_token_end: int,
+        consumed_boundary_fact_id: str,
         language: str,
         policy: RenderPolicy,
         dropped_punct_facts: List[Dict[str, Any]],
@@ -154,6 +161,8 @@ class RenderCore:
         suffix_map: Dict[int, List[str]] = {}
 
         for fact in facts:
+            if consumed_boundary_fact_id and fact.fact_id == consumed_boundary_fact_id:
+                continue
             if fact.punct_class == "sentence_end":
                 if fact.normalized_text in {"。", "！", "？"}:
                     continue
@@ -267,6 +276,7 @@ class RenderCore:
         normalized = re.sub(r"\s+", " ", normalized).strip()
         normalized = re.sub(r"\s+([,.;:!?\)\]\}])", r"\1", normalized)
         normalized = re.sub(r"([\(\[\{])\s+", r"\1", normalized)
+        normalized = self._normalize_time_expressions(normalized)
 
         chars = list(normalized)
         out: list[str] = []
@@ -278,7 +288,11 @@ class RenderCore:
             next_char = chars[index + 1]
             if next_char.isspace():
                 continue
-            if char in {",", ";", ":", "!", "?"} and next_char not in self._EN_RIGHT_PUNCT:
+            if (
+                char in {",", ";", ":", "!", "?"}
+                and next_char not in self._EN_RIGHT_PUNCT
+                and not (char == ":" and is_time_punctuation_in_text(normalized, index))
+            ):
                 out.append(" ")
             elif (
                 char == "."
@@ -294,6 +308,14 @@ class RenderCore:
         normalized = re.sub(r"\s+([,.;:!?\)\]\}])", r"\1", normalized)
         normalized = re.sub(r"([\(\[\{])\s+", r"\1", normalized)
         return normalized
+
+    @classmethod
+    def _normalize_time_expressions(cls, text: str) -> str:
+        def _replace(match: re.Match[str]) -> str:
+            meridiem = re.sub(r"\s+", "", str(match.group("meridiem") or ""))
+            return f"{match.group('clock')} {meridiem}"
+
+        return cls._TIME_WITH_MERIDIEM_PATTERN.sub(_replace, text)
 
     @staticmethod
     def _should_insert_space_after_dot(*, prev_char: str, next_char: str) -> bool:
