@@ -27,7 +27,7 @@ def resolve_default_whisper_model() -> str:
 def normalize_edge_selection_mode(value: Any) -> str:
     """规范化 edge_selection_mode，非法值回退 auto。"""
     normalized = str(value or "auto").strip().lower()
-    if normalized in {"auto", "force_fast", "force_slow"}:
+    if normalized in {"auto", "prefer_fast", "prefer_slow", "force_fast", "force_slow"}:
         return normalized
     _logger.warning(
         "edge_selection_mode_invalid_fallback_auto field=task_config.transcription.edge_selection_mode value=%r",
@@ -163,7 +163,7 @@ class TranscriptionConfig:
 
     # 复核触发阈值: 0.0-1.0
     patching_threshold: float = 0.60
-    # 选边模式：auto/force_fast/force_slow
+    # 选边模式：auto/prefer_fast/prefer_slow/force_fast/force_slow
     edge_selection_mode: str = "auto"
 
 

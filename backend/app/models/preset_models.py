@@ -18,7 +18,7 @@ from enum import Enum
 
 def _normalize_edge_selection_mode(value: Any) -> str:
     normalized = str(value or "auto").strip().lower()
-    if normalized in {"auto", "force_fast", "force_slow"}:
+    if normalized in {"auto", "prefer_fast", "prefer_slow", "force_fast", "force_slow"}:
         return normalized
     return "auto"
 
@@ -182,7 +182,7 @@ class TranscriptionSettings:
 
     # 复核触发阈值: 0.0-1.0, 低于此置信度的句子送给 Whisper 重跑
     patching_threshold: float = 0.60
-    # 选边模式: auto/force_fast/force_slow
+    # 选边模式: auto/prefer_fast/prefer_slow/force_fast/force_slow
     edge_selection_mode: str = "auto"
 
     def to_dict(self) -> Dict[str, Any]:
