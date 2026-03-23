@@ -83,7 +83,7 @@ class TranscriptionAPI {
    * @param {string} [settings.task_config.transcription.sensevoice_device] - SenseVoice 设备 (auto/cpu)
    * @param {string} [settings.task_config.transcription.whisper_model] - Whisper 模型 (tiny/small/medium/large-v3)
    * @param {number} [settings.task_config.transcription.patching_threshold] - 复核触发阈值 (0.0-1.0)
-   * @param {string} [settings.task_config.transcription.edge_selection_mode] - 选边模式 (auto/force_fast/force_slow)
+   * @param {string} [settings.task_config.transcription.edge_selection_mode] - 选边模式 (auto/prefer_fast/prefer_slow/force_fast/force_slow)
    * @param {Object} [settings.task_config.refinement] - 增强设置
    * @param {string} [settings.task_config.refinement.llm_task] - LLM 任务 (off/proofread/translate)
    * @param {string} [settings.task_config.refinement.llm_scope] - LLM 范围 (sparse/global)
