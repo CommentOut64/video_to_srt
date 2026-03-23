@@ -36,6 +36,8 @@ class TextArbiterProcessor:
         "enable": True,
         "text_source_preference": "auto",
         "edge_selection_mode": "auto",
+        "edge_prefer_fast_bias": 0.08,
+        "edge_prefer_slow_bias": 0.08,
         "min_length_ratio": 0.65,
         "max_length_ratio": 3.0,
         "low_confidence_threshold": 0.5,
@@ -130,6 +132,7 @@ class TextArbiterProcessor:
         chosen_source, reason = self._decide_source(
             is_enabled=is_enabled,
             preference=preference,
+            edge_selection_mode=edge_selection_mode,
             quality=quality,
             config=config,
             sv_text=sv_text,
@@ -179,6 +182,7 @@ class TextArbiterProcessor:
         *,
         is_enabled: bool,
         preference: str,
+        edge_selection_mode: str,
         quality: QualitySignals,
         config: Dict[str, Any],
         sv_text: str,
@@ -220,11 +224,48 @@ class TextArbiterProcessor:
         ):
             return "fast", "fast_tail_guard"
 
+        edge_prefer_decision = self._decide_edge_preference_source(
+            edge_selection_mode=edge_selection_mode,
+            quality=quality,
+            config=config,
+        )
+        if edge_prefer_decision is not None:
+            return edge_prefer_decision
+
         if preference == "fast":
             return "fast", "preference_fast"
         if preference == "slow":
             return "slow", "preference_slow"
         return "slow", "auto_slow"
+
+    def _decide_edge_preference_source(
+        self,
+        *,
+        edge_selection_mode: str,
+        quality: QualitySignals,
+        config: Dict[str, Any],
+    ) -> Optional[tuple[str, str]]:
+        fast_conf = float(quality.confidence_fast or 0.0)
+        slow_conf = float(quality.confidence_slow or 0.0)
+        if edge_selection_mode == "prefer_fast":
+            fast_bias = self._resolve_non_negative_float(
+                config.get("edge_prefer_fast_bias"),
+                0.08,
+            )
+            fast_score = fast_conf + fast_bias
+            if fast_score >= slow_conf:
+                return "fast", "edge_prefer_fast"
+            return "slow", "edge_prefer_fast_fallback_slow"
+        if edge_selection_mode == "prefer_slow":
+            slow_bias = self._resolve_non_negative_float(
+                config.get("edge_prefer_slow_bias"),
+                0.08,
+            )
+            slow_score = slow_conf + slow_bias
+            if slow_score >= fast_conf:
+                return "slow", "edge_prefer_slow"
+            return "fast", "edge_prefer_slow_fallback_fast"
+        return None
 
     def _is_fast_tail_guard_triggered(
         self,
@@ -315,9 +356,17 @@ class TextArbiterProcessor:
         if not value:
             return "auto"
         normalized = str(value).strip().lower()
-        if normalized in {"auto", "force_fast", "force_slow"}:
+        if normalized in {"auto", "prefer_fast", "prefer_slow", "force_fast", "force_slow"}:
             return normalized
         return "auto"
+
+    @staticmethod
+    def _resolve_non_negative_float(value: Any, default: float) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        return max(0.0, parsed)
 
     @staticmethod
     def _resolve_forced_source(edge_selection_mode: str) -> Optional[str]:

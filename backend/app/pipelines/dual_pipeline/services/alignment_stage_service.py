@@ -10,7 +10,7 @@ from __future__ import annotations
 import copy
 import hashlib
 from dataclasses import asdict, replace
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 from app.models.sensevoice_models import SentenceSegment, TextSource
 from app.pipelines.dual_pipeline.services.textflow_facade_service import Layer456RunResult
@@ -18,6 +18,7 @@ from app.schemas.pipeline_context import ProcessingContext
 from app.services.alignment.types import PunctTrack
 from app.services.language_policy import build_language_policy_snapshot
 from app.services.timeanchored_alignment import (
+    AlignmentItem,
     ChunkWindow,
     ChunkProjector,
     EdgeSelector,
@@ -68,6 +69,17 @@ class AlignmentStageService:
         """执行单个 chunk 的对齐阶段。"""
         host = self._host
         chunk = ctx.audio_chunk
+
+        fast_direct_reason = self._resolve_fast_direct_reason(ctx=ctx)
+        if fast_direct_reason:
+            if ctx.sv_result is None:
+                raise ValueError("对齐阶段缺少 SenseVoice 推理结果")
+            self._commit_fast_direct_result(
+                ctx=ctx,
+                sv_result=ctx.sv_result,
+                reason=fast_direct_reason,
+            )
+            return
 
         # V3.10: 快速路径 - SlowWorker 跳过时直接使用 SenseVoice
         if ctx.whisper_skipped:
@@ -916,6 +928,127 @@ class AlignmentStageService:
             stage_result.base_result.route,
         )
 
+    def _commit_fast_direct_result(
+        self,
+        *,
+        ctx: ProcessingContext,
+        sv_result: Dict[str, Any],
+        reason: str,
+    ) -> None:
+        host = self._host
+        chunk = ctx.audio_chunk
+        language = str(
+            getattr(chunk, "language", "")
+            or sv_result.get("language")
+            or "auto"
+        )
+        speaker_id = host._resolve_speaker_id_for_chunk(chunk)
+        turn_id = host._resolve_turn_id_for_chunk(chunk)
+        sv_words = host._build_sv_word_timestamps(sv_result, chunk)
+        fast_stream = self._build_fast_direct_stream(words=sv_words)
+        final_sentences = self._timeanchored_sentence_segmenter.segment(
+            stream=fast_stream,
+            language=language,
+        )
+
+        fallback_error_code = ""
+        if not final_sentences:
+            fallback_text = str(
+                sv_result.get("text_clean")
+                or sv_result.get("text_itn_raw")
+                or sv_result.get("text")
+                or ""
+            ).strip()
+            fallback_confidence = self._resolve_text_fallback_confidence(
+                chosen_source="fast",
+                whisper_result=ctx.whisper_result or {},
+                sv_result=sv_result,
+            )
+            fallback_sentence = self._build_text_fallback_sentence(
+                text=fallback_text,
+                chunk=chunk,
+                confidence=fallback_confidence,
+            )
+            if fallback_sentence is not None:
+                fallback_sentence.speaker_id = speaker_id
+                fallback_sentence.turn_id = turn_id
+                final_sentences = [fallback_sentence]
+                fallback_error_code = "E_FAST_DIRECT_SEGMENT_EMPTY_FALLBACK"
+
+        for sentence in final_sentences:
+            sentence.source = TextSource.SENSEVOICE
+            sentence.is_draft = False
+            sentence.is_finalized = True
+            sentence.confidence_source = host._resolve_sentence_confidence_source(
+                sentence.words
+            )
+            if getattr(sentence, "speaker_id", None) is None:
+                sentence.speaker_id = speaker_id
+            if getattr(sentence, "turn_id", None) is None:
+                sentence.turn_id = turn_id
+
+        host._assign_sentence_identity_by_timeline_overlap(
+            final_sentences,
+            fallback_chunk=chunk,
+        )
+
+        output_layer_result = host._emit_output_layer(
+            chunk_index=ctx.chunk_index,
+            sentence_segments=final_sentences,
+            language=language,
+            injection_report={
+                "mapping_coverage": 1.0 if fast_stream else 0.0,
+                "error_code": fallback_error_code,
+            },
+            segmentation_report={
+                "route": "fast_direct",
+                "text_route": "fast_direct",
+                "edge_route": "fast",
+                "error_code": fallback_error_code,
+            },
+            output_traces=[],
+            default_trace_reason="fast_direct",
+        )
+
+        ctx.final_sentences = list(final_sentences)
+        ctx.hetero_route = "fast"
+        ctx.hetero_alignment_result = {
+            "mode": "fast_direct",
+            "selected": True,
+            "reason": reason,
+            "route": "fast",
+        }
+        ctx.hetero_alignment_report = dict(ctx.hetero_alignment_result)
+        ctx.finalization_metrics = {
+            "coverage": 1.0 if fast_stream else 0.0,
+            "gap_ratio": 0.0,
+            "alignment_score": 1.0 if fast_stream else 0.0,
+            "gap_positions": [],
+            "gap_resolution": None,
+            "fast_direct_enabled": 1.0,
+            "alignment_pipeline_mode": "fast_direct",
+            "alignment_pipeline_selected": 1.0,
+            "alignment_pipeline_reason": reason,
+            "alignment_pipeline_route": "fast",
+            "timeanchored_enabled": 0.0,
+            "timeanchored_text_route": "fast_direct",
+            "timeanchored_edge_route": "fast",
+            "timeanchored_final_route": "fast",
+            "timeanchored_item_count": float(len(fast_stream)),
+            "timeanchored_sentence_count": float(len(final_sentences)),
+            "timeanchored_failed_span_count": 0.0,
+            "l7_error_count": float(len(output_layer_result.output_payload.get("errors", []))),
+        }
+        if fallback_error_code:
+            ctx.finalization_metrics["timeanchored_error_code"] = fallback_error_code
+
+        host.logger.debug(
+            "Chunk {}: 快流直通定稿完成 sentences={} reason={}",
+            ctx.chunk_index,
+            len(final_sentences),
+            reason,
+        )
+
     def _record_hetero_alignment_result(
         self,
         *,
@@ -971,6 +1104,51 @@ class AlignmentStageService:
         if mode == "default":
             return True, "default_gate_pass"
         return True, f"{mode}_gate_pass"
+
+    def _resolve_fast_direct_reason(self, *, ctx: ProcessingContext) -> str:
+        host = self._host
+        if bool(getattr(host, "is_sensevoice_only", False)):
+            return "sensevoice_only"
+        ctx_mode = str(getattr(ctx, "edge_selection_mode", "") or "").strip().lower()
+        host_mode = str(getattr(host, "_edge_selection_mode", "auto") or "auto").strip().lower()
+        if ctx_mode == "force_fast" or host_mode == "force_fast":
+            return "force_fast"
+        return ""
+
+    @staticmethod
+    def _build_fast_direct_stream(*, words: Sequence[Any]) -> tuple[AlignmentItem, ...]:
+        stream: list[AlignmentItem] = []
+        cursor = 0.0
+        for item in words or []:
+            text = str(getattr(item, "word", "") or "")
+            if not text:
+                continue
+            try:
+                start = float(getattr(item, "start", 0.0) or 0.0)
+                end = float(getattr(item, "end", start) or start)
+            except (TypeError, ValueError):
+                continue
+            start = max(start, cursor)
+            end = max(end, start)
+            cursor = end
+            confidence = getattr(item, "confidence", None)
+            if confidence is not None:
+                try:
+                    confidence = max(0.0, min(1.0, float(confidence)))
+                except (TypeError, ValueError):
+                    confidence = None
+            stream.append(
+                AlignmentItem(
+                    text=text,
+                    start=start,
+                    end=end,
+                    status="direct",
+                    source="fast",
+                    confidence=confidence,
+                    reason="fast_direct",
+                )
+            )
+        return tuple(stream)
 
     def _should_sample_alignment_pipeline_shadow(self, ctx: ProcessingContext) -> bool:
         sample_rate = max(

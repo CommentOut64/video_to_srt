@@ -295,7 +295,7 @@ class AsyncDualPipelineKernel:
             segmenter: 分句服务实例（可选）
             aligner: 对齐服务实例（可选）
             patching_threshold: 复核阈值配置（可选）
-            edge_selection_mode: 选边模式（auto/force_fast/force_slow）
+            edge_selection_mode: 选边模式（auto/prefer_fast/prefer_slow/force_fast/force_slow）
             enable_cross_chunk_merge: 是否启用跨 chunk 合并
             bridge_controller: Bridge 控制器实例（可选）
             debug_punctuation: 是否启用标点调试输出
@@ -370,14 +370,24 @@ class AsyncDualPipelineKernel:
             self._speaker_min_count,
             self._speaker_max_count,
         )
+
+        # 判断是否为纯 SenseVoice 模式
+        self.is_sensevoice_only = (transcription_profile == "sensevoice_only")
+        if self.is_sensevoice_only and self._edge_selection_mode != "force_fast":
+            # 极速模式下统一走快流直通，选边模式强制收敛为 force_fast。
+            previous_mode = self._edge_selection_mode
+            self._edge_selection_mode = "force_fast"
+            self.logger.info(
+                "极速模式自动收敛选边策略: {} -> force_fast",
+                previous_mode,
+            )
+
         self.logger.info("任务级选边模式: edge_selection_mode={}", self._edge_selection_mode)
         self.logger.info(
             "Whisper 提示词策略: {}",
             self._whisper_prompt_policy.describe_config(),
         )
 
-        # 判断是否为纯 SenseVoice 模式
-        self.is_sensevoice_only = (transcription_profile == "sensevoice_only")
         # V3.10: 判断是否为智能复核模式
         self.is_patching_mode = (transcription_profile == "sv_whisper_patch")
 
@@ -2639,7 +2649,7 @@ class AsyncDualPipelineKernel:
     @staticmethod
     def _normalize_edge_selection_mode(value: Any) -> str:
         normalized = str(value or "auto").strip().lower()
-        if normalized in {"auto", "force_fast", "force_slow"}:
+        if normalized in {"auto", "prefer_fast", "prefer_slow", "force_fast", "force_slow"}:
             return normalized
         return "auto"
 
