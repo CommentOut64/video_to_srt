@@ -55,7 +55,7 @@ const builtinPresets = [
     id: 'fast',
     config: {
       preprocessing: { demucs_strategy: 'off', language_detection_mode: 'balanced' },
-      transcription: { transcription_profile: 'sensevoice_only' },
+      transcription: { transcription_profile: 'sensevoice_only', edge_selection_mode: 'force_fast' },
       refinement: { llm_task: 'off', llm_scope: 'sparse' },
     },
   },
@@ -63,7 +63,7 @@ const builtinPresets = [
     id: 'balanced',
     config: {
       preprocessing: { demucs_strategy: 'auto', language_detection_mode: 'balanced' },
-      transcription: { transcription_profile: 'sv_whisper_patch' },
+      transcription: { transcription_profile: 'sv_whisper_patch', edge_selection_mode: 'auto' },
       refinement: { llm_task: 'proofread', llm_scope: 'sparse' },
     },
   },
@@ -71,7 +71,7 @@ const builtinPresets = [
     id: 'quality',
     config: {
       preprocessing: { demucs_strategy: 'force_on', language_detection_mode: 'balanced' },
-      transcription: { transcription_profile: 'sv_whisper_dual' },
+      transcription: { transcription_profile: 'sv_whisper_dual', edge_selection_mode: 'auto' },
       refinement: { llm_task: 'proofread', llm_scope: 'global' },
     },
   },
@@ -108,6 +108,7 @@ function detectPreset(config) {
       config.preprocessing.demucs_strategy === preset.config.preprocessing.demucs_strategy &&
       config.preprocessing.language_detection_mode === preset.config.preprocessing.language_detection_mode &&
       config.transcription.transcription_profile === preset.config.transcription.transcription_profile &&
+      (config.transcription.edge_selection_mode || 'auto') === preset.config.transcription.edge_selection_mode &&
       config.refinement.llm_task === preset.config.refinement.llm_task &&
       config.refinement.llm_scope === preset.config.refinement.llm_scope
     ) {

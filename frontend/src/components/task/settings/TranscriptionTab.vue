@@ -4,7 +4,7 @@
     <SettingRow label="转录模式">
       <el-select
         :model-value="modelValue.transcription.transcription_profile"
-        @update:model-value="updateField('transcription', 'transcription_profile', $event)"
+        @update:model-value="handleTranscriptionProfileChange"
       >
         <el-option value="sensevoice_only" label="极速 (仅 SenseVoice)" />
         <el-option value="sv_whisper_patch" label="SV + Whisper 复核" />
@@ -14,12 +14,16 @@
 
     <SettingRow label="选边模式" hint="双流定稿选边策略">
       <el-select
-        :model-value="modelValue.transcription.edge_selection_mode || 'auto'"
-        @update:model-value="updateField('transcription', 'edge_selection_mode', $event)"
+        :model-value="displayEdgeSelectionMode"
+        :disabled="isFastProfile"
+        @update:model-value="handleEdgeSelectionModeChange"
       >
-        <el-option value="auto" label="自动选边" />
-        <el-option value="force_fast" label="强制快流" />
-        <el-option value="force_slow" label="强制慢流" />
+        <el-option
+          v-for="option in edgeSelectionOptions"
+          :key="option.value"
+          :value="option.value"
+          :label="option.label"
+        />
       </el-select>
     </SettingRow>
 
@@ -51,6 +55,7 @@
 </template>
 
 <script setup>
+import { computed, watch } from 'vue'
 import SettingRow from './shared/SettingRow.vue'
 
 const props = defineProps({
@@ -62,11 +67,100 @@ const props = defineProps({
 
 const emit = defineEmits(['update:modelValue'])
 
+const EDGE_MODE_AUTO = 'auto'
+const EDGE_MODE_PREFER_FAST = 'prefer_fast'
+const EDGE_MODE_PREFER_SLOW = 'prefer_slow'
+const EDGE_MODE_FORCE_FAST = 'force_fast'
+const EDGE_MODE_FORCE_SLOW = 'force_slow'
+
+const isFastProfile = computed(
+  () => props.modelValue.transcription.transcription_profile === 'sensevoice_only'
+)
+
+const edgeSelectionOptions = computed(() => {
+  if (isFastProfile.value) {
+    return [{ value: EDGE_MODE_FORCE_FAST, label: '强制快流' }]
+  }
+  return [
+    { value: EDGE_MODE_AUTO, label: '自动选边' },
+    { value: EDGE_MODE_PREFER_FAST, label: '快流优先' },
+    { value: EDGE_MODE_PREFER_SLOW, label: '慢流优先' },
+  ]
+})
+
+const displayEdgeSelectionMode = computed(() => {
+  return normalizeEdgeSelectionModeForProfile(
+    props.modelValue.transcription.transcription_profile,
+    props.modelValue.transcription.edge_selection_mode
+  )
+})
+
 function updateField(group, field, value) {
   const updated = JSON.parse(JSON.stringify(props.modelValue))
   updated[group][field] = value
   emit('update:modelValue', updated)
 }
+
+function normalizeEdgeSelectionModeForProfile(profile, mode) {
+  const normalizedProfile = String(profile || '').trim().toLowerCase()
+  const normalizedMode = String(mode || EDGE_MODE_AUTO).trim().toLowerCase()
+
+  if (normalizedProfile === 'sensevoice_only') {
+    return EDGE_MODE_FORCE_FAST
+  }
+  if (
+    normalizedMode === EDGE_MODE_AUTO ||
+    normalizedMode === EDGE_MODE_PREFER_FAST ||
+    normalizedMode === EDGE_MODE_PREFER_SLOW
+  ) {
+    return normalizedMode
+  }
+  if (normalizedMode === EDGE_MODE_FORCE_SLOW) {
+    return EDGE_MODE_PREFER_SLOW
+  }
+  if (normalizedMode === EDGE_MODE_FORCE_FAST) {
+    return EDGE_MODE_AUTO
+  }
+  return EDGE_MODE_AUTO
+}
+
+function handleEdgeSelectionModeChange(value) {
+  const updated = JSON.parse(JSON.stringify(props.modelValue))
+  updated.transcription.edge_selection_mode = normalizeEdgeSelectionModeForProfile(
+    updated.transcription.transcription_profile,
+    value
+  )
+  emit('update:modelValue', updated)
+}
+
+function handleTranscriptionProfileChange(value) {
+  const updated = JSON.parse(JSON.stringify(props.modelValue))
+  updated.transcription.transcription_profile = value
+  updated.transcription.edge_selection_mode = normalizeEdgeSelectionModeForProfile(
+    value,
+    updated.transcription.edge_selection_mode
+  )
+
+  emit('update:modelValue', updated)
+}
+
+watch(
+  () => [
+    props.modelValue.transcription.transcription_profile,
+    props.modelValue.transcription.edge_selection_mode,
+  ],
+  ([profile, mode]) => {
+    const normalized = normalizeEdgeSelectionModeForProfile(profile, mode)
+    const current = String(mode || EDGE_MODE_AUTO).trim().toLowerCase()
+    if (current === normalized) {
+      return
+    }
+    const updated = JSON.parse(JSON.stringify(props.modelValue))
+    updated.transcription.edge_selection_mode = normalized
+    emit('update:modelValue', updated)
+  },
+  { immediate: true }
+)
 
 /* 说话人检测开关的联动逻辑 */
 function handleSpeakerToggle(enabled) {
@@ -105,16 +199,13 @@ function handleSpeakerToggle(enabled) {
 :deep(.el-select) {
   --el-select-input-color: var(--af-text-normal);
   --el-select-input-focus-border-color: var(--af-accent-primary);
+
   width: 200px;
 }
 
 :deep(.el-select) .el-input__wrapper {
   background-color: var(--af-bg-secondary);
   box-shadow: 0 0 0 1px var(--af-border-default) inset;
-}
-
-:deep(.el-select) .el-input__wrapper:hover {
-  box-shadow: 0 0 0 1px var(--af-accent-primary) inset;
 }
 
 /* --- el-checkbox 样式定制 ---
@@ -143,6 +234,10 @@ function handleSpeakerToggle(enabled) {
 :deep(.el-input-number) .el-input__wrapper {
   background-color: var(--af-bg-secondary);
   box-shadow: 0 0 0 1px var(--af-border-default) inset;
+}
+
+:deep(.el-select) .el-input__wrapper:hover {
+  box-shadow: 0 0 0 1px var(--af-accent-primary) inset;
 }
 
 :deep(.el-input-number) .el-input__wrapper:hover {
