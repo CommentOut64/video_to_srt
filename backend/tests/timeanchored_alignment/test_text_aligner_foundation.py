@@ -232,3 +232,20 @@ def test_text_exact_success_cannot_be_overridden_by_pronunciation_evidence() -> 
     )
     assert result.route == "text"
     assert [item.status for item in result.items] == ["direct", "direct"]
+
+
+def test_text_unit_char_spans_do_not_consume_timestamp_fields() -> None:
+    text_truth = TextTruthPackage(
+        units=(
+            TextTruthUnit(text="你", normalized_text="你", confidence=0.9, language="zh", start=10.0, end=10.1),
+            TextTruthUnit(text="好", normalized_text="好", confidence=0.9, language="zh", start=10.1, end=10.2),
+        ),
+        quality=TextTruthQuality(hallucination_risk=0.0, repetition_ratio=0.0, length_ratio=1.0),
+        language="zh",
+        raw_text="你好",
+        normalized_text="你好",
+    )
+
+    spans = TextAligner._resolve_text_unit_spans(text_truth)
+
+    assert spans == [(0, 1), (1, 2)]

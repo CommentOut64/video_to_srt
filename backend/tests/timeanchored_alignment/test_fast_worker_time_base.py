@@ -133,7 +133,9 @@ async def test_fast_worker_writes_time_base_chunk_when_enabled(monkeypatch: pyte
 
 
 @pytest.mark.asyncio
-async def test_fast_worker_keeps_legacy_path_without_time_base(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_fast_worker_legacy_flag_is_ignored_and_still_builds_time_base(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import app.pipelines.workers.fast_worker as fast_worker_module
 
     runtime_payload = {
@@ -154,5 +156,5 @@ async def test_fast_worker_keeps_legacy_path_without_time_base(monkeypatch: pyte
     ctx = _make_ctx()
     await worker.process(ctx)
 
-    assert ctx.time_base_chunk is None
-    assert "ctc_logits" in (ctx.sv_result or {})
+    assert ctx.time_base_chunk is not None
+    assert "ctc_logits" not in (ctx.sv_result or {})

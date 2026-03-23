@@ -172,6 +172,7 @@ def test_alignment_stage_routes_to_timeanchored_main_chain_when_time_base_availa
         enable_semantic_buffer=False,
         punctuation_service=Mock(),
     )
+    pipeline._alignment_pipeline_mode = "default"
 
     _patch_common_alignment_inputs(monkeypatch=monkeypatch, pipeline=pipeline, chosen_source="slow")
     monkeypatch.setattr(
@@ -204,10 +205,10 @@ def test_alignment_stage_routes_to_timeanchored_main_chain_when_time_base_availa
     remove_streaming_subtitle_manager(job_id)
 
 
-def test_alignment_stage_uses_legacy_when_time_base_missing(
+def test_alignment_stage_raises_when_time_base_missing_and_legacy_disabled(
     monkeypatch,
 ) -> None:
-    job_id = "test_timeanchored_missing_time_base_fallback"
+    job_id = "test_timeanchored_missing_time_base_raise"
     pipeline = AsyncDualPipeline(
         job_id=job_id,
         draft_engine=DummyEngine(response_text="你好世界", latency_ms=0),
@@ -217,18 +218,13 @@ def test_alignment_stage_uses_legacy_when_time_base_missing(
         enable_semantic_buffer=False,
         punctuation_service=Mock(),
     )
+    pipeline._alignment_pipeline_mode = "default"
 
     _patch_common_alignment_inputs(monkeypatch=monkeypatch, pipeline=pipeline, chosen_source="slow")
-    legacy_run = Mock(return_value=_build_legacy_run_result())
-    monkeypatch.setattr(pipeline, "_run_collection_scoring_decision_once", legacy_run)
-    monkeypatch.setattr(pipeline._alignment_stage_service, "_try_run_timeanchored_main_chain", Mock())
-    monkeypatch.setattr(pipeline, "_emit_layer_diagnostics", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(pipeline, "_emit_layer_trace_full", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(pipeline, "_record_punct_retry_candidates", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         pipeline,
-        "_emit_output_layer",
-        lambda **_kwargs: SimpleNamespace(output_payload={"errors": []}),
+        "_run_collection_scoring_decision_once",
+        Mock(side_effect=AssertionError("legacy 链路已下线，不应被调用")),
     )
 
     ctx = ProcessingContext(
@@ -244,20 +240,16 @@ def test_alignment_stage_uses_legacy_when_time_base_missing(
         whisper_track=_build_track("你好世界", source="whisper"),
     )
 
-    asyncio.run(pipeline._run_alignment_stage(ctx))
-
-    assert legacy_run.call_count == 1
-    assert pipeline._alignment_stage_service._try_run_timeanchored_main_chain.call_count == 0
-    assert ctx.final_sentences
-    assert ctx.finalization_metrics.get("timeanchored_enabled") is None
+    with pytest.raises(RuntimeError, match="legacy_alignment_pipeline_disabled"):
+        asyncio.run(pipeline._run_alignment_stage(ctx))
 
     remove_streaming_subtitle_manager(job_id)
 
 
-def test_alignment_stage_falls_back_to_legacy_when_timeanchored_raises(
+def test_alignment_stage_raises_when_timeanchored_main_chain_fails(
     monkeypatch,
 ) -> None:
-    job_id = "test_timeanchored_exception_fallback_legacy"
+    job_id = "test_timeanchored_exception_raise"
     pipeline = AsyncDualPipeline(
         job_id=job_id,
         draft_engine=DummyEngine(response_text="你好世界", latency_ms=0),
@@ -267,24 +259,19 @@ def test_alignment_stage_falls_back_to_legacy_when_timeanchored_raises(
         enable_semantic_buffer=False,
         punctuation_service=Mock(),
     )
+    pipeline._alignment_pipeline_mode = "default"
 
     _patch_common_alignment_inputs(monkeypatch=monkeypatch, pipeline=pipeline, chosen_source="slow")
-    legacy_run = Mock(return_value=_build_legacy_run_result())
-    monkeypatch.setattr(pipeline, "_run_collection_scoring_decision_once", legacy_run)
+    monkeypatch.setattr(
+        pipeline,
+        "_run_collection_scoring_decision_once",
+        Mock(side_effect=AssertionError("legacy 链路已下线，不应被调用")),
+    )
     monkeypatch.setattr(
         pipeline._alignment_stage_service._timeanchored_whisper_adapter,
         "build_text_truth_package",
         Mock(side_effect=RuntimeError("forced_timeanchored_error")),
     )
-    monkeypatch.setattr(pipeline, "_emit_layer_diagnostics", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(pipeline, "_emit_layer_trace_full", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(pipeline, "_record_punct_retry_candidates", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        pipeline,
-        "_emit_output_layer",
-        lambda **_kwargs: SimpleNamespace(output_payload={"errors": []}),
-    )
-
     ctx = ProcessingContext(
         job_id=job_id,
         chunk_index=0,
@@ -298,11 +285,8 @@ def test_alignment_stage_falls_back_to_legacy_when_timeanchored_raises(
         whisper_track=_build_track("你好世界", source="whisper"),
     )
 
-    asyncio.run(pipeline._run_alignment_stage(ctx))
-
-    assert legacy_run.call_count == 1
-    assert ctx.final_sentences
-    assert ctx.finalization_metrics.get("timeanchored_enabled") is None
+    with pytest.raises(RuntimeError, match="legacy_alignment_pipeline_disabled"):
+        asyncio.run(pipeline._run_alignment_stage(ctx))
 
     remove_streaming_subtitle_manager(job_id)
 
@@ -331,6 +315,7 @@ def test_alignment_stage_forwards_force_mode_to_timeanchored_edge_selector(
         enable_semantic_buffer=False,
         punctuation_service=Mock(),
     )
+    pipeline._alignment_pipeline_mode = "default"
 
     _patch_common_alignment_inputs(
         monkeypatch=monkeypatch,
