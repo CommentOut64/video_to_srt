@@ -490,6 +490,16 @@ class ModelRuntimeConfigService:
                 "dual_time_boundary_tolerance_ms": 250,
                 "dual_time_active_min_boundary_f1": 0.85,
             },
+            # V3.3.0 Phase7: 新旧主链灰度矩阵（legacy/shadow/active/default）
+            "alignment_pipeline": {
+                "version": "timeanchored",
+                "mode": "default",
+                "shadow_sample_rate": 0.1,
+                "write_debug_artifacts": False,
+                # 兼容旧调用方的布尔开关口径
+                "enabled": True,
+                "enable_timeanchored": True,
+            },
             # V3.2.0+dev.20260210.01: 裁决层（decision）统一参数入口。
             "segmentation": {
                 "enable": True,

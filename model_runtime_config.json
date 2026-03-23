@@ -14,6 +14,14 @@
       "dual_time_write_debug_srt": false,
       "dual_time_mode": "off"
     },
+    "alignment_pipeline": {
+      "version": "timeanchored",
+      "mode": "default",
+      "shadow_sample_rate": 0.1,
+      "write_debug_artifacts": false,
+      "enabled": true,
+      "enable_timeanchored": true
+    },
     "timeline": {
       "enabled": true,
       "diarization_enabled": true,
