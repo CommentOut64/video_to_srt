@@ -145,6 +145,10 @@ class SentenceSegment:
     - confidence: 原始置信度（保持不变，用于内部逻辑）
     - display_confidence: 映射后的准确率（用于前端显示）
     - confidence_source: 置信度来源（sensevoice/whisper）
+
+    V3.3.0+dev.20260323:
+    - 该类型在新主链中仅作为南向兼容 DTO。
+    - 统一切分层与渲染层的内部协议迁移到 `app.services.textflow.contracts`。
     """
     text: str  # 原始文本（包含标签和连字符）
     text_clean: str = ""  # 清洗后的文本（用于展示）
