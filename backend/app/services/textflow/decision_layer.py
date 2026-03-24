@@ -29,8 +29,8 @@ from app.services.textflow.contracts import (
     ConsumedBoundaryPunct,
     SegmentPlan,
     SegmentationResult,
+    SegmentationIngressContext,
 )
-from app.services.textflow.legacy_sentence_adapter import LegacySentenceAdapter
 from app.services.textflow.render_core import RenderCore
 from app.services.textflow.segmentation_core import SegmentationCore
 from app.services.text_protection import (
@@ -114,7 +114,6 @@ class SegmentationProcessor:
         self._segmentation_core = SegmentationCore(process_impl=self._run_legacy_segmentation)
         self._canonical_text_stream_adapter = CanonicalTextStreamAdapter()
         self._render_core = RenderCore()
-        self._legacy_sentence_adapter = LegacySentenceAdapter()
 
     def reset_state(self) -> None:
         """重置裁决层跨 chunk 状态（新任务开始时调用）。"""
@@ -128,127 +127,158 @@ class SegmentationProcessor:
         chunk_index: Optional[int] = None,
         is_last_chunk: bool = False,
     ) -> DecisionLayerOutput:
-        """统一切分主入口：优先走统一渲染主链，失败时回退 legacy 链。"""
-        legacy_output = self._segmentation_core.process(
+        """统一切分主入口：固定走统一渲染主链。"""
+        segmentation_output = self._segmentation_core.process(
             data=data,
             stream_id=stream_id,
             chunk_index=chunk_index,
             is_last_chunk=is_last_chunk,
         )
-        upgraded_output = self._try_render_with_unified_pipeline(
-            legacy_output=legacy_output,
+        return self._render_with_unified_pipeline(
+            segmentation_output=segmentation_output,
             data=data,
             stream_id=stream_id,
             chunk_index=chunk_index,
         )
-        if upgraded_output is not None:
-            return upgraded_output
 
-        return self._finalize_legacy_fallback_output(legacy_output=legacy_output)
-
-    def _try_render_with_unified_pipeline(
+    def _render_with_unified_pipeline(
         self,
         *,
-        legacy_output: DecisionLayerOutput,
+        segmentation_output: DecisionLayerOutput,
         data: DecisionLayerInput,
         stream_id: str,
         chunk_index: Optional[int],
-    ) -> Optional[DecisionLayerOutput]:
-        if not legacy_output.sentence_segments or not legacy_output.words_for_split:
-            return None
-        try:
-            canonical_stream = self._build_canonical_stream_from_words(
-                words=legacy_output.words_for_split,
-                data=data,
-                stream_id=stream_id,
-                chunk_index=chunk_index,
-            )
-            if not canonical_stream.tokens:
-                return None
-
-            segmentation_result = self._build_segmentation_result_from_legacy(
-                canonical_stream=canonical_stream,
-                sentence_segments=legacy_output.sentence_segments,
-                output_traces=legacy_output.output_traces,
-            )
-            if not segmentation_result.segments:
-                return None
-
-            render_result = self._render_core.render(
-                canonical_stream=canonical_stream,
-                segmentation_result=segmentation_result,
-            )
-            rendered_sentences, rendered_traces = self._legacy_sentence_adapter.to_legacy(
-                render_result=render_result,
-            )
-            if not rendered_sentences:
-                return None
-            for sentence_index, sentence in enumerate(rendered_sentences):
-                if sentence_index < len(segmentation_result.segments):
-                    sentence.words = self._build_sentence_words_from_segment(
-                        canonical_stream=canonical_stream,
-                        segment=segmentation_result.segments[sentence_index],
-                    )
-                if sentence_index >= len(legacy_output.sentence_segments):
-                    continue
-                legacy_sentence = legacy_output.sentence_segments[sentence_index]
-                if getattr(sentence, "confidence", None) is None:
-                    sentence.confidence = getattr(legacy_sentence, "confidence", None)
-            self._apply_output_traces_to_sentences(
-                sentence_segments=rendered_sentences,
-                output_traces=rendered_traces,
-            )
-            self._strip_boundary_residual_weak_punct(rendered_sentences)
-
-            report = dict(legacy_output.segmentation_report or {})
+    ) -> DecisionLayerOutput:
+        if not segmentation_output.sentence_segments or not segmentation_output.words_for_split:
+            report = dict(segmentation_output.segmentation_report or {})
             report["pipeline_route"] = "canonical_segmentation_render"
-            report["render_report"] = dict(render_result.render_report or {})
-            report["render_output_trace"] = list(render_result.output_trace or ())
-            report["output_trace"] = [self._serialize_output_trace(item) for item in rendered_traces]
+            report["render_report"] = {
+                "segment_count": 0,
+                "input_segment_count": 0,
+                "rendered_terminal_count": 0,
+                "dropped_punct_fact_count": 0,
+                "dropped_punct_facts": [],
+            }
+            report["render_output_trace"] = []
+            report["output_trace"] = [
+                self._serialize_output_trace(item)
+                for item in segmentation_output.output_traces
+            ]
+            segmentation_output.segmentation_report = report
+            return segmentation_output
 
-            return DecisionLayerOutput(
-                sentence_segments=rendered_sentences,
-                words_for_split=legacy_output.words_for_split,
-                segmentation_report=report,
-                applied_cut_plan=legacy_output.applied_cut_plan,
-                output_traces=rendered_traces,
-            )
-        except Exception:
-            self._logger.exception(
-                "统一切分主链渲染失败，回退 legacy 输出: stream_id={} chunk_index={}",
-                stream_id,
-                chunk_index,
-            )
-            return None
+        canonical_stream = self._build_canonical_stream_from_words(
+            words=segmentation_output.words_for_split,
+            data=data,
+            stream_id=stream_id,
+            chunk_index=chunk_index,
+        )
+        segmentation_result = self._build_segmentation_result_from_legacy(
+            canonical_stream=canonical_stream,
+            sentence_segments=segmentation_output.sentence_segments,
+            output_traces=segmentation_output.output_traces,
+        )
+        render_result = self._render_core.render(
+            canonical_stream=canonical_stream,
+            segmentation_result=segmentation_result,
+        )
+        rendered_sentences, rendered_traces = self._build_legacy_sentences_from_render_result(
+            render_result=render_result,
+        )
+        for sentence_index, sentence in enumerate(rendered_sentences):
+            if sentence_index < len(segmentation_result.segments):
+                sentence.words = self._build_sentence_words_from_segment(
+                    canonical_stream=canonical_stream,
+                    segment=segmentation_result.segments[sentence_index],
+                )
+            if sentence_index >= len(segmentation_output.sentence_segments):
+                continue
+            legacy_sentence = segmentation_output.sentence_segments[sentence_index]
+            if getattr(sentence, "confidence", None) is None:
+                sentence.confidence = getattr(legacy_sentence, "confidence", None)
+        self._apply_output_traces_to_sentences(
+            sentence_segments=rendered_sentences,
+            output_traces=rendered_traces,
+        )
+        self._strip_boundary_residual_weak_punct(rendered_sentences)
 
-    def _finalize_legacy_fallback_output(
+        report = dict(segmentation_output.segmentation_report or {})
+        report["pipeline_route"] = "canonical_segmentation_render"
+        report["render_report"] = dict(render_result.render_report or {})
+        report["render_output_trace"] = list(render_result.output_trace or ())
+        report["output_trace"] = [self._serialize_output_trace(item) for item in rendered_traces]
+
+        return DecisionLayerOutput(
+            sentence_segments=rendered_sentences,
+            words_for_split=segmentation_output.words_for_split,
+            segmentation_report=report,
+            applied_cut_plan=segmentation_output.applied_cut_plan,
+            output_traces=rendered_traces,
+        )
+
+    def _build_legacy_sentences_from_render_result(
         self,
         *,
-        legacy_output: DecisionLayerOutput,
-    ) -> DecisionLayerOutput:
-        self._mark_legacy_fallback_report(
-            legacy_output=legacy_output,
-            reason="unified_render_unavailable",
-        )
-        if not self._is_keep_sentence_end_punct:
-            self._strip_sentence_end_punct(legacy_output.sentence_segments)
-            self._apply_output_traces_to_sentences(
-                sentence_segments=legacy_output.sentence_segments,
-                output_traces=legacy_output.output_traces,
+        render_result: Any,
+    ) -> Tuple[List[SentenceSegment], List[OutputTrace]]:
+        sentences: List[SentenceSegment] = []
+        traces: List[OutputTrace] = []
+
+        for idx, subtitle in enumerate(list(render_result.subtitles or ())):
+            trace_data = dict(getattr(subtitle, "trace", {}) or {})
+            split_reason = str(trace_data.get("split_reason", "") or "")
+            split_risk = str(trace_data.get("split_risk", "") or "")
+            window_id = str(trace_data.get("window_id", "") or "")
+            mapped_cut_time = trace_data.get("mapped_cut_time", subtitle.end)
+            mapping_quality = str(trace_data.get("mapping_quality", "") or "")
+            mapping_reason = str(trace_data.get("mapping_reason", "") or "")
+            pyannote_frame_time = trace_data.get("pyannote_frame_time")
+
+            sentence = SentenceSegment(
+                text=str(subtitle.text_display or ""),
+                text_clean=str(subtitle.text_display or ""),
+                start=float(subtitle.start),
+                end=float(subtitle.end),
+                source=self._map_render_text_source(str(subtitle.text_source or "")),
+                is_draft=False,
+                is_finalized=True,
+                speaker_id=subtitle.speaker_id,
+                turn_id=subtitle.turn_id,
+                split_reason=split_reason,
+                split_risk=split_risk,
+                window_id=window_id,
+                pyannote_frame_time=pyannote_frame_time,
+                mapped_cut_time=mapped_cut_time,
+                mapping_quality=mapping_quality,
+                mapping_reason=mapping_reason,
+                segment_id=subtitle.segment_id,
+                sentence_uid=subtitle.segment_id,
             )
-        self._strip_boundary_residual_weak_punct(legacy_output.sentence_segments)
-        return legacy_output
+            sentences.append(sentence)
+            traces.append(
+                OutputTrace(
+                    sentence_index=idx,
+                    split_reason=split_reason,
+                    split_risk=split_risk,
+                    window_id=window_id,
+                    pyannote_frame_time=pyannote_frame_time,
+                    mapped_cut_time=mapped_cut_time,
+                    mapping_quality=mapping_quality,
+                    mapping_reason=mapping_reason,
+                    sentence_start=float(subtitle.start),
+                    sentence_end=float(subtitle.end),
+                )
+            )
+        return sentences, traces
 
     @staticmethod
-    def _mark_legacy_fallback_report(
-        *,
-        legacy_output: DecisionLayerOutput,
-        reason: str,
-    ) -> None:
-        report = dict(legacy_output.segmentation_report or {})
-        report.setdefault("pipeline_route", "legacy_fallback")
-        report.setdefault("fallback_reason", str(reason or "unknown"))
-        legacy_output.segmentation_report = report
+    def _map_render_text_source(text_source: str) -> TextSource:
+        normalized = str(text_source or "").strip().lower()
+        if normalized == "fast":
+            return TextSource.SENSEVOICE
+        if normalized in {"slow", "aligned"}:
+            return TextSource.WHISPER_PATCH
+        return TextSource.WHISPER_PATCH
 
     def _build_canonical_stream_from_words(
         self,
@@ -259,6 +289,13 @@ class SegmentationProcessor:
         chunk_index: Optional[int],
     ):
         language = self._resolve_language_from_decision_input(data)
+        chunk_ref = str(chunk_index if chunk_index is not None else "chunk-unknown")
+        ingress_context = SegmentationIngressContext(
+            unit_kind="chunk",
+            unit_id=chunk_ref,
+            chunk_id=chunk_ref,
+            chunk_index=chunk_index,
+        )
         synthetic_text, clean_to_word = self._build_synthetic_text_and_word_mapping(words=words)
         char_mapping = [
             CharMapping(raw_idx=index, clean_idx=index, punct=None)
@@ -281,7 +318,8 @@ class SegmentationProcessor:
         aligned_facts = data.aligned_facts or self._build_synthetic_aligned_facts(words=words)
         return self._canonical_text_stream_adapter.build(
             stream_id=stream_id,
-            chunk_ref=str(chunk_index if chunk_index is not None else "chunk-unknown"),
+            chunk_ref=chunk_ref,
+            ingress_context=ingress_context,
             tracks=tracks,
             text_source=self._resolve_text_source_from_words(words=words),
             language=language,

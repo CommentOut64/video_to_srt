@@ -13,6 +13,7 @@ from app.services.textflow.contracts import (
     CanonicalTextStream,
     CoreToken,
     PunctuationFact,
+    SegmentationIngressContext,
 )
 from app.services.timeanchored_alignment.contracts import BoundaryEvidence, ProtectedSpan
 
@@ -40,6 +41,7 @@ class CanonicalTextStreamAdapter:
         *,
         stream_id: str,
         chunk_ref: str,
+        ingress_context: Optional[SegmentationIngressContext] = None,
         tracks: TextTrackBundle,
         text_source: str,
         language: str = "auto",
@@ -106,6 +108,7 @@ class CanonicalTextStreamAdapter:
             facts=[*raw_fast_facts, *raw_slow_facts, *raw_aligned_facts],
             source_priority=source_priority,
         )
+        ingress_payload = self._serialize_ingress_context(ingress_context)
         diagnostics = CanonicalStreamDiagnostics(
             raw_fast_text=str(tracks.sv_track.text_clean if tracks.sv_track else ""),
             raw_slow_text=str(tracks.whisper_track.text_clean if tracks.whisper_track else ""),
@@ -116,7 +119,11 @@ class CanonicalTextStreamAdapter:
             dedup_log=tuple(dedup_log),
             raw_mount_trace=dict(raw_mount_trace or {}),
             token_mapping_trace=tuple(dict(item) for item in token_mapping_trace),
+            ingress_context=ingress_payload,
         )
+        metadata_payload = dict(metadata or {})
+        if ingress_payload:
+            metadata_payload["ingress_context"] = ingress_payload
         return CanonicalTextStream(
             stream_id=stream_id,
             chunk_ref=chunk_ref,
@@ -128,8 +135,16 @@ class CanonicalTextStreamAdapter:
             protected_spans=tuple(protected_spans),
             cross_chunk_context=dict(cross_chunk_context or {}),
             diagnostics=diagnostics,
-            metadata=dict(metadata or {}),
+            metadata=metadata_payload,
         )
+
+    @staticmethod
+    def _serialize_ingress_context(
+        ingress_context: Optional[SegmentationIngressContext],
+    ) -> Dict[str, Any]:
+        if ingress_context is None:
+            return {}
+        return ingress_context.to_dict()
 
     def _build_tokens(
         self,
@@ -459,4 +474,3 @@ class CanonicalTextStreamAdapter:
         if punctuation in _BRACKET_PUNCT:
             return "bracket"
         return "other"
-

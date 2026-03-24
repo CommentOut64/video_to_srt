@@ -15,6 +15,7 @@ ALLOWED_PUNCT_SOURCES = frozenset({"fast", "slow", "aligned", "injected"})
 ALLOWED_ATTACH_MODES = frozenset({"leading", "trailing", "between", "standalone"})
 ALLOWED_PUNCT_CLASSES = frozenset({"sentence_end", "weak", "quote", "bracket", "other"})
 ALLOWED_WIDTH_POLICIES = frozenset({"auto", "fullwidth", "halfwidth", "none"})
+ALLOWED_INGRESS_UNIT_KINDS = frozenset({"chunk", "slow_window", "turn_group"})
 
 
 def _ensure_probability(name: str, value: float) -> float:
@@ -108,6 +109,45 @@ class CanonicalStreamDiagnostics:
     dedup_log: Tuple[Dict[str, Any], ...] = field(default_factory=tuple)
     raw_mount_trace: Dict[str, Any] = field(default_factory=dict)
     token_mapping_trace: Tuple[Dict[str, Any], ...] = field(default_factory=tuple)
+    ingress_context: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SegmentationIngressContext:
+    unit_kind: str
+    unit_id: str
+    chunk_id: Optional[str] = None
+    chunk_index: Optional[int] = None
+    slow_window_id: Optional[str] = None
+    turn_group_id: Optional[str] = None
+    window_coverage: Optional[float] = None
+    source_chunk_ids: Tuple[str, ...] = field(default_factory=tuple)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.unit_kind not in ALLOWED_INGRESS_UNIT_KINDS:
+            raise ValueError(f"SegmentationIngressContext.unit_kind 不支持: {self.unit_kind}")
+        if not self.unit_id:
+            raise ValueError("SegmentationIngressContext.unit_id 不能为空")
+        if self.chunk_index is not None and int(self.chunk_index) < 0:
+            raise ValueError("SegmentationIngressContext.chunk_index 必须 >= 0")
+        if self.window_coverage is not None:
+            _ensure_probability("SegmentationIngressContext.window_coverage", self.window_coverage)
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "unit_kind": self.unit_kind,
+            "unit_id": self.unit_id,
+            "chunk_id": self.chunk_id,
+            "chunk_index": self.chunk_index,
+            "slow_window_id": self.slow_window_id,
+            "turn_group_id": self.turn_group_id,
+            "window_coverage": self.window_coverage,
+            "source_chunk_ids": [str(item) for item in self.source_chunk_ids],
+        }
+        if self.metadata:
+            payload["metadata"] = dict(self.metadata)
+        return payload
 
 
 @dataclass(frozen=True)
@@ -258,11 +298,51 @@ class RenderResult:
     contract_version: str = CONTRACT_VERSION
 
 
+@dataclass(frozen=True)
+class SubtitleItem:
+    segment_id: str
+    chunk_id: str
+    start: float
+    end: float
+    text: str
+    status: str = "final"
+    source: str = "unknown"
+    speaker_id: Optional[str] = None
+    turn_id: Optional[str] = None
+    trace: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.segment_id:
+            raise ValueError("SubtitleItem.segment_id 不能为空")
+        if not self.chunk_id:
+            raise ValueError("SubtitleItem.chunk_id 不能为空")
+        if not self.text:
+            raise ValueError("SubtitleItem.text 不能为空")
+        _ensure_time_span(self.start, self.end, field_name="SubtitleItem")
+
+
+@dataclass(frozen=True)
+class SubtitleBatch:
+    chunk_id: str
+    items: Tuple[SubtitleItem, ...]
+    chunk_index: Optional[int] = None
+    render_report: Dict[str, Any] = field(default_factory=dict)
+    diagnostics: Dict[str, Any] = field(default_factory=dict)
+    contract_version: str = CONTRACT_VERSION
+
+    def __post_init__(self) -> None:
+        if not self.chunk_id:
+            raise ValueError("SubtitleBatch.chunk_id 不能为空")
+        if self.chunk_index is not None and int(self.chunk_index) < 0:
+            raise ValueError("SubtitleBatch.chunk_index 必须 >= 0")
+
+
 __all__ = [
     "CONTRACT_VERSION",
     "CoreToken",
     "PunctuationFact",
     "CanonicalStreamDiagnostics",
+    "SegmentationIngressContext",
     "CanonicalTextStream",
     "SegmentationOptions",
     "ConsumedBoundaryPunct",
@@ -271,4 +351,6 @@ __all__ = [
     "RenderPolicy",
     "RenderedSubtitle",
     "RenderResult",
+    "SubtitleItem",
+    "SubtitleBatch",
 ]

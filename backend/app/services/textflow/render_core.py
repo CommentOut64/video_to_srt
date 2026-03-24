@@ -47,7 +47,7 @@ class RenderCore:
     _EN_RIGHT_PUNCT = {",", ".", "!", "?", ";", ":", ")", "]", "}"}
     _EN_LEFT_PUNCT = {"(", "[", "{"}
     _TIME_WITH_MERIDIEM_PATTERN = re.compile(
-        r"(?P<clock>\b\d{1,2}(?::[0-5]\d){1,2})\s*[,;:]?\s*(?P<meridiem>(?:[AaPp][Mm]|[AaPp]\.[Mm]\.))(?=$|[\s,;:!?.])"
+        r"(?P<clock>\b\d{1,2}(?:\s*:\s*[0-5]\d){1,2})\s*[,;:]?\s*(?P<meridiem>(?:[AaPp][Mm]|[AaPp]\.[Mm]\.))(?=$|[\s,;:!?.])"
     )
 
     def render(
@@ -312,8 +312,9 @@ class RenderCore:
     @classmethod
     def _normalize_time_expressions(cls, text: str) -> str:
         def _replace(match: re.Match[str]) -> str:
+            clock = re.sub(r"\s*:\s*", ":", str(match.group("clock") or ""))
             meridiem = re.sub(r"\s+", "", str(match.group("meridiem") or ""))
-            return f"{match.group('clock')} {meridiem}"
+            return f"{clock} {meridiem}"
 
         return cls._TIME_WITH_MERIDIEM_PATTERN.sub(_replace, text)
 

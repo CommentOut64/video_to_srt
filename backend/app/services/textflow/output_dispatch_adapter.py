@@ -1,13 +1,224 @@
-"""OutputDispatchAdapter（Phase 5）。"""
+"""输出分发与统一输出处理器。"""
 
 from __future__ import annotations
 
-import copy
 import hashlib
 from typing import Any, Callable, Dict, Optional, Sequence
 
 from app.core.logging import resolve_loguru_logger
-from app.services.alignment.types import OutputTrace
+from app.services.alignment.types import OutputLayerInput, OutputLayerOutput, OutputTrace
+from app.services.textflow.contracts import SubtitleBatch, SubtitleItem
+from app.services.subtitle_visibility import is_hidden_unknown_sentence
+
+
+class OutputLayerProcessor:
+    """统一输出处理器：过滤 unknown、补齐 trace、构建 SubtitleBatch 并分发。"""
+
+    def __init__(
+        self,
+        *,
+        subtitle_manager: Any,
+        speaker_store_service_getter: Optional[Callable[[], Any]] = None,
+        logger: Optional[Any] = None,
+    ) -> None:
+        self._output_dispatch_adapter = OutputDispatchAdapter(
+            subtitle_manager=subtitle_manager,
+            speaker_store_service_getter=speaker_store_service_getter,
+            logger=logger,
+        )
+
+    def process(self, data: OutputLayerInput) -> OutputLayerOutput:
+        """执行统一输出分发。"""
+        sentence_segments = list(data.sentence_segments or [])
+        raw_output_traces = list(data.output_traces or [])
+        filtered_sentences: list[Any] = []
+        filtered_traces: list[OutputTrace] = []
+        unknown_sentence_filtered_count = 0
+        for sentence_index, sentence in enumerate(sentence_segments):
+            if is_hidden_unknown_sentence(sentence):
+                unknown_sentence_filtered_count += 1
+                continue
+            filtered_sentences.append(sentence)
+            if sentence_index < len(raw_output_traces):
+                filtered_traces.append(raw_output_traces[sentence_index])
+        sentence_segments = filtered_sentences
+
+        output_traces = self._resolve_output_traces(
+            sentence_segments=sentence_segments,
+            output_traces=filtered_traces,
+        )
+        self._apply_output_traces_to_sentences(
+            sentence_segments=sentence_segments,
+            output_traces=output_traces,
+        )
+        subtitle_batch = self._build_subtitle_batch(
+            chunk_ref=data.chunk_index,
+            sentence_segments=sentence_segments,
+            output_traces=output_traces,
+        )
+        payload = self._output_dispatch_adapter.dispatch(
+            subtitle_batch=subtitle_batch,
+            injection_report=dict(data.injection_report or {}),
+            segmentation_report=dict(data.segmentation_report or {}),
+            unknown_sentence_filtered_count=int(unknown_sentence_filtered_count),
+        )
+        return OutputLayerOutput(
+            output_payload=payload,
+            output_traces=output_traces,
+        )
+
+    @staticmethod
+    def _resolve_output_traces(
+        *,
+        sentence_segments: Sequence[Any],
+        output_traces: Optional[Sequence[OutputTrace]],
+    ) -> list[OutputTrace]:
+        traces = list(output_traces or [])
+        if traces:
+            return traces
+        fallback: list[OutputTrace] = []
+        for sentence_index, sentence in enumerate(sentence_segments):
+            fallback.append(
+                OutputTrace(
+                    sentence_index=sentence_index,
+                    split_reason=str(getattr(sentence, "split_reason", "") or "default_splitter"),
+                    split_risk=str(getattr(sentence, "split_risk", "") or ""),
+                    window_id=str(getattr(sentence, "window_id", "") or ""),
+                    pyannote_frame_time=getattr(sentence, "pyannote_frame_time", None),
+                    mapped_cut_time=getattr(sentence, "mapped_cut_time", None),
+                    mapping_quality=str(getattr(sentence, "mapping_quality", "") or "default"),
+                    mapping_reason=str(getattr(sentence, "mapping_reason", "") or "default_splitter"),
+                    sentence_start=float(getattr(sentence, "start", 0.0) or 0.0),
+                    sentence_end=float(getattr(sentence, "end", 0.0) or 0.0),
+                )
+            )
+        return fallback
+
+    @staticmethod
+    def _apply_output_traces_to_sentences(
+        *,
+        sentence_segments: Sequence[Any],
+        output_traces: Sequence[OutputTrace],
+    ) -> None:
+        trace_by_index = {int(trace.sentence_index): trace for trace in output_traces}
+        for sentence_index, sentence in enumerate(sentence_segments):
+            trace = trace_by_index.get(sentence_index)
+            if trace is None:
+                continue
+            setattr(sentence, "split_reason", str(trace.split_reason or ""))
+            setattr(sentence, "split_risk", str(trace.split_risk or ""))
+            setattr(sentence, "window_id", str(trace.window_id or ""))
+            setattr(sentence, "pyannote_frame_time", trace.pyannote_frame_time)
+            setattr(sentence, "mapped_cut_time", trace.mapped_cut_time)
+            setattr(sentence, "mapping_quality", str(trace.mapping_quality or ""))
+            setattr(sentence, "mapping_reason", str(trace.mapping_reason or ""))
+
+    def _build_subtitle_batch(
+        self,
+        *,
+        chunk_ref: Any,
+        sentence_segments: Sequence[Any],
+        output_traces: Sequence[OutputTrace],
+    ) -> SubtitleBatch:
+        chunk_id = str(chunk_ref)
+        items = tuple(
+            SubtitleItem(
+                segment_id=self._resolve_segment_id(chunk_id, sentence_index, sentence),
+                chunk_id=chunk_id,
+                start=float(getattr(sentence, "start", 0.0) or 0.0),
+                end=float(getattr(sentence, "end", 0.0) or 0.0),
+                text=self._resolve_sentence_text(sentence),
+                status=self._resolve_sentence_status(sentence),
+                source=self._resolve_sentence_source(sentence),
+                speaker_id=getattr(sentence, "speaker_id", None),
+                turn_id=getattr(sentence, "turn_id", None),
+                trace=self._build_sentence_trace(sentence),
+            )
+            for sentence_index, sentence in enumerate(sentence_segments)
+        )
+        return SubtitleBatch(
+            chunk_id=chunk_id,
+            chunk_index=self._try_parse_chunk_index(chunk_ref),
+            items=items,
+            diagnostics={
+                "source": "output_dispatch_adapter",
+                "output_trace": [self._serialize_output_trace(item) for item in output_traces],
+            },
+        )
+
+    @staticmethod
+    def _try_parse_chunk_index(chunk_ref: Any) -> Optional[int]:
+        if isinstance(chunk_ref, int):
+            return chunk_ref
+        chunk_text = str(chunk_ref or "").strip()
+        if not chunk_text:
+            return None
+        if chunk_text.lstrip("-").isdigit():
+            try:
+                return int(chunk_text)
+            except ValueError:
+                return None
+        if chunk_text.startswith("chunk-"):
+            try:
+                return int(chunk_text.split("-")[-1])
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _resolve_sentence_text(sentence: Any) -> str:
+        return str(getattr(sentence, "text_clean", "") or getattr(sentence, "text", "") or "")
+
+    @staticmethod
+    def _resolve_sentence_status(sentence: Any) -> str:
+        if getattr(sentence, "is_draft", False) and not getattr(sentence, "is_finalized", False):
+            return "draft"
+        return "final"
+
+    @staticmethod
+    def _resolve_sentence_source(sentence: Any) -> str:
+        source = getattr(sentence, "source", None)
+        return str(getattr(source, "value", source) or "unknown")
+
+    @classmethod
+    def _resolve_segment_id(cls, chunk_id: str, sentence_index: int, sentence: Any) -> str:
+        existing = str(getattr(sentence, "segment_id", "") or getattr(sentence, "sentence_uid", "") or "")
+        if existing:
+            return existing
+        seed = (
+            f"{chunk_id}|{sentence_index}|"
+            f"{float(getattr(sentence, 'start', 0.0) or 0.0):.3f}|"
+            f"{float(getattr(sentence, 'end', 0.0) or 0.0):.3f}|"
+            f"{cls._resolve_sentence_text(sentence)}"
+        )
+        return f"seg-{hashlib.sha1(seed.encode('utf-8')).hexdigest()[:16]}"
+
+    @staticmethod
+    def _build_sentence_trace(sentence: Any) -> dict[str, Any]:
+        return {
+            "split_reason": str(getattr(sentence, "split_reason", "") or ""),
+            "split_risk": str(getattr(sentence, "split_risk", "") or ""),
+            "window_id": str(getattr(sentence, "window_id", "") or ""),
+            "pyannote_frame_time": getattr(sentence, "pyannote_frame_time", None),
+            "mapped_cut_time": getattr(sentence, "mapped_cut_time", None),
+            "mapping_quality": str(getattr(sentence, "mapping_quality", "") or ""),
+            "mapping_reason": str(getattr(sentence, "mapping_reason", "") or ""),
+        }
+
+    @staticmethod
+    def _serialize_output_trace(trace: OutputTrace) -> dict[str, Any]:
+        return {
+            "sentence_index": int(trace.sentence_index),
+            "split_reason": str(trace.split_reason or ""),
+            "split_risk": str(trace.split_risk or ""),
+            "window_id": str(trace.window_id or ""),
+            "pyannote_frame_time": trace.pyannote_frame_time,
+            "mapped_cut_time": trace.mapped_cut_time,
+            "mapping_quality": str(trace.mapping_quality or ""),
+            "mapping_reason": str(trace.mapping_reason or ""),
+            "sentence_start": trace.sentence_start,
+            "sentence_end": trace.sentence_end,
+        }
 
 
 class OutputDispatchAdapter:
@@ -32,14 +243,11 @@ class OutputDispatchAdapter:
     def dispatch(
         self,
         *,
-        chunk_index: Any,
-        sentence_segments: Sequence[Any],
-        output_traces: Sequence[OutputTrace],
+        subtitle_batch: SubtitleBatch,
         injection_report: Optional[Dict[str, Any]] = None,
         segmentation_report: Optional[Dict[str, Any]] = None,
         unknown_sentence_filtered_count: int = 0,
     ) -> Dict[str, Any]:
-        sentences_for_manager = copy.deepcopy(list(sentence_segments or []))
         output_errors: list[str] = []
         replaced_sentence_indices: list[int] = []
         subtitle_channel_status = "ok"
@@ -48,41 +256,41 @@ class OutputDispatchAdapter:
 
         try:
             replaced_sentence_indices = list(
-                self._subtitle_manager.replace_chunk(chunk_index, sentences_for_manager) or []
+                self._subtitle_manager.replace_chunk_batch(subtitle_batch) or []
             )
         except Exception:
             output_errors.append("E_OUTPUT_CHANNEL_FAIL")
             subtitle_channel_status = "failed"
             speaker_store_channel_status = "skipped_upstream_failed"
             self._logger.exception(
-                "输出层分发失败: chunk_index={} sentences={}",
-                chunk_index,
-                len(sentence_segments),
+                "输出层分发失败: chunk_id={} sentences={}",
+                subtitle_batch.chunk_id,
+                len(subtitle_batch.items),
             )
 
         if "E_OUTPUT_CHANNEL_FAIL" not in output_errors:
             try:
                 speaker_store_channel_status, speaker_link_count = self._write_speaker_links(
-                    sentence_segments=sentence_segments,
+                    subtitle_items=subtitle_batch.items,
                     sentence_indices=replaced_sentence_indices,
                 )
             except Exception:
                 output_errors.append("E_OUTPUT_SPEAKER_STORE_FAIL")
                 speaker_store_channel_status = "failed"
                 self._logger.exception(
-                    "输出层 speaker_store 写入失败: chunk_index={} sentences={}",
-                    chunk_index,
-                    len(sentence_segments),
+                    "输出层 speaker_store 写入失败: chunk_id={} sentences={}",
+                    subtitle_batch.chunk_id,
+                    len(subtitle_batch.items),
                 )
 
         segmentation_payload = dict(segmentation_report or {})
         segmentation_payload["unknown_sentence_filtered_count"] = int(unknown_sentence_filtered_count)
         payload: Dict[str, Any] = {
-            "chunk_index": self._try_parse_chunk_index(chunk_index),
-            "chunk_uid": str(chunk_index),
-            "sentence_count": int(len(sentence_segments)),
+            "chunk_index": self._resolve_chunk_index(subtitle_batch),
+            "chunk_uid": str(subtitle_batch.chunk_id),
+            "sentence_count": int(len(subtitle_batch.items)),
             "sentence_segments": [
-                self._serialize_sentence_segment(item) for item in sentence_segments
+                self._serialize_subtitle_item(item) for item in subtitle_batch.items
             ],
             "transport_meta": {
                 "channels": [
@@ -100,13 +308,16 @@ class OutputDispatchAdapter:
             },
             "injection_report": dict(injection_report or {}),
             "segmentation_report": segmentation_payload,
-            "output_trace": [self._serialize_output_trace(item) for item in output_traces],
+            "output_trace": [
+                self._serialize_trace_dict(item)
+                for item in list(subtitle_batch.diagnostics.get("output_trace") or [])
+            ],
             "errors": output_errors,
         }
         self._logger.info(
-            "输出分发完成: chunk_index={} sentences={} filtered_unknown={} errors={}",
-            chunk_index,
-            len(sentence_segments),
+            "输出分发完成: chunk_id={} sentences={} filtered_unknown={} errors={}",
+            subtitle_batch.chunk_id,
+            len(subtitle_batch.items),
             int(unknown_sentence_filtered_count),
             len(output_errors),
         )
@@ -128,34 +339,34 @@ class OutputDispatchAdapter:
     def _write_speaker_links(
         self,
         *,
-        sentence_segments: Sequence[Any],
+        subtitle_items: Sequence[SubtitleItem],
         sentence_indices: Sequence[int],
     ) -> tuple[str, int]:
         speaker_store_service = self._resolve_speaker_store_service()
         if speaker_store_service is None:
             return "skipped_no_service", 0
-        if not sentence_segments or not sentence_indices:
+        if not subtitle_items or not sentence_indices:
             return "skipped_empty", 0
-        if len(sentence_indices) < len(sentence_segments):
+        if len(sentence_indices) < len(subtitle_items):
             self._logger.warning(
                 "输出层 speaker_store 写入索引不足: indices={} sentences={}",
                 len(sentence_indices),
-                len(sentence_segments),
+                len(subtitle_items),
             )
 
         payload_items = []
-        for idx, sentence in enumerate(sentence_segments):
+        for idx, subtitle_item in enumerate(subtitle_items):
             if idx >= len(sentence_indices):
                 break
             sentence_index = int(sentence_indices[idx])
-            text = str(getattr(sentence, "text_clean", "") or getattr(sentence, "text", "") or "")
+            text = str(subtitle_item.text or "")
             payload_items.append(
                 {
                     "sentence_index": sentence_index,
-                    "turn_id": getattr(sentence, "turn_id", None),
-                    "speaker_id": str(getattr(sentence, "speaker_id", None) or "unknown"),
-                    "start": float(getattr(sentence, "start", 0.0) or 0.0),
-                    "end": float(getattr(sentence, "end", 0.0) or 0.0),
+                    "turn_id": subtitle_item.turn_id,
+                    "speaker_id": str(subtitle_item.speaker_id or "unknown"),
+                    "start": float(subtitle_item.start or 0.0),
+                    "end": float(subtitle_item.end or 0.0),
                     "text_hash": self._compute_sentence_text_hash(text),
                     "binding_source": "auto",
                 }
@@ -185,35 +396,49 @@ class OutputDispatchAdapter:
                 return None
         return None
 
+    def _resolve_chunk_index(self, subtitle_batch: SubtitleBatch) -> Optional[int]:
+        if subtitle_batch.chunk_index is not None:
+            return int(subtitle_batch.chunk_index)
+        return self._try_parse_chunk_index(subtitle_batch.chunk_id)
+
     @staticmethod
-    def _serialize_output_trace(trace: OutputTrace) -> Dict[str, Any]:
+    def _serialize_trace_dict(trace: Dict[str, Any]) -> Dict[str, Any]:
         return {
-            "sentence_index": int(trace.sentence_index),
-            "split_reason": str(trace.split_reason or ""),
-            "split_risk": str(trace.split_risk or ""),
-            "window_id": str(trace.window_id or ""),
-            "pyannote_frame_time": trace.pyannote_frame_time,
-            "mapped_cut_time": trace.mapped_cut_time,
-            "mapping_quality": str(trace.mapping_quality or ""),
-            "mapping_reason": str(trace.mapping_reason or ""),
-            "sentence_start": trace.sentence_start,
-            "sentence_end": trace.sentence_end,
+            "sentence_index": int(trace.get("sentence_index", 0) or 0),
+            "split_reason": str(trace.get("split_reason", "") or ""),
+            "split_risk": str(trace.get("split_risk", "") or ""),
+            "window_id": str(trace.get("window_id", "") or ""),
+            "pyannote_frame_time": trace.get("pyannote_frame_time"),
+            "mapped_cut_time": trace.get("mapped_cut_time"),
+            "mapping_quality": str(trace.get("mapping_quality", "") or ""),
+            "mapping_reason": str(trace.get("mapping_reason", "") or ""),
+            "sentence_start": trace.get("sentence_start"),
+            "sentence_end": trace.get("sentence_end"),
         }
 
     @staticmethod
-    def _serialize_sentence_segment(sentence: Any) -> Dict[str, Any]:
+    def _serialize_subtitle_item(item: SubtitleItem) -> Dict[str, Any]:
+        trace = dict(item.trace or {})
         return {
-            "text": str(getattr(sentence, "text", "") or ""),
-            "text_clean": str(getattr(sentence, "text_clean", "") or ""),
-            "start": float(getattr(sentence, "start", 0.0) or 0.0),
-            "end": float(getattr(sentence, "end", 0.0) or 0.0),
-            "speaker_id": str(getattr(sentence, "speaker_id", "") or ""),
-            "turn_id": str(getattr(sentence, "turn_id", "") or ""),
-            "split_reason": str(getattr(sentence, "split_reason", "") or ""),
-            "split_risk": str(getattr(sentence, "split_risk", "") or ""),
-            "window_id": str(getattr(sentence, "window_id", "") or ""),
-            "mapped_cut_time": getattr(sentence, "mapped_cut_time", None),
-            "mapping_quality": str(getattr(sentence, "mapping_quality", "") or ""),
-            "mapping_reason": str(getattr(sentence, "mapping_reason", "") or ""),
+            "segment_id": str(item.segment_id),
+            "chunk_id": str(item.chunk_id),
+            "text": str(item.text or ""),
+            "text_clean": str(item.text or ""),
+            "start": float(item.start or 0.0),
+            "end": float(item.end or 0.0),
+            "status": str(item.status or ""),
+            "source": str(item.source or ""),
+            "speaker_id": str(item.speaker_id or ""),
+            "turn_id": str(item.turn_id or ""),
+            "split_reason": str(trace.get("split_reason", "") or ""),
+            "split_risk": str(trace.get("split_risk", "") or ""),
+            "window_id": str(trace.get("window_id", "") or ""),
+            "mapped_cut_time": trace.get("mapped_cut_time"),
+            "mapping_quality": str(trace.get("mapping_quality", "") or ""),
+            "mapping_reason": str(trace.get("mapping_reason", "") or ""),
         }
 
+
+OutputProcessor = OutputLayerProcessor
+
+__all__ = ["OutputLayerProcessor", "OutputProcessor", "OutputDispatchAdapter"]
