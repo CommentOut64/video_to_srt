@@ -65,9 +65,10 @@ def test_decision_processor_process_delegates_to_segmentation_core() -> None:
     assert called["stream_id"] == "legacy:main:none"
     assert called["chunk_index"] == 1
     assert called["is_last_chunk"] is False
+    assert output.segmentation_report["pipeline_route"] == "canonical_segmentation_render"
 
 
-def test_decision_processor_marks_legacy_route_when_unified_render_unavailable() -> None:
+def test_decision_processor_marks_unified_route_even_when_output_is_empty() -> None:
     processor = SegmentationProcessor(final_splitter=FinalSplitter())
     expected = DecisionLayerOutput(
         sentence_segments=[],
@@ -80,13 +81,12 @@ def test_decision_processor_marks_legacy_route_when_unified_render_unavailable()
             return expected
 
     processor._segmentation_core = _DummyCore()
-    processor._try_render_with_unified_pipeline = lambda **kwargs: None
     payload = DecisionLayerInput(annotated_words=[], vad_intervals=[])
     output = processor.process(payload)
 
     assert output is expected
-    assert output.segmentation_report["pipeline_route"] == "legacy_fallback"
-    assert output.segmentation_report["fallback_reason"] == "unified_render_unavailable"
+    assert output.segmentation_report["pipeline_route"] == "canonical_segmentation_render"
+    assert "fallback_reason" not in output.segmentation_report
 
 
 def test_build_segmentation_result_from_legacy_segment_id_must_include_chunk_ref() -> None:
@@ -133,9 +133,9 @@ def test_build_segmentation_result_from_legacy_segment_id_must_include_chunk_ref
     assert result.segments[0].segment_id == "timeanchored:main:none:3:seg:0"
 
 
-def test_try_render_with_unified_pipeline_rebuilds_clean_words_instead_of_copying_legacy() -> None:
+def test_render_with_unified_pipeline_rebuilds_clean_words_instead_of_copying_legacy() -> None:
     processor = SegmentationProcessor(final_splitter=FinalSplitter())
-    legacy_output = DecisionLayerOutput(
+    segmentation_output = DecisionLayerOutput(
         sentence_segments=[
             SentenceSegment(
                 text="Hello world??",
@@ -155,8 +155,8 @@ def test_try_render_with_unified_pipeline_rebuilds_clean_words_instead_of_copyin
         output_traces=[OutputTrace(sentence_index=0, split_reason="legacy")],
     )
 
-    output = processor._try_render_with_unified_pipeline(
-        legacy_output=legacy_output,
+    output = processor._render_with_unified_pipeline(
+        segmentation_output=segmentation_output,
         data=DecisionLayerInput(annotated_words=[], vad_intervals=[]),
         stream_id="timeanchored:main:none",
         chunk_index=3,

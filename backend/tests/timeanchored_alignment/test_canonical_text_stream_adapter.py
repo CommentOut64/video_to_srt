@@ -3,6 +3,7 @@ from __future__ import annotations
 from app.services.alignment.types import CharMapping, TextTrack, TextTrackBundle
 from app.services.punctuation.base import PuncPosition
 from app.services.textflow.canonical_text_stream_adapter import CanonicalTextStreamAdapter
+from app.services.textflow.contracts import SegmentationIngressContext
 from app.services.timeanchored_alignment.contracts import BoundaryEvidence, ProtectedSpan
 
 
@@ -61,6 +62,12 @@ def test_adapter_builds_canonical_stream_and_keeps_diagnostics() -> None:
     stream = adapter.build(
         stream_id="stream-1",
         chunk_ref="chunk-1",
+        ingress_context=SegmentationIngressContext(
+            unit_kind="chunk",
+            unit_id="chunk-1",
+            chunk_id="chunk-1",
+            chunk_index=1,
+        ),
         tracks=tracks,
         text_source="fast",
         language="en",
@@ -73,6 +80,8 @@ def test_adapter_builds_canonical_stream_and_keeps_diagnostics() -> None:
     assert stream.candidate_boundaries == boundaries
     assert stream.protected_spans == spans
     assert stream.diagnostics.raw_mount_trace["mapping_pairs"] == [{"a": 1}]
+    assert stream.diagnostics.ingress_context["unit_kind"] == "chunk"
+    assert stream.metadata["ingress_context"]["chunk_id"] == "chunk-1"
 
     # fast 优先：逗号应保留 fast，slow 同位同类逗号应被去重淘汰并写入 dedup_log。
     comma = [fact for fact in stream.punctuation_facts if fact.normalized_text == ","]
@@ -108,6 +117,12 @@ def test_adapter_respects_text_source_priority_for_slow() -> None:
     stream = adapter.build(
         stream_id="stream-2",
         chunk_ref="chunk-2",
+        ingress_context=SegmentationIngressContext(
+            unit_kind="slow_window",
+            unit_id="window-2",
+            slow_window_id="window-2",
+            source_chunk_ids=("chunk-2",),
+        ),
         tracks=tracks,
         text_source="slow",
         language="en",
@@ -115,3 +130,6 @@ def test_adapter_respects_text_source_priority_for_slow() -> None:
     comma = [fact for fact in stream.punctuation_facts if fact.normalized_text == ","]
     assert len(comma) == 1
     assert comma[0].source == "slow"
+    assert stream.chunk_ref == "chunk-2"
+    assert stream.diagnostics.ingress_context["slow_window_id"] == "window-2"
+    assert stream.metadata["ingress_context"]["source_chunk_ids"] == ["chunk-2"]

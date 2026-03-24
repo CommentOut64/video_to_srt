@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from app.services.punctuation.final_splitter import FinalSplitter
+from app.services.textflow.decision_layer import SegmentationProcessor
 from app.services.textflow.contracts import RenderResult, RenderedSubtitle
-from app.services.textflow.legacy_sentence_adapter import LegacySentenceAdapter
 
 
-def test_legacy_sentence_adapter_maps_rendered_subtitle_to_sentence_segment_and_trace() -> None:
-    adapter = LegacySentenceAdapter()
+def test_decision_layer_render_bridge_maps_rendered_subtitle_to_sentence_segment_and_trace() -> None:
+    processor = SegmentationProcessor(final_splitter=FinalSplitter())
     render_result = RenderResult(
         subtitles=(
             RenderedSubtitle(
@@ -30,7 +31,9 @@ def test_legacy_sentence_adapter_maps_rendered_subtitle_to_sentence_segment_and_
         )
     )
 
-    sentences, traces = adapter.to_legacy(render_result=render_result)
+    sentences, traces = processor._build_legacy_sentences_from_render_result(
+        render_result=render_result
+    )
 
     assert len(sentences) == 1
     assert sentences[0].text == "你好，世界？"

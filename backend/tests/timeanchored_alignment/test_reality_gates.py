@@ -12,7 +12,7 @@ from app.services.bridge.turn_group_builder import TurnGroupEnvelope
 from app.services.bridge.turn_group_models import TurnGroup
 from app.services.language_policy import resolve_language_tag
 from app.services.sensevoice_onnx_service import SenseVoiceLanguageInfo, SenseVoiceONNXService
-from app.services.textflow.output_layer import OutputLayerProcessor
+from app.services.textflow.output_dispatch_adapter import OutputLayerProcessor
 from app.services.alignment.types import OutputLayerInput
 from app.models.sensevoice_models import SentenceSegment
 from app.pipelines.dual_pipeline.services.slow_loop_service import SlowLoopService
@@ -182,16 +182,16 @@ async def test_phase0_reality_gate_slow_loop_consumes_turn_group_envelope() -> N
     assert isinstance(processed_payloads[0], TurnGroupEnvelope)
 
 
-def test_phase0_reality_gate_output_layer_uses_output_layer_input_to_replace_chunk() -> None:
-    """现实基线：OutputLayerProcessor 通过 OutputLayerInput -> replace_chunk() 收口。"""
+def test_phase0_reality_gate_output_layer_uses_output_layer_input_to_replace_chunk_batch() -> None:
+    """现实基线：OutputLayerProcessor 通过 OutputLayerInput -> SubtitleBatch -> replace_chunk_batch() 收口。"""
 
     class _DummySubtitleManager:
         def __init__(self) -> None:
             self.last_call = None
 
-        def replace_chunk(self, chunk_index: int, sentences: list[SentenceSegment]) -> list[int]:
-            self.last_call = (chunk_index, list(sentences))
-            return list(range(len(sentences)))
+        def replace_chunk_batch(self, subtitle_batch) -> list[int]:
+            self.last_call = subtitle_batch
+            return list(range(len(subtitle_batch.items)))
 
     subtitle_manager = _DummySubtitleManager()
     processor = OutputLayerProcessor(subtitle_manager=subtitle_manager)
@@ -212,6 +212,6 @@ def test_phase0_reality_gate_output_layer_uses_output_layer_input_to_replace_chu
     )
 
     assert subtitle_manager.last_call is not None
-    assert subtitle_manager.last_call[0] == 3
-    assert len(subtitle_manager.last_call[1]) == 1
+    assert subtitle_manager.last_call.chunk_id == "3"
+    assert len(subtitle_manager.last_call.items) == 1
     assert output.output_payload.get("transport_meta", {}).get("channels")
