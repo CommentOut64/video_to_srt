@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Tuple, TYPE_CHECKING
 
 from app.services.user_config_service import get_user_config_service
 from app.services.subtitle_visibility import filter_hidden_unknown_sentences
+from app.services.textflow.contracts import SubtitleItem
 from app.utils.text_utils import (
     detect_timestamp_overlaps,
     format_srt_timestamp,
@@ -188,25 +189,58 @@ class SubtitleOutputService:
         Returns:
             List[Segment]: 标准化字幕段落列表
         """
+        visible_sentences = filter_hidden_unknown_sentences(sentences)
+        segments = self._build_segments_core(
+            items=visible_sentences,
+            include_translation=include_translation,
+            apply_offset=apply_offset,
+            offset_override=offset_override,
+        )
+        logger.debug(f"[SubtitleOutputService] 构建 {len(segments)} 个 segments")
+        return segments
+
+    def build_segments_from_subtitles(
+        self,
+        subtitles: List[Any],
+        *,
+        apply_offset: bool = True,
+        offset_override: float | None = None,
+    ) -> List[Segment]:
+        """从统一字幕 DTO 或同形字典构建标准化 segments。"""
+        segments = self._build_segments_core(
+            items=list(subtitles or []),
+            include_translation=False,
+            apply_offset=apply_offset,
+            offset_override=offset_override,
+        )
+        logger.debug(f"[SubtitleOutputService] 从统一字幕 DTO 构建 {len(segments)} 个 segments")
+        return segments
+
+    def _build_segments_core(
+        self,
+        *,
+        items: List[Any],
+        include_translation: bool,
+        apply_offset: bool,
+        offset_override: float | None,
+    ) -> List[Segment]:
         # V3.2.0+dev.20260130.09: 输出阶段统一应用全局字幕时间偏移
         offset = 0.0
         if apply_offset:
             offset = offset_override if offset_override is not None else get_user_config_service().get_subtitle_time_offset()
 
         segments: List[Segment] = []
-        visible_sentences = filter_hidden_unknown_sentences(sentences)
-        for sentence in visible_sentences:
-            # 优先使用清洗后的文本
-            base_text = getattr(sentence, "text_clean", None) or sentence.text
-            translation = getattr(sentence, "translation", None)
+        for item in items:
+            base_text = self._resolve_base_text(item)
+            translation = self._resolve_translation(item)
 
             if include_translation and translation:
                 text = f"{base_text}\n{translation}"
             else:
                 text = base_text
 
-            start = float(sentence.start) + offset
-            end = float(sentence.end) + offset
+            start = self._resolve_float_field(item, "start", 0.0) + offset
+            end = self._resolve_float_field(item, "end", start - offset) + offset
             if start < 0:
                 start = 0.0
             if end < start:
@@ -217,9 +251,32 @@ class SubtitleOutputService:
                 "end": end,
                 "text": text,
             })
-
-        logger.debug(f"[SubtitleOutputService] 构建 {len(segments)} 个 segments")
         return segments
+
+    @staticmethod
+    def _resolve_base_text(item: Any) -> str:
+        if isinstance(item, SubtitleItem):
+            return str(item.text or "")
+        if isinstance(item, dict):
+            return str(item.get("text", "") or "")
+        return str(getattr(item, "text_clean", None) or getattr(item, "text", "") or "")
+
+    @staticmethod
+    def _resolve_translation(item: Any) -> Any:
+        if isinstance(item, dict):
+            return item.get("translation")
+        return getattr(item, "translation", None)
+
+    @staticmethod
+    def _resolve_float_field(item: Any, field_name: str, default: float) -> float:
+        try:
+            if isinstance(item, SubtitleItem):
+                return float(getattr(item, field_name))
+            if isinstance(item, dict):
+                return float(item.get(field_name, default) or default)
+            return float(getattr(item, field_name, default) or default)
+        except (TypeError, ValueError):
+            return float(default)
 
     def repair_overlaps(
         self,
@@ -246,6 +303,39 @@ class SubtitleOutputService:
         logger.info(f"[SubtitleOutputService] 修复了 {repair_count} 处时间戳重叠")
         return repaired, repair_count
 
+    def format_srt_segments(
+        self,
+        segments: List[Segment],
+        *,
+        auto_repair: bool = True,
+    ) -> str:
+        segments_to_write = segments
+        if auto_repair:
+            segments_to_write, repair_count = self.repair_overlaps(segments_to_write)
+            if repair_count > 0:
+                logger.debug(f"[SubtitleOutputService] SRT 格式化前修复了 {repair_count} 处重叠")
+        return self._srt_formatter.format(segments_to_write)
+
+    def format_ass_segments(
+        self,
+        segments: List[Segment],
+        *,
+        title: str = "Untitled",
+        style_preset: str = "default",
+        video_width: int = 1920,
+        video_height: int = 1080,
+    ) -> str:
+        segments_to_write, repair_count = self.repair_overlaps(segments)
+        if repair_count > 0:
+            logger.debug(f"[SubtitleOutputService] ASS 格式化前修复了 {repair_count} 处重叠")
+        return self._ass_formatter.format(
+            segments_to_write,
+            style_preset=style_preset,
+            title=title,
+            video_width=video_width,
+            video_height=video_height,
+        )
+
     def write_srt(
         self,
         segments: List[Segment],
@@ -264,14 +354,7 @@ class SubtitleOutputService:
             Path: 输出文件路径
         """
         output_path = Path(output_path)
-        segments_to_write = segments
-
-        if auto_repair:
-            segments_to_write, repair_count = self.repair_overlaps(segments_to_write)
-            if repair_count > 0:
-                logger.debug(f"[SubtitleOutputService] SRT 写入前修复了 {repair_count} 处重叠")
-
-        content = self._srt_formatter.format(segments_to_write)
+        content = self.format_srt_segments(segments, auto_repair=auto_repair)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(content, encoding="utf-8")
 
@@ -332,14 +415,8 @@ class SubtitleOutputService:
             Path: 输出文件路径
         """
         output_path = Path(output_path)
-
-        # ASS 格式总是自动修复重叠
-        segments_to_write, repair_count = self.repair_overlaps(segments)
-        if repair_count > 0:
-            logger.debug(f"[SubtitleOutputService] ASS 写入前修复了 {repair_count} 处重叠")
-
-        content = self._ass_formatter.format(
-            segments_to_write,
+        content = self.format_ass_segments(
+            segments,
             style_preset=style_preset,
             title=output_path.stem or "Untitled",
             video_width=video_width,

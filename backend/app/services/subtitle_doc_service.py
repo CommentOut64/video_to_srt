@@ -47,15 +47,31 @@ class SubtitleSegment:
     is_deleted: bool = False
     legacy_index: Optional[int] = None
     source_type: str = "import"
+    sentence_uid: Optional[str] = None
+    chunk_id: Optional[str] = None
+    status: str = "final"
+    source: Optional[str] = None
+    speaker_id: Optional[str] = None
+    turn_id: Optional[str] = None
+    trace: dict = field(default_factory=dict)
     created_at: float = field(default_factory=time)
     updated_at: float = field(default_factory=time)
 
     def to_dict(self) -> dict:
+        resolved_chunk_id = str(self.chunk_id or "")
         return {
             "segment_id": self.segment_id,
+            "sentence_uid": self.sentence_uid or self.segment_id,
+            "chunk_id": resolved_chunk_id or None,
+            "chunk_uid": resolved_chunk_id or None,
             "text": self.text,
             "start": float(self.start),
             "end": float(self.end),
+            "status": self.status,
+            "source": self.source or self.source_type,
+            "speaker_id": self.speaker_id,
+            "turn_id": self.turn_id,
+            "trace": dict(self.trace or {}),
             "original_text": self.original_text,
             "is_modified": bool(self.is_modified),
             "is_deleted": bool(self.is_deleted),
@@ -72,6 +88,14 @@ class SubtitleDocService:
     SEGMENT_MAP_KEY = "_segment_map"
     # V3.2.4+dev.20260303.01: tombstone 映射，支持 batch-sync 恢复已删除字幕
     DELETED_SEGMENT_MAP_KEY = "_deleted_segment_map"
+
+    @staticmethod
+    def _default_chunk_id(*, legacy_index: Optional[int], source_type: str) -> str:
+        if source_type == "manual" or (legacy_index is not None and int(legacy_index) < 0):
+            return "chunk:manual"
+        if legacy_index is None:
+            return f"chunk:{source_type}"
+        return f"chunk:{source_type}:{int(legacy_index)}"
 
     def import_segments(
         self,
@@ -162,6 +186,10 @@ class SubtitleDocService:
                 is_deleted=False,
                 legacy_index=int(index),
                 source_type=source,
+                sentence_uid=index_to_segment.get(index, generate_segment_id()),
+                chunk_id=self._default_chunk_id(legacy_index=int(index), source_type=source),
+                status="final",
+                source=source,
                 updated_at=float(entry.get("updated_at", time())),
             )
             segments.append(segment.to_dict())
@@ -253,6 +281,13 @@ class SubtitleDocService:
             is_deleted=False,
             legacy_index=int(sentence_index),
             source_type=str(entry.get("source", "manual")),
+            sentence_uid=segment_id,
+            chunk_id=self._default_chunk_id(
+                legacy_index=int(sentence_index),
+                source_type=str(entry.get("source", "manual")),
+            ),
+            status="final",
+            source=str(entry.get("source", "manual")),
             updated_at=float(entry.get("updated_at", time())),
         ).to_dict()
 
@@ -375,41 +410,30 @@ class SubtitleDocService:
 
     def export_srt(self, project_dir: Path) -> str:
         """导出 SRT 字符串。"""
+        from app.services.subtitle_output_service import get_subtitle_output_service
+
         segments = self.load_segments(project_dir)
-        raw_segments = [
-            {
-                "start": float(seg.get("start", 0.0)),
-                "end": float(seg.get("end", 0.0)),
-                "text": str(seg.get("text", "")),
-            }
-            for seg in segments
-        ]
-        return segments_to_srt(raw_segments)
+        output_service = get_subtitle_output_service()
+        export_segments = output_service.build_segments_from_subtitles(
+            segments,
+            apply_offset=False,
+        )
+        return output_service.format_srt_segments(export_segments)
 
     def export_ass(self, project_dir: Path) -> str:
         """导出 ASS 字符串。"""
-        segments = self.load_segments(project_dir)
-        style = ASSConverter.STYLE_PRESETS["default"]
+        from app.services.subtitle_output_service import get_subtitle_output_service
 
-        content_parts: List[str] = [
-            ASSConverter.generate_script_info(title=project_dir.name),
-            "\n[V4+ Styles]",
-            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
-            "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
-            "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
-            "Alignment, MarginL, MarginR, MarginV, Encoding",
-            ASSConverter.generate_style_section(style),
-            "\n[Events]",
-            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
-        ]
-        for seg in segments:
-            start = ASSConverter.format_ass_timestamp(float(seg.get("start", 0.0)))
-            end = ASSConverter.format_ass_timestamp(float(seg.get("end", 0.0)))
-            text = str(seg.get("text", "")).replace("\n", "\\N")
-            content_parts.append(
-                f"Dialogue: 0,{start},{end},{style.name},,0,0,0,,{text}"
-            )
-        return "\n".join(content_parts)
+        segments = self.load_segments(project_dir)
+        output_service = get_subtitle_output_service()
+        export_segments = output_service.build_segments_from_subtitles(
+            segments,
+            apply_offset=False,
+        )
+        return output_service.format_ass_segments(
+            export_segments,
+            title=project_dir.name,
+        )
 
     @staticmethod
     def parse_srt(content: str) -> List[dict]:

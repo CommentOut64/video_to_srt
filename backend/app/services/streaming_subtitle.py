@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 from app.models.sensevoice_models import SentenceSegment, TextSource
 from app.services.sse_service import get_sse_manager
 from app.services.subtitle_visibility import is_hidden_unknown_sentence
+from app.services.textflow.contracts import SubtitleBatch, SubtitleItem
 import logging
 
 logger = logging.getLogger(__name__)
@@ -204,6 +205,119 @@ class StreamingSubtitleManager:
             )
         if not getattr(sentence, "segment_id", None):
             sentence.segment_id = sentence.sentence_uid
+
+    @staticmethod
+    def _resolve_subtitle_item_source(source: Optional[str]) -> TextSource:
+        source_text = str(source or "").strip().lower()
+        if source_text in {"fast", TextSource.SENSEVOICE.value}:
+            return TextSource.SENSEVOICE
+        if source_text in {"manual", TextSource.MANUAL.value}:
+            return TextSource.MANUAL
+        if source_text in {
+            "slow",
+            "aligned",
+            "render_core",
+            TextSource.WHISPER_PATCH.value,
+            TextSource.LLM_CORRECTION.value,
+            TextSource.LLM_TRANSLATION.value,
+        }:
+            return TextSource.WHISPER_PATCH
+        return TextSource.WHISPER_PATCH
+
+    def _build_sentence_from_subtitle_item(self, item: SubtitleItem) -> SentenceSegment:
+        trace = dict(item.trace or {})
+        sentence = SentenceSegment(
+            text=str(item.text),
+            text_clean=str(item.text),
+            start=float(item.start),
+            end=float(item.end),
+            source=self._resolve_subtitle_item_source(item.source),
+            is_draft=str(item.status or "").lower() == "draft",
+            is_finalized=str(item.status or "").lower() != "draft",
+            speaker_id=item.speaker_id,
+            turn_id=item.turn_id,
+            sentence_uid=item.segment_id,
+            segment_id=item.segment_id,
+            chunk_uid=item.chunk_id,
+        )
+        sentence.split_reason = str(trace.get("split_reason", "") or "")
+        sentence.split_risk = str(trace.get("split_risk", "") or "")
+        sentence.window_id = str(trace.get("window_id", "") or "")
+        sentence.pyannote_frame_time = trace.get("pyannote_frame_time")
+        sentence.mapped_cut_time = trace.get("mapped_cut_time")
+        sentence.mapping_quality = str(trace.get("mapping_quality", "") or "")
+        sentence.mapping_reason = str(trace.get("mapping_reason", "") or "")
+        return sentence
+
+    def _build_subtitle_snapshot_payload(
+        self,
+        sentence: SentenceSegment,
+        *,
+        index: int,
+    ) -> Dict[str, Any]:
+        payload = self._build_sentence_payload(
+            sentence,
+            index=index,
+            is_draft=getattr(sentence, "is_draft", False),
+            is_finalized=getattr(sentence, "is_finalized", False),
+        )
+        segment_id = str(
+            payload.get("segment_id")
+            or payload.get("sentence_uid")
+            or getattr(sentence, "segment_id", None)
+            or getattr(sentence, "sentence_uid", None)
+            or f"seg-{index}"
+        )
+        chunk_id = str(
+            payload.get("chunk_id")
+            or payload.get("chunk_uid")
+            or getattr(sentence, "chunk_uid", None)
+            or f"chunk:transcribe:{index}"
+        )
+        source_value = payload.get("source")
+        if hasattr(source_value, "value"):
+            source_value = source_value.value
+        is_draft = bool(payload.get("is_draft", getattr(sentence, "is_draft", False)))
+        is_finalized = bool(
+            payload.get("is_finalized", getattr(sentence, "is_finalized", not is_draft))
+        )
+        status = "draft" if is_draft and not is_finalized else "final"
+        trace: Dict[str, Any] = {}
+        raw_trace = payload.get("trace")
+        if isinstance(raw_trace, dict):
+            trace.update(raw_trace)
+        for key in (
+            "split_reason",
+            "split_risk",
+            "window_id",
+            "pyannote_frame_time",
+            "mapped_cut_time",
+            "mapping_quality",
+            "mapping_reason",
+        ):
+            value = payload.get(key)
+            if value is None:
+                continue
+            trace.setdefault(key, value)
+
+        return {
+            "segment_id": segment_id,
+            "sentence_uid": segment_id,
+            "chunk_id": chunk_id,
+            "chunk_uid": chunk_id,
+            "text": str(payload.get("text", "") or ""),
+            "start": float(payload.get("start", 0.0) or 0.0),
+            "end": float(payload.get("end", payload.get("start", 0.0)) or payload.get("start", 0.0)),
+            "status": status,
+            "source": str(source_value or "transcribe"),
+            "speaker_id": payload.get("speaker_id"),
+            "turn_id": payload.get("turn_id"),
+            "trace": trace,
+            "legacy_index": int(index),
+            "source_type": str(source_value or "transcribe"),
+            "is_modified": bool(payload.get("is_modified", getattr(sentence, "is_modified", False))),
+            "original_text": payload.get("original_text"),
+        }
 
     def _persist_runtime_subtitle_state(self, *, reason: str) -> None:
         """持久化运行态字幕快照到 runtime_state.db。"""
@@ -828,6 +942,15 @@ class StreamingSubtitleManager:
         self._persist_runtime_subtitle_state(reason="replace_chunk")
         return new_indices
 
+    def replace_chunk_batch(self, subtitle_batch: SubtitleBatch) -> List[int]:
+        """按统一字幕 DTO 替换 Chunk。"""
+        subtitle_items = list(subtitle_batch.items or ())
+        sentences = [
+            self._build_sentence_from_subtitle_item(item)
+            for item in subtitle_items
+        ]
+        return self.replace_chunk(subtitle_batch.chunk_id, sentences)
+
     def add_finalized_sentences(
         self,
         chunk_ref: Any,
@@ -937,6 +1060,7 @@ class StreamingSubtitleManager:
             dict: 可直接保存到 Checkpoint 的字幕数据
         """
         sentences_snapshot = []
+        subtitle_items_snapshot = []
         visible_indices = set()
         for idx, sentence in self.sentences.items():
             if self._is_hidden_unknown_sentence(sentence):
@@ -948,6 +1072,9 @@ class StreamingSubtitleManager:
             sentence_dict["_is_draft"] = getattr(sentence, 'is_draft', False)
             sentence_dict["_is_finalized"] = getattr(sentence, 'is_finalized', False)
             sentences_snapshot.append(sentence_dict)
+            subtitle_items_snapshot.append(
+                self._build_subtitle_snapshot_payload(sentence, index=idx)
+            )
             visible_indices.add(idx)
 
         chunk_sentences_map: Dict[str, List[int]] = {}
@@ -958,6 +1085,7 @@ class StreamingSubtitleManager:
             ]
 
         return {
+            "subtitle_items_snapshot": subtitle_items_snapshot,
             "sentences_snapshot": sentences_snapshot,
             "sentence_count": self.sentence_count,
             "chunk_sentences_map": chunk_sentences_map,
