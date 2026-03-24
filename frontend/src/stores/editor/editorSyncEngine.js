@@ -91,7 +91,7 @@ function resolveAuthoritativeLocalId(docStore, snapshot) {
 
   const sentenceIndex = snapshot.sentenceIndex
   if (sentenceIndex !== null && sentenceIndex !== undefined) {
-    const boundBySentenceIndex = docStore.bindingBySentenceIndex.get(sentenceIndex)
+    const boundBySentenceIndex = docStore.findLocalIdBySentenceIndex(sentenceIndex)
     if (boundBySentenceIndex) {
       const existingCold = docStore.getCold(boundBySentenceIndex)
       const existingSegmentId = toNormalizedSegmentId(existingCold?.segmentId)
@@ -121,13 +121,6 @@ function syncSnapshotColdState(docStore, localId, snapshot, existingCold) {
   if (existingCold?.segmentId && existingCold.segmentId !== snapshot.segmentId) {
     docStore.bindingBySegmentId.delete(existingCold.segmentId)
   }
-  if (
-    existingCold?.sentenceIndex !== null
-    && existingCold?.sentenceIndex !== undefined
-    && existingCold.sentenceIndex !== snapshot.sentenceIndex
-  ) {
-    docStore.bindingBySentenceIndex.delete(existingCold.sentenceIndex)
-  }
 
   if (existingCold) {
     docStore._applyColdUpdate(localId, {
@@ -151,9 +144,6 @@ function syncSnapshotColdState(docStore, localId, snapshot, existingCold) {
 
   if (snapshot.segmentId) {
     docStore.updateColdBinding(localId, snapshot.segmentId)
-  }
-  if (snapshot.sentenceIndex !== null && snapshot.sentenceIndex !== undefined) {
-    docStore.bindingBySentenceIndex.set(snapshot.sentenceIndex, localId)
   }
 }
 
@@ -1008,22 +998,8 @@ export const useEditorSyncEngine = defineStore('editorSyncEngine', () => {
           })
           docStore._applyReorder(localId)
           if (replayCold) {
-            const previousCold = docStore.getCold(localId)
             docStore._applyColdUpdate(localId, replayCold)
             docStore.updateColdBinding(localId, replayCold.segmentId ?? null)
-
-            const previousSentenceIndex = previousCold?.sentenceIndex
-            const nextSentenceIndex = replayCold.sentenceIndex
-            if (
-              previousSentenceIndex !== null
-              && previousSentenceIndex !== undefined
-              && previousSentenceIndex !== nextSentenceIndex
-            ) {
-              docStore.bindingBySentenceIndex.delete(previousSentenceIndex)
-            }
-            if (nextSentenceIndex !== null && nextSentenceIndex !== undefined) {
-              docStore.bindingBySentenceIndex.set(nextSentenceIndex, localId)
-            }
           }
         } else {
           docStore._applyInsert(

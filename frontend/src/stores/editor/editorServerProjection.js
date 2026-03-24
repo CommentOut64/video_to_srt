@@ -39,17 +39,17 @@ function resolveSentenceIndex(rawSegment) {
 }
 
 function resolvePatchLocalId(docStore, rawSentence) {
-  const sentenceIndex = resolveSentenceIndex(rawSentence)
-  if (sentenceIndex !== null) {
-    const localId = docStore.bindingBySentenceIndex.get(sentenceIndex)
+  const segmentId = normalizeSegmentId(rawSentence?.segment_id)
+  if (segmentId) {
+    const localId = docStore.bindingBySegmentId.get(segmentId)
     if (localId) {
       return localId
     }
   }
 
-  const segmentId = normalizeSegmentId(rawSentence?.segment_id)
-  if (segmentId) {
-    const localId = docStore.bindingBySegmentId.get(segmentId)
+  const sentenceIndex = resolveSentenceIndex(rawSentence)
+  if (sentenceIndex !== null) {
+    const localId = docStore.findLocalIdBySentenceIndex(sentenceIndex)
     if (localId) {
       return localId
     }
@@ -120,7 +120,7 @@ function resolveUpsertLocalId(docStore, rawSegment, explicitLocalId = null) {
 
   const sentenceIndex = resolveSentenceIndex(rawSegment)
   if (sentenceIndex !== null) {
-    const boundLocalId = docStore.bindingBySentenceIndex.get(sentenceIndex)
+    const boundLocalId = docStore.findLocalIdBySentenceIndex(sentenceIndex)
     if (boundLocalId) {
       return boundLocalId
     }
@@ -137,13 +137,6 @@ function syncColdBindings(docStore, localId, currentCold, nextCold) {
   if (currentCold?.segmentId && currentCold.segmentId !== nextCold.segmentId) {
     docStore.bindingBySegmentId.delete(currentCold.segmentId)
   }
-  if (
-    currentCold?.sentenceIndex !== null
-    && currentCold?.sentenceIndex !== undefined
-    && currentCold.sentenceIndex !== nextCold.sentenceIndex
-  ) {
-    docStore.bindingBySentenceIndex.delete(currentCold.sentenceIndex)
-  }
 
   if (currentCold) {
     docStore._applyColdUpdate(localId, nextCold)
@@ -151,9 +144,6 @@ function syncColdBindings(docStore, localId, currentCold, nextCold) {
 
   if (nextCold.segmentId) {
     docStore.updateColdBinding(localId, nextCold.segmentId)
-  }
-  if (nextCold.sentenceIndex !== null && nextCold.sentenceIndex !== undefined) {
-    docStore.bindingBySentenceIndex.set(nextCold.sentenceIndex, localId)
   }
 }
 

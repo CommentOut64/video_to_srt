@@ -1903,40 +1903,14 @@ export const useProjectStore = defineStore("project", () => {
       .padStart(3, "0")}`;
   }
 
-  const sharedApi = {
-    // 状态
+  const v2Api = {
+    // V2 下 projectStore 只保留会话元信息、播放器/视图兼容壳与时间偏移辅助。
     meta,
-    subtitles,
     player,
     view,
     subtitleOffset,
-
-    // Phase 5: 双模态架构状态
-    chunkSubtitleMap,
     dualStreamProgress,
-    speakerProfiles,
-
-    // 计算属性
     primaryId,
-    totalSubtitles,
-    currentSubtitle,
-    isDirty,
-    validationErrors,
-
-    // Phase 5: 双模态架构计算属性
-    draftSubtitleCount,
-    finalizedSubtitleCount,
-
-    // 历史记录
-    canUndo,
-    canRedo,
-    undo,
-    redo,
-    clearHistory,
-    pauseHistory, // 暂停历史记录（用于 SSE 推送等系统操作）
-    resumeHistory, // 恢复历史记录
-
-    // 操作方法
     patchMeta,
     setIdentity,
     setMediaPaths,
@@ -1949,26 +1923,9 @@ export const useProjectStore = defineStore("project", () => {
     setPlaybackRate,
     setIsPlaying,
     setPlayerSeeking,
-    importSRT,
-    importSegments,
-    markSentenceDeleted,
-    isSentenceDeleted,
-    generateSRT,
     seekTo,
-    saveProject,
     resetProject,
-
-    // Phase 5: 双模态架构方法
-    appendOrUpdateDraft,
-    replaceChunk,
-    finalizeDraftSubtitlesOnCancel,
-    restoreChunk, // V3.1.0: 断点续传字幕恢复
-    applyRevisedSubtitle,
-    applySpeakerProfiles,
-    updateDualStreamProgress,
-    updateDualStreamProgressFromSSE,  // V3.1.0: 从 SSE 更新双流进度
-
-    // 辅助方法
+    updateDualStreamProgressFromSSE,
     setSubtitleOffset,
     toBaseTime,
     toDisplayTime,
@@ -1978,12 +1935,45 @@ export const useProjectStore = defineStore("project", () => {
     parseTimestamp,
   };
 
+  const legacySharedApi = {
+    ...v2Api,
+    subtitles,
+    chunkSubtitleMap,
+    speakerProfiles,
+    totalSubtitles,
+    currentSubtitle,
+    isDirty,
+    validationErrors,
+    draftSubtitleCount,
+    finalizedSubtitleCount,
+    canUndo,
+    canRedo,
+    undo,
+    redo,
+    clearHistory,
+    pauseHistory, // 暂停历史记录（用于 SSE 推送等系统操作）
+    resumeHistory, // 恢复历史记录
+    importSRT,
+    importSegments,
+    markSentenceDeleted,
+    isSentenceDeleted,
+    generateSRT,
+    saveProject,
+    appendOrUpdateDraft,
+    replaceChunk,
+    finalizeDraftSubtitlesOnCancel,
+    restoreChunk, // V3.1.0: 断点续传字幕恢复
+    applyRevisedSubtitle,
+    applySpeakerProfiles,
+    updateDualStreamProgress,
+  };
+
   if (FEATURE_FLAGS.USE_EDITOR_V2) {
-    return sharedApi;
+    return v2Api;
   }
 
   return {
-    ...sharedApi,
+    ...legacySharedApi,
     insertSubtitleAt,
     removeSubtitleAt,
     loadFromProjectData,

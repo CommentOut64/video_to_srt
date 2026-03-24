@@ -23,6 +23,19 @@ function unwrapEnvelope(response, fallback = null) {
   return response ?? fallback
 }
 
+function normalizeSubtitleDto(segment) {
+  if (!segment || typeof segment !== 'object') {
+    return segment
+  }
+
+  const segmentId = String(segment.segment_id ?? '').trim()
+  return {
+    ...segment,
+    segment_id: segmentId || null,
+    chunk_id: segment.chunk_id ?? segment.chunk_uid ?? null,
+  }
+}
+
 class ProjectAPI {
   async importProject(subtitleFile, format = 'srt', videoFile = null, title = '') {
     const formData = new FormData()
@@ -81,12 +94,19 @@ class ProjectAPI {
 
   async getSubtitles(projectId) {
     const response = await apiClient.get(`/api/projects/${projectId}/subtitles`)
-    return unwrapEnvelope(response, [])
+    const subtitles = unwrapEnvelope(response, [])
+    return Array.isArray(subtitles)
+      ? subtitles.map((segment) => normalizeSubtitleDto(segment))
+      : []
   }
 
   async updateSubtitle(projectId, segmentId, update) {
+    const normalizedSegmentId = String(segmentId ?? '').trim()
+    if (!normalizedSegmentId) {
+      throw new Error('[ProjectAPI] updateSubtitle 缺少 segment_id')
+    }
     const response = await apiClient.patch(
-      `/api/projects/${projectId}/subtitles/${segmentId}`,
+      `/api/projects/${projectId}/subtitles/${normalizedSegmentId}`,
       update
     )
     return unwrapEnvelope(response, null)

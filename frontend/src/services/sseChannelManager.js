@@ -270,19 +270,28 @@ class SSEChannelManager extends EventEmitter {
       // Phase 5: 双模态架构 - 替换 Chunk 事件（慢流/Whisper）
       'subtitle.replace_chunk': (data) => {
         console.log(`[SSE Job ${jobId}] 替换 Chunk:`, data)
-        handlers.onReplaceChunk?.(data)
+        handlers.onReplaceChunk?.({
+          ...data,
+          __eventType: 'subtitle.replace_chunk',
+        })
       },
 
       // V3.1.0: 字幕恢复事件（断点续传后恢复字幕）
       'subtitle.restored': (data) => {
         console.log(`[SSE Job ${jobId}] 恢复字幕:`, data)
-        handlers.onRestored?.(data)
+        handlers.onReplaceChunk?.({
+          ...data,
+          __eventType: 'subtitle.restored',
+        })
       },
 
       // V3.5: 极速模式定稿事件
       'subtitle.finalized': (data) => {
         console.log(`[SSE Job ${jobId}] 定稿字幕:`, data)
-        handlers.onFinalized?.(data)
+        handlers.onReplaceChunk?.({
+          ...data,
+          __eventType: 'subtitle.finalized',
+        })
       },
       // 说话人改绑/修订事件（后端唯一真源回推）
       'subtitle.revised': (data) => {
@@ -311,27 +320,27 @@ class SSEChannelManager extends EventEmitter {
       'subtitle.sv_sentence': (data) => {
         console.log(`[SSE Job ${jobId}] SenseVoice 句子:`, data)
         handlers.onSvSentence?.(data)
-        handlers.onSubtitleUpdate?.(data)
+        handlers.onDeprecatedSubtitleEvent?.('subtitle.sv_sentence', data)
       },
       'subtitle.whisper_patch': (data) => {
-        console.log(`[SSE Job ${jobId}] Whisper 复核:`, data);
+        console.log(`[SSE Job ${jobId}] Whisper 复核:`, data)
         handlers.onWhisperPatch?.(data)
-        handlers.onSubtitleUpdate?.(data)
+        handlers.onDeprecatedSubtitleEvent?.('subtitle.whisper_patch', data)
       },
       'subtitle.llm_proof': (data) => {
         console.log(`[SSE Job ${jobId}] LLM 校对:`, data)
         handlers.onLlmProof?.(data)
-        handlers.onSubtitleUpdate?.(data)
+        handlers.onDeprecatedSubtitleEvent?.('subtitle.llm_proof', data)
       },
       'subtitle.llm_trans': (data) => {
         console.log(`[SSE Job ${jobId}] LLM 翻译:`, data)
         handlers.onLlmTrans?.(data)
-        handlers.onSubtitleUpdate?.(data)
+        handlers.onDeprecatedSubtitleEvent?.('subtitle.llm_trans', data)
       },
       'subtitle.batch_update': (data) => {
         console.log(`[SSE Job ${jobId}] 批量更新:`, data)
         handlers.onBatchUpdate?.(data)
-        handlers.onSubtitleUpdate?.(data)
+        handlers.onDeprecatedSubtitleEvent?.('subtitle.batch_update', data)
       },
 
       // === 预处理事件 ===

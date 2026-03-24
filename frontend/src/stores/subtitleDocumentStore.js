@@ -131,7 +131,7 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
     if (bySegmentId) return bySegmentId
 
     const numericKey = Number(queueKey)
-    if (Number.isFinite(numericKey)) {
+    if (!useEditorV2 && Number.isFinite(numericKey)) {
       const bySentenceIndex = subtitleList.find(
         (item) => Number(item.sentenceIndex) === numericKey
       )
@@ -150,6 +150,9 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
   }
 
   function resolveLegacySentenceIndex(queueKey) {
+    if (useEditorV2) {
+      return null
+    }
     const numericKey = Number(queueKey)
     if (Number.isFinite(numericKey)) return numericKey
     const subtitle = findSubtitleByQueueKey(queueKey)
@@ -170,6 +173,9 @@ export const useSubtitleDocumentStore = defineStore('subtitleDocument', () => {
   }
 
   async function resolveProjectSegmentIdFromServer(queueKey, cache) {
+    if (useEditorV2) {
+      return null
+    }
     const sentenceIndex = resolveLegacySentenceIndex(queueKey)
     if (!Number.isFinite(sentenceIndex) || !projectStore.meta.projectId) {
       return null
