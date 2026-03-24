@@ -107,8 +107,12 @@ backend/tests/
 backend/tests/*
 !backend/tests/timeanchored_alignment/
 !backend/tests/timeanchored_alignment/**
+!backend/tests/textflow/
+!backend/tests/textflow/**
 backend/tests/timeanchored_alignment/**/__pycache__/
 backend/tests/timeanchored_alignment/**/*.pyc
+backend/tests/textflow/**/__pycache__/
+backend/tests/textflow/**/*.pyc
 frontend/src/**/__tests__/
 
 llmdoc/
