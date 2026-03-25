@@ -753,7 +753,10 @@ class StreamingSubtitleManager:
     def replace_chunk(
         self,
         chunk_ref: Any,
-        sentences: List[SentenceSegment]
+        sentences: List[SentenceSegment],
+        *,
+        empty_replace_is_expected: bool = False,
+        empty_reason: str = "",
     ) -> List[int]:
         """
         替换 Chunk 的所有句子（慢流推送）
@@ -820,11 +823,19 @@ class StreamingSubtitleManager:
                     "sentences": [],
                 },
             )
-            logger.warning(
-                f"replace_chunk: Chunk {chunk_key} 的定稿句子为空，"
-                f"已清理 {max(len(old_indices) - len(new_indices), 0)} 个草稿并推送空替换事件，"
-                f"保留用户编辑 {len(new_indices)} 条"
-            )
+            if empty_replace_is_expected:
+                logger.info(
+                    f"replace_chunk: Chunk {chunk_key} 触发预期空替换清理，"
+                    f"已清理 {max(len(old_indices) - len(new_indices), 0)} 个草稿并推送空替换事件，"
+                    f"保留用户编辑 {len(new_indices)} 条，"
+                    f"reason={empty_reason or 'projection_cleanup'}"
+                )
+            else:
+                logger.warning(
+                    f"replace_chunk: Chunk {chunk_key} 的定稿句子为空，"
+                    f"已清理 {max(len(old_indices) - len(new_indices), 0)} 个草稿并推送空替换事件，"
+                    f"保留用户编辑 {len(new_indices)} 条"
+                )
             self._persist_runtime_subtitle_state(reason="replace_chunk_empty")
             return new_indices
 
@@ -913,7 +924,32 @@ class StreamingSubtitleManager:
             self._build_sentence_from_subtitle_item(item)
             for item in subtitle_items
         ]
-        return self.replace_chunk(subtitle_batch.chunk_id, sentences)
+        diagnostics = dict(subtitle_batch.diagnostics or {})
+        projection = diagnostics.get("projection")
+        empty_replace_is_expected = False
+        empty_reason = ""
+        if not subtitle_items and isinstance(projection, dict):
+            projection_mode = str(projection.get("projection_mode", "") or "")
+            owner_carrier_role = str(projection.get("owner_carrier_role", "") or "")
+            owner_chunk_ref = projection.get("owner_chunk_id")
+            is_non_owner_projection = (
+                owner_chunk_ref is not None
+                and self._normalize_chunk_ref(owner_chunk_ref)
+                != self._normalize_chunk_ref(subtitle_batch.chunk_id)
+            )
+            if (
+                projection_mode == "coverage_chunk_bindings"
+                and owner_carrier_role == "text_carrier_only"
+                and is_non_owner_projection
+            ):
+                empty_replace_is_expected = True
+                empty_reason = "projection_non_owner_cleanup"
+        return self.replace_chunk(
+            subtitle_batch.chunk_id,
+            sentences,
+            empty_replace_is_expected=empty_replace_is_expected,
+            empty_reason=empty_reason,
+        )
 
     def add_finalized_sentences(
         self,
