@@ -994,7 +994,7 @@ class SenseVoiceONNXService:
         return logits
 
     def _is_timeanchored_alignment_enabled(self) -> bool:
-        """读取 alignment_pipeline flag，决定是否临时保留完整 ctc_logits。"""
+        """读取显式开关，决定是否保留完整 ctc_logits。"""
         try:
             from app.services.model_runtime_config_service import get_model_runtime_config_service
 
@@ -1002,24 +1002,32 @@ class SenseVoiceONNXService:
             effective = runtime.get("effective", {}) if isinstance(runtime, dict) else {}
             override = runtime.get("override", {}) if isinstance(runtime, dict) else {}
 
-            group: Dict[str, Any] = {}
+            effective_group: Dict[str, Any] = {}
             if isinstance(effective, dict):
-                effective_group = effective.get("alignment_pipeline", {})
-                if isinstance(effective_group, dict):
-                    group.update(effective_group)
-            if isinstance(override, dict):
-                override_group = override.get("alignment_pipeline", {})
-                if isinstance(override_group, dict):
-                    group.update(override_group)
+                value = effective.get("alignment_pipeline", {})
+                if isinstance(value, dict):
+                    effective_group = value
 
-            version = str(group.get("version", "") or "").lower()
-            mode = str(group.get("mode", "") or "").lower()
-            enabled = bool(group.get("enabled") or group.get("enable") or group.get("enable_timeanchored"))
-            if version == "timeanchored":
-                return True
-            if mode in {"shadow", "active", "default", "timeanchored"}:
-                return True
-            return enabled
+            override_group: Dict[str, Any] = {}
+            if isinstance(override, dict):
+                value = override.get("alignment_pipeline", {})
+                if isinstance(value, dict):
+                    override_group = value
+
+            # Phase0 现实门：默认不暴露完整矩阵，仅在显式开关开启时保留。
+            explicit_keys = (
+                "retain_ctc_logits",
+                "include_ctc_logits",
+                "export_ctc_logits",
+                "expose_ctc_logits",
+            )
+            for key in explicit_keys:
+                if key in override_group:
+                    return bool(override_group.get(key))
+            for key in explicit_keys:
+                if key in effective_group:
+                    return bool(effective_group.get(key))
+            return False
         except Exception:
             # 参数读取异常时保守关闭，避免默认携带大对象。
             return False

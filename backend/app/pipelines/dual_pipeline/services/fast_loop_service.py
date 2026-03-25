@@ -155,10 +155,7 @@ class FastLoopService:
                     normalized = host._normalize_sensevoice_result(ctx)
                     await host._apply_fast_punctuation(ctx, normalized)
                     host._context_cache[ctx.chunk_index] = ctx
-                    used_semantic = await host._emit_draft_sentences(
-                        ctx,
-                        is_final_output=False,
-                    )
+                    used_semantic = await host._emit_draft_sentences(ctx)
 
                     if (
                         not host._enable_bridge_batches
@@ -258,10 +255,7 @@ class FastLoopService:
         finally:
             if should_send_end_signal:
                 if last_chunk_index is not None:
-                    await host._flush_semantic_buffer(
-                        is_final_output=False,
-                        chunk_index=last_chunk_index,
-                    )
+                    await host._flush_semantic_buffer(chunk_index=last_chunk_index)
                 end_ctx = ProcessingContext(
                     job_id=host.job_id,
                     chunk_index=-1,

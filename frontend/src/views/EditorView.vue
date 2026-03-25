@@ -1482,18 +1482,6 @@ function subscribeSSE() {
       taskStore.updateSSEHeartbeat()
     },
 
-    // V3.2.4+dev.20260222.14: onSubtitleUpdate 仅用于旧事件，避免新事件双路径改写导致状态漂移
-    onSubtitleUpdate(data) {
-      // 新架构事件（draft/replace_chunk/finalized/restored）统一走专用处理器
-      if (data?.chunk_index !== undefined && data?.chunk_index !== null) {
-        return
-      }
-      // 仅处理旧架构字幕事件（sv_sentence/whisper_patch/llm_proof 等）
-      if (data.sentence || data.sentence_index !== undefined) {
-        handleStreamingSubtitle(data)
-      }
-    },
-
     // Phase 5: 草稿字幕事件（快流/SenseVoice）
     onDraft(data) {
       handleDraftSubtitle(data)
@@ -1502,16 +1490,6 @@ function subscribeSSE() {
     // Phase 5: 替换 Chunk 事件（慢流/Whisper）
     onReplaceChunk(data) {
       handleReplaceChunk(data)
-    },
-
-    // V3.1.0: 恢复字幕事件（断点续传后恢复）
-    onRestored(data) {
-      handleRestoredChunk(data)
-    },
-
-    // V3.5: 极速模式定稿事件
-    onFinalized(data) {
-      handleFinalizedSubtitle(data)
     },
 
     onRevised(data) {
@@ -1647,41 +1625,6 @@ function startCancelTimeoutPolling() {
   }, CANCEL_TIMEOUT_MS)
 }
 
-// 处理流式字幕更新（旧版兼容，已弃用）
-// V3.1.2+dev.20260112.01: 此函数已弃用，保留仅供旧版 SSE 事件兼容
-// 新架构使用专用处理器：handleDraftSubtitle、handleReplaceChunk 等
-// eslint-disable-next-line no-unused-vars
-function handleStreamingSubtitle(data) {
-  if (!data) return
-
-  const sentence = data.sentence || {}
-  const sentenceIndex = data.sentence_index ?? data.index ?? sentence.index
-  if (sentenceIndex === undefined || sentenceIndex === null) {
-    throw new Error('[EditorView] subtitle.legacy_update 缺少 sentence_index')
-  }
-
-  const applied = applySentencePatch(editorDocumentStore, {
-    ...sentence,
-    index: sentenceIndex,
-    sentence_index: sentenceIndex,
-    text: sentence.text ?? data.text ?? data.content,
-    start: sentence.start ?? data.start_time ?? data.start,
-    end: sentence.end ?? data.end_time ?? data.end,
-    confidence: sentence.confidence ?? data.confidence,
-    display_confidence: sentence.display_confidence ?? data.display_confidence,
-    confidence_source: sentence.confidence_source ?? data.confidence_source,
-    warning_type: sentence.warning_type ?? data.warning_type ?? 'none',
-    source: data.source ?? data.event_type ?? 'unknown',
-    is_modified: sentence.is_modified ?? false,
-    original_text: sentence.original_text ?? null,
-  })
-  if (!applied) {
-    throw new Error(
-      `[EditorView] subtitle.legacy_update 未命中新内核字幕（sentence_index=${sentenceIndex}）`
-    )
-  }
-}
-
 // Phase 5: 处理草稿字幕（快流/SenseVoice）
 function handleDraftSubtitle(data) {
   if (!data) return
@@ -1734,42 +1677,25 @@ function handleReplaceChunk(data) {
       )
     }
   }
-  void scheduleRealtimeFinalSync(`subtitle_replace_chunk_${chunkIndex ?? 'unknown'}`)
+  if (data.is_restore === true) {
+    scheduleV2RealtimeAuthoritativeReload(`subtitle_restored_${chunkIndex ?? 'unknown'}`)
+    return
+  }
+  void scheduleRealtimeFinalSync(`subtitle.replace_chunk_${chunkIndex ?? 'unknown'}`)
 }
 
 function handleSubtitleAdded(data) {
   if (!data) return
 
-  if (useEditorV2) {
-    if (data?.segment && typeof data.segment === 'object') {
-      handleProjectSubtitleUpsert(data, 'subtitle.added')
-      return
-    }
-
-    const applied = upsertServerSegment(editorDocumentStore, data)
-    if (!applied) {
-      throw new Error('[EditorView] subtitle.added 无法投影到 editorDocumentStore')
-    }
+  if (data?.segment && typeof data.segment === 'object') {
+    handleProjectSubtitleUpsert(data, 'subtitle.added')
     return
   }
 
-  handleStreamingSubtitle(data)
-}
-
-/**
- * V3.1.0: 处理恢复的字幕（断点续传后恢复）
- * 后端数据格式: { chunk_index, sentences: [...], is_restore: true }
- */
-function handleRestoredChunk(data) {
-  if (!data) return
-
-  const applied = editorEventProjector.projectRestored(data)
+  const applied = upsertServerSegment(editorDocumentStore, data)
   if (!applied) {
-    throw new Error(
-      `[EditorView] subtitle.restored 未能应用到新内核（chunk_index=${data.chunk_index ?? 'unknown'}）`
-    )
+    throw new Error('[EditorView] subtitle.added 缺少可投影的 segment_id')
   }
-  scheduleV2RealtimeAuthoritativeReload(`subtitle_restored_${data.chunk_index ?? 'unknown'}`)
 }
 
 function handleSubtitleDeleted(data) {
@@ -1790,47 +1716,30 @@ function handleSubtitleEdited(data) {
   }
 
   const sentence = data.sentence || {}
-  const sentenceIndex = data.index ?? data.sentence_index ?? sentence.index
   const segmentId = data.segment_id ?? sentence.segment_id
-  if ((sentenceIndex === undefined || sentenceIndex === null) && !segmentId) {
-    throw new Error('[EditorView] subtitle.edited 缺少 sentence_index/segment_id')
+  if (!segmentId) {
+    throw new Error('[EditorView] subtitle.edited 缺少 segment_id')
   }
 
   const applied = applySentencePatch(editorDocumentStore, {
     ...sentence,
-    ...(sentenceIndex !== undefined && sentenceIndex !== null
-      ? {
-          index: sentenceIndex,
-          sentence_index: sentenceIndex,
-        }
-      : {}),
-    ...(segmentId ? { segment_id: segmentId } : {}),
+    segment_id: segmentId,
+    text: sentence.text ?? data.text,
+    start: sentence.start ?? data.start,
+    end: sentence.end ?? data.end,
+    confidence: sentence.confidence ?? data.confidence,
+    display_confidence: sentence.display_confidence ?? data.display_confidence,
+    confidence_source: sentence.confidence_source ?? data.confidence_source,
+    warning_type: sentence.warning_type ?? data.warning_type ?? 'none',
+    source: sentence.source ?? data.source ?? 'unknown',
+    is_modified: sentence.is_modified ?? data.is_modified ?? false,
+    original_text: sentence.original_text ?? data.original_text ?? null,
   })
   if (!applied) {
     throw new Error(
-      `[EditorView] subtitle.edited 未命中新内核字幕（key=${sentenceIndex ?? segmentId ?? 'unknown'}）`
+      `[EditorView] subtitle.edited 未命中新内核字幕（segment_id=${segmentId}）`
     )
   }
-}
-
-/**
- * V3.5: 处理极速模式定稿字幕
- * 后端数据格式: { index, chunk_index, sentence: {...}, mode: 'sensevoice_only' }
- */
-function handleFinalizedSubtitle(data) {
-  if (!data) return
-
-  const chunkIndex = data.chunk_index
-  const sentenceIndex = data.index
-  if (useEditorV2) {
-    const applied = editorEventProjector.projectFinalized(data)
-    if (!applied) {
-      throw new Error(
-        `[EditorView] subtitle.finalized 未能应用到新内核（key=${chunkIndex ?? sentenceIndex ?? 'unknown'}）`
-      )
-    }
-  }
-  void scheduleRealtimeFinalSync(`subtitle_finalized_${chunkIndex ?? sentenceIndex ?? 'unknown'}`)
 }
 
 function handleRevisedSubtitle(data) {
@@ -1881,6 +1790,52 @@ function handleRevisedSubtitle(data) {
 
 function handleSpeakerProfiles(data) {
   if (!data) return
+  if (useEditorV2) {
+    if (!Array.isArray(data.profiles) || data.profiles.length === 0) {
+      return
+    }
+
+    const profileBySpeakerId = new Map()
+    data.profiles.forEach((profile) => {
+      const speakerId = profile?.speaker_id
+      if (!speakerId) return
+      profileBySpeakerId.set(speakerId, profile)
+    })
+
+    if (profileBySpeakerId.size === 0) {
+      return
+    }
+
+    editorDocumentStore.order.forEach((localId) => {
+      const entity = editorDocumentStore.getEntity(localId)
+      const cold = editorDocumentStore.getCold(localId)
+      const speakerId = cold?.speakerId
+      if (!entity || entity.isDraft || !speakerId) {
+        return
+      }
+
+      const profile = profileBySpeakerId.get(speakerId)
+      if (!profile) {
+        return
+      }
+
+      const nextSpeakerLabel = profile.display_name || cold.speakerLabel || speakerId
+      const nextSpeakerColorKey = profile.color_key || cold.speakerColorKey || null
+      const needsPatch = (
+        nextSpeakerLabel !== cold.speakerLabel
+        || nextSpeakerColorKey !== cold.speakerColorKey
+      )
+      if (!needsPatch) {
+        return
+      }
+
+      editorDocumentStore._applyColdUpdate(localId, {
+        speakerLabel: nextSpeakerLabel,
+        speakerColorKey: nextSpeakerColorKey,
+      })
+    })
+    return
+  }
   projectStore.applySpeakerProfiles(data)
 }
 

@@ -40,6 +40,9 @@ def test_output_adapter_converts_projection_to_output_layer_input() -> None:
     assert payload.segmentation_report == {"route": "timeanchored"}
     assert payload.output_traces is not None
     assert payload.output_traces[0].split_reason == "long_pause"
+    assert payload.subtitle_batch is not None
+    assert payload.subtitle_batch.chunk_id == "chunk-7"
+    assert [item.text for item in payload.subtitle_batch.items] == ["你好", "世界"]
 
 
 def test_output_adapter_preserves_empty_projection_for_replace_chunk_clear() -> None:
@@ -54,3 +57,6 @@ def test_output_adapter_preserves_empty_projection_for_replace_chunk_clear() -> 
     assert len(outputs) == 1
     assert outputs[0].chunk_index == 3
     assert outputs[0].sentence_segments == []
+    assert outputs[0].subtitle_batch is not None
+    assert outputs[0].subtitle_batch.chunk_id == "3"
+    assert outputs[0].subtitle_batch.items == ()

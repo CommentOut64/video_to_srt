@@ -24,9 +24,9 @@ export function createSubtitleHotEntity(localId, text, startMs, endMs) {
 export function createSubtitleColdEntity(localId) {
   return {
     localId,
-    segmentId: null,
-    sentenceIndex: null,
-    chunkId: null,
+    segmentId: null, // 唯一身份主键
+    sentenceIndex: null, // 仅保留 legacy 兼容/诊断，不再作为运行时绑定索引
+    chunkId: null, // 批替换锚点
     words: null,
     confidence: null,
     displayConfidence: null,

@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from app.services.punctuation.base import PuncPosition, WordTimestampLike, apply_punctuation
 from app.services.punctuation.config import get_punctuation_config
+from app.services.text_protection import should_skip_raw_punctuation
 from app.services.text_pipeline_config import PunctuationRuntimeOverrides
 
 
@@ -222,7 +223,7 @@ def build_clean_text(raw_text: str) -> Tuple[str, List[int], List[Optional[int]]
     raw_to_clean: List[Optional[int]] = []
     clean_idx = 0
     for idx, char in enumerate(raw_text):
-        if char in _PUNCTUATION_SET and not _is_decimal_dot(raw_text, idx):
+        if char in _PUNCTUATION_SET and not should_skip_raw_punctuation(raw_text, idx, char):
             raw_to_clean.append(None)
             continue
         clean_chars.append(char)
@@ -412,7 +413,7 @@ def _extract_raw_marks(
     for idx, char in enumerate(raw_text):
         if char not in _PUNCTUATION_SET:
             continue
-        if _is_decimal_dot(raw_text, idx):
+        if should_skip_raw_punctuation(raw_text, idx, char):
             continue
         clean_idx = _map_raw_punct_to_clean_index(idx, raw_text, raw_to_clean, char)
         if clean_idx is None:

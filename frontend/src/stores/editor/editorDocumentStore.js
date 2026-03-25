@@ -9,7 +9,6 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
   const order = shallowRef([])
   const indexById = new Map()
   const bindingBySegmentId = new Map()
-  const bindingBySentenceIndex = new Map()
   const revision = ref(0)
   const structureRevision = ref(0)
   const timingRevision = ref(0)
@@ -73,8 +72,58 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
   }
 
   function getBySentenceIndex(idx) {
-    const localId = bindingBySentenceIndex.get(idx)
+    const localId = findLocalIdBySentenceIndex(idx)
     return localId ? entities.get(localId) : undefined
+  }
+
+  function findLocalIdBySentenceIndex(idx, options = {}) {
+    if (idx === null || idx === undefined) {
+      return null
+    }
+
+    const {
+      preferDraft = null,
+      preferSegmentBound = true,
+    } = options
+
+    const matchedLocalIds = order.value.filter((localId) => {
+      const cold = coldEntities.get(localId)
+      return cold?.sentenceIndex === idx
+    })
+    if (matchedLocalIds.length === 0) {
+      return null
+    }
+
+    const matchesPreference = (localId) => {
+      const entity = entities.get(localId)
+      if (!entity) {
+        return false
+      }
+      if (preferDraft === null) {
+        return true
+      }
+      return Boolean(entity.isDraft) === Boolean(preferDraft)
+    }
+
+    if (preferSegmentBound) {
+      const preferredSegmentBound = matchedLocalIds.find((localId) => {
+        if (!matchesPreference(localId)) {
+          return false
+        }
+        const cold = coldEntities.get(localId)
+        return Boolean(cold?.segmentId)
+      })
+      if (preferredSegmentBound) {
+        return preferredSegmentBound
+      }
+    }
+
+    const preferredDraftState = matchedLocalIds.find(matchesPreference)
+    if (preferredDraftState) {
+      return preferredDraftState
+    }
+
+    return matchedLocalIds[0]
   }
 
   function getOrderIndex(localId) {
@@ -210,18 +259,10 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
   // ─── 原子写操作（仅由 reducer 调用） ───
   function _applyInsert(localId, hot, cold, afterLocalId) {
     const existingCold = coldEntities.get(localId)
-    const existingSentenceIndex = existingCold?.sentenceIndex
     const existingSegmentId = existingCold?.segmentId
 
     if (existingSegmentId && (!cold || cold.segmentId !== existingSegmentId)) {
       bindingBySegmentId.delete(existingSegmentId)
-    }
-    if (
-      existingSentenceIndex !== null
-      && existingSentenceIndex !== undefined
-      && (!cold || cold.sentenceIndex !== existingSentenceIndex)
-    ) {
-      bindingBySentenceIndex.delete(existingSentenceIndex)
     }
 
     const nextHot = {
@@ -244,9 +285,6 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
       if (nextCold.segmentId) {
         bindingBySegmentId.set(nextCold.segmentId, localId)
         enforceUniqueSegmentBinding(localId, nextCold.segmentId)
-      }
-      if (nextCold.sentenceIndex !== null && nextCold.sentenceIndex !== undefined) {
-        bindingBySentenceIndex.set(nextCold.sentenceIndex, localId)
       }
     }
 
@@ -322,9 +360,6 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
 
     rebuildIndexById()
     if (cold?.segmentId) bindingBySegmentId.delete(cold.segmentId)
-    if (cold && cold.sentenceIndex !== null && cold.sentenceIndex !== undefined) {
-      bindingBySentenceIndex.delete(cold.sentenceIndex)
-    }
     dirtyLocalIds.delete(localId)
     bumpRevisions({ structure: true })
     return true
@@ -514,7 +549,6 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     const entitiesArray = Array.from(entities.entries()).map(([id, e]) => ({ ...e, localId: id }))
     const coldEntitiesArray = Array.from(coldEntities.entries()).map(([id, c]) => ({ localId: id, ...c }))
     const bindings = Array.from(bindingBySegmentId.entries()).map(([segmentId, localId]) => ({ localId, segmentId }))
-    const sentenceBindings = Array.from(bindingBySentenceIndex.entries()).map(([sentenceIndex, localId]) => ({ localId, sentenceIndex }))
     return {
       revision: revision.value,
       structureRevision: structureRevision.value,
@@ -524,7 +558,6 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
       coldEntities: coldEntitiesArray,
       order: [...order.value],
       bindings,
-      sentenceBindings,
       tombstones: [...tombstones.value],
       createdAt: Date.now(),
     }
@@ -535,7 +568,6 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     coldEntities.clear()
     indexById.clear()
     bindingBySegmentId.clear()
-    bindingBySentenceIndex.clear()
     entityVersionTokens.clear()
     dirtyLocalIds.clear()
 
@@ -559,7 +591,6 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     order.value = Array.isArray(snapshot.order) ? [...snapshot.order] : []
     rebuildIndexById()
     ;(snapshot.bindings || []).forEach(b => bindingBySegmentId.set(b.segmentId, b.localId))
-    ;(snapshot.sentenceBindings || []).forEach(b => bindingBySentenceIndex.set(b.sentenceIndex, b.localId))
     tombstones.value = Array.isArray(snapshot.tombstones) ? [...snapshot.tombstones] : []
     revision.value = Number.isFinite(snapshot.revision) ? snapshot.revision : 0
     structureRevision.value = Number.isFinite(snapshot.structureRevision)
@@ -579,7 +610,6 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     coldEntities.clear()
     indexById.clear()
     bindingBySegmentId.clear()
-    bindingBySentenceIndex.clear()
     entityVersionTokens.clear()
     dirtyLocalIds.clear()
     order.value = []
@@ -601,11 +631,11 @@ export const useEditorDocumentStore = defineStore('editorDocument', () => {
     tombstones,
     entityVersionTokens,
     bindingBySegmentId,
-    bindingBySentenceIndex,
     getEntity,
     getCold,
     getBySegmentId,
     getBySentenceIndex,
+    findLocalIdBySentenceIndex,
     getOrderIndex,
     getNeighbors,
     getCount,

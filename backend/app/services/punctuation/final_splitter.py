@@ -15,6 +15,19 @@ from app.services.text_protection import (
     is_sentence_end_punct,
     merge_protected_word_tokens,
 )
+from app.services.textflow.segmentation_rules import (
+    compute_pause_strength,
+    is_ascii_word,
+    is_cjk_text,
+    is_temporal_backtrack_boundary,
+    next_real_word_index,
+    normalize_boundary_token,
+    select_best_long_split_boundary,
+    should_block_pause_split,
+    should_merge_continuation_pair,
+    should_merge_short_with_next,
+    should_merge_short_with_previous,
+)
 
 
 _STRONG_PUNCT = set("。？！.!?")
@@ -383,33 +396,12 @@ class FinalSplitter:
         boundary_idx: int,
     ) -> bool:
         """停顿切分保护：续接词/不完整结尾时避免句中误切。"""
-        next_idx = self._next_real_word_index(words, boundary_idx)
-        if next_idx is None:
-            return False
-
-        strategy = self._sentence_builder.config.get_strategy()
-        next_probe = self._build_probe_text(words, next_idx)
-        if next_probe and strategy.is_continuation(next_probe):
-            return True
-
-        current_token = self._normalize_boundary_token(words[boundary_idx].word or "")
-        if current_token and strategy.is_incomplete_ending(current_token):
-            return True
-
-        # V3.2.0+dev.20260210.01: 英文兜底规则。
-        # 对无强句末标点且后句小写开头的边界，判定为更可能是句内续写，优先阻断停顿切分。
-        prev_raw = str(words[boundary_idx].word or "").strip()
-        next_first = self._normalize_boundary_token(words[next_idx].word or "")
-        if (
-            next_first
-            and self._is_ascii_word(next_first)
-            and next_first[:1].islower()
-            and not is_sentence_end_punct(prev_raw, words[next_idx].word or "")
-            and boundary_idx >= start_idx
-        ):
-            return True
-
-        return False
+        return should_block_pause_split(
+            words,
+            start_idx=start_idx,
+            boundary_idx=boundary_idx,
+            strategy=self._sentence_builder.config.get_strategy(),
+        )
 
     def _select_force_split(
         self,
@@ -469,14 +461,11 @@ class FinalSplitter:
         start_idx: int,
         limit_idx: int,
     ) -> Optional[int]:
-        best_weak: Optional[int] = None
-        for idx in range(limit_idx, start_idx - 1, -1):
-            strength = self._get_boundary_strength(words, idx)
-            if strength >= 3:
-                return idx
-            if strength >= 1 and best_weak is None:
-                best_weak = idx
-        return best_weak
+        return select_best_long_split_boundary(
+            start_idx=start_idx,
+            limit_idx=limit_idx,
+            get_boundary_strength=lambda idx: self._get_boundary_strength(words, idx),
+        )
 
     def _merge_short_segments(self, segments: List[SentenceSegment]) -> List[SentenceSegment]:
         if len(segments) <= 1:
@@ -496,8 +485,12 @@ class FinalSplitter:
 
             if is_short and merged:
                 candidate = self._merge_two_segments(merged[-1], current)
-                if len(candidate.words) <= self.config.max_tokens and (
-                    candidate.end - candidate.start <= self.config.max_duration * 1.2
+                if should_merge_short_with_previous(
+                    merged_exists=True,
+                    candidate_token_count=len(candidate.words),
+                    candidate_duration=(candidate.end - candidate.start),
+                    max_tokens=self.config.max_tokens,
+                    max_duration=self.config.max_duration,
                 ):
                     merged[-1] = candidate
                     idx += 1
@@ -505,7 +498,11 @@ class FinalSplitter:
 
             if is_short and idx + 1 < len(segments):
                 candidate = self._merge_two_segments(current, segments[idx + 1])
-                if len(candidate.words) <= self.config.max_tokens:
+                if should_merge_short_with_next(
+                    next_exists=True,
+                    candidate_token_count=len(candidate.words),
+                    max_tokens=self.config.max_tokens,
+                ):
                     merged.append(candidate)
                     idx += 2
                     continue
@@ -538,54 +535,15 @@ class FinalSplitter:
         return merged, merge_count
 
     def _should_merge_continuation_pair(self, left: SentenceSegment, right: SentenceSegment) -> bool:
-        if not left.words or not right.words:
-            return False
-        strategy = self._sentence_builder.config.get_strategy()
-        left_last = self._normalize_boundary_token(left.words[-1].word or "")
-        right_probe = self._build_probe_text(right.words, 0)
-        left_end = float(getattr(left.words[-1], "end", 0.0) or 0.0)
-        right_start = float(getattr(right.words[0], "start", left_end) or left_end)
-        gap_sec = max(0.0, right_start - left_end)
-        if gap_sec > self._CONTINUATION_MERGE_MAX_GAP_SEC:
-            return False
-
-        right_real_word_count = sum(1 for item in right.words if not getattr(item, "is_pseudo", False))
-        if right_real_word_count <= 0:
-            return False
-        right_duration = max(
-            0.0,
-            float(getattr(right, "end", right_start) or right_start)
-            - float(getattr(right, "start", right_start) or right_start),
+        return should_merge_continuation_pair(
+            left,
+            right,
+            strategy=self._sentence_builder.config.get_strategy(),
+            continuation_merge_max_gap_sec=self._CONTINUATION_MERGE_MAX_GAP_SEC,
+            cjk_continuation_merge_max_words=self._CJK_CONTINUATION_MERGE_MAX_WORDS,
+            cjk_continuation_merge_max_duration_sec=self._CJK_CONTINUATION_MERGE_MAX_DURATION_SEC,
+            cjk_discourse_break_markers=self._CJK_DISCOURSE_BREAK_MARKERS,
         )
-        right_probe_compact = str(right_probe or "").replace(" ", "")
-        is_cjk_context = self._is_cjk_text(left_last) or self._is_cjk_text(right_probe_compact)
-        is_cjk_discourse_break = bool(
-            is_cjk_context
-            and any(
-                right_probe_compact.startswith(marker)
-                for marker in self._CJK_DISCOURSE_BREAK_MARKERS
-            )
-        )
-
-        if right_probe and strategy.is_continuation(right_probe):
-            if is_cjk_discourse_break:
-                return False
-            if is_cjk_context:
-                return (
-                    right_real_word_count <= self._CJK_CONTINUATION_MERGE_MAX_WORDS
-                    and right_duration <= self._CJK_CONTINUATION_MERGE_MAX_DURATION_SEC
-                )
-            return True
-        if left_last and strategy.is_incomplete_ending(left_last):
-            if is_cjk_context:
-                if is_cjk_discourse_break:
-                    return False
-                return (
-                    right_real_word_count <= (self._CJK_CONTINUATION_MERGE_MAX_WORDS + 1)
-                    and right_duration <= (self._CJK_CONTINUATION_MERGE_MAX_DURATION_SEC + 0.8)
-                )
-            return True
-        return False
 
     def _merge_two_segments(self, left: SentenceSegment, right: SentenceSegment) -> SentenceSegment:
         words = left.words + right.words
@@ -593,12 +551,7 @@ class FinalSplitter:
 
     @staticmethod
     def _next_real_word_index(words: List[WordTimestamp], boundary_idx: int) -> Optional[int]:
-        next_idx = boundary_idx + 1
-        while next_idx < len(words) and getattr(words[next_idx], "is_pseudo", False):
-            next_idx += 1
-        if next_idx >= len(words):
-            return None
-        return next_idx
+        return next_real_word_index(words, boundary_idx)
 
     def _build_probe_text(
         self,
@@ -620,23 +573,15 @@ class FinalSplitter:
 
     @staticmethod
     def _normalize_boundary_token(token: str) -> str:
-        trim_chars = "".join(_STRONG_PUNCT | _WEAK_PUNCT) + "\"'”’）)]}】」』"
-        return token.replace("▁", " ").strip().strip(trim_chars)
+        return normalize_boundary_token(token)
 
     @staticmethod
     def _is_ascii_word(token: str) -> bool:
-        return bool(token) and all(ch.isascii() for ch in token)
+        return is_ascii_word(token)
 
     @staticmethod
     def _is_cjk_text(text: str) -> bool:
-        for char in str(text or ""):
-            if "\u4e00" <= char <= "\u9fff":
-                return True
-            if "\u3040" <= char <= "\u30ff":
-                return True
-            if "\uac00" <= char <= "\ud7af":
-                return True
-        return False
+        return is_cjk_text(text)
 
     def _build_sentence(
         self,
@@ -685,60 +630,20 @@ class FinalSplitter:
         return max(token_strength, pause_strength)
 
     def _pause_strength(self, words: List[WordTimestamp], idx: int) -> int:
-        if idx >= len(words) - 1:
-            return 0
-        # V3.2.0+dev.20260205.10: 伪对齐词可能压扁时间戳，跳过连续伪词以恢复真实停顿切分能力。
-        # 伪对齐词可能会“填平”真实停顿，导致 pause_strength 失效。
-        # 这里跳过连续的 is_pseudo 词，使用下一个非伪词作为边界参考。
-        # 关键策略：只在“下一段非伪词的前一个词”处触发边界（即 next_idx - 1），
-        # 这样能把中间的伪词一起归入前一句，避免产生“伪词单独成句”的碎片化结果，
-        # 同时也避免把边界错误地提前到更早的真实词上。
-        next_idx = idx + 1
-        while next_idx < len(words) and getattr(words[next_idx], "is_pseudo", False):
-            next_idx += 1
-        if next_idx >= len(words):
-            return 0
-        boundary_idx = next_idx - 1
-        if idx != boundary_idx:
-            return 0
-
-        current_end = float(words[idx].end or 0.0)
-        if getattr(words[idx], "is_pseudo", False):
-            for prev in range(idx - 1, -1, -1):
-                if not getattr(words[prev], "is_pseudo", False):
-                    current_end = float(words[prev].end or current_end)
-                    break
-
-        gap = float(words[next_idx].start or 0.0) - current_end
-        if gap >= self.config.long_pause:
-            return 2
-        if gap >= self.config.soft_pause:
-            return 1
-        return 0
+        return compute_pause_strength(
+            words,
+            idx,
+            soft_pause=self.config.soft_pause,
+            long_pause=self.config.long_pause,
+        )
 
     def _is_temporal_backtrack_boundary(self, words: List[WordTimestamp], idx: int) -> bool:
         """时间回退守门：右词起点明显早于左侧边界时，阻断该切点。"""
-        if idx < 0 or idx >= len(words) - 1:
-            return False
-
-        left_end = float(getattr(words[idx], "end", 0.0) or 0.0)
-        if getattr(words[idx], "is_pseudo", False):
-            for prev in range(idx - 1, -1, -1):
-                if not getattr(words[prev], "is_pseudo", False):
-                    left_end = float(getattr(words[prev], "end", left_end) or left_end)
-                    break
-
-        immediate_right_start = float(getattr(words[idx + 1], "start", left_end) or left_end)
-        if immediate_right_start < (left_end - self._TIMELINE_BACKTRACK_TOLERANCE_SEC):
-            return True
-
-        next_idx = idx + 1
-        while next_idx < len(words) and getattr(words[next_idx], "is_pseudo", False):
-            next_idx += 1
-        if next_idx >= len(words):
-            return False
-        right_start = float(getattr(words[next_idx], "start", left_end) or left_end)
-        return right_start < (left_end - self._TIMELINE_BACKTRACK_TOLERANCE_SEC)
+        return is_temporal_backtrack_boundary(
+            words,
+            idx,
+            tolerance_sec=self._TIMELINE_BACKTRACK_TOLERANCE_SEC,
+        )
 
     def _trailing_punct_strength(self, token: str, next_token: Optional[str] = None) -> int:
         if not token:

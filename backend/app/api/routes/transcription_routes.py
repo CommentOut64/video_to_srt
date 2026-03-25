@@ -276,26 +276,6 @@ def create_transcription_router(
             raise HTTPException(status_code=404, detail="任务未找到")
         return str(identity.project_id)
 
-    def _build_legacy_subtitle_payload(segment: Dict[str, Any], fallback_index: Optional[int] = None) -> Dict[str, Any]:
-        raw_index = segment.get("legacy_index", fallback_index)
-        try:
-            normalized_index = int(raw_index) if raw_index is not None else int(fallback_index or 0)
-        except (TypeError, ValueError):
-            normalized_index = int(fallback_index or 0)
-        return {
-            "index": normalized_index,
-            "text": segment.get("text", ""),
-            "start": segment.get("start", 0.0),
-            "end": segment.get("end", 0.0),
-            "confidence": None,
-            "display_confidence": None,
-            "confidence_source": "manual",
-            "source": segment.get("source_type", "project_api"),
-            "is_modified": bool(segment.get("is_modified", True)),
-            "original_text": segment.get("original_text"),
-            "segment_id": segment.get("segment_id"),
-        }
-
     def _resolve_runtime_job_id(identifier: str) -> Optional[str]:
         """
         将任意 identifier（project_id / legacy job_id）解析为运行态 job_id。
@@ -1393,143 +1373,6 @@ def create_transcription_router(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"复制文件失败: {str(e)}")
 
-    # V3.2.0+dev.20260124.02: 用户编辑字幕接口
-    class SubtitleCreateRequest(BaseModel):
-        """字幕新增请求模型"""
-        text: Optional[str] = ""
-        start: float
-        end: float
-
-    class SubtitleUpdateRequest(BaseModel):
-        """字幕更新请求模型"""
-        text: Optional[str] = None
-        start: Optional[float] = None
-        end: Optional[float] = None
-
-    @router.post("/legacy/tasks/{identifier}/subtitles")
-    async def create_subtitle(identifier: str, payload: SubtitleCreateRequest):
-        """
-        V3.2.0+dev.20260124.02: 用户新增字幕接口
-        """
-        from app.api.routes import project_routes as project_routes_module
-        from app.services.sse_service import push_subtitle_event
-
-        if payload.start < 0 or payload.end <= payload.start:
-            raise HTTPException(status_code=400, detail="时间戳不合法")
-
-        job_id = identifier
-        project_id = _resolve_project_id_or_404(job_id)
-        project_result = await project_routes_module.create_project_subtitle(
-            project_id=project_id,
-            body=payload,
-        )
-        segment = dict(project_result.get("data") or {})
-        sentence_payload = _build_legacy_subtitle_payload(segment)
-
-        push_subtitle_event(
-            sse_manager,
-            project_id,
-            "added",
-            {
-                "index": sentence_payload["index"],
-                "sentence": sentence_payload,
-                "source": "user_add",
-                "is_update": True,
-            },
-        )
-        return {"success": True, "data": sentence_payload}
-
-    @router.patch("/legacy/tasks/{identifier}/subtitles/{sentence_index}")
-    async def update_subtitle(
-        identifier: str,
-        sentence_index: int,
-        update: SubtitleUpdateRequest
-    ):
-        """
-        V3.2.0+dev.20260124.02: 用户编辑字幕接口
-
-        核心功能：
-        1. 接收前端的实时编辑
-        2. 标记为 is_modified=True，防止 AI 覆盖
-        3. 持久化到编辑落盘文件，必要时同步快照
-
-        Args:
-            job_id: 任务 ID
-            sentence_index: 句子索引
-            update: 更新内容（text/start/end）
-        """
-        from app.api.routes import project_routes as project_routes_module
-        from app.services.sse_service import push_subtitle_event
-
-        update_payload = update.model_dump(exclude_none=True)
-        if not update_payload:
-            raise HTTPException(status_code=400, detail="更新内容为空")
-        if (
-            update_payload.get("start") is not None
-            and update_payload.get("end") is not None
-            and float(update_payload["end"]) < float(update_payload["start"])
-        ):
-            raise HTTPException(status_code=400, detail="结束时间必须大于等于开始时间")
-
-        job_id = identifier
-        project_id = _resolve_project_id_or_404(job_id)
-        project_result = await project_routes_module.update_project_subtitle_by_legacy_index(
-            project_id=project_id,
-            sentence_index=sentence_index,
-            body=update,
-        )
-        segment = dict(project_result.get("data") or {})
-        sentence_payload = _build_legacy_subtitle_payload(segment, fallback_index=sentence_index)
-
-        push_subtitle_event(
-            sse_manager,
-            project_id,
-            "edited",
-            {
-                "index": sentence_payload["index"],
-                "sentence": sentence_payload,
-                "source": "user_edit",
-                "is_update": True,
-            },
-        )
-        return {"success": True, "data": sentence_payload}
-
-    @router.delete("/legacy/tasks/{identifier}/subtitles/{sentence_index}")
-    async def delete_subtitle(identifier: str, sentence_index: int):
-        """
-        V3.2.0+dev.20260124.02: 用户删除字幕接口
-        """
-        from app.api.routes import project_routes as project_routes_module
-        from app.services.sse_service import push_subtitle_event
-
-        job_id = identifier
-        project_id = _resolve_project_id_or_404(job_id)
-        project_result = await project_routes_module.delete_project_subtitle_by_legacy_index(
-            project_id=project_id,
-            sentence_index=sentence_index,
-        )
-        result_data = dict(project_result.get("data") or {})
-
-        push_subtitle_event(
-            sse_manager,
-            project_id,
-            "deleted",
-            {
-                "index": sentence_index,
-                "source": "user_delete",
-                "is_update": True,
-            },
-        )
-
-        return {
-            "success": True,
-            "data": {
-                "index": sentence_index,
-                "is_deleted": bool(result_data.get("is_deleted", True)),
-                "segment_id": result_data.get("segment_id"),
-            },
-        }
-
     # 同音检索路由已迁移到 `homophone_routes.py`，此处不再保留 legacy/job 旧格式入口。
 
     @router.get("/check-resume/{identifier}")
@@ -1689,8 +1532,9 @@ def create_transcription_router(
             }
 
         try:
-            # V3.1.0+: 优先从 transcription.sentences_snapshot 读取（实时字幕快照）
+            # 统一 DTO 为主真源，旧 sentences_snapshot 仅做兼容恢复。
             transcription = transcription_data or {}
+            subtitle_items_snapshot = transcription.get("subtitle_items_snapshot", [])
             sentences_snapshot = transcription.get("sentences_snapshot", [])
             from app.services.subtitle_edit_store import (
                 apply_deletions_to_segments,
@@ -1711,7 +1555,37 @@ def create_transcription_router(
             detected_language = None
             need_update_checkpoint = False  # V3.1.2: 标记是否需要更新 checkpoint
 
-            if sentences_snapshot:
+            if isinstance(subtitle_items_snapshot, list) and subtitle_items_snapshot:
+                for index, item in enumerate(subtitle_items_snapshot):
+                    if not isinstance(item, dict):
+                        continue
+                    text = str(item.get("text", "") or "")
+                    if not text:
+                        continue
+                    all_segments.append({
+                        "id": int(item.get("legacy_index", index) or index),
+                        "start": item.get("start", 0),
+                        "end": item.get("end", item.get("start", 0)),
+                        "text": text,
+                        "confidence": item.get("confidence"),
+                        "display_confidence": item.get("display_confidence"),
+                        "confidence_source": item.get("confidence_source"),
+                        "source": item.get("source", "render_core"),
+                        "is_modified": item.get("is_modified", False),
+                        "original_text": item.get("original_text"),
+                        "is_draft": str(item.get("status", "final") or "final").lower() == "draft",
+                        "is_finalized": str(item.get("status", "final") or "final").lower() != "draft",
+                        "segment_id": item.get("segment_id"),
+                        "chunk_id": item.get("chunk_id") or item.get("chunk_uid"),
+                        "speaker_id": item.get("speaker_id"),
+                        "turn_id": item.get("turn_id"),
+                    })
+
+                all_segments.sort(key=lambda x: x.get("id", 0))
+                detected_language = transcription.get("language") or job.language
+                processed_count = transcription.get("processed_count", 0)
+                total_chunks = transcription.get("total_chunks", 0)
+            elif sentences_snapshot:
                 # V3.2.0+dev.20260124.02: 叠加用户编辑落盘数据
                 if edits:
                     apply_edits_to_sentences_snapshot(sentences_snapshot, edits)

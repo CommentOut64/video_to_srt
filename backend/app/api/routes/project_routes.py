@@ -19,6 +19,7 @@ from app.core.config import FLAVOR
 from app.services.file_service import FileManagementService
 from app.services.project_service import get_project_service
 from app.services.subtitle_doc_service import get_subtitle_doc_service
+from app.services.subtitle_output_service import get_subtitle_output_service
 from app.services.subtitle_edit_store import (
     add_deletion,
     create_manual_entry,
@@ -31,8 +32,6 @@ from app.services.subtitle_edit_store import (
     save_edit,
 )
 from app.services.sse_service import get_sse_manager
-from app.utils.ass_converter import ASSConverter
-from app.utils.text_utils import segments_to_srt
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/projects", tags=["projects"])
@@ -208,6 +207,138 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return float(default)
+
+
+def _build_trace_payload(segment: dict[str, Any]) -> dict[str, Any]:
+    raw_trace = segment.get("trace")
+    if isinstance(raw_trace, dict):
+        trace = dict(raw_trace)
+    else:
+        trace = {}
+    for key in (
+        "split_reason",
+        "split_risk",
+        "window_id",
+        "pyannote_frame_time",
+        "mapped_cut_time",
+        "mapping_quality",
+        "mapping_reason",
+    ):
+        value = segment.get(key)
+        if value is None:
+            continue
+        trace.setdefault(key, value)
+    return trace
+
+
+def _resolve_project_chunk_id(
+    segment: dict[str, Any],
+    *,
+    legacy_index: Optional[int],
+    source_type: str,
+) -> str:
+    raw_chunk_id = segment.get("chunk_id") or segment.get("chunk_uid")
+    if raw_chunk_id:
+        return str(raw_chunk_id)
+    if source_type == "manual" or (legacy_index is not None and int(legacy_index) < 0):
+        return "chunk:manual"
+    if legacy_index is None:
+        return f"chunk:{source_type}"
+    return f"chunk:{source_type}:{int(legacy_index)}"
+
+
+def _normalize_project_subtitle_payload(
+    segment: dict[str, Any],
+    *,
+    legacy_index_fallback: Optional[int] = None,
+    allow_empty_text: bool = False,
+) -> Optional[dict[str, Any]]:
+    if not isinstance(segment, dict):
+        return None
+
+    text = str(segment.get("text", "") or "")
+    if not allow_empty_text and not text.strip():
+        return None
+
+    raw_index = segment.get("legacy_index", legacy_index_fallback)
+    legacy_index: Optional[int]
+    try:
+        legacy_index = int(raw_index) if raw_index is not None else None
+    except (TypeError, ValueError):
+        legacy_index = legacy_index_fallback
+
+    start = _safe_float(segment.get("start"), 0.0)
+    end = _safe_float(segment.get("end"), start)
+    if end < start:
+        end = start
+
+    source_type = str(segment.get("source_type") or segment.get("source") or "project").strip() or "project"
+    segment_id = str(
+        segment.get("segment_id")
+        or segment.get("sentence_uid")
+        or (f"seg-{legacy_index}" if legacy_index is not None else "")
+    ).strip()
+    if not segment_id:
+        return None
+
+    status = str(segment.get("status") or "").strip().lower()
+    if not status:
+        is_draft = bool(segment.get("is_draft", False))
+        is_finalized = segment.get("is_finalized")
+        status = "draft" if is_draft and not bool(is_finalized) else "final"
+
+    chunk_id = _resolve_project_chunk_id(
+        segment,
+        legacy_index=legacy_index,
+        source_type=source_type,
+    )
+
+    return {
+        "segment_id": segment_id,
+        "sentence_uid": str(segment.get("sentence_uid") or segment_id),
+        "chunk_id": chunk_id,
+        "chunk_uid": chunk_id,
+        "text": text,
+        "start": start,
+        "end": end,
+        "status": status,
+        "source": str(segment.get("source") or source_type),
+        "speaker_id": segment.get("speaker_id"),
+        "turn_id": segment.get("turn_id"),
+        "trace": _build_trace_payload(segment),
+        "legacy_index": legacy_index,
+        "source_type": source_type,
+        "is_modified": bool(segment.get("is_modified", False)),
+        "original_text": segment.get("original_text"),
+    }
+
+
+def _normalize_project_subtitle_list(
+    segments: list[dict[str, Any]],
+    *,
+    allow_empty_text: bool = False,
+) -> list[dict[str, Any]]:
+    normalized_segments: list[dict[str, Any]] = []
+    for index, segment in enumerate(segments or []):
+        if not isinstance(segment, dict):
+            continue
+        legacy_index = segment.get("legacy_index")
+        normalized_segment = _normalize_project_subtitle_payload(
+            segment,
+            legacy_index_fallback=index if legacy_index is None else legacy_index,
+            allow_empty_text=allow_empty_text,
+        )
+        if normalized_segment is not None:
+            normalized_segments.append(normalized_segment)
+
+    normalized_segments.sort(
+        key=lambda item: (
+            float(item.get("start", 0.0)),
+            float(item.get("end", 0.0)),
+            int(item.get("legacy_index", 0) or 0),
+        )
+    )
+    return normalized_segments
 
 
 EDITOR_OPS_STATE_FILE = ".editor_ops_state.json"
@@ -968,25 +1099,38 @@ def _normalize_runtime_sentence_to_segment(sentence: dict[str, Any]) -> Optional
     if end < start:
         end = start
 
-    sentence_uid = str(
-        sentence.get("sentence_uid")
-        or sentence.get("segment_id")
-        or f"seg-{legacy_index}"
+    return _normalize_project_subtitle_payload(
+        {
+            "segment_id": sentence.get("sentence_uid")
+            or sentence.get("segment_id")
+            or f"seg-{legacy_index}",
+            "sentence_uid": sentence.get("sentence_uid"),
+            "chunk_id": sentence.get("chunk_id") or sentence.get("chunk_uid"),
+            "chunk_uid": sentence.get("chunk_uid"),
+            "text": text,
+            "start": start,
+            "end": end,
+            "status": sentence.get("status"),
+            "source": sentence.get("source", "transcribe"),
+            "speaker_id": sentence.get("speaker_id"),
+            "turn_id": sentence.get("turn_id"),
+            "trace": sentence.get("trace"),
+            "legacy_index": legacy_index,
+            "source_type": "transcribe",
+            "is_modified": bool(sentence.get("is_modified", False)),
+            "original_text": sentence.get("original_text"),
+            "is_draft": sentence.get("_is_draft"),
+            "is_finalized": sentence.get("_is_finalized"),
+            "split_reason": sentence.get("split_reason"),
+            "split_risk": sentence.get("split_risk"),
+            "window_id": sentence.get("window_id"),
+            "pyannote_frame_time": sentence.get("pyannote_frame_time"),
+            "mapped_cut_time": sentence.get("mapped_cut_time"),
+            "mapping_quality": sentence.get("mapping_quality"),
+            "mapping_reason": sentence.get("mapping_reason"),
+        },
+        legacy_index_fallback=legacy_index,
     )
-    chunk_uid = sentence.get("chunk_uid")
-
-    return {
-        "segment_id": sentence_uid,
-        "sentence_uid": sentence_uid,
-        "chunk_uid": str(chunk_uid) if chunk_uid is not None else None,
-        "text": text,
-        "start": start,
-        "end": end,
-        "legacy_index": legacy_index,
-        "source_type": "transcribe",
-        "is_modified": bool(sentence.get("is_modified", False)),
-        "original_text": sentence.get("original_text"),
-    }
 
 
 def _load_runtime_subtitle_segments(project_dir: Path) -> list[dict]:
@@ -1004,13 +1148,24 @@ def _load_runtime_subtitle_segments(project_dir: Path) -> list[dict]:
     except Exception as exc:
         logger.warning("读取 runtime 字幕快照失败，降级 checkpoint 路径: %s", exc)
     sentences_snapshot: list[dict[str, Any]] = []
+    segments: list[dict[str, Any]] = []
 
     if runtime_payload:
+        raw_subtitle_items = runtime_payload.get("subtitle_items_snapshot", [])
+        if isinstance(raw_subtitle_items, list):
+            for item in raw_subtitle_items:
+                normalized_item = _normalize_project_subtitle_payload(
+                    item,
+                    legacy_index_fallback=item.get("legacy_index") if isinstance(item, dict) else None,
+                    allow_empty_text=True,
+                )
+                if normalized_item is not None:
+                    segments.append(normalized_item)
         raw_snapshot = runtime_payload.get("sentences_snapshot", [])
-        if isinstance(raw_snapshot, list):
+        if not segments and isinstance(raw_snapshot, list):
             sentences_snapshot = [item for item in raw_snapshot if isinstance(item, dict)]
 
-    if not sentences_snapshot:
+    if not segments and not sentences_snapshot:
         restored_from_checkpoint = _restore_segments_from_checkpoint(project_dir)
         if restored_from_checkpoint:
             return restored_from_checkpoint
@@ -1019,11 +1174,11 @@ def _load_runtime_subtitle_segments(project_dir: Path) -> list[dict]:
             return restored_from_srt
         return []
 
-    segments: list[dict] = []
-    for sentence in sentences_snapshot:
-        segment = _normalize_runtime_sentence_to_segment(sentence)
-        if segment is not None:
-            segments.append(segment)
+    if not segments:
+        for sentence in sentences_snapshot:
+            segment = _normalize_runtime_sentence_to_segment(sentence)
+            if segment is not None:
+                segments.append(segment)
 
     segments.sort(
         key=lambda item: (
@@ -1078,7 +1233,13 @@ def _compose_runtime_segments_with_user_edits(
             if float(merged_segment["end"]) < float(merged_segment["start"]):
                 merged_segment["end"] = merged_segment["start"]
             merged_segment["is_modified"] = True
-        composed.append(merged_segment)
+        normalized_segment = _normalize_project_subtitle_payload(
+            merged_segment,
+            legacy_index_fallback=legacy_index,
+            allow_empty_text=True,
+        )
+        if normalized_segment is not None:
+            composed.append(normalized_segment)
 
     # 手动新增字幕（负索引）
     for index, edit_entry in edits.items():
@@ -1093,20 +1254,27 @@ def _compose_runtime_segments_with_user_edits(
         end = _safe_float(edit_entry.get("end"), start)
         if end < start:
             end = start
-        composed.append(
+        normalized_segment = _normalize_project_subtitle_payload(
             {
                 "segment_id": _manual_segment_id(int(index)),
                 "sentence_uid": None,
+                "chunk_id": "chunk:manual",
                 "chunk_uid": "chunk:manual",
                 "text": text,
                 "start": start,
                 "end": end,
+                "status": "final",
+                "source": "manual",
                 "legacy_index": int(index),
                 "source_type": "manual",
                 "is_modified": True,
                 "original_text": edit_entry.get("original_text"),
-            }
+            },
+            legacy_index_fallback=int(index),
+            allow_empty_text=True,
         )
+        if normalized_segment is not None:
+            composed.append(normalized_segment)
 
     composed.sort(
         key=lambda item: (
@@ -1128,20 +1296,6 @@ def _find_segment_by_segment_id(segments: list[dict], segment_id: str) -> Option
     return None
 
 
-def _find_segment_by_legacy_index(segments: list[dict], sentence_index: int) -> Optional[dict]:
-    target_index = int(sentence_index)
-    for segment in segments:
-        legacy_index = segment.get("legacy_index")
-        if legacy_index is None:
-            continue
-        try:
-            if int(legacy_index) == target_index:
-                return segment
-        except (TypeError, ValueError):
-            continue
-    return None
-
-
 def _build_runtime_export_segments(project_dir: Path) -> Optional[list[dict]]:
     """
     构建导出使用的字幕段：
@@ -1155,40 +1309,24 @@ def _build_runtime_export_segments(project_dir: Path) -> Optional[list[dict]]:
 
 
 def _export_segments_as_srt(segments: list[dict]) -> str:
-    raw_segments = [
-        {
-            "start": float(item.get("start", 0.0) or 0.0),
-            "end": float(item.get("end", item.get("start", 0.0)) or item.get("start", 0.0)),
-            "text": str(item.get("text", "") or ""),
-        }
-        for item in segments
-    ]
-    return segments_to_srt(raw_segments)
+    output_service = get_subtitle_output_service()
+    export_segments = output_service.build_segments_from_subtitles(
+        segments,
+        apply_offset=False,
+    )
+    return output_service.format_srt_segments(export_segments)
 
 
 def _export_segments_as_ass(project_dir: Path, segments: list[dict]) -> str:
-    style = ASSConverter.STYLE_PRESETS["default"]
-    content_parts: list[str] = [
-        ASSConverter.generate_script_info(title=project_dir.name),
-        "\n[V4+ Styles]",
-        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
-        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
-        "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
-        "Alignment, MarginL, MarginR, MarginV, Encoding",
-        ASSConverter.generate_style_section(style),
-        "\n[Events]",
-        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
-    ]
-    for seg in segments:
-        start = ASSConverter.format_ass_timestamp(float(seg.get("start", 0.0) or 0.0))
-        end = ASSConverter.format_ass_timestamp(
-            float(seg.get("end", seg.get("start", 0.0)) or seg.get("start", 0.0))
-        )
-        text = str(seg.get("text", "") or "").replace("\n", "\\N")
-        content_parts.append(
-            f"Dialogue: 0,{start},{end},{style.name},,0,0,0,,{text}"
-        )
-    return "\n".join(content_parts)
+    output_service = get_subtitle_output_service()
+    export_segments = output_service.build_segments_from_subtitles(
+        segments,
+        apply_offset=False,
+    )
+    return output_service.format_ass_segments(
+        export_segments,
+        title=project_dir.name,
+    )
 
 
 def _restore_segments_from_checkpoint(project_dir: Path) -> list[dict]:
@@ -1209,54 +1347,30 @@ def _restore_segments_from_checkpoint(project_dir: Path) -> list[dict]:
             continue
 
         transcription_payload = payload.get("transcription", payload)
+        subtitle_items_snapshot = transcription_payload.get(
+            "subtitle_items_snapshot",
+            payload.get("subtitle_items_snapshot", []),
+        )
+        if isinstance(subtitle_items_snapshot, list):
+            normalized_items = _normalize_project_subtitle_list(
+                [item for item in subtitle_items_snapshot if isinstance(item, dict)],
+                allow_empty_text=True,
+            )
+            if normalized_items:
+                return normalized_items
+
         sentences = transcription_payload.get("sentences_snapshot", [])
         if not isinstance(sentences, list) or not sentences:
             continue
 
         segments = []
         for sentence in sentences:
-            if not isinstance(sentence, dict):
-                continue
-            text = str(sentence.get("text", "") or "")
-            if not text.strip():
-                continue
-            raw_index = sentence.get("_index", sentence.get("index"))
-            try:
-                legacy_index = int(raw_index)
-            except (TypeError, ValueError):
-                legacy_index = len(segments)
-            start = float(sentence.get("start", 0.0) or 0.0)
-            end = float(sentence.get("end", start) or start)
-            if end < start:
-                end = start
-            segments.append(
-                {
-                    "segment_id": str(
-                        sentence.get("sentence_uid")
-                        or sentence.get("segment_id")
-                        or f"seg-{legacy_index}"
-                    ),
-                    "sentence_uid": sentence.get("sentence_uid"),
-                    "chunk_uid": sentence.get("chunk_uid"),
-                    "text": text,
-                    "start": start,
-                    "end": end,
-                    "legacy_index": legacy_index,
-                    "source_type": "transcribe",
-                    "is_modified": bool(sentence.get("is_modified", False)),
-                    "original_text": sentence.get("original_text"),
-                }
-            )
+            normalized_sentence = _normalize_runtime_sentence_to_segment(sentence)
+            if normalized_sentence is not None:
+                segments.append(normalized_sentence)
 
         if segments:
-            segments.sort(
-                key=lambda item: (
-                    float(item["start"]),
-                    float(item["end"]),
-                    int(item.get("legacy_index", 0) or 0),
-                )
-            )
-            return segments
+            return _normalize_project_subtitle_list(segments, allow_empty_text=True)
     return []
 
 
@@ -1282,14 +1396,22 @@ def _restore_segments_from_srt(project_dir: Path) -> list[dict]:
         parsed_segments = subtitle_doc_service.parse_srt(content)
         segments = []
         for index, segment in enumerate(parsed_segments):
-            normalized_segment = dict(segment)
-            normalized_segment["segment_id"] = str(
-                normalized_segment.get("segment_id") or f"seg-{index}"
+            normalized_segment = _normalize_project_subtitle_payload(
+                {
+                    **dict(segment),
+                    "segment_id": str(segment.get("segment_id") or f"seg-{index}"),
+                    "legacy_index": int(index),
+                    "source": segment.get("source") or "import",
+                    "source_type": segment.get("source_type") or "import",
+                    "status": segment.get("status") or "final",
+                },
+                legacy_index_fallback=index,
+                allow_empty_text=True,
             )
-            normalized_segment["legacy_index"] = int(index)
-            segments.append(normalized_segment)
+            if normalized_segment is not None:
+                segments.append(normalized_segment)
         if segments:
-            return segments
+            return _normalize_project_subtitle_list(segments, allow_empty_text=True)
     return []
 
 
@@ -1581,7 +1703,10 @@ async def list_project_subtitles(project_id: str):
         return {"success": True, "data": segments}
 
     # 纯导入/仅编辑项目：沿用 subtitle_doc 读取。
-    segments = subtitle_doc_service.load_segments(project_dir)
+    segments = _normalize_project_subtitle_list(
+        subtitle_doc_service.load_segments(project_dir),
+        allow_empty_text=True,
+    )
     return {"success": True, "data": segments}
 
 
@@ -1605,18 +1730,24 @@ async def create_project_subtitle(project_id: str, body: SubtitleCreateRequest):
             float(body.start),
             float(body.end),
         )
-        segment = {
-            "segment_id": _manual_segment_id(legacy_index),
-            "sentence_uid": None,
-            "chunk_uid": "chunk:manual",
-            "text": str(entry.get("text", body.text or "")),
-            "start": _safe_float(entry.get("start"), float(body.start)),
-            "end": _safe_float(entry.get("end"), float(body.end)),
-            "legacy_index": int(legacy_index),
-            "source_type": "manual",
-            "is_modified": True,
-            "original_text": entry.get("original_text"),
-        }
+        segment = _normalize_project_subtitle_payload(
+            {
+                "segment_id": _manual_segment_id(legacy_index),
+                "text": str(entry.get("text", body.text or "")),
+                "start": _safe_float(entry.get("start"), float(body.start)),
+                "end": _safe_float(entry.get("end"), float(body.end)),
+                "legacy_index": int(legacy_index),
+                "source": "manual",
+                "source_type": "manual",
+                "status": "final",
+                "is_modified": True,
+                "original_text": entry.get("original_text"),
+            },
+            legacy_index_fallback=int(legacy_index),
+            allow_empty_text=True,
+        )
+        if segment is None:
+            raise HTTPException(status_code=500, detail="新增字幕构建失败")
         _sync_homophone_index_for_project_change(
             project_id=project_id,
             project_dir=project_dir,
@@ -1635,6 +1766,13 @@ async def create_project_subtitle(project_id: str, body: SubtitleCreateRequest):
         start=body.start,
         end=body.end,
     )
+    segment = _normalize_project_subtitle_payload(
+        segment,
+        legacy_index_fallback=segment.get("legacy_index") if isinstance(segment, dict) else None,
+        allow_empty_text=True,
+    )
+    if segment is None:
+        raise HTTPException(status_code=500, detail="新增字幕构建失败")
     _sync_homophone_index_for_project_change(
         project_id=project_id,
         project_dir=project_dir,
@@ -1712,6 +1850,11 @@ async def update_project_subtitle(
         raise HTTPException(status_code=404, detail="字幕段不存在")
 
     segment = subtitle_doc_service.get_segment(project_dir, segment_id)
+    segment = _normalize_project_subtitle_payload(
+        segment,
+        legacy_index_fallback=segment.get("legacy_index") if isinstance(segment, dict) else None,
+        allow_empty_text=True,
+    )
     _sync_homophone_index_for_project_change(
         project_id=project_id,
         project_dir=project_dir,
@@ -2088,25 +2231,26 @@ def _batch_sync_runtime(
                 project_dir, item.text or "", float(item.start), float(item.end)
             )
             segment_id = _manual_segment_id(new_index)
-            segment = {
-                "segment_id": segment_id,
-                "sentence_uid": None,
-                "chunk_uid": "chunk:manual",
-                "text": str(entry.get("text", item.text or "")),
-                "start": float(entry.get("start", float(item.start))),
-                "end": float(entry.get("end", float(item.end))),
-                "legacy_index": int(new_index),
-                "source_type": "manual",
-                "is_modified": True,
-                "original_text": entry.get("original_text"),
-            }
-            results["created_segments"].append({
-                "segment_id": segment_id,
-                "legacy_index": new_index,
-                "text": segment["text"],
-                "start": segment["start"],
-                "end": segment["end"],
-            })
+            segment = _normalize_project_subtitle_payload(
+                {
+                    "segment_id": segment_id,
+                    "text": str(entry.get("text", item.text or "")),
+                    "start": float(entry.get("start", float(item.start))),
+                    "end": float(entry.get("end", float(item.end))),
+                    "legacy_index": int(new_index),
+                    "source": "manual",
+                    "source_type": "manual",
+                    "status": "final",
+                    "is_modified": True,
+                    "original_text": entry.get("original_text"),
+                },
+                legacy_index_fallback=int(new_index),
+                allow_empty_text=True,
+            )
+            if segment is None:
+                results["errors"].append(f"create: {segment_id} 构建失败")
+                continue
+            results["created_segments"].append(segment)
             updated_indices.add(int(new_index))
             results["created"] += 1
             _publish_project_subtitle_event(
@@ -2146,25 +2290,26 @@ def _handle_runtime_restore(
             project_dir, original_index, item.text or "", float(item.start), float(item.end)
         )
         if ok:
-            segment = {
-                "segment_id": seg_id,
-                "sentence_uid": None,
-                "chunk_uid": "chunk:manual",
-                "text": str(item.text or ""),
-                "start": float(item.start),
-                "end": float(item.end),
-                "legacy_index": int(original_index),
-                "source_type": "manual",
-                "is_modified": True,
-                "original_text": None,
-            }
-            results["created_segments"].append({
-                "segment_id": seg_id,
-                "legacy_index": original_index,
-                "text": segment["text"],
-                "start": segment["start"],
-                "end": segment["end"],
-            })
+            segment = _normalize_project_subtitle_payload(
+                {
+                    "segment_id": seg_id,
+                    "text": str(item.text or ""),
+                    "start": float(item.start),
+                    "end": float(item.end),
+                    "legacy_index": int(original_index),
+                    "source": "manual",
+                    "source_type": "manual",
+                    "status": "final",
+                    "is_modified": True,
+                    "original_text": None,
+                },
+                legacy_index_fallback=int(original_index),
+                allow_empty_text=True,
+            )
+            if segment is None:
+                results["errors"].append(f"restore: {seg_id} 构建失败")
+                return None
+            results["created_segments"].append(segment)
             results["created"] += 1
             _publish_project_subtitle_event(
                 project_id,
@@ -2211,29 +2356,34 @@ def _handle_runtime_restore(
             if restored_segment is not None
             else float(item.end if item.end is not None else target.get("end", restored_start))
         )
-        results["created_segments"].append({
-            "segment_id": seg_id,
-            "legacy_index": idx,
-            "text": restored_text,
-            "start": restored_start,
-            "end": restored_end,
-        })
+        normalized_restored_segment = restored_segment
+        if normalized_restored_segment is None:
+            normalized_restored_segment = _normalize_project_subtitle_payload(
+                {
+                    "segment_id": seg_id,
+                    "text": restored_text,
+                    "start": restored_start,
+                    "end": restored_end,
+                    "legacy_index": idx,
+                    "source": target.get("source") or "transcribe",
+                    "source_type": target.get("source_type") or target.get("source") or "transcribe",
+                    "status": "final",
+                    "is_modified": True,
+                    "original_text": target.get("original_text"),
+                },
+                legacy_index_fallback=idx,
+                allow_empty_text=True,
+            )
+        if normalized_restored_segment is None:
+            results["errors"].append(f"restore: {seg_id} 构建失败")
+            return None
+        results["created_segments"].append(normalized_restored_segment)
         results["created"] += 1
         _publish_project_subtitle_event(
             project_id,
             "added",
             {
-                "segment": restored_segment
-                if restored_segment is not None
-                else {
-                    "segment_id": seg_id,
-                    "legacy_index": idx,
-                    "text": restored_text,
-                    "start": restored_start,
-                    "end": restored_end,
-                    "source_type": "restored",
-                    "is_modified": True,
-                },
+                "segment": normalized_restored_segment,
                 "source": "project_api",
                 "is_update": True,
             },
@@ -2262,7 +2412,10 @@ def _batch_sync_subtitle_doc(
         ok = subtitle_doc_service.update_segment(project_dir, item.segment_id, payload)
         if ok:
             results["updated"] += 1
-            segment = subtitle_doc_service.get_segment(project_dir, item.segment_id)
+            segment = _normalize_project_subtitle_payload(
+                subtitle_doc_service.get_segment(project_dir, item.segment_id),
+                allow_empty_text=True,
+            )
             if segment is not None:
                 updated_indices.add(int(segment.get("legacy_index", 0)))
                 _publish_project_subtitle_event(
@@ -2310,13 +2463,15 @@ def _batch_sync_subtitle_doc(
             new_seg = subtitle_doc_service.create_segment(
                 project_dir, item.text or "", float(item.start), float(item.end)
             )
-            results["created_segments"].append({
-                "segment_id": new_seg.get("segment_id"),
-                "legacy_index": new_seg.get("legacy_index"),
-                "text": new_seg.get("text"),
-                "start": new_seg.get("start"),
-                "end": new_seg.get("end"),
-            })
+            new_seg = _normalize_project_subtitle_payload(
+                new_seg,
+                legacy_index_fallback=new_seg.get("legacy_index") if isinstance(new_seg, dict) else None,
+                allow_empty_text=True,
+            )
+            if new_seg is None:
+                results["errors"].append("create: 字幕构建失败")
+                continue
+            results["created_segments"].append(new_seg)
             updated_indices.add(int(new_seg.get("legacy_index", 0)))
             results["created"] += 1
             _publish_project_subtitle_event(
@@ -2355,23 +2510,25 @@ def _handle_subtitle_doc_restore(
             project_dir, original_index, item.text or "", float(item.start), float(item.end)
         )
         if ok:
-            segment = {
-                "segment_id": seg_id,
-                "legacy_index": int(original_index),
-                "text": str(item.text or ""),
-                "start": float(item.start),
-                "end": float(item.end),
-                "source_type": "manual",
-                "is_modified": True,
-                "is_deleted": False,
-            }
-            results["created_segments"].append({
-                "segment_id": seg_id,
-                "legacy_index": original_index,
-                "text": segment["text"],
-                "start": segment["start"],
-                "end": segment["end"],
-            })
+            segment = _normalize_project_subtitle_payload(
+                {
+                    "segment_id": seg_id,
+                    "text": str(item.text or ""),
+                    "start": float(item.start),
+                    "end": float(item.end),
+                    "legacy_index": int(original_index),
+                    "source": "manual",
+                    "source_type": "manual",
+                    "status": "final",
+                    "is_modified": True,
+                },
+                legacy_index_fallback=int(original_index),
+                allow_empty_text=True,
+            )
+            if segment is None:
+                results["errors"].append(f"restore: {seg_id} 构建失败")
+                return None
+            results["created_segments"].append(segment)
             results["created"] += 1
             _publish_project_subtitle_event(
                 project_id,
@@ -2396,44 +2553,52 @@ def _handle_subtitle_doc_restore(
         )
         if restored_index is not None:
             restored_segment = subtitle_doc_service.get_segment(project_dir, seg_id)
+            normalized_restored_segment = _normalize_project_subtitle_payload(
+                restored_segment,
+                legacy_index_fallback=restored_index,
+                allow_empty_text=True,
+            )
             restored_text = (
-                str(restored_segment.get("text", ""))
-                if restored_segment is not None
+                str(normalized_restored_segment.get("text", ""))
+                if normalized_restored_segment is not None
                 else str(item.text or "")
             )
             restored_start = (
-                float(restored_segment.get("start", 0.0))
-                if restored_segment is not None
+                float(normalized_restored_segment.get("start", 0.0))
+                if normalized_restored_segment is not None
                 else float(item.start if item.start is not None else 0.0)
             )
             restored_end = (
-                float(restored_segment.get("end", restored_start))
-                if restored_segment is not None
+                float(normalized_restored_segment.get("end", restored_start))
+                if normalized_restored_segment is not None
                 else float(item.end if item.end is not None else restored_start)
             )
-            results["created_segments"].append({
-                "segment_id": seg_id,
-                "legacy_index": restored_index,
-                "text": restored_text,
-                "start": restored_start,
-                "end": restored_end,
-            })
-            results["created"] += 1
-            _publish_project_subtitle_event(
-                project_id,
-                "added",
-                {
-                    "segment": restored_segment
-                    if restored_segment is not None
-                    else {
+            if normalized_restored_segment is None:
+                normalized_restored_segment = _normalize_project_subtitle_payload(
+                    {
                         "segment_id": seg_id,
                         "legacy_index": restored_index,
                         "text": restored_text,
                         "start": restored_start,
                         "end": restored_end,
+                        "source": "restored",
                         "source_type": "restored",
+                        "status": "final",
                         "is_modified": True,
                     },
+                    legacy_index_fallback=restored_index,
+                    allow_empty_text=True,
+                )
+            if normalized_restored_segment is None:
+                results["errors"].append(f"restore: {seg_id} 构建失败")
+                return None
+            results["created_segments"].append(normalized_restored_segment)
+            results["created"] += 1
+            _publish_project_subtitle_event(
+                project_id,
+                "added",
+                {
+                    "segment": normalized_restored_segment,
                     "source": "project_api",
                     "is_update": True,
                 },
@@ -2443,70 +2608,6 @@ def _handle_subtitle_doc_restore(
             results["errors"].append(f"restore: {seg_id} tombstone 中未找到")
             return None
     return None
-
-
-@router.patch("/{project_id}/subtitles/legacy/{sentence_index}")
-async def update_project_subtitle_by_legacy_index(
-    project_id: str,
-    sentence_index: int,
-    body: SubtitleUpdateRequest,
-):
-    """兼容入口：按 legacy_index 更新项目字幕。"""
-    project_service = get_project_service()
-    subtitle_doc_service = get_subtitle_doc_service()
-    project_dir = project_service.get_project_dir(project_id)
-    if project_dir is None:
-        raise HTTPException(status_code=404, detail="项目不存在")
-
-    runtime_segments = _load_runtime_subtitle_segments(project_dir)
-    if runtime_segments:
-        composed_segments = _compose_runtime_segments_with_user_edits(project_dir, runtime_segments)
-        target_segment = _find_segment_by_legacy_index(composed_segments, sentence_index)
-        if target_segment is None:
-            raise HTTPException(status_code=404, detail="字幕段不存在")
-        target_segment_id = str(target_segment.get("segment_id", "") or "").strip()
-        if not target_segment_id:
-            raise HTTPException(status_code=404, detail="字幕段不存在")
-        return await update_project_subtitle(project_id, target_segment_id, body)
-
-    segments = subtitle_doc_service.load_segments(project_dir)
-    target_segment = _find_segment_by_legacy_index(segments, sentence_index)
-    if target_segment is None:
-        raise HTTPException(status_code=404, detail="字幕段不存在")
-    target_segment_id = str(target_segment.get("segment_id", "") or "").strip()
-    if not target_segment_id:
-        raise HTTPException(status_code=404, detail="字幕段不存在")
-    return await update_project_subtitle(project_id, target_segment_id, body)
-
-
-@router.delete("/{project_id}/subtitles/legacy/{sentence_index}")
-async def delete_project_subtitle_by_legacy_index(project_id: str, sentence_index: int):
-    """兼容入口：按 legacy_index 删除项目字幕。"""
-    project_service = get_project_service()
-    subtitle_doc_service = get_subtitle_doc_service()
-    project_dir = project_service.get_project_dir(project_id)
-    if project_dir is None:
-        raise HTTPException(status_code=404, detail="项目不存在")
-
-    runtime_segments = _load_runtime_subtitle_segments(project_dir)
-    if runtime_segments:
-        composed_segments = _compose_runtime_segments_with_user_edits(project_dir, runtime_segments)
-        target_segment = _find_segment_by_legacy_index(composed_segments, sentence_index)
-        if target_segment is None:
-            raise HTTPException(status_code=404, detail="字幕段不存在")
-        target_segment_id = str(target_segment.get("segment_id", "") or "").strip()
-        if not target_segment_id:
-            raise HTTPException(status_code=404, detail="字幕段不存在")
-        return await delete_project_subtitle(project_id, target_segment_id)
-
-    segments = subtitle_doc_service.load_segments(project_dir)
-    target_segment = _find_segment_by_legacy_index(segments, sentence_index)
-    if target_segment is None:
-        raise HTTPException(status_code=404, detail="字幕段不存在")
-    target_segment_id = str(target_segment.get("segment_id", "") or "").strip()
-    if not target_segment_id:
-        raise HTTPException(status_code=404, detail="字幕段不存在")
-    return await delete_project_subtitle(project_id, target_segment_id)
 
 
 @router.get("/{project_id}/export")

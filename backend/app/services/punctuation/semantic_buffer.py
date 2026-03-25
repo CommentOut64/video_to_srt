@@ -262,9 +262,17 @@ class SemanticBuffer:
         combined_end = float(item.audio_range[1])
         combined_language = item.language or self._pending_language or "auto"
         combined_speaker_id = item.speaker_id or self._pending_speaker_id
-        combined_sources = self._pending_source_chunks + (item.source_chunks or [item.chunk_id])
+        current_source_chunks = self._dedupe_source_chunks(item.source_chunks or [item.chunk_id])
+        combined_sources = self._merge_source_chunks(
+            self._pending_source_chunks,
+            current_source_chunks,
+        )
         selected_words = self._select_words(item.word_timestamps, item.raw_tokens, item.language)
-        current_words = self._normalize_words(selected_words, item.audio_range)
+        current_words = self._normalize_words(
+            selected_words,
+            item.audio_range,
+            source_chunk_id=str(item.chunk_id or ""),
+        )
         combined_words = self._pending_words + current_words
 
         decision = item.punctuation_decision or self._pending_decision
@@ -414,12 +422,20 @@ class SemanticBuffer:
                     split_text_index=last_end,
                     split_time=split_time,
                 )
+                chunk_source_chunks = self._resolve_word_source_chunks(
+                    fallback_source_chunks=source_chunks,
+                    words=chunk_words,
+                )
+                pending_source_chunks = self._resolve_word_source_chunks(
+                    fallback_source_chunks=source_chunks,
+                    words=pending_words,
+                )
                 chunk = self._build_chunk(
                     text=chunk_text,
                     audio_range=chunk_range,
                     language=language,
                     speaker_id=speaker_id,
-                    source_chunks=source_chunks,
+                    source_chunks=chunk_source_chunks,
                     decision=decision,
                     split_end_indices=split_end_indices,
                     locked_end_indices=locked_end_indices if split_end_indices else set(),
@@ -433,7 +449,7 @@ class SemanticBuffer:
                     audio_range=pending_range,
                     language=language,
                     speaker_id=speaker_id,
-                    source_chunks=source_chunks,
+                    source_chunks=pending_source_chunks,
                     decision=decision,
                     punctuation_result=punct_result,
                     pending_words=pending_words,
@@ -783,12 +799,20 @@ class SemanticBuffer:
             weak_index,
         )
         chunk_words, pending_words = self._split_words_by_time(self._pending_words, chunk_range[1])
+        chunk_source_chunks = self._resolve_word_source_chunks(
+            fallback_source_chunks=self._pending_source_chunks,
+            words=chunk_words,
+        )
+        pending_source_chunks = self._resolve_word_source_chunks(
+            fallback_source_chunks=self._pending_source_chunks,
+            words=pending_words,
+        )
         chunk = self._build_chunk(
             text=chunk_text,
             audio_range=chunk_range,
             language=self._pending_language,
             speaker_id=self._pending_speaker_id,
-            source_chunks=self._pending_source_chunks,
+            source_chunks=chunk_source_chunks,
             decision=self._pending_decision,
             split_end_indices=[weak_index],
             locked_end_indices=set(),
@@ -807,7 +831,7 @@ class SemanticBuffer:
             audio_range=pending_range,
             language=self._pending_language,
             speaker_id=self._pending_speaker_id,
-            source_chunks=self._pending_source_chunks,
+            source_chunks=pending_source_chunks,
             decision=self._pending_decision,
             punctuation_result=self._pending_punctuation_result,
             pending_words=pending_words,
@@ -853,7 +877,7 @@ class SemanticBuffer:
             audio_range=audio_range,
             language=language,
             speaker_id=speaker_id,
-            source_chunks=source_chunks,
+            source_chunks=self._dedupe_source_chunks(source_chunks),
             word_timestamps=word_timestamps or [],
         )
 
@@ -1082,7 +1106,7 @@ class SemanticBuffer:
         self._pending_audio_end = float(audio_range[1])
         self._pending_language = language or self._pending_language
         self._pending_speaker_id = speaker_id or self._pending_speaker_id
-        self._pending_source_chunks = list(source_chunks)
+        self._pending_source_chunks = self._dedupe_source_chunks(source_chunks)
         self._pending_decision = decision
         self._pending_punctuation_result = punctuation_result
         self._pending_words = pending_words or []
@@ -1112,6 +1136,42 @@ class SemanticBuffer:
         if len(source_chunks) == 1:
             return source_chunks[0]
         return f"{source_chunks[0]}+{source_chunks[-1]}"
+
+    @staticmethod
+    def _dedupe_source_chunks(source_chunks: Sequence[str]) -> List[str]:
+        normalized: List[str] = []
+        seen = set()
+        for item in source_chunks or []:
+            chunk_id = str(item or "").strip()
+            if not chunk_id or chunk_id in seen:
+                continue
+            seen.add(chunk_id)
+            normalized.append(chunk_id)
+        return normalized
+
+    @classmethod
+    def _merge_source_chunks(
+        cls,
+        left: Sequence[str],
+        right: Sequence[str],
+    ) -> List[str]:
+        return cls._dedupe_source_chunks([*list(left or []), *list(right or [])])
+
+    @classmethod
+    def _resolve_word_source_chunks(
+        cls,
+        *,
+        fallback_source_chunks: Sequence[str],
+        words: Sequence[Dict[str, Any]],
+    ) -> List[str]:
+        source_chunks = [
+            str(word.get("source_chunk_id") or "").strip()
+            for word in words or []
+            if str(word.get("source_chunk_id") or "").strip()
+        ]
+        if source_chunks:
+            return cls._dedupe_source_chunks(source_chunks)
+        return cls._dedupe_source_chunks(fallback_source_chunks)
 
     @staticmethod
     def _clean_length(text: str) -> int:
@@ -1188,6 +1248,7 @@ class SemanticBuffer:
     def _normalize_words(
         words: Optional[Sequence[Dict[str, Any]]],
         audio_range: Tuple[float, float],
+        source_chunk_id: str = "",
     ) -> List[Dict[str, Any]]:
         if not words:
             return []
@@ -1214,6 +1275,7 @@ class SemanticBuffer:
                     "confidence": word.get("confidence", 1.0),
                     "confidence_display_raw": word.get("confidence_display_raw"),
                     "token_type": word.get("token_type"),
+                    "source_chunk_id": source_chunk_id,
                 }
             )
         return normalized

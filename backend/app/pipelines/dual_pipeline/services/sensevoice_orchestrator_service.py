@@ -40,7 +40,6 @@ class SensevoiceOrchestratorService:
         host._fast_processed_indices = processed_indices
         host._finalized_indices = processed_indices
         total_chunks = len(audio_chunks)
-        last_chunk_index: Optional[int] = None
         host._audio_chunks_by_index = {chunk.index: chunk for chunk in audio_chunks}
         host._decision_processor.reset_state()
         host._soft_cut_pending_deferred_by_stream.clear()
@@ -142,13 +141,12 @@ class SensevoiceOrchestratorService:
                     },
                     output_traces=output_traces,
                     default_trace_reason="sensevoice_only",
+                    subtitle_batch=run_result.subtitle_batch,
                 )
                 ctx.finalization_metrics["l7_error_count"] = float(
                     len(output_layer_result.output_payload.get("errors", []))
                 )
                 results.append(ctx)
-                last_chunk_index = i
-
                 if host.progress_emitter:
                     processed_count = len(results)
                     host.progress_emitter.update_fast(
@@ -200,9 +198,6 @@ class SensevoiceOrchestratorService:
         if host.pause_exception:
             host.is_pause_snapshot_saved = host._force_save_pause_checkpoint(job_dir, total_chunks)
             raise host.pause_exception
-
-        if last_chunk_index is not None:
-            await host._flush_semantic_buffer(is_final_output=True, chunk_index=last_chunk_index)
 
         host.logger.info(f"极速模式完成: {len(results)} 个 Chunk 已处理")
         return results

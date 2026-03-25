@@ -10,6 +10,20 @@
 
 import axios from 'axios'
 
+function resolveApiBaseUrl() {
+  const envBaseUrl = String(import.meta.env.VITE_API_BASE_URL ?? '').trim()
+  if (envBaseUrl) {
+    return envBaseUrl
+  }
+
+  const browserOrigin = globalThis?.window?.location?.origin
+  if (browserOrigin) {
+    return browserOrigin
+  }
+
+  return 'http://localhost'
+}
+
 // 自定义错误类
 export class APIError extends Error {
   constructor(status, message, data = null) {
@@ -29,7 +43,7 @@ export class NetworkError extends Error {
 
 // 创建 Axios 实例
 export const apiClient = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE_URL || window.location.origin,
+  baseURL: resolveApiBaseUrl(),
   timeout: 30000, // 默认 30 秒超时
   headers: {
     'Content-Type': 'application/json'

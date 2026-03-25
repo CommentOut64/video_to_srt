@@ -12,9 +12,9 @@ from app.services.bridge.turn_group_builder import TurnGroupEnvelope
 from app.services.bridge.turn_group_models import TurnGroup
 from app.services.language_policy import resolve_language_tag
 from app.services.sensevoice_onnx_service import SenseVoiceLanguageInfo, SenseVoiceONNXService
-from app.services.textflow.output_layer import OutputLayerProcessor
+from app.services.textflow.output_dispatch_adapter import OutputLayerProcessor
+from app.services.textflow.contracts import SubtitleBatch, SubtitleItem
 from app.services.alignment.types import OutputLayerInput
-from app.models.sensevoice_models import SentenceSegment
 from app.pipelines.dual_pipeline.services.slow_loop_service import SlowLoopService
 
 
@@ -83,6 +83,47 @@ def test_phase0_reality_gate_baseline_sensevoice_result_default_no_ctc_logits(mo
     assert "ctc_logits" not in result
 
 
+def test_phase0_reality_gate_sensevoice_result_keeps_ctc_logits_only_with_explicit_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.model_runtime_config_service as runtime_config_module
+    import app.services.text_normalizer as text_normalizer_module
+    import app.services.token_merge_service as token_merge_service_module
+
+    class _DummyRuntimeService:
+        @staticmethod
+        def get_effective_runtime_global() -> dict:
+            return {
+                "effective": {
+                    "alignment_pipeline": {
+                        "retain_ctc_logits": True,
+                    }
+                },
+                "override": {
+                    "alignment_pipeline": {
+                        "retain_ctc_logits": True,
+                    }
+                },
+            }
+
+    monkeypatch.setattr(text_normalizer_module, "get_text_normalizer", lambda: _DummyNormalizer())
+    monkeypatch.setattr(
+        token_merge_service_module,
+        "merge_tokens",
+        lambda tokens, language=None: _DummyMergeResult(words=list(tokens), raw_tokens=[dict(item) for item in tokens]),
+    )
+    monkeypatch.setattr(
+        runtime_config_module,
+        "get_model_runtime_config_service",
+        lambda: _DummyRuntimeService(),
+    )
+
+    service = _build_stub_sensevoice_service()
+    result = service.transcribe_audio_array(np.zeros(16000, dtype=np.float32), sample_rate=16000)
+
+    assert "ctc_logits" in result
+
+
 def test_phase0_reality_gate_language_policy_currently_aliases_mixed_to_zh() -> None:
     """阶段性现实基线：language_policy 仍存在 mixed -> zh 归一化。"""
     assert resolve_language_tag(language_hint="mixed", fallback="en") == "zh"
@@ -141,36 +182,43 @@ async def test_phase0_reality_gate_slow_loop_consumes_turn_group_envelope() -> N
     assert isinstance(processed_payloads[0], TurnGroupEnvelope)
 
 
-def test_phase0_reality_gate_output_layer_uses_output_layer_input_to_replace_chunk() -> None:
-    """现实基线：OutputLayerProcessor 通过 OutputLayerInput -> replace_chunk() 收口。"""
+def test_phase0_reality_gate_output_layer_requires_subtitle_batch_to_replace_chunk_batch() -> None:
+    """现实基线：OutputLayerProcessor 只接受显式 SubtitleBatch，再调用 replace_chunk_batch()。"""
 
     class _DummySubtitleManager:
         def __init__(self) -> None:
             self.last_call = None
 
-        def replace_chunk(self, chunk_index: int, sentences: list[SentenceSegment]) -> list[int]:
-            self.last_call = (chunk_index, list(sentences))
-            return list(range(len(sentences)))
+        def replace_chunk_batch(self, subtitle_batch) -> list[int]:
+            self.last_call = subtitle_batch
+            return list(range(len(subtitle_batch.items)))
 
     subtitle_manager = _DummySubtitleManager()
     processor = OutputLayerProcessor(subtitle_manager=subtitle_manager)
 
-    sentence = SentenceSegment(
-        text="你好",
-        text_clean="你好",
-        start=0.0,
-        end=0.8,
-        display_confidence=0.95,
-    )
     output = processor.process(
         OutputLayerInput(
             chunk_index=3,
-            sentence_segments=[sentence],
+            sentence_segments=[],
             language="zh",
+            subtitle_batch=SubtitleBatch(
+                chunk_id="3",
+                chunk_index=3,
+                items=(
+                    SubtitleItem(
+                        segment_id="seg-3-0",
+                        chunk_id="3",
+                        text="你好",
+                        start=0.0,
+                        end=0.8,
+                        source="timeanchored",
+                    ),
+                ),
+            ),
         )
     )
 
     assert subtitle_manager.last_call is not None
-    assert subtitle_manager.last_call[0] == 3
-    assert len(subtitle_manager.last_call[1]) == 1
+    assert subtitle_manager.last_call.chunk_id == "3"
+    assert len(subtitle_manager.last_call.items) == 1
     assert output.output_payload.get("transport_meta", {}).get("channels")

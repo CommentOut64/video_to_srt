@@ -56,12 +56,6 @@ export function createEditorBridge() {
         case 'subtitle.replace_chunk':
           projector.projectReplaceChunk(data)
           break
-        case 'subtitle.restored':
-          projector.projectRestored(data)
-          break
-        case 'subtitle.finalized':
-          projector.projectFinalized(data)
-          break
         case 'subtitle.revised':
           projector.projectRevised(data)
           break
