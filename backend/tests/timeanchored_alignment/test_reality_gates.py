@@ -130,25 +130,16 @@ def test_phase0_reality_gate_language_policy_currently_aliases_mixed_to_zh() -> 
 
 
 @pytest.mark.asyncio
-async def test_phase0_reality_gate_slow_loop_consumes_turn_group_envelope() -> None:
-    """现实基线：SlowLoopService 当前显式消费 TurnGroupEnvelope。"""
+async def test_phase0_reality_gate_slow_loop_rejects_turn_group_envelope() -> None:
+    """现实基线更新：SlowLoopService 默认主链只接受 ReadySlowWindow。"""
     import asyncio
-
-    processed_payloads: list[TurnGroupEnvelope] = []
-
-    async def _process_turn_group(*args, **kwargs):
-        processed_payloads.append(args[0])
-        return False
 
     host = SimpleNamespace(
         cancellation_token=None,
         queue_inter=asyncio.Queue(),
         queue_final=asyncio.Queue(),
         bridge_controller=None,
-        _turn_group_builder=SimpleNamespace(flush_idle=lambda now: None),
-        _is_turn_group_committed=lambda _group_id: False,
-        _record_turn_group_unit=lambda **kwargs: None,
-        _process_turn_group=_process_turn_group,
+        _flush_window_assembler_idle=lambda now: None,
         logger=Mock(),
         progress_emitter=None,
         debug_punctuation=False,
@@ -178,8 +169,12 @@ async def test_phase0_reality_gate_slow_loop_consumes_turn_group_envelope() -> N
     service = SlowLoopService(host=host)
     await service.run(job_dir=None, total_chunks=0)
 
-    assert len(processed_payloads) == 1
-    assert isinstance(processed_payloads[0], TurnGroupEnvelope)
+    assert len(host.errors) == 1
+    assert isinstance(host.errors[0], RuntimeError)
+    assert "不再接受 TurnGroupEnvelope" in str(host.errors[0])
+    terminal_ctx = await asyncio.wait_for(host.queue_final.get(), timeout=1.0)
+    assert terminal_ctx.is_end is True
+    assert isinstance(terminal_ctx.error, RuntimeError)
 
 
 def test_phase0_reality_gate_output_layer_requires_subtitle_batch_to_replace_chunk_batch() -> None:

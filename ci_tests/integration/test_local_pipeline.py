@@ -76,7 +76,10 @@ class TestMinimalDummyPipeline:
         result = await runner.run_full_pipeline()
 
         assert result.success, f"流水线失败: {result.error}"
-        assert len(result.contexts) == 2
+        assert len(result.contexts) == 1
+        ready_window = result.contexts[0].ready_slow_window
+        assert ready_window is not None
+        assert tuple(ready_window.source_chunk_indices) == (0, 1)
 
     @pytest.mark.integration_ci
     @pytest.mark.asyncio
@@ -97,7 +100,10 @@ class TestMinimalDummyPipeline:
         result = await runner.run_full_pipeline()
 
         assert result.success, f"流水线失败: {result.error}"
-        assert len(result.contexts) == 3
+        assert len(result.contexts) == 1
+        ready_window = result.contexts[0].ready_slow_window
+        assert ready_window is not None
+        assert tuple(ready_window.source_chunk_indices) == (0, 1, 2)
 
 
 # ============================================================
@@ -125,7 +131,10 @@ class TestFullDummyPipeline:
         result = await runner.run_full_pipeline()
 
         assert result.success, f"流水线失败: {result.error}"
-        assert len(result.contexts) == 4
+        assert len(result.contexts) == 1
+        ready_window = result.contexts[0].ready_slow_window
+        assert ready_window is not None
+        assert tuple(ready_window.source_chunk_indices) == (0, 1, 2, 3)
         assert "pipeline_run" in result.stage_timings
 
     @pytest.mark.integration_ci

@@ -6,7 +6,6 @@ Mock ASR 引擎工厂。
 以及新增的 ConfigurableEngine。
 """
 from __future__ import annotations
-
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
@@ -15,6 +14,52 @@ from app.core.asr.engine import ASREngine
 from app.core.asr.enums import ASRCapability, TimestampPrecision
 from app.core.asr.models import ASRMetadata, ASRResult, Segment, WordTimestamp
 from app.engines.dummy_engine import DummyEngine
+
+
+class TimeBaseReadyDummyEngine(DummyEngine):
+    """为 integration harness 补最小 time-base 轨迹的 DummyEngine。"""
+
+    async def transcribe(
+        self,
+        audio: np.ndarray,
+        language: Optional[str] = None,
+        **kwargs: object,
+    ) -> ASRResult:
+        result = await super().transcribe(audio, language=language, **kwargs)
+        raw_tokens = self._build_raw_tokens(result.words or [])
+        result.raw_tokens = list(raw_tokens)
+        result.metadata.raw_tags.update(
+            {
+                "raw_tokens": list(raw_tokens),
+                "ctc_compact_trace": {
+                    "blank_ratio": 0.0,
+                    "avg_max_prob": float(self.confidence),
+                    "low_prob_ratio": 0.0,
+                    "raw_tokens": list(raw_tokens),
+                    "top_k": 1,
+                },
+                "ctc_frame_stride": 0.06,
+            }
+        )
+        return result
+
+    @staticmethod
+    def _build_raw_tokens(words: Sequence[WordTimestamp]) -> List[dict]:
+        return [
+            {
+                "word": str(word.word or ""),
+                "start": float(word.start),
+                "end": float(word.end),
+                "confidence": float(
+                    word.confidence
+                    if word.confidence is not None
+                    else (word.probability if word.probability is not None else 1.0)
+                ),
+                "is_pseudo": bool(word.is_pseudo),
+            }
+            for word in words
+            if str(word.word or "")
+        ]
 
 
 class RecordingWhisperEngine(ASREngine):
@@ -193,7 +238,7 @@ class MockEngineFactory:
         latency_ms: int = 0,
     ) -> DummyEngine:
         """创建 Dummy 草稿引擎。"""
-        return DummyEngine(
+        return TimeBaseReadyDummyEngine(
             response_text=text,
             confidence=confidence,
             latency_ms=latency_ms,
