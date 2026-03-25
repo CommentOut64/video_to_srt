@@ -111,22 +111,19 @@ from app.services.punctuation.base import PunctuationResult, PuncPosition, Split
 from app.services.punctuation.scheduler import get_punctuation_scheduler
 from app.services.punctuation.final_splitter import FinalSplitter, FinalSplitConfig
 from app.services.bridge.bridge_controller import BridgeController
-from app.services.bridge.flush_policy import FlushPolicyConfig
-from app.services.bridge.turn_group_builder import TurnGroupBuilder, TurnGroupEnvelope
-from app.services.bridge.turn_group_models import TurnGroup
 from app.services.punctuation.semantic_buffer import (
     PunctuationDecision,
     SemanticBuffer,
     SemanticBufferInput,
     SemanticChunk,
 )
-from app.services.timeanchored_alignment.hint_builder import HintBuilder
-from app.services.timeanchored_alignment.slow_window_assembler import (
-    SlowWindowAssembler,
-    SlowWindowAssemblerConfig,
+from app.services.timeanchored_alignment.slow_window import (
+    ReadySlowWindow,
+    SlowWindowBuilder,
+    SlowWindowBuilderConfig,
+    SlowWindowIngressAdapter,
 )
-from app.services.timeanchored_alignment.turn_group_adapter import TurnGroupAdapter
-from app.services.timeanchored_alignment.window_language_classifier import WindowLanguageClassifier
+from app.services.timeanchored_alignment.window_time_base_assembler import WindowTimeBaseAssembler
 from app.services.text_protection import is_sentence_end_punct
 from app.pipelines.dual_pipeline.services import (
     AlignLoopService,
@@ -331,15 +328,11 @@ class AsyncDualPipelineKernel:
         )
         self._enable_bridge_batches: bool = False
         self._consume_turn_groups_only: bool = True
-        self._turn_group_builder = TurnGroupBuilder()
-        self._window_language_classifier = WindowLanguageClassifier()
-        self._window_hint_builder = HintBuilder()
-        self._slow_window_assembler = SlowWindowAssembler(
-            config=SlowWindowAssemblerConfig(),
-            classifier=self._window_language_classifier,
-            hint_builder=self._window_hint_builder,
+        self._slow_window_ingress_adapter = SlowWindowIngressAdapter()
+        self._slow_window_builder = SlowWindowBuilder(
+            config=SlowWindowBuilderConfig(),
         )
-        self._turn_group_adapter = TurnGroupAdapter()
+        self._window_time_base_assembler = WindowTimeBaseAssembler()
         self._runtime_checkpoint_service = None
         self._speaker_store_service: Optional["SpeakerStoreService"] = None
         self._context_cache: Dict[int, ProcessingContext] = {}
@@ -872,29 +865,35 @@ class AsyncDualPipelineKernel:
             timeline_cfg.get("segmentation_min_boundary_interval_sec", 0.2) or 0.2
         )
 
-        self._turn_group_builder = TurnGroupBuilder(
-            flush_config=FlushPolicyConfig(
-                min_audio_sec=float(flush_cfg_raw.get("min_audio_sec", 6.0) or 6.0),
-                min_token_count=int(flush_cfg_raw.get("min_token_count", 40) or 40),
-                max_wait_sec=float(flush_cfg_raw.get("max_wait_sec", 5.0) or 5.0),
-                tail_idle_sec=float(flush_cfg_raw.get("tail_idle_sec", 1.0) or 1.0),
-                long_pause_cut_sec=float(
-                    timeline_cfg.get("long_pause_cut_sec", 1.8) or 1.8
-                ),
-            )
-        )
-        self._slow_window_assembler = SlowWindowAssembler(
-            config=SlowWindowAssemblerConfig(
+        self._slow_window_builder = SlowWindowBuilder(
+            config=SlowWindowBuilderConfig(
                 first_window_target_sec=float(flush_cfg_raw.get("min_audio_sec", 6.0) or 6.0),
                 steady_window_target_sec=max(
                     float(flush_cfg_raw.get("min_audio_sec", 6.0) or 6.0),
                     float(flush_cfg_raw.get("steady_window_target_sec", 12.0) or 12.0),
                 ),
+                steady_two_party_target_sec=float(
+                    flush_cfg_raw.get("steady_window_target_two_party_sec", 9.0) or 9.0
+                ),
+                steady_fragmented_target_sec=float(
+                    flush_cfg_raw.get("steady_window_target_fragmented_sec", 5.0) or 5.0
+                ),
+                hard_max_window_sec=max(
+                    float(flush_cfg_raw.get("steady_window_target_sec", 12.0) or 12.0),
+                    float(flush_cfg_raw.get("hard_max_window_sec", 16.0) or 16.0),
+                ),
                 long_pause_cut_sec=float(timeline_cfg.get("long_pause_cut_sec", 1.8) or 1.8),
                 tail_idle_sec=float(flush_cfg_raw.get("tail_idle_sec", 1.0) or 1.0),
+                ready_queue_low_watermark=int(
+                    flush_cfg_raw.get("ready_queue_low_watermark", 0) or 0
+                ),
+                ready_queue_target_depth=int(
+                    flush_cfg_raw.get("ready_queue_target_depth", 1) or 1
+                ),
+                ready_queue_high_watermark=int(
+                    flush_cfg_raw.get("ready_queue_high_watermark", 2) or 2
+                ),
             ),
-            classifier=self._window_language_classifier,
-            hint_builder=self._window_hint_builder,
         )
 
         runtime_checkpoint_service = None
@@ -1969,419 +1968,206 @@ class AsyncDualPipelineKernel:
                     speaker_id = self._resolve_speaker_id_for_chunk(source_chunk)
                     turn_id = self._resolve_turn_id_for_chunk(source_chunk)
 
-            if self._should_use_window_assembler():
-                window_envelopes = self._slow_window_assembler.add_chunk(
-                    chunk,
-                    speaker_id=speaker_id,
-                    turn_id=turn_id,
-                    slow_language_hint=chunk.language,
-                    now=time.time(),
-                )
-                for window_envelope in window_envelopes:
-                    await self._enqueue_turn_group(
-                        self._turn_group_adapter.to_turn_group_envelope(window_envelope)
-                    )
-                continue
-
-            envelopes = self._turn_group_builder.add_chunk(
+            if not self._should_use_window_assembler():
+                raise RuntimeError("window-first 主链要求 SlowWindowBuilder 可用")
+            ingress = self._slow_window_ingress_adapter.adapt(
                 chunk,
                 speaker_id=speaker_id,
                 turn_id=turn_id,
-                now=time.time(),
+                source_chunk_indices=source_indices,
+                arrived_at=time.time(),
             )
-            for envelope in envelopes:
-                await self._enqueue_turn_group(envelope)
+            ready_windows = self._slow_window_builder.add_chunk(
+                ingress,
+                ready_queue_depth=self.queue_inter.qsize(),
+            )
+            for ready_window in ready_windows:
+                await self._enqueue_slow_payload(ready_window)
 
     async def _flush_bridge_controller(self) -> None:
         """强制刷新 Bridge 控制器缓冲。"""
-        if self._should_use_window_assembler():
-            window_envelope = self._slow_window_assembler.flush(reason="eof_flush")
-            if window_envelope:
-                await self._enqueue_turn_group(
-                    self._turn_group_adapter.to_turn_group_envelope(window_envelope)
-                )
+        if not self._should_use_window_assembler():
             return
+        ready_window = self._slow_window_builder.flush(reason="eof_flush")
+        if ready_window:
+            await self._enqueue_slow_payload(ready_window)
 
-        envelope = self._turn_group_builder.flush(reason="eof_flush")
-        if envelope:
-            await self._enqueue_turn_group(envelope)
-
-    def _flush_window_assembler_idle(self, *, now: float) -> Optional[TurnGroupEnvelope]:
+    def _flush_window_assembler_idle(self, *, now: float) -> Optional[Any]:
         """空闲时优先从异构窗口组装链 flush。"""
-        if self._should_use_window_assembler():
-            window_envelope = self._slow_window_assembler.flush_idle(now=now)
-            if not window_envelope:
-                return None
-            return self._turn_group_adapter.to_turn_group_envelope(window_envelope)
-        return self._turn_group_builder.flush_idle(now=now)
+        if not self._should_use_window_assembler():
+            return None
+        ready_window = self._slow_window_builder.flush_idle(now=now)
+        if not ready_window:
+            return None
+        return ready_window
 
     def _should_use_window_assembler(self) -> bool:
-        return bool(
-            self._enable_bridge_batches
-            and self._slow_window_assembler is not None
-            and self._turn_group_adapter is not None
-        )
+        return bool(self._enable_bridge_batches and self._slow_window_builder is not None)
 
-    async def _enqueue_turn_group(self, envelope: TurnGroupEnvelope) -> None:
-        """将 TurnGroup 送入 SlowWorker 队列。"""
-        if not envelope:
+    async def _enqueue_slow_payload(self, payload: Any) -> None:
+        """将慢流待处理载荷送入 SlowWorker 队列。"""
+        if not payload:
             return
-        await self.queue_inter.put(envelope)
+        await self.queue_inter.put(payload)
 
-    async def _process_turn_group(
+    async def _process_ready_slow_window(
         self,
-        envelope: TurnGroupEnvelope,
+        ready_window: ReadySlowWindow,
         *,
         job_dir: Optional[Path],
         total_chunks: int,
         slow_processed_indices: Set[int],
         token: Optional["CancellationToken"],
     ) -> bool:
-        """处理 TurnGroup 并推送到对齐阶段。"""
-        if not self.slow_worker:
-            return False
-
-        group = envelope.group
-        group_metadata = dict(getattr(group, "metadata", {}) or {})
-        window_id = str(group_metadata.get("window_id") or group.group_id)
-        is_mixed_window = bool(group_metadata.get("is_mixed_window", False))
-        chunk_indices = self._parse_source_chunk_indices(group.source_chunks)
-        if not chunk_indices:
-            self.logger.warning("TurnGroup 缺少 source_chunks: group_id=%s", group.group_id)
-            self._record_turn_group_unit(
-                group=group,
-                status="committed",
-                payload={
-                    "source_chunks": [],
-                    "speaker_id": group.speaker_id,
-                    "flush_reason": group.flush_reason,
-                    "window_id": window_id,
-                    "is_mixed_window": is_mixed_window,
-                    "skipped": True,
-                    "skip_reason": "missing_source_chunks",
-                },
-            )
-            return False
-
-        contexts: List[tuple[int, ProcessingContext]] = []
-        for idx in chunk_indices:
-            ctx = self._context_cache.get(idx)
-            if ctx:
-                contexts.append((idx, ctx))
-
+        """处理 ReadySlowWindow 并把稳定包挂到 owner ctx。"""
+        contexts: list[tuple[int, ProcessingContext]] = []
+        for chunk_index in ready_window.source_chunk_indices:
+            ctx = self._context_cache.get(int(chunk_index))
+            if ctx is not None:
+                contexts.append((int(chunk_index), ctx))
         if not contexts:
-            self.logger.warning("TurnGroup 缺少上下文缓存: group_id=%s", group.group_id)
-            self._record_turn_group_unit(
-                group=group,
-                status="committed",
-                payload={
-                    "source_chunks": list(group.source_chunks),
-                    "speaker_id": group.speaker_id,
-                    "flush_reason": group.flush_reason,
-                    "window_id": window_id,
-                    "is_mixed_window": is_mixed_window,
-                    "skipped": True,
-                    "skip_reason": "missing_context_cache",
-                },
-            )
+            self.logger.warning("ReadySlowWindow 缺少上下文缓存: window_id=%s", ready_window.window_id)
             return False
 
-        for _, ctx in contexts:
-            ctx.slow_window_id = window_id
-            ctx.slow_window_flush_reason = str(group.flush_reason or "")
-            ctx.slow_window_is_mixed = is_mixed_window
-
-        if is_mixed_window:
-            self.logger.info("TurnGroup mixed 窗口回退快流: window_id=%s group_id=%s", window_id, group.group_id)
-            for _, ctx in contexts:
-                ctx.whisper_skipped = True
-                ctx.whisper_result = {}
-            self._record_turn_group_unit(
-                group=group,
-                status="committed",
-                payload={
-                    "source_chunks": list(group.source_chunks),
-                    "speaker_id": group.speaker_id,
-                    "flush_reason": group.flush_reason,
-                    "window_id": window_id,
-                    "is_mixed_window": True,
-                    "skipped": True,
-                    "skip_reason": "mixed_window_fallback",
-                },
-            )
-            return await self._push_batch_contexts(
-                contexts,
-                slow_processed_indices,
-                total_chunks=total_chunks,
-                job_dir=job_dir,
-                token=token,
-            )
-
-        skip_map: Dict[int, bool] = {}
-        if self.is_patching_mode:
-            for idx, ctx in contexts:
-                if ctx.sv_result and ctx.audio_chunk:
-                    skip_map[idx] = self._should_skip_whisper(ctx.sv_result, ctx.audio_chunk)
-                else:
-                    skip_map[idx] = False
-
-        if self.is_patching_mode and all(skip_map.values()):
-            for _, ctx in contexts:
-                ctx.whisper_skipped = True
-                ctx.whisper_result = {}
-            self._record_turn_group_unit(
-                group=group,
-                status="committed",
-                payload={
-                    "source_chunks": list(group.source_chunks),
-                    "speaker_id": group.speaker_id,
-                    "flush_reason": group.flush_reason,
-                    "window_id": window_id,
-                    "is_mixed_window": False,
-                    "skipped": True,
-                    "skip_reason": "all_skip_by_policy",
-                },
-            )
-            return await self._push_batch_contexts(
-                contexts,
-                slow_processed_indices,
-                total_chunks=total_chunks,
-                job_dir=job_dir,
-                token=token,
-            )
-
-        if self._full_audio_array is None:
-            self.logger.warning("TurnGroup 缺少完整音频，跳过慢流: group_id=%s", group.group_id)
-            for _, ctx in contexts:
-                ctx.whisper_skipped = True
-                ctx.whisper_result = {}
-            self._record_turn_group_unit(
-                group=group,
-                status="committed",
-                payload={
-                    "source_chunks": list(group.source_chunks),
-                    "speaker_id": group.speaker_id,
-                    "flush_reason": group.flush_reason,
-                    "window_id": window_id,
-                    "is_mixed_window": False,
-                    "skipped": True,
-                    "skip_reason": "missing_full_audio",
-                },
-            )
-            return await self._push_batch_contexts(
-                contexts,
-                slow_processed_indices,
-                total_chunks=total_chunks,
-                job_dir=job_dir,
-                token=token,
-            )
-
-        group_start = min((seg[0] for seg in group.audio_segments), default=0.0)
-        group_end = max((seg[1] for seg in group.audio_segments), default=group_start)
-        pause_gap_sec: Optional[float] = None
-        if self._last_prompt_audio_end is not None:
-            pause_gap_sec = max(0.0, float(group_start) - float(self._last_prompt_audio_end))
+        owner_ctx = self._select_owner_context_for_window(ready_window=ready_window, contexts=contexts)
+        if owner_ctx is None:
+            self.logger.warning("ReadySlowWindow 缺少 owner ctx: window_id=%s", ready_window.window_id)
+            return False
 
         prompt = self._build_whisper_prompt(
-            group.prompt_text or None,
-            pause_gap_sec=pause_gap_sec,
+            ready_window.prompt_seed.text or None,
+            pause_gap_sec=self._resolve_window_pause_gap_sec(ready_window),
         )
-        whisper_result = await self.slow_worker.process_turn_group(
-            group,
-            full_audio_array=self._full_audio_array,
-            full_audio_sr=self._full_audio_sr,
+        full_audio_array = self._full_audio_array if self._full_audio_array is not None else owner_ctx.full_audio_array
+        full_audio_sr = self._full_audio_sr if self._full_audio_array is not None else owner_ctx.full_audio_sr
+        if full_audio_array is None:
+            self.logger.warning("ReadySlowWindow 缺少完整音频，跳过慢流: window_id=%s", ready_window.window_id)
+            owner_ctx.whisper_skipped = True
+            owner_ctx.ready_slow_window = ready_window
+            owner_ctx.window_time_base = self._window_time_base_assembler.assemble(
+                ready_window=ready_window,
+                source_contexts=[ctx for _, ctx in contexts],
+            )
+            owner_ctx.time_base_chunk = owner_ctx.window_time_base
+            return await self._push_owner_window_context(
+                owner_ctx=owner_ctx,
+                source_indices=[idx for idx, _ in contexts],
+                slow_processed_indices=slow_processed_indices,
+                total_chunks=total_chunks,
+                job_dir=job_dir,
+                token=token,
+            )
+
+        whisper_result = await self.slow_worker.process_ready_window(
+            ready_window,
+            full_audio_array=full_audio_array,
+            full_audio_sr=full_audio_sr,
             prompt_text=prompt,
             cancel_checker=token.raise_if_canceled if token else None,
         )
-
-        self._record_turn_group_unit(
-            group=group,
-            status="committed",
-            payload={
-                "source_chunks": list(group.source_chunks),
-                "target_turn_ids": list(group.target_turn_ids),
-                "speaker_id": group.speaker_id,
-                "flush_reason": group.flush_reason,
-                "window_id": window_id,
-                "is_mixed_window": False,
-            },
-        )
-
         self._validate_l0_result(whisper_result, source="slow")
-        whisper_text_raw = str(whisper_result.get("raw_text") or "")
-        whisper_result["text_raw"] = whisper_text_raw
-        whisper_result["prompt"] = prompt
-        base_text = whisper_result.get("min_clean_text") or whisper_text_raw
-        whisper_result["text"] = self._whisper_sanitizer.sanitize_minimal(
-            str(base_text or ""),
-            prompt=prompt,
+        window_time_base = self._window_time_base_assembler.assemble(
+            ready_window=ready_window,
+            source_contexts=[ctx for _, ctx in contexts],
         )
 
-        self._emit_whisper_debug(
-            job_dir,
-            group_id=group.group_id,
-            flush_reason=group.flush_reason,
-            whisper_result=whisper_result,
-            chunk_indices=chunk_indices,
-        )
+        owner_ctx.ready_slow_window = ready_window
+        owner_ctx.window_time_base = window_time_base
+        owner_ctx.time_base_chunk = window_time_base
+        owner_ctx.whisper_result = copy.deepcopy(whisper_result)
+        owner_ctx.whisper_skipped = False
+        owner_ctx.slow_window_id = ready_window.window_id
+        owner_ctx.slow_window_flush_reason = ready_window.flush_reason
+        owner_ctx.slow_window_is_mixed = ready_window.language_profile.language_mix_state == "true_mixed"
 
-        if whisper_result and self._hallucination_detector.is_hallucination(whisper_result, prompt):
-            self.logger.warning("TurnGroup 检测到 Whisper 幻觉，回退快流: group_id=%s", group.group_id)
-            self._reset_prompt_cache(reason="hallucination")
-            self._last_prompt_audio_end = float(group_end)
-            for _, ctx in contexts:
-                ctx.whisper_skipped = True
-                ctx.whisper_result = {}
-            return await self._push_batch_contexts(
-                contexts,
-                slow_processed_indices,
-                total_chunks=total_chunks,
-                job_dir=job_dir,
-                token=token,
-            )
-
-        group_language = group.language or whisper_result.get("language") or "auto"
-        normalized_whisper = self._text_normalizer.normalize(whisper_result.get("text", ""), group_language)
-        whisper_result["text_itn_raw"] = normalized_whisper.text_itn_raw
-        whisper_result["text_clean"] = normalized_whisper.text_clean
-        whisper_result["text"] = normalized_whisper.text_clean or whisper_result.get("text", "")
-        whisper_result["language"] = group_language
-
+        raw_text = str(whisper_result.get("raw_text") or whisper_result.get("text") or "")
+        owner_ctx.whisper_result["raw_text"] = raw_text
+        owner_ctx.whisper_result["text_raw"] = raw_text
+        owner_ctx.whisper_result["prompt"] = prompt
+        if not owner_ctx.whisper_result.get("text"):
+            owner_ctx.whisper_result["text"] = str(owner_ctx.whisper_result.get("min_clean_text") or raw_text)
         self._update_prompt_cache(
-            str(whisper_result.get("text", "")),
-            confidence=whisper_result.get("confidence"),
-            whisper_result=whisper_result,
+            str(owner_ctx.whisper_result.get("text", "")),
+            confidence=owner_ctx.whisper_result.get("confidence"),
+            whisper_result=owner_ctx.whisper_result,
         )
-        self._last_prompt_audio_end = float(group_end)
+        self._last_prompt_audio_end = max(segment[1] for segment in ready_window.audio_segments)
 
-        batch_start = min((seg[0] for seg in group.audio_segments), default=0.0)
-        chunk_results = self._split_whisper_result_by_chunks(
-            whisper_result,
-            [idx for idx, _ in contexts],
-            batch_start=batch_start,
-            language_override=group_language,
-        )
-
-        for idx, ctx in contexts:
-            setattr(
-                ctx,
-                "_trace_l0_batch_whisper",
-                {
-                    "group_id": group.group_id,
-                    "chunk_indices": list(chunk_indices),
-                    "prompt": str(prompt or ""),
-                    "flush_reason": str(group.flush_reason or ""),
-                    "whisper_text_raw": str(whisper_result.get("text_raw") or ""),
-                    "whisper_text_clean": str(whisper_result.get("text") or ""),
-                    "raw_result": dict(whisper_result.get("raw_result", {}) or {}),
-                },
-            )
-            if skip_map.get(idx):
-                ctx.whisper_skipped = True
-                ctx.whisper_result = {}
-                continue
-
-            ctx.whisper_skipped = False
-            chunk_result = chunk_results.get(
-                idx,
-                {
-                    "text": "",
-                    "confidence": float(whisper_result.get("confidence", 0.0) or 0.0),
-                    "language": group_language,
-                    "raw_result": {"segments": []},
-                    "word_time_base": "batch_local",
-                    "word_time_offset": float(batch_start),
-                },
-            )
-            chunk_text_raw = str(chunk_result.get("raw_text") or chunk_result.get("text", "") or "")
-            chunk_result["raw_text"] = chunk_text_raw
-            chunk_result["text_raw"] = chunk_text_raw
-            if not chunk_result.get("min_clean_text"):
-                chunk_result["min_clean_text"] = self._whisper_sanitizer.sanitize_minimal(
-                    chunk_text_raw,
-                    prompt=None,
-                )
-            chunk_result["text"] = str(chunk_result.get("min_clean_text") or "")
-            raw_text_for_track = chunk_text_raw
-            normalized_chunk = self._text_normalizer.normalize(chunk_result.get("text", ""), group_language)
-            chunk_result["text_itn_raw"] = normalized_chunk.text_itn_raw
-            chunk_result["text_clean"] = normalized_chunk.text_clean
-            chunk_result["text"] = normalized_chunk.text_clean or raw_text_for_track
-            chunk_result["language"] = group_language
-            ctx.whisper_result = chunk_result
-            tracks = self._ensure_text_tracks(ctx)
-            tracks.whisper_track = self._build_text_track(
-                raw_text_for_track,
-                normalized_chunk,
-                source="whisper",
-                language=group_language,
-            )
-
-        return await self._push_batch_contexts(
-            contexts,
-            slow_processed_indices,
+        return await self._push_owner_window_context(
+            owner_ctx=owner_ctx,
+            source_indices=[idx for idx, _ in contexts],
+            slow_processed_indices=slow_processed_indices,
             total_chunks=total_chunks,
             job_dir=job_dir,
             token=token,
         )
 
-    def _record_turn_group_unit(
+    @staticmethod
+    def _select_owner_context_for_window(
+        *,
+        ready_window: ReadySlowWindow,
+        contexts: list[tuple[int, ProcessingContext]],
+    ) -> Optional[ProcessingContext]:
+        for chunk_index, ctx in contexts:
+            if chunk_index == ready_window.owner_chunk_index:
+                return ctx
+        return contexts[0][1] if contexts else None
+
+    def _resolve_window_pause_gap_sec(self, ready_window: ReadySlowWindow) -> Optional[float]:
+        if self._last_prompt_audio_end is None or not ready_window.audio_segments:
+            return None
+        first_start = min(segment[0] for segment in ready_window.audio_segments)
+        return max(0.0, float(first_start) - float(self._last_prompt_audio_end))
+
+    async def _push_owner_window_context(
         self,
         *,
-        group: TurnGroup,
-        status: str,
-        payload: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """W-Epoch 单元状态提交（每个 TurnGroup 一次）。"""
-        service = self._runtime_checkpoint_service
-        if service is None:
-            return
-        stage = "slow_epoch"
-        unit_id = f"turn_group:{group.group_id}"
-        try:
-            if status == "started":
-                service.record_unit_started(stage=stage, unit_id=unit_id, payload=payload)
-            elif status == "committed":
-                service.record_unit_committed(stage=stage, unit_id=unit_id, payload=payload)
-        except Exception as exc:
-            self.logger.warning("TurnGroup 单元写入失败（降级继续）: %s", exc)
+        owner_ctx: ProcessingContext,
+        source_indices: List[int],
+        slow_processed_indices: Set[int],
+        total_chunks: int,
+        job_dir: Optional[Path],
+        token: Optional["CancellationToken"],
+    ) -> bool:
+        """只推送 owner ctx，但按整窗 source indices 更新慢流进度。"""
+        pause_requested = False
+        await self.queue_final.put(owner_ctx)
+        last_index = owner_ctx.chunk_index
+        for source_index in sorted(set(int(item) for item in source_indices)):
+            self._context_cache.pop(source_index, None)
+            slow_processed_indices.add(source_index)
+            last_index = max(last_index, source_index)
+            self._last_slow_chunk_index = last_index
 
-    def _is_turn_group_committed(self, group_id: str) -> bool:
-        """判断 TurnGroup 是否已提交（用于恢复跳过重算）。"""
-        service = self._runtime_checkpoint_service
-        if service is None:
-            return False
-        try:
-            snapshot = service.load_snapshot()
-        except Exception:
-            return False
-        commits: Dict[str, str]
-        if isinstance(snapshot, dict):
-            commits = dict(snapshot.get("last_unit_commits", {}))
-        else:
-            commits = dict(getattr(snapshot, "last_unit_commits", {}) or {})
-        committed_unit = commits.get("slow_epoch")
-        if not committed_unit:
-            return False
-        current_unit = f"turn_group:{group_id}"
-        if committed_unit == current_unit:
-            return True
+            if self.progress_emitter and total_chunks > 0:
+                total_processed = len(slow_processed_indices)
+                self.progress_emitter.update_slow(
+                    total_processed,
+                    total_chunks,
+                    message=f"Whisper: {total_processed}/{total_chunks}",
+                )
 
-        def _extract_seq(unit: str) -> Optional[int]:
-            if not isinstance(unit, str):
-                return None
-            if not unit.startswith("turn_group:tg-"):
-                return None
-            try:
-                return int(unit.split(":tg-")[-1])
-            except ValueError:
-                return None
+            if token and job_dir:
+                previous_whisper_text = self.previous_whisper_text or ""
+                self._slow_processed_indices = slow_processed_indices
+                checkpoint_data = {
+                    "transcription": {
+                        "slow_processed_count": len(slow_processed_indices),
+                        "slow_processed_indices": list(slow_processed_indices),
+                        "previous_whisper_text": previous_whisper_text,
+                        "last_slow_chunk_index": last_index,
+                    }
+                }
+                try:
+                    token.check_and_save(checkpoint_data, job_dir)
+                except PausedException as exc:
+                    if not pause_requested:
+                        self.logger.debug("[V3.1.0] ReadySlowWindow 捕获暂停信号，继续排空队列")
+                    pause_requested = True
+                    if not self.pause_exception:
+                        self.pause_exception = exc
 
-        committed_seq = _extract_seq(committed_unit)
-        current_seq = _extract_seq(current_unit)
-        if committed_seq is None or current_seq is None:
-            return False
-        return current_seq <= committed_seq
+        return pause_requested
 
     def _record_finalize_batch_unit(
         self,

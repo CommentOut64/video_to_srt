@@ -21,6 +21,19 @@ class AlignLoopService:
     def __init__(self, *, host: Any) -> None:
         self._host = host
 
+    @staticmethod
+    def _resolve_finalized_chunk_indices(ctx: ProcessingContext) -> set[int]:
+        ready_window = getattr(ctx, "ready_slow_window", None)
+        source_indices = getattr(ready_window, "source_chunk_indices", ()) if ready_window is not None else ()
+        normalized = {
+            int(index)
+            for index in source_indices
+            if index is not None
+        }
+        if normalized:
+            return normalized
+        return {int(ctx.chunk_index)}
+
     async def run(
         self,
         *,
@@ -77,8 +90,9 @@ class AlignLoopService:
                         "Finalize 命中已提交 batch，跳过重算: chunk_index=%s",
                         chunk_index,
                     )
-                    finalized_indices.add(chunk_index)
-                    host._last_align_chunk_index = chunk_index
+                    finalized_chunk_indices = self._resolve_finalized_chunk_indices(ctx)
+                    finalized_indices.update(finalized_chunk_indices)
+                    host._last_align_chunk_index = max(finalized_chunk_indices)
                     results.append(ctx)
                     self._release_preparation_artifacts(ctx)
                     if host.progress_emitter and total_chunks > 0:
@@ -106,8 +120,9 @@ class AlignLoopService:
                     await host._run_alignment_stage(ctx)
 
                     results.append(ctx)
-                    finalized_indices.add(chunk_index)
-                    host._last_align_chunk_index = chunk_index
+                    finalized_chunk_indices = self._resolve_finalized_chunk_indices(ctx)
+                    finalized_indices.update(finalized_chunk_indices)
+                    host._last_align_chunk_index = max(finalized_chunk_indices)
                     host._record_finalize_batch_unit(
                         chunk_index=chunk_index,
                         status="committed",

@@ -43,9 +43,19 @@ from app.services.timeanchored_alignment.phonetic_matchers import (
     align_monotonic_sequences,
     project_token_phone_keys,
 )
-from app.services.timeanchored_alignment.slow_window_assembler import (
-    SlowWindowAssembler,
-    SlowWindowAssemblerConfig,
+from app.services.timeanchored_alignment.slow_window import (
+    DialogueShapeSnapshot,
+    PromptSeed,
+    ReadySlowWindow,
+    SlowWindowBuilder,
+    SlowWindowBuilderConfig,
+    SlowWindowIngressAdapter,
+    SlowWindowIngressUnit,
+    WindowBatchHint,
+    WindowChunkBinding,
+    WindowCoverage,
+    WindowLanguageProfile,
+    WindowSourceUnit,
 )
 from app.services.timeanchored_alignment.subtitle_assembler import (
     FinalAlignedStream,
@@ -84,7 +94,10 @@ from app.services.timeanchored_alignment.edge_selector import (
     FailedSpan,
 )
 from app.services.timeanchored_alignment.time_base_builder import TimeBaseBuilder
-from app.services.timeanchored_alignment.turn_group_adapter import TurnGroupAdapter
+from app.services.timeanchored_alignment.window_time_base_assembler import (
+    WindowTimeBaseAssembler,
+    WindowTimeBasePackage,
+)
 from app.services.timeanchored_alignment.window_language_classifier import (
     MAIN_CHAIN_DECISION_DOMAINS,
     MIXED_DECISION_DOMAINS,
@@ -135,12 +148,17 @@ __all__ = [
     "TextAlignmentScorer",
     "TextAlignmentScoreConfig",
     "TextAlignmentScoreBreakdown",
-    "SlowWindowAssembler",
-    "SlowWindowAssemblerConfig",
+    "DialogueShapeSnapshot",
     "FinalAlignedStream",
+    "PromptSeed",
+    "ReadySlowWindow",
     "SubtitleAssembler",
     "SentenceSegmenter",
     "SentenceSegmenterConfig",
+    "SlowWindowBuilder",
+    "SlowWindowBuilderConfig",
+    "SlowWindowIngressAdapter",
+    "SlowWindowIngressUnit",
     "ChunkProjection",
     "ChunkProjector",
     "ChunkWindow",
@@ -153,12 +171,18 @@ __all__ = [
     "TextTruthQuality",
     "TextTruthUnit",
     "TimeBaseBuilder",
-    "TurnGroupAdapter",
     "TimeBasePackage",
     "TimeBaseQuality",
     "TimeBaseUnit",
+    "WindowBatchHint",
+    "WindowChunkBinding",
+    "WindowCoverage",
     "WindowLanguageClassifier",
     "WindowLanguageDecision",
+    "WindowLanguageProfile",
+    "WindowSourceUnit",
+    "WindowTimeBaseAssembler",
+    "WindowTimeBasePackage",
     "MIXED_DECISION_DOMAINS",
     "MAIN_CHAIN_DECISION_DOMAINS",
 ]

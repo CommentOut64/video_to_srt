@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from app.schemas.pipeline_context import ProcessingContext
-from app.services.bridge.turn_group_builder import TurnGroupEnvelope
+from app.services.timeanchored_alignment.slow_window.contracts import ReadySlowWindow
 from app.utils.cancellation_token import CancelledException, PausedException
 
 
@@ -143,33 +143,16 @@ class SlowLoopService:
                         host.queue_inter.qsize()
                     ):
                         await host._flush_bridge_controller()
-                    if hasattr(host, "_flush_window_assembler_idle"):
-                        envelope = host._flush_window_assembler_idle(now=time.time())
-                    else:
-                        envelope = host._turn_group_builder.flush_idle(now=time.time())
+                    envelope = host._flush_window_assembler_idle(now=time.time())
                     if envelope:
-                        await host._enqueue_turn_group(envelope)
+                        await host._enqueue_slow_payload(envelope)
                     continue
 
-                if isinstance(payload, TurnGroupEnvelope):
-                    if host._is_turn_group_committed(payload.group.group_id):
-                        host.logger.info(
-                            "W-Epoch 命中已提交 TurnGroup，跳过重算: group_id=%s",
-                            payload.group.group_id,
-                        )
-                        continue
-                    host._record_turn_group_unit(
-                        group=payload.group,
-                        status="started",
-                        payload={
-                            "source_chunks": list(payload.group.source_chunks),
-                            "speaker_id": payload.group.speaker_id,
-                            "flush_reason": payload.group.flush_reason,
-                            "window_id": str(payload.group.metadata.get("window_id", "") or ""),
-                            "is_mixed_window": bool(payload.group.metadata.get("is_mixed_window", False)),
-                        },
-                    )
-                    if await host._process_turn_group(
+                if isinstance(payload, ReadySlowWindow):
+                    slow_window_builder = getattr(host, "_slow_window_builder", None)
+                    if slow_window_builder is not None and hasattr(slow_window_builder, "mark_ready_window_dequeued"):
+                        slow_window_builder.mark_ready_window_dequeued()
+                    if await host._process_ready_slow_window(
                         payload,
                         job_dir=job_dir,
                         total_chunks=total_chunks,
@@ -178,6 +161,12 @@ class SlowLoopService:
                     ):
                         pause_requested = True
                     continue
+
+                payload_type = type(payload).__name__
+                if payload_type == "TurnGroupEnvelope":
+                    raise RuntimeError("SlowLoopService 不再接受 TurnGroupEnvelope 兼容载荷")
+                if not isinstance(payload, ProcessingContext):
+                    raise RuntimeError(f"SlowLoopService 收到不支持的慢流载荷: {payload_type}")
 
                 ctx = payload
 

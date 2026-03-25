@@ -13,7 +13,7 @@ from typing import Callable, Dict, Optional, Any, List, TYPE_CHECKING
 from app.core.asr.engine import ASREngine
 from app.core.asr.models import ASRResult
 from app.core.logging import resolve_loguru_logger
-from app.services.bridge.turn_group_models import TurnGroup
+from app.services.timeanchored_alignment.slow_window.contracts import ReadySlowWindow
 from app.services.whisper_buffer_pool import WhisperBufferPool, WhisperBufferConfig
 from app.services.whisper.whisper_text_sanitizer import WhisperTextSanitizer
 
@@ -119,33 +119,32 @@ class SlowWorker:
         )
         return self._convert_asr_result(asr_result, prompt=initial_prompt)
 
-    async def process_turn_group(
+    async def process_ready_window(
         self,
-        group: TurnGroup,
+        ready_window: ReadySlowWindow,
         *,
         full_audio_array: Any,
         full_audio_sr: int = 16000,
         prompt_text: Optional[str] = None,
         cancel_checker: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
-        """处理 TurnGroup（Phase 3 W-Epoch）。"""
-        if not group:
-            raise ValueError("SlowWorker TurnGroup 为空")
-        if not group.audio_segments:
-            raise ValueError("SlowWorker TurnGroup 缺少音频片段")
+        """处理 ReadySlowWindow（window-first 主入口）。"""
+        if ready_window is None:
+            raise ValueError("SlowWorker ReadySlowWindow 为空")
+        if not ready_window.audio_segments:
+            raise ValueError("SlowWorker ReadySlowWindow 缺少音频片段")
 
-        log = self.logger.bind(group_id=group.group_id, speaker_id=group.speaker_id)
-        log.debug("SlowWorker TurnGroup 推理开始")
+        log = self.logger.bind(window_id=ready_window.window_id, owner_chunk_id=ready_window.owner_chunk_id)
+        log.debug("SlowWorker ReadySlowWindow 推理开始")
         audio = self._concat_segments_audio(
-            segments=group.audio_segments,
+            segments=list(ready_window.audio_segments),
             full_audio_array=full_audio_array,
             full_audio_sr=full_audio_sr,
         )
-        # Why: 禁止隐式回退到 group.prompt_text，避免关闭注入后仍发生上下文拼接污染。
-        prompt = prompt_text if prompt_text else None
+        prompt = prompt_text if prompt_text else (ready_window.prompt_seed.text or None)
         asr_result = await self._transcribe_with_cancel_guard(
             audio=audio,
-            language=group.language or self.whisper_language,
+            language=ready_window.language_profile.primary_language or self.whisper_language,
             cancel_checker=cancel_checker,
             initial_prompt=prompt,
             word_timestamps=True,
@@ -155,13 +154,13 @@ class SlowWorker:
         )
         whisper_result = self._convert_asr_result(asr_result, prompt=prompt)
         whisper_result["source"] = "slow"
-        whisper_result["speaker_id"] = group.speaker_id
-        whisper_result["group_id"] = group.group_id
-        whisper_result["turn_group_id"] = group.group_id
-        whisper_result["target_turn_ids"] = list(group.target_turn_ids)
-        whisper_result["context_turn_ids"] = list(group.context_turn_ids)
-        whisper_result["flush_reason"] = group.flush_reason
-        whisper_result["language"] = group.language or whisper_result.get("language")
+        whisper_result["window_id"] = ready_window.window_id
+        whisper_result["owner_chunk_id"] = ready_window.owner_chunk_id
+        whisper_result["owner_chunk_index"] = ready_window.owner_chunk_index
+        whisper_result["source_chunk_ids"] = list(ready_window.source_chunk_ids)
+        whisper_result["source_chunk_indices"] = list(ready_window.source_chunk_indices)
+        whisper_result["flush_reason"] = ready_window.flush_reason
+        whisper_result["language"] = ready_window.language_profile.primary_language or whisper_result.get("language")
         return whisper_result
 
     def _concat_segments_audio(

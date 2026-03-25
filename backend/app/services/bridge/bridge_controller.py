@@ -1,7 +1,7 @@
 """Bridge 控制器（Phase 3 精简版）。
 
 设计说明：
-- Phase 3 主链路已切换为 `TurnGroupBuilder + FlushPolicy`。
+- 当前默认慢流主链已切换为 `SlowWindowBuilder + ReadySlowWindow`。
 - 当前类仅保留轻量控制面能力（空闲 flush 判定与仲裁结果记录），避免上层依赖断裂。
 """
 
@@ -17,7 +17,7 @@ from app.services.punctuation.semantic_buffer import PunctuationDecision
 
 
 class BridgeController:
-    """Phase 3 过渡期的 Bridge 轻量控制器。"""
+    """Window-first 主链下的 Bridge 轻量控制器。"""
 
     def __init__(
         self,

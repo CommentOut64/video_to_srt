@@ -19,6 +19,8 @@ if TYPE_CHECKING:
         TextTruthPackage,
         TimeBasePackage,
     )
+    from app.services.timeanchored_alignment.slow_window.contracts import ReadySlowWindow
+    from app.services.timeanchored_alignment.window_time_base_assembler import WindowTimeBasePackage
 
 @dataclass
 class ProcessingContext:
@@ -63,6 +65,8 @@ class ProcessingContext:
     finalization_metrics: Dict[str, Any] = field(default_factory=dict)  # V3.2.0+dev.20260203.03
     time_base_chunk: Optional["TimeBasePackage"] = None  # V3.3.0: 时间锚定主链时间基底
     time_base_report: Optional[Dict[str, Any]] = None  # V3.3.0: 时间基底构建报告（轻量）
+    ready_slow_window: Optional["ReadySlowWindow"] = None  # V3.3.0 Chunk1: owner ctx 挂靠的稳定 slow window
+    window_time_base: Optional["WindowTimeBasePackage"] = None  # V3.3.0 Chunk1: owner ctx 挂靠的 window time base
     text_truth: Optional["TextTruthPackage"] = None  # V3.3.0 Phase3: 文本真相包
     protected_spans: List["ProtectedSpan"] = field(default_factory=list)  # V3.3.0 Phase3: 保护结构 span
     language_runs: List["LanguageRun"] = field(default_factory=list)  # V3.3.0 Phase3: run级语言切分结果
