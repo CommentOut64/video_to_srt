@@ -48,7 +48,7 @@ class WhisperTextSanitizer:
             fallback_text = self._remove_hallucination_markers(fallback_text)
             fallback_text = self._remove_extreme_repetition(fallback_text)
             self._logger.warning(
-                "Whisper 最小清洗触发回退: prompt_len=%d, raw_len=%d",
+                "Whisper 最小清洗触发回退: prompt_len={}, raw_len={}",
                 len(prompt or ""),
                 len(raw_text),
             )
@@ -56,7 +56,7 @@ class WhisperTextSanitizer:
 
         if raw_text != text:
             self._logger.debug(
-                "Whisper 最小清洗完成: raw_len=%d -> clean_len=%d",
+                "Whisper 最小清洗完成: raw_len={} -> clean_len={}",
                 len(raw_text),
                 len(text),
             )
@@ -86,7 +86,7 @@ class WhisperTextSanitizer:
             text = ""
 
         if raw_text != text:
-            self._logger.debug("Whisper 完整清洗完成: raw_len=%d -> clean_len=%d", len(raw_text), len(text))
+            self._logger.debug("Whisper 完整清洗完成: raw_len={} -> clean_len={}", len(raw_text), len(text))
         return text.strip()
 
     def _remove_prompt_echo(self, text: str, prompt: Optional[str]) -> str:
@@ -169,7 +169,7 @@ class WhisperTextSanitizer:
                 else:
                     text = self._apply_phrase_rule(text, value, position)
             except re.error as exc:
-                self._logger.warning("Whisper 清洗规则无效: %s (%s)", value, exc)
+                self._logger.warning("Whisper 清洗规则无效: {} ({})", value, exc)
         return text
 
     @staticmethod

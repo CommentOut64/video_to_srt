@@ -94,7 +94,7 @@ class FastWorker:
                 "chunk_index": ctx.chunk_index,
             }
         except Exception:
-            self.logger.exception("Chunk %s: 构建 time_base_chunk 失败，降级继续旧链路", ctx.chunk_index)
+            self.logger.exception("Chunk {}: 构建 time_base_chunk 失败，降级继续旧链路", ctx.chunk_index)
             ctx.time_base_chunk = None
             ctx.time_base_report = {
                 "enabled": True,

@@ -52,7 +52,7 @@ class AlignLoopService:
 
                 host._runtime_checkpoint_service = RuntimeCheckpointService(job_dir=job_dir)
             except Exception as exc:
-                host.logger.warning("Finalize 断点服务初始化失败，降级继续: %s", exc)
+                host.logger.warning("Finalize 断点服务初始化失败，降级继续: {}", exc)
 
         finalized_indices = set(initial_finalized_indices) if initial_finalized_indices else set()
         host._finalized_indices = finalized_indices
@@ -87,7 +87,7 @@ class AlignLoopService:
 
                 if host._is_finalize_batch_committed(chunk_index):
                     host.logger.info(
-                        "Finalize 命中已提交 batch，跳过重算: chunk_index=%s",
+                        "Finalize 命中已提交 batch，跳过重算: chunk_index={}",
                         chunk_index,
                     )
                     finalized_chunk_indices = self._resolve_finalized_chunk_indices(ctx)
@@ -193,7 +193,7 @@ class AlignLoopService:
             ctx.release_preparation_artifacts()
         except Exception as exc:
             self._host.logger.warning(
-                "释放准备层中间对象失败，已降级继续: chunk_index=%s err=%s",
+                "释放准备层中间对象失败，已降级继续: chunk_index={} err={}",
                 getattr(ctx, "chunk_index", "unknown"),
                 exc,
             )

@@ -190,7 +190,7 @@ class DualTimeDiagnosticsService:
             (debug_dir / "dual_time_legacy.srt").write_text(legacy_srt, encoding="utf-8")
             (debug_dir / "dual_time_experiment.srt").write_text(experiment_srt, encoding="utf-8")
         except Exception as exc:
-            host.logger.debug("写入双轨实验 SRT 失败（忽略）: %s", exc)
+            host.logger.debug("写入双轨实验 SRT 失败（忽略）: {}", exc)
 
     @staticmethod
     def build_srt_from_chunk_map(chunk_map: Dict[int, List[SentenceSegment]]) -> str:

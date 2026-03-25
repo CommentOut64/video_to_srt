@@ -312,7 +312,7 @@ class SemanticBuffer:
             word_timestamps=self._pending_words,
         )
         self._reset_pending()
-        self._logger.debug("语义缓冲强制刷新: reason=%s", reason)
+        self._logger.debug("语义缓冲强制刷新: reason={}", reason)
         return [chunk]
 
     def _refresh_runtime_config(self) -> None:
@@ -320,7 +320,7 @@ class SemanticBuffer:
         try:
             runtime = self._runtime_service.get_effective_runtime_global()
         except Exception as exc:
-            self._logger.debug("SemanticBuffer 运行参数读取失败（忽略）: %s", exc)
+            self._logger.debug("SemanticBuffer 运行参数读取失败（忽略）: {}", exc)
             return
 
         punct = runtime.get("effective", {}).get("punctuation", {})
@@ -573,14 +573,14 @@ class SemanticBuffer:
             pending_duration = max(audio_end - seg_start, 0.0)
             if pending_duration > self._fast_delay_budget_sec:
                 self._logger.debug(
-                    "短句延迟预算超限: pending=%.2fs > budget=%.2fs，保持切分点",
+                    "短句延迟预算超限: pending={:.2f}s > budget={:.2f}s，保持切分点",
                     pending_duration,
                     self._fast_delay_budget_sec,
                 )
                 break
 
             self._logger.debug(
-                "短句延迟输出: duration=%.2fs, text='%s'",
+                "短句延迟输出: duration={:.2f}s, text='{}'",
                 duration,
                 segment_text.strip()[:30],
             )
@@ -937,7 +937,7 @@ class SemanticBuffer:
             # SemanticBuffer 不承担清洗职责（由 L1 统一规范化保证 clean 口径）。
             # 若仍出现 <|...|>/▁，视为上游契约违约：直接跳过该句，避免污染下游展示。
             if "<|" in display_text or "▁" in display_text:
-                self._logger.debug("SemanticBuffer 检测到污染展示文本，跳过输出: %s", display_text[:50])
+                self._logger.debug("SemanticBuffer 检测到污染展示文本，跳过输出: {}", display_text[:50])
                 start_idx = end_idx + 1
                 continue
             # V3.2.0+dev.20260131.04: 仅修复英文展示文本的缩写撇号，避免影响时间戳与切分。
@@ -1241,7 +1241,7 @@ class SemanticBuffer:
                 if merge_result.words:
                     return merge_result.words
             except Exception as exc:
-                self._logger.debug("SemanticBuffer 回退合并失败: %s", exc)
+                self._logger.debug("SemanticBuffer 回退合并失败: {}", exc)
         return list(words) if words else []
 
     @staticmethod

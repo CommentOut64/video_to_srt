@@ -1928,7 +1928,7 @@ class AsyncDualPipelineKernel:
             await self._ingest_bridge_chunks(chunks)
         else:
             self.logger.debug(
-                "Chunk %s: 跳过 Bridge 入队（mode=%s）",
+                "Chunk {}: 跳过 Bridge 入队（mode={}）",
                 ctx.chunk_index,
                 self.transcription_profile,
             )
@@ -1949,7 +1949,7 @@ class AsyncDualPipelineKernel:
             self.subtitle_manager.add_draft_sentences(chunk_ref, sentences)
             total_sentences += len(sentences)
         self.logger.debug(
-            "Chunk %s: SemanticBuffer 草稿推送 (%d 个句子)",
+            "Chunk {}: SemanticBuffer 草稿推送 ({} 个句子)",
             ctx.chunk_index,
             total_sentences,
         )
@@ -2026,12 +2026,12 @@ class AsyncDualPipelineKernel:
             if ctx is not None:
                 contexts.append((int(chunk_index), ctx))
         if not contexts:
-            self.logger.warning("ReadySlowWindow 缺少上下文缓存: window_id=%s", ready_window.window_id)
+            self.logger.warning("ReadySlowWindow 缺少上下文缓存: window_id={}", ready_window.window_id)
             return False
 
         owner_ctx = self._select_owner_context_for_window(ready_window=ready_window, contexts=contexts)
         if owner_ctx is None:
-            self.logger.warning("ReadySlowWindow 缺少 owner ctx: window_id=%s", ready_window.window_id)
+            self.logger.warning("ReadySlowWindow 缺少 owner ctx: window_id={}", ready_window.window_id)
             return False
 
         prompt = self._build_whisper_prompt(
@@ -2041,7 +2041,7 @@ class AsyncDualPipelineKernel:
         full_audio_array = self._full_audio_array if self._full_audio_array is not None else owner_ctx.full_audio_array
         full_audio_sr = self._full_audio_sr if self._full_audio_array is not None else owner_ctx.full_audio_sr
         if full_audio_array is None:
-            self.logger.warning("ReadySlowWindow 缺少完整音频，跳过慢流: window_id=%s", ready_window.window_id)
+            self.logger.warning("ReadySlowWindow 缺少完整音频，跳过慢流: window_id={}", ready_window.window_id)
             owner_ctx.whisper_skipped = True
             owner_ctx.ready_slow_window = ready_window
             owner_ctx.window_time_base = self._window_time_base_assembler.assemble(
@@ -2936,7 +2936,7 @@ class AsyncDualPipelineKernel:
             self.subtitle_manager.add_draft_sentences(chunk_ref, sentences)
             total_sentences += len(sentences)
         self.logger.debug(
-            "SemanticBuffer 尾部刷新完成: 草稿 %d 个句子",
+            "SemanticBuffer 尾部刷新完成: 草稿 {} 个句子",
             total_sentences,
         )
 
