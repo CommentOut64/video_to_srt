@@ -63,11 +63,15 @@ def test_subtitle_delivery_keeps_future_ready_ingress_fields_in_diagnostics_only
             "unit_id": "window-2",
             "slow_window_id": "window-2",
             "turn_group_id": "turn-group-9",
+            "window_coverage": 0.6,
             "source_chunk_ids": ["chunk-2", "chunk-3"],
+            "projection_chunk_ids": ["chunk-3"],
         },
     )
 
     assert batch.items[0].chunk_id == "chunk-unknown"
     assert batch.items[0].text == "Hello world"
     assert batch.diagnostics["ingress_context"]["slow_window_id"] == "window-2"
+    assert batch.diagnostics["ingress_context"]["window_coverage"] == 0.6
     assert batch.diagnostics["ingress_context"]["source_chunk_ids"] == ["chunk-2", "chunk-3"]
+    assert batch.diagnostics["ingress_context"]["projection_chunk_ids"] == ["chunk-3"]

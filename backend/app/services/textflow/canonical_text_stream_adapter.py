@@ -58,7 +58,11 @@ class CanonicalTextStreamAdapter:
             raise ValueError("CanonicalTextStreamAdapter 缺少 chosen_track，无法构建主输入流")
 
         clean_text = str(chosen_track.text_clean or chosen_track.text_itn_raw or chosen_track.raw_text or "")
-        token_spans, char_to_token = self._build_token_spans(clean_text)
+        token_spans, char_to_token = self._build_token_spans_for_track(
+            clean_text=clean_text,
+            chosen_track=chosen_track,
+            aligned_facts=aligned_facts,
+        )
         tokens = self._build_tokens(
             token_spans=token_spans,
             text_source=text_source,
@@ -145,6 +149,114 @@ class CanonicalTextStreamAdapter:
         if ingress_context is None:
             return {}
         return ingress_context.to_dict()
+
+    def _build_token_spans_for_track(
+        self,
+        *,
+        clean_text: str,
+        chosen_track: TextTrack,
+        aligned_facts: Optional[AlignedFacts],
+    ) -> Tuple[List[_TokenSpan], List[Optional[int]]]:
+        clean_to_word = list(getattr(chosen_track, "clean_to_word", []) or [])
+        words = list(getattr(aligned_facts, "annotated_words", []) or [])
+        word_spans, char_to_token = self._build_word_aligned_token_spans(
+            clean_text=clean_text,
+            clean_to_word=clean_to_word,
+            words=words,
+        )
+        if word_spans:
+            return word_spans, char_to_token
+        return self._build_token_spans(clean_text)
+
+    @staticmethod
+    def _build_word_aligned_token_spans(
+        *,
+        clean_text: str,
+        clean_to_word: Sequence[Optional[int]],
+        words: Sequence[Any],
+    ) -> Tuple[List[_TokenSpan], List[Optional[int]]]:
+        char_to_token: List[Optional[int]] = [None] * len(clean_text)
+        if not clean_text or not words or len(clean_to_word) != len(clean_text):
+            return [], char_to_token
+
+        ordered_indices: List[int] = []
+        positions_by_word: Dict[int, List[int]] = {}
+        last_word_index: Optional[int] = None
+        for pos, raw_index in enumerate(clean_to_word):
+            if raw_index is None:
+                continue
+            word_index = int(raw_index)
+            if word_index < 0 or word_index >= len(words):
+                return [], [None] * len(clean_text)
+            if word_index in positions_by_word and last_word_index != word_index:
+                # Why: 同一词索引若在后续再次出现，说明 clean_to_word 不是单调词流，不能安全复用。
+                return [], [None] * len(clean_text)
+            if word_index not in positions_by_word:
+                ordered_indices.append(word_index)
+                positions_by_word[word_index] = []
+            positions_by_word[word_index].append(pos)
+            last_word_index = word_index
+
+        spans: List[_TokenSpan] = []
+        for word_index in ordered_indices:
+            positions = positions_by_word.get(word_index, [])
+            if not positions:
+                continue
+            start = positions[0]
+            end = positions[-1]
+            for pos in range(start, end + 1):
+                mapped_index = clean_to_word[pos]
+                if mapped_index is not None and int(mapped_index) != word_index:
+                    return [], [None] * len(clean_text)
+            trimmed_range = CanonicalTextStreamAdapter._trim_span_to_core_chars(
+                text=clean_text,
+                start=start,
+                end=end,
+            )
+            if trimmed_range is None:
+                return [], [None] * len(clean_text)
+            start, end = trimmed_range
+            token_text = clean_text[start : end + 1].strip()
+            if not token_text:
+                token_text = CanonicalTextStreamAdapter._strip_edge_non_core_chars(
+                    str(getattr(words[word_index], "word", "") or "")
+                )
+            if not token_text:
+                return [], [None] * len(clean_text)
+            spans.append(_TokenSpan(index=word_index, start=start, end=end, text=token_text))
+            for pos in range(start, end + 1):
+                if not clean_text[pos].isspace():
+                    char_to_token[pos] = word_index
+        return spans, char_to_token
+
+    @staticmethod
+    def _trim_span_to_core_chars(
+        *,
+        text: str,
+        start: int,
+        end: int,
+    ) -> Optional[Tuple[int, int]]:
+        while start <= end and not CanonicalTextStreamAdapter._is_core_char(text=text, idx=start):
+            start += 1
+        while end >= start and not CanonicalTextStreamAdapter._is_core_char(text=text, idx=end):
+            end -= 1
+        if start > end:
+            return None
+        return start, end
+
+    @staticmethod
+    def _strip_edge_non_core_chars(text: str) -> str:
+        if not text:
+            return ""
+        start = 0
+        end = len(text) - 1
+        while start <= end and not CanonicalTextStreamAdapter._is_core_char(text=text, idx=start):
+            start += 1
+        while end >= start and not CanonicalTextStreamAdapter._is_core_char(text=text, idx=end):
+            end -= 1
+        if start > end:
+            return ""
+        return text[start : end + 1].strip()
 
     def _build_tokens(
         self,
@@ -440,13 +552,14 @@ class CanonicalTextStreamAdapter:
             cursor += 1
         return spans, char_to_token
 
-    def _is_core_char(self, *, text: str, idx: int) -> bool:
+    @staticmethod
+    def _is_core_char(*, text: str, idx: int) -> bool:
         char = text[idx]
         if char.isspace():
             return False
-        if self._is_connector_as_core(text=text, idx=idx):
+        if CanonicalTextStreamAdapter._is_connector_as_core(text=text, idx=idx):
             return True
-        return not self._is_punctuation_char(char)
+        return not CanonicalTextStreamAdapter._is_punctuation_char(char)
 
     @staticmethod
     def _is_connector_as_core(*, text: str, idx: int) -> bool:

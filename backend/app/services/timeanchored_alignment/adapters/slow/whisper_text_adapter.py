@@ -179,6 +179,7 @@ class WhisperTextAdapter:
         prompt: Optional[str],
     ) -> list[TextTruthUnit]:
         units: list[TextTruthUnit] = []
+        time_offset = self._resolve_time_offset(whisper_result)
         for segment in self._iter_segments(whisper_result):
             words = segment.get("words")
             if not isinstance(words, list):
@@ -189,7 +190,11 @@ class WhisperTextAdapter:
                 normalized = self._sanitize_fragment(str(word.get("word") or ""), prompt=prompt)
                 if not normalized:
                     continue
-                span = self._resolve_time_span(start=word.get("start"), end=word.get("end"))
+                span = self._resolve_time_span(
+                    start=word.get("start"),
+                    end=word.get("end"),
+                    time_offset=time_offset,
+                )
                 if span is None:
                     continue
                 confidence = self._clamp_probability(word.get("probability"), default=default_confidence)
@@ -215,8 +220,13 @@ class WhisperTextAdapter:
         prompt: Optional[str],
     ) -> list[TextTruthUnit]:
         units: list[TextTruthUnit] = []
+        time_offset = self._resolve_time_offset(whisper_result)
         for segment in self._iter_segments(whisper_result):
-            span = self._resolve_time_span(start=segment.get("start"), end=segment.get("end"))
+            span = self._resolve_time_span(
+                start=segment.get("start"),
+                end=segment.get("end"),
+                time_offset=time_offset,
+            )
             if span is None:
                 continue
             text = self._sanitize_fragment(str(segment.get("text") or ""), prompt=prompt, strip=False)
@@ -289,10 +299,24 @@ class WhisperTextAdapter:
         return [item for item in segments if isinstance(item, Mapping)]
 
     @staticmethod
-    def _resolve_time_span(*, start: Any, end: Any) -> tuple[float, float] | None:
+    def _resolve_time_offset(whisper_result: Mapping[str, Any]) -> float:
+        if str(whisper_result.get("word_time_base") or "").strip().lower() != "batch_local":
+            return 0.0
         try:
-            span_start = float(start)
-            span_end = float(end)
+            return float(whisper_result.get("word_time_offset") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _resolve_time_span(
+        *,
+        start: Any,
+        end: Any,
+        time_offset: float = 0.0,
+    ) -> tuple[float, float] | None:
+        try:
+            span_start = float(start) + float(time_offset)
+            span_end = float(end) + float(time_offset)
         except (TypeError, ValueError):
             return None
         if span_end <= span_start:

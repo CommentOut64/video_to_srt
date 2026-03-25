@@ -16,6 +16,12 @@ if TYPE_CHECKING:
     from app.services.arbitration.arbiter import ArbitrationResult
     from app.services.language_policy.types import LanguagePolicySnapshot
     from app.services.segmentation.soft_cut.types import CutPlan
+    from app.services.textflow.contracts import (
+        RenderResult,
+        SegmentationIngressContext,
+        SegmentationResult,
+        SubtitleBatch,
+    )
 
 
 @dataclass
@@ -294,6 +300,7 @@ class DecisionLayerInput:
     fallback_punctuation_positions: List[PuncPosition] = field(default_factory=list)
     policy_snapshot: Optional["LanguagePolicySnapshot"] = None
     allow_fast_draft_fallback: bool = True
+    ingress_context: Optional["SegmentationIngressContext"] = None
 
 
 @dataclass
@@ -305,6 +312,9 @@ class DecisionLayerOutput:
     segmentation_report: Dict[str, Any] = field(default_factory=dict)
     applied_cut_plan: Optional["CutPlan"] = None
     output_traces: List[OutputTrace] = field(default_factory=list)
+    segmentation_result: Optional["SegmentationResult"] = None
+    render_result: Optional["RenderResult"] = None
+    subtitle_batch: Optional["SubtitleBatch"] = None
 
 
 @dataclass
@@ -317,6 +327,7 @@ class OutputLayerInput:
     injection_report: Optional[Dict[str, Any]] = None
     segmentation_report: Optional[Dict[str, Any]] = None
     output_traces: Optional[List[OutputTrace]] = None
+    subtitle_batch: Optional["SubtitleBatch"] = None
 
 
 @dataclass

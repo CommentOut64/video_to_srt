@@ -122,6 +122,7 @@ class SegmentationIngressContext:
     turn_group_id: Optional[str] = None
     window_coverage: Optional[float] = None
     source_chunk_ids: Tuple[str, ...] = field(default_factory=tuple)
+    projection_chunk_ids: Tuple[str, ...] = field(default_factory=tuple)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -144,6 +145,7 @@ class SegmentationIngressContext:
             "turn_group_id": self.turn_group_id,
             "window_coverage": self.window_coverage,
             "source_chunk_ids": [str(item) for item in self.source_chunk_ids],
+            "projection_chunk_ids": [str(item) for item in self.projection_chunk_ids],
         }
         if self.metadata:
             payload["metadata"] = dict(self.metadata)

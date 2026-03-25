@@ -131,3 +131,68 @@ def test_whisper_text_adapter_falls_back_to_segment_splitting_when_no_word_times
     assert package.units[0].start == 1.0
     assert package.units[-1].text == "界"
     assert package.units[-1].end == 1.8
+
+
+def test_whisper_text_adapter_translates_batch_local_word_timestamps_to_absolute_time() -> None:
+    adapter = WhisperTextAdapter(
+        sanitizer=_DummySanitizer(cleaned_text=None),
+        hallucination_detector=_DummyHallucinationDetector(result=False),
+    )
+    package = adapter.build_text_truth_package(
+        whisper_result={
+            "raw_text": "hello world",
+            "text": "hello world",
+            "language": "en",
+            "confidence": 0.88,
+            "word_time_base": "batch_local",
+            "word_time_offset": 12.5,
+            "raw_result": {
+                "segments": [
+                    {
+                        "start": 0.0,
+                        "end": 0.8,
+                        "text": "hello world",
+                        "words": [
+                            {"word": "hello", "start": 0.0, "end": 0.3, "probability": 0.9},
+                            {"word": "world", "start": 0.3, "end": 0.8, "probability": 0.91},
+                        ],
+                    }
+                ],
+            },
+        }
+    )
+
+    assert package.source_metadata["timestamp_mode"] == "word"
+    assert package.units[0].start == 12.5
+    assert package.units[0].end == 12.8
+    assert package.units[-1].start == 12.8
+    assert package.units[-1].end == 13.3
+
+
+def test_whisper_text_adapter_translates_batch_local_segment_timestamps_to_absolute_time() -> None:
+    adapter = WhisperTextAdapter(
+        sanitizer=_DummySanitizer(cleaned_text=None),
+        hallucination_detector=_DummyHallucinationDetector(result=False),
+    )
+    package = adapter.build_text_truth_package(
+        whisper_result={
+            "raw_text": "你好世界",
+            "text": "你好世界",
+            "language": "zh",
+            "confidence": 0.88,
+            "word_time_base": "batch_local",
+            "word_time_offset": 7.25,
+            "raw_result": {
+                "segments": [
+                    {"start": 0.0, "end": 0.4, "text": "你好"},
+                    {"start": 0.4, "end": 0.8, "text": "世界"},
+                ],
+            },
+        }
+    )
+
+    assert package.source_metadata["timestamp_mode"] == "segment"
+    assert package.units[0].start == 7.25
+    assert package.units[1].end == 7.65
+    assert package.units[2].start == 7.65
+    assert package.units[-1].end == 8.05

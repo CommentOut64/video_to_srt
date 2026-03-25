@@ -162,6 +162,7 @@ class AlignmentStageService:
                 },
                 output_traces=output_traces,
                 default_trace_reason="sensevoice_only",
+                subtitle_batch=run_result.subtitle_batch,
             )
             ctx.finalization_metrics["l7_error_count"] = float(
                 len(output_layer_result.output_payload.get("errors", []))
@@ -653,6 +654,7 @@ class AlignmentStageService:
             },
             output_traces=output_traces,
             default_trace_reason="default_splitter",
+            subtitle_batch=run_result.subtitle_batch,
         )
         ctx.finalization_metrics["l7_error_count"] = float(
             len(output_layer_result.output_payload.get("errors", []))
@@ -951,6 +953,7 @@ class AlignmentStageService:
             },
             output_traces=output_traces,
             default_trace_reason="timeanchored_chain",
+            subtitle_batch=run_result.subtitle_batch,
         )
         ctx.final_sentences = list(final_sentences)
         ctx.finalization_metrics = {
@@ -1127,6 +1130,7 @@ class AlignmentStageService:
             },
             output_traces=output_traces,
             default_trace_reason="fast_direct",
+            subtitle_batch=run_result.subtitle_batch,
         )
 
         ctx.final_sentences = list(final_sentences)

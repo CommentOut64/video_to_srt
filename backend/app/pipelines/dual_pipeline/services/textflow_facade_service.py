@@ -31,6 +31,7 @@ from app.services.alignment.types import (
     TextTrack,
     TextTrackBundle,
 )
+from app.services.textflow.contracts import SubtitleBatch
 from app.services.text_protection import is_sentence_end_punct
 from app.services.timeanchored_alignment.contracts import AlignmentItem, BoundaryEvidence
 
@@ -48,6 +49,7 @@ class Layer456RunResult:
     split_stats: Dict[str, Any]
     final_sentences: List[SentenceSegment]
     output_traces: List[OutputTrace]
+    subtitle_batch: Optional[SubtitleBatch] = None
     alignment_time_source: str = "sv"
     alignment_time_word_count: int = 0
     detected_language: str = "auto"
@@ -381,6 +383,7 @@ class TextflowFacadeService:
             split_stats=dict(split_stats),
             final_sentences=final_sentences,
             output_traces=output_traces,
+            subtitle_batch=decision_output.subtitle_batch,
             alignment_time_source=time_source,
             alignment_time_word_count=len(time_words),
             detected_language=str(detected_language or "auto"),
@@ -498,6 +501,7 @@ class TextflowFacadeService:
             split_stats=split_stats,
             final_sentences=final_sentences,
             output_traces=list(run_result.output_traces),
+            subtitle_batch=run_result.subtitle_batch,
             alignment_time_source=run_result.alignment_time_source,
             alignment_time_word_count=run_result.alignment_time_word_count,
             detected_language=run_result.detected_language,
@@ -583,17 +587,29 @@ class TextflowFacadeService:
         decision_chunk_index = self._host._resolve_chunk_index_from_words(words=words_for_split)
         decision_is_last_chunk = self._host._is_last_chunk_for_words(words=words_for_split)
         decision_stream_id = f"timeanchored:{speaker_id or 'main'}:{turn_id or 'none'}"
+        soft_cut_plan = self._host._build_soft_cut_plan_for_decision(
+            annotated_words=annotated_words,
+            stream_id=decision_stream_id,
+            block_id=(
+                f"{self._host.job_id}:{decision_stream_id}:"
+                f"{decision_chunk_index if decision_chunk_index is not None else -1}"
+            ),
+            is_last_chunk=decision_is_last_chunk,
+            aligned_facts=aligned_facts,
+            fused_evidence=fused_evidence,
+            policy_snapshot=policy_snapshot,
+        )
         decision_output = self._host._decision_processor.process(
             DecisionLayerInput(
                 annotated_words=annotated_words,
                 vad_intervals=self._host._vad_intervals,
-                cut_plan=None,
+                cut_plan=soft_cut_plan,
                 aligned_facts=aligned_facts,
                 fused_evidence=fused_evidence,
                 fallback_clean_text_ref=str(punctuation_clean_text or chosen_text_clean or ""),
                 fallback_punctuation_positions=list(punctuation_positions or []),
                 policy_snapshot=policy_snapshot,
-                allow_fast_draft_fallback=False,
+                allow_fast_draft_fallback=True,
             ),
             stream_id=decision_stream_id,
             chunk_index=decision_chunk_index,
@@ -659,6 +675,7 @@ class TextflowFacadeService:
             split_stats=split_stats,
             final_sentences=final_sentences,
             output_traces=output_traces,
+            subtitle_batch=decision_output.subtitle_batch,
             alignment_time_source="timeanchored",
             alignment_time_word_count=len(words_for_split),
             detected_language=str(detected_language or "auto"),

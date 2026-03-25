@@ -164,7 +164,10 @@ class TurnGroupBuilder:
         self._pending.last_audio_end = max(self._pending.last_audio_end, float(chunk.audio_range[1]))
         self._pending.language = language
         self._pending.audio_segments.append((float(chunk.audio_range[0]), float(chunk.audio_range[1])))
-        self._pending.source_chunks.extend(list(chunk.source_chunks or [chunk.chunk_id]))
+        self._pending.source_chunks = self._merge_source_chunks(
+            self._pending.source_chunks,
+            list(chunk.source_chunks or [chunk.chunk_id]),
+        )
         if chunk.sentences:
             self._pending.sentences.extend(chunk.sentences)
         if chunk.punctuation_decision:
@@ -189,7 +192,7 @@ class TurnGroupBuilder:
             prompt_text=prompt_text,
             flush_reason=reason,
             language=self._pending.language,
-            source_chunks=list(self._pending.source_chunks),
+            source_chunks=self._merge_source_chunks([], self._pending.source_chunks),
         )
         envelope = TurnGroupEnvelope(
             group=group,
@@ -279,4 +282,16 @@ class TurnGroupBuilder:
                 mode=slow_requested[0].mode,
             )
         return decisions[0]
+
+    @staticmethod
+    def _merge_source_chunks(left: list[str], right: list[str]) -> list[str]:
+        merged: list[str] = []
+        seen = set()
+        for item in [*list(left or []), *list(right or [])]:
+            chunk_id = str(item or "").strip()
+            if not chunk_id or chunk_id in seen:
+                continue
+            seen.add(chunk_id)
+            merged.append(chunk_id)
+        return merged
 

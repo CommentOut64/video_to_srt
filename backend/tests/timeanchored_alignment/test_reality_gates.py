@@ -13,8 +13,8 @@ from app.services.bridge.turn_group_models import TurnGroup
 from app.services.language_policy import resolve_language_tag
 from app.services.sensevoice_onnx_service import SenseVoiceLanguageInfo, SenseVoiceONNXService
 from app.services.textflow.output_dispatch_adapter import OutputLayerProcessor
+from app.services.textflow.contracts import SubtitleBatch, SubtitleItem
 from app.services.alignment.types import OutputLayerInput
-from app.models.sensevoice_models import SentenceSegment
 from app.pipelines.dual_pipeline.services.slow_loop_service import SlowLoopService
 
 
@@ -182,8 +182,8 @@ async def test_phase0_reality_gate_slow_loop_consumes_turn_group_envelope() -> N
     assert isinstance(processed_payloads[0], TurnGroupEnvelope)
 
 
-def test_phase0_reality_gate_output_layer_uses_output_layer_input_to_replace_chunk_batch() -> None:
-    """现实基线：OutputLayerProcessor 通过 OutputLayerInput -> SubtitleBatch -> replace_chunk_batch() 收口。"""
+def test_phase0_reality_gate_output_layer_requires_subtitle_batch_to_replace_chunk_batch() -> None:
+    """现实基线：OutputLayerProcessor 只接受显式 SubtitleBatch，再调用 replace_chunk_batch()。"""
 
     class _DummySubtitleManager:
         def __init__(self) -> None:
@@ -196,18 +196,25 @@ def test_phase0_reality_gate_output_layer_uses_output_layer_input_to_replace_chu
     subtitle_manager = _DummySubtitleManager()
     processor = OutputLayerProcessor(subtitle_manager=subtitle_manager)
 
-    sentence = SentenceSegment(
-        text="你好",
-        text_clean="你好",
-        start=0.0,
-        end=0.8,
-        display_confidence=0.95,
-    )
     output = processor.process(
         OutputLayerInput(
             chunk_index=3,
-            sentence_segments=[sentence],
+            sentence_segments=[],
             language="zh",
+            subtitle_batch=SubtitleBatch(
+                chunk_id="3",
+                chunk_index=3,
+                items=(
+                    SubtitleItem(
+                        segment_id="seg-3-0",
+                        chunk_id="3",
+                        text="你好",
+                        start=0.0,
+                        end=0.8,
+                        source="timeanchored",
+                    ),
+                ),
+            ),
         )
     )
 

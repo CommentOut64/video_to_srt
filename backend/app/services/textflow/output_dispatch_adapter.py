@@ -8,11 +8,10 @@ from typing import Any, Callable, Dict, Optional, Sequence
 from app.core.logging import resolve_loguru_logger
 from app.services.alignment.types import OutputLayerInput, OutputLayerOutput, OutputTrace
 from app.services.textflow.contracts import SubtitleBatch, SubtitleItem
-from app.services.subtitle_visibility import is_hidden_unknown_sentence
 
 
 class OutputLayerProcessor:
-    """统一输出处理器：过滤 unknown、补齐 trace、构建 SubtitleBatch 并分发。"""
+    """统一输出处理器：只接受统一 SubtitleBatch 并分发。"""
 
     def __init__(
         self,
@@ -29,38 +28,18 @@ class OutputLayerProcessor:
 
     def process(self, data: OutputLayerInput) -> OutputLayerOutput:
         """执行统一输出分发。"""
-        sentence_segments = list(data.sentence_segments or [])
-        raw_output_traces = list(data.output_traces or [])
-        filtered_sentences: list[Any] = []
-        filtered_traces: list[OutputTrace] = []
-        unknown_sentence_filtered_count = 0
-        for sentence_index, sentence in enumerate(sentence_segments):
-            if is_hidden_unknown_sentence(sentence):
-                unknown_sentence_filtered_count += 1
-                continue
-            filtered_sentences.append(sentence)
-            if sentence_index < len(raw_output_traces):
-                filtered_traces.append(raw_output_traces[sentence_index])
-        sentence_segments = filtered_sentences
-
-        output_traces = self._resolve_output_traces(
-            sentence_segments=sentence_segments,
-            output_traces=filtered_traces,
-        )
-        self._apply_output_traces_to_sentences(
-            sentence_segments=sentence_segments,
-            output_traces=output_traces,
-        )
-        subtitle_batch = self._build_subtitle_batch(
-            chunk_ref=data.chunk_index,
-            sentence_segments=sentence_segments,
-            output_traces=output_traces,
-        )
+        subtitle_batch = data.subtitle_batch
+        if subtitle_batch is None:
+            raise ValueError(
+                "OutputLayerProcessor 需要 subtitle_batch；"
+                "sentence_segments -> SubtitleBatch 兼容回退已停用。"
+            )
+        output_traces = self._resolve_output_traces_from_batch(subtitle_batch)
         payload = self._output_dispatch_adapter.dispatch(
             subtitle_batch=subtitle_batch,
             injection_report=dict(data.injection_report or {}),
             segmentation_report=dict(data.segmentation_report or {}),
-            unknown_sentence_filtered_count=int(unknown_sentence_filtered_count),
+            unknown_sentence_filtered_count=0,
         )
         return OutputLayerOutput(
             output_payload=payload,
@@ -68,158 +47,44 @@ class OutputLayerProcessor:
         )
 
     @staticmethod
-    def _resolve_output_traces(
-        *,
-        sentence_segments: Sequence[Any],
-        output_traces: Optional[Sequence[OutputTrace]],
-    ) -> list[OutputTrace]:
-        traces = list(output_traces or [])
-        if traces:
+    def _resolve_output_traces_from_batch(subtitle_batch: SubtitleBatch) -> list[OutputTrace]:
+        raw_traces = list(subtitle_batch.diagnostics.get("output_trace") or [])
+        if raw_traces:
+            traces: list[OutputTrace] = []
+            for item in raw_traces:
+                traces.append(
+                    OutputTrace(
+                        sentence_index=int(item.get("sentence_index", 0) or 0),
+                        split_reason=str(item.get("split_reason", "") or ""),
+                        split_risk=str(item.get("split_risk", "") or ""),
+                        window_id=str(item.get("window_id", "") or ""),
+                        pyannote_frame_time=item.get("pyannote_frame_time"),
+                        mapped_cut_time=item.get("mapped_cut_time"),
+                        mapping_quality=str(item.get("mapping_quality", "") or ""),
+                        mapping_reason=str(item.get("mapping_reason", "") or ""),
+                        sentence_start=item.get("sentence_start"),
+                        sentence_end=item.get("sentence_end"),
+                    )
+                )
             return traces
-        fallback: list[OutputTrace] = []
-        for sentence_index, sentence in enumerate(sentence_segments):
-            fallback.append(
+        traces: list[OutputTrace] = []
+        for sentence_index, item in enumerate(subtitle_batch.items):
+            trace = dict(item.trace or {})
+            traces.append(
                 OutputTrace(
                     sentence_index=sentence_index,
-                    split_reason=str(getattr(sentence, "split_reason", "") or "default_splitter"),
-                    split_risk=str(getattr(sentence, "split_risk", "") or ""),
-                    window_id=str(getattr(sentence, "window_id", "") or ""),
-                    pyannote_frame_time=getattr(sentence, "pyannote_frame_time", None),
-                    mapped_cut_time=getattr(sentence, "mapped_cut_time", None),
-                    mapping_quality=str(getattr(sentence, "mapping_quality", "") or "default"),
-                    mapping_reason=str(getattr(sentence, "mapping_reason", "") or "default_splitter"),
-                    sentence_start=float(getattr(sentence, "start", 0.0) or 0.0),
-                    sentence_end=float(getattr(sentence, "end", 0.0) or 0.0),
+                    split_reason=str(trace.get("split_reason", "") or ""),
+                    split_risk=str(trace.get("split_risk", "") or ""),
+                    window_id=str(trace.get("window_id", "") or ""),
+                    pyannote_frame_time=trace.get("pyannote_frame_time"),
+                    mapped_cut_time=trace.get("mapped_cut_time", float(item.end)),
+                    mapping_quality=str(trace.get("mapping_quality", "") or ""),
+                    mapping_reason=str(trace.get("mapping_reason", "") or ""),
+                    sentence_start=float(item.start),
+                    sentence_end=float(item.end),
                 )
             )
-        return fallback
-
-    @staticmethod
-    def _apply_output_traces_to_sentences(
-        *,
-        sentence_segments: Sequence[Any],
-        output_traces: Sequence[OutputTrace],
-    ) -> None:
-        trace_by_index = {int(trace.sentence_index): trace for trace in output_traces}
-        for sentence_index, sentence in enumerate(sentence_segments):
-            trace = trace_by_index.get(sentence_index)
-            if trace is None:
-                continue
-            setattr(sentence, "split_reason", str(trace.split_reason or ""))
-            setattr(sentence, "split_risk", str(trace.split_risk or ""))
-            setattr(sentence, "window_id", str(trace.window_id or ""))
-            setattr(sentence, "pyannote_frame_time", trace.pyannote_frame_time)
-            setattr(sentence, "mapped_cut_time", trace.mapped_cut_time)
-            setattr(sentence, "mapping_quality", str(trace.mapping_quality or ""))
-            setattr(sentence, "mapping_reason", str(trace.mapping_reason or ""))
-
-    def _build_subtitle_batch(
-        self,
-        *,
-        chunk_ref: Any,
-        sentence_segments: Sequence[Any],
-        output_traces: Sequence[OutputTrace],
-    ) -> SubtitleBatch:
-        chunk_id = str(chunk_ref)
-        items = tuple(
-            SubtitleItem(
-                segment_id=self._resolve_segment_id(chunk_id, sentence_index, sentence),
-                chunk_id=chunk_id,
-                start=float(getattr(sentence, "start", 0.0) or 0.0),
-                end=float(getattr(sentence, "end", 0.0) or 0.0),
-                text=self._resolve_sentence_text(sentence),
-                status=self._resolve_sentence_status(sentence),
-                source=self._resolve_sentence_source(sentence),
-                speaker_id=getattr(sentence, "speaker_id", None),
-                turn_id=getattr(sentence, "turn_id", None),
-                trace=self._build_sentence_trace(sentence),
-            )
-            for sentence_index, sentence in enumerate(sentence_segments)
-        )
-        return SubtitleBatch(
-            chunk_id=chunk_id,
-            chunk_index=self._try_parse_chunk_index(chunk_ref),
-            items=items,
-            diagnostics={
-                "source": "output_dispatch_adapter",
-                "output_trace": [self._serialize_output_trace(item) for item in output_traces],
-            },
-        )
-
-    @staticmethod
-    def _try_parse_chunk_index(chunk_ref: Any) -> Optional[int]:
-        if isinstance(chunk_ref, int):
-            return chunk_ref
-        chunk_text = str(chunk_ref or "").strip()
-        if not chunk_text:
-            return None
-        if chunk_text.lstrip("-").isdigit():
-            try:
-                return int(chunk_text)
-            except ValueError:
-                return None
-        if chunk_text.startswith("chunk-"):
-            try:
-                return int(chunk_text.split("-")[-1])
-            except ValueError:
-                return None
-        return None
-
-    @staticmethod
-    def _resolve_sentence_text(sentence: Any) -> str:
-        return str(getattr(sentence, "text_clean", "") or getattr(sentence, "text", "") or "")
-
-    @staticmethod
-    def _resolve_sentence_status(sentence: Any) -> str:
-        if getattr(sentence, "is_draft", False) and not getattr(sentence, "is_finalized", False):
-            return "draft"
-        return "final"
-
-    @staticmethod
-    def _resolve_sentence_source(sentence: Any) -> str:
-        source = getattr(sentence, "source", None)
-        return str(getattr(source, "value", source) or "unknown")
-
-    @classmethod
-    def _resolve_segment_id(cls, chunk_id: str, sentence_index: int, sentence: Any) -> str:
-        existing = str(getattr(sentence, "segment_id", "") or getattr(sentence, "sentence_uid", "") or "")
-        if existing:
-            return existing
-        seed = (
-            f"{chunk_id}|{sentence_index}|"
-            f"{float(getattr(sentence, 'start', 0.0) or 0.0):.3f}|"
-            f"{float(getattr(sentence, 'end', 0.0) or 0.0):.3f}|"
-            f"{cls._resolve_sentence_text(sentence)}"
-        )
-        return f"seg-{hashlib.sha1(seed.encode('utf-8')).hexdigest()[:16]}"
-
-    @staticmethod
-    def _build_sentence_trace(sentence: Any) -> dict[str, Any]:
-        return {
-            "split_reason": str(getattr(sentence, "split_reason", "") or ""),
-            "split_risk": str(getattr(sentence, "split_risk", "") or ""),
-            "window_id": str(getattr(sentence, "window_id", "") or ""),
-            "pyannote_frame_time": getattr(sentence, "pyannote_frame_time", None),
-            "mapped_cut_time": getattr(sentence, "mapped_cut_time", None),
-            "mapping_quality": str(getattr(sentence, "mapping_quality", "") or ""),
-            "mapping_reason": str(getattr(sentence, "mapping_reason", "") or ""),
-        }
-
-    @staticmethod
-    def _serialize_output_trace(trace: OutputTrace) -> dict[str, Any]:
-        return {
-            "sentence_index": int(trace.sentence_index),
-            "split_reason": str(trace.split_reason or ""),
-            "split_risk": str(trace.split_risk or ""),
-            "window_id": str(trace.window_id or ""),
-            "pyannote_frame_time": trace.pyannote_frame_time,
-            "mapped_cut_time": trace.mapped_cut_time,
-            "mapping_quality": str(trace.mapping_quality or ""),
-            "mapping_reason": str(trace.mapping_reason or ""),
-            "sentence_start": trace.sentence_start,
-            "sentence_end": trace.sentence_end,
-        }
-
+        return traces
 
 class OutputDispatchAdapter:
     """负责输出层南向分发与 payload 封装。"""

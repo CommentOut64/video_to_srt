@@ -428,39 +428,9 @@ class StreamingSubtitleManager:
         if self._is_hidden_unknown_sentence(sentence):
             logger.info("跳过 unknown 字幕写入: job_id=%s", self.job_id)
             return -1
-
-        index = self.sentence_count
-        self._ensure_sentence_identity(sentence, chunk_ref="chunk:legacy")
-        self.sentences[index] = sentence
-        self.sentence_count += 1
-
-        # 推送 SSE 事件（使用清洗后的文本）
-        # V3.1.2+dev.20260113.01: fallback 字典补充 display_confidence 和 confidence_source
-        sentence_dict = sentence.to_dict() if hasattr(sentence, 'to_dict') else {
-            "index": index,
-            "text": sentence.text_clean or sentence.text,  # 优先使用清洗后的文本
-            "start": sentence.start,
-            "end": sentence.end,
-            "confidence": sentence.confidence,
-            "confidence_display_raw": getattr(sentence, 'confidence_display_raw', None),
-            "display_confidence": getattr(sentence, 'display_confidence', None),  # V3.1.2: 映射后准确率
-            "confidence_source": getattr(sentence, 'confidence_source', None),    # V3.1.2: 置信度来源
-            "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),
-            "words": [w.to_dict() if hasattr(w, 'to_dict') else w for w in getattr(sentence, 'words', [])]  # 确保包含 words
-        }
-
-        self._emit_subtitle_event(
-            "sv_sentence",
-            {
-                "index": index,
-                "sentence": sentence_dict,
-                "source": "sensevoice",
-            },
-        )
-
-        logger.debug(f"添加句子 {index}: {sentence.text[:30]}...")
-        self._persist_runtime_subtitle_state(reason="add_sentence")
-        return index
+        chunk_ref = getattr(sentence, "chunk_uid", None) or f"chunk:legacy:{self.sentence_count}"
+        indices = self.add_draft_sentences(chunk_ref, [sentence])
+        return indices[0] if indices else -1
 
     def update_sentence(
         self,
@@ -528,18 +498,12 @@ class StreamingSubtitleManager:
             logger.info("移除更新后变为 unknown 的字幕: job_id=%s index=%s", self.job_id, index)
             return
 
-        # 推送 SSE 事件
-        event_type = {
-            TextSource.WHISPER_PATCH: "whisper_patch",
-            TextSource.LLM_CORRECTION: "llm_proof",
-            TextSource.LLM_TRANSLATION: "llm_trans",
-        }.get(source, "batch_update")
-
         self._emit_subtitle_event(
-            event_type,
+            "revised",
             {
                 "index": index,
                 "sentence": sentence.to_dict(),
+                "segment_id": getattr(sentence, "segment_id", None),
                 "source": source.value,
                 "is_update": True,
             },
@@ -956,94 +920,8 @@ class StreamingSubtitleManager:
         chunk_ref: Any,
         sentences: List[SentenceSegment]
     ) -> List[int]:
-        """
-        添加定稿句子（极速模式专用）
-
-        V3.5 新增: 极速模式下 FastWorker 直接输出定稿，不经过 SlowWorker。
-        与 add_draft_sentences 不同，这里直接推送定稿事件。
-
-        V3.8: 添加锁保护和深拷贝，防止竞态条件
-
-        Args:
-            chunk_ref: Chunk 引用（支持 int chunk_index 或 string chunk_id）
-            sentences: 定稿句子列表
-
-        Returns:
-            List[int]: 句子索引列表
-        """
-        visible_sentences = self._filter_unknown_sentences(sentences)
-        chunk_key = self._normalize_chunk_ref(chunk_ref)
-        dropped_unknown_count = max(0, len(list(sentences or [])) - len(visible_sentences))
-        if dropped_unknown_count > 0:
-            logger.info(
-                "极速定稿过滤 unknown 字幕: job_id=%s chunk=%s count=%s",
-                self.job_id,
-                chunk_key,
-                dropped_unknown_count,
-            )
-
-        sentence_indices = []
-        sentences_to_push = []  # V3.8: 收集待推送的句子数据
-
-        with self._lock:
-            old_indices = self.get_chunk_sentence_indices(chunk_key)
-            for old_index in old_indices:
-                existing_sentence = self.sentences.get(old_index)
-                if existing_sentence is None:
-                    continue
-                if getattr(existing_sentence, "is_modified", False):
-                    continue
-                del self.sentences[old_index]
-
-            for sentence in visible_sentences:
-                # V3.8 修复：深拷贝句子对象，避免共享引用
-                sentence_copy = copy.deepcopy(sentence)
-
-                # 确保句子标记为定稿
-                sentence_copy.is_draft = False
-                sentence_copy.is_finalized = True
-
-                index = self.sentence_count
-                self._ensure_sentence_identity(sentence_copy, chunk_ref=chunk_key)
-                self.sentences[index] = sentence_copy
-                self.sentence_count += 1
-                sentence_indices.append(index)
-
-                # 定稿事件允许透传 speaker 字段
-                sentence_dict = self._build_sentence_payload(
-                    sentence_copy,
-                    index=index,
-                    is_draft=False,
-                    is_finalized=True,
-                    sanitize_draft_speaker=False,
-                )
-                sentences_to_push.append((index, sentence_dict))
-
-            # 记录 Chunk 级别的索引映射
-            self._remove_chunk_alias_mappings(chunk_key)
-            self.chunk_sentences[chunk_key] = sentence_indices
-
-        # V3.8: 在锁外推送 SSE 事件，避免死锁
-        chunk_index_for_event = self._try_parse_chunk_index(chunk_key)
-        for index, sentence_dict in sentences_to_push:
-            self._emit_subtitle_event(
-                "finalized",
-                {
-                    "index": index,
-                    "chunk_index": chunk_index_for_event if chunk_index_for_event is not None else chunk_key,
-                    "chunk_uid": str(chunk_key),
-                    "sentence": sentence_dict,
-                    "mode": "sensevoice_only",
-                },
-            )
-
-        logger.debug(
-            f"添加定稿句子 [极速模式]: Chunk {chunk_key}, "
-            f"{len(visible_sentences)} 个句子, 索引 {sentence_indices}"
-        )
-
-        self._persist_runtime_subtitle_state(reason="add_finalized_sentences")
-        return sentence_indices
+        """极速模式定稿统一复用 replace_chunk 语义。"""
+        return self.replace_chunk(chunk_ref, sentences)
 
     # ========== V3.1.0: 字幕持久化方法 ==========
 
@@ -1114,108 +992,156 @@ class StreamingSubtitleManager:
         from app.models.sensevoice_models import SentenceSegment, TextSource, WarningType, WordTimestamp
 
         try:
+            subtitle_items_snapshot = checkpoint_data.get("subtitle_items_snapshot", [])
             sentences_snapshot = checkpoint_data.get("sentences_snapshot", [])
             sentence_count = checkpoint_data.get("sentence_count", 0)
             chunk_sentences_map = checkpoint_data.get("chunk_sentences_map", {})
 
-            if not sentences_snapshot:
+            if not subtitle_items_snapshot and not sentences_snapshot:
                 logger.info(f"[V3.1.0] 无字幕快照需要恢复: job_id={self.job_id}")
                 return True
 
             # 恢复句子
             restored_count = 0
-            for sentence_dict in sentences_snapshot:
-                idx = sentence_dict.get("_index")
-                if idx is None:
-                    continue
-
-                # V3.1.2: 读取置信度相关字段（兼容旧数据）
-                raw_confidence = sentence_dict.get("confidence", 1.0)
-                display_confidence = sentence_dict.get("display_confidence")  # 可能为 None（旧数据）
-                display_raw = sentence_dict.get("confidence_display_raw")
-                confidence_source = sentence_dict.get("confidence_source")    # 可能为 None（旧数据）
-
-                # 从字典重建 SentenceSegment
-                sentence = SentenceSegment(
-                    text=sentence_dict.get("original_text") or sentence_dict.get("text", ""),
-                    text_clean=sentence_dict.get("text", ""),
-                    start=sentence_dict.get("start", 0.0),
-                    end=sentence_dict.get("end", 0.0),
-                    confidence=raw_confidence,
-                    confidence_display_raw=display_raw,
-                    display_confidence=display_confidence,  # V3.1.2: 新增
-                    confidence_source=confidence_source,    # V3.1.2: 新增
-                )
-
-                # 恢复来源
-                source_str = sentence_dict.get("source", "sensevoice")
-                try:
-                    sentence.source = TextSource(source_str)
-                except ValueError:
-                    sentence.source = TextSource.SENSEVOICE
-
-                # V3.1.2: 如果旧数据没有 display_confidence，立即计算
-                # __post_init__ 已经会自动计算，但这里确保 confidence_source 正确
-                if sentence.confidence_source is None:
-                    sentence.confidence_source = source_str
-                if sentence.display_confidence is None:
-                    sentence._compute_display_confidence()
-
-                # 恢复警告类型
-                warning_str = sentence_dict.get("warning_type", "none")
-                try:
-                    sentence.warning_type = WarningType(warning_str)
-                except ValueError:
-                    sentence.warning_type = WarningType.NONE
-
-                # 恢复其他字段
-                sentence.is_modified = sentence_dict.get("is_modified", False)
-                sentence.original_text = sentence_dict.get("original_text")
-                sentence.whisper_alternative = sentence_dict.get("whisper_alternative")
-                sentence.perplexity = sentence_dict.get("perplexity")
-                sentence.translation = sentence_dict.get("translation")
-                sentence.translation_confidence = sentence_dict.get("translation_confidence")
-                restored_is_draft = bool(sentence_dict.get("_is_draft", False))
-                restored_is_finalized = sentence_dict.get("_is_finalized")
-                if restored_is_finalized is None:
-                    restored_is_finalized = not restored_is_draft
-                sentence.is_draft = restored_is_draft
-                sentence.is_finalized = bool(restored_is_finalized)
-                sentence.sentence_uid = sentence_dict.get("sentence_uid") or sentence_dict.get("segment_id")
-                sentence.segment_id = sentence_dict.get("segment_id") or sentence.sentence_uid
-                sentence.chunk_uid = sentence_dict.get("chunk_uid")
-                sentence.speaker_id = sentence_dict.get("speaker_id")
-                sentence.turn_id = sentence_dict.get("turn_id")
-                sentence.speaker_label = sentence_dict.get("speaker_label")
-                sentence.speaker_color_key = sentence_dict.get("speaker_color_key")
-                sentence.binding_source = sentence_dict.get("binding_source")
-
-                # 恢复字级时间戳
-                words_data = sentence_dict.get("words", [])
-                sentence.words = []
-                for word_dict in words_data:
-                    # V3.1.2: confidence 可能为 None（Whisper 复核后的伪对齐）
-                    word_confidence = word_dict.get("confidence")  # 不设置默认值，保持 None
-                    word = WordTimestamp(
-                        word=word_dict.get("word", ""),
-                        start=word_dict.get("start", 0.0),
-                        end=word_dict.get("end", 0.0),
-                        confidence=word_confidence,
-                        confidence_raw=word_dict.get("confidence_raw"),
-                        confidence_display_raw=word_dict.get("confidence_display_raw"),
-                        token_type=word_dict.get("token_type"),
-                        is_pseudo=word_dict.get("is_pseudo", False)
+            if isinstance(subtitle_items_snapshot, list) and subtitle_items_snapshot:
+                for item_dict in subtitle_items_snapshot:
+                    if not isinstance(item_dict, dict):
+                        continue
+                    idx = item_dict.get("legacy_index")
+                    if idx is None:
+                        continue
+                    text = str(item_dict.get("text", "") or "")
+                    if not text:
+                        continue
+                    try:
+                        sentence = self._build_sentence_from_subtitle_item(
+                            SubtitleItem(
+                                segment_id=str(
+                                    item_dict.get("segment_id")
+                                    or item_dict.get("sentence_uid")
+                                    or f"seg-{idx}"
+                                ),
+                                chunk_id=str(
+                                    item_dict.get("chunk_id")
+                                    or item_dict.get("chunk_uid")
+                                    or f"chunk:restored:{idx}"
+                                ),
+                                start=float(item_dict.get("start", 0.0) or 0.0),
+                                end=float(
+                                    item_dict.get("end", item_dict.get("start", 0.0))
+                                    or item_dict.get("start", 0.0)
+                                ),
+                                text=text,
+                                status=str(item_dict.get("status", "final") or "final"),
+                                source=str(item_dict.get("source", "render_core") or "render_core"),
+                                speaker_id=item_dict.get("speaker_id"),
+                                turn_id=item_dict.get("turn_id"),
+                                trace=dict(item_dict.get("trace", {}) or {}),
+                            )
+                        )
+                    except ValueError:
+                        continue
+                    if self._is_hidden_unknown_sentence(sentence):
+                        continue
+                    self._ensure_sentence_identity(
+                        sentence,
+                        chunk_ref=sentence.chunk_uid or "chunk:restored",
                     )
-                    sentence.words.append(word)
+                    self.sentences[int(idx)] = sentence
+                    restored_count += 1
+            else:
+                for sentence_dict in sentences_snapshot:
+                    idx = sentence_dict.get("_index")
+                    if idx is None:
+                        continue
 
-                if self._is_hidden_unknown_sentence(sentence):
-                    continue
-                self._ensure_sentence_identity(
-                    sentence,
-                    chunk_ref=sentence.chunk_uid or "chunk:restored",
-                )
-                self.sentences[idx] = sentence
-                restored_count += 1
+                    # V3.1.2: 读取置信度相关字段（兼容旧数据）
+                    raw_confidence = sentence_dict.get("confidence", 1.0)
+                    display_confidence = sentence_dict.get("display_confidence")  # 可能为 None（旧数据）
+                    display_raw = sentence_dict.get("confidence_display_raw")
+                    confidence_source = sentence_dict.get("confidence_source")    # 可能为 None（旧数据）
+
+                    # 从字典重建 SentenceSegment
+                    sentence = SentenceSegment(
+                        text=sentence_dict.get("original_text") or sentence_dict.get("text", ""),
+                        text_clean=sentence_dict.get("text", ""),
+                        start=sentence_dict.get("start", 0.0),
+                        end=sentence_dict.get("end", 0.0),
+                        confidence=raw_confidence,
+                        confidence_display_raw=display_raw,
+                        display_confidence=display_confidence,  # V3.1.2: 新增
+                        confidence_source=confidence_source,    # V3.1.2: 新增
+                    )
+
+                    # 恢复来源
+                    source_str = sentence_dict.get("source", "sensevoice")
+                    try:
+                        sentence.source = TextSource(source_str)
+                    except ValueError:
+                        sentence.source = TextSource.SENSEVOICE
+
+                    # V3.1.2: 如果旧数据没有 display_confidence，立即计算
+                    # __post_init__ 已经会自动计算，但这里确保 confidence_source 正确
+                    if sentence.confidence_source is None:
+                        sentence.confidence_source = source_str
+                    if sentence.display_confidence is None:
+                        sentence._compute_display_confidence()
+
+                    # 恢复警告类型
+                    warning_str = sentence_dict.get("warning_type", "none")
+                    try:
+                        sentence.warning_type = WarningType(warning_str)
+                    except ValueError:
+                        sentence.warning_type = WarningType.NONE
+
+                    # 恢复其他字段
+                    sentence.is_modified = sentence_dict.get("is_modified", False)
+                    sentence.original_text = sentence_dict.get("original_text")
+                    sentence.whisper_alternative = sentence_dict.get("whisper_alternative")
+                    sentence.perplexity = sentence_dict.get("perplexity")
+                    sentence.translation = sentence_dict.get("translation")
+                    sentence.translation_confidence = sentence_dict.get("translation_confidence")
+                    restored_is_draft = bool(sentence_dict.get("_is_draft", False))
+                    restored_is_finalized = sentence_dict.get("_is_finalized")
+                    if restored_is_finalized is None:
+                        restored_is_finalized = not restored_is_draft
+                    sentence.is_draft = restored_is_draft
+                    sentence.is_finalized = bool(restored_is_finalized)
+                    sentence.sentence_uid = sentence_dict.get("sentence_uid") or sentence_dict.get("segment_id")
+                    sentence.segment_id = sentence_dict.get("segment_id") or sentence.sentence_uid
+                    sentence.chunk_uid = sentence_dict.get("chunk_uid")
+                    sentence.speaker_id = sentence_dict.get("speaker_id")
+                    sentence.turn_id = sentence_dict.get("turn_id")
+                    sentence.speaker_label = sentence_dict.get("speaker_label")
+                    sentence.speaker_color_key = sentence_dict.get("speaker_color_key")
+                    sentence.binding_source = sentence_dict.get("binding_source")
+
+                    # 恢复字级时间戳
+                    words_data = sentence_dict.get("words", [])
+                    sentence.words = []
+                    for word_dict in words_data:
+                        # V3.1.2: confidence 可能为 None（Whisper 复核后的伪对齐）
+                        word_confidence = word_dict.get("confidence")  # 不设置默认值，保持 None
+                        word = WordTimestamp(
+                            word=word_dict.get("word", ""),
+                            start=word_dict.get("start", 0.0),
+                            end=word_dict.get("end", 0.0),
+                            confidence=word_confidence,
+                            confidence_raw=word_dict.get("confidence_raw"),
+                            confidence_display_raw=word_dict.get("confidence_display_raw"),
+                            token_type=word_dict.get("token_type"),
+                            is_pseudo=word_dict.get("is_pseudo", False)
+                        )
+                        sentence.words.append(word)
+
+                    if self._is_hidden_unknown_sentence(sentence):
+                        continue
+                    self._ensure_sentence_identity(
+                        sentence,
+                        chunk_ref=sentence.chunk_uid or "chunk:restored",
+                    )
+                    self.sentences[idx] = sentence
+                    restored_count += 1
 
             # 恢复计数器（关键：确保新句子索引不会冲突）
             self.sentence_count = max(sentence_count, restored_count)
@@ -1415,11 +1341,13 @@ class StreamingSubtitleManager:
                     sentences_data.append(sentence_dict)
 
             if sentences_data:
-                # 推送恢复事件（使用新的事件类型，避免与实时推送混淆）
                 self._emit_subtitle_event(
-                    "restored",
+                    "replace_chunk",
                     {
                         "chunk_index": chunk_index,
+                        "chunk_uid": str(chunk_index),
+                        "old_indices": list(sentence_indices),
+                        "new_indices": list(sentence_indices),
                         "sentences": sentences_data,
                         "is_restore": True,
                     },
@@ -1443,10 +1371,14 @@ class StreamingSubtitleManager:
             manual_sentences.append(sentence_dict)
 
         if manual_sentences:
+            manual_indices = [idx for idx, sentence in self.sentences.items() if idx < 0 and not self._is_hidden_unknown_sentence(sentence)]
             self._emit_subtitle_event(
-                "restored",
+                "replace_chunk",
                 {
                     "chunk_index": "manual",
+                    "chunk_uid": "manual",
+                    "old_indices": manual_indices,
+                    "new_indices": manual_indices,
                     "sentences": manual_sentences,
                     "is_restore": True,
                 },

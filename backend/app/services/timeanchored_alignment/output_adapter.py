@@ -22,18 +22,29 @@ class OutputAdapter:
         injection_report: dict[str, Any] | None = None,
         segmentation_report: dict[str, Any] | None = None,
     ) -> list[OutputLayerInput]:
+        from app.services.textflow.subtitle_delivery import SubtitleDelivery
+
+        subtitle_delivery = SubtitleDelivery()
         outputs: list[OutputLayerInput] = []
         for projection in projections:
             sentences = [deepcopy(sentence) for sentence in projection.sentence_segments]
             traces = self._build_output_traces(sentences)
+            chunk_ref = projection.chunk_window.chunk_ref
             outputs.append(
                 OutputLayerInput(
-                    chunk_index=projection.chunk_window.chunk_ref,
+                    chunk_index=chunk_ref,
                     sentence_segments=sentences,
                     language=language,
                     injection_report=dict(injection_report or {}),
                     segmentation_report=dict(segmentation_report or {}),
                     output_traces=traces,
+                    subtitle_batch=subtitle_delivery.build_batch_from_sentences(
+                        chunk_id=str(chunk_ref),
+                        chunk_index=self._try_parse_chunk_index(chunk_ref),
+                        sentence_segments=sentences,
+                        output_traces=traces,
+                        source="timeanchored_output_adapter",
+                    ),
                 )
             )
         return outputs
@@ -57,6 +68,25 @@ class OutputAdapter:
                 )
             )
         return traces
+
+    @staticmethod
+    def _try_parse_chunk_index(chunk_ref: Any) -> int | None:
+        if isinstance(chunk_ref, int):
+            return chunk_ref
+        chunk_text = str(chunk_ref or "").strip()
+        if not chunk_text:
+            return None
+        if chunk_text.lstrip("-").isdigit():
+            try:
+                return int(chunk_text)
+            except ValueError:
+                return None
+        if chunk_text.startswith("chunk-"):
+            try:
+                return int(chunk_text.split("-")[-1])
+            except ValueError:
+                return None
+        return None
 
 
 __all__ = ["OutputAdapter"]

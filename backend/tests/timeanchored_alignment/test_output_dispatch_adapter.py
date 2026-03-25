@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import pytest
+
+from app.models.sensevoice_models import SentenceSegment
+from app.services.alignment.types import OutputLayerInput
 from app.services.textflow.contracts import SubtitleBatch, SubtitleItem
-from app.services.textflow.output_dispatch_adapter import OutputDispatchAdapter
+from app.services.textflow.output_dispatch_adapter import OutputDispatchAdapter, OutputLayerProcessor
 
 
 class _DummySubtitleManager:
@@ -118,3 +122,77 @@ def test_output_dispatch_adapter_marks_output_channel_failure() -> None:
     assert payload["transport_meta"]["subtitle_channel"]["status"] == "failed"
     assert payload["transport_meta"]["speaker_store_channel"]["status"] == "skipped_upstream_failed"
     assert "E_OUTPUT_CHANNEL_FAIL" in payload["errors"]
+
+
+def test_output_layer_processor_uses_provided_subtitle_batch() -> None:
+    subtitle_manager = _DummySubtitleManager()
+    processor = OutputLayerProcessor(subtitle_manager=subtitle_manager)
+
+    payload = processor.process(
+        OutputLayerInput(
+            chunk_index="chunk-9",
+            sentence_segments=[
+                SentenceSegment(
+                    text="旧句段文本",
+                    text_clean="旧句段文本",
+                    start=0.0,
+                    end=0.5,
+                )
+            ],
+            subtitle_batch=SubtitleBatch(
+                chunk_id="chunk-9",
+                chunk_index=9,
+                items=(
+                    SubtitleItem(
+                        segment_id="seg-9-0",
+                        chunk_id="chunk-9",
+                        text="统一 DTO 文本",
+                        start=1.0,
+                        end=2.0,
+                        source="render_core",
+                    ),
+                ),
+                diagnostics={
+                    "output_trace": [
+                        {
+                            "sentence_index": 0,
+                            "split_reason": "render_core",
+                            "split_risk": "",
+                            "window_id": "",
+                            "mapped_cut_time": 2.0,
+                            "mapping_quality": "boundary",
+                            "mapping_reason": "render_core",
+                            "sentence_start": 1.0,
+                            "sentence_end": 2.0,
+                        }
+                    ]
+                },
+            ),
+            language="zh",
+        )
+    ).output_payload
+
+    assert subtitle_manager.calls == [("chunk-9", 1)]
+    assert payload["sentence_segments"][0]["text"] == "统一 DTO 文本"
+    assert payload["output_trace"][0]["split_reason"] == "render_core"
+
+
+def test_output_layer_processor_rejects_missing_subtitle_batch() -> None:
+    subtitle_manager = _DummySubtitleManager()
+    processor = OutputLayerProcessor(subtitle_manager=subtitle_manager)
+
+    with pytest.raises(ValueError, match="subtitle_batch"):
+        processor.process(
+            OutputLayerInput(
+                chunk_index="chunk-3",
+                sentence_segments=[
+                    SentenceSegment(
+                        text="旧句段文本",
+                        text_clean="旧句段文本",
+                        start=0.0,
+                        end=0.5,
+                    )
+                ],
+                language="zh",
+            )
+        )
