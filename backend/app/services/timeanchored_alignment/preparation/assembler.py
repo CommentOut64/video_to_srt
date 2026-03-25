@@ -7,6 +7,7 @@ from typing import Any, Mapping, Sequence
 import unicodedata
 
 from app.core.logging import resolve_loguru_logger
+from app.services.alignment.types import PunctTrack
 from app.services.timeanchored_alignment.chunk_projector import ChunkWindow
 from app.services.timeanchored_alignment.contracts import (
     ProtectedSpan,
@@ -17,6 +18,7 @@ from app.services.timeanchored_alignment.preparation.contracts import (
     AlignmentPreparationCompat,
     AlignmentPreparationPackage,
     PreparedSlowText,
+    PunctuationEvidence,
 )
 from app.services.timeanchored_alignment.preparation.display_projection_builder import (
     DisplayProjectionBuilder,
@@ -94,6 +96,7 @@ class AlignmentPreparationAssembler:
         default_language: str,
         fallback_text: str = "",
         chunk_window: ChunkWindow | None = None,
+        external_punct_track: PunctTrack | None = None,
     ) -> AlignmentPreparationPackage:
         normalized = self._slow_text_normalizer.normalize(
             whisper_result=whisper_result,
@@ -123,14 +126,23 @@ class AlignmentPreparationAssembler:
             protected_units=protected.protected_units,
             source_language=safe_text.language,
         )
-        punctuation_evidences = self._punctuation_evidence_builder.build(
+        lexical_punctuation_evidences = self._punctuation_evidence_builder.build(
             source_text=safe_text.normalized_text,
             source_char_to_text_index=projection.source_char_to_text_index,
             protected_units=protected.protected_units,
         )
-        slots = self._source_attribution_binder.bind(
-            text=projection.window_text.text,
-            source_units=ready_window.source_units,
+        external_punctuation_evidences = tuple()
+        if external_punct_track is not None and getattr(external_punct_track, "positions", None):
+            external_punctuation_evidences = self._punctuation_evidence_builder.build_from_punct_track(
+                track_clean_text_ref=str(getattr(external_punct_track, "clean_text_ref", "") or ""),
+                window_text=projection.window_text.text,
+                positions=tuple(getattr(external_punct_track, "positions", ()) or ()),
+                evidence_source="punct_track",
+                remap_mode="tolerant",
+            )
+        punctuation_evidences = self._merge_punctuation_evidences(
+            lexical_evidences=lexical_punctuation_evidences,
+            external_evidences=external_punctuation_evidences,
         )
         language_profile = self._language_profile_builder.build(
             text=projection.window_text.text,
@@ -141,6 +153,12 @@ class AlignmentPreparationAssembler:
             language_hint=safe_text.language,
             language_runs=language_profile.package.runs,
             dominant_language=language_profile.package.dominant_language,
+        )
+        slots = self._source_attribution_binder.bind(
+            text=projection.window_text.text,
+            source_units=ready_window.source_units,
+            punctuation_evidences=punctuation_evidences,
+            pronunciation_hints=pronunciation.hints,
         )
 
         compat_protected_spans = tuple(
@@ -193,11 +211,13 @@ class AlignmentPreparationAssembler:
             compat=compat,
         )
         self._logger.debug(
-            "AlignmentPreparation 完成 window_id={} window_text_len={} slot_count={} punctuation_count={} protected_unit_count={} language_run_count={} pronunciation_hint_count={} fast_hook_count={} compat_text_truth_unit_count={} compat_timed_unit_count={}",
+            "AlignmentPreparation 完成 window_id={} window_text_len={} slot_count={} punctuation_count={} lexical_punctuation_count={} external_punctuation_count={} protected_unit_count={} language_run_count={} pronunciation_hint_count={} fast_hook_count={} compat_text_truth_unit_count={} compat_timed_unit_count={}",
             package.window_id,
             len(package.slow_text.window_text.text),
             len(package.slow_text.slots),
             len(package.slow_text.punctuation_evidences),
+            len(lexical_punctuation_evidences),
+            len(external_punctuation_evidences),
             len(package.slow_text.protected_units),
             len(package.slow_text.language_runs),
             len(package.slow_text.pronunciation_hints),
@@ -206,6 +226,22 @@ class AlignmentPreparationAssembler:
             self._count_timed_units(package.compat.text_truth.units),
         )
         return package
+
+    @staticmethod
+    def _merge_punctuation_evidences(
+        *,
+        lexical_evidences: tuple[PunctuationEvidence, ...],
+        external_evidences: tuple[PunctuationEvidence, ...],
+    ) -> tuple[PunctuationEvidence, ...]:
+        dedup: dict[tuple[str, int, str], PunctuationEvidence] = {}
+        for item in lexical_evidences:
+            dedup[(str(item.mark), int(item.source_char_index), str(item.attach_side))] = item
+        for item in external_evidences:
+            key = (str(item.mark), int(item.source_char_index), str(item.attach_side))
+            if key in dedup:
+                continue
+            dedup[key] = item
+        return tuple(dedup.values())
 
     @staticmethod
     def _build_owner_chunk_window(*, ready_window: ReadySlowWindow) -> ChunkWindow:

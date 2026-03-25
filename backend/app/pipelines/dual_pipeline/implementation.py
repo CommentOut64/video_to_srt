@@ -4183,36 +4183,6 @@ class AsyncDualPipelineKernel:
         """
         return self._textflow_facade_service.finalize_sensevoice_only(ctx)
 
-    def _finalize_timeanchored_stream(
-        self,
-        *,
-        final_stream: Sequence[Any],
-        boundary_evidences: Sequence[Any],
-        detected_language: str,
-        chosen_text_clean: str,
-        punctuation_positions: Optional[List[PuncPosition]],
-        punctuation_clean_text: Optional[str],
-        speaker_id: Optional[str],
-        turn_id: Optional[str],
-        coverage: float,
-        route_confidence: float,
-        error_code: str,
-    ) -> Layer456RunResult:
-        """兼容入口：委派 timeanchored 词流到统一裁决层。"""
-        return self._textflow_facade_service.finalize_timeanchored_stream(
-            final_stream=final_stream,
-            boundary_evidences=boundary_evidences,
-            detected_language=detected_language,
-            chosen_text_clean=chosen_text_clean,
-            punctuation_positions=punctuation_positions,
-            punctuation_clean_text=punctuation_clean_text,
-            speaker_id=speaker_id,
-            turn_id=turn_id,
-            coverage=coverage,
-            route_confidence=route_confidence,
-            error_code=error_code,
-        )
-
     def _update_soft_cut_observability(
         self,
         *,

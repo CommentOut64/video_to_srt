@@ -4,8 +4,6 @@ V3.2.0+dev.20260205.02
 """
 from __future__ import annotations
 
-from bisect import bisect_left
-import difflib
 from typing import Any, Dict, List, Optional, Sequence, TYPE_CHECKING
 
 from app.core.logging import resolve_loguru_logger
@@ -17,6 +15,7 @@ from app.services.alignment.types import (
     TextTrack,
 )
 from app.services.punctuation.base import PuncPosition, PunctuationResult, WordTimestampLike, apply_punctuation
+from app.services.punctuation.punct_position_mapper import PunctPositionMapper
 from app.services.punctuation.postprocess import (
     PunctuationPostprocessResult,
     get_postprocess_config,
@@ -52,6 +51,7 @@ class PunctuationProcessor:
             from app.services.punctuation.service import get_punctuation_service
 
             self._punctuation_service = get_punctuation_service()
+        self._position_mapper = PunctPositionMapper()
 
     async def process(self, data: PunctuationPreInput) -> PunctuationPreOutput:
         """执行标点前置域恢复并输出 PunctTrack。"""
@@ -177,8 +177,8 @@ class PunctuationProcessor:
             self._logger.warning("评分层标点模型恢复失败: {}", exc)
             return [], None
 
-    @staticmethod
     def _extract_source_positions(
+        self,
         source: Optional[PunctSource],
         clean_text: str,
         *,
@@ -189,14 +189,14 @@ class PunctuationProcessor:
             return []
         if source.source not in allowed:
             return []
-        return PunctuationProcessor._resolve_positions_by_mode(
+        return self._resolve_positions_by_mode(
             source=source,
             clean_text=clean_text,
             fallback_mode=fallback_mode,
         )
 
-    @staticmethod
     def _filter_candidates_by_source(
+        self,
         source: Optional[PunctSource],
         clean_text: str,
         candidates: List[PuncPosition],
@@ -205,7 +205,7 @@ class PunctuationProcessor:
         fallback_mode: str = "strict",
     ) -> List[PuncPosition]:
         if source and source.positions:
-            mapped = PunctuationProcessor._resolve_positions_by_mode(
+            mapped = self._resolve_positions_by_mode(
                 source=source,
                 clean_text=clean_text,
                 fallback_mode=fallback_mode,
@@ -214,29 +214,9 @@ class PunctuationProcessor:
                 return mapped
         return list(candidates) if fallback_keep else []
 
-    # V3.2.0+dev.20260206.01: 允许 clean_text_ref 在大小写/引号形态上的等价匹配，
-    # 但仍保持字符索引一一对应（长度不变），避免误放宽导致越界注入。
-    @staticmethod
-    def _is_compatible_clean_text_ref(source_ref: str, clean_text: str) -> bool:
-        if source_ref == clean_text:
-            return True
-        if not source_ref or not clean_text:
-            return False
-        if len(source_ref) != len(clean_text):
-            return False
-        for source_char, target_char in zip(source_ref, clean_text):
-            if source_char == target_char:
-                continue
-            if source_char.isspace() and target_char.isspace():
-                continue
-            if PunctuationProcessor._normalize_ref_char(source_char) == PunctuationProcessor._normalize_ref_char(target_char):
-                continue
-            return False
-        return True
-
-    
-    @staticmethod
+    # V3.2.0+dev.20260206.01: 统一使用公共 mapper 处理 strict/tolerant 映射。
     def _resolve_positions_by_mode(
+        self,
         source: PunctSource,
         clean_text: str,
         fallback_mode: str,
@@ -246,111 +226,12 @@ class PunctuationProcessor:
         mode = str(fallback_mode or "strict").lower()
         if mode not in {"strict", "tolerant"}:
             mode = "strict"
-        if mode == "strict":
-            if not PunctuationProcessor._is_compatible_clean_text_ref(source.clean_text_ref, clean_text):
-                return []
-            return list(source.positions)
-        if PunctuationProcessor._is_compatible_clean_text_ref(source.clean_text_ref, clean_text):
-            return list(source.positions)
-        return PunctuationProcessor._remap_positions_tolerant(
+        return self._position_mapper.remap(
             source_ref=str(source.clean_text_ref or ""),
             target_ref=clean_text,
             positions=source.positions,
+            mode=mode,
         )
-
-    @staticmethod
-    def _remap_positions_tolerant(
-        source_ref: str,
-        target_ref: str,
-        positions: Sequence[PuncPosition],
-    ) -> List[PuncPosition]:
-        if not source_ref or not target_ref or not positions:
-            return []
-        source_chars = [PunctuationProcessor._normalize_ref_char(ch) for ch in source_ref]
-        target_chars = [PunctuationProcessor._normalize_ref_char(ch) for ch in target_ref]
-        matcher = difflib.SequenceMatcher(a=source_chars, b=target_chars, autojunk=False)
-        if matcher.ratio() < 0.55:
-            return []
-        direct_map: Dict[int, int] = {}
-        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-            if tag != "equal":
-                continue
-            span = min(i2 - i1, j2 - j1)
-            for offset in range(span):
-                direct_map[i1 + offset] = j1 + offset
-        if not direct_map:
-            return []
-        mapped_indexes = sorted(direct_map.keys())
-        remapped: List[PuncPosition] = []
-        for position in positions:
-            target_index = PunctuationProcessor._project_char_index(
-                source_index=int(position.char_index),
-                direct_map=direct_map,
-                mapped_indexes=mapped_indexes,
-                target_len=len(target_ref),
-            )
-            if target_index is None:
-                continue
-            remapped.append(
-                PuncPosition(
-                    char_index=target_index,
-                    punctuation=position.punctuation,
-                    confidence=position.confidence,
-                )
-            )
-        if not remapped:
-            return []
-        dedup: Dict[tuple[int, str], PuncPosition] = {}
-        for position in remapped:
-            key = (position.char_index, position.punctuation)
-            exists = dedup.get(key)
-            if exists is None or position.confidence > exists.confidence:
-                dedup[key] = position
-        return sorted(dedup.values(), key=lambda item: item.char_index)
-
-    @staticmethod
-    def _project_char_index(
-        source_index: int,
-        direct_map: Dict[int, int],
-        mapped_indexes: Sequence[int],
-        target_len: int,
-    ) -> Optional[int]:
-        if target_len <= 0:
-            return None
-        if source_index in direct_map:
-            return max(0, min(target_len - 1, direct_map[source_index]))
-        if not mapped_indexes:
-            return None
-        pos = bisect_left(mapped_indexes, source_index)
-        left = mapped_indexes[pos - 1] if pos > 0 else None
-        right = mapped_indexes[pos] if pos < len(mapped_indexes) else None
-        candidate: Optional[int]
-        if left is not None and right is not None and right != left:
-            left_target = direct_map[left]
-            right_target = direct_map[right]
-            ratio = float(source_index - left) / float(right - left)
-            candidate = int(round(left_target + ratio * (right_target - left_target)))
-        elif left is not None:
-            candidate = direct_map[left] + (source_index - left)
-        elif right is not None:
-            candidate = direct_map[right] - (right - source_index)
-        else:
-            candidate = None
-        if candidate is None:
-            return None
-        return max(0, min(target_len - 1, int(candidate)))
-    @staticmethod
-    def _normalize_ref_char(value: str) -> str:
-        if not value:
-            return ""
-        quote_alias = {
-            '’': "'",
-            '‘': "'",
-            '`': "'",
-            '“': '"',
-            '”': '"',
-        }
-        return quote_alias.get(value, value).lower()
 
     def _filter_dense_weak_positions(
         self,

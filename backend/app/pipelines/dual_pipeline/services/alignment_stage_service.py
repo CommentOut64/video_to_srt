@@ -15,7 +15,7 @@ from typing import Any, Dict, Optional, Sequence
 from app.models.sensevoice_models import SentenceSegment, TextSource
 from app.pipelines.dual_pipeline.services.textflow_facade_service import Layer456RunResult
 from app.schemas.pipeline_context import ProcessingContext
-from app.services.alignment.types import PunctTrack
+from app.services.alignment.types import CharMapping, PunctTrack, TextTrack, TextTrackBundle
 from app.services.language_policy import build_language_policy_snapshot
 from app.services.textflow.decision_ingress_adapter import DecisionIngressAdapter
 from app.services.timeanchored_alignment import AlignmentItem
@@ -27,7 +27,6 @@ from app.services.timeanchored_alignment.preparation import (
     AlignmentPreparationAssembler,
     AlignmentPreparationPackage,
 )
-from app.services.timeanchored_alignment.sentence_segmenter import SentenceSegmenter
 from app.services.timeanchored_alignment.slow_window.contracts import (
     DialogueShapeSnapshot,
     PromptSeed,
@@ -62,7 +61,6 @@ class AlignmentStageService:
             sanitizer=getattr(host, "_whisper_sanitizer", None),
             hallucination_detector=getattr(host, "_hallucination_detector", None),
         )
-        self._timeanchored_sentence_segmenter = SentenceSegmenter()
         self._timeanchored_stage_service = AnchorMountAlignmentService()
         self._decision_ingress_adapter = DecisionIngressAdapter()
         self._output_projector = OutputProjector()
@@ -818,6 +816,7 @@ class AlignmentStageService:
                 whisper_result=whisper_result,
                 default_language=base_language,
                 fallback_text=fallback_text,
+                external_punct_track=ctx.punct_track,
             )
             self._trace_write(
                 ctx=ctx,
@@ -1269,6 +1268,39 @@ class AlignmentStageService:
         split_stats["decision_ingress_adapter_fallback_punct_count"] = int(
             adapter_result.compat_report.get("fallback_punctuation_position_count", 0) or 0
         )
+        preparation_punctuation_count = int(
+            len(getattr(getattr(preparation, "slow_text", None), "punctuation_evidences", ()) or ())
+            if preparation is not None
+            else 0
+        )
+        punctuation_chain_health = self._build_punctuation_chain_health_metrics(
+            chosen_source=str(getattr(ctx.arbitration_result, "chosen_source", "") or "unknown"),
+            punct_track=ctx.punct_track,
+            preparation_punctuation_count=preparation_punctuation_count,
+            punctuation_fact_count=int(len(stage_result.decision_ingress.punctuation_facts)),
+        )
+        split_stats["punctuation_chain_broken_flag"] = int(
+            punctuation_chain_health["punctuation_chain_broken_flag"]
+        )
+        split_stats["punctuation_chain_track_sentence_end_count"] = int(
+            punctuation_chain_health["punct_track_sentence_end_count"]
+        )
+        split_stats["punctuation_chain_preparation_count"] = int(
+            punctuation_chain_health["preparation_punctuation_count"]
+        )
+        split_stats["punctuation_chain_fact_count"] = int(
+            punctuation_chain_health["punctuation_fact_count"]
+        )
+        if punctuation_chain_health["punctuation_chain_broken_flag"]:
+            host.logger.warning(
+                "Chunk {}: punctuation_chain_broken chosen_source={} track_positions={} preparation_punctuation_count={} punctuation_fact_count={} reason={}",
+                ctx.chunk_index,
+                punctuation_chain_health["chosen_source"],
+                punctuation_chain_health["punct_track_positions_total"],
+                punctuation_chain_health["preparation_punctuation_count"],
+                punctuation_chain_health["punctuation_fact_count"],
+                punctuation_chain_health["punctuation_chain_broken_reason"],
+            )
         soft_cut_observe_snapshot = host._update_soft_cut_observability(
             split_stats=split_stats,
             chunk_index=ctx.chunk_index,
@@ -1384,6 +1416,7 @@ class AlignmentStageService:
             "timeanchored_failed_span_count": 0.0,
             "timeanchored_boundary_candidate_count": float(len(stage_result.decision_ingress.boundary_hints)),
             "l7_error_count": float(output_error_count),
+            **punctuation_chain_health,
         }
         for key, value in stage_result.anchor_mount_result.metrics.items():
             ctx.finalization_metrics[f"anchor_mount_{key}"] = value
@@ -1463,32 +1496,76 @@ class AlignmentStageService:
         turn_id = host._resolve_turn_id_for_chunk(chunk)
         sv_words = host._build_sv_word_timestamps(sv_result, chunk)
         fast_stream = self._build_fast_direct_stream(words=sv_words)
-        boundary_evidences = self._timeanchored_sentence_segmenter.collect_boundary_evidences(
-            stream=fast_stream,
-            language=language,
+        tracks = ctx.text_tracks or TextTrackBundle()
+        ctx.text_tracks = tracks
+        normalize_sensevoice_result = getattr(host, "_normalize_sensevoice_result", None)
+        if tracks.sv_track is None and callable(normalize_sensevoice_result):
+            normalize_sensevoice_result(ctx)
+            tracks = ctx.text_tracks or tracks
+        if tracks.sv_track is None:
+            fallback_text = str(
+                sv_result.get("text_clean")
+                or sv_result.get("text_itn_raw")
+                or sv_result.get("text")
+                or sv_result.get("raw_text")
+                or ""
+            ).strip()
+            text_length = len(fallback_text)
+            mapping = list(range(text_length))
+            tracks.sv_track = TextTrack(
+                raw_text=fallback_text,
+                text_itn_raw=fallback_text,
+                text_clean=fallback_text,
+                char_mapping=[
+                    CharMapping(raw_idx=index, clean_idx=index, punct=None)
+                    for index in range(text_length)
+                ],
+                raw_to_clean=list(mapping),
+                clean_to_raw=list(mapping),
+                language=language,
+                source="sensevoice",
+                mapping_coverage=1.0 if text_length > 0 else 0.0,
+            )
+        if tracks.chosen_track is None:
+            clone_text_track = getattr(host, "_clone_text_track", None)
+            if callable(clone_text_track):
+                tracks.chosen_track = clone_text_track(tracks.sv_track, source="chosen")
+            else:
+                tracks.chosen_track = tracks.sv_track
+
+        punct_track = ctx.punct_track
+        punctuation_positions = list(punct_track.positions) if punct_track and punct_track.positions else None
+        punctuation_clean_text = (
+            punct_track.clean_text_ref
+            if punct_track and punct_track.clean_text_ref
+            else str(
+                getattr(tracks.chosen_track, "text_clean", "")
+                or sv_result.get("text_clean")
+                or sv_result.get("text_itn_raw")
+                or sv_result.get("text")
+                or ""
+            ).strip()
         )
-        run_result = host._finalize_timeanchored_stream(
-            final_stream=fast_stream,
-            boundary_evidences=boundary_evidences,
-            detected_language=language,
-            chosen_text_clean=str(
-                sv_result.get("text_clean")
-                or sv_result.get("text_itn_raw")
-                or sv_result.get("text")
-                or ""
-            ).strip(),
-            punctuation_positions=[],
-            punctuation_clean_text=str(
-                sv_result.get("text_clean")
-                or sv_result.get("text_itn_raw")
-                or sv_result.get("text")
-                or ""
-            ).strip(),
+        policy_snapshot = None
+        try:
+            policy_snapshot = build_language_policy_snapshot(language_hint=language)
+        except Exception:
+            host.logger.exception(
+                "Chunk {}: fast_direct 语言策略快照编译失败，回退空快照注入",
+                ctx.chunk_index,
+            )
+        run_result = host._run_collection_scoring_decision_once(
+            tracks=tracks,
+            sv_result=sv_result,
+            whisper_result=ctx.whisper_result or {},
+            sv_words=sv_words,
+            punctuation_positions=punctuation_positions,
+            punctuation_clean_text=punctuation_clean_text,
+            variant="legacy",
             speaker_id=speaker_id,
             turn_id=turn_id,
-            coverage=1.0 if fast_stream else 0.0,
-            route_confidence=1.0 if fast_stream else 0.0,
-            error_code="",
+            policy_snapshot=policy_snapshot,
+            is_fast_only_mode=True,
         )
         final_sentences = list(run_result.final_sentences)
 
@@ -1600,7 +1677,9 @@ class AlignmentStageService:
             "timeanchored_item_count": float(len(fast_stream)),
             "timeanchored_sentence_count": float(len(final_sentences)),
             "timeanchored_failed_span_count": 0.0,
-            "timeanchored_boundary_candidate_count": float(len(boundary_evidences)),
+            "timeanchored_boundary_candidate_count": float(
+                split_stats.get("boundary_candidate_count", 0.0) or 0.0
+            ),
             "l7_error_count": float(len(output_layer_result.output_payload.get("errors", []))),
         }
         for key, value in run_result.injection_stats.items():
@@ -1739,6 +1818,39 @@ class AlignmentStageService:
         ctx.finalization_metrics["alignment_pipeline_selected"] = 1.0 if selected else 0.0
         ctx.finalization_metrics["alignment_pipeline_reason"] = str(reason)
         ctx.finalization_metrics["alignment_pipeline_route"] = route
+
+    @staticmethod
+    def _build_punctuation_chain_health_metrics(
+        *,
+        chosen_source: str,
+        punct_track: Optional[PunctTrack],
+        preparation_punctuation_count: int,
+        punctuation_fact_count: int,
+    ) -> dict[str, Any]:
+        positions = tuple(getattr(punct_track, "positions", ()) or ()) if punct_track is not None else tuple()
+        sentence_end_marks = {"。", "！", "？", ".", "!", "?"}
+        track_sentence_end_count = sum(
+            1
+            for item in positions
+            if str(getattr(item, "punctuation", "") or "") in sentence_end_marks
+        )
+        broken_flag = 0
+        broken_reason = ""
+        if track_sentence_end_count > 0 and int(preparation_punctuation_count) <= 0:
+            broken_flag = 1
+            broken_reason = "punct_track_not_projected_to_preparation"
+        elif track_sentence_end_count > 0 and int(punctuation_fact_count) <= 0:
+            broken_flag = 1
+            broken_reason = "preparation_not_mapped_to_punctuation_facts"
+        return {
+            "chosen_source": str(chosen_source or "unknown"),
+            "punct_track_positions_total": int(len(positions)),
+            "punct_track_sentence_end_count": int(track_sentence_end_count),
+            "preparation_punctuation_count": int(preparation_punctuation_count),
+            "punctuation_fact_count": int(punctuation_fact_count),
+            "punctuation_chain_broken_flag": int(broken_flag),
+            "punctuation_chain_broken_reason": str(broken_reason),
+        }
 
     @staticmethod
     def _should_accept_timeanchored_result(

@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from app.services.timeanchored_alignment.preparation.contracts import SlowSlot
+from app.services.timeanchored_alignment.preparation.contracts import (
+    PunctuationEvidence,
+    PronunciationHint,
+    SlowSlot,
+)
 from app.services.timeanchored_alignment.slow_window.contracts import WindowSourceUnit
 
 
@@ -33,6 +37,8 @@ class SourceAttributionBinder:
         *,
         text: str,
         source_units: tuple[WindowSourceUnit, ...],
+        punctuation_evidences: tuple[PunctuationEvidence, ...] = tuple(),
+        pronunciation_hints: tuple[PronunciationHint, ...] = tuple(),
     ) -> tuple[SlowSlot, ...]:
         lexical_text = str(text or "")
         if not lexical_text:
@@ -108,4 +114,142 @@ class SourceAttributionBinder:
                 source_unit_ids=last.source_unit_ids,
             )
 
+        slots = self._split_slots_by_punctuation(
+            slots=slots,
+            lexical_text=lexical_text,
+            punctuation_evidences=punctuation_evidences,
+        )
+        slots = self._split_slots_by_pronunciation_hints(
+            slots=slots,
+            lexical_text=lexical_text,
+            pronunciation_hints=pronunciation_hints,
+        )
         return tuple(slots)
+
+    @staticmethod
+    def _split_slots_by_punctuation(
+        *,
+        slots: list[SlowSlot],
+        lexical_text: str,
+        punctuation_evidences: tuple[PunctuationEvidence, ...],
+    ) -> list[SlowSlot]:
+        split_marks = frozenset({"。", "！", "？", ".", "!", "?", "，", ",", "；", ";", "：", ":"})
+        split_points = sorted(
+            {
+                int(item.source_char_index) + (1 if str(item.attach_side) == "after" else 0)
+                for item in punctuation_evidences
+                if str(item.mark or "") in split_marks
+            }
+        )
+        if not split_points:
+            return slots
+        return SourceAttributionBinder._split_slots_by_boundaries(
+            slots=slots,
+            lexical_text=lexical_text,
+            split_points=tuple(split_points),
+            tag="punct",
+        )
+
+    @staticmethod
+    def _split_slots_by_pronunciation_hints(
+        *,
+        slots: list[SlowSlot],
+        lexical_text: str,
+        pronunciation_hints: tuple[PronunciationHint, ...],
+    ) -> list[SlowSlot]:
+        # under-segmentation 防线：保持完整 window 直传，只在 slot 粒度明显过粗时按 token 边界细分。
+        # 触发条件使用“hints/slots 密度”而非 long/short window 分类，避免引入窗口分型语义。
+        hint_count = len(pronunciation_hints)
+        slot_count = len(slots)
+        if slot_count <= 0 or hint_count < 16:
+            return slots
+        avg_hints_per_slot = hint_count / float(slot_count)
+        if avg_hints_per_slot < 10.0:
+            return slots
+        split_points = sorted(
+            {
+                int(item.char_end)
+                for item in pronunciation_hints
+                if int(item.char_end) > 0
+            }
+        )
+        if not split_points:
+            return slots
+        return SourceAttributionBinder._split_slots_by_boundaries(
+            slots=slots,
+            lexical_text=lexical_text,
+            split_points=tuple(split_points),
+            tag="hint",
+        )
+
+    @staticmethod
+    def _split_slots_by_boundaries(
+        *,
+        slots: list[SlowSlot],
+        lexical_text: str,
+        split_points: tuple[int, ...],
+        tag: str,
+    ) -> list[SlowSlot]:
+        refined: list[SlowSlot] = []
+        for slot in slots:
+            boundaries = [slot.char_start]
+            boundaries.extend(
+                point
+                for point in split_points
+                if slot.char_start < point < slot.char_end
+            )
+            boundaries.append(slot.char_end)
+
+            if len(boundaries) <= 2:
+                refined.append(slot)
+                continue
+
+            created = 0
+            for index in range(len(boundaries) - 1):
+                raw_start = int(boundaries[index])
+                raw_end = int(boundaries[index + 1])
+                start = SourceAttributionBinder._trim_left_whitespace(
+                    text=lexical_text,
+                    start=raw_start,
+                    end=raw_end,
+                )
+                end = SourceAttributionBinder._trim_right_whitespace(
+                    text=lexical_text,
+                    start=start,
+                    end=raw_end,
+                )
+                if end <= start:
+                    continue
+                created += 1
+                refined.append(
+                    SlowSlot(
+                        slot_id=f"{slot.slot_id}:{tag}-{index}:{start}-{end}",
+                        text=lexical_text[start:end],
+                        char_start=start,
+                        char_end=end,
+                        speaker_id=slot.speaker_id,
+                        turn_id=slot.turn_id,
+                        source_chunk_ids=slot.source_chunk_ids,
+                        source_chunk_indices=slot.source_chunk_indices,
+                        source_unit_ids=slot.source_unit_ids,
+                    )
+                )
+
+            if created <= 0:
+                refined.append(slot)
+
+        return refined
+
+    @staticmethod
+    def _trim_left_whitespace(*, text: str, start: int, end: int) -> int:
+        cursor = int(start)
+        while cursor < int(end) and str(text[cursor]).isspace():
+            cursor += 1
+        return cursor
+
+    @staticmethod
+    def _trim_right_whitespace(*, text: str, start: int, end: int) -> int:
+        cursor = int(end)
+        while cursor > int(start) and str(text[cursor - 1]).isspace():
+            cursor -= 1
+        return cursor
