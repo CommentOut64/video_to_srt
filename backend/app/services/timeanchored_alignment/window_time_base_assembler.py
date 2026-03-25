@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable
 
 from app.schemas.pipeline_context import ProcessingContext
@@ -54,12 +54,18 @@ class WindowTimeBaseAssembler:
         frame_stride = 0.06
         language = ready_window.language_profile.primary_language or "auto"
 
+        chunk_bindings_by_index = {
+            int(binding.chunk_index): binding
+            for binding in ready_window.coverage.chunk_bindings
+        }
+
         for chunk_index in ready_window.source_chunk_indices:
             package = packages_by_index.get(int(chunk_index))
             if package is None:
                 continue
-            raw_units.extend(package.raw_units)
-            word_units.extend(package.word_units)
+            binding = chunk_bindings_by_index.get(int(chunk_index))
+            raw_units.extend(self._rebase_units(package.raw_units, binding=binding))
+            word_units.extend(self._rebase_units(package.word_units, binding=binding))
             blank_ratio += float(package.quality.blank_ratio)
             avg_max_prob += float(package.quality.avg_max_prob)
             low_prob_ratio += float(package.quality.low_prob_ratio)
@@ -94,4 +100,44 @@ class WindowTimeBaseAssembler:
             chunk_bindings=ready_window.coverage.chunk_bindings,
             metadata=metadata,
             frame_stride=frame_stride,
+        )
+
+    @staticmethod
+    def _rebase_units(
+        units: Iterable[TimeBaseUnit],
+        *,
+        binding: WindowChunkBinding | None,
+    ) -> tuple[TimeBaseUnit, ...]:
+        resolved_units = tuple(units or ())
+        if not resolved_units or binding is None:
+            return resolved_units
+
+        chunk_start = float(getattr(binding, "chunk_start", 0.0) or 0.0)
+        chunk_end = float(getattr(binding, "chunk_end", chunk_start) or chunk_start)
+        chunk_duration = max(chunk_end - chunk_start, 0.0)
+        min_start = min(float(unit.start) for unit in resolved_units)
+        max_end = max(float(unit.end) for unit in resolved_units)
+        tolerance = 1e-4
+
+        is_already_absolute = (
+            min_start >= (chunk_start - tolerance)
+            and max_end <= (chunk_end + tolerance)
+        )
+        if is_already_absolute:
+            return resolved_units
+
+        is_chunk_relative = (
+            min_start >= -tolerance
+            and max_end <= (chunk_duration + tolerance)
+        )
+        if not is_chunk_relative:
+            return resolved_units
+
+        return tuple(
+            replace(
+                unit,
+                start=float(unit.start) + chunk_start,
+                end=float(unit.end) + chunk_start,
+            )
+            for unit in resolved_units
         )

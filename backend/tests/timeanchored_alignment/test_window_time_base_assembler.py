@@ -115,3 +115,23 @@ def test_window_time_base_assembler_aggregates_multiple_chunk_time_bases() -> No
     assert package.source_chunk_indices == (2, 3)
     assert tuple(binding.chunk_index for binding in package.chunk_bindings) == (2, 3)
     assert tuple(unit.text for unit in package.raw_units) == ("你", "好")
+
+
+def test_window_time_base_assembler_rebases_chunk_relative_units_to_absolute_timeline() -> None:
+    assembler = WindowTimeBaseAssembler()
+    ready_window = _build_ready_window()
+    contexts = [
+        _build_ctx(index=2, start=0.0, end=0.6, text="你"),
+        _build_ctx(index=3, start=0.0, end=0.5, text="好"),
+    ]
+
+    package = assembler.assemble(ready_window=ready_window, source_contexts=contexts)
+
+    assert tuple((unit.start, unit.end) for unit in package.raw_units) == (
+        (0.0, 0.6),
+        (1.0, 1.5),
+    )
+    assert tuple((unit.start, unit.end) for unit in package.word_units) == (
+        (0.0, 0.6),
+        (1.0, 1.5),
+    )

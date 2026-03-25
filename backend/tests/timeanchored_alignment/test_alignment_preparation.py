@@ -125,6 +125,101 @@ def _build_ready_window(*, text_a: str = "你好", text_b: str = "世界") -> Re
     )
 
 
+def _build_english_ready_window(
+    *,
+    text_a: str = "Wouldn't it make sense.",
+    text_b: str = "It's not like I even wanted to graduate anyways.",
+) -> ReadySlowWindow:
+    return ReadySlowWindow(
+        window_id="window-en-001",
+        owner_chunk_id="chunk-en-1",
+        owner_chunk_index=1,
+        window_mode="steady",
+        flush_reason="test_flush",
+        audio_segments=((0.0, 1.0), (1.0, 2.0)),
+        coverage=WindowCoverage(
+            core_segments=((0.0, 2.0),),
+            left_guard_sec=0.0,
+            right_guard_sec=0.0,
+            chunk_bindings=(
+                WindowChunkBinding(
+                    chunk_id="chunk-en-1",
+                    chunk_index=1,
+                    chunk_start=0.0,
+                    chunk_end=1.0,
+                    overlap_ratio=1.0,
+                    role="owner",
+                    is_owner=True,
+                ),
+                WindowChunkBinding(
+                    chunk_id="chunk-en-2",
+                    chunk_index=2,
+                    chunk_start=1.0,
+                    chunk_end=2.0,
+                    overlap_ratio=1.0,
+                    role="core",
+                    is_owner=False,
+                ),
+            ),
+        ),
+        source_semantic_chunk_ids=("sem-en-1", "sem-en-2"),
+        source_chunk_ids=("chunk-en-1", "chunk-en-2"),
+        source_chunk_indices=(1, 2),
+        source_units=(
+            WindowSourceUnit(
+                unit_id="unit-en-1",
+                semantic_chunk_id="sem-en-1",
+                text=text_a,
+                audio_start=0.0,
+                audio_end=1.0,
+                source_chunk_ids=("chunk-en-1",),
+                source_chunk_indices=(1,),
+                speaker_id="speaker-en",
+                turn_id="turn-en-1",
+                language="en",
+                arrived_at=1.0,
+            ),
+            WindowSourceUnit(
+                unit_id="unit-en-2",
+                semantic_chunk_id="sem-en-2",
+                text=text_b,
+                audio_start=1.0,
+                audio_end=2.0,
+                source_chunk_ids=("chunk-en-2",),
+                source_chunk_indices=(2,),
+                speaker_id="speaker-en",
+                turn_id="turn-en-2",
+                language="en",
+                arrived_at=2.0,
+            ),
+        ),
+        dialogue_shape=DialogueShapeSnapshot(
+            shape="single_speaker",
+            speaker_count=1,
+            dominant_speaker_id="speaker-en",
+            dominant_speaker_ratio=1.0,
+            speaker_switch_count=0,
+            speaker_switch_density=0.0,
+            turn_count=2,
+            avg_turn_duration_sec=1.0,
+        ),
+        language_profile=WindowLanguageProfile(
+            primary_language="en",
+            language_mix_state="single_language",
+            decision_domains=("timeanchored_alignment",),
+            should_bypass_whisper=False,
+        ),
+        prompt_seed=PromptSeed(text=f"{text_a} {text_b}".strip()),
+        batch_hint=WindowBatchHint(
+            duration_bucket="short",
+            token_estimate=16,
+            acoustic_density_hint="medium",
+            queue_priority=1,
+        ),
+        created_at=3.0,
+    )
+
+
 def _build_window_time_base() -> WindowTimeBasePackage:
     units = (
         TimeBaseUnit(text="你", start=0.0, end=0.1, confidence=0.9, token_type="word"),
@@ -310,3 +405,21 @@ def test_alignment_preparation_preserves_slow_timestamps_for_edge_selector_fallb
 
     assert package.compat.text_truth.units
     assert any(unit.start is not None and unit.end is not None for unit in package.compat.text_truth.units)
+
+
+def test_alignment_preparation_keeps_slot_boundaries_stable_when_projection_preserves_contractions() -> None:
+    whisper_text = "Wouldn't it make sense. It's not like I even wanted to graduate anyways."
+    package = AlignmentPreparationAssembler().prepare(
+        ready_window=_build_english_ready_window(),
+        window_time_base=_build_window_time_base(),
+        whisper_result=_build_whisper_result(whisper_text),
+        default_language="en",
+    )
+
+    assert package.slow_text.window_text.text == (
+        "Wouldn't it make sense It's not like I even wanted to graduate anyways"
+    )
+    assert tuple(slot.text for slot in package.slow_text.slots) == (
+        "Wouldn't it make sense",
+        "It's not like I even wanted to graduate anyways",
+    )

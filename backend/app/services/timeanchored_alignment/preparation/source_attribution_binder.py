@@ -2,19 +2,27 @@
 
 from __future__ import annotations
 
-import unicodedata
-
 from app.services.timeanchored_alignment.preparation.contracts import SlowSlot
 from app.services.timeanchored_alignment.slow_window.contracts import WindowSourceUnit
 
 
+def _is_key_char(char: str) -> bool:
+    return char.isalnum() or ("\u4e00" <= char <= "\u9fff")
+
+
 def _normalize_slot_text(text: str) -> str:
-    chars: list[str] = []
-    for char in str(text or ""):
-        if unicodedata.category(char).startswith("P"):
+    return "".join(char.lower() for char in str(text or "") if _is_key_char(char))
+
+
+def _build_lexical_key_positions(text: str) -> tuple[str, tuple[int, ...]]:
+    key_chars: list[str] = []
+    char_positions: list[int] = []
+    for index, char in enumerate(str(text or "")):
+        if not _is_key_char(char):
             continue
-        chars.append(char)
-    return "".join(chars)
+        key_chars.append(char.lower())
+        char_positions.append(index)
+    return "".join(key_chars), tuple(char_positions)
 
 
 class SourceAttributionBinder:
@@ -31,30 +39,35 @@ class SourceAttributionBinder:
             return tuple()
 
         slots: list[SlowSlot] = []
-        cursor = 0
         text_length = len(lexical_text)
+        lexical_key, lexical_key_positions = _build_lexical_key_positions(lexical_text)
+        key_length = len(lexical_key)
+        key_cursor = 0
         normalized_units = [
             (unit, _normalize_slot_text(unit.text))
             for unit in source_units
+            if _normalize_slot_text(unit.text)
         ]
 
         for index, (unit, normalized_text) in enumerate(normalized_units):
-            if cursor >= text_length:
+            if key_cursor >= key_length:
                 break
-            span_length = len(normalized_text)
-            if span_length <= 0:
-                continue
+            start_key = key_cursor
             if index == len(normalized_units) - 1:
-                end = text_length
+                end_key = key_length
             else:
-                end = min(text_length, cursor + span_length)
-            if end <= cursor:
+                end_key = min(key_length, key_cursor + len(normalized_text))
+            if end_key <= start_key:
+                continue
+            start = lexical_key_positions[start_key]
+            end = lexical_key_positions[end_key - 1] + 1
+            if end <= start:
                 continue
             slots.append(
                 SlowSlot(
-                    slot_id=f"{unit.unit_id}:{cursor}-{end}",
-                    text=lexical_text[cursor:end],
-                    char_start=cursor,
+                    slot_id=f"{unit.unit_id}:{start}-{end}",
+                    text=lexical_text[start:end],
+                    char_start=start,
                     char_end=end,
                     speaker_id=unit.speaker_id,
                     turn_id=unit.turn_id,
@@ -63,7 +76,7 @@ class SourceAttributionBinder:
                     source_unit_ids=(unit.unit_id,),
                 )
             )
-            cursor = end
+            key_cursor = end_key
 
         if not slots and source_units:
             unit = source_units[0]
@@ -81,7 +94,7 @@ class SourceAttributionBinder:
                 ),
             )
 
-        if cursor < text_length and slots:
+        if slots and slots[-1].char_end < text_length:
             last = slots[-1]
             slots[-1] = SlowSlot(
                 slot_id=last.slot_id,
