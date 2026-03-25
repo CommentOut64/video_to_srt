@@ -46,6 +46,10 @@ from app.services.timeanchored_alignment.output_projection.output_projector impo
     OutputProjectionInput,
     OutputProjector,
 )
+from app.pipelines.dual_pipeline.services.postprocess_trace_writer import PostprocessTraceWriter
+from app.pipelines.dual_pipeline.services.anchor_mount_graph_renderer import (
+    AnchorMountGraphRenderer,
+)
 
 
 class AlignmentStageService:
@@ -62,6 +66,16 @@ class AlignmentStageService:
         self._timeanchored_stage_service = AnchorMountAlignmentService()
         self._decision_ingress_adapter = DecisionIngressAdapter()
         self._output_projector = OutputProjector()
+        self._postprocess_trace_writer = PostprocessTraceWriter(
+            logger=getattr(host, "logger", None),
+            enabled=bool(getattr(host, "_postprocess_trace_enabled", False)),
+            level=str(getattr(host, "_postprocess_trace_level", "summary") or "summary"),
+        )
+        self._anchor_mount_graph_renderer = AnchorMountGraphRenderer()
+        graph_mode = str(getattr(host, "_anchor_mount_graph", "off") or "off").strip().lower()
+        if graph_mode not in {"off", "svg", "html", "both"}:
+            graph_mode = "off"
+        self._anchor_mount_graph_mode = graph_mode
 
     async def run(self, ctx: ProcessingContext) -> None:
         """执行单个 chunk 的对齐阶段。"""
@@ -773,6 +787,31 @@ class AlignmentStageService:
                 len(window_time_base.word_units),
                 len(fallback_text),
             )
+            self._trace_write(
+                ctx=ctx,
+                filename="10_preparation.input.json",
+                stage="preparation_input",
+                summary_payload={
+                    "window_id": str(ready_window.window_id),
+                    "owner_chunk_id": str(ready_window.owner_chunk_id),
+                    "owner_chunk_index": int(ready_window.owner_chunk_index),
+                    "source_chunk_ids": list(ready_window.source_chunk_ids),
+                    "source_chunk_indices": list(ready_window.source_chunk_indices),
+                    "source_units_count": len(ready_window.source_units),
+                    "time_base_raw_units_count": len(window_time_base.raw_units),
+                    "time_base_word_units_count": len(window_time_base.word_units),
+                    "fallback_text_len": len(fallback_text),
+                    "language_hint": base_language,
+                },
+                full_payload={
+                    "ready_window": ready_window,
+                    "window_time_base": window_time_base,
+                    "fallback_text": fallback_text,
+                    "language_hint": base_language,
+                    "whisper_result": whisper_result,
+                    "sv_result": sv_result,
+                },
+            )
             preparation = self._timeanchored_preparation_assembler.prepare(
                 ready_window=ready_window,
                 window_time_base=window_time_base,
@@ -780,9 +819,25 @@ class AlignmentStageService:
                 default_language=base_language,
                 fallback_text=fallback_text,
             )
+            self._trace_write(
+                ctx=ctx,
+                filename="11_preparation.output.json",
+                stage="preparation_output",
+                summary_payload={
+                    "window_id": str(preparation.window_id),
+                    "owner_chunk_id": str(preparation.owner_chunk_id),
+                    "owner_chunk_index": int(preparation.owner_chunk_index),
+                    "slot_count": len(preparation.slow_text.slots),
+                    "hook_count": len(preparation.fast_hooks),
+                    "punctuation_evidence_count": len(preparation.slow_text.punctuation_evidences),
+                    "pronunciation_hint_count": len(preparation.slow_text.pronunciation_hints),
+                },
+                full_payload=preparation,
+            )
             self._commit_preparation_context(ctx=ctx, preparation=preparation)
 
             return self._execute_prepared_timeanchored_stage(
+                ctx=ctx,
                 preparation=preparation,
                 language=base_language,
             )
@@ -796,6 +851,7 @@ class AlignmentStageService:
     def _execute_prepared_timeanchored_stage(
         self,
         *,
+        ctx: ProcessingContext,
         preparation: AlignmentPreparationPackage,
         language: str,
     ) -> AnchorMountStageResult:
@@ -807,10 +863,48 @@ class AlignmentStageService:
             len(preparation.fast_hooks),
             len(preparation.slow_text.punctuation_evidences),
         )
-        return self._timeanchored_stage_service.execute(
+        self._trace_write(
+            ctx=ctx,
+            filename="20_anchor_mount.input.json",
+            stage="anchor_mount_input",
+            summary_payload={
+                "window_id": str(preparation.window_id),
+                "owner_chunk_id": str(preparation.owner_chunk_id),
+                "slot_count": len(preparation.slow_text.slots),
+                "hook_count": len(preparation.fast_hooks),
+                "punctuation_evidence_count": len(preparation.slow_text.punctuation_evidences),
+                "language": language,
+            },
+            full_payload={
+                "preparation": preparation,
+                "language": language,
+            },
+        )
+        stage_result = self._timeanchored_stage_service.execute(
             preparation=preparation,
             language=language,
         )
+        if isinstance(stage_result, AnchorMountStageResult):
+            self._trace_write(
+                ctx=ctx,
+                filename="21_anchor_mount.output.json",
+                stage="anchor_mount_output",
+                summary_payload={
+                    "window_id": str(stage_result.decision_ingress.window_id),
+                    "token_count": len(stage_result.decision_ingress.tokens),
+                    "boundary_hint_count": len(stage_result.decision_ingress.boundary_hints),
+                    "cross_chunk_lock_count": len(stage_result.decision_ingress.cross_chunk_locks),
+                    "should_fallback": bool(stage_result.anchor_mount_result.should_fallback),
+                    "metrics": dict(stage_result.anchor_mount_result.metrics),
+                },
+                full_payload=stage_result,
+            )
+            self._emit_anchor_mount_graph(
+                ctx=ctx,
+                preparation=preparation,
+                stage_result=stage_result,
+            )
+        return stage_result
 
     def _commit_preparation_context(
         self,
@@ -1039,11 +1133,51 @@ class AlignmentStageService:
             speaker_id=speaker_id,
             turn_id=turn_id,
         )
+        self._trace_write(
+            ctx=ctx,
+            filename="30_decision_ingress.input.json",
+            stage="decision_ingress_input",
+            summary_payload={
+                "window_id": str(stage_result.decision_ingress.window_id),
+                "token_count": len(stage_result.decision_ingress.tokens),
+                "punctuation_fact_count": len(stage_result.decision_ingress.punctuation_facts),
+                "boundary_hint_count": len(stage_result.decision_ingress.boundary_hints),
+                "cross_chunk_lock_count": len(stage_result.decision_ingress.cross_chunk_locks),
+                "coverage_owner_chunks": len(stage_result.decision_ingress.source_chunk_ids),
+            },
+            full_payload=stage_result.decision_ingress,
+        )
+        self._trace_write(
+            ctx=ctx,
+            filename="31_decision_ingress.output.json",
+            stage="decision_ingress_output",
+            summary_payload={
+                "stream_id": str(adapter_result.stream_id),
+                "chunk_index": int(adapter_result.chunk_index),
+                "fallback_clean_text_len": len(
+                    str(adapter_result.decision_input.fallback_clean_text_ref or "")
+                ),
+                "compat_report": dict(adapter_result.compat_report),
+            },
+            full_payload=adapter_result,
+        )
         decision_output = host._decision_processor.process(
             adapter_result.decision_input,
             stream_id=adapter_result.stream_id,
             chunk_index=adapter_result.chunk_index,
             is_last_chunk=host._is_last_chunk_index(adapter_result.chunk_index),
+        )
+        self._trace_write(
+            ctx=ctx,
+            filename="40_decision.output.json",
+            stage="decision_output",
+            summary_payload={
+                "sentence_count": len(decision_output.sentence_segments),
+                "trace_count": len(decision_output.output_traces),
+                "segmentation_report": dict(decision_output.segmentation_report or {}),
+                "has_subtitle_batch": bool(getattr(decision_output, "subtitle_batch", None)),
+            },
+            full_payload=decision_output,
         )
         final_sentences = list(decision_output.sentence_segments)
         fallback_error_code = ""
@@ -1146,7 +1280,23 @@ class AlignmentStageService:
             decision_output=decision_output,
             split_stats=split_stats,
         )
+        self._trace_write(
+            ctx=ctx,
+            filename="50_output_projection.output.json",
+            stage="output_projection_output",
+            summary_payload={
+                "projected_chunk_count": len(projected_batches),
+                "owner_chunk_index": int(stage_result.decision_ingress.owner_chunk_index),
+                "source_chunk_indices": list(stage_result.decision_ingress.source_chunk_indices),
+            },
+            full_payload={
+                "projected_batches": projected_batches,
+                "owner_chunk_index": int(stage_result.decision_ingress.owner_chunk_index),
+                "source_chunk_indices": list(stage_result.decision_ingress.source_chunk_indices),
+            },
+        )
         output_error_count = 0
+        dispatch_payloads: list[dict[str, Any]] = []
         for projected_batch in projected_batches:
             output_layer_result = host._emit_output_layer(
                 chunk_index=(
@@ -1184,6 +1334,30 @@ class AlignmentStageService:
                 subtitle_batch=projected_batch,
             )
             output_error_count += len(output_layer_result.output_payload.get("errors", []))
+            dispatch_payloads.append(
+                {
+                    "dispatch_chunk_index": (
+                        projected_batch.chunk_index
+                        if projected_batch.chunk_index is not None
+                        else projected_batch.chunk_id
+                    ),
+                    "subtitle_count": len(getattr(projected_batch, "subtitles", ()) or ()),
+                    "error_count": len(output_layer_result.output_payload.get("errors", [])),
+                }
+            )
+        self._trace_write(
+            ctx=ctx,
+            filename="60_output_dispatch.payload.json",
+            stage="output_dispatch_payload",
+            summary_payload={
+                "dispatch_count": len(dispatch_payloads),
+                "dispatch_payloads": dispatch_payloads,
+            },
+            full_payload={
+                "dispatch_payloads": dispatch_payloads,
+                "projected_batches": projected_batches,
+            },
+        )
         ctx.final_sentences = list(final_sentences)
         ctx.finalization_metrics = {
             "coverage": float(
@@ -1444,6 +1618,91 @@ class AlignmentStageService:
             len(final_sentences),
             reason,
         )
+
+    def _trace_write(
+        self,
+        *,
+        ctx: ProcessingContext,
+        filename: str,
+        stage: str,
+        summary_payload: Any,
+        full_payload: Any = None,
+    ) -> None:
+        writer = self._postprocess_trace_writer
+        if not writer.enabled:
+            return
+        payload = full_payload if writer.level == "full" and full_payload is not None else summary_payload
+        try:
+            writer.write_stage(
+                job_dir=ctx.job_dir,
+                chunk_index=int(ctx.chunk_index),
+                filename=filename,
+                payload=payload,
+                stage=stage,
+            )
+        except Exception:
+            self._host.logger.exception(
+                "Chunk {}: 写入后处理追踪失败 stage={} filename={}",
+                ctx.chunk_index,
+                stage,
+                filename,
+            )
+
+    def _emit_anchor_mount_graph(
+        self,
+        *,
+        ctx: ProcessingContext,
+        preparation: AlignmentPreparationPackage,
+        stage_result: AnchorMountStageResult,
+    ) -> None:
+        if not self._postprocess_trace_writer.enabled:
+            return
+        if self._anchor_mount_graph_mode == "off":
+            return
+        try:
+            graph_payload = self._anchor_mount_graph_renderer.build_graph_payload(
+                window_id=str(stage_result.decision_ingress.window_id),
+                items=stage_result.anchor_mount_result.items,
+                hooks=preparation.fast_hooks,
+                metrics=stage_result.anchor_mount_result.metrics,
+            )
+            self._postprocess_trace_writer.write_stage(
+                job_dir=ctx.job_dir,
+                chunk_index=int(ctx.chunk_index),
+                filename="21_anchor_mount.graph.json",
+                payload=graph_payload,
+                stage="anchor_mount_graph",
+            )
+            if self._anchor_mount_graph_mode in {"svg", "both"}:
+                svg_body = self._anchor_mount_graph_renderer.render_svg(graph_payload)
+                self._postprocess_trace_writer.write_graph_artifact(
+                    job_dir=ctx.job_dir,
+                    chunk_index=int(ctx.chunk_index),
+                    filename="21_anchor_mount.graph.svg",
+                    body=svg_body,
+                    stage="anchor_mount_graph",
+                    media_type="image/svg+xml",
+                )
+            if self._anchor_mount_graph_mode in {"html", "both"}:
+                svg_body = self._anchor_mount_graph_renderer.render_svg(graph_payload)
+                html_body = (
+                    "<!doctype html><html><head><meta charset='utf-8'>"
+                    "<title>Anchor Mount Graph</title></head><body>"
+                    f"{svg_body}</body></html>"
+                )
+                self._postprocess_trace_writer.write_graph_artifact(
+                    job_dir=ctx.job_dir,
+                    chunk_index=int(ctx.chunk_index),
+                    filename="21_anchor_mount.graph.html",
+                    body=html_body,
+                    stage="anchor_mount_graph",
+                    media_type="text/html",
+                )
+        except Exception:
+            self._host.logger.exception(
+                "Chunk {}: 生成锚点挂载图失败",
+                ctx.chunk_index,
+            )
 
     def _record_hetero_alignment_result(
         self,

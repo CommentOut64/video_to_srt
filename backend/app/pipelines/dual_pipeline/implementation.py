@@ -262,6 +262,9 @@ class AsyncDualPipelineKernel:
         enable_cross_chunk_merge: bool = True,
         bridge_controller: Optional[BridgeController] = None,
         debug_punctuation: bool = False,
+        postprocess_trace_enabled: bool = True,
+        postprocess_trace_level: str = "summary",
+        anchor_mount_graph: str = "svg",
         is_enable_speaker_detection: bool = True,
         is_enable_speaker_guided_split: bool = True,
         speaker_count: int = 0,
@@ -296,6 +299,9 @@ class AsyncDualPipelineKernel:
             enable_cross_chunk_merge: 是否启用跨 chunk 合并
             bridge_controller: Bridge 控制器实例（可选）
             debug_punctuation: 是否启用标点调试输出
+            postprocess_trace_enabled: 是否启用后处理全链路落盘
+            postprocess_trace_level: 后处理落盘级别（summary/full）
+            anchor_mount_graph: 锚点挂载图输出格式（off/svg/html/both）
             logger: 日志记录器
             cancellation_token: 取消令牌（可选，v3.1.0）
             progress_emitter: 进度发射器（可选，V3.1.0）
@@ -318,6 +324,15 @@ class AsyncDualPipelineKernel:
         self._edge_selection_mode = self._normalize_edge_selection_mode(edge_selection_mode)
         self.enable_cross_chunk_merge = enable_cross_chunk_merge
         self.debug_punctuation = debug_punctuation
+        self._postprocess_trace_enabled = bool(postprocess_trace_enabled)
+        normalized_trace_level = str(postprocess_trace_level or "summary").strip().lower()
+        if normalized_trace_level not in {"summary", "full"}:
+            normalized_trace_level = "summary"
+        self._postprocess_trace_level = normalized_trace_level
+        normalized_anchor_mount_graph = str(anchor_mount_graph or "off").strip().lower()
+        if normalized_anchor_mount_graph not in {"off", "svg", "html", "both"}:
+            normalized_anchor_mount_graph = "off"
+        self._anchor_mount_graph = normalized_anchor_mount_graph
         self.user_glossary = user_glossary
         self.previous_whisper_text: Optional[str] = None
         self._job_dir: Optional[Path] = None

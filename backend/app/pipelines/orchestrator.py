@@ -186,6 +186,15 @@ class PipelineOrchestrator:
                 env_value=os.getenv("DEBUG_PUNCTUATION"),
                 config_value=bool(getattr(debug_config, "punctuation_output", False)),
             )
+            postprocess_trace_enabled = bool(
+                getattr(debug_config, "postprocess_trace_enabled", True)
+            )
+            postprocess_trace_level = str(
+                getattr(debug_config, "postprocess_trace_level", "summary") or "summary"
+            ).strip().lower()
+            anchor_mount_graph = str(
+                getattr(debug_config, "anchor_mount_graph", "svg") or "svg"
+            ).strip().lower()
             preprocessing = getattr(job.settings, "preprocessing", None)
             is_enable_speaker_detection = bool(
                 getattr(preprocessing, "is_enable_speaker_detection", True)
@@ -214,6 +223,9 @@ class PipelineOrchestrator:
                 patching_threshold=profile_config.patching_threshold,
                 edge_selection_mode=edge_selection_mode,
                 debug_punctuation=debug_punctuation,
+                postprocess_trace_enabled=postprocess_trace_enabled,
+                postprocess_trace_level=postprocess_trace_level,
+                anchor_mount_graph=anchor_mount_graph,
                 is_enable_speaker_detection=is_enable_speaker_detection,
                 is_enable_speaker_guided_split=is_enable_speaker_guided_split,
                 speaker_count=speaker_count,
