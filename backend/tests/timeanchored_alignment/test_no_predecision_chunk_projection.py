@@ -178,8 +178,10 @@ def test_execute_prepared_timeanchored_stage_returns_anchor_mount_stage_result()
     host = SimpleNamespace(logger=SimpleNamespace(debug=lambda *args, **kwargs: None))
     service = AlignmentStageService(host=host)
     preparation = _build_preparation_package()
+    ctx = SimpleNamespace(chunk_index=0, job_dir=None)
 
     result = service._execute_prepared_timeanchored_stage(
+        ctx=ctx,
         preparation=preparation,
         language="zh",
     )
