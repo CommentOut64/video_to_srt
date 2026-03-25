@@ -142,6 +142,15 @@ class DebugSettingsAPI(BaseModel):
     调试配置 API 模型
     """
     punctuation_output: bool = Field(default=False, description="标点调试输出（SSE + 文件）")
+    postprocess_trace_enabled: bool = Field(default=True, description="后处理全链路追踪落盘开关")
+    postprocess_trace_level: Literal["summary", "full"] = Field(
+        default="summary",
+        description="后处理追踪粒度",
+    )
+    anchor_mount_graph: Literal["off", "svg", "html", "both"] = Field(
+        default="svg",
+        description="锚点挂载图输出格式",
+    )
 
 
 class TaskConfigAPI(BaseModel):
