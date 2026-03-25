@@ -4,7 +4,7 @@ from app.services.language_policy.types import (
     WINDOW_KIND_SINGLE_LANGUAGE,
     WINDOW_KIND_TRUE_MIXED,
 )
-from app.services.timeanchored_alignment import ChunkWindow, TimeanchoredAlignmentStageService
+from app.services.timeanchored_alignment.chunk_projector import ChunkWindow
 from app.services.timeanchored_alignment.contracts import (
     LanguageRun,
     LanguageRunPackage,
@@ -18,6 +18,9 @@ from app.services.timeanchored_alignment.contracts import (
     TimeBaseUnit,
     TokenToPhoneSpan,
     TokenUnit,
+)
+from app.services.timeanchored_alignment.stage_service import (
+    TimeanchoredAlignmentStageService,
 )
 
 

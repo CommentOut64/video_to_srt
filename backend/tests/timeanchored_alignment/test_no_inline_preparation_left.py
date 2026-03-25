@@ -206,8 +206,10 @@ def test_run_timeanchored_main_chain_delegates_to_preparation_service(monkeypatc
     )
 
     assert result is expected_result
-    assert captured["time_base"] is preparation.compat.time_base
-    assert captured["text_truth"] is preparation.compat.text_truth
-    assert captured["language_runs"] is preparation.compat.language_runs
-    assert captured["pronunciation"] is preparation.compat.pronunciation
-    assert captured["chunk_window"] is preparation.compat.chunk_window
+    assert captured["preparation"] is preparation
+    assert captured["language"] == "zh"
+    assert "time_base" not in captured
+    assert "text_truth" not in captured
+    assert "language_runs" not in captured
+    assert "pronunciation" not in captured
+    assert "chunk_window" not in captured

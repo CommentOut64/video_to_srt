@@ -298,6 +298,8 @@ class DecisionLayerInput:
     fused_evidence: Optional[FusedEvidence] = None
     fallback_clean_text_ref: str = ""
     fallback_punctuation_positions: List[PuncPosition] = field(default_factory=list)
+    canonical_punctuation_facts: Tuple[Any, ...] = field(default_factory=tuple)
+    canonical_candidate_boundaries: Tuple[Any, ...] = field(default_factory=tuple)
     policy_snapshot: Optional["LanguagePolicySnapshot"] = None
     allow_fast_draft_fallback: bool = True
     ingress_context: Optional["SegmentationIngressContext"] = None

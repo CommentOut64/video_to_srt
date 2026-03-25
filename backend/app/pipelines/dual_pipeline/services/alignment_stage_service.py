@@ -17,23 +17,17 @@ from app.pipelines.dual_pipeline.services.textflow_facade_service import Layer45
 from app.schemas.pipeline_context import ProcessingContext
 from app.services.alignment.types import PunctTrack
 from app.services.language_policy import build_language_policy_snapshot
-from app.services.timeanchored_alignment import (
-    AlignmentItem,
-    ChunkWindow,
-    ChunkProjector,
-    EdgeSelector,
-    OutputAdapter,
-    PhoneticAligner,
-    SentenceSegmenter,
-    SubtitleAssembler,
-    TimeanchoredAlignmentStageService,
-    TimeanchoredStageResult,
-    TextAligner,
+from app.services.textflow.decision_ingress_adapter import DecisionIngressAdapter
+from app.services.timeanchored_alignment import AlignmentItem
+from app.services.timeanchored_alignment.anchor_mount.service import (
+    AnchorMountAlignmentService,
+    AnchorMountStageResult,
 )
 from app.services.timeanchored_alignment.preparation import (
     AlignmentPreparationAssembler,
     AlignmentPreparationPackage,
 )
+from app.services.timeanchored_alignment.sentence_segmenter import SentenceSegmenter
 from app.services.timeanchored_alignment.slow_window.contracts import (
     DialogueShapeSnapshot,
     PromptSeed,
@@ -45,6 +39,7 @@ from app.services.timeanchored_alignment.slow_window.contracts import (
     WindowSourceUnit,
 )
 from app.services.timeanchored_alignment.window_time_base_assembler import (
+    WindowTimeBaseAssembler,
     WindowTimeBasePackage,
 )
 
@@ -59,22 +54,9 @@ class AlignmentStageService:
             sanitizer=getattr(host, "_whisper_sanitizer", None),
             hallucination_detector=getattr(host, "_hallucination_detector", None),
         )
-        self._timeanchored_text_aligner = TextAligner(
-            phonetic_aligner=PhoneticAligner(),
-        )
-        self._timeanchored_edge_selector = EdgeSelector()
-        self._timeanchored_subtitle_assembler = SubtitleAssembler()
         self._timeanchored_sentence_segmenter = SentenceSegmenter()
-        self._timeanchored_chunk_projector = ChunkProjector()
-        self._timeanchored_output_adapter = OutputAdapter()
-        self._timeanchored_stage_service = TimeanchoredAlignmentStageService(
-            text_aligner=self._timeanchored_text_aligner,
-            edge_selector=self._timeanchored_edge_selector,
-            subtitle_assembler=self._timeanchored_subtitle_assembler,
-            sentence_segmenter=self._timeanchored_sentence_segmenter,
-            chunk_projector=self._timeanchored_chunk_projector,
-            output_adapter=self._timeanchored_output_adapter,
-        )
+        self._timeanchored_stage_service = AnchorMountAlignmentService()
+        self._decision_ingress_adapter = DecisionIngressAdapter()
 
     async def run(self, ctx: ProcessingContext) -> None:
         """执行单个 chunk 的对齐阶段。"""
@@ -343,6 +325,7 @@ class AlignmentStageService:
                 should_accept, reason = self._should_accept_timeanchored_result(
                     stage_result=stage_result,
                     mode=alignment_pipeline_mode,
+                    ctx=ctx,
                 )
                 if should_accept and stage_result is not None:
                     self._commit_timeanchored_main_chain_result(
@@ -731,6 +714,7 @@ class AlignmentStageService:
         should_accept, _ = self._should_accept_timeanchored_result(
             stage_result=stage_result,
             mode="default",
+            ctx=ctx,
         )
         if not should_accept or stage_result is None:
             return False
@@ -754,7 +738,7 @@ class AlignmentStageService:
         language_hint: str,
         speaker_id: Optional[str],
         turn_id: Optional[str],
-    ) -> Optional[TimeanchoredStageResult]:
+    ) -> Optional[AnchorMountStageResult]:
         host = self._host
         try:
             base_language = str(language_hint or "auto")
@@ -793,16 +777,9 @@ class AlignmentStageService:
             )
             self._commit_preparation_context(ctx=ctx, preparation=preparation)
 
-            ctx_edge_mode = str(getattr(ctx, "edge_selection_mode", "") or "").strip().lower()
-            host_edge_mode = str(getattr(host, "_edge_selection_mode", "auto") or "auto").strip().lower()
-            edge_mode = ctx_edge_mode if ctx_edge_mode in {"force_fast", "force_slow"} else host_edge_mode
-
             return self._execute_prepared_timeanchored_stage(
                 preparation=preparation,
                 language=base_language,
-                edge_selection_mode=edge_mode,
-                speaker_id=speaker_id,
-                turn_id=turn_id,
             )
         except Exception:
             host.logger.exception(
@@ -816,35 +793,18 @@ class AlignmentStageService:
         *,
         preparation: AlignmentPreparationPackage,
         language: str,
-        edge_selection_mode: str,
-        speaker_id: Optional[str],
-        turn_id: Optional[str],
-    ) -> TimeanchoredStageResult:
-        compat = preparation.compat
+    ) -> AnchorMountStageResult:
         self._host.logger.debug(
-            "Chunk {}: preparation 执行 stage window_id={} edge_mode={} text_truth_units={} timed_units={} fast_hooks={} language_runs={}",
+            "Chunk {}: preparation 执行 anchor_mount window_id={} slots={} fast_hooks={} punctuation_evidences={}",
             preparation.owner_chunk_index,
             preparation.window_id,
-            edge_selection_mode,
-            len(compat.text_truth.units),
-            sum(
-                1
-                for unit in compat.text_truth.units
-                if getattr(unit, "start", None) is not None and getattr(unit, "end", None) is not None
-            ),
+            len(preparation.slow_text.slots),
             len(preparation.fast_hooks),
-            len(compat.language_runs.runs),
+            len(preparation.slow_text.punctuation_evidences),
         )
         return self._timeanchored_stage_service.execute(
-            time_base=compat.time_base,
-            text_truth=compat.text_truth,
-            language_runs=compat.language_runs,
-            pronunciation=compat.pronunciation,
-            chunk_window=compat.chunk_window,
+            preparation=preparation,
             language=language,
-            edge_selection_mode=edge_selection_mode,
-            speaker_id=speaker_id,
-            turn_id=turn_id,
         )
 
     def _commit_preparation_context(
@@ -854,11 +814,6 @@ class AlignmentStageService:
         preparation: AlignmentPreparationPackage,
     ) -> None:
         ctx.alignment_preparation = preparation
-        ctx.text_truth = preparation.compat.text_truth
-        ctx.protected_spans = list(preparation.compat.protected_spans)
-        ctx.language_runs = list(preparation.compat.language_runs.runs)
-        ctx.pronunciation_package = preparation.compat.pronunciation
-        ctx.pronunciation_report = dict(preparation.compat.pronunciation_report)
         ctx.slow_window_meta = {
             "window_id": preparation.window_id,
             "owner_chunk_id": preparation.owner_chunk_id,
@@ -866,24 +821,16 @@ class AlignmentStageService:
             "hook_count": len(preparation.fast_hooks),
             "source_chunk_ids": list(preparation.source_chunk_ids),
         }
-        ctx.time_base_chunk = preparation.compat.time_base
         if isinstance(preparation.compat.time_base, WindowTimeBasePackage):
             ctx.window_time_base = preparation.compat.time_base
         self._host.logger.debug(
-            "Chunk {}: preparation 已写回 ctx window_id={} slot_count={} hook_count={} protected_span_count={} language_run_count={} pronunciation_hint_count={} text_truth_units={} timed_units={}",
+            "Chunk {}: preparation 已写回 ctx window_id={} slot_count={} hook_count={} pronunciation_hint_count={} window_time_base_units={}",
             ctx.chunk_index,
             preparation.window_id,
             len(preparation.slow_text.slots),
             len(preparation.fast_hooks),
-            len(preparation.compat.protected_spans),
-            len(preparation.compat.language_runs.runs),
             len(preparation.slow_text.pronunciation_hints),
-            len(preparation.compat.text_truth.units),
-            sum(
-                1
-                for unit in preparation.compat.text_truth.units
-                if getattr(unit, "start", None) is not None and getattr(unit, "end", None) is not None
-            ),
+            len(getattr(preparation.compat.time_base, "word_units", ()) or ()),
         )
 
     def _resolve_preparation_inputs(
@@ -1024,15 +971,22 @@ class AlignmentStageService:
             raise ValueError("对齐阶段缺少 time base，无法构建 AlignmentPreparation")
         if isinstance(time_base, WindowTimeBasePackage):
             return time_base
+        chunk_bindings = tuple(getattr(ready_window.coverage, "chunk_bindings", ()) or ())
         return WindowTimeBasePackage(
             window_id=ready_window.window_id,
             language=str(getattr(time_base, "language", "") or language_hint or "auto"),
-            raw_units=tuple(getattr(time_base, "raw_units", ()) or ()),
-            word_units=tuple(getattr(time_base, "word_units", ()) or ()),
+            raw_units=WindowTimeBaseAssembler._rebase_units(
+                tuple(getattr(time_base, "raw_units", ()) or ()),
+                binding=chunk_bindings[0] if chunk_bindings else None,
+            ),
+            word_units=WindowTimeBaseAssembler._rebase_units(
+                tuple(getattr(time_base, "word_units", ()) or ()),
+                binding=chunk_bindings[0] if chunk_bindings else None,
+            ),
             quality=getattr(time_base, "quality"),
             source_chunk_ids=ready_window.source_chunk_ids,
             source_chunk_indices=ready_window.source_chunk_indices,
-            chunk_bindings=ready_window.coverage.chunk_bindings,
+            chunk_bindings=chunk_bindings,
             metadata=dict(getattr(time_base, "metadata", {}) or {}),
             frame_stride=float(getattr(time_base, "frame_stride", 0.06) or 0.06),
             source=str(getattr(time_base, "source", "sensevoice_window") or "sensevoice_window"),
@@ -1043,21 +997,29 @@ class AlignmentStageService:
         self,
         *,
         ctx: ProcessingContext,
-        stage_result: TimeanchoredStageResult,
+        stage_result: AnchorMountStageResult,
         whisper_result: Dict[str, Any],
         sv_result: Dict[str, Any],
         speaker_id: Optional[str],
         turn_id: Optional[str],
     ) -> None:
         host = self._host
+        text_route, edge_route, final_route, stage_error_code = self._resolve_anchor_mount_routes(
+            ctx=ctx,
+            stage_result=stage_result,
+        )
+        preparation = ctx.alignment_preparation
         language = str(
-            getattr(ctx.text_truth, "language", "")
+            getattr(getattr(preparation, "compat", None), "text_truth", None).language
+            if getattr(getattr(preparation, "compat", None), "text_truth", None) is not None
+            else ""
             or whisper_result.get("language")
             or "auto"
         )
         chosen_text_clean = str(
-            getattr(ctx.text_truth, "normalized_text", "")
-            or getattr(ctx.text_truth, "raw_text", "")
+            getattr(getattr(preparation, "slow_text", None), "window_text", None).text
+            if getattr(getattr(preparation, "slow_text", None), "window_text", None) is not None
+            else ""
             or ""
         ).strip()
         if not chosen_text_clean:
@@ -1067,31 +1029,21 @@ class AlignmentStageService:
                 whisper_result=whisper_result,
                 sv_result=sv_result,
             )
-        punct_track = ctx.punct_track
-        run_result = host._finalize_timeanchored_stream(
-            final_stream=stage_result.final_stream,
-            boundary_evidences=stage_result.boundary_evidences,
-            detected_language=language,
-            chosen_text_clean=chosen_text_clean,
-            punctuation_positions=list(punct_track.positions) if punct_track and punct_track.positions else [],
-            punctuation_clean_text=(
-                str(punct_track.clean_text_ref or "")
-                if punct_track is not None
-                else chosen_text_clean
-            ),
+        adapter_result = self._decision_ingress_adapter.build(
+            package=stage_result.decision_ingress,
             speaker_id=speaker_id,
             turn_id=turn_id,
-            coverage=float(stage_result.base_result.metrics.coverage),
-            route_confidence=float(stage_result.base_result.metrics.route_confidence),
-            error_code=str(stage_result.base_result.error_code or ""),
         )
-        final_sentences = list(run_result.final_sentences)
+        decision_output = host._decision_processor.process(
+            adapter_result.decision_input,
+            stream_id=adapter_result.stream_id,
+            chunk_index=adapter_result.chunk_index,
+            is_last_chunk=host._is_last_chunk_index(adapter_result.chunk_index),
+        )
+        final_sentences = list(decision_output.sentence_segments)
         fallback_error_code = ""
         if not final_sentences:
-            fallback_text = chosen_text_clean or self._timeanchored_sentence_segmenter.compose_text(
-                stream=stage_result.final_stream,
-                language=language,
-            ).strip()
+            fallback_text = chosen_text_clean or adapter_result.decision_input.fallback_clean_text_ref
             if not fallback_text:
                 fallback_text = chosen_text_clean
             fallback_confidence = self._resolve_text_fallback_confidence(
@@ -1110,7 +1062,23 @@ class AlignmentStageService:
                 final_sentences = [fallback_sentence]
                 fallback_error_code = "E_TIMEANCHORED_SEGMENT_EMPTY_FALLBACK"
 
+        if host._final_grouper:
+            final_sentences = host._final_grouper.group(final_sentences)
         for sentence in final_sentences:
+            sentence.source = TextSource.WHISPER_PATCH
+            sentence.is_draft = False
+            sentence.is_finalized = True
+            sentence.alignment_score = float(
+                stage_result.anchor_mount_result.metrics.get("alignment_score")
+                or 0.0
+            )
+            sentence.matched_ratio = float(
+                stage_result.anchor_mount_result.metrics.get("coverage_ratio")
+                or 0.0
+            )
+            sentence.confidence_source = host._resolve_sentence_confidence_source(
+                sentence.words
+            )
             if getattr(sentence, "speaker_id", None) is None:
                 sentence.speaker_id = speaker_id
             if getattr(sentence, "turn_id", None) is None:
@@ -1121,15 +1089,47 @@ class AlignmentStageService:
         )
         output_traces = host._normalize_output_traces_for_sentences(
             final_sentences=final_sentences,
-            output_traces=list(run_result.output_traces or []),
+            output_traces=list(decision_output.output_traces or []),
             default_reason="timeanchored_chain",
         )
-
-        alignment_result = run_result.alignment_result
-        aligned_facts = run_result.aligned_facts
-        fused_evidence = run_result.fused_evidence
-        injection_stats = dict(run_result.injection_stats)
-        split_stats = dict(run_result.split_stats)
+        aligned_facts = adapter_result.decision_input.aligned_facts
+        fused_evidence = adapter_result.decision_input.fused_evidence
+        injection_stats = {
+            "injection_positions_total": float(
+                adapter_result.compat_report.get("fallback_punctuation_position_count", 0)
+            ),
+            "injection_unmatched_total": 0.0,
+            "injection_miss_ratio": 0.0,
+            "injection_mapping_coverage": (
+                1.0
+                if stage_result.decision_ingress.punctuation_facts
+                else 0.0
+            ),
+            "injection_blocked": 0.0,
+            "injection_error_code": "",
+        }
+        split_stats = dict(host._final_splitter.last_split_stats or {})
+        split_stats.update(dict(decision_output.segmentation_report.get("boundary_score_stats", {})))
+        split_stats.update(dict(decision_output.segmentation_report.get("soft_cut_stats", {})))
+        split_stats["timeanchored_boundary_candidate_count"] = int(
+            len(stage_result.decision_ingress.boundary_hints)
+        )
+        split_stats["timeanchored_boundary_hard_count"] = int(
+            sum(1 for item in stage_result.decision_ingress.boundary_hints if bool(item.hard_flag))
+        )
+        split_stats["timeanchored_boundary_pause_count"] = int(
+            sum(1 for item in stage_result.decision_ingress.boundary_hints if "pause" in str(item.reason))
+        )
+        split_stats["timeanchored_boundary_punct_count"] = int(
+            sum(
+                1
+                for item in stage_result.decision_ingress.boundary_hints
+                if str(item.reason).startswith("punctuation")
+            )
+        )
+        split_stats["decision_ingress_adapter_fallback_punct_count"] = int(
+            adapter_result.compat_report.get("fallback_punctuation_position_count", 0) or 0
+        )
         soft_cut_observe_snapshot = host._update_soft_cut_observability(
             split_stats=split_stats,
             chunk_index=ctx.chunk_index,
@@ -1154,38 +1154,46 @@ class AlignmentStageService:
                 "boundary_score_stats": dict(split_stats),
                 "forced_split_count": float(split_stats.get("force_split_count", 0.0)),
                 "route": "timeanchored",
-                "text_route": stage_result.text_result.route,
-                "edge_route": stage_result.edge_result.route,
+                "text_route": text_route,
+                "edge_route": edge_route,
                 "error_code": str(
                     split_stats.get("error_code", "")
-                    or stage_result.base_result.error_code
+                    or stage_error_code
                     or fallback_error_code
                 ),
             },
             output_traces=output_traces,
             default_trace_reason="timeanchored_chain",
-            subtitle_batch=run_result.subtitle_batch,
+            subtitle_batch=decision_output.subtitle_batch,
         )
         ctx.final_sentences = list(final_sentences)
         ctx.finalization_metrics = {
-            "coverage": alignment_result.coverage,
-            "gap_ratio": alignment_result.gap_ratio,
-            "alignment_score": alignment_result.alignment_score,
-            "gap_positions": list(alignment_result.gap_positions),
-            "gap_resolution": (
-                alignment_result.resolution.value if alignment_result.resolution else None
+            "coverage": float(
+                stage_result.anchor_mount_result.metrics.get("coverage_ratio", 0.0) or 0.0
             ),
+            "gap_ratio": float(
+                stage_result.anchor_mount_result.metrics.get("largest_unresolved_span", 0.0)
+                or 0.0
+            ),
+            "alignment_score": float(
+                stage_result.anchor_mount_result.metrics.get("alignment_score")
+                or 0.0
+            ),
+            "gap_positions": [],
+            "gap_resolution": None,
             **injection_stats,
             "timeanchored_enabled": 1.0,
-            "timeanchored_text_route": stage_result.text_result.route,
-            "timeanchored_edge_route": stage_result.edge_result.route,
-            "timeanchored_final_route": stage_result.base_result.route,
-            "timeanchored_item_count": float(len(stage_result.final_stream)),
+            "timeanchored_text_route": text_route,
+            "timeanchored_edge_route": edge_route,
+            "timeanchored_final_route": final_route,
+            "timeanchored_item_count": float(len(stage_result.decision_ingress.tokens)),
             "timeanchored_sentence_count": float(len(final_sentences)),
-            "timeanchored_failed_span_count": float(len(stage_result.failed_spans)),
-            "timeanchored_boundary_candidate_count": float(len(stage_result.boundary_evidences)),
+            "timeanchored_failed_span_count": 0.0,
+            "timeanchored_boundary_candidate_count": float(len(stage_result.decision_ingress.boundary_hints)),
             "l7_error_count": float(len(output_layer_result.output_payload.get("errors", []))),
         }
+        for key, value in stage_result.anchor_mount_result.metrics.items():
+            ctx.finalization_metrics[f"anchor_mount_{key}"] = value
         for key, value in split_stats.items():
             ctx.finalization_metrics[f"split_{key}"] = value
         for key, value in soft_cut_observe_snapshot.items():
@@ -1194,26 +1202,24 @@ class AlignmentStageService:
         ctx.finalization_metrics["fact_turn_count"] = float(len(aligned_facts.speaker_turns))
         ctx.finalization_metrics["fact_mapping_count"] = float(len(aligned_facts.time_mappings))
         ctx.finalization_metrics["evidence_speaker_change_count"] = float(
-            len(fused_evidence.speaker_changes)
+            len(fused_evidence.speaker_changes) if fused_evidence is not None else 0
         )
         ctx.finalization_metrics["evidence_pause_anchor_count"] = float(
-            len(fused_evidence.pause_anchors)
+            len(fused_evidence.pause_anchors) if fused_evidence is not None else 0
         )
         ctx.finalization_metrics["evidence_semantic_anchor_count"] = float(
-            len(fused_evidence.semantic_anchors)
+            len(fused_evidence.semantic_anchors) if fused_evidence is not None else 0
         )
         ctx.finalization_metrics["evidence_punctuation_anchor_count"] = float(
-            len(fused_evidence.punctuation_anchors)
+            len(fused_evidence.punctuation_anchors) if fused_evidence is not None else 0
         )
         if fallback_error_code:
             ctx.finalization_metrics["timeanchored_error_code"] = fallback_error_code
-        if ctx.arbitration_result:
-            ctx.arbitration_result.gap_positions = list(alignment_result.gap_positions)
         host.logger.debug(
             "Chunk {}: timeanchored 主链完成 sentences={} route={}",
             ctx.chunk_index,
             len(final_sentences),
-            stage_result.base_result.route,
+            final_route,
         )
 
     def _commit_fast_direct_result(
@@ -1394,12 +1400,15 @@ class AlignmentStageService:
         self,
         *,
         ctx: ProcessingContext,
-        stage_result: Optional[TimeanchoredStageResult],
+        stage_result: Optional[AnchorMountStageResult],
         mode: str,
         selected: bool,
         reason: str,
     ) -> None:
-        route = str(stage_result.base_result.route) if stage_result is not None else "unavailable"
+        _, _, route, _ = self._resolve_anchor_mount_routes(
+            ctx=ctx,
+            stage_result=stage_result,
+        )
         ctx.hetero_route = route
         ctx.hetero_alignment_result = {
             "mode": str(mode),
@@ -1407,15 +1416,11 @@ class AlignmentStageService:
             "reason": str(reason),
             "route": route,
             "sentence_count": (
-                int(len(stage_result.final_stream))
+                int(len(stage_result.decision_ingress.tokens))
                 if stage_result is not None
                 else 0
             ),
-            "failed_span_count": (
-                int(len(stage_result.failed_spans))
-                if stage_result is not None
-                else 0
-            ),
+            "failed_span_count": 0,
         }
         ctx.hetero_alignment_report = (
             asdict(stage_result.pipeline_report)
@@ -1427,22 +1432,49 @@ class AlignmentStageService:
         ctx.finalization_metrics["alignment_pipeline_reason"] = str(reason)
         ctx.finalization_metrics["alignment_pipeline_route"] = route
 
-    @staticmethod
     def _should_accept_timeanchored_result(
+        self,
         *,
-        stage_result: Optional[TimeanchoredStageResult],
+        stage_result: Optional[AnchorMountStageResult],
         mode: str,
+        ctx: ProcessingContext,
     ) -> tuple[bool, str]:
         if stage_result is None:
             return False, f"{mode}_timeanchored_failed"
-        route = str(stage_result.base_result.route or "")
+        _, _, route, _ = self._resolve_anchor_mount_routes(
+            ctx=ctx,
+            stage_result=stage_result,
+        )
         if route == "error":
             return False, f"{mode}_gate_route_error"
-        if not stage_result.final_stream:
+        if not stage_result.decision_ingress.tokens:
             return False, f"{mode}_gate_empty_stream"
         if mode == "default":
             return True, "default_gate_pass"
         return True, f"{mode}_gate_pass"
+
+    def _resolve_anchor_mount_routes(
+        self,
+        *,
+        ctx: ProcessingContext,
+        stage_result: Optional[AnchorMountStageResult],
+    ) -> tuple[str, str, str, str | None]:
+        token_count = len(stage_result.decision_ingress.tokens) if stage_result is not None else 0
+        text_route = "slow" if token_count else "error"
+        edge_selection_mode = str(getattr(ctx, "edge_selection_mode", "") or "").strip().lower()
+        if edge_selection_mode not in {"force_fast", "prefer_fast", "force_slow", "prefer_slow"}:
+            edge_selection_mode = str(
+                getattr(self._host, "_edge_selection_mode", "auto") or "auto"
+            ).strip().lower()
+        if not token_count:
+            edge_route = "error"
+        elif edge_selection_mode in {"force_fast", "prefer_fast"}:
+            edge_route = "fast"
+        else:
+            edge_route = "slow"
+        final_route = edge_route if edge_route != "error" else text_route
+        error_code = "anchor_mount_empty" if not token_count else None
+        return text_route, edge_route, final_route, error_code
 
     def _resolve_fast_direct_reason(self, *, ctx: ProcessingContext) -> str:
         host = self._host

@@ -10,15 +10,13 @@ import pytest
 from app.engines.dummy_engine import DummyEngine
 from app.models.sensevoice_models import SentenceSegment
 from app.pipelines.async_dual_pipeline import AsyncDualPipeline
+from app.pipelines.dual_pipeline.services.alignment_stage_service import AlignmentStageService
 from app.schemas.pipeline_context import ProcessingContext
 from app.services.alignment.types import L2Output, PunctTrack, TextTrack, TextTrackBundle
 from app.services.arbitration.arbiter import ArbitrationResult
 from app.services.audio.chunk_engine import AudioChunk
 from app.services.streaming_subtitle import remove_streaming_subtitle_manager
 from app.services.timeanchored_alignment.contracts import (
-    AlignmentItem,
-    AlignmentMetrics,
-    FinalAlignmentResult,
     TimeBasePackage,
     TimeBaseQuality,
     TimeBaseUnit,
@@ -180,6 +178,11 @@ def test_alignment_stage_routes_to_timeanchored_main_chain_when_time_base_availa
         "_run_collection_scoring_decision_once",
         Mock(side_effect=AssertionError("timeanchored 分支命中后不应执行 legacy 四层")),
     )
+    monkeypatch.setattr(
+        pipeline,
+        "_finalize_timeanchored_stream",
+        Mock(side_effect=AssertionError("AnchorMount 默认主链不应再回流到 finalize_timeanchored_stream")),
+    )
 
     ctx = ProcessingContext(
         job_id=job_id,
@@ -198,9 +201,9 @@ def test_alignment_stage_routes_to_timeanchored_main_chain_when_time_base_availa
 
     assert ctx.final_sentences
     assert ctx.finalization_metrics.get("timeanchored_enabled") == 1.0
-    assert ctx.finalization_metrics.get("timeanchored_final_route") in {"text", "phonetic", "fast", "slow", "mixed", "error"}
-    assert ctx.pronunciation_package is not None
-    assert ctx.text_truth is not None
+    assert ctx.finalization_metrics.get("timeanchored_final_route") in {"fast", "slow", "error"}
+    assert ctx.alignment_preparation is not None
+    assert ctx.window_time_base is not None
 
     remove_streaming_subtitle_manager(job_id)
 
@@ -244,6 +247,55 @@ def test_alignment_stage_raises_when_time_base_missing_and_legacy_disabled(
         asyncio.run(pipeline._run_alignment_stage(ctx))
 
     remove_streaming_subtitle_manager(job_id)
+
+
+def test_alignment_stage_compat_window_time_base_rebases_relative_units() -> None:
+    ready_window = SimpleNamespace(
+        window_id="compat-window-001",
+        source_chunk_ids=("chunk-0",),
+        source_chunk_indices=(0,),
+        coverage=SimpleNamespace(
+            chunk_bindings=(
+                SimpleNamespace(
+                    chunk_id="chunk-0",
+                    chunk_index=0,
+                    chunk_start=12.5,
+                    chunk_end=13.5,
+                    overlap_ratio=1.0,
+                    role="owner",
+                    is_owner=True,
+                ),
+            )
+        ),
+    )
+    ctx = ProcessingContext(
+        job_id="job-compat-window-time-base",
+        chunk_index=0,
+        audio_chunk=_build_chunk(),
+        time_base_chunk=TimeBasePackage(
+            raw_units=(
+                TimeBaseUnit(text="你", start=0.0, end=0.1, confidence=0.95, token_type="raw"),
+            ),
+            word_units=(
+                TimeBaseUnit(text="你", start=0.0, end=0.1, confidence=0.95, token_type="word"),
+            ),
+            quality=TimeBaseQuality(blank_ratio=0.2, avg_max_prob=0.8, low_prob_ratio=0.1),
+            language="zh",
+        ),
+    )
+
+    compat_window_time_base = AlignmentStageService._build_compat_window_time_base(
+        ctx=ctx,
+        ready_window=ready_window,
+        language_hint="zh",
+    )
+
+    assert tuple((unit.start, unit.end) for unit in compat_window_time_base.raw_units) == (
+        (12.5, 12.6),
+    )
+    assert tuple((unit.start, unit.end) for unit in compat_window_time_base.word_units) == (
+        (12.5, 12.6),
+    )
 
 
 def test_alignment_stage_force_fast_direct_path_without_time_base(
@@ -369,36 +421,6 @@ def test_alignment_stage_forwards_edge_mode_to_timeanchored_edge_selector(
         Mock(side_effect=AssertionError("timeanchored 分支命中后不应执行 legacy 四层")),
     )
 
-    captured: dict[str, str] = {}
-
-    def _mock_select(**kwargs):
-        captured["mode"] = str(kwargs.get("edge_selection_mode", ""))
-        return FinalAlignmentResult(
-            items=(
-                AlignmentItem(
-                    text="你",
-                    start=0.0,
-                    end=0.1,
-                    status="direct",
-                    source="test_selector",
-                    confidence=0.9,
-                ),
-            ),
-            route=expected_route,
-            metrics=AlignmentMetrics(
-                coverage=1.0,
-                duration_ratio=1.0,
-                failed_count=0,
-                route_confidence=1.0,
-            ),
-        )
-
-    monkeypatch.setattr(
-        pipeline._alignment_stage_service._timeanchored_edge_selector,
-        "select",
-        _mock_select,
-    )
-
     ctx = ProcessingContext(
         job_id=job_id,
         chunk_index=0,
@@ -414,9 +436,9 @@ def test_alignment_stage_forwards_edge_mode_to_timeanchored_edge_selector(
 
     asyncio.run(pipeline._run_alignment_stage(ctx))
 
-    assert captured.get("mode") == mode
     assert ctx.finalization_metrics.get("timeanchored_enabled") == 1.0
     assert ctx.finalization_metrics.get("timeanchored_edge_route") == expected_route
+    assert ctx.finalization_metrics.get("timeanchored_final_route") == expected_route
 
     remove_streaming_subtitle_manager(job_id)
 

@@ -390,12 +390,15 @@ class SegmentationProcessor:
         chunk_index: Optional[int],
     ):
         language = self._resolve_language_from_decision_input(data)
-        chunk_ref = str(chunk_index if chunk_index is not None else "chunk-unknown")
         ingress_context = data.ingress_context or SegmentationIngressContext(
             unit_kind="chunk",
-            unit_id=chunk_ref,
-            chunk_id=chunk_ref,
+            unit_id=str(chunk_index if chunk_index is not None else "chunk-unknown"),
+            chunk_id=str(chunk_index if chunk_index is not None else "chunk-unknown"),
             chunk_index=chunk_index,
+        )
+        chunk_ref = str(
+            getattr(ingress_context, "chunk_id", None)
+            or (chunk_index if chunk_index is not None else "chunk-unknown")
         )
         synthetic_text, clean_to_word = self._build_synthetic_text_and_word_mapping(words=words)
         char_mapping = [
@@ -417,7 +420,7 @@ class SegmentationProcessor:
         )
         tracks = TextTrackBundle(chosen_track=chosen_track)
         aligned_facts = data.aligned_facts or self._build_synthetic_aligned_facts(words=words)
-        return self._canonical_text_stream_adapter.build(
+        canonical_stream = self._canonical_text_stream_adapter.build(
             stream_id=stream_id,
             chunk_ref=chunk_ref,
             ingress_context=ingress_context,
@@ -430,6 +433,21 @@ class SegmentationProcessor:
                 "phase": "6",
             },
         )
+        if data.canonical_punctuation_facts or data.canonical_candidate_boundaries:
+            return replace(
+                canonical_stream,
+                punctuation_facts=(
+                    tuple(data.canonical_punctuation_facts)
+                    if data.canonical_punctuation_facts
+                    else tuple(canonical_stream.punctuation_facts)
+                ),
+                candidate_boundaries=(
+                    tuple(data.canonical_candidate_boundaries)
+                    if data.canonical_candidate_boundaries
+                    else tuple(canonical_stream.candidate_boundaries)
+                ),
+            )
+        return canonical_stream
 
     @staticmethod
     def _build_synthetic_text_and_word_mapping(

@@ -57,20 +57,9 @@ from app.services.timeanchored_alignment.slow_window import (
     WindowLanguageProfile,
     WindowSourceUnit,
 )
-from app.services.timeanchored_alignment.subtitle_assembler import (
-    FinalAlignedStream,
-    SubtitleAssembler,
-)
-from app.services.timeanchored_alignment.sentence_segmenter import (
-    SentenceSegmenter,
-    SentenceSegmenterConfig,
-)
 from app.services.timeanchored_alignment.chunk_projector import (
-    ChunkProjection,
-    ChunkProjector,
     ChunkWindow,
 )
-from app.services.timeanchored_alignment.output_adapter import OutputAdapter
 from app.services.timeanchored_alignment.preparation import (
     AlignmentPreparationAssembler,
     AlignmentPreparationCompat,
@@ -83,11 +72,6 @@ from app.services.timeanchored_alignment.preparation import (
     SlowSlot,
     SlowWindowTextPackage,
 )
-from app.services.timeanchored_alignment.stage_service import (
-    TimeanchoredAlignmentStageService,
-    TimeanchoredStageResult,
-)
-from app.services.timeanchored_alignment.text_aligner import TextAligner, TextAlignerThresholds
 from app.services.timeanchored_alignment.text_alignment_scoring import (
     TextAlignmentScoreBreakdown,
     TextAlignmentScoreConfig,
@@ -99,11 +83,6 @@ from app.services.timeanchored_alignment.hallucination_gate import (
     GateEvaluation,
     HallucinationGate,
     HallucinationGateConfig,
-)
-from app.services.timeanchored_alignment.edge_selector import (
-    EdgeSelector,
-    EdgeSelectorConfig,
-    FailedSpan,
 )
 from app.services.timeanchored_alignment.time_base_builder import TimeBaseBuilder
 from app.services.timeanchored_alignment.window_time_base_assembler import (
@@ -147,34 +126,22 @@ __all__ = [
     "PhoneticAlignmentPair",
     "align_monotonic_sequences",
     "project_token_phone_keys",
-    "TextAligner",
-    "TextAlignerThresholds",
     "BOTH_SIDES_UNAVAILABLE_ERROR",
     "GateDecision",
     "GateEvaluation",
     "HallucinationGate",
     "HallucinationGateConfig",
-    "EdgeSelector",
-    "EdgeSelectorConfig",
-    "FailedSpan",
     "TextAlignmentScorer",
     "TextAlignmentScoreConfig",
     "TextAlignmentScoreBreakdown",
     "DialogueShapeSnapshot",
-    "FinalAlignedStream",
     "PromptSeed",
     "ReadySlowWindow",
-    "SubtitleAssembler",
-    "SentenceSegmenter",
-    "SentenceSegmenterConfig",
     "SlowWindowBuilder",
     "SlowWindowBuilderConfig",
     "SlowWindowIngressAdapter",
     "SlowWindowIngressUnit",
-    "ChunkProjection",
-    "ChunkProjector",
     "ChunkWindow",
-    "OutputAdapter",
     "AlignmentPreparationAssembler",
     "AlignmentPreparationCompat",
     "AlignmentPreparationPackage",
@@ -185,8 +152,6 @@ __all__ = [
     "PunctuationEvidence",
     "SlowSlot",
     "SlowWindowTextPackage",
-    "TimeanchoredAlignmentStageService",
-    "TimeanchoredStageResult",
     "SlowInferenceWindow",
     "SlowInferenceWindowEnvelope",
     "TextTruthPackage",
