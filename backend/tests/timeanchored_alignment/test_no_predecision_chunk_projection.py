@@ -161,6 +161,8 @@ def test_alignment_stage_service_main_chain_no_longer_references_legacy_predecis
     assert "TextAligner(" not in source
     assert "EdgeSelector(" not in source
     assert "SubtitleAssembler(" not in source
+    assert "ChunkProjector(" not in source
+    assert "OutputAdapter(" not in source
     assert "_AnchorMountEdgeSelectorCompat" not in source
     assert "TimeanchoredAlignmentStageService(" not in source
 

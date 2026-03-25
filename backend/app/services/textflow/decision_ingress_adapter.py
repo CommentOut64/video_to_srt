@@ -41,6 +41,8 @@ class DecisionIngressAdapter:
     """把 AnchorMount 的稳定出口投影到当前 Decision 入口。"""
 
     _SOFT_CUT_THRESHOLD = 0.75
+    _INGRESS_VERSION = "window_first_compat_v1"
+    _FALLBACK_PROJECTION_MODE = "layer_internal_compat"
 
     def build(
         self,
@@ -83,8 +85,10 @@ class DecisionIngressAdapter:
             slow_window_id=str(package.window_id),
             window_coverage=self._resolve_window_coverage_ratio(package.coverage),
             source_chunk_ids=tuple(str(item) for item in package.source_chunk_ids),
-            projection_chunk_ids=(str(package.owner_chunk_id),),
+            projection_chunk_ids=(),
             metadata={
+                "decision_ingress_version": self._INGRESS_VERSION,
+                "fallback_projection_mode": self._FALLBACK_PROJECTION_MODE,
                 "source_chunk_indices": [int(item) for item in package.source_chunk_indices],
                 "cross_chunk_locks": [
                     self._serialize_cross_chunk_lock(item) for item in package.cross_chunk_locks
@@ -182,6 +186,8 @@ class DecisionIngressAdapter:
             chunk_index=int(package.owner_chunk_index),
             ingress_context=ingress_context,
             compat_report={
+                "decision_ingress_version": self._INGRESS_VERSION,
+                "fallback_projection_mode": self._FALLBACK_PROJECTION_MODE,
                 "fallback_clean_text_length": len(fallback_clean_text),
                 "fallback_punctuation_position_count": len(fallback_positions),
                 "canonical_punctuation_fact_count": len(canonical_punctuation_facts),

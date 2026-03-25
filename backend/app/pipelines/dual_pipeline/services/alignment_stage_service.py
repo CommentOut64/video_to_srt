@@ -42,6 +42,10 @@ from app.services.timeanchored_alignment.window_time_base_assembler import (
     WindowTimeBaseAssembler,
     WindowTimeBasePackage,
 )
+from app.services.timeanchored_alignment.output_projection.output_projector import (
+    OutputProjectionInput,
+    OutputProjector,
+)
 
 
 class AlignmentStageService:
@@ -57,6 +61,7 @@ class AlignmentStageService:
         self._timeanchored_sentence_segmenter = SentenceSegmenter()
         self._timeanchored_stage_service = AnchorMountAlignmentService()
         self._decision_ingress_adapter = DecisionIngressAdapter()
+        self._output_projector = OutputProjector()
 
     async def run(self, ctx: ProcessingContext) -> None:
         """执行单个 chunk 的对齐阶段。"""
@@ -1136,36 +1141,49 @@ class AlignmentStageService:
             stage="timeanchored_alignment_stage",
         )
 
-        output_layer_result = host._emit_output_layer(
-            chunk_index=ctx.chunk_index,
-            sentence_segments=final_sentences,
-            language=language,
-            injection_report={
-                "mapping_coverage": float(
-                    injection_stats.get("injection_mapping_coverage", 0.0)
-                ),
-                "mismatch_count": float(
-                    injection_stats.get("injection_unmatched_total", 0.0)
-                ),
-                "error_code": str(injection_stats.get("injection_error_code", "") or ""),
-                "blocked": float(injection_stats.get("injection_blocked", 0.0)),
-            },
-            segmentation_report={
-                "boundary_score_stats": dict(split_stats),
-                "forced_split_count": float(split_stats.get("force_split_count", 0.0)),
-                "route": "timeanchored",
-                "text_route": text_route,
-                "edge_route": edge_route,
-                "error_code": str(
-                    split_stats.get("error_code", "")
-                    or stage_error_code
-                    or fallback_error_code
-                ),
-            },
-            output_traces=output_traces,
-            default_trace_reason="timeanchored_chain",
-            subtitle_batch=decision_output.subtitle_batch,
+        projected_batches = self._build_projected_output_batches(
+            stage_result=stage_result,
+            decision_output=decision_output,
+            split_stats=split_stats,
         )
+        output_error_count = 0
+        for projected_batch in projected_batches:
+            output_layer_result = host._emit_output_layer(
+                chunk_index=(
+                    projected_batch.chunk_index
+                    if projected_batch.chunk_index is not None
+                    else projected_batch.chunk_id
+                ),
+                sentence_segments=final_sentences,
+                language=language,
+                injection_report={
+                    "mapping_coverage": float(
+                        injection_stats.get("injection_mapping_coverage", 0.0)
+                    ),
+                    "mismatch_count": float(
+                        injection_stats.get("injection_unmatched_total", 0.0)
+                    ),
+                    "error_code": str(injection_stats.get("injection_error_code", "") or ""),
+                    "blocked": float(injection_stats.get("injection_blocked", 0.0)),
+                },
+                segmentation_report={
+                    "boundary_score_stats": dict(split_stats),
+                    "forced_split_count": float(split_stats.get("force_split_count", 0.0)),
+                    "route": "timeanchored",
+                    "text_route": text_route,
+                    "edge_route": edge_route,
+                    "projection_chunk_count": int(len(projected_batches)),
+                    "error_code": str(
+                        split_stats.get("error_code", "")
+                        or stage_error_code
+                        or fallback_error_code
+                    ),
+                },
+                output_traces=output_traces,
+                default_trace_reason="timeanchored_chain",
+                subtitle_batch=projected_batch,
+            )
+            output_error_count += len(output_layer_result.output_payload.get("errors", []))
         ctx.final_sentences = list(final_sentences)
         ctx.finalization_metrics = {
             "coverage": float(
@@ -1188,9 +1206,10 @@ class AlignmentStageService:
             "timeanchored_final_route": final_route,
             "timeanchored_item_count": float(len(stage_result.decision_ingress.tokens)),
             "timeanchored_sentence_count": float(len(final_sentences)),
+            "timeanchored_projected_chunk_count": float(len(projected_batches)),
             "timeanchored_failed_span_count": 0.0,
             "timeanchored_boundary_candidate_count": float(len(stage_result.decision_ingress.boundary_hints)),
-            "l7_error_count": float(len(output_layer_result.output_payload.get("errors", []))),
+            "l7_error_count": float(output_error_count),
         }
         for key, value in stage_result.anchor_mount_result.metrics.items():
             ctx.finalization_metrics[f"anchor_mount_{key}"] = value
@@ -1221,6 +1240,36 @@ class AlignmentStageService:
             len(final_sentences),
             final_route,
         )
+
+    def _build_projected_output_batches(
+        self,
+        *,
+        stage_result: AnchorMountStageResult,
+        decision_output: Any,
+        split_stats: Dict[str, Any],
+    ) -> tuple[Any, ...]:
+        owner_batch = getattr(decision_output, "subtitle_batch", None)
+        if owner_batch is None:
+            raise ValueError("timeanchored 主链缺少 subtitle_batch，无法执行 output projection")
+        projection_input = OutputProjectionInput(
+            window_id=str(stage_result.decision_ingress.window_id),
+            owner_chunk_id=str(stage_result.decision_ingress.owner_chunk_id),
+            owner_chunk_index=int(stage_result.decision_ingress.owner_chunk_index),
+            source_chunk_ids=tuple(str(item) for item in stage_result.decision_ingress.source_chunk_ids),
+            source_chunk_indices=tuple(
+                int(item) for item in stage_result.decision_ingress.source_chunk_indices
+            ),
+            coverage=stage_result.decision_ingress.coverage,
+            owner_carrier_batch=owner_batch,
+            decision_metadata={
+                "boundary_score_stats": dict(split_stats),
+                "segmentation_report": dict(getattr(decision_output, "segmentation_report", {}) or {}),
+            },
+        )
+        projected_batches = tuple(self._output_projector.project(projection_input))
+        if not projected_batches:
+            return (owner_batch,)
+        return projected_batches
 
     def _commit_fast_direct_result(
         self,
@@ -1432,22 +1481,34 @@ class AlignmentStageService:
         ctx.finalization_metrics["alignment_pipeline_reason"] = str(reason)
         ctx.finalization_metrics["alignment_pipeline_route"] = route
 
+    @staticmethod
     def _should_accept_timeanchored_result(
-        self,
         *,
         stage_result: Optional[AnchorMountStageResult],
         mode: str,
-        ctx: ProcessingContext,
+        ctx: Optional[ProcessingContext] = None,
     ) -> tuple[bool, str]:
         if stage_result is None:
             return False, f"{mode}_timeanchored_failed"
-        _, _, route, _ = self._resolve_anchor_mount_routes(
-            ctx=ctx,
-            stage_result=stage_result,
-        )
+
+        if hasattr(stage_result, "decision_ingress"):
+            token_count = len(getattr(stage_result.decision_ingress, "tokens", ()) or ())
+        else:
+            token_count = len(getattr(stage_result, "final_stream", ()) or ())
+
+        if ctx is not None and hasattr(stage_result, "decision_ingress"):
+            edge_selection_mode = str(getattr(ctx, "edge_selection_mode", "") or "").strip().lower()
+            if edge_selection_mode in {"force_fast", "prefer_fast"}:
+                route = "fast" if token_count else "error"
+            else:
+                route = "slow" if token_count else "error"
+        else:
+            base_route = str(getattr(getattr(stage_result, "base_result", None), "route", "") or "")
+            route = base_route or ("slow" if token_count else "error")
+
         if route == "error":
             return False, f"{mode}_gate_route_error"
-        if not stage_result.decision_ingress.tokens:
+        if token_count <= 0:
             return False, f"{mode}_gate_empty_stream"
         if mode == "default":
             return True, "default_gate_pass"

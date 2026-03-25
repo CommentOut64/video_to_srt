@@ -16,6 +16,7 @@ from app.services.alignment.types import L2Output, PunctTrack, TextTrack, TextTr
 from app.services.arbitration.arbiter import ArbitrationResult
 from app.services.audio.chunk_engine import AudioChunk
 from app.services.streaming_subtitle import remove_streaming_subtitle_manager
+from app.services.textflow.contracts import SubtitleBatch, SubtitleItem
 from app.services.timeanchored_alignment.contracts import (
     TimeBasePackage,
     TimeBaseQuality,
@@ -121,6 +122,20 @@ def _build_legacy_run_result() -> SimpleNamespace:
         split_stats={},
         final_sentences=[sentence],
         output_traces=[],
+        subtitle_batch=SubtitleBatch(
+            chunk_id="0",
+            chunk_index=0,
+            items=(
+                SubtitleItem(
+                    segment_id="legacy:0:seg:0",
+                    chunk_id="0",
+                    start=0.0,
+                    end=0.4,
+                    text="legacy fallback",
+                    source="aligned",
+                ),
+            ),
+        ),
         detected_language="zh",
     )
 
@@ -319,6 +334,12 @@ def test_alignment_stage_force_fast_direct_path_without_time_base(
         "_run_collection_scoring_decision_once",
         Mock(side_effect=AssertionError("force_fast 直通不应进入 legacy 四层")),
     )
+    finalize_mock = Mock(return_value=_build_legacy_run_result())
+    monkeypatch.setattr(
+        pipeline,
+        "_finalize_timeanchored_stream",
+        finalize_mock,
+    )
 
     ctx = ProcessingContext(
         job_id=job_id,
@@ -334,6 +355,93 @@ def test_alignment_stage_force_fast_direct_path_without_time_base(
     assert ctx.final_sentences
     assert ctx.finalization_metrics.get("fast_direct_enabled") == 1.0
     assert ctx.finalization_metrics.get("alignment_pipeline_route") == "fast"
+    finalize_mock.assert_called_once()
+
+    remove_streaming_subtitle_manager(job_id)
+
+
+def test_alignment_stage_timeanchored_main_chain_dispatches_projected_batches(
+    monkeypatch,
+) -> None:
+    job_id = "test_timeanchored_output_projection_dispatch"
+    pipeline = AsyncDualPipeline(
+        job_id=job_id,
+        draft_engine=DummyEngine(response_text="你好世界", latency_ms=0),
+        patch_engine=DummyEngine(response_text="你好世界", latency_ms=0),
+        transcription_profile="sv_whisper_dual",
+        enable_cross_chunk_merge=False,
+        enable_semantic_buffer=False,
+        punctuation_service=Mock(),
+    )
+    pipeline._alignment_pipeline_mode = "default"
+
+    _patch_common_alignment_inputs(monkeypatch=monkeypatch, pipeline=pipeline, chosen_source="slow")
+    monkeypatch.setattr(
+        pipeline,
+        "_run_collection_scoring_decision_once",
+        Mock(side_effect=AssertionError("timeanchored 分支命中后不应执行 legacy 四层")),
+    )
+
+    projected_batches = (
+        SubtitleBatch(
+            chunk_id="chunk-0",
+            chunk_index=0,
+            items=(
+                SubtitleItem(
+                    segment_id="seg-0",
+                    chunk_id="chunk-0",
+                    text="第一句",
+                    start=0.0,
+                    end=0.8,
+                    source="render_core",
+                ),
+            ),
+        ),
+        SubtitleBatch(
+            chunk_id="chunk-1",
+            chunk_index=1,
+            items=(),
+        ),
+    )
+    monkeypatch.setattr(
+        type(pipeline._alignment_stage_service._output_projector),
+        "project",
+        lambda _self, _data: projected_batches,
+    )
+
+    emit_calls: list[tuple[object, str, int]] = []
+
+    def _mock_emit_output_layer(**kwargs):
+        subtitle_batch = kwargs["subtitle_batch"]
+        emit_calls.append(
+            (
+                kwargs["chunk_index"],
+                subtitle_batch.chunk_id,
+                int(kwargs["segmentation_report"].get("projection_chunk_count", -1)),
+            )
+        )
+        return SimpleNamespace(output_payload={"errors": []})
+
+    monkeypatch.setattr(pipeline, "_emit_output_layer", _mock_emit_output_layer)
+
+    ctx = ProcessingContext(
+        job_id=job_id,
+        chunk_index=0,
+        audio_chunk=_build_chunk(),
+        sv_result=_build_sv_result(),
+        whisper_result=_build_whisper_result(),
+        time_base_chunk=_build_time_base(),
+    )
+    ctx.text_tracks = TextTrackBundle(
+        sv_track=_build_track("你 好 世 界", source="sv"),
+        whisper_track=_build_track("你好世界", source="whisper"),
+    )
+
+    asyncio.run(pipeline._run_alignment_stage(ctx))
+
+    assert emit_calls == [(0, "chunk-0", 2), (1, "chunk-1", 2)]
+    assert ctx.finalization_metrics.get("timeanchored_projected_chunk_count") == 2.0
+    assert ctx.finalization_metrics.get("l7_error_count") == 0.0
 
     remove_streaming_subtitle_manager(job_id)
 

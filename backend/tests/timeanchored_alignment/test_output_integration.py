@@ -1,15 +1,13 @@
 from __future__ import annotations
 
+from app.services.alignment.types import OutputLayerInput
 from app.services.textflow.output_dispatch_adapter import OutputLayerProcessor
-from app.services.timeanchored_alignment.chunk_projector import ChunkProjector, ChunkWindow
-from app.services.timeanchored_alignment.output_adapter import OutputAdapter
-from app.services.timeanchored_alignment.sentence_segmenter import SentenceSegmenter
-from app.services.timeanchored_alignment.subtitle_assembler import SubtitleAssembler
-from app.services.timeanchored_alignment.contracts import (
-    AlignmentItem,
-    AlignmentMetrics,
-    FinalAlignmentResult,
+from app.services.timeanchored_alignment.output_projection.output_projector import (
+    OutputProjectionInput,
+    OutputProjector,
 )
+from app.services.textflow.contracts import SubtitleBatch, SubtitleItem
+from app.services.timeanchored_alignment.slow_window.contracts import WindowChunkBinding, WindowCoverage
 
 
 class _DummySubtitleManager:
@@ -21,64 +19,87 @@ class _DummySubtitleManager:
         return list(range(len(list(subtitle_batch.items or ()))))
 
 
-def _build_result() -> FinalAlignmentResult:
-    items = (
-        AlignmentItem(
-            text="跨",
-            start=0.9,
-            end=1.05,
-            status="direct",
-            source="text_aligner",
-            confidence=0.9,
+def _build_projection_input() -> OutputProjectionInput:
+    return OutputProjectionInput(
+        window_id="window-0",
+        owner_chunk_id="chunk-0",
+        owner_chunk_index=0,
+        source_chunk_ids=("chunk-0", "chunk-1", "chunk-2"),
+        source_chunk_indices=(0, 1, 2),
+        coverage=WindowCoverage(
+            core_segments=((0.0, 2.0),),
+            left_guard_sec=0.0,
+            right_guard_sec=0.0,
+            chunk_bindings=(
+                WindowChunkBinding(
+                    chunk_id="chunk-0",
+                    chunk_index=0,
+                    chunk_start=0.0,
+                    chunk_end=1.0,
+                    overlap_ratio=0.6,
+                    role="owner",
+                    is_owner=True,
+                ),
+                WindowChunkBinding(
+                    chunk_id="chunk-1",
+                    chunk_index=1,
+                    chunk_start=1.0,
+                    chunk_end=2.0,
+                    overlap_ratio=0.8,
+                    role="core",
+                    is_owner=False,
+                ),
+                WindowChunkBinding(
+                    chunk_id="chunk-2",
+                    chunk_index=2,
+                    chunk_start=2.0,
+                    chunk_end=3.0,
+                    overlap_ratio=0.1,
+                    role="right_guard",
+                    is_owner=False,
+                ),
+            ),
         ),
-        AlignmentItem(
-            text="段",
-            start=1.05,
-            end=1.35,
-            status="direct",
-            source="text_aligner",
-            confidence=0.9,
+        owner_carrier_batch=SubtitleBatch(
+            chunk_id="chunk-0",
+            chunk_index=0,
+            items=(
+                SubtitleItem(
+                    segment_id="seg-0",
+                    chunk_id="chunk-0",
+                    start=0.9,
+                    end=1.35,
+                    text="跨段",
+                    source="render_core",
+                    trace={"split_reason": "timeanchored"},
+                ),
+            ),
         ),
-    )
-    return FinalAlignmentResult(
-        items=items,
-        route="text",
-        metrics=AlignmentMetrics(
-            coverage=1.0,
-            duration_ratio=1.0,
-            failed_count=0,
-            route_confidence=0.9,
-        ),
+        decision_metadata={"route": "timeanchored"},
     )
 
 
 def test_timeanchored_output_chain_supports_empty_replace_chunk_cleanup() -> None:
-    assembler = SubtitleAssembler()
-    segmenter = SentenceSegmenter()
-    projector = ChunkProjector()
-    adapter = OutputAdapter()
-
-    stream = assembler.assemble(base_result=_build_result())
-    segments = segmenter.segment(stream=stream, language="zh")
-    projections = projector.project(
-        sentence_segments=segments,
-        chunk_windows=(
-            ChunkWindow(chunk_ref=0, start=0.0, end=1.0),
-            ChunkWindow(chunk_ref=1, start=1.0, end=2.0),
-            ChunkWindow(chunk_ref=2, start=2.0, end=3.0),
-        ),
-    )
-    outputs = adapter.to_output_layer_inputs(
-        projections=projections,
-        language="zh",
-        segmentation_report={"route": "timeanchored"},
-    )
+    projected_batches = OutputProjector().project(_build_projection_input())
 
     subtitle_manager = _DummySubtitleManager()
     processor = OutputLayerProcessor(subtitle_manager=subtitle_manager)
-    payloads = [processor.process(item).output_payload for item in outputs]
+    payloads = [
+        processor.process(
+            OutputLayerInput(
+                chunk_index=batch.chunk_index if batch.chunk_index is not None else batch.chunk_id,
+                sentence_segments=[],
+                language="zh",
+                injection_report={},
+                segmentation_report={"route": "timeanchored"},
+                output_traces=[],
+                subtitle_batch=batch,
+            )
+        ).output_payload
+        for batch in projected_batches
+    ]
 
-    assert subtitle_manager.calls == [("0", 0), ("1", 1), ("2", 0)]
+    assert subtitle_manager.calls == [("chunk-0", 0), ("chunk-1", 1), ("chunk-2", 0)]
     assert payloads[0]["sentence_count"] == 0
     assert payloads[1]["sentence_count"] == 1
     assert payloads[2]["sentence_count"] == 0

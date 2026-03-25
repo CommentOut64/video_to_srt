@@ -57,8 +57,9 @@ from app.services.timeanchored_alignment.slow_window import (
     WindowLanguageProfile,
     WindowSourceUnit,
 )
-from app.services.timeanchored_alignment.chunk_projector import (
-    ChunkWindow,
+from app.services.timeanchored_alignment.output_projection import (
+    OutputProjectionInput,
+    OutputProjector,
 )
 from app.services.timeanchored_alignment.preparation import (
     AlignmentPreparationAssembler,
@@ -141,7 +142,8 @@ __all__ = [
     "SlowWindowBuilderConfig",
     "SlowWindowIngressAdapter",
     "SlowWindowIngressUnit",
-    "ChunkWindow",
+    "OutputProjectionInput",
+    "OutputProjector",
     "AlignmentPreparationAssembler",
     "AlignmentPreparationCompat",
     "AlignmentPreparationPackage",
