@@ -279,6 +279,51 @@ def test_alignment_stage_mode_active_uses_timeanchored_when_gate_passes(monkeypa
     remove_streaming_subtitle_manager(job_id)
 
 
+def test_alignment_stage_mode_active_forces_fast_direct_on_anchor_mount_fallback(monkeypatch) -> None:
+    job_id = "test_phase7_route_active_anchor_mount_force_fast"
+    pipeline = _build_pipeline(job_id, mode="active")
+    _patch_common_alignment_inputs(monkeypatch=monkeypatch, pipeline=pipeline)
+
+    monkeypatch.setattr(
+        pipeline,
+        "_run_collection_scoring_decision_once",
+        Mock(side_effect=AssertionError("legacy 链路已下线，不应被调用")),
+    )
+    stage_result = SimpleNamespace(
+        anchor_mount_result=SimpleNamespace(should_fallback=True),
+    )
+    timeanchored_run = Mock(return_value=stage_result)
+    commit_timeanchored = Mock()
+    commit_fast_direct = Mock()
+    record = Mock()
+    monkeypatch.setattr(pipeline._alignment_stage_service, "_run_timeanchored_main_chain", timeanchored_run)
+    monkeypatch.setattr(
+        pipeline._alignment_stage_service,
+        "_should_accept_timeanchored_result",
+        Mock(return_value=(True, "active_gate_pass")),
+    )
+    monkeypatch.setattr(
+        pipeline._alignment_stage_service,
+        "_commit_timeanchored_main_chain_result",
+        commit_timeanchored,
+    )
+    monkeypatch.setattr(
+        pipeline._alignment_stage_service,
+        "_commit_fast_direct_result",
+        commit_fast_direct,
+    )
+    monkeypatch.setattr(pipeline._alignment_stage_service, "_record_hetero_alignment_result", record)
+
+    ctx = _build_ctx(job_id)
+    asyncio.run(pipeline._run_alignment_stage(ctx))
+
+    assert timeanchored_run.call_count == 1
+    assert commit_fast_direct.call_count == 1
+    assert commit_timeanchored.call_count == 0
+    assert record.call_count == 0
+    remove_streaming_subtitle_manager(job_id)
+
+
 def test_alignment_stage_mode_default_raises_when_gate_fails(monkeypatch) -> None:
     job_id = "test_phase7_route_default_raise"
     pipeline = _build_pipeline(job_id, mode="default")
