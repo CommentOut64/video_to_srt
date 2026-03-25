@@ -552,24 +552,58 @@ class TextflowFacadeService:
             list(getattr(policy_snapshot, "semantic_anchor_words", []) or [])
         )
 
-        punct_track = PunctTrack(
-            clean_text_ref=str(punctuation_clean_text or chosen_text_clean or ""),
-            positions=list(punctuation_positions or []),
-            source="timeanchored_finalize",
-            confidence_stats={},
+        effective_punctuation_positions = list(punctuation_positions or [])
+        effective_punctuation_clean_text = str(punctuation_clean_text or chosen_text_clean or "")
+        decision_fallback_clean_text = effective_punctuation_clean_text
+        local_clean_text = self._build_timeanchored_local_clean_text(
+            final_stream,
+            detected_language=detected_language,
         )
-        scoring_output = self._host._scoring_processor.process(
-            ScoringLayerInput(
-                alignment_result=alignment_result,
-                punct_track=punct_track,
-                language=detected_language,
+        is_punct_track_mismatched = self._should_block_timeanchored_punctuation_injection(
+            final_stream=final_stream,
+            detected_language=detected_language,
+            punctuation_clean_text=effective_punctuation_clean_text,
+            punctuation_positions=effective_punctuation_positions,
+        )
+        if is_punct_track_mismatched:
+            self._host.logger.warning(
+                "timeanchored 标点注入已阻断: punct_clean_len={} local_clean_len={} language={}",
+                len(effective_punctuation_clean_text),
+                len(local_clean_text),
+                detected_language,
+            )
+            annotated_words = self._build_timeanchored_annotated_words(
+                final_stream,
                 speaker_id=speaker_id,
                 turn_id=turn_id,
-                policy_snapshot=policy_snapshot,
             )
-        )
-        annotated_words = list(scoring_output.annotated_words or [])
-        injection_report = dict(scoring_output.injection_report or {})
+            injection_report = {
+                "mapping_coverage": 0.0,
+                "mismatch_count": float(len(effective_punctuation_positions)),
+                "error_code": "E_SCORING_INJECTION_BLOCKED",
+                "blocked": 1.0,
+            }
+            effective_punctuation_positions = []
+            decision_fallback_clean_text = local_clean_text or str(chosen_text_clean or "")
+        else:
+            punct_track = PunctTrack(
+                clean_text_ref=effective_punctuation_clean_text,
+                positions=effective_punctuation_positions,
+                source="timeanchored_finalize",
+                confidence_stats={},
+            )
+            scoring_output = self._host._scoring_processor.process(
+                ScoringLayerInput(
+                    alignment_result=alignment_result,
+                    punct_track=punct_track,
+                    language=detected_language,
+                    speaker_id=speaker_id,
+                    turn_id=turn_id,
+                    policy_snapshot=policy_snapshot,
+                )
+            )
+            annotated_words = list(scoring_output.annotated_words or [])
+            injection_report = dict(scoring_output.injection_report or {})
 
         aligned_facts = self._host._fact_builder.build(
             annotated_words=annotated_words,
@@ -606,8 +640,8 @@ class TextflowFacadeService:
                 cut_plan=soft_cut_plan,
                 aligned_facts=aligned_facts,
                 fused_evidence=fused_evidence,
-                fallback_clean_text_ref=str(punctuation_clean_text or chosen_text_clean or ""),
-                fallback_punctuation_positions=list(punctuation_positions or []),
+                fallback_clean_text_ref=decision_fallback_clean_text,
+                fallback_punctuation_positions=effective_punctuation_positions,
                 policy_snapshot=policy_snapshot,
                 allow_fast_draft_fallback=True,
             ),
@@ -680,6 +714,44 @@ class TextflowFacadeService:
             alignment_time_word_count=len(words_for_split),
             detected_language=str(detected_language or "auto"),
         )
+
+    @staticmethod
+    def _should_block_timeanchored_punctuation_injection(
+        *,
+        final_stream: Sequence[AlignmentItem],
+        detected_language: str,
+        punctuation_clean_text: str,
+        punctuation_positions: Sequence[PuncPosition],
+    ) -> bool:
+        if not punctuation_positions or not punctuation_clean_text:
+            return False
+        if not TextflowFacadeService._is_cjk_language_tag(detected_language):
+            return False
+        local_clean_text = TextflowFacadeService._build_timeanchored_local_clean_text(
+            final_stream,
+            detected_language=detected_language,
+        )
+        if not local_clean_text:
+            return False
+        punct_track_text = TextflowFacadeService._normalize_fast_draft_token(punctuation_clean_text)
+        return bool(punct_track_text) and punct_track_text != local_clean_text
+
+    @staticmethod
+    def _build_timeanchored_local_clean_text(
+        stream: Sequence[AlignmentItem],
+        *,
+        detected_language: str,
+    ) -> str:
+        tokens = [
+            TextflowFacadeService._normalize_fast_draft_token(str(getattr(item, "text", "") or ""))
+            for item in stream
+        ]
+        normalized_tokens = [token for token in tokens if token]
+        if not normalized_tokens:
+            return ""
+        if TextflowFacadeService._is_cjk_language_tag(detected_language):
+            return "".join(normalized_tokens)
+        return " ".join(normalized_tokens)
 
     def _resolve_alignment_time_words(
         self,

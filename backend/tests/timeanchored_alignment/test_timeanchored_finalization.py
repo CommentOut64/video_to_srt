@@ -170,6 +170,45 @@ def test_finalize_timeanchored_stream_writes_back_punctuation_positions() -> Non
     assert run_result.words_for_split[-1].word.endswith("。")
 
 
+def test_finalize_timeanchored_stream_blocks_punctuation_when_track_is_out_of_local_index_space() -> None:
+    pipeline = AsyncDualPipeline(
+        job_id="test_timeanchored_finalization_blocks_shifted_punct_track",
+        draft_engine=DummyEngine(response_text="现了一瓶未开封的可乐这家", latency_ms=0),
+        patch_engine=DummyEngine(response_text="现了一瓶未开封的可乐这家", latency_ms=0),
+        transcription_profile="sv_whisper_dual",
+        enable_cross_chunk_merge=False,
+        enable_semantic_buffer=False,
+        punctuation_service=Mock(),
+    )
+
+    final_stream = tuple(
+        _item(token, start=index * 0.08, end=index * 0.08 + 0.06)
+        for index, token in enumerate(("现", "了", "一", "瓶", "未", "开", "封", "的", "可", "乐", "这", "家"))
+    )
+
+    run_result = pipeline._finalize_timeanchored_stream(
+        final_stream=final_stream,
+        boundary_evidences=(),
+        detected_language="zh",
+        chosen_text_clean="现了一瓶未开封的可乐这家",
+        punctuation_positions=[
+            PuncPosition(char_index=10, punctuation="，", confidence=0.99),
+        ],
+        punctuation_clean_text="发现了一瓶未开封的可乐这家",
+        speaker_id=None,
+        turn_id=None,
+        coverage=1.0,
+        route_confidence=0.96,
+        error_code="",
+    )
+
+    assert len(run_result.final_sentences) == 1
+    assert run_result.final_sentences[0].text_clean == "现了一瓶未开封的可乐这家"
+    assert all("，" not in word.word for word in run_result.words_for_split)
+    assert run_result.injection_stats["injection_blocked"] == 1.0
+    assert run_result.injection_stats["injection_error_code"] == "E_SCORING_INJECTION_BLOCKED"
+
+
 def test_finalize_timeanchored_stream_cjk_gap_pause_can_promote_fast_draft_boundary() -> None:
     pipeline = AsyncDualPipeline(
         job_id="test_timeanchored_finalization_disable_cjk_fast_draft_fallback",
@@ -226,9 +265,12 @@ def test_finalize_timeanchored_stream_cjk_gap_pause_can_promote_fast_draft_bound
         error_code="",
     )
 
-    assert len(run_result.final_sentences) == 1
-    assert run_result.final_sentences[0].text_clean == "今天天气真不错我们出发吧"
-    assert any(trace.split_reason == "fast_draft" for trace in run_result.output_traces)
+    assert len(run_result.final_sentences) == 2
+    assert [sentence.text_clean for sentence in run_result.final_sentences] == [
+        "今天天气真不错",
+        "我们出发吧",
+    ]
+    assert [trace.split_reason for trace in run_result.output_traces] == ["fast_draft", "tail_flush"]
     assert int(run_result.split_stats.get("applied_decision_count", 0) or 0) >= 1
 
 

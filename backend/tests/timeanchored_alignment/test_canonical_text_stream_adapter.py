@@ -251,3 +251,39 @@ def test_adapter_word_aligned_tokens_strip_trailing_punctuation_from_word_mapped
     )
 
     assert [token.text_core for token in stream.tokens] == ["大家好", "欢迎"]
+
+
+def test_adapter_maps_clean_text_punctuation_positions_to_current_token_trailing_anchor() -> None:
+    adapter = CanonicalTextStreamAdapter()
+
+    stream = adapter.build(
+        stream_id="stream-clean-punct",
+        chunk_ref="chunk-clean-punct",
+        tracks=TextTrackBundle(
+            chosen_track=_track(
+                text="你好世界",
+                source="aligned",
+                punct_positions=[
+                    PuncPosition(char_index=1, punctuation="，", confidence=0.99),
+                    PuncPosition(char_index=3, punctuation="。", confidence=0.99),
+                ],
+                clean_to_word=[0, 1, 2, 3],
+                language="zh",
+            )
+        ),
+        text_source="aligned",
+        language="zh",
+        aligned_facts=AlignedFacts(
+            annotated_words=[
+                AnnotatedWord(word="你", start=0.0, end=0.1, confidence=0.9),
+                AnnotatedWord(word="好", start=0.1, end=0.2, confidence=0.9),
+                AnnotatedWord(word="世", start=0.2, end=0.3, confidence=0.9),
+                AnnotatedWord(word="界", start=0.3, end=0.4, confidence=0.9),
+            ]
+        ),
+    )
+
+    facts = list(stream.punctuation_facts)
+    assert len(facts) == 2
+    assert (facts[0].left_token_index, facts[0].right_token_index, facts[0].attach_mode) == (1, None, "trailing")
+    assert (facts[1].left_token_index, facts[1].right_token_index, facts[1].attach_mode) == (3, None, "trailing")

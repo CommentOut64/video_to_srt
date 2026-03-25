@@ -437,6 +437,10 @@ class CanonicalTextStreamAdapter:
         if char_index is None or char_index < 0 or char_index >= len(char_to_token):
             return None, None, "standalone"
 
+        current_idx = char_to_token[char_index]
+        if current_idx is not None:
+            return int(current_idx), None, "trailing"
+
         left_idx: Optional[int] = None
         right_idx: Optional[int] = None
         for pos in range(char_index - 1, -1, -1):
