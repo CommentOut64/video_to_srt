@@ -59,6 +59,7 @@ def test_preparation_context_release_artifacts_cleans_large_intermediate_data() 
             "top_candidates": [{"token": "你"}],
             "compact_trace": {"frames": [1, 2, 3]},
         },
+        alignment_preparation=object(),
         text_truth=_build_dummy_text_truth(),
         protected_spans=[ProtectedSpan(start=0, end=2, kind="decimal", text="3.14")],
         language_runs=[LanguageRun(run_text="你好", run_language="zh", char_start=0, char_end=2)],
@@ -70,6 +71,7 @@ def test_preparation_context_release_artifacts_cleans_large_intermediate_data() 
     context.release_preparation_artifacts()
 
     assert context.text_truth is None
+    assert context.alignment_preparation is None
     assert context.protected_spans == []
     assert context.language_runs == []
     assert context.pronunciation_package is None
@@ -93,5 +95,6 @@ def test_preparation_context_release_artifacts_is_idempotent() -> None:
     context.release_preparation_artifacts()
 
     assert context.text_truth is None
+    assert context.alignment_preparation is None
     assert context.protected_spans == []
     assert context.language_runs == []

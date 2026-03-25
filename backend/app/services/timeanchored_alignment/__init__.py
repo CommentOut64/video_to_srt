@@ -71,6 +71,18 @@ from app.services.timeanchored_alignment.chunk_projector import (
     ChunkWindow,
 )
 from app.services.timeanchored_alignment.output_adapter import OutputAdapter
+from app.services.timeanchored_alignment.preparation import (
+    AlignmentPreparationAssembler,
+    AlignmentPreparationCompat,
+    AlignmentPreparationPackage,
+    FastHook,
+    PreparedSlowText,
+    PronunciationHint,
+    ProtectedUnit,
+    PunctuationEvidence,
+    SlowSlot,
+    SlowWindowTextPackage,
+)
 from app.services.timeanchored_alignment.stage_service import (
     TimeanchoredAlignmentStageService,
     TimeanchoredStageResult,
@@ -163,6 +175,16 @@ __all__ = [
     "ChunkProjector",
     "ChunkWindow",
     "OutputAdapter",
+    "AlignmentPreparationAssembler",
+    "AlignmentPreparationCompat",
+    "AlignmentPreparationPackage",
+    "FastHook",
+    "PreparedSlowText",
+    "PronunciationHint",
+    "ProtectedUnit",
+    "PunctuationEvidence",
+    "SlowSlot",
+    "SlowWindowTextPackage",
     "TimeanchoredAlignmentStageService",
     "TimeanchoredStageResult",
     "SlowInferenceWindow",

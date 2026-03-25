@@ -89,6 +89,7 @@ async def test_align_loop_releases_preparation_artifacts_after_alignment_stage()
             "ctc_logits": [[0.1, 0.9]],
             "top_candidates": [{"token": "你"}],
         },
+        alignment_preparation=object(),
         text_truth=_build_text_truth(),
         protected_spans=[ProtectedSpan(start=0, end=2, kind="decimal", text="3.14")],
         language_runs=[LanguageRun(run_text="你好", run_language="zh", char_start=0, char_end=2)],
@@ -122,6 +123,7 @@ async def test_align_loop_releases_preparation_artifacts_after_alignment_stage()
 
     assert len(results) == 1
     assert ctx.text_truth is None
+    assert ctx.alignment_preparation is None
     assert ctx.protected_spans == []
     assert ctx.language_runs == []
     assert ctx.pronunciation_package is None
@@ -144,6 +146,7 @@ async def test_align_loop_releases_preparation_artifacts_when_batch_already_comm
             "ctc_logits": [[0.1, 0.9]],
             "top_candidates": [{"token": "你"}],
         },
+        alignment_preparation=object(),
         text_truth=_build_text_truth(),
         protected_spans=[ProtectedSpan(start=0, end=2, kind="decimal", text="3.14")],
         language_runs=[LanguageRun(run_text="你好", run_language="zh", char_start=0, char_end=2)],
@@ -181,5 +184,6 @@ async def test_align_loop_releases_preparation_artifacts_when_batch_already_comm
     assert run_called is False
     assert len(results) == 1
     assert ctx.text_truth is None
+    assert ctx.alignment_preparation is None
     assert ctx.pronunciation_package is None
     assert "ctc_logits" not in (ctx.sv_result or {})

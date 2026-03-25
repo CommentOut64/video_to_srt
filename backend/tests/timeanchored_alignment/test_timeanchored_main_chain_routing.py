@@ -308,8 +308,8 @@ def test_alignment_stage_raises_when_timeanchored_main_chain_fails(
         Mock(side_effect=AssertionError("legacy 链路已下线，不应被调用")),
     )
     monkeypatch.setattr(
-        pipeline._alignment_stage_service._timeanchored_whisper_adapter,
-        "build_text_truth_package",
+        pipeline._alignment_stage_service._timeanchored_preparation_assembler,
+        "prepare",
         Mock(side_effect=RuntimeError("forced_timeanchored_error")),
     )
     ctx = ProcessingContext(

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from typing import Any, Dict, Optional, Sequence
 
 from app.models.sensevoice_models import SentenceSegment, TextSource
@@ -22,17 +22,31 @@ from app.services.timeanchored_alignment import (
     ChunkWindow,
     ChunkProjector,
     EdgeSelector,
-    LanguageRunFrontend,
     OutputAdapter,
     PhoneticAligner,
-    PronunciationFrontend,
     SentenceSegmenter,
     SubtitleAssembler,
     TimeanchoredAlignmentStageService,
     TimeanchoredStageResult,
     TextAligner,
 )
-from app.services.timeanchored_alignment.adapters.slow import WhisperTextAdapter
+from app.services.timeanchored_alignment.preparation import (
+    AlignmentPreparationAssembler,
+    AlignmentPreparationPackage,
+)
+from app.services.timeanchored_alignment.slow_window.contracts import (
+    DialogueShapeSnapshot,
+    PromptSeed,
+    ReadySlowWindow,
+    WindowBatchHint,
+    WindowChunkBinding,
+    WindowCoverage,
+    WindowLanguageProfile,
+    WindowSourceUnit,
+)
+from app.services.timeanchored_alignment.window_time_base_assembler import (
+    WindowTimeBasePackage,
+)
 
 
 class AlignmentStageService:
@@ -40,13 +54,10 @@ class AlignmentStageService:
 
     def __init__(self, *, host: Any) -> None:
         self._host = host
-        self._timeanchored_whisper_adapter = WhisperTextAdapter(
+        self._timeanchored_preparation_assembler = AlignmentPreparationAssembler(
+            logger=getattr(host, "logger", None),
             sanitizer=getattr(host, "_whisper_sanitizer", None),
             hallucination_detector=getattr(host, "_hallucination_detector", None),
-        )
-        self._timeanchored_language_frontend = LanguageRunFrontend()
-        self._timeanchored_pronunciation_frontend = PronunciationFrontend(
-            language_run_frontend=self._timeanchored_language_frontend,
         )
         self._timeanchored_text_aligner = TextAligner(
             phonetic_aligner=PhoneticAligner(),
@@ -745,77 +756,49 @@ class AlignmentStageService:
         turn_id: Optional[str],
     ) -> Optional[TimeanchoredStageResult]:
         host = self._host
-        chunk = ctx.audio_chunk
         try:
             base_language = str(language_hint or "auto")
-            text_truth = self._timeanchored_whisper_adapter.build_text_truth_package(
+            fallback_text = self._resolve_text_fallback_content(
+                chosen_text_clean=host._select_text_for_alignment(
+                    getattr(tracks, "chosen_track", None)
+                ),
+                tracks=tracks,
+                whisper_result=whisper_result,
+                sv_result=sv_result,
+            )
+            ready_window, window_time_base = self._resolve_preparation_inputs(
+                ctx=ctx,
+                whisper_result=whisper_result,
+                fallback_text=fallback_text,
+                language_hint=base_language,
+                speaker_id=speaker_id,
+                turn_id=turn_id,
+            )
+            host.logger.debug(
+                "Chunk {}: preparation 输入 window_id={} source_chunks={} source_units={} time_base_raw_units={} time_base_word_units={} fallback_text_len={}",
+                ctx.chunk_index,
+                ready_window.window_id,
+                len(ready_window.source_chunk_ids),
+                len(ready_window.source_units),
+                len(window_time_base.raw_units),
+                len(window_time_base.word_units),
+                len(fallback_text),
+            )
+            preparation = self._timeanchored_preparation_assembler.prepare(
+                ready_window=ready_window,
+                window_time_base=window_time_base,
                 whisper_result=whisper_result,
                 default_language=base_language,
+                fallback_text=fallback_text,
             )
-            truth_text = str(text_truth.normalized_text or text_truth.raw_text or "").strip()
-            if not truth_text:
-                truth_text = self._resolve_text_fallback_content(
-                    chosen_text_clean=host._select_text_for_alignment(
-                        getattr(tracks, "chosen_track", None)
-                    ),
-                    tracks=tracks,
-                    whisper_result=whisper_result,
-                    sv_result=sv_result,
-                )
-                text_truth = replace(
-                    text_truth,
-                    raw_text=truth_text,
-                    normalized_text=truth_text,
-                )
+            self._commit_preparation_context(ctx=ctx, preparation=preparation)
 
-            from app.services.text_protection import extract_protected_spans
-
-            protected_spans = tuple(extract_protected_spans(truth_text))
-            text_truth = replace(text_truth, protected_spans=protected_spans)
-            language_runs = self._timeanchored_language_frontend.build_runs(
-                text=truth_text,
-                language_hint=base_language,
-            )
-            pronunciation = self._timeanchored_pronunciation_frontend.build_package(
-                text=truth_text,
-                language_hint=base_language,
-                language_runs=language_runs.runs,
-                dominant_language=language_runs.dominant_language,
-            )
-
-            ctx.text_truth = text_truth
-            ctx.protected_spans = list(text_truth.protected_spans)
-            ctx.language_runs = list(language_runs.runs)
-            ctx.pronunciation_package = pronunciation
-            ctx.pronunciation_report = {
-                "token_count": len(pronunciation.token_units),
-                "phone_count": len(pronunciation.phone_units),
-                "window_kind": language_runs.window_kind,
-                "foreign_run_ratio": float(language_runs.foreign_run_ratio),
-            }
-
-            chunk_start = float(getattr(chunk, "start", 0.0) or 0.0) if chunk is not None else 0.0
-            chunk_end = (
-                float(getattr(chunk, "end", chunk_start) or chunk_start)
-                if chunk is not None
-                else chunk_start
-            )
-            if chunk_end <= chunk_start:
-                chunk_end = chunk_start + 0.01
             ctx_edge_mode = str(getattr(ctx, "edge_selection_mode", "") or "").strip().lower()
             host_edge_mode = str(getattr(host, "_edge_selection_mode", "auto") or "auto").strip().lower()
             edge_mode = ctx_edge_mode if ctx_edge_mode in {"force_fast", "force_slow"} else host_edge_mode
 
-            return self._timeanchored_stage_service.execute(
-                time_base=ctx.time_base_chunk,
-                text_truth=text_truth,
-                language_runs=language_runs,
-                pronunciation=pronunciation,
-                chunk_window=ChunkWindow(
-                    chunk_ref=ctx.chunk_index,
-                    start=chunk_start,
-                    end=chunk_end,
-                ),
+            return self._execute_prepared_timeanchored_stage(
+                preparation=preparation,
                 language=base_language,
                 edge_selection_mode=edge_mode,
                 speaker_id=speaker_id,
@@ -827,6 +810,234 @@ class AlignmentStageService:
                 ctx.chunk_index,
             )
             return None
+
+    def _execute_prepared_timeanchored_stage(
+        self,
+        *,
+        preparation: AlignmentPreparationPackage,
+        language: str,
+        edge_selection_mode: str,
+        speaker_id: Optional[str],
+        turn_id: Optional[str],
+    ) -> TimeanchoredStageResult:
+        compat = preparation.compat
+        self._host.logger.debug(
+            "Chunk {}: preparation 执行 stage window_id={} edge_mode={} text_truth_units={} timed_units={} fast_hooks={} language_runs={}",
+            preparation.owner_chunk_index,
+            preparation.window_id,
+            edge_selection_mode,
+            len(compat.text_truth.units),
+            sum(
+                1
+                for unit in compat.text_truth.units
+                if getattr(unit, "start", None) is not None and getattr(unit, "end", None) is not None
+            ),
+            len(preparation.fast_hooks),
+            len(compat.language_runs.runs),
+        )
+        return self._timeanchored_stage_service.execute(
+            time_base=compat.time_base,
+            text_truth=compat.text_truth,
+            language_runs=compat.language_runs,
+            pronunciation=compat.pronunciation,
+            chunk_window=compat.chunk_window,
+            language=language,
+            edge_selection_mode=edge_selection_mode,
+            speaker_id=speaker_id,
+            turn_id=turn_id,
+        )
+
+    def _commit_preparation_context(
+        self,
+        *,
+        ctx: ProcessingContext,
+        preparation: AlignmentPreparationPackage,
+    ) -> None:
+        ctx.alignment_preparation = preparation
+        ctx.text_truth = preparation.compat.text_truth
+        ctx.protected_spans = list(preparation.compat.protected_spans)
+        ctx.language_runs = list(preparation.compat.language_runs.runs)
+        ctx.pronunciation_package = preparation.compat.pronunciation
+        ctx.pronunciation_report = dict(preparation.compat.pronunciation_report)
+        ctx.slow_window_meta = {
+            "window_id": preparation.window_id,
+            "owner_chunk_id": preparation.owner_chunk_id,
+            "slot_count": len(preparation.slow_text.slots),
+            "hook_count": len(preparation.fast_hooks),
+            "source_chunk_ids": list(preparation.source_chunk_ids),
+        }
+        ctx.time_base_chunk = preparation.compat.time_base
+        if isinstance(preparation.compat.time_base, WindowTimeBasePackage):
+            ctx.window_time_base = preparation.compat.time_base
+        self._host.logger.debug(
+            "Chunk {}: preparation 已写回 ctx window_id={} slot_count={} hook_count={} protected_span_count={} language_run_count={} pronunciation_hint_count={} text_truth_units={} timed_units={}",
+            ctx.chunk_index,
+            preparation.window_id,
+            len(preparation.slow_text.slots),
+            len(preparation.fast_hooks),
+            len(preparation.compat.protected_spans),
+            len(preparation.compat.language_runs.runs),
+            len(preparation.slow_text.pronunciation_hints),
+            len(preparation.compat.text_truth.units),
+            sum(
+                1
+                for unit in preparation.compat.text_truth.units
+                if getattr(unit, "start", None) is not None and getattr(unit, "end", None) is not None
+            ),
+        )
+
+    def _resolve_preparation_inputs(
+        self,
+        *,
+        ctx: ProcessingContext,
+        whisper_result: Dict[str, Any],
+        fallback_text: str,
+        language_hint: str,
+        speaker_id: Optional[str],
+        turn_id: Optional[str],
+    ) -> tuple[ReadySlowWindow, WindowTimeBasePackage]:
+        ready_window = ctx.ready_slow_window or self._build_compat_ready_slow_window(
+            ctx=ctx,
+            whisper_result=whisper_result,
+            fallback_text=fallback_text,
+            language_hint=language_hint,
+            speaker_id=speaker_id,
+            turn_id=turn_id,
+        )
+        window_time_base = ctx.window_time_base or self._build_compat_window_time_base(
+            ctx=ctx,
+            ready_window=ready_window,
+            language_hint=language_hint,
+        )
+        ctx.ready_slow_window = ready_window
+        ctx.window_time_base = window_time_base
+        ctx.time_base_chunk = window_time_base
+        return ready_window, window_time_base
+
+    def _build_compat_ready_slow_window(
+        self,
+        *,
+        ctx: ProcessingContext,
+        whisper_result: Dict[str, Any],
+        fallback_text: str,
+        language_hint: str,
+        speaker_id: Optional[str],
+        turn_id: Optional[str],
+    ) -> ReadySlowWindow:
+        chunk = ctx.audio_chunk
+        chunk_id = str(getattr(chunk, "chunk_id", "") or f"chunk-{ctx.chunk_index}")
+        start = float(getattr(chunk, "start", 0.0) or 0.0) if chunk is not None else 0.0
+        end = float(getattr(chunk, "end", start) or start) if chunk is not None else start
+        if end <= start and ctx.time_base_chunk is not None:
+            units = tuple(getattr(ctx.time_base_chunk, "word_units", ()) or getattr(ctx.time_base_chunk, "raw_units", ()))
+            if units:
+                start = float(units[0].start)
+                end = float(units[-1].end)
+        if end <= start:
+            end = start + 0.01
+        source_text = str(
+            fallback_text
+            or whisper_result.get("text_clean")
+            or whisper_result.get("text")
+            or whisper_result.get("text_itn_raw")
+            or ""
+        ).strip()
+        semantic_chunk_id = f"compat-semantic-{ctx.chunk_index}"
+        speaker = str(speaker_id or "unknown")
+        ready_window = ReadySlowWindow(
+            window_id=str(ctx.slow_window_id or f"compat-window-{ctx.chunk_index}"),
+            owner_chunk_id=chunk_id,
+            owner_chunk_index=int(ctx.chunk_index),
+            window_mode="steady",
+            flush_reason=str(ctx.slow_window_flush_reason or "compat_single_chunk"),
+            audio_segments=((start, end),),
+            coverage=WindowCoverage(
+                core_segments=((start, end),),
+                left_guard_sec=0.0,
+                right_guard_sec=0.0,
+                chunk_bindings=(
+                    WindowChunkBinding(
+                        chunk_id=chunk_id,
+                        chunk_index=int(ctx.chunk_index),
+                        chunk_start=start,
+                        chunk_end=end,
+                        overlap_ratio=1.0,
+                        role="owner",
+                        is_owner=True,
+                    ),
+                ),
+            ),
+            source_semantic_chunk_ids=(semantic_chunk_id,),
+            source_chunk_ids=(chunk_id,),
+            source_chunk_indices=(int(ctx.chunk_index),),
+            source_units=(
+                WindowSourceUnit(
+                    unit_id=f"{chunk_id}:compat-source",
+                    semantic_chunk_id=semantic_chunk_id,
+                    text=source_text,
+                    audio_start=start,
+                    audio_end=end,
+                    source_chunk_ids=(chunk_id,),
+                    source_chunk_indices=(int(ctx.chunk_index),),
+                    speaker_id=speaker,
+                    turn_id=turn_id,
+                    language=str(language_hint or "auto"),
+                    arrived_at=end,
+                ),
+            ),
+            dialogue_shape=DialogueShapeSnapshot(
+                shape="single_speaker",
+                speaker_count=1,
+                dominant_speaker_id=speaker,
+                dominant_speaker_ratio=1.0,
+                speaker_switch_count=0,
+                speaker_switch_density=0.0,
+                turn_count=1,
+                avg_turn_duration_sec=max(end - start, 0.01),
+            ),
+            language_profile=WindowLanguageProfile(
+                primary_language=str(language_hint or "auto"),
+                language_mix_state="single_language",
+                decision_domains=("timeanchored_alignment",),
+                should_bypass_whisper=False,
+            ),
+            prompt_seed=PromptSeed(text=source_text),
+            batch_hint=WindowBatchHint(
+                duration_bucket="compat_single_chunk",
+                token_estimate=max(len(source_text), 1),
+                acoustic_density_hint="unknown",
+                queue_priority=0,
+            ),
+            created_at=end,
+        )
+        return ready_window
+
+    @staticmethod
+    def _build_compat_window_time_base(
+        *,
+        ctx: ProcessingContext,
+        ready_window: ReadySlowWindow,
+        language_hint: str,
+    ) -> WindowTimeBasePackage:
+        time_base = ctx.time_base_chunk
+        if time_base is None:
+            raise ValueError("对齐阶段缺少 time base，无法构建 AlignmentPreparation")
+        if isinstance(time_base, WindowTimeBasePackage):
+            return time_base
+        return WindowTimeBasePackage(
+            window_id=ready_window.window_id,
+            language=str(getattr(time_base, "language", "") or language_hint or "auto"),
+            raw_units=tuple(getattr(time_base, "raw_units", ()) or ()),
+            word_units=tuple(getattr(time_base, "word_units", ()) or ()),
+            quality=getattr(time_base, "quality"),
+            source_chunk_ids=ready_window.source_chunk_ids,
+            source_chunk_indices=ready_window.source_chunk_indices,
+            chunk_bindings=ready_window.coverage.chunk_bindings,
+            metadata=dict(getattr(time_base, "metadata", {}) or {}),
+            frame_stride=float(getattr(time_base, "frame_stride", 0.06) or 0.06),
+            source=str(getattr(time_base, "source", "sensevoice_window") or "sensevoice_window"),
+            contract_version=str(getattr(time_base, "contract_version", "1.0") or "1.0"),
+        )
 
     def _commit_timeanchored_main_chain_result(
         self,
