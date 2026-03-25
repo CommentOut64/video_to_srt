@@ -10,6 +10,8 @@ from app.services.timeanchored_alignment.contracts import (
 from app.services.timeanchored_alignment.preparation.assembler import (
     AlignmentPreparationAssembler,
 )
+from app.services.alignment.types import PunctTrack
+from app.services.punctuation.base import PuncPosition
 from app.services.timeanchored_alignment.preparation.display_projection_builder import (
     DisplayProjectionBuilder,
 )
@@ -423,3 +425,58 @@ def test_alignment_preparation_keeps_slot_boundaries_stable_when_projection_pres
         "Wouldn't it make sense",
         "It's not like I even wanted to graduate anyways",
     )
+
+
+def test_alignment_preparation_splits_slots_inside_same_source_unit_when_punctuation_exists() -> None:
+    text_a = (
+        "Then tomorrow we can celebrate her birthday, and maybe even get her a lava lamp. "
+        "Who is my favorite DDLC character?"
+    )
+    text_b = "Probably Monica she has the right idea in a lot of ways,"
+    whisper_text = f"{text_a} {text_b}".strip()
+    package = AlignmentPreparationAssembler().prepare(
+        ready_window=_build_english_ready_window(text_a=text_a, text_b=text_b),
+        window_time_base=_build_window_time_base(),
+        whisper_result=_build_whisper_result(whisper_text),
+        default_language="en",
+    )
+
+    assert len(package.slow_text.slots) > 2
+    assert sum(
+        1 for slot in package.slow_text.slots if slot.source_chunk_indices == (1,)
+    ) >= 2
+
+
+def test_alignment_preparation_refines_undersegmented_slots_with_pronunciation_hints() -> None:
+    text_a = (
+        "Then tomorrow we can celebrate her birthday and maybe even get her a laval lamp "
+        "Who is my favorite DDLC character?"
+    )
+    text_b = "Probably Monica, she has the right idea in a lot of ways."
+    whisper_text = f"{text_a} {text_b}".strip()
+    package = AlignmentPreparationAssembler().prepare(
+        ready_window=_build_english_ready_window(text_a=text_a, text_b=text_b),
+        window_time_base=_build_window_time_base(),
+        whisper_result=_build_whisper_result(whisper_text),
+        default_language="en",
+    )
+
+    assert len(package.slow_text.slots) > 4
+
+
+def test_assembler_accepts_external_punct_track_and_merges_evidence() -> None:
+    punct_track = PunctTrack(
+        clean_text_ref="你好世界",
+        positions=[PuncPosition(char_index=3, punctuation="。", confidence=0.99)],
+        source="fast",
+    )
+    package = AlignmentPreparationAssembler().prepare(
+        ready_window=_build_ready_window(),
+        window_time_base=_build_window_time_base(),
+        whisper_result=_build_whisper_result("你好世界"),
+        default_language="zh",
+        external_punct_track=punct_track,
+    )
+
+    assert len(package.slow_text.punctuation_evidences) > 0
+    assert any(item.mark == "。" for item in package.slow_text.punctuation_evidences)

@@ -15,6 +15,7 @@ from app.schemas.pipeline_context import ProcessingContext
 from app.services.alignment.types import L2Output, PunctTrack, TextTrack, TextTrackBundle
 from app.services.arbitration.arbiter import ArbitrationResult
 from app.services.audio.chunk_engine import AudioChunk
+from app.services.punctuation.base import PuncPosition
 from app.services.streaming_subtitle import remove_streaming_subtitle_manager
 from app.services.timeanchored_alignment.contracts import TimeBasePackage, TimeBaseQuality, TimeBaseUnit
 
@@ -356,3 +357,21 @@ def test_should_accept_timeanchored_default_accepts_valid_result_without_final_s
 
     assert accepted is True
     assert reason == "default_gate_pass"
+
+
+def test_alignment_stage_emits_punctuation_chain_health_metrics() -> None:
+    metrics = AlignmentStageService._build_punctuation_chain_health_metrics(
+        chosen_source="slow",
+        punct_track=PunctTrack(
+            clean_text_ref="你好世界",
+            positions=[PuncPosition(char_index=3, punctuation="。", confidence=0.9)],
+            source="fast",
+        ),
+        preparation_punctuation_count=0,
+        punctuation_fact_count=0,
+    )
+
+    assert metrics["chosen_source"] == "slow"
+    assert metrics["punct_track_positions_total"] == 1
+    assert metrics["preparation_punctuation_count"] == 0
+    assert metrics["punctuation_chain_broken_flag"] in (0, 1)

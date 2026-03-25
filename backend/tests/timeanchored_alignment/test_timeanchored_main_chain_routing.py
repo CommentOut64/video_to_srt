@@ -193,11 +193,6 @@ def test_alignment_stage_routes_to_timeanchored_main_chain_when_time_base_availa
         "_run_collection_scoring_decision_once",
         Mock(side_effect=AssertionError("timeanchored 分支命中后不应执行 legacy 四层")),
     )
-    monkeypatch.setattr(
-        pipeline,
-        "_finalize_timeanchored_stream",
-        Mock(side_effect=AssertionError("AnchorMount 默认主链不应再回流到 finalize_timeanchored_stream")),
-    )
 
     ctx = ProcessingContext(
         job_id=job_id,
@@ -329,18 +324,12 @@ def test_alignment_stage_force_fast_direct_path_without_time_base(
     )
     pipeline._alignment_pipeline_mode = "default"
 
+    run_collection_mock = Mock(return_value=_build_legacy_run_result())
     monkeypatch.setattr(
         pipeline,
         "_run_collection_scoring_decision_once",
-        Mock(side_effect=AssertionError("force_fast 直通不应进入 legacy 四层")),
+        run_collection_mock,
     )
-    finalize_mock = Mock(return_value=_build_legacy_run_result())
-    monkeypatch.setattr(
-        pipeline,
-        "_finalize_timeanchored_stream",
-        finalize_mock,
-    )
-
     ctx = ProcessingContext(
         job_id=job_id,
         chunk_index=0,
@@ -355,7 +344,8 @@ def test_alignment_stage_force_fast_direct_path_without_time_base(
     assert ctx.final_sentences
     assert ctx.finalization_metrics.get("fast_direct_enabled") == 1.0
     assert ctx.finalization_metrics.get("alignment_pipeline_route") == "fast"
-    finalize_mock.assert_called_once()
+    assert run_collection_mock.call_count == 1
+    assert run_collection_mock.call_args.kwargs.get("is_fast_only_mode") is True
 
     remove_streaming_subtitle_manager(job_id)
 
