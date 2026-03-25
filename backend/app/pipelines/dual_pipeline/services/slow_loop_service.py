@@ -229,39 +229,25 @@ class SlowLoopService:
                             source="slow",
                             chunk_index=chunk_index,
                         )
-                        whisper_text_raw = str(whisper_result.get("raw_text") or "")
-                        whisper_result["text_raw"] = whisper_text_raw
-                        whisper_result["prompt"] = prompt
-                        base_text = whisper_result.get("min_clean_text") or whisper_text_raw
-                        whisper_result["text"] = host._whisper_sanitizer.sanitize_minimal(
-                            str(base_text or ""),
+                        guard_result = host._slow_whisper_hallucination_guard.prepare_and_detect(
+                            whisper_result=whisper_result,
                             prompt=prompt,
                         )
-                        if host._hallucination_detector.is_hallucination(whisper_result, prompt):
+                        if guard_result.is_hallucination:
                             host.logger.warning(
                                 f"Chunk {chunk_index}: 检测到 Whisper 幻觉，回退到 SenseVoice"
                             )
                             host._reset_prompt_cache(reason="hallucination")
-                            fallback_text = sv_result.get("text_clean", "")
-                            whisper_result["text"] = fallback_text
-                            whisper_result["text_itn_raw"] = (
-                                sv_result.get("text_itn_raw") or fallback_text
+                            host._slow_whisper_hallucination_guard.apply_fast_fallback(
+                                whisper_result=whisper_result,
+                                sv_result=sv_result,
                             )
-                            whisper_result["text_clean"] = fallback_text
-                            whisper_result["language"] = sv_result.get("language", "auto")
-                            whisper_result["is_hallucination"] = True
                         else:
                             whisper_language = chunk.language or whisper_result.get("language") or "auto"
-                            normalized = host._text_normalizer.normalize(
-                                whisper_result.get("text", ""),
-                                whisper_language,
+                            host._slow_whisper_hallucination_guard.normalize_non_hallucination(
+                                whisper_result=whisper_result,
+                                language=whisper_language,
                             )
-                            whisper_result["text_itn_raw"] = normalized.text_itn_raw
-                            whisper_result["text_clean"] = normalized.text_clean
-                            whisper_result["text"] = (
-                                normalized.text_clean or whisper_result.get("text", "")
-                            )
-                            whisper_result["language"] = whisper_language
 
                         ctx.whisper_result = copy.deepcopy(whisper_result)
                         ctx.whisper_skipped = False

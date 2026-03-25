@@ -345,6 +345,16 @@ class AlignmentStageService:
                     ctx=ctx,
                 )
                 if should_accept and stage_result is not None:
+                    force_fast_reason = self._resolve_anchor_mount_force_fast_reason(
+                        stage_result=stage_result
+                    )
+                    if force_fast_reason:
+                        self._commit_fast_direct_result(
+                            ctx=ctx,
+                            sv_result=sv_result,
+                            reason=force_fast_reason,
+                        )
+                        return
                     self._commit_timeanchored_main_chain_result(
                         ctx=ctx,
                         stage_result=stage_result,
@@ -1916,6 +1926,21 @@ class AlignmentStageService:
         host_mode = str(getattr(host, "_edge_selection_mode", "auto") or "auto").strip().lower()
         if ctx_mode == "force_fast" or host_mode == "force_fast":
             return "force_fast"
+        return ""
+
+    @staticmethod
+    def _resolve_anchor_mount_force_fast_reason(
+        *,
+        stage_result: Optional[AnchorMountStageResult],
+    ) -> str:
+        """将 AnchorMount 的 fallback 质量信号映射为快流直通触发原因。"""
+        if stage_result is None:
+            return ""
+        anchor_mount_result = getattr(stage_result, "anchor_mount_result", None)
+        if anchor_mount_result is None:
+            return ""
+        if bool(getattr(anchor_mount_result, "should_fallback", False)):
+            return "anchor_mount_should_fallback"
         return ""
 
     @staticmethod

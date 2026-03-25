@@ -75,6 +75,9 @@ from app.services.alignment.types import (
 )
 from app.services.arbitration.arbiter import TextArbiterProcessor
 from app.services.arbitration.hallucination_detector import HallucinationDetector
+from app.services.arbitration.slow_whisper_hallucination_guard import (
+    SlowWhisperHallucinationGuard,
+)
 from app.services.model_runtime_config_service import get_model_runtime_config_service
 from app.services.sse_service import get_sse_manager
 from app.services.segmentation.default_segmenter import DefaultSegmenter, DraftSegmenter
@@ -457,6 +460,11 @@ class AsyncDualPipelineKernel:
         self._whisper_sanitizer = WhisperTextSanitizer(logger=self.logger)
         # V3.2.0+dev.20260204.03: L2 仲裁处理器与幻觉检测器
         self._hallucination_detector = HallucinationDetector(logger=self.logger)
+        self._slow_whisper_hallucination_guard = SlowWhisperHallucinationGuard(
+            sanitizer=self._whisper_sanitizer,
+            hallucination_detector=self._hallucination_detector,
+            text_normalizer=self._text_normalizer,
+        )
         self._l2_processor = TextArbiterProcessor(logger=self.logger)
         self._fast_punctuator = FastPunctuationPipeline(
             job_id=self.job_id,
@@ -2095,18 +2103,23 @@ class AsyncDualPipelineKernel:
         owner_ctx.slow_window_flush_reason = ready_window.flush_reason
         owner_ctx.slow_window_is_mixed = ready_window.language_profile.language_mix_state == "true_mixed"
 
-        raw_text = str(whisper_result.get("raw_text") or whisper_result.get("text") or "")
-        owner_ctx.whisper_result["raw_text"] = raw_text
-        owner_ctx.whisper_result["text_raw"] = raw_text
-        owner_ctx.whisper_result["prompt"] = prompt
-        if not owner_ctx.whisper_result.get("text"):
-            owner_ctx.whisper_result["text"] = str(owner_ctx.whisper_result.get("min_clean_text") or raw_text)
-        self._update_prompt_cache(
-            str(owner_ctx.whisper_result.get("text", "")),
-            confidence=owner_ctx.whisper_result.get("confidence"),
+        guard_result = self._slow_whisper_hallucination_guard.prepare_and_detect(
             whisper_result=owner_ctx.whisper_result,
+            prompt=prompt,
         )
-        self._last_prompt_audio_end = max(segment[1] for segment in ready_window.audio_segments)
+        if guard_result.is_hallucination:
+            self.logger.warning(
+                "Chunk {}: ReadySlowWindow 慢流检测到幻觉，标记后交由对齐层强制选边快流",
+                owner_ctx.chunk_index,
+            )
+            self._reset_prompt_cache(reason="hallucination")
+        else:
+            self._update_prompt_cache(
+                str(owner_ctx.whisper_result.get("text", "")),
+                confidence=owner_ctx.whisper_result.get("confidence"),
+                whisper_result=owner_ctx.whisper_result,
+            )
+            self._last_prompt_audio_end = max(segment[1] for segment in ready_window.audio_segments)
 
         return await self._push_owner_window_context(
             owner_ctx=owner_ctx,
