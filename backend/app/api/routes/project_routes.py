@@ -1296,20 +1296,6 @@ def _find_segment_by_segment_id(segments: list[dict], segment_id: str) -> Option
     return None
 
 
-def _find_segment_by_legacy_index(segments: list[dict], sentence_index: int) -> Optional[dict]:
-    target_index = int(sentence_index)
-    for segment in segments:
-        legacy_index = segment.get("legacy_index")
-        if legacy_index is None:
-            continue
-        try:
-            if int(legacy_index) == target_index:
-                return segment
-        except (TypeError, ValueError):
-            continue
-    return None
-
-
 def _build_runtime_export_segments(project_dir: Path) -> Optional[list[dict]]:
     """
     构建导出使用的字幕段：
@@ -2622,70 +2608,6 @@ def _handle_subtitle_doc_restore(
             results["errors"].append(f"restore: {seg_id} tombstone 中未找到")
             return None
     return None
-
-
-@router.patch("/{project_id}/subtitles/legacy/{sentence_index}")
-async def update_project_subtitle_by_legacy_index(
-    project_id: str,
-    sentence_index: int,
-    body: SubtitleUpdateRequest,
-):
-    """兼容入口：按 legacy_index 更新项目字幕。"""
-    project_service = get_project_service()
-    subtitle_doc_service = get_subtitle_doc_service()
-    project_dir = project_service.get_project_dir(project_id)
-    if project_dir is None:
-        raise HTTPException(status_code=404, detail="项目不存在")
-
-    runtime_segments = _load_runtime_subtitle_segments(project_dir)
-    if runtime_segments:
-        composed_segments = _compose_runtime_segments_with_user_edits(project_dir, runtime_segments)
-        target_segment = _find_segment_by_legacy_index(composed_segments, sentence_index)
-        if target_segment is None:
-            raise HTTPException(status_code=404, detail="字幕段不存在")
-        target_segment_id = str(target_segment.get("segment_id", "") or "").strip()
-        if not target_segment_id:
-            raise HTTPException(status_code=404, detail="字幕段不存在")
-        return await update_project_subtitle(project_id, target_segment_id, body)
-
-    segments = subtitle_doc_service.load_segments(project_dir)
-    target_segment = _find_segment_by_legacy_index(segments, sentence_index)
-    if target_segment is None:
-        raise HTTPException(status_code=404, detail="字幕段不存在")
-    target_segment_id = str(target_segment.get("segment_id", "") or "").strip()
-    if not target_segment_id:
-        raise HTTPException(status_code=404, detail="字幕段不存在")
-    return await update_project_subtitle(project_id, target_segment_id, body)
-
-
-@router.delete("/{project_id}/subtitles/legacy/{sentence_index}")
-async def delete_project_subtitle_by_legacy_index(project_id: str, sentence_index: int):
-    """兼容入口：按 legacy_index 删除项目字幕。"""
-    project_service = get_project_service()
-    subtitle_doc_service = get_subtitle_doc_service()
-    project_dir = project_service.get_project_dir(project_id)
-    if project_dir is None:
-        raise HTTPException(status_code=404, detail="项目不存在")
-
-    runtime_segments = _load_runtime_subtitle_segments(project_dir)
-    if runtime_segments:
-        composed_segments = _compose_runtime_segments_with_user_edits(project_dir, runtime_segments)
-        target_segment = _find_segment_by_legacy_index(composed_segments, sentence_index)
-        if target_segment is None:
-            raise HTTPException(status_code=404, detail="字幕段不存在")
-        target_segment_id = str(target_segment.get("segment_id", "") or "").strip()
-        if not target_segment_id:
-            raise HTTPException(status_code=404, detail="字幕段不存在")
-        return await delete_project_subtitle(project_id, target_segment_id)
-
-    segments = subtitle_doc_service.load_segments(project_dir)
-    target_segment = _find_segment_by_legacy_index(segments, sentence_index)
-    if target_segment is None:
-        raise HTTPException(status_code=404, detail="字幕段不存在")
-    target_segment_id = str(target_segment.get("segment_id", "") or "").strip()
-    if not target_segment_id:
-        raise HTTPException(status_code=404, detail="字幕段不存在")
-    return await delete_project_subtitle(project_id, target_segment_id)
 
 
 @router.get("/{project_id}/export")

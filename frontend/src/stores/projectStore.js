@@ -1403,7 +1403,7 @@ export const useProjectStore = defineStore("project", () => {
   /**
    * V3.1.0: 恢复字幕（断点续传后恢复）
    *
-   * 当收到 subtitle.restored 事件时调用
+   * legacy 壳：恢复链路现在统一复用 subtitle.replace_chunk + is_restore=true
    * 将从 Checkpoint 恢复的字幕添加到前端，确保不会与已有字幕冲突
    *
    * @param {string} chunk_id - Chunk ID

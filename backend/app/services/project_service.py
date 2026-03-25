@@ -523,6 +523,9 @@ class ProjectService:
             runtime_service = RuntimeCheckpointService(job_dir=project_dir)
             runtime_payload = runtime_service.load_subtitle_runtime()
             if runtime_payload:
+                raw_items = runtime_payload.get("subtitle_items_snapshot", [])
+                if isinstance(raw_items, list) and raw_items:
+                    return len([item for item in raw_items if isinstance(item, dict)])
                 raw_snapshot = runtime_payload.get("sentences_snapshot", [])
                 if isinstance(raw_snapshot, list):
                     return len([item for item in raw_snapshot if isinstance(item, dict)])

@@ -1482,10 +1482,6 @@ function subscribeSSE() {
       taskStore.updateSSEHeartbeat()
     },
 
-    onDeprecatedSubtitleEvent(eventType, data) {
-      console.warn(`[EditorView] 已忽略旧字幕事件 ${eventType}，等待后端完全清退`, data)
-    },
-
     // Phase 5: 草稿字幕事件（快流/SenseVoice）
     onDraft(data) {
       handleDraftSubtitle(data)
@@ -1629,41 +1625,6 @@ function startCancelTimeoutPolling() {
   }, CANCEL_TIMEOUT_MS)
 }
 
-// 处理流式字幕更新（旧版兼容，已弃用）
-// V3.1.2+dev.20260112.01: 此函数已弃用，保留仅供旧版 SSE 事件兼容
-// 新架构使用专用处理器：handleDraftSubtitle、handleReplaceChunk 等
-// eslint-disable-next-line no-unused-vars
-function handleStreamingSubtitle(data) {
-  if (!data) return
-
-  const sentence = data.sentence || {}
-  const sentenceIndex = data.sentence_index ?? data.index ?? sentence.index
-  if (sentenceIndex === undefined || sentenceIndex === null) {
-    throw new Error('[EditorView] subtitle.legacy_update 缺少 sentence_index')
-  }
-
-  const applied = applySentencePatch(editorDocumentStore, {
-    ...sentence,
-    index: sentenceIndex,
-    sentence_index: sentenceIndex,
-    text: sentence.text ?? data.text ?? data.content,
-    start: sentence.start ?? data.start_time ?? data.start,
-    end: sentence.end ?? data.end_time ?? data.end,
-    confidence: sentence.confidence ?? data.confidence,
-    display_confidence: sentence.display_confidence ?? data.display_confidence,
-    confidence_source: sentence.confidence_source ?? data.confidence_source,
-    warning_type: sentence.warning_type ?? data.warning_type ?? 'none',
-    source: data.source ?? data.event_type ?? 'unknown',
-    is_modified: sentence.is_modified ?? false,
-    original_text: sentence.original_text ?? null,
-  })
-  if (!applied) {
-    throw new Error(
-      `[EditorView] subtitle.legacy_update 未命中新内核字幕（sentence_index=${sentenceIndex}）`
-    )
-  }
-}
-
 // Phase 5: 处理草稿字幕（快流/SenseVoice）
 function handleDraftSubtitle(data) {
   if (!data) return
@@ -1707,40 +1668,34 @@ function handleDraftSubtitle(data) {
 function handleReplaceChunk(data) {
   if (!data) return
 
-  const eventType = data.__eventType || 'subtitle.replace_chunk'
   const chunkIndex = data.chunk_index
   if (useEditorV2) {
     const applied = editorEventProjector.projectReplaceChunk(data)
     if (!applied) {
       throw new Error(
-        `[EditorView] ${eventType} 未能应用到新内核（chunk_index=${chunkIndex ?? 'unknown'}）`
+        `[EditorView] subtitle.replace_chunk 未能应用到新内核（chunk_index=${chunkIndex ?? 'unknown'}）`
       )
     }
   }
-  if (eventType === 'subtitle.restored') {
+  if (data.is_restore === true) {
     scheduleV2RealtimeAuthoritativeReload(`subtitle_restored_${chunkIndex ?? 'unknown'}`)
     return
   }
-  void scheduleRealtimeFinalSync(`${eventType}_${chunkIndex ?? 'unknown'}`)
+  void scheduleRealtimeFinalSync(`subtitle.replace_chunk_${chunkIndex ?? 'unknown'}`)
 }
 
 function handleSubtitleAdded(data) {
   if (!data) return
 
-  if (useEditorV2) {
-    if (data?.segment && typeof data.segment === 'object') {
-      handleProjectSubtitleUpsert(data, 'subtitle.added')
-      return
-    }
-
-    const applied = upsertServerSegment(editorDocumentStore, data)
-    if (!applied) {
-      throw new Error('[EditorView] subtitle.added 无法投影到 editorDocumentStore')
-    }
+  if (data?.segment && typeof data.segment === 'object') {
+    handleProjectSubtitleUpsert(data, 'subtitle.added')
     return
   }
 
-  handleStreamingSubtitle(data)
+  const applied = upsertServerSegment(editorDocumentStore, data)
+  if (!applied) {
+    throw new Error('[EditorView] subtitle.added 缺少可投影的 segment_id')
+  }
 }
 
 function handleSubtitleDeleted(data) {
@@ -1761,25 +1716,28 @@ function handleSubtitleEdited(data) {
   }
 
   const sentence = data.sentence || {}
-  const sentenceIndex = data.index ?? data.sentence_index ?? sentence.index
   const segmentId = data.segment_id ?? sentence.segment_id
-  if ((sentenceIndex === undefined || sentenceIndex === null) && !segmentId) {
-    throw new Error('[EditorView] subtitle.edited 缺少 sentence_index/segment_id')
+  if (!segmentId) {
+    throw new Error('[EditorView] subtitle.edited 缺少 segment_id')
   }
 
   const applied = applySentencePatch(editorDocumentStore, {
     ...sentence,
-    ...(sentenceIndex !== undefined && sentenceIndex !== null
-      ? {
-          index: sentenceIndex,
-          sentence_index: sentenceIndex,
-        }
-      : {}),
-    ...(segmentId ? { segment_id: segmentId } : {}),
+    segment_id: segmentId,
+    text: sentence.text ?? data.text,
+    start: sentence.start ?? data.start,
+    end: sentence.end ?? data.end,
+    confidence: sentence.confidence ?? data.confidence,
+    display_confidence: sentence.display_confidence ?? data.display_confidence,
+    confidence_source: sentence.confidence_source ?? data.confidence_source,
+    warning_type: sentence.warning_type ?? data.warning_type ?? 'none',
+    source: sentence.source ?? data.source ?? 'unknown',
+    is_modified: sentence.is_modified ?? data.is_modified ?? false,
+    original_text: sentence.original_text ?? data.original_text ?? null,
   })
   if (!applied) {
     throw new Error(
-      `[EditorView] subtitle.edited 未命中新内核字幕（key=${sentenceIndex ?? segmentId ?? 'unknown'}）`
+      `[EditorView] subtitle.edited 未命中新内核字幕（segment_id=${segmentId}）`
     )
   }
 }
