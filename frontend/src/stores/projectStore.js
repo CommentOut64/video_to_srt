@@ -1230,22 +1230,36 @@ export const useProjectStore = defineStore("project", () => {
    * @param {string} chunk_id - Chunk ID
    * @param {Array} sentences - 定稿句子列表
    */
-  function replaceChunk(chunk_id, sentences) {
+  function replaceChunk(chunk_id, sentences, options = {}) {
+    const sourceScopeChunkIds = Array.isArray(options?.source_chunk_ids)
+      ? options.source_chunk_ids.filter((item) => item !== undefined && item !== null)
+      : [];
+    const cleanupChunkIds = Array.from(new Set([chunk_id, ...sourceScopeChunkIds]));
+
     // 暂停历史记录，SSE 推送的内容不应被撤销
     pauseHistory();
 
-    // 1. 删除该 Chunk 的所有旧字幕（保留用户编辑）
-    const oldSubtitleIds = chunkSubtitleMap.value.get(chunk_id) || [];
-    const protectedIds = oldSubtitleIds.filter((id) => {
-      const subtitle = subtitles.value.find((s) => s.id === id);
-      return subtitle?.isModified;
+    // 1. 删除作用域 Chunk 的所有旧字幕（保留用户编辑）
+    const oldSubtitleIds = [];
+    const protectedIdsSet = new Set();
+    cleanupChunkIds.forEach((scopeChunkId) => {
+      const ids = chunkSubtitleMap.value.get(scopeChunkId) || [];
+      oldSubtitleIds.push(...ids);
+      ids.forEach((id) => {
+        const subtitle = subtitles.value.find((s) => s.id === id);
+        if (subtitle?.isModified) {
+          protectedIdsSet.add(id);
+        }
+      });
+      chunkSubtitleMap.value.set(scopeChunkId, []);
     });
+    const protectedIds = Array.from(protectedIdsSet);
     subtitles.value = subtitles.value.filter(
       (s) => !oldSubtitleIds.includes(s.id) || protectedIds.includes(s.id)
     );
 
     console.log(
-      `[ProjectStore] 删除 Chunk ${chunk_id} 的 ${oldSubtitleIds.length} 个旧字幕, ` +
+      `[ProjectStore] 删除 Chunk Scope ${cleanupChunkIds.join(',')} 的 ${oldSubtitleIds.length} 个旧字幕, ` +
       `保护 ${protectedIds.length} 条用户编辑`
     );
 

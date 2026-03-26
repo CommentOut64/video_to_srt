@@ -6,6 +6,7 @@ import { createInsertSubtitleCommand } from './editorCommandFactory'
 
 let pendingCommands = []
 let flushScheduled = false
+let finalizedScopeChunkKeys = new Set()
 
 function secondsToMs(sessionStore, value) {
   return sessionStore.secondsToMs(value || 0)
@@ -47,6 +48,27 @@ function normalizeLogicalChunkKey(chunkId) {
 
 function getLogicalChunkKeyFromData(data) {
   return normalizeLogicalChunkKey(normalizeChunkId(data))
+}
+
+function normalizeLogicalChunkKeys(values) {
+  if (!Array.isArray(values)) {
+    return []
+  }
+  const keys = []
+  const seen = new Set()
+  values.forEach((value) => {
+    const normalized = normalizeLogicalChunkKey(value)
+    if (normalized === null || normalized === undefined || seen.has(normalized)) {
+      return
+    }
+    seen.add(normalized)
+    keys.push(normalized)
+  })
+  return keys
+}
+
+function resolveSourceScopeLogicalChunkKeys(data) {
+  return normalizeLogicalChunkKeys(data?.source_chunk_ids)
 }
 
 function isSameLogicalChunk(left, right) {
@@ -294,6 +316,10 @@ export function useEditorEventProjector() {
     const sentenceIndex = data.index
     const logicalChunkKey = getLogicalChunkKeyFromData(data)
 
+    if (logicalChunkKey !== null && finalizedScopeChunkKeys.has(logicalChunkKey)) {
+      return false
+    }
+
     const existingLocalId = resolvePrimaryLocalId(docStore, sentence, sentenceIndex, {
       preferDraft: true,
     })
@@ -356,21 +382,40 @@ export function useEditorEventProjector() {
     flushPendingCommandsNow()
     const chunkId = normalizeChunkId(data)
     const logicalChunkKey = getLogicalChunkKeyFromData(data)
+    const sourceScopeKeys = resolveSourceScopeLogicalChunkKeys(data)
     const replacementItems = resolveReplacementItems(data, mode)
+    const oldIndices = Array.isArray(data?.old_indices) ? data.old_indices : []
 
-    if (replacementItems.length === 0) {
+    if (replacementItems.length === 0 && sourceScopeKeys.length === 0 && oldIndices.length === 0) {
       return false
     }
+    if (mode === 'replace_chunk') {
+      const hasInvalidReplacementIdentity = replacementItems.some(({ sentence, sentenceIndex }) => {
+        if (!sentence) {
+          return true
+        }
+        const hasSentenceIndex = sentenceIndex !== null && sentenceIndex !== undefined
+        const hasSegmentId = normalizeSegmentId(sentence?.segment_id) !== null
+        return !hasSentenceIndex && !hasSegmentId
+      })
+      if (hasInvalidReplacementIdentity) {
+        return false
+      }
+    }
 
-    const oldLocalIdsFromIndices = (data.old_indices || [])
+    const oldLocalIdsFromIndices = oldIndices
       .map((idx) => docStore.findLocalIdBySentenceIndex(idx))
       .filter(Boolean)
     const oldLocalIdsFromPrimaryKeys = replacementItems
       .map(({ sentence, sentenceIndex }) => resolvePrimaryLocalId(docStore, sentence, sentenceIndex))
       .filter(Boolean)
+    const oldLocalIdsFromSourceScope = sourceScopeKeys.flatMap((scopeKey) => (
+      collectLocalIdsForLogicalChunk(docStore, scopeKey)
+    ))
     const oldLocalIds = uniqueLocalIds([
       ...oldLocalIdsFromIndices,
       ...oldLocalIdsFromPrimaryKeys,
+      ...oldLocalIdsFromSourceScope,
       // Why:
       // - 后端 replace_chunk 在极端恢复路径下可能缺失/漂移 old_indices；
       // - 若这里只回收草稿，旧定稿会与新定稿并存，形成“标点差异重复”。
@@ -407,6 +452,13 @@ export function useEditorEventProjector() {
       createdAt: Date.now(),
       oldLocalIds,
       newEntities
+    })
+
+    if (logicalChunkKey !== null && logicalChunkKey !== undefined) {
+      finalizedScopeChunkKeys.add(logicalChunkKey)
+    }
+    sourceScopeKeys.forEach((scopeKey) => {
+      finalizedScopeChunkKeys.add(scopeKey)
     })
 
     scheduleFlush()
@@ -502,6 +554,7 @@ export function useEditorEventProjector() {
   function reset() {
     pendingCommands = []
     flushScheduled = false
+    finalizedScopeChunkKeys = new Set()
   }
 
   return {
