@@ -79,8 +79,9 @@ def _build_projection_input() -> OutputProjectionInput:
     )
 
 
-def test_timeanchored_output_chain_supports_empty_replace_chunk_cleanup() -> None:
+def test_timeanchored_output_chain_dispatches_window_group_batch() -> None:
     projected_batches = OutputProjector().project(_build_projection_input())
+    assert len(projected_batches) == 1
 
     subtitle_manager = _DummySubtitleManager()
     processor = OutputLayerProcessor(subtitle_manager=subtitle_manager)
@@ -99,7 +100,6 @@ def test_timeanchored_output_chain_supports_empty_replace_chunk_cleanup() -> Non
         for batch in projected_batches
     ]
 
-    assert subtitle_manager.calls == [("chunk-0", 0), ("chunk-1", 1), ("chunk-2", 0)]
-    assert payloads[0]["sentence_count"] == 0
-    assert payloads[1]["sentence_count"] == 1
-    assert payloads[2]["sentence_count"] == 0
+    assert subtitle_manager.calls == [("ow-window-0", 1)]
+    assert payloads[0]["sentence_count"] == 1
+    assert payloads[0]["source_chunk_ids"] == ["chunk-0", "chunk-1", "chunk-2"]

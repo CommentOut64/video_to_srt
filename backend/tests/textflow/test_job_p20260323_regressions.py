@@ -6,6 +6,9 @@ from __future__ import annotations
 这里改为使用同一批样本文本构造“活回归”，直接守住当前切分层与输出层的关键行为。
 """
 
+import logging
+
+from app.models.sensevoice_models import SentenceSegment
 from app.services.alignment.types import CharMapping, TextTrack, TextTrackBundle
 from app.services.punctuation.base import PuncPosition
 from app.services.streaming_subtitle import StreamingSubtitleManager
@@ -117,6 +120,61 @@ def test_job_p20260323_chunk_8_replace_chunk_batch_does_not_accumulate_repeated_
         "给了六个同事里面年龄最小的一个说我不喜欢喝可乐送给你喝吧",
         "没想到这个女孩的好心举动",
     ]
+
+
+def test_replace_chunk_empty_projection_cleanup_does_not_emit_warning_for_non_owner_batch(caplog) -> None:
+    manager = StreamingSubtitleManager("job-empty-projection-cleanup")
+    manager.add_draft_sentences(
+        "chunk-3",
+        [
+            SentenceSegment(text="草稿一", text_clean="草稿一", start=1.0, end=1.5),
+            SentenceSegment(text="草稿二", text_clean="草稿二", start=1.5, end=2.0),
+        ],
+    )
+    empty_non_owner_batch = SubtitleBatch(
+        chunk_id="chunk-3",
+        chunk_index=3,
+        items=(),
+        diagnostics={
+            "projection": {
+                "projection_mode": "coverage_chunk_bindings",
+                "owner_chunk_id": "chunk-0",
+                "owner_carrier_role": "text_carrier_only",
+            }
+        },
+    )
+
+    with caplog.at_level(logging.WARNING, logger="app.services.streaming_subtitle"):
+        manager.replace_chunk_batch(empty_non_owner_batch)
+
+    assert not any("定稿句子为空" in record.message for record in caplog.records)
+
+
+def test_replace_chunk_empty_owner_batch_keeps_warning_signal(caplog) -> None:
+    manager = StreamingSubtitleManager("job-empty-owner-warning")
+    manager.add_draft_sentences(
+        "chunk-0",
+        [
+            SentenceSegment(text="草稿", text_clean="草稿", start=0.0, end=0.5),
+        ],
+    )
+    empty_owner_batch = SubtitleBatch(
+        chunk_id="chunk-0",
+        chunk_index=0,
+        items=(),
+        diagnostics={
+            "projection": {
+                "projection_mode": "coverage_chunk_bindings",
+                "owner_chunk_id": "chunk-0",
+                "owner_carrier_role": "text_carrier_only",
+            }
+        },
+    )
+
+    with caplog.at_level(logging.WARNING, logger="app.services.streaming_subtitle"):
+        manager.replace_chunk_batch(empty_owner_batch)
+
+    assert any("定稿句子为空" in record.message for record in caplog.records)
 
 
 def test_job_p20260323_entry_77_render_path_deduplicates_double_weak_punct() -> None:

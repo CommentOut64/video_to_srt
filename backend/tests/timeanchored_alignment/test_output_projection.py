@@ -91,27 +91,24 @@ def _build_input() -> OutputProjectionInput:
     )
 
 
-def test_output_projector_fans_out_by_window_coverage_chunk_bindings() -> None:
+def test_output_projector_emits_single_output_group_batch_with_scope_metadata() -> None:
     projected = OutputProjector().project(_build_input())
-    by_chunk_id = {batch.chunk_id: batch for batch in projected}
-
-    assert tuple(batch.chunk_id for batch in projected) == ("chunk-0", "chunk-1", "chunk-2")
-    assert [item.text for item in by_chunk_id["chunk-0"].items] == ["第一句"]
-    assert [item.text for item in by_chunk_id["chunk-1"].items] == ["第二句"]
-
-
-def test_output_projector_keeps_empty_chunk_batch_for_replace_chunk_cleanup() -> None:
-    projected = OutputProjector().project(_build_input())
-    by_chunk_id = {batch.chunk_id: batch for batch in projected}
-
-    assert by_chunk_id["chunk-2"].items == ()
+    assert len(projected) == 1
+    batch = projected[0]
+    assert batch.chunk_id == "ow-window-0"
+    assert batch.chunk_index is None
+    assert [item.text for item in batch.items] == ["第一句", "第二句"]
+    projection_meta = dict(batch.diagnostics.get("projection") or {})
+    assert projection_meta["projection_mode"] == "window_group"
+    assert projection_meta["replace_scope_chunk_ids"] == ["chunk-0", "chunk-1", "chunk-2"]
+    assert projection_meta["replace_scope_chunk_indices"] == [0, 1, 2]
 
 
 def test_output_projector_does_not_reinfer_boundaries_from_owner_items() -> None:
     projected = OutputProjector().project(_build_input())
-    by_chunk_id = {batch.chunk_id: batch for batch in projected}
-    first = by_chunk_id["chunk-0"].items[0]
-    second = by_chunk_id["chunk-1"].items[0]
+    assert len(projected) == 1
+    first = projected[0].items[0]
+    second = projected[0].items[1]
 
     assert first.start == 0.1
     assert first.end == 1.3
