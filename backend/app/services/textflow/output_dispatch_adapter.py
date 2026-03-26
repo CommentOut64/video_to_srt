@@ -150,9 +150,20 @@ class OutputDispatchAdapter:
 
         segmentation_payload = dict(segmentation_report or {})
         segmentation_payload["unknown_sentence_filtered_count"] = int(unknown_sentence_filtered_count)
+        projection_payload = dict(subtitle_batch.diagnostics.get("projection") or {})
+        source_chunk_ids = [
+            str(item)
+            for item in list(
+                projection_payload.get("replace_scope_chunk_ids")
+                or projection_payload.get("source_chunk_ids")
+                or []
+            )
+            if item is not None
+        ]
         payload: Dict[str, Any] = {
             "chunk_index": self._resolve_chunk_index(subtitle_batch),
             "chunk_uid": str(subtitle_batch.chunk_id),
+            "source_chunk_ids": source_chunk_ids,
             "sentence_count": int(len(subtitle_batch.items)),
             "sentence_segments": [
                 self._serialize_subtitle_item(item) for item in subtitle_batch.items

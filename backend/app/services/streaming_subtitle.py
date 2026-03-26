@@ -11,7 +11,7 @@ import hashlib
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 from app.models.sensevoice_models import SentenceSegment, TextSource
 from app.services.sse_service import get_sse_manager
 from app.services.subtitle_visibility import is_hidden_unknown_sentence
@@ -757,6 +757,7 @@ class StreamingSubtitleManager:
         *,
         empty_replace_is_expected: bool = False,
         empty_reason: str = "",
+        source_chunk_refs: Optional[Sequence[Any]] = None,
     ) -> List[int]:
         """
         替换 Chunk 的所有句子（慢流推送）
@@ -781,6 +782,7 @@ class StreamingSubtitleManager:
         """
         visible_sentences = self._filter_unknown_sentences(sentences)
         chunk_key = self._normalize_chunk_ref(chunk_ref)
+        normalized_source_chunk_ids = self._normalize_source_chunk_ids(source_chunk_refs)
         dropped_unknown_count = max(0, len(list(sentences or [])) - len(visible_sentences))
         if dropped_unknown_count > 0:
             logger.info(
@@ -813,16 +815,16 @@ class StreamingSubtitleManager:
                 self.chunk_sentences[chunk_key] = new_indices
 
             chunk_index_for_event = self._try_parse_chunk_index(chunk_key)
-            self._emit_subtitle_event(
-                "replace_chunk",
-                {
-                    "chunk_index": chunk_index_for_event if chunk_index_for_event is not None else chunk_key,
-                    "chunk_uid": str(chunk_key),
-                    "old_indices": old_indices,
-                    "new_indices": new_indices,
-                    "sentences": [],
-                },
-            )
+            event_payload: Dict[str, Any] = {
+                "chunk_index": chunk_index_for_event if chunk_index_for_event is not None else chunk_key,
+                "chunk_uid": str(chunk_key),
+                "old_indices": old_indices,
+                "new_indices": new_indices,
+                "sentences": [],
+            }
+            if normalized_source_chunk_ids:
+                event_payload["source_chunk_ids"] = list(normalized_source_chunk_ids)
+            self._emit_subtitle_event("replace_chunk", event_payload)
             if empty_replace_is_expected:
                 logger.info(
                     f"replace_chunk: Chunk {chunk_key} 触发预期空替换清理，"
@@ -895,16 +897,16 @@ class StreamingSubtitleManager:
             )
 
         chunk_index_for_event = self._try_parse_chunk_index(chunk_key)
-        self._emit_subtitle_event(
-            "replace_chunk",
-            {
-                "chunk_index": chunk_index_for_event if chunk_index_for_event is not None else chunk_key,
-                "chunk_uid": str(chunk_key),
-                "old_indices": old_indices,
-                "new_indices": new_indices,
-                "sentences": sentences_data,
-            },
-        )
+        event_payload = {
+            "chunk_index": chunk_index_for_event if chunk_index_for_event is not None else chunk_key,
+            "chunk_uid": str(chunk_key),
+            "old_indices": old_indices,
+            "new_indices": new_indices,
+            "sentences": sentences_data,
+        }
+        if normalized_source_chunk_ids:
+            event_payload["source_chunk_ids"] = list(normalized_source_chunk_ids)
+        self._emit_subtitle_event("replace_chunk", event_payload)
 
         # V3.8 调试日志：确认替换成功
         logger.debug(
@@ -917,6 +919,70 @@ class StreamingSubtitleManager:
         self._persist_runtime_subtitle_state(reason="replace_chunk")
         return new_indices
 
+    def _normalize_source_chunk_ids(self, chunk_refs: Optional[Sequence[Any]]) -> list[str]:
+        normalized_ids: list[str] = []
+        seen_ids: set[str] = set()
+        for chunk_ref in list(chunk_refs or []):
+            normalized_ref = str(self._normalize_chunk_ref(chunk_ref))
+            if not normalized_ref or normalized_ref in seen_ids:
+                continue
+            seen_ids.add(normalized_ref)
+            normalized_ids.append(normalized_ref)
+        return normalized_ids
+
+    def replace_chunk_scope(
+        self,
+        *,
+        target_chunk_ref: Any,
+        scope_chunk_refs: Sequence[Any],
+        sentences: List[SentenceSegment],
+    ) -> List[int]:
+        """按 source scope 先清理旧映射，再把定稿写入目标 chunk。"""
+        normalized_scope_refs = self._normalize_source_chunk_ids(scope_chunk_refs)
+        if not normalized_scope_refs:
+            return self.replace_chunk(target_chunk_ref, sentences)
+
+        target_chunk_key = self._normalize_chunk_ref(target_chunk_ref)
+        protected_indices_from_scope: list[int] = []
+        with self._lock:
+            scope_old_indices: list[int] = []
+            seen_indices = set()
+            for scope_ref in normalized_scope_refs:
+                for index in self.get_chunk_sentence_indices(scope_ref):
+                    if index in seen_indices:
+                        continue
+                    seen_indices.add(index)
+                    scope_old_indices.append(index)
+
+            for old_index in scope_old_indices:
+                sentence = self.sentences.get(old_index)
+                if sentence is None:
+                    continue
+                if getattr(sentence, "is_modified", False):
+                    protected_indices_from_scope.append(old_index)
+                    logger.info(
+                        "[window_group_scope] 保留 scope 内用户编辑: target=%s scope=%s index=%s",
+                        target_chunk_key,
+                        normalized_scope_refs,
+                        old_index,
+                    )
+                    continue
+                del self.sentences[old_index]
+
+            for scope_ref in normalized_scope_refs:
+                self._remove_chunk_alias_mappings(scope_ref)
+
+            if protected_indices_from_scope:
+                existing_target_indices = self.get_chunk_sentence_indices(target_chunk_key)
+                merged_indices = sorted(set(existing_target_indices + protected_indices_from_scope))
+                self.chunk_sentences[target_chunk_key] = merged_indices
+
+        return self.replace_chunk(
+            target_chunk_key,
+            sentences,
+            source_chunk_refs=normalized_scope_refs,
+        )
+
     def replace_chunk_batch(self, subtitle_batch: SubtitleBatch) -> List[int]:
         """按统一字幕 DTO 替换 Chunk。"""
         subtitle_items = list(subtitle_batch.items or ())
@@ -926,30 +992,20 @@ class StreamingSubtitleManager:
         ]
         diagnostics = dict(subtitle_batch.diagnostics or {})
         projection = diagnostics.get("projection")
-        empty_replace_is_expected = False
-        empty_reason = ""
-        if not subtitle_items and isinstance(projection, dict):
+        if isinstance(projection, dict):
             projection_mode = str(projection.get("projection_mode", "") or "")
-            owner_carrier_role = str(projection.get("owner_carrier_role", "") or "")
-            owner_chunk_ref = projection.get("owner_chunk_id")
-            is_non_owner_projection = (
-                owner_chunk_ref is not None
-                and self._normalize_chunk_ref(owner_chunk_ref)
-                != self._normalize_chunk_ref(subtitle_batch.chunk_id)
-            )
-            if (
-                projection_mode == "coverage_chunk_bindings"
-                and owner_carrier_role == "text_carrier_only"
-                and is_non_owner_projection
-            ):
-                empty_replace_is_expected = True
-                empty_reason = "projection_non_owner_cleanup"
-        return self.replace_chunk(
-            subtitle_batch.chunk_id,
-            sentences,
-            empty_replace_is_expected=empty_replace_is_expected,
-            empty_reason=empty_reason,
-        )
+            if projection_mode == "window_group":
+                scope_chunk_refs = projection.get("replace_scope_chunk_ids")
+                if not isinstance(scope_chunk_refs, list):
+                    scope_chunk_refs = projection.get("source_chunk_ids")
+                if not isinstance(scope_chunk_refs, list):
+                    scope_chunk_refs = []
+                return self.replace_chunk_scope(
+                    target_chunk_ref=subtitle_batch.chunk_id,
+                    scope_chunk_refs=scope_chunk_refs,
+                    sentences=sentences,
+                )
+        return self.replace_chunk(subtitle_batch.chunk_id, sentences)
 
     def add_finalized_sentences(
         self,
