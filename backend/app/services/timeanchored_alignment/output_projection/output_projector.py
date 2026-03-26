@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from app.services.timeanchored_alignment.slow_window.contracts import WindowChunkBinding, WindowCoverage
+from app.services.timeanchored_alignment.slow_window.contracts import WindowCoverage
 
 if TYPE_CHECKING:
     from app.services.textflow.contracts import SubtitleBatch, SubtitleItem
@@ -59,7 +59,7 @@ class OutputProjectionInput:
 
 @dataclass(frozen=True)
 class OutputProjector:
-    """Thin projector shell for window->chunk fan-out."""
+    """Thin projector shell for window->output-group dispatch."""
 
     def validate_input(self, data: OutputProjectionInput) -> OutputProjectionInput:
         return data
@@ -72,46 +72,55 @@ class OutputProjector:
         if not bindings:
             return tuple()
 
-        buckets: list[list["SubtitleItem"]] = [[] for _ in bindings]
-        bucket_segment_ids: list[set[str]] = [set() for _ in bindings]
+        output_group_chunk_id = self._build_output_group_chunk_id(validated.window_id)
+        grouped_items: list["SubtitleItem"] = []
+        seen_segment_ids: set[str] = set()
         for item in tuple(validated.owner_carrier_batch.items or ()):
-            target_index = self._resolve_target_binding(item=item, bindings=bindings)
             segment_id = str(item.segment_id)
-            if segment_id in bucket_segment_ids[target_index]:
+            if segment_id in seen_segment_ids:
                 continue
-            bucket_segment_ids[target_index].add(segment_id)
-            buckets[target_index].append(
-                self._clone_item_for_chunk(item=item, chunk_id=str(bindings[target_index].chunk_id))
+            seen_segment_ids.add(segment_id)
+            grouped_items.append(
+                self._clone_item_for_chunk(item=item, chunk_id=output_group_chunk_id)
             )
 
+        source_chunk_ids = [str(item) for item in validated.source_chunk_ids]
+        source_chunk_indices = [int(item) for item in validated.source_chunk_indices]
+        binding_chunk_ids = [str(binding.chunk_id) for binding in bindings]
+        binding_chunk_indices = [int(binding.chunk_index) for binding in bindings]
         projection_meta = {
             "window_id": str(validated.window_id),
             "owner_chunk_id": str(validated.owner_chunk_id),
-            "source_chunk_ids": [str(item) for item in validated.source_chunk_ids],
-            "source_chunk_indices": [int(item) for item in validated.source_chunk_indices],
-            "projection_mode": "coverage_chunk_bindings",
+            "source_chunk_ids": source_chunk_ids,
+            "source_chunk_indices": source_chunk_indices,
+            "replace_scope_chunk_ids": source_chunk_ids,
+            "replace_scope_chunk_indices": source_chunk_indices,
+            "binding_chunk_ids": binding_chunk_ids,
+            "binding_chunk_indices": binding_chunk_indices,
+            "projection_mode": "window_group",
             "owner_carrier_role": validated.owner_carrier_role,
             "decision_metadata": dict(validated.decision_metadata or {}),
         }
         render_report = dict(validated.owner_carrier_batch.render_report or {})
         base_diagnostics = dict(validated.owner_carrier_batch.diagnostics or {})
+        grouped_tuple = tuple(grouped_items)
+        diagnostics = dict(base_diagnostics)
+        diagnostics["projection"] = dict(projection_meta)
+        diagnostics["output_trace"] = self._build_output_trace(grouped_tuple)
+        return (
+            SubtitleBatch(
+                chunk_id=output_group_chunk_id,
+                chunk_index=None,
+                items=grouped_tuple,
+                render_report=dict(render_report),
+                diagnostics=diagnostics,
+            ),
+        )
 
-        projected_batches: list["SubtitleBatch"] = []
-        for index, binding in enumerate(bindings):
-            items = tuple(buckets[index])
-            diagnostics = dict(base_diagnostics)
-            diagnostics["projection"] = dict(projection_meta)
-            diagnostics["output_trace"] = self._build_output_trace(items)
-            projected_batches.append(
-                SubtitleBatch(
-                    chunk_id=str(binding.chunk_id),
-                    chunk_index=int(binding.chunk_index),
-                    items=items,
-                    render_report=dict(render_report),
-                    diagnostics=diagnostics,
-                )
-            )
-        return tuple(projected_batches)
+    @staticmethod
+    def _build_output_group_chunk_id(window_id: str) -> str:
+        normalized_window_id = str(window_id or "").strip() or "window-unknown"
+        return f"ow-{normalized_window_id}"
 
     @staticmethod
     def _clone_item_for_chunk(*, item: "SubtitleItem", chunk_id: str) -> "SubtitleItem":
@@ -129,35 +138,6 @@ class OutputProjector:
             turn_id=item.turn_id,
             trace=dict(item.trace or {}),
         )
-
-    @classmethod
-    def _resolve_target_binding(
-        cls,
-        *,
-        item: "SubtitleItem",
-        bindings: tuple[WindowChunkBinding, ...],
-    ) -> int:
-        best_index = 0
-        best_score = -1.0
-        best_owner_bonus = -1
-        for index, binding in enumerate(bindings):
-            overlap = cls._compute_overlap(
-                start=float(item.start),
-                end=float(item.end),
-                binding=binding,
-            )
-            owner_bonus = 1 if bool(binding.is_owner) else 0
-            if overlap > best_score or (overlap == best_score and owner_bonus > best_owner_bonus):
-                best_index = index
-                best_score = overlap
-                best_owner_bonus = owner_bonus
-        return best_index
-
-    @staticmethod
-    def _compute_overlap(*, start: float, end: float, binding: WindowChunkBinding) -> float:
-        left = max(float(start), float(binding.chunk_start))
-        right = min(float(end), float(binding.chunk_end))
-        return max(0.0, right - left)
 
     @staticmethod
     def _build_output_trace(items: tuple["SubtitleItem", ...]) -> list[dict[str, Any]]:

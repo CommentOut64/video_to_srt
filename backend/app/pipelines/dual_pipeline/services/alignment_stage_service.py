@@ -785,6 +785,13 @@ class AlignmentStageService:
                 speaker_id=speaker_id,
                 turn_id=turn_id,
             )
+            preparation_whisper_result, preparation_fallback_text = (
+                self._resolve_preparation_text_inputs(
+                    ready_window=ready_window,
+                    whisper_result=whisper_result,
+                    fallback_text=fallback_text,
+                )
+            )
             host.logger.debug(
                 "Chunk {}: preparation 输入 window_id={} source_chunks={} source_units={} time_base_raw_units={} time_base_word_units={} fallback_text_len={}",
                 ctx.chunk_index,
@@ -793,7 +800,7 @@ class AlignmentStageService:
                 len(ready_window.source_units),
                 len(window_time_base.raw_units),
                 len(window_time_base.word_units),
-                len(fallback_text),
+                len(preparation_fallback_text),
             )
             self._trace_write(
                 ctx=ctx,
@@ -808,24 +815,24 @@ class AlignmentStageService:
                     "source_units_count": len(ready_window.source_units),
                     "time_base_raw_units_count": len(window_time_base.raw_units),
                     "time_base_word_units_count": len(window_time_base.word_units),
-                    "fallback_text_len": len(fallback_text),
+                    "fallback_text_len": len(preparation_fallback_text),
                     "language_hint": base_language,
                 },
                 full_payload={
                     "ready_window": ready_window,
                     "window_time_base": window_time_base,
-                    "fallback_text": fallback_text,
+                    "fallback_text": preparation_fallback_text,
                     "language_hint": base_language,
-                    "whisper_result": whisper_result,
+                    "whisper_result": preparation_whisper_result,
                     "sv_result": sv_result,
                 },
             )
             preparation = self._timeanchored_preparation_assembler.prepare(
                 ready_window=ready_window,
                 window_time_base=window_time_base,
-                whisper_result=whisper_result,
+                whisper_result=preparation_whisper_result,
                 default_language=base_language,
-                fallback_text=fallback_text,
+                fallback_text=preparation_fallback_text,
                 external_punct_track=ctx.punct_track,
             )
             self._trace_write(
@@ -968,6 +975,58 @@ class AlignmentStageService:
         ctx.window_time_base = window_time_base
         ctx.time_base_chunk = window_time_base
         return ready_window, window_time_base
+
+    def _resolve_preparation_text_inputs(
+        self,
+        *,
+        ready_window: ReadySlowWindow,
+        whisper_result: Dict[str, Any],
+        fallback_text: str,
+    ) -> tuple[Dict[str, Any], str]:
+        """
+        为 preparation 选择窗口级文本输入。
+
+        根因背景：
+        - 某些窗口场景下 whisper_result 仅包含 owner chunk 文本；
+        - 但 ready_window.source_units 可能覆盖多个 source chunk；
+        - 若仍用 owner 文本驱动 preparation，会导致非 owner chunk 内容在窗口定稿中被吞掉。
+        """
+        normalized_whisper = dict(whisper_result or {})
+        normalized_fallback = str(fallback_text or "").strip()
+        if len(tuple(ready_window.source_units or ())) <= 1:
+            return normalized_whisper, normalized_fallback
+
+        window_source_text = self._build_ready_window_source_text(ready_window=ready_window)
+        if not window_source_text:
+            return normalized_whisper, normalized_fallback
+
+        current_text = str(
+            normalized_whisper.get("text_clean")
+            or normalized_whisper.get("text")
+            or normalized_whisper.get("text_itn_raw")
+            or normalized_fallback
+            or ""
+        ).strip()
+        if self._key_char_length(window_source_text) <= self._key_char_length(current_text):
+            return normalized_whisper, normalized_fallback
+
+        promoted = dict(normalized_whisper)
+        for field in ("text", "text_clean", "text_itn_raw", "min_clean_text"):
+            promoted[field] = window_source_text
+        return promoted, window_source_text
+
+    @staticmethod
+    def _build_ready_window_source_text(*, ready_window: ReadySlowWindow) -> str:
+        texts = [
+            str(getattr(unit, "text", "") or "").strip()
+            for unit in tuple(getattr(ready_window, "source_units", ()) or ())
+            if str(getattr(unit, "text", "") or "").strip()
+        ]
+        return " ".join(texts).strip()
+
+    @staticmethod
+    def _key_char_length(text: str) -> int:
+        return sum(1 for char in str(text or "") if char.isalnum())
 
     def _build_compat_ready_slow_window(
         self,
