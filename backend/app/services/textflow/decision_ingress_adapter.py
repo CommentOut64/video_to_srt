@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any, Sequence
 
 from app.services.alignment.types import (
@@ -17,9 +18,9 @@ from app.services.textflow.contracts import (
     SegmentationIngressContext,
 )
 from app.services.timeanchored_alignment.anchor_mount.contracts import (
+    AnchoredTokenUnit,
     CrossChunkLock,
     DecisionIngressPackage,
-    DecisionToken,
     PunctuationFact,
     PunctuationPairState,
 )
@@ -40,7 +41,6 @@ class DecisionIngressAdapterResult:
 class DecisionIngressAdapter:
     """把 AnchorMount 的稳定出口投影到当前 Decision 入口。"""
 
-    _SOFT_CUT_THRESHOLD = 0.75
     _INGRESS_VERSION = "window_first_compat_v1"
     _FALLBACK_PROJECTION_MODE = "layer_internal_compat"
 
@@ -51,30 +51,20 @@ class DecisionIngressAdapter:
         speaker_id: str | None = None,
         turn_id: str | None = None,
     ) -> DecisionIngressAdapterResult:
-        tokens = tuple(package.tokens)
-        annotated_words = [
-            AnnotatedWord(
-                word=str(token.text_core),
-                start=float(token.start),
-                end=float(token.end),
-                confidence=float(token.metadata.get("match_confidence", 1.0) or 1.0),
-                confidence_source="aligned",
-                is_pseudo=False,
-                speaker_id=token.speaker_id or speaker_id,
-                turn_id=token.turn_id or turn_id,
-                track_id="decision_ingress",
-            )
-            for token in tokens
-        ]
+        token_units = tuple(package.anchored_token_units)
+        annotated_words = self._build_annotated_words(
+            token_units=token_units,
+            fallback_speaker_id=speaker_id,
+            fallback_turn_id=turn_id,
+        )
         boundary_evidences = self._build_boundary_evidences(
-            boundary_hints=package.boundary_hints,
-            tokens=tokens,
+            boundary_evidences=package.boundary_evidences,
         )
         canonical_punctuation_facts = self._build_canonical_punctuation_facts(
             punctuation_facts=package.punctuation_facts,
         )
         fallback_clean_text, fallback_positions = self._build_fallback_punct_projection(
-            tokens=tokens,
+            token_units=token_units,
             punctuation_facts=package.punctuation_facts,
         )
         ingress_context = SegmentationIngressContext(
@@ -98,6 +88,7 @@ class DecisionIngressAdapter:
                 ],
                 "quality_metrics": dict(package.quality_metrics or {}),
                 "should_fallback": bool(package.should_fallback),
+                "candidate_boundary_count": int(len(boundary_evidences)),
             },
         )
         aligned_facts = AlignedFacts(
@@ -110,50 +101,47 @@ class DecisionIngressAdapter:
             ),
             gap_ratio=float(package.quality_metrics.get("largest_unresolved_span", 0.0) or 0.0),
             gap_positions=[],
-            speaker_turns=self._build_speaker_turns(tokens=tokens),
-            fast_draft_cuts=[
-                float(item.event_time)
-                for item in boundary_evidences
-                if bool(item.hard_flag) or float(item.score) >= self._SOFT_CUT_THRESHOLD
-            ],
+            speaker_turns=self._build_speaker_turns(token_units=token_units),
+            # Why: timeanchored 不再由 ingress 下发可执行切点；切分统一由 Decision 层评分并执行。
+            fast_draft_cuts=[],
             time_axis_version="anchor_mount_window_first",
             time_mappings=[
                 {
-                    "slot_index": int(token.slot_index),
-                    "slot_id": str(token.metadata.get("slot_id", token.token_id) or token.token_id),
+                    "token_index": int(index),
+                    "unit_id": str(token.unit_id),
                     "start": float(token.start),
                     "end": float(token.end),
-                    "mapping_quality": str(
-                        token.metadata.get("mount_status", "aligned") or "aligned"
-                    ),
+                    "mapping_quality": str(token.mount_status or "aligned"),
                     "source_chunk_ids": list(token.source_chunk_ids),
                     "source_chunk_indices": list(token.source_chunk_indices),
                 }
-                for token in tokens
+                for index, token in enumerate(token_units)
             ],
         )
         fused_evidence = FusedEvidence(
             speaker_changes=[
                 self._serialize_boundary_anchor(item)
-                for item in package.boundary_hints
-                if str(item.reason) == "speaker_change" and not bool(item.blocked_by_lock)
+                for item in boundary_evidences
+                if str(item.reason) == "speaker_change"
+                and not bool((item.metadata or {}).get("blocked_by_lock"))
             ],
             pause_anchors=[
                 self._serialize_boundary_anchor(item)
-                for item in package.boundary_hints
-                if "pause" in str(item.reason) and not bool(item.blocked_by_lock)
+                for item in boundary_evidences
+                if "pause" in str(item.reason)
+                and not bool((item.metadata or {}).get("blocked_by_lock"))
             ],
             semantic_anchors=[
                 self._serialize_boundary_anchor(item)
-                for item in package.boundary_hints
+                for item in boundary_evidences
                 if str(item.reason) in {"lexical_boundary", "anchor_block_close"}
-                and not bool(item.blocked_by_lock)
+                and not bool((item.metadata or {}).get("blocked_by_lock"))
             ],
             punctuation_anchors=[
                 {
                     "fact_id": item.fact_id,
-                    "left_slot_index": item.left_slot_index,
-                    "right_slot_index": item.right_slot_index,
+                    "left_token_index": item.left_token_index,
+                    "right_token_index": item.right_token_index,
                     "punct_class": item.punct_class,
                     "normalized_text": item.normalized_text,
                     "boundary_weight": float(item.boundary_weight),
@@ -163,7 +151,7 @@ class DecisionIngressAdapter:
             ],
             evidence_report={
                 "builder": "decision_ingress_adapter",
-                "boundary_hint_count": len(package.boundary_hints),
+                "boundary_evidence_count": len(boundary_evidences),
                 "punctuation_fact_count": len(package.punctuation_facts),
                 "cross_chunk_lock_count": len(package.cross_chunk_locks),
             },
@@ -175,9 +163,11 @@ class DecisionIngressAdapter:
             fallback_clean_text_ref=fallback_clean_text,
             fallback_punctuation_positions=fallback_positions,
             canonical_punctuation_facts=canonical_punctuation_facts,
-            canonical_candidate_boundaries=tuple(boundary_evidences),
+            # Why: 对齐层专属边界证据必须进入 canonical_candidate_boundaries，
+            # 由 Decision 与 punctuation/speaker/gap 信号统一评分。
+            canonical_candidate_boundaries=boundary_evidences,
             policy_snapshot=package.policy_snapshot,
-            allow_fast_draft_fallback=True,
+            allow_fast_draft_fallback=False,
             ingress_context=ingress_context,
         )
         return DecisionIngressAdapterResult(
@@ -196,41 +186,64 @@ class DecisionIngressAdapter:
         )
 
     @classmethod
-    def _build_boundary_evidences(
+    def _build_annotated_words(
         cls,
         *,
-        boundary_hints: Sequence[Any],
-        tokens: Sequence[DecisionToken],
-    ) -> tuple[BoundaryEvidence, ...]:
-        token_by_slot_index = {int(token.slot_index): token for token in tokens}
-        slot_index_by_slot_id = {
-            str(token.metadata.get("slot_id", token.token_id) or token.token_id): int(token.slot_index)
-            for token in tokens
-        }
-        evidences: list[BoundaryEvidence] = []
-        for hint in boundary_hints:
-            if bool(hint.blocked_by_lock):
+        token_units: Sequence[AnchoredTokenUnit],
+        fallback_speaker_id: str | None,
+        fallback_turn_id: str | None,
+    ) -> list[AnnotatedWord]:
+        words: list[AnnotatedWord] = []
+        for token in token_units:
+            token_text = str(token.token_text or "").strip()
+            if not token_text:
                 continue
-            slot_index = slot_index_by_slot_id.get(str(hint.split_after_slot_id))
-            if slot_index is None:
+            parts = cls._split_token_text(token_text)
+            if not parts:
                 continue
-            left_token = token_by_slot_index.get(slot_index)
-            if left_token is None:
-                continue
-            right_token = token_by_slot_index.get(slot_index + 1, left_token)
-            evidences.append(
-                BoundaryEvidence(
-                    split_idx=slot_index,
-                    event_time=float(hint.decision_time),
-                    left_end=float(left_token.end),
-                    right_start=float(right_token.start),
-                    reason=str(hint.reason),
-                    score=float(hint.score),
-                    hard_flag=bool(hint.hard_flag),
-                    metadata={"blocked_by_lock": bool(hint.blocked_by_lock)},
+            start = float(token.start)
+            end = float(token.end)
+            duration = max(end - start, 0.001)
+            total_weight = float(sum(max(len(part), 1) for part in parts))
+            cursor = start
+            for idx, part in enumerate(parts):
+                weight = float(max(len(part), 1)) / total_weight
+                piece_duration = duration * weight
+                piece_start = cursor
+                piece_end = end if idx == len(parts) - 1 else max(piece_start + 1e-3, cursor + piece_duration)
+                cursor = piece_end
+                annotated = AnnotatedWord(
+                    word=str(part),
+                    start=float(piece_start),
+                    end=float(piece_end),
+                    confidence=float(token.match_confidence or 1.0),
+                    confidence_source="aligned",
+                    is_pseudo=False,
+                    speaker_id=token.speaker_id or fallback_speaker_id,
+                    turn_id=token.turn_id or fallback_turn_id,
+                    track_id="decision_ingress",
                 )
-            )
-        return tuple(evidences)
+                words.append(annotated)
+        return words
+
+    @staticmethod
+    def _split_token_text(text: str) -> list[str]:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return []
+        parts = [part for part in re.split(r"\s+", normalized) if part]
+        return parts if parts else [normalized]
+
+    @staticmethod
+    def _build_boundary_evidences(
+        *,
+        boundary_evidences: Sequence[BoundaryEvidence],
+    ) -> tuple[BoundaryEvidence, ...]:
+        return tuple(
+            item
+            for item in boundary_evidences
+            if not bool((item.metadata or {}).get("blocked_by_lock"))
+        )
 
     @staticmethod
     def _build_canonical_punctuation_facts(
@@ -247,10 +260,10 @@ class DecisionIngressAdapter:
                 CanonicalPunctuationFact(
                     fact_id=str(item.fact_id),
                     left_token_index=(
-                        int(item.left_slot_index) if item.left_slot_index is not None else None
+                        int(item.left_token_index) if item.left_token_index is not None else None
                     ),
                     right_token_index=(
-                        int(item.right_slot_index) if item.right_slot_index is not None else None
+                        int(item.right_token_index) if item.right_token_index is not None else None
                     ),
                     attach_mode=str(item.attach_mode),
                     raw_text=normalized_text,
@@ -274,10 +287,10 @@ class DecisionIngressAdapter:
     def _build_fallback_punct_projection(
         cls,
         *,
-        tokens: Sequence[DecisionToken],
+        token_units: Sequence[AnchoredTokenUnit],
         punctuation_facts: Sequence[PunctuationFact],
     ) -> tuple[str, list[PuncPosition]]:
-        clean_text, token_spans = cls._build_synthetic_text(tokens=tokens)
+        clean_text, token_spans = cls._build_synthetic_text(token_units=token_units)
         positions: list[PuncPosition] = []
         for item in punctuation_facts:
             char_index = cls._resolve_fallback_char_index(
@@ -299,13 +312,13 @@ class DecisionIngressAdapter:
     @staticmethod
     def _build_synthetic_text(
         *,
-        tokens: Sequence[DecisionToken],
+        token_units: Sequence[AnchoredTokenUnit],
     ) -> tuple[str, dict[int, tuple[int, int]]]:
         chars: list[str] = []
         token_spans: dict[int, tuple[int, int]] = {}
         previous_char = ""
-        for token in tokens:
-            text = str(token.display_text or token.text_core or "").strip()
+        for index, token in enumerate(token_units):
+            text = str(token.token_text or "").strip()
             if not text:
                 continue
             if chars:
@@ -321,7 +334,7 @@ class DecisionIngressAdapter:
             start = len(chars)
             chars.extend(list(text))
             end = len(chars) - 1
-            token_spans[int(token.slot_index)] = (start, end)
+            token_spans[int(index)] = (start, end)
             previous_char = text[-1]
         return "".join(chars), token_spans
 
@@ -332,10 +345,10 @@ class DecisionIngressAdapter:
         token_spans: dict[int, tuple[int, int]],
         clean_text: str,
     ) -> int | None:
-        if fact.left_slot_index is not None and int(fact.left_slot_index) in token_spans:
-            return int(token_spans[int(fact.left_slot_index)][1])
-        if fact.right_slot_index is not None and int(fact.right_slot_index) in token_spans:
-            start = int(token_spans[int(fact.right_slot_index)][0])
+        if fact.left_token_index is not None and int(fact.left_token_index) in token_spans:
+            return int(token_spans[int(fact.left_token_index)][1])
+        if fact.right_token_index is not None and int(fact.right_token_index) in token_spans:
+            start = int(token_spans[int(fact.right_token_index)][0])
             return max(start - 1, 0) if clean_text else None
         if clean_text:
             return len(clean_text) - 1
@@ -344,11 +357,11 @@ class DecisionIngressAdapter:
     @staticmethod
     def _build_speaker_turns(
         *,
-        tokens: Sequence[DecisionToken],
+        token_units: Sequence[AnchoredTokenUnit],
     ) -> list[dict[str, Any]]:
         turns: list[dict[str, Any]] = []
         current: dict[str, Any] | None = None
-        for token in tokens:
+        for token in token_units:
             speaker = token.speaker_id
             turn = token.turn_id
             if current and current["speaker_id"] == speaker and current["turn_id"] == turn:
@@ -378,8 +391,8 @@ class DecisionIngressAdapter:
     @staticmethod
     def _serialize_boundary_anchor(item: Any) -> dict[str, Any]:
         return {
-            "slot_id": str(item.split_after_slot_id),
-            "decision_time": float(item.decision_time),
+            "split_idx": int(item.split_idx),
+            "decision_time": float(item.event_time),
             "score": float(item.score),
             "reason": str(item.reason),
         }
@@ -399,7 +412,7 @@ class DecisionIngressAdapter:
     def _serialize_cross_chunk_lock(item: CrossChunkLock) -> dict[str, Any]:
         return {
             "lock_id": str(item.lock_id),
-            "slot_ids": [str(value) for value in item.slot_ids],
+            "unit_ids": [str(value) for value in item.unit_ids],
             "hook_ids": [str(value) for value in item.hook_ids],
             "reason": str(item.reason),
             "source_chunk_ids": [str(value) for value in item.source_chunk_ids],

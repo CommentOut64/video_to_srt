@@ -519,7 +519,12 @@ def _clone_word(word: WordTimestamp) -> WordTimestamp:
         warning_type=word.warning_type,
         perplexity=word.perplexity,
     )
-    for attr in ("speaker_id", "turn_id", "speaker_label", "speaker_color_key"):
+    for attr in (
+        "speaker_id",
+        "turn_id",
+        "speaker_label",
+        "speaker_color_key",
+    ):
         if hasattr(word, attr):
             setattr(cloned, attr, getattr(word, attr))
     return cloned
@@ -553,7 +558,12 @@ def _merge_word_pair(left: WordTimestamp, right: WordTimestamp) -> WordTimestamp
             default=None,
         ),
     )
-    for attr in ("speaker_id", "turn_id", "speaker_label", "speaker_color_key"):
+    for attr in (
+        "speaker_id",
+        "turn_id",
+        "speaker_label",
+        "speaker_color_key",
+    ):
         left_value = getattr(left, attr, None)
         right_value = getattr(right, attr, None)
         setattr(merged, attr, left_value if left_value is not None else right_value)

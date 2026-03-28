@@ -936,11 +936,18 @@ class StreamingSubtitleManager:
         target_chunk_ref: Any,
         scope_chunk_refs: Sequence[Any],
         sentences: List[SentenceSegment],
+        empty_replace_is_expected: bool = False,
+        empty_reason: str = "",
     ) -> List[int]:
         """按 source scope 先清理旧映射，再把定稿写入目标 chunk。"""
         normalized_scope_refs = self._normalize_source_chunk_ids(scope_chunk_refs)
         if not normalized_scope_refs:
-            return self.replace_chunk(target_chunk_ref, sentences)
+            return self.replace_chunk(
+                target_chunk_ref,
+                sentences,
+                empty_replace_is_expected=empty_replace_is_expected,
+                empty_reason=empty_reason,
+            )
 
         target_chunk_key = self._normalize_chunk_ref(target_chunk_ref)
         protected_indices_from_scope: list[int] = []
@@ -981,6 +988,8 @@ class StreamingSubtitleManager:
             target_chunk_key,
             sentences,
             source_chunk_refs=normalized_scope_refs,
+            empty_replace_is_expected=empty_replace_is_expected,
+            empty_reason=empty_reason,
         )
 
     def replace_chunk_batch(self, subtitle_batch: SubtitleBatch) -> List[int]:
@@ -1000,10 +1009,13 @@ class StreamingSubtitleManager:
                     scope_chunk_refs = projection.get("source_chunk_ids")
                 if not isinstance(scope_chunk_refs, list):
                     scope_chunk_refs = []
+                expected_empty_cleanup = len(sentences) == 0
                 return self.replace_chunk_scope(
                     target_chunk_ref=subtitle_batch.chunk_id,
                     scope_chunk_refs=scope_chunk_refs,
                     sentences=sentences,
+                    empty_replace_is_expected=expected_empty_cleanup,
+                    empty_reason="window_group_scope_cleanup" if expected_empty_cleanup else "",
                 )
         return self.replace_chunk(subtitle_batch.chunk_id, sentences)
 
