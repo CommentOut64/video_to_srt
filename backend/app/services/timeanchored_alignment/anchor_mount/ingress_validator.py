@@ -16,24 +16,28 @@ class IngressValidator:
         language: str,
         policy_snapshot: object | None = None,
     ) -> AnchorMountInputView:
-        slots = tuple(preparation.slow_text.slots)
-        if not slots:
-            raise ValueError("AnchorMountAlignment 需要至少一个 slow slot")
+        token_units = tuple(preparation.slow_text.token_units)
+        if not token_units:
+            raise ValueError("AnchorMountAlignment 需要至少一个 prepared token unit")
         source_chunk_ids = set(preparation.source_chunk_ids)
         source_chunk_indices = set(preparation.source_chunk_indices)
         previous_end = -1
-        for slot in slots:
-            if slot.char_start < previous_end:
-                raise ValueError("SlowSlot 必须按 char 空间顺序排列")
-            if slot.char_end > len(preparation.slow_text.window_text.text):
-                raise ValueError("SlowSlot.char_end 越过 window_text 边界")
-            if not slot.source_chunk_ids or not slot.source_chunk_indices:
-                raise ValueError("SlowSlot 必须保留 source chunk provenance")
-            if not set(slot.source_chunk_ids).issubset(source_chunk_ids):
-                raise ValueError("SlowSlot.source_chunk_ids 必须属于 window source_chunk_ids")
-            if not set(slot.source_chunk_indices).issubset(source_chunk_indices):
-                raise ValueError("SlowSlot.source_chunk_indices 必须属于 window source_chunk_indices")
-            previous_end = slot.char_end
+        for token_unit in token_units:
+            if token_unit.char_start < previous_end:
+                raise ValueError("PreparedTokenUnit 必须按 char 空间顺序排列")
+            if token_unit.char_end > len(preparation.slow_text.window_text.text):
+                raise ValueError("PreparedTokenUnit.char_end 越过 window_text 边界")
+            if not token_unit.source_chunk_ids or not token_unit.source_chunk_indices:
+                raise ValueError("PreparedTokenUnit 必须保留 source chunk provenance")
+            if not set(token_unit.source_chunk_ids).issubset(source_chunk_ids):
+                raise ValueError(
+                    "PreparedTokenUnit.source_chunk_ids 必须属于 window source_chunk_ids"
+                )
+            if not set(token_unit.source_chunk_indices).issubset(source_chunk_indices):
+                raise ValueError(
+                    "PreparedTokenUnit.source_chunk_indices 必须属于 window source_chunk_indices"
+                )
+            previous_end = token_unit.char_end
         text_length = len(preparation.slow_text.window_text.text)
         for evidence in preparation.slow_text.punctuation_evidences:
             if evidence.source_char_index >= text_length:
@@ -57,7 +61,7 @@ class IngressValidator:
             source_chunk_ids=preparation.source_chunk_ids,
             source_chunk_indices=preparation.source_chunk_indices,
             language=str(language or preparation.compat.text_truth.language or "auto"),
-            slots=slots,
+            token_units=token_units,
             window_text=preparation.slow_text.window_text,
             punctuation_evidences=tuple(preparation.slow_text.punctuation_evidences),
             fast_hooks=fast_hooks,

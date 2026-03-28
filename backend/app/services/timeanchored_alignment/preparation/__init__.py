@@ -8,11 +8,14 @@ from app.services.timeanchored_alignment.preparation.contracts import (
     AlignmentPreparationPackage,
     FastHook,
     PreparedSlowText,
+    PreparedTokenUnit,
     PronunciationHint,
     ProtectedUnit,
     PunctuationEvidence,
-    SlowSlot,
     SlowWindowTextPackage,
+)
+from app.services.timeanchored_alignment.preparation.token_provenance_binder import (
+    TokenProvenanceBinder,
 )
 
 __all__ = [
@@ -21,9 +24,10 @@ __all__ = [
     "AlignmentPreparationPackage",
     "FastHook",
     "PreparedSlowText",
+    "PreparedTokenUnit",
     "PronunciationHint",
     "ProtectedUnit",
     "PunctuationEvidence",
-    "SlowSlot",
     "SlowWindowTextPackage",
+    "TokenProvenanceBinder",
 ]

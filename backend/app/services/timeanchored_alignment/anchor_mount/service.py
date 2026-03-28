@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.services.language_policy import build_language_policy_snapshot
-from app.services.timeanchored_alignment.anchor_mount.boundary_hint_assembler import (
-    BoundaryHintAssembler,
+from app.services.timeanchored_alignment.anchor_mount.boundary_evidence_builder import (
+    BoundaryEvidenceBuilder,
 )
 from app.services.timeanchored_alignment.anchor_mount.chain_solver import ChainSolveResult, ChainSolver
 from app.services.timeanchored_alignment.anchor_mount.contracts import (
@@ -66,7 +66,7 @@ class AnchorMountAlignmentService:
         temporal_envelope_builder: TemporalEnvelopeBuilder | None = None,
         hook_claim_resolver: HookClaimResolver | None = None,
         cross_chunk_lock_builder: CrossChunkLockBuilder | None = None,
-        boundary_hint_assembler: BoundaryHintAssembler | None = None,
+        boundary_evidence_builder: BoundaryEvidenceBuilder | None = None,
         fallback_gate: FallbackGate | None = None,
         decision_ingress_assembler: DecisionIngressAssembler | None = None,
     ) -> None:
@@ -79,7 +79,7 @@ class AnchorMountAlignmentService:
         self._temporal_envelope_builder = temporal_envelope_builder or TemporalEnvelopeBuilder()
         self._hook_claim_resolver = hook_claim_resolver or HookClaimResolver()
         self._cross_chunk_lock_builder = cross_chunk_lock_builder or CrossChunkLockBuilder()
-        self._boundary_hint_assembler = boundary_hint_assembler or BoundaryHintAssembler()
+        self._boundary_evidence_builder = boundary_evidence_builder or BoundaryEvidenceBuilder()
         self._fallback_gate = fallback_gate or FallbackGate()
         self._decision_ingress_assembler = decision_ingress_assembler or DecisionIngressAssembler()
 
@@ -103,7 +103,7 @@ class AnchorMountAlignmentService:
         )
         punctuation_facts, punctuation_pair_states, punctuation_diagnostics = self._punctuation_fact_mapper.map(
             window_text=input_view.window_text,
-            slots=input_view.slots,
+            token_units=input_view.token_units,
             punctuation_evidences=input_view.punctuation_evidences,
         )
         candidates = self._seed_discovery.discover(input_view=input_view)
@@ -111,7 +111,10 @@ class AnchorMountAlignmentService:
             candidates=candidates,
             input_view=input_view,
         )
-        blocks = self._local_extension.build(candidates=masked_candidates)
+        blocks = self._local_extension.build(
+            input_view=input_view,
+            candidates=masked_candidates,
+        )
         solve_result = self._chain_solver.solve(input_view=input_view, blocks=blocks)
         items, envelopes = self._temporal_envelope_builder.build(
             input_view=input_view,
@@ -125,7 +128,7 @@ class AnchorMountAlignmentService:
             items=items,
             envelopes=envelopes,
         )
-        boundary_hints = self._boundary_hint_assembler.build(
+        boundary_evidences = self._boundary_evidence_builder.build(
             items=items,
             envelopes=envelopes,
             punctuation_facts=punctuation_facts,
@@ -139,7 +142,7 @@ class AnchorMountAlignmentService:
             envelopes=envelopes,
             hook_claims=hook_claims,
             cross_chunk_locks=cross_chunk_locks,
-            boundary_hint_count=len(boundary_hints),
+            boundary_evidence_count=len(boundary_evidences),
             punctuation_fact_count=len(punctuation_facts),
             punctuation_diagnostics=punctuation_diagnostics,
         )
@@ -150,7 +153,7 @@ class AnchorMountAlignmentService:
             punctuation_pair_states=punctuation_pair_states,
             hook_claims=hook_claims,
             cross_chunk_locks=cross_chunk_locks,
-            boundary_hints=boundary_hints,
+            boundary_evidences=boundary_evidences,
             metrics=metrics,
             should_fallback=False,
         )
@@ -162,7 +165,7 @@ class AnchorMountAlignmentService:
             punctuation_pair_states=provisional_result.punctuation_pair_states,
             hook_claims=provisional_result.hook_claims,
             cross_chunk_locks=provisional_result.cross_chunk_locks,
-            boundary_hints=provisional_result.boundary_hints,
+            boundary_evidences=provisional_result.boundary_evidences,
             metrics=provisional_result.metrics,
             should_fallback=should_fallback,
         )
@@ -170,14 +173,14 @@ class AnchorMountAlignmentService:
             input_view=input_view,
             result=anchor_mount_result,
         )
-        route = "slow" if decision_ingress.tokens else "error"
+        route = "slow" if decision_ingress.anchored_token_units else "error"
         pipeline_report = PipelineReport(
             alignment_report=LayerReport(
                 name="anchor_mount_alignment",
-                status="ok" if decision_ingress.tokens else "error",
+                status="ok" if decision_ingress.anchored_token_units else "error",
                 metrics={
                     "route": route,
-                    "slot_count": len(items),
+                    "unit_count": len(items),
                     "anchored_count": metrics["anchored_count"],
                     "reseed_count": metrics["reseed_count"],
                     "should_fallback": should_fallback,
@@ -187,14 +190,14 @@ class AnchorMountAlignmentService:
                 name="anchor_mount_boundary",
                 status="ok",
                 metrics={
-                    "boundary_candidate_count": len(decision_ingress.boundary_hints),
+                    "boundary_candidate_count": len(decision_ingress.boundary_evidences),
                     "punctuation_fact_count": len(punctuation_facts),
                 },
             ),
             output_report=LayerReport(
                 name="decision_ingress",
                 status="ok",
-                metrics={"token_count": len(decision_ingress.tokens)},
+                metrics={"token_count": len(decision_ingress.anchored_token_units)},
             ),
         )
         return AnchorMountStageResult(
@@ -229,11 +232,11 @@ class AnchorMountAlignmentService:
         envelopes: tuple[Any, ...],
         hook_claims: tuple[Any, ...],
         cross_chunk_locks: tuple[Any, ...],
-        boundary_hint_count: int,
+        boundary_evidence_count: int,
         punctuation_fact_count: int,
         punctuation_diagnostics: Any,
     ) -> dict[str, Any]:
-        slot_count = len(items)
+        unit_count = len(items)
         anchored_count = sum(
             1 for envelope in envelopes if envelope.envelope_kind in {"anchored", "merged"}
         )
@@ -247,7 +250,7 @@ class AnchorMountAlignmentService:
             1 for block in solve_result.committed_blocks if block.block_kind == "anchored"
         )
         soft_anchor_count = sum(
-            1 for kind in solve_result.slot_anchor_kinds if str(kind) == "soft_pronunciation"
+            1 for kind in solve_result.unit_anchor_kinds if str(kind) == "soft_pronunciation"
         )
         total_hooks = len(getattr(input_view, "fast_hooks", ()) or ())
         claimed_hook_ids = {
@@ -269,22 +272,22 @@ class AnchorMountAlignmentService:
             items=items,
         )
         coverage_ratio = (
-            float(anchored_count) / float(slot_count)
-            if slot_count
+            float(anchored_count) / float(unit_count)
+            if unit_count
             else 0.0
         )
         alignment_score = max(
             0.0,
-            1.0 - float(unresolved_count) / max(float(slot_count), 1.0),
+            1.0 - float(unresolved_count) / max(float(unit_count), 1.0),
         )
         return {
-            "slot_count": slot_count,
+            "unit_count": unit_count,
             "anchored_count": anchored_count,
             "unresolved_count": unresolved_count,
             "inferred_count": inferred_count,
             "hard_anchor_count": hard_anchor_count,
             "reseed_count": solve_result.reseed_count,
-            "boundary_hint_count": int(boundary_hint_count),
+            "boundary_evidence_count": int(boundary_evidence_count),
             "punctuation_fact_count": int(punctuation_fact_count),
             "largest_unresolved_span": AnchorMountAlignmentService._largest_unresolved_span(
                 envelopes=envelopes,
@@ -295,8 +298,8 @@ class AnchorMountAlignmentService:
                 else 0.0
             ),
             "soft_anchor_ratio": (
-                float(soft_anchor_count) / float(slot_count)
-                if slot_count
+                float(soft_anchor_count) / float(unit_count)
+                if unit_count
                 else 0.0
             ),
             "hook_claim_conflict_count": hook_claim_conflict_count,

@@ -19,6 +19,8 @@ class AnchorMountGraphRenderer:
         *,
         window_id: str,
         items: Iterable[Any],
+        envelopes: Iterable[Any],
+        boundary_evidences: Iterable[Any],
         hooks: Iterable[Any],
         metrics: Dict[str, Any] | None,
     ) -> Dict[str, Any]:
@@ -29,8 +31,27 @@ class AnchorMountGraphRenderer:
             }
             for hook in hooks or ()
         }
+        envelope_rows = list(envelopes or ())
+        boundary_after_by_split_idx: Dict[int, List[Dict[str, Any]]] = {}
+        for item in boundary_evidences or ():
+            raw_split_idx = getattr(item, "split_idx", -1)
+            split_idx = int(raw_split_idx) if raw_split_idx is not None else -1
+            if split_idx < 0:
+                continue
+            boundary_after_by_split_idx.setdefault(split_idx, []).append(
+                {
+                    "split_idx": split_idx,
+                    "event_time": float(getattr(item, "event_time", 0.0) or 0.0),
+                    "left_end": float(getattr(item, "left_end", 0.0) or 0.0),
+                    "right_start": float(getattr(item, "right_start", 0.0) or 0.0),
+                    "reason": str(getattr(item, "reason", "") or ""),
+                    "score": float(getattr(item, "score", 0.0) or 0.0),
+                    "hard_flag": bool(getattr(item, "hard_flag", False)),
+                    "metadata": dict(getattr(item, "metadata", {}) or {}),
+                }
+            )
         mounts: List[Dict[str, Any]] = []
-        for item in items or ():
+        for index, item in enumerate(items or ()):
             mount_status = str(getattr(item, "mount_status", "") or "")
             if mount_status in self.SUCCESS_STATUSES:
                 classification = "success"
@@ -39,19 +60,54 @@ class AnchorMountGraphRenderer:
             else:
                 classification = "unresolved"
             hook_ids = [str(v) for v in (getattr(item, "source_hook_ids", ()) or ())]
+            envelope = envelope_rows[index] if index < len(envelope_rows) else None
             mounts.append(
                 {
-                    "slot_id": str(getattr(item, "slot_id", "") or ""),
-                    "slot_index": int(getattr(item, "slot_index", 0) or 0),
+                    "unit_id": str(getattr(item, "unit_id", "") or ""),
+                    "unit_index": int(getattr(item, "unit_index", 0) or 0),
                     "text": str(getattr(item, "display_text", "") or ""),
                     "mount_status": mount_status,
                     "classification": classification,
+                    "anchor_kind": str(getattr(item, "anchor_kind", "") or ""),
                     "hook_ids": hook_ids,
                     "hooks": [hook_index.get(hook_id, {"hook_id": hook_id, "text": ""}) for hook_id in hook_ids],
+                    "source_chunk_ids": [
+                        str(chunk_id)
+                        for chunk_id in (getattr(item, "source_chunk_ids", ()) or ())
+                    ],
+                    "source_chunk_indices": [
+                        int(chunk_index)
+                        for chunk_index in (getattr(item, "source_chunk_indices", ()) or ())
+                    ],
+                    "alignment_block_id": str(getattr(item, "alignment_block_id", "") or "") or None,
                     "match_confidence": float(getattr(item, "match_confidence", 0.0) or 0.0),
+                    "envelope": None
+                    if envelope is None
+                    else {
+                        "kind": str(getattr(envelope, "envelope_kind", "") or ""),
+                        "provisional_start": float(
+                            getattr(envelope, "provisional_start", 0.0) or 0.0
+                        ),
+                        "provisional_end": float(
+                            getattr(envelope, "provisional_end", 0.0) or 0.0
+                        ),
+                        "left_bound": float(getattr(envelope, "left_bound", 0.0) or 0.0),
+                        "right_bound": float(getattr(envelope, "right_bound", 0.0) or 0.0),
+                        "source_chunk_ids": [
+                            str(chunk_id)
+                            for chunk_id in (getattr(envelope, "source_chunk_ids", ()) or ())
+                        ],
+                        "source_chunk_indices": [
+                            int(chunk_index)
+                            for chunk_index in (getattr(envelope, "source_chunk_indices", ()) or ())
+                        ],
+                    },
+                    "boundary_after": list(
+                        boundary_after_by_split_idx.get(int(getattr(item, "unit_index", 0)), [])
+                    ),
                 }
             )
-        mounts.sort(key=lambda row: int(row["slot_index"]))
+        mounts.sort(key=lambda row: int(row["unit_index"]))
         summary = {
             "total": len(mounts),
             "success": sum(1 for row in mounts if row["classification"] == "success"),
@@ -142,17 +198,53 @@ class AnchorMountGraphRenderer:
         return "\n".join(svg_lines)
 
     def _build_row_lines(self, row: Dict[str, Any]) -> List[str]:
-        slot_index = int(row.get("slot_index", 0) or 0)
-        slot_text = str(row.get("text", "") or "")
+        unit_index = int(row.get("unit_index", 0) or 0)
+        unit_id = str(row.get("unit_id", "") or "")
+        unit_text = str(row.get("text", "") or "")
         confidence = float(row.get("match_confidence", 0.0) or 0.0)
+        envelope = dict(row.get("envelope") or {})
+        chunk_ids = ",".join(str(item) for item in (row.get("source_chunk_ids") or [])) or "(none)"
+        hook_ids = ",".join(str(item) for item in (row.get("hook_ids") or [])) or "(none)"
+        block_id = str(row.get("alignment_block_id", "") or "") or "(none)"
+        anchor_kind = str(row.get("anchor_kind", "") or "") or "(none)"
         lines: List[str] = []
         lines.extend(
             self._wrap_text(
-                f"slot[{slot_index}] text: {slot_text}",
+                f"unit[{unit_index}] id: {unit_id} text: {unit_text}",
                 max_chars=116,
             )
         )
         lines.append(f"match_confidence: {confidence:.3f}")
+        if envelope:
+            lines.append(
+                "time: "
+                f"{self._format_float(envelope.get('provisional_start'))} -> "
+                f"{self._format_float(envelope.get('provisional_end'))} "
+                "bounds: "
+                f"{self._format_float(envelope.get('left_bound'))} -> "
+                f"{self._format_float(envelope.get('right_bound'))}"
+            )
+        lines.extend(
+            self._wrap_text(
+                f"chunks: {chunk_ids} hooks: {hook_ids} block: {block_id} anchor_kind: {anchor_kind}",
+                max_chars=110,
+            )
+        )
+        for index, boundary in enumerate(list(row.get("boundary_after") or [])):
+            metadata = dict(boundary.get("metadata") or {})
+            metadata_text = ""
+            if metadata:
+                metadata_text = f" metadata={metadata}"
+            lines.extend(
+                self._wrap_text(
+                    "boundary_after"
+                    f"[{index}] {str(boundary.get('reason', '') or '')} "
+                    f"score={self._format_float(boundary.get('score'))} "
+                    f"gap={self._format_float(boundary.get('left_end'))}->{self._format_float(boundary.get('right_start'))}"
+                    f"{metadata_text}",
+                    max_chars=110,
+                )
+            )
         hooks = list(row.get("hooks") or [])
         if not hooks:
             lines.append("hook: (none)")
@@ -192,3 +284,10 @@ class AnchorMountGraphRenderer:
             .replace("\"", "&quot;")
             .replace("'", "&apos;")
         )
+
+    @staticmethod
+    def _format_float(value: Any) -> str:
+        try:
+            return f"{float(value):.3f}"
+        except (TypeError, ValueError):
+            return "0.000"

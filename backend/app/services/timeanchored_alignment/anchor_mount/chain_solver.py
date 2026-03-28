@@ -13,14 +13,14 @@ from app.services.timeanchored_alignment.anchor_mount.contracts import (
 @dataclass(frozen=True)
 class ChainSolveResult:
     committed_blocks: tuple[LocalAlignmentBlock, ...]
-    slot_to_hook_indices: tuple[tuple[int, ...], ...]
-    slot_anchor_kinds: tuple[str, ...]
-    unresolved_slot_indices: tuple[int, ...]
+    unit_to_hook_indices: tuple[tuple[int, ...], ...]
+    unit_anchor_kinds: tuple[str, ...]
+    unresolved_unit_indices: tuple[int, ...]
     reseed_count: int
 
 
 class ChainSolver:
-    """贪心维持 slot/hook 单调关系。"""
+    """贪心维持 unit/hook 单调关系。"""
 
     def solve(
         self,
@@ -30,7 +30,7 @@ class ChainSolver:
     ) -> ChainSolveResult:
         committed: list[LocalAlignmentBlock] = []
         reseed_count = 0
-        ordered_blocks = sorted(blocks, key=lambda item: (item.slot_indices[0], item.hook_indices[0]))
+        ordered_blocks = sorted(blocks, key=lambda item: (item.unit_indices[0], item.hook_indices[0]))
 
         for block in ordered_blocks:
             conflict_start = self._find_conflict_start(committed=committed, block=block)
@@ -43,21 +43,26 @@ class ChainSolver:
                 committed = committed[:conflict_start]
             committed.append(block)
 
-        slot_to_hook_indices: list[tuple[int, ...]] = [tuple() for _ in input_view.slots]
-        slot_anchor_kinds: list[str] = ["none" for _ in input_view.slots]
+        unit_to_hook_indices: list[tuple[int, ...]] = [tuple() for _ in input_view.token_units]
+        unit_anchor_kinds: list[str] = ["none" for _ in input_view.token_units]
         for block in committed:
-            for slot_index in block.slot_indices:
-                slot_to_hook_indices[slot_index] = tuple(block.hook_indices)
-                slot_anchor_kinds[slot_index] = block.anchor_kind
+            if len(block.unit_indices) == len(block.hook_indices):
+                for unit_index, hook_index in zip(block.unit_indices, block.hook_indices, strict=False):
+                    unit_to_hook_indices[unit_index] = (int(hook_index),)
+                    unit_anchor_kinds[unit_index] = block.anchor_kind
+                continue
+            for unit_index in block.unit_indices:
+                unit_to_hook_indices[unit_index] = tuple(block.hook_indices)
+                unit_anchor_kinds[unit_index] = block.anchor_kind
 
         unresolved = tuple(
-            index for index, hook_indices in enumerate(slot_to_hook_indices) if not hook_indices
+            index for index, hook_indices in enumerate(unit_to_hook_indices) if not hook_indices
         )
         return ChainSolveResult(
             committed_blocks=tuple(committed),
-            slot_to_hook_indices=tuple(slot_to_hook_indices),
-            slot_anchor_kinds=tuple(slot_anchor_kinds),
-            unresolved_slot_indices=unresolved,
+            unit_to_hook_indices=tuple(unit_to_hook_indices),
+            unit_anchor_kinds=tuple(unit_anchor_kinds),
+            unresolved_unit_indices=unresolved,
             reseed_count=reseed_count,
         )
 
@@ -67,12 +72,12 @@ class ChainSolver:
         committed: list[LocalAlignmentBlock],
         block: LocalAlignmentBlock,
     ) -> int | None:
-        block_slot_set = set(block.slot_indices)
+        block_unit_set = set(block.unit_indices)
         current_hook_min = min(block.hook_indices)
         current_hook_max = max(block.hook_indices)
         for index, item in enumerate(committed):
-            item_slot_set = set(item.slot_indices)
-            if block_slot_set & item_slot_set:
+            item_unit_set = set(item.unit_indices)
+            if block_unit_set & item_unit_set:
                 return index
             item_hook_min = min(item.hook_indices)
             item_hook_max = max(item.hook_indices)

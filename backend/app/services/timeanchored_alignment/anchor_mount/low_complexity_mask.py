@@ -24,11 +24,11 @@ class LowComplexityMask:
     ) -> tuple[AnchorCandidate, ...]:
         masked: list[AnchorCandidate] = []
         for candidate in candidates:
-            slot_text = "".join(
-                str(input_view.slots[index].text or "")
-                for index in candidate.slot_indices
+            unit_text = "".join(
+                str(input_view.token_units[index].token_text or "")
+                for index in candidate.unit_indices
             ).strip().lower()
-            if slot_text in _LOW_INFO_TOKENS or len(slot_text) <= 1:
+            if unit_text in _LOW_INFO_TOKENS or len(unit_text) <= 1:
                 masked.append(
                     replace(
                         candidate,

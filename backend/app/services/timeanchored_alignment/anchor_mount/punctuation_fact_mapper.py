@@ -1,4 +1,4 @@
-"""把 char-space 标点证据映射到 slot-space。"""
+"""把 char-space 标点证据映射到 token-unit space。"""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ from app.services.timeanchored_alignment.anchor_mount.contracts import (
     PunctuationPairState,
 )
 from app.services.timeanchored_alignment.preparation.contracts import (
+    PreparedTokenUnit,
     PunctuationEvidence,
-    SlowSlot,
     SlowWindowTextPackage,
 )
 
@@ -34,24 +34,24 @@ def _classify_mark(mark: str) -> str:
     return "other"
 
 
-def _slot_for_char(slots: tuple[SlowSlot, ...], char_index: int) -> int | None:
-    for index, slot in enumerate(slots):
-        if slot.char_start <= char_index < slot.char_end:
+def _token_for_char(token_units: tuple[PreparedTokenUnit, ...], char_index: int) -> int | None:
+    for index, token_unit in enumerate(token_units):
+        if token_unit.char_start <= char_index < token_unit.char_end:
             return index
     return None
 
 
-def _next_slot(slots: tuple[SlowSlot, ...], char_index: int) -> int | None:
-    for index, slot in enumerate(slots):
-        if char_index < slot.char_start:
+def _next_token(token_units: tuple[PreparedTokenUnit, ...], char_index: int) -> int | None:
+    for index, token_unit in enumerate(token_units):
+        if char_index < token_unit.char_start:
             return index
     return None
 
 
-def _previous_slot(slots: tuple[SlowSlot, ...], char_index: int) -> int | None:
+def _previous_token(token_units: tuple[PreparedTokenUnit, ...], char_index: int) -> int | None:
     candidate: int | None = None
-    for index, slot in enumerate(slots):
-        if slot.char_end <= char_index:
+    for index, token_unit in enumerate(token_units):
+        if token_unit.char_end <= char_index:
             candidate = index
             continue
         break
@@ -59,13 +59,13 @@ def _previous_slot(slots: tuple[SlowSlot, ...], char_index: int) -> int | None:
 
 
 class PunctuationFactMapper:
-    """把 Preparation 标点证据映射到 slot 域。"""
+    """把 Preparation 标点证据映射到 token-unit 域。"""
 
     def map(
         self,
         *,
         window_text: SlowWindowTextPackage,
-        slots: tuple[SlowSlot, ...],
+        token_units: tuple[PreparedTokenUnit, ...],
         punctuation_evidences: tuple[PunctuationEvidence, ...],
     ) -> tuple[
         tuple[PunctuationFact, ...],
@@ -109,43 +109,45 @@ class PunctuationFactMapper:
                     }
                 )
                 continue
-            slot_index = _slot_for_char(slots, char_index)
-            next_slot_index = _next_slot(slots, char_index)
-            previous_slot_index = _previous_slot(slots, char_index)
+            token_index = _token_for_char(token_units, char_index)
+            next_token_index = _next_token(token_units, char_index)
+            previous_token_index = _previous_token(token_units, char_index)
             attach_mode = "standalone"
-            left_slot_index: int | None = None
-            right_slot_index: int | None = None
+            left_token_index: int | None = None
+            right_token_index: int | None = None
             if evidence.attach_side == "after":
-                if slot_index is not None:
-                    left_slot_index = slot_index
-                    right_slot_index = slot_index + 1 if slot_index + 1 < len(slots) else None
-                    attach_mode = "between" if right_slot_index is not None else "trailing"
-                elif next_slot_index is not None:
-                    right_slot_index = next_slot_index
+                if token_index is not None:
+                    left_token_index = token_index
+                    right_token_index = (
+                        token_index + 1 if token_index + 1 < len(token_units) else None
+                    )
+                    attach_mode = "between" if right_token_index is not None else "trailing"
+                elif next_token_index is not None:
+                    right_token_index = next_token_index
                     attach_mode = "leading"
-                elif previous_slot_index is not None:
-                    left_slot_index = previous_slot_index
+                elif previous_token_index is not None:
+                    left_token_index = previous_token_index
                     attach_mode = "trailing"
             else:
-                if next_slot_index is not None:
-                    right_slot_index = next_slot_index
-                    left_slot_index = next_slot_index - 1 if next_slot_index > 0 else None
-                    attach_mode = "between" if left_slot_index is not None else "leading"
-                elif slot_index is not None:
-                    right_slot_index = slot_index
+                if next_token_index is not None:
+                    right_token_index = next_token_index
+                    left_token_index = next_token_index - 1 if next_token_index > 0 else None
+                    attach_mode = "between" if left_token_index is not None else "leading"
+                elif token_index is not None:
+                    right_token_index = token_index
                     attach_mode = "leading"
-                elif previous_slot_index is not None:
-                    left_slot_index = previous_slot_index
+                elif previous_token_index is not None:
+                    left_token_index = previous_token_index
                     attach_mode = "trailing"
 
-            if left_slot_index is None and right_slot_index is None:
+            if left_token_index is None and right_token_index is None:
                 unmapped.append(
                     {
                         "evidence_index": evidence_index,
                         "mark": mark,
                         "char_index": char_index,
                         "attach_side": str(evidence.attach_side or ""),
-                        "reason": "no_slot_mapping",
+                        "reason": "no_token_mapping",
                     }
                 )
                 continue
@@ -185,8 +187,8 @@ class PunctuationFactMapper:
             facts.append(
                 PunctuationFact(
                     fact_id=fact_id,
-                    left_slot_index=left_slot_index,
-                    right_slot_index=right_slot_index,
+                    left_token_index=left_token_index,
+                    right_token_index=right_token_index,
                     attach_mode=attach_mode,
                     normalized_text=mark,
                     punct_class=punct_class,

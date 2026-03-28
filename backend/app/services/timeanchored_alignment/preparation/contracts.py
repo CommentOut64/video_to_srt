@@ -39,9 +39,10 @@ class SlowWindowTextPackage:
 
 
 @dataclass(frozen=True)
-class SlowSlot:
-    slot_id: str
-    text: str
+class PreparedTokenUnit:
+    unit_id: str
+    token_text: str
+    normalized_text: str
     char_start: int
     char_end: int
     speaker_id: str | None
@@ -51,13 +52,16 @@ class SlowSlot:
     source_unit_ids: tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
-        _ensure_non_negative_int("SlowSlot.char_start", self.char_start)
+        _ensure_non_negative_int("PreparedTokenUnit.char_start", self.char_start)
         if int(self.char_end) <= int(self.char_start):
             raise ValueError(
-                f"SlowSlot 非法：char_end({self.char_end}) 必须大于 char_start({self.char_start})"
+                "PreparedTokenUnit 非法："
+                f"char_end({self.char_end}) 必须大于 char_start({self.char_start})"
             )
         if len(self.source_chunk_ids) != len(self.source_chunk_indices):
-            raise ValueError("SlowSlot.source_chunk_ids/source_chunk_indices 长度必须一致")
+            raise ValueError(
+                "PreparedTokenUnit.source_chunk_ids/source_chunk_indices 长度必须一致"
+            )
 
 
 @dataclass(frozen=True)
@@ -123,7 +127,7 @@ class FastHook:
 @dataclass(frozen=True)
 class PreparedSlowText:
     window_text: SlowWindowTextPackage
-    slots: tuple[SlowSlot, ...]
+    token_units: tuple[PreparedTokenUnit, ...]
     punctuation_evidences: tuple[PunctuationEvidence, ...]
     protected_units: tuple[ProtectedUnit, ...]
     language_runs: tuple[LanguageRun, ...]
