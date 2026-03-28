@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-from app.services.timeanchored_alignment.anchor_mount.service import AnchorMountAlignmentService
 from app.services.timeanchored_alignment.anchor_mount.punctuation_fact_mapper import (
     PunctuationFactMapper,
 )
+from app.services.timeanchored_alignment.anchor_mount.service import AnchorMountAlignmentService
 from app.services.timeanchored_alignment.preparation.assembler import (
     AlignmentPreparationAssembler,
 )
 from app.services.timeanchored_alignment.preparation.contracts import (
+    PreparedTokenUnit,
     PunctuationEvidence,
-    SlowSlot,
     SlowWindowTextPackage,
 )
 from app.services.timeanchored_alignment.contracts import (
@@ -158,7 +158,7 @@ def _build_preparation_package(*, whisper_text: str):
     )
 
 
-def test_anchor_mount_maps_punctuation_into_slot_space_and_generates_pair_states() -> None:
+def test_anchor_mount_maps_punctuation_into_token_space_and_generates_pair_states() -> None:
     service = AnchorMountAlignmentService()
     preparation = _build_preparation_package(whisper_text="你好，“世界”！")
 
@@ -166,25 +166,30 @@ def test_anchor_mount_maps_punctuation_into_slot_space_and_generates_pair_states
 
     facts = result.anchor_mount_result.punctuation_facts
     assert [fact.normalized_text for fact in facts] == ["，", "“", "”", "！"]
-    assert facts[1].right_slot_index == 1
-    assert facts[2].left_slot_index == 1
-    assert facts[3].left_slot_index == 1
+    assert facts[1].right_token_index == 2
+    assert facts[2].left_token_index == 3
+    assert facts[3].left_token_index == 3
     assert result.anchor_mount_result.punctuation_pair_states[0].state == "closed"
 
 
-def test_anchor_mount_builds_boundary_hints_and_decision_tokens_from_envelopes() -> None:
+def test_anchor_mount_only_forwards_alignment_specific_boundary_evidences() -> None:
     service = AnchorMountAlignmentService()
     preparation = _build_preparation_package(whisper_text="你好，世界！")
 
     result = service.align(preparation=preparation, language="zh")
 
-    assert result.anchor_mount_result.boundary_hints
-    assert any(hint.reason == "punctuation_sentence_end" for hint in result.anchor_mount_result.boundary_hints)
-    assert result.decision_ingress.tokens
-    assert all(token.start is not None and token.end is not None for token in result.decision_ingress.tokens)
+    assert result.anchor_mount_result.boundary_evidences
+    reasons = {evidence.reason for evidence in result.anchor_mount_result.boundary_evidences}
+    assert reasons <= {"lexical_boundary", "anchor_block_close"}
+    assert "punctuation_sentence_end" not in reasons
+    assert result.decision_ingress.anchored_token_units
+    assert all(
+        token.start is not None and token.end is not None
+        for token in result.decision_ingress.anchored_token_units
+    )
     assert [
         (token.start, token.end)
-        for token in result.decision_ingress.tokens
+        for token in result.decision_ingress.anchored_token_units
     ] == [
         (envelope.provisional_start, envelope.provisional_end)
         for envelope in result.anchor_mount_result.envelopes
@@ -200,10 +205,11 @@ def test_punctuation_fact_mapper_fail_closed_records_unmapped_diagnostics() -> N
             display_text="你好",
             source_language="zh",
         ),
-        slots=(
-            SlowSlot(
-                slot_id="slot-0",
-                text="你",
+        token_units=(
+            PreparedTokenUnit(
+                unit_id="unit-0",
+                token_text="你",
+                normalized_text="你",
                 char_start=0,
                 char_end=1,
                 speaker_id="speaker-a",
@@ -211,9 +217,10 @@ def test_punctuation_fact_mapper_fail_closed_records_unmapped_diagnostics() -> N
                 source_chunk_ids=("chunk-1",),
                 source_chunk_indices=(1,),
             ),
-            SlowSlot(
-                slot_id="slot-1",
-                text="好",
+            PreparedTokenUnit(
+                unit_id="unit-1",
+                token_text="好",
+                normalized_text="好",
                 char_start=1,
                 char_end=2,
                 speaker_id="speaker-a",

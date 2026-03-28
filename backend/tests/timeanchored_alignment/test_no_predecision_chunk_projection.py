@@ -187,7 +187,7 @@ def test_execute_prepared_timeanchored_stage_returns_anchor_mount_stage_result()
     )
 
     assert isinstance(result, AnchorMountStageResult)
-    assert result.decision_ingress.tokens
+    assert result.decision_ingress.anchored_token_units
     assert not hasattr(result, "sentence_segments")
     assert not hasattr(result, "text_result")
     assert not hasattr(result, "edge_result")

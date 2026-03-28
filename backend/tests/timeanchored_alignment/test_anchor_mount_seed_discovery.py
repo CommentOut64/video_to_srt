@@ -4,7 +4,7 @@ from app.services.timeanchored_alignment.anchor_mount.contracts import AnchorMou
 from app.services.timeanchored_alignment.anchor_mount.seed_discovery import SeedDiscovery
 from app.services.timeanchored_alignment.preparation.contracts import (
     FastHook,
-    SlowSlot,
+    PreparedTokenUnit,
     SlowWindowTextPackage,
 )
 from app.services.timeanchored_alignment.slow_window.contracts import (
@@ -13,7 +13,7 @@ from app.services.timeanchored_alignment.slow_window.contracts import (
 )
 
 
-def test_seed_discovery_matches_single_slot_to_multiple_contiguous_hooks() -> None:
+def test_seed_discovery_matches_single_token_unit_to_multiple_contiguous_hooks() -> None:
     input_view = AnchorMountInputView(
         window_id="window-seed-001",
         owner_chunk_id="chunk-1",
@@ -21,10 +21,11 @@ def test_seed_discovery_matches_single_slot_to_multiple_contiguous_hooks() -> No
         source_chunk_ids=("chunk-1",),
         source_chunk_indices=(1,),
         language="en",
-        slots=(
-            SlowSlot(
-                slot_id="slot-0",
-                text="hello world",
+        token_units=(
+            PreparedTokenUnit(
+                unit_id="unit-0",
+                token_text="hello world",
+                normalized_text="hello world",
                 char_start=0,
                 char_end=11,
                 speaker_id=None,
@@ -82,5 +83,5 @@ def test_seed_discovery_matches_single_slot_to_multiple_contiguous_hooks() -> No
     candidates = SeedDiscovery().discover(input_view=input_view)
 
     assert candidates
-    assert candidates[0].slot_indices == (0,)
+    assert candidates[0].unit_indices == (0,)
     assert candidates[0].hook_indices == (0, 1)

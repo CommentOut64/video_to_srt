@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from app.services.textflow.decision_ingress_adapter import DecisionIngressAdapter
 from app.services.timeanchored_alignment.anchor_mount.contracts import (
-    BoundaryHint,
+    AnchoredTokenUnit,
     CrossChunkLock,
     DecisionIngressPackage,
-    DecisionToken,
     PunctuationFact,
     PunctuationPairState,
 )
+from app.services.timeanchored_alignment.contracts import BoundaryEvidence
 from app.services.timeanchored_alignment.slow_window.contracts import (
     WindowChunkBinding,
     WindowCoverage,
@@ -24,12 +26,10 @@ def _build_package() -> DecisionIngressPackage:
         source_chunk_indices=(11, 12),
         language="zh",
         policy_snapshot=None,
-        tokens=(
-            DecisionToken(
-                token_id="token-1",
-                slot_index=0,
-                text_core="hello",
-                display_text="hello",
+        anchored_token_units=(
+            AnchoredTokenUnit(
+                unit_id="token-1",
+                token_text="hello",
                 normalized_text="hello",
                 start=0.0,
                 end=0.5,
@@ -37,16 +37,17 @@ def _build_package() -> DecisionIngressPackage:
                 right_bound=0.55,
                 speaker_id="spk-1",
                 turn_id="turn-1",
+                mount_status="anchored",
+                anchor_kind="lexical",
                 source_chunk_ids=("chunk-11",),
                 source_chunk_indices=(11,),
                 source_hook_ids=("hook-1",),
-                metadata={"slot_id": "slot-1", "match_confidence": 0.91},
+                match_confidence=0.91,
+                cross_chunk_lock_ids=("lock-1",),
             ),
-            DecisionToken(
-                token_id="token-2",
-                slot_index=1,
-                text_core="world",
-                display_text="world",
+            AnchoredTokenUnit(
+                unit_id="token-2",
+                token_text="world",
                 normalized_text="world",
                 start=0.55,
                 end=1.0,
@@ -54,17 +55,20 @@ def _build_package() -> DecisionIngressPackage:
                 right_bound=1.0,
                 speaker_id="spk-1",
                 turn_id="turn-1",
+                mount_status="merged",
+                anchor_kind="soft_pronunciation",
                 source_chunk_ids=("chunk-12",),
                 source_chunk_indices=(12,),
                 source_hook_ids=("hook-2",),
-                metadata={"slot_id": "slot-2", "match_confidence": 0.93},
+                match_confidence=0.93,
+                cross_chunk_lock_ids=("lock-1",),
             ),
         ),
         punctuation_facts=(
             PunctuationFact(
                 fact_id="fact-1",
-                left_slot_index=1,
-                right_slot_index=None,
+                left_token_index=1,
+                right_token_index=None,
                 attach_mode="trailing",
                 normalized_text=".",
                 punct_class="sentence_end",
@@ -86,20 +90,26 @@ def _build_package() -> DecisionIngressPackage:
                 metadata={},
             ),
         ),
-        boundary_hints=(
-            BoundaryHint(
-                split_after_slot_id="slot-1",
-                decision_time=0.52,
+        boundary_evidences=(
+            BoundaryEvidence(
+                split_idx=0,
+                event_time=0.52,
+                left_end=0.5,
+                right_start=0.55,
+                reason="lexical_boundary",
                 score=0.9,
-                reason="pause_long",
                 hard_flag=False,
-                blocked_by_lock=False,
+                metadata={
+                    "blocked_by_lock": False,
+                    "left_mount_status": "anchored",
+                    "right_mount_status": "merged",
+                },
             ),
         ),
         cross_chunk_locks=(
             CrossChunkLock(
                 lock_id="lock-1",
-                slot_ids=("slot-1", "slot-2"),
+                unit_ids=("token-1", "token-2"),
                 hook_ids=("hook-1",),
                 reason="quote_scope",
                 source_chunk_ids=("chunk-11", "chunk-12"),
@@ -151,10 +161,81 @@ def test_decision_ingress_adapter_keeps_compat_fields_but_cleans_projection_boun
     assert metadata["cross_chunk_locks"][0]["lock_id"] == "lock-1"
     assert metadata["decision_ingress_version"] == "window_first_compat_v1"
     assert metadata["fallback_projection_mode"] == "layer_internal_compat"
+    assert metadata["candidate_boundary_count"] == 1
 
     decision_input = result.decision_input
-    assert decision_input.allow_fast_draft_fallback is True
+    assert decision_input.cut_plan is None
+    assert decision_input.allow_fast_draft_fallback is False
     assert decision_input.fallback_clean_text_ref
     assert len(decision_input.fallback_punctuation_positions) == 1
+    assert decision_input.aligned_facts is not None
+    assert decision_input.aligned_facts.fast_draft_cuts == []
 
     assert result.compat_report["fallback_projection_mode"] == "layer_internal_compat"
+    assert result.compat_report["canonical_boundary_count"] == 1
+
+
+def test_decision_ingress_adapter_forwards_alignment_boundary_evidences_into_canonical_input() -> None:
+    result = DecisionIngressAdapter().build(package=_build_package())
+
+    assert result.decision_input.cut_plan is None
+    assert len(result.decision_input.canonical_candidate_boundaries) == 1
+    assert result.decision_input.canonical_candidate_boundaries[0].reason == "lexical_boundary"
+    assert result.compat_report["canonical_boundary_count"] == 1
+    assert result.ingress_context.metadata["candidate_boundary_count"] == 1
+
+
+def test_decision_ingress_adapter_drops_blocked_boundary_evidence_from_projection_metrics() -> None:
+    package = _build_package()
+    blocked = replace(
+        package.boundary_evidences[0],
+        metadata={
+            **dict(package.boundary_evidences[0].metadata),
+            "blocked_by_lock": True,
+        },
+    )
+    package = replace(package, boundary_evidences=(blocked,))
+
+    result = DecisionIngressAdapter().build(package=package)
+    assert result.decision_input.cut_plan is None
+    assert result.decision_input.canonical_candidate_boundaries == ()
+    assert result.compat_report["canonical_boundary_count"] == 0
+
+
+def test_decision_ingress_adapter_keeps_alignment_boundaries_single_sourced() -> None:
+    result = DecisionIngressAdapter().build(package=_build_package())
+
+    reasons = {
+        item.reason for item in result.decision_input.canonical_candidate_boundaries
+    }
+    assert reasons <= {"lexical_boundary", "anchor_block_close"}
+    assert result.decision_input.fused_evidence is not None
+    assert result.decision_input.fused_evidence.speaker_changes == []
+    assert result.decision_input.fused_evidence.pause_anchors == []
+
+
+def test_decision_ingress_adapter_keeps_split_token_parts_free_of_legacy_position_metadata() -> None:
+    package = _build_package()
+    first = replace(
+        package.anchored_token_units[0],
+        token_text="what do",
+        normalized_text="what do",
+    )
+    package = replace(package, anchored_token_units=(first, package.anchored_token_units[1]))
+
+    result = DecisionIngressAdapter().build(package=package)
+    annotated_words = list(result.decision_input.annotated_words)
+    assert [item.word for item in annotated_words] == ["what", "do", "world"]
+    for item in annotated_words:
+        assert set(vars(item).keys()) == {
+            "word",
+            "start",
+            "end",
+            "trailing_punct",
+            "confidence",
+            "confidence_source",
+            "is_pseudo",
+            "speaker_id",
+            "turn_id",
+            "track_id",
+        }

@@ -279,8 +279,10 @@ def test_alignment_stage_mode_active_uses_timeanchored_when_gate_passes(monkeypa
     remove_streaming_subtitle_manager(job_id)
 
 
-def test_alignment_stage_mode_active_forces_fast_direct_on_anchor_mount_fallback(monkeypatch) -> None:
-    job_id = "test_phase7_route_active_anchor_mount_force_fast"
+def test_alignment_stage_mode_active_forces_fast_direct_on_single_chunk_anchor_mount_fallback(
+    monkeypatch,
+) -> None:
+    job_id = "test_phase7_route_active_single_chunk_anchor_mount_force_fast"
     pipeline = _build_pipeline(job_id, mode="active")
     _patch_common_alignment_inputs(monkeypatch=monkeypatch, pipeline=pipeline)
 
@@ -290,6 +292,7 @@ def test_alignment_stage_mode_active_forces_fast_direct_on_anchor_mount_fallback
         Mock(side_effect=AssertionError("legacy 链路已下线，不应被调用")),
     )
     stage_result = SimpleNamespace(
+        decision_ingress=SimpleNamespace(source_chunk_ids=("chunk-0",)),
         anchor_mount_result=SimpleNamespace(should_fallback=True),
     )
     timeanchored_run = Mock(return_value=stage_result)
@@ -320,7 +323,159 @@ def test_alignment_stage_mode_active_forces_fast_direct_on_anchor_mount_fallback
     assert timeanchored_run.call_count == 1
     assert commit_fast_direct.call_count == 1
     assert commit_timeanchored.call_count == 0
-    assert record.call_count == 0
+    assert record.call_count == 1
+    assert record.call_args.kwargs.get("reason") == "anchor_mount_should_fallback"
+    assert record.call_args.kwargs.get("selected") is True
+    assert ctx.edge_selection_mode == "auto"
+    remove_streaming_subtitle_manager(job_id)
+
+
+def test_alignment_stage_mode_active_keeps_timeanchored_commit_on_multi_chunk_anchor_mount_fallback(
+    monkeypatch,
+) -> None:
+    job_id = "test_phase7_route_active_multi_chunk_anchor_mount_scope_commit"
+    pipeline = _build_pipeline(job_id, mode="active")
+    _patch_common_alignment_inputs(monkeypatch=monkeypatch, pipeline=pipeline)
+
+    monkeypatch.setattr(
+        pipeline,
+        "_run_collection_scoring_decision_once",
+        Mock(side_effect=AssertionError("legacy 链路已下线，不应被调用")),
+    )
+    stage_result = SimpleNamespace(
+        decision_ingress=SimpleNamespace(source_chunk_ids=("chunk-19", "chunk-20")),
+        anchor_mount_result=SimpleNamespace(should_fallback=True),
+    )
+    timeanchored_run = Mock(return_value=stage_result)
+    commit_timeanchored = Mock()
+    commit_fast_direct = Mock()
+    record = Mock()
+    monkeypatch.setattr(pipeline._alignment_stage_service, "_run_timeanchored_main_chain", timeanchored_run)
+    monkeypatch.setattr(
+        pipeline._alignment_stage_service,
+        "_should_accept_timeanchored_result",
+        Mock(return_value=(True, "active_gate_pass")),
+    )
+    monkeypatch.setattr(
+        pipeline._alignment_stage_service,
+        "_commit_timeanchored_main_chain_result",
+        commit_timeanchored,
+    )
+    monkeypatch.setattr(
+        pipeline._alignment_stage_service,
+        "_commit_fast_direct_result",
+        commit_fast_direct,
+    )
+    monkeypatch.setattr(pipeline._alignment_stage_service, "_record_hetero_alignment_result", record)
+
+    ctx = _build_ctx(job_id)
+    asyncio.run(pipeline._run_alignment_stage(ctx))
+
+    assert timeanchored_run.call_count == 1
+    assert commit_fast_direct.call_count == 0
+    assert commit_timeanchored.call_count == 1
+    assert record.call_count == 1
+    assert record.call_args.kwargs.get("reason") == "active_gate_pass"
+    assert record.call_args.kwargs.get("selected") is True
+    remove_streaming_subtitle_manager(job_id)
+
+
+def test_alignment_stage_sensevoice_only_enters_unified_main_chain(monkeypatch) -> None:
+    job_id = "test_phase7_route_sensevoice_only_unified"
+    pipeline = AsyncDualPipeline(
+        job_id=job_id,
+        draft_engine=DummyEngine(response_text="你好世界", latency_ms=0),
+        patch_engine=None,
+        transcription_profile="sensevoice_only",
+        enable_cross_chunk_merge=False,
+        enable_semantic_buffer=False,
+        punctuation_service=Mock(),
+    )
+    pipeline._alignment_pipeline_mode = "default"
+    _patch_common_alignment_inputs(monkeypatch=monkeypatch, pipeline=pipeline, chosen_source="fast")
+
+    monkeypatch.setattr(
+        pipeline,
+        "_run_collection_scoring_decision_once",
+        Mock(side_effect=AssertionError("统一主链命中后不应执行 legacy 四层")),
+    )
+    timeanchored_run = Mock(return_value=object())
+    commit = Mock()
+    commit_fast_direct = Mock()
+    record = Mock()
+    monkeypatch.setattr(pipeline._alignment_stage_service, "_run_timeanchored_main_chain", timeanchored_run)
+    monkeypatch.setattr(
+        pipeline._alignment_stage_service,
+        "_should_accept_timeanchored_result",
+        Mock(return_value=(True, "default_gate_pass")),
+    )
+    monkeypatch.setattr(pipeline._alignment_stage_service, "_commit_timeanchored_main_chain_result", commit)
+    monkeypatch.setattr(pipeline._alignment_stage_service, "_commit_fast_direct_result", commit_fast_direct)
+    monkeypatch.setattr(pipeline._alignment_stage_service, "_record_hetero_alignment_result", record)
+
+    ctx = ProcessingContext(
+        job_id=job_id,
+        chunk_index=0,
+        audio_chunk=_build_chunk(),
+        sv_result=_build_sv_result(),
+        whisper_result=None,
+        time_base_chunk=_build_time_base(),
+    )
+    ctx.text_tracks = TextTrackBundle(
+        sv_track=_build_track("你 好 世 界", source="sv"),
+        whisper_track=None,
+    )
+    asyncio.run(pipeline._run_alignment_stage(ctx))
+
+    assert timeanchored_run.call_count == 1
+    assert commit.call_count == 1
+    assert commit_fast_direct.call_count == 0
+    assert record.call_count == 1
+    assert isinstance(ctx.whisper_result, dict)
+    remove_streaming_subtitle_manager(job_id)
+
+
+def test_alignment_stage_whisper_skipped_still_enters_unified_main_chain(monkeypatch) -> None:
+    job_id = "test_phase7_route_whisper_skipped_unified"
+    pipeline = _build_pipeline(job_id, mode="default")
+    _patch_common_alignment_inputs(monkeypatch=monkeypatch, pipeline=pipeline, chosen_source="fast")
+
+    monkeypatch.setattr(
+        pipeline,
+        "_run_collection_scoring_decision_once",
+        Mock(side_effect=AssertionError("统一主链命中后不应执行 legacy 四层")),
+    )
+    timeanchored_run = Mock(return_value=object())
+    commit = Mock()
+    finalize_sensevoice_only = Mock(side_effect=AssertionError("不应走 finalize_sensevoice_only 旁路"))
+    monkeypatch.setattr(pipeline._alignment_stage_service, "_run_timeanchored_main_chain", timeanchored_run)
+    monkeypatch.setattr(
+        pipeline._alignment_stage_service,
+        "_should_accept_timeanchored_result",
+        Mock(return_value=(True, "default_gate_pass")),
+    )
+    monkeypatch.setattr(pipeline._alignment_stage_service, "_commit_timeanchored_main_chain_result", commit)
+    monkeypatch.setattr(pipeline, "_finalize_sensevoice_only", finalize_sensevoice_only)
+    monkeypatch.setattr(pipeline._alignment_stage_service, "_record_hetero_alignment_result", Mock())
+
+    ctx = ProcessingContext(
+        job_id=job_id,
+        chunk_index=0,
+        audio_chunk=_build_chunk(),
+        sv_result=_build_sv_result(),
+        whisper_result=None,
+        time_base_chunk=_build_time_base(),
+        whisper_skipped=True,
+    )
+    ctx.text_tracks = TextTrackBundle(
+        sv_track=_build_track("你 好 世 界", source="sv"),
+        whisper_track=None,
+    )
+    asyncio.run(pipeline._run_alignment_stage(ctx))
+
+    assert timeanchored_run.call_count == 1
+    assert commit.call_count == 1
+    assert finalize_sensevoice_only.call_count == 0
     remove_streaming_subtitle_manager(job_id)
 
 

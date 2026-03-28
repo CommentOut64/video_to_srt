@@ -22,11 +22,12 @@ def test_alignment_preparation_package_contract_exposes_window_hook_and_coverage
     assert "coverage" in field_names
 
 
-def test_prepared_slow_text_contract_exposes_text_slot_and_fact_fields() -> None:
+def test_prepared_slow_text_contract_exposes_text_token_unit_and_fact_fields() -> None:
     field_names = {field.name for field in fields(PreparedSlowText)}
 
     assert "window_text" in field_names
-    assert "slots" in field_names
+    assert "token_units" in field_names
+    assert "slots" not in field_names
     assert "punctuation_evidences" in field_names
     assert "protected_units" in field_names
     assert "language_runs" in field_names

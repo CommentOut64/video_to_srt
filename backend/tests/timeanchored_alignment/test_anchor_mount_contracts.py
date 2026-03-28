@@ -6,15 +6,15 @@ import pytest
 
 from app.services.timeanchored_alignment.anchor_mount.contracts import (
     AnchorMountResult,
-    BoundaryHint,
+    AnchoredTokenUnit,
     DecisionIngressPackage,
-    DecisionToken,
 )
 from app.services.timeanchored_alignment.anchor_mount.ingress_validator import (
     IngressValidator,
 )
 from app.services.timeanchored_alignment.chunk_projector import ChunkWindow
 from app.services.timeanchored_alignment.contracts import (
+    BoundaryEvidence,
     LanguageRun,
     LanguageRunPackage,
     PronunciationPackage,
@@ -29,7 +29,7 @@ from app.services.timeanchored_alignment.preparation.contracts import (
     AlignmentPreparationPackage,
     FastHook,
     PreparedSlowText,
-    SlowSlot,
+    PreparedTokenUnit,
     SlowWindowTextPackage,
 )
 from app.services.timeanchored_alignment.slow_window.contracts import (
@@ -43,7 +43,7 @@ from app.services.timeanchored_alignment.window_time_base_assembler import (
 
 def _build_preparation_for_ingress_validation(
     *,
-    slots: tuple[SlowSlot, ...],
+    token_units: tuple[PreparedTokenUnit, ...],
     fast_hooks: tuple[FastHook, ...],
     window_text: str = "hello world",
 ) -> AlignmentPreparationPackage:
@@ -84,8 +84,12 @@ def _build_preparation_for_ingress_validation(
         source_chunk_ids=("chunk-1",),
         source_chunk_indices=(1,),
         slow_text=PreparedSlowText(
-            window_text=SlowWindowTextPackage(text=window_text, display_text=window_text, source_language="en"),
-            slots=slots,
+            window_text=SlowWindowTextPackage(
+                text=window_text,
+                display_text=window_text,
+                source_language="en",
+            ),
+            token_units=token_units,
             punctuation_evidences=tuple(),
             protected_units=tuple(),
             language_runs=(
@@ -152,32 +156,35 @@ def _build_preparation_for_ingress_validation(
 def test_anchor_mount_result_contract_exposes_mount_fact_and_boundary_fields() -> None:
     field_names = {field.name for field in fields(AnchorMountResult)}
 
-    assert "items" in field_names
-    assert "envelopes" in field_names
-    assert "punctuation_facts" in field_names
-    assert "punctuation_pair_states" in field_names
-    assert "cross_chunk_locks" in field_names
-    assert "boundary_hints" in field_names
-    assert "hook_claims" in field_names
+    assert field_names >= {
+        "items",
+        "envelopes",
+        "punctuation_facts",
+        "punctuation_pair_states",
+        "cross_chunk_locks",
+        "boundary_evidences",
+        "hook_claims",
+    }
+    assert "boundary_evidences" in field_names
 
 
 def test_decision_ingress_package_contract_exposes_tokens_punctuation_and_coverage() -> None:
     field_names = {field.name for field in fields(DecisionIngressPackage)}
 
-    assert "tokens" in field_names
-    assert "punctuation_facts" in field_names
-    assert "punctuation_pair_states" in field_names
-    assert "boundary_hints" in field_names
-    assert "coverage" in field_names
+    assert field_names >= {
+        "anchored_token_units",
+        "punctuation_facts",
+        "punctuation_pair_states",
+        "boundary_evidences",
+        "coverage",
+    }
 
 
-def test_decision_token_rejects_none_start_end() -> None:
-    with pytest.raises(ValueError, match="DecisionToken.start/end 不能为空"):
-        DecisionToken(
-            token_id="token-1",
-            slot_index=0,
-            text_core="你",
-            display_text="你",
+def test_anchored_token_unit_rejects_none_start_end() -> None:
+    with pytest.raises(ValueError, match="AnchoredTokenUnit.start/end 不能为空"):
+        AnchoredTokenUnit(
+            unit_id="unit-1",
+            token_text="你",
             normalized_text="你",
             start=None,
             end=0.1,
@@ -185,30 +192,37 @@ def test_decision_token_rejects_none_start_end() -> None:
             right_bound=0.1,
             speaker_id=None,
             turn_id=None,
+            mount_status="anchored",
+            anchor_kind="lexical",
             source_chunk_ids=("chunk-1",),
             source_chunk_indices=(1,),
             source_hook_ids=("hook-0",),
+            match_confidence=0.9,
+            cross_chunk_lock_ids=tuple(),
+        )
+
+
+def test_boundary_evidence_requires_non_negative_event_time() -> None:
+    with pytest.raises(ValueError, match="BoundaryEvidence.event_time 必须 >= 0"):
+        BoundaryEvidence(
+            split_idx=0,
+            event_time=-0.1,
+            left_end=0.0,
+            right_start=0.1,
+            reason="lexical_boundary",
+            score=0.9,
+            hard_flag=False,
             metadata={},
         )
 
 
-def test_boundary_hint_requires_decision_time() -> None:
-    with pytest.raises(ValueError, match="BoundaryHint.decision_time 必须 >= 0"):
-        BoundaryHint(
-            split_after_slot_id="slot-0",
-            decision_time=-0.1,
-            score=0.9,
-            reason="punctuation_sentence_end",
-            hard_flag=True,
-        )
-
-
-def test_ingress_validator_rejects_slot_that_runs_past_window_text() -> None:
+def test_ingress_validator_rejects_token_unit_that_runs_past_window_text() -> None:
     preparation = _build_preparation_for_ingress_validation(
-        slots=(
-            SlowSlot(
-                slot_id="slot-0",
-                text="hello",
+        token_units=(
+            PreparedTokenUnit(
+                unit_id="unit-0",
+                token_text="hello",
+                normalized_text="hello",
                 char_start=0,
                 char_end=12,
                 speaker_id=None,
@@ -229,16 +243,17 @@ def test_ingress_validator_rejects_slot_that_runs_past_window_text() -> None:
         ),
     )
 
-    with pytest.raises(ValueError, match="SlowSlot.char_end 越过 window_text 边界"):
+    with pytest.raises(ValueError, match="PreparedTokenUnit.char_end 越过 window_text 边界"):
         IngressValidator().validate(preparation=preparation, language="en")
 
 
-def test_ingress_validator_rejects_slot_without_window_provenance() -> None:
+def test_ingress_validator_rejects_token_unit_without_window_provenance() -> None:
     preparation = _build_preparation_for_ingress_validation(
-        slots=(
-            SlowSlot(
-                slot_id="slot-0",
-                text="hello",
+        token_units=(
+            PreparedTokenUnit(
+                unit_id="unit-0",
+                token_text="hello",
+                normalized_text="hello",
                 char_start=0,
                 char_end=5,
                 speaker_id=None,
@@ -259,16 +274,17 @@ def test_ingress_validator_rejects_slot_without_window_provenance() -> None:
         ),
     )
 
-    with pytest.raises(ValueError, match="SlowSlot 必须保留 source chunk provenance"):
+    with pytest.raises(ValueError, match="PreparedTokenUnit 必须保留 source chunk provenance"):
         IngressValidator().validate(preparation=preparation, language="en")
 
 
 def test_ingress_validator_rejects_non_monotonic_fast_hooks() -> None:
     preparation = _build_preparation_for_ingress_validation(
-        slots=(
-            SlowSlot(
-                slot_id="slot-0",
-                text="hello",
+        token_units=(
+            PreparedTokenUnit(
+                unit_id="unit-0",
+                token_text="hello",
+                normalized_text="hello",
                 char_start=0,
                 char_end=5,
                 speaker_id=None,

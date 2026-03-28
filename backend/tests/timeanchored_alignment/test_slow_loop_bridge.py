@@ -13,6 +13,7 @@ from app.pipelines.dual_pipeline.services.slow_loop_service import SlowLoopServi
 from app.schemas.pipeline_context import ProcessingContext
 from app.services.bridge.turn_group_builder import TurnGroupEnvelope
 from app.services.bridge.turn_group_models import TurnGroup
+from app.services.audio.chunk_engine import AudioChunk
 from app.services.punctuation.semantic_buffer import SemanticChunk
 from app.models.sensevoice_models import SentenceSegment
 from app.services.timeanchored_alignment.slow_window.contracts import ReadySlowWindow
@@ -151,3 +152,82 @@ async def test_legacy_turn_group_envelope_path_is_rejected() -> None:
     terminal_ctx = await asyncio.wait_for(host.queue_final.get(), timeout=1.0)
     assert terminal_ctx.is_end is True
     assert isinstance(terminal_ctx.error, RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_patching_mode_still_runs_whisper_even_when_skip_gate_says_true() -> None:
+    slow_worker_infer = AsyncMock(
+        return_value={
+            "text": "慢流文本",
+            "text_clean": "慢流文本",
+            "language": "zh",
+            "raw_result": {"segments": [{"avg_logprob": -0.1}]},
+        }
+    )
+    hallucination_guard = SimpleNamespace(
+        prepare_and_detect=Mock(return_value=SimpleNamespace(is_hallucination=False)),
+        normalize_non_hallucination=Mock(),
+        apply_fast_fallback=Mock(),
+    )
+    host = SimpleNamespace(
+        cancellation_token=None,
+        queue_inter=asyncio.Queue(),
+        queue_final=asyncio.Queue(),
+        bridge_controller=None,
+        _flush_window_assembler_idle=lambda now: None,
+        logger=Mock(),
+        progress_emitter=None,
+        debug_punctuation=False,
+        job_id="job-patching-dual-mode",
+        errors=[],
+        pause_exception=None,
+        _slow_processed_indices=set(),
+        _last_slow_chunk_index=-1,
+        _context_cache={},
+        is_patching_mode=True,
+        _should_skip_whisper=Mock(return_value=True),
+        _last_prompt_audio_end=None,
+        _build_whisper_prompt=lambda *_args, **_kwargs: None,
+        _extract_audio_with_overlap=lambda _ctx: np.zeros(1600, dtype=np.float32),
+        slow_worker=SimpleNamespace(infer=slow_worker_infer),
+        _validate_l0_result=Mock(),
+        _slow_whisper_hallucination_guard=hallucination_guard,
+        _update_prompt_cache=Mock(),
+    )
+
+    ctx = ProcessingContext(
+        job_id="job-patching-dual-mode",
+        chunk_index=0,
+        audio_chunk=AudioChunk(
+            index=0,
+            start=0.0,
+            end=1.0,
+            audio=np.zeros(16000, dtype=np.float32),
+            sample_rate=16000,
+            language="zh",
+        ),
+        sv_result={
+            "text": "快流文本",
+            "text_clean": "快流文本",
+            "confidence": 0.99,
+            "words": [{"word": "快", "start": 0.0, "end": 0.1, "confidence": 0.99}],
+        },
+    )
+    await host.queue_inter.put(ctx)
+    await host.queue_inter.put(
+        ProcessingContext(
+            job_id="job-patching-dual-mode",
+            chunk_index=-1,
+            audio_chunk=None,
+            is_end=True,
+        )
+    )
+
+    service = SlowLoopService(host=host)
+    await service.run(job_dir=None, total_chunks=1)
+
+    assert slow_worker_infer.call_count == 1
+    forwarded_ctx = await asyncio.wait_for(host.queue_final.get(), timeout=1.0)
+    assert forwarded_ctx.is_end is False
+    assert forwarded_ctx.whisper_skipped is False
+    assert forwarded_ctx.whisper_result is not None
