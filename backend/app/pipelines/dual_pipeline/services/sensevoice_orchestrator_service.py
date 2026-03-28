@@ -69,83 +69,8 @@ class SensevoiceOrchestratorService:
                     host._validate_l0_result(ctx.sv_result, source="fast", chunk_index=i)
                 normalized = host._normalize_sensevoice_result(ctx)
                 await host._apply_fast_punctuation(ctx, normalized)
-                run_result = host._finalize_sensevoice_only(ctx)
-                final_sentences = list(run_result.final_sentences)
-                host._assign_sentence_identity_by_timeline_overlap(
-                    final_sentences,
-                    fallback_chunk=ctx.audio_chunk,
-                )
-                output_traces = host._normalize_output_traces_for_sentences(
-                    final_sentences=final_sentences,
-                    output_traces=list(run_result.output_traces or []),
-                    default_reason="sensevoice_only",
-                )
-                ctx.final_sentences = final_sentences
-                injection_stats = dict(run_result.injection_stats)
-                split_stats = dict(run_result.split_stats)
-                soft_cut_observe_snapshot = host._update_soft_cut_observability(
-                    split_stats=split_stats,
-                    chunk_index=ctx.chunk_index,
-                    stage="sensevoice_orchestrator",
-                )
-                alignment_result = run_result.alignment_result
-                aligned_facts = run_result.aligned_facts
-                fused_evidence = run_result.fused_evidence
-                ctx.finalization_metrics = {
-                    "coverage": alignment_result.coverage,
-                    "gap_ratio": alignment_result.gap_ratio,
-                    "alignment_score": alignment_result.alignment_score,
-                    "gap_positions": list(alignment_result.gap_positions),
-                    "gap_resolution": (
-                        alignment_result.resolution.value if alignment_result.resolution else None
-                    ),
-                    **injection_stats,
-                }
-                for key, value in split_stats.items():
-                    ctx.finalization_metrics[f"split_{key}"] = value
-                for key, value in soft_cut_observe_snapshot.items():
-                    ctx.finalization_metrics[f"soft_cut_obs_{key}"] = value
-                ctx.finalization_metrics["fact_word_count"] = float(len(aligned_facts.annotated_words))
-                ctx.finalization_metrics["fact_turn_count"] = float(len(aligned_facts.speaker_turns))
-                ctx.finalization_metrics["fact_mapping_count"] = float(len(aligned_facts.time_mappings))
-                ctx.finalization_metrics["evidence_speaker_change_count"] = float(
-                    len(fused_evidence.speaker_changes)
-                )
-                ctx.finalization_metrics["evidence_pause_anchor_count"] = float(
-                    len(fused_evidence.pause_anchors)
-                )
-                ctx.finalization_metrics["evidence_semantic_anchor_count"] = float(
-                    len(fused_evidence.semantic_anchors)
-                )
-                ctx.finalization_metrics["evidence_punctuation_anchor_count"] = float(
-                    len(fused_evidence.punctuation_anchors)
-                )
-                output_layer_result = host._emit_output_layer(
-                    chunk_index=ctx.chunk_index,
-                    sentence_segments=final_sentences,
-                    language=str(run_result.detected_language or "auto"),
-                    injection_report={
-                        "mapping_coverage": float(
-                            injection_stats.get("injection_mapping_coverage", 0.0)
-                        ),
-                        "mismatch_count": float(
-                            injection_stats.get("injection_unmatched_total", 0.0)
-                        ),
-                        "error_code": str(injection_stats.get("injection_error_code", "") or ""),
-                        "blocked": float(injection_stats.get("injection_blocked", 0.0)),
-                    },
-                    segmentation_report={
-                        "boundary_score_stats": dict(split_stats),
-                        "forced_split_count": float(split_stats.get("force_split_count", 0.0)),
-                        "error_code": str(split_stats.get("error_code", "") or ""),
-                    },
-                    output_traces=output_traces,
-                    default_trace_reason="sensevoice_only",
-                    subtitle_batch=run_result.subtitle_batch,
-                )
-                ctx.finalization_metrics["l7_error_count"] = float(
-                    len(output_layer_result.output_payload.get("errors", []))
-                )
+                ctx.whisper_skipped = True
+                await host._run_alignment_stage(ctx)
                 results.append(ctx)
                 if host.progress_emitter:
                     processed_count = len(results)

@@ -19,6 +19,11 @@ from app.services.alignment.types import CharMapping, PunctTrack, TextTrack, Tex
 from app.services.language_policy import build_language_policy_snapshot
 from app.services.textflow.decision_ingress_adapter import DecisionIngressAdapter
 from app.services.timeanchored_alignment import AlignmentItem
+from app.services.timeanchored_alignment.contracts import (
+    TimeBasePackage,
+    TimeBaseQuality,
+    TimeBaseUnit,
+)
 from app.services.timeanchored_alignment.anchor_mount.service import (
     AnchorMountAlignmentService,
     AnchorMountStageResult,
@@ -80,109 +85,13 @@ class AlignmentStageService:
         host = self._host
         chunk = ctx.audio_chunk
 
-        fast_direct_reason = self._resolve_fast_direct_reason(ctx=ctx)
-        if fast_direct_reason:
+        fast_mode_reason = self._resolve_fast_direct_reason(ctx=ctx)
+        if fast_mode_reason:
             if ctx.sv_result is None:
                 raise ValueError("对齐阶段缺少 SenseVoice 推理结果")
-            self._commit_fast_direct_result(
-                ctx=ctx,
-                sv_result=ctx.sv_result,
-                reason=fast_direct_reason,
-            )
-            return
-
-        # V3.10: 快速路径 - SlowWorker 跳过时直接使用 SenseVoice
-        if ctx.whisper_skipped:
-            if ctx.sv_result is None:
-                raise ValueError("对齐阶段缺少 SenseVoice 推理结果")
-            host.logger.debug(
-                f"Chunk {ctx.chunk_index}: Whisper 跳过，直接使用 SenseVoice 定稿"
-            )
-            run_result = host._finalize_sensevoice_only(ctx)
-            final_sentences = list(run_result.final_sentences)
-            host._assign_sentence_identity_by_timeline_overlap(
-                final_sentences,
-                fallback_chunk=ctx.audio_chunk,
-            )
-            output_traces = host._normalize_output_traces_for_sentences(
-                final_sentences=final_sentences,
-                output_traces=list(run_result.output_traces or []),
-                default_reason="sensevoice_only",
-            )
-            ctx.final_sentences = final_sentences
-            alignment_result = run_result.alignment_result
-            aligned_facts = run_result.aligned_facts
-            fused_evidence = run_result.fused_evidence
-            injection_stats = dict(run_result.injection_stats)
-            split_stats = dict(run_result.split_stats)
-            soft_cut_observe_snapshot = host._update_soft_cut_observability(
-                split_stats=split_stats,
-                chunk_index=ctx.chunk_index,
-                stage="sensevoice_only_alignment_stage",
-            )
-            ctx.finalization_metrics = {
-                "coverage": alignment_result.coverage,
-                "gap_ratio": alignment_result.gap_ratio,
-                "alignment_score": alignment_result.alignment_score,
-                "gap_positions": list(alignment_result.gap_positions),
-                "gap_resolution": (
-                    alignment_result.resolution.value if alignment_result.resolution else None
-                ),
-                **injection_stats,
-            }
-            for key, value in split_stats.items():
-                ctx.finalization_metrics[f"split_{key}"] = value
-            for key, value in soft_cut_observe_snapshot.items():
-                ctx.finalization_metrics[f"soft_cut_obs_{key}"] = value
-            ctx.finalization_metrics["fact_word_count"] = float(len(aligned_facts.annotated_words))
-            ctx.finalization_metrics["fact_turn_count"] = float(len(aligned_facts.speaker_turns))
-            ctx.finalization_metrics["fact_mapping_count"] = float(len(aligned_facts.time_mappings))
-            ctx.finalization_metrics["evidence_speaker_change_count"] = float(
-                len(fused_evidence.speaker_changes)
-            )
-            ctx.finalization_metrics["evidence_pause_anchor_count"] = float(
-                len(fused_evidence.pause_anchors)
-            )
-            ctx.finalization_metrics["evidence_semantic_anchor_count"] = float(
-                len(fused_evidence.semantic_anchors)
-            )
-            ctx.finalization_metrics["evidence_punctuation_anchor_count"] = float(
-                len(fused_evidence.punctuation_anchors)
-            )
-
-            # 输出层薄层分发：即便走快路，也统一通过输出层入口。
-            output_layer_result = host._emit_output_layer(
-                chunk_index=ctx.chunk_index,
-                sentence_segments=final_sentences,
-                language=str(run_result.detected_language or "auto"),
-                injection_report={
-                    "mapping_coverage": float(
-                        injection_stats.get("injection_mapping_coverage", 0.0)
-                    ),
-                    "mismatch_count": float(
-                        injection_stats.get("injection_unmatched_total", 0.0)
-                    ),
-                    "error_code": str(injection_stats.get("injection_error_code", "") or ""),
-                    "blocked": float(injection_stats.get("injection_blocked", 0.0)),
-                },
-                segmentation_report={
-                    "boundary_score_stats": dict(split_stats),
-                    "forced_split_count": float(split_stats.get("force_split_count", 0.0)),
-                    "error_code": str(split_stats.get("error_code", "") or ""),
-                },
-                output_traces=output_traces,
-                default_trace_reason="sensevoice_only",
-                subtitle_batch=run_result.subtitle_batch,
-            )
-            ctx.finalization_metrics["l7_error_count"] = float(
-                len(output_layer_result.output_payload.get("errors", []))
-            )
-
-            host.logger.debug(
-                f"Chunk {ctx.chunk_index}: SenseVoice 定稿已推送 "
-                f"({len(final_sentences)} 个句子) [智能复核-跳过]"
-            )
-            return
+            self._hydrate_fast_mode_unified_inputs(ctx=ctx)
+        elif ctx.whisper_skipped and ctx.sv_result is not None and ctx.whisper_result is None:
+            self._hydrate_fast_mode_unified_inputs(ctx=ctx)
 
         # 阶段 1: 双流定稿主链（前置仲裁/标点域 + 四层主链）
         host.logger.debug(f"Chunk {ctx.chunk_index}: 双流对齐")
@@ -352,6 +261,13 @@ class AlignmentStageService:
                         self._commit_fast_direct_result(
                             ctx=ctx,
                             sv_result=sv_result,
+                            reason=force_fast_reason,
+                        )
+                        self._record_hetero_alignment_result(
+                            ctx=ctx,
+                            stage_result=stage_result,
+                            mode=alignment_pipeline_mode,
+                            selected=True,
                             reason=force_fast_reason,
                         )
                         return
@@ -714,9 +630,121 @@ class AlignmentStageService:
     def _is_timeanchored_main_chain_enabled(ctx: ProcessingContext) -> bool:
         if ctx.time_base_chunk is None:
             return False
-        if ctx.whisper_result is None:
+        if ctx.whisper_result is None and ctx.sv_result is None:
             return False
         return True
+
+    def _hydrate_fast_mode_unified_inputs(self, *, ctx: ProcessingContext) -> None:
+        self._ensure_time_base_for_fast_mode(ctx=ctx)
+        if ctx.whisper_result is None:
+            ctx.whisper_result = self._build_compat_whisper_result_from_fast(ctx=ctx)
+
+    def _ensure_time_base_for_fast_mode(self, *, ctx: ProcessingContext) -> None:
+        if ctx.time_base_chunk is not None:
+            return
+        sv_result = ctx.sv_result or {}
+        if not sv_result:
+            return
+        chunk = ctx.audio_chunk
+        sv_words = list(self._host._build_sv_word_timestamps(sv_result, chunk) or [])
+        units: list[TimeBaseUnit] = []
+        for item in sv_words:
+            text = str(getattr(item, "word", "") or "").strip()
+            if not text:
+                continue
+            try:
+                start = float(getattr(item, "start", 0.0) or 0.0)
+                end = float(getattr(item, "end", start) or start)
+            except (TypeError, ValueError):
+                continue
+            if end <= start:
+                end = start + 0.01
+            confidence_raw = getattr(item, "confidence", 0.8)
+            try:
+                confidence = float(confidence_raw if confidence_raw is not None else 0.8)
+            except (TypeError, ValueError):
+                confidence = 0.8
+            confidence = max(0.0, min(1.0, confidence))
+            units.append(
+                TimeBaseUnit(
+                    text=text,
+                    start=start,
+                    end=end,
+                    confidence=confidence,
+                    token_type="word",
+                    source="sensevoice",
+                )
+            )
+        if not units:
+            source_text = str(
+                sv_result.get("text_clean")
+                or sv_result.get("text_itn_raw")
+                or sv_result.get("text")
+                or ""
+            ).strip()
+            if source_text:
+                start = float(getattr(chunk, "start", 0.0) or 0.0) if chunk is not None else 0.0
+                end = float(getattr(chunk, "end", start) or start) if chunk is not None else start
+                if end <= start:
+                    end = start + 0.01
+                units.append(
+                    TimeBaseUnit(
+                        text=source_text,
+                        start=start,
+                        end=end,
+                        confidence=0.8,
+                        token_type="raw",
+                        source="sensevoice",
+                    )
+                )
+        if not units:
+            return
+        language = str(
+            sv_result.get("language")
+            or getattr(chunk, "language", "")
+            or "auto"
+        )
+        quality = TimeBaseQuality(
+            blank_ratio=0.0,
+            avg_max_prob=0.8,
+            low_prob_ratio=0.0,
+            unit_count=len(units),
+            word_count=len(units),
+        )
+        ctx.time_base_chunk = TimeBasePackage(
+            raw_units=tuple(units),
+            word_units=tuple(units),
+            quality=quality,
+            language=language,
+            source="sensevoice_fast_compat",
+            metadata={"compat_generated": True},
+        )
+
+    @staticmethod
+    def _build_compat_whisper_result_from_fast(*, ctx: ProcessingContext) -> Dict[str, Any]:
+        sv_result = dict(ctx.sv_result or {})
+        text = str(
+            sv_result.get("text_clean")
+            or sv_result.get("text_itn_raw")
+            or sv_result.get("text")
+            or ""
+        ).strip()
+        language = str(
+            sv_result.get("language")
+            or getattr(ctx.audio_chunk, "language", "")
+            or "auto"
+        )
+        confidence = sv_result.get("confidence", 0.8)
+        return {
+            "text": text,
+            "text_clean": text,
+            "text_itn_raw": text,
+            "language": language,
+            "confidence": confidence,
+            "segments": [],
+            "raw_result": {"segments": []},
+            "is_fast_compat": True,
+        }
 
     def _try_run_timeanchored_main_chain(
         self,
@@ -843,7 +871,7 @@ class AlignmentStageService:
                     "window_id": str(preparation.window_id),
                     "owner_chunk_id": str(preparation.owner_chunk_id),
                     "owner_chunk_index": int(preparation.owner_chunk_index),
-                    "slot_count": len(preparation.slow_text.slots),
+                    "token_unit_count": len(preparation.slow_text.token_units),
                     "hook_count": len(preparation.fast_hooks),
                     "punctuation_evidence_count": len(preparation.slow_text.punctuation_evidences),
                     "pronunciation_hint_count": len(preparation.slow_text.pronunciation_hints),
@@ -872,10 +900,10 @@ class AlignmentStageService:
         language: str,
     ) -> AnchorMountStageResult:
         self._host.logger.debug(
-            "Chunk {}: preparation 执行 anchor_mount window_id={} slots={} fast_hooks={} punctuation_evidences={}",
+            "Chunk {}: preparation 执行 anchor_mount window_id={} token_units={} fast_hooks={} punctuation_evidences={}",
             preparation.owner_chunk_index,
             preparation.window_id,
-            len(preparation.slow_text.slots),
+            len(preparation.slow_text.token_units),
             len(preparation.fast_hooks),
             len(preparation.slow_text.punctuation_evidences),
         )
@@ -886,7 +914,7 @@ class AlignmentStageService:
             summary_payload={
                 "window_id": str(preparation.window_id),
                 "owner_chunk_id": str(preparation.owner_chunk_id),
-                "slot_count": len(preparation.slow_text.slots),
+                "token_unit_count": len(preparation.slow_text.token_units),
                 "hook_count": len(preparation.fast_hooks),
                 "punctuation_evidence_count": len(preparation.slow_text.punctuation_evidences),
                 "language": language,
@@ -907,8 +935,8 @@ class AlignmentStageService:
                 stage="anchor_mount_output",
                 summary_payload={
                     "window_id": str(stage_result.decision_ingress.window_id),
-                    "token_count": len(stage_result.decision_ingress.tokens),
-                    "boundary_hint_count": len(stage_result.decision_ingress.boundary_hints),
+                    "token_count": len(stage_result.decision_ingress.anchored_token_units),
+                    "boundary_evidence_count": len(stage_result.decision_ingress.boundary_evidences),
                     "cross_chunk_lock_count": len(stage_result.decision_ingress.cross_chunk_locks),
                     "should_fallback": bool(stage_result.anchor_mount_result.should_fallback),
                     "metrics": dict(stage_result.anchor_mount_result.metrics),
@@ -932,17 +960,17 @@ class AlignmentStageService:
         ctx.slow_window_meta = {
             "window_id": preparation.window_id,
             "owner_chunk_id": preparation.owner_chunk_id,
-            "slot_count": len(preparation.slow_text.slots),
+            "token_unit_count": len(preparation.slow_text.token_units),
             "hook_count": len(preparation.fast_hooks),
             "source_chunk_ids": list(preparation.source_chunk_ids),
         }
         if isinstance(preparation.compat.time_base, WindowTimeBasePackage):
             ctx.window_time_base = preparation.compat.time_base
         self._host.logger.debug(
-            "Chunk {}: preparation 已写回 ctx window_id={} slot_count={} hook_count={} pronunciation_hint_count={} window_time_base_units={}",
+            "Chunk {}: preparation 已写回 ctx window_id={} token_unit_count={} hook_count={} pronunciation_hint_count={} window_time_base_units={}",
             ctx.chunk_index,
             preparation.window_id,
-            len(preparation.slow_text.slots),
+            len(preparation.slow_text.token_units),
             len(preparation.fast_hooks),
             len(preparation.slow_text.pronunciation_hints),
             len(getattr(preparation.compat.time_base, "word_units", ()) or ()),
@@ -1201,15 +1229,19 @@ class AlignmentStageService:
             speaker_id=speaker_id,
             turn_id=turn_id,
         )
+        self._inject_timeline_turns_into_decision_input(
+            decision_input=adapter_result.decision_input,
+            decision_ingress=stage_result.decision_ingress,
+        )
         self._trace_write(
             ctx=ctx,
             filename="30_decision_ingress.input.json",
             stage="decision_ingress_input",
             summary_payload={
                 "window_id": str(stage_result.decision_ingress.window_id),
-                "token_count": len(stage_result.decision_ingress.tokens),
+                "token_count": len(stage_result.decision_ingress.anchored_token_units),
                 "punctuation_fact_count": len(stage_result.decision_ingress.punctuation_facts),
-                "boundary_hint_count": len(stage_result.decision_ingress.boundary_hints),
+                "boundary_evidence_count": len(stage_result.decision_ingress.boundary_evidences),
                 "cross_chunk_lock_count": len(stage_result.decision_ingress.cross_chunk_locks),
                 "coverage_owner_chunks": len(stage_result.decision_ingress.source_chunk_ids),
             },
@@ -1219,14 +1251,10 @@ class AlignmentStageService:
             ctx=ctx,
             filename="31_decision_ingress.output.json",
             stage="decision_ingress_output",
-            summary_payload={
-                "stream_id": str(adapter_result.stream_id),
-                "chunk_index": int(adapter_result.chunk_index),
-                "fallback_clean_text_len": len(
-                    str(adapter_result.decision_input.fallback_clean_text_ref or "")
-                ),
-                "compat_report": dict(adapter_result.compat_report),
-            },
+            summary_payload=self._build_decision_ingress_trace_summary(
+                package=stage_result.decision_ingress,
+                adapter_result=adapter_result,
+            ),
             full_payload=adapter_result,
         )
         decision_output = host._decision_processor.process(
@@ -1319,19 +1347,23 @@ class AlignmentStageService:
         split_stats.update(dict(decision_output.segmentation_report.get("boundary_score_stats", {})))
         split_stats.update(dict(decision_output.segmentation_report.get("soft_cut_stats", {})))
         split_stats["timeanchored_boundary_candidate_count"] = int(
-            len(stage_result.decision_ingress.boundary_hints)
+            len(stage_result.decision_ingress.boundary_evidences)
         )
         split_stats["timeanchored_boundary_hard_count"] = int(
-            sum(1 for item in stage_result.decision_ingress.boundary_hints if bool(item.hard_flag))
+            sum(1 for item in stage_result.decision_ingress.boundary_evidences if bool(item.hard_flag))
         )
-        split_stats["timeanchored_boundary_pause_count"] = int(
-            sum(1 for item in stage_result.decision_ingress.boundary_hints if "pause" in str(item.reason))
-        )
-        split_stats["timeanchored_boundary_punct_count"] = int(
+        split_stats["timeanchored_boundary_lexical_count"] = int(
             sum(
                 1
-                for item in stage_result.decision_ingress.boundary_hints
-                if str(item.reason).startswith("punctuation")
+                for item in stage_result.decision_ingress.boundary_evidences
+                if str(item.reason) == "lexical_boundary"
+            )
+        )
+        split_stats["timeanchored_boundary_anchor_block_close_count"] = int(
+            sum(
+                1
+                for item in stage_result.decision_ingress.boundary_evidences
+                if str(item.reason) == "anchor_block_close"
             )
         )
         split_stats["decision_ingress_adapter_fallback_punct_count"] = int(
@@ -1479,11 +1511,13 @@ class AlignmentStageService:
             "timeanchored_text_route": text_route,
             "timeanchored_edge_route": edge_route,
             "timeanchored_final_route": final_route,
-            "timeanchored_item_count": float(len(stage_result.decision_ingress.tokens)),
+            "timeanchored_item_count": float(len(stage_result.decision_ingress.anchored_token_units)),
             "timeanchored_sentence_count": float(len(final_sentences)),
             "timeanchored_projected_chunk_count": float(len(projected_batches)),
             "timeanchored_failed_span_count": 0.0,
-            "timeanchored_boundary_candidate_count": float(len(stage_result.decision_ingress.boundary_hints)),
+            "timeanchored_boundary_candidate_count": float(
+                len(stage_result.decision_ingress.boundary_evidences)
+            ),
             "l7_error_count": float(output_error_count),
             **punctuation_chain_health,
         }
@@ -1516,6 +1550,52 @@ class AlignmentStageService:
             len(final_sentences),
             final_route,
         )
+
+    def _inject_timeline_turns_into_decision_input(
+        self,
+        *,
+        decision_input: Any,
+        decision_ingress: Any,
+    ) -> None:
+        """
+        将窗口内 timeline turn 真值注入 Decision 输入，避免 slot 级 speaker 继承导致误判。
+        """
+        aligned_facts = getattr(decision_input, "aligned_facts", None)
+        if aligned_facts is None:
+            return
+        host = self._host
+        timeline_turns = list(getattr(host, "_timeline_turns", []) or [])
+        if not timeline_turns:
+            return
+        tokens = list(getattr(decision_ingress, "tokens", ()) or ())
+        if not tokens:
+            return
+        window_start = min(float(getattr(item, "start", 0.0) or 0.0) for item in tokens)
+        window_end = max(float(getattr(item, "end", window_start) or window_start) for item in tokens)
+        if window_end <= window_start:
+            return
+        selected_turns: list[dict[str, Any]] = []
+        for turn in timeline_turns:
+            turn_start = float(getattr(turn, "start", 0.0) or 0.0)
+            turn_end = float(getattr(turn, "end", turn_start) or turn_start)
+            if turn_end <= turn_start:
+                continue
+            if min(window_end, turn_end) <= max(window_start, turn_start):
+                continue
+            selected_turns.append(
+                {
+                    "turn_id": str(getattr(turn, "turn_id", "") or ""),
+                    "speaker_id": str(getattr(turn, "speaker_id", "unknown") or "unknown"),
+                    "start": turn_start,
+                    "end": turn_end,
+                    "source": "timeline_overlap",
+                    "boundary_confidence": float(
+                        getattr(turn, "boundary_confidence", 0.0) or 0.0
+                    ),
+                }
+            )
+        if selected_turns:
+            aligned_facts.speaker_turns = selected_turns
 
     def _build_projected_output_batches(
         self,
@@ -1811,6 +1891,8 @@ class AlignmentStageService:
             graph_payload = self._anchor_mount_graph_renderer.build_graph_payload(
                 window_id=str(stage_result.decision_ingress.window_id),
                 items=stage_result.anchor_mount_result.items,
+                envelopes=stage_result.anchor_mount_result.envelopes,
+                boundary_evidences=stage_result.anchor_mount_result.boundary_evidences,
                 hooks=preparation.fast_hooks,
                 metrics=stage_result.anchor_mount_result.metrics,
             )
@@ -1852,6 +1934,145 @@ class AlignmentStageService:
                 ctx.chunk_index,
             )
 
+    @staticmethod
+    def _build_decision_ingress_trace_summary(
+        *,
+        package: Any,
+        adapter_result: Any,
+    ) -> dict[str, Any]:
+        token_units = list(getattr(package, "anchored_token_units", ()) or ())
+        boundary_evidences = list(getattr(package, "boundary_evidences", ()) or ())
+        rows = [
+            AlignmentStageService._serialize_decision_ingress_token_unit(index=index, token_unit=item)
+            for index, item in enumerate(token_units)
+        ]
+        return {
+            "stream_id": str(getattr(adapter_result, "stream_id", "") or ""),
+            "chunk_index": int(getattr(adapter_result, "chunk_index", 0) or 0),
+            "fallback_clean_text_len": len(
+                str(getattr(getattr(adapter_result, "decision_input", None), "fallback_clean_text_ref", "") or "")
+            ),
+            "compat_report": dict(getattr(adapter_result, "compat_report", {}) or {}),
+            "token_units": rows,
+            "boundary_evidences": [
+                AlignmentStageService._serialize_boundary_evidence(item)
+                for item in boundary_evidences
+            ],
+            "boundary_by_split": AlignmentStageService._build_boundary_groups_for_trace(
+                token_units=token_units,
+                boundary_evidences=boundary_evidences,
+            ),
+            "cross_chunk_locks": [
+                AlignmentStageService._serialize_cross_chunk_lock_for_trace(item)
+                for item in (getattr(package, "cross_chunk_locks", ()) or ())
+            ],
+        }
+
+    @staticmethod
+    def _serialize_decision_ingress_token_unit(
+        *,
+        index: int,
+        token_unit: Any,
+    ) -> dict[str, Any]:
+        return {
+            "token_index": int(index),
+            "unit_id": str(getattr(token_unit, "unit_id", "") or ""),
+            "token_text": str(getattr(token_unit, "token_text", "") or ""),
+            "normalized_text": str(getattr(token_unit, "normalized_text", "") or ""),
+            "start": float(getattr(token_unit, "start", 0.0) or 0.0),
+            "end": float(getattr(token_unit, "end", 0.0) or 0.0),
+            "left_bound": float(getattr(token_unit, "left_bound", 0.0) or 0.0),
+            "right_bound": float(getattr(token_unit, "right_bound", 0.0) or 0.0),
+            "speaker_id": getattr(token_unit, "speaker_id", None),
+            "turn_id": getattr(token_unit, "turn_id", None),
+            "mount_status": str(getattr(token_unit, "mount_status", "") or ""),
+            "anchor_kind": str(getattr(token_unit, "anchor_kind", "") or ""),
+            "source_chunk_ids": [
+                str(item) for item in (getattr(token_unit, "source_chunk_ids", ()) or ())
+            ],
+            "source_chunk_indices": [
+                int(item) for item in (getattr(token_unit, "source_chunk_indices", ()) or ())
+            ],
+            "source_hook_ids": [
+                str(item) for item in (getattr(token_unit, "source_hook_ids", ()) or ())
+            ],
+            "cross_chunk_lock_ids": [
+                str(item) for item in (getattr(token_unit, "cross_chunk_lock_ids", ()) or ())
+            ],
+            "match_confidence": float(getattr(token_unit, "match_confidence", 0.0) or 0.0),
+        }
+
+    @staticmethod
+    def _serialize_boundary_evidence(item: Any) -> dict[str, Any]:
+        return {
+            "split_idx": int(getattr(item, "split_idx", 0) or 0),
+            "event_time": float(getattr(item, "event_time", 0.0) or 0.0),
+            "left_end": float(getattr(item, "left_end", 0.0) or 0.0),
+            "right_start": float(getattr(item, "right_start", 0.0) or 0.0),
+            "reason": str(getattr(item, "reason", "") or ""),
+            "score": float(getattr(item, "score", 0.0) or 0.0),
+            "hard_flag": bool(getattr(item, "hard_flag", False)),
+            "metadata": dict(getattr(item, "metadata", {}) or {}),
+        }
+
+    @staticmethod
+    def _serialize_cross_chunk_lock_for_trace(item: Any) -> dict[str, Any]:
+        return {
+            "lock_id": str(getattr(item, "lock_id", "") or ""),
+            "unit_ids": [str(value) for value in (getattr(item, "unit_ids", ()) or ())],
+            "hook_ids": [str(value) for value in (getattr(item, "hook_ids", ()) or ())],
+            "reason": str(getattr(item, "reason", "") or ""),
+            "source_chunk_ids": [
+                str(value) for value in (getattr(item, "source_chunk_ids", ()) or ())
+            ],
+            "source_chunk_indices": [
+                int(value) for value in (getattr(item, "source_chunk_indices", ()) or ())
+            ],
+        }
+
+    @staticmethod
+    def _build_boundary_groups_for_trace(
+        *,
+        token_units: Sequence[Any],
+        boundary_evidences: Sequence[Any],
+    ) -> list[dict[str, Any]]:
+        by_split_idx: dict[int, list[Any]] = {}
+        for item in boundary_evidences:
+            raw_split_idx = getattr(item, "split_idx", -1)
+            split_idx = int(raw_split_idx) if raw_split_idx is not None else -1
+            if split_idx < 0:
+                continue
+            by_split_idx.setdefault(split_idx, []).append(item)
+        rows: list[dict[str, Any]] = []
+        for split_idx in sorted(by_split_idx):
+            left_text = ""
+            right_text = ""
+            if 0 <= split_idx < len(token_units):
+                left_text = str(getattr(token_units[split_idx], "token_text", "") or "")
+            if 0 <= split_idx + 1 < len(token_units):
+                right_text = str(getattr(token_units[split_idx + 1], "token_text", "") or "")
+            evidences = by_split_idx[split_idx]
+            rows.append(
+                {
+                    "split_idx": int(split_idx),
+                    "left_text": left_text,
+                    "right_text": right_text,
+                    "reasons": [
+                        str(getattr(item, "reason", "") or "")
+                        for item in evidences
+                    ],
+                    "scores": [
+                        float(getattr(item, "score", 0.0) or 0.0)
+                        for item in evidences
+                    ],
+                    "blocked_by_lock": any(
+                        bool((getattr(item, "metadata", {}) or {}).get("blocked_by_lock"))
+                        for item in evidences
+                    ),
+                }
+            )
+        return rows
+
     def _record_hetero_alignment_result(
         self,
         *,
@@ -1872,7 +2093,7 @@ class AlignmentStageService:
             "reason": str(reason),
             "route": route,
             "sentence_count": (
-                int(len(stage_result.decision_ingress.tokens))
+                int(len(stage_result.decision_ingress.anchored_token_units))
                 if stage_result is not None
                 else 0
             ),
@@ -1932,7 +2153,9 @@ class AlignmentStageService:
             return False, f"{mode}_timeanchored_failed"
 
         if hasattr(stage_result, "decision_ingress"):
-            token_count = len(getattr(stage_result.decision_ingress, "tokens", ()) or ())
+            token_count = len(
+                getattr(stage_result.decision_ingress, "anchored_token_units", ()) or ()
+            )
         else:
             token_count = len(getattr(stage_result, "final_stream", ()) or ())
 
@@ -1960,8 +2183,19 @@ class AlignmentStageService:
         ctx: ProcessingContext,
         stage_result: Optional[AnchorMountStageResult],
     ) -> tuple[str, str, str, str | None]:
-        token_count = len(stage_result.decision_ingress.tokens) if stage_result is not None else 0
+        token_count = (
+            len(stage_result.decision_ingress.anchored_token_units)
+            if stage_result is not None
+            else 0
+        )
         text_route = "slow" if token_count else "error"
+        if self._should_force_fast_direct_on_anchor_mount_fallback(
+            stage_result=stage_result
+        ):
+            edge_route = "fast" if token_count else "error"
+            final_route = edge_route if edge_route != "error" else text_route
+            error_code = "anchor_mount_empty" if not token_count else None
+            return text_route, edge_route, final_route, error_code
         edge_selection_mode = str(getattr(ctx, "edge_selection_mode", "") or "").strip().lower()
         if edge_selection_mode not in {"force_fast", "prefer_fast", "force_slow", "prefer_slow"}:
             edge_selection_mode = str(
@@ -1988,17 +2222,66 @@ class AlignmentStageService:
         return ""
 
     @staticmethod
+    def _resolve_anchor_mount_source_chunk_ids(
+        *,
+        stage_result: Optional[AnchorMountStageResult],
+    ) -> tuple[str, ...]:
+        if stage_result is None:
+            return tuple()
+        decision_ingress = getattr(stage_result, "decision_ingress", None)
+        if decision_ingress is None:
+            return tuple()
+        source_chunk_ids = tuple(
+            str(item)
+            for item in (getattr(decision_ingress, "source_chunk_ids", ()) or ())
+            if str(item)
+        )
+        if source_chunk_ids:
+            return source_chunk_ids
+
+        deduped_source_chunk_ids: list[str] = []
+        seen_source_chunk_ids: set[str] = set()
+        for token_unit in (getattr(decision_ingress, "anchored_token_units", ()) or ()):
+            for chunk_id in (getattr(token_unit, "source_chunk_ids", ()) or ()):
+                chunk_value = str(chunk_id).strip()
+                if not chunk_value or chunk_value in seen_source_chunk_ids:
+                    continue
+                seen_source_chunk_ids.add(chunk_value)
+                deduped_source_chunk_ids.append(chunk_value)
+        return tuple(deduped_source_chunk_ids)
+
+    @classmethod
+    def _should_force_fast_direct_on_anchor_mount_fallback(
+        cls,
+        *,
+        stage_result: Optional[AnchorMountStageResult],
+    ) -> bool:
+        if stage_result is None:
+            return False
+        anchor_mount_result = getattr(stage_result, "anchor_mount_result", None)
+        if anchor_mount_result is None:
+            return False
+        if not bool(getattr(anchor_mount_result, "should_fallback", False)):
+            return False
+        source_chunk_ids = cls._resolve_anchor_mount_source_chunk_ids(
+            stage_result=stage_result
+        )
+        if source_chunk_ids and len(source_chunk_ids) > 1:
+            return False
+        return True
+
+    @classmethod
     def _resolve_anchor_mount_force_fast_reason(
+        cls,
         *,
         stage_result: Optional[AnchorMountStageResult],
     ) -> str:
         """将 AnchorMount 的 fallback 质量信号映射为快流直通触发原因。"""
         if stage_result is None:
             return ""
-        anchor_mount_result = getattr(stage_result, "anchor_mount_result", None)
-        if anchor_mount_result is None:
-            return ""
-        if bool(getattr(anchor_mount_result, "should_fallback", False)):
+        if cls._should_force_fast_direct_on_anchor_mount_fallback(
+            stage_result=stage_result
+        ):
             return "anchor_mount_should_fallback"
         return ""
 

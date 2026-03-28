@@ -19,7 +19,7 @@ def test_postprocess_trace_writer_writes_stage_file_and_manifest(tmp_path: Path)
         job_dir=job_dir,
         chunk_index=3,
         filename="10_preparation.input.json",
-        payload={"window_id": "w1", "slot_count": 4},
+        payload={"window_id": "w1", "token_unit_count": 4},
         stage="preparation_input",
     )
 
@@ -37,4 +37,3 @@ def test_postprocess_trace_writer_writes_stage_file_and_manifest(tmp_path: Path)
     chunk_entry = manifest["chunks"]["3"]
     assert "10_preparation.input.json" in chunk_entry["files"]
     assert chunk_entry["files"]["10_preparation.input.json"]["stage"] == "preparation_input"
-

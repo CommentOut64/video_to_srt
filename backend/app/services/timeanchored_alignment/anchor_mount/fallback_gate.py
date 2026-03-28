@@ -10,7 +10,7 @@ class FallbackGate:
 
     def should_fallback(self, *, result: AnchorMountResult) -> bool:
         anchored = int(result.metrics.get("anchored_count", 0) or 0)
-        total = int(result.metrics.get("slot_count", 0) or 0)
+        total = int(result.metrics.get("unit_count", 0) or 0)
         unresolved = int(result.metrics.get("unresolved_count", 0) or 0)
         inferred = int(result.metrics.get("inferred_count", 0) or 0)
         largest_unresolved_span = int(result.metrics.get("largest_unresolved_span", 0) or 0)

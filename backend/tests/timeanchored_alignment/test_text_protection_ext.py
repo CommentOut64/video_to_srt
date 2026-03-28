@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from app.services.text_protection import extract_protected_spans
+from app.models.sensevoice_models import WordTimestamp
+from app.services.text_protection import extract_protected_spans, merge_protected_word_tokens
 
 
 def test_extract_protected_spans_supports_phase3_rules() -> None:
@@ -42,3 +43,18 @@ def test_extract_protected_spans_supports_time_expressions_and_build_clean_text_
 
     clean_text, _, _ = build_clean_text("It's still only 7:28 PM.")
     assert clean_text == "It's still only 7:28 PM"
+
+
+def test_merge_protected_word_tokens_only_preserves_supported_metadata() -> None:
+    left = WordTimestamp(word="0", start=0.0, end=0.1, confidence=0.9)
+    right = WordTimestamp(word=".", start=0.1, end=0.2, confidence=0.8)
+    setattr(left, "speaker_id", "spk-1")
+    setattr(left, "legacy_marker_a", 3)
+    setattr(right, "legacy_marker_b", "legacy-3")
+
+    merged = merge_protected_word_tokens([left, right])
+
+    assert len(merged) == 1
+    assert getattr(merged[0], "speaker_id", None) == "spk-1"
+    assert getattr(merged[0], "legacy_marker_a", None) is None
+    assert getattr(merged[0], "legacy_marker_b", None) is None

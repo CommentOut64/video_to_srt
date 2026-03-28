@@ -168,6 +168,8 @@ class TextflowFacadeService:
         is_fast_only_mode: bool = False,
     ) -> Layer456RunResult:
         """执行一次集合层→评分层→裁决层主路径（内部主入口）。"""
+        # 保留入参仅为兼容调用面；统一主链下不再启用 fast-only 语义分叉。
+        semantic_fast_only_mode = False
         time_words, time_source = self._resolve_alignment_time_words(
             variant=variant,
             sv_words=sv_words,
@@ -179,7 +181,7 @@ class TextflowFacadeService:
                 sv_words=time_words,
                 vad_intervals=self._host._vad_intervals,
                 policy_snapshot=policy_snapshot,
-                is_fast_only_mode=is_fast_only_mode,
+                is_fast_only_mode=semantic_fast_only_mode,
             )
         )
         alignment_result = collection_output.alignment_result
@@ -189,20 +191,15 @@ class TextflowFacadeService:
         )
         self._host._final_splitter.set_language(detected_language)
         is_cjk_language = self._is_cjk_language_tag(detected_language)
-        # Why: 纯快流是当前稳定基线，双流 CJK 仅保留语义断点，不启用弱标点扩展切分。
-        is_enable_cjk_weak_punct = (not is_fast_only_mode) and (not is_cjk_language)
-        is_enable_cjk_semantic = (not is_fast_only_mode)
+        is_enable_cjk_weak_punct = (not is_cjk_language)
+        is_enable_cjk_semantic = True
         self._host._final_splitter.set_cjk_split_mode(
             is_enable_weak_punct=is_enable_cjk_weak_punct,
             is_enable_semantic=is_enable_cjk_semantic,
         )
-        if is_fast_only_mode:
-            # Why: fast-only 以“稳定快流基线”为优先，避免 CJK 语义词表触发额外碎切。
-            self._host._final_splitter.set_semantic_anchor_words([])
-        else:
-            self._host._final_splitter.set_semantic_anchor_words(
-                list(getattr(policy_snapshot, "semantic_anchor_words", []) or [])
-            )
+        self._host._final_splitter.set_semantic_anchor_words(
+            list(getattr(policy_snapshot, "semantic_anchor_words", []) or [])
+        )
         injection_stats: Dict[str, Any] = {
             "injection_positions_total": len(punctuation_positions or []),
             "injection_unmatched_total": 0,
@@ -267,7 +264,7 @@ class TextflowFacadeService:
             stream_id=decision_stream_id,
             aligned_facts=aligned_facts,
             policy_snapshot=policy_snapshot,
-            is_fast_only_mode=is_fast_only_mode,
+            is_fast_only_mode=semantic_fast_only_mode,
         )
 
         decision_chunk_index = self._host._resolve_chunk_index_from_words(words=time_words)
@@ -283,7 +280,7 @@ class TextflowFacadeService:
             aligned_facts=aligned_facts,
             fused_evidence=fused_evidence,
             policy_snapshot=policy_snapshot,
-            is_fast_only_mode=is_fast_only_mode,
+            is_fast_only_mode=semantic_fast_only_mode,
         )
         decision_output = self._host._decision_processor.process(
             DecisionLayerInput(
@@ -464,7 +461,7 @@ class TextflowFacadeService:
             speaker_id=speaker_id,
             turn_id=turn_id,
             policy_snapshot=policy_snapshot,
-            is_fast_only_mode=True,
+            is_fast_only_mode=False,
         )
 
         final_sentences = list(run_result.final_sentences)

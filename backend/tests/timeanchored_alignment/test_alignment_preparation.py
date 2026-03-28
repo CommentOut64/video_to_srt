@@ -348,7 +348,7 @@ def test_alignment_preparation_runs_safe_structure_display_in_order() -> None:
     assert calls == ["safe", "protect", "display"]
 
 
-def test_alignment_preparation_slots_carry_speaker_turn_and_source_chunk_fields() -> None:
+def test_alignment_preparation_token_units_carry_speaker_turn_and_source_chunk_fields() -> None:
     package = AlignmentPreparationAssembler().prepare(
         ready_window=_build_ready_window(),
         window_time_base=_build_window_time_base(),
@@ -356,15 +356,15 @@ def test_alignment_preparation_slots_carry_speaker_turn_and_source_chunk_fields(
         default_language="zh",
     )
 
-    assert package.slow_text.slots
-    assert package.slow_text.slots[0].speaker_id == "speaker-a"
-    assert package.slow_text.slots[0].turn_id == "turn-a"
-    assert package.slow_text.slots[0].source_chunk_ids == ("chunk-1",)
-    assert package.slow_text.slots[0].source_chunk_indices == (1,)
-    assert package.slow_text.slots[-1].speaker_id == "speaker-b"
-    assert package.slow_text.slots[-1].turn_id == "turn-b"
-    assert package.slow_text.slots[-1].source_chunk_ids == ("chunk-2",)
-    assert package.slow_text.slots[-1].source_chunk_indices == (2,)
+    assert package.slow_text.token_units
+    assert package.slow_text.token_units[0].speaker_id == "speaker-a"
+    assert package.slow_text.token_units[0].turn_id == "turn-a"
+    assert package.slow_text.token_units[0].source_chunk_ids == ("chunk-1",)
+    assert package.slow_text.token_units[0].source_chunk_indices == (1,)
+    assert package.slow_text.token_units[-1].speaker_id == "speaker-b"
+    assert package.slow_text.token_units[-1].turn_id == "turn-b"
+    assert package.slow_text.token_units[-1].source_chunk_ids == ("chunk-2",)
+    assert package.slow_text.token_units[-1].source_chunk_indices == (2,)
 
 
 def test_alignment_preparation_hooks_only_come_from_window_time_base_package() -> None:
@@ -409,7 +409,7 @@ def test_alignment_preparation_preserves_slow_timestamps_for_edge_selector_fallb
     assert any(unit.start is not None and unit.end is not None for unit in package.compat.text_truth.units)
 
 
-def test_alignment_preparation_keeps_slot_boundaries_stable_when_projection_preserves_contractions() -> None:
+def test_alignment_preparation_keeps_token_units_stable_when_projection_preserves_contractions() -> None:
     whisper_text = "Wouldn't it make sense. It's not like I even wanted to graduate anyways."
     package = AlignmentPreparationAssembler().prepare(
         ready_window=_build_english_ready_window(),
@@ -421,13 +421,27 @@ def test_alignment_preparation_keeps_slot_boundaries_stable_when_projection_pres
     assert package.slow_text.window_text.text == (
         "Wouldn't it make sense It's not like I even wanted to graduate anyways"
     )
-    assert tuple(slot.text for slot in package.slow_text.slots) == (
-        "Wouldn't it make sense",
-        "It's not like I even wanted to graduate anyways",
-    )
+    assert [item.token_text for item in package.slow_text.token_units] == [
+        "Wouldn't",
+        "it",
+        "make",
+        "sense",
+        "It's",
+        "not",
+        "like",
+        "I",
+        "even",
+        "wanted",
+        "to",
+        "graduate",
+        "anyways",
+    ]
+    assert [item.token_text for item in package.slow_text.token_units] == [
+        item.token_text for item in package.compat.pronunciation.token_units
+    ]
 
 
-def test_alignment_preparation_splits_slots_inside_same_source_unit_when_punctuation_exists() -> None:
+def test_alignment_preparation_does_not_split_token_units_by_punctuation() -> None:
     text_a = (
         "Then tomorrow we can celebrate her birthday, and maybe even get her a lava lamp. "
         "Who is my favorite DDLC character?"
@@ -441,13 +455,12 @@ def test_alignment_preparation_splits_slots_inside_same_source_unit_when_punctua
         default_language="en",
     )
 
-    assert len(package.slow_text.slots) > 2
-    assert sum(
-        1 for slot in package.slow_text.slots if slot.source_chunk_indices == (1,)
-    ) >= 2
+    assert [item.token_text for item in package.slow_text.token_units] == [
+        item.token_text for item in package.compat.pronunciation.token_units
+    ]
+    assert len(package.slow_text.token_units) == len(package.compat.pronunciation.token_units)
 
-
-def test_alignment_preparation_refines_undersegmented_slots_with_pronunciation_hints() -> None:
+def test_alignment_preparation_does_not_split_token_units_by_pronunciation_hints() -> None:
     text_a = (
         "Then tomorrow we can celebrate her birthday and maybe even get her a laval lamp "
         "Who is my favorite DDLC character?"
@@ -461,7 +474,10 @@ def test_alignment_preparation_refines_undersegmented_slots_with_pronunciation_h
         default_language="en",
     )
 
-    assert len(package.slow_text.slots) > 4
+    assert [item.token_text for item in package.slow_text.token_units] == [
+        item.token_text for item in package.compat.pronunciation.token_units
+    ]
+    assert len(package.slow_text.token_units) == len(package.compat.pronunciation.token_units)
 
 
 def test_assembler_accepts_external_punct_track_and_merges_evidence() -> None:

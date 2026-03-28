@@ -167,13 +167,14 @@ def test_job_has_punctuation_points_then_preparation_should_not_be_zero() -> Non
         preparation_punctuation_count=len(preparation.slow_text.punctuation_evidences),
         punctuation_fact_count=len(stage_result.decision_ingress.punctuation_facts),
     )
-    punctuation_boundary_count = sum(
-        1
-        for hint in stage_result.decision_ingress.boundary_hints
-        if str(hint.reason).startswith("punctuation")
-    )
-    ratio_default_splitter = 0.0 if punctuation_boundary_count > 0 else 1.0
+    boundary_reasons = {
+        str(evidence.reason)
+        for evidence in stage_result.decision_ingress.boundary_evidences
+    }
 
     assert len(punct_track.positions) > 0
     assert metrics["preparation_punctuation_count"] > 0
-    assert ratio_default_splitter < 0.8
+    assert metrics["punctuation_fact_count"] > 0
+    assert metrics["punctuation_chain_broken_flag"] == 0
+    assert boundary_reasons <= {"lexical_boundary", "anchor_block_close"}
+    assert "punctuation_sentence_end" not in boundary_reasons

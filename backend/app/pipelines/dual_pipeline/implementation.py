@@ -47,7 +47,7 @@ import numpy as np
 
 from app.core.asr.engine import ASREngine
 from app.core.logging import resolve_loguru_logger
-from app.core.thresholds import ThresholdConfig, needs_whisper_patch
+from app.core.thresholds import ThresholdConfig
 from app.schemas.pipeline_context import ProcessingContext
 from app.models.confidence_models import AlignmentStatus
 from app.models.sensevoice_models import SentenceSegment, TextSource, WordTimestamp
@@ -191,7 +191,7 @@ class AsyncDualPipelineKernel:
 
     V3.5 更新：
     - 支持 transcription_profile 参数
-    - sensevoice_only 模式下跳过 SlowWorker，FastWorker 直接输出定稿
+    - sensevoice_only 模式下跳过 SlowWorker，FastWorker 结果进入统一 Alignment 主链定稿
     """
     # Why: pyannote 边界在快语速下会出现亚词级抖动，直接参与软切会导致单词级碎句。
     _SOFT_CUT_MIN_TURN_DURATION_SEC = 0.45
@@ -403,9 +403,9 @@ class AsyncDualPipelineKernel:
         self.is_patching_mode = (transcription_profile == "sv_whisper_patch")
 
         if self.is_sensevoice_only:
-            self.logger.info("极速模式: 纯 SenseVoice 流水线，跳过 Whisper")
+            self.logger.info("极速模式: 纯 SenseVoice 快流，跳过 SlowWorker，统一进入 Alignment 主链")
         elif self.is_patching_mode:
-            self.logger.info("智能复核模式: 根据 SenseVoice 质量决定是否调用 Whisper")
+            self.logger.info("智能复核模式: 当前阶段按双流执行（SlowWorker 不跳过 Whisper）")
         else:
             self.logger.info(f"双流精校模式: 全量 Whisper 转录")
 
@@ -1753,7 +1753,7 @@ class AsyncDualPipelineKernel:
         运行流水线
 
         流程：
-        - 极速模式 (sensevoice_only): 仅运行 FastWorker，直接输出定稿
+        - 极速模式 (sensevoice_only): FastWorker 后进入统一 Alignment 主链（单路短路选边）
         - 复核/双流模式: 运行完整三级流水线
 
         V3.1.0: 支持分别设置各 Worker 的基准偏移量和初始索引，修复恢复后进度跳变问题
@@ -1836,9 +1836,10 @@ class AsyncDualPipelineKernel:
         processed_indices: Optional[Set[int]] = None  # v3.1.0
     ) -> List[ProcessingContext]:
         """
-        极速模式: 仅运行 FastWorker
+        极速模式: FastWorker + 统一 Alignment 主链
 
-        FastWorker 输出经四层主链定稿并由输出层分发，跳过 Whisper 和对齐。
+        FastWorker 输出在对齐阶段补齐统一输入后，进入
+        Preparation -> Alignment -> Decision -> Output 主链完成定稿。
 
         v3.1.0: 支持逐 Chunk 中断和检查点保存
         V3.1.0: 集成进度发射器，实时推送 SSE 进度
@@ -2966,22 +2967,6 @@ class AsyncDualPipelineKernel:
         self.logger.debug(
             "SemanticBuffer 尾部刷新完成: 草稿 {} 个句子",
             total_sentences,
-        )
-
-    def _should_skip_whisper(self, sv_result: Dict[str, Any], chunk: AudioChunk) -> bool:
-        """
-        智能复核模式下判断是否跳过 Whisper。
-        """
-        confidence = sv_result.get("confidence", 0.0)
-        text_clean = sv_result.get("text_clean", "")
-        words = sv_result.get("words", [])
-        duration = chunk.duration
-        return not needs_whisper_patch(
-            confidence=confidence,
-            duration=duration,
-            text_length=len(text_clean),
-            words=words,
-            config=self.patching_threshold or ThresholdConfig()
         )
 
     def _build_whisper_prompt(

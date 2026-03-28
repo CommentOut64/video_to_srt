@@ -191,79 +191,66 @@ class SlowLoopService:
                     sv_result = ctx.sv_result or {}
                     chunk = ctx.audio_chunk
 
-                    skip_whisper = False
                     whisper_result: Optional[dict] = None
                     prompt: Optional[str] = None
-
-                    if host.is_patching_mode and sv_result:
-                        if host._should_skip_whisper(sv_result, chunk):
-                            skip_whisper = True
-                            ctx.whisper_skipped = True
-                            ctx.whisper_result = {}
-                            host.logger.debug(
-                                f"Chunk {chunk_index}: SenseVoice 质量足够，跳过 Whisper "
-                                f"(confidence={sv_result.get('confidence', 0):.2f})"
-                            )
-
-                    if not skip_whisper:
-                        sv_context = sv_result.get("text_clean", "") if sv_result else None
-                        pause_gap_sec = None
-                        if host._last_prompt_audio_end is not None and chunk is not None:
-                            pause_gap_sec = max(
-                                0.0,
-                                float(chunk.start) - float(host._last_prompt_audio_end),
-                            )
-                        prompt = host._build_whisper_prompt(
-                            sv_context,
-                            pause_gap_sec=pause_gap_sec,
+                    sv_context = sv_result.get("text_clean", "") if sv_result else None
+                    pause_gap_sec = None
+                    if host._last_prompt_audio_end is not None and chunk is not None:
+                        pause_gap_sec = max(
+                            0.0,
+                            float(chunk.start) - float(host._last_prompt_audio_end),
                         )
-                        audio_with_overlap = host._extract_audio_with_overlap(ctx)
+                    prompt = host._build_whisper_prompt(
+                        sv_context,
+                        pause_gap_sec=pause_gap_sec,
+                    )
+                    audio_with_overlap = host._extract_audio_with_overlap(ctx)
 
-                        whisper_result = await host.slow_worker.infer(
-                            audio_with_overlap,
-                            initial_prompt=prompt,
-                            cancel_checker=token.raise_if_canceled if token else None,
+                    whisper_result = await host.slow_worker.infer(
+                        audio_with_overlap,
+                        initial_prompt=prompt,
+                        cancel_checker=token.raise_if_canceled if token else None,
+                    )
+                    host._validate_l0_result(
+                        whisper_result,
+                        source="slow",
+                        chunk_index=chunk_index,
+                    )
+                    guard_result = host._slow_whisper_hallucination_guard.prepare_and_detect(
+                        whisper_result=whisper_result,
+                        prompt=prompt,
+                    )
+                    if guard_result.is_hallucination:
+                        host.logger.warning(
+                            f"Chunk {chunk_index}: 检测到 Whisper 幻觉，回退到 SenseVoice"
                         )
-                        host._validate_l0_result(
-                            whisper_result,
-                            source="slow",
-                            chunk_index=chunk_index,
-                        )
-                        guard_result = host._slow_whisper_hallucination_guard.prepare_and_detect(
+                        host._reset_prompt_cache(reason="hallucination")
+                        host._slow_whisper_hallucination_guard.apply_fast_fallback(
                             whisper_result=whisper_result,
-                            prompt=prompt,
+                            sv_result=sv_result,
                         )
-                        if guard_result.is_hallucination:
-                            host.logger.warning(
-                                f"Chunk {chunk_index}: 检测到 Whisper 幻觉，回退到 SenseVoice"
-                            )
-                            host._reset_prompt_cache(reason="hallucination")
-                            host._slow_whisper_hallucination_guard.apply_fast_fallback(
-                                whisper_result=whisper_result,
-                                sv_result=sv_result,
-                            )
-                        else:
-                            whisper_language = chunk.language or whisper_result.get("language") or "auto"
-                            host._slow_whisper_hallucination_guard.normalize_non_hallucination(
-                                whisper_result=whisper_result,
-                                language=whisper_language,
-                            )
-
-                        ctx.whisper_result = copy.deepcopy(whisper_result)
-                        ctx.whisper_skipped = False
-                        if not whisper_result.get("is_hallucination"):
-                            host._update_prompt_cache(
-                                whisper_result.get("text", ""),
-                                confidence=whisper_result.get("confidence"),
-                                whisper_result=whisper_result,
-                            )
-                            if chunk is not None:
-                                host._last_prompt_audio_end = float(chunk.end)
-
-                        host.logger.debug(
-                            f"Chunk {chunk_index}: Whisper 推理完成 "
-                            f"(text_length={len(whisper_result.get('text', ''))})"
+                    else:
+                        whisper_language = chunk.language or whisper_result.get("language") or "auto"
+                        host._slow_whisper_hallucination_guard.normalize_non_hallucination(
+                            whisper_result=whisper_result,
+                            language=whisper_language,
                         )
+
+                    ctx.whisper_result = copy.deepcopy(whisper_result)
+                    ctx.whisper_skipped = False
+                    if not whisper_result.get("is_hallucination"):
+                        host._update_prompt_cache(
+                            whisper_result.get("text", ""),
+                            confidence=whisper_result.get("confidence"),
+                            whisper_result=whisper_result,
+                        )
+                        if chunk is not None:
+                            host._last_prompt_audio_end = float(chunk.end)
+
+                    host.logger.debug(
+                        f"Chunk {chunk_index}: Whisper 推理完成 "
+                        f"(text_length={len(whisper_result.get('text', ''))})"
+                    )
 
                     await self._put_queue_final_with_guard(
                         payload=ctx,

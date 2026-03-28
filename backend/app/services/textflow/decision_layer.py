@@ -23,6 +23,7 @@ from app.services.alignment.types import (
     TextTrack,
     TextTrackBundle,
 )
+from app.services.segmentation.soft_cut.types import AnchorType, CutDecision, CutPlan
 from app.services.segmentation.boundary_mapper import WordBoundaryMapper
 from app.services.punctuation.final_splitter import FinalSplitter
 from app.services.textflow.canonical_text_stream_adapter import CanonicalTextStreamAdapter
@@ -32,6 +33,7 @@ from app.services.textflow.contracts import (
     SegmentationResult,
     SegmentationIngressContext,
 )
+from app.services.textflow.ingress_segment_planner import IngressSegmentPlanner
 from app.services.textflow.render_core import RenderCore
 from app.services.textflow.segmentation_core import SegmentationCore
 from app.services.textflow.subtitle_delivery import SubtitleDelivery
@@ -87,6 +89,35 @@ class SegmentationProcessor:
     _SPEAKER_REPAIR_EDGE_GUARD_SEC = 0.15
     _TIMELINE_BACKTRACK_DROP_TOLERANCE_SEC = 0.02
     _TIMELINE_NORMALIZE_MIN_DURATION_SEC = 0.01
+    _INGRESS_LOW_QUALITY_MOUNT_STATUSES = {"inferred", "unresolved"}
+    _INGRESS_FRAGMENT_MAX_LEFT_ALPHA_LEN = 4
+    _INGRESS_FRAGMENT_MAX_RIGHT_ALPHA_LEN = 2
+    _INGRESS_SCORING_DEFAULT_THRESHOLD = 0.74
+    _INGRESS_SCORING_CJK_THRESHOLD = 0.66
+    _INGRESS_SCORING_MIN_ADJACENT_BOUNDARY_GAP_SEC = 0.22
+    _INGRESS_SCORING_MIN_ADJACENT_BOUNDARY_GAP_CJK_SEC = 0.16
+    _INGRESS_SCORING_REASON_BONUS = {
+        "punctuation_sentence_end": 0.20,
+        "speaker_change": 0.14,
+        "gap_pause": 0.10,
+        "blank_valley": 0.05,
+        "pause_long": 0.05,
+        "pause": 0.04,
+        "punctuation_soft": 0.03,
+        "lexical_boundary": 0.00,
+        "anchor_block_close": -0.02,
+    }
+    _INGRESS_SCORING_REASON_PRIORITY = {
+        "punctuation_sentence_end": 100,
+        "speaker_change": 90,
+        "gap_pause": 80,
+        "blank_valley": 70,
+        "pause_long": 65,
+        "pause": 60,
+        "punctuation_soft": 55,
+        "lexical_boundary": 45,
+        "anchor_block_close": 40,
+    }
     _UNKNOWN_PSEUDO_JUNK_PATTERN = re.compile(
         r"^[\s\|·•`~!@#$%^&*()_+\-=\[\]{};:'\",.<>/?\\，。！？：；、（）《》【】…—]+$"
     )
@@ -115,6 +146,7 @@ class SegmentationProcessor:
         self._active_vad_intervals: List[Tuple[float, float]] = []
         self._segmentation_core = SegmentationCore(processor=self)
         self._canonical_text_stream_adapter = CanonicalTextStreamAdapter()
+        self._ingress_segment_planner = IngressSegmentPlanner()
         self._render_core = RenderCore()
         self._subtitle_delivery = SubtitleDelivery()
 
@@ -536,8 +568,8 @@ class SegmentationProcessor:
             idx
             for idx, token in enumerate(tokens)
             if idx >= cursor
-            and float(getattr(token, "end", 0.0) or 0.0) >= sentence_start - tolerance_sec
-            and float(getattr(token, "start", 0.0) or 0.0) <= sentence_end + tolerance_sec
+            and float(getattr(token, "end", 0.0) or 0.0) > sentence_start + 1e-4
+            and float(getattr(token, "start", 0.0) or 0.0) < sentence_end - 1e-4
         ]
         if matched_indices:
             return matched_indices[0], matched_indices[-1], matched_indices[-1] + 1
@@ -730,8 +762,7 @@ class SegmentationProcessor:
                 confidence_source=str(getattr(token, "source", "") or None),
                 is_pseudo=bool(getattr(token, "is_pseudo", False)),
             )
-            setattr(word, "speaker_id", getattr(token, "speaker_id", None))
-            setattr(word, "turn_id", getattr(token, "turn_id", None))
+            SegmentationProcessor._copy_word_runtime_metadata(source=token, target=word)
             words.append(word)
         return words
 
@@ -746,13 +777,14 @@ class SegmentationProcessor:
         """执行统一切分核心主路径（由 SegmentationCore 调用）。"""
         annotated_words = data.annotated_words or []
         pending_prefix_words = self._consume_pending_prefix_words(stream_id)
-        cut_plan = self._normalize_cut_plan(
-            data.cut_plan,
+        input_cut_plan = data.cut_plan
+        aligned_facts = data.aligned_facts
+        fused_evidence = data.fused_evidence
+        empty_cut_plan = self._normalize_cut_plan(
+            input_cut_plan,
             stream_id=stream_id,
             chunk_index=chunk_index,
         )
-        aligned_facts = data.aligned_facts
-        fused_evidence = data.fused_evidence
         has_annotated_words = bool(annotated_words)
         if not has_annotated_words and not pending_prefix_words:
             return DecisionLayerOutput(
@@ -765,7 +797,7 @@ class SegmentationProcessor:
                     "cross_chunk_pending_out_word_count": 0,
                     "cross_chunk_dangling_fix_count": 0,
                     "soft_cut_stats": self._build_soft_cut_stats(
-                        cut_plan=cut_plan,
+                        cut_plan=empty_cut_plan,
                         applied_window_ids=[],
                     ),
                     "aligned_facts_stats": self._build_aligned_facts_stats(aligned_facts),
@@ -773,7 +805,7 @@ class SegmentationProcessor:
                     "stream_id": stream_id,
                     "error_code": "E_DECISION_SPLIT_EMPTY",
                 },
-                applied_cut_plan=cut_plan,
+                applied_cut_plan=empty_cut_plan,
                 output_traces=[],
             )
 
@@ -804,7 +836,7 @@ class SegmentationProcessor:
                     "unknown_pseudo_filter_fallback": bool(is_unknown_pseudo_filter_fallback),
                     "timestamp_backtrack_fix_count": int(timestamp_backtrack_fix_count),
                     "soft_cut_stats": self._build_soft_cut_stats(
-                        cut_plan=cut_plan,
+                        cut_plan=empty_cut_plan,
                         applied_window_ids=[],
                     ),
                     "aligned_facts_stats": self._build_aligned_facts_stats(aligned_facts),
@@ -813,9 +845,16 @@ class SegmentationProcessor:
                     "chunk_index": chunk_index,
                     "error_code": "E_DECISION_SPLIT_EMPTY",
                 },
-                applied_cut_plan=cut_plan,
+                applied_cut_plan=empty_cut_plan,
                 output_traces=[],
             )
+
+        cut_plan = self._resolve_cut_plan_for_split(
+            data=data,
+            stream_id=stream_id,
+            chunk_index=chunk_index,
+            words_for_split=words_for_split,
+        )
 
         applied_window_ids: List[str] = []
         output_traces: List[OutputTrace] = []
@@ -1021,6 +1060,593 @@ class SegmentationProcessor:
                 "generated_by": "segmentation_processor",
             },
         )
+
+    def _resolve_cut_plan_for_split(
+        self,
+        *,
+        data: DecisionLayerInput,
+        stream_id: str,
+        chunk_index: Optional[int],
+        words_for_split: Sequence[WordTimestamp],
+    ) -> Any:
+        if data.cut_plan is not None:
+            return data.cut_plan
+        if self._is_timeanchored_ingress(stream_id=stream_id, ingress_context=data.ingress_context):
+            return self._ingress_segment_planner.build_plan(
+                processor=self,
+                data=data,
+                stream_id=stream_id,
+                chunk_index=chunk_index,
+                words_for_split=words_for_split,
+            )
+        scored_plan = self._build_decision_scored_cut_plan(
+            data=data,
+            stream_id=stream_id,
+            chunk_index=chunk_index,
+            words_for_split=words_for_split,
+        )
+        if scored_plan is not None:
+            return scored_plan
+        return self._normalize_cut_plan(
+            None,
+            stream_id=stream_id,
+            chunk_index=chunk_index,
+        )
+
+    def _build_decision_scored_cut_plan(
+        self,
+        *,
+        data: DecisionLayerInput,
+        stream_id: str,
+        chunk_index: Optional[int],
+        words_for_split: Sequence[WordTimestamp],
+    ) -> Optional[CutPlan]:
+        if len(words_for_split) <= 1:
+            return None
+
+        boundaries = self._collect_boundary_evidences_for_scoring(
+            data=data,
+            words_for_split=words_for_split,
+        )
+        language_is_cjk = self._is_cjk_policy_language(data.policy_snapshot)
+        score_threshold = (
+            self._INGRESS_SCORING_CJK_THRESHOLD
+            if language_is_cjk
+            else self._INGRESS_SCORING_DEFAULT_THRESHOLD
+        )
+        min_adjacent_gap_sec = (
+            self._INGRESS_SCORING_MIN_ADJACENT_BOUNDARY_GAP_CJK_SEC
+            if language_is_cjk
+            else self._INGRESS_SCORING_MIN_ADJACENT_BOUNDARY_GAP_SEC
+        )
+
+        best_by_split_idx: Dict[int, Dict[str, Any]] = {}
+        eligible_reason_stats: Counter[str] = Counter()
+        rejected_boundary_stats: Counter[str] = Counter()
+        for boundary in boundaries:
+            reject_reason = self._resolve_ingress_boundary_reject_reason(
+                boundary=boundary,
+                words_for_split=words_for_split,
+            )
+            if reject_reason:
+                rejected_boundary_stats[reject_reason] += 1
+                continue
+            candidate = self._build_ingress_boundary_candidate(
+                boundary=boundary,
+                words_for_split=words_for_split,
+            )
+            if candidate is None:
+                continue
+            is_force = bool(candidate["hard_flag"]) and str(candidate["reason"]) in {
+                "punctuation_sentence_end",
+                "speaker_change",
+            }
+            if not is_force and float(candidate["scored"]) < float(score_threshold):
+                continue
+            candidate["force"] = bool(is_force)
+            eligible_reason_stats[str(candidate["reason"])] += 1
+
+            split_idx = int(candidate["split_idx"])
+            previous = best_by_split_idx.get(split_idx)
+            if previous is None or self._is_better_ingress_candidate(candidate, previous):
+                best_by_split_idx[split_idx] = candidate
+
+        selected_candidates = [
+            dict(item)
+            for item in sorted(
+                best_by_split_idx.values(),
+                key=lambda value: (int(value["split_idx"]), float(value["event_time"])),
+            )
+        ]
+        compressed_candidates: List[Dict[str, Any]] = []
+        for candidate in selected_candidates:
+            if not compressed_candidates:
+                compressed_candidates.append(candidate)
+                continue
+            previous = compressed_candidates[-1]
+            is_adjacent = int(candidate["split_idx"]) - int(previous["split_idx"]) <= 1
+            boundary_gap = float(candidate["event_time"]) - float(previous["event_time"])
+            if not is_adjacent or boundary_gap >= float(min_adjacent_gap_sec):
+                compressed_candidates.append(candidate)
+                continue
+            if self._is_better_ingress_candidate(candidate, previous):
+                compressed_candidates[-1] = candidate
+
+        decisions = [
+            self._build_ingress_cut_decision(
+                stream_id=stream_id,
+                candidate=item,
+                words_for_split=words_for_split,
+            )
+            for item in compressed_candidates
+        ]
+        decision_reason_stats = Counter(str(item.reason) for item in decisions)
+        fallback_reason = ""
+        if not decisions:
+            fallback_reason = "no_candidate_boundaries" if not boundaries else "no_boundary_passed_scoring"
+        chunk_part = int(chunk_index) if chunk_index is not None else -1
+        return CutPlan(
+            plan_id=f"{stream_id}-evidence-scored-{chunk_part}",
+            block_id=f"{stream_id}:{chunk_part}",
+            decisions=decisions,
+            deferred_cuts=[],
+            generation_report={
+                "generated_by": "decision_layer_boundary_scoring",
+                "fallback_reason": fallback_reason,
+                "input_boundary_count": int(len(boundaries)),
+                "eligible_boundary_count": int(sum(eligible_reason_stats.values())),
+                "decision_count": int(len(decisions)),
+                "rejected_boundary_count": int(sum(rejected_boundary_stats.values())),
+                "rejected_boundary_stats": dict(rejected_boundary_stats),
+                "score_threshold": float(score_threshold),
+                "reason_stats": dict(decision_reason_stats),
+                "eligible_reason_stats": dict(eligible_reason_stats),
+            },
+        )
+
+    def _collect_boundary_evidences_for_scoring(
+        self,
+        *,
+        data: DecisionLayerInput,
+        words_for_split: Sequence[WordTimestamp],
+    ) -> List[Any]:
+        boundaries: List[Any] = list(data.canonical_candidate_boundaries or ())
+        boundaries.extend(
+            self._build_punctuation_fact_boundaries(
+                punctuation_facts=list(getattr(data, "canonical_punctuation_facts", ()) or ()),
+                words_for_split=words_for_split,
+            )
+        )
+        boundaries.extend(self._build_gap_boundaries(words_for_split=words_for_split))
+        boundaries.extend(
+            self._build_turn_change_boundaries(
+                turns=list(getattr(getattr(data, "aligned_facts", None), "speaker_turns", ()) or ()),
+                words_for_split=words_for_split,
+            )
+        )
+        boundaries.extend(
+            self._build_duration_guard_boundaries(
+                words_for_split=words_for_split,
+                policy_snapshot=data.policy_snapshot,
+            )
+        )
+        return boundaries
+
+    def _build_punctuation_fact_boundaries(
+        self,
+        *,
+        punctuation_facts: Sequence[Any],
+        words_for_split: Sequence[WordTimestamp],
+    ) -> List[Any]:
+        boundaries: List[Any] = []
+        if len(words_for_split) <= 1:
+            return boundaries
+        for fact in punctuation_facts:
+            left_idx_raw = getattr(fact, "left_token_index", None)
+            right_idx_raw = getattr(fact, "right_token_index", None)
+            split_idx: Optional[int] = None
+            if left_idx_raw is not None:
+                try:
+                    split_idx = int(left_idx_raw)
+                except (TypeError, ValueError):
+                    split_idx = None
+            elif right_idx_raw is not None:
+                try:
+                    split_idx = int(right_idx_raw) - 1
+                except (TypeError, ValueError):
+                    split_idx = None
+            if split_idx is None or split_idx < 0 or split_idx >= len(words_for_split) - 1:
+                continue
+            punct_class = str(getattr(fact, "punct_class", "") or "").strip().lower()
+            is_sentence_end = punct_class == "sentence_end"
+            reason = "punctuation_sentence_end" if is_sentence_end else "punctuation_soft"
+            left_end = float(getattr(words_for_split[split_idx], "end", 0.0) or 0.0)
+            right_start = float(
+                getattr(words_for_split[split_idx + 1], "start", left_end) or left_end
+            )
+            boundaries.append(
+                SimpleNamespace(
+                    split_idx=int(split_idx),
+                    event_time=(left_end + right_start) / 2.0,
+                    left_end=left_end,
+                    right_start=right_start,
+                    reason=reason,
+                    score=1.0 if is_sentence_end else 0.65,
+                    hard_flag=is_sentence_end,
+                    metadata={
+                        "evidence_source": "canonical_punctuation_fact",
+                        "fact_id": str(getattr(fact, "fact_id", "") or ""),
+                        "left_token_index": left_idx_raw,
+                        "right_token_index": right_idx_raw,
+                    },
+                )
+            )
+        return boundaries
+
+    def _build_gap_boundaries(
+        self,
+        *,
+        words_for_split: Sequence[WordTimestamp],
+    ) -> List[Any]:
+        boundaries: List[Any] = []
+        if len(words_for_split) <= 1:
+            return boundaries
+        for split_idx in range(len(words_for_split) - 1):
+            left_word = words_for_split[split_idx]
+            right_word = words_for_split[split_idx + 1]
+            left_end = float(getattr(left_word, "end", 0.0) or 0.0)
+            right_start = float(getattr(right_word, "start", left_end) or left_end)
+            gap = max(0.0, right_start - left_end)
+            if gap < 0.12:
+                continue
+            if gap >= 0.25:
+                reason = "gap_pause"
+                score = min(1.0, 0.45 + gap)
+                hard_flag = gap >= 0.45
+            else:
+                reason = "blank_valley"
+                score = min(0.8, 0.32 + gap)
+                hard_flag = False
+            boundaries.append(
+                SimpleNamespace(
+                    split_idx=int(split_idx),
+                    event_time=(left_end + right_start) / 2.0,
+                    left_end=left_end,
+                    right_start=right_start,
+                    reason=reason,
+                    score=float(score),
+                    hard_flag=bool(hard_flag),
+                    metadata={"evidence_source": "decision_layer_gap_scan"},
+                )
+            )
+        return boundaries
+
+    def _build_turn_change_boundaries(
+        self,
+        *,
+        turns: Sequence[Any],
+        words_for_split: Sequence[WordTimestamp],
+    ) -> List[Any]:
+        boundaries: List[Any] = []
+        if len(words_for_split) <= 1 or len(turns) <= 1:
+            return boundaries
+        ordered_turns = sorted(
+            list(turns),
+            key=lambda item: (
+                self._resolve_turn_float(item, "start"),
+                self._resolve_turn_float(item, "end"),
+            ),
+        )
+        for index in range(1, len(ordered_turns)):
+            left_turn = ordered_turns[index - 1]
+            right_turn = ordered_turns[index]
+            left_speaker = self._resolve_turn_speaker(left_turn)
+            right_speaker = self._resolve_turn_speaker(right_turn)
+            if not left_speaker or not right_speaker or left_speaker == right_speaker:
+                continue
+            left_start = self._resolve_turn_float(left_turn, "start")
+            left_end = self._resolve_turn_float(left_turn, "end")
+            right_start = self._resolve_turn_float(right_turn, "start")
+            right_end = self._resolve_turn_float(right_turn, "end")
+            if min(max(0.0, left_end - left_start), max(0.0, right_end - right_start)) < float(
+                self._SPEAKER_REPAIR_MIN_TURN_DURATION_SEC
+            ):
+                continue
+            selection = self._boundary_mapper.select_best_boundary(
+                words=words_for_split,
+                event_time=right_start,
+            )
+            if selection is None:
+                continue
+            split_idx = int(selection.split_idx)
+            if split_idx < 0 or split_idx >= len(words_for_split) - 1:
+                continue
+            boundary_confidence = max(
+                float(getattr(right_turn, "boundary_confidence", 0.0) or 0.0),
+                float(getattr(left_turn, "boundary_confidence", 0.0) or 0.0),
+            )
+            if boundary_confidence <= 0.0:
+                boundary_confidence = 0.8
+            left_word_end = float(getattr(words_for_split[split_idx], "end", 0.0) or 0.0)
+            right_word_start = float(
+                getattr(words_for_split[split_idx + 1], "start", left_word_end) or left_word_end
+            )
+            boundaries.append(
+                SimpleNamespace(
+                    split_idx=split_idx,
+                    event_time=float(right_start),
+                    left_end=left_word_end,
+                    right_start=right_word_start,
+                    reason="speaker_change",
+                    score=max(0.72, min(0.99, boundary_confidence)),
+                    hard_flag=True,
+                    metadata={
+                        "evidence_source": "aligned_facts_speaker_turns",
+                        "from_speaker": left_speaker,
+                        "to_speaker": right_speaker,
+                        "left_turn_id": self._resolve_turn_id(left_turn),
+                        "right_turn_id": self._resolve_turn_id(right_turn),
+                    },
+                )
+            )
+        return boundaries
+
+    def _build_duration_guard_boundaries(
+        self,
+        *,
+        words_for_split: Sequence[WordTimestamp],
+        policy_snapshot: Optional["LanguagePolicySnapshot"],
+    ) -> List[Any]:
+        boundaries: List[Any] = []
+        if len(words_for_split) <= 2:
+            return boundaries
+        max_segment_sec = 6.2 if self._is_cjk_policy_language(policy_snapshot) else 5.8
+        segment_start_idx = 0
+        for index in range(1, len(words_for_split)):
+            segment_start = float(getattr(words_for_split[segment_start_idx], "start", 0.0) or 0.0)
+            current_end = float(getattr(words_for_split[index], "end", segment_start) or segment_start)
+            if current_end - segment_start < float(max_segment_sec):
+                continue
+            split_idx = max(segment_start_idx, index - 1)
+            if split_idx >= len(words_for_split) - 1:
+                break
+            left_word_end = float(getattr(words_for_split[split_idx], "end", 0.0) or 0.0)
+            right_word_start = float(
+                getattr(words_for_split[split_idx + 1], "start", left_word_end) or left_word_end
+            )
+            boundaries.append(
+                SimpleNamespace(
+                    split_idx=int(split_idx),
+                    event_time=(left_word_end + right_word_start) / 2.0,
+                    left_end=left_word_end,
+                    right_start=right_word_start,
+                    reason="hard_limit_forced",
+                    score=1.0,
+                    hard_flag=True,
+                    metadata={
+                        "evidence_source": "decision_layer_duration_guard",
+                        "max_segment_sec": float(max_segment_sec),
+                    },
+                )
+            )
+            segment_start_idx = split_idx + 1
+            if segment_start_idx >= len(words_for_split) - 1:
+                break
+        return boundaries
+
+    def _resolve_ingress_boundary_reject_reason(
+        self,
+        *,
+        boundary: Any,
+        words_for_split: Sequence[WordTimestamp],
+    ) -> str:
+        try:
+            split_idx = int(getattr(boundary, "split_idx", -1))
+        except (TypeError, ValueError):
+            return "invalid_split_idx"
+        if split_idx < 0 or split_idx >= len(words_for_split) - 1:
+            return "invalid_split_idx"
+
+        metadata = dict(getattr(boundary, "metadata", {}) or {})
+        if bool(metadata.get("blocked_by_lock")):
+            return "blocked_by_lock"
+
+        reason = str(getattr(boundary, "reason", "") or "").strip().lower()
+        left_status = str(metadata.get("left_mount_status", "") or "").strip().lower()
+        right_status = str(metadata.get("right_mount_status", "") or "").strip().lower()
+        if (
+            left_status in self._INGRESS_LOW_QUALITY_MOUNT_STATUSES
+            or right_status in self._INGRESS_LOW_QUALITY_MOUNT_STATUSES
+        ):
+            return "low_quality_mount_status"
+
+        left_word = str(getattr(words_for_split[split_idx], "word", "") or "")
+        right_word = str(getattr(words_for_split[split_idx + 1], "word", "") or "")
+        if self._is_ascii_fragment_boundary(
+            left_token=left_word,
+            right_token=right_word,
+            reason=reason,
+        ):
+            return "alpha_fragment"
+
+        return ""
+
+    @classmethod
+    def _is_ascii_fragment_boundary(
+        cls,
+        *,
+        left_token: str,
+        right_token: str,
+        reason: str,
+    ) -> bool:
+        if reason in {"punctuation_sentence_end", "punctuation_soft"}:
+            return False
+        if is_sentence_end_punct(
+            left_token,
+            right_token,
+            sentence_end_chars=tuple(cls._SENTENCE_END_PUNCT),
+        ):
+            return False
+
+        left_tail = cls._extract_ascii_alpha_tail(left_token)
+        right_head = cls._extract_ascii_alpha_head(right_token)
+        if not left_tail or not right_head:
+            return False
+        if not (left_tail[-1].islower() and right_head[0].islower()):
+            return False
+        return (
+            len(left_tail) <= cls._INGRESS_FRAGMENT_MAX_LEFT_ALPHA_LEN
+            and len(right_head) <= cls._INGRESS_FRAGMENT_MAX_RIGHT_ALPHA_LEN
+        )
+
+    @staticmethod
+    def _extract_ascii_alpha_tail(token: str) -> str:
+        text = str(token or "").strip().lstrip("\"'“”‘’([{")
+        if not text:
+            return ""
+        match = re.search(r"([A-Za-z]+)[^A-Za-z]*$", text)
+        if match is None:
+            return ""
+        return str(match.group(1) or "")
+
+    @staticmethod
+    def _extract_ascii_alpha_head(token: str) -> str:
+        text = str(token or "").strip().lstrip("\"'“”‘’([{")
+        if not text:
+            return ""
+        match = re.match(r"([A-Za-z]+)", text)
+        if match is None:
+            return ""
+        return str(match.group(1) or "")
+
+    def _build_ingress_boundary_candidate(
+        self,
+        *,
+        boundary: Any,
+        words_for_split: Sequence[WordTimestamp],
+    ) -> Optional[Dict[str, Any]]:
+        if len(words_for_split) <= 1:
+            return None
+        try:
+            split_idx = int(getattr(boundary, "split_idx", -1))
+        except (TypeError, ValueError):
+            return None
+        if split_idx < 0 or split_idx >= len(words_for_split) - 1:
+            return None
+
+        reason = str(getattr(boundary, "reason", "") or "boundary_hint").strip().lower()
+        if not reason:
+            reason = "boundary_hint"
+        try:
+            base_score = float(getattr(boundary, "score", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            base_score = 0.0
+        base_score = max(0.0, min(1.0, base_score))
+        hard_flag = bool(getattr(boundary, "hard_flag", False))
+
+        left_end = self._optional_float(getattr(boundary, "left_end", None))
+        right_start = self._optional_float(getattr(boundary, "right_start", None))
+        if left_end is None:
+            left_end = float(getattr(words_for_split[split_idx], "end", 0.0) or 0.0)
+        if right_start is None:
+            right_start = float(
+                getattr(words_for_split[split_idx + 1], "start", left_end) or left_end
+            )
+        event_time = self._optional_float(getattr(boundary, "event_time", None))
+        if event_time is None:
+            event_time = (float(left_end) + float(right_start)) / 2.0
+
+        reason_bonus = float(self._INGRESS_SCORING_REASON_BONUS.get(reason, 0.0))
+        hard_bonus = 0.20 if hard_flag else 0.0
+        scored = max(0.0, min(1.0, base_score + reason_bonus + hard_bonus))
+        reason_priority = int(self._INGRESS_SCORING_REASON_PRIORITY.get(reason, 10))
+        return {
+            "split_idx": split_idx,
+            "reason": reason,
+            "base_score": base_score,
+            "scored": scored,
+            "hard_flag": hard_flag,
+            "event_time": float(event_time),
+            "left_end": float(left_end),
+            "right_start": float(right_start),
+            "reason_priority": reason_priority,
+        }
+
+    @staticmethod
+    def _is_better_ingress_candidate(current: Dict[str, Any], previous: Dict[str, Any]) -> bool:
+        if bool(current.get("force", False)) != bool(previous.get("force", False)):
+            return bool(current.get("force", False))
+        current_scored = float(current.get("scored", 0.0) or 0.0)
+        previous_scored = float(previous.get("scored", 0.0) or 0.0)
+        if abs(current_scored - previous_scored) > 1e-6:
+            return current_scored > previous_scored
+        current_priority = int(current.get("reason_priority", 0) or 0)
+        previous_priority = int(previous.get("reason_priority", 0) or 0)
+        if current_priority != previous_priority:
+            return current_priority > previous_priority
+        current_base_score = float(current.get("base_score", 0.0) or 0.0)
+        previous_base_score = float(previous.get("base_score", 0.0) or 0.0)
+        if abs(current_base_score - previous_base_score) > 1e-6:
+            return current_base_score > previous_base_score
+        return float(current.get("event_time", 0.0) or 0.0) <= float(
+            previous.get("event_time", 0.0) or 0.0
+        )
+
+    def _build_ingress_cut_decision(
+        self,
+        *,
+        stream_id: str,
+        candidate: Dict[str, Any],
+        words_for_split: Sequence[WordTimestamp],
+    ) -> CutDecision:
+        split_idx = int(candidate["split_idx"])
+        mapped_cut_time = self._resolve_split_boundary_time(
+            words_for_split=words_for_split,
+            split_idx=split_idx,
+        )
+        reason = str(candidate["reason"] or "boundary_hint")
+        return CutDecision(
+            time=float(candidate["event_time"]),
+            window_id=f"{stream_id}:slot-{split_idx}",
+            reason=reason,
+            risk=None,
+            anchor_type=self._resolve_ingress_anchor_type(reason),
+            anchor_score=float(candidate["scored"]),
+            depends_on_fast_draft=reason == "fast_draft",
+            time_range=(
+                min(float(candidate["left_end"]), float(candidate["right_start"])),
+                max(float(candidate["left_end"]), float(candidate["right_start"])),
+            ),
+            source="decision_layer_boundary_scoring",
+            pyannote_frame_time=float(candidate["event_time"]),
+            mapped_cut_time=float(mapped_cut_time),
+            mapping_quality="boundary",
+            mapping_reason="decision_layer_boundary_scoring",
+        )
+
+    @staticmethod
+    def _resolve_ingress_anchor_type(reason: str) -> AnchorType:
+        normalized_reason = str(reason or "").strip().lower()
+        if "pause" in normalized_reason:
+            return AnchorType.PAUSE_ANCHOR
+        if "punct" in normalized_reason:
+            return AnchorType.PUNCTUATION_ANCHOR
+        if normalized_reason in {"lexical_boundary", "anchor_block_close", "semantic", "llm_semantic"}:
+            return AnchorType.SEMANTIC_ANCHOR
+        if normalized_reason in {"hard_limit_forced", "speaker_change"}:
+            return AnchorType.WORD_BOUNDARY
+        return AnchorType.WORD_BOUNDARY
+
+    @staticmethod
+    def _is_timeanchored_ingress(
+        *,
+        stream_id: str,
+        ingress_context: Optional[SegmentationIngressContext],
+    ) -> bool:
+        if str(stream_id or "").strip().lower().startswith("timeanchored:"):
+            return True
+        unit_kind = str(getattr(ingress_context, "unit_kind", "") or "").strip().lower()
+        return unit_kind == "slow_window"
 
     @staticmethod
     def _build_fused_evidence_stats(fused_evidence: Any) -> Dict[str, Any]:
@@ -2424,6 +3050,12 @@ class SegmentationProcessor:
                 "reason_stats": {},
                 "risk_stats": {},
                 "source_stats": {},
+                "planner_diagnostics": {
+                    "feature_stats": {},
+                    "constraint_stats": {},
+                    "rejection_stats": {},
+                    "candidate_diagnostics": [],
+                },
             }
 
         decisions = list(getattr(cut_plan, "decisions", []) or [])
@@ -2480,6 +3112,12 @@ class SegmentationProcessor:
         diagnostic_code = ""
         if fusion_output_window_count > 0 and len(decisions) <= 0:
             diagnostic_code = "E_SOFT_CUT_WINDOWS_WITHOUT_DECISIONS"
+        planner_diagnostics = {
+            "feature_stats": dict(generation_report.get("feature_stats", {}) or {}),
+            "constraint_stats": dict(generation_report.get("constraint_stats", {}) or {}),
+            "rejection_stats": dict(generation_report.get("rejection_stats", {}) or {}),
+            "candidate_diagnostics": list(generation_report.get("candidate_diagnostics", []) or []),
+        }
         return {
             "enabled": True,
             "plan_id": str(getattr(cut_plan, "plan_id", "") or ""),
@@ -2495,6 +3133,7 @@ class SegmentationProcessor:
             "fusion_output_window_count": fusion_output_window_count,
             "fallback_reason": fallback_reason,
             "diagnostic_code": diagnostic_code,
+            "planner_diagnostics": planner_diagnostics,
         }
 
     def _consume_pending_prefix_words(self, stream_id: str) -> List[WordTimestamp]:
@@ -2773,9 +3412,7 @@ class SegmentationProcessor:
                 token_type=word.token_type,
                 is_pseudo=word.is_pseudo,
             )
-            # Why: 词级 speaker/turn 信号用于后续跨 speaker 残留修复，克隆时必须保留。
-            setattr(cloned, "speaker_id", getattr(word, "speaker_id", None))
-            setattr(cloned, "turn_id", getattr(word, "turn_id", None))
+            SegmentationProcessor._copy_word_runtime_metadata(source=word, target=cloned)
             cloned_words.append(cloned)
         return cloned_words
 
@@ -3327,8 +3964,7 @@ class SegmentationProcessor:
             token_type=word.token_type,
             is_pseudo=word.is_pseudo,
         )
-        setattr(degraded, "speaker_id", getattr(word, "speaker_id", None))
-        setattr(degraded, "turn_id", getattr(word, "turn_id", None))
+        SegmentationProcessor._copy_word_runtime_metadata(source=word, target=degraded)
         return degraded
 
     @classmethod
@@ -3370,8 +4006,7 @@ class SegmentationProcessor:
                 token_type=source_word.token_type,
                 is_pseudo=source_word.is_pseudo,
             )
-            setattr(normalized, "speaker_id", getattr(source_word, "speaker_id", None))
-            setattr(normalized, "turn_id", getattr(source_word, "turn_id", None))
+            cls._copy_word_runtime_metadata(source=source_word, target=normalized)
             normalized_words.append(normalized)
             previous_end = float(normalized.end)
 
@@ -3395,11 +4030,14 @@ class SegmentationProcessor:
                 confidence_source=item.confidence_source,
                 is_pseudo=bool(getattr(item, "is_pseudo", False)),
             )
-            # Why: 后续“单次闭环”修复需要词级 speaker/turn 信息判断跨 speaker 残留。
-            setattr(word, "speaker_id", getattr(item, "speaker_id", None))
-            setattr(word, "turn_id", getattr(item, "turn_id", None))
+            SegmentationProcessor._copy_word_runtime_metadata(source=item, target=word)
             words.append(word)
         return words
+
+    @staticmethod
+    def _copy_word_runtime_metadata(*, source: Any, target: WordTimestamp) -> None:
+        for attr in ("speaker_id", "turn_id"):
+            setattr(target, attr, getattr(source, attr, None))
 
     @staticmethod
     def _build_single_sentence(

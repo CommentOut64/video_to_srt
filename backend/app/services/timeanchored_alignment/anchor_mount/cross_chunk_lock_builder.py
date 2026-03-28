@@ -29,7 +29,7 @@ class CrossChunkLockBuilder:
                 locks.append(
                     CrossChunkLock(
                         lock_id=f"lock-{index - 1}-{index}",
-                        slot_ids=(left.slot_id, right.slot_id),
+                        unit_ids=(left.unit_id, right.unit_id),
                         hook_ids=tuple(left.source_hook_ids + right.source_hook_ids),
                         reason="stable_anchor_group",
                         source_chunk_ids=tuple(dict.fromkeys(left.source_chunk_ids + right.source_chunk_ids)),

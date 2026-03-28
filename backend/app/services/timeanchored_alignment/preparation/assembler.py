@@ -39,8 +39,8 @@ from app.services.timeanchored_alignment.preparation.safe_pre_normalizer import 
 from app.services.timeanchored_alignment.preparation.slow_text_normalizer import (
     SlowTextNormalizer,
 )
-from app.services.timeanchored_alignment.preparation.source_attribution_binder import (
-    SourceAttributionBinder,
+from app.services.timeanchored_alignment.preparation.token_provenance_binder import (
+    TokenProvenanceBinder,
 )
 from app.services.timeanchored_alignment.preparation.structure_protector import (
     StructureProtector,
@@ -63,7 +63,7 @@ class AlignmentPreparationAssembler:
         structure_protector: StructureProtector | None = None,
         display_projection_builder: DisplayProjectionBuilder | None = None,
         punctuation_evidence_builder: PunctuationEvidenceBuilder | None = None,
-        source_attribution_binder: SourceAttributionBinder | None = None,
+        token_provenance_binder: TokenProvenanceBinder | None = None,
         hook_selector: HookSelector | None = None,
         language_profile_builder: LanguageProfileBuilder | None = None,
         pronunciation_hint_builder: PronunciationHintBuilder | None = None,
@@ -82,7 +82,7 @@ class AlignmentPreparationAssembler:
         self._structure_protector = structure_protector or StructureProtector()
         self._display_projection_builder = display_projection_builder or DisplayProjectionBuilder()
         self._punctuation_evidence_builder = punctuation_evidence_builder or PunctuationEvidenceBuilder()
-        self._source_attribution_binder = source_attribution_binder or SourceAttributionBinder()
+        self._token_provenance_binder = token_provenance_binder or TokenProvenanceBinder()
         self._hook_selector = hook_selector or HookSelector()
         self._language_profile_builder = language_profile_builder or LanguageProfileBuilder()
         self._pronunciation_hint_builder = pronunciation_hint_builder or PronunciationHintBuilder()
@@ -154,11 +154,10 @@ class AlignmentPreparationAssembler:
             language_runs=language_profile.package.runs,
             dominant_language=language_profile.package.dominant_language,
         )
-        slots = self._source_attribution_binder.bind(
+        token_units = self._token_provenance_binder.bind(
             text=projection.window_text.text,
+            token_units=tuple(pronunciation.package.token_units),
             source_units=ready_window.source_units,
-            punctuation_evidences=punctuation_evidences,
-            pronunciation_hints=pronunciation.hints,
         )
 
         compat_protected_spans = tuple(
@@ -200,7 +199,7 @@ class AlignmentPreparationAssembler:
             source_chunk_indices=ready_window.source_chunk_indices,
             slow_text=PreparedSlowText(
                 window_text=projection.window_text,
-                slots=slots,
+                token_units=token_units,
                 punctuation_evidences=punctuation_evidences,
                 protected_units=projection.protected_units,
                 language_runs=tuple(language_profile.package.runs),
@@ -211,10 +210,10 @@ class AlignmentPreparationAssembler:
             compat=compat,
         )
         self._logger.debug(
-            "AlignmentPreparation 完成 window_id={} window_text_len={} slot_count={} punctuation_count={} lexical_punctuation_count={} external_punctuation_count={} protected_unit_count={} language_run_count={} pronunciation_hint_count={} fast_hook_count={} compat_text_truth_unit_count={} compat_timed_unit_count={}",
+            "AlignmentPreparation 完成 window_id={} window_text_len={} token_unit_count={} punctuation_count={} lexical_punctuation_count={} external_punctuation_count={} protected_unit_count={} language_run_count={} pronunciation_hint_count={} fast_hook_count={} compat_text_truth_unit_count={} compat_timed_unit_count={}",
             package.window_id,
             len(package.slow_text.window_text.text),
-            len(package.slow_text.slots),
+            len(package.slow_text.token_units),
             len(package.slow_text.punctuation_evidences),
             len(lexical_punctuation_evidences),
             len(external_punctuation_evidences),

@@ -308,10 +308,10 @@ def test_alignment_stage_compat_window_time_base_rebases_relative_units() -> Non
     )
 
 
-def test_alignment_stage_force_fast_direct_path_without_time_base(
+def test_alignment_stage_force_fast_without_time_base_still_uses_unified_main_chain(
     monkeypatch,
 ) -> None:
-    job_id = "test_timeanchored_force_fast_direct_without_time_base"
+    job_id = "test_timeanchored_force_fast_without_time_base_unified"
     pipeline = AsyncDualPipeline(
         job_id=job_id,
         draft_engine=DummyEngine(response_text="你好世界", latency_ms=0),
@@ -324,29 +324,172 @@ def test_alignment_stage_force_fast_direct_path_without_time_base(
     )
     pipeline._alignment_pipeline_mode = "default"
 
-    run_collection_mock = Mock(return_value=_build_legacy_run_result())
+    _patch_common_alignment_inputs(monkeypatch=monkeypatch, pipeline=pipeline, chosen_source="fast")
+    run_collection_mock = Mock(side_effect=AssertionError("统一主链命中后不应执行 legacy 四层"))
     monkeypatch.setattr(
         pipeline,
         "_run_collection_scoring_decision_once",
         run_collection_mock,
+    )
+    timeanchored_run = Mock(return_value=object())
+    commit = Mock()
+    monkeypatch.setattr(
+        pipeline._alignment_stage_service,
+        "_run_timeanchored_main_chain",
+        timeanchored_run,
+    )
+    monkeypatch.setattr(
+        pipeline._alignment_stage_service,
+        "_should_accept_timeanchored_result",
+        Mock(return_value=(True, "default_gate_pass")),
+    )
+    monkeypatch.setattr(
+        pipeline._alignment_stage_service,
+        "_commit_timeanchored_main_chain_result",
+        commit,
+    )
+    monkeypatch.setattr(pipeline._alignment_stage_service, "_record_hetero_alignment_result", Mock())
+    commit_fast_direct = Mock()
+    monkeypatch.setattr(
+        pipeline._alignment_stage_service,
+        "_commit_fast_direct_result",
+        commit_fast_direct,
     )
     ctx = ProcessingContext(
         job_id=job_id,
         chunk_index=0,
         audio_chunk=_build_chunk(),
         sv_result=_build_sv_result(),
-        whisper_result=_build_whisper_result(),
+        whisper_result=None,
         time_base_chunk=None,
+    )
+    ctx.text_tracks = TextTrackBundle(
+        sv_track=_build_track("你 好 世 界", source="sv"),
+        whisper_track=None,
     )
 
     asyncio.run(pipeline._run_alignment_stage(ctx))
 
-    assert ctx.final_sentences
-    assert ctx.finalization_metrics.get("fast_direct_enabled") == 1.0
-    assert ctx.finalization_metrics.get("alignment_pipeline_route") == "fast"
-    assert run_collection_mock.call_count == 1
-    assert run_collection_mock.call_args.kwargs.get("is_fast_only_mode") is True
+    assert timeanchored_run.call_count == 1
+    assert commit.call_count == 1
+    assert commit_fast_direct.call_count == 0
+    assert run_collection_mock.call_count == 0
+    assert ctx.time_base_chunk is not None
+    assert isinstance(ctx.whisper_result, dict)
 
+    remove_streaming_subtitle_manager(job_id)
+
+
+def test_resolve_anchor_mount_routes_uses_fast_route_when_single_chunk_anchor_mount_requests_fallback() -> None:
+    service = AlignmentStageService(
+        host=SimpleNamespace(
+            logger=Mock(),
+            _edge_selection_mode="force_slow",
+            _postprocess_trace_enabled=False,
+            _postprocess_trace_level="summary",
+            _anchor_mount_graph="off",
+        )
+    )
+    stage_result = SimpleNamespace(
+        decision_ingress=SimpleNamespace(
+            anchored_token_units=(object(),),
+            source_chunk_ids=("chunk-0",),
+        ),
+        anchor_mount_result=SimpleNamespace(should_fallback=True),
+    )
+
+    text_route, edge_route, final_route, error_code = service._resolve_anchor_mount_routes(
+        ctx=SimpleNamespace(edge_selection_mode="force_slow"),
+        stage_result=stage_result,
+    )
+
+    assert text_route == "slow"
+    assert edge_route == "fast"
+    assert final_route == "fast"
+    assert error_code is None
+
+
+def test_resolve_anchor_mount_routes_keeps_slow_route_when_multi_chunk_anchor_mount_requests_fallback() -> None:
+    service = AlignmentStageService(
+        host=SimpleNamespace(
+            logger=Mock(),
+            _edge_selection_mode="force_slow",
+            _postprocess_trace_enabled=False,
+            _postprocess_trace_level="summary",
+            _anchor_mount_graph="off",
+        )
+    )
+    stage_result = SimpleNamespace(
+        decision_ingress=SimpleNamespace(
+            anchored_token_units=(object(),),
+            source_chunk_ids=("chunk-19", "chunk-20"),
+        ),
+        anchor_mount_result=SimpleNamespace(should_fallback=True),
+    )
+
+    text_route, edge_route, final_route, error_code = service._resolve_anchor_mount_routes(
+        ctx=SimpleNamespace(edge_selection_mode="force_slow"),
+        stage_result=stage_result,
+    )
+
+    assert text_route == "slow"
+    assert edge_route == "slow"
+    assert final_route == "slow"
+    assert error_code is None
+
+
+def test_sensevoice_only_pipeline_runs_alignment_stage_instead_of_finalize_shortcut(
+    monkeypatch,
+) -> None:
+    job_id = "test_sensevoice_only_pipeline_unified_alignment_stage"
+    pipeline = AsyncDualPipeline(
+        job_id=job_id,
+        draft_engine=DummyEngine(response_text="你好世界", latency_ms=0),
+        patch_engine=None,
+        transcription_profile="sensevoice_only",
+        enable_cross_chunk_merge=False,
+        enable_semantic_buffer=False,
+        punctuation_service=Mock(),
+    )
+
+    async def _mock_fast_process(ctx: ProcessingContext) -> None:
+        ctx.sv_result = _build_sv_result()
+
+    async def _mock_apply_fast_punctuation(_ctx: ProcessingContext, _normalized: Dict[str, Any]) -> None:
+        return None
+
+    captured_whisper_results: list[object] = []
+
+    async def _mock_run_alignment_stage(ctx: ProcessingContext) -> None:
+        captured_whisper_results.append(ctx.whisper_result)
+        ctx.final_sentences = [
+            SentenceSegment(text="统一主链定稿", text_clean="统一主链定稿", start=0.0, end=0.4, words=[])
+        ]
+
+    monkeypatch.setattr(pipeline.fast_worker, "process", _mock_fast_process)
+    monkeypatch.setattr(pipeline, "_normalize_sensevoice_result", lambda _ctx: _build_sv_result())
+    monkeypatch.setattr(pipeline, "_apply_fast_punctuation", _mock_apply_fast_punctuation)
+    monkeypatch.setattr(pipeline, "_run_alignment_stage", _mock_run_alignment_stage)
+    monkeypatch.setattr(
+        pipeline,
+        "_finalize_sensevoice_only",
+        Mock(side_effect=AssertionError("极速模式不应再走 finalize_sensevoice_only 旁路")),
+    )
+
+    results = asyncio.run(
+        pipeline._run_sensevoice_only(
+            [_build_chunk()],
+            full_audio_array=None,
+            full_audio_sr=16000,
+            job_dir=None,
+            processed_indices=set(),
+        )
+    )
+
+    assert len(results) == 1
+    assert results[0].final_sentences
+    assert results[0].final_sentences[0].text == "统一主链定稿"
+    assert captured_whisper_results == [None]
     remove_streaming_subtitle_manager(job_id)
 
 
