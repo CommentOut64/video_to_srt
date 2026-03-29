@@ -3,7 +3,10 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from app.services.timeanchored_alignment.anchor_mount.chain_solver import ChainSolver
-from app.services.timeanchored_alignment.anchor_mount.contracts import LocalAlignmentBlock
+from app.services.timeanchored_alignment.anchor_mount.contracts import (
+    AnchorCandidate,
+    LocalAlignmentBlock,
+)
 from app.services.timeanchored_alignment.anchor_mount.service import AnchorMountAlignmentService
 from app.services.timeanchored_alignment.preparation.contracts import (
     AlignmentPreparationCompat,
@@ -405,6 +408,54 @@ def _build_preparation_with_noisy_contiguous_run() -> AlignmentPreparationPackag
     )
 
 
+def _build_preparation_with_rescuable_middle_unit() -> AlignmentPreparationPackage:
+    preparation = _build_preparation_with_unresolved_middle_unit()
+    return AlignmentPreparationPackage(
+        window_id=preparation.window_id,
+        owner_chunk_id=preparation.owner_chunk_id,
+        owner_chunk_index=preparation.owner_chunk_index,
+        source_chunk_ids=preparation.source_chunk_ids,
+        source_chunk_indices=preparation.source_chunk_indices,
+        slow_text=preparation.slow_text,
+        fast_hooks=(
+            preparation.fast_hooks[0],
+            FastHook(
+                hook_text="brave",
+                start=0.45,
+                end=0.72,
+                confidence=0.9,
+                source_chunk_id="chunk-1",
+                source_chunk_index=1,
+            ),
+            preparation.fast_hooks[1],
+        ),
+        coverage=preparation.coverage,
+        compat=preparation.compat,
+    )
+
+
+class _PrimaryOnlySeedDiscovery:
+    def discover(self, *, input_view):
+        return (
+            AnchorCandidate(
+                candidate_id="exact:0:0",
+                unit_indices=(0,),
+                hook_indices=(0,),
+                anchor_kind="exact",
+                score=1.0,
+                is_hard=True,
+            ),
+            AnchorCandidate(
+                candidate_id="exact:2:2",
+                unit_indices=(2,),
+                hook_indices=(2,),
+                anchor_kind="exact",
+                score=1.0,
+                is_hard=True,
+            ),
+        )
+
+
 def test_anchor_mount_service_finalizes_hook_claims_and_marks_fallback_for_unresolved_gap() -> None:
     service = AnchorMountAlignmentService()
     preparation = _build_preparation_with_unresolved_middle_unit()
@@ -412,10 +463,31 @@ def test_anchor_mount_service_finalizes_hook_claims_and_marks_fallback_for_unres
     result = service.align(preparation=preparation, language="en")
 
     assert result.anchor_mount_result.should_fallback is True
+    assert result.anchor_mount_result.timeline_validity == "repairable"
+    assert result.decision_ingress.timeline_validity == "repairable"
     assert all(claim.finalized for claim in result.anchor_mount_result.hook_claims)
     assert result.anchor_mount_result.envelopes[1].envelope_kind in {"inferred", "unresolved"}
     assert result.decision_ingress.anchored_token_units[1].start is not None
     assert result.decision_ingress.anchored_token_units[1].end is not None
+
+
+def test_anchor_mount_service_rescues_single_gap_and_promotes_secondary_anchor() -> None:
+    service = AnchorMountAlignmentService(seed_discovery=_PrimaryOnlySeedDiscovery())
+    preparation = _build_preparation_with_rescuable_middle_unit()
+
+    result = service.align(preparation=preparation, language="en")
+
+    assert result.anchor_mount_result.timeline_validity == "valid"
+    assert result.anchor_mount_result.should_fallback is False
+    assert result.anchor_mount_result.metrics["promoted_anchor_count"] == 1
+    assert [item.mount_status for item in result.anchor_mount_result.items] == [
+        "anchored",
+        "anchored",
+        "anchored",
+    ]
+    assert result.anchor_mount_result.items[0].trust_tier == "primary"
+    assert result.anchor_mount_result.items[1].trust_tier == "secondary"
+    assert result.anchor_mount_result.items[2].trust_tier == "primary"
 
 
 def test_anchor_mount_service_metrics_include_documented_quality_signals() -> None:
@@ -432,9 +504,11 @@ def test_anchor_mount_service_metrics_include_documented_quality_signals() -> No
     assert "cross_chunk_lock_count" in metrics
     assert "duplicate_candidate_hook_count" in metrics
     assert "unmapped_punctuation_count" in metrics
+    assert "timeline_validity" in metrics
+    assert "timeline_residual_gap_token_count" in metrics
 
 
-def test_chain_solver_rolls_back_suffix_when_later_block_has_higher_score() -> None:
+def test_chain_solver_selects_higher_value_conflicting_block_with_sparse_dp() -> None:
     solver = ChainSolver()
 
     result = solver.solve(
@@ -459,7 +533,7 @@ def test_chain_solver_rolls_back_suffix_when_later_block_has_higher_score() -> N
         ),
     )
 
-    assert result.reseed_count == 1
+    assert result.reseed_count == 0
     assert [block.block_id for block in result.committed_blocks] == ["block-1"]
 
 

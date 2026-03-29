@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+from app.services.timeanchored_alignment.anchor_mount.chain_solver import ChainSolveResult
+from app.services.timeanchored_alignment.anchor_mount.contracts import (
+    AnchorMountInputView,
+    LocalAlignmentBlock,
+)
+from app.services.timeanchored_alignment.anchor_mount.temporal_envelope_builder import (
+    TemporalEnvelopeBuilder,
+)
 from app.services.timeanchored_alignment.anchor_mount.punctuation_fact_mapper import (
     PunctuationFactMapper,
 )
@@ -8,6 +16,7 @@ from app.services.timeanchored_alignment.preparation.assembler import (
     AlignmentPreparationAssembler,
 )
 from app.services.timeanchored_alignment.preparation.contracts import (
+    FastHook,
     PreparedTokenUnit,
     PunctuationEvidence,
     SlowWindowTextPackage,
@@ -238,3 +247,144 @@ def test_punctuation_fact_mapper_fail_closed_records_unmapped_diagnostics() -> N
     assert pair_states == ()
     assert len(diagnostics.unmapped) == 1
     assert diagnostics.unmapped[0]["reason"] == "char_index_out_of_window_text"
+
+
+def test_temporal_envelope_builder_keeps_large_residual_gap_unresolved() -> None:
+    builder = TemporalEnvelopeBuilder()
+    input_view = AnchorMountInputView(
+        window_id="window-envelope-gap-001",
+        owner_chunk_id="chunk-1",
+        owner_chunk_index=1,
+        source_chunk_ids=("chunk-1",),
+        source_chunk_indices=(1,),
+        language="en",
+        token_units=(
+            PreparedTokenUnit(
+                unit_id="unit-0",
+                token_text="hello",
+                normalized_text="hello",
+                char_start=0,
+                char_end=5,
+                speaker_id="speaker-a",
+                turn_id="turn-a",
+                source_chunk_ids=("chunk-1",),
+                source_chunk_indices=(1,),
+            ),
+            PreparedTokenUnit(
+                unit_id="unit-1",
+                token_text="very",
+                normalized_text="very",
+                char_start=6,
+                char_end=10,
+                speaker_id="speaker-a",
+                turn_id="turn-a",
+                source_chunk_ids=("chunk-1",),
+                source_chunk_indices=(1,),
+            ),
+            PreparedTokenUnit(
+                unit_id="unit-2",
+                token_text="brave",
+                normalized_text="brave",
+                char_start=11,
+                char_end=16,
+                speaker_id="speaker-a",
+                turn_id="turn-a",
+                source_chunk_ids=("chunk-1",),
+                source_chunk_indices=(1,),
+            ),
+            PreparedTokenUnit(
+                unit_id="unit-3",
+                token_text="world",
+                normalized_text="world",
+                char_start=17,
+                char_end=22,
+                speaker_id="speaker-a",
+                turn_id="turn-a",
+                source_chunk_ids=("chunk-1",),
+                source_chunk_indices=(1,),
+            ),
+        ),
+        window_text=SlowWindowTextPackage(
+            text="hello very brave world",
+            display_text="hello very brave world",
+            source_language="en",
+        ),
+        punctuation_evidences=tuple(),
+        fast_hooks=(
+            FastHook(
+                hook_text="hello",
+                start=0.0,
+                end=0.3,
+                confidence=0.95,
+                source_chunk_id="chunk-1",
+                source_chunk_index=1,
+            ),
+            FastHook(
+                hook_text="world",
+                start=0.9,
+                end=1.2,
+                confidence=0.95,
+                source_chunk_id="chunk-1",
+                source_chunk_index=1,
+            ),
+        ),
+        pronunciation_hints=tuple(),
+        policy_snapshot=None,
+        coverage=WindowCoverage(
+            core_segments=((0.0, 1.2),),
+            left_guard_sec=0.0,
+            right_guard_sec=0.0,
+            chunk_bindings=(
+                WindowChunkBinding(
+                    chunk_id="chunk-1",
+                    chunk_index=1,
+                    chunk_start=0.0,
+                    chunk_end=1.2,
+                    overlap_ratio=1.0,
+                    role="owner",
+                    is_owner=True,
+                ),
+            ),
+        ),
+    )
+    solve_result = ChainSolveResult(
+        committed_blocks=(
+            LocalAlignmentBlock(
+                block_id="block-left",
+                unit_indices=(0,),
+                hook_indices=(0,),
+                score=1.0,
+                block_kind="anchored",
+                anchor_kind="exact",
+                trust_tier="primary",
+            ),
+            LocalAlignmentBlock(
+                block_id="block-right",
+                unit_indices=(3,),
+                hook_indices=(1,),
+                score=1.0,
+                block_kind="anchored",
+                anchor_kind="exact",
+                trust_tier="primary",
+            ),
+        ),
+        unit_to_hook_indices=((0,), tuple(), tuple(), (1,)),
+        unit_anchor_kinds=("exact", "none", "none", "exact"),
+        unresolved_unit_indices=(1, 2),
+        reseed_count=0,
+    )
+
+    _, envelopes = builder.build(input_view=input_view, solve_result=solve_result)
+
+    assert [envelope.envelope_kind for envelope in envelopes] == [
+        "anchored",
+        "unresolved",
+        "unresolved",
+        "anchored",
+    ]
+    assert [envelope.gap_state for envelope in envelopes] == [
+        "resolved",
+        "large_residual",
+        "large_residual",
+        "resolved",
+    ]

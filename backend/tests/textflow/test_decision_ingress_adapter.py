@@ -142,6 +142,7 @@ def _build_package() -> DecisionIngressPackage:
             ),
         ),
         quality_metrics={"alignment_score": 0.92, "soft_anchor_ratio": 0.88},
+        timeline_validity="repairable",
         should_fallback=True,
     )
 
@@ -157,6 +158,7 @@ def test_decision_ingress_adapter_keeps_compat_fields_but_cleans_projection_boun
     metadata = ingress_context.metadata
     assert metadata["source_chunk_indices"] == [11, 12]
     assert metadata["quality_metrics"] == {"alignment_score": 0.92, "soft_anchor_ratio": 0.88}
+    assert metadata["timeline_validity"] == "repairable"
     assert metadata["should_fallback"] is True
     assert metadata["cross_chunk_locks"][0]["lock_id"] == "lock-1"
     assert metadata["decision_ingress_version"] == "window_first_compat_v1"
@@ -172,6 +174,7 @@ def test_decision_ingress_adapter_keeps_compat_fields_but_cleans_projection_boun
     assert decision_input.aligned_facts.fast_draft_cuts == []
 
     assert result.compat_report["fallback_projection_mode"] == "layer_internal_compat"
+    assert result.compat_report["timeline_validity"] == "repairable"
     assert result.compat_report["canonical_boundary_count"] == 1
 
 

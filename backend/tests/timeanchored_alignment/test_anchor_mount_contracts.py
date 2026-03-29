@@ -164,6 +164,8 @@ def test_anchor_mount_result_contract_exposes_mount_fact_and_boundary_fields() -
         "cross_chunk_locks",
         "boundary_evidences",
         "hook_claims",
+        "timeline_validity",
+        "validity_reasons",
     }
     assert "boundary_evidences" in field_names
 
@@ -177,7 +179,23 @@ def test_decision_ingress_package_contract_exposes_tokens_punctuation_and_covera
         "punctuation_pair_states",
         "boundary_evidences",
         "coverage",
+        "timeline_validity",
     }
+
+
+def test_anchor_mount_result_rejects_unknown_timeline_validity() -> None:
+    with pytest.raises(ValueError, match="AnchorMountResult.timeline_validity"):
+        AnchorMountResult(
+            items=tuple(),
+            envelopes=tuple(),
+            punctuation_facts=tuple(),
+            punctuation_pair_states=tuple(),
+            hook_claims=tuple(),
+            cross_chunk_locks=tuple(),
+            boundary_evidences=tuple(),
+            metrics={},
+            timeline_validity="unknown",
+        )
 
 
 def test_anchored_token_unit_rejects_none_start_end() -> None:

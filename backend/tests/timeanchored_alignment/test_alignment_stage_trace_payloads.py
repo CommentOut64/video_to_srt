@@ -14,6 +14,7 @@ from app.services.timeanchored_alignment.slow_window.contracts import (
     WindowCoverage,
 )
 from app.pipelines.dual_pipeline.services.alignment_stage_service import AlignmentStageService
+from unittest.mock import Mock
 
 
 def test_alignment_stage_service_builds_detailed_decision_ingress_trace_summary() -> None:
@@ -105,6 +106,7 @@ def test_alignment_stage_service_builds_detailed_decision_ingress_trace_summary(
         ),
         coverage=coverage,
         quality_metrics={"alignment_score": 1.0},
+        timeline_validity="valid",
         should_fallback=False,
     )
     adapter_result = DecisionIngressAdapterResult(
@@ -136,3 +138,113 @@ def test_alignment_stage_service_builds_detailed_decision_ingress_trace_summary(
     assert summary["boundary_by_split"][0]["left_text"] == "beneficial"
     assert summary["boundary_by_split"][0]["right_text"] == "for"
     assert summary["cross_chunk_locks"][0]["lock_id"] == "lock-1"
+
+
+def test_alignment_stage_service_injects_timeline_turns_from_anchored_token_window() -> None:
+    coverage = WindowCoverage(
+        core_segments=((10.0, 12.0),),
+        left_guard_sec=0.0,
+        right_guard_sec=0.0,
+        chunk_bindings=(
+            WindowChunkBinding(
+                chunk_id="chunk-10",
+                chunk_index=10,
+                chunk_start=10.0,
+                chunk_end=11.0,
+                overlap_ratio=1.0,
+                role="owner",
+                is_owner=True,
+            ),
+            WindowChunkBinding(
+                chunk_id="chunk-11",
+                chunk_index=11,
+                chunk_start=11.0,
+                chunk_end=12.0,
+                overlap_ratio=1.0,
+                role="core",
+                is_owner=False,
+            ),
+        ),
+    )
+    service = AlignmentStageService(
+        host=type(
+            "Host",
+            (),
+            {
+                "logger": Mock(),
+                "_postprocess_trace_enabled": False,
+                "_postprocess_trace_level": "summary",
+                "_anchor_mount_graph": "off",
+                "_timeline_turns": [
+                    type("Turn", (), {"turn_id": "turn-a", "speaker_id": "speaker-a", "start": 10.2, "end": 10.9, "boundary_confidence": 0.9})(),
+                    type("Turn", (), {"turn_id": "turn-b", "speaker_id": "speaker-b", "start": 11.0, "end": 11.8, "boundary_confidence": 0.9})(),
+                ],
+            },
+        )()
+    )
+    decision_input = DecisionLayerInput(annotated_words=[], vad_intervals=[])
+    decision_ingress = DecisionIngressPackage(
+        window_id="window-speaker-001",
+        owner_chunk_id="chunk-10",
+        owner_chunk_index=10,
+        source_chunk_ids=("chunk-10", "chunk-11"),
+        source_chunk_indices=(10, 11),
+        language="en",
+        policy_snapshot=None,
+        anchored_token_units=(
+            AnchoredTokenUnit(
+                unit_id="unit-0",
+                token_text="hello",
+                normalized_text="hello",
+                start=10.25,
+                end=10.55,
+                left_bound=10.2,
+                right_bound=10.55,
+                speaker_id=None,
+                turn_id=None,
+                mount_status="anchored",
+                anchor_kind="exact",
+                source_chunk_ids=("chunk-10",),
+                source_chunk_indices=(10,),
+                source_hook_ids=("hook-0",),
+                match_confidence=1.0,
+                cross_chunk_lock_ids=(),
+            ),
+            AnchoredTokenUnit(
+                unit_id="unit-1",
+                token_text="world",
+                normalized_text="world",
+                start=11.1,
+                end=11.45,
+                left_bound=11.0,
+                right_bound=11.5,
+                speaker_id=None,
+                turn_id=None,
+                mount_status="anchored",
+                anchor_kind="exact",
+                source_chunk_ids=("chunk-11",),
+                source_chunk_indices=(11,),
+                source_hook_ids=("hook-1",),
+                match_confidence=1.0,
+                cross_chunk_lock_ids=(),
+            ),
+        ),
+        punctuation_facts=(),
+        punctuation_pair_states=(),
+        boundary_evidences=(),
+        cross_chunk_locks=(),
+        coverage=coverage,
+        quality_metrics={"alignment_score": 1.0},
+        timeline_validity="valid",
+        should_fallback=False,
+    )
+
+    diagnostics = service._inject_timeline_turns_into_decision_input(
+        decision_input=decision_input,
+        decision_ingress=decision_ingress,
+    )
+
+    assert [item["turn_id"] for item in decision_input.aligned_facts.speaker_turns] == ["turn-a", "turn-b"]
+    assert diagnostics["window_span_source"] == "anchored_token_units"
+    assert diagnostics["selected_turn_count"] == 2
+    assert diagnostics["window_spans"] == [[10.25, 11.45]]

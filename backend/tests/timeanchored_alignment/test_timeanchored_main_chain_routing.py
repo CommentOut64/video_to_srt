@@ -380,7 +380,7 @@ def test_alignment_stage_force_fast_without_time_base_still_uses_unified_main_ch
     remove_streaming_subtitle_manager(job_id)
 
 
-def test_resolve_anchor_mount_routes_uses_fast_route_when_single_chunk_anchor_mount_requests_fallback() -> None:
+def test_resolve_anchor_mount_routes_keeps_timeanchored_route_when_single_chunk_is_only_repairable() -> None:
     service = AlignmentStageService(
         host=SimpleNamespace(
             logger=Mock(),
@@ -394,8 +394,9 @@ def test_resolve_anchor_mount_routes_uses_fast_route_when_single_chunk_anchor_mo
         decision_ingress=SimpleNamespace(
             anchored_token_units=(object(),),
             source_chunk_ids=("chunk-0",),
+            timeline_validity="repairable",
         ),
-        anchor_mount_result=SimpleNamespace(should_fallback=True),
+        anchor_mount_result=SimpleNamespace(should_fallback=True, timeline_validity="repairable"),
     )
 
     text_route, edge_route, final_route, error_code = service._resolve_anchor_mount_routes(
@@ -404,8 +405,8 @@ def test_resolve_anchor_mount_routes_uses_fast_route_when_single_chunk_anchor_mo
     )
 
     assert text_route == "slow"
-    assert edge_route == "fast"
-    assert final_route == "fast"
+    assert edge_route == "slow"
+    assert final_route == "slow"
     assert error_code is None
 
 
@@ -423,8 +424,9 @@ def test_resolve_anchor_mount_routes_keeps_slow_route_when_multi_chunk_anchor_mo
         decision_ingress=SimpleNamespace(
             anchored_token_units=(object(),),
             source_chunk_ids=("chunk-19", "chunk-20"),
+            timeline_validity="repairable",
         ),
-        anchor_mount_result=SimpleNamespace(should_fallback=True),
+        anchor_mount_result=SimpleNamespace(should_fallback=True, timeline_validity="repairable"),
     )
 
     text_route, edge_route, final_route, error_code = service._resolve_anchor_mount_routes(
@@ -435,6 +437,36 @@ def test_resolve_anchor_mount_routes_keeps_slow_route_when_multi_chunk_anchor_mo
     assert text_route == "slow"
     assert edge_route == "slow"
     assert final_route == "slow"
+    assert error_code is None
+
+
+def test_resolve_anchor_mount_routes_marks_fatal_window_for_safe_fallback() -> None:
+    service = AlignmentStageService(
+        host=SimpleNamespace(
+            logger=Mock(),
+            _edge_selection_mode="force_slow",
+            _postprocess_trace_enabled=False,
+            _postprocess_trace_level="summary",
+            _anchor_mount_graph="off",
+        )
+    )
+    stage_result = SimpleNamespace(
+        decision_ingress=SimpleNamespace(
+            anchored_token_units=(object(),),
+            source_chunk_ids=("chunk-19", "chunk-20"),
+            timeline_validity="fatal",
+        ),
+        anchor_mount_result=SimpleNamespace(should_fallback=True, timeline_validity="fatal"),
+    )
+
+    text_route, edge_route, final_route, error_code = service._resolve_anchor_mount_routes(
+        ctx=SimpleNamespace(edge_selection_mode="force_slow"),
+        stage_result=stage_result,
+    )
+
+    assert text_route == "slow"
+    assert edge_route == "safe_window_fallback"
+    assert final_route == "safe_window_fallback"
     assert error_code is None
 
 
