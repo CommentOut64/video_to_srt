@@ -15,6 +15,27 @@ from app.services.timeanchored_alignment.preparation.contracts import (
 )
 from app.services.timeanchored_alignment.slow_window.contracts import WindowCoverage
 
+_ALLOWED_TRUST_TIERS = {
+    "unreviewed",
+    "primary",
+    "secondary",
+    "boundary_only",
+    "rejected",
+}
+_ALLOWED_GAP_STATES = {
+    "unexamined",
+    "resolved",
+    "residual",
+    "large_residual",
+    "invalid",
+}
+_ALLOWED_TIMELINE_VALIDITY = {
+    "valid",
+    "repairable",
+    "quarantined",
+    "fatal",
+}
+
 
 def _ensure_probability(name: str, value: float) -> float:
     normalized = float(value)
@@ -37,6 +58,15 @@ def _ensure_time_span(name: str, start: float, end: float) -> None:
         raise ValueError(f"{name} 非法：end({end}) < start({start})")
 
 
+def _ensure_choice(name: str, value: str, allowed: set[str]) -> str:
+    normalized = str(value or "").strip()
+    if normalized not in allowed:
+        raise ValueError(
+            f"{name} 必须属于 {sorted(allowed)}，当前为 {value}"
+        )
+    return normalized
+
+
 @dataclass(frozen=True)
 class AnchorMountInputView:
     window_id: str
@@ -56,18 +86,25 @@ class AnchorMountInputView:
 
 @dataclass(frozen=True)
 class AnchorCandidate:
+    candidate_id: str
     unit_indices: tuple[int, ...]
     hook_indices: tuple[int, ...]
     anchor_kind: str
     score: float
     is_hard: bool
+    ambiguity_cluster_id: str | None = None
+    trust_tier: str = "unreviewed"
+    reject_reason: str | None = None
 
     def __post_init__(self) -> None:
+        if not self.candidate_id:
+            raise ValueError("AnchorCandidate.candidate_id 不能为空")
         if not self.unit_indices:
             raise ValueError("AnchorCandidate.unit_indices 不能为空")
         if not self.hook_indices:
             raise ValueError("AnchorCandidate.hook_indices 不能为空")
         _ensure_probability("AnchorCandidate.score", self.score)
+        _ensure_choice("AnchorCandidate.trust_tier", self.trust_tier, _ALLOWED_TRUST_TIERS)
 
 
 @dataclass(frozen=True)
@@ -78,11 +115,39 @@ class LocalAlignmentBlock:
     score: float
     block_kind: str
     anchor_kind: str
+    candidate_ids: tuple[str, ...] = field(default_factory=tuple)
+    ambiguity_cluster_ids: tuple[str, ...] = field(default_factory=tuple)
+    trust_tier: str = "unreviewed"
 
     def __post_init__(self) -> None:
         if not self.block_id:
             raise ValueError("LocalAlignmentBlock.block_id 不能为空")
         _ensure_probability("LocalAlignmentBlock.score", self.score)
+        _ensure_choice("LocalAlignmentBlock.trust_tier", self.trust_tier, _ALLOWED_TRUST_TIERS)
+
+
+@dataclass(frozen=True)
+class PromotedAnchor:
+    candidate_id: str
+    unit_indices: tuple[int, ...]
+    hook_indices: tuple[int, ...]
+    anchor_kind: str
+    source_gap_id: str
+    trust_score: float
+    trust_tier: str
+    reject_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.candidate_id:
+            raise ValueError("PromotedAnchor.candidate_id 不能为空")
+        if not self.source_gap_id:
+            raise ValueError("PromotedAnchor.source_gap_id 不能为空")
+        if not self.unit_indices:
+            raise ValueError("PromotedAnchor.unit_indices 不能为空")
+        if not self.hook_indices:
+            raise ValueError("PromotedAnchor.hook_indices 不能为空")
+        _ensure_probability("PromotedAnchor.trust_score", self.trust_score)
+        _ensure_choice("PromotedAnchor.trust_tier", self.trust_tier, _ALLOWED_TRUST_TIERS)
 
 
 @dataclass(frozen=True)
@@ -103,11 +168,14 @@ class AnchorMountItem:
     match_confidence: float
     cross_chunk_lock_ids: tuple[str, ...]
     alignment_block_id: str | None = None
+    trust_tier: str = "unreviewed"
+    ambiguity_cluster_id: str | None = None
 
     def __post_init__(self) -> None:
         _ensure_non_negative_int("AnchorMountItem.unit_index", self.unit_index)
         _ensure_non_negative_int("AnchorMountItem.envelope_index", self.envelope_index)
         _ensure_probability("AnchorMountItem.match_confidence", self.match_confidence)
+        _ensure_choice("AnchorMountItem.trust_tier", self.trust_tier, _ALLOWED_TRUST_TIERS)
 
 
 @dataclass(frozen=True)
@@ -125,6 +193,8 @@ class TemporalEnvelope:
     source_chunk_ids: tuple[str, ...]
     source_chunk_indices: tuple[int, ...]
     cross_chunk_lock: bool
+    gap_state: str = "unexamined"
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _ensure_time_span("TemporalEnvelope", self.left_bound, self.right_bound)
@@ -134,6 +204,7 @@ class TemporalEnvelope:
             self.provisional_end,
         )
         _ensure_probability("TemporalEnvelope.confidence", self.confidence)
+        _ensure_choice("TemporalEnvelope.gap_state", self.gap_state, _ALLOWED_GAP_STATES)
 
 
 @dataclass(frozen=True)
@@ -159,6 +230,18 @@ class CrossChunkLock:
     reason: str
     source_chunk_ids: tuple[str, ...]
     source_chunk_indices: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class FuseEvent:
+    level: str
+    reason: str
+    gap_id: str | None
+    round_index: int
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _ensure_non_negative_int("FuseEvent.round_index", self.round_index)
 
 
 @dataclass(frozen=True)
@@ -211,7 +294,17 @@ class AnchorMountResult:
     cross_chunk_locks: tuple[CrossChunkLock, ...]
     boundary_evidences: tuple[BoundaryEvidence, ...]
     metrics: dict[str, Any]
-    should_fallback: bool
+    should_fallback: bool = False
+    timeline_validity: str = "valid"
+    validity_reasons: tuple[str, ...] = field(default_factory=tuple)
+    fuse_events: tuple[FuseEvent, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        _ensure_choice(
+            "AnchorMountResult.timeline_validity",
+            self.timeline_validity,
+            _ALLOWED_TIMELINE_VALIDITY,
+        )
 
 
 @dataclass(frozen=True)
@@ -255,4 +348,12 @@ class DecisionIngressPackage:
     cross_chunk_locks: tuple[CrossChunkLock, ...]
     coverage: WindowCoverage
     quality_metrics: dict[str, Any]
-    should_fallback: bool
+    timeline_validity: str = "valid"
+    should_fallback: bool = False
+
+    def __post_init__(self) -> None:
+        _ensure_choice(
+            "DecisionIngressPackage.timeline_validity",
+            self.timeline_validity,
+            _ALLOWED_TIMELINE_VALIDITY,
+        )

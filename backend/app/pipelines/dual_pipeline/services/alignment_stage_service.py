@@ -10,13 +10,21 @@ from __future__ import annotations
 import copy
 import hashlib
 from dataclasses import asdict
+from types import SimpleNamespace
 from typing import Any, Dict, Optional, Sequence
 
 from app.models.sensevoice_models import SentenceSegment, TextSource
 from app.pipelines.dual_pipeline.services.textflow_facade_service import Layer456RunResult
 from app.schemas.pipeline_context import ProcessingContext
-from app.services.alignment.types import CharMapping, PunctTrack, TextTrack, TextTrackBundle
+from app.services.alignment.types import (
+    AlignedFacts,
+    CharMapping,
+    PunctTrack,
+    TextTrack,
+    TextTrackBundle,
+)
 from app.services.language_policy import build_language_policy_snapshot
+from app.services.textflow.contracts import SubtitleBatch, SubtitleItem
 from app.services.textflow.decision_ingress_adapter import DecisionIngressAdapter
 from app.services.timeanchored_alignment import AlignmentItem
 from app.services.timeanchored_alignment.contracts import (
@@ -50,6 +58,7 @@ from app.services.timeanchored_alignment.output_projection.output_projector impo
     OutputProjectionInput,
     OutputProjector,
 )
+from app.pipelines.dual_pipeline.services.commit_scope_resolver import CommitScopeResolver
 from app.pipelines.dual_pipeline.services.postprocess_trace_writer import PostprocessTraceWriter
 from app.pipelines.dual_pipeline.services.anchor_mount_graph_renderer import (
     AnchorMountGraphRenderer,
@@ -69,6 +78,7 @@ class AlignmentStageService:
         self._timeanchored_stage_service = AnchorMountAlignmentService()
         self._decision_ingress_adapter = DecisionIngressAdapter()
         self._output_projector = OutputProjector()
+        self._commit_scope_resolver = CommitScopeResolver()
         self._postprocess_trace_writer = PostprocessTraceWriter(
             logger=getattr(host, "logger", None),
             enabled=bool(getattr(host, "_postprocess_trace_enabled", False)),
@@ -254,21 +264,25 @@ class AlignmentStageService:
                     ctx=ctx,
                 )
                 if should_accept and stage_result is not None:
-                    force_fast_reason = self._resolve_anchor_mount_force_fast_reason(
+                    safe_window_fallback_reason = self._resolve_anchor_mount_safe_window_fallback_reason(
                         stage_result=stage_result
                     )
-                    if force_fast_reason:
-                        self._commit_fast_direct_result(
+                    if safe_window_fallback_reason:
+                        self._commit_safe_window_fallback_result(
                             ctx=ctx,
+                            stage_result=stage_result,
+                            whisper_result=whisper_result,
                             sv_result=sv_result,
-                            reason=force_fast_reason,
+                            speaker_id=speaker_id,
+                            turn_id=turn_id,
+                            reason=safe_window_fallback_reason,
                         )
                         self._record_hetero_alignment_result(
                             ctx=ctx,
                             stage_result=stage_result,
                             mode=alignment_pipeline_mode,
                             selected=True,
-                            reason=force_fast_reason,
+                            reason=safe_window_fallback_reason,
                         )
                         return
                     self._commit_timeanchored_main_chain_result(
@@ -1229,10 +1243,11 @@ class AlignmentStageService:
             speaker_id=speaker_id,
             turn_id=turn_id,
         )
-        self._inject_timeline_turns_into_decision_input(
+        speaker_bridge_diagnostics = self._inject_timeline_turns_into_decision_input(
             decision_input=adapter_result.decision_input,
             decision_ingress=stage_result.decision_ingress,
         )
+        adapter_result.compat_report["speaker_bridge"] = dict(speaker_bridge_diagnostics)
         self._trace_write(
             ctx=ctx,
             filename="30_decision_ingress.input.json",
@@ -1556,31 +1571,47 @@ class AlignmentStageService:
         *,
         decision_input: Any,
         decision_ingress: Any,
-    ) -> None:
+    ) -> dict[str, Any]:
         """
-        将窗口内 timeline turn 真值注入 Decision 输入，避免 slot 级 speaker 继承导致误判。
+        将窗口内 timeline turn 真值注入 Decision 输入，避免 token 级 speaker 继承导致误判。
         """
         aligned_facts = getattr(decision_input, "aligned_facts", None)
         if aligned_facts is None:
-            return
+            aligned_facts = AlignedFacts(
+                annotated_words=list(getattr(decision_input, "annotated_words", []) or [])
+            )
+            decision_input.aligned_facts = aligned_facts
         host = self._host
         timeline_turns = list(getattr(host, "_timeline_turns", []) or [])
+        diagnostics: dict[str, Any] = {
+            "window_span_source": "",
+            "window_spans": [],
+            "selected_turn_count": 0,
+            "timeline_turn_count": int(len(timeline_turns)),
+        }
         if not timeline_turns:
-            return
-        tokens = list(getattr(decision_ingress, "tokens", ()) or ())
-        if not tokens:
-            return
-        window_start = min(float(getattr(item, "start", 0.0) or 0.0) for item in tokens)
-        window_end = max(float(getattr(item, "end", window_start) or window_start) for item in tokens)
-        if window_end <= window_start:
-            return
+            aligned_facts.speaker_turns = []
+            return diagnostics
+        window_spans, span_source = self._resolve_decision_ingress_window_spans(
+            decision_ingress=decision_ingress
+        )
+        diagnostics["window_span_source"] = span_source
+        diagnostics["window_spans"] = [
+            [float(start), float(end)] for start, end in window_spans
+        ]
+        if not window_spans:
+            aligned_facts.speaker_turns = []
+            return diagnostics
         selected_turns: list[dict[str, Any]] = []
         for turn in timeline_turns:
             turn_start = float(getattr(turn, "start", 0.0) or 0.0)
             turn_end = float(getattr(turn, "end", turn_start) or turn_start)
             if turn_end <= turn_start:
                 continue
-            if min(window_end, turn_end) <= max(window_start, turn_start):
+            if not any(
+                min(window_end, turn_end) > max(window_start, turn_start)
+                for window_start, window_end in window_spans
+            ):
                 continue
             selected_turns.append(
                 {
@@ -1594,8 +1625,9 @@ class AlignmentStageService:
                     ),
                 }
             )
-        if selected_turns:
-            aligned_facts.speaker_turns = selected_turns
+        aligned_facts.speaker_turns = selected_turns
+        diagnostics["selected_turn_count"] = int(len(selected_turns))
+        return diagnostics
 
     def _build_projected_output_batches(
         self,
@@ -1620,12 +1652,216 @@ class AlignmentStageService:
             decision_metadata={
                 "boundary_score_stats": dict(split_stats),
                 "segmentation_report": dict(getattr(decision_output, "segmentation_report", {}) or {}),
+                "commit_scope": asdict(
+                    self._commit_scope_resolver.build(
+                        window_id=str(stage_result.decision_ingress.window_id),
+                        source_chunk_ids=tuple(
+                            str(item) for item in stage_result.decision_ingress.source_chunk_ids
+                        ),
+                        source_chunk_indices=tuple(
+                            int(item) for item in stage_result.decision_ingress.source_chunk_indices
+                        ),
+                        coverage=stage_result.decision_ingress.coverage,
+                        owner_batch=owner_batch,
+                        timeline_validity=self._resolve_anchor_mount_timeline_validity(
+                            stage_result=stage_result
+                        ),
+                    )
+                ),
             },
         )
         projected_batches = tuple(self._output_projector.project(projection_input))
         if not projected_batches:
             return (owner_batch,)
         return projected_batches
+
+    def _commit_safe_window_fallback_result(
+        self,
+        *,
+        ctx: ProcessingContext,
+        stage_result: AnchorMountStageResult,
+        whisper_result: Dict[str, Any],
+        sv_result: Dict[str, Any],
+        speaker_id: Optional[str],
+        turn_id: Optional[str],
+        reason: str,
+    ) -> None:
+        host = self._host
+        preparation = ctx.alignment_preparation
+        decision_ingress = stage_result.decision_ingress
+        language = str(
+            getattr(getattr(preparation, "compat", None), "text_truth", None).language
+            if getattr(getattr(preparation, "compat", None), "text_truth", None) is not None
+            else ""
+            or whisper_result.get("language")
+            or "auto"
+        )
+        chosen_text_clean = str(
+            getattr(getattr(preparation, "slow_text", None), "window_text", None).text
+            if getattr(getattr(preparation, "slow_text", None), "window_text", None) is not None
+            else ""
+            or whisper_result.get("text_clean")
+            or whisper_result.get("text")
+            or ""
+        ).strip()
+        if not chosen_text_clean:
+            chosen_text_clean = self._resolve_text_fallback_content(
+                chosen_text_clean="",
+                tracks=ctx.text_tracks,
+                whisper_result=whisper_result,
+                sv_result=sv_result,
+            )
+        if not chosen_text_clean:
+            raise RuntimeError("safe_window_fallback_missing_text")
+
+        fallback_confidence = self._resolve_text_fallback_confidence(
+            chosen_source="slow",
+            whisper_result=whisper_result,
+            sv_result=sv_result,
+        )
+        window_start, window_end = self._resolve_safe_window_fallback_time_span(
+            stage_result=stage_result,
+            ctx=ctx,
+        )
+        final_sentence = SentenceSegment(
+            text=chosen_text_clean,
+            text_clean=chosen_text_clean,
+            start=window_start,
+            end=window_end,
+            words=[],
+            confidence=fallback_confidence,
+            source=TextSource.WHISPER_PATCH,
+            is_draft=False,
+            is_finalized=True,
+        )
+        final_sentence.speaker_id = speaker_id
+        final_sentence.turn_id = turn_id
+        final_sentence.alignment_score = float(
+            getattr(stage_result.anchor_mount_result, "metrics", {}).get("alignment_score", 0.0)
+            or 0.0
+        )
+        final_sentence.matched_ratio = float(
+            getattr(stage_result.anchor_mount_result, "metrics", {}).get("coverage_ratio", 0.0)
+            or 0.0
+        )
+        final_sentence.confidence_source = "slow"
+        final_sentences = [final_sentence]
+        host._assign_sentence_identity_by_timeline_overlap(
+            final_sentences,
+            fallback_chunk=ctx.audio_chunk,
+        )
+        output_traces = host._normalize_output_traces_for_sentences(
+            final_sentences=final_sentences,
+            output_traces=[],
+            default_reason="timeanchored_safe_window_fallback",
+        )
+        owner_batch = SubtitleBatch(
+            chunk_id=str(decision_ingress.owner_chunk_id),
+            chunk_index=int(decision_ingress.owner_chunk_index),
+            items=(
+                SubtitleItem(
+                    segment_id=f"timeanchored:{decision_ingress.window_id}:safe_fallback:0",
+                    chunk_id=str(decision_ingress.owner_chunk_id),
+                    start=window_start,
+                    end=window_end,
+                    text=chosen_text_clean,
+                    source="safe_window_fallback",
+                    speaker_id=speaker_id,
+                    turn_id=turn_id,
+                    trace={
+                        "split_reason": "safe_window_fallback",
+                        "window_id": str(decision_ingress.window_id),
+                        "mapped_cut_time": float(window_end),
+                        "mapping_quality": "safe_window_fallback",
+                        "mapping_reason": str(reason),
+                    },
+                ),
+            ),
+        )
+        split_stats = {
+            "safe_window_fallback": 1,
+            "safe_window_fallback_reason": str(reason),
+            "error_code": str(reason),
+        }
+        projected_batches = self._build_projected_output_batches(
+            stage_result=stage_result,
+            decision_output=SimpleNamespace(
+                subtitle_batch=owner_batch,
+                segmentation_report={"safe_window_fallback": True},
+            ),
+            split_stats=split_stats,
+        )
+        output_error_count = 0
+        for projected_batch in projected_batches:
+            output_layer_result = host._emit_output_layer(
+                chunk_index=(
+                    projected_batch.chunk_index
+                    if projected_batch.chunk_index is not None
+                    else projected_batch.chunk_id
+                ),
+                sentence_segments=final_sentences,
+                language=language,
+                injection_report={
+                    "mapping_coverage": 0.0,
+                    "mismatch_count": 0.0,
+                    "error_code": str(reason),
+                    "blocked": 0.0,
+                },
+                segmentation_report={
+                    "boundary_score_stats": dict(split_stats),
+                    "forced_split_count": 0.0,
+                    "route": "timeanchored",
+                    "text_route": "slow",
+                    "edge_route": "safe_window_fallback",
+                    "projection_chunk_count": int(len(projected_batches)),
+                    "error_code": str(reason),
+                },
+                output_traces=output_traces,
+                default_trace_reason="safe_window_fallback",
+                subtitle_batch=projected_batch,
+            )
+            output_error_count += len(output_layer_result.output_payload.get("errors", []))
+
+        ctx.final_sentences = final_sentences
+        ctx.finalization_metrics = {
+            "coverage": float(
+                getattr(stage_result.anchor_mount_result, "metrics", {}).get("coverage_ratio", 0.0)
+                or 0.0
+            ),
+            "gap_ratio": float(
+                getattr(stage_result.anchor_mount_result, "metrics", {}).get(
+                    "largest_unresolved_span", 0.0
+                )
+                or 0.0
+            ),
+            "alignment_score": float(
+                getattr(stage_result.anchor_mount_result, "metrics", {}).get("alignment_score", 0.0)
+                or 0.0
+            ),
+            "gap_positions": [],
+            "gap_resolution": None,
+            "timeanchored_enabled": 1.0,
+            "timeanchored_text_route": "slow",
+            "timeanchored_edge_route": "safe_window_fallback",
+            "timeanchored_final_route": "safe_window_fallback",
+            "timeanchored_item_count": float(len(decision_ingress.anchored_token_units)),
+            "timeanchored_sentence_count": float(len(final_sentences)),
+            "timeanchored_projected_chunk_count": float(len(projected_batches)),
+            "timeanchored_failed_span_count": 0.0,
+            "timeanchored_boundary_candidate_count": float(len(decision_ingress.boundary_evidences)),
+            "timeanchored_error_code": str(reason),
+            "l7_error_count": float(output_error_count),
+        }
+        for key, value in getattr(stage_result.anchor_mount_result, "metrics", {}).items():
+            ctx.finalization_metrics[f"anchor_mount_{key}"] = value
+        for key, value in split_stats.items():
+            ctx.finalization_metrics[f"split_{key}"] = value
+        host.logger.warning(
+            "Chunk {}: timeanchored safe_window_fallback 完成 sentences={} reason={}",
+            ctx.chunk_index,
+            len(final_sentences),
+            reason,
+        )
 
     def _commit_fast_direct_result(
         self,
@@ -2188,14 +2424,10 @@ class AlignmentStageService:
             if stage_result is not None
             else 0
         )
-        text_route = "slow" if token_count else "error"
-        if self._should_force_fast_direct_on_anchor_mount_fallback(
-            stage_result=stage_result
-        ):
-            edge_route = "fast" if token_count else "error"
-            final_route = edge_route if edge_route != "error" else text_route
+        text_route = "slow" if stage_result is not None else "error"
+        if self._should_use_safe_window_fallback(stage_result=stage_result):
             error_code = "anchor_mount_empty" if not token_count else None
-            return text_route, edge_route, final_route, error_code
+            return text_route, "safe_window_fallback", "safe_window_fallback", error_code
         edge_selection_mode = str(getattr(ctx, "edge_selection_mode", "") or "").strip().lower()
         if edge_selection_mode not in {"force_fast", "prefer_fast", "force_slow", "prefer_slow"}:
             edge_selection_mode = str(
@@ -2256,19 +2488,7 @@ class AlignmentStageService:
         *,
         stage_result: Optional[AnchorMountStageResult],
     ) -> bool:
-        if stage_result is None:
-            return False
-        anchor_mount_result = getattr(stage_result, "anchor_mount_result", None)
-        if anchor_mount_result is None:
-            return False
-        if not bool(getattr(anchor_mount_result, "should_fallback", False)):
-            return False
-        source_chunk_ids = cls._resolve_anchor_mount_source_chunk_ids(
-            stage_result=stage_result
-        )
-        if source_chunk_ids and len(source_chunk_ids) > 1:
-            return False
-        return True
+        return False
 
     @classmethod
     def _resolve_anchor_mount_force_fast_reason(
@@ -2276,14 +2496,108 @@ class AlignmentStageService:
         *,
         stage_result: Optional[AnchorMountStageResult],
     ) -> str:
-        """将 AnchorMount 的 fallback 质量信号映射为快流直通触发原因。"""
-        if stage_result is None:
-            return ""
-        if cls._should_force_fast_direct_on_anchor_mount_fallback(
-            stage_result=stage_result
-        ):
-            return "anchor_mount_should_fallback"
         return ""
+
+    @staticmethod
+    def _resolve_anchor_mount_timeline_validity(
+        *,
+        stage_result: Optional[AnchorMountStageResult],
+    ) -> str:
+        if stage_result is None:
+            return "fatal"
+        decision_ingress = getattr(stage_result, "decision_ingress", None)
+        ingress_validity = str(
+            getattr(decision_ingress, "timeline_validity", "") or ""
+        ).strip().lower()
+        if ingress_validity:
+            return ingress_validity
+        anchor_mount_result = getattr(stage_result, "anchor_mount_result", None)
+        result_validity = str(
+            getattr(anchor_mount_result, "timeline_validity", "") or ""
+        ).strip().lower()
+        return result_validity or "valid"
+
+    @classmethod
+    def _should_use_safe_window_fallback(
+        cls,
+        *,
+        stage_result: Optional[AnchorMountStageResult],
+    ) -> bool:
+        return cls._resolve_anchor_mount_timeline_validity(
+            stage_result=stage_result
+        ) in {"quarantined", "fatal"}
+
+    @classmethod
+    def _resolve_anchor_mount_safe_window_fallback_reason(
+        cls,
+        *,
+        stage_result: Optional[AnchorMountStageResult],
+    ) -> str:
+        timeline_validity = cls._resolve_anchor_mount_timeline_validity(
+            stage_result=stage_result
+        )
+        if timeline_validity in {"quarantined", "fatal"}:
+            return f"anchor_mount_{timeline_validity}"
+        return ""
+
+    @staticmethod
+    def _resolve_decision_ingress_window_spans(
+        *,
+        decision_ingress: Any,
+    ) -> tuple[tuple[tuple[float, float], ...], str]:
+        token_units = tuple(getattr(decision_ingress, "anchored_token_units", ()) or ())
+        token_spans = tuple(
+            (float(item.start), float(item.end))
+            for item in token_units
+            if float(item.end) > float(item.start)
+        )
+        if token_spans:
+            return (
+                (
+                    (
+                        min(start for start, _ in token_spans),
+                        max(end for _, end in token_spans),
+                    ),
+                ),
+                "anchored_token_units",
+            )
+
+        coverage = getattr(decision_ingress, "coverage", None)
+        core_segments = tuple(
+            (float(start), float(end))
+            for start, end in (getattr(coverage, "core_segments", ()) or ())
+            if float(end) > float(start)
+        )
+        if core_segments:
+            return core_segments, "coverage.core_segments"
+
+        binding_segments = tuple(
+            (float(item.chunk_start), float(item.chunk_end))
+            for item in (getattr(coverage, "chunk_bindings", ()) or ())
+            if float(item.chunk_end) > float(item.chunk_start)
+        )
+        if binding_segments:
+            return binding_segments, "coverage.chunk_bindings"
+        return tuple(), ""
+
+    def _resolve_safe_window_fallback_time_span(
+        self,
+        *,
+        stage_result: AnchorMountStageResult,
+        ctx: ProcessingContext,
+    ) -> tuple[float, float]:
+        window_spans, _ = self._resolve_decision_ingress_window_spans(
+            decision_ingress=stage_result.decision_ingress
+        )
+        if window_spans:
+            start = min(item[0] for item in window_spans)
+            end = max(item[1] for item in window_spans)
+        else:
+            start = float(getattr(ctx.audio_chunk, "start", 0.0) or 0.0)
+            end = float(getattr(ctx.audio_chunk, "end", start) or start)
+        if end <= start:
+            end = start + 0.01
+        return start, end
 
     @staticmethod
     def _build_fast_direct_stream(*, words: Sequence[Any]) -> tuple[AlignmentItem, ...]:

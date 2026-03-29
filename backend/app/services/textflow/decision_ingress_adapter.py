@@ -87,6 +87,7 @@ class DecisionIngressAdapter:
                     self._serialize_pair_state(item) for item in package.punctuation_pair_states
                 ],
                 "quality_metrics": dict(package.quality_metrics or {}),
+                "timeline_validity": str(package.timeline_validity),
                 "should_fallback": bool(package.should_fallback),
                 "candidate_boundary_count": int(len(boundary_evidences)),
             },
@@ -178,6 +179,7 @@ class DecisionIngressAdapter:
             compat_report={
                 "decision_ingress_version": self._INGRESS_VERSION,
                 "fallback_projection_mode": self._FALLBACK_PROJECTION_MODE,
+                "timeline_validity": str(package.timeline_validity),
                 "fallback_clean_text_length": len(fallback_clean_text),
                 "fallback_punctuation_position_count": len(fallback_positions),
                 "canonical_punctuation_fact_count": len(canonical_punctuation_facts),

@@ -7,6 +7,9 @@ from app.services.timeanchored_alignment.anchor_mount.contracts import (
     AnchorMountInputView,
 )
 
+MAX_TOKEN_MERGE_WIDTH = 2
+MAX_HOOK_SEQUENCE_WIDTH = 3
+
 
 def _normalize(text: str) -> str:
     return "".join(
@@ -35,7 +38,7 @@ class SeedDiscovery:
                 hook_key = _normalize(hook.hook_text)
                 if token_unit.token_text == hook.hook_text:
                     candidates.append(
-                        AnchorCandidate(
+                        self._build_candidate(
                             unit_indices=(unit_index,),
                             hook_indices=(hook_index,),
                             anchor_kind="exact",
@@ -46,7 +49,7 @@ class SeedDiscovery:
                     matched = True
                 elif unit_key and unit_key == hook_key:
                     candidates.append(
-                        AnchorCandidate(
+                        self._build_candidate(
                             unit_indices=(unit_index,),
                             hook_indices=(hook_index,),
                             anchor_kind="normalized",
@@ -59,7 +62,7 @@ class SeedDiscovery:
                 for hook_index, hook in enumerate(input_view.fast_hooks):
                     if unit_key == _normalize(hook.hook_text):
                         candidates.append(
-                            AnchorCandidate(
+                            self._build_candidate(
                                 unit_indices=(unit_index,),
                                 hook_indices=(hook_index,),
                                 anchor_kind="soft_pronunciation",
@@ -68,21 +71,12 @@ class SeedDiscovery:
                             )
                         )
             if not matched and len(input_view.token_units) > 1:
-                for next_unit_index in range(unit_index + 1, len(input_view.token_units)):
-                    merged_key = _normalize(
-                        token_unit.token_text + input_view.token_units[next_unit_index].token_text
-                    )
-                    for hook_index, hook in enumerate(input_view.fast_hooks):
-                        if merged_key and merged_key == _normalize(hook.hook_text):
-                            candidates.append(
-                                AnchorCandidate(
-                                    unit_indices=(unit_index, next_unit_index),
-                                    hook_indices=(hook_index,),
-                                    anchor_kind="merge",
-                                    score=0.82,
-                                    is_hard=True,
-                                )
-                            )
+                merge_candidate = self._match_bounded_adjacent_merge(
+                    input_view=input_view,
+                    unit_index=unit_index,
+                )
+                if merge_candidate is not None:
+                    candidates.append(merge_candidate)
             if not matched:
                 sequence_candidate = self._match_contiguous_hook_sequence(
                     unit_key=unit_key,
@@ -92,6 +86,51 @@ class SeedDiscovery:
                 if sequence_candidate is not None:
                     candidates.append(sequence_candidate)
         return tuple(candidates)
+
+    @staticmethod
+    def _build_candidate(
+        *,
+        unit_indices: tuple[int, ...],
+        hook_indices: tuple[int, ...],
+        anchor_kind: str,
+        score: float,
+        is_hard: bool,
+    ) -> AnchorCandidate:
+        unit_part = "-".join(str(index) for index in unit_indices)
+        hook_part = "-".join(str(index) for index in hook_indices)
+        return AnchorCandidate(
+            candidate_id=f"{anchor_kind}:{unit_part}:{hook_part}",
+            unit_indices=unit_indices,
+            hook_indices=hook_indices,
+            anchor_kind=anchor_kind,
+            score=score,
+            is_hard=is_hard,
+        )
+
+    def _match_bounded_adjacent_merge(
+        self,
+        *,
+        input_view: AnchorMountInputView,
+        unit_index: int,
+    ) -> AnchorCandidate | None:
+        max_width = min(MAX_TOKEN_MERGE_WIDTH, len(input_view.token_units) - unit_index)
+        for width in range(2, max_width + 1):
+            unit_span = tuple(range(unit_index, unit_index + width))
+            merged_key = _normalize(
+                "".join(input_view.token_units[index].token_text for index in unit_span)
+            )
+            if not merged_key:
+                continue
+            for hook_index, hook in enumerate(input_view.fast_hooks):
+                if merged_key == _normalize(hook.hook_text):
+                    return self._build_candidate(
+                        unit_indices=unit_span,
+                        hook_indices=(hook_index,),
+                        anchor_kind="merge",
+                        score=0.82,
+                        is_hard=True,
+                    )
+        return None
 
     @staticmethod
     def _match_contiguous_hook_sequence(
@@ -107,10 +146,11 @@ class SeedDiscovery:
             _normalize(getattr(hook, "hook_text", ""))
             for hook in hooks
         ]
+        max_width = SeedDiscovery._sequence_width_limit(unit_key=unit_key)
         for start_index in range(len(normalized_hooks)):
             merged_parts: list[str] = []
             hook_indices: list[int] = []
-            for hook_index in range(start_index, len(normalized_hooks)):
+            for hook_index in range(start_index, min(len(normalized_hooks), start_index + max_width)):
                 hook_key = normalized_hooks[hook_index]
                 if not hook_key:
                     continue
@@ -118,7 +158,7 @@ class SeedDiscovery:
                 hook_indices.append(hook_index)
                 merged_key = "".join(merged_parts)
                 if merged_key == unit_key:
-                    return AnchorCandidate(
+                    return SeedDiscovery._build_candidate(
                         unit_indices=(unit_index,),
                         hook_indices=tuple(hook_indices),
                         anchor_kind="sequence",
@@ -128,3 +168,7 @@ class SeedDiscovery:
                 if len(merged_key) > len(unit_key):
                     break
         return None
+
+    @staticmethod
+    def _sequence_width_limit(*, unit_key: str) -> int:
+        return MAX_HOOK_SEQUENCE_WIDTH

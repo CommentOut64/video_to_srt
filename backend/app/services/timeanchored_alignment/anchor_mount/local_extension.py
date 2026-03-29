@@ -40,6 +40,9 @@ class LocalExtension:
                 score=block.score,
                 block_kind=block.block_kind,
                 anchor_kind=block.anchor_kind,
+                candidate_ids=block.candidate_ids,
+                ambiguity_cluster_ids=block.ambiguity_cluster_ids,
+                trust_tier=block.trust_tier,
             )
             for index, block in enumerate(all_blocks)
         )
@@ -111,6 +114,17 @@ class LocalExtension:
                 score=score,
                 block_kind="anchored",
                 anchor_kind=anchor_kind,
+                candidate_ids=tuple(candidate.candidate_id for candidate in current_run),
+                ambiguity_cluster_ids=tuple(
+                    candidate.ambiguity_cluster_id
+                    for candidate in current_run
+                    if candidate.ambiguity_cluster_id
+                ),
+                trust_tier=(
+                    "primary"
+                    if all(candidate.trust_tier == "primary" for candidate in current_run)
+                    else "unreviewed"
+                ),
             )
         )
         consumed_pairs.update(zip(unit_indices, hook_indices, strict=False))
@@ -124,6 +138,13 @@ class LocalExtension:
             score=candidate.score,
             block_kind="anchored" if candidate.is_hard else "partial",
             anchor_kind=candidate.anchor_kind,
+            candidate_ids=(candidate.candidate_id,),
+            ambiguity_cluster_ids=(
+                (candidate.ambiguity_cluster_id,)
+                if candidate.ambiguity_cluster_id is not None
+                else tuple()
+            ),
+            trust_tier=candidate.trust_tier,
         )
 
     @staticmethod

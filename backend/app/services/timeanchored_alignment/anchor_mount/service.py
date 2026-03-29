@@ -10,6 +10,9 @@ from app.services.timeanchored_alignment.anchor_mount.boundary_evidence_builder 
     BoundaryEvidenceBuilder,
 )
 from app.services.timeanchored_alignment.anchor_mount.chain_solver import ChainSolveResult, ChainSolver
+from app.services.timeanchored_alignment.anchor_mount.core_pipeline import (
+    AnchorMountCorePipeline,
+)
 from app.services.timeanchored_alignment.anchor_mount.contracts import (
     AnchorMountResult,
     DecisionIngressPackage,
@@ -20,7 +23,13 @@ from app.services.timeanchored_alignment.anchor_mount.cross_chunk_lock_builder i
 from app.services.timeanchored_alignment.anchor_mount.decision_ingress_assembler import (
     DecisionIngressAssembler,
 )
+from app.services.timeanchored_alignment.anchor_mount.densification_promoter import (
+    DensificationPromoter,
+)
 from app.services.timeanchored_alignment.anchor_mount.fallback_gate import FallbackGate
+from app.services.timeanchored_alignment.anchor_mount.gap_rescue_aligner import (
+    GapRescueAligner,
+)
 from app.services.timeanchored_alignment.anchor_mount.hook_claim_resolver import (
     HookClaimResolver,
 )
@@ -37,6 +46,12 @@ from app.services.timeanchored_alignment.anchor_mount.punctuation_fact_mapper im
 from app.services.timeanchored_alignment.anchor_mount.seed_discovery import SeedDiscovery
 from app.services.timeanchored_alignment.anchor_mount.temporal_envelope_builder import (
     TemporalEnvelopeBuilder,
+)
+from app.services.timeanchored_alignment.anchor_mount.timeline_validity_validator import (
+    TimelineValidityValidator,
+)
+from app.services.timeanchored_alignment.anchor_mount.window_alignment_state import (
+    WindowAlignmentState,
 )
 from app.services.timeanchored_alignment.contracts import LayerReport, PipelineReport
 from app.services.timeanchored_alignment.preparation.contracts import AlignmentPreparationPackage
@@ -63,24 +78,36 @@ class AnchorMountAlignmentService:
         low_complexity_mask: LowComplexityMask | None = None,
         local_extension: LocalExtension | None = None,
         chain_solver: ChainSolver | None = None,
+        gap_rescue_aligner: GapRescueAligner | None = None,
+        densification_promoter: DensificationPromoter | None = None,
         temporal_envelope_builder: TemporalEnvelopeBuilder | None = None,
         hook_claim_resolver: HookClaimResolver | None = None,
         cross_chunk_lock_builder: CrossChunkLockBuilder | None = None,
         boundary_evidence_builder: BoundaryEvidenceBuilder | None = None,
+        timeline_validity_validator: TimelineValidityValidator | None = None,
         fallback_gate: FallbackGate | None = None,
         decision_ingress_assembler: DecisionIngressAssembler | None = None,
     ) -> None:
         self._ingress_validator = ingress_validator or IngressValidator()
-        self._punctuation_fact_mapper = punctuation_fact_mapper or PunctuationFactMapper()
-        self._seed_discovery = seed_discovery or SeedDiscovery()
-        self._low_complexity_mask = low_complexity_mask or LowComplexityMask()
-        self._local_extension = local_extension or LocalExtension()
-        self._chain_solver = chain_solver or ChainSolver()
-        self._temporal_envelope_builder = temporal_envelope_builder or TemporalEnvelopeBuilder()
-        self._hook_claim_resolver = hook_claim_resolver or HookClaimResolver()
-        self._cross_chunk_lock_builder = cross_chunk_lock_builder or CrossChunkLockBuilder()
-        self._boundary_evidence_builder = boundary_evidence_builder or BoundaryEvidenceBuilder()
-        self._fallback_gate = fallback_gate or FallbackGate()
+        self._core_pipeline = AnchorMountCorePipeline(
+            punctuation_fact_mapper=punctuation_fact_mapper or PunctuationFactMapper(),
+            seed_discovery=seed_discovery or SeedDiscovery(),
+            low_complexity_mask=low_complexity_mask or LowComplexityMask(),
+            local_extension=local_extension or LocalExtension(),
+            chain_solver=chain_solver or ChainSolver(),
+            gap_rescue_aligner=gap_rescue_aligner or GapRescueAligner(),
+            densification_promoter=densification_promoter or DensificationPromoter(),
+            temporal_envelope_builder=temporal_envelope_builder or TemporalEnvelopeBuilder(),
+            hook_claim_resolver=hook_claim_resolver or HookClaimResolver(),
+            cross_chunk_lock_builder=cross_chunk_lock_builder or CrossChunkLockBuilder(),
+            boundary_evidence_builder=boundary_evidence_builder or BoundaryEvidenceBuilder(),
+        )
+        self._timeline_validity_validator = (
+            timeline_validity_validator or TimelineValidityValidator()
+        )
+        self._fallback_gate = fallback_gate or FallbackGate(
+            timeline_validity_validator=self._timeline_validity_validator,
+        )
         self._decision_ingress_assembler = decision_ingress_assembler or DecisionIngressAssembler()
 
     def align(
@@ -101,63 +128,52 @@ class AnchorMountAlignmentService:
             language=language,
             policy_snapshot=resolved_policy,
         )
-        punctuation_facts, punctuation_pair_states, punctuation_diagnostics = self._punctuation_fact_mapper.map(
-            window_text=input_view.window_text,
-            token_units=input_view.token_units,
-            punctuation_evidences=input_view.punctuation_evidences,
-        )
-        candidates = self._seed_discovery.discover(input_view=input_view)
-        masked_candidates = self._low_complexity_mask.apply(
-            candidates=candidates,
-            input_view=input_view,
-        )
-        blocks = self._local_extension.build(
-            input_view=input_view,
-            candidates=masked_candidates,
-        )
-        solve_result = self._chain_solver.solve(input_view=input_view, blocks=blocks)
-        items, envelopes = self._temporal_envelope_builder.build(
-            input_view=input_view,
-            solve_result=solve_result,
-        )
-        hook_claims = self._hook_claim_resolver.resolve(
-            input_view=input_view,
-            envelopes=envelopes,
-        )
-        cross_chunk_locks = self._cross_chunk_lock_builder.build(
-            items=items,
-            envelopes=envelopes,
-        )
-        boundary_evidences = self._boundary_evidence_builder.build(
-            items=items,
-            envelopes=envelopes,
-            punctuation_facts=punctuation_facts,
-            cross_chunk_locks=cross_chunk_locks,
-        )
+        state = self._core_pipeline.run(input_view)
         metrics = self._build_metrics(
             input_view=input_view,
-            solve_result=solve_result,
-            candidates=masked_candidates,
-            items=items,
-            envelopes=envelopes,
-            hook_claims=hook_claims,
-            cross_chunk_locks=cross_chunk_locks,
-            boundary_evidence_count=len(boundary_evidences),
-            punctuation_fact_count=len(punctuation_facts),
-            punctuation_diagnostics=punctuation_diagnostics,
+            solve_result=state.main_chain,
+            candidates=state.raw_seed_candidates,
+            items=state.items,
+            envelopes=state.envelopes,
+            hook_claims=state.hook_claims,
+            cross_chunk_locks=state.cross_chunk_locks,
+            boundary_evidence_count=len(state.boundary_evidences),
+            punctuation_fact_count=len(state.punctuation_facts),
+            punctuation_diagnostics=state.punctuation_diagnostics,
         )
-        provisional_result = AnchorMountResult(
-            items=items,
-            envelopes=envelopes,
-            punctuation_facts=punctuation_facts,
-            punctuation_pair_states=punctuation_pair_states,
-            hook_claims=hook_claims,
-            cross_chunk_locks=cross_chunk_locks,
-            boundary_evidences=boundary_evidences,
+        metrics.update(
+            {
+                key: value
+                for key, value in dict(state.diagnostics).items()
+                if key
+                in {
+                    "seed_candidate_count",
+                    "masked_candidate_count",
+                    "ambiguity_cluster_count",
+                    "primary_candidate_count",
+                    "block_candidate_count",
+                    "block_count",
+                    "compatibility_edge_count",
+                    "solver_elapsed_ms",
+                    "avg_in_degree",
+                    "max_in_degree",
+                    "promoted_anchor_count",
+                    "anchor_island_count",
+                    "open_gap_count",
+                    "gap_rescue_match_count",
+                }
+            }
+        )
+        provisional_result = self._build_result_from_state(
+            state=state,
             metrics=metrics,
-            should_fallback=False,
         )
-        should_fallback = self._fallback_gate.should_fallback(result=provisional_result)
+        validity_report = self._timeline_validity_validator.validate(result=provisional_result)
+        metrics = self._merge_validity_metrics(
+            metrics=metrics,
+            validity_report=validity_report,
+        )
+        should_fallback = self._fallback_gate.should_fallback(validity_report=validity_report)
         anchor_mount_result = AnchorMountResult(
             items=provisional_result.items,
             envelopes=provisional_result.envelopes,
@@ -166,8 +182,10 @@ class AnchorMountAlignmentService:
             hook_claims=provisional_result.hook_claims,
             cross_chunk_locks=provisional_result.cross_chunk_locks,
             boundary_evidences=provisional_result.boundary_evidences,
-            metrics=provisional_result.metrics,
+            metrics=metrics,
             should_fallback=should_fallback,
+            timeline_validity=validity_report.state,
+            validity_reasons=validity_report.reasons,
         )
         decision_ingress = self._decision_ingress_assembler.build(
             input_view=input_view,
@@ -180,10 +198,13 @@ class AnchorMountAlignmentService:
                 status="ok" if decision_ingress.anchored_token_units else "error",
                 metrics={
                     "route": route,
-                    "unit_count": len(items),
+                    "unit_count": len(state.items),
                     "anchored_count": metrics["anchored_count"],
                     "reseed_count": metrics["reseed_count"],
+                    "compatibility_edge_count": metrics.get("compatibility_edge_count", 0),
+                    "solver_elapsed_ms": metrics.get("solver_elapsed_ms", 0.0),
                     "should_fallback": should_fallback,
+                    "timeline_validity": validity_report.state,
                 },
             ),
             segmentation_report=LayerReport(
@@ -191,7 +212,7 @@ class AnchorMountAlignmentService:
                 status="ok",
                 metrics={
                     "boundary_candidate_count": len(decision_ingress.boundary_evidences),
-                    "punctuation_fact_count": len(punctuation_facts),
+                    "punctuation_fact_count": len(state.punctuation_facts),
                 },
             ),
             output_report=LayerReport(
@@ -221,6 +242,49 @@ class AnchorMountAlignmentService:
             language=language,
             policy_snapshot=policy_snapshot,
         )
+
+    @staticmethod
+    def _build_result_from_state(
+        *,
+        state: WindowAlignmentState,
+        metrics: dict[str, Any],
+    ) -> AnchorMountResult:
+        return AnchorMountResult(
+            items=state.items,
+            envelopes=state.envelopes,
+            punctuation_facts=state.punctuation_facts,
+            punctuation_pair_states=state.punctuation_pair_states,
+            hook_claims=state.hook_claims,
+            cross_chunk_locks=state.cross_chunk_locks,
+            boundary_evidences=state.boundary_evidences,
+            metrics=metrics,
+            fuse_events=state.fuse_events,
+        )
+
+    @staticmethod
+    def _merge_validity_metrics(
+        *,
+        metrics: dict[str, Any],
+        validity_report: Any,
+    ) -> dict[str, Any]:
+        merged = dict(metrics)
+        merged["timeline_validity"] = str(getattr(validity_report, "state", "repairable"))
+        merged["timeline_validity_reasons"] = list(
+            getattr(validity_report, "reasons", ()) or ()
+        )
+        merged["timeline_monotonic_violation_count"] = int(
+            getattr(validity_report, "monotonic_violation_count", 0) or 0
+        )
+        merged["timeline_compressed_run_count"] = int(
+            getattr(validity_report, "compressed_run_count", 0) or 0
+        )
+        merged["timeline_residual_gap_token_count"] = int(
+            getattr(validity_report, "residual_gap_token_count", 0) or 0
+        )
+        merged["timeline_invalid_gap_ids"] = list(
+            getattr(validity_report, "invalid_gap_ids", ()) or ()
+        )
+        return merged
 
     @staticmethod
     def _build_metrics(

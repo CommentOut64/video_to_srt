@@ -13,6 +13,8 @@ from app.services.timeanchored_alignment.anchor_mount.contracts import (
 class TemporalEnvelopeBuilder:
     """把链路结果收口成 envelope 与 token 真相。"""
 
+    _MAX_INTERPOLATION_RESIDUAL = 1
+
     @staticmethod
     def _build_unit_block_map(
         *,
@@ -92,6 +94,7 @@ class TemporalEnvelopeBuilder:
             input_view=input_view,
             solve_result=solve_result,
         )
+        unresolved_span_sizes = self._build_unresolved_span_sizes(solve_result=solve_result)
 
         for unit_index, token_unit in enumerate(input_view.token_units):
             hook_indices = solve_result.unit_to_hook_indices[unit_index]
@@ -99,11 +102,15 @@ class TemporalEnvelopeBuilder:
             hook_ids = tuple(f"hook-{index}" for index in hook_indices)
             block_id = unit_to_block_id.get(unit_index)
             block = block_lookup.get(str(block_id)) if block_id is not None else None
+            trust_tier = getattr(block, "trust_tier", "unreviewed")
+            ambiguity_cluster_ids = tuple(getattr(block, "ambiguity_cluster_ids", ()) or ())
             if hook_indices:
                 left_bound, right_bound = resolved_bounds[unit_index]
                 envelope_kind = "merged" if block is not None and len(block.unit_indices) > 1 else "anchored"
                 confidence = 1.0 if envelope_kind == "anchored" else 0.85
+                gap_state = "resolved"
             else:
+                unresolved_span_size = unresolved_span_sizes.get(unit_index, 0)
                 previous_resolved = max(
                     (index for index in resolved_bounds if index < unit_index),
                     default=None,
@@ -121,14 +128,25 @@ class TemporalEnvelopeBuilder:
                     ratio = (unit_index - previous_resolved) / max(next_resolved - previous_resolved, 1)
                     left_bound = local_start + span * max(0.0, ratio - 0.15)
                     right_bound = local_start + span * min(1.0, ratio + 0.15)
-                    envelope_kind = "inferred"
-                    confidence = 0.45
+                    if unresolved_span_size <= self._MAX_INTERPOLATION_RESIDUAL:
+                        envelope_kind = "inferred"
+                        confidence = 0.45
+                        gap_state = "residual"
+                    else:
+                        envelope_kind = "unresolved"
+                        confidence = 0.2
+                        gap_state = "large_residual"
                 else:
                     slice_width = coverage_span / float(total_units)
                     left_bound = coverage_start + slice_width * unit_index
                     right_bound = left_bound + slice_width
                     envelope_kind = "unresolved"
                     confidence = 0.2
+                    gap_state = (
+                        "large_residual"
+                        if unresolved_span_size > self._MAX_INTERPOLATION_RESIDUAL
+                        else "unexamined"
+                    )
             provisional_start = float(left_bound)
             provisional_end = max(float(right_bound), provisional_start + 0.01)
             envelopes.append(
@@ -146,6 +164,11 @@ class TemporalEnvelopeBuilder:
                     source_chunk_ids=token_unit.source_chunk_ids,
                     source_chunk_indices=token_unit.source_chunk_indices,
                     cross_chunk_lock=False,
+                    gap_state=gap_state,
+                    diagnostics={
+                        "alignment_block_id": block_id,
+                        "ambiguity_cluster_ids": list(ambiguity_cluster_ids),
+                    },
                 )
             )
             items.append(
@@ -166,6 +189,28 @@ class TemporalEnvelopeBuilder:
                     match_confidence=confidence,
                     cross_chunk_lock_ids=tuple(),
                     alignment_block_id=unit_to_block_id.get(unit_index),
+                    trust_tier=trust_tier,
+                    ambiguity_cluster_id=ambiguity_cluster_ids[0] if ambiguity_cluster_ids else None,
                 )
             )
         return tuple(items), tuple(envelopes)
+
+    @staticmethod
+    def _build_unresolved_span_sizes(
+        *,
+        solve_result: ChainSolveResult,
+    ) -> dict[int, int]:
+        span_sizes: dict[int, int] = {}
+        current_run: list[int] = []
+        for unit_index, hook_indices in enumerate(solve_result.unit_to_hook_indices):
+            if hook_indices:
+                if current_run:
+                    for unresolved_index in current_run:
+                        span_sizes[unresolved_index] = len(current_run)
+                    current_run = []
+                continue
+            current_run.append(unit_index)
+        if current_run:
+            for unresolved_index in current_run:
+                span_sizes[unresolved_index] = len(current_run)
+        return span_sizes

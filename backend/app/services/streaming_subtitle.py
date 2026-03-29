@@ -58,6 +58,7 @@ class StreamingSubtitleManager:
         # Phase 4: Chunk 级别的句子索引映射
         # chunk_sentences[chunk_index] = [sentence_index_1, sentence_index_2, ...]
         self.chunk_sentences: Dict[Any, List[int]] = {}
+        self._window_group_generation_ranks: Dict[str, int] = {}
 
         # V3.8: 添加锁保护，防止 remove_marked_sentences 在错误时机执行
         self._lock = threading.RLock()
@@ -930,6 +931,36 @@ class StreamingSubtitleManager:
             normalized_ids.append(normalized_ref)
         return normalized_ids
 
+    @staticmethod
+    def _resolve_window_group_generation_key(
+        *,
+        projection: dict[str, Any],
+        normalized_scope_refs: Sequence[str],
+        target_chunk_ref: Any,
+    ) -> str:
+        window_id = str(projection.get("window_id", "") or "").strip()
+        if window_id:
+            return f"window:{window_id}"
+        if normalized_scope_refs:
+            return "scope:" + ",".join(sorted(str(item) for item in normalized_scope_refs))
+        return f"target:{StreamingSubtitleManager._normalize_chunk_ref(target_chunk_ref)}"
+
+    @staticmethod
+    def _parse_generation_rank(generation_id: str) -> Optional[int]:
+        normalized = str(generation_id or "").strip()
+        if not normalized:
+            return None
+        parts = normalized.split(":")
+        if len(parts) < 2:
+            return None
+        rank_part = parts[1].strip()
+        if not rank_part.isdigit():
+            return None
+        try:
+            return int(rank_part)
+        except ValueError:
+            return None
+
     def replace_chunk_scope(
         self,
         *,
@@ -1009,14 +1040,36 @@ class StreamingSubtitleManager:
                     scope_chunk_refs = projection.get("source_chunk_ids")
                 if not isinstance(scope_chunk_refs, list):
                     scope_chunk_refs = []
-                expected_empty_cleanup = len(sentences) == 0
-                return self.replace_chunk_scope(
+                normalized_scope_refs = self._normalize_source_chunk_ids(scope_chunk_refs)
+                generation_id = str(projection.get("generation_id", "") or "").strip()
+                generation_rank = self._parse_generation_rank(generation_id)
+                generation_key = self._resolve_window_group_generation_key(
+                    projection=projection,
+                    normalized_scope_refs=normalized_scope_refs,
                     target_chunk_ref=subtitle_batch.chunk_id,
-                    scope_chunk_refs=scope_chunk_refs,
+                )
+                if generation_rank is not None:
+                    current_rank = self._window_group_generation_ranks.get(generation_key)
+                    if current_rank is not None and generation_rank <= current_rank:
+                        logger.info(
+                            "[window_group_scope] 忽略过期窗口提交: target=%s key=%s generation_id=%s current_rank=%s",
+                            subtitle_batch.chunk_id,
+                            generation_key,
+                            generation_id,
+                            current_rank,
+                        )
+                        return self.get_chunk_sentence_indices(subtitle_batch.chunk_id)
+                expected_empty_cleanup = len(sentences) == 0
+                replaced_indices = self.replace_chunk_scope(
+                    target_chunk_ref=subtitle_batch.chunk_id,
+                    scope_chunk_refs=normalized_scope_refs,
                     sentences=sentences,
                     empty_replace_is_expected=expected_empty_cleanup,
                     empty_reason="window_group_scope_cleanup" if expected_empty_cleanup else "",
                 )
+                if generation_rank is not None:
+                    self._window_group_generation_ranks[generation_key] = generation_rank
+                return replaced_indices
         return self.replace_chunk(subtitle_batch.chunk_id, sentences)
 
     def add_finalized_sentences(

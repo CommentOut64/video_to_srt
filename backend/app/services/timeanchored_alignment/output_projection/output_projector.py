@@ -101,6 +101,12 @@ class OutputProjector:
             "owner_carrier_role": validated.owner_carrier_role,
             "decision_metadata": dict(validated.decision_metadata or {}),
         }
+        commit_scope = projection_meta["decision_metadata"].get("commit_scope")
+        if isinstance(commit_scope, dict):
+            projection_meta["commit_scope"] = dict(commit_scope)
+            generation_id = str(commit_scope.get("generation_id", "") or "")
+            if generation_id:
+                projection_meta["generation_id"] = generation_id
         render_report = dict(validated.owner_carrier_batch.render_report or {})
         base_diagnostics = dict(validated.owner_carrier_batch.diagnostics or {})
         grouped_tuple = tuple(grouped_items)

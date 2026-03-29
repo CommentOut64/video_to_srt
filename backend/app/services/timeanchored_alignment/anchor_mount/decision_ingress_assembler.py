@@ -55,5 +55,6 @@ class DecisionIngressAssembler:
             cross_chunk_locks=result.cross_chunk_locks,
             coverage=input_view.coverage,
             quality_metrics=dict(result.metrics),
+            timeline_validity=result.timeline_validity,
             should_fallback=result.should_fallback,
         )
