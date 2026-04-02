@@ -121,3 +121,102 @@ def test_sparse_dp_chain_solver_records_unit_to_hook_mapping_for_selected_chain(
 
     assert result.unit_to_hook_indices == ((0,), (1,), (2,))
     assert result.unresolved_unit_indices == tuple()
+
+
+def test_sparse_dp_chain_solver_explains_hard_boundary_rejection() -> None:
+    solver = ChainSolver()
+    input_view = SimpleNamespace(
+        token_units=(
+            SimpleNamespace(speaker_id="speaker-a", turn_id="turn-a", char_start=0, char_end=1),
+            SimpleNamespace(speaker_id="speaker-a", turn_id="turn-a", char_start=2, char_end=3),
+            SimpleNamespace(speaker_id="speaker-a", turn_id="turn-a", char_start=4, char_end=5),
+        ),
+        punctuation_evidences=(SimpleNamespace(mark=".", source_char_index=2),),
+    )
+
+    decision = solver.explain_block_compatibility(
+        input_view=input_view,
+        previous=LocalAlignmentBlock(
+            block_id="block-0",
+            unit_indices=(0,),
+            hook_indices=(0,),
+            score=0.8,
+            block_kind="anchored",
+            anchor_kind="exact",
+        ),
+        current=LocalAlignmentBlock(
+            block_id="block-1",
+            unit_indices=(2,),
+            hook_indices=(2,),
+            score=0.8,
+            block_kind="anchored",
+            anchor_kind="exact",
+        ),
+    )
+
+    assert decision.compatible is False
+    assert decision.reason == "hard_boundary_crossed"
+    assert decision.diagnostics["crossed_boundary_after_unit"] == 1
+
+
+def test_sparse_dp_chain_solver_explains_turn_change_rejection() -> None:
+    solver = ChainSolver()
+    input_view = SimpleNamespace(
+        token_units=(
+            SimpleNamespace(speaker_id="speaker-a", turn_id="turn-a", char_start=0, char_end=1),
+            SimpleNamespace(speaker_id="speaker-a", turn_id="turn-b", char_start=2, char_end=3),
+        ),
+        punctuation_evidences=tuple(),
+    )
+
+    decision = solver.explain_block_compatibility(
+        input_view=input_view,
+        previous=LocalAlignmentBlock(
+            block_id="block-0",
+            unit_indices=(0,),
+            hook_indices=(0,),
+            score=0.8,
+            block_kind="anchored",
+            anchor_kind="exact",
+        ),
+        current=LocalAlignmentBlock(
+            block_id="block-1",
+            unit_indices=(1,),
+            hook_indices=(1,),
+            score=0.8,
+            block_kind="anchored",
+            anchor_kind="exact",
+        ),
+    )
+
+    assert decision.compatible is False
+    assert decision.reason == "turn_change_blocked"
+
+
+def test_sparse_dp_chain_solver_explains_monotonic_corridor_rejection() -> None:
+    solver = ChainSolver()
+
+    decision = solver.explain_block_compatibility(
+        input_view=_build_input_view(6),
+        previous=LocalAlignmentBlock(
+            block_id="block-0",
+            unit_indices=(0,),
+            hook_indices=(0,),
+            score=0.8,
+            block_kind="anchored",
+            anchor_kind="exact",
+        ),
+        current=LocalAlignmentBlock(
+            block_id="block-1",
+            unit_indices=(5,),
+            hook_indices=(1,),
+            score=0.8,
+            block_kind="anchored",
+            anchor_kind="exact",
+        ),
+    )
+
+    assert decision.compatible is False
+    assert decision.reason == "monotonic_corridor_exceeded"
+    assert decision.diagnostics["unit_jump"] == 5
+    assert decision.diagnostics["hook_jump"] == 1

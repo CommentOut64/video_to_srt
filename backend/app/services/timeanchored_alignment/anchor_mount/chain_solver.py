@@ -24,6 +24,13 @@ class ChainSolveResult:
     solver_elapsed_ms: float = 0.0
 
 
+@dataclass(frozen=True)
+class CompatibilityDecision:
+    compatible: bool
+    reason: str
+    diagnostics: dict[str, int | float | str]
+
+
 class ChainSolver:
     """在稀疏兼容图上做全局最优单调链 DP。"""
 
@@ -32,6 +39,22 @@ class ChainSolver:
     _MAX_UNIT_JUMP = 12
     _DISTANCE_RATIO_LIMIT = 3.0
     _HARD_BOUNDARY_MARKS = {"。", "！", "？", ".", "!", "?", ";", "；"}
+
+    def explain_block_compatibility(
+        self,
+        *,
+        input_view: AnchorMountInputView,
+        previous: LocalAlignmentBlock,
+        current: LocalAlignmentBlock,
+    ) -> CompatibilityDecision:
+        return self._evaluate_compatibility(
+            input_view=input_view,
+            previous=previous,
+            current=current,
+            hard_boundaries_after_unit=self._collect_hard_boundaries_after_unit(
+                input_view=input_view
+            ),
+        )
 
     def solve(
         self,
@@ -136,42 +159,113 @@ class ChainSolver:
         current: LocalAlignmentBlock,
         hard_boundaries_after_unit: set[int],
     ) -> bool:
+        return self._evaluate_compatibility(
+            input_view=input_view,
+            previous=previous,
+            current=current,
+            hard_boundaries_after_unit=hard_boundaries_after_unit,
+        ).compatible
+
+    def _evaluate_compatibility(
+        self,
+        *,
+        input_view: AnchorMountInputView,
+        previous: LocalAlignmentBlock,
+        current: LocalAlignmentBlock,
+        hard_boundaries_after_unit: set[int],
+    ) -> CompatibilityDecision:
         prev_unit_end = max(previous.unit_indices)
         curr_unit_start = min(current.unit_indices)
         prev_hook_end = max(previous.hook_indices)
         curr_hook_start = min(current.hook_indices)
+        diagnostics: dict[str, int | float | str] = {
+            "previous_block_id": previous.block_id,
+            "current_block_id": current.block_id,
+            "prev_unit_end": prev_unit_end,
+            "curr_unit_start": curr_unit_start,
+            "prev_hook_end": prev_hook_end,
+            "curr_hook_start": curr_hook_start,
+        }
         if prev_unit_end >= curr_unit_start:
-            return False
+            return CompatibilityDecision(
+                compatible=False,
+                reason="unit_overlap",
+                diagnostics=diagnostics,
+            )
         if prev_hook_end >= curr_hook_start:
-            return False
+            return CompatibilityDecision(
+                compatible=False,
+                reason="hook_overlap",
+                diagnostics=diagnostics,
+            )
 
         unit_jump = curr_unit_start - prev_unit_end
         hook_jump = curr_hook_start - prev_hook_end
+        diagnostics["unit_jump"] = unit_jump
+        diagnostics["hook_jump"] = hook_jump
         if unit_jump > self._MAX_UNIT_JUMP or hook_jump > self._MAX_HOOK_JUMP:
-            return False
+            return CompatibilityDecision(
+                compatible=False,
+                reason=(
+                    "unit_jump_exceeded"
+                    if unit_jump > self._MAX_UNIT_JUMP
+                    else "hook_jump_exceeded"
+                ),
+                diagnostics=diagnostics,
+            )
         if abs(unit_jump - hook_jump) > self._MONOTONIC_CORRIDOR:
-            return False
+            return CompatibilityDecision(
+                compatible=False,
+                reason="monotonic_corridor_exceeded",
+                diagnostics=diagnostics,
+            )
 
         min_gap = min(max(unit_jump, 1), max(hook_jump, 1))
         max_gap = max(max(unit_jump, 1), max(hook_jump, 1))
+        diagnostics["distance_ratio"] = max_gap / float(min_gap)
         if (max_gap / float(min_gap)) > self._DISTANCE_RATIO_LIMIT:
-            return False
+            return CompatibilityDecision(
+                compatible=False,
+                reason="distance_ratio_exceeded",
+                diagnostics=diagnostics,
+            )
 
         for boundary_after in hard_boundaries_after_unit:
             if prev_unit_end <= boundary_after < curr_unit_start:
-                return False
+                diagnostics["crossed_boundary_after_unit"] = boundary_after
+                return CompatibilityDecision(
+                    compatible=False,
+                    reason="hard_boundary_crossed",
+                    diagnostics=diagnostics,
+                )
 
         prev_unit = input_view.token_units[prev_unit_end]
         curr_unit = input_view.token_units[curr_unit_start]
         prev_speaker_id = getattr(prev_unit, "speaker_id", None)
         curr_speaker_id = getattr(curr_unit, "speaker_id", None)
+        diagnostics["prev_speaker_id"] = str(prev_speaker_id or "")
+        diagnostics["curr_speaker_id"] = str(curr_speaker_id or "")
         if prev_speaker_id is not None and curr_speaker_id is not None and prev_speaker_id != curr_speaker_id:
-            return False
+            return CompatibilityDecision(
+                compatible=False,
+                reason="speaker_change_blocked",
+                diagnostics=diagnostics,
+            )
         prev_turn_id = getattr(prev_unit, "turn_id", None)
         curr_turn_id = getattr(curr_unit, "turn_id", None)
+        diagnostics["prev_turn_id"] = str(prev_turn_id or "")
+        diagnostics["curr_turn_id"] = str(curr_turn_id or "")
         if prev_turn_id is not None and curr_turn_id is not None and prev_turn_id != curr_turn_id:
-            return False
-        return True
+            return CompatibilityDecision(
+                compatible=False,
+                reason="turn_change_blocked",
+                diagnostics=diagnostics,
+            )
+        return CompatibilityDecision(
+            compatible=True,
+            reason="compatible",
+            diagnostics=diagnostics,
+        )
 
     def _collect_hard_boundaries_after_unit(
         self,
