@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 from typing import Any, Dict, Optional, Sequence
 
@@ -54,6 +54,9 @@ from app.services.timeanchored_alignment.window_time_base_assembler import (
     WindowTimeBaseAssembler,
     WindowTimeBasePackage,
 )
+from app.services.timeanchored_alignment.window_recovery_planner import (
+    WindowRecoveryPlanner,
+)
 from app.services.timeanchored_alignment.output_projection.output_projector import (
     OutputProjectionInput,
     OutputProjector,
@@ -76,6 +79,7 @@ class AlignmentStageService:
             hallucination_detector=getattr(host, "_hallucination_detector", None),
         )
         self._timeanchored_stage_service = AnchorMountAlignmentService()
+        self._window_recovery_planner = WindowRecoveryPlanner()
         self._decision_ingress_adapter = DecisionIngressAdapter()
         self._output_projector = OutputProjector()
         self._commit_scope_resolver = CommitScopeResolver()
@@ -942,6 +946,10 @@ class AlignmentStageService:
             preparation=preparation,
             language=language,
         )
+        stage_result = replace(
+            stage_result,
+            window_recovery_plan=self._window_recovery_planner.build(stage_result=stage_result),
+        )
         if isinstance(stage_result, AnchorMountStageResult):
             self._trace_write(
                 ctx=ctx,
@@ -1238,108 +1246,80 @@ class AlignmentStageService:
                 whisper_result=whisper_result,
                 sv_result=sv_result,
             )
-        adapter_result = self._decision_ingress_adapter.build(
-            package=stage_result.decision_ingress,
-            speaker_id=speaker_id,
-            turn_id=turn_id,
+        partial_commit_spans = (
+            self._build_partial_window_spans(stage_result=stage_result)
+            if final_route == "partial_commit"
+            else tuple()
         )
-        speaker_bridge_diagnostics = self._inject_timeline_turns_into_decision_input(
-            decision_input=adapter_result.decision_input,
-            decision_ingress=stage_result.decision_ingress,
+        decision_runs = (
+            [
+                (
+                    self._execute_timeanchored_decision_pass(
+                        ctx=ctx,
+                        stage_result=stage_result,
+                        chosen_text_clean=chosen_text_clean,
+                        whisper_result=whisper_result,
+                        sv_result=sv_result,
+                        speaker_id=speaker_id,
+                        turn_id=turn_id,
+                        span_selector=(int(span.token_start), int(span.token_end)),
+                    )
+                    if str(getattr(span, "route", "") or "").strip().lower() == "decision"
+                    else self._build_timeanchored_span_fallback_run(
+                        ctx=ctx,
+                        stage_result=stage_result,
+                        span=span,
+                        chosen_text_clean=chosen_text_clean,
+                        whisper_result=whisper_result,
+                        sv_result=sv_result,
+                        speaker_id=speaker_id,
+                        turn_id=turn_id,
+                    )
+                )
+                for span in partial_commit_spans
+            ]
+            if partial_commit_spans
+            else [
+                self._execute_timeanchored_decision_pass(
+                    ctx=ctx,
+                    stage_result=stage_result,
+                    chosen_text_clean=chosen_text_clean,
+                    whisper_result=whisper_result,
+                    sv_result=sv_result,
+                    speaker_id=speaker_id,
+                    turn_id=turn_id,
+                    span_selector=None,
+                )
+            ]
         )
-        adapter_result.compat_report["speaker_bridge"] = dict(speaker_bridge_diagnostics)
-        self._trace_write(
-            ctx=ctx,
-            filename="30_decision_ingress.input.json",
-            stage="decision_ingress_input",
-            summary_payload={
-                "window_id": str(stage_result.decision_ingress.window_id),
-                "token_count": len(stage_result.decision_ingress.anchored_token_units),
-                "punctuation_fact_count": len(stage_result.decision_ingress.punctuation_facts),
-                "boundary_evidence_count": len(stage_result.decision_ingress.boundary_evidences),
-                "cross_chunk_lock_count": len(stage_result.decision_ingress.cross_chunk_locks),
-                "coverage_owner_chunks": len(stage_result.decision_ingress.source_chunk_ids),
-            },
-            full_payload=stage_result.decision_ingress,
-        )
-        self._trace_write(
-            ctx=ctx,
-            filename="31_decision_ingress.output.json",
-            stage="decision_ingress_output",
-            summary_payload=self._build_decision_ingress_trace_summary(
-                package=stage_result.decision_ingress,
-                adapter_result=adapter_result,
-            ),
-            full_payload=adapter_result,
-        )
-        decision_output = host._decision_processor.process(
-            adapter_result.decision_input,
-            stream_id=adapter_result.stream_id,
-            chunk_index=adapter_result.chunk_index,
-            is_last_chunk=host._is_last_chunk_index(adapter_result.chunk_index),
-        )
-        self._trace_write(
-            ctx=ctx,
-            filename="40_decision.output.json",
-            stage="decision_output",
-            summary_payload={
-                "sentence_count": len(decision_output.sentence_segments),
-                "trace_count": len(decision_output.output_traces),
-                "segmentation_report": dict(decision_output.segmentation_report or {}),
-                "has_subtitle_batch": bool(getattr(decision_output, "subtitle_batch", None)),
-            },
-            full_payload=decision_output,
-        )
-        final_sentences = list(decision_output.sentence_segments)
-        fallback_error_code = ""
-        if not final_sentences:
-            fallback_text = chosen_text_clean or adapter_result.decision_input.fallback_clean_text_ref
-            if not fallback_text:
-                fallback_text = chosen_text_clean
-            fallback_confidence = self._resolve_text_fallback_confidence(
-                chosen_source=str(getattr(ctx.arbitration_result, "chosen_source", "") or "slow"),
-                whisper_result=whisper_result,
-                sv_result=sv_result,
-            )
-            fallback_sentence = self._build_text_fallback_sentence(
-                text=fallback_text,
-                chunk=ctx.audio_chunk,
-                confidence=fallback_confidence,
-            )
-            if fallback_sentence is not None:
-                fallback_sentence.speaker_id = speaker_id
-                fallback_sentence.turn_id = turn_id
-                final_sentences = [fallback_sentence]
-                fallback_error_code = "E_TIMEANCHORED_SEGMENT_EMPTY_FALLBACK"
-
-        if host._final_grouper:
-            final_sentences = host._final_grouper.group(final_sentences)
-        for sentence in final_sentences:
-            sentence.source = TextSource.WHISPER_PATCH
-            sentence.is_draft = False
-            sentence.is_finalized = True
-            sentence.alignment_score = float(
-                stage_result.anchor_mount_result.metrics.get("alignment_score")
-                or 0.0
-            )
-            sentence.matched_ratio = float(
-                stage_result.anchor_mount_result.metrics.get("coverage_ratio")
-                or 0.0
-            )
-            sentence.confidence_source = host._resolve_sentence_confidence_source(
-                sentence.words
-            )
-            if getattr(sentence, "speaker_id", None) is None:
-                sentence.speaker_id = speaker_id
-            if getattr(sentence, "turn_id", None) is None:
-                sentence.turn_id = turn_id
-        host._assign_sentence_identity_by_timeline_overlap(
-            final_sentences,
-            fallback_chunk=ctx.audio_chunk,
-        )
+        if len(decision_runs) == 1:
+            decision_run = decision_runs[0]
+        else:
+            try:
+                decision_run = self._aggregate_partial_commit_runs(
+                    stage_result=stage_result,
+                    decision_runs=tuple(decision_runs),
+                )
+            except ValueError as exc:
+                if str(exc) != "partial_commit_non_monotonic":
+                    raise
+                self._commit_safe_window_fallback_result(
+                    ctx=ctx,
+                    stage_result=stage_result,
+                    whisper_result=whisper_result,
+                    sv_result=sv_result,
+                    speaker_id=speaker_id,
+                    turn_id=turn_id,
+                    reason="partial_commit_non_monotonic",
+                )
+                return
+        adapter_result = decision_run.adapter_result
+        decision_output = decision_run.decision_output
+        final_sentences = list(decision_run.final_sentences)
+        fallback_error_code = str(decision_run.fallback_error_code or "")
         output_traces = host._normalize_output_traces_for_sentences(
             final_sentences=final_sentences,
-            output_traces=list(decision_output.output_traces or []),
+            output_traces=list(getattr(decision_output, "output_traces", []) or []),
             default_reason="timeanchored_chain",
         )
         aligned_facts = adapter_result.decision_input.aligned_facts
@@ -1674,6 +1654,481 @@ class AlignmentStageService:
         if not projected_batches:
             return (owner_batch,)
         return projected_batches
+
+    @staticmethod
+    def _merge_partial_commit_batches(
+        *,
+        owner_chunk_id: str,
+        owner_chunk_index: int,
+        partial_batches: tuple[SubtitleBatch, ...],
+    ) -> SubtitleBatch:
+        merged_items = sorted(
+            (
+                item
+                for batch in partial_batches
+                for item in tuple(getattr(batch, "items", ()) or ())
+            ),
+            key=lambda item: (
+                float(getattr(item, "start", 0.0) or 0.0),
+                float(getattr(item, "end", 0.0) or 0.0),
+                str(getattr(item, "segment_id", "") or ""),
+            ),
+        )
+        previous_end: float | None = None
+        for item in merged_items:
+            start = float(getattr(item, "start", 0.0) or 0.0)
+            end = float(getattr(item, "end", start) or start)
+            if previous_end is not None and start < previous_end:
+                raise ValueError("partial_commit_non_monotonic")
+            previous_end = max(end, start)
+        return SubtitleBatch(
+            chunk_id=str(owner_chunk_id),
+            chunk_index=int(owner_chunk_index),
+            items=tuple(merged_items),
+            diagnostics={"partial_batch_count": len(partial_batches)},
+        )
+
+    def _execute_timeanchored_decision_pass(
+        self,
+        *,
+        ctx: ProcessingContext,
+        stage_result: AnchorMountStageResult,
+        chosen_text_clean: str,
+        whisper_result: Dict[str, Any],
+        sv_result: Dict[str, Any],
+        speaker_id: Optional[str],
+        turn_id: Optional[str],
+        span_selector: tuple[int, int] | None,
+    ) -> SimpleNamespace:
+        host = self._host
+        trace_suffix = ""
+        if span_selector is not None:
+            trace_suffix = f".span_{int(span_selector[0])}_{int(span_selector[1])}"
+        adapter_result = self._decision_ingress_adapter.build(
+            package=stage_result.decision_ingress,
+            span_selector=span_selector,
+            speaker_id=speaker_id,
+            turn_id=turn_id,
+        )
+        speaker_bridge_diagnostics = self._inject_timeline_turns_into_decision_input(
+            decision_input=adapter_result.decision_input,
+            decision_ingress=stage_result.decision_ingress,
+        )
+        adapter_result.compat_report["speaker_bridge"] = dict(speaker_bridge_diagnostics)
+        self._trace_write(
+            ctx=ctx,
+            filename=f"30_decision_ingress.input{trace_suffix}.json",
+            stage="decision_ingress_input",
+            summary_payload={
+                "window_id": str(stage_result.decision_ingress.window_id),
+                "token_count": len(stage_result.decision_ingress.anchored_token_units),
+                "punctuation_fact_count": len(stage_result.decision_ingress.punctuation_facts),
+                "boundary_evidence_count": len(stage_result.decision_ingress.boundary_evidences),
+                "cross_chunk_lock_count": len(stage_result.decision_ingress.cross_chunk_locks),
+                "coverage_owner_chunks": len(stage_result.decision_ingress.source_chunk_ids),
+                "span_selector": list(span_selector) if span_selector is not None else None,
+            },
+            full_payload=stage_result.decision_ingress,
+        )
+        self._trace_write(
+            ctx=ctx,
+            filename=f"31_decision_ingress.output{trace_suffix}.json",
+            stage="decision_ingress_output",
+            summary_payload=self._build_decision_ingress_trace_summary(
+                package=stage_result.decision_ingress,
+                adapter_result=adapter_result,
+            ),
+            full_payload=adapter_result,
+        )
+        decision_output = host._decision_processor.process(
+            adapter_result.decision_input,
+            stream_id=adapter_result.stream_id,
+            chunk_index=adapter_result.chunk_index,
+            is_last_chunk=host._is_last_chunk_index(adapter_result.chunk_index),
+        )
+        self._trace_write(
+            ctx=ctx,
+            filename=f"40_decision.output{trace_suffix}.json",
+            stage="decision_output",
+            summary_payload={
+                "sentence_count": len(decision_output.sentence_segments),
+                "trace_count": len(decision_output.output_traces),
+                "segmentation_report": dict(decision_output.segmentation_report or {}),
+                "has_subtitle_batch": bool(getattr(decision_output, "subtitle_batch", None)),
+            },
+            full_payload=decision_output,
+        )
+        final_sentences = list(decision_output.sentence_segments)
+        fallback_error_code = ""
+        if not final_sentences:
+            fallback_text = chosen_text_clean or adapter_result.decision_input.fallback_clean_text_ref
+            if not fallback_text:
+                fallback_text = chosen_text_clean
+            fallback_confidence = self._resolve_text_fallback_confidence(
+                chosen_source=str(getattr(ctx.arbitration_result, "chosen_source", "") or "slow"),
+                whisper_result=whisper_result,
+                sv_result=sv_result,
+            )
+            fallback_sentence = self._build_text_fallback_sentence(
+                text=fallback_text,
+                chunk=ctx.audio_chunk,
+                confidence=fallback_confidence,
+            )
+            if fallback_sentence is not None:
+                fallback_sentence.speaker_id = speaker_id
+                fallback_sentence.turn_id = turn_id
+                final_sentences = [fallback_sentence]
+                fallback_error_code = "E_TIMEANCHORED_SEGMENT_EMPTY_FALLBACK"
+
+        if host._final_grouper:
+            final_sentences = host._final_grouper.group(final_sentences)
+        for sentence in final_sentences:
+            sentence.source = TextSource.WHISPER_PATCH
+            sentence.is_draft = False
+            sentence.is_finalized = True
+            sentence.alignment_score = float(
+                stage_result.anchor_mount_result.metrics.get("alignment_score")
+                or 0.0
+            )
+            sentence.matched_ratio = float(
+                stage_result.anchor_mount_result.metrics.get("coverage_ratio")
+                or 0.0
+            )
+            sentence.confidence_source = host._resolve_sentence_confidence_source(
+                sentence.words
+            )
+            if getattr(sentence, "speaker_id", None) is None:
+                sentence.speaker_id = speaker_id
+            if getattr(sentence, "turn_id", None) is None:
+                sentence.turn_id = turn_id
+        host._assign_sentence_identity_by_timeline_overlap(
+            final_sentences,
+            fallback_chunk=ctx.audio_chunk,
+        )
+        return SimpleNamespace(
+            adapter_result=adapter_result,
+            decision_output=decision_output,
+            final_sentences=tuple(final_sentences),
+            fallback_error_code=fallback_error_code,
+        )
+
+    def _aggregate_partial_commit_runs(
+        self,
+        *,
+        stage_result: AnchorMountStageResult,
+        decision_runs: tuple[SimpleNamespace, ...],
+    ) -> SimpleNamespace:
+        merged_batch = self._merge_partial_commit_batches(
+            owner_chunk_id=str(stage_result.decision_ingress.owner_chunk_id),
+            owner_chunk_index=int(stage_result.decision_ingress.owner_chunk_index),
+            partial_batches=tuple(
+                run.decision_output.subtitle_batch
+                for run in decision_runs
+                if getattr(run.decision_output, "subtitle_batch", None) is not None
+            ),
+        )
+        final_sentences = sorted(
+            [sentence for run in decision_runs for sentence in tuple(run.final_sentences)],
+            key=lambda item: (
+                float(getattr(item, "start", 0.0) or 0.0),
+                float(getattr(item, "end", 0.0) or 0.0),
+                str(getattr(item, "text", "") or ""),
+            ),
+        )
+        compat_report = self._merge_partial_commit_compat_report(
+            tuple(dict(getattr(run.adapter_result, "compat_report", {}) or {}) for run in decision_runs)
+        )
+        aligned_facts = SimpleNamespace(
+            annotated_words=[
+                item
+                for run in decision_runs
+                for item in list(
+                    getattr(
+                        getattr(run.adapter_result.decision_input, "aligned_facts", None),
+                        "annotated_words",
+                        [],
+                    )
+                    or []
+                )
+            ],
+            speaker_turns=[
+                item
+                for run in decision_runs
+                for item in list(
+                    getattr(
+                        getattr(run.adapter_result.decision_input, "aligned_facts", None),
+                        "speaker_turns",
+                        [],
+                    )
+                    or []
+                )
+            ],
+            time_mappings=[
+                item
+                for run in decision_runs
+                for item in list(
+                    getattr(
+                        getattr(run.adapter_result.decision_input, "aligned_facts", None),
+                        "time_mappings",
+                        [],
+                    )
+                    or []
+                )
+            ],
+        )
+        fused_evidence = SimpleNamespace(
+            speaker_changes=[
+                item
+                for run in decision_runs
+                for item in list(
+                    getattr(
+                        getattr(run.adapter_result.decision_input, "fused_evidence", None),
+                        "speaker_changes",
+                        [],
+                    )
+                    or []
+                )
+            ],
+            pause_anchors=[
+                item
+                for run in decision_runs
+                for item in list(
+                    getattr(
+                        getattr(run.adapter_result.decision_input, "fused_evidence", None),
+                        "pause_anchors",
+                        [],
+                    )
+                    or []
+                )
+            ],
+            semantic_anchors=[
+                item
+                for run in decision_runs
+                for item in list(
+                    getattr(
+                        getattr(run.adapter_result.decision_input, "fused_evidence", None),
+                        "semantic_anchors",
+                        [],
+                    )
+                    or []
+                )
+            ],
+            punctuation_anchors=[
+                item
+                for run in decision_runs
+                for item in list(
+                    getattr(
+                        getattr(run.adapter_result.decision_input, "fused_evidence", None),
+                        "punctuation_anchors",
+                        [],
+                    )
+                    or []
+                )
+            ],
+        )
+        merged_decision_output = SimpleNamespace(
+            sentence_segments=tuple(final_sentences),
+            output_traces=[
+                trace
+                for run in decision_runs
+                for trace in list(getattr(run.decision_output, "output_traces", []) or [])
+            ],
+            segmentation_report={},
+            subtitle_batch=merged_batch,
+        )
+        merged_adapter_result = SimpleNamespace(
+            decision_input=SimpleNamespace(
+                aligned_facts=aligned_facts,
+                fused_evidence=fused_evidence,
+            ),
+            compat_report=compat_report,
+        )
+        fallback_error_code = next(
+            (
+                str(run.fallback_error_code or "")
+                for run in decision_runs
+                if str(run.fallback_error_code or "")
+            ),
+            "",
+        )
+        return SimpleNamespace(
+            adapter_result=merged_adapter_result,
+            decision_output=merged_decision_output,
+            final_sentences=tuple(final_sentences),
+            fallback_error_code=fallback_error_code,
+        )
+
+    def _build_timeanchored_span_fallback_run(
+        self,
+        *,
+        ctx: ProcessingContext,
+        stage_result: AnchorMountStageResult,
+        span: Any,
+        chosen_text_clean: str,
+        whisper_result: Dict[str, Any],
+        sv_result: Dict[str, Any],
+        speaker_id: Optional[str],
+        turn_id: Optional[str],
+    ) -> SimpleNamespace:
+        fallback_text = self._resolve_partial_span_fallback_text(
+            stage_result=stage_result,
+            span=span,
+            chosen_text_clean=chosen_text_clean,
+        )
+        fallback_confidence = self._resolve_text_fallback_confidence(
+            chosen_source=str(getattr(ctx.arbitration_result, "chosen_source", "") or "slow"),
+            whisper_result=whisper_result,
+            sv_result=sv_result,
+        )
+        sentence = SentenceSegment(
+            text=fallback_text,
+            text_clean=fallback_text,
+            start=float(getattr(span, "time_start", 0.0) or 0.0),
+            end=max(
+                float(getattr(span, "time_end", 0.0) or 0.0),
+                float(getattr(span, "time_start", 0.0) or 0.0) + 0.01,
+            ),
+            words=[],
+            confidence=fallback_confidence,
+            source=TextSource.WHISPER_PATCH,
+            is_draft=False,
+            is_finalized=True,
+        )
+        sentence.speaker_id = speaker_id
+        sentence.turn_id = turn_id
+        sentence.alignment_score = float(
+            stage_result.anchor_mount_result.metrics.get("alignment_score")
+            or 0.0
+        )
+        sentence.matched_ratio = float(
+            stage_result.anchor_mount_result.metrics.get("coverage_ratio")
+            or 0.0
+        )
+        sentence.confidence_source = "slow"
+        self._host._assign_sentence_identity_by_timeline_overlap(
+            [sentence],
+            fallback_chunk=ctx.audio_chunk,
+        )
+        subtitle_batch = SubtitleBatch(
+            chunk_id=str(stage_result.decision_ingress.owner_chunk_id),
+            chunk_index=int(stage_result.decision_ingress.owner_chunk_index),
+            items=(
+                SubtitleItem(
+                    segment_id=(
+                        f"timeanchored:{stage_result.decision_ingress.window_id}:"
+                        f"span_fallback:{getattr(span, 'span_id', 'unknown')}"
+                    ),
+                    chunk_id=str(stage_result.decision_ingress.owner_chunk_id),
+                    start=float(sentence.start),
+                    end=float(sentence.end),
+                    text=fallback_text,
+                    source="span_fallback",
+                    speaker_id=speaker_id,
+                    turn_id=turn_id,
+                    trace={
+                        "split_reason": "span_fallback",
+                        "window_id": str(stage_result.decision_ingress.window_id),
+                        "span_id": str(getattr(span, "span_id", "") or ""),
+                        "mapping_quality": "span_fallback",
+                    },
+                ),
+            ),
+        )
+        return SimpleNamespace(
+            adapter_result=SimpleNamespace(
+                decision_input=SimpleNamespace(
+                    aligned_facts=SimpleNamespace(
+                        annotated_words=[],
+                        speaker_turns=[],
+                        time_mappings=[],
+                    ),
+                    fused_evidence=SimpleNamespace(
+                        speaker_changes=[],
+                        pause_anchors=[],
+                        semantic_anchors=[],
+                        punctuation_anchors=[],
+                    ),
+                ),
+                compat_report={
+                    "fallback_punctuation_position_count": 0,
+                    "canonical_boundary_count": 0,
+                    "canonical_punctuation_fact_count": 0,
+                    "span_selector": [
+                        int(getattr(span, "token_start", -1)),
+                        int(getattr(span, "token_end", -1)),
+                    ],
+                },
+            ),
+            decision_output=SimpleNamespace(
+                sentence_segments=(sentence,),
+                output_traces=[],
+                segmentation_report={"route": "span_fallback"},
+                subtitle_batch=subtitle_batch,
+            ),
+            final_sentences=(sentence,),
+            fallback_error_code="",
+        )
+
+    @staticmethod
+    def _merge_partial_commit_compat_report(
+        compat_reports: tuple[dict[str, Any], ...],
+    ) -> dict[str, Any]:
+        if not compat_reports:
+            return {"fallback_punctuation_position_count": 0}
+        merged = dict(compat_reports[0])
+        merged["fallback_punctuation_position_count"] = int(
+            sum(
+                int(report.get("fallback_punctuation_position_count", 0) or 0)
+                for report in compat_reports
+            )
+        )
+        merged["canonical_boundary_count"] = int(
+            sum(int(report.get("canonical_boundary_count", 0) or 0) for report in compat_reports)
+        )
+        merged["canonical_punctuation_fact_count"] = int(
+            sum(
+                int(report.get("canonical_punctuation_fact_count", 0) or 0)
+                for report in compat_reports
+            )
+        )
+        return merged
+
+    @staticmethod
+    def _resolve_partial_span_fallback_text(
+        *,
+        stage_result: AnchorMountStageResult,
+        span: Any,
+        chosen_text_clean: str,
+    ) -> str:
+        raw_char_start = getattr(span, "char_start", -1)
+        raw_char_end = getattr(span, "char_end", -1)
+        char_start = int(-1 if raw_char_start is None else raw_char_start)
+        char_end = int(-1 if raw_char_end is None else raw_char_end)
+        normalized_text = str(chosen_text_clean or "")
+        if 0 <= char_start < char_end <= len(normalized_text):
+            sliced = normalized_text[char_start:char_end].strip()
+            if sliced:
+                return sliced
+        raw_token_start = getattr(span, "token_start", -1)
+        raw_token_end = getattr(span, "token_end", -1)
+        token_start = int(-1 if raw_token_start is None else raw_token_start)
+        token_end = int(-1 if raw_token_end is None else raw_token_end)
+        token_units = tuple(getattr(stage_result.decision_ingress, "anchored_token_units", ()) or ())
+        fallback_tokens: list[str] = []
+        for token in token_units:
+            token_index = int(getattr(token, "token_index", -1) or -1)
+            if token_start <= token_index < token_end:
+                token_text = str(
+                    getattr(token, "token_text", None)
+                    or getattr(token, "normalized_text", None)
+                    or ""
+                ).strip()
+                if token_text:
+                    fallback_tokens.append(token_text)
+        fallback_text = " ".join(fallback_tokens).strip()
+        if fallback_text:
+            return fallback_text
+        return str(normalized_text).strip()
 
     def _commit_safe_window_fallback_result(
         self,
@@ -2425,6 +2880,13 @@ class AlignmentStageService:
             else 0
         )
         text_route = "slow" if stage_result is not None else "error"
+        timeline_validity = self._resolve_anchor_mount_timeline_validity(stage_result=stage_result)
+        if (
+            timeline_validity in {"quarantined", "fatal"}
+            and self._has_anchor_mount_recoverable_spans(stage_result=stage_result)
+        ):
+            error_code = "anchor_mount_empty" if not token_count else None
+            return text_route, "partial_commit", "partial_commit", error_code
         if self._should_use_safe_window_fallback(stage_result=stage_result):
             error_code = "anchor_mount_empty" if not token_count else None
             return text_route, "safe_window_fallback", "safe_window_fallback", error_code
@@ -2483,6 +2945,45 @@ class AlignmentStageService:
         return tuple(deduped_source_chunk_ids)
 
     @classmethod
+    def _has_anchor_mount_recoverable_spans(
+        cls,
+        *,
+        stage_result: Optional[AnchorMountStageResult],
+    ) -> bool:
+        if stage_result is None:
+            return False
+        recovery_plan = getattr(stage_result, "window_recovery_plan", None)
+        return bool(getattr(recovery_plan, "has_recoverable_spans", False))
+
+    @staticmethod
+    def _build_partial_commit_spans(
+        *,
+        stage_result: Optional[AnchorMountStageResult],
+    ) -> tuple[Any, ...]:
+        if stage_result is None:
+            return tuple()
+        recovery_plan = getattr(stage_result, "window_recovery_plan", None)
+        if recovery_plan is None or bool(getattr(recovery_plan, "emergency_fallback_only", False)):
+            return tuple()
+        return tuple(
+            span
+            for span in tuple(getattr(recovery_plan, "spans", ()) or ())
+            if str(getattr(span, "route", "") or "").strip().lower() == "decision"
+        )
+
+    @staticmethod
+    def _build_partial_window_spans(
+        *,
+        stage_result: Optional[AnchorMountStageResult],
+    ) -> tuple[Any, ...]:
+        if stage_result is None:
+            return tuple()
+        recovery_plan = getattr(stage_result, "window_recovery_plan", None)
+        if recovery_plan is None or bool(getattr(recovery_plan, "emergency_fallback_only", False)):
+            return tuple()
+        return tuple(getattr(recovery_plan, "spans", ()) or ())
+
+    @classmethod
     def _should_force_fast_direct_on_anchor_mount_fallback(
         cls,
         *,
@@ -2523,6 +3024,8 @@ class AlignmentStageService:
         *,
         stage_result: Optional[AnchorMountStageResult],
     ) -> bool:
+        if cls._has_anchor_mount_recoverable_spans(stage_result=stage_result):
+            return False
         return cls._resolve_anchor_mount_timeline_validity(
             stage_result=stage_result
         ) in {"quarantined", "fatal"}
@@ -2533,6 +3036,8 @@ class AlignmentStageService:
         *,
         stage_result: Optional[AnchorMountStageResult],
     ) -> str:
+        if cls._has_anchor_mount_recoverable_spans(stage_result=stage_result):
+            return ""
         timeline_validity = cls._resolve_anchor_mount_timeline_validity(
             stage_result=stage_result
         )

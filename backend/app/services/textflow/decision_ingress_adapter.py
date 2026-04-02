@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import re
 from typing import Any, Sequence
 
@@ -48,10 +48,14 @@ class DecisionIngressAdapter:
         self,
         *,
         package: DecisionIngressPackage,
+        span_selector: tuple[int, int] | None = None,
         speaker_id: str | None = None,
         turn_id: str | None = None,
     ) -> DecisionIngressAdapterResult:
-        token_units = tuple(package.anchored_token_units)
+        token_units = self._slice_token_units(
+            token_units=tuple(package.anchored_token_units),
+            span_selector=span_selector,
+        )
         annotated_words = self._build_annotated_words(
             token_units=token_units,
             fallback_speaker_id=speaker_id,
@@ -59,13 +63,18 @@ class DecisionIngressAdapter:
         )
         boundary_evidences = self._build_boundary_evidences(
             boundary_evidences=package.boundary_evidences,
+            span_selector=span_selector,
         )
         canonical_punctuation_facts = self._build_canonical_punctuation_facts(
             punctuation_facts=package.punctuation_facts,
+            span_selector=span_selector,
         )
         fallback_clean_text, fallback_positions = self._build_fallback_punct_projection(
             token_units=token_units,
-            punctuation_facts=package.punctuation_facts,
+            punctuation_facts=self._slice_punctuation_facts(
+                punctuation_facts=package.punctuation_facts,
+                span_selector=span_selector,
+            ),
         )
         ingress_context = SegmentationIngressContext(
             unit_kind="slow_window",
@@ -90,6 +99,7 @@ class DecisionIngressAdapter:
                 "timeline_validity": str(package.timeline_validity),
                 "should_fallback": bool(package.should_fallback),
                 "candidate_boundary_count": int(len(boundary_evidences)),
+                "span_selector": list(span_selector) if span_selector is not None else None,
             },
         )
         aligned_facts = AlignedFacts(
@@ -180,6 +190,7 @@ class DecisionIngressAdapter:
                 "decision_ingress_version": self._INGRESS_VERSION,
                 "fallback_projection_mode": self._FALLBACK_PROJECTION_MODE,
                 "timeline_validity": str(package.timeline_validity),
+                "span_selector": list(span_selector) if span_selector is not None else None,
                 "fallback_clean_text_length": len(fallback_clean_text),
                 "fallback_punctuation_position_count": len(fallback_positions),
                 "canonical_punctuation_fact_count": len(canonical_punctuation_facts),
@@ -240,20 +251,35 @@ class DecisionIngressAdapter:
     def _build_boundary_evidences(
         *,
         boundary_evidences: Sequence[BoundaryEvidence],
+        span_selector: tuple[int, int] | None = None,
     ) -> tuple[BoundaryEvidence, ...]:
-        return tuple(
+        filtered = tuple(
             item
             for item in boundary_evidences
             if not bool((item.metadata or {}).get("blocked_by_lock"))
         )
+        if span_selector is None:
+            return filtered
+        start, end = span_selector
+        sliced: list[BoundaryEvidence] = []
+        for item in filtered:
+            split_idx = int(getattr(item, "split_idx", -1))
+            if split_idx < start or split_idx >= max(start, end - 1):
+                continue
+            sliced.append(replace(item, split_idx=split_idx - start))
+        return tuple(sliced)
 
     @staticmethod
     def _build_canonical_punctuation_facts(
         *,
         punctuation_facts: Sequence[PunctuationFact],
+        span_selector: tuple[int, int] | None = None,
     ) -> tuple[CanonicalPunctuationFact, ...]:
         facts: list[CanonicalPunctuationFact] = []
-        for item in punctuation_facts:
+        for item in DecisionIngressAdapter._slice_punctuation_facts(
+            punctuation_facts=punctuation_facts,
+            span_selector=span_selector,
+        ):
             normalized_text = str(item.normalized_text or "")
             source = str(item.source or "aligned").strip().lower()
             if source not in {"fast", "slow", "aligned", "injected"}:
@@ -284,6 +310,43 @@ class DecisionIngressAdapter:
                 )
             )
         return tuple(facts)
+
+    @staticmethod
+    def _slice_token_units(
+        *,
+        token_units: tuple[AnchoredTokenUnit, ...],
+        span_selector: tuple[int, int] | None,
+    ) -> tuple[AnchoredTokenUnit, ...]:
+        if span_selector is None:
+            return token_units
+        start, end = span_selector
+        return tuple(token for token in token_units if start <= int(getattr(token, "token_index", -1)) < end)
+
+    @staticmethod
+    def _slice_punctuation_facts(
+        *,
+        punctuation_facts: Sequence[PunctuationFact],
+        span_selector: tuple[int, int] | None,
+    ) -> tuple[PunctuationFact, ...]:
+        if span_selector is None:
+            return tuple(punctuation_facts)
+        start, end = span_selector
+        sliced: list[PunctuationFact] = []
+        for item in punctuation_facts:
+            left = getattr(item, "left_token_index", None)
+            right = getattr(item, "right_token_index", None)
+            left_in = left is not None and start <= int(left) < end
+            right_in = right is not None and start <= int(right) < end
+            if not left_in and not right_in:
+                continue
+            sliced.append(
+                replace(
+                    item,
+                    left_token_index=(int(left) - start) if left_in else None,
+                    right_token_index=(int(right) - start) if right_in else None,
+                )
+            )
+        return tuple(sliced)
 
     @classmethod
     def _build_fallback_punct_projection(

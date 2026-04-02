@@ -325,8 +325,21 @@ class AnchoredTokenUnit:
     source_hook_ids: tuple[str, ...]
     match_confidence: float
     cross_chunk_lock_ids: tuple[str, ...]
+    token_index: int = -1
+    char_start: int = -1
+    char_end: int = -1
 
     def __post_init__(self) -> None:
+        if self.token_index >= 0:
+            _ensure_non_negative_int("AnchoredTokenUnit.token_index", self.token_index)
+        if self.char_start >= 0:
+            _ensure_non_negative_int("AnchoredTokenUnit.char_start", self.char_start)
+        if self.char_end >= 0:
+            _ensure_non_negative_int("AnchoredTokenUnit.char_end", self.char_end)
+        if self.char_start >= 0 and self.char_end >= 0 and self.char_end < self.char_start:
+            raise ValueError(
+                f"AnchoredTokenUnit.char span 非法：char_end({self.char_end}) < char_start({self.char_start})"
+            )
         _ensure_time_span("AnchoredTokenUnit", self.start, self.end)
         _ensure_time_span("AnchoredTokenUnit.bounds", self.left_bound, self.right_bound)
         _ensure_probability("AnchoredTokenUnit.match_confidence", self.match_confidence)

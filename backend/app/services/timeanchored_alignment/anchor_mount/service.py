@@ -64,6 +64,7 @@ class AnchorMountStageResult:
     decision_ingress: DecisionIngressPackage
     anchor_mount_result: AnchorMountResult
     pipeline_report: PipelineReport
+    window_recovery_plan: Any | None = None
 
 
 class AnchorMountAlignmentService:

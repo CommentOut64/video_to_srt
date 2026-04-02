@@ -242,3 +242,134 @@ def test_decision_ingress_adapter_keeps_split_token_parts_free_of_legacy_positio
             "turn_id",
             "track_id",
         }
+
+
+def test_decision_ingress_adapter_can_build_span_scoped_input() -> None:
+    package = DecisionIngressPackage(
+        window_id="window-12",
+        owner_chunk_id="chunk-12",
+        owner_chunk_index=12,
+        source_chunk_ids=("chunk-12",),
+        source_chunk_indices=(12,),
+        language="en",
+        policy_snapshot=None,
+        anchored_token_units=(
+            AnchoredTokenUnit(
+                unit_id="token-0",
+                token_text="hello",
+                normalized_text="hello",
+                start=0.0,
+                end=0.2,
+                left_bound=0.0,
+                right_bound=0.2,
+                speaker_id="spk-1",
+                turn_id="turn-1",
+                mount_status="anchored",
+                anchor_kind="lexical",
+                source_chunk_ids=("chunk-12",),
+                source_chunk_indices=(12,),
+                source_hook_ids=("hook-0",),
+                match_confidence=0.95,
+                cross_chunk_lock_ids=tuple(),
+                token_index=0,
+                char_start=0,
+                char_end=5,
+            ),
+            AnchoredTokenUnit(
+                unit_id="token-1",
+                token_text="brave",
+                normalized_text="brave",
+                start=0.2,
+                end=0.4,
+                left_bound=0.2,
+                right_bound=0.4,
+                speaker_id="spk-1",
+                turn_id="turn-1",
+                mount_status="anchored",
+                anchor_kind="lexical",
+                source_chunk_ids=("chunk-12",),
+                source_chunk_indices=(12,),
+                source_hook_ids=("hook-1",),
+                match_confidence=0.95,
+                cross_chunk_lock_ids=tuple(),
+                token_index=1,
+                char_start=6,
+                char_end=11,
+            ),
+            AnchoredTokenUnit(
+                unit_id="token-2",
+                token_text="world",
+                normalized_text="world",
+                start=0.4,
+                end=0.6,
+                left_bound=0.4,
+                right_bound=0.6,
+                speaker_id="spk-1",
+                turn_id="turn-1",
+                mount_status="anchored",
+                anchor_kind="lexical",
+                source_chunk_ids=("chunk-12",),
+                source_chunk_indices=(12,),
+                source_hook_ids=("hook-2",),
+                match_confidence=0.95,
+                cross_chunk_lock_ids=tuple(),
+                token_index=2,
+                char_start=12,
+                char_end=17,
+            ),
+        ),
+        punctuation_facts=tuple(),
+        punctuation_pair_states=tuple(),
+        boundary_evidences=(
+            BoundaryEvidence(
+                split_idx=0,
+                event_time=0.19,
+                left_end=0.2,
+                right_start=0.2,
+                reason="lexical_boundary",
+                score=0.9,
+                hard_flag=False,
+                metadata={},
+            ),
+            BoundaryEvidence(
+                split_idx=1,
+                event_time=0.39,
+                left_end=0.4,
+                right_start=0.4,
+                reason="lexical_boundary",
+                score=0.9,
+                hard_flag=False,
+                metadata={},
+            ),
+        ),
+        cross_chunk_locks=tuple(),
+        coverage=WindowCoverage(
+            core_segments=((0.0, 0.6),),
+            left_guard_sec=0.0,
+            right_guard_sec=0.0,
+            chunk_bindings=(
+                WindowChunkBinding(
+                    chunk_id="chunk-12",
+                    chunk_index=12,
+                    chunk_start=0.0,
+                    chunk_end=0.6,
+                    overlap_ratio=1.0,
+                    role="owner",
+                    is_owner=True,
+                ),
+            ),
+        ),
+        quality_metrics={"alignment_score": 0.95},
+    )
+
+    result = DecisionIngressAdapter().build(package=package, span_selector=(1, 3))
+
+    assert [item.word for item in result.decision_input.annotated_words] == ["brave", "world"]
+    assert len(result.decision_input.canonical_candidate_boundaries) == 1
+    assert result.decision_input.canonical_candidate_boundaries[0].split_idx == 0
+
+
+def test_decision_ingress_adapter_reports_span_selector_in_compat_report() -> None:
+    result = DecisionIngressAdapter().build(package=_build_package(), span_selector=(0, 1))
+
+    assert result.compat_report["span_selector"] == [0, 1]

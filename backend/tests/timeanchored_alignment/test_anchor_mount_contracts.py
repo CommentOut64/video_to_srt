@@ -183,6 +183,16 @@ def test_decision_ingress_package_contract_exposes_tokens_punctuation_and_covera
     }
 
 
+def test_anchored_token_unit_contract_exposes_token_and_char_slice_coordinates() -> None:
+    field_names = {field.name for field in fields(AnchoredTokenUnit)}
+
+    assert field_names >= {
+        "token_index",
+        "char_start",
+        "char_end",
+    }
+
+
 def test_anchor_mount_result_rejects_unknown_timeline_validity() -> None:
     with pytest.raises(ValueError, match="AnchorMountResult.timeline_validity"):
         AnchorMountResult(

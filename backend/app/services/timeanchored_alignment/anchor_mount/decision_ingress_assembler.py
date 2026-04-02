@@ -13,6 +13,18 @@ from app.services.timeanchored_alignment.anchor_mount.contracts import (
 class DecisionIngressAssembler:
     """把 AnchorMount 真相收口成 DecisionIngressPackage。"""
 
+    @staticmethod
+    def _resolve_token_slice(
+        *,
+        input_view: AnchorMountInputView,
+        unit_index: int,
+    ) -> tuple[int, int]:
+        token_units = tuple(getattr(input_view, "token_units", ()) or ())
+        if 0 <= int(unit_index) < len(token_units):
+            token_unit = token_units[int(unit_index)]
+            return int(getattr(token_unit, "char_start", -1)), int(getattr(token_unit, "char_end", -1))
+        return -1, -1
+
     def build(
         self,
         *,
@@ -24,6 +36,15 @@ class DecisionIngressAssembler:
                 unit_id=item.unit_id,
                 token_text=item.token_text,
                 normalized_text=item.normalized_text,
+                token_index=int(item.unit_index),
+                char_start=self._resolve_token_slice(
+                    input_view=input_view,
+                    unit_index=int(item.unit_index),
+                )[0],
+                char_end=self._resolve_token_slice(
+                    input_view=input_view,
+                    unit_index=int(item.unit_index),
+                )[1],
                 start=envelope.provisional_start,
                 end=envelope.provisional_end,
                 left_bound=envelope.left_bound,

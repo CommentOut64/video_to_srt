@@ -22,6 +22,10 @@ from app.services.timeanchored_alignment.contracts import (
     TimeBaseQuality,
     TimeBaseUnit,
 )
+from app.services.timeanchored_alignment.window_recovery_contracts import (
+    RecoveredWindowPlan,
+    WindowSpanDecision,
+)
 
 
 def _build_chunk() -> AudioChunk:
@@ -468,6 +472,168 @@ def test_resolve_anchor_mount_routes_marks_fatal_window_for_safe_fallback() -> N
     assert edge_route == "safe_window_fallback"
     assert final_route == "safe_window_fallback"
     assert error_code is None
+
+
+def test_resolve_anchor_mount_routes_prefers_partial_commit_for_quarantined_window_with_recoverable_spans() -> None:
+    service = AlignmentStageService(
+        host=SimpleNamespace(
+            logger=Mock(),
+            _edge_selection_mode="force_slow",
+            _postprocess_trace_enabled=False,
+            _postprocess_trace_level="summary",
+            _anchor_mount_graph="off",
+        )
+    )
+    stage_result = SimpleNamespace(
+        decision_ingress=SimpleNamespace(
+            anchored_token_units=(object(), object()),
+            source_chunk_ids=("chunk-19", "chunk-20"),
+            timeline_validity="quarantined",
+        ),
+        anchor_mount_result=SimpleNamespace(should_fallback=True, timeline_validity="quarantined"),
+        window_recovery_plan=SimpleNamespace(has_recoverable_spans=True),
+    )
+
+    text_route, edge_route, final_route, error_code = service._resolve_anchor_mount_routes(
+        ctx=SimpleNamespace(edge_selection_mode="force_slow"),
+        stage_result=stage_result,
+    )
+
+    assert text_route == "slow"
+    assert edge_route == "partial_commit"
+    assert final_route == "partial_commit"
+    assert error_code is None
+
+
+def test_should_use_safe_window_fallback_is_false_when_quarantined_window_has_recoverable_spans() -> None:
+    stage_result = SimpleNamespace(
+        decision_ingress=SimpleNamespace(
+            anchored_token_units=(object(),),
+            source_chunk_ids=("chunk-19", "chunk-20"),
+            timeline_validity="quarantined",
+        ),
+        anchor_mount_result=SimpleNamespace(should_fallback=True, timeline_validity="quarantined"),
+        window_recovery_plan=SimpleNamespace(has_recoverable_spans=True),
+    )
+
+    assert (
+        AlignmentStageService._should_use_safe_window_fallback(stage_result=stage_result) is False
+    )
+
+
+def test_build_partial_commit_spans_returns_only_decision_spans_and_skips_emergency_window() -> None:
+    service = AlignmentStageService(
+        host=SimpleNamespace(
+            logger=Mock(),
+            _edge_selection_mode="force_slow",
+            _postprocess_trace_enabled=False,
+            _postprocess_trace_level="summary",
+            _anchor_mount_graph="off",
+        )
+    )
+    stage_result = SimpleNamespace(
+        window_recovery_plan=RecoveredWindowPlan(
+            spans=(
+                WindowSpanDecision(
+                    span_id="span-decision",
+                    span_kind="trusted",
+                    route="decision",
+                    token_start=1,
+                    token_end=3,
+                ),
+                WindowSpanDecision(
+                    span_id="span-fallback",
+                    span_kind="fallback",
+                    route="span_fallback",
+                    token_start=3,
+                    token_end=4,
+                ),
+            )
+        )
+    )
+    emergency_stage_result = SimpleNamespace(
+        window_recovery_plan=RecoveredWindowPlan(
+            spans=(
+                WindowSpanDecision(
+                    span_id="span-emergency",
+                    span_kind="trusted",
+                    route="decision",
+                    token_start=4,
+                    token_end=6,
+                ),
+            ),
+            emergency_fallback_only=True,
+        )
+    )
+
+    spans = service._build_partial_commit_spans(stage_result=stage_result)
+
+    assert [(span.span_id, span.token_start, span.token_end) for span in spans] == [
+        ("span-decision", 1, 3),
+    ]
+    assert service._build_partial_commit_spans(stage_result=emergency_stage_result) == ()
+
+
+def test_partial_commit_passes_span_selector_to_decision_ingress_adapter(monkeypatch) -> None:
+    service = AlignmentStageService(
+        host=SimpleNamespace(
+            logger=Mock(),
+            _edge_selection_mode="force_slow",
+            _postprocess_trace_enabled=False,
+            _postprocess_trace_level="summary",
+            _anchor_mount_graph="off",
+        )
+    )
+    stage_result = SimpleNamespace(
+        decision_ingress=SimpleNamespace(window_id="window-1"),
+        anchor_mount_result=SimpleNamespace(metrics={}),
+        window_recovery_plan=RecoveredWindowPlan(
+            spans=(
+                WindowSpanDecision(
+                    span_id="span-decision",
+                    span_kind="trusted",
+                    route="decision",
+                    token_start=1,
+                    token_end=3,
+                ),
+            )
+        ),
+    )
+    ctx = SimpleNamespace(
+        chunk_index=0,
+        audio_chunk=_build_chunk(),
+        arbitration_result=SimpleNamespace(chosen_source="slow"),
+        alignment_preparation=SimpleNamespace(
+            compat=SimpleNamespace(text_truth=SimpleNamespace(language="en")),
+            slow_text=SimpleNamespace(window_text=SimpleNamespace(text="hello world")),
+        ),
+        text_tracks=None,
+    )
+    calls: list[dict] = []
+
+    monkeypatch.setattr(
+        service,
+        "_resolve_anchor_mount_routes",
+        lambda **_kwargs: ("slow", "partial_commit", "partial_commit", None),
+    )
+
+    def _mock_build(**kwargs):
+        calls.append(kwargs)
+        raise RuntimeError("stop_after_adapter")
+
+    monkeypatch.setattr(service._decision_ingress_adapter, "build", _mock_build)
+
+    with pytest.raises(RuntimeError, match="stop_after_adapter"):
+        service._commit_timeanchored_main_chain_result(
+            ctx=ctx,
+            stage_result=stage_result,
+            whisper_result={"language": "en"},
+            sv_result={},
+            speaker_id=None,
+            turn_id=None,
+        )
+
+    assert [call.get("span_selector") for call in calls] == [(1, 3)]
 
 
 def test_sensevoice_only_pipeline_runs_alignment_stage_instead_of_finalize_shortcut(

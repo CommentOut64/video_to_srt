@@ -192,3 +192,19 @@ def test_execute_prepared_timeanchored_stage_returns_anchor_mount_stage_result()
     assert not hasattr(result, "text_result")
     assert not hasattr(result, "edge_result")
     assert not hasattr(result, "base_result")
+
+
+def test_execute_prepared_timeanchored_stage_attaches_window_recovery_plan() -> None:
+    host = SimpleNamespace(logger=SimpleNamespace(debug=lambda *args, **kwargs: None))
+    service = AlignmentStageService(host=host)
+    preparation = _build_preparation_package()
+    ctx = SimpleNamespace(chunk_index=0, job_dir=None)
+
+    result = service._execute_prepared_timeanchored_stage(
+        ctx=ctx,
+        preparation=preparation,
+        language="zh",
+    )
+
+    assert result.window_recovery_plan is not None
+    assert hasattr(result.window_recovery_plan, "has_recoverable_spans")
