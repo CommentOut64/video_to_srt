@@ -6,6 +6,7 @@ from pathlib import Path
 from app.pipelines.dual_pipeline.services.postprocess_trace_writer import (
     PostprocessTraceWriter,
 )
+from app.services.timeanchored_alignment.contracts import LayerSummary
 
 
 def test_postprocess_trace_writer_writes_stage_file_and_manifest(tmp_path: Path) -> None:
@@ -37,3 +38,31 @@ def test_postprocess_trace_writer_writes_stage_file_and_manifest(tmp_path: Path)
     chunk_entry = manifest["chunks"]["3"]
     assert "10_preparation.input.json" in chunk_entry["files"]
     assert chunk_entry["files"]["10_preparation.input.json"]["stage"] == "preparation_input"
+
+
+def test_postprocess_trace_writer_supports_empty_layer_summary_schema(tmp_path: Path) -> None:
+    writer = PostprocessTraceWriter(
+        logger=None,
+        enabled=True,
+        level="summary",
+    )
+    job_dir = tmp_path / "job-2"
+    writer.write_layer_summary(
+        job_dir=job_dir,
+        layer_summary=LayerSummary(layer="preparation", status="ok"),
+    )
+
+    summary_file = (
+        job_dir / "debug" / "postprocess" / "summaries" / "preparation.summary.json"
+    )
+    assert summary_file.exists()
+    with summary_file.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    assert payload["layer"] == "preparation"
+    assert payload["warnings"] == []
+    assert payload["errors"] == []
+
+    manifest_file = job_dir / "debug" / "postprocess" / "manifest.json"
+    with manifest_file.open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    assert "preparation" in manifest["summaries"]

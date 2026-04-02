@@ -1,0 +1,15 @@
+{
+  "case_id": "slow-hallucination-force-fast",
+  "case_type": "slow_hallucination",
+  "language_profile": "zh",
+  "expected_route": "selection_reject_slow",
+  "expected_failure_semantic": "selection_reject_slow",
+  "description": "慢流幻觉被选择层拒绝时，必须保留明确失败语义。",
+  "selected_text": "今天我们正式开始",
+  "observation_tokens": [
+    "今天",
+    "我们",
+    "正式",
+    "开始"
+  ]
+}

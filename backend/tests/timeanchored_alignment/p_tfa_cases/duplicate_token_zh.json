@@ -1,0 +1,15 @@
+{
+  "case_id": "duplicate-token-zh",
+  "case_type": "duplicate_token",
+  "language_profile": "zh",
+  "expected_route": "alignment_path",
+  "expected_failure_semantic": "none",
+  "description": "重复 token 场景，要求 occurrence-aware 路径不整体崩溃。",
+  "selected_text": "我们我们现在开始",
+  "observation_tokens": [
+    "我们",
+    "我们",
+    "现在",
+    "开始"
+  ]
+}

@@ -9,6 +9,53 @@ from typing import Any, Dict, Optional, Tuple
 CONTRACT_VERSION = "1.0"
 ALLOWED_ALIGNMENT_ROUTES = frozenset({"text", "phonetic", "mixed", "fast", "slow", "error"})
 ALLOWED_ALIGNMENT_STATUS = frozenset({"direct", "phonetic", "estimated", "interpolated", "failed"})
+OBSERVATION_CAPABILITY_FRAME_POSTERIOR = "frame_posterior_capable"
+OBSERVATION_CAPABILITY_TOKEN_TOPK = "token_topk_capable"
+OBSERVATION_CAPABILITY_TIMESTAMP_ONLY = "timestamp_only_capable"
+ALLOWED_OBSERVATION_CAPABILITIES = frozenset(
+    {
+        OBSERVATION_CAPABILITY_FRAME_POSTERIOR,
+        OBSERVATION_CAPABILITY_TOKEN_TOPK,
+        OBSERVATION_CAPABILITY_TIMESTAMP_ONLY,
+    }
+)
+ACOUSTIC_OBSERVATION_MIN_REQUIRED_FIELDS = (
+    "capability_level",
+    "adapter_type",
+    "source_chunk_ids",
+    "source_chunk_indices",
+    "absolute_time_range",
+    "slices",
+    "quality",
+)
+PTFA_LAYER_OBJECT_REGISTRY = {
+    "selection": {
+        "inputs": ("FastObservationSummary", "SlowTextCandidateSet", "WindowSelectionScope", "SlowQualitySignals"),
+        "outputs": ("SelectedTextTruth", "SelectionDecision", "SelectionReport"),
+    },
+    "preparation": {
+        "inputs": ("SelectedTextTruth", "ObservationAdapterOutput", "ExternalStableFacts", "PreparationScope"),
+        "outputs": (
+            "CanonicalSequence",
+            "PronunciationGraph",
+            "AcousticObservationPack",
+            "PreparationBundle",
+            "PreparationReport",
+        ),
+    },
+    "alignment": {
+        "inputs": ("PreparationBundle",),
+        "outputs": ("AlignmentPath", "BoundaryCandidates", "LowConfidenceSpans", "AlignmentReport"),
+    },
+    "segmentation": {
+        "inputs": ("AlignmentPath", "BoundaryCandidates", "SegmentationFacts", "SegmentationBudgetPolicy"),
+        "outputs": ("AlignedSentence", "SegmentationReport"),
+    },
+    "output": {
+        "inputs": ("AlignedSentence", "OutputProjectionScope", "OutputDeliveryConfig"),
+        "outputs": ("SentenceRecord", "ChunkSentenceIndex", "SubtitleBatchCompat", "OutputReport"),
+    },
+}
 
 
 def _ensure_probability(name: str, value: float) -> float:
@@ -330,3 +377,296 @@ class PipelineReport:
     segmentation_report: Optional[LayerReport] = None
     output_report: Optional[LayerReport] = None
     warnings: Tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class PhysicalChunk:
+    chunk_id: str
+    chunk_index: int
+    start: float
+    end: float
+    language_hint: str = "auto"
+    observation_ref: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.chunk_id:
+            raise ValueError("PhysicalChunk.chunk_id 不能为空")
+        if int(self.chunk_index) < 0:
+            raise ValueError("PhysicalChunk.chunk_index 必须 >= 0")
+        _ensure_time_span(self.start, self.end, field_name="PhysicalChunk")
+
+
+@dataclass(frozen=True)
+class SelectedTextTruth:
+    text: str
+    text_source: str
+    language_hint: str
+    source_chunk_ids: Tuple[str, ...]
+    quality: Dict[str, float] = field(default_factory=dict)
+    rejection_reasons: Tuple[str, ...] = field(default_factory=tuple)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.text:
+            raise ValueError("SelectedTextTruth.text 不能为空")
+        if self.text_source not in {"fast", "slow", "mixed"}:
+            raise ValueError(f"SelectedTextTruth.text_source 不支持: {self.text_source}")
+        if not self.source_chunk_ids:
+            raise ValueError("SelectedTextTruth.source_chunk_ids 不能为空")
+
+
+@dataclass(frozen=True)
+class SelectionDecision:
+    decision: str
+    accepted_text_source: str
+    reason_codes: Tuple[str, ...] = field(default_factory=tuple)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.decision not in {"accept_slow", "force_fast", "mixed"}:
+            raise ValueError(f"SelectionDecision.decision 不支持: {self.decision}")
+        if self.accepted_text_source not in {"fast", "slow", "mixed"}:
+            raise ValueError(
+                "SelectionDecision.accepted_text_source 不支持: "
+                f"{self.accepted_text_source}"
+            )
+
+
+@dataclass(frozen=True)
+class LayerWarning:
+    code: str
+    message: str
+    layer: str
+    job_id: str | None = None
+    window_id: str | None = None
+    chunk_id: str | None = None
+    details: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.code:
+            raise ValueError("LayerWarning.code 不能为空")
+        if not self.message:
+            raise ValueError("LayerWarning.message 不能为空")
+        if not self.layer:
+            raise ValueError("LayerWarning.layer 不能为空")
+
+
+@dataclass(frozen=True)
+class LayerError:
+    code: str
+    message: str
+    layer: str
+    job_id: str | None = None
+    window_id: str | None = None
+    chunk_id: str | None = None
+    details: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.code:
+            raise ValueError("LayerError.code 不能为空")
+        if not self.message:
+            raise ValueError("LayerError.message 不能为空")
+        if not self.layer:
+            raise ValueError("LayerError.layer 不能为空")
+
+
+@dataclass(frozen=True)
+class LayerSummary:
+    layer: str
+    status: str = "ok"
+    counters: Dict[str, Any] = field(default_factory=dict)
+    warnings: Tuple[LayerWarning, ...] = field(default_factory=tuple)
+    errors: Tuple[LayerError, ...] = field(default_factory=tuple)
+    debug_enabled: bool = False
+    artifact_refs: Tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        if self.layer not in PTFA_LAYER_OBJECT_REGISTRY:
+            raise ValueError(f"LayerSummary.layer 不支持: {self.layer}")
+
+
+@dataclass(frozen=True)
+class PostprocessDebugConfig:
+    enabled: bool = False
+    level: str = "summary"
+    root_dir: str = "debug/postprocess"
+
+    def __post_init__(self) -> None:
+        if self.level not in {"summary", "full"}:
+            raise ValueError(f"PostprocessDebugConfig.level 不支持: {self.level}")
+
+
+@dataclass(frozen=True)
+class AcousticObservationTokenCandidate:
+    token: str
+    score: float
+    token_id: int | None = None
+
+    def __post_init__(self) -> None:
+        _ensure_probability("AcousticObservationTokenCandidate.score", self.score)
+
+
+@dataclass(frozen=True)
+class AcousticObservationSlice:
+    slice_id: str
+    start: float
+    end: float
+    primary_token: str = ""
+    top_candidates: Tuple[AcousticObservationTokenCandidate, ...] = field(default_factory=tuple)
+    blank_score: float | None = None
+    confidence: float | None = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.slice_id:
+            raise ValueError("AcousticObservationSlice.slice_id 不能为空")
+        _ensure_time_span(self.start, self.end, field_name="AcousticObservationSlice")
+        if self.blank_score is not None:
+            _ensure_probability("AcousticObservationSlice.blank_score", self.blank_score)
+        if self.confidence is not None:
+            _ensure_probability("AcousticObservationSlice.confidence", self.confidence)
+
+
+@dataclass(frozen=True)
+class AcousticObservationQuality:
+    slice_count: int
+    blank_coverage: float = 0.0
+    topk_coverage: float = 0.0
+    timestamp_coverage: float = 1.0
+    capability_degraded: bool = False
+    notes: Tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        if int(self.slice_count) < 0:
+            raise ValueError("AcousticObservationQuality.slice_count 必须 >= 0")
+        _ensure_probability("AcousticObservationQuality.blank_coverage", self.blank_coverage)
+        _ensure_probability("AcousticObservationQuality.topk_coverage", self.topk_coverage)
+        _ensure_probability(
+            "AcousticObservationQuality.timestamp_coverage",
+            self.timestamp_coverage,
+        )
+
+
+@dataclass(frozen=True)
+class AcousticObservationPack:
+    capability_level: str
+    adapter_type: str
+    source_chunk_ids: Tuple[str, ...]
+    source_chunk_indices: Tuple[int, ...]
+    absolute_time_range: Tuple[float, float]
+    slices: Tuple[AcousticObservationSlice, ...]
+    quality: AcousticObservationQuality
+    blank_track: Tuple[float, ...] = field(default_factory=tuple)
+    topk_limit: int | None = None
+    control_meta: Dict[str, Any] = field(default_factory=dict)
+    contract_version: str = CONTRACT_VERSION
+
+    def __post_init__(self) -> None:
+        if self.capability_level not in ALLOWED_OBSERVATION_CAPABILITIES:
+            raise ValueError(
+                "AcousticObservationPack.capability_level 不支持: "
+                f"{self.capability_level}"
+            )
+        if not self.adapter_type:
+            raise ValueError("AcousticObservationPack.adapter_type 不能为空")
+        if len(self.source_chunk_ids) != len(self.source_chunk_indices):
+            raise ValueError(
+                "AcousticObservationPack.source_chunk_ids/source_chunk_indices 长度必须一致"
+            )
+        if not self.source_chunk_ids:
+            raise ValueError("AcousticObservationPack.source_chunk_ids 不能为空")
+        _ensure_time_span(
+            self.absolute_time_range[0],
+            self.absolute_time_range[1],
+            field_name="AcousticObservationPack.absolute_time_range",
+        )
+        if self.topk_limit is not None and int(self.topk_limit) <= 0:
+            raise ValueError("AcousticObservationPack.topk_limit 必须 > 0")
+
+
+@dataclass(frozen=True)
+class BoundaryCandidate:
+    split_token_index: int
+    event_time: float
+    reason: str
+    score: float
+    hard_boundary: bool = False
+    source_chunk_ids: Tuple[str, ...] = field(default_factory=tuple)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if int(self.split_token_index) < 0:
+            raise ValueError("BoundaryCandidate.split_token_index 必须 >= 0")
+        if float(self.event_time) < 0.0:
+            raise ValueError("BoundaryCandidate.event_time 必须 >= 0")
+        _ensure_probability("BoundaryCandidate.score", self.score)
+
+
+@dataclass(frozen=True)
+class AlignedToken:
+    token_id: str
+    text: str
+    start: float
+    end: float
+    source_chunk_ids: Tuple[str, ...]
+    confidence: float = 0.0
+    trace: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.token_id:
+            raise ValueError("AlignedToken.token_id 不能为空")
+        if not self.text:
+            raise ValueError("AlignedToken.text 不能为空")
+        if not self.source_chunk_ids:
+            raise ValueError("AlignedToken.source_chunk_ids 不能为空")
+        _ensure_time_span(self.start, self.end, field_name="AlignedToken")
+        _ensure_probability("AlignedToken.confidence", self.confidence)
+
+
+@dataclass(frozen=True)
+class LowConfidenceSpan:
+    start_token_index: int
+    end_token_index: int
+    reason: str
+    score: float
+
+    def __post_init__(self) -> None:
+        if int(self.start_token_index) < 0:
+            raise ValueError("LowConfidenceSpan.start_token_index 必须 >= 0")
+        if int(self.end_token_index) < int(self.start_token_index):
+            raise ValueError("LowConfidenceSpan.end_token_index 必须 >= start_token_index")
+        _ensure_probability("LowConfidenceSpan.score", self.score)
+
+
+@dataclass(frozen=True)
+class AlignmentPath:
+    path_id: str
+    aligned_tokens: Tuple[AlignedToken, ...]
+    route_confidence: float
+    low_confidence_spans: Tuple[LowConfidenceSpan, ...]
+    summary: LayerSummary
+    source_chunk_ids: Tuple[str, ...]
+    boundary_candidates: Tuple[BoundaryCandidate, ...] = field(default_factory=tuple)
+    contract_version: str = CONTRACT_VERSION
+
+    def __post_init__(self) -> None:
+        if not self.path_id:
+            raise ValueError("AlignmentPath.path_id 不能为空")
+        if not self.source_chunk_ids:
+            raise ValueError("AlignmentPath.source_chunk_ids 不能为空")
+        _ensure_probability("AlignmentPath.route_confidence", self.route_confidence)
+
+
+@dataclass(frozen=True)
+class AlignmentReport:
+    summary: LayerSummary
+    route: str
+    failure_semantic: str = "none"
+    warnings: Tuple[LayerWarning, ...] = field(default_factory=tuple)
+    errors: Tuple[LayerError, ...] = field(default_factory=tuple)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.route not in {"alignment_path", "selection_reject_slow", "alignment_no_path", "alignment_low_confidence", "true_mixed_unresolved"}:
+            raise ValueError(f"AlignmentReport.route 不支持: {self.route}")

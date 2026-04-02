@@ -95,6 +95,32 @@ class PostprocessTraceWriter:
             path=target.relative_to(job_dir).as_posix(),
         )
 
+    def write_layer_summary(
+        self,
+        *,
+        job_dir: Optional[Path],
+        layer_summary: Any,
+    ) -> None:
+        """写入冻结后的层级 summary。"""
+        if not self._enabled or job_dir is None:
+            return
+
+        serializable = self._to_jsonable(layer_summary)
+        if not isinstance(serializable, dict) or not str(serializable.get("layer", "")).strip():
+            raise ValueError("layer_summary 必须包含非空 layer 字段")
+
+        layer = str(serializable["layer"]).strip()
+        summary_dir = self._resolve_summary_dir(job_dir=job_dir)
+        filename = f"{layer}.summary.json"
+        target = summary_dir / filename
+        self._atomic_write_json(target, serializable)
+        self._update_summary_manifest(
+            job_dir=job_dir,
+            layer=layer,
+            filename=filename,
+            path=target.relative_to(job_dir).as_posix(),
+        )
+
     def _resolve_chunk_dir(self, *, job_dir: Path, chunk_index: int) -> Path:
         trace_dir = (
             job_dir
@@ -104,6 +130,11 @@ class PostprocessTraceWriter:
         )
         trace_dir.mkdir(parents=True, exist_ok=True)
         return trace_dir
+
+    def _resolve_summary_dir(self, *, job_dir: Path) -> Path:
+        summary_dir = job_dir / "debug" / "postprocess" / "summaries"
+        summary_dir.mkdir(parents=True, exist_ok=True)
+        return summary_dir
 
     def _update_manifest(
         self,
@@ -132,15 +163,37 @@ class PostprocessTraceWriter:
         manifest["updated_at"] = datetime.utcnow().isoformat() + "Z"
         self._atomic_write_json(manifest_path, manifest)
 
+    def _update_summary_manifest(
+        self,
+        *,
+        job_dir: Path,
+        layer: str,
+        filename: str,
+        path: str,
+    ) -> None:
+        manifest_path = job_dir / "debug" / "postprocess" / "manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest = self._load_manifest(manifest_path)
+        manifest.setdefault("summaries", {})[layer] = {
+            "filename": filename,
+            "layer": layer,
+            "kind": "summary",
+            "path": path,
+            "updated_at": datetime.utcnow().isoformat() + "Z",
+        }
+        manifest["updated_at"] = datetime.utcnow().isoformat() + "Z"
+        self._atomic_write_json(manifest_path, manifest)
+
     @staticmethod
     def _load_manifest(path: Path) -> Dict[str, Any]:
         if not path.exists():
             now = datetime.utcnow().isoformat() + "Z"
             return {
-                "schema_version": "1",
+                "schema_version": "2",
                 "created_at": now,
                 "updated_at": now,
                 "chunks": {},
+                "summaries": {},
             }
         try:
             with path.open("r", encoding="utf-8") as handle:
@@ -148,17 +201,20 @@ class PostprocessTraceWriter:
             if not isinstance(payload, dict):
                 raise ValueError("manifest 非对象")
             payload.setdefault("chunks", {})
-            payload.setdefault("schema_version", "1")
+            payload.setdefault("summaries", {})
+            payload.setdefault("schema_version", "2")
             payload.setdefault("created_at", datetime.utcnow().isoformat() + "Z")
             payload.setdefault("updated_at", datetime.utcnow().isoformat() + "Z")
             return payload
-        except Exception:
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
             now = datetime.utcnow().isoformat() + "Z"
             return {
-                "schema_version": "1",
+                "schema_version": "2",
                 "created_at": now,
                 "updated_at": now,
                 "chunks": {},
+                "summaries": {},
+                "load_error": str(exc),
             }
 
     @staticmethod
@@ -200,4 +256,3 @@ class PostprocessTraceWriter:
             except Exception:
                 return str(payload)
         return str(payload)
-

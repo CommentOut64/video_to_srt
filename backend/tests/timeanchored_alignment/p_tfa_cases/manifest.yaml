@@ -1,0 +1,50 @@
+version: "1"
+cases:
+  - case_id: duplicate-token-zh
+    case_type: duplicate_token
+    language_profile: zh
+    expected_route: alignment_path
+    expected_failure_semantic: none
+    data_ref: duplicate_token_zh.json
+  - case_id: one-to-many-zh
+    case_type: one_to_many
+    language_profile: zh
+    expected_route: alignment_path
+    expected_failure_semantic: none
+    data_ref: one_to_many_zh.json
+  - case_id: many-to-one-en
+    case_type: many_to_one
+    language_profile: en
+    expected_route: alignment_path
+    expected_failure_semantic: none
+    data_ref: many_to_one_en.json
+  - case_id: heteronym-zh
+    case_type: heteronym
+    language_profile: zh
+    expected_route: alignment_path
+    expected_failure_semantic: alignment_low_confidence
+    data_ref: heteronym_zh.json
+  - case_id: dominant-island-mixed
+    case_type: dominant_island
+    language_profile: dominant_zh_with_en_island
+    expected_route: alignment_path
+    expected_failure_semantic: none
+    data_ref: dominant_island_mixed.json
+  - case_id: true-mixed-unresolved
+    case_type: true_mixed
+    language_profile: true_mixed_zh_en
+    expected_route: true_mixed_unresolved
+    expected_failure_semantic: true_mixed_unresolved
+    data_ref: true_mixed_unresolved.json
+  - case_id: protected-structure-email
+    case_type: protected_structure
+    language_profile: zh
+    expected_route: alignment_path
+    expected_failure_semantic: none
+    data_ref: protected_structure_email.json
+  - case_id: slow-hallucination-force-fast
+    case_type: slow_hallucination
+    language_profile: zh
+    expected_route: selection_reject_slow
+    expected_failure_semantic: selection_reject_slow
+    data_ref: slow_hallucination_force_fast.json

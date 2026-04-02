@@ -177,3 +177,27 @@ class ReadySlowWindow:
             raise ValueError("ReadySlowWindow.owner_chunk_id 必须属于 source_chunk_ids")
         if self.owner_chunk_index not in self.source_chunk_indices:
             raise ValueError("ReadySlowWindow.owner_chunk_index 必须属于 source_chunk_indices")
+
+
+@dataclass(frozen=True)
+class SlowWindow:
+    window_id: str
+    source_chunk_ids: tuple[str, ...]
+    source_chunk_indices: tuple[int, ...]
+    source_units: tuple[WindowSourceUnit, ...]
+    coverage: WindowCoverage
+    flush_reason: str
+    mode: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.window_id:
+            raise ValueError("SlowWindow.window_id 不能为空")
+        if len(self.source_chunk_ids) != len(self.source_chunk_indices):
+            raise ValueError("SlowWindow.source_chunk_ids/source_chunk_indices 长度必须一致")
+        if not self.source_chunk_ids:
+            raise ValueError("SlowWindow.source_chunk_ids 不能为空")
+        if not self.flush_reason:
+            raise ValueError("SlowWindow.flush_reason 不能为空")
+        if not self.mode:
+            raise ValueError("SlowWindow.mode 不能为空")

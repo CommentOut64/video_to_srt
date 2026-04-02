@@ -1,0 +1,13 @@
+{
+  "case_id": "many-to-one-en",
+  "case_type": "many_to_one",
+  "language_profile": "en",
+  "expected_route": "alignment_path",
+  "expected_failure_semantic": "none",
+  "description": "多个文本 token 合并到单个快速观测的多对一场景。",
+  "selected_text": "gonna go",
+  "observation_tokens": [
+    "gonna",
+    "go"
+  ]
+}

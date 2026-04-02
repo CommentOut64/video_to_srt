@@ -1,0 +1,14 @@
+{
+  "case_id": "heteronym-zh",
+  "case_type": "heteronym",
+  "language_profile": "zh",
+  "expected_route": "alignment_path",
+  "expected_failure_semantic": "alignment_low_confidence",
+  "description": "多音字需要 pronunciation graph 维持候选而不是提前拍扁。",
+  "selected_text": "银行行长到了",
+  "observation_tokens": [
+    "银行",
+    "行长",
+    "到了"
+  ]
+}

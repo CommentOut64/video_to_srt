@@ -1,0 +1,14 @@
+{
+  "case_id": "one-to-many-zh",
+  "case_type": "one_to_many",
+  "language_profile": "zh",
+  "expected_route": "alignment_path",
+  "expected_failure_semantic": "none",
+  "description": "单个慢流词需吸附到多个观测 slice 的一对多场景。",
+  "selected_text": "看一下",
+  "observation_tokens": [
+    "看",
+    "一",
+    "下"
+  ]
+}

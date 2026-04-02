@@ -1,0 +1,14 @@
+{
+  "case_id": "protected-structure-email",
+  "case_type": "protected_structure",
+  "language_profile": "zh",
+  "expected_route": "alignment_path",
+  "expected_failure_semantic": "none",
+  "description": "受保护结构不能在准备层之后被拆断。",
+  "selected_text": "请发到 demo@example.com",
+  "observation_tokens": [
+    "请",
+    "发到",
+    "demo@example.com"
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "case_id": "true-mixed-unresolved",
+  "case_type": "true_mixed",
+  "language_profile": "true_mixed_zh_en",
+  "expected_route": "true_mixed_unresolved",
+  "expected_failure_semantic": "true_mixed_unresolved",
+  "description": "真实混合语种无法稳定吸附时，应输出明确失败语义。",
+  "selected_text": "这个 meeting 我们晚点 follow up",
+  "observation_tokens": [
+    "这个",
+    "meeting",
+    "我们",
+    "晚点",
+    "follow",
+    "up"
+  ]
+}

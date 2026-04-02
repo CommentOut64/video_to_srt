@@ -1,0 +1,16 @@
+{
+  "case_id": "dominant-island-mixed",
+  "case_type": "dominant_island",
+  "language_profile": "dominant_zh_with_en_island",
+  "expected_route": "alignment_path",
+  "expected_failure_semantic": "none",
+  "description": "dominant + island 混合语种场景，英文岛不应破坏主路径。",
+  "selected_text": "我们先 check 这个版本",
+  "observation_tokens": [
+    "我们",
+    "先",
+    "check",
+    "这个",
+    "版本"
+  ]
+}

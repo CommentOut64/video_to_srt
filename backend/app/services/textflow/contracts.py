@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 import unicodedata
 
-from app.services.timeanchored_alignment.contracts import BoundaryEvidence, ProtectedSpan
+from app.services.timeanchored_alignment.contracts import BoundaryEvidence, LayerSummary, ProtectedSpan
 
 
 CONTRACT_VERSION = "1.0"
@@ -339,6 +339,108 @@ class SubtitleBatch:
             raise ValueError("SubtitleBatch.chunk_index 必须 >= 0")
 
 
+@dataclass(frozen=True)
+class Sentence:
+    sentence_id: str
+    text: str
+    start: float
+    end: float
+    token_span: tuple[int, int] | None = None
+    source_chunk_ids: Tuple[str, ...] = field(default_factory=tuple)
+    overlap_chunk_ids: Tuple[str, ...] = field(default_factory=tuple)
+    replace_scope_chunk_ids: Tuple[str, ...] = field(default_factory=tuple)
+    route: str = ""
+    trace: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.sentence_id:
+            raise ValueError("Sentence.sentence_id 不能为空")
+        if not self.text:
+            raise ValueError("Sentence.text 不能为空")
+        _ensure_time_span(self.start, self.end, field_name="Sentence")
+        if self.token_span is not None:
+            if int(self.token_span[0]) < 0 or int(self.token_span[1]) < int(self.token_span[0]):
+                raise ValueError("Sentence.token_span 非法")
+
+
+@dataclass(frozen=True)
+class AlignedSentence:
+    sentence_id: str
+    text: str
+    start: float
+    end: float
+    token_span: tuple[int, int] | None = None
+    source_chunk_ids: Tuple[str, ...] = field(default_factory=tuple)
+    trace: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.sentence_id:
+            raise ValueError("AlignedSentence.sentence_id 不能为空")
+        if not self.text:
+            raise ValueError("AlignedSentence.text 不能为空")
+        _ensure_time_span(self.start, self.end, field_name="AlignedSentence")
+
+
+@dataclass(frozen=True)
+class SentenceRecord:
+    sentence_id: str
+    text: str
+    start: float
+    end: float
+    source_chunk_ids: Tuple[str, ...] = field(default_factory=tuple)
+    overlap_chunk_ids: Tuple[str, ...] = field(default_factory=tuple)
+    replace_scope_chunk_ids: Tuple[str, ...] = field(default_factory=tuple)
+    route: str = ""
+    trace: Dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.sentence_id:
+            raise ValueError("SentenceRecord.sentence_id 不能为空")
+        if not self.text:
+            raise ValueError("SentenceRecord.text 不能为空")
+        _ensure_time_span(self.start, self.end, field_name="SentenceRecord")
+
+
+@dataclass(frozen=True)
+class ChunkSentenceIndex:
+    chunk_id: str
+    sentence_ids: Tuple[str, ...]
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.chunk_id:
+            raise ValueError("ChunkSentenceIndex.chunk_id 不能为空")
+
+
+@dataclass(frozen=True)
+class SegmentationReport:
+    summary: LayerSummary
+    sentence_count: int = 0
+    boundary_reason_counts: Dict[str, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if int(self.sentence_count) < 0:
+            raise ValueError("SegmentationReport.sentence_count 必须 >= 0")
+
+
+@dataclass(frozen=True)
+class OutputReport:
+    summary: LayerSummary
+    affected_chunk_count: int = 0
+    cross_chunk_sentence_count: int = 0
+    replace_scope_chunk_ids: Tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        if int(self.affected_chunk_count) < 0:
+            raise ValueError("OutputReport.affected_chunk_count 必须 >= 0")
+        if int(self.cross_chunk_sentence_count) < 0:
+            raise ValueError("OutputReport.cross_chunk_sentence_count 必须 >= 0")
+
+
+SubtitleBatchCompat = SubtitleBatch
+
+
 __all__ = [
     "CONTRACT_VERSION",
     "CoreToken",
@@ -353,6 +455,13 @@ __all__ = [
     "RenderPolicy",
     "RenderedSubtitle",
     "RenderResult",
+    "Sentence",
+    "AlignedSentence",
+    "SentenceRecord",
+    "ChunkSentenceIndex",
+    "SegmentationReport",
+    "OutputReport",
     "SubtitleItem",
     "SubtitleBatch",
+    "SubtitleBatchCompat",
 ]
