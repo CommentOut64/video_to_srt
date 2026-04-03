@@ -4,10 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.pipelines.dual_pipeline.services.alignment_stage_service import AlignmentStageService
 from app.services.alignment.types import CharMapping, L2Input, QualitySignals, TextTrack
-from app.services.alignment.types import L2Output, TextTrackBundle
-from app.services.arbitration.arbiter import ArbitrationResult, TextArbiterProcessor
+from app.services.alignment.types import TextTrackBundle
+from app.services.arbitration.arbiter import TextArbiterProcessor
+from app.services.timeanchored_alignment.selection.service import TextSelectionService
 
 
 def _build_track(*, text: str, source: str) -> TextTrack:
@@ -174,31 +174,35 @@ def test_force_mode_missing_source_returns_error_without_fallback() -> None:
     assert result.chosen_text_track is None
 
 
-def test_alignment_stage_raises_when_forced_source_missing() -> None:
+def test_selection_service_raises_when_forced_source_missing() -> None:
+    service = TextSelectionService(logger=None)
     tracks = TextTrackBundle(
         sv_track=_build_track(text="快流文本", source="sv"),
         whisper_track=None,
-        chosen_track=None,
     )
-    arbitration_result = ArbitrationResult(
-        chosen_source="slow",
-        reason="forced_source_missing",
-        sv_score=0.8,
-        wh_score=0.0,
-        coverage=0.0,
-        error_code="E_L2_ARBITRATION_FORCED_SOURCE_MISSING",
-        is_edge_selection_bypassed=True,
-        forced_source="slow",
+    ctx = SimpleNamespace(
+        job_id="job-force-missing",
+        chunk_index=5,
         edge_selection_mode="force_slow",
+        ready_slow_window=None,
+        audio_chunk=SimpleNamespace(chunk_id="chunk-5"),
+    )
+    selection_inputs = service.build_selection_inputs(
+        ctx=ctx,
+        tracks=tracks,
+        quality_signals=QualitySignals(
+            is_hallucination=False,
+            confidence_fast=0.8,
+            confidence_slow=0.0,
+        ),
+        sv_result={"text_itn_raw": "快流文本"},
+        whisper_result={},
     )
 
     with pytest.raises(ValueError, match="强制选边源缺失"):
-        AlignmentStageService._apply_arbitration_track_selection(
-            host=SimpleNamespace(_clone_text_track=lambda track, source: track),
-            chunk_index=5,
-            tracks=tracks,
-            arbitration_output=L2Output(
-                chosen_text_track=None,
-                arbitration_result=arbitration_result,
-            ),
+        service.select(
+            ctx=ctx,
+            selection_inputs=selection_inputs,
+            arbitration_processor=TextArbiterProcessor(),
+            clone_text_track=lambda track, source: track,
         )

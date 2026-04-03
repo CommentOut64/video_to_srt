@@ -50,6 +50,7 @@ from app.services.timeanchored_alignment.output_projection.output_projector impo
     OutputProjectionInput,
     OutputProjector,
 )
+from app.services.timeanchored_alignment.selection import TextSelectionService
 from app.pipelines.dual_pipeline.services.postprocess_trace_writer import PostprocessTraceWriter
 from app.pipelines.dual_pipeline.services.anchor_mount_graph_renderer import (
     AnchorMountGraphRenderer,
@@ -69,6 +70,7 @@ class AlignmentStageService:
         self._timeanchored_stage_service = AnchorMountAlignmentService()
         self._decision_ingress_adapter = DecisionIngressAdapter()
         self._output_projector = OutputProjector()
+        self._selection_service = TextSelectionService(logger=getattr(host, "logger", None))
         self._postprocess_trace_writer = PostprocessTraceWriter(
             logger=getattr(host, "logger", None),
             enabled=bool(getattr(host, "_postprocess_trace_enabled", False)),
@@ -105,29 +107,47 @@ class AlignmentStageService:
         # V3.2.0+dev.20260202.07: Whisper 清洗增强 + 规范化重算
         host._apply_whisper_full_sanitize(ctx)
 
-        arbitration_output = host._run_arbitration(ctx, sv_result, whisper_result)
-        arbitration_result = arbitration_output.arbitration_result
-        ctx.arbitration_result = arbitration_result
         tracks = host._ensure_text_tracks(ctx)
-        self._apply_arbitration_track_selection(
-            host=host,
-            chunk_index=ctx.chunk_index,
+        quality_signals = host._build_quality_signals(
+            sv_result=sv_result,
+            whisper_result=whisper_result,
             tracks=tracks,
-            arbitration_output=arbitration_output,
         )
-
-        chosen_text_clean = host._select_text_for_alignment(tracks.chosen_track)
-        host._apply_arbitration_text(
-            whisper_result,
-            sv_result,
-            arbitration_result.chosen_source,
-            chosen_text_clean,
+        selection_inputs = self._selection_service.build_selection_inputs(
+            ctx=ctx,
+            tracks=tracks,
+            quality_signals=quality_signals,
+            sv_result=sv_result,
+            whisper_result=whisper_result,
         )
+        selection_outcome = self._selection_service.select(
+            ctx=ctx,
+            selection_inputs=selection_inputs,
+            arbitration_processor=host._l2_processor,
+            clone_text_track=host._clone_text_track,
+        )
+        arbitration_output = selection_outcome.arbitration_output
+        arbitration_result = selection_outcome.arbitration_result
+        ctx.selected_text_truth = selection_outcome.selected_text_truth
+        ctx.selection_decision = selection_outcome.selection_decision
+        ctx.selection_report = selection_outcome.selection_report
+        ctx.arbitration_result = arbitration_result
+        self._write_selection_trace(
+            ctx=ctx,
+            selection_outcome=selection_outcome,
+        )
+        chosen_text_clean = self._selection_service.apply_runtime_selection(
+            tracks=tracks,
+            whisper_result=whisper_result,
+            sv_result=sv_result,
+            selection_outcome=selection_outcome,
+        )
+        chosen_source = selection_outcome.selection_decision.chosen_source
         # V3.2.0+dev.20260204.10: 删除慢流补跑分支，定稿标点仅走统一前置入口
         punct_track: Optional[PunctTrack] = None
         # V3.2.0+dev.20260204.11: 若仲裁选择 fast 且快流已产出同一 clean_text_ref 的 PunctTrack，直接复用避免重复跑模型
         if (
-            arbitration_result.chosen_source == "fast"
+            chosen_source == "fast"
             and ctx.punct_track is not None
             and tracks.chosen_track is not None
             and ctx.punct_track.clean_text_ref == tracks.chosen_track.text_clean
@@ -138,7 +158,7 @@ class AlignmentStageService:
                 ctx,
                 sv_result,
                 whisper_result,
-                arbitration_result.chosen_source,
+                chosen_source,
             )
         ctx.punct_track = punct_track
         punctuation_positions = punct_track.positions if punct_track and punct_track.positions else None
@@ -161,8 +181,8 @@ class AlignmentStageService:
         host.logger.debug(
             "Chunk {}: 选文完成 chosen_source={} reason={} coverage={:.2f}",
             ctx.chunk_index,
-            arbitration_result.chosen_source,
-            arbitration_result.reason,
+            chosen_source,
+            str(getattr(ctx.selection_report, "primary_reason_code", "") or arbitration_result.reason),
             arbitration_result.coverage,
         )
 
@@ -172,7 +192,8 @@ class AlignmentStageService:
         turn_id = host._resolve_turn_id_for_chunk(ctx.audio_chunk) if ctx.audio_chunk else None
         policy_snapshot = None
         language_hint = str(
-            (tracks.chosen_track.language if tracks.chosen_track else "")
+            (getattr(ctx.selected_text_truth, "language_hint", "") or "")
+            or (tracks.chosen_track.language if tracks.chosen_track else "")
             or whisper_result.get("language")
             or getattr(chunk, "language", "")
             or "auto"
@@ -541,7 +562,7 @@ class AlignmentStageService:
                     sv_result=sv_result,
                 )
                 fallback_confidence = self._resolve_text_fallback_confidence(
-                    chosen_source=arbitration_result.chosen_source,
+                    chosen_source=self._resolve_selected_source(ctx, default="slow"),
                     whisper_result=whisper_result,
                     sv_result=sv_result,
                 )
@@ -555,7 +576,9 @@ class AlignmentStageService:
                 fallback_sentence.speaker_id = speaker_id
                 fallback_sentence.turn_id = turn_id
                 fallback_sentence.confidence_source = (
-                    "slow" if arbitration_result.chosen_source == "slow" else "fast"
+                    "slow"
+                    if self._resolve_selected_source(ctx, default="slow") == "slow"
+                    else "fast"
                 )
                 final_sentences = [fallback_sentence]
                 host._assign_sentence_identity_by_timeline_overlap(
@@ -798,8 +821,8 @@ class AlignmentStageService:
         try:
             base_language = str(language_hint or "auto")
             fallback_text = self._resolve_text_fallback_content(
-                chosen_text_clean=host._select_text_for_alignment(
-                    getattr(tracks, "chosen_track", None)
+                chosen_text_clean=str(
+                    getattr(getattr(ctx, "selected_text_truth", None), "text", "") or ""
                 ),
                 tracks=tracks,
                 whisper_result=whisper_result,
@@ -1282,7 +1305,7 @@ class AlignmentStageService:
             if not fallback_text:
                 fallback_text = chosen_text_clean
             fallback_confidence = self._resolve_text_fallback_confidence(
-                chosen_source=str(getattr(ctx.arbitration_result, "chosen_source", "") or "slow"),
+                chosen_source=self._resolve_selected_source(ctx, default="slow"),
                 whisper_result=whisper_result,
                 sv_result=sv_result,
             )
@@ -1375,7 +1398,7 @@ class AlignmentStageService:
             else 0
         )
         punctuation_chain_health = self._build_punctuation_chain_health_metrics(
-            chosen_source=str(getattr(ctx.arbitration_result, "chosen_source", "") or "unknown"),
+            chosen_source=self._resolve_selected_source(ctx, default="unknown"),
             punct_track=ctx.punct_track,
             preparation_punctuation_count=preparation_punctuation_count,
             punctuation_fact_count=int(len(stage_result.decision_ingress.punctuation_facts)),
@@ -2416,32 +2439,53 @@ class AlignmentStageService:
             is_finalized=True,
         )
 
-    @staticmethod
-    def _apply_arbitration_track_selection(
+    def _write_selection_trace(
+        self,
         *,
-        host: Any,
-        chunk_index: int,
-        tracks: Any,
-        arbitration_output: Any,
+        ctx: ProcessingContext,
+        selection_outcome: Any,
     ) -> None:
-        arbitration_result = getattr(arbitration_output, "arbitration_result", None)
-        if arbitration_output.chosen_text_track:
-            tracks.chosen_track = arbitration_output.chosen_text_track
+        writer = self._postprocess_trace_writer
+        if not writer.enabled:
             return
-        if (
-            arbitration_result is not None
-            and str(getattr(arbitration_result, "error_code", "") or "")
-            == "E_L2_ARBITRATION_FORCED_SOURCE_MISSING"
-        ):
-            forced_source = str(getattr(arbitration_result, "forced_source", "") or "")
-            raise ValueError(
-                f"Chunk {chunk_index}: 强制选边源缺失，终止本 chunk 定稿。forced_source={forced_source}"
-            )
-        if tracks.chosen_track is None:
-            fallback_track = tracks.sv_track or tracks.whisper_track
-            if fallback_track:
-                tracks.chosen_track = host._clone_text_track(
-                    fallback_track,
-                    source="chosen",
-                )
+        writer.write_stage(
+            job_dir=ctx.job_dir,
+            chunk_index=int(ctx.chunk_index),
+            filename="04_selection.input.json",
+            payload=selection_outcome.selection_inputs,
+            stage="selection_input",
+        )
+        writer.write_stage(
+            job_dir=ctx.job_dir,
+            chunk_index=int(ctx.chunk_index),
+            filename="05_selection.output.json",
+            payload={
+                "selected_text_truth": selection_outcome.selected_text_truth,
+                "selection_decision": selection_outcome.selection_decision,
+                "selection_report": selection_outcome.selection_report,
+            },
+            stage="selection_output",
+        )
+        writer.write_layer_summary(
+            job_dir=ctx.job_dir,
+            layer_summary=selection_outcome.selection_report.summary,
+        )
+
+    @staticmethod
+    def _resolve_selected_source(ctx: ProcessingContext, *, default: str) -> str:
+        selection_decision = getattr(ctx, "selection_decision", None)
+        if selection_decision is not None:
+            chosen_source = str(
+                getattr(selection_decision, "chosen_source", "")
+                or getattr(selection_decision, "accepted_text_source", "")
+                or ""
+            ).strip()
+            if chosen_source:
+                return chosen_source
+        arbitration_result = getattr(ctx, "arbitration_result", None)
+        if arbitration_result is not None:
+            chosen_source = str(getattr(arbitration_result, "chosen_source", "") or "").strip()
+            if chosen_source:
+                return chosen_source
+        return default
 

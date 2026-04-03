@@ -37,6 +37,33 @@ def test_emit_layer_trace_full_includes_timeanchored_raw_mount_trace() -> None:
         job_id="job-diag",
         chunk_index=7,
         job_dir=None,
+        selected_text_truth=SimpleNamespace(
+            text="你",
+            text_source="slow",
+            language_hint="zh",
+            source_chunk_ids=("chunk-7",),
+            quality={"confidence_slow": 0.9},
+            rejection_reasons=(),
+            metadata={"edge_selection_mode": "auto"},
+        ),
+        selection_decision=SimpleNamespace(
+            decision="accept_slow",
+            chosen_source="slow",
+            reason_code="test",
+            reason_codes=("test",),
+            metadata={"coverage": 1.0},
+        ),
+        selection_report=SimpleNamespace(
+            chosen_source="slow",
+            primary_reason_code="test",
+            decision="accept_slow",
+            reason_codes=("test",),
+            warnings=(),
+            errors=(),
+            metrics={"confidence_slow": 0.9},
+            metadata={},
+            summary={"layer": "selection", "status": "ok"},
+        ),
         arbitration_result=ArbitrationResult(
             chosen_source="slow",
             reason="test",
@@ -107,3 +134,6 @@ def test_emit_layer_trace_full_includes_timeanchored_raw_mount_trace() -> None:
 
     payload = captured["payload"]
     assert payload["timeanchored_alignment"]["raw_mount_trace"]["mapping_pairs"][0]["text"] == "你"
+    assert payload["selection"]["selected_text_truth"]["text"] == "你"
+    assert payload["selection"]["selection_decision"]["chosen_source"] == "slow"
+    assert payload["selection"]["selection_report"]["summary"]["layer"] == "selection"

@@ -415,6 +415,22 @@ class SelectedTextTruth:
         if not self.source_chunk_ids:
             raise ValueError("SelectedTextTruth.source_chunk_ids 不能为空")
 
+    @property
+    def normalized_text(self) -> str:
+        return self.text
+
+    @property
+    def raw_text(self) -> str:
+        return str(self.metadata.get("raw_text") or self.text)
+
+    @property
+    def source(self) -> str:
+        return self.text_source
+
+    @property
+    def language(self) -> str:
+        return self.language_hint
+
 
 @dataclass(frozen=True)
 class SelectionDecision:
@@ -424,13 +440,50 @@ class SelectionDecision:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if self.decision not in {"accept_slow", "force_fast", "mixed"}:
+        if self.decision not in {
+            "accept_slow",
+            "accept_fast",
+            "force_fast",
+            "force_slow",
+            "mixed",
+        }:
             raise ValueError(f"SelectionDecision.decision 不支持: {self.decision}")
         if self.accepted_text_source not in {"fast", "slow", "mixed"}:
             raise ValueError(
                 "SelectionDecision.accepted_text_source 不支持: "
                 f"{self.accepted_text_source}"
             )
+
+    @property
+    def chosen_source(self) -> str:
+        return self.accepted_text_source
+
+    @property
+    def reason_code(self) -> str:
+        if self.reason_codes:
+            return str(self.reason_codes[0] or "")
+        return ""
+
+
+@dataclass(frozen=True)
+class SelectionReport:
+    chosen_source: str
+    primary_reason_code: str
+    decision: str
+    summary: LayerSummary
+    reason_codes: Tuple[str, ...] = field(default_factory=tuple)
+    warnings: Tuple[LayerWarning, ...] = field(default_factory=tuple)
+    errors: Tuple[LayerError, ...] = field(default_factory=tuple)
+    metrics: Dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.chosen_source not in {"fast", "slow", "mixed"}:
+            raise ValueError(f"SelectionReport.chosen_source 不支持: {self.chosen_source}")
+        if not self.primary_reason_code:
+            raise ValueError("SelectionReport.primary_reason_code 不能为空")
+        if self.summary.layer != "selection":
+            raise ValueError("SelectionReport.summary.layer 必须为 selection")
 
 
 @dataclass(frozen=True)

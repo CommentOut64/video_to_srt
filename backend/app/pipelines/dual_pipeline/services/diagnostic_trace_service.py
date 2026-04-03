@@ -89,10 +89,12 @@ class DiagnosticTraceService:
         append_debug_layer_diag_line: Any,
     ) -> None:
         """输出分层诊断到独立文件（四层口径）。"""
-        chosen_clean = tracks.chosen_track.text_clean if tracks.chosen_track else ""
+        chosen_clean = self._resolve_selected_text(ctx=ctx, tracks=tracks)
         punct_ref = punct_track.clean_text_ref if punct_track else ""
         chosen_compact = str(chosen_clean or "").replace("\n", " ").strip()
         punct_compact = str(punct_ref or "").replace("\n", " ").strip()
+        chosen_source = self._resolve_selected_source(ctx)
+        selection_reason = self._resolve_selection_reason(ctx)
 
         unmatched_prefix_len = 0
         for aligned_word in alignment_result.aligned_words:
@@ -106,9 +108,7 @@ class DiagnosticTraceService:
             unmatched_prefix_len += len(str(aligned_word.word or ""))
 
         is_ref_mismatch = bool(chosen_compact and punct_compact and chosen_compact != punct_compact)
-        is_slow_chosen = bool(
-            ctx.arbitration_result and ctx.arbitration_result.chosen_source == "slow"
-        )
+        is_slow_chosen = chosen_source == "slow"
         punct_positions_count = len(punct_track.positions) if punct_track and punct_track.positions else 0
         is_cross_chunk_boundary_suspected = bool(
             is_slow_chosen
@@ -133,8 +133,9 @@ class DiagnosticTraceService:
             "job_id": ctx.job_id,
             "chunk_index": int(ctx.chunk_index),
             "layer": "选文到裁决",
-            "chosen_source": ctx.arbitration_result.chosen_source if ctx.arbitration_result else "",
-            "arbitration_reason": ctx.arbitration_result.reason if ctx.arbitration_result else "",
+            "chosen_source": chosen_source,
+            "arbitration_reason": selection_reason,
+            "selection_reason": selection_reason,
             "chosen_clean_len": len(chosen_clean or ""),
             "l2_chosen_text_head": self._clip_head(chosen_compact),
             "l2_chosen_text_tail": self._clip_tail(chosen_compact),
@@ -243,8 +244,10 @@ class DiagnosticTraceService:
             "chunk_index": int(ctx.chunk_index),
             "layer": "全链路追踪",
             "arbitration": {
-                "chosen_source": arbitration_output.arbitration_result.chosen_source,
-                "reason": arbitration_output.arbitration_result.reason,
+                "chosen_source": self._resolve_selected_source(ctx)
+                or arbitration_output.arbitration_result.chosen_source,
+                "reason": self._resolve_selection_reason(ctx)
+                or arbitration_output.arbitration_result.reason,
                 "coverage": float(arbitration_output.arbitration_result.coverage),
                 "sv_score": float(arbitration_output.arbitration_result.sv_score),
                 "wh_score": float(arbitration_output.arbitration_result.wh_score),
@@ -279,6 +282,7 @@ class DiagnosticTraceService:
                 "whisper_track": self._serialize_text_track(tracks.whisper_track),
                 "chosen_track": self._serialize_text_track(tracks.chosen_track),
             },
+            "selection": self._serialize_selection(ctx=ctx, tracks=tracks),
             "punctuation_pre": {
                 "input": {
                     "chosen_source": punctuation_pre_input.get("chosen_source"),
@@ -330,6 +334,217 @@ class DiagnosticTraceService:
             },
         }
         append_debug_layer_trace_line(ctx.job_dir, payload, logger=self.logger)
+
+    @staticmethod
+    def _resolve_selected_text(*, ctx: Any, tracks: TextTrackBundle) -> str:
+        selected_text_truth = getattr(ctx, "selected_text_truth", None)
+        if selected_text_truth is not None:
+            selected_text = str(
+                getattr(selected_text_truth, "text", "")
+                or getattr(selected_text_truth, "normalized_text", "")
+                or getattr(selected_text_truth, "raw_text", "")
+                or ""
+            ).strip()
+            if selected_text:
+                return selected_text
+        chosen_track = getattr(tracks, "chosen_track", None)
+        if chosen_track is None:
+            return ""
+        return str(
+            getattr(chosen_track, "text_clean", "")
+            or getattr(chosen_track, "text_itn_raw", "")
+            or getattr(chosen_track, "raw_text", "")
+            or ""
+        ).strip()
+
+    @classmethod
+    def _serialize_selection(cls, *, ctx: Any, tracks: TextTrackBundle) -> Dict[str, Any]:
+        selected_text_truth = getattr(ctx, "selected_text_truth", None)
+        selection_decision = getattr(ctx, "selection_decision", None)
+        selection_report = getattr(ctx, "selection_report", None)
+        return {
+            "selected_text_truth": cls._serialize_selected_text_truth(
+                selected_text_truth=selected_text_truth,
+                tracks=tracks,
+            ),
+            "selection_decision": cls._serialize_selection_decision(selection_decision),
+            "selection_report": cls._serialize_selection_report(selection_report),
+        }
+
+    @staticmethod
+    def _serialize_selected_text_truth(
+        *,
+        selected_text_truth: Any,
+        tracks: TextTrackBundle,
+    ) -> Dict[str, Any]:
+        if selected_text_truth is not None:
+            return {
+                "text": str(
+                    getattr(selected_text_truth, "text", "")
+                    or getattr(selected_text_truth, "normalized_text", "")
+                    or ""
+                ),
+                "text_source": str(
+                    getattr(selected_text_truth, "text_source", "")
+                    or getattr(selected_text_truth, "source", "")
+                    or ""
+                ),
+                "language_hint": str(
+                    getattr(selected_text_truth, "language_hint", "")
+                    or getattr(selected_text_truth, "language", "")
+                    or ""
+                ),
+                "source_chunk_ids": [
+                    str(item)
+                    for item in (getattr(selected_text_truth, "source_chunk_ids", ()) or ())
+                ],
+                "quality": dict(getattr(selected_text_truth, "quality", {}) or {}),
+                "rejection_reasons": [
+                    str(item)
+                    for item in (getattr(selected_text_truth, "rejection_reasons", ()) or ())
+                ],
+                "metadata": dict(getattr(selected_text_truth, "metadata", {}) or {}),
+            }
+        chosen_track = getattr(tracks, "chosen_track", None)
+        if chosen_track is None:
+            return {}
+        return {
+            "text": str(
+                getattr(chosen_track, "text_clean", "")
+                or getattr(chosen_track, "text_itn_raw", "")
+                or getattr(chosen_track, "raw_text", "")
+                or ""
+            ),
+            "text_source": str(getattr(chosen_track, "source", "") or ""),
+            "language_hint": str(getattr(chosen_track, "language", "") or ""),
+            "source_chunk_ids": [],
+            "quality": {},
+            "rejection_reasons": [],
+            "metadata": {},
+        }
+
+    @staticmethod
+    def _serialize_selection_decision(selection_decision: Any) -> Dict[str, Any]:
+        if selection_decision is None:
+            return {}
+        return {
+            "decision": str(getattr(selection_decision, "decision", "") or ""),
+            "chosen_source": str(
+                getattr(selection_decision, "chosen_source", "")
+                or getattr(selection_decision, "accepted_text_source", "")
+                or ""
+            ),
+            "reason_code": str(getattr(selection_decision, "reason_code", "") or ""),
+            "reason_codes": [
+                str(item)
+                for item in (getattr(selection_decision, "reason_codes", ()) or ())
+            ],
+            "metadata": dict(getattr(selection_decision, "metadata", {}) or {}),
+        }
+
+    @classmethod
+    def _serialize_selection_report(cls, selection_report: Any) -> Dict[str, Any]:
+        if selection_report is None:
+            return {}
+        return {
+            "chosen_source": str(getattr(selection_report, "chosen_source", "") or ""),
+            "primary_reason_code": str(
+                getattr(selection_report, "primary_reason_code", "") or ""
+            ),
+            "decision": str(getattr(selection_report, "decision", "") or ""),
+            "reason_codes": [
+                str(item)
+                for item in (getattr(selection_report, "reason_codes", ()) or ())
+            ],
+            "warnings": [
+                cls._serialize_named_message(item)
+                for item in (getattr(selection_report, "warnings", ()) or ())
+            ],
+            "errors": [
+                cls._serialize_named_message(item)
+                for item in (getattr(selection_report, "errors", ()) or ())
+            ],
+            "metrics": dict(getattr(selection_report, "metrics", {}) or {}),
+            "metadata": dict(getattr(selection_report, "metadata", {}) or {}),
+            "summary": cls._serialize_layer_summary(getattr(selection_report, "summary", None)),
+        }
+
+    @staticmethod
+    def _serialize_named_message(item: Any) -> Dict[str, Any]:
+        if item is None:
+            return {}
+        if isinstance(item, dict):
+            return dict(item)
+        return {
+            "code": str(getattr(item, "code", "") or ""),
+            "message": str(getattr(item, "message", "") or ""),
+            "layer": str(getattr(item, "layer", "") or ""),
+            "job_id": str(getattr(item, "job_id", "") or ""),
+            "window_id": str(getattr(item, "window_id", "") or ""),
+            "chunk_id": str(getattr(item, "chunk_id", "") or ""),
+            "details": dict(getattr(item, "details", {}) or {}),
+        }
+
+    @classmethod
+    def _serialize_layer_summary(cls, summary: Any) -> Dict[str, Any]:
+        if summary is None:
+            return {}
+        if isinstance(summary, dict):
+            return dict(summary)
+        return {
+            "layer": str(getattr(summary, "layer", "") or ""),
+            "status": str(getattr(summary, "status", "") or ""),
+            "counters": dict(getattr(summary, "counters", {}) or {}),
+            "warnings": [
+                cls._serialize_named_message(item)
+                for item in (getattr(summary, "warnings", ()) or ())
+            ],
+            "errors": [
+                cls._serialize_named_message(item)
+                for item in (getattr(summary, "errors", ()) or ())
+            ],
+            "debug_enabled": bool(getattr(summary, "debug_enabled", False)),
+            "artifact_refs": [
+                str(item)
+                for item in (getattr(summary, "artifact_refs", ()) or ())
+            ],
+        }
+
+    @staticmethod
+    def _resolve_selected_source(ctx: Any) -> str:
+        selection_decision = getattr(ctx, "selection_decision", None)
+        if selection_decision is not None:
+            chosen_source = str(
+                getattr(selection_decision, "chosen_source", "")
+                or getattr(selection_decision, "accepted_text_source", "")
+                or ""
+            ).strip()
+            if chosen_source:
+                return chosen_source
+        arbitration_result = getattr(ctx, "arbitration_result", None)
+        if arbitration_result is not None:
+            return str(getattr(arbitration_result, "chosen_source", "") or "").strip()
+        return ""
+
+    @staticmethod
+    def _resolve_selection_reason(ctx: Any) -> str:
+        selection_report = getattr(ctx, "selection_report", None)
+        if selection_report is not None:
+            primary_reason = str(getattr(selection_report, "primary_reason_code", "") or "").strip()
+            if primary_reason:
+                return primary_reason
+        selection_decision = getattr(ctx, "selection_decision", None)
+        if selection_decision is not None:
+            reason_code = str(getattr(selection_decision, "reason_code", "") or "").strip()
+            if reason_code:
+                return reason_code
+            reason_codes = tuple(getattr(selection_decision, "reason_codes", ()) or ())
+            if reason_codes:
+                return str(reason_codes[0] or "").strip()
+        arbitration_result = getattr(ctx, "arbitration_result", None)
+        if arbitration_result is not None:
+            return str(getattr(arbitration_result, "reason", "") or "").strip()
+        return ""
 
     @staticmethod
     def _clip_head(text: str, limit: int = 40) -> str:

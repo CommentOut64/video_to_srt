@@ -151,18 +151,38 @@ def _patch_common_alignment_inputs(
         "你 好 世 界" if chosen_source == "fast" else "你好世界",
         "chosen",
     )
+    arbitration_result = ArbitrationResult(
+        chosen_source=chosen_source,
+        reason="test",
+        sv_score=0.8,
+        wh_score=0.9,
+        coverage=1.0,
+    )
     monkeypatch.setattr(
-        pipeline,
-        "_run_arbitration",
-        lambda *_args, **_kwargs: L2Output(
-            chosen_text_track=chosen_track,
-            arbitration_result=ArbitrationResult(
-                chosen_source=chosen_source,
-                reason="test",
-                sv_score=0.8,
-                wh_score=0.9,
-                coverage=1.0,
-            ),
+        pipeline._alignment_stage_service._selection_service,
+        "build_selection_inputs",
+        Mock(return_value=SimpleNamespace(scope="selection-input")),
+    )
+    monkeypatch.setattr(
+        pipeline._alignment_stage_service._selection_service,
+        "select",
+        Mock(
+            return_value=SimpleNamespace(
+                selected_text_truth=SimpleNamespace(
+                    text=chosen_track.text_clean,
+                    language_hint="zh",
+                ),
+                selection_decision=SimpleNamespace(chosen_source=chosen_source),
+                selection_report=SimpleNamespace(primary_reason_code="test", summary={"layer": "selection"}),
+                selection_inputs=SimpleNamespace(scope="selection-input"),
+                arbitration_output=L2Output(
+                    chosen_text_track=chosen_track,
+                    arbitration_result=arbitration_result,
+                ),
+                arbitration_result=arbitration_result,
+                chosen_track=chosen_track,
+                chosen_text_clean=chosen_track.text_clean,
+            )
         ),
     )
     monkeypatch.setattr(

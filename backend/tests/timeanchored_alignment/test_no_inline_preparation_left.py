@@ -295,7 +295,6 @@ def test_run_timeanchored_main_chain_delegates_to_preparation_service(monkeypatc
         _whisper_sanitizer=None,
         _hallucination_detector=None,
         _edge_selection_mode="auto",
-        _select_text_for_alignment=lambda track: str(getattr(track, "text_clean", "") or ""),
         logger=Mock(),
     )
     service = AlignmentStageService(host=host)
@@ -353,7 +352,6 @@ def test_run_timeanchored_main_chain_promotes_window_source_text_when_owner_text
         _whisper_sanitizer=None,
         _hallucination_detector=None,
         _edge_selection_mode="auto",
-        _select_text_for_alignment=lambda track: str(getattr(track, "text_clean", "") or ""),
         logger=Mock(),
     )
     service = AlignmentStageService(host=host)

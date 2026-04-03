@@ -2379,27 +2379,6 @@ class AsyncDualPipelineKernel:
         tracks = self._ensure_text_tracks(ctx)
         tracks.whisper_track = wh_track
 
-    def _run_arbitration(
-        self,
-        ctx: ProcessingContext,
-        sv_result: Dict[str, Any],
-        whisper_result: Dict[str, Any],
-    ) -> L2Output:
-        tracks = self._ensure_text_tracks(ctx)
-        quality_signals = self._build_quality_signals(
-            sv_result=sv_result,
-            whisper_result=whisper_result,
-            tracks=tracks,
-        )
-        return self._l2_processor.process(
-            L2Input(
-                sv_track=tracks.sv_track,
-                whisper_track=tracks.whisper_track,
-                quality_signals=quality_signals,
-                edge_selection_mode=self._edge_selection_mode,
-            )
-        )
-
     @staticmethod
     def _normalize_edge_selection_mode(value: Any) -> str:
         normalized = str(value or "auto").strip().lower()
@@ -2499,34 +2478,6 @@ class AsyncDualPipelineKernel:
         if normalized in {"legacy", "shadow", "default", "timeanchored", "off"}:
             return "default"
         return None
-
-    @staticmethod
-    def _select_text_for_alignment(
-        chosen_track: Optional[TextTrack],
-    ) -> str:
-        if not chosen_track:
-            return ""
-        return str(
-            chosen_track.text_clean
-            or chosen_track.text_itn_raw
-            or chosen_track.raw_text
-            or ""
-        )
-
-    def _apply_arbitration_text(
-        self,
-        whisper_result: Dict[str, Any],
-        sv_result: Dict[str, Any],
-        chosen_source: str,
-        chosen_text_clean: str,
-    ) -> None:
-        if chosen_source == "fast":
-            whisper_result["text"] = chosen_text_clean
-            whisper_result["text_clean"] = chosen_text_clean
-            whisper_result["text_itn_raw"] = sv_result.get("text_itn_raw") or chosen_text_clean
-        else:
-            whisper_result["text"] = chosen_text_clean
-            whisper_result["text_clean"] = chosen_text_clean
 
     def _build_quality_signals(
         self,

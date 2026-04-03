@@ -14,11 +14,14 @@ if TYPE_CHECKING:
     from app.services.timeanchored_alignment.contracts import (
         LanguageRun,
         PipelineReport,
+        SelectedTextTruth,
+        SelectionDecision,
         PronunciationPackage,
         ProtectedSpan,
         TextTruthPackage,
         TimeBasePackage,
     )
+    from app.services.timeanchored_alignment.selection.contracts import SelectionReport
     from app.services.timeanchored_alignment.preparation.contracts import (
         AlignmentPreparationPackage,
     )
@@ -63,6 +66,9 @@ class ProcessingContext:
     whisper_result: Optional[dict] = None # SlowWorker 产出
     final_sentences: List[Any] = field(default_factory=list)  # 对齐阶段产出
     arbitration_result: Optional[Any] = None  # V3.2.0+dev.20260202.08: 仲裁结果（Phase G-3）
+    selected_text_truth: Optional["SelectedTextTruth"] = None  # V3.3.1 Phase1: 选择层正式文本真相
+    selection_decision: Optional["SelectionDecision"] = None  # V3.3.1 Phase1: 选择层正式决策
+    selection_report: Optional["SelectionReport"] = None  # V3.3.1 Phase1: 选择层结构化报告
     text_tracks: Optional[TextTrackBundle] = None  # V3.2.0+dev.20260203.03: 三轨文本
     punct_track: Optional[PunctTrack] = None  # V3.2.0+dev.20260204.05: 标点前置域轨道
     finalization_metrics: Dict[str, Any] = field(default_factory=dict)  # V3.2.0+dev.20260203.03
