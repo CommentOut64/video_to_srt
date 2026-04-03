@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any, Dict, Optional, Sequence
 
 from app.models.sensevoice_models import SentenceSegment, TextSource
@@ -20,6 +20,7 @@ from app.services.language_policy import build_language_policy_snapshot
 from app.services.textflow.decision_ingress_adapter import DecisionIngressAdapter
 from app.services.timeanchored_alignment import AlignmentItem
 from app.services.timeanchored_alignment.contracts import (
+    SelectedTextTruth,
     TimeBasePackage,
     TimeBaseQuality,
     TimeBaseUnit,
@@ -30,7 +31,7 @@ from app.services.timeanchored_alignment.anchor_mount.service import (
 )
 from app.services.timeanchored_alignment.preparation import (
     AlignmentPreparationAssembler,
-    AlignmentPreparationPackage,
+    PreparationBundle,
 )
 from app.services.timeanchored_alignment.slow_window.contracts import (
     DialogueShapeSnapshot,
@@ -836,22 +837,24 @@ class AlignmentStageService:
                 speaker_id=speaker_id,
                 turn_id=turn_id,
             )
-            preparation_whisper_result, preparation_fallback_text = (
+            preparation_selected_text_truth, preparation_whisper_result = (
                 self._resolve_preparation_text_inputs(
                     ready_window=ready_window,
+                    selected_text_truth=getattr(ctx, "selected_text_truth", None),
                     whisper_result=whisper_result,
                     fallback_text=fallback_text,
+                    language_hint=base_language,
                 )
             )
             host.logger.debug(
-                "Chunk {}: preparation 输入 window_id={} source_chunks={} source_units={} time_base_raw_units={} time_base_word_units={} fallback_text_len={}",
+                "Chunk {}: preparation 输入 window_id={} source_chunks={} source_units={} time_base_raw_units={} time_base_word_units={} selected_text_len={}",
                 ctx.chunk_index,
                 ready_window.window_id,
                 len(ready_window.source_chunk_ids),
                 len(ready_window.source_units),
                 len(window_time_base.raw_units),
                 len(window_time_base.word_units),
-                len(preparation_fallback_text),
+                len(preparation_selected_text_truth.text),
             )
             self._trace_write(
                 ctx=ctx,
@@ -866,13 +869,14 @@ class AlignmentStageService:
                     "source_units_count": len(ready_window.source_units),
                     "time_base_raw_units_count": len(window_time_base.raw_units),
                     "time_base_word_units_count": len(window_time_base.word_units),
-                    "fallback_text_len": len(preparation_fallback_text),
+                    "selected_text_source": str(preparation_selected_text_truth.text_source),
+                    "selected_text_len": len(preparation_selected_text_truth.text),
                     "language_hint": base_language,
                 },
                 full_payload={
                     "ready_window": ready_window,
                     "window_time_base": window_time_base,
-                    "fallback_text": preparation_fallback_text,
+                    "selected_text_truth": preparation_selected_text_truth,
                     "language_hint": base_language,
                     "whisper_result": preparation_whisper_result,
                     "sv_result": sv_result,
@@ -881,9 +885,9 @@ class AlignmentStageService:
             preparation = self._timeanchored_preparation_assembler.prepare(
                 ready_window=ready_window,
                 window_time_base=window_time_base,
+                selected_text_truth=preparation_selected_text_truth,
                 whisper_result=preparation_whisper_result,
                 default_language=base_language,
-                fallback_text=preparation_fallback_text,
                 external_punct_track=ctx.punct_track,
             )
             self._trace_write(
@@ -892,14 +896,17 @@ class AlignmentStageService:
                 stage="preparation_output",
                 summary_payload={
                     "window_id": str(preparation.window_id),
-                    "owner_chunk_id": str(preparation.owner_chunk_id),
-                    "owner_chunk_index": int(preparation.owner_chunk_index),
-                    "token_unit_count": len(preparation.slow_text.token_units),
-                    "hook_count": len(preparation.fast_hooks),
-                    "punctuation_evidence_count": len(preparation.slow_text.punctuation_evidences),
-                    "pronunciation_hint_count": len(preparation.slow_text.pronunciation_hints),
+                    "canonical_token_count": len(preparation.canonical_sequence.tokens),
+                    "observation_slice_count": len(preparation.acoustic_observation_pack.slices),
+                    "punctuation_fact_count": len(preparation.external_stable_facts.punctuation_facts),
+                    "source_chunk_count": len(preparation.source_chunk_ids),
+                    "selected_text_source": str(preparation.provenance.text_source),
                 },
                 full_payload=preparation,
+            )
+            self._postprocess_trace_writer.write_layer_summary(
+                job_dir=ctx.job_dir,
+                layer_summary=preparation.report.summary,
             )
             self._commit_preparation_context(ctx=ctx, preparation=preparation)
 
@@ -919,7 +926,7 @@ class AlignmentStageService:
         self,
         *,
         ctx: ProcessingContext,
-        preparation: AlignmentPreparationPackage,
+        preparation: PreparationBundle,
         language: str,
     ) -> AnchorMountStageResult:
         self._host.logger.debug(
@@ -977,25 +984,29 @@ class AlignmentStageService:
         self,
         *,
         ctx: ProcessingContext,
-        preparation: AlignmentPreparationPackage,
+        preparation: PreparationBundle,
     ) -> None:
         ctx.alignment_preparation = preparation
+        ctx.preparation_report = preparation.report
+        ctx.text_truth = preparation.compat.text_truth
+        ctx.protected_spans = list(preparation.compat.protected_spans)
+        ctx.language_runs = list(preparation.compat.language_runs.runs)
+        ctx.pronunciation_package = preparation.compat.pronunciation
+        ctx.pronunciation_report = dict(preparation.compat.pronunciation_report)
         ctx.slow_window_meta = {
             "window_id": preparation.window_id,
-            "owner_chunk_id": preparation.owner_chunk_id,
-            "token_unit_count": len(preparation.slow_text.token_units),
-            "hook_count": len(preparation.fast_hooks),
+            "canonical_token_count": len(preparation.canonical_sequence.tokens),
             "source_chunk_ids": list(preparation.source_chunk_ids),
         }
         if isinstance(preparation.compat.time_base, WindowTimeBasePackage):
             ctx.window_time_base = preparation.compat.time_base
         self._host.logger.debug(
-            "Chunk {}: preparation 已写回 ctx window_id={} token_unit_count={} hook_count={} pronunciation_hint_count={} window_time_base_units={}",
+            "Chunk {}: preparation 已写回 ctx window_id={} canonical_token_count={} compat_hook_count={} pronunciation_state_count={} window_time_base_units={}",
             ctx.chunk_index,
             preparation.window_id,
-            len(preparation.slow_text.token_units),
+            len(preparation.canonical_sequence.tokens),
             len(preparation.fast_hooks),
-            len(preparation.slow_text.pronunciation_hints),
+            len(preparation.pronunciation_graph.state_nodes),
             len(getattr(preparation.compat.time_base, "word_units", ()) or ()),
         )
 
@@ -1031,9 +1042,11 @@ class AlignmentStageService:
         self,
         *,
         ready_window: ReadySlowWindow,
+        selected_text_truth: SelectedTextTruth | None,
         whisper_result: Dict[str, Any],
         fallback_text: str,
-    ) -> tuple[Dict[str, Any], str]:
+        language_hint: str,
+    ) -> tuple[SelectedTextTruth, Dict[str, Any]]:
         """
         为 preparation 选择窗口级文本输入。
 
@@ -1043,28 +1056,69 @@ class AlignmentStageService:
         - 若仍用 owner 文本驱动 preparation，会导致非 owner chunk 内容在窗口定稿中被吞掉。
         """
         normalized_whisper = dict(whisper_result or {})
-        normalized_fallback = str(fallback_text or "").strip()
+        current_text = str(
+            getattr(selected_text_truth, "text", "") or fallback_text or ""
+        ).strip()
+        if not current_text:
+            current_text = str(
+                normalized_whisper.get("text_clean")
+                or normalized_whisper.get("text")
+                or normalized_whisper.get("text_itn_raw")
+                or ""
+            ).strip()
+        if isinstance(selected_text_truth, SelectedTextTruth):
+            normalized_selected = selected_text_truth
+        else:
+            source_chunk_ids = tuple(
+                str(item)
+                for item in (
+                    getattr(selected_text_truth, "source_chunk_ids", None)
+                    or ready_window.source_chunk_ids
+                )
+            )
+            quality = dict(getattr(selected_text_truth, "quality", {}) or {})
+            metadata = dict(getattr(selected_text_truth, "metadata", {}) or {})
+            metadata.setdefault("raw_text", current_text)
+            normalized_selected = SelectedTextTruth(
+                text=current_text or fallback_text or " ",
+                text_source=str(getattr(selected_text_truth, "text_source", "") or "slow"),
+                language_hint=str(
+                    getattr(selected_text_truth, "language_hint", "")
+                    or language_hint
+                    or "auto"
+                ),
+                source_chunk_ids=source_chunk_ids,
+                quality=quality,
+                rejection_reasons=tuple(
+                    getattr(selected_text_truth, "rejection_reasons", ()) or ()
+                ),
+                metadata=metadata,
+            )
         if len(tuple(ready_window.source_units or ())) <= 1:
-            return normalized_whisper, normalized_fallback
+            return normalized_selected, normalized_whisper
 
         window_source_text = self._build_ready_window_source_text(ready_window=ready_window)
         if not window_source_text:
-            return normalized_whisper, normalized_fallback
-
-        current_text = str(
-            normalized_whisper.get("text_clean")
-            or normalized_whisper.get("text")
-            or normalized_whisper.get("text_itn_raw")
-            or normalized_fallback
-            or ""
-        ).strip()
+            return normalized_selected, normalized_whisper
         if self._key_char_length(window_source_text) <= self._key_char_length(current_text):
-            return normalized_whisper, normalized_fallback
+            return normalized_selected, normalized_whisper
 
         promoted = dict(normalized_whisper)
         for field in ("text", "text_clean", "text_itn_raw", "min_clean_text"):
             promoted[field] = window_source_text
-        return promoted, window_source_text
+        return (
+            replace(
+                normalized_selected,
+                text=window_source_text,
+                source_chunk_ids=tuple(str(item) for item in ready_window.source_chunk_ids),
+                metadata={
+                    **dict(getattr(normalized_selected, "metadata", {}) or {}),
+                    "raw_text": window_source_text,
+                    "promoted_from_window_source_units": True,
+                },
+            ),
+            promoted,
+        )
 
     @staticmethod
     def _build_ready_window_source_text(*, ready_window: ReadySlowWindow) -> str:
@@ -1228,15 +1282,18 @@ class AlignmentStageService:
         )
         preparation = ctx.alignment_preparation
         language = str(
-            getattr(getattr(preparation, "compat", None), "text_truth", None).language
-            if getattr(getattr(preparation, "compat", None), "text_truth", None) is not None
-            else ""
+            getattr(getattr(preparation, "canonical_sequence", None), "language_hint", "")
+            or (
+                getattr(getattr(preparation, "compat", None), "text_truth", None).language
+                if getattr(getattr(preparation, "compat", None), "text_truth", None) is not None
+                else ""
+            )
             or whisper_result.get("language")
             or "auto"
         )
         chosen_text_clean = str(
-            getattr(getattr(preparation, "slow_text", None), "window_text", None).text
-            if getattr(getattr(preparation, "slow_text", None), "window_text", None) is not None
+            getattr(getattr(preparation, "canonical_sequence", None), "normalized_text", "")
+            if getattr(getattr(preparation, "canonical_sequence", None), "normalized_text", None) is not None
             else ""
             or ""
         ).strip()
@@ -1903,7 +1960,7 @@ class AlignmentStageService:
         self,
         *,
         ctx: ProcessingContext,
-        preparation: AlignmentPreparationPackage,
+        preparation: PreparationBundle,
         stage_result: AnchorMountStageResult,
     ) -> None:
         if not self._postprocess_trace_writer.enabled:

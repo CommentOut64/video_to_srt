@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from app.services.timeanchored_alignment.anchor_mount.contracts import AnchorMountInputView
-from app.services.timeanchored_alignment.preparation.contracts import AlignmentPreparationPackage
+from app.services.timeanchored_alignment.preparation.contracts import PreparationBundle
 
 
 class IngressValidator:
@@ -12,7 +12,7 @@ class IngressValidator:
     def validate(
         self,
         *,
-        preparation: AlignmentPreparationPackage,
+        preparation: PreparationBundle,
         language: str,
         policy_snapshot: object | None = None,
     ) -> AnchorMountInputView:

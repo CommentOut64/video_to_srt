@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 
 from app.services.timeanchored_alignment.contracts import (
+    LayerSummary,
+    SelectedTextTruth,
     TimeBasePackage,
     TimeBaseQuality,
     TimeBaseUnit,
@@ -10,6 +12,7 @@ from app.services.timeanchored_alignment.contracts import (
 from app.services.timeanchored_alignment.preparation.assembler import (
     AlignmentPreparationAssembler,
 )
+from app.services.timeanchored_alignment.preparation.contracts import PreparationBundle
 from app.services.alignment.types import PunctTrack
 from app.services.punctuation.base import PuncPosition
 from app.services.timeanchored_alignment.preparation.display_projection_builder import (
@@ -299,6 +302,117 @@ def _build_whisper_result_with_word_timestamps() -> dict:
     }
 
 
+def _build_decimal_ready_window() -> ReadySlowWindow:
+    return ReadySlowWindow(
+        window_id="window-decimal-001",
+        owner_chunk_id="chunk-decimal-1",
+        owner_chunk_index=1,
+        window_mode="steady",
+        flush_reason="test_flush",
+        audio_segments=((0.0, 1.0),),
+        coverage=WindowCoverage(
+            core_segments=((0.0, 1.0),),
+            left_guard_sec=0.0,
+            right_guard_sec=0.0,
+            chunk_bindings=(
+                WindowChunkBinding(
+                    chunk_id="chunk-decimal-1",
+                    chunk_index=1,
+                    chunk_start=0.0,
+                    chunk_end=1.0,
+                    overlap_ratio=1.0,
+                    role="owner",
+                    is_owner=True,
+                ),
+            ),
+        ),
+        source_semantic_chunk_ids=("sem-decimal-1",),
+        source_chunk_ids=("chunk-decimal-1",),
+        source_chunk_indices=(1,),
+        source_units=(
+            WindowSourceUnit(
+                unit_id="unit-decimal-1",
+                semantic_chunk_id="sem-decimal-1",
+                text="价格3.14元。",
+                audio_start=0.0,
+                audio_end=1.0,
+                source_chunk_ids=("chunk-decimal-1",),
+                source_chunk_indices=(1,),
+                speaker_id="speaker-decimal",
+                turn_id="turn-decimal",
+                language="zh",
+                arrived_at=1.0,
+            ),
+        ),
+        dialogue_shape=DialogueShapeSnapshot(
+            shape="single_speaker",
+            speaker_count=1,
+            dominant_speaker_id="speaker-decimal",
+            dominant_speaker_ratio=1.0,
+            speaker_switch_count=0,
+            speaker_switch_density=0.0,
+            turn_count=1,
+            avg_turn_duration_sec=1.0,
+        ),
+        language_profile=WindowLanguageProfile(
+            primary_language="zh",
+            language_mix_state="single_language",
+            decision_domains=("timeanchored_alignment",),
+            should_bypass_whisper=False,
+        ),
+        prompt_seed=PromptSeed(text="价格3.14元。"),
+        batch_hint=WindowBatchHint(
+            duration_bucket="short",
+            token_estimate=6,
+            acoustic_density_hint="medium",
+            queue_priority=1,
+        ),
+        created_at=1.0,
+    )
+
+
+def _build_decimal_window_time_base() -> WindowTimeBasePackage:
+    units = (
+        TimeBaseUnit(text="价", start=0.0, end=0.1, confidence=0.9, token_type="word"),
+        TimeBaseUnit(text="格", start=0.1, end=0.2, confidence=0.9, token_type="word"),
+        TimeBaseUnit(text="3", start=0.2, end=0.3, confidence=0.9, token_type="word"),
+        TimeBaseUnit(text="14", start=0.3, end=0.4, confidence=0.9, token_type="word"),
+        TimeBaseUnit(text="元", start=0.4, end=0.5, confidence=0.9, token_type="word"),
+    )
+    ready_window = _build_decimal_ready_window()
+    return WindowTimeBasePackage(
+        window_id=ready_window.window_id,
+        language="zh",
+        raw_units=units,
+        word_units=units,
+        quality=TimeBaseQuality(
+            blank_ratio=0.0,
+            avg_max_prob=0.9,
+            low_prob_ratio=0.0,
+        ),
+        source_chunk_ids=ready_window.source_chunk_ids,
+        source_chunk_indices=ready_window.source_chunk_indices,
+        chunk_bindings=ready_window.coverage.chunk_bindings,
+    )
+
+
+def _build_selected_text_truth(
+    text: str,
+    *,
+    source_chunk_ids: tuple[str, ...] = ("chunk-1", "chunk-2"),
+    text_source: str = "slow",
+    language_hint: str = "zh",
+) -> SelectedTextTruth:
+    return SelectedTextTruth(
+        text=text,
+        text_source=text_source,
+        language_hint=language_hint,
+        source_chunk_ids=source_chunk_ids,
+        quality={"confidence": 0.9},
+        metadata={"raw_text": text},
+    )
+
+
 class _RecordingSafePreNormalizer(SafePreNormalizer):
     def __init__(self, calls: list[str]) -> None:
         self._calls = calls
@@ -341,7 +455,7 @@ def test_alignment_preparation_runs_safe_structure_display_in_order() -> None:
     assembler.prepare(
         ready_window=_build_ready_window(),
         window_time_base=_build_window_time_base(),
-        whisper_result=_build_whisper_result("你好，世界！"),
+        selected_text_truth=_build_selected_text_truth("你好，世界！"),
         default_language="zh",
     )
 
@@ -352,7 +466,7 @@ def test_alignment_preparation_token_units_carry_speaker_turn_and_source_chunk_f
     package = AlignmentPreparationAssembler().prepare(
         ready_window=_build_ready_window(),
         window_time_base=_build_window_time_base(),
-        whisper_result=_build_whisper_result("你好世界"),
+        selected_text_truth=_build_selected_text_truth("你好世界"),
         default_language="zh",
     )
 
@@ -372,7 +486,7 @@ def test_alignment_preparation_hooks_only_come_from_window_time_base_package() -
     package = AlignmentPreparationAssembler().prepare(
         ready_window=_build_ready_window(text_a="完全", text_b="不同"),
         window_time_base=window_time_base,
-        whisper_result=_build_whisper_result("完全不同的慢流文本"),
+        selected_text_truth=_build_selected_text_truth("完全不同的慢流文本"),
         default_language="zh",
     )
 
@@ -385,7 +499,7 @@ def test_alignment_preparation_display_text_stays_lexical_and_punctuation_only_b
     package = AlignmentPreparationAssembler().prepare(
         ready_window=_build_ready_window(),
         window_time_base=_build_window_time_base(),
-        whisper_result=_build_whisper_result("你好，世界！"),
+        selected_text_truth=_build_selected_text_truth("你好，世界！"),
         default_language="zh",
     )
 
@@ -401,6 +515,7 @@ def test_alignment_preparation_preserves_slow_timestamps_for_edge_selector_fallb
     package = AlignmentPreparationAssembler().prepare(
         ready_window=_build_ready_window(text_a="补刀A", text_b="补刀B"),
         window_time_base=_build_window_time_base(),
+        selected_text_truth=_build_selected_text_truth("补刀A补刀B"),
         whisper_result=_build_whisper_result_with_word_timestamps(),
         default_language="zh",
     )
@@ -414,7 +529,11 @@ def test_alignment_preparation_keeps_token_units_stable_when_projection_preserve
     package = AlignmentPreparationAssembler().prepare(
         ready_window=_build_english_ready_window(),
         window_time_base=_build_window_time_base(),
-        whisper_result=_build_whisper_result(whisper_text),
+        selected_text_truth=_build_selected_text_truth(
+            whisper_text,
+            source_chunk_ids=("chunk-en-1", "chunk-en-2"),
+            language_hint="en",
+        ),
         default_language="en",
     )
 
@@ -451,7 +570,11 @@ def test_alignment_preparation_does_not_split_token_units_by_punctuation() -> No
     package = AlignmentPreparationAssembler().prepare(
         ready_window=_build_english_ready_window(text_a=text_a, text_b=text_b),
         window_time_base=_build_window_time_base(),
-        whisper_result=_build_whisper_result(whisper_text),
+        selected_text_truth=_build_selected_text_truth(
+            whisper_text,
+            source_chunk_ids=("chunk-en-1", "chunk-en-2"),
+            language_hint="en",
+        ),
         default_language="en",
     )
 
@@ -470,7 +593,11 @@ def test_alignment_preparation_does_not_split_token_units_by_pronunciation_hints
     package = AlignmentPreparationAssembler().prepare(
         ready_window=_build_english_ready_window(text_a=text_a, text_b=text_b),
         window_time_base=_build_window_time_base(),
-        whisper_result=_build_whisper_result(whisper_text),
+        selected_text_truth=_build_selected_text_truth(
+            whisper_text,
+            source_chunk_ids=("chunk-en-1", "chunk-en-2"),
+            language_hint="en",
+        ),
         default_language="en",
     )
 
@@ -489,10 +616,64 @@ def test_assembler_accepts_external_punct_track_and_merges_evidence() -> None:
     package = AlignmentPreparationAssembler().prepare(
         ready_window=_build_ready_window(),
         window_time_base=_build_window_time_base(),
-        whisper_result=_build_whisper_result("你好世界"),
+        selected_text_truth=_build_selected_text_truth("你好世界"),
         default_language="zh",
         external_punct_track=punct_track,
     )
 
     assert len(package.slow_text.punctuation_evidences) > 0
     assert any(item.mark == "。" for item in package.slow_text.punctuation_evidences)
+
+
+def test_alignment_preparation_builds_formal_bundle_and_report_from_selected_text_truth() -> None:
+    selected_text_truth = _build_selected_text_truth("你好，世界！")
+
+    package = AlignmentPreparationAssembler().prepare(
+        ready_window=_build_ready_window(),
+        window_time_base=_build_window_time_base(),
+        selected_text_truth=selected_text_truth,
+        default_language="zh",
+    )
+
+    assert isinstance(package, PreparationBundle)
+    assert package.canonical_sequence.original_text == "你好世界"
+    assert package.canonical_sequence.normalized_text == "你好世界"
+    assert [token.text for token in package.canonical_sequence.tokens] == ["你", "好", "世", "界"]
+    assert package.pronunciation_graph.token_nodes
+    assert package.acoustic_observation_pack.source_chunk_ids == ("chunk-1", "chunk-2")
+    assert package.scope.window_id == "window-001"
+    assert package.scope.source_chunk_indices == (1, 2)
+    assert package.scope.absolute_time_range == (0.0, 2.0)
+    assert package.provenance.text_source == "slow"
+    assert package.provenance.observation_source == "sensevoice_window"
+    assert package.external_stable_facts.punctuation_facts
+    assert package.compat.text_truth.raw_text == "你好世界"
+    assert package.report.summary == LayerSummary(
+        layer="preparation",
+        counters={
+            "token_count": 4,
+            "protected_span_count": 0,
+            "language_run_count": 1,
+            "pronunciation_token_count": len(package.pronunciation_graph.token_nodes),
+            "observation_slice_count": len(package.acoustic_observation_pack.slices),
+        },
+    )
+
+
+def test_alignment_preparation_observation_pack_follows_canonical_tokenization_for_protected_structure() -> None:
+    package = AlignmentPreparationAssembler().prepare(
+        ready_window=_build_decimal_ready_window(),
+        window_time_base=_build_decimal_window_time_base(),
+        selected_text_truth=_build_selected_text_truth(
+            "价格3.14元。",
+            source_chunk_ids=("chunk-decimal-1",),
+        ),
+        default_language="zh",
+    )
+
+    assert [token.text for token in package.canonical_sequence.tokens] == [
+        slice_item.primary_token for slice_item in package.acoustic_observation_pack.slices
+    ]
+    assert package.canonical_sequence.protected_spans[0].text == "3.14"
+    assert package.canonical_sequence.protected_spans[0].start == 2
+    assert package.canonical_sequence.protected_spans[0].end == 6

@@ -3,15 +3,15 @@ from __future__ import annotations
 from dataclasses import fields
 
 from app.services.timeanchored_alignment.preparation.contracts import (
-    AlignmentPreparationPackage,
+    PreparationBundle,
     PreparedSlowText,
     PunctuationEvidence,
     SlowWindowTextPackage,
 )
 
 
-def test_alignment_preparation_package_contract_exposes_window_hook_and_coverage_fields() -> None:
-    field_names = {field.name for field in fields(AlignmentPreparationPackage)}
+def test_preparation_bundle_contract_exposes_window_hook_and_coverage_fields() -> None:
+    field_names = {field.name for field in fields(PreparationBundle)}
 
     assert "window_id" in field_names
     assert "owner_chunk_id" in field_names
@@ -43,7 +43,7 @@ def test_punctuation_evidence_source_char_index_targets_slow_window_text_package
 
 
 def test_alignment_preparation_contracts_do_not_expose_fallback_punctuation_positions() -> None:
-    package_fields = {field.name for field in fields(AlignmentPreparationPackage)}
+    package_fields = {field.name for field in fields(PreparationBundle)}
     slow_text_fields = {field.name for field in fields(PreparedSlowText)}
     window_text_fields = {field.name for field in fields(SlowWindowTextPackage)}
 

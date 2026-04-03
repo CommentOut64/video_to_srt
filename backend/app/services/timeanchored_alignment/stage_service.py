@@ -16,15 +16,12 @@ from app.services.timeanchored_alignment.contracts import (
     AlignmentItem,
     BoundaryEvidence,
     FinalAlignmentResult,
-    LanguageRunPackage,
     LayerReport,
     PipelineReport,
-    PronunciationPackage,
-    TextTruthPackage,
-    TimeBasePackage,
 )
 from app.services.timeanchored_alignment.edge_selector import EdgeSelector, FailedSpan
 from app.services.timeanchored_alignment.output_adapter import OutputAdapter
+from app.services.timeanchored_alignment.preparation.contracts import PreparationBundle
 from app.services.timeanchored_alignment.sentence_segmenter import SentenceSegmenter
 from app.services.timeanchored_alignment.subtitle_assembler import SubtitleAssembler
 from app.services.timeanchored_alignment.text_aligner import TextAligner
@@ -69,16 +66,18 @@ class TimeanchoredAlignmentStageService:
     def execute(
         self,
         *,
-        time_base: TimeBasePackage,
-        text_truth: TextTruthPackage,
-        language_runs: LanguageRunPackage,
-        pronunciation: PronunciationPackage,
-        chunk_window: ChunkWindow,
+        preparation: PreparationBundle,
         language: str = "auto",
         edge_selection_mode: str = "auto",
         speaker_id: str | None = None,
         turn_id: str | None = None,
     ) -> TimeanchoredStageResult:
+        compat = preparation.compat
+        time_base = compat.time_base
+        text_truth = compat.text_truth
+        language_runs = compat.language_runs
+        pronunciation = compat.pronunciation
+        chunk_window = compat.chunk_window
         text_result = self._text_aligner.align_window(
             time_base=time_base,
             text_truth=text_truth,

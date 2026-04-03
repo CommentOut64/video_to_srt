@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -8,6 +10,7 @@ from app.schemas.pipeline_context import ProcessingContext
 from app.services.timeanchored_alignment.preparation import AlignmentPreparationAssembler
 from app.pipelines.dual_pipeline.services.alignment_stage_service import AlignmentStageService
 from app.services.timeanchored_alignment.contracts import (
+    SelectedTextTruth,
     TimeBaseQuality,
     TimeBaseUnit,
 )
@@ -259,14 +262,14 @@ def _build_preparation_package():
     return AlignmentPreparationAssembler().prepare(
         ready_window=_build_ready_window(),
         window_time_base=_build_window_time_base(),
-        whisper_result={
-            "text": "你好，世界！",
-            "text_clean": "你好，世界！",
-            "text_itn_raw": "你好，世界！",
-            "confidence": 0.9,
-            "language": "zh",
-            "raw_result": {"segments": [{"avg_logprob": -0.1}]},
-        },
+        selected_text_truth=SelectedTextTruth(
+            text="你好，世界！",
+            text_source="slow",
+            language_hint="zh",
+            source_chunk_ids=("chunk-1",),
+            quality={"confidence": 0.9},
+            metadata={"raw_text": "你好，世界！"},
+        ),
         default_language="zh",
     )
 
@@ -302,10 +305,14 @@ def test_run_timeanchored_main_chain_delegates_to_preparation_service(monkeypatc
     captured: dict[str, object] = {}
     expected_result = object()
 
+    def _capture_prepare(**kwargs):
+        captured.update({f"prepare_{key}": value for key, value in kwargs.items()})
+        return preparation
+
     monkeypatch.setattr(
         service._timeanchored_preparation_assembler,
         "prepare",
-        lambda **_kwargs: preparation,
+        _capture_prepare,
     )
 
     def _capture_execute(**kwargs):
@@ -321,6 +328,13 @@ def test_run_timeanchored_main_chain_delegates_to_preparation_service(monkeypatc
         whisper_result={"text": "你好，世界！", "language": "zh"},
         sv_result={"text": "你好世界"},
         time_base_chunk=preparation.compat.time_base,
+        selected_text_truth=SelectedTextTruth(
+            text="你好世界",
+            text_source="slow",
+            language_hint="zh",
+            source_chunk_ids=("chunk-1",),
+            quality={"confidence": 0.9},
+        ),
     )
     ctx.ready_slow_window = _build_ready_window()
     ctx.window_time_base = _build_window_time_base()
@@ -336,6 +350,7 @@ def test_run_timeanchored_main_chain_delegates_to_preparation_service(monkeypatc
     )
 
     assert result is expected_result
+    assert captured["prepare_selected_text_truth"] is ctx.selected_text_truth
     assert captured["preparation"] is preparation
     assert captured["language"] == "zh"
     assert "time_base" not in captured
@@ -379,6 +394,13 @@ def test_run_timeanchored_main_chain_promotes_window_source_text_when_owner_text
         },
         sv_result={"text": "这家商店的老板有个15岁的儿子"},
         time_base_chunk=_build_multi_source_window_time_base(),
+        selected_text_truth=SelectedTextTruth(
+            text="这家商店的老板有个15岁的儿子，他说自己之前就看到这瓶可乐。",
+            text_source="slow",
+            language_hint="zh",
+            source_chunk_ids=("chunk-33",),
+            quality={"confidence": 0.9},
+        ),
     )
     ctx.ready_slow_window = _build_multi_source_ready_window()
     ctx.window_time_base = _build_multi_source_window_time_base()
@@ -400,11 +422,127 @@ def test_run_timeanchored_main_chain_promotes_window_source_text_when_owner_text
         turn_id="turn-a",
     )
 
+    promoted_selected_text_truth = captured_prepare["selected_text_truth"]
     promoted_whisper = captured_prepare["whisper_result"]
-    promoted_fallback = captured_prepare["fallback_text"]
 
+    assert isinstance(promoted_selected_text_truth, SelectedTextTruth)
+    assert "在中午12点50分" in promoted_selected_text_truth.text
+    assert "这家商店的老板" in promoted_selected_text_truth.text
+    assert promoted_selected_text_truth.source_chunk_ids == ("chunk-32", "chunk-33")
     assert isinstance(promoted_whisper, dict)
-    assert isinstance(promoted_fallback, str)
     assert "在中午12点50分" in str(promoted_whisper.get("text", ""))
-    assert "这家商店的老板" in str(promoted_whisper.get("text", ""))
-    assert "在中午12点50分" in promoted_fallback
+
+
+def test_preparation_context_meta_uses_formal_preparation_metrics_only() -> None:
+    host = SimpleNamespace(
+        _whisper_sanitizer=None,
+        _hallucination_detector=None,
+        _edge_selection_mode="auto",
+        logger=Mock(),
+    )
+    service = AlignmentStageService(host=host)
+    preparation = _build_preparation_package()
+    ctx = ProcessingContext(job_id="job-meta-test", chunk_index=1, audio_chunk=None)
+
+    service._commit_preparation_context(ctx=ctx, preparation=preparation)
+
+    assert ctx.slow_window_meta["window_id"] == preparation.window_id
+    assert ctx.slow_window_meta["source_chunk_ids"] == list(preparation.source_chunk_ids)
+    assert ctx.slow_window_meta["canonical_token_count"] == len(preparation.canonical_sequence.tokens)
+    assert "owner_chunk_id" not in ctx.slow_window_meta
+    assert "compat_hook_count" not in ctx.slow_window_meta
+
+
+def test_run_timeanchored_main_chain_writes_preparation_layer_summary(monkeypatch) -> None:
+    host = SimpleNamespace(
+        _whisper_sanitizer=None,
+        _hallucination_detector=None,
+        _edge_selection_mode="auto",
+        logger=Mock(),
+    )
+    service = AlignmentStageService(host=host)
+    preparation = _build_preparation_package()
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        service._timeanchored_preparation_assembler,
+        "prepare",
+        lambda **_kwargs: preparation,
+    )
+    monkeypatch.setattr(service, "_execute_prepared_timeanchored_stage", lambda **_kwargs: object())
+    monkeypatch.setattr(service, "_trace_write", lambda **_kwargs: None)
+
+    with TemporaryDirectory() as tmpdir:
+        ctx = ProcessingContext(
+            job_id="job-summary-test",
+            chunk_index=1,
+            audio_chunk=SimpleNamespace(start=0.0, end=1.0),
+            job_dir=Path(tmpdir),
+            whisper_result={"text": "你好，世界！", "language": "zh"},
+            sv_result={"text": "你好世界"},
+            time_base_chunk=preparation.compat.time_base,
+            selected_text_truth=SelectedTextTruth(
+                text="你好世界",
+                text_source="slow",
+                language_hint="zh",
+                source_chunk_ids=("chunk-1",),
+                quality={"confidence": 0.9},
+            ),
+        )
+        ctx.ready_slow_window = _build_ready_window()
+        ctx.window_time_base = _build_window_time_base()
+
+        service._postprocess_trace_writer._enabled = True
+        monkeypatch.setattr(
+            service._postprocess_trace_writer,
+            "write_layer_summary",
+            lambda **kwargs: captured.update(kwargs),
+        )
+
+        service._run_timeanchored_main_chain(
+            ctx=ctx,
+            tracks=SimpleNamespace(chosen_track=SimpleNamespace(text_clean="你好世界")),
+            sv_result={"text": "你好世界"},
+            whisper_result={"text": "你好，世界！", "language": "zh"},
+            language_hint="zh",
+            speaker_id="speaker-a",
+            turn_id="turn-a",
+        )
+
+    assert captured["job_dir"] == ctx.job_dir
+    assert captured["layer_summary"] == preparation.report.summary
+
+
+def test_runtime_code_uses_preparation_bundle_name_instead_of_alignment_preparation_package() -> None:
+    ingress_source = inspect.getsource(__import__(
+        "app.services.timeanchored_alignment.anchor_mount.ingress_validator",
+        fromlist=["IngressValidator"],
+    ).IngressValidator.validate)
+    service_source = inspect.getsource(__import__(
+        "app.services.timeanchored_alignment.anchor_mount.service",
+        fromlist=["AnchorMountAlignmentService"],
+    ).AnchorMountAlignmentService.align)
+
+    assert "PreparationBundle" in ingress_source
+    assert "PreparationBundle" in service_source
+    assert "AlignmentPreparationPackage" not in ingress_source
+    assert "AlignmentPreparationPackage" not in service_source
+
+
+def test_public_exports_do_not_expose_alignment_preparation_package() -> None:
+    preparation_module = __import__(
+        "app.services.timeanchored_alignment.preparation",
+        fromlist=["__all__"],
+    )
+    timeanchored_module = __import__(
+        "app.services.timeanchored_alignment",
+        fromlist=["__all__"],
+    )
+
+    preparation_exports = tuple(getattr(preparation_module, "__all__", ()) or ())
+    timeanchored_exports = tuple(getattr(timeanchored_module, "__all__", ()) or ())
+
+    assert "PreparationBundle" in preparation_exports
+    assert "PreparationBundle" in timeanchored_exports
+    assert "AlignmentPreparationPackage" not in preparation_exports
+    assert "AlignmentPreparationPackage" not in timeanchored_exports

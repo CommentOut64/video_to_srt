@@ -14,6 +14,11 @@ from app.services.timeanchored_alignment.anchor_mount.ingress_validator import (
 )
 from app.services.timeanchored_alignment.chunk_projector import ChunkWindow
 from app.services.timeanchored_alignment.contracts import (
+    AcousticObservationPack,
+    AcousticObservationQuality,
+    AcousticObservationSlice,
+    LayerSummary,
+    OBSERVATION_CAPABILITY_TIMESTAMP_ONLY,
     BoundaryEvidence,
     LanguageRun,
     LanguageRunPackage,
@@ -26,10 +31,17 @@ from app.services.timeanchored_alignment.contracts import (
 )
 from app.services.timeanchored_alignment.preparation.contracts import (
     AlignmentPreparationCompat,
-    AlignmentPreparationPackage,
+    CanonicalSequence,
+    CanonicalToken,
+    ExternalStableFacts,
     FastHook,
+    PreparationBundle,
+    PreparationProvenance,
+    PreparationReport,
+    PreparationScope,
     PreparedSlowText,
     PreparedTokenUnit,
+    PronunciationGraph,
     SlowWindowTextPackage,
 )
 from app.services.timeanchored_alignment.slow_window.contracts import (
@@ -41,12 +53,85 @@ from app.services.timeanchored_alignment.window_time_base_assembler import (
 )
 
 
+def _build_phase2_fields(
+    *,
+    window_id: str,
+    source_chunk_ids: tuple[str, ...],
+    source_chunk_indices: tuple[int, ...],
+    window_text: str,
+    token_units: tuple[PreparedTokenUnit, ...],
+    language_runs: tuple[LanguageRun, ...],
+    time_base: WindowTimeBasePackage,
+) -> dict[str, object]:
+    return {
+        "canonical_sequence": CanonicalSequence(
+            original_text=window_text,
+            normalized_text=window_text,
+            tokens=tuple(
+                CanonicalToken(
+                    token_id=unit.unit_id,
+                    text=unit.token_text,
+                    normalized_text=unit.normalized_text,
+                    char_start=unit.char_start,
+                    char_end=unit.char_end,
+                    language="en",
+                    source_chunk_ids=unit.source_chunk_ids,
+                    source_chunk_indices=unit.source_chunk_indices,
+                )
+                for unit in token_units
+            ),
+            protected_spans=tuple(),
+            language_runs=language_runs,
+            frontend_version="test",
+            language_hint="en",
+        ),
+        "pronunciation_graph": PronunciationGraph(
+            token_nodes=tuple(),
+            state_nodes=tuple(),
+            edges=tuple(),
+        ),
+        "acoustic_observation_pack": AcousticObservationPack(
+            capability_level=OBSERVATION_CAPABILITY_TIMESTAMP_ONLY,
+            adapter_type="test",
+            source_chunk_ids=source_chunk_ids,
+            source_chunk_indices=source_chunk_indices,
+            absolute_time_range=(0.0, 1.0),
+            slices=tuple(
+                AcousticObservationSlice(
+                    slice_id=f"slice-{index}",
+                    start=float(unit.start),
+                    end=float(unit.end),
+                    primary_token=str(unit.text),
+                    confidence=float(unit.confidence),
+                )
+                for index, unit in enumerate(time_base.word_units)
+            ),
+            quality=AcousticObservationQuality(
+                slice_count=len(time_base.word_units),
+                timestamp_coverage=1.0,
+            ),
+        ),
+        "scope": PreparationScope(
+            window_id=window_id,
+            source_chunk_ids=source_chunk_ids,
+            source_chunk_indices=source_chunk_indices,
+            absolute_time_range=(0.0, 1.0),
+        ),
+        "provenance": PreparationProvenance(
+            text_source="slow",
+            observation_source="test",
+        ),
+        "external_stable_facts": ExternalStableFacts(),
+        "report": PreparationReport(summary=LayerSummary(layer="preparation")),
+    }
+
+
 def _build_preparation_for_ingress_validation(
     *,
     token_units: tuple[PreparedTokenUnit, ...],
     fast_hooks: tuple[FastHook, ...],
     window_text: str = "hello world",
-) -> AlignmentPreparationPackage:
+) -> PreparationBundle:
     coverage = WindowCoverage(
         core_segments=((0.0, 1.0),),
         left_guard_sec=0.0,
@@ -77,7 +162,7 @@ def _build_preparation_for_ingress_validation(
         source_chunk_indices=(1,),
         chunk_bindings=coverage.chunk_bindings,
     )
-    return AlignmentPreparationPackage(
+    return PreparationBundle(
         window_id="window-1",
         owner_chunk_id="chunk-1",
         owner_chunk_index=1,
@@ -149,6 +234,22 @@ def _build_preparation_for_ingress_validation(
             ),
             pronunciation_report={},
             chunk_window=ChunkWindow(chunk_ref="chunk-1", start=0.0, end=1.0),
+        ),
+        **_build_phase2_fields(
+            window_id="window-1",
+            source_chunk_ids=("chunk-1",),
+            source_chunk_indices=(1,),
+            window_text=window_text,
+            token_units=token_units,
+            language_runs=(
+                LanguageRun(
+                    run_text=window_text,
+                    run_language="en",
+                    char_start=0,
+                    char_end=len(window_text),
+                ),
+            ),
+            time_base=time_base,
         ),
     )
 

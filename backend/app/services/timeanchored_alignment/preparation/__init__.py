@@ -5,7 +5,6 @@ from app.services.timeanchored_alignment.preparation.assembler import (
 )
 from app.services.timeanchored_alignment.preparation.contracts import (
     AlignmentPreparationCompat,
-    AlignmentPreparationPackage,
     CanonicalSequence,
     CanonicalToken,
     ExternalStableFacts,
@@ -33,7 +32,6 @@ from app.services.timeanchored_alignment.preparation.token_provenance_binder imp
 __all__ = [
     "AlignmentPreparationAssembler",
     "AlignmentPreparationCompat",
-    "AlignmentPreparationPackage",
     "CanonicalSequence",
     "CanonicalToken",
     "ExternalStableFacts",

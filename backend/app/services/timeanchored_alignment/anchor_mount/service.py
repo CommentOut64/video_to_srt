@@ -39,7 +39,7 @@ from app.services.timeanchored_alignment.anchor_mount.temporal_envelope_builder 
     TemporalEnvelopeBuilder,
 )
 from app.services.timeanchored_alignment.contracts import LayerReport, PipelineReport
-from app.services.timeanchored_alignment.preparation.contracts import AlignmentPreparationPackage
+from app.services.timeanchored_alignment.preparation.contracts import PreparationBundle
 
 
 @dataclass(frozen=True)
@@ -86,7 +86,7 @@ class AnchorMountAlignmentService:
     def align(
         self,
         *,
-        preparation: AlignmentPreparationPackage,
+        preparation: PreparationBundle,
         language: str,
         policy_snapshot: Any | None = None,
     ) -> AnchorMountStageResult:
@@ -209,7 +209,7 @@ class AnchorMountAlignmentService:
     def execute(
         self,
         *,
-        preparation: AlignmentPreparationPackage,
+        preparation: PreparationBundle,
         language: str,
         policy_snapshot: Any | None = None,
         **_: Any,

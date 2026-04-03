@@ -7,18 +7,30 @@ from app.services.timeanchored_alignment.anchor_mount.contracts import LocalAlig
 from app.services.timeanchored_alignment.anchor_mount.service import AnchorMountAlignmentService
 from app.services.timeanchored_alignment.preparation.contracts import (
     AlignmentPreparationCompat,
-    AlignmentPreparationPackage,
+    CanonicalSequence,
+    CanonicalToken,
+    ExternalStableFacts,
     FastHook,
+    PreparationBundle,
+    PreparationProvenance,
+    PreparationReport,
+    PreparationScope,
     PreparedSlowText,
     PreparedTokenUnit,
     ProtectedUnit,
     PunctuationEvidence,
+    PronunciationGraph,
     PronunciationHint,
     SlowWindowTextPackage,
 )
 from app.services.timeanchored_alignment.contracts import (
+    AcousticObservationPack,
+    AcousticObservationQuality,
+    AcousticObservationSlice,
     LanguageRun,
     LanguageRunPackage,
+    LayerSummary,
+    OBSERVATION_CAPABILITY_TIMESTAMP_ONLY,
     PronunciationPackage,
     TextTruthPackage,
     TextTruthQuality,
@@ -33,7 +45,82 @@ from app.services.timeanchored_alignment.slow_window.contracts import (
 from app.services.timeanchored_alignment.window_time_base_assembler import WindowTimeBasePackage
 
 
-def _build_preparation_with_unresolved_middle_unit() -> AlignmentPreparationPackage:
+def _build_phase2_fields(
+    *,
+    window_id: str,
+    source_chunk_ids: tuple[str, ...],
+    source_chunk_indices: tuple[int, ...],
+    window_text: str,
+    token_units: tuple[PreparedTokenUnit, ...],
+    language_runs: tuple[LanguageRun, ...],
+    time_base: WindowTimeBasePackage,
+    absolute_time_range: tuple[float, float],
+) -> dict[str, object]:
+    return {
+        "canonical_sequence": CanonicalSequence(
+            original_text=window_text,
+            normalized_text=window_text,
+            tokens=tuple(
+                CanonicalToken(
+                    token_id=unit.unit_id,
+                    text=unit.token_text,
+                    normalized_text=unit.normalized_text,
+                    char_start=unit.char_start,
+                    char_end=unit.char_end,
+                    language="en",
+                    source_chunk_ids=unit.source_chunk_ids,
+                    source_chunk_indices=unit.source_chunk_indices,
+                    is_protected=False,
+                )
+                for unit in token_units
+            ),
+            protected_spans=tuple(),
+            language_runs=language_runs,
+            frontend_version="test",
+            language_hint="en",
+        ),
+        "pronunciation_graph": PronunciationGraph(
+            token_nodes=tuple(),
+            state_nodes=tuple(),
+            edges=tuple(),
+        ),
+        "acoustic_observation_pack": AcousticObservationPack(
+            capability_level=OBSERVATION_CAPABILITY_TIMESTAMP_ONLY,
+            adapter_type="test",
+            source_chunk_ids=source_chunk_ids,
+            source_chunk_indices=source_chunk_indices,
+            absolute_time_range=absolute_time_range,
+            slices=tuple(
+                AcousticObservationSlice(
+                    slice_id=f"slice-{index}",
+                    start=float(unit.start),
+                    end=float(unit.end),
+                    primary_token=str(unit.text),
+                    confidence=float(unit.confidence),
+                )
+                for index, unit in enumerate(time_base.word_units)
+            ),
+            quality=AcousticObservationQuality(
+                slice_count=len(time_base.word_units),
+                timestamp_coverage=1.0,
+            ),
+        ),
+        "scope": PreparationScope(
+            window_id=window_id,
+            source_chunk_ids=source_chunk_ids,
+            source_chunk_indices=source_chunk_indices,
+            absolute_time_range=absolute_time_range,
+        ),
+        "provenance": PreparationProvenance(
+            text_source="slow",
+            observation_source="test",
+        ),
+        "external_stable_facts": ExternalStableFacts(),
+        "report": PreparationReport(summary=LayerSummary(layer="preparation")),
+    }
+
+
+def _build_preparation_with_unresolved_middle_unit() -> PreparationBundle:
     coverage = WindowCoverage(
         core_segments=((0.0, 1.2),),
         left_guard_sec=0.0,
@@ -66,7 +153,7 @@ def _build_preparation_with_unresolved_middle_unit() -> AlignmentPreparationPack
         source_chunk_indices=(1,),
         chunk_bindings=coverage.chunk_bindings,
     )
-    return AlignmentPreparationPackage(
+    return PreparationBundle(
         window_id="window-service-001",
         owner_chunk_id="chunk-1",
         owner_chunk_index=1,
@@ -215,10 +302,61 @@ def _build_preparation_with_unresolved_middle_unit() -> AlignmentPreparationPack
             pronunciation_report={"source": "test"},
             chunk_window=type("ChunkWindow", (), {"chunk_ref": 1, "start": 0.0, "end": 1.2})(),
         ),
+        **_build_phase2_fields(
+            window_id="window-service-001",
+            source_chunk_ids=("chunk-1",),
+            source_chunk_indices=(1,),
+            window_text="hellobraveworld",
+            token_units=(
+                PreparedTokenUnit(
+                    unit_id="unit-0",
+                    token_text="hello",
+                    normalized_text="hello",
+                    char_start=0,
+                    char_end=5,
+                    speaker_id="speaker-a",
+                    turn_id="turn-a",
+                    source_chunk_ids=("chunk-1",),
+                    source_chunk_indices=(1,),
+                ),
+                PreparedTokenUnit(
+                    unit_id="unit-1",
+                    token_text="brave",
+                    normalized_text="brave",
+                    char_start=5,
+                    char_end=10,
+                    speaker_id="speaker-a",
+                    turn_id="turn-a",
+                    source_chunk_ids=("chunk-1",),
+                    source_chunk_indices=(1,),
+                ),
+                PreparedTokenUnit(
+                    unit_id="unit-2",
+                    token_text="world",
+                    normalized_text="world",
+                    char_start=10,
+                    char_end=15,
+                    speaker_id="speaker-a",
+                    turn_id="turn-a",
+                    source_chunk_ids=("chunk-1",),
+                    source_chunk_indices=(1,),
+                ),
+            ),
+            language_runs=(
+                LanguageRun(
+                    run_text="hellobraveworld",
+                    run_language="en",
+                    char_start=0,
+                    char_end=15,
+                ),
+            ),
+            time_base=compat_time_base,
+            absolute_time_range=(0.0, 1.2),
+        ),
     )
 
 
-def _build_preparation_with_noisy_contiguous_run() -> AlignmentPreparationPackage:
+def _build_preparation_with_noisy_contiguous_run() -> PreparationBundle:
     coverage = WindowCoverage(
         core_segments=((0.0, 1.2),),
         left_guard_sec=0.0,
@@ -253,7 +391,7 @@ def _build_preparation_with_noisy_contiguous_run() -> AlignmentPreparationPackag
         source_chunk_indices=(1,),
         chunk_bindings=coverage.chunk_bindings,
     )
-    return AlignmentPreparationPackage(
+    return PreparationBundle(
         window_id="window-service-002",
         owner_chunk_id="chunk-1",
         owner_chunk_index=1,
@@ -401,6 +539,57 @@ def _build_preparation_with_noisy_contiguous_run() -> AlignmentPreparationPackag
             ),
             pronunciation_report={"source": "test"},
             chunk_window=type("ChunkWindow", (), {"chunk_ref": 1, "start": 0.0, "end": 1.2})(),
+        ),
+        **_build_phase2_fields(
+            window_id="window-service-002",
+            source_chunk_ids=("chunk-1",),
+            source_chunk_indices=(1,),
+            window_text="probably more beneficial",
+            token_units=(
+                PreparedTokenUnit(
+                    unit_id="unit-0",
+                    token_text="probably",
+                    normalized_text="probably",
+                    char_start=0,
+                    char_end=8,
+                    speaker_id="speaker-a",
+                    turn_id="turn-a",
+                    source_chunk_ids=("chunk-1",),
+                    source_chunk_indices=(1,),
+                ),
+                PreparedTokenUnit(
+                    unit_id="unit-1",
+                    token_text="more",
+                    normalized_text="more",
+                    char_start=9,
+                    char_end=13,
+                    speaker_id="speaker-a",
+                    turn_id="turn-a",
+                    source_chunk_ids=("chunk-1",),
+                    source_chunk_indices=(1,),
+                ),
+                PreparedTokenUnit(
+                    unit_id="unit-2",
+                    token_text="beneficial",
+                    normalized_text="beneficial",
+                    char_start=14,
+                    char_end=24,
+                    speaker_id="speaker-a",
+                    turn_id="turn-a",
+                    source_chunk_ids=("chunk-1",),
+                    source_chunk_indices=(1,),
+                ),
+            ),
+            language_runs=(
+                LanguageRun(
+                    run_text="probably more beneficial",
+                    run_language="en",
+                    char_start=0,
+                    char_end=24,
+                ),
+            ),
+            time_base=compat_time_base,
+            absolute_time_range=(0.0, 1.2),
         ),
     )
 

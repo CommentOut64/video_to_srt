@@ -148,38 +148,6 @@ class AlignmentPreparationCompat:
 
 
 @dataclass(frozen=True)
-class AlignmentPreparationPackage:
-    window_id: str
-    owner_chunk_id: str
-    owner_chunk_index: int
-    source_chunk_ids: tuple[str, ...]
-    source_chunk_indices: tuple[int, ...]
-    slow_text: PreparedSlowText
-    fast_hooks: tuple[FastHook, ...]
-    coverage: WindowCoverage
-    compat: AlignmentPreparationCompat
-    contract_version: str = CONTRACT_VERSION
-
-    def __post_init__(self) -> None:
-        _ensure_non_negative_int(
-            "AlignmentPreparationPackage.owner_chunk_index",
-            self.owner_chunk_index,
-        )
-        if len(self.source_chunk_ids) != len(self.source_chunk_indices):
-            raise ValueError(
-                "AlignmentPreparationPackage.source_chunk_ids/source_chunk_indices 长度必须一致"
-            )
-        if not self.source_chunk_ids:
-            raise ValueError("AlignmentPreparationPackage.source_chunk_ids 不能为空")
-        if self.owner_chunk_id not in self.source_chunk_ids:
-            raise ValueError("AlignmentPreparationPackage.owner_chunk_id 必须属于 source_chunk_ids")
-        if self.owner_chunk_index not in self.source_chunk_indices:
-            raise ValueError(
-                "AlignmentPreparationPackage.owner_chunk_index 必须属于 source_chunk_indices"
-            )
-
-
-@dataclass(frozen=True)
 class CanonicalToken:
     token_id: str
     text: str
@@ -335,14 +303,52 @@ class ExternalStableFacts:
 
 @dataclass(frozen=True)
 class PreparationBundle:
+    window_id: str
+    owner_chunk_id: str
+    owner_chunk_index: int
+    source_chunk_ids: tuple[str, ...]
+    source_chunk_indices: tuple[int, ...]
+    slow_text: PreparedSlowText
+    fast_hooks: tuple[FastHook, ...]
+    coverage: WindowCoverage
+    compat: AlignmentPreparationCompat
     canonical_sequence: CanonicalSequence
     pronunciation_graph: PronunciationGraph
     acoustic_observation_pack: AcousticObservationPack
     scope: PreparationScope
     provenance: PreparationProvenance
     external_stable_facts: ExternalStableFacts
+    report: "PreparationReport"
     debug_refs: dict[str, str] = field(default_factory=dict)
     contract_version: str = CONTRACT_VERSION
+
+    def __post_init__(self) -> None:
+        _ensure_non_negative_int(
+            "PreparationBundle.owner_chunk_index",
+            self.owner_chunk_index,
+        )
+        if len(self.source_chunk_ids) != len(self.source_chunk_indices):
+            raise ValueError(
+                "PreparationBundle.source_chunk_ids/source_chunk_indices 长度必须一致"
+            )
+        if not self.source_chunk_ids:
+            raise ValueError("PreparationBundle.source_chunk_ids 不能为空")
+        if self.owner_chunk_id not in self.source_chunk_ids:
+            raise ValueError("PreparationBundle.owner_chunk_id 必须属于 source_chunk_ids")
+        if self.owner_chunk_index not in self.source_chunk_indices:
+            raise ValueError(
+                "PreparationBundle.owner_chunk_index 必须属于 source_chunk_indices"
+            )
+        if self.scope.window_id != self.window_id:
+            raise ValueError("PreparationBundle.scope.window_id 必须与 window_id 一致")
+        if self.scope.source_chunk_ids != self.source_chunk_ids:
+            raise ValueError("PreparationBundle.scope.source_chunk_ids 必须与 preparation 一致")
+        if self.scope.source_chunk_indices != self.source_chunk_indices:
+            raise ValueError(
+                "PreparationBundle.scope.source_chunk_indices 必须与 preparation 一致"
+            )
+        if self.report.summary.layer != "preparation":
+            raise ValueError("PreparationBundle.report.summary.layer 必须为 preparation")
 
 
 @dataclass(frozen=True)

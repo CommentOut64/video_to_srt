@@ -85,7 +85,6 @@ from app.services.timeanchored_alignment.output_projection import (
 from app.services.timeanchored_alignment.preparation import (
     AlignmentPreparationAssembler,
     AlignmentPreparationCompat,
-    AlignmentPreparationPackage,
     CanonicalSequence,
     CanonicalToken,
     ExternalStableFacts,
@@ -201,7 +200,6 @@ __all__ = [
     "OutputProjector",
     "AlignmentPreparationAssembler",
     "AlignmentPreparationCompat",
-    "AlignmentPreparationPackage",
     "CanonicalSequence",
     "CanonicalToken",
     "ExternalStableFacts",

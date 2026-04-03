@@ -23,7 +23,8 @@ if TYPE_CHECKING:
     )
     from app.services.timeanchored_alignment.selection.contracts import SelectionReport
     from app.services.timeanchored_alignment.preparation.contracts import (
-        AlignmentPreparationPackage,
+        PreparationBundle,
+        PreparationReport,
     )
     from app.services.timeanchored_alignment.slow_window.contracts import ReadySlowWindow
     from app.services.timeanchored_alignment.window_time_base_assembler import WindowTimeBasePackage
@@ -76,7 +77,8 @@ class ProcessingContext:
     time_base_report: Optional[Dict[str, Any]] = None  # V3.3.0: 时间基底构建报告（轻量）
     ready_slow_window: Optional["ReadySlowWindow"] = None  # V3.3.0 Chunk1: owner ctx 挂靠的稳定 slow window
     window_time_base: Optional["WindowTimeBasePackage"] = None  # V3.3.0 Chunk1: owner ctx 挂靠的 window time base
-    alignment_preparation: Optional["AlignmentPreparationPackage"] = None  # V3.3.0 Chunk2: 对齐准备稳定包
+    alignment_preparation: Optional["PreparationBundle"] = None  # V3.3.1 Phase2: 准备层正式产物
+    preparation_report: Optional["PreparationReport"] = None  # V3.3.1 Phase2: 准备层结构化报告
     text_truth: Optional["TextTruthPackage"] = None  # V3.3.0 Phase3: 文本真相包
     protected_spans: List["ProtectedSpan"] = field(default_factory=list)  # V3.3.0 Phase3: 保护结构 span
     language_runs: List["LanguageRun"] = field(default_factory=list)  # V3.3.0 Phase3: run级语言切分结果
@@ -110,6 +112,7 @@ class ProcessingContext:
         self.language_runs = []
         self.pronunciation_package = None
         self.alignment_preparation = None
+        self.preparation_report = None
         self.slow_window_meta = {}
         self.pronunciation_report = {}
 

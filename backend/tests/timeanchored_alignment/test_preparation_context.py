@@ -3,6 +3,7 @@ from __future__ import annotations
 from app.schemas.pipeline_context import ProcessingContext
 from app.services.timeanchored_alignment.contracts import (
     LanguageRun,
+    LayerSummary,
     PhoneUnit,
     PronunciationPackage,
     ProtectedSpan,
@@ -66,6 +67,7 @@ def test_preparation_context_release_artifacts_cleans_large_intermediate_data() 
         pronunciation_package=_build_dummy_pronunciation(),
         slow_window_meta={"window_id": "sw-001"},
         pronunciation_report={"cache_size": 1024},
+        preparation_report={"summary": LayerSummary(layer="preparation")},
     )
 
     context.release_preparation_artifacts()
@@ -74,9 +76,11 @@ def test_preparation_context_release_artifacts_cleans_large_intermediate_data() 
     assert context.alignment_preparation is None
     assert context.protected_spans == []
     assert context.language_runs == []
+    assert context.preparation_report is None
     assert context.pronunciation_package is None
     assert context.slow_window_meta == {}
     assert context.pronunciation_report == {}
+    assert context.preparation_report is None
     assert context.sv_result is not None
     assert "ctc_logits" not in context.sv_result
     assert "top_candidates" not in context.sv_result
