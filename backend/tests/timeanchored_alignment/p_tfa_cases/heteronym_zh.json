@@ -5,6 +5,7 @@
   "expected_route": "alignment_path",
   "expected_failure_semantic": "alignment_low_confidence",
   "description": "多音字需要 pronunciation graph 维持候选而不是提前拍扁。",
+  "ambiguous_token_indices": [1, 2, 3],
   "selected_text": "银行行长到了",
   "observation_tokens": [
     "银行",

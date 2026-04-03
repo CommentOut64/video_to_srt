@@ -29,6 +29,7 @@ from app.services.timeanchored_alignment.anchor_mount.service import (
     AnchorMountAlignmentService,
     AnchorMountStageResult,
 )
+from app.services.timeanchored_alignment.decoder import AlignmentDecoderService
 from app.services.timeanchored_alignment.preparation import (
     AlignmentPreparationAssembler,
     PreparationBundle,
@@ -69,6 +70,7 @@ class AlignmentStageService:
             hallucination_detector=getattr(host, "_hallucination_detector", None),
         )
         self._timeanchored_stage_service = AnchorMountAlignmentService()
+        self._alignment_decoder_service = AlignmentDecoderService()
         self._decision_ingress_adapter = DecisionIngressAdapter()
         self._output_projector = OutputProjector()
         self._selection_service = TextSelectionService(logger=getattr(host, "logger", None))
@@ -958,6 +960,10 @@ class AlignmentStageService:
             preparation=preparation,
             language=language,
         )
+        decoder_shadow_result = self._run_decoder_shadow(
+            ctx=ctx,
+            preparation=preparation,
+        )
         if isinstance(stage_result, AnchorMountStageResult):
             self._trace_write(
                 ctx=ctx,
@@ -973,12 +979,147 @@ class AlignmentStageService:
                 },
                 full_payload=stage_result,
             )
+            if decoder_shadow_result is not None:
+                self._write_decoder_shadow_trace(
+                    ctx=ctx,
+                    preparation=preparation,
+                    stage_result=stage_result,
+                    decoder_shadow_result=decoder_shadow_result,
+                )
             self._emit_anchor_mount_graph(
                 ctx=ctx,
                 preparation=preparation,
                 stage_result=stage_result,
             )
         return stage_result
+
+    def _run_decoder_shadow(
+        self,
+        *,
+        ctx: ProcessingContext,
+        preparation: PreparationBundle,
+    ) -> Any | None:
+        if not self._should_run_decoder_shadow(ctx):
+            return None
+        try:
+            return self._alignment_decoder_service.execute(preparation=preparation)
+        except Exception:
+            self._host.logger.exception(
+                "Chunk {}: decoder shadow 执行失败，但不影响正式 anchor_mount 输出",
+                getattr(ctx, "chunk_index", -1),
+            )
+            return None
+
+    def _should_run_decoder_shadow(self, ctx: ProcessingContext) -> bool:
+        if not self._postprocess_trace_writer.enabled:
+            return False
+        return self._should_sample_alignment_pipeline_shadow(ctx)
+
+    def _write_decoder_shadow_trace(
+        self,
+        *,
+        ctx: ProcessingContext,
+        preparation: PreparationBundle,
+        stage_result: AnchorMountStageResult,
+        decoder_shadow_result: Any,
+    ) -> None:
+        alignment_path = getattr(decoder_shadow_result, "alignment_path", None)
+        alignment_report = getattr(decoder_shadow_result, "alignment_report", None)
+        self._trace_write(
+            ctx=ctx,
+            filename="22_decoder_shadow.output.json",
+            stage="decoder_shadow_output",
+            summary_payload={
+                "window_id": str(preparation.window_id),
+                "route": str(getattr(alignment_report, "route", "") or ""),
+                "failure_semantic": str(getattr(alignment_report, "failure_semantic", "") or ""),
+                "path_token_count": len(getattr(alignment_path, "aligned_tokens", ()) or ()),
+                "boundary_candidate_count": len(
+                    getattr(decoder_shadow_result, "boundary_candidates", ()) or ()
+                ),
+                "low_confidence_span_count": len(
+                    getattr(decoder_shadow_result, "low_confidence_spans", ()) or ()
+                ),
+            },
+            full_payload={
+                "alignment_path": alignment_path,
+                "boundary_candidates": getattr(decoder_shadow_result, "boundary_candidates", ()),
+                "low_confidence_spans": getattr(decoder_shadow_result, "low_confidence_spans", ()),
+                "alignment_report": alignment_report,
+                "diagnostics": getattr(decoder_shadow_result, "diagnostics", {}),
+            },
+        )
+        self._trace_write(
+            ctx=ctx,
+            filename="23_decoder_shadow.diff.json",
+            stage="decoder_shadow_diff",
+            summary_payload=self._build_decoder_shadow_diff(
+                stage_result=stage_result,
+                decoder_shadow_result=decoder_shadow_result,
+            ),
+            full_payload=self._build_decoder_shadow_diff(
+                stage_result=stage_result,
+                decoder_shadow_result=decoder_shadow_result,
+            ),
+        )
+        if alignment_report is not None:
+            self._postprocess_trace_writer.write_layer_summary(
+                job_dir=ctx.job_dir,
+                layer_summary=alignment_report.summary,
+            )
+
+    @staticmethod
+    def _build_decoder_shadow_diff(
+        *,
+        stage_result: AnchorMountStageResult,
+        decoder_shadow_result: Any,
+    ) -> dict[str, Any]:
+        alignment_path = getattr(decoder_shadow_result, "alignment_path", None)
+        decoder_tokens = tuple(getattr(alignment_path, "aligned_tokens", ()) or ())
+        anchor_tokens = tuple(getattr(stage_result.decision_ingress, "anchored_token_units", ()) or ())
+        pair_count = min(len(decoder_tokens), len(anchor_tokens))
+        avg_timing_delta_ms = 0.0
+        if pair_count:
+            deltas = []
+            for index in range(pair_count):
+                decoder_item = decoder_tokens[index]
+                anchor_item = anchor_tokens[index]
+                deltas.append(
+                    abs(float(getattr(decoder_item, "start", 0.0) or 0.0) - float(getattr(anchor_item, "start", 0.0) or 0.0))
+                )
+                deltas.append(
+                    abs(float(getattr(decoder_item, "end", 0.0) or 0.0) - float(getattr(anchor_item, "end", 0.0) or 0.0))
+                )
+            avg_timing_delta_ms = sum(deltas) / max(len(deltas), 1) * 1000.0
+        return {
+            "decoder": {
+                "route": str(getattr(getattr(decoder_shadow_result, "alignment_report", None), "route", "") or ""),
+                "path_token_count": len(decoder_tokens),
+                "boundary_candidate_count": len(
+                    getattr(decoder_shadow_result, "boundary_candidates", ()) or ()
+                ),
+                "low_confidence_span_count": len(
+                    getattr(decoder_shadow_result, "low_confidence_spans", ()) or ()
+                ),
+            },
+            "anchor_mount": {
+                "path_token_count": len(anchor_tokens),
+                "boundary_evidence_count": len(
+                    getattr(stage_result.decision_ingress, "boundary_evidences", ()) or ()
+                ),
+                "should_fallback": bool(stage_result.anchor_mount_result.should_fallback),
+            },
+            "diff": {
+                "path_token_count_delta": int(len(decoder_tokens) - len(anchor_tokens)),
+                "boundary_count_delta": int(
+                    len(getattr(decoder_shadow_result, "boundary_candidates", ()) or ())
+                    - len(getattr(stage_result.decision_ingress, "boundary_evidences", ()) or ())
+                ),
+                "source_chunk_scope_match": tuple(getattr(alignment_path, "source_chunk_ids", ()) or ())
+                == tuple(getattr(stage_result.decision_ingress, "source_chunk_ids", ()) or ()),
+                "avg_timing_delta_ms": float(avg_timing_delta_ms),
+            },
+        }
 
     def _commit_preparation_context(
         self,
