@@ -4,7 +4,7 @@ import pytest
 
 from app.models.sensevoice_models import SentenceSegment
 from app.services.alignment.types import OutputLayerInput
-from app.services.textflow.contracts import SubtitleBatch, SubtitleItem
+from app.services.textflow.contracts import ChunkSentenceIndex, SentenceRecord, SubtitleBatch, SubtitleItem
 from app.services.textflow.output_dispatch_adapter import OutputDispatchAdapter, OutputLayerProcessor
 
 
@@ -75,6 +75,27 @@ def test_output_dispatch_adapter_dispatch_success() -> None:
     )
 
     payload = adapter.dispatch(
+        sentence_records=[
+            SentenceRecord(
+                sentence_id="seg-1",
+                text="Hello, world",
+                start=0.0,
+                end=1.2,
+                source_chunk_ids=("chunk-7",),
+                overlap_chunk_ids=("chunk-7",),
+                replace_scope_chunk_ids=("chunk-7",),
+                route="timeanchored",
+                trace={
+                    "split_reason": "punctuation",
+                    "window_id": "w1",
+                    "mapped_cut_time": 1.2,
+                    "mapping_quality": "boundary",
+                    "mapping_reason": "render_core",
+                },
+                metadata={"speaker_id": "spk-1", "turn_id": "turn-1", "source": "aligned"},
+            ),
+        ],
+        chunk_sentence_indices=[ChunkSentenceIndex(chunk_id="chunk-7", sentence_ids=("seg-1",))],
         subtitle_batch=subtitle_batch,
         injection_report={"mapping_coverage": 1.0},
         segmentation_report={"route": "timeanchored"},
@@ -86,6 +107,7 @@ def test_output_dispatch_adapter_dispatch_success() -> None:
     assert payload["chunk_uid"] == "chunk-7"
     assert payload["sentence_count"] == 1
     assert payload["sentence_segments"][0]["text"] == "Hello, world"
+    assert payload["sentence_segments"][0]["source_chunk_ids"] == ["chunk-7"]
     assert payload["output_trace"][0]["split_reason"] == "punctuation"
     assert payload["transport_meta"]["subtitle_channel"]["status"] == "ok"
     assert payload["transport_meta"]["speaker_store_channel"]["status"] == "ok"
@@ -113,6 +135,17 @@ def test_output_dispatch_adapter_marks_output_channel_failure() -> None:
     )
 
     payload = adapter.dispatch(
+        sentence_records=[
+            SentenceRecord(
+                sentence_id="seg-x",
+                text="x",
+                start=0.0,
+                end=0.1,
+                source_chunk_ids=("chunk-1",),
+                replace_scope_chunk_ids=("chunk-1",),
+            ),
+        ],
+        chunk_sentence_indices=[ChunkSentenceIndex(chunk_id="chunk-1", sentence_ids=("seg-x",))],
         subtitle_batch=subtitle_batch,
         injection_report={},
         segmentation_report={},
@@ -124,7 +157,7 @@ def test_output_dispatch_adapter_marks_output_channel_failure() -> None:
     assert "E_OUTPUT_CHANNEL_FAIL" in payload["errors"]
 
 
-def test_output_layer_processor_uses_provided_subtitle_batch() -> None:
+def test_output_layer_processor_uses_sentence_records_as_internal_truth() -> None:
     subtitle_manager = _DummySubtitleManager()
     processor = OutputLayerProcessor(subtitle_manager=subtitle_manager)
 
@@ -138,6 +171,29 @@ def test_output_layer_processor_uses_provided_subtitle_batch() -> None:
                     start=0.0,
                     end=0.5,
                 )
+            ],
+            sentence_records=[
+                SentenceRecord(
+                    sentence_id="seg-9-0",
+                    text="统一 DTO 文本",
+                    start=1.0,
+                    end=2.0,
+                    source_chunk_ids=("chunk-9",),
+                    overlap_chunk_ids=("chunk-9",),
+                    replace_scope_chunk_ids=("chunk-9",),
+                    route="timeanchored",
+                    trace={
+                        "split_reason": "render_core",
+                        "window_id": "",
+                        "mapped_cut_time": 2.0,
+                        "mapping_quality": "boundary",
+                        "mapping_reason": "render_core",
+                    },
+                    metadata={"source": "render_core"},
+                )
+            ],
+            chunk_sentence_indices=[
+                ChunkSentenceIndex(chunk_id="chunk-9", sentence_ids=("seg-9-0",))
             ],
             subtitle_batch=SubtitleBatch(
                 chunk_id="chunk-9",
@@ -174,14 +230,15 @@ def test_output_layer_processor_uses_provided_subtitle_batch() -> None:
 
     assert subtitle_manager.calls == [("chunk-9", 1)]
     assert payload["sentence_segments"][0]["text"] == "统一 DTO 文本"
+    assert payload["sentence_segments"][0]["source_chunk_ids"] == ["chunk-9"]
     assert payload["output_trace"][0]["split_reason"] == "render_core"
 
 
-def test_output_layer_processor_rejects_missing_subtitle_batch() -> None:
+def test_output_layer_processor_rejects_missing_sentence_records() -> None:
     subtitle_manager = _DummySubtitleManager()
     processor = OutputLayerProcessor(subtitle_manager=subtitle_manager)
 
-    with pytest.raises(ValueError, match="subtitle_batch"):
+    with pytest.raises(ValueError, match="sentence_records"):
         processor.process(
             OutputLayerInput(
                 chunk_index="chunk-3",

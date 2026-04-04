@@ -7,7 +7,8 @@ from typing import Any, Callable, Dict, Optional, Sequence
 
 from app.core.logging import resolve_loguru_logger
 from app.services.alignment.types import OutputLayerInput, OutputLayerOutput, OutputTrace
-from app.services.textflow.contracts import SubtitleBatch, SubtitleItem
+from app.services.textflow.contracts import ChunkSentenceIndex, SentenceRecord, SubtitleBatch, SubtitleItem
+from app.services.textflow.subtitle_delivery import SubtitleDelivery
 
 
 class OutputLayerProcessor:
@@ -20,6 +21,7 @@ class OutputLayerProcessor:
         speaker_store_service_getter: Optional[Callable[[], Any]] = None,
         logger: Optional[Any] = None,
     ) -> None:
+        self._subtitle_delivery = SubtitleDelivery()
         self._output_dispatch_adapter = OutputDispatchAdapter(
             subtitle_manager=subtitle_manager,
             speaker_store_service_getter=speaker_store_service_getter,
@@ -28,14 +30,23 @@ class OutputLayerProcessor:
 
     def process(self, data: OutputLayerInput) -> OutputLayerOutput:
         """执行统一输出分发。"""
-        subtitle_batch = data.subtitle_batch
-        if subtitle_batch is None:
-            raise ValueError(
-                "OutputLayerProcessor 需要 subtitle_batch；"
-                "sentence_segments -> SubtitleBatch 兼容回退已停用。"
-            )
-        output_traces = self._resolve_output_traces_from_batch(subtitle_batch)
+        sentence_records = self._resolve_sentence_records(data)
+        chunk_sentence_indices = self._resolve_chunk_sentence_indices(
+            data=data,
+            sentence_records=sentence_records,
+        )
+        subtitle_batch = self._resolve_subtitle_batch_compat(
+            data=data,
+            sentence_records=sentence_records,
+            chunk_sentence_indices=chunk_sentence_indices,
+        )
+        output_traces = self._resolve_output_traces(
+            sentence_records=sentence_records,
+            subtitle_batch=subtitle_batch,
+        )
         payload = self._output_dispatch_adapter.dispatch(
+            sentence_records=sentence_records,
+            chunk_sentence_indices=chunk_sentence_indices,
             subtitle_batch=subtitle_batch,
             injection_report=dict(data.injection_report or {}),
             segmentation_report=dict(data.segmentation_report or {}),
@@ -45,6 +56,33 @@ class OutputLayerProcessor:
             output_payload=payload,
             output_traces=output_traces,
         )
+
+    @staticmethod
+    def _resolve_output_traces(
+        *,
+        sentence_records: Sequence[SentenceRecord],
+        subtitle_batch: SubtitleBatch,
+    ) -> list[OutputTrace]:
+        if sentence_records:
+            traces: list[OutputTrace] = []
+            for sentence_index, record in enumerate(sentence_records):
+                trace = dict(record.trace or {})
+                traces.append(
+                    OutputTrace(
+                        sentence_index=sentence_index,
+                        split_reason=str(trace.get("split_reason", "") or ""),
+                        split_risk=str(trace.get("split_risk", "") or ""),
+                        window_id=str(trace.get("window_id", "") or ""),
+                        pyannote_frame_time=trace.get("pyannote_frame_time"),
+                        mapped_cut_time=trace.get("mapped_cut_time", float(record.end)),
+                        mapping_quality=str(trace.get("mapping_quality", "") or ""),
+                        mapping_reason=str(trace.get("mapping_reason", "") or ""),
+                        sentence_start=float(record.start),
+                        sentence_end=float(record.end),
+                    )
+                )
+            return traces
+        return OutputLayerProcessor._resolve_output_traces_from_batch(subtitle_batch)
 
     @staticmethod
     def _resolve_output_traces_from_batch(subtitle_batch: SubtitleBatch) -> list[OutputTrace]:
@@ -86,6 +124,91 @@ class OutputLayerProcessor:
             )
         return traces
 
+    def _resolve_sentence_records(self, data: OutputLayerInput) -> list[SentenceRecord]:
+        if data.sentence_records:
+            return list(data.sentence_records)
+        if data.subtitle_batch is not None and not data.sentence_segments:
+            return []
+        raise ValueError(
+            "OutputLayerProcessor 需要 sentence_records；"
+            "subtitle_batch 仅作为南向 compat 边界保留。"
+        )
+
+    def _resolve_chunk_sentence_indices(
+        self,
+        *,
+        data: OutputLayerInput,
+        sentence_records: Sequence[SentenceRecord],
+    ) -> list[ChunkSentenceIndex]:
+        if data.chunk_sentence_indices:
+            return list(data.chunk_sentence_indices)
+        chunk_id = self._resolve_target_chunk_id(data=data)
+        return list(
+            self._subtitle_delivery.build_chunk_sentence_indices(
+                chunk_id=chunk_id,
+                sentence_records=sentence_records,
+            )
+        )
+
+    def _resolve_subtitle_batch_compat(
+        self,
+        *,
+        data: OutputLayerInput,
+        sentence_records: Sequence[SentenceRecord],
+        chunk_sentence_indices: Sequence[ChunkSentenceIndex],
+    ) -> SubtitleBatch:
+        if data.subtitle_batch is not None:
+            return data.subtitle_batch
+        chunk_id = self._resolve_target_chunk_id(data=data, chunk_sentence_indices=chunk_sentence_indices)
+        chunk_index = self._resolve_target_chunk_index(data=data, chunk_id=chunk_id)
+        diagnostics: Dict[str, Any] = {}
+        if not diagnostics and chunk_sentence_indices:
+            first_metadata = dict(chunk_sentence_indices[0].metadata or {})
+            projection_payload = dict(first_metadata.get("projection") or {})
+            if projection_payload:
+                diagnostics["projection"] = projection_payload
+            projection_mode = str(first_metadata.get("projection_mode", "") or "")
+            if projection_mode and "projection" not in diagnostics:
+                diagnostics["projection"] = {"projection_mode": projection_mode}
+        return self._subtitle_delivery.build_batch_from_sentence_records(
+            chunk_id=chunk_id,
+            chunk_index=chunk_index,
+            sentence_records=sentence_records,
+            diagnostics=diagnostics,
+            render_report={},
+        )
+
+    @staticmethod
+    def _resolve_target_chunk_id(
+        *,
+        data: OutputLayerInput,
+        chunk_sentence_indices: Sequence[ChunkSentenceIndex] = (),
+    ) -> str:
+        if chunk_sentence_indices:
+            chunk_id = str(chunk_sentence_indices[0].chunk_id or "").strip()
+            if chunk_id:
+                return chunk_id
+        if data.subtitle_batch is not None:
+            chunk_id = str(data.subtitle_batch.chunk_id or "").strip()
+            if chunk_id:
+                return chunk_id
+        chunk_text = str(data.chunk_index or "").strip()
+        if chunk_text:
+            return chunk_text
+        raise ValueError("OutputLayerProcessor 无法解析目标 chunk_id")
+
+    @staticmethod
+    def _resolve_target_chunk_index(
+        *,
+        data: OutputLayerInput,
+        chunk_id: str,
+    ) -> int | None:
+        if data.subtitle_batch is not None and data.subtitle_batch.chunk_index is not None:
+            return int(data.subtitle_batch.chunk_index)
+        if isinstance(data.chunk_index, int):
+            return int(data.chunk_index)
+        return OutputDispatchAdapter._try_parse_chunk_index(chunk_id)
+
 class OutputDispatchAdapter:
     """负责输出层南向分发与 payload 封装。"""
 
@@ -108,6 +231,8 @@ class OutputDispatchAdapter:
     def dispatch(
         self,
         *,
+        sentence_records: Sequence[SentenceRecord],
+        chunk_sentence_indices: Sequence[ChunkSentenceIndex],
         subtitle_batch: SubtitleBatch,
         injection_report: Optional[Dict[str, Any]] = None,
         segmentation_report: Optional[Dict[str, Any]] = None,
@@ -136,7 +261,7 @@ class OutputDispatchAdapter:
         if "E_OUTPUT_CHANNEL_FAIL" not in output_errors:
             try:
                 speaker_store_channel_status, speaker_link_count = self._write_speaker_links(
-                    subtitle_items=subtitle_batch.items,
+                    sentence_records=sentence_records,
                     sentence_indices=replaced_sentence_indices,
                 )
             except Exception:
@@ -161,12 +286,19 @@ class OutputDispatchAdapter:
             if item is not None
         ]
         payload: Dict[str, Any] = {
-            "chunk_index": self._resolve_chunk_index(subtitle_batch),
-            "chunk_uid": str(subtitle_batch.chunk_id),
+            "chunk_index": self._resolve_chunk_index(
+                subtitle_batch=subtitle_batch,
+                chunk_sentence_indices=chunk_sentence_indices,
+            ),
+            "chunk_uid": str(self._resolve_chunk_uid(subtitle_batch, chunk_sentence_indices)),
             "source_chunk_ids": source_chunk_ids,
-            "sentence_count": int(len(subtitle_batch.items)),
+            "sentence_count": int(len(sentence_records)),
             "sentence_segments": [
-                self._serialize_subtitle_item(item) for item in subtitle_batch.items
+                self._serialize_sentence_record(
+                    record=record,
+                    chunk_id=str(self._resolve_chunk_uid(subtitle_batch, chunk_sentence_indices)),
+                )
+                for record in sentence_records
             ],
             "transport_meta": {
                 "channels": [
@@ -215,34 +347,34 @@ class OutputDispatchAdapter:
     def _write_speaker_links(
         self,
         *,
-        subtitle_items: Sequence[SubtitleItem],
+        sentence_records: Sequence[SentenceRecord],
         sentence_indices: Sequence[int],
     ) -> tuple[str, int]:
         speaker_store_service = self._resolve_speaker_store_service()
         if speaker_store_service is None:
             return "skipped_no_service", 0
-        if not subtitle_items or not sentence_indices:
+        if not sentence_records or not sentence_indices:
             return "skipped_empty", 0
-        if len(sentence_indices) < len(subtitle_items):
+        if len(sentence_indices) < len(sentence_records):
             self._logger.warning(
                 "输出层 speaker_store 写入索引不足: indices={} sentences={}",
                 len(sentence_indices),
-                len(subtitle_items),
+                len(sentence_records),
             )
 
         payload_items = []
-        for idx, subtitle_item in enumerate(subtitle_items):
+        for idx, record in enumerate(sentence_records):
             if idx >= len(sentence_indices):
                 break
             sentence_index = int(sentence_indices[idx])
-            text = str(subtitle_item.text or "")
+            text = str(record.text or "")
             payload_items.append(
                 {
                     "sentence_index": sentence_index,
-                    "turn_id": subtitle_item.turn_id,
-                    "speaker_id": str(subtitle_item.speaker_id or "unknown"),
-                    "start": float(subtitle_item.start or 0.0),
-                    "end": float(subtitle_item.end or 0.0),
+                    "turn_id": record.metadata.get("turn_id"),
+                    "speaker_id": str(record.metadata.get("speaker_id") or "unknown"),
+                    "start": float(record.start or 0.0),
+                    "end": float(record.end or 0.0),
                     "text_hash": self._compute_sentence_text_hash(text),
                     "binding_source": "auto",
                 }
@@ -272,10 +404,30 @@ class OutputDispatchAdapter:
                 return None
         return None
 
-    def _resolve_chunk_index(self, subtitle_batch: SubtitleBatch) -> Optional[int]:
+    def _resolve_chunk_uid(
+        self,
+        subtitle_batch: SubtitleBatch,
+        chunk_sentence_indices: Sequence[ChunkSentenceIndex],
+    ) -> str:
+        chunk_id = str(subtitle_batch.chunk_id or "").strip()
+        if chunk_id:
+            return chunk_id
+        if chunk_sentence_indices:
+            chunk_id = str(chunk_sentence_indices[0].chunk_id or "").strip()
+            if chunk_id:
+                return chunk_id
+        return str(subtitle_batch.chunk_id)
+
+    def _resolve_chunk_index(
+        self,
+        *,
+        subtitle_batch: SubtitleBatch,
+        chunk_sentence_indices: Sequence[ChunkSentenceIndex],
+    ) -> Optional[int]:
         if subtitle_batch.chunk_index is not None:
             return int(subtitle_batch.chunk_index)
-        return self._try_parse_chunk_index(subtitle_batch.chunk_id)
+        chunk_uid = self._resolve_chunk_uid(subtitle_batch, chunk_sentence_indices)
+        return self._try_parse_chunk_index(chunk_uid)
 
     @staticmethod
     def _serialize_trace_dict(trace: Dict[str, Any]) -> Dict[str, Any]:
@@ -306,6 +458,31 @@ class OutputDispatchAdapter:
             "source": str(item.source or ""),
             "speaker_id": str(item.speaker_id or ""),
             "turn_id": str(item.turn_id or ""),
+            "split_reason": str(trace.get("split_reason", "") or ""),
+            "split_risk": str(trace.get("split_risk", "") or ""),
+            "window_id": str(trace.get("window_id", "") or ""),
+            "mapped_cut_time": trace.get("mapped_cut_time"),
+            "mapping_quality": str(trace.get("mapping_quality", "") or ""),
+            "mapping_reason": str(trace.get("mapping_reason", "") or ""),
+        }
+
+    @staticmethod
+    def _serialize_sentence_record(*, record: SentenceRecord, chunk_id: str) -> Dict[str, Any]:
+        trace = dict(record.trace or {})
+        return {
+            "segment_id": str(record.sentence_id),
+            "chunk_id": str(chunk_id),
+            "text": str(record.text or ""),
+            "text_clean": str(record.text or ""),
+            "start": float(record.start or 0.0),
+            "end": float(record.end or 0.0),
+            "status": str(record.metadata.get("status", "final") or "final"),
+            "source": str(record.metadata.get("source", "") or ""),
+            "speaker_id": str(record.metadata.get("speaker_id") or ""),
+            "turn_id": str(record.metadata.get("turn_id") or ""),
+            "source_chunk_ids": [str(item) for item in record.source_chunk_ids],
+            "overlap_chunk_ids": [str(item) for item in record.overlap_chunk_ids],
+            "replace_scope_chunk_ids": [str(item) for item in record.replace_scope_chunk_ids],
             "split_reason": str(trace.get("split_reason", "") or ""),
             "split_risk": str(trace.get("split_risk", "") or ""),
             "window_id": str(trace.get("window_id", "") or ""),

@@ -5517,6 +5517,8 @@ class AsyncDualPipelineKernel:
         segmentation_report: Dict[str, Any],
         output_traces: Optional[Sequence[OutputTrace]],
         default_trace_reason: str,
+        sentence_records: Optional[Sequence[Any]] = None,
+        chunk_sentence_indices: Optional[Sequence[Any]] = None,
         subtitle_batch: Optional["SubtitleBatch"] = None,
     ) -> Any:
         """
@@ -5526,10 +5528,10 @@ class AsyncDualPipelineKernel:
         - 输出层要求单入口，所有路径统一经过 OutputLayerProcessor；
         - trace 在入口先对齐句段数量，保障 transport payload 稳定可追溯。
         """
-        if subtitle_batch is None:
+        if not sentence_records and subtitle_batch is None:
             raise ValueError(
-                "_emit_output_layer 需要 subtitle_batch；"
-                "sentence_segments -> SubtitleBatch 兼容回退已停用。"
+                "_emit_output_layer 需要 sentence_records；"
+                "subtitle_batch 仅作为南向 compat 边界保留。"
             )
         return self._output_processor.process(
             OutputLayerInput(
@@ -5539,6 +5541,8 @@ class AsyncDualPipelineKernel:
                 injection_report=dict(injection_report),
                 segmentation_report=dict(segmentation_report),
                 output_traces=list(output_traces or []),
+                sentence_records=list(sentence_records or []),
+                chunk_sentence_indices=list(chunk_sentence_indices or []),
                 subtitle_batch=subtitle_batch,
             )
         )

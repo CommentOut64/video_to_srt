@@ -318,6 +318,8 @@ class DecisionLayerOutput:
     output_traces: List[OutputTrace] = field(default_factory=list)
     segmentation_result: Optional["SegmentationResult"] = None
     render_result: Optional["RenderResult"] = None
+    sentence_records: List["SentenceRecord"] = field(default_factory=list)
+    chunk_sentence_indices: List["ChunkSentenceIndex"] = field(default_factory=list)
     subtitle_batch: Optional["SubtitleBatch"] = None
     aligned_sentences: List["AlignedSentence"] = field(default_factory=list)
     segmentation_report_contract: Optional["SegmentationReport"] = None
@@ -333,6 +335,8 @@ class OutputLayerInput:
     injection_report: Optional[Dict[str, Any]] = None
     segmentation_report: Optional[Dict[str, Any]] = None
     output_traces: Optional[List[OutputTrace]] = None
+    sentence_records: List["SentenceRecord"] = field(default_factory=list)
+    chunk_sentence_indices: List["ChunkSentenceIndex"] = field(default_factory=list)
     subtitle_batch: Optional["SubtitleBatch"] = None
     aligned_sentences: List["AlignedSentence"] = field(default_factory=list)
     segmentation_report_contract: Optional["SegmentationReport"] = None

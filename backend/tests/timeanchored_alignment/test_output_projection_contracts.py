@@ -4,7 +4,7 @@ import inspect
 
 import pytest
 
-from app.services.textflow.contracts import SubtitleBatch, SubtitleItem
+from app.services.textflow.contracts import ChunkSentenceIndex, SentenceRecord
 from app.services.textflow.output_dispatch_adapter import OutputDispatchAdapter
 from app.services.timeanchored_alignment.output_projection.output_projector import (
     OutputProjectionInput,
@@ -43,19 +43,17 @@ def _build_coverage() -> WindowCoverage:
     )
 
 
-def _build_carrier_batch() -> SubtitleBatch:
-    return SubtitleBatch(
-        chunk_id="window-10",
-        chunk_index=None,
-        items=(
-            SubtitleItem(
-                segment_id="timeanchored:window-10:seg:0",
-                chunk_id="window-10",
-                start=10.0,
-                end=11.6,
-                text="测试输出",
-                source="render_core",
-            ),
+def _build_carrier_sentence_records() -> tuple[SentenceRecord, ...]:
+    return (
+        SentenceRecord(
+            sentence_id="timeanchored:window-10:seg:0",
+            text="测试输出",
+            start=10.0,
+            end=11.6,
+            source_chunk_ids=("chunk-10", "chunk-11"),
+            replace_scope_chunk_ids=("chunk-10", "chunk-11"),
+            route="timeanchored",
+            metadata={"source": "render_core"},
         ),
     )
 
@@ -66,11 +64,15 @@ def test_output_projection_min_input_requires_window_source_and_coverage() -> No
         source_chunk_ids=("chunk-10", "chunk-11"),
         source_chunk_indices=(10, 11),
         coverage=_build_coverage(),
-        carrier_batch=_build_carrier_batch(),
+        carrier_chunk_id="window-10",
+        carrier_sentence_records=_build_carrier_sentence_records(),
+        carrier_chunk_sentence_indices=(
+            ChunkSentenceIndex(chunk_id="window-10", sentence_ids=("timeanchored:window-10:seg:0",)),
+        ),
         decision_metadata={"route": "timeanchored"},
     )
 
-    assert data.carrier_batch.chunk_id == "window-10"
+    assert data.carrier_chunk_id == "window-10"
     assert data.window_id == "window-10"
     assert data.source_chunk_ids == ("chunk-10", "chunk-11")
     assert data.source_chunk_indices == (10, 11)
@@ -84,24 +86,26 @@ def test_output_projection_accepts_window_carrier_batch_outside_source_chunk_sco
         source_chunk_ids=("chunk-10", "chunk-11"),
         source_chunk_indices=(10, 11),
         coverage=_build_coverage(),
-        carrier_batch=SubtitleBatch(
-            chunk_id="window-10",
-            chunk_index=None,
-            items=(
-                SubtitleItem(
-                    segment_id="seg-999",
-                    chunk_id="window-10",
-                    start=10.0,
-                    end=11.0,
-                    text="窗口载体",
-                    source="render_core",
-                ),
+        carrier_chunk_id="window-10",
+        carrier_sentence_records=(
+            SentenceRecord(
+                sentence_id="seg-999",
+                text="窗口载体",
+                start=10.0,
+                end=11.0,
+                source_chunk_ids=("chunk-10", "chunk-11"),
+                replace_scope_chunk_ids=("chunk-10", "chunk-11"),
+                route="timeanchored",
+                metadata={"source": "render_core"},
             ),
+        ),
+        carrier_chunk_sentence_indices=(
+            ChunkSentenceIndex(chunk_id="window-10", sentence_ids=("seg-999",)),
         ),
         decision_metadata={},
     )
 
-    assert data.carrier_batch.chunk_id == "window-10"
+    assert data.carrier_chunk_id == "window-10"
 
 
 def test_output_projection_keeps_southbound_replace_chunk_batch_contract() -> None:

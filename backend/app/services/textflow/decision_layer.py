@@ -240,11 +240,43 @@ class SegmentationProcessor:
             canonical_stream=canonical_stream,
             segmentation_result=segmentation_result,
         )
-        subtitle_batch = self._subtitle_delivery.build_batch(
+        ingress_context_payload = self._serialize_ingress_context(data.ingress_context)
+        sentence_records = self._subtitle_delivery.build_sentence_records(
             render_result=render_result,
+            source_chunk_ids=(
+                list(getattr(data.ingress_context, "source_chunk_ids", ()) or ())
+                or [str(canonical_stream.chunk_ref)]
+            ),
+            overlap_chunk_ids=(
+                list(getattr(data.ingress_context, "projection_chunk_ids", ()) or ())
+                or list(getattr(data.ingress_context, "source_chunk_ids", ()) or ())
+                or [str(canonical_stream.chunk_ref)]
+            ),
+            replace_scope_chunk_ids=(
+                list(getattr(data.ingress_context, "source_chunk_ids", ()) or ())
+                or [str(canonical_stream.chunk_ref)]
+            ),
+            route=str(getattr(data.ingress_context, "unit_kind", "") or ""),
+            metadata={"chunk_id": str(canonical_stream.chunk_ref)},
+        )
+        chunk_sentence_indices = self._subtitle_delivery.build_chunk_sentence_indices(
+            chunk_id=str(canonical_stream.chunk_ref),
+            sentence_records=sentence_records,
+            metadata={
+                "projection_mode": "carrier_batch",
+                "ingress_unit_kind": str(getattr(data.ingress_context, "unit_kind", "") or ""),
+            },
+        )
+        subtitle_batch = self._subtitle_delivery.build_batch_from_sentence_records(
             chunk_id=str(canonical_stream.chunk_ref),
             chunk_index=chunk_index,
-            ingress_context=self._serialize_ingress_context(data.ingress_context),
+            sentence_records=sentence_records,
+            diagnostics={
+                "source": "render_core",
+                "render_output_trace": [dict(entry) for entry in render_result.output_trace],
+                "ingress_context": ingress_context_payload or {},
+            },
+            render_report=dict(render_result.render_report or {}),
         )
         rendered_sentences = self._build_compat_sentences_from_subtitle_batch(
             subtitle_batch=subtitle_batch,
@@ -287,6 +319,8 @@ class SegmentationProcessor:
             output_traces=rendered_traces,
             segmentation_result=segmentation_result,
             render_result=render_result,
+            sentence_records=list(sentence_records),
+            chunk_sentence_indices=list(chunk_sentence_indices),
             subtitle_batch=subtitle_batch,
             aligned_sentences=aligned_sentences,
             segmentation_report_contract=segmentation_report_contract,

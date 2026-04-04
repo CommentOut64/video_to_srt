@@ -8,7 +8,22 @@ from typing import TYPE_CHECKING, Any
 from app.services.timeanchored_alignment.slow_window.contracts import WindowCoverage
 
 if TYPE_CHECKING:
-    from app.services.textflow.contracts import SubtitleBatch, SubtitleItem
+    from app.services.textflow.contracts import (
+        ChunkSentenceIndex,
+        SentenceRecord,
+        SubtitleBatch,
+    )
+
+
+@dataclass(frozen=True)
+class OutputProjectionResult:
+    """输出层内部 sentence-first 投影结果。"""
+
+    chunk_id: str
+    sentence_records: tuple["SentenceRecord", ...]
+    chunk_sentence_indices: tuple["ChunkSentenceIndex", ...]
+    subtitle_batch_compat: "SubtitleBatch"
+    chunk_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -19,7 +34,9 @@ class OutputProjectionInput:
     source_chunk_ids: tuple[str, ...]
     source_chunk_indices: tuple[int, ...]
     coverage: WindowCoverage
-    carrier_batch: "SubtitleBatch"
+    carrier_chunk_id: str
+    carrier_sentence_records: tuple["SentenceRecord", ...]
+    carrier_chunk_sentence_indices: tuple["ChunkSentenceIndex", ...]
     decision_metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -35,8 +52,10 @@ class OutputProjectionInput:
             )
         if not tuple(getattr(self.coverage, "chunk_bindings", ()) or ()):
             raise ValueError("OutputProjectionInput.coverage.chunk_bindings 不能为空")
-        if not str(getattr(self.carrier_batch, "chunk_id", "") or "").strip():
-            raise ValueError("OutputProjectionInput.carrier_batch.chunk_id 不能为空")
+        if not str(self.carrier_chunk_id or "").strip():
+            raise ValueError("OutputProjectionInput.carrier_chunk_id 不能为空")
+        if not self.carrier_chunk_sentence_indices:
+            raise ValueError("OutputProjectionInput.carrier_chunk_sentence_indices 不能为空")
 
     @property
     def carrier_role(self) -> str:
@@ -50,35 +69,27 @@ class OutputProjector:
     def validate_input(self, data: OutputProjectionInput) -> OutputProjectionInput:
         return data
 
-    def project(self, data: OutputProjectionInput) -> tuple["SubtitleBatch", ...]:
-        from app.services.textflow.contracts import SubtitleBatch
+    def project(self, data: OutputProjectionInput) -> tuple[OutputProjectionResult, ...]:
+        from app.services.textflow.subtitle_delivery import SubtitleDelivery
 
         validated = self.validate_input(data)
         bindings = tuple(validated.coverage.chunk_bindings or ())
         if not bindings:
             return tuple()
 
+        internal_chunk_id = str(validated.carrier_chunk_id)
         output_group_chunk_id = self._build_output_group_chunk_id(validated.window_id)
-        grouped_items: list["SubtitleItem"] = []
-        seen_segment_ids: set[str] = set()
-        for item in tuple(validated.carrier_batch.items or ()):
-            segment_id = str(item.segment_id)
-            if segment_id in seen_segment_ids:
-                continue
-            seen_segment_ids.add(segment_id)
-            grouped_items.append(
-                self._clone_item_for_chunk(item=item, chunk_id=output_group_chunk_id)
-            )
-
         source_chunk_ids = [str(item) for item in validated.source_chunk_ids]
         source_chunk_indices = [int(item) for item in validated.source_chunk_indices]
         binding_chunk_ids = [str(binding.chunk_id) for binding in bindings]
         binding_chunk_indices = [int(binding.chunk_index) for binding in bindings]
         projection_meta = {
             "window_id": str(validated.window_id),
-            "carrier_chunk_id": str(validated.carrier_batch.chunk_id),
+            "carrier_chunk_id": str(validated.carrier_chunk_id),
             "source_chunk_ids": source_chunk_ids,
             "source_chunk_indices": source_chunk_indices,
+            "overlap_chunk_ids": binding_chunk_ids,
+            "overlap_chunk_indices": binding_chunk_indices,
             "replace_scope_chunk_ids": source_chunk_ids,
             "replace_scope_chunk_indices": source_chunk_indices,
             "binding_chunk_ids": binding_chunk_ids,
@@ -87,19 +98,35 @@ class OutputProjector:
             "carrier_role": validated.carrier_role,
             "decision_metadata": dict(validated.decision_metadata or {}),
         }
-        render_report = dict(validated.carrier_batch.render_report or {})
-        base_diagnostics = dict(validated.carrier_batch.diagnostics or {})
-        grouped_tuple = tuple(grouped_items)
-        diagnostics = dict(base_diagnostics)
-        diagnostics["projection"] = dict(projection_meta)
-        diagnostics["output_trace"] = self._build_output_trace(grouped_tuple)
+        projected_records = self._project_sentence_records(
+            carrier_sentence_records=validated.carrier_sentence_records,
+            source_chunk_ids=tuple(source_chunk_ids),
+            overlap_chunk_ids=tuple(binding_chunk_ids),
+            replace_scope_chunk_ids=tuple(source_chunk_ids),
+        )
+        projected_indices = self._project_chunk_sentence_indices(
+            chunk_id=internal_chunk_id,
+            carrier_chunk_sentence_indices=validated.carrier_chunk_sentence_indices,
+            sentence_records=projected_records,
+            projection_meta=projection_meta,
+        )
+        subtitle_delivery = SubtitleDelivery()
+        subtitle_batch_compat = subtitle_delivery.build_batch_from_sentence_records(
+            chunk_id=output_group_chunk_id,
+            chunk_index=None,
+            sentence_records=projected_records,
+            diagnostics={
+                "source": "output_projector",
+                "projection": dict(projection_meta),
+            },
+        )
         return (
-            SubtitleBatch(
-                chunk_id=output_group_chunk_id,
+            OutputProjectionResult(
+                chunk_id=internal_chunk_id,
                 chunk_index=None,
-                items=grouped_tuple,
-                render_report=dict(render_report),
-                diagnostics=diagnostics,
+                sentence_records=projected_records,
+                chunk_sentence_indices=projected_indices,
+                subtitle_batch_compat=subtitle_batch_compat,
             ),
         )
 
@@ -109,39 +136,61 @@ class OutputProjector:
         return f"ow-{normalized_window_id}"
 
     @staticmethod
-    def _clone_item_for_chunk(*, item: "SubtitleItem", chunk_id: str) -> "SubtitleItem":
-        from app.services.textflow.contracts import SubtitleItem
+    def _project_sentence_records(
+        *,
+        carrier_sentence_records: tuple["SentenceRecord", ...],
+        source_chunk_ids: tuple[str, ...],
+        overlap_chunk_ids: tuple[str, ...],
+        replace_scope_chunk_ids: tuple[str, ...],
+    ) -> tuple["SentenceRecord", ...]:
+        from app.services.textflow.contracts import SentenceRecord
 
-        return SubtitleItem(
-            segment_id=str(item.segment_id),
-            chunk_id=str(chunk_id),
-            start=float(item.start),
-            end=float(item.end),
-            text=str(item.text),
-            status=str(item.status or "final"),
-            source=str(item.source or "unknown"),
-            speaker_id=item.speaker_id,
-            turn_id=item.turn_id,
-            trace=dict(item.trace or {}),
-        )
+        projected: list[SentenceRecord] = []
+        seen_sentence_ids: set[str] = set()
+        for record in carrier_sentence_records:
+            sentence_id = str(record.sentence_id)
+            if sentence_id in seen_sentence_ids:
+                continue
+            seen_sentence_ids.add(sentence_id)
+            projected.append(
+                SentenceRecord(
+                    sentence_id=sentence_id,
+                    text=str(record.text),
+                    start=float(record.start),
+                    end=float(record.end),
+                    source_chunk_ids=tuple(record.source_chunk_ids or source_chunk_ids),
+                    overlap_chunk_ids=tuple(record.overlap_chunk_ids or overlap_chunk_ids),
+                    replace_scope_chunk_ids=tuple(
+                        record.replace_scope_chunk_ids or replace_scope_chunk_ids
+                    ),
+                    route=str(record.route or ""),
+                    trace=dict(record.trace or {}),
+                    metadata=dict(record.metadata or {}),
+                )
+            )
+        return tuple(projected)
 
     @staticmethod
-    def _build_output_trace(items: tuple["SubtitleItem", ...]) -> list[dict[str, Any]]:
-        traces: list[dict[str, Any]] = []
-        for sentence_index, item in enumerate(items):
-            trace = dict(item.trace or {})
-            traces.append(
-                {
-                    "sentence_index": int(sentence_index),
-                    "split_reason": str(trace.get("split_reason", "") or ""),
-                    "split_risk": str(trace.get("split_risk", "") or ""),
-                    "window_id": str(trace.get("window_id", "") or ""),
-                    "pyannote_frame_time": trace.get("pyannote_frame_time"),
-                    "mapped_cut_time": trace.get("mapped_cut_time", float(item.end)),
-                    "mapping_quality": str(trace.get("mapping_quality", "") or ""),
-                    "mapping_reason": str(trace.get("mapping_reason", "") or ""),
-                    "sentence_start": float(item.start),
-                    "sentence_end": float(item.end),
-                }
-            )
-        return traces
+    def _project_chunk_sentence_indices(
+        *,
+        chunk_id: str,
+        carrier_chunk_sentence_indices: tuple["ChunkSentenceIndex", ...],
+        sentence_records: tuple["SentenceRecord", ...],
+        projection_meta: dict[str, Any],
+    ) -> tuple["ChunkSentenceIndex", ...]:
+        from app.services.textflow.contracts import ChunkSentenceIndex
+
+        carrier_metadata = (
+            dict(carrier_chunk_sentence_indices[0].metadata or {})
+            if carrier_chunk_sentence_indices
+            else {}
+        )
+        merged_metadata = dict(carrier_metadata)
+        merged_metadata.update({"projection": dict(projection_meta)})
+        return (
+            ChunkSentenceIndex(
+                chunk_id=str(chunk_id),
+                sentence_ids=tuple(str(record.sentence_id) for record in sentence_records),
+                metadata=merged_metadata,
+            ),
+        )

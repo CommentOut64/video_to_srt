@@ -29,7 +29,7 @@ from app.services.alignment.types import (
     TextTrack,
     TextTrackBundle,
 )
-from app.services.textflow.contracts import SubtitleBatch
+from app.services.textflow.contracts import ChunkSentenceIndex, SentenceRecord, SubtitleBatch
 from app.services.text_protection import is_sentence_end_punct
 
 if TYPE_CHECKING:
@@ -46,6 +46,8 @@ class Layer456RunResult:
     split_stats: Dict[str, Any]
     final_sentences: List[SentenceSegment]
     output_traces: List[OutputTrace]
+    sentence_records: List[SentenceRecord]
+    chunk_sentence_indices: List[ChunkSentenceIndex]
     subtitle_batch: Optional[SubtitleBatch] = None
     alignment_time_source: str = "sv"
     alignment_time_word_count: int = 0
@@ -377,6 +379,8 @@ class TextflowFacadeService:
             split_stats=dict(split_stats),
             final_sentences=final_sentences,
             output_traces=output_traces,
+            sentence_records=list(decision_output.sentence_records or []),
+            chunk_sentence_indices=list(decision_output.chunk_sentence_indices or []),
             subtitle_batch=decision_output.subtitle_batch,
             alignment_time_source=time_source,
             alignment_time_word_count=len(time_words),
@@ -495,6 +499,8 @@ class TextflowFacadeService:
             split_stats=split_stats,
             final_sentences=final_sentences,
             output_traces=list(run_result.output_traces),
+            sentence_records=list(run_result.sentence_records or []),
+            chunk_sentence_indices=list(run_result.chunk_sentence_indices or []),
             subtitle_batch=run_result.subtitle_batch,
             alignment_time_source=run_result.alignment_time_source,
             alignment_time_word_count=run_result.alignment_time_word_count,

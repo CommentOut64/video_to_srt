@@ -16,7 +16,8 @@ from app.services.alignment.types import L2Output, PunctTrack, TextTrack, TextTr
 from app.services.arbitration.arbiter import ArbitrationResult
 from app.services.audio.chunk_engine import AudioChunk
 from app.services.streaming_subtitle import remove_streaming_subtitle_manager
-from app.services.textflow.contracts import SubtitleBatch, SubtitleItem
+from app.services.textflow.contracts import ChunkSentenceIndex, SentenceRecord, SubtitleBatch, SubtitleItem
+from app.services.timeanchored_alignment.output_projection.output_projector import OutputProjectionResult
 from app.services.timeanchored_alignment.contracts import (
     TimeBasePackage,
     TimeBaseQuality,
@@ -534,24 +535,50 @@ def test_alignment_stage_timeanchored_main_chain_dispatches_projected_batches(
     )
 
     projected_batches = (
-        SubtitleBatch(
+        OutputProjectionResult(
             chunk_id="chunk-0",
             chunk_index=0,
-            items=(
-                SubtitleItem(
-                    segment_id="seg-0",
-                    chunk_id="chunk-0",
+            sentence_records=(
+                SentenceRecord(
+                    sentence_id="seg-0",
                     text="第一句",
                     start=0.0,
                     end=0.8,
-                    source="render_core",
+                    source_chunk_ids=("chunk-0",),
+                    replace_scope_chunk_ids=("chunk-0",),
+                    metadata={"source": "render_core"},
+                ),
+            ),
+            chunk_sentence_indices=(
+                ChunkSentenceIndex(chunk_id="chunk-0", sentence_ids=("seg-0",)),
+            ),
+            subtitle_batch_compat=SubtitleBatch(
+                chunk_id="chunk-0",
+                chunk_index=0,
+                items=(
+                    SubtitleItem(
+                        segment_id="seg-0",
+                        chunk_id="chunk-0",
+                        text="第一句",
+                        start=0.0,
+                        end=0.8,
+                        source="render_core",
+                    ),
                 ),
             ),
         ),
-        SubtitleBatch(
+        OutputProjectionResult(
             chunk_id="chunk-1",
             chunk_index=1,
-            items=(),
+            sentence_records=(),
+            chunk_sentence_indices=(
+                ChunkSentenceIndex(chunk_id="chunk-1", sentence_ids=()),
+            ),
+            subtitle_batch_compat=SubtitleBatch(
+                chunk_id="chunk-1",
+                chunk_index=1,
+                items=(),
+            ),
         ),
     )
     monkeypatch.setattr(

@@ -13,7 +13,7 @@ from app.services.bridge.turn_group_models import TurnGroup
 from app.services.language_policy import resolve_language_tag
 from app.services.sensevoice_onnx_service import SenseVoiceLanguageInfo, SenseVoiceONNXService
 from app.services.textflow.output_dispatch_adapter import OutputLayerProcessor
-from app.services.textflow.contracts import SubtitleBatch, SubtitleItem
+from app.services.textflow.contracts import ChunkSentenceIndex, SentenceRecord, SubtitleBatch, SubtitleItem
 from app.services.alignment.types import OutputLayerInput
 from app.pipelines.dual_pipeline.services.slow_loop_service import SlowLoopService
 
@@ -177,8 +177,8 @@ async def test_phase0_reality_gate_slow_loop_rejects_turn_group_envelope() -> No
     assert isinstance(terminal_ctx.error, RuntimeError)
 
 
-def test_phase0_reality_gate_output_layer_requires_subtitle_batch_to_replace_chunk_batch() -> None:
-    """现实基线：OutputLayerProcessor 只接受显式 SubtitleBatch，再调用 replace_chunk_batch()。"""
+def test_phase0_reality_gate_output_layer_requires_sentence_records_and_only_southbound_uses_subtitle_batch() -> None:
+    """现实基线：OutputLayerProcessor 以 sentence_records 为内部真源，仅把 SubtitleBatch 留给南向 replace_chunk_batch()."""
 
     class _DummySubtitleManager:
         def __init__(self) -> None:
@@ -196,6 +196,21 @@ def test_phase0_reality_gate_output_layer_requires_subtitle_batch_to_replace_chu
             chunk_index=3,
             sentence_segments=[],
             language="zh",
+            sentence_records=[
+                SentenceRecord(
+                    sentence_id="seg-3-0",
+                    text="你好",
+                    start=0.0,
+                    end=0.8,
+                    source_chunk_ids=("3",),
+                    overlap_chunk_ids=("3",),
+                    replace_scope_chunk_ids=("3",),
+                    route="timeanchored",
+                )
+            ],
+            chunk_sentence_indices=[
+                ChunkSentenceIndex(chunk_id="3", sentence_ids=("seg-3-0",))
+            ],
             subtitle_batch=SubtitleBatch(
                 chunk_id="3",
                 chunk_index=3,

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from app.services.textflow.contracts import SubtitleBatch, SubtitleItem
+from app.services.textflow.contracts import (
+    ChunkSentenceIndex,
+    SentenceRecord,
+    SubtitleBatch,
+)
 from app.services.timeanchored_alignment.output_projection.output_projector import (
     OutputProjectionInput,
     OutputProjector,
@@ -46,53 +50,66 @@ def _build_input() -> OutputProjectionInput:
             ),
         ),
     )
-    carrier_batch = SubtitleBatch(
-        chunk_id="window-0",
-        chunk_index=None,
-        items=(
-            SubtitleItem(
-                segment_id="seg-0",
-                chunk_id="window-0",
-                start=0.1,
-                end=1.3,
-                text="第一句",
-                source="render_core",
-                trace={
-                    "split_reason": "boundary_a",
-                    "mapped_cut_time": 1.3,
-                    "mapping_quality": "boundary",
-                },
-            ),
-            SubtitleItem(
-                segment_id="seg-1",
-                chunk_id="window-0",
-                start=1.7,
-                end=2.8,
-                text="第二句",
-                source="render_core",
-                trace={
-                    "split_reason": "boundary_b",
-                    "mapped_cut_time": 2.8,
-                    "mapping_quality": "boundary",
-                },
-            ),
-        ),
-        diagnostics={"output_trace": [{"sentence_index": 0}, {"sentence_index": 1}]},
-    )
     return OutputProjectionInput(
         window_id="window-0",
         source_chunk_ids=("chunk-0", "chunk-1", "chunk-2"),
         source_chunk_indices=(0, 1, 2),
         coverage=coverage,
-        carrier_batch=carrier_batch,
+        carrier_chunk_id="window-0",
+        carrier_sentence_records=(
+            SentenceRecord(
+                sentence_id="seg-0",
+                text="第一句",
+                start=0.1,
+                end=1.3,
+                source_chunk_ids=("chunk-0", "chunk-1"),
+                replace_scope_chunk_ids=("chunk-0", "chunk-1", "chunk-2"),
+                route="timeanchored",
+                trace={
+                    "split_reason": "boundary_a",
+                    "mapped_cut_time": 1.3,
+                    "mapping_quality": "boundary",
+                },
+                metadata={"source": "render_core"},
+            ),
+            SentenceRecord(
+                sentence_id="seg-1",
+                text="第二句",
+                start=1.7,
+                end=2.8,
+                source_chunk_ids=("chunk-1", "chunk-2"),
+                replace_scope_chunk_ids=("chunk-0", "chunk-1", "chunk-2"),
+                route="timeanchored",
+                trace={
+                    "split_reason": "boundary_b",
+                    "mapped_cut_time": 2.8,
+                    "mapping_quality": "boundary",
+                },
+                metadata={"source": "render_core"},
+            ),
+        ),
+        carrier_chunk_sentence_indices=(
+            ChunkSentenceIndex(
+                chunk_id="window-0",
+                sentence_ids=("seg-0", "seg-1"),
+            ),
+        ),
         decision_metadata={"route": "timeanchored"},
     )
 
 
-def test_output_projector_emits_single_output_group_batch_with_scope_metadata() -> None:
+def test_output_projector_emits_sentence_first_projection_with_compat_batch() -> None:
     projected = OutputProjector().project(_build_input())
     assert len(projected) == 1
-    batch = projected[0]
+    result = projected[0]
+    assert result.chunk_id == "window-0"
+    assert result.chunk_index is None
+    assert [record.text for record in result.sentence_records] == ["第一句", "第二句"]
+    assert result.chunk_sentence_indices[0].chunk_id == "window-0"
+    assert result.chunk_sentence_indices[0].sentence_ids == ("seg-0", "seg-1")
+    assert result.sentence_records[0].replace_scope_chunk_ids == ("chunk-0", "chunk-1", "chunk-2")
+    assert result.sentence_records[1].replace_scope_chunk_ids == ("chunk-0", "chunk-1", "chunk-2")
+    batch = result.subtitle_batch_compat
     assert batch.chunk_id == "ow-window-0"
     assert batch.chunk_index is None
     assert [item.text for item in batch.items] == ["第一句", "第二句"]
@@ -105,11 +122,11 @@ def test_output_projector_emits_single_output_group_batch_with_scope_metadata() 
     assert "owner_carrier_role" not in projection_meta
 
 
-def test_output_projector_does_not_reinfer_boundaries_from_owner_items() -> None:
+def test_output_projector_keeps_sentence_record_timing_and_trace() -> None:
     projected = OutputProjector().project(_build_input())
     assert len(projected) == 1
-    first = projected[0].items[0]
-    second = projected[0].items[1]
+    first = projected[0].sentence_records[0]
+    second = projected[0].sentence_records[1]
 
     assert first.start == 0.1
     assert first.end == 1.3

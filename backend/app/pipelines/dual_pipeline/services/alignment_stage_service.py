@@ -618,6 +618,8 @@ class AlignmentStageService:
             },
             output_traces=output_traces,
             default_trace_reason="default_splitter",
+            sentence_records=getattr(run_result, "sentence_records", ()) or (),
+            chunk_sentence_indices=getattr(run_result, "chunk_sentence_indices", ()) or (),
             subtitle_batch=run_result.subtitle_batch,
         )
         ctx.finalization_metrics["l7_error_count"] = float(
@@ -1738,7 +1740,9 @@ class AlignmentStageService:
                 },
                 output_traces=output_traces,
                 default_trace_reason="timeanchored_chain",
-                subtitle_batch=projected_batch,
+                sentence_records=projected_batch.sentence_records,
+                chunk_sentence_indices=projected_batch.chunk_sentence_indices,
+                subtitle_batch=projected_batch.subtitle_batch_compat,
             )
             output_error_count += len(output_layer_result.output_payload.get("errors", []))
             dispatch_payloads.append(
@@ -1748,7 +1752,7 @@ class AlignmentStageService:
                         if projected_batch.chunk_index is not None
                         else projected_batch.chunk_id
                     ),
-                    "subtitle_count": len(getattr(projected_batch, "subtitles", ()) or ()),
+                    "subtitle_count": len(getattr(projected_batch, "sentence_records", ()) or ()),
                     "error_count": len(output_layer_result.output_payload.get("errors", [])),
                 }
             )
@@ -1879,15 +1883,22 @@ class AlignmentStageService:
         decision_output: Any,
         split_stats: Dict[str, Any],
     ) -> tuple[Any, ...]:
-        owner_batch = getattr(decision_output, "subtitle_batch", None)
-        if owner_batch is None:
-            raise ValueError("timeanchored 主链缺少 subtitle_batch，无法执行 output projection")
+        owner_sentence_records = tuple(getattr(decision_output, "sentence_records", ()) or ())
+        owner_chunk_sentence_indices = tuple(
+            getattr(decision_output, "chunk_sentence_indices", ()) or ()
+        )
+        if not owner_chunk_sentence_indices:
+            raise ValueError(
+                "timeanchored 主链缺少 chunk_sentence_indices，无法执行 output projection"
+            )
         projection_input = OutputProjectionInput(
             window_id=str(preparation.window_id),
             source_chunk_ids=tuple(str(item) for item in preparation.source_chunk_ids),
             source_chunk_indices=tuple(int(item) for item in preparation.source_chunk_indices),
             coverage=preparation.coverage,
-            carrier_batch=owner_batch,
+            carrier_chunk_id=str(owner_chunk_sentence_indices[0].chunk_id),
+            carrier_sentence_records=owner_sentence_records,
+            carrier_chunk_sentence_indices=owner_chunk_sentence_indices,
             decision_metadata={
                 "boundary_score_stats": dict(split_stats),
                 "segmentation_report": dict(getattr(decision_output, "segmentation_report", {}) or {}),
@@ -2072,6 +2083,8 @@ class AlignmentStageService:
             },
             output_traces=output_traces,
             default_trace_reason="fast_direct",
+            sentence_records=getattr(run_result, "sentence_records", ()) or (),
+            chunk_sentence_indices=getattr(run_result, "chunk_sentence_indices", ()) or (),
             subtitle_batch=run_result.subtitle_batch,
         )
 

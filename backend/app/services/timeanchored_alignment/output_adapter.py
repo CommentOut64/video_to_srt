@@ -32,10 +32,25 @@ class OutputAdapter:
             sentences = [deepcopy(sentence) for sentence in projection.sentence_segments]
             traces = self._build_output_traces(sentences)
             chunk_ref = projection.chunk_window.chunk_ref
+            sentence_records = subtitle_delivery.build_sentence_records_from_sentences(
+                sentence_segments=sentences,
+                output_traces=traces,
+                source_chunk_ids=[str(chunk_ref)],
+                replace_scope_chunk_ids=[str(chunk_ref)],
+                route="timeanchored_output_adapter",
+                metadata={"chunk_id": str(chunk_ref)},
+            )
+            chunk_sentence_indices = subtitle_delivery.build_chunk_sentence_indices(
+                chunk_id=str(chunk_ref),
+                sentence_records=sentence_records,
+                metadata={"projection_mode": "compat_adapter"},
+            )
             outputs.append(
                 OutputLayerInput(
                     chunk_index=chunk_ref,
                     sentence_segments=sentences,
+                    sentence_records=list(sentence_records),
+                    chunk_sentence_indices=list(chunk_sentence_indices),
                     aligned_sentences=self._build_aligned_sentences(sentences),
                     language=language,
                     injection_report=dict(injection_report or {}),
