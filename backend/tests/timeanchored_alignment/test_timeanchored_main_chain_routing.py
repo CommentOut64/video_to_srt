@@ -401,52 +401,21 @@ def test_alignment_stage_force_fast_without_time_base_still_uses_unified_main_ch
     remove_streaming_subtitle_manager(job_id)
 
 
-def test_resolve_anchor_mount_routes_uses_fast_route_when_single_chunk_anchor_mount_requests_fallback() -> None:
+def test_resolve_timeanchored_routes_no_longer_reads_legacy_anchor_mount_fallback_signal() -> None:
     service = AlignmentStageService(
         host=SimpleNamespace(
             logger=Mock(),
             _edge_selection_mode="force_slow",
             _postprocess_trace_enabled=False,
             _postprocess_trace_level="summary",
-            _anchor_mount_graph="off",
         )
     )
     stage_result = SimpleNamespace(
-        anchor_mount_result=SimpleNamespace(
-            items=(SimpleNamespace(source_chunk_ids=("chunk-0",)),),
-            should_fallback=True,
-        ),
+        alignment_path=SimpleNamespace(aligned_tokens=(SimpleNamespace(source_chunk_ids=("chunk-0",)),)),
+        alignment_report=SimpleNamespace(route="alignment_path", failure_semantic="alignment_low_confidence"),
     )
 
-    text_route, edge_route, final_route, error_code = service._resolve_anchor_mount_routes(
-        ctx=SimpleNamespace(edge_selection_mode="force_slow"),
-        stage_result=stage_result,
-    )
-
-    assert text_route == "slow"
-    assert edge_route == "fast"
-    assert final_route == "fast"
-    assert error_code is None
-
-
-def test_resolve_anchor_mount_routes_keeps_slow_route_when_multi_chunk_anchor_mount_requests_fallback() -> None:
-    service = AlignmentStageService(
-        host=SimpleNamespace(
-            logger=Mock(),
-            _edge_selection_mode="force_slow",
-            _postprocess_trace_enabled=False,
-            _postprocess_trace_level="summary",
-            _anchor_mount_graph="off",
-        )
-    )
-    stage_result = SimpleNamespace(
-        anchor_mount_result=SimpleNamespace(
-            items=(SimpleNamespace(source_chunk_ids=("chunk-19", "chunk-20")),),
-            should_fallback=True,
-        ),
-    )
-
-    text_route, edge_route, final_route, error_code = service._resolve_anchor_mount_routes(
+    text_route, edge_route, final_route, error_code = service._resolve_timeanchored_routes(
         ctx=SimpleNamespace(edge_selection_mode="force_slow"),
         stage_result=stage_result,
     )
@@ -454,6 +423,33 @@ def test_resolve_anchor_mount_routes_keeps_slow_route_when_multi_chunk_anchor_mo
     assert text_route == "slow"
     assert edge_route == "slow"
     assert final_route == "slow"
+    assert error_code is None
+
+
+def test_resolve_timeanchored_routes_still_respects_explicit_edge_mode() -> None:
+    service = AlignmentStageService(
+        host=SimpleNamespace(
+            logger=Mock(),
+            _edge_selection_mode="prefer_fast",
+            _postprocess_trace_enabled=False,
+            _postprocess_trace_level="summary",
+        )
+    )
+    stage_result = SimpleNamespace(
+        alignment_path=SimpleNamespace(
+            aligned_tokens=(SimpleNamespace(source_chunk_ids=("chunk-19", "chunk-20")),)
+        ),
+        alignment_report=SimpleNamespace(route="alignment_path", failure_semantic="none"),
+    )
+
+    text_route, edge_route, final_route, error_code = service._resolve_timeanchored_routes(
+        ctx=SimpleNamespace(edge_selection_mode="prefer_fast"),
+        stage_result=stage_result,
+    )
+
+    assert text_route == "slow"
+    assert edge_route == "fast"
+    assert final_route == "fast"
     assert error_code is None
 
 

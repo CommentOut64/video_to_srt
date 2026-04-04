@@ -6,13 +6,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from app.pipelines.dual_pipeline.services.alignment_stage_service import AlignmentStageService
-from app.services.timeanchored_alignment.anchor_mount.service import AnchorMountStageResult
 from app.services.timeanchored_alignment.contracts import (
     AlignmentReport,
     SelectedTextTruth,
     TimeBaseQuality,
     TimeBaseUnit,
 )
+from app.services.timeanchored_alignment.decoder.contracts import DecoderShadowResult
 from app.services.timeanchored_alignment.decoder.service import AlignmentDecoderService
 from app.services.timeanchored_alignment.preparation.assembler import AlignmentPreparationAssembler
 from app.services.timeanchored_alignment.slow_window.contracts import (
@@ -247,7 +247,6 @@ def test_phase3_alignment_stage_writes_decoder_shadow_trace_and_diff(tmp_path: P
         ),
         _postprocess_trace_enabled=True,
         _postprocess_trace_level="summary",
-        _anchor_mount_graph="off",
         _alignment_pipeline_shadow_sample_rate=1.0,
         _alignment_pipeline_write_debug_artifacts=False,
     )
@@ -265,24 +264,19 @@ def test_phase3_alignment_stage_writes_decoder_shadow_trace_and_diff(tmp_path: P
         language="zh",
     )
 
-    assert isinstance(stage_result, AnchorMountStageResult)
-    shadow_output = tmp_path / "debug" / "postprocess" / "chunk_0000" / "22_decoder_shadow.output.json"
-    shadow_diff = tmp_path / "debug" / "postprocess" / "chunk_0000" / "23_decoder_shadow.diff.json"
+    assert isinstance(stage_result, DecoderShadowResult)
+    shadow_output = tmp_path / "debug" / "postprocess" / "chunk_0000" / "21_alignment_decoder.output.json"
     shadow_summary = tmp_path / "debug" / "postprocess" / "summaries" / "alignment.summary.json"
 
     assert shadow_output.exists()
-    assert shadow_diff.exists()
     assert shadow_summary.exists()
 
     output_payload = json.loads(shadow_output.read_text(encoding="utf-8"))
-    diff_payload = json.loads(shadow_diff.read_text(encoding="utf-8"))
     summary_payload = json.loads(shadow_summary.read_text(encoding="utf-8"))
 
     assert output_payload["route"] in {
         "alignment_path",
         "alignment_low_confidence",
     }
-    assert "decoder" in diff_payload
-    assert "anchor_mount" in diff_payload
     assert summary_payload["layer"] == "alignment"
     assert summary_payload["status"] in {"ok", "warning", "error"}

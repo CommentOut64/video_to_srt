@@ -231,7 +231,6 @@ class DebugConfig:
     punctuation_output: bool = False  # 标点调试输出（SSE + 文件）
     postprocess_trace_enabled: bool = True  # 后处理全链路落盘开关（临时默认开启）
     postprocess_trace_level: str = "summary"  # summary | full
-    anchor_mount_graph: str = "svg"  # off | svg | html | both
 
 
 # ========== 任务设置 ==========
@@ -320,7 +319,6 @@ class JobSettings:
                 "punctuation_output": self.debug.punctuation_output,
                 "postprocess_trace_enabled": self.debug.postprocess_trace_enabled,
                 "postprocess_trace_level": self.debug.postprocess_trace_level,
-                "anchor_mount_graph": self.debug.anchor_mount_graph,
             },
         }
 
@@ -362,9 +360,6 @@ class JobSettings:
         trace_level = str(debug_data.get("postprocess_trace_level", "summary") or "summary").strip().lower()
         if trace_level not in {"summary", "full"}:
             trace_level = "summary"
-        anchor_mount_graph = str(debug_data.get("anchor_mount_graph", "svg") or "svg").strip().lower()
-        if anchor_mount_graph not in {"off", "svg", "html", "both"}:
-            anchor_mount_graph = "svg"
 
         raw_whitelist = preprocessing_data.get("langid_whitelist", ["zh", "ja", "en"])
         if isinstance(raw_whitelist, str):
@@ -469,7 +464,6 @@ class JobSettings:
                 punctuation_output=bool(debug_data.get("punctuation_output", False)),
                 postprocess_trace_enabled=bool(debug_data.get("postprocess_trace_enabled", True)),
                 postprocess_trace_level=trace_level,
-                anchor_mount_graph=anchor_mount_graph,
             ),
         )
 

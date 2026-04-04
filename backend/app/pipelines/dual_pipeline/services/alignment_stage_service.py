@@ -26,11 +26,8 @@ from app.services.timeanchored_alignment.contracts import (
     TimeBaseQuality,
     TimeBaseUnit,
 )
-from app.services.timeanchored_alignment.anchor_mount.service import (
-    AnchorMountAlignmentService,
-    AnchorMountStageResult,
-)
 from app.services.timeanchored_alignment.decoder import AlignmentDecoderService
+from app.services.timeanchored_alignment.decoder.contracts import DecoderShadowResult
 from app.services.timeanchored_alignment.preparation import (
     AlignmentPreparationAssembler,
     PreparationBundle,
@@ -55,9 +52,6 @@ from app.services.timeanchored_alignment.output_projection.output_projector impo
 )
 from app.services.timeanchored_alignment.selection import TextSelectionService
 from app.pipelines.dual_pipeline.services.postprocess_trace_writer import PostprocessTraceWriter
-from app.pipelines.dual_pipeline.services.anchor_mount_graph_renderer import (
-    AnchorMountGraphRenderer,
-)
 
 
 class AlignmentStageService:
@@ -70,7 +64,6 @@ class AlignmentStageService:
             sanitizer=getattr(host, "_whisper_sanitizer", None),
             hallucination_detector=getattr(host, "_hallucination_detector", None),
         )
-        self._timeanchored_stage_service = AnchorMountAlignmentService()
         self._alignment_decoder_service = AlignmentDecoderService()
         self._alignment_path_adapter = AlignmentPathAdapter()
         self._output_projector = OutputProjector()
@@ -80,11 +73,6 @@ class AlignmentStageService:
             enabled=bool(getattr(host, "_postprocess_trace_enabled", False)),
             level=str(getattr(host, "_postprocess_trace_level", "summary") or "summary"),
         )
-        self._anchor_mount_graph_renderer = AnchorMountGraphRenderer()
-        graph_mode = str(getattr(host, "_anchor_mount_graph", "off") or "off").strip().lower()
-        if graph_mode not in {"off", "svg", "html", "both"}:
-            graph_mode = "off"
-        self._anchor_mount_graph_mode = graph_mode
 
     async def run(self, ctx: ProcessingContext) -> None:
         """执行单个 chunk 的对齐阶段。"""
@@ -279,23 +267,6 @@ class AlignmentStageService:
                     ctx=ctx,
                 )
                 if should_accept and stage_result is not None:
-                    force_fast_reason = self._resolve_anchor_mount_force_fast_reason(
-                        stage_result=stage_result
-                    )
-                    if force_fast_reason:
-                        self._commit_fast_direct_result(
-                            ctx=ctx,
-                            sv_result=sv_result,
-                            reason=force_fast_reason,
-                        )
-                        self._record_hetero_alignment_result(
-                            ctx=ctx,
-                            stage_result=stage_result,
-                            mode=alignment_pipeline_mode,
-                            selected=True,
-                            reason=force_fast_reason,
-                        )
-                        return
                     self._commit_timeanchored_main_chain_result(
                         ctx=ctx,
                         stage_result=stage_result,
@@ -822,7 +793,7 @@ class AlignmentStageService:
         language_hint: str,
         speaker_id: Optional[str],
         turn_id: Optional[str],
-    ) -> Optional[AnchorMountStageResult]:
+    ) -> Optional[DecoderShadowResult]:
         host = self._host
         try:
             base_language = str(language_hint or "auto")
@@ -933,24 +904,25 @@ class AlignmentStageService:
         ctx: ProcessingContext,
         preparation: PreparationBundle,
         language: str,
-    ) -> AnchorMountStageResult:
+    ) -> DecoderShadowResult:
         self._host.logger.debug(
-            "Chunk {}: preparation 执行 anchor_mount window_id={} token_units={} fast_hooks={} punctuation_evidences={}",
+            "Chunk {}: preparation 执行 alignment_decoder window_id={} canonical_tokens={} observation_slices={} punctuation_evidences={}",
             preparation.owner_chunk_index,
             preparation.window_id,
-            len(preparation.slow_text.token_units),
-            len(preparation.fast_hooks),
+            len(preparation.canonical_sequence.tokens),
+            len(preparation.acoustic_observation_pack.slices),
             len(preparation.slow_text.punctuation_evidences),
         )
         self._trace_write(
             ctx=ctx,
-            filename="20_anchor_mount.input.json",
-            stage="anchor_mount_input",
+            filename="20_alignment_decoder.input.json",
+            stage="alignment_decoder_input",
             summary_payload={
                 "window_id": str(preparation.window_id),
                 "owner_chunk_id": str(preparation.owner_chunk_id),
-                "token_unit_count": len(preparation.slow_text.token_units),
-                "hook_count": len(preparation.fast_hooks),
+                "canonical_token_count": len(preparation.canonical_sequence.tokens),
+                "observation_slice_count": len(preparation.acoustic_observation_pack.slices),
+                "observation_capability": str(preparation.acoustic_observation_pack.capability_level),
                 "punctuation_evidence_count": len(preparation.slow_text.punctuation_evidences),
                 "language": language,
             },
@@ -959,43 +931,35 @@ class AlignmentStageService:
                 "language": language,
             },
         )
-        stage_result = self._timeanchored_stage_service.execute(
-            preparation=preparation,
-            language=language,
-        )
         decoder_result = self._run_decoder_alignment(
             ctx=ctx,
             preparation=preparation,
         )
         setattr(ctx, "decoder_alignment_result", decoder_result)
-        if isinstance(stage_result, AnchorMountStageResult):
-            self._trace_write(
-                ctx=ctx,
-                filename="21_anchor_mount.output.json",
-                stage="anchor_mount_output",
-                summary_payload={
-                    "window_id": str(preparation.window_id),
-                    "token_count": len(stage_result.anchor_mount_result.items),
-                    "boundary_evidence_count": len(stage_result.anchor_mount_result.boundary_evidences),
-                    "cross_chunk_lock_count": len(stage_result.anchor_mount_result.cross_chunk_locks),
-                    "should_fallback": bool(stage_result.anchor_mount_result.should_fallback),
-                    "metrics": dict(stage_result.anchor_mount_result.metrics),
-                },
-                full_payload=stage_result,
+        if decoder_result is None:
+            raise RuntimeError("timeanchored 主链缺少 decoder result")
+        self._trace_write(
+            ctx=ctx,
+            filename="21_alignment_decoder.output.json",
+            stage="alignment_decoder_output",
+            summary_payload={
+                "window_id": str(preparation.window_id),
+                "route": str(getattr(decoder_result.alignment_report, "route", "") or ""),
+                "failure_semantic": str(
+                    getattr(decoder_result.alignment_report, "failure_semantic", "") or ""
+                ),
+                "path_token_count": len(getattr(decoder_result.alignment_path, "aligned_tokens", ()) or ()),
+                "boundary_candidate_count": len(getattr(decoder_result, "boundary_candidates", ()) or ()),
+                "low_confidence_span_count": len(getattr(decoder_result, "low_confidence_spans", ()) or ()),
+            },
+            full_payload=decoder_result,
+        )
+        if getattr(decoder_result, "alignment_report", None) is not None:
+            self._postprocess_trace_writer.write_layer_summary(
+                job_dir=ctx.job_dir,
+                layer_summary=decoder_result.alignment_report.summary,
             )
-            if decoder_result is not None and self._should_run_decoder_shadow(ctx):
-                self._write_decoder_shadow_trace(
-                    ctx=ctx,
-                    preparation=preparation,
-                    stage_result=stage_result,
-                    decoder_shadow_result=decoder_result,
-                )
-            self._emit_anchor_mount_graph(
-                ctx=ctx,
-                preparation=preparation,
-                stage_result=stage_result,
-            )
-        return stage_result
+        return decoder_result
 
     def _run_decoder_alignment(
         self,
@@ -1011,126 +975,6 @@ class AlignmentStageService:
                 getattr(ctx, "chunk_index", -1),
             )
             return None
-
-    def _should_run_decoder_shadow(self, ctx: ProcessingContext) -> bool:
-        if not self._postprocess_trace_writer.enabled:
-            return False
-        return self._should_sample_alignment_pipeline_shadow(ctx)
-
-    def _write_decoder_shadow_trace(
-        self,
-        *,
-        ctx: ProcessingContext,
-        preparation: PreparationBundle,
-        stage_result: AnchorMountStageResult,
-        decoder_shadow_result: Any,
-    ) -> None:
-        alignment_path = getattr(decoder_shadow_result, "alignment_path", None)
-        alignment_report = getattr(decoder_shadow_result, "alignment_report", None)
-        self._trace_write(
-            ctx=ctx,
-            filename="22_decoder_shadow.output.json",
-            stage="decoder_shadow_output",
-            summary_payload={
-                "window_id": str(preparation.window_id),
-                "route": str(getattr(alignment_report, "route", "") or ""),
-                "failure_semantic": str(getattr(alignment_report, "failure_semantic", "") or ""),
-                "path_token_count": len(getattr(alignment_path, "aligned_tokens", ()) or ()),
-                "boundary_candidate_count": len(
-                    getattr(decoder_shadow_result, "boundary_candidates", ()) or ()
-                ),
-                "low_confidence_span_count": len(
-                    getattr(decoder_shadow_result, "low_confidence_spans", ()) or ()
-                ),
-            },
-            full_payload={
-                "alignment_path": alignment_path,
-                "boundary_candidates": getattr(decoder_shadow_result, "boundary_candidates", ()),
-                "low_confidence_spans": getattr(decoder_shadow_result, "low_confidence_spans", ()),
-                "alignment_report": alignment_report,
-                "diagnostics": getattr(decoder_shadow_result, "diagnostics", {}),
-            },
-        )
-        self._trace_write(
-            ctx=ctx,
-            filename="23_decoder_shadow.diff.json",
-            stage="decoder_shadow_diff",
-            summary_payload=self._build_decoder_shadow_diff(
-                stage_result=stage_result,
-                decoder_shadow_result=decoder_shadow_result,
-            ),
-            full_payload=self._build_decoder_shadow_diff(
-                stage_result=stage_result,
-                decoder_shadow_result=decoder_shadow_result,
-            ),
-        )
-        if alignment_report is not None:
-            self._postprocess_trace_writer.write_layer_summary(
-                job_dir=ctx.job_dir,
-                layer_summary=alignment_report.summary,
-            )
-
-    @staticmethod
-    def _build_decoder_shadow_diff(
-        *,
-        stage_result: AnchorMountStageResult,
-        decoder_shadow_result: Any,
-    ) -> dict[str, Any]:
-        alignment_path = getattr(decoder_shadow_result, "alignment_path", None)
-        decoder_tokens = tuple(getattr(alignment_path, "aligned_tokens", ()) or ())
-        anchor_mount_result = getattr(stage_result, "anchor_mount_result", None)
-        anchor_tokens = tuple(
-            SimpleNamespace(
-                start=float(getattr(envelope, "provisional_start", 0.0) or 0.0),
-                end=float(getattr(envelope, "provisional_end", 0.0) or 0.0),
-            )
-            for envelope in (getattr(anchor_mount_result, "envelopes", ()) or ())
-        )
-        pair_count = min(len(decoder_tokens), len(anchor_tokens))
-        avg_timing_delta_ms = 0.0
-        if pair_count:
-            deltas = []
-            for index in range(pair_count):
-                decoder_item = decoder_tokens[index]
-                anchor_item = anchor_tokens[index]
-                deltas.append(
-                    abs(float(getattr(decoder_item, "start", 0.0) or 0.0) - float(getattr(anchor_item, "start", 0.0) or 0.0))
-                )
-                deltas.append(
-                    abs(float(getattr(decoder_item, "end", 0.0) or 0.0) - float(getattr(anchor_item, "end", 0.0) or 0.0))
-                )
-            avg_timing_delta_ms = sum(deltas) / max(len(deltas), 1) * 1000.0
-        return {
-            "decoder": {
-                "route": str(getattr(getattr(decoder_shadow_result, "alignment_report", None), "route", "") or ""),
-                "path_token_count": len(decoder_tokens),
-                "boundary_candidate_count": len(
-                    getattr(decoder_shadow_result, "boundary_candidates", ()) or ()
-                ),
-                "low_confidence_span_count": len(
-                    getattr(decoder_shadow_result, "low_confidence_spans", ()) or ()
-                ),
-            },
-            "anchor_mount": {
-                "path_token_count": len(anchor_tokens),
-                "boundary_evidence_count": len(
-                    getattr(anchor_mount_result, "boundary_evidences", ()) or ()
-                ),
-                "should_fallback": bool(stage_result.anchor_mount_result.should_fallback),
-            },
-            "diff": {
-                "path_token_count_delta": int(len(decoder_tokens) - len(anchor_tokens)),
-                "boundary_count_delta": int(
-                    len(getattr(decoder_shadow_result, "boundary_candidates", ()) or ())
-                    - len(getattr(anchor_mount_result, "boundary_evidences", ()) or ())
-                ),
-                "source_chunk_scope_match": tuple(getattr(alignment_path, "source_chunk_ids", ()) or ())
-                == AlignmentStageService._resolve_anchor_mount_source_chunk_ids(
-                    stage_result=stage_result
-                ),
-                "avg_timing_delta_ms": float(avg_timing_delta_ms),
-            },
-        }
 
     def _commit_preparation_context(
         self,
@@ -1153,37 +997,14 @@ class AlignmentStageService:
         if isinstance(preparation.compat.time_base, WindowTimeBasePackage):
             ctx.window_time_base = preparation.compat.time_base
         self._host.logger.debug(
-            "Chunk {}: preparation 已写回 ctx window_id={} canonical_token_count={} compat_hook_count={} pronunciation_state_count={} window_time_base_units={}",
+            "Chunk {}: preparation 已写回 ctx window_id={} canonical_token_count={} observation_capability={} pronunciation_state_count={} window_time_base_units={}",
             ctx.chunk_index,
             preparation.window_id,
             len(preparation.canonical_sequence.tokens),
-            len(preparation.fast_hooks),
+            str(preparation.acoustic_observation_pack.capability_level),
             len(preparation.pronunciation_graph.state_nodes),
             len(getattr(preparation.compat.time_base, "word_units", ()) or ()),
         )
-
-    def _require_decoder_alignment_result(
-        self,
-        *,
-        ctx: ProcessingContext,
-        preparation: PreparationBundle,
-    ) -> Any:
-        decoder_result = getattr(ctx, "decoder_alignment_result", None)
-        if decoder_result is None:
-            decoder_result = self._run_decoder_alignment(
-                ctx=ctx,
-                preparation=preparation,
-            )
-            setattr(ctx, "decoder_alignment_result", decoder_result)
-        if decoder_result is None or getattr(decoder_result, "alignment_path", None) is None:
-            route = str(
-                getattr(getattr(decoder_result, "alignment_report", None), "route", "") or ""
-            )
-            raise RuntimeError(
-                "timeanchored 主链缺少 AlignmentPath，"
-                f"无法进入正式切分入口 route={route or 'unknown'}"
-            )
-        return decoder_result
 
     def _resolve_preparation_inputs(
         self,
@@ -1444,14 +1265,14 @@ class AlignmentStageService:
         self,
         *,
         ctx: ProcessingContext,
-        stage_result: AnchorMountStageResult,
+        stage_result: DecoderShadowResult,
         whisper_result: Dict[str, Any],
         sv_result: Dict[str, Any],
         speaker_id: Optional[str],
         turn_id: Optional[str],
     ) -> None:
         host = self._host
-        text_route, edge_route, final_route, stage_error_code = self._resolve_anchor_mount_routes(
+        text_route, edge_route, final_route, stage_error_code = self._resolve_timeanchored_routes(
             ctx=ctx,
             stage_result=stage_result,
         )
@@ -1479,14 +1300,13 @@ class AlignmentStageService:
                 whisper_result=whisper_result,
                 sv_result=sv_result,
             )
-        decoder_result = self._require_decoder_alignment_result(
-            ctx=ctx,
-            preparation=preparation,
-        )
-        alignment_path = decoder_result.alignment_path
+        alignment_path = stage_result.alignment_path
+        if alignment_path is None:
+            route = str(getattr(stage_result.alignment_report, "route", "") or "unknown")
+            raise RuntimeError(f"timeanchored 主链缺少 AlignmentPath，无法进入正式切分入口 route={route}")
         adapter_result = self._alignment_path_adapter.build(
             preparation=preparation,
-            decoder_result=decoder_result,
+            decoder_result=stage_result,
             speaker_id=speaker_id,
             turn_id=turn_id,
         )
@@ -1511,9 +1331,9 @@ class AlignmentStageService:
             },
             full_payload={
                 "alignment_path": alignment_path,
-                "alignment_report": getattr(decoder_result, "alignment_report", None),
-                "boundary_candidates": getattr(decoder_result, "boundary_candidates", ()),
-                "low_confidence_spans": getattr(decoder_result, "low_confidence_spans", ()),
+                "alignment_report": getattr(stage_result, "alignment_report", None),
+                "boundary_candidates": getattr(stage_result, "boundary_candidates", ()),
+                "low_confidence_spans": getattr(stage_result, "low_confidence_spans", ()),
             },
         )
         self._trace_write(
@@ -1572,13 +1392,13 @@ class AlignmentStageService:
             sentence.source = TextSource.WHISPER_PATCH
             sentence.is_draft = False
             sentence.is_finalized = True
-            sentence.alignment_score = float(
-                stage_result.anchor_mount_result.metrics.get("alignment_score")
-                or 0.0
-            )
+            sentence.alignment_score = float(getattr(alignment_path, "route_confidence", 0.0) or 0.0)
             sentence.matched_ratio = float(
-                stage_result.anchor_mount_result.metrics.get("coverage_ratio")
-                or 0.0
+                self._resolve_alignment_report_metric(
+                    stage_result=stage_result,
+                    key="coverage_ratio",
+                    default=0.0,
+                )
             )
             sentence.confidence_source = host._resolve_sentence_confidence_source(
                 sentence.words
@@ -1772,16 +1592,14 @@ class AlignmentStageService:
         ctx.final_sentences = list(final_sentences)
         ctx.finalization_metrics = {
             "coverage": float(
-                stage_result.anchor_mount_result.metrics.get("coverage_ratio", 0.0) or 0.0
+                self._resolve_alignment_report_metric(
+                    stage_result=stage_result,
+                    key="coverage_ratio",
+                    default=float(getattr(alignment_path, "route_confidence", 0.0) or 0.0),
+                )
             ),
-            "gap_ratio": float(
-                stage_result.anchor_mount_result.metrics.get("largest_unresolved_span", 0.0)
-                or 0.0
-            ),
-            "alignment_score": float(
-                stage_result.anchor_mount_result.metrics.get("alignment_score")
-                or 0.0
-            ),
+            "gap_ratio": float(getattr(adapter_result.decision_input.aligned_facts, "gap_ratio", 0.0) or 0.0),
+            "alignment_score": float(getattr(alignment_path, "route_confidence", 0.0) or 0.0),
             "gap_positions": [],
             "gap_resolution": None,
             **injection_stats,
@@ -1789,18 +1607,22 @@ class AlignmentStageService:
             "timeanchored_text_route": text_route,
             "timeanchored_edge_route": edge_route,
             "timeanchored_final_route": final_route,
+            "timeanchored_alignment_route": str(
+                getattr(stage_result.alignment_report, "route", "") or ""
+            ),
+            "timeanchored_failure_semantic": str(
+                getattr(stage_result.alignment_report, "failure_semantic", "") or ""
+            ),
             "timeanchored_item_count": float(len(getattr(alignment_path, "aligned_tokens", ()) or ())),
             "timeanchored_sentence_count": float(len(final_sentences)),
             "timeanchored_projected_chunk_count": float(len(projected_batches)),
-            "timeanchored_failed_span_count": 0.0,
+            "timeanchored_failed_span_count": float(len(getattr(stage_result, "low_confidence_spans", ()) or ())),
             "timeanchored_boundary_candidate_count": float(
                 len(getattr(alignment_path, "boundary_candidates", ()) or ())
             ),
             "l7_error_count": float(output_error_count),
             **punctuation_chain_health,
         }
-        for key, value in stage_result.anchor_mount_result.metrics.items():
-            ctx.finalization_metrics[f"anchor_mount_{key}"] = value
         for key, value in split_stats.items():
             ctx.finalization_metrics[f"split_{key}"] = value
         for key, value in soft_cut_observe_snapshot.items():
@@ -1879,7 +1701,7 @@ class AlignmentStageService:
         self,
         *,
         preparation: PreparationBundle,
-        stage_result: AnchorMountStageResult,
+        stage_result: DecoderShadowResult,
         decision_output: Any,
         split_stats: Dict[str, Any],
     ) -> tuple[Any, ...]:
@@ -2165,64 +1987,6 @@ class AlignmentStageService:
                 filename,
             )
 
-    def _emit_anchor_mount_graph(
-        self,
-        *,
-        ctx: ProcessingContext,
-        preparation: PreparationBundle,
-        stage_result: AnchorMountStageResult,
-    ) -> None:
-        if not self._postprocess_trace_writer.enabled:
-            return
-        if self._anchor_mount_graph_mode == "off":
-            return
-        try:
-            graph_payload = self._anchor_mount_graph_renderer.build_graph_payload(
-                window_id=str(preparation.window_id),
-                items=stage_result.anchor_mount_result.items,
-                envelopes=stage_result.anchor_mount_result.envelopes,
-                boundary_evidences=stage_result.anchor_mount_result.boundary_evidences,
-                hooks=preparation.fast_hooks,
-                metrics=stage_result.anchor_mount_result.metrics,
-            )
-            self._postprocess_trace_writer.write_stage(
-                job_dir=ctx.job_dir,
-                chunk_index=int(ctx.chunk_index),
-                filename="21_anchor_mount.graph.json",
-                payload=graph_payload,
-                stage="anchor_mount_graph",
-            )
-            if self._anchor_mount_graph_mode in {"svg", "both"}:
-                svg_body = self._anchor_mount_graph_renderer.render_svg(graph_payload)
-                self._postprocess_trace_writer.write_graph_artifact(
-                    job_dir=ctx.job_dir,
-                    chunk_index=int(ctx.chunk_index),
-                    filename="21_anchor_mount.graph.svg",
-                    body=svg_body,
-                    stage="anchor_mount_graph",
-                    media_type="image/svg+xml",
-                )
-            if self._anchor_mount_graph_mode in {"html", "both"}:
-                svg_body = self._anchor_mount_graph_renderer.render_svg(graph_payload)
-                html_body = (
-                    "<!doctype html><html><head><meta charset='utf-8'>"
-                    "<title>Anchor Mount Graph</title></head><body>"
-                    f"{svg_body}</body></html>"
-                )
-                self._postprocess_trace_writer.write_graph_artifact(
-                    job_dir=ctx.job_dir,
-                    chunk_index=int(ctx.chunk_index),
-                    filename="21_anchor_mount.graph.html",
-                    body=html_body,
-                    stage="anchor_mount_graph",
-                    media_type="text/html",
-                )
-        except Exception:
-            self._host.logger.exception(
-                "Chunk {}: 生成锚点挂载图失败",
-                ctx.chunk_index,
-            )
-
     @staticmethod
     def _build_segmentation_ingress_trace_summary(
         *,
@@ -2360,12 +2124,12 @@ class AlignmentStageService:
         self,
         *,
         ctx: ProcessingContext,
-        stage_result: Optional[AnchorMountStageResult],
+        stage_result: Optional[DecoderShadowResult],
         mode: str,
         selected: bool,
         reason: str,
     ) -> None:
-        _, _, route, _ = self._resolve_anchor_mount_routes(
+        _, _, route, _ = self._resolve_timeanchored_routes(
             ctx=ctx,
             stage_result=stage_result,
         )
@@ -2376,14 +2140,21 @@ class AlignmentStageService:
             "reason": str(reason),
             "route": route,
             "sentence_count": (
-                int(len(stage_result.anchor_mount_result.items))
+                int(len(getattr(getattr(stage_result, "alignment_path", None), "aligned_tokens", ()) or ()))
                 if stage_result is not None
                 else 0
             ),
-            "failed_span_count": 0,
+            "failed_span_count": (
+                int(len(getattr(stage_result, "low_confidence_spans", ()) or ()))
+                if stage_result is not None
+                else 0
+            ),
         }
         ctx.hetero_alignment_report = (
-            asdict(stage_result.pipeline_report)
+            {
+                "alignment_report": asdict(stage_result.alignment_report),
+                "diagnostics": dict(getattr(stage_result, "diagnostics", {}) or {}),
+            }
             if stage_result is not None
             else None
         )
@@ -2426,50 +2197,57 @@ class AlignmentStageService:
         }
 
     @staticmethod
+    def _resolve_alignment_report_metric(
+        *,
+        stage_result: DecoderShadowResult,
+        key: str,
+        default: float,
+    ) -> float:
+        report = getattr(stage_result, "alignment_report", None)
+        metadata = dict(getattr(report, "metadata", {}) or {})
+        value = metadata.get(key)
+        if value is None:
+            summary = getattr(report, "summary", None)
+            counters = dict(getattr(summary, "counters", {}) or {})
+            value = counters.get(key, default)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    @staticmethod
     def _should_accept_timeanchored_result(
         *,
-        stage_result: Optional[AnchorMountStageResult],
+        stage_result: Optional[DecoderShadowResult],
         mode: str,
         ctx: Optional[ProcessingContext] = None,
     ) -> tuple[bool, str]:
         if stage_result is None:
             return False, f"{mode}_timeanchored_failed"
 
-        token_count = AlignmentStageService._resolve_anchor_mount_token_count(stage_result=stage_result)
+        token_count = AlignmentStageService._resolve_timeanchored_token_count(stage_result=stage_result)
+        route = str(getattr(getattr(stage_result, "alignment_report", None), "route", "") or "")
+        failure_semantic = str(
+            getattr(getattr(stage_result, "alignment_report", None), "failure_semantic", "") or ""
+        )
 
-        if ctx is not None and getattr(stage_result, "anchor_mount_result", None) is not None:
-            edge_selection_mode = str(getattr(ctx, "edge_selection_mode", "") or "").strip().lower()
-            if edge_selection_mode in {"force_fast", "prefer_fast"}:
-                route = "fast" if token_count else "error"
-            else:
-                route = "slow" if token_count else "error"
-        else:
-            base_route = str(getattr(getattr(stage_result, "base_result", None), "route", "") or "")
-            route = base_route or ("slow" if token_count else "error")
-
-        if route == "error":
-            return False, f"{mode}_gate_route_error"
+        if not token_count or getattr(stage_result, "alignment_path", None) is None:
+            failure_reason = failure_semantic or route or "alignment_path_missing"
+            return False, f"{mode}_{failure_reason}"
         if token_count <= 0:
             return False, f"{mode}_gate_empty_stream"
         if mode == "default":
             return True, "default_gate_pass"
         return True, f"{mode}_gate_pass"
 
-    def _resolve_anchor_mount_routes(
+    def _resolve_timeanchored_routes(
         self,
         *,
         ctx: ProcessingContext,
-        stage_result: Optional[AnchorMountStageResult],
+        stage_result: Optional[DecoderShadowResult],
     ) -> tuple[str, str, str, str | None]:
-        token_count = self._resolve_anchor_mount_token_count(stage_result=stage_result)
+        token_count = self._resolve_timeanchored_token_count(stage_result=stage_result)
         text_route = "slow" if token_count else "error"
-        if self._should_force_fast_direct_on_anchor_mount_fallback(
-            stage_result=stage_result
-        ):
-            edge_route = "fast" if token_count else "error"
-            final_route = edge_route if edge_route != "error" else text_route
-            error_code = "anchor_mount_empty" if not token_count else None
-            return text_route, edge_route, final_route, error_code
         edge_selection_mode = str(getattr(ctx, "edge_selection_mode", "") or "").strip().lower()
         if edge_selection_mode not in {"force_fast", "prefer_fast", "force_slow", "prefer_slow"}:
             edge_selection_mode = str(
@@ -2482,8 +2260,21 @@ class AlignmentStageService:
         else:
             edge_route = "slow"
         final_route = edge_route if edge_route != "error" else text_route
-        error_code = "anchor_mount_empty" if not token_count else None
+        error_code = None
+        if not token_count:
+            error_code = str(
+                getattr(getattr(stage_result, "alignment_report", None), "failure_semantic", "") or ""
+            ) or "alignment_path_empty"
         return text_route, edge_route, final_route, error_code
+
+    def _resolve_anchor_mount_routes(
+        self,
+        *,
+        ctx: ProcessingContext,
+        stage_result: Optional[DecoderShadowResult],
+    ) -> tuple[str, str, str, str | None]:
+        """兼容旧测试/调用方；Phase 6 起路由语义完全以新主链为准。"""
+        return self._resolve_timeanchored_routes(ctx=ctx, stage_result=stage_result)
 
     def _resolve_fast_direct_reason(self, *, ctx: ProcessingContext) -> str:
         host = self._host
@@ -2496,18 +2287,18 @@ class AlignmentStageService:
         return ""
 
     @staticmethod
-    def _resolve_anchor_mount_source_chunk_ids(
+    def _resolve_timeanchored_source_chunk_ids(
         *,
-        stage_result: Optional[AnchorMountStageResult],
+        stage_result: Optional[DecoderShadowResult],
     ) -> tuple[str, ...]:
         if stage_result is None:
             return tuple()
-        anchor_mount_result = getattr(stage_result, "anchor_mount_result", None)
-        if anchor_mount_result is None:
+        alignment_path = getattr(stage_result, "alignment_path", None)
+        if alignment_path is None:
             return tuple()
         deduped_source_chunk_ids: list[str] = []
         seen_source_chunk_ids: set[str] = set()
-        for token_unit in (getattr(anchor_mount_result, "items", ()) or ()):
+        for token_unit in (getattr(alignment_path, "aligned_tokens", ()) or ()):
             for chunk_id in (getattr(token_unit, "source_chunk_ids", ()) or ()):
                 chunk_value = str(chunk_id).strip()
                 if not chunk_value or chunk_value in seen_source_chunk_ids:
@@ -2517,51 +2308,27 @@ class AlignmentStageService:
         return tuple(deduped_source_chunk_ids)
 
     @staticmethod
-    def _resolve_anchor_mount_token_count(
+    def _resolve_anchor_mount_source_chunk_ids(
+        *,
+        stage_result: Optional[DecoderShadowResult],
+    ) -> tuple[str, ...]:
+        return AlignmentStageService._resolve_timeanchored_source_chunk_ids(stage_result=stage_result)
+
+    @staticmethod
+    def _resolve_timeanchored_token_count(
         *,
         stage_result: Optional[Any],
     ) -> int:
         if stage_result is None:
             return 0
-        anchor_mount_result = getattr(stage_result, "anchor_mount_result", None)
-        if anchor_mount_result is not None:
-            return int(len(getattr(anchor_mount_result, "items", ()) or ()))
-        return int(len(getattr(stage_result, "final_stream", ()) or ()))
+        return int(len(getattr(getattr(stage_result, "alignment_path", None), "aligned_tokens", ()) or ()))
 
-    @classmethod
-    def _should_force_fast_direct_on_anchor_mount_fallback(
-        cls,
+    @staticmethod
+    def _resolve_anchor_mount_token_count(
         *,
-        stage_result: Optional[AnchorMountStageResult],
-    ) -> bool:
-        if stage_result is None:
-            return False
-        anchor_mount_result = getattr(stage_result, "anchor_mount_result", None)
-        if anchor_mount_result is None:
-            return False
-        if not bool(getattr(anchor_mount_result, "should_fallback", False)):
-            return False
-        source_chunk_ids = cls._resolve_anchor_mount_source_chunk_ids(
-            stage_result=stage_result
-        )
-        if source_chunk_ids and len(source_chunk_ids) > 1:
-            return False
-        return True
-
-    @classmethod
-    def _resolve_anchor_mount_force_fast_reason(
-        cls,
-        *,
-        stage_result: Optional[AnchorMountStageResult],
-    ) -> str:
-        """将 AnchorMount 的 fallback 质量信号映射为快流直通触发原因。"""
-        if stage_result is None:
-            return ""
-        if cls._should_force_fast_direct_on_anchor_mount_fallback(
-            stage_result=stage_result
-        ):
-            return "anchor_mount_should_fallback"
-        return ""
+        stage_result: Optional[Any],
+    ) -> int:
+        return AlignmentStageService._resolve_timeanchored_token_count(stage_result=stage_result)
 
     @staticmethod
     def _build_fast_direct_stream(*, words: Sequence[Any]) -> tuple[AlignmentItem, ...]:

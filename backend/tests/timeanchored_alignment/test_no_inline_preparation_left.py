@@ -319,7 +319,7 @@ def test_run_timeanchored_main_chain_delegates_to_preparation_service(monkeypatc
         captured.update(kwargs)
         return expected_result
 
-    monkeypatch.setattr(service._timeanchored_stage_service, "execute", _capture_execute)
+    monkeypatch.setattr(service, "_execute_prepared_timeanchored_stage", _capture_execute)
 
     ctx = ProcessingContext(
         job_id="job-inline-test",
@@ -382,7 +382,7 @@ def test_run_timeanchored_main_chain_promotes_window_source_text_when_owner_text
         "prepare",
         _capture_prepare,
     )
-    monkeypatch.setattr(service._timeanchored_stage_service, "execute", lambda **_: object())
+    monkeypatch.setattr(service, "_execute_prepared_timeanchored_stage", lambda **_: object())
 
     ctx = ProcessingContext(
         job_id="job-window-promote",
@@ -511,22 +511,6 @@ def test_run_timeanchored_main_chain_writes_preparation_layer_summary(monkeypatc
 
     assert captured["job_dir"] == ctx.job_dir
     assert captured["layer_summary"] == preparation.report.summary
-
-
-def test_runtime_code_uses_preparation_bundle_name_instead_of_alignment_preparation_package() -> None:
-    ingress_source = inspect.getsource(__import__(
-        "app.services.timeanchored_alignment.anchor_mount.ingress_validator",
-        fromlist=["IngressValidator"],
-    ).IngressValidator.validate)
-    service_source = inspect.getsource(__import__(
-        "app.services.timeanchored_alignment.anchor_mount.service",
-        fromlist=["AnchorMountAlignmentService"],
-    ).AnchorMountAlignmentService.align)
-
-    assert "PreparationBundle" in ingress_source
-    assert "PreparationBundle" in service_source
-    assert "AlignmentPreparationPackage" not in ingress_source
-    assert "AlignmentPreparationPackage" not in service_source
 
 
 def test_public_exports_do_not_expose_alignment_preparation_package() -> None:

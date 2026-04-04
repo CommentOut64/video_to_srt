@@ -5,11 +5,12 @@ from types import SimpleNamespace
 
 import app.services.timeanchored_alignment as timeanchored_alignment
 from app.pipelines.dual_pipeline.services.alignment_stage_service import AlignmentStageService
-from app.services.timeanchored_alignment.anchor_mount.service import AnchorMountStageResult
+from app.services.timeanchored_alignment.decoder.contracts import DecoderShadowResult
 from app.services.timeanchored_alignment.preparation.assembler import (
     AlignmentPreparationAssembler,
 )
 from app.services.timeanchored_alignment.contracts import (
+    SelectedTextTruth,
     TimeBaseQuality,
     TimeBaseUnit,
 )
@@ -143,6 +144,12 @@ def _build_preparation_package():
     return AlignmentPreparationAssembler().prepare(
         ready_window=_build_ready_window(),
         window_time_base=_build_window_time_base(),
+        selected_text_truth=SelectedTextTruth(
+            text="你好世界",
+            text_source="slow",
+            language_hint="zh",
+            source_chunk_ids=("chunk-1", "chunk-2"),
+        ),
         whisper_result={
             "text": "你好，世界！",
             "text_clean": "你好，世界！",
@@ -165,6 +172,8 @@ def test_alignment_stage_service_main_chain_no_longer_references_legacy_predecis
     assert "OutputAdapter(" not in source
     assert "_AnchorMountEdgeSelectorCompat" not in source
     assert "TimeanchoredAlignmentStageService(" not in source
+    assert "AnchorMountAlignmentService(" not in source
+    assert "AnchorMountStageResult" not in source
 
 
 def test_timeanchored_package_no_longer_exports_chunk3_legacy_helpers() -> None:
@@ -174,7 +183,7 @@ def test_timeanchored_package_no_longer_exports_chunk3_legacy_helpers() -> None:
     assert not hasattr(timeanchored_alignment, "SentenceSegmenter")
 
 
-def test_execute_prepared_timeanchored_stage_returns_anchor_mount_stage_result() -> None:
+def test_execute_prepared_timeanchored_stage_returns_decoder_result() -> None:
     host = SimpleNamespace(logger=SimpleNamespace(debug=lambda *args, **kwargs: None))
     service = AlignmentStageService(host=host)
     preparation = _build_preparation_package()
@@ -186,9 +195,9 @@ def test_execute_prepared_timeanchored_stage_returns_anchor_mount_stage_result()
         language="zh",
     )
 
-    assert isinstance(result, AnchorMountStageResult)
-    assert result.decision_ingress.anchored_token_units
-    assert not hasattr(result, "sentence_segments")
-    assert not hasattr(result, "text_result")
-    assert not hasattr(result, "edge_result")
-    assert not hasattr(result, "base_result")
+    assert isinstance(result, DecoderShadowResult)
+    assert result.alignment_path is not None
+    assert result.boundary_candidates
+    assert result.alignment_report.route == "alignment_path"
+    assert not hasattr(result, "decision_ingress")
+    assert not hasattr(result, "anchor_mount_result")

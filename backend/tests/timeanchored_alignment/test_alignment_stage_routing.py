@@ -299,10 +299,10 @@ def test_alignment_stage_mode_active_uses_timeanchored_when_gate_passes(monkeypa
     remove_streaming_subtitle_manager(job_id)
 
 
-def test_alignment_stage_mode_active_forces_fast_direct_on_single_chunk_anchor_mount_fallback(
+def test_alignment_stage_mode_active_no_longer_forces_fast_direct_from_legacy_fallback_signal(
     monkeypatch,
 ) -> None:
-    job_id = "test_phase7_route_active_single_chunk_anchor_mount_force_fast"
+    job_id = "test_phase7_route_active_decoder_failure_semantic_keeps_timeanchored_commit"
     pipeline = _build_pipeline(job_id, mode="active")
     _patch_common_alignment_inputs(monkeypatch=monkeypatch, pipeline=pipeline)
 
@@ -312,59 +312,8 @@ def test_alignment_stage_mode_active_forces_fast_direct_on_single_chunk_anchor_m
         Mock(side_effect=AssertionError("legacy 链路已下线，不应被调用")),
     )
     stage_result = SimpleNamespace(
-        decision_ingress=SimpleNamespace(source_chunk_ids=("chunk-0",)),
-        anchor_mount_result=SimpleNamespace(should_fallback=True),
-    )
-    timeanchored_run = Mock(return_value=stage_result)
-    commit_timeanchored = Mock()
-    commit_fast_direct = Mock()
-    record = Mock()
-    monkeypatch.setattr(pipeline._alignment_stage_service, "_run_timeanchored_main_chain", timeanchored_run)
-    monkeypatch.setattr(
-        pipeline._alignment_stage_service,
-        "_should_accept_timeanchored_result",
-        Mock(return_value=(True, "active_gate_pass")),
-    )
-    monkeypatch.setattr(
-        pipeline._alignment_stage_service,
-        "_commit_timeanchored_main_chain_result",
-        commit_timeanchored,
-    )
-    monkeypatch.setattr(
-        pipeline._alignment_stage_service,
-        "_commit_fast_direct_result",
-        commit_fast_direct,
-    )
-    monkeypatch.setattr(pipeline._alignment_stage_service, "_record_hetero_alignment_result", record)
-
-    ctx = _build_ctx(job_id)
-    asyncio.run(pipeline._run_alignment_stage(ctx))
-
-    assert timeanchored_run.call_count == 1
-    assert commit_fast_direct.call_count == 1
-    assert commit_timeanchored.call_count == 0
-    assert record.call_count == 1
-    assert record.call_args.kwargs.get("reason") == "anchor_mount_should_fallback"
-    assert record.call_args.kwargs.get("selected") is True
-    assert ctx.edge_selection_mode == "auto"
-    remove_streaming_subtitle_manager(job_id)
-
-
-def test_alignment_stage_mode_active_keeps_timeanchored_commit_on_multi_chunk_anchor_mount_fallback(
-    monkeypatch,
-) -> None:
-    job_id = "test_phase7_route_active_multi_chunk_anchor_mount_scope_commit"
-    pipeline = _build_pipeline(job_id, mode="active")
-    _patch_common_alignment_inputs(monkeypatch=monkeypatch, pipeline=pipeline)
-
-    monkeypatch.setattr(
-        pipeline,
-        "_run_collection_scoring_decision_once",
-        Mock(side_effect=AssertionError("legacy 链路已下线，不应被调用")),
-    )
-    stage_result = SimpleNamespace(
-        decision_ingress=SimpleNamespace(source_chunk_ids=("chunk-19", "chunk-20")),
-        anchor_mount_result=SimpleNamespace(should_fallback=True),
+        alignment_path=SimpleNamespace(aligned_tokens=(SimpleNamespace(source_chunk_ids=("chunk-0",)),)),
+        alignment_report=SimpleNamespace(route="alignment_path", failure_semantic="alignment_low_confidence"),
     )
     timeanchored_run = Mock(return_value=stage_result)
     commit_timeanchored = Mock()
@@ -533,10 +482,8 @@ def test_alignment_stage_mode_default_raises_when_gate_fails(monkeypatch) -> Non
 
 def test_should_accept_timeanchored_default_rejects_error_route() -> None:
     stage_result = SimpleNamespace(
-        base_result=SimpleNamespace(route="error"),
-        final_stream=(object(),),
-        sentence_segments=(object(),),
-        boundary_evidences=(object(),),
+        alignment_path=None,
+        alignment_report=SimpleNamespace(route="alignment_no_path", failure_semantic="alignment_no_path"),
     )
     accepted, reason = AlignmentStageService._should_accept_timeanchored_result(
         stage_result=stage_result,
@@ -544,15 +491,13 @@ def test_should_accept_timeanchored_default_rejects_error_route() -> None:
     )
 
     assert accepted is False
-    assert reason == "default_gate_route_error"
+    assert reason == "default_alignment_no_path"
 
 
 def test_should_accept_timeanchored_default_requires_non_empty_stream() -> None:
     stage_result = SimpleNamespace(
-        base_result=SimpleNamespace(route="fast"),
-        final_stream=tuple(),
-        sentence_segments=tuple(),
-        boundary_evidences=tuple(),
+        alignment_path=SimpleNamespace(aligned_tokens=tuple()),
+        alignment_report=SimpleNamespace(route="alignment_path", failure_semantic="alignment_path_empty"),
     )
     accepted, reason = AlignmentStageService._should_accept_timeanchored_result(
         stage_result=stage_result,
@@ -560,15 +505,13 @@ def test_should_accept_timeanchored_default_requires_non_empty_stream() -> None:
     )
 
     assert accepted is False
-    assert reason == "default_gate_empty_stream"
+    assert reason == "default_alignment_path_empty"
 
 
 def test_should_accept_timeanchored_default_accepts_valid_result_without_final_sentences() -> None:
     stage_result = SimpleNamespace(
-        base_result=SimpleNamespace(route="slow"),
-        final_stream=(object(),),
-        sentence_segments=tuple(),
-        boundary_evidences=(object(),),
+        alignment_path=SimpleNamespace(aligned_tokens=(object(),)),
+        alignment_report=SimpleNamespace(route="alignment_path", failure_semantic="none"),
     )
     accepted, reason = AlignmentStageService._should_accept_timeanchored_result(
         stage_result=stage_result,

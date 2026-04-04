@@ -15,22 +15,22 @@ def test_resolve_postprocess_file_allows_graph_and_payload_filenames(
     monkeypatch.setattr(debug_routes.config, "JOBS_DIR", tmp_path)
     base = tmp_path / "job1" / "debug" / "postprocess" / "chunk_0001"
     base.mkdir(parents=True, exist_ok=True)
-    graph = base / "21_anchor_mount.graph.json"
+    decoder_output = base / "21_alignment_decoder.output.json"
     payload = base / "60_output_dispatch.payload.json"
-    graph.write_text("{}", encoding="utf-8")
+    decoder_output.write_text("{}", encoding="utf-8")
     payload.write_text("{}", encoding="utf-8")
 
-    resolved_graph = debug_routes._resolve_postprocess_file(
+    resolved_decoder_output = debug_routes._resolve_postprocess_file(
         identifier="job1",
         chunk_index=1,
-        filename="21_anchor_mount.graph.json",
+        filename="21_alignment_decoder.output.json",
     )
     resolved_payload = debug_routes._resolve_postprocess_file(
         identifier="job1",
         chunk_index=1,
         filename="60_output_dispatch.payload.json",
     )
-    assert resolved_graph == graph
+    assert resolved_decoder_output == decoder_output
     assert resolved_payload == payload
 
 
@@ -45,4 +45,3 @@ def test_resolve_postprocess_file_rejects_unsafe_filename(
             chunk_index=1,
             filename="../escape.json",
         )
-
