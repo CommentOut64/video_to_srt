@@ -109,7 +109,7 @@ def test_decision_layer_applies_canonical_facts_and_boundaries_without_projectio
     assert stream.diagnostics.ingress_context["metadata"]["trace_scope"] == "window9"
 
 
-def test_decision_layer_render_keeps_owner_carrier_subtitle_batch_for_slow_window_ingress() -> None:
+def test_decision_layer_render_emits_window_carrier_batch_and_aligned_sentence_contract() -> None:
     processor = SegmentationProcessor(final_splitter=FinalSplitter())
     ingress_context = SegmentationIngressContext(
         unit_kind="slow_window",
@@ -164,8 +164,42 @@ def test_decision_layer_render_keeps_owner_carrier_subtitle_batch_for_slow_windo
     )
 
     assert output.subtitle_batch is not None
-    assert output.subtitle_batch.chunk_id == "chunk-owner-12"
+    assert output.subtitle_batch.chunk_id == "window-12"
     assert output.subtitle_batch.diagnostics["ingress_context"]["projection_chunk_ids"] == []
+    assert output.aligned_sentences[0].source_chunk_ids == ("chunk-owner-12", "chunk-13")
+    assert output.segmentation_report_contract.summary.layer == "segmentation"
+    assert output.segmentation_report_contract.sentence_count == 1
+
+
+def test_decision_layer_slow_window_canonical_stream_keeps_protected_decimal_span() -> None:
+    processor = SegmentationProcessor(final_splitter=FinalSplitter())
+    ingress_context = SegmentationIngressContext(
+        unit_kind="slow_window",
+        unit_id="window-protected-1",
+        chunk_id="window-protected-1",
+        slow_window_id="window-protected-1",
+        source_chunk_ids=("chunk-21", "chunk-22"),
+        projection_chunk_ids=(),
+    )
+    decision_input = DecisionLayerInput(
+        annotated_words=[],
+        vad_intervals=[],
+        ingress_context=ingress_context,
+    )
+
+    stream = processor._build_canonical_stream_from_words(
+        words=[
+            WordTimestamp(word="版本", start=0.0, end=0.4, confidence=0.9, confidence_source="slow"),
+            WordTimestamp(word="3.14", start=0.4, end=0.8, confidence=0.9, confidence_source="slow"),
+            WordTimestamp(word="发布", start=0.8, end=1.2, confidence=0.9, confidence_source="slow"),
+        ],
+        data=decision_input,
+        stream_id="timeanchored:window-protected-1",
+        chunk_index=21,
+    )
+
+    assert stream.chunk_ref == "window-protected-1"
+    assert [span.text for span in stream.protected_spans] == ["3.14"]
 
 
 def test_decision_layer_builds_scored_cut_plan_from_timeanchored_candidate_boundaries() -> None:

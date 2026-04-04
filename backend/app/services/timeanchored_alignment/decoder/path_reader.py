@@ -129,11 +129,15 @@ class AlignmentPathReader:
 
     @staticmethod
     def _resolve_split_index(*, tokens: tuple[object, ...], char_index: int) -> int | None:
+        fallback_index: int | None = None
         for index, token in enumerate(tokens):
+            token_start = int(getattr(token, "char_start", 0) or 0)
             token_end = int(getattr(token, "char_end", 0) or 0)
-            if token_end - 1 <= char_index:
+            if token_start <= char_index < token_end:
                 return index
-        return None
+            if char_index >= token_end - 1:
+                fallback_index = index
+        return fallback_index
 
     @staticmethod
     def _build_low_confidence_spans(

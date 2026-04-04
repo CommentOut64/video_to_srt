@@ -16,21 +16,15 @@ class OutputProjectionInput:
     """OutputProjection minimal input boundary."""
 
     window_id: str
-    owner_chunk_id: str
-    owner_chunk_index: int
     source_chunk_ids: tuple[str, ...]
     source_chunk_indices: tuple[int, ...]
     coverage: WindowCoverage
-    owner_carrier_batch: "SubtitleBatch"
+    carrier_batch: "SubtitleBatch"
     decision_metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.window_id:
             raise ValueError("OutputProjectionInput.window_id 不能为空")
-        if not self.owner_chunk_id:
-            raise ValueError("OutputProjectionInput.owner_chunk_id 不能为空")
-        if int(self.owner_chunk_index) < 0:
-            raise ValueError("OutputProjectionInput.owner_chunk_index 必须 >= 0")
         if not self.source_chunk_ids:
             raise ValueError("OutputProjectionInput.source_chunk_ids 不能为空")
         if not self.source_chunk_indices:
@@ -39,22 +33,14 @@ class OutputProjectionInput:
             raise ValueError(
                 "OutputProjectionInput.source_chunk_ids/source_chunk_indices 长度必须一致"
             )
-        if self.owner_chunk_id not in self.source_chunk_ids:
-            raise ValueError("OutputProjectionInput.owner_chunk_id 必须属于 source_chunk_ids")
-        if int(self.owner_chunk_index) not in self.source_chunk_indices:
-            raise ValueError(
-                "OutputProjectionInput.owner_chunk_index 必须属于 source_chunk_indices"
-            )
         if not tuple(getattr(self.coverage, "chunk_bindings", ()) or ()):
             raise ValueError("OutputProjectionInput.coverage.chunk_bindings 不能为空")
-        if str(self.owner_carrier_batch.chunk_id) != str(self.owner_chunk_id):
-            raise ValueError(
-                "OutputProjectionInput.owner_carrier_batch.chunk_id 必须等于 owner_chunk_id"
-            )
+        if not str(getattr(self.carrier_batch, "chunk_id", "") or "").strip():
+            raise ValueError("OutputProjectionInput.carrier_batch.chunk_id 不能为空")
 
     @property
-    def owner_carrier_role(self) -> str:
-        return "text_carrier_only"
+    def carrier_role(self) -> str:
+        return "window_text_carrier"
 
 
 @dataclass(frozen=True)
@@ -75,7 +61,7 @@ class OutputProjector:
         output_group_chunk_id = self._build_output_group_chunk_id(validated.window_id)
         grouped_items: list["SubtitleItem"] = []
         seen_segment_ids: set[str] = set()
-        for item in tuple(validated.owner_carrier_batch.items or ()):
+        for item in tuple(validated.carrier_batch.items or ()):
             segment_id = str(item.segment_id)
             if segment_id in seen_segment_ids:
                 continue
@@ -90,7 +76,7 @@ class OutputProjector:
         binding_chunk_indices = [int(binding.chunk_index) for binding in bindings]
         projection_meta = {
             "window_id": str(validated.window_id),
-            "owner_chunk_id": str(validated.owner_chunk_id),
+            "carrier_chunk_id": str(validated.carrier_batch.chunk_id),
             "source_chunk_ids": source_chunk_ids,
             "source_chunk_indices": source_chunk_indices,
             "replace_scope_chunk_ids": source_chunk_ids,
@@ -98,11 +84,11 @@ class OutputProjector:
             "binding_chunk_ids": binding_chunk_ids,
             "binding_chunk_indices": binding_chunk_indices,
             "projection_mode": "window_group",
-            "owner_carrier_role": validated.owner_carrier_role,
+            "carrier_role": validated.carrier_role,
             "decision_metadata": dict(validated.decision_metadata or {}),
         }
-        render_report = dict(validated.owner_carrier_batch.render_report or {})
-        base_diagnostics = dict(validated.owner_carrier_batch.diagnostics or {})
+        render_report = dict(validated.carrier_batch.render_report or {})
+        base_diagnostics = dict(validated.carrier_batch.diagnostics or {})
         grouped_tuple = tuple(grouped_items)
         diagnostics = dict(base_diagnostics)
         diagnostics["projection"] = dict(projection_meta)

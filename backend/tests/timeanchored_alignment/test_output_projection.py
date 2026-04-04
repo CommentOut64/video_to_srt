@@ -46,13 +46,13 @@ def _build_input() -> OutputProjectionInput:
             ),
         ),
     )
-    owner_batch = SubtitleBatch(
-        chunk_id="chunk-0",
-        chunk_index=0,
+    carrier_batch = SubtitleBatch(
+        chunk_id="window-0",
+        chunk_index=None,
         items=(
             SubtitleItem(
                 segment_id="seg-0",
-                chunk_id="chunk-0",
+                chunk_id="window-0",
                 start=0.1,
                 end=1.3,
                 text="第一句",
@@ -65,7 +65,7 @@ def _build_input() -> OutputProjectionInput:
             ),
             SubtitleItem(
                 segment_id="seg-1",
-                chunk_id="chunk-0",
+                chunk_id="window-0",
                 start=1.7,
                 end=2.8,
                 text="第二句",
@@ -81,12 +81,10 @@ def _build_input() -> OutputProjectionInput:
     )
     return OutputProjectionInput(
         window_id="window-0",
-        owner_chunk_id="chunk-0",
-        owner_chunk_index=0,
         source_chunk_ids=("chunk-0", "chunk-1", "chunk-2"),
         source_chunk_indices=(0, 1, 2),
         coverage=coverage,
-        owner_carrier_batch=owner_batch,
+        carrier_batch=carrier_batch,
         decision_metadata={"route": "timeanchored"},
     )
 
@@ -102,6 +100,9 @@ def test_output_projector_emits_single_output_group_batch_with_scope_metadata() 
     assert projection_meta["projection_mode"] == "window_group"
     assert projection_meta["replace_scope_chunk_ids"] == ["chunk-0", "chunk-1", "chunk-2"]
     assert projection_meta["replace_scope_chunk_indices"] == [0, 1, 2]
+    assert projection_meta["carrier_chunk_id"] == "window-0"
+    assert "owner_chunk_id" not in projection_meta
+    assert "owner_carrier_role" not in projection_meta
 
 
 def test_output_projector_does_not_reinfer_boundaries_from_owner_items() -> None:

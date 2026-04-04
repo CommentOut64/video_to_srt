@@ -28,16 +28,20 @@ from app.services.segmentation.boundary_mapper import WordBoundaryMapper
 from app.services.punctuation.final_splitter import FinalSplitter
 from app.services.textflow.canonical_text_stream_adapter import CanonicalTextStreamAdapter
 from app.services.textflow.contracts import (
+    AlignedSentence,
     ConsumedBoundaryPunct,
     SegmentPlan,
+    SegmentationReport,
     SegmentationResult,
     SegmentationIngressContext,
 )
+from app.services.timeanchored_alignment.contracts import LayerSummary
 from app.services.textflow.ingress_segment_planner import IngressSegmentPlanner
 from app.services.textflow.render_core import RenderCore
 from app.services.textflow.segmentation_core import SegmentationCore
 from app.services.textflow.subtitle_delivery import SubtitleDelivery
 from app.services.text_protection import (
+    extract_protected_spans,
     is_sentence_end_punct,
     merge_protected_word_tokens,
 )
@@ -200,6 +204,16 @@ class SegmentationProcessor:
                 for item in segmentation_output.output_traces
             ]
             segmentation_output.segmentation_report = report
+            segmentation_output.aligned_sentences = self._build_aligned_sentences(
+                sentence_segments=segmentation_output.sentence_segments,
+                segmentation_result=segmentation_output.segmentation_result,
+                ingress_context=data.ingress_context,
+            )
+            segmentation_output.segmentation_report_contract = self._build_segmentation_report_contract(
+                segmentation_report=report,
+                aligned_sentences=segmentation_output.aligned_sentences,
+                segmentation_result=segmentation_output.segmentation_result,
+            )
             return segmentation_output
 
         canonical_stream = self._build_canonical_stream_from_words(
@@ -254,6 +268,16 @@ class SegmentationProcessor:
         report["render_report"] = dict(render_result.render_report or {})
         report["render_output_trace"] = list(render_result.output_trace or ())
         report["output_trace"] = [self._serialize_output_trace(item) for item in rendered_traces]
+        aligned_sentences = self._build_aligned_sentences(
+            sentence_segments=rendered_sentences,
+            segmentation_result=segmentation_result,
+            ingress_context=data.ingress_context,
+        )
+        segmentation_report_contract = self._build_segmentation_report_contract(
+            segmentation_report=report,
+            aligned_sentences=aligned_sentences,
+            segmentation_result=segmentation_result,
+        )
 
         return DecisionLayerOutput(
             sentence_segments=rendered_sentences,
@@ -264,6 +288,8 @@ class SegmentationProcessor:
             segmentation_result=segmentation_result,
             render_result=render_result,
             subtitle_batch=subtitle_batch,
+            aligned_sentences=aligned_sentences,
+            segmentation_report_contract=segmentation_report_contract,
         )
 
     @staticmethod
@@ -428,11 +454,12 @@ class SegmentationProcessor:
             chunk_id=str(chunk_index if chunk_index is not None else "chunk-unknown"),
             chunk_index=chunk_index,
         )
-        chunk_ref = str(
-            getattr(ingress_context, "chunk_id", None)
-            or (chunk_index if chunk_index is not None else "chunk-unknown")
+        chunk_ref = self._resolve_output_chunk_ref(
+            ingress_context=ingress_context,
+            chunk_index=chunk_index,
         )
         synthetic_text, clean_to_word = self._build_synthetic_text_and_word_mapping(words=words)
+        protected_spans = tuple(extract_protected_spans(synthetic_text))
         char_mapping = [
             CharMapping(raw_idx=index, clean_idx=index, punct=None)
             for index in range(len(synthetic_text))
@@ -459,6 +486,7 @@ class SegmentationProcessor:
             tracks=tracks,
             text_source=self._resolve_text_source_from_words(words=words),
             language=language,
+            protected_spans=protected_spans,
             aligned_facts=aligned_facts,
             metadata={
                 "builder": "decision_layer",
@@ -480,6 +508,99 @@ class SegmentationProcessor:
                 ),
             )
         return canonical_stream
+
+    @staticmethod
+    def _resolve_output_chunk_ref(
+        *,
+        ingress_context: SegmentationIngressContext,
+        chunk_index: Optional[int],
+    ) -> str:
+        unit_kind = str(getattr(ingress_context, "unit_kind", "") or "").strip().lower()
+        if unit_kind == "slow_window":
+            return str(
+                getattr(ingress_context, "slow_window_id", None)
+                or getattr(ingress_context, "unit_id", None)
+                or getattr(ingress_context, "chunk_id", None)
+                or (chunk_index if chunk_index is not None else "window-unknown")
+            )
+        return str(
+            getattr(ingress_context, "chunk_id", None)
+            or getattr(ingress_context, "unit_id", None)
+            or (chunk_index if chunk_index is not None else "chunk-unknown")
+        )
+
+    @staticmethod
+    def _build_aligned_sentences(
+        *,
+        sentence_segments: Sequence[SentenceSegment],
+        segmentation_result: Optional[SegmentationResult],
+        ingress_context: Optional[SegmentationIngressContext],
+    ) -> List[AlignedSentence]:
+        source_chunk_ids = tuple(
+            str(item) for item in (getattr(ingress_context, "source_chunk_ids", ()) or ()) if str(item)
+        )
+        segments = list(getattr(segmentation_result, "segments", ()) or ())
+        aligned_sentences: List[AlignedSentence] = []
+        for sentence_index, sentence in enumerate(list(sentence_segments or [])):
+            segment = segments[sentence_index] if sentence_index < len(segments) else None
+            sentence_id = str(
+                getattr(segment, "segment_id", "")
+                or getattr(sentence, "segment_id", "")
+                or getattr(sentence, "sentence_uid", "")
+                or f"aligned-sentence-{sentence_index}"
+            )
+            token_span = None
+            if segment is not None:
+                token_span = (
+                    int(getattr(segment, "token_start", 0) or 0),
+                    int(getattr(segment, "token_end", 0) or 0),
+                )
+            aligned_sentences.append(
+                AlignedSentence(
+                    sentence_id=sentence_id,
+                    text=str(getattr(sentence, "text_clean", "") or getattr(sentence, "text", "") or ""),
+                    start=float(getattr(sentence, "start", 0.0) or 0.0),
+                    end=float(getattr(sentence, "end", 0.0) or 0.0),
+                    token_span=token_span,
+                    source_chunk_ids=source_chunk_ids,
+                    trace={
+                        "split_reason": str(getattr(sentence, "split_reason", "") or ""),
+                        "split_risk": str(getattr(sentence, "split_risk", "") or ""),
+                        "window_id": str(getattr(sentence, "window_id", "") or ""),
+                        "mapped_cut_time": getattr(sentence, "mapped_cut_time", None),
+                        "mapping_quality": str(getattr(sentence, "mapping_quality", "") or ""),
+                        "mapping_reason": str(getattr(sentence, "mapping_reason", "") or ""),
+                    },
+                )
+            )
+        return aligned_sentences
+
+    @staticmethod
+    def _build_segmentation_report_contract(
+        *,
+        segmentation_report: Dict[str, Any],
+        aligned_sentences: Sequence[AlignedSentence],
+        segmentation_result: Optional[SegmentationResult],
+    ) -> SegmentationReport:
+        boundary_reason_counts = Counter()
+        for segment in list(getattr(segmentation_result, "segments", ()) or ()):
+            boundary_reason = str(getattr(segment, "boundary_reason", "") or "")
+            if boundary_reason:
+                boundary_reason_counts[boundary_reason] += 1
+        error_code = str(segmentation_report.get("error_code", "") or "")
+        summary = LayerSummary(
+            layer="segmentation",
+            status="error" if error_code else "ok",
+            counters={
+                "sentence_count": int(len(list(aligned_sentences or []))),
+                "boundary_reason_count": int(sum(boundary_reason_counts.values())),
+            },
+        )
+        return SegmentationReport(
+            summary=summary,
+            sentence_count=int(len(list(aligned_sentences or []))),
+            boundary_reason_counts=dict(boundary_reason_counts),
+        )
 
     @staticmethod
     def _build_synthetic_text_and_word_mapping(

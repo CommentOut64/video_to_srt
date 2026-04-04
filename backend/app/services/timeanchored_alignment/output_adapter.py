@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 from app.services.alignment.types import OutputLayerInput, OutputTrace
+from app.services.textflow.contracts import AlignedSentence, SegmentationReport
+from app.services.timeanchored_alignment.contracts import LayerSummary
 from app.services.timeanchored_alignment.chunk_projector import ChunkProjection
 
 
@@ -34,9 +36,14 @@ class OutputAdapter:
                 OutputLayerInput(
                     chunk_index=chunk_ref,
                     sentence_segments=sentences,
+                    aligned_sentences=self._build_aligned_sentences(sentences),
                     language=language,
                     injection_report=dict(injection_report or {}),
                     segmentation_report=dict(segmentation_report or {}),
+                    segmentation_report_contract=self._build_segmentation_report_contract(
+                        segmentation_report=segmentation_report,
+                        sentence_count=len(sentences),
+                    ),
                     output_traces=traces,
                     subtitle_batch=subtitle_delivery.build_batch_from_sentences(
                         chunk_id=str(chunk_ref),
@@ -48,6 +55,45 @@ class OutputAdapter:
                 )
             )
         return outputs
+
+    @staticmethod
+    def _build_aligned_sentences(sentences: Sequence[Any]) -> list[AlignedSentence]:
+        aligned_sentences: list[AlignedSentence] = []
+        for idx, sentence in enumerate(sentences):
+            aligned_sentences.append(
+                AlignedSentence(
+                    sentence_id=str(
+                        getattr(sentence, "segment_id", "")
+                        or getattr(sentence, "sentence_uid", "")
+                        or f"projection-seg-{idx}"
+                    ),
+                    text=str(getattr(sentence, "text_clean", "") or getattr(sentence, "text", "") or ""),
+                    start=float(getattr(sentence, "start", 0.0) or 0.0),
+                    end=float(getattr(sentence, "end", 0.0) or 0.0),
+                    trace={
+                        "split_reason": str(getattr(sentence, "split_reason", "") or ""),
+                        "split_risk": str(getattr(sentence, "split_risk", "") or ""),
+                    },
+                )
+            )
+        return aligned_sentences
+
+    @staticmethod
+    def _build_segmentation_report_contract(
+        *,
+        segmentation_report: dict[str, Any] | None,
+        sentence_count: int,
+    ) -> SegmentationReport:
+        report = dict(segmentation_report or {})
+        error_code = str(report.get("error_code", "") or "")
+        return SegmentationReport(
+            summary=LayerSummary(
+                layer="segmentation",
+                status="error" if error_code else "ok",
+                counters={"sentence_count": int(sentence_count)},
+            ),
+            sentence_count=int(sentence_count),
+        )
 
     @staticmethod
     def _build_output_traces(sentences: Sequence[Any]) -> list[OutputTrace]:

@@ -17,7 +17,9 @@ if TYPE_CHECKING:
     from app.services.language_policy.types import LanguagePolicySnapshot
     from app.services.segmentation.soft_cut.types import CutPlan
     from app.services.textflow.contracts import (
+        AlignedSentence,
         RenderResult,
+        SegmentationReport,
         SegmentationIngressContext,
         SegmentationResult,
         SubtitleBatch,
@@ -317,6 +319,8 @@ class DecisionLayerOutput:
     segmentation_result: Optional["SegmentationResult"] = None
     render_result: Optional["RenderResult"] = None
     subtitle_batch: Optional["SubtitleBatch"] = None
+    aligned_sentences: List["AlignedSentence"] = field(default_factory=list)
+    segmentation_report_contract: Optional["SegmentationReport"] = None
 
 
 @dataclass
@@ -330,6 +334,8 @@ class OutputLayerInput:
     segmentation_report: Optional[Dict[str, Any]] = None
     output_traces: Optional[List[OutputTrace]] = None
     subtitle_batch: Optional["SubtitleBatch"] = None
+    aligned_sentences: List["AlignedSentence"] = field(default_factory=list)
+    segmentation_report_contract: Optional["SegmentationReport"] = None
 
 
 @dataclass

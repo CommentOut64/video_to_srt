@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import hashlib
 from dataclasses import asdict, replace
+from types import SimpleNamespace
 from typing import Any, Dict, Optional, Sequence
 
 from app.models.sensevoice_models import SentenceSegment, TextSource
@@ -17,7 +18,7 @@ from app.pipelines.dual_pipeline.services.textflow_facade_service import Layer45
 from app.schemas.pipeline_context import ProcessingContext
 from app.services.alignment.types import CharMapping, PunctTrack, TextTrack, TextTrackBundle
 from app.services.language_policy import build_language_policy_snapshot
-from app.services.textflow.decision_ingress_adapter import DecisionIngressAdapter
+from app.services.textflow.alignment_path_adapter import AlignmentPathAdapter
 from app.services.timeanchored_alignment import AlignmentItem
 from app.services.timeanchored_alignment.contracts import (
     SelectedTextTruth,
@@ -71,7 +72,7 @@ class AlignmentStageService:
         )
         self._timeanchored_stage_service = AnchorMountAlignmentService()
         self._alignment_decoder_service = AlignmentDecoderService()
-        self._decision_ingress_adapter = DecisionIngressAdapter()
+        self._alignment_path_adapter = AlignmentPathAdapter()
         self._output_projector = OutputProjector()
         self._selection_service = TextSelectionService(logger=getattr(host, "logger", None))
         self._postprocess_trace_writer = PostprocessTraceWriter(
@@ -960,31 +961,32 @@ class AlignmentStageService:
             preparation=preparation,
             language=language,
         )
-        decoder_shadow_result = self._run_decoder_shadow(
+        decoder_result = self._run_decoder_alignment(
             ctx=ctx,
             preparation=preparation,
         )
+        setattr(ctx, "decoder_alignment_result", decoder_result)
         if isinstance(stage_result, AnchorMountStageResult):
             self._trace_write(
                 ctx=ctx,
                 filename="21_anchor_mount.output.json",
                 stage="anchor_mount_output",
                 summary_payload={
-                    "window_id": str(stage_result.decision_ingress.window_id),
-                    "token_count": len(stage_result.decision_ingress.anchored_token_units),
-                    "boundary_evidence_count": len(stage_result.decision_ingress.boundary_evidences),
-                    "cross_chunk_lock_count": len(stage_result.decision_ingress.cross_chunk_locks),
+                    "window_id": str(preparation.window_id),
+                    "token_count": len(stage_result.anchor_mount_result.items),
+                    "boundary_evidence_count": len(stage_result.anchor_mount_result.boundary_evidences),
+                    "cross_chunk_lock_count": len(stage_result.anchor_mount_result.cross_chunk_locks),
                     "should_fallback": bool(stage_result.anchor_mount_result.should_fallback),
                     "metrics": dict(stage_result.anchor_mount_result.metrics),
                 },
                 full_payload=stage_result,
             )
-            if decoder_shadow_result is not None:
+            if decoder_result is not None and self._should_run_decoder_shadow(ctx):
                 self._write_decoder_shadow_trace(
                     ctx=ctx,
                     preparation=preparation,
                     stage_result=stage_result,
-                    decoder_shadow_result=decoder_shadow_result,
+                    decoder_shadow_result=decoder_result,
                 )
             self._emit_anchor_mount_graph(
                 ctx=ctx,
@@ -993,19 +995,17 @@ class AlignmentStageService:
             )
         return stage_result
 
-    def _run_decoder_shadow(
+    def _run_decoder_alignment(
         self,
         *,
         ctx: ProcessingContext,
         preparation: PreparationBundle,
     ) -> Any | None:
-        if not self._should_run_decoder_shadow(ctx):
-            return None
         try:
             return self._alignment_decoder_service.execute(preparation=preparation)
         except Exception:
             self._host.logger.exception(
-                "Chunk {}: decoder shadow 执行失败，但不影响正式 anchor_mount 输出",
+                "Chunk {}: decoder AlignmentPath 执行失败",
                 getattr(ctx, "chunk_index", -1),
             )
             return None
@@ -1076,7 +1076,14 @@ class AlignmentStageService:
     ) -> dict[str, Any]:
         alignment_path = getattr(decoder_shadow_result, "alignment_path", None)
         decoder_tokens = tuple(getattr(alignment_path, "aligned_tokens", ()) or ())
-        anchor_tokens = tuple(getattr(stage_result.decision_ingress, "anchored_token_units", ()) or ())
+        anchor_mount_result = getattr(stage_result, "anchor_mount_result", None)
+        anchor_tokens = tuple(
+            SimpleNamespace(
+                start=float(getattr(envelope, "provisional_start", 0.0) or 0.0),
+                end=float(getattr(envelope, "provisional_end", 0.0) or 0.0),
+            )
+            for envelope in (getattr(anchor_mount_result, "envelopes", ()) or ())
+        )
         pair_count = min(len(decoder_tokens), len(anchor_tokens))
         avg_timing_delta_ms = 0.0
         if pair_count:
@@ -1105,7 +1112,7 @@ class AlignmentStageService:
             "anchor_mount": {
                 "path_token_count": len(anchor_tokens),
                 "boundary_evidence_count": len(
-                    getattr(stage_result.decision_ingress, "boundary_evidences", ()) or ()
+                    getattr(anchor_mount_result, "boundary_evidences", ()) or ()
                 ),
                 "should_fallback": bool(stage_result.anchor_mount_result.should_fallback),
             },
@@ -1113,10 +1120,12 @@ class AlignmentStageService:
                 "path_token_count_delta": int(len(decoder_tokens) - len(anchor_tokens)),
                 "boundary_count_delta": int(
                     len(getattr(decoder_shadow_result, "boundary_candidates", ()) or ())
-                    - len(getattr(stage_result.decision_ingress, "boundary_evidences", ()) or ())
+                    - len(getattr(anchor_mount_result, "boundary_evidences", ()) or ())
                 ),
                 "source_chunk_scope_match": tuple(getattr(alignment_path, "source_chunk_ids", ()) or ())
-                == tuple(getattr(stage_result.decision_ingress, "source_chunk_ids", ()) or ()),
+                == AlignmentStageService._resolve_anchor_mount_source_chunk_ids(
+                    stage_result=stage_result
+                ),
                 "avg_timing_delta_ms": float(avg_timing_delta_ms),
             },
         }
@@ -1150,6 +1159,29 @@ class AlignmentStageService:
             len(preparation.pronunciation_graph.state_nodes),
             len(getattr(preparation.compat.time_base, "word_units", ()) or ()),
         )
+
+    def _require_decoder_alignment_result(
+        self,
+        *,
+        ctx: ProcessingContext,
+        preparation: PreparationBundle,
+    ) -> Any:
+        decoder_result = getattr(ctx, "decoder_alignment_result", None)
+        if decoder_result is None:
+            decoder_result = self._run_decoder_alignment(
+                ctx=ctx,
+                preparation=preparation,
+            )
+            setattr(ctx, "decoder_alignment_result", decoder_result)
+        if decoder_result is None or getattr(decoder_result, "alignment_path", None) is None:
+            route = str(
+                getattr(getattr(decoder_result, "alignment_report", None), "route", "") or ""
+            )
+            raise RuntimeError(
+                "timeanchored 主链缺少 AlignmentPath，"
+                f"无法进入正式切分入口 route={route or 'unknown'}"
+            )
+        return decoder_result
 
     def _resolve_preparation_inputs(
         self,
@@ -1445,35 +1477,49 @@ class AlignmentStageService:
                 whisper_result=whisper_result,
                 sv_result=sv_result,
             )
-        adapter_result = self._decision_ingress_adapter.build(
-            package=stage_result.decision_ingress,
+        decoder_result = self._require_decoder_alignment_result(
+            ctx=ctx,
+            preparation=preparation,
+        )
+        alignment_path = decoder_result.alignment_path
+        adapter_result = self._alignment_path_adapter.build(
+            preparation=preparation,
+            decoder_result=decoder_result,
             speaker_id=speaker_id,
             turn_id=turn_id,
         )
         self._inject_timeline_turns_into_decision_input(
             decision_input=adapter_result.decision_input,
-            decision_ingress=stage_result.decision_ingress,
+            time_axis_tokens=getattr(alignment_path, "aligned_tokens", ()) or (),
         )
         self._trace_write(
             ctx=ctx,
-            filename="30_decision_ingress.input.json",
-            stage="decision_ingress_input",
+            filename="30_segmentation_ingress.input.json",
+            stage="segmentation_ingress_input",
             summary_payload={
-                "window_id": str(stage_result.decision_ingress.window_id),
-                "token_count": len(stage_result.decision_ingress.anchored_token_units),
-                "punctuation_fact_count": len(stage_result.decision_ingress.punctuation_facts),
-                "boundary_evidence_count": len(stage_result.decision_ingress.boundary_evidences),
-                "cross_chunk_lock_count": len(stage_result.decision_ingress.cross_chunk_locks),
-                "coverage_owner_chunks": len(stage_result.decision_ingress.source_chunk_ids),
+                "window_id": str(preparation.window_id),
+                "aligned_token_count": len(getattr(alignment_path, "aligned_tokens", ()) or ()),
+                "punctuation_fact_count": len(
+                    getattr(adapter_result.decision_input, "canonical_punctuation_facts", ()) or ()
+                ),
+                "boundary_candidate_count": len(
+                    getattr(adapter_result.decision_input, "canonical_candidate_boundaries", ()) or ()
+                ),
+                "coverage_owner_chunks": len(preparation.source_chunk_ids),
             },
-            full_payload=stage_result.decision_ingress,
+            full_payload={
+                "alignment_path": alignment_path,
+                "alignment_report": getattr(decoder_result, "alignment_report", None),
+                "boundary_candidates": getattr(decoder_result, "boundary_candidates", ()),
+                "low_confidence_spans": getattr(decoder_result, "low_confidence_spans", ()),
+            },
         )
         self._trace_write(
             ctx=ctx,
-            filename="31_decision_ingress.output.json",
-            stage="decision_ingress_output",
-            summary_payload=self._build_decision_ingress_trace_summary(
-                package=stage_result.decision_ingress,
+            filename="31_segmentation_ingress.output.json",
+            stage="segmentation_ingress_output",
+            summary_payload=self._build_segmentation_ingress_trace_summary(
+                alignment_path=alignment_path,
                 adapter_result=adapter_result,
             ),
             full_payload=adapter_result,
@@ -1489,7 +1535,7 @@ class AlignmentStageService:
             filename="40_decision.output.json",
             stage="decision_output",
             summary_payload={
-                "sentence_count": len(decision_output.sentence_segments),
+                "sentence_count": len(getattr(decision_output, "aligned_sentences", ()) or ()),
                 "trace_count": len(decision_output.output_traces),
                 "segmentation_report": dict(decision_output.segmentation_report or {}),
                 "has_subtitle_batch": bool(getattr(decision_output, "subtitle_batch", None)),
@@ -1558,7 +1604,7 @@ class AlignmentStageService:
             "injection_miss_ratio": 0.0,
             "injection_mapping_coverage": (
                 1.0
-                if stage_result.decision_ingress.punctuation_facts
+                if getattr(adapter_result.decision_input, "canonical_punctuation_facts", ())
                 else 0.0
             ),
             "injection_blocked": 0.0,
@@ -1568,26 +1614,30 @@ class AlignmentStageService:
         split_stats.update(dict(decision_output.segmentation_report.get("boundary_score_stats", {})))
         split_stats.update(dict(decision_output.segmentation_report.get("soft_cut_stats", {})))
         split_stats["timeanchored_boundary_candidate_count"] = int(
-            len(stage_result.decision_ingress.boundary_evidences)
+            len(getattr(alignment_path, "boundary_candidates", ()) or ())
         )
         split_stats["timeanchored_boundary_hard_count"] = int(
-            sum(1 for item in stage_result.decision_ingress.boundary_evidences if bool(item.hard_flag))
+            sum(
+                1
+                for item in (getattr(alignment_path, "boundary_candidates", ()) or ())
+                if bool(getattr(item, "hard_boundary", False))
+            )
         )
         split_stats["timeanchored_boundary_lexical_count"] = int(
             sum(
                 1
-                for item in stage_result.decision_ingress.boundary_evidences
-                if str(item.reason) == "lexical_boundary"
+                for item in (getattr(alignment_path, "boundary_candidates", ()) or ())
+                if str(getattr(item, "reason", "") or "") == "lexical_boundary"
             )
         )
         split_stats["timeanchored_boundary_anchor_block_close_count"] = int(
             sum(
                 1
-                for item in stage_result.decision_ingress.boundary_evidences
-                if str(item.reason) == "anchor_block_close"
+                for item in (getattr(alignment_path, "boundary_candidates", ()) or ())
+                if str(getattr(item, "reason", "") or "") == "anchor_block_close"
             )
         )
-        split_stats["decision_ingress_adapter_fallback_punct_count"] = int(
+        split_stats["segmentation_ingress_fallback_punct_count"] = int(
             adapter_result.compat_report.get("fallback_punctuation_position_count", 0) or 0
         )
         preparation_punctuation_count = int(
@@ -1599,7 +1649,9 @@ class AlignmentStageService:
             chosen_source=self._resolve_selected_source(ctx, default="unknown"),
             punct_track=ctx.punct_track,
             preparation_punctuation_count=preparation_punctuation_count,
-            punctuation_fact_count=int(len(stage_result.decision_ingress.punctuation_facts)),
+            punctuation_fact_count=int(
+                len(getattr(adapter_result.decision_input, "canonical_punctuation_facts", ()) or ())
+            ),
         )
         split_stats["punctuation_chain_broken_flag"] = int(
             punctuation_chain_health["punctuation_chain_broken_flag"]
@@ -1630,6 +1682,7 @@ class AlignmentStageService:
         )
 
         projected_batches = self._build_projected_output_batches(
+            preparation=preparation,
             stage_result=stage_result,
             decision_output=decision_output,
             split_stats=split_stats,
@@ -1640,13 +1693,13 @@ class AlignmentStageService:
             stage="output_projection_output",
             summary_payload={
                 "projected_chunk_count": len(projected_batches),
-                "owner_chunk_index": int(stage_result.decision_ingress.owner_chunk_index),
-                "source_chunk_indices": list(stage_result.decision_ingress.source_chunk_indices),
+                "window_id": str(preparation.window_id),
+                "source_chunk_indices": list(preparation.source_chunk_indices),
             },
             full_payload={
                 "projected_batches": projected_batches,
-                "owner_chunk_index": int(stage_result.decision_ingress.owner_chunk_index),
-                "source_chunk_indices": list(stage_result.decision_ingress.source_chunk_indices),
+                "window_id": str(preparation.window_id),
+                "source_chunk_indices": list(preparation.source_chunk_indices),
             },
         )
         output_error_count = 0
@@ -1732,12 +1785,12 @@ class AlignmentStageService:
             "timeanchored_text_route": text_route,
             "timeanchored_edge_route": edge_route,
             "timeanchored_final_route": final_route,
-            "timeanchored_item_count": float(len(stage_result.decision_ingress.anchored_token_units)),
+            "timeanchored_item_count": float(len(getattr(alignment_path, "aligned_tokens", ()) or ())),
             "timeanchored_sentence_count": float(len(final_sentences)),
             "timeanchored_projected_chunk_count": float(len(projected_batches)),
             "timeanchored_failed_span_count": 0.0,
             "timeanchored_boundary_candidate_count": float(
-                len(stage_result.decision_ingress.boundary_evidences)
+                len(getattr(alignment_path, "boundary_candidates", ()) or ())
             ),
             "l7_error_count": float(output_error_count),
             **punctuation_chain_health,
@@ -1776,7 +1829,7 @@ class AlignmentStageService:
         self,
         *,
         decision_input: Any,
-        decision_ingress: Any,
+        time_axis_tokens: Sequence[Any],
     ) -> None:
         """
         将窗口内 timeline turn 真值注入 Decision 输入，避免 slot 级 speaker 继承导致误判。
@@ -1788,7 +1841,7 @@ class AlignmentStageService:
         timeline_turns = list(getattr(host, "_timeline_turns", []) or [])
         if not timeline_turns:
             return
-        tokens = list(getattr(decision_ingress, "tokens", ()) or ())
+        tokens = list(time_axis_tokens or ())
         if not tokens:
             return
         window_start = min(float(getattr(item, "start", 0.0) or 0.0) for item in tokens)
@@ -1821,6 +1874,7 @@ class AlignmentStageService:
     def _build_projected_output_batches(
         self,
         *,
+        preparation: PreparationBundle,
         stage_result: AnchorMountStageResult,
         decision_output: Any,
         split_stats: Dict[str, Any],
@@ -1829,18 +1883,19 @@ class AlignmentStageService:
         if owner_batch is None:
             raise ValueError("timeanchored 主链缺少 subtitle_batch，无法执行 output projection")
         projection_input = OutputProjectionInput(
-            window_id=str(stage_result.decision_ingress.window_id),
-            owner_chunk_id=str(stage_result.decision_ingress.owner_chunk_id),
-            owner_chunk_index=int(stage_result.decision_ingress.owner_chunk_index),
-            source_chunk_ids=tuple(str(item) for item in stage_result.decision_ingress.source_chunk_ids),
-            source_chunk_indices=tuple(
-                int(item) for item in stage_result.decision_ingress.source_chunk_indices
-            ),
-            coverage=stage_result.decision_ingress.coverage,
-            owner_carrier_batch=owner_batch,
+            window_id=str(preparation.window_id),
+            source_chunk_ids=tuple(str(item) for item in preparation.source_chunk_ids),
+            source_chunk_indices=tuple(int(item) for item in preparation.source_chunk_indices),
+            coverage=preparation.coverage,
+            carrier_batch=owner_batch,
             decision_metadata={
                 "boundary_score_stats": dict(split_stats),
                 "segmentation_report": dict(getattr(decision_output, "segmentation_report", {}) or {}),
+                "segmentation_report_contract": (
+                    asdict(getattr(decision_output, "segmentation_report_contract"))
+                    if getattr(decision_output, "segmentation_report_contract", None) is not None
+                    else None
+                ),
             },
         )
         projected_batches = tuple(self._output_projector.project(projection_input))
@@ -2110,7 +2165,7 @@ class AlignmentStageService:
             return
         try:
             graph_payload = self._anchor_mount_graph_renderer.build_graph_payload(
-                window_id=str(stage_result.decision_ingress.window_id),
+                window_id=str(preparation.window_id),
                 items=stage_result.anchor_mount_result.items,
                 envelopes=stage_result.anchor_mount_result.envelopes,
                 boundary_evidences=stage_result.anchor_mount_result.boundary_evidences,
@@ -2156,16 +2211,16 @@ class AlignmentStageService:
             )
 
     @staticmethod
-    def _build_decision_ingress_trace_summary(
+    def _build_segmentation_ingress_trace_summary(
         *,
-        package: Any,
+        alignment_path: Any,
         adapter_result: Any,
     ) -> dict[str, Any]:
-        token_units = list(getattr(package, "anchored_token_units", ()) or ())
-        boundary_evidences = list(getattr(package, "boundary_evidences", ()) or ())
+        aligned_tokens = list(getattr(alignment_path, "aligned_tokens", ()) or ())
+        boundary_candidates = list(getattr(alignment_path, "boundary_candidates", ()) or ())
         rows = [
-            AlignmentStageService._serialize_decision_ingress_token_unit(index=index, token_unit=item)
-            for index, item in enumerate(token_units)
+            AlignmentStageService._serialize_alignment_path_token(index=index, token=item)
+            for index, item in enumerate(aligned_tokens)
         ]
         return {
             "stream_id": str(getattr(adapter_result, "stream_id", "") or ""),
@@ -2174,65 +2229,49 @@ class AlignmentStageService:
                 str(getattr(getattr(adapter_result, "decision_input", None), "fallback_clean_text_ref", "") or "")
             ),
             "compat_report": dict(getattr(adapter_result, "compat_report", {}) or {}),
-            "token_units": rows,
-            "boundary_evidences": [
-                AlignmentStageService._serialize_boundary_evidence(item)
-                for item in boundary_evidences
+            "aligned_tokens": rows,
+            "boundary_candidates": [
+                AlignmentStageService._serialize_alignment_boundary_candidate(item)
+                for item in boundary_candidates
             ],
             "boundary_by_split": AlignmentStageService._build_boundary_groups_for_trace(
-                token_units=token_units,
-                boundary_evidences=boundary_evidences,
+                token_units=aligned_tokens,
+                boundary_evidences=boundary_candidates,
             ),
-            "cross_chunk_locks": [
-                AlignmentStageService._serialize_cross_chunk_lock_for_trace(item)
-                for item in (getattr(package, "cross_chunk_locks", ()) or ())
-            ],
         }
 
     @staticmethod
-    def _serialize_decision_ingress_token_unit(
+    def _serialize_alignment_path_token(
         *,
         index: int,
-        token_unit: Any,
+        token: Any,
     ) -> dict[str, Any]:
         return {
             "token_index": int(index),
-            "unit_id": str(getattr(token_unit, "unit_id", "") or ""),
-            "token_text": str(getattr(token_unit, "token_text", "") or ""),
-            "normalized_text": str(getattr(token_unit, "normalized_text", "") or ""),
-            "start": float(getattr(token_unit, "start", 0.0) or 0.0),
-            "end": float(getattr(token_unit, "end", 0.0) or 0.0),
-            "left_bound": float(getattr(token_unit, "left_bound", 0.0) or 0.0),
-            "right_bound": float(getattr(token_unit, "right_bound", 0.0) or 0.0),
-            "speaker_id": getattr(token_unit, "speaker_id", None),
-            "turn_id": getattr(token_unit, "turn_id", None),
-            "mount_status": str(getattr(token_unit, "mount_status", "") or ""),
-            "anchor_kind": str(getattr(token_unit, "anchor_kind", "") or ""),
+            "token_id": str(getattr(token, "token_id", "") or ""),
+            "text": str(getattr(token, "text", "") or ""),
+            "start": float(getattr(token, "start", 0.0) or 0.0),
+            "end": float(getattr(token, "end", 0.0) or 0.0),
             "source_chunk_ids": [
-                str(item) for item in (getattr(token_unit, "source_chunk_ids", ()) or ())
+                str(item) for item in (getattr(token, "source_chunk_ids", ()) or ())
             ],
-            "source_chunk_indices": [
-                int(item) for item in (getattr(token_unit, "source_chunk_indices", ()) or ())
-            ],
-            "source_hook_ids": [
-                str(item) for item in (getattr(token_unit, "source_hook_ids", ()) or ())
-            ],
-            "cross_chunk_lock_ids": [
-                str(item) for item in (getattr(token_unit, "cross_chunk_lock_ids", ()) or ())
-            ],
-            "match_confidence": float(getattr(token_unit, "match_confidence", 0.0) or 0.0),
+            "confidence": float(getattr(token, "confidence", 0.0) or 0.0),
+            "trace": dict(getattr(token, "trace", {}) or {}),
         }
 
     @staticmethod
-    def _serialize_boundary_evidence(item: Any) -> dict[str, Any]:
+    def _serialize_alignment_boundary_candidate(item: Any) -> dict[str, Any]:
         return {
-            "split_idx": int(getattr(item, "split_idx", 0) or 0),
+            "split_idx": int(
+                getattr(item, "split_token_index", getattr(item, "split_idx", 0)) or 0
+            ),
             "event_time": float(getattr(item, "event_time", 0.0) or 0.0),
-            "left_end": float(getattr(item, "left_end", 0.0) or 0.0),
-            "right_start": float(getattr(item, "right_start", 0.0) or 0.0),
             "reason": str(getattr(item, "reason", "") or ""),
             "score": float(getattr(item, "score", 0.0) or 0.0),
-            "hard_flag": bool(getattr(item, "hard_flag", False)),
+            "hard_flag": bool(getattr(item, "hard_boundary", getattr(item, "hard_flag", False))),
+            "source_chunk_ids": [
+                str(value) for value in (getattr(item, "source_chunk_ids", ()) or ())
+            ],
             "metadata": dict(getattr(item, "metadata", {}) or {}),
         }
 
@@ -2259,7 +2298,7 @@ class AlignmentStageService:
     ) -> list[dict[str, Any]]:
         by_split_idx: dict[int, list[Any]] = {}
         for item in boundary_evidences:
-            raw_split_idx = getattr(item, "split_idx", -1)
+            raw_split_idx = getattr(item, "split_idx", getattr(item, "split_token_index", -1))
             split_idx = int(raw_split_idx) if raw_split_idx is not None else -1
             if split_idx < 0:
                 continue
@@ -2269,9 +2308,19 @@ class AlignmentStageService:
             left_text = ""
             right_text = ""
             if 0 <= split_idx < len(token_units):
-                left_text = str(getattr(token_units[split_idx], "token_text", "") or "")
+                left_text = str(
+                    getattr(token_units[split_idx], "token_text", getattr(token_units[split_idx], "text", ""))
+                    or ""
+                )
             if 0 <= split_idx + 1 < len(token_units):
-                right_text = str(getattr(token_units[split_idx + 1], "token_text", "") or "")
+                right_text = str(
+                    getattr(
+                        token_units[split_idx + 1],
+                        "token_text",
+                        getattr(token_units[split_idx + 1], "text", ""),
+                    )
+                    or ""
+                )
             evidences = by_split_idx[split_idx]
             rows.append(
                 {
@@ -2314,7 +2363,7 @@ class AlignmentStageService:
             "reason": str(reason),
             "route": route,
             "sentence_count": (
-                int(len(stage_result.decision_ingress.anchored_token_units))
+                int(len(stage_result.anchor_mount_result.items))
                 if stage_result is not None
                 else 0
             ),
@@ -2373,14 +2422,9 @@ class AlignmentStageService:
         if stage_result is None:
             return False, f"{mode}_timeanchored_failed"
 
-        if hasattr(stage_result, "decision_ingress"):
-            token_count = len(
-                getattr(stage_result.decision_ingress, "anchored_token_units", ()) or ()
-            )
-        else:
-            token_count = len(getattr(stage_result, "final_stream", ()) or ())
+        token_count = AlignmentStageService._resolve_anchor_mount_token_count(stage_result=stage_result)
 
-        if ctx is not None and hasattr(stage_result, "decision_ingress"):
+        if ctx is not None and getattr(stage_result, "anchor_mount_result", None) is not None:
             edge_selection_mode = str(getattr(ctx, "edge_selection_mode", "") or "").strip().lower()
             if edge_selection_mode in {"force_fast", "prefer_fast"}:
                 route = "fast" if token_count else "error"
@@ -2404,11 +2448,7 @@ class AlignmentStageService:
         ctx: ProcessingContext,
         stage_result: Optional[AnchorMountStageResult],
     ) -> tuple[str, str, str, str | None]:
-        token_count = (
-            len(stage_result.decision_ingress.anchored_token_units)
-            if stage_result is not None
-            else 0
-        )
+        token_count = self._resolve_anchor_mount_token_count(stage_result=stage_result)
         text_route = "slow" if token_count else "error"
         if self._should_force_fast_direct_on_anchor_mount_fallback(
             stage_result=stage_result
@@ -2449,20 +2489,12 @@ class AlignmentStageService:
     ) -> tuple[str, ...]:
         if stage_result is None:
             return tuple()
-        decision_ingress = getattr(stage_result, "decision_ingress", None)
-        if decision_ingress is None:
+        anchor_mount_result = getattr(stage_result, "anchor_mount_result", None)
+        if anchor_mount_result is None:
             return tuple()
-        source_chunk_ids = tuple(
-            str(item)
-            for item in (getattr(decision_ingress, "source_chunk_ids", ()) or ())
-            if str(item)
-        )
-        if source_chunk_ids:
-            return source_chunk_ids
-
         deduped_source_chunk_ids: list[str] = []
         seen_source_chunk_ids: set[str] = set()
-        for token_unit in (getattr(decision_ingress, "anchored_token_units", ()) or ()):
+        for token_unit in (getattr(anchor_mount_result, "items", ()) or ()):
             for chunk_id in (getattr(token_unit, "source_chunk_ids", ()) or ()):
                 chunk_value = str(chunk_id).strip()
                 if not chunk_value or chunk_value in seen_source_chunk_ids:
@@ -2470,6 +2502,18 @@ class AlignmentStageService:
                 seen_source_chunk_ids.add(chunk_value)
                 deduped_source_chunk_ids.append(chunk_value)
         return tuple(deduped_source_chunk_ids)
+
+    @staticmethod
+    def _resolve_anchor_mount_token_count(
+        *,
+        stage_result: Optional[Any],
+    ) -> int:
+        if stage_result is None:
+            return 0
+        anchor_mount_result = getattr(stage_result, "anchor_mount_result", None)
+        if anchor_mount_result is not None:
+            return int(len(getattr(anchor_mount_result, "items", ()) or ()))
+        return int(len(getattr(stage_result, "final_stream", ()) or ()))
 
     @classmethod
     def _should_force_fast_direct_on_anchor_mount_fallback(

@@ -22,8 +22,6 @@ class _DummySubtitleManager:
 def _build_projection_input() -> OutputProjectionInput:
     return OutputProjectionInput(
         window_id="window-0",
-        owner_chunk_id="chunk-0",
-        owner_chunk_index=0,
         source_chunk_ids=("chunk-0", "chunk-1", "chunk-2"),
         source_chunk_indices=(0, 1, 2),
         coverage=WindowCoverage(
@@ -60,13 +58,13 @@ def _build_projection_input() -> OutputProjectionInput:
                 ),
             ),
         ),
-        owner_carrier_batch=SubtitleBatch(
-            chunk_id="chunk-0",
-            chunk_index=0,
+        carrier_batch=SubtitleBatch(
+            chunk_id="window-0",
+            chunk_index=None,
             items=(
                 SubtitleItem(
                     segment_id="seg-0",
-                    chunk_id="chunk-0",
+                    chunk_id="window-0",
                     start=0.9,
                     end=1.35,
                     text="跨段",

@@ -411,11 +411,10 @@ def test_resolve_anchor_mount_routes_uses_fast_route_when_single_chunk_anchor_mo
         )
     )
     stage_result = SimpleNamespace(
-        decision_ingress=SimpleNamespace(
-            anchored_token_units=(object(),),
-            source_chunk_ids=("chunk-0",),
+        anchor_mount_result=SimpleNamespace(
+            items=(SimpleNamespace(source_chunk_ids=("chunk-0",)),),
+            should_fallback=True,
         ),
-        anchor_mount_result=SimpleNamespace(should_fallback=True),
     )
 
     text_route, edge_route, final_route, error_code = service._resolve_anchor_mount_routes(
@@ -440,11 +439,10 @@ def test_resolve_anchor_mount_routes_keeps_slow_route_when_multi_chunk_anchor_mo
         )
     )
     stage_result = SimpleNamespace(
-        decision_ingress=SimpleNamespace(
-            anchored_token_units=(object(),),
-            source_chunk_ids=("chunk-19", "chunk-20"),
+        anchor_mount_result=SimpleNamespace(
+            items=(SimpleNamespace(source_chunk_ids=("chunk-19", "chunk-20")),),
+            should_fallback=True,
         ),
-        anchor_mount_result=SimpleNamespace(should_fallback=True),
     )
 
     text_route, edge_route, final_route, error_code = service._resolve_anchor_mount_routes(

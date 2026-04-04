@@ -43,14 +43,14 @@ def _build_coverage() -> WindowCoverage:
     )
 
 
-def _build_owner_batch() -> SubtitleBatch:
+def _build_carrier_batch() -> SubtitleBatch:
     return SubtitleBatch(
-        chunk_id="chunk-10",
-        chunk_index=10,
+        chunk_id="window-10",
+        chunk_index=None,
         items=(
             SubtitleItem(
                 segment_id="timeanchored:window-10:seg:0",
-                chunk_id="chunk-10",
+                chunk_id="window-10",
                 start=10.0,
                 end=11.6,
                 text="测试输出",
@@ -63,48 +63,45 @@ def _build_owner_batch() -> SubtitleBatch:
 def test_output_projection_min_input_requires_window_source_and_coverage() -> None:
     data = OutputProjectionInput(
         window_id="window-10",
-        owner_chunk_id="chunk-10",
-        owner_chunk_index=10,
         source_chunk_ids=("chunk-10", "chunk-11"),
         source_chunk_indices=(10, 11),
         coverage=_build_coverage(),
-        owner_carrier_batch=_build_owner_batch(),
+        carrier_batch=_build_carrier_batch(),
         decision_metadata={"route": "timeanchored"},
     )
 
-    assert data.owner_carrier_batch.chunk_id == "chunk-10"
+    assert data.carrier_batch.chunk_id == "window-10"
     assert data.window_id == "window-10"
     assert data.source_chunk_ids == ("chunk-10", "chunk-11")
     assert data.source_chunk_indices == (10, 11)
     assert len(data.coverage.chunk_bindings) == 2
-    assert data.owner_carrier_role == "text_carrier_only"
+    assert data.carrier_role == "window_text_carrier"
 
 
-def test_output_projection_rejects_owner_batch_without_source_provenance_alignment() -> None:
-    with pytest.raises(ValueError, match="owner_carrier_batch.chunk_id"):
-        OutputProjectionInput(
-            window_id="window-10",
-            owner_chunk_id="chunk-10",
-            owner_chunk_index=10,
-            source_chunk_ids=("chunk-10", "chunk-11"),
-            source_chunk_indices=(10, 11),
-            coverage=_build_coverage(),
-            owner_carrier_batch=SubtitleBatch(
-                chunk_id="chunk-999",
-                chunk_index=999,
-                items=(
-                    SubtitleItem(
-                        segment_id="seg-999",
-                        chunk_id="chunk-999",
-                        start=10.0,
-                        end=11.0,
-                        text="错误载体",
-                        source="render_core",
-                    ),
+def test_output_projection_accepts_window_carrier_batch_outside_source_chunk_scope() -> None:
+    data = OutputProjectionInput(
+        window_id="window-10",
+        source_chunk_ids=("chunk-10", "chunk-11"),
+        source_chunk_indices=(10, 11),
+        coverage=_build_coverage(),
+        carrier_batch=SubtitleBatch(
+            chunk_id="window-10",
+            chunk_index=None,
+            items=(
+                SubtitleItem(
+                    segment_id="seg-999",
+                    chunk_id="window-10",
+                    start=10.0,
+                    end=11.0,
+                    text="窗口载体",
+                    source="render_core",
                 ),
             ),
-            decision_metadata={},
-        )
+        ),
+        decision_metadata={},
+    )
+
+    assert data.carrier_batch.chunk_id == "window-10"
 
 
 def test_output_projection_keeps_southbound_replace_chunk_batch_contract() -> None:
