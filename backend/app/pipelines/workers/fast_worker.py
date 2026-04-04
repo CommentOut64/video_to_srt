@@ -293,10 +293,16 @@ class FastWorker:
         ctc_compact_trace = None
         ctc_logits = None
         ctc_frame_stride = None
+        encoder_out_lens = None
+        blank_track = None
+        sparse_logits = None
         if asr_result.metadata and asr_result.metadata.raw_tags:
             ctc_compact_trace = asr_result.metadata.raw_tags.get("ctc_compact_trace")
             ctc_logits = asr_result.metadata.raw_tags.get("ctc_logits")
             ctc_frame_stride = asr_result.metadata.raw_tags.get("ctc_frame_stride")
+            encoder_out_lens = asr_result.metadata.raw_tags.get("encoder_out_lens")
+            blank_track = asr_result.metadata.raw_tags.get("blank_track")
+            sparse_logits = asr_result.metadata.raw_tags.get("sparse_logits")
 
         # V3.2.0+dev.20260203.10: L0 仅透传原始文本与置信度来源
         raw_text = asr_result.text if asr_result.text is not None else None
@@ -320,5 +326,11 @@ class FastWorker:
             result["ctc_logits"] = ctc_logits
         if ctc_frame_stride is not None:
             result["ctc_frame_stride"] = ctc_frame_stride
+        if encoder_out_lens is not None:
+            result["encoder_out_lens"] = encoder_out_lens
+        if blank_track is not None:
+            result["blank_track"] = blank_track
+        if sparse_logits is not None:
+            result["sparse_logits"] = sparse_logits
         return result
 

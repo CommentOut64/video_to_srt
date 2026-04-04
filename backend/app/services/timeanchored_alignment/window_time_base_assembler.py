@@ -89,6 +89,31 @@ class WindowTimeBaseAssembler:
                 str(binding.chunk_index): binding.role for binding in ready_window.coverage.chunk_bindings
             },
         }
+        blank_track: list[float] = []
+        sparse_logits: list[dict[str, Any]] = []
+        encoder_out_lens_total = 0
+        for chunk_index in ready_window.source_chunk_indices:
+            package = packages_by_index.get(int(chunk_index))
+            if package is None:
+                continue
+            package_metadata = dict(getattr(package, "metadata", {}) or {})
+            blank_track.extend(float(item) for item in (package_metadata.get("blank_track") or ()))
+            encoder_out_lens_value = package_metadata.get("encoder_out_lens")
+            if encoder_out_lens_value is not None:
+                try:
+                    encoder_out_lens_total += int(encoder_out_lens_value)
+                except (TypeError, ValueError):
+                    pass
+            for item in (package_metadata.get("sparse_logits") or ()):
+                if not isinstance(item, dict):
+                    continue
+                sparse_logits.append({"chunk_index": int(chunk_index), **item})
+        if blank_track:
+            metadata["blank_track"] = blank_track
+        if encoder_out_lens_total > 0:
+            metadata["encoder_out_lens"] = encoder_out_lens_total
+        if sparse_logits:
+            metadata["sparse_logits"] = sparse_logits
         return WindowTimeBasePackage(
             window_id=ready_window.window_id,
             language=language,

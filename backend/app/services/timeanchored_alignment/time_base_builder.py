@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Optional
 
-from app.services.timeanchored_alignment.adapters.fast.sensevoice_time_adapter import SenseVoiceTimeAdapter
+from app.services.timeanchored_alignment.adapters.fast import FastTimeAdapter, SenseVoiceTimeAdapter
 from app.services.timeanchored_alignment.contracts import TimeBasePackage
 
 
 class TimeBaseBuilder:
     """协调适配器并管理 ctc 大对象生命周期。"""
 
-    def __init__(self, adapter: Optional[SenseVoiceTimeAdapter] = None) -> None:
+    def __init__(self, adapter: Optional[FastTimeAdapter] = None) -> None:
         self._adapter = adapter or SenseVoiceTimeAdapter(vocab=None, blank_id=0)
 
     def build(self, ctx: Any) -> Optional[TimeBasePackage]:
@@ -23,6 +24,7 @@ class TimeBaseBuilder:
         frame_stride = float(sv_result.get("ctc_frame_stride", 0.06) or 0.06)
         ctc_logits = sv_result.get("ctc_logits")
         compact_trace = sv_result.get("ctc_compact_trace") or {}
+        encoder_out_lens = sv_result.get("encoder_out_lens")
         raw_tokens = sv_result.get("raw_tokens") or compact_trace.get("raw_tokens") or []
 
         if ctc_logits is None and not raw_tokens:
@@ -40,9 +42,22 @@ class TimeBaseBuilder:
                 raw_tokens=raw_tokens,
                 language=language,
                 frame_stride=frame_stride,
+                encoder_out_lens=encoder_out_lens,
             )
         finally:
             # 构建后立即释放完整矩阵，防止在上下文中长期滞留。
             sv_result.pop("ctc_logits", None)
+
+        metadata = dict(getattr(package, "metadata", {}) or {})
+        if encoder_out_lens is not None:
+            metadata["encoder_out_lens"] = int(encoder_out_lens)
+        blank_track = sv_result.get("blank_track")
+        if blank_track is not None:
+            metadata["blank_track"] = [float(item) for item in list(blank_track)]
+        sparse_logits = sv_result.get("sparse_logits")
+        if sparse_logits is not None:
+            metadata["sparse_logits"] = list(sparse_logits)
+        if metadata != dict(getattr(package, "metadata", {}) or {}):
+            package = replace(package, metadata=metadata)
 
         return package

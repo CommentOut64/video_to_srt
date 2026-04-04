@@ -22,8 +22,14 @@ class _DummyRuntimeService:
 
 
 class _DummyDraftEngine:
-    def __init__(self, *, include_ctc_logits: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        include_ctc_logits: bool = True,
+        include_high_capability_fields: bool = False,
+    ) -> None:
         self._include_ctc_logits = include_ctc_logits
+        self._include_high_capability_fields = include_high_capability_fields
 
     async def transcribe(self, *args: Any, **kwargs: Any) -> ASRResult:
         logits = np.array(
@@ -71,6 +77,13 @@ class _DummyDraftEngine:
         }
         if self._include_ctc_logits:
             raw_tags["ctc_logits"] = logits
+        if self._include_high_capability_fields:
+            raw_tags["encoder_out_lens"] = 4
+            raw_tags["blank_track"] = [0.72, 0.19, 0.61, 0.08]
+            raw_tags["sparse_logits"] = [
+                {"frame": 0, "token_id": 1, "score": 0.93},
+                {"frame": 1, "token_id": 2, "score": 0.89},
+            ]
 
         metadata = ASRMetadata(
             engine="unit",
@@ -158,3 +171,43 @@ async def test_fast_worker_legacy_flag_is_ignored_and_still_builds_time_base(
 
     assert ctx.time_base_chunk is not None
     assert "ctc_logits" not in (ctx.sv_result or {})
+
+
+@pytest.mark.asyncio
+async def test_fast_worker_preserves_high_capability_observation_fields_into_time_base(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.pipelines.workers.fast_worker as fast_worker_module
+
+    runtime_payload = {
+        "effective": {
+            "sensevoice": {"use_itn": True},
+            "alignment_pipeline": {"version": "timeanchored", "mode": "default"},
+        },
+        "override": {
+            "alignment_pipeline": {"version": "timeanchored", "mode": "default"},
+        },
+    }
+    monkeypatch.setattr(
+        fast_worker_module,
+        "get_model_runtime_config_service",
+        lambda: _DummyRuntimeService(runtime_payload),
+    )
+
+    worker = FastWorker(
+        job_id="job-high-capability",
+        draft_engine=_DummyDraftEngine(
+            include_ctc_logits=True,
+            include_high_capability_fields=True,
+        ),
+    )
+    ctx = _make_ctx()
+    await worker.process(ctx)
+
+    assert ctx.time_base_chunk is not None
+    assert ctx.time_base_chunk.metadata["encoder_out_lens"] == 4
+    assert ctx.time_base_chunk.metadata["blank_track"] == [0.72, 0.19, 0.61, 0.08]
+    assert ctx.time_base_chunk.metadata["sparse_logits"] == [
+        {"frame": 0, "token_id": 1, "score": 0.93},
+        {"frame": 1, "token_id": 2, "score": 0.89},
+    ]

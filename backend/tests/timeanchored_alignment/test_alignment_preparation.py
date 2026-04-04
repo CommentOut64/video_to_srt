@@ -3,7 +3,11 @@ from __future__ import annotations
 from dataclasses import replace
 
 from app.services.timeanchored_alignment.contracts import (
+    AcousticCandidate,
     LayerSummary,
+    OBSERVATION_CAPABILITY_FRAME_POSTERIOR,
+    OBSERVATION_CAPABILITY_TIMESTAMP_ONLY,
+    OBSERVATION_CAPABILITY_TOKEN_TOPK,
     SelectedTextTruth,
     TimeBasePackage,
     TimeBaseQuality,
@@ -677,3 +681,74 @@ def test_alignment_preparation_observation_pack_follows_canonical_tokenization_f
     assert package.canonical_sequence.protected_spans[0].text == "3.14"
     assert package.canonical_sequence.protected_spans[0].start == 2
     assert package.canonical_sequence.protected_spans[0].end == 6
+
+
+def test_prepare_marks_frame_posterior_capability_when_blank_track_exists() -> None:
+    assembler = AlignmentPreparationAssembler()
+    window_time_base = replace(
+        _build_window_time_base(),
+        metadata={"blank_track": [0.82, 0.17, 0.65], "encoder_out_lens": 3},
+        source="mock_frame_window",
+    )
+
+    package = assembler.prepare(
+        ready_window=_build_ready_window(),
+        window_time_base=window_time_base,
+        selected_text_truth=_build_selected_text_truth("你好世界"),
+        whisper_result=_build_whisper_result("你好世界"),
+        default_language="zh",
+    )
+
+    assert package.acoustic_observation_pack.capability_level == OBSERVATION_CAPABILITY_FRAME_POSTERIOR
+    assert package.acoustic_observation_pack.adapter_type == "mock_frame_window"
+    assert package.acoustic_observation_pack.blank_track == (0.82, 0.17, 0.65)
+
+
+def test_prepare_marks_token_topk_capability_when_top_candidates_exist() -> None:
+    topk_unit = TimeBaseUnit(
+        text="你",
+        start=0.0,
+        end=0.1,
+        confidence=0.91,
+        token_type="word",
+        top_candidates=(
+            AcousticCandidate(text="你", score=0.91, token_id=1),
+            AcousticCandidate(text="尼", score=0.84, token_id=2),
+        ),
+    )
+    window_time_base = replace(
+        _build_window_time_base(),
+        raw_units=(topk_unit,),
+        word_units=(topk_unit,),
+        metadata={},
+        source="mock_topk_window",
+    )
+    assembler = AlignmentPreparationAssembler()
+
+    package = assembler.prepare(
+        ready_window=_build_ready_window(text_a="你", text_b=""),
+        window_time_base=window_time_base,
+        selected_text_truth=_build_selected_text_truth("你", source_chunk_ids=("chunk-1",)),
+        whisper_result=_build_whisper_result("你"),
+        default_language="zh",
+    )
+
+    assert package.acoustic_observation_pack.capability_level == OBSERVATION_CAPABILITY_TOKEN_TOPK
+    assert package.acoustic_observation_pack.adapter_type == "mock_topk_window"
+    assert package.acoustic_observation_pack.topk_limit == 2
+
+
+def test_prepare_marks_timestamp_only_capability_when_only_timestamps_exist() -> None:
+    assembler = AlignmentPreparationAssembler()
+
+    package = assembler.prepare(
+        ready_window=_build_ready_window(),
+        window_time_base=replace(_build_window_time_base(), source="mock_timestamp_window"),
+        selected_text_truth=_build_selected_text_truth("你好世界"),
+        whisper_result=_build_whisper_result("你好世界"),
+        default_language="zh",
+    )
+
+    assert package.acoustic_observation_pack.capability_level == OBSERVATION_CAPABILITY_TIMESTAMP_ONLY
+    assert package.acoustic_observation_pack.adapter_type == "mock_timestamp_window"
+    assert package.acoustic_observation_pack.quality.notes == ("timestamp_only",)

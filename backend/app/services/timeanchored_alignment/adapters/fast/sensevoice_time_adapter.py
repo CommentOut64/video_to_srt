@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
@@ -61,16 +62,25 @@ class SenseVoiceTimeAdapter:
                     encoder_out_lens=encoder_out_lens,
                 )
                 if package.raw_units or package.word_units:
-                    return package
+                    return self._attach_observation_metadata(
+                        package=package,
+                        compact_acoustic_trace=compact_acoustic_trace or {},
+                        encoder_out_lens=encoder_out_lens,
+                    )
             except Exception:
                 # logits 异常（空帧/NaN/解码失败）时回退 compact_trace，避免整 chunk 丢失。
                 pass
 
-        return self._build_from_compact_trace(
+        package = self._build_from_compact_trace(
             language=normalized_language,
             frame_stride=normalized_stride,
             compact_acoustic_trace=compact_acoustic_trace or {},
             raw_tokens=list(raw_tokens or []),
+        )
+        return self._attach_observation_metadata(
+            package=package,
+            compact_acoustic_trace=compact_acoustic_trace or {},
+            encoder_out_lens=encoder_out_lens,
         )
 
     def _build_from_logits(
@@ -286,3 +296,23 @@ class SenseVoiceTimeAdapter:
         except (TypeError, ValueError):
             numeric = int(default)
         return max(1, min(numeric, 3))
+
+    @staticmethod
+    def _attach_observation_metadata(
+        *,
+        package: TimeBasePackage,
+        compact_acoustic_trace: Dict[str, Any],
+        encoder_out_lens: Optional[int],
+    ) -> TimeBasePackage:
+        metadata = dict(getattr(package, "metadata", {}) or {})
+        if encoder_out_lens is not None:
+            metadata["encoder_out_lens"] = int(encoder_out_lens)
+        blank_track = compact_acoustic_trace.get("blank_track")
+        if blank_track is not None:
+            metadata["blank_track"] = [float(item) for item in list(blank_track)]
+        sparse_logits = compact_acoustic_trace.get("sparse_logits")
+        if sparse_logits is not None:
+            metadata["sparse_logits"] = list(sparse_logits)
+        if metadata == dict(getattr(package, "metadata", {}) or {}):
+            return package
+        return replace(package, metadata=metadata)

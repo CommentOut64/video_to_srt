@@ -17,7 +17,14 @@ from app.services.timeanchored_alignment.slow_window.contracts import (
 from app.services.timeanchored_alignment.window_time_base_assembler import WindowTimeBaseAssembler
 
 
-def _build_ctx(index: int, start: float, end: float, text: str) -> ProcessingContext:
+def _build_ctx(
+    index: int,
+    start: float,
+    end: float,
+    text: str,
+    *,
+    metadata: dict | None = None,
+) -> ProcessingContext:
     chunk = AudioChunk(
         index=index,
         start=start,
@@ -36,6 +43,7 @@ def _build_ctx(index: int, start: float, end: float, text: str) -> ProcessingCon
             word_units=(unit,),
             quality=TimeBaseQuality(blank_ratio=0.1, avg_max_prob=0.9, low_prob_ratio=0.05),
             language="zh",
+            metadata=dict(metadata or {}),
         ),
     )
 
@@ -135,3 +143,45 @@ def test_window_time_base_assembler_rebases_chunk_relative_units_to_absolute_tim
         (0.0, 0.6),
         (1.0, 1.5),
     )
+
+
+def test_window_time_base_assembler_preserves_high_capability_observation_metadata() -> None:
+    assembler = WindowTimeBaseAssembler()
+    ready_window = _build_ready_window()
+    contexts = [
+        _build_ctx(
+            index=2,
+            start=0.0,
+            end=0.6,
+            text="你",
+            metadata={
+                "blank_track": (0.81, 0.24),
+                "encoder_out_lens": 2,
+                "sparse_logits": (
+                    {"frame": 0, "token_id": 1, "score": 0.91},
+                ),
+            },
+        ),
+        _build_ctx(
+            index=3,
+            start=1.0,
+            end=1.5,
+            text="好",
+            metadata={
+                "blank_track": (0.67,),
+                "encoder_out_lens": 1,
+                "sparse_logits": (
+                    {"frame": 0, "token_id": 2, "score": 0.88},
+                ),
+            },
+        ),
+    ]
+
+    package = assembler.assemble(ready_window=ready_window, source_contexts=contexts)
+
+    assert package.metadata["blank_track"] == [0.81, 0.24, 0.67]
+    assert package.metadata["encoder_out_lens"] == 3
+    assert package.metadata["sparse_logits"] == [
+        {"chunk_index": 2, "frame": 0, "token_id": 1, "score": 0.91},
+        {"chunk_index": 3, "frame": 0, "token_id": 2, "score": 0.88},
+    ]

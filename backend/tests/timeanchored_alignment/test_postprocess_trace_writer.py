@@ -66,3 +66,67 @@ def test_postprocess_trace_writer_supports_empty_layer_summary_schema(tmp_path: 
     with manifest_file.open("r", encoding="utf-8") as handle:
         manifest = json.load(handle)
     assert "preparation" in manifest["summaries"]
+
+
+def test_postprocess_trace_writer_disabled_mode_does_not_create_files(tmp_path: Path) -> None:
+    writer = PostprocessTraceWriter(
+        logger=None,
+        enabled=False,
+        level="full",
+    )
+    job_dir = tmp_path / "job-disabled"
+    writer.write_stage(
+        job_dir=job_dir,
+        chunk_index=1,
+        filename="20_alignment_decoder.input.json",
+        payload={"window_id": "w-disabled"},
+        stage="alignment_decoder_input",
+    )
+    writer.write_layer_summary(
+        job_dir=job_dir,
+        layer_summary=LayerSummary(layer="alignment", status="ok"),
+    )
+
+    assert not (job_dir / "debug" / "postprocess").exists()
+    assert not (job_dir / "debug" / "postprocess" / "manifest.json").exists()
+
+
+def test_postprocess_trace_writer_summary_level_skips_full_only_payload(tmp_path: Path) -> None:
+    writer = PostprocessTraceWriter(
+        logger=None,
+        enabled=True,
+        level="summary",
+    )
+    job_dir = tmp_path / "job-summary"
+    writer.write_stage(
+        job_dir=job_dir,
+        chunk_index=2,
+        filename="20_alignment_decoder.input.json",
+        payload={"window_id": "w-summary"},
+        stage="alignment_decoder_input",
+        full_only=True,
+    )
+    writer.write_stage(
+        job_dir=job_dir,
+        chunk_index=2,
+        filename="21_alignment_decoder.output.json",
+        payload={"window_id": "w-summary", "status": "ok"},
+        stage="alignment_decoder_output",
+    )
+
+    full_only_file = (
+        job_dir / "debug" / "postprocess" / "chunk_0002" / "20_alignment_decoder.input.json"
+    )
+    kept_file = (
+        job_dir / "debug" / "postprocess" / "chunk_0002" / "21_alignment_decoder.output.json"
+    )
+    manifest_file = job_dir / "debug" / "postprocess" / "manifest.json"
+
+    assert not full_only_file.exists()
+    assert kept_file.exists()
+
+    with manifest_file.open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    chunk_entry = manifest["chunks"]["2"]["files"]
+    assert "20_alignment_decoder.input.json" not in chunk_entry
+    assert chunk_entry["21_alignment_decoder.output.json"]["stage"] == "alignment_decoder_output"
