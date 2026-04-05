@@ -4,6 +4,7 @@ from app.services.alignment.types import AnnotatedWord, DecisionLayerInput
 from app.services.punctuation.final_splitter import FinalSplitter
 from app.services.textflow.contracts import SegmentationIngressContext
 from app.services.textflow.decision_layer import SegmentationProcessor
+from app.services.timeanchored_alignment.contracts import BoundaryEvidence
 
 
 def _build_timeanchored_decision_input(
@@ -12,6 +13,7 @@ def _build_timeanchored_decision_input(
     chunk_id: str,
     chunk_index: int,
     words: list[tuple[str, float, float]],
+    canonical_candidate_boundaries: tuple[BoundaryEvidence, ...] = (),
 ) -> DecisionLayerInput:
     ingress_context = SegmentationIngressContext(
         unit_kind="slow_window",
@@ -35,6 +37,7 @@ def _build_timeanchored_decision_input(
         ],
         vad_intervals=[],
         ingress_context=ingress_context,
+        canonical_candidate_boundaries=canonical_candidate_boundaries,
     )
 
 
@@ -161,4 +164,93 @@ def test_timeanchored_ingress_allows_small_overflow_to_avoid_breaking_prepositio
     assert [segment.text for segment in output.sentence_segments] == [
         "Bennet, okay, sure a trolley is heading towards five people, you can pull the lever to diver the track",
         "One person said, at least that's what you think is happening,",
+    ]
+
+
+def test_timeanchored_ingress_does_not_split_pause_only_english_clause_tail() -> None:
+    processor = SegmentationProcessor(final_splitter=FinalSplitter())
+    decision_input = _build_timeanchored_decision_input(
+        unit_id="window-tr-tail-hold",
+        chunk_id="chunk-tr-tail-hold",
+        chunk_index=0,
+        words=[
+            ("There's", 6.856, 7.096),
+            ("plenty", 7.216, 7.276),
+            ("of", 7.516, 7.576),
+            ("time", 7.696, 7.756),
+            ("left", 7.996, 8.056),
+            ("to", 8.176, 8.236),
+            ("go", 8.356, 8.416),
+            ("and", 8.536, 8.596),
+            ("hunt", 8.716, 8.776),
+            ("evil", 9.016, 9.076),
+            ("down", 9.316, 9.976),
+        ],
+    )
+
+    output = processor.process(
+        decision_input,
+        stream_id="timeanchored:window-tr-tail-hold",
+        chunk_index=0,
+        is_last_chunk=True,
+    )
+
+    assert [segment.text for segment in output.sentence_segments] == [
+        "There's plenty of time left to go and hunt evil down"
+    ]
+
+
+def test_timeanchored_ingress_does_not_split_before_right_idea_clause() -> None:
+    processor = SegmentationProcessor(final_splitter=FinalSplitter())
+    decision_input = _build_timeanchored_decision_input(
+        unit_id="window-tr-right-idea",
+        chunk_id="chunk-tr-right-idea",
+        chunk_index=2,
+        words=[
+            ("Probably", 21.348, 21.708),
+            ("Monica,", 21.888, 22.428),
+            ("she", 22.548, 22.608),
+            ("has", 22.848, 22.908),
+            ("the", 23.088, 23.148),
+            ("right", 23.268, 23.328),
+            ("idea", 23.448, 23.508),
+            ("in", 23.928, 23.988),
+            ("a", 24.108, 24.168),
+            ("lot", 24.228, 24.288),
+            ("of", 24.408, 24.468),
+            ("ways", 24.588, 25.428),
+        ],
+        canonical_candidate_boundaries=(
+            BoundaryEvidence(
+                split_idx=4,
+                event_time=23.208,
+                left_end=23.148,
+                right_start=23.268,
+                reason="gap_pause",
+                score=0.24,
+                hard_flag=False,
+                metadata={"gap_sec": 0.12},
+            ),
+            BoundaryEvidence(
+                split_idx=5,
+                event_time=23.388,
+                left_end=23.328,
+                right_start=23.448,
+                reason="gap_pause",
+                score=0.24,
+                hard_flag=False,
+                metadata={"gap_sec": 0.12},
+            ),
+        ),
+    )
+
+    output = processor.process(
+        decision_input,
+        stream_id="timeanchored:window-tr-right-idea",
+        chunk_index=2,
+        is_last_chunk=True,
+    )
+
+    assert [segment.text for segment in output.sentence_segments] == [
+        "Probably Monica, she has the right idea in a lot of ways"
     ]

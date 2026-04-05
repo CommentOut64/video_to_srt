@@ -39,6 +39,17 @@ class _SegmentCandidate:
     constraint_only: bool
     short_fragment_hit: bool
     overflow_sec: float
+    pause_only: bool
+
+
+@dataclass(frozen=True)
+class _TailHoldCandidate:
+    segment_start_idx: int
+    segment_end_idx: int
+    duration_sec: float
+    word_count: int
+    score: float
+    reason: str = "tail_hold"
 
 
 class IngressSegmentPlanner:
@@ -50,6 +61,7 @@ class IngressSegmentPlanner:
     _CJK_MAX_OVERFLOW_SEC = 0.45
     _DEFAULT_ACCEPT_THRESHOLD = 0.55
     _CJK_ACCEPT_THRESHOLD = 0.48
+    _ENGLISH_TAIL_HOLD_MARGIN = 0.08
     _SENTENCE_END_PUNCT = ("。", "！", "？", ".", "!", "?")
     _WEAK_CLOSURE_PUNCT = ",，、;；:："
     _LEFT_OPEN_ENGLISH_TOKENS = frozenset(
@@ -146,13 +158,17 @@ class IngressSegmentPlanner:
         decisions: list[CutDecision] = []
         candidate_diagnostics: list[dict[str, Any]] = []
         planner_rejections: Counter[str] = Counter()
+        tail_hold_stats = {
+            "considered_count": 0,
+            "selected_count": 0,
+        }
         constraint_stats = {
             "hard_limit_hits": 0,
             "rolling_resets": 0,
         }
         segment_start_idx = 0
         while segment_start_idx < len(words_for_split) - 1:
-            candidate, considered_candidates = self._select_best_segment_end(
+            candidate, considered_candidates, tail_hold, suppressed_split_idx = self._select_best_segment_end(
                 processor=processor,
                 words_for_split=words_for_split,
                 segment_start_idx=segment_start_idx,
@@ -160,13 +176,20 @@ class IngressSegmentPlanner:
                 accept_threshold=accept_threshold,
                 max_segment_sec=max_segment_sec,
                 max_overflow_sec=max_overflow_sec,
+                language_is_cjk=language_is_cjk,
                 rejection_stats=planner_rejections,
             )
+            if tail_hold is not None:
+                tail_hold_stats["considered_count"] += 1
+            if suppressed_split_idx is not None:
+                tail_hold_stats["selected_count"] += 1
             candidate_diagnostics.extend(
                 self._serialize_candidate_diagnostics(
                     segment_start_idx=segment_start_idx,
                     considered_candidates=considered_candidates,
                     selected_candidate=candidate,
+                    suppressed_split_idx=suppressed_split_idx,
+                    tail_hold=tail_hold,
                 )
             )
             if candidate is None:
@@ -223,6 +246,7 @@ class IngressSegmentPlanner:
                 "reason_stats": dict(reason_stats),
                 "feature_stats": dict(feature_stats),
                 "constraint_stats": dict(constraint_stats),
+                "tail_hold_stats": dict(tail_hold_stats),
                 "rejection_stats": {
                     **dict(rejection_stats),
                     **{
@@ -324,8 +348,14 @@ class IngressSegmentPlanner:
         accept_threshold: float,
         max_segment_sec: float,
         max_overflow_sec: float,
+        language_is_cjk: bool,
         rejection_stats: Counter[str],
-    ) -> tuple[Optional[_SegmentCandidate], list[_SegmentCandidate]]:
+    ) -> tuple[
+        Optional[_SegmentCandidate],
+        list[_SegmentCandidate],
+        Optional[_TailHoldCandidate],
+        Optional[int],
+    ]:
         segment_start_time = float(getattr(words_for_split[segment_start_idx], "start", 0.0) or 0.0)
         last_feasible_split: Optional[int] = None
         last_overflow_split: Optional[int] = None
@@ -339,12 +369,19 @@ class IngressSegmentPlanner:
                 continue
             break
         if last_feasible_split is None:
-            return None, []
+            return None, [], None, None
 
         must_split = float(getattr(words_for_split[-1], "end", segment_start_time) or segment_start_time) - segment_start_time > max_segment_sec
         candidate_end_idx = last_feasible_split
         if must_split and last_overflow_split is not None:
             candidate_end_idx = last_overflow_split
+        tail_hold = None
+        if not language_is_cjk and not must_split:
+            tail_hold = self._build_tail_hold_candidate(
+                words_for_split=words_for_split,
+                segment_start_idx=segment_start_idx,
+                max_segment_sec=max_segment_sec,
+            )
         best_candidate: Optional[_SegmentCandidate] = None
         considered_candidates: list[_SegmentCandidate] = []
         for split_idx in range(segment_start_idx, candidate_end_idx + 1):
@@ -360,18 +397,29 @@ class IngressSegmentPlanner:
             if candidate is None:
                 continue
             considered_candidates.append(candidate)
-            if best_candidate is None or candidate.score > best_candidate.score:
+            if best_candidate is None or self._should_replace_best_candidate(
+                current=best_candidate,
+                challenger=candidate,
+                prefer_later_pause_tie=not language_is_cjk,
+            ):
                 best_candidate = candidate
 
         if best_candidate is None:
-            return None, considered_candidates
+            return None, considered_candidates, tail_hold, None
+        if (
+            tail_hold is not None
+            and best_candidate.pause_only
+            and best_candidate.score <= tail_hold.score + self._ENGLISH_TAIL_HOLD_MARGIN
+        ):
+            rejection_stats["tail_hold_preferred"] += 1
+            return None, considered_candidates, tail_hold, int(best_candidate.split_idx)
         if best_candidate.score >= accept_threshold or must_split:
-            return best_candidate, considered_candidates
+            return best_candidate, considered_candidates, tail_hold, None
         if best_candidate.short_fragment_hit:
             rejection_stats["short_fragment"] += 1
         else:
             rejection_stats["low_closure"] += 1
-        return None, considered_candidates
+        return None, considered_candidates, tail_hold, None
 
     def _build_candidate(
         self,
@@ -464,6 +512,13 @@ class IngressSegmentPlanner:
             short_fragment_penalty = 0.26
         else:
             short_fragment_penalty = 0.0
+        pause_only = (
+            primary_reason in {"gap_pause", "blank_valley"}
+            and not has_sentence_end
+            and not has_speaker_change
+            and not has_soft_punct
+            and "punctuation_soft" not in reasons
+        )
         score -= max(0.0, short_fragment_penalty)
         score -= min(0.35, overflow_sec * 0.45)
         score -= self._continuation_penalty(
@@ -496,14 +551,18 @@ class IngressSegmentPlanner:
             constraint_only=bool(constraint_only),
             short_fragment_hit=short_fragment_penalty >= 0.42,
             overflow_sec=float(overflow_sec),
+            pause_only=bool(pause_only),
         )
 
-    @staticmethod
+    @classmethod
     def _serialize_candidate_diagnostics(
+        cls,
         *,
         segment_start_idx: int,
         considered_candidates: Sequence[_SegmentCandidate],
         selected_candidate: Optional[_SegmentCandidate],
+        suppressed_split_idx: Optional[int],
+        tail_hold: Optional[_TailHoldCandidate],
     ) -> list[dict[str, Any]]:
         selected_split_idx = (
             int(selected_candidate.split_idx)
@@ -521,7 +580,9 @@ class IngressSegmentPlanner:
         rows: list[dict[str, Any]] = []
         for item in considered_candidates:
             status = "candidate"
-            if selected_split_idx is not None and int(item.split_idx) == selected_split_idx:
+            if suppressed_split_idx is not None and int(item.split_idx) == int(suppressed_split_idx):
+                status = "suppressed_by_tail_hold"
+            elif selected_split_idx is not None and int(item.split_idx) == selected_split_idx:
                 status = "selected"
             elif best_split_idx is not None and int(item.split_idx) == int(best_split_idx):
                 status = "best_rejected"
@@ -541,10 +602,74 @@ class IngressSegmentPlanner:
                     "constraint_only": bool(item.constraint_only),
                     "short_fragment_hit": bool(item.short_fragment_hit),
                     "overflow_sec": float(item.overflow_sec),
+                    "pause_only": bool(item.pause_only),
                     "selection_status": status,
+                    "tail_hold_score": float(tail_hold.score) if tail_hold is not None else None,
+                    "tail_hold_margin": float(cls._ENGLISH_TAIL_HOLD_MARGIN) if tail_hold is not None else None,
                 }
             )
         return rows
+
+    @classmethod
+    def _build_tail_hold_candidate(
+        cls,
+        *,
+        words_for_split: Sequence[WordTimestamp],
+        segment_start_idx: int,
+        max_segment_sec: float,
+    ) -> Optional[_TailHoldCandidate]:
+        if segment_start_idx < 0 or segment_start_idx >= len(words_for_split):
+            return None
+        segment_start_time = float(getattr(words_for_split[segment_start_idx], "start", 0.0) or 0.0)
+        segment_end_time = float(getattr(words_for_split[-1], "end", segment_start_time) or segment_start_time)
+        duration_sec = max(0.0, segment_end_time - segment_start_time)
+        if duration_sec <= 0.0 or duration_sec > max_segment_sec:
+            return None
+        word_count = len(words_for_split) - int(segment_start_idx)
+        end_token = cls._normalize_english_token(str(getattr(words_for_split[-1], "word", "") or ""))
+
+        score = 0.56
+        if word_count >= 4:
+            score += 0.10
+        if word_count >= 7:
+            score += 0.08
+        if 1.8 <= duration_sec <= max_segment_sec:
+            score += 0.08
+        if end_token and end_token not in cls._LEFT_OPEN_ENGLISH_TOKENS:
+            score += 0.06
+        if end_token and end_token not in cls._RIGHT_CONTINUATION_TOKENS:
+            score += 0.04
+        if word_count <= 2:
+            score -= 0.10
+
+        return _TailHoldCandidate(
+            segment_start_idx=int(segment_start_idx),
+            segment_end_idx=len(words_for_split) - 1,
+            duration_sec=float(duration_sec),
+            word_count=int(word_count),
+            score=float(score),
+        )
+
+    @staticmethod
+    def _should_replace_best_candidate(
+        *,
+        current: _SegmentCandidate,
+        challenger: _SegmentCandidate,
+        prefer_later_pause_tie: bool,
+    ) -> bool:
+        score_delta = float(challenger.score) - float(current.score)
+        if score_delta > 1e-6:
+            return True
+        if abs(score_delta) > 1e-6:
+            return False
+        if (
+            prefer_later_pause_tie
+            and current.pause_only
+            and challenger.pause_only
+            and challenger.split_idx > current.split_idx
+        ):
+            return True
+        return False
 
     @classmethod
     def _continuation_penalty(

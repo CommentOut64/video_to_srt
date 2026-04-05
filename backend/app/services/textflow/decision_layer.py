@@ -3208,6 +3208,7 @@ class SegmentationProcessor:
                 "planner_diagnostics": {
                     "feature_stats": {},
                     "constraint_stats": {},
+                    "tail_hold_stats": {},
                     "rejection_stats": {},
                     "candidate_diagnostics": [],
                 },
@@ -3270,6 +3271,7 @@ class SegmentationProcessor:
         planner_diagnostics = {
             "feature_stats": dict(generation_report.get("feature_stats", {}) or {}),
             "constraint_stats": dict(generation_report.get("constraint_stats", {}) or {}),
+            "tail_hold_stats": dict(generation_report.get("tail_hold_stats", {}) or {}),
             "rejection_stats": dict(generation_report.get("rejection_stats", {}) or {}),
             "candidate_diagnostics": list(generation_report.get("candidate_diagnostics", []) or []),
         }

@@ -519,6 +519,69 @@ def test_decision_layer_exposes_planner_candidate_diagnostics_in_soft_cut_stats(
     )
 
 
+def test_timeanchored_planner_reports_pause_cut_suppressed_by_tail_hold_on_near_tie() -> None:
+    processor = SegmentationProcessor(final_splitter=FinalSplitter())
+    ingress_context = SegmentationIngressContext(
+        unit_kind="slow_window",
+        unit_id="window-tail-hold-48",
+        chunk_id="chunk-tail-hold-48",
+        chunk_index=48,
+        slow_window_id="window-tail-hold-48",
+        source_chunk_ids=("chunk-tail-hold-48",),
+        projection_chunk_ids=(),
+    )
+    decision_input = DecisionLayerInput(
+        annotated_words=[
+            AnnotatedWord(word="Probably", start=21.348, end=21.708, confidence=0.9, confidence_source="aligned"),
+            AnnotatedWord(word="Monica", start=21.888, end=22.428, confidence=0.9, confidence_source="aligned"),
+            AnnotatedWord(word="she", start=22.548, end=22.608, confidence=0.9, confidence_source="aligned"),
+            AnnotatedWord(word="has", start=22.848, end=22.908, confidence=0.9, confidence_source="aligned"),
+            AnnotatedWord(word="the", start=23.088, end=23.148, confidence=0.9, confidence_source="aligned"),
+            AnnotatedWord(word="right", start=23.268, end=23.328, confidence=0.9, confidence_source="aligned"),
+            AnnotatedWord(word="idea", start=23.448, end=23.508, confidence=0.9, confidence_source="aligned"),
+            AnnotatedWord(word="in", start=23.928, end=23.988, confidence=0.9, confidence_source="aligned"),
+            AnnotatedWord(word="a", start=24.108, end=24.168, confidence=0.9, confidence_source="aligned"),
+            AnnotatedWord(word="lot", start=24.228, end=24.288, confidence=0.9, confidence_source="aligned"),
+            AnnotatedWord(word="of", start=24.408, end=24.468, confidence=0.9, confidence_source="aligned"),
+            AnnotatedWord(word="ways", start=24.588, end=25.428, confidence=0.9, confidence_source="aligned"),
+        ],
+        vad_intervals=[],
+        ingress_context=ingress_context,
+        canonical_candidate_boundaries=(
+            BoundaryEvidence(
+                split_idx=4,
+                event_time=23.208,
+                left_end=23.148,
+                right_start=23.268,
+                reason="gap_pause",
+                score=0.24,
+                hard_flag=False,
+                metadata={"gap_sec": 0.12},
+            ),
+            BoundaryEvidence(
+                split_idx=5,
+                event_time=23.388,
+                left_end=23.328,
+                right_start=23.448,
+                reason="gap_pause",
+                score=0.24,
+                hard_flag=False,
+                metadata={"gap_sec": 0.12},
+            ),
+        ),
+    )
+
+    output = processor.process(
+        decision_input,
+        stream_id="timeanchored:window-tail-hold-48",
+        chunk_index=48,
+        is_last_chunk=True,
+    )
+
+    diagnostics = output.segmentation_report["soft_cut_stats"]["planner_diagnostics"]
+    assert diagnostics["rejection_stats"].get("tail_hold_preferred", 0) >= 1
+
+
 def test_decision_layer_consumes_token_indexed_punctuation_facts_without_slot_mapping() -> None:
     processor = SegmentationProcessor(final_splitter=FinalSplitter())
     words_for_split = [
