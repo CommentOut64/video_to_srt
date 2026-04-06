@@ -98,6 +98,11 @@ class RenderCore:
             )
             if terminal_punct:
                 rendered_terminal_count += 1
+                inner_text = self._strip_conflicting_inner_terminal_punct(
+                    text=inner_text,
+                    terminal_punct=terminal_punct,
+                    language=language,
+                )
                 text_display_raw = f"{inner_text}{terminal_punct}"
             else:
                 text_display_raw = inner_text
@@ -277,6 +282,8 @@ class RenderCore:
         normalized = re.sub(r"\s+([,.;:!?\)\]\}])", r"\1", normalized)
         normalized = re.sub(r"([\(\[\{])\s+", r"\1", normalized)
         normalized = self._normalize_time_expressions(normalized)
+        normalized = self._deduplicate_english_weak_punctuation(normalized)
+        normalized = self._strip_english_weak_punct_before_terminal(normalized)
 
         chars = list(normalized)
         out: list[str] = []
@@ -307,7 +314,22 @@ class RenderCore:
         normalized = re.sub(r"\s+", " ", normalized).strip()
         normalized = re.sub(r"\s+([,.;:!?\)\]\}])", r"\1", normalized)
         normalized = re.sub(r"([\(\[\{])\s+", r"\1", normalized)
+        normalized = self._deduplicate_english_weak_punctuation(normalized)
+        normalized = self._strip_english_weak_punct_before_terminal(normalized)
+        normalized = self._strip_trailing_english_weak_punctuation(normalized)
         return normalized
+
+    @staticmethod
+    def _deduplicate_english_weak_punctuation(text: str) -> str:
+        return re.sub(r"([,;:])(?:\s*\1)+", r"\1", text)
+
+    @staticmethod
+    def _strip_trailing_english_weak_punctuation(text: str) -> str:
+        return re.sub(r"(?:\s*[,;:])+\s*$", "", text).rstrip()
+
+    @staticmethod
+    def _strip_english_weak_punct_before_terminal(text: str) -> str:
+        return re.sub(r"(?:\s*[,;:])+\s*([!?])", r"\1", text)
 
     @classmethod
     def _normalize_time_expressions(cls, text: str) -> str:
@@ -351,3 +373,17 @@ class RenderCore:
                 continue
             chars.append(self._HALF_TO_FULL_PUNCT.get(char, char))
         return "".join(chars)
+
+    def _strip_conflicting_inner_terminal_punct(
+        self,
+        *,
+        text: str,
+        terminal_punct: str,
+        language: str,
+    ) -> str:
+        normalized = str(text or "")
+        if language == "en" and terminal_punct in {"?", "!"}:
+            return self._strip_english_weak_punct_before_terminal(f"{normalized}{terminal_punct}")[
+                : -len(terminal_punct)
+            ]
+        return normalized.rstrip()

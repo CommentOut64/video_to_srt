@@ -18,6 +18,7 @@ class _BoundaryFeature:
     right_start: float
     reasons: tuple[str, ...]
     scores: tuple[float, ...]
+    metadata: tuple[dict[str, Any], ...] = tuple()
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,7 @@ class _SegmentCandidate:
     short_fragment_hit: bool
     overflow_sec: float
     pause_only: bool
+    weak_speaker_change: bool
 
 
 @dataclass(frozen=True)
@@ -62,6 +64,18 @@ class IngressSegmentPlanner:
     _DEFAULT_ACCEPT_THRESHOLD = 0.55
     _CJK_ACCEPT_THRESHOLD = 0.48
     _ENGLISH_TAIL_HOLD_MARGIN = 0.08
+    _ENGLISH_LATE_HOLD_DURATION_WINDOW_SEC = 0.70
+    _WEAK_SPEAKER_CHANGE_MAX_GAP_SEC = 0.18
+    _UNRELIABLE_BOUNDARY_MOUNT_STATUSES = frozenset(
+        {
+            "synthetic",
+            "local_interpolation",
+            "null",
+            "estimated",
+            "inferred",
+            "unresolved",
+        }
+    )
     _SENTENCE_END_PUNCT = ("。", "！", "？", ".", "!", "?")
     _WEAK_CLOSURE_PUNCT = ",，、;；:："
     _LEFT_OPEN_ENGLISH_TOKENS = frozenset(
@@ -315,6 +329,7 @@ class IngressSegmentPlanner:
                     "right_start": float(getattr(boundary, "right_start", 0.0) or 0.0),
                     "reasons": [],
                     "scores": [],
+                    "metadata": [],
                 },
             )
             payload["event_time"] = float(getattr(boundary, "event_time", payload["event_time"]) or payload["event_time"])
@@ -324,6 +339,7 @@ class IngressSegmentPlanner:
             )
             payload["reasons"].append(str(getattr(boundary, "reason", "") or "boundary_hint"))
             payload["scores"].append(float(getattr(boundary, "score", 0.0) or 0.0))
+            payload["metadata"].append(dict(getattr(boundary, "metadata", {}) or {}))
             feature_stats[f"{source_kind}_feature_count"] += 1
 
         normalized_map: dict[int, _BoundaryFeature] = {}
@@ -335,6 +351,7 @@ class IngressSegmentPlanner:
                 right_start=float(payload["right_start"]),
                 reasons=tuple(str(item) for item in payload["reasons"]),
                 scores=tuple(float(item) for item in payload["scores"]),
+                metadata=tuple(dict(item) for item in payload["metadata"]),
             )
         return normalized_map, feature_stats, rejection_stats, len(raw_boundaries)
 
@@ -403,12 +420,37 @@ class IngressSegmentPlanner:
                 prefer_later_pause_tie=not language_is_cjk,
             ):
                 best_candidate = candidate
+        late_hold_candidate = (
+            self._select_late_hold_candidate(
+                considered_candidates=considered_candidates,
+                max_segment_sec=max_segment_sec,
+            )
+            if not language_is_cjk and must_split
+            else None
+        )
 
         if best_candidate is None:
             return None, considered_candidates, tail_hold, None
         if (
+            late_hold_candidate is not None
+            and late_hold_candidate.split_idx > best_candidate.split_idx
+            and (best_candidate.pause_only or best_candidate.weak_speaker_change)
+            and self._must_split_tail_priority(late_hold_candidate)
+            > self._must_split_tail_priority(best_candidate)
+        ):
+            rejection_stats["must_split_tail_preferred"] += 1
+            return late_hold_candidate, considered_candidates, tail_hold, None
+        if (
+            late_hold_candidate is not None
+            and late_hold_candidate.split_idx > best_candidate.split_idx
+            and (best_candidate.pause_only or best_candidate.weak_speaker_change)
+            and best_candidate.score <= late_hold_candidate.score + self._ENGLISH_TAIL_HOLD_MARGIN
+        ):
+            rejection_stats["late_hold_preferred"] += 1
+            return late_hold_candidate, considered_candidates, tail_hold, None
+        if (
             tail_hold is not None
-            and best_candidate.pause_only
+            and (best_candidate.pause_only or best_candidate.weak_speaker_change)
             and best_candidate.score <= tail_hold.score + self._ENGLISH_TAIL_HOLD_MARGIN
         ):
             rejection_stats["tail_hold_preferred"] += 1
@@ -448,6 +490,7 @@ class IngressSegmentPlanner:
         overflow_sec = max(0.0, duration_sec - max_segment_sec)
 
         reasons = tuple(feature.reasons) if feature is not None else tuple()
+        metadata_items = tuple(feature.metadata) if feature is not None else tuple()
         has_sentence_end = (
             "punctuation_sentence_end" in reasons
             or is_sentence_end_punct(
@@ -461,6 +504,15 @@ class IngressSegmentPlanner:
         has_gap_pause = "gap_pause" in reasons
         has_blank_valley = "blank_valley" in reasons
         has_alignment = any(reason in {"anchor_block_close", "lexical_boundary"} for reason in reasons)
+        unreliable_boundary = self._is_unreliable_boundary_support(metadata_items)
+        weak_speaker_change = (
+            has_speaker_change
+            and not has_sentence_end
+            and (
+                gap_sec < self._WEAK_SPEAKER_CHANGE_MAX_GAP_SEC
+                or unreliable_boundary
+            )
+        )
 
         closure_score = 0.0
         primary_reason = "rolling_constraint"
@@ -470,7 +522,7 @@ class IngressSegmentPlanner:
             primary_reason = "punctuation_sentence_end"
             anchor_type = AnchorType.PUNCTUATION_ANCHOR
         elif has_speaker_change:
-            closure_score = 0.92
+            closure_score = 0.62 if weak_speaker_change else 0.92
             primary_reason = "speaker_change"
         elif has_gap_pause:
             closure_score = min(0.96, 0.42 + (gap_sec * 0.45))
@@ -519,13 +571,20 @@ class IngressSegmentPlanner:
             and not has_soft_punct
             and "punctuation_soft" not in reasons
         )
+        if unreliable_boundary and not has_sentence_end:
+            if primary_reason == "speaker_change":
+                score -= 0.46
+            elif primary_reason in {"gap_pause", "blank_valley"}:
+                score -= 0.40
+            else:
+                score -= 0.18
         score -= max(0.0, short_fragment_penalty)
         score -= min(0.35, overflow_sec * 0.45)
         score -= self._continuation_penalty(
             left_text=left_text,
             right_text=right_text,
             has_sentence_end=has_sentence_end,
-            has_speaker_change=has_speaker_change,
+            has_speaker_change=has_speaker_change and not weak_speaker_change,
         )
 
         event_time = (
@@ -552,6 +611,7 @@ class IngressSegmentPlanner:
             short_fragment_hit=short_fragment_penalty >= 0.42,
             overflow_sec=float(overflow_sec),
             pause_only=bool(pause_only),
+            weak_speaker_change=bool(weak_speaker_change),
         )
 
     @classmethod
@@ -603,12 +663,57 @@ class IngressSegmentPlanner:
                     "short_fragment_hit": bool(item.short_fragment_hit),
                     "overflow_sec": float(item.overflow_sec),
                     "pause_only": bool(item.pause_only),
+                    "weak_speaker_change": bool(item.weak_speaker_change),
                     "selection_status": status,
                     "tail_hold_score": float(tail_hold.score) if tail_hold is not None else None,
                     "tail_hold_margin": float(cls._ENGLISH_TAIL_HOLD_MARGIN) if tail_hold is not None else None,
                 }
             )
         return rows
+
+    @classmethod
+    def _select_late_hold_candidate(
+        cls,
+        *,
+        considered_candidates: Sequence[_SegmentCandidate],
+        max_segment_sec: float,
+    ) -> Optional[_SegmentCandidate]:
+        tail_zone = [
+            item
+            for item in considered_candidates
+            if item.duration_sec >= max(0.0, max_segment_sec - cls._ENGLISH_LATE_HOLD_DURATION_WINDOW_SEC)
+            and not item.short_fragment_hit
+        ]
+        if not tail_zone:
+            return None
+        safe_tail_zone = [
+            item
+            for item in tail_zone
+            if cls._must_split_tail_priority(item) > 0
+        ]
+        if safe_tail_zone:
+            return max(
+                safe_tail_zone,
+                key=lambda item: (
+                    int(cls._must_split_tail_priority(item)),
+                    int(item.split_idx),
+                    float(item.score),
+                ),
+            )
+        return max(
+            tail_zone,
+            key=lambda item: (float(item.score), int(item.split_idx)),
+        )
+
+    @classmethod
+    def _must_split_tail_priority(cls, candidate: _SegmentCandidate) -> int:
+        if candidate.reason == "punctuation_sentence_end":
+            return 3
+        if candidate.reason == "punctuation_soft" or cls._ends_with_weak_closure_punct(candidate.left_text):
+            return 2
+        if candidate.reason == "speaker_change" and not candidate.weak_speaker_change:
+            return 2
+        return 0
 
     @classmethod
     def _build_tail_hold_candidate(
@@ -699,3 +804,23 @@ class IngressSegmentPlanner:
         while normalized and not normalized[-1].isalnum():
             normalized = normalized[:-1]
         return normalized
+
+    @classmethod
+    def _ends_with_weak_closure_punct(cls, token: str) -> bool:
+        return bool(str(token or "").rstrip().endswith(tuple(cls._WEAK_CLOSURE_PUNCT)))
+
+    @classmethod
+    def _is_unreliable_boundary_support(cls, metadata_items: Sequence[dict[str, Any]]) -> bool:
+        for metadata in tuple(metadata_items or ()):
+            left_status = str(metadata.get("left_mount_status", "") or "").strip().lower()
+            right_status = str(metadata.get("right_mount_status", "") or "").strip().lower()
+            match_kind = str(metadata.get("match_kind", "") or "").strip().lower()
+            synthetic_flag = bool(metadata.get("synthetic"))
+            if (
+                left_status in cls._UNRELIABLE_BOUNDARY_MOUNT_STATUSES
+                or right_status in cls._UNRELIABLE_BOUNDARY_MOUNT_STATUSES
+                or match_kind == "null"
+                or synthetic_flag
+            ):
+                return True
+        return False

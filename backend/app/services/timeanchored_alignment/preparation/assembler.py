@@ -118,6 +118,7 @@ class AlignmentPreparationAssembler:
         fallback_text: str = "",
         chunk_window: ChunkWindow | None = None,
         external_punct_track: PunctTrack | None = None,
+        external_speaker_turns: Sequence[Any] | None = None,
     ) -> PreparationBundle:
         selected_payload = self._build_selected_text_payload(
             selected_text_truth=selected_text_truth,
@@ -249,6 +250,7 @@ class AlignmentPreparationAssembler:
             ready_window=ready_window,
             punctuation_evidences=punctuation_evidences,
             external_punct_track=external_punct_track,
+            external_speaker_turns=external_speaker_turns,
         )
         provenance = self._build_provenance(
             selected_text_truth=selected_text_truth,
@@ -564,19 +566,31 @@ class AlignmentPreparationAssembler:
         ready_window: ReadySlowWindow,
         punctuation_evidences: Sequence[PunctuationEvidence],
         external_punct_track: PunctTrack | None,
+        external_speaker_turns: Sequence[Any] | None = None,
     ) -> ExternalStableFacts:
-        speaker_turns = tuple(
-            {
-                "unit_id": str(unit.unit_id),
-                "speaker_id": str(unit.speaker_id or ""),
-                "turn_id": str(unit.turn_id or ""),
-                "audio_start": float(unit.audio_start),
-                "audio_end": float(unit.audio_end),
-                "source_chunk_ids": list(unit.source_chunk_ids),
-                "source_chunk_indices": list(unit.source_chunk_indices),
-            }
-            for unit in ready_window.source_units
-        )
+        speaker_turn_rows: list[dict[str, Any]] = []
+        if external_speaker_turns:
+            for item in tuple(external_speaker_turns or ()):
+                serialized = AlignmentPreparationAssembler._serialize_external_speaker_turn(item)
+                if serialized is not None:
+                    speaker_turn_rows.append(serialized)
+        if speaker_turn_rows:
+            speaker_turns = tuple(speaker_turn_rows)
+            speaker_turn_source = "timeline_turns"
+        else:
+            speaker_turns = tuple(
+                {
+                    "unit_id": str(unit.unit_id),
+                    "speaker_id": str(unit.speaker_id or ""),
+                    "turn_id": str(unit.turn_id or ""),
+                    "audio_start": float(unit.audio_start),
+                    "audio_end": float(unit.audio_end),
+                    "source_chunk_ids": list(unit.source_chunk_ids),
+                    "source_chunk_indices": list(unit.source_chunk_indices),
+                }
+                for unit in ready_window.source_units
+            )
+            speaker_turn_source = "window_source_units"
         pause_facts = tuple(
             {
                 "pause_start": float(left.audio_end),
@@ -596,6 +610,7 @@ class AlignmentPreparationAssembler:
                     and getattr(external_punct_track, "positions", None)
                 ),
                 "source_unit_count": len(ready_window.source_units),
+                "speaker_turn_source": speaker_turn_source,
             },
         )
 
@@ -610,7 +625,9 @@ class AlignmentPreparationAssembler:
         if external_stable_facts.metadata.get("has_external_punct_track"):
             stable_fact_sources.append("punct_track")
         if external_stable_facts.speaker_turns:
-            stable_fact_sources.append("window_source_units")
+            stable_fact_sources.append(
+                str(external_stable_facts.metadata.get("speaker_turn_source") or "window_source_units")
+            )
         return PreparationProvenance(
             text_source=str(selected_text_truth.text_source),
             observation_source=str(window_time_base.source or "sensevoice_window"),
@@ -619,6 +636,41 @@ class AlignmentPreparationAssembler:
                 "selected_source_chunk_ids": list(selected_text_truth.source_chunk_ids),
             },
         )
+
+    @staticmethod
+    def _serialize_external_speaker_turn(item: Any) -> dict[str, Any] | None:
+        start = float(getattr(item, "start", getattr(item, "audio_start", 0.0)) or 0.0)
+        end = float(getattr(item, "end", getattr(item, "audio_end", start)) or start)
+        if end <= start:
+            return None
+        source_chunk_ids = tuple(
+            str(value)
+            for value in (
+                getattr(item, "source_chunk_ids", ())
+                or getattr(item, "chunk_ids", ())
+                or ()
+            )
+            if str(value).strip()
+        )
+        source_chunk_indices = tuple(
+            int(value)
+            for value in (
+                getattr(item, "source_chunk_indices", ())
+                or getattr(item, "chunk_indices", ())
+                or ()
+            )
+        )
+        return {
+            "unit_id": str(getattr(item, "unit_id", getattr(item, "block_id", "")) or ""),
+            "speaker_id": str(getattr(item, "speaker_id", "") or ""),
+            "turn_id": str(getattr(item, "turn_id", getattr(item, "unit_id", "")) or ""),
+            "audio_start": start,
+            "audio_end": end,
+            "source_chunk_ids": list(source_chunk_ids),
+            "source_chunk_indices": list(source_chunk_indices),
+            "boundary_confidence": float(getattr(item, "boundary_confidence", 0.0) or 0.0),
+            "source": str(getattr(item, "source", "timeline_turns") or "timeline_turns"),
+        }
 
     @staticmethod
     def _explode_observation_chars(

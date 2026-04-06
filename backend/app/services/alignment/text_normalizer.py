@@ -213,9 +213,17 @@ class TextNormalizer:
 
         lang_key = (lang or "").lower()
         if lang_key.startswith("en"):
+            meridiem_source = normalized
+
+            def _normalize_meridiem(match: re.Match) -> str:
+                left_context = meridiem_source[: match.start()]
+                if not re.search(r"\d{1,2}(?:\s*[:：]\s*[0-5]\d){1,2}\s*$", left_context):
+                    return match.group(0)
+                return f"{match.group(1).upper()}M"
+
             normalized = re.sub(
                 r"\b([APap])\s*\.?\s*m\.?m?\.?\b",
-                lambda m: f"{m.group(1).upper()}M",
+                _normalize_meridiem,
                 normalized,
             )
             normalized = re.sub(r"([A-Za-z]{2,})(\d)", r"\1 \2", normalized)

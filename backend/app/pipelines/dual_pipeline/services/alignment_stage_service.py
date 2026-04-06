@@ -290,6 +290,16 @@ class AlignmentStageService:
                     selected=False,
                     reason=reason,
                 )
+                if self._should_commit_fast_direct_on_timeanchored_rejection(
+                    ctx=ctx,
+                    stage_result=stage_result,
+                ):
+                    self._commit_fast_direct_result(
+                        ctx=ctx,
+                        sv_result=sv_result,
+                        reason=reason,
+                    )
+                    return
             else:
                 self._record_hetero_alignment_result(
                     ctx=ctx,
@@ -865,6 +875,10 @@ class AlignmentStageService:
                 whisper_result=preparation_whisper_result,
                 default_language=base_language,
                 external_punct_track=ctx.punct_track,
+                external_speaker_turns=self._resolve_preparation_speaker_turns(
+                    ready_window=ready_window,
+                    window_time_base=window_time_base,
+                ),
             )
             self._trace_write(
                 ctx=ctx,
@@ -1046,10 +1060,10 @@ class AlignmentStageService:
         """
         为 preparation 选择窗口级文本输入。
 
-        根因背景：
-        - 某些窗口场景下 whisper_result 仅包含 owner chunk 文本；
-        - 但 ready_window.source_units 可能覆盖多个 source chunk；
-        - 若仍用 owner 文本驱动 preparation，会导致非 owner chunk 内容在窗口定稿中被吞掉。
+        约束：
+        - 默认以 SelectedTextTruth 作为 preparation 的 canonical 文本真源；
+        - 仅当 ready_window 覆盖多 source chunk 且窗口级 source text 明显长于当前文本时，
+          才提升为窗口级文本，避免 owner chunk 文本过短时吞掉非 owner 内容。
         """
         normalized_whisper = dict(whisper_result or {})
         current_text = str(
@@ -1128,6 +1142,63 @@ class AlignmentStageService:
     @staticmethod
     def _key_char_length(text: str) -> int:
         return sum(1 for char in str(text or "") if char.isalnum())
+
+    def _resolve_preparation_speaker_turns(
+        self,
+        *,
+        ready_window: ReadySlowWindow,
+        window_time_base: WindowTimeBasePackage,
+    ) -> tuple[Any, ...]:
+        timeline_turns = tuple(getattr(self._host, "_timeline_turns", ()) or ())
+        if not timeline_turns:
+            return tuple()
+
+        window_start, window_end = self._resolve_window_time_span(
+            ready_window=ready_window,
+            window_time_base=window_time_base,
+        )
+        if window_end <= window_start:
+            return tuple()
+
+        selected_turns: list[Any] = []
+        for turn in timeline_turns:
+            turn_start = float(getattr(turn, "start", 0.0) or 0.0)
+            turn_end = float(getattr(turn, "end", turn_start) or turn_start)
+            if turn_end <= turn_start:
+                continue
+            if min(window_end, turn_end) <= max(window_start, turn_start):
+                continue
+            selected_turns.append(turn)
+        return tuple(selected_turns)
+
+    @staticmethod
+    def _resolve_window_time_span(
+        *,
+        ready_window: ReadySlowWindow,
+        window_time_base: WindowTimeBasePackage,
+    ) -> tuple[float, float]:
+        timed_units = tuple(
+            getattr(window_time_base, "word_units", ())
+            or getattr(window_time_base, "raw_units", ())
+            or ()
+        )
+        valid_units = [
+            item
+            for item in timed_units
+            if float(getattr(item, "end", getattr(item, "start", 0.0)) or 0.0)
+            > float(getattr(item, "start", 0.0) or 0.0)
+        ]
+        if valid_units:
+            return (
+                float(min(getattr(item, "start", 0.0) or 0.0 for item in valid_units)),
+                float(max(getattr(item, "end", 0.0) or 0.0 for item in valid_units)),
+            )
+        if ready_window.audio_segments:
+            return (
+                float(min(start for start, _ in ready_window.audio_segments)),
+                float(max(end for _, end in ready_window.audio_segments)),
+            )
+        return 0.0, 0.0
 
     def _build_compat_ready_slow_window(
         self,
@@ -2275,6 +2346,24 @@ class AlignmentStageService:
     ) -> tuple[str, str, str, str | None]:
         """兼容旧测试/调用方；Phase 6 起路由语义完全以新主链为准。"""
         return self._resolve_timeanchored_routes(ctx=ctx, stage_result=stage_result)
+
+    @classmethod
+    def _should_commit_fast_direct_on_timeanchored_rejection(
+        cls,
+        *,
+        ctx: ProcessingContext,
+        stage_result: Optional[DecoderShadowResult],
+    ) -> bool:
+        if stage_result is None:
+            return False
+        if cls._resolve_selected_source(ctx, default="slow") != "fast":
+            return False
+        alignment_report = getattr(stage_result, "alignment_report", None)
+        route = str(getattr(alignment_report, "route", "") or "").strip()
+        failure_semantic = str(
+            getattr(alignment_report, "failure_semantic", "") or ""
+        ).strip()
+        return route == "selection_reject_slow" or failure_semantic == "selection_reject_slow"
 
     def _resolve_fast_direct_reason(self, *, ctx: ProcessingContext) -> str:
         host = self._host
