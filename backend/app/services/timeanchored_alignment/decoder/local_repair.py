@@ -24,8 +24,12 @@ class LocalRepair:
             metadata = dict(step.metadata or {})
             start = metadata.get("slice_start")
             end = metadata.get("slice_end")
-            synthetic = bool(step.synthetic or metadata.get("synthetic"))
-            if synthetic or start is None or end is None or float(end) <= float(start):
+            if self._needs_local_repair(
+                step=step,
+                start=start,
+                end=end,
+                metadata=metadata,
+            ):
                 start = previous_end
                 end = float(start) + max(frame_stride, 0.03)
                 metadata["synthetic"] = True
@@ -37,3 +41,26 @@ class LocalRepair:
             previous_end = float(end)
             repaired_steps.append(replace(step, metadata=metadata))
         return replace(decode_path, steps=tuple(repaired_steps))
+
+    @staticmethod
+    def _needs_local_repair(
+        *,
+        step: DecoderStep,
+        start: object,
+        end: object,
+        metadata: dict[str, object],
+    ) -> bool:
+        if start is None or end is None:
+            return True
+        try:
+            if float(end) <= float(start):
+                return True
+        except (TypeError, ValueError):
+            return True
+        synthetic_reason = str(metadata.get("synthetic_reason", "") or "")
+        match_kind = str(metadata.get("match_kind", "") or "")
+        if synthetic_reason in {"null_align", "canonical_only_token", "estimated"}:
+            return True
+        if match_kind in {"null", "estimated"}:
+            return True
+        return bool(step.synthetic or metadata.get("synthetic"))

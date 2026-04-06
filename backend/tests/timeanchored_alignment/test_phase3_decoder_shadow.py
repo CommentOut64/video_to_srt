@@ -139,6 +139,105 @@ def _build_window_time_base() -> WindowTimeBasePackage:
     )
 
 
+def _build_future_hijack_ready_window() -> ReadySlowWindow:
+    observation_tokens = ("alpha", "beta", "gamma", "box")
+    bindings = []
+    source_units = []
+    cursor = 0.0
+    for index, token_text in enumerate(observation_tokens):
+        start = cursor
+        end = start + 0.2
+        bindings.append(
+            WindowChunkBinding(
+                chunk_id=f"chunk-future-{index}",
+                chunk_index=index,
+                chunk_start=start,
+                chunk_end=end,
+                overlap_ratio=1.0,
+                role="owner" if index == 0 else "core",
+                is_owner=index == 0,
+            )
+        )
+        source_units.append(
+            WindowSourceUnit(
+                unit_id=f"future-unit-{index}",
+                semantic_chunk_id=f"future-sem-{index}",
+                text=token_text,
+                audio_start=start,
+                audio_end=end,
+                source_chunk_ids=(f"chunk-future-{index}",),
+                source_chunk_indices=(index,),
+                speaker_id="speaker-a",
+                turn_id="turn-a",
+                language="en",
+                arrived_at=end,
+            )
+        )
+        cursor = end
+    return ReadySlowWindow(
+        window_id="phase3-window-future-hijack",
+        owner_chunk_id="chunk-future-0",
+        owner_chunk_index=0,
+        window_mode="steady",
+        flush_reason="test",
+        audio_segments=tuple((unit.audio_start, unit.audio_end) for unit in source_units),
+        coverage=WindowCoverage(
+            core_segments=((0.0, cursor),),
+            left_guard_sec=0.0,
+            right_guard_sec=0.0,
+            chunk_bindings=tuple(bindings),
+        ),
+        source_semantic_chunk_ids=tuple(f"future-sem-{index}" for index in range(len(observation_tokens))),
+        source_chunk_ids=tuple(f"chunk-future-{index}" for index in range(len(observation_tokens))),
+        source_chunk_indices=tuple(range(len(observation_tokens))),
+        source_units=tuple(source_units),
+        dialogue_shape=DialogueShapeSnapshot(
+            shape="single_party",
+            speaker_count=1,
+            dominant_speaker_id="speaker-a",
+            dominant_speaker_ratio=1.0,
+            speaker_switch_count=0,
+            speaker_switch_density=0.0,
+            turn_count=1,
+            avg_turn_duration_sec=cursor,
+        ),
+        language_profile=WindowLanguageProfile(
+            primary_language="en",
+            language_mix_state="single_language",
+            decision_domains=("timeanchored_alignment",),
+            should_bypass_whisper=False,
+        ),
+        prompt_seed=PromptSeed(text="alpha box beta gamma box"),
+        batch_hint=WindowBatchHint(
+            duration_bucket="short",
+            token_estimate=5,
+            acoustic_density_hint="medium",
+            queue_priority=1,
+        ),
+        created_at=cursor,
+    )
+
+
+def _build_future_hijack_window_time_base() -> WindowTimeBasePackage:
+    ready_window = _build_future_hijack_ready_window()
+    units = (
+        TimeBaseUnit(text="alpha", start=0.0, end=0.2, confidence=0.95, token_type="word"),
+        TimeBaseUnit(text="beta", start=0.2, end=0.4, confidence=0.95, token_type="word"),
+        TimeBaseUnit(text="gamma", start=0.4, end=0.6, confidence=0.95, token_type="word"),
+        TimeBaseUnit(text="box", start=0.6, end=0.8, confidence=0.95, token_type="word"),
+    )
+    return WindowTimeBasePackage(
+        window_id=ready_window.window_id,
+        language="en",
+        raw_units=units,
+        word_units=units,
+        quality=TimeBaseQuality(blank_ratio=0.0, avg_max_prob=0.9, low_prob_ratio=0.0),
+        source_chunk_ids=ready_window.source_chunk_ids,
+        source_chunk_indices=ready_window.source_chunk_indices,
+        chunk_bindings=ready_window.coverage.chunk_bindings,
+    )
+
+
 def _build_preparation_bundle(*, selected_source: str = "slow"):
     ready_window = _build_ready_window()
     selected_text_truth = SelectedTextTruth(
@@ -165,6 +264,32 @@ def _build_preparation_bundle(*, selected_source: str = "slow"):
     )
 
 
+def _build_future_hijack_preparation_bundle():
+    ready_window = _build_future_hijack_ready_window()
+    selected_text = "alpha box beta gamma box"
+    return AlignmentPreparationAssembler().prepare(
+        ready_window=ready_window,
+        window_time_base=_build_future_hijack_window_time_base(),
+        selected_text_truth=SelectedTextTruth(
+            text=selected_text,
+            text_source="slow",
+            language_hint="en",
+            source_chunk_ids=ready_window.source_chunk_ids,
+            quality={"confidence": 0.9},
+            metadata={"raw_text": selected_text},
+        ),
+        whisper_result={
+            "text": selected_text,
+            "text_clean": selected_text,
+            "text_itn_raw": selected_text,
+            "confidence": 0.9,
+            "language": "en",
+            "raw_result": {"segments": [{"avg_logprob": -0.1}]},
+        },
+        default_language="en",
+    )
+
+
 def test_phase3_decoder_builds_alignment_path_from_preparation_bundle() -> None:
     preparation = _build_preparation_bundle()
 
@@ -175,6 +300,29 @@ def test_phase3_decoder_builds_alignment_path_from_preparation_bundle() -> None:
     assert len(result.alignment_path.aligned_tokens) == len(preparation.canonical_sequence.tokens)
     assert result.alignment_path.source_chunk_ids == preparation.source_chunk_ids
     assert result.boundary_candidates == result.alignment_path.boundary_candidates
+
+
+def test_phase3_decoder_uses_null_align_instead_of_future_hijack() -> None:
+    preparation = _build_future_hijack_preparation_bundle()
+
+    assert [
+        item.primary_token for item in preparation.acoustic_observation_pack.slices
+    ] == ["alpha", "beta", "gamma", "box"]
+
+    result = AlignmentDecoderService().execute(preparation=preparation)
+
+    assert result.alignment_path is not None
+    first_box = result.alignment_path.aligned_tokens[1]
+    beta = result.alignment_path.aligned_tokens[2]
+    gamma = result.alignment_path.aligned_tokens[3]
+    final_box = result.alignment_path.aligned_tokens[4]
+
+    assert first_box.trace["synthetic"] is True
+    assert first_box.trace["synthetic_reason"] == "null_align"
+    assert first_box.trace["slice_primary_token"] == ""
+    assert beta.trace["slice_primary_token"] == "beta"
+    assert gamma.trace["slice_primary_token"] == "gamma"
+    assert final_box.trace["slice_primary_token"] == "box"
 
 
 def test_phase3_decoder_reports_selection_reject_when_slow_text_not_selected() -> None:

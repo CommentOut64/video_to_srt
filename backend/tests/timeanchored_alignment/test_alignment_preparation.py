@@ -664,7 +664,7 @@ def test_alignment_preparation_builds_formal_bundle_and_report_from_selected_tex
     )
 
 
-def test_alignment_preparation_observation_pack_follows_canonical_tokenization_for_protected_structure() -> None:
+def test_alignment_preparation_observation_pack_follows_real_time_base_units_for_protected_structure() -> None:
     package = AlignmentPreparationAssembler().prepare(
         ready_window=_build_decimal_ready_window(),
         window_time_base=_build_decimal_window_time_base(),
@@ -675,9 +675,22 @@ def test_alignment_preparation_observation_pack_follows_canonical_tokenization_f
         default_language="zh",
     )
 
-    assert [token.text for token in package.canonical_sequence.tokens] == [
-        slice_item.primary_token for slice_item in package.acoustic_observation_pack.slices
+    assert [slice_item.primary_token for slice_item in package.acoustic_observation_pack.slices] == [
+        "价",
+        "格",
+        "3",
+        "1",
+        "4",
+        "元",
     ]
+    assert [
+        slice_item.metadata.get("observation_unit_index")
+        for slice_item in package.acoustic_observation_pack.slices
+    ] == [0, 1, 2, 3, 3, 4]
+    assert not any(
+        bool((slice_item.metadata or {}).get("synthetic"))
+        for slice_item in package.acoustic_observation_pack.slices
+    )
     assert package.canonical_sequence.protected_spans[0].text == "3.14"
     assert package.canonical_sequence.protected_spans[0].start == 2
     assert package.canonical_sequence.protected_spans[0].end == 6

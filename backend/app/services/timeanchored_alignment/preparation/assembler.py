@@ -490,12 +490,10 @@ class AlignmentPreparationAssembler:
         canonical_sequence: CanonicalSequence,
         window_time_base: WindowTimeBasePackage,
     ) -> AcousticObservationPack:
-        char_units = AlignmentPreparationAssembler._explode_observation_chars(
-            units=tuple(window_time_base.word_units or window_time_base.raw_units)
-        )
-        slices = AlignmentPreparationAssembler._project_observation_slices_to_canonical_tokens(
-            canonical_sequence=canonical_sequence,
-            char_units=char_units,
+        del canonical_sequence
+        observation_units = tuple(window_time_base.word_units or window_time_base.raw_units)
+        slices = AlignmentPreparationAssembler._build_observation_slices_from_time_base(
+            units=observation_units
         )
         blank_track = tuple(
             float(item)
@@ -503,12 +501,12 @@ class AlignmentPreparationAssembler:
         )
         if blank_track:
             capability_level = OBSERVATION_CAPABILITY_FRAME_POSTERIOR
-        elif any(getattr(unit, "top_candidates", ()) for unit in window_time_base.word_units):
+        elif any(getattr(unit, "top_candidates", ()) for unit in observation_units):
             capability_level = OBSERVATION_CAPABILITY_TOKEN_TOPK
         else:
             capability_level = OBSERVATION_CAPABILITY_TIMESTAMP_ONLY
         topk_limit = max(
-            (len(getattr(unit, "top_candidates", ()) or ()) for unit in window_time_base.word_units),
+            (len(getattr(unit, "top_candidates", ()) or ()) for unit in observation_units),
             default=0,
         )
         return AcousticObservationPack(
@@ -526,10 +524,10 @@ class AlignmentPreparationAssembler:
                 topk_coverage=(
                     sum(
                         1
-                        for unit in window_time_base.word_units
+                        for unit in observation_units
                         if getattr(unit, "top_candidates", ())
                     )
-                    / max(len(window_time_base.word_units), 1)
+                    / max(len(observation_units), 1)
                 ),
                 timestamp_coverage=1.0 if slices else 0.0,
                 capability_degraded=False,
@@ -673,103 +671,80 @@ class AlignmentPreparationAssembler:
         }
 
     @staticmethod
-    def _explode_observation_chars(
+    def _build_observation_slices_from_time_base(
         *,
         units: Sequence[Any],
-    ) -> tuple[dict[str, Any], ...]:
-        exploded: list[dict[str, Any]] = []
+    ) -> tuple[AcousticObservationSlice, ...]:
+        slices: list[AcousticObservationSlice] = []
         for unit_index, unit in enumerate(units):
             token_text = str(getattr(unit, "text", "") or "")
             if not token_text:
                 continue
+            top_candidates = tuple(
+                AcousticObservationTokenCandidate(
+                    token=str(candidate.text),
+                    score=float(candidate.score),
+                    token_id=candidate.token_id,
+                )
+                for candidate in (getattr(unit, "top_candidates", ()) or ())
+            )
             unit_start = float(getattr(unit, "start", 0.0) or 0.0)
-            unit_end = float(getattr(unit, "end", unit_start) or unit_start)
-            token_count = max(len(token_text), 1)
-            unit_duration = max(unit_end - unit_start, 0.0)
-            for char_index, char in enumerate(token_text):
-                char_start = unit_start + unit_duration * (char_index / token_count)
-                char_end = unit_start + unit_duration * ((char_index + 1) / token_count)
-                exploded.append(
-                    {
-                        "char": char,
-                        "start": float(char_start),
-                        "end": float(max(char_end, char_start)),
-                        "confidence": float(getattr(unit, "confidence", 0.0) or 0.0),
-                        "top_candidates": tuple(getattr(unit, "top_candidates", ()) or ()),
-                        "token_type": str(getattr(unit, "token_type", "word") or "word"),
-                        "unit_index": unit_index,
-                    }
-                )
-        return tuple(exploded)
-
-    @staticmethod
-    def _project_observation_slices_to_canonical_tokens(
-        *,
-        canonical_sequence: CanonicalSequence,
-        char_units: Sequence[dict[str, Any]],
-    ) -> tuple[AcousticObservationSlice, ...]:
-        slices: list[AcousticObservationSlice] = []
-        cursor = 0
-        current_time = float(char_units[0]["start"]) if char_units else 0.0
-        for index, token in enumerate(canonical_sequence.tokens):
-            token_text = str(token.text or "")
-            token_chars = [char for char in token_text]
-            matched: list[dict[str, Any]] = []
-            if token_chars:
-                if cursor + len(token_chars) <= len(char_units):
-                    candidate = list(char_units[cursor: cursor + len(token_chars)])
-                    if "".join(item["char"] for item in candidate) == token_text:
-                        matched = candidate
-                        cursor += len(token_chars)
-                if not matched and token_text and not all(
-                    unicodedata.category(char).startswith("P") for char in token_chars
-                ):
-                    joined = "".join(item["char"] for item in char_units[cursor:])
-                    token_offset = joined.find(token_text)
-                    if token_offset >= 0:
-                        matched = list(
-                            char_units[cursor + token_offset: cursor + token_offset + len(token_chars)]
-                        )
-                        cursor = cursor + token_offset + len(token_chars)
-            if matched:
-                current_time = float(matched[-1]["end"])
-                top_candidates = tuple(
-                    AcousticObservationTokenCandidate(
-                        token=str(candidate.text),
-                        score=float(candidate.score),
-                        token_id=candidate.token_id,
-                    )
-                    for candidate in matched[0]["top_candidates"]
-                )
-                confidence = sum(float(item["confidence"]) for item in matched) / len(matched)
-                metadata = {
-                    "matched_char_count": len(matched),
-                    "matched_unit_indices": [int(item["unit_index"]) for item in matched],
-                    "token_type": str(matched[0]["token_type"]),
-                }
+            unit_end = float(max(float(getattr(unit, "end", unit_start) or unit_start), unit_start))
+            token_type = str(getattr(unit, "token_type", "word") or "word")
+            parts = AlignmentPreparationAssembler._split_observation_unit_text(
+                token_text=token_text
+            )
+            part_count = max(len(parts), 1)
+            for part_index, part_text in enumerate(parts):
+                part_start = unit_start + (unit_end - unit_start) * (part_index / part_count)
+                part_end = unit_start + (unit_end - unit_start) * ((part_index + 1) / part_count)
                 slices.append(
                     AcousticObservationSlice(
-                        slice_id=f"slice-{index}",
-                        start=float(matched[0]["start"]),
-                        end=float(max(matched[-1]["end"], matched[0]["start"])),
-                        primary_token=token_text,
+                        slice_id=f"obs-{unit_index}-{part_index}",
+                        start=float(part_start),
+                        end=float(max(part_end, part_start)),
+                        primary_token=str(part_text),
                         top_candidates=top_candidates,
-                        confidence=float(confidence),
-                        metadata=metadata,
+                        confidence=float(getattr(unit, "confidence", 0.0) or 0.0),
+                        metadata={
+                            "token_type": token_type,
+                            "observation_unit_index": unit_index,
+                            "observation_unit_text": token_text,
+                            "observation_part_index": part_index,
+                            "observation_part_count": part_count,
+                        },
                     )
                 )
-                continue
-            slices.append(
-                AcousticObservationSlice(
-                    slice_id=f"slice-{index}",
-                    start=float(current_time),
-                    end=float(current_time),
-                    primary_token=token_text,
-                    confidence=None,
-                    metadata={"synthetic": True, "reason": "canonical_only_token"},
-                )
-            )
         return tuple(slices)
+
+    @staticmethod
+    def _split_observation_unit_text(
+        *,
+        token_text: str,
+    ) -> tuple[str, ...]:
+        normalized = str(token_text or "")
+        if not normalized:
+            return tuple()
+        if len(normalized) <= 1:
+            return (normalized,)
+        if any(char.isspace() for char in normalized):
+            compact_parts = tuple(part for part in normalized.split() if part)
+            if compact_parts:
+                return compact_parts
+        if AlignmentPreparationAssembler._should_split_observation_unit(normalized):
+            return tuple(char for char in normalized if not char.isspace())
+        return (normalized,)
+
+    @staticmethod
+    def _should_split_observation_unit(token_text: str) -> bool:
+        normalized = str(token_text or "")
+        if len(normalized) <= 1:
+            return False
+        if any(char.isascii() and char.isalpha() for char in normalized):
+            return False
+        if all(unicodedata.category(char).startswith("P") for char in normalized):
+            return False
+        return True
 
     @staticmethod
     def _build_preparation_report(

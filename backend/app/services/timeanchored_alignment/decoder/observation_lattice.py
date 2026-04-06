@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import unicodedata
+
 from app.services.timeanchored_alignment.decoder.contracts import (
     LatticeCandidate,
     ObservationLattice,
@@ -10,11 +12,17 @@ from app.services.timeanchored_alignment.preparation.contracts import Preparatio
 
 
 def _normalize_token(value: str) -> str:
-    return "".join(char for char in str(value or "").strip().lower() if not char.isspace())
+    return "".join(
+        char
+        for char in str(value or "").strip().lower()
+        if not char.isspace() and not unicodedata.category(char).startswith("P")
+    )
 
 
 class ObservationLatticeBuilder:
     """把 canonical token、pronunciation graph、observation slices 组织成轻量 lattice。"""
+
+    _NULL_ALIGN_SCORE = 0.16
 
     def build(self, *, preparation: PreparationBundle) -> ObservationLattice:
         canonical_tokens = tuple(preparation.canonical_sequence.tokens)
@@ -50,16 +58,19 @@ class ObservationLatticeBuilder:
                     primary_key in pronunciation_keys or bool(pronunciation_keys & top_candidate_keys)
                 )
                 top_candidate_match = bool(token_key) and token_key in top_candidate_keys
-                language_consistent = str(token.language or default_language) == str(
-                    token.language or default_language
-                )
+                language_consistent = True
                 blank_support = self._resolve_blank_support(
                     blank_track=blank_track,
                     slice_index=slice_index,
                     fallback=float(observation.blank_score or 0.0),
                 )
                 synthetic = bool((observation.metadata or {}).get("synthetic"))
-                blocked = bool(token.is_protected) and slice_index != token_index
+                match_kind = self._resolve_match_kind(
+                    lexical_exact=lexical_exact,
+                    pronunciation_match=pronunciation_match,
+                    top_candidate_match=top_candidate_match,
+                )
+                blocked = False
                 score = 0.0
                 if lexical_exact:
                     score += 0.58
@@ -72,10 +83,10 @@ class ObservationLatticeBuilder:
                 score += min(max(blank_support, 0.0), 1.0) * 0.06
                 if synthetic:
                     score -= 0.32
+                if match_kind == "weak":
+                    score -= 0.06
                 if slice_index != token_index:
                     score -= 0.08 * abs(slice_index - token_index)
-                if blocked:
-                    score -= 1.0
                 confidence = max(min(score, 1.0), 0.0)
                 candidates.append(
                     LatticeCandidate(
@@ -97,11 +108,47 @@ class ObservationLatticeBuilder:
                             "blank_support": float(blank_support),
                             "source_chunk_ids": list(token.source_chunk_ids),
                             "source_chunk_indices": list(token.source_chunk_indices),
+                            "observation_unit_index": (observation.metadata or {}).get("observation_unit_index"),
+                            "observation_unit_text": str((observation.metadata or {}).get("observation_unit_text", "") or ""),
+                            "observation_part_index": (observation.metadata or {}).get("observation_part_index"),
+                            "observation_part_count": (observation.metadata or {}).get("observation_part_count"),
                             "synthetic": bool(synthetic),
                             "synthetic_reason": str((observation.metadata or {}).get("reason", "") or ""),
+                            "match_kind": match_kind,
                         },
                     )
                 )
+            null_slice_index = min(max(token_index, 0), max(len(observation_slices) - 1, 0))
+            candidates.append(
+                LatticeCandidate(
+                    token_index=token_index,
+                    slice_index=int(null_slice_index),
+                    score=self._NULL_ALIGN_SCORE,
+                    lexical_exact=False,
+                    pronunciation_match=False,
+                    top_candidate_match=False,
+                    language_consistent=True,
+                    blank_support=0.0,
+                    synthetic=True,
+                    blocked=False,
+                    metadata={
+                        "token_text": str(token.text),
+                        "slice_primary_token": "",
+                        "slice_start": None,
+                        "slice_end": None,
+                        "blank_support": 0.0,
+                        "source_chunk_ids": list(token.source_chunk_ids),
+                        "source_chunk_indices": list(token.source_chunk_indices),
+                        "observation_unit_index": None,
+                        "observation_unit_text": "",
+                        "observation_part_index": None,
+                        "observation_part_count": None,
+                        "synthetic": True,
+                        "synthetic_reason": "null_align",
+                        "match_kind": "null",
+                    },
+                )
+            )
             candidates.sort(key=lambda item: item.score, reverse=True)
             rows.append(tuple(candidates))
         return ObservationLattice(
@@ -129,3 +176,18 @@ class ObservationLatticeBuilder:
             if window:
                 return max(0.0, min(1.0, max(window)))
         return max(0.0, min(1.0, float(fallback or 0.0)))
+
+    @staticmethod
+    def _resolve_match_kind(
+        *,
+        lexical_exact: bool,
+        pronunciation_match: bool,
+        top_candidate_match: bool,
+    ) -> str:
+        if lexical_exact:
+            return "direct"
+        if top_candidate_match:
+            return "top_candidate"
+        if pronunciation_match:
+            return "pronunciation"
+        return "weak"

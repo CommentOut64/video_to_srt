@@ -34,17 +34,45 @@ class ViterbiDecoder:
                     metadata=dict(candidate.metadata or {}),
                 )
                 if token_index == 0:
-                    next_states[(token_index, candidate.slice_index)] = (
-                        float(candidate.score),
-                        (step,),
-                    )
+                    state_key = (token_index, candidate.slice_index)
+                    best_score = next_states.get(state_key, (-10.0, tuple()))[0]
+                    if float(candidate.score) > best_score:
+                        next_states[state_key] = (
+                            float(candidate.score),
+                            (step,),
+                        )
                     continue
                 for (_, prev_slice_index), (prev_score, prev_steps) in states.items():
                     if candidate.slice_index < prev_slice_index:
                         continue
-                    transition_penalty = 0.06 * max(candidate.slice_index - prev_slice_index - 1, 0)
-                    jump_penalty = 0.03 * abs(candidate.slice_index - prev_slice_index)
-                    total_score = float(prev_score) + float(candidate.score) - transition_penalty - jump_penalty
+                    step_metadata = dict(step.metadata or {})
+                    prev_metadata = dict(prev_steps[-1].metadata or {})
+                    delta = int(candidate.slice_index - prev_slice_index)
+                    transition_penalty = 0.06 * max(delta - 1, 0)
+                    jump_penalty = 0.03 * abs(delta)
+                    if delta > 2:
+                        jump_penalty += 0.12 * float(delta - 2)
+                    unsupported_gap_penalty = 0.0
+                    current_match_kind = str(step_metadata.get("match_kind", "") or "")
+                    previous_end = prev_metadata.get("slice_end")
+                    current_start = step_metadata.get("slice_start")
+                    boundary_support = max(
+                        float(prev_metadata.get("blank_support", 0.0) or 0.0),
+                        float(step_metadata.get("blank_support", 0.0) or 0.0),
+                    )
+                    if current_match_kind == "null":
+                        unsupported_gap_penalty += 0.04
+                    if previous_end is not None and current_start is not None:
+                        gap = float(current_start) - float(previous_end)
+                        if gap > 0.25 and boundary_support < 0.55:
+                            unsupported_gap_penalty += min(float(gap), 4.0) * 0.25
+                    total_score = (
+                        float(prev_score)
+                        + float(candidate.score)
+                        - transition_penalty
+                        - jump_penalty
+                        - unsupported_gap_penalty
+                    )
                     state_key = (token_index, candidate.slice_index)
                     best_score = next_states.get(state_key, (-10.0, tuple()))[0]
                     if total_score <= best_score:
