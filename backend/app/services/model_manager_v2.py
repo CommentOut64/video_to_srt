@@ -774,16 +774,12 @@ _model_manager_lock = threading.Lock()
 def get_model_manager_v2() -> ModelManagerV2:
     """单例访问入口。"""
     global _model_manager_v2
-    created = False
     if _model_manager_v2 is None:
         with _model_manager_lock:
             if _model_manager_v2 is None:
                 _model_manager_v2 = ModelManagerV2()
-                created = True
     # 如果注册表为空，说明可能路径配置不正确，强制重建以确保加载 models.yaml
     if _model_manager_v2 and not _model_manager_v2.registry.list():
         with _model_manager_lock:
             _model_manager_v2 = ModelManagerV2()
-            created = True
-    logger.info("get_model_manager_v2 调用: created=%s", created)
     return _model_manager_v2
