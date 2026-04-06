@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from app.models.speaker_timeline_models import SpeakerTurn
 from app.services.textflow.alignment_path_adapter import AlignmentPathAdapter
 from app.services.timeanchored_alignment.contracts import (
     SelectedTextTruth,
@@ -196,3 +197,150 @@ def test_alignment_path_adapter_rejects_decoder_results_without_alignment_path()
         assert "AlignmentPath" in str(exc)
     else:
         raise AssertionError("缺少 AlignmentPath 时必须拒绝建立正式切分入口")
+
+
+def test_alignment_path_adapter_builds_speaker_change_anchor_from_timeline_turns_inside_single_source_unit() -> None:
+    ready_window = ReadySlowWindow(
+        window_id="phase4-window-timeline-001",
+        owner_chunk_id="chunk-1",
+        owner_chunk_index=1,
+        window_mode="steady",
+        flush_reason="test",
+        audio_segments=((0.0, 1.2),),
+        coverage=WindowCoverage(
+            core_segments=((0.0, 1.2),),
+            left_guard_sec=0.0,
+            right_guard_sec=0.0,
+            chunk_bindings=(
+                WindowChunkBinding(
+                    chunk_id="chunk-1",
+                    chunk_index=1,
+                    chunk_start=0.0,
+                    chunk_end=1.2,
+                    overlap_ratio=1.0,
+                    role="owner",
+                    is_owner=True,
+                ),
+            ),
+        ),
+        source_semantic_chunk_ids=("sem-1",),
+        source_chunk_ids=("chunk-1",),
+        source_chunk_indices=(1,),
+        source_units=(
+            WindowSourceUnit(
+                unit_id="unit-1",
+                semantic_chunk_id="sem-1",
+                text="Wouldn't it make sense",
+                audio_start=0.0,
+                audio_end=1.2,
+                source_chunk_ids=("chunk-1",),
+                source_chunk_indices=(1,),
+                speaker_id="speaker-a",
+                turn_id="unit-turn-a",
+                language="en",
+                arrived_at=1.2,
+            ),
+        ),
+        dialogue_shape=DialogueShapeSnapshot(
+            shape="single_speaker",
+            speaker_count=1,
+            dominant_speaker_id="speaker-a",
+            dominant_speaker_ratio=1.0,
+            speaker_switch_count=0,
+            speaker_switch_density=0.0,
+            turn_count=1,
+            avg_turn_duration_sec=1.2,
+        ),
+        language_profile=WindowLanguageProfile(
+            primary_language="en",
+            language_mix_state="single_language",
+            decision_domains=("timeanchored_alignment",),
+            should_bypass_whisper=False,
+        ),
+        prompt_seed=PromptSeed(text="Wouldn't it make sense"),
+        batch_hint=WindowBatchHint(
+            duration_bucket="short",
+            token_estimate=4,
+            acoustic_density_hint="medium",
+            queue_priority=1,
+        ),
+        created_at=1.2,
+    )
+    window_time_base = WindowTimeBasePackage(
+        window_id=ready_window.window_id,
+        language="en",
+        raw_units=(
+            TimeBaseUnit(text="Wouldn't", start=0.0, end=0.25, confidence=0.95, token_type="word"),
+            TimeBaseUnit(text="it", start=0.25, end=0.45, confidence=0.95, token_type="word"),
+            TimeBaseUnit(text="make", start=0.45, end=0.75, confidence=0.95, token_type="word"),
+            TimeBaseUnit(text="sense", start=0.75, end=1.2, confidence=0.95, token_type="word"),
+        ),
+        word_units=(
+            TimeBaseUnit(text="Wouldn't", start=0.0, end=0.25, confidence=0.95, token_type="word"),
+            TimeBaseUnit(text="it", start=0.25, end=0.45, confidence=0.95, token_type="word"),
+            TimeBaseUnit(text="make", start=0.45, end=0.75, confidence=0.95, token_type="word"),
+            TimeBaseUnit(text="sense", start=0.75, end=1.2, confidence=0.95, token_type="word"),
+        ),
+        quality=TimeBaseQuality(blank_ratio=0.1, avg_max_prob=0.9, low_prob_ratio=0.05),
+        source_chunk_ids=("chunk-1",),
+        source_chunk_indices=(1,),
+        chunk_bindings=ready_window.coverage.chunk_bindings,
+    )
+    preparation = AlignmentPreparationAssembler().prepare(
+        ready_window=ready_window,
+        window_time_base=window_time_base,
+        selected_text_truth=SelectedTextTruth(
+            text="Wouldn't it make sense",
+            text_source="slow",
+            language_hint="en",
+            source_chunk_ids=("chunk-1",),
+            quality={"confidence": 0.9},
+            metadata={"raw_text": "Wouldn't it make sense"},
+        ),
+        whisper_result={
+            "text": "Wouldn't it make sense",
+            "text_clean": "Wouldn't it make sense",
+            "text_itn_raw": "Wouldn't it make sense",
+            "confidence": 0.9,
+            "language": "en",
+            "raw_result": {"segments": [{"avg_logprob": -0.1}]},
+        },
+        default_language="en",
+        external_speaker_turns=(
+            SpeakerTurn(
+                turn_id="timeline-turn-1",
+                block_id="timeline-block",
+                speaker_id="speaker-a",
+                start=0.0,
+                end=0.45,
+                boundary_confidence=0.92,
+                is_overlap=False,
+                source="merged",
+            ),
+            SpeakerTurn(
+                turn_id="timeline-turn-2",
+                block_id="timeline-block",
+                speaker_id="speaker-b",
+                start=0.45,
+                end=1.2,
+                boundary_confidence=0.94,
+                is_overlap=False,
+                source="merged",
+            ),
+        ),
+    )
+    decoder_result = AlignmentDecoderService().execute(preparation=preparation)
+
+    result = AlignmentPathAdapter().build(
+        preparation=preparation,
+        decoder_result=decoder_result,
+    )
+
+    assert [item["speaker_id"] for item in result.decision_input.aligned_facts.speaker_turns] == [
+        "speaker-a",
+        "speaker-b",
+    ]
+    assert any(
+        item["reason"] == "speaker_change" and item["decision_time"] == 0.45
+        for item in result.decision_input.fused_evidence.speaker_changes
+    )

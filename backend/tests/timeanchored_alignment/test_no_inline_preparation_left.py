@@ -429,6 +429,7 @@ def test_run_timeanchored_main_chain_promotes_window_source_text_when_owner_text
     assert "在中午12点50分" in promoted_selected_text_truth.text
     assert "这家商店的老板" in promoted_selected_text_truth.text
     assert promoted_selected_text_truth.source_chunk_ids == ("chunk-32", "chunk-33")
+    assert promoted_selected_text_truth.metadata.get("promoted_from_window_source_units") is True
     assert isinstance(promoted_whisper, dict)
     assert "在中午12点50分" in str(promoted_whisper.get("text", ""))
 

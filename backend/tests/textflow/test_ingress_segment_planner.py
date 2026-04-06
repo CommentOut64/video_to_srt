@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from collections import Counter
+
 from app.services.alignment.types import AnnotatedWord, DecisionLayerInput
 from app.services.punctuation.final_splitter import FinalSplitter
 from app.services.textflow.contracts import SegmentationIngressContext
 from app.services.textflow.decision_layer import SegmentationProcessor
+from app.services.textflow.ingress_segment_planner import IngressSegmentPlanner, _BoundaryFeature
 from app.services.timeanchored_alignment.contracts import BoundaryEvidence
 
 
@@ -163,7 +166,7 @@ def test_timeanchored_ingress_allows_small_overflow_to_avoid_breaking_prepositio
 
     assert [segment.text for segment in output.sentence_segments] == [
         "Bennet, okay, sure a trolley is heading towards five people, you can pull the lever to diver the track",
-        "One person said, at least that's what you think is happening,",
+        "One person said, at least that's what you think is happening",
     ]
 
 
@@ -254,3 +257,211 @@ def test_timeanchored_ingress_does_not_split_before_right_idea_clause() -> None:
     assert [segment.text for segment in output.sentence_segments] == [
         "Probably Monica, she has the right idea in a lot of ways"
     ]
+
+
+def test_timeanchored_ingress_must_split_defers_pause_only_clause_break_until_late_boundary() -> None:
+    processor = SegmentationProcessor(final_splitter=FinalSplitter())
+    decision_input = _build_timeanchored_decision_input(
+        unit_id="window-tr-must-split-late-hold",
+        chunk_id="chunk-tr-must-split-late-hold",
+        chunk_index=4,
+        words=[
+            ("A", 7.468, 7.528),
+            ("trolley", 7.768, 8.068),
+            ("is", 8.128, 8.188),
+            ("heading", 8.248, 8.308),
+            ("towards", 8.488, 8.548),
+            ("your", 8.788, 8.848),
+            ("best", 8.968, 9.028),
+            ("friend,", 9.268, 9.568),
+            ("you", 9.688, 9.748),
+            ("can", 9.868, 9.928),
+            ("pull", 10.048, 10.108),
+            ("the", 10.228, 10.288),
+            ("lever", 10.408, 10.468),
+            ("to", 10.708, 10.768),
+            ("divert", 10.828, 11.068),
+            ("it", 11.068, 11.128),
+            ("to", 11.188, 11.248),
+            ("the", 11.308, 11.368),
+            ("other", 11.428, 11.488),
+            ("track,", 11.668, 11.908),
+            ("killing", 12.028, 12.088),
+            ("five", 12.328, 12.388),
+            ("strangers", 12.688, 13.048),
+            ("instead,", 13.228, 13.588),
+            ("What", 13.768, 13.828),
+            ("do", 14.008, 14.068),
+            ("you", 14.128, 14.188),
+            ("do", 14.308, 14.968),
+        ],
+    )
+
+    output = processor._run_segmentation_core(
+        decision_input,
+        stream_id="timeanchored:window-tr-must-split-late-hold",
+        chunk_index=4,
+        is_last_chunk=True,
+    )
+
+    assert output.segmentation_result is not None
+    assert output.segmentation_result.segments[0].token_end > 6
+
+
+def test_timeanchored_ingress_must_split_prefers_late_safe_boundary_over_early_pause_peak() -> None:
+    planner = IngressSegmentPlanner()
+    words = [
+        AnnotatedWord(word="Oh", start=16.04, end=16.10, confidence=0.9, confidence_source="aligned"),
+        AnnotatedWord(word="God,", start=16.52, end=16.94, confidence=0.9, confidence_source="aligned"),
+        AnnotatedWord(word="killinging", start=18.20, end=18.50, confidence=0.9, confidence_source="aligned"),
+        AnnotatedWord(word="five", start=18.68, end=18.74, confidence=0.9, confidence_source="aligned"),
+        AnnotatedWord(word="strangers", start=19.04, end=19.40, confidence=0.9, confidence_source="aligned"),
+        AnnotatedWord(word="is", start=19.52, end=19.58, confidence=0.9, confidence_source="aligned"),
+        AnnotatedWord(word="probably", start=19.76, end=19.82, confidence=0.9, confidence_source="aligned"),
+        AnnotatedWord(word="more", start=20.24, end=20.30, confidence=0.9, confidence_source="aligned"),
+        AnnotatedWord(word="beneficial", start=20.48, end=20.54, confidence=0.9, confidence_source="aligned"),
+        AnnotatedWord(word="for", start=21.08, end=21.14, confidence=0.9, confidence_source="aligned"),
+        AnnotatedWord(word="society,", start=21.32, end=21.92, confidence=0.9, confidence_source="aligned"),
+        AnnotatedWord(word="so", start=21.98, end=22.04, confidence=0.9, confidence_source="aligned"),
+        AnnotatedWord(word="I'll", start=22.16, end=22.40, confidence=0.9, confidence_source="aligned"),
+        AnnotatedWord(word="do", start=22.46, end=22.60, confidence=0.9, confidence_source="aligned"),
+        AnnotatedWord(word="that", start=22.66, end=23.30, confidence=0.9, confidence_source="aligned"),
+    ]
+    words_for_split = SegmentationProcessor._build_words_for_split(words)
+    feature_map = {
+        6: _BoundaryFeature(
+            split_idx=6,
+            event_time=20.03,
+            left_end=19.82,
+            right_start=20.24,
+            reasons=("gap_pause", "gap_pause"),
+            scores=(0.7, 0.7),
+        ),
+        10: _BoundaryFeature(
+            split_idx=10,
+            event_time=21.95,
+            left_end=21.92,
+            right_start=21.98,
+            reasons=("punctuation_soft",),
+            scores=(0.6,),
+        ),
+        11: _BoundaryFeature(
+            split_idx=11,
+            event_time=22.10,
+            left_end=22.04,
+            right_start=22.16,
+            reasons=("gap_pause", "blank_valley"),
+            scores=(0.5, 0.4),
+        ),
+    }
+
+    candidate, _, _, _ = planner._select_best_segment_end(
+        processor=object(),
+        words_for_split=words_for_split,
+        segment_start_idx=0,
+        feature_map=feature_map,
+        accept_threshold=planner._DEFAULT_ACCEPT_THRESHOLD,
+        max_segment_sec=planner._DEFAULT_MAX_SEGMENT_SEC,
+        max_overflow_sec=planner._DEFAULT_MAX_OVERFLOW_SEC,
+        language_is_cjk=False,
+        rejection_stats=Counter(),
+    )
+
+    assert candidate is not None
+    assert candidate.split_idx == 10
+
+
+def test_timeanchored_ingress_does_not_cut_on_speaker_change_without_real_break() -> None:
+    processor = SegmentationProcessor(final_splitter=FinalSplitter())
+    decision_input = _build_timeanchored_decision_input(
+        unit_id="window-tr-weak-speaker-change",
+        chunk_id="chunk-tr-weak-speaker-change",
+        chunk_index=5,
+        words=[
+            ("Tell", 0.00, 0.20),
+            ("me", 0.22, 0.34),
+            ("your", 0.36, 0.54),
+            ("answer", 0.56, 0.88),
+            ("right", 0.90, 1.12),
+            ("now", 1.14, 1.34),
+            ("please", 1.36, 1.62),
+        ],
+        canonical_candidate_boundaries=(
+            BoundaryEvidence(
+                split_idx=2,
+                event_time=0.55,
+                left_end=0.54,
+                right_start=0.56,
+                reason="speaker_change",
+                score=0.95,
+                hard_flag=True,
+                metadata={},
+            ),
+        ),
+    )
+
+    output = processor.process(
+        decision_input,
+        stream_id="timeanchored:window-tr-weak-speaker-change",
+        chunk_index=5,
+        is_last_chunk=True,
+    )
+
+    assert [segment.text for segment in output.sentence_segments] == [
+        "Tell me your answer right now please"
+    ]
+
+
+def test_timeanchored_ingress_must_split_does_not_let_synthetic_pause_peak_beat_late_safe_boundary() -> None:
+    planner = IngressSegmentPlanner()
+    words = [
+        AnnotatedWord(word="Tell", start=0.00, end=0.18, confidence=0.9, confidence_source="aligned"),
+        AnnotatedWord(word="me", start=0.20, end=0.34, confidence=0.9, confidence_source="aligned"),
+        AnnotatedWord(word="What's", start=0.36, end=0.46, confidence=0.9, confidence_source="aligned"),
+        AnnotatedWord(word="your", start=0.90, end=1.00, confidence=0.9, confidence_source="aligned"),
+        AnnotatedWord(word="answer", start=1.02, end=1.42, confidence=0.9, confidence_source="aligned"),
+        AnnotatedWord(word="right", start=1.46, end=1.62, confidence=0.9, confidence_source="aligned"),
+        AnnotatedWord(word="now,", start=1.66, end=2.08, confidence=0.9, confidence_source="aligned"),
+        AnnotatedWord(word="please", start=2.12, end=2.78, confidence=0.9, confidence_source="aligned"),
+    ]
+    words_for_split = SegmentationProcessor._build_words_for_split(words)
+    feature_map = {
+        2: _BoundaryFeature(
+            split_idx=2,
+            event_time=0.68,
+            left_end=0.46,
+            right_start=0.90,
+            reasons=("gap_pause", "speaker_change"),
+            scores=(0.92, 0.91),
+            metadata=(
+                {
+                    "left_mount_status": "synthetic",
+                    "right_mount_status": "local_interpolation",
+                },
+            ),
+        ),
+        6: _BoundaryFeature(
+            split_idx=6,
+            event_time=2.08,
+            left_end=2.08,
+            right_start=2.12,
+            reasons=("punctuation_soft",),
+            scores=(0.65,),
+            metadata=({},),
+        ),
+    }
+
+    candidate, _, _, _ = planner._select_best_segment_end(
+        processor=object(),
+        words_for_split=words_for_split,
+        segment_start_idx=0,
+        feature_map=feature_map,
+        accept_threshold=planner._DEFAULT_ACCEPT_THRESHOLD,
+        max_segment_sec=2.4,
+        max_overflow_sec=0.45,
+        language_is_cjk=False,
+        rejection_stats=Counter(),
+    )
+
+    assert candidate is not None
+    assert candidate.split_idx == 6

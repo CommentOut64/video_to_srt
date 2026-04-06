@@ -403,3 +403,92 @@ def test_render_core_normalizes_time_expression_from_split_tokens_and_punct_fact
     )
 
     assert result.subtitles[0].text_display == "7:28 PM"
+
+
+def test_render_core_deduplicates_repeated_weak_punctuation_on_same_token() -> None:
+    core = RenderCore()
+    stream = CanonicalTextStream(
+        stream_id="s-dedup",
+        chunk_ref="chunk-dedup",
+        language="en",
+        text_source="slow",
+        tokens=(
+            CoreToken(
+                token_id="t0",
+                index=0,
+                text_core="Okay",
+                normalized_text="okay",
+                start=0.0,
+                end=0.3,
+                source="slow",
+            ),
+            CoreToken(
+                token_id="t1",
+                index=1,
+                text_core="fine",
+                normalized_text="fine",
+                start=0.3,
+                end=0.6,
+                source="slow",
+            ),
+        ),
+        punctuation_facts=(
+            PunctuationFact(
+                fact_id="pf-comma-a",
+                left_token_index=0,
+                right_token_index=1,
+                attach_mode="between",
+                raw_text=",",
+                normalized_text=",",
+                punct_class="weak",
+                source="slow",
+            ),
+            PunctuationFact(
+                fact_id="pf-comma-b",
+                left_token_index=0,
+                right_token_index=1,
+                attach_mode="between",
+                raw_text=",",
+                normalized_text=",",
+                punct_class="weak",
+                source="injected",
+            ),
+        ),
+    )
+
+    result = core.render(
+        canonical_stream=stream,
+        segmentation_result=SegmentationResult(
+            segments=(
+                SegmentPlan(
+                    segment_id="seg-dedup",
+                    token_start=0,
+                    token_end=1,
+                    start=0.0,
+                    end=0.6,
+                ),
+            )
+        ),
+        policy=RenderPolicy(),
+    )
+
+    assert result.subtitles[0].text_display == "Okay, fine"
+
+
+def test_render_core_strips_trailing_weak_punctuation_but_keeps_sentence_end() -> None:
+    core = RenderCore()
+
+    assert (
+        core._standardize_english_punctuation("Then tomorrow we can celebrate her birthday,")
+        == "Then tomorrow we can celebrate her birthday"
+    )
+    assert core._standardize_english_punctuation("Who is my favorite DDLC character?") == (
+        "Who is my favorite DDLC character?"
+    )
+
+
+def test_render_core_drops_trailing_weak_punct_before_terminal_question_mark() -> None:
+    core = RenderCore()
+
+    assert core._standardize_english_punctuation("Why,?") == "Why?"
+    assert core._standardize_english_punctuation("Sorry ; ?") == "Sorry?"

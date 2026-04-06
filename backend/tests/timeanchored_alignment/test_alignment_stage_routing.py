@@ -480,6 +480,114 @@ def test_alignment_stage_mode_default_raises_when_gate_fails(monkeypatch) -> Non
     remove_streaming_subtitle_manager(job_id)
 
 
+def test_alignment_stage_mode_default_commits_fast_direct_when_selected_fast_rejects_slow(
+    monkeypatch,
+) -> None:
+    job_id = "test_phase7_route_default_selection_reject_slow_fast_direct"
+    pipeline = _build_pipeline(job_id, mode="default")
+    _patch_common_alignment_inputs(monkeypatch=monkeypatch, pipeline=pipeline, chosen_source="fast")
+
+    stage_result = SimpleNamespace(
+        alignment_path=None,
+        alignment_report=SimpleNamespace(
+            route="selection_reject_slow",
+            failure_semantic="selection_reject_slow",
+        ),
+        low_confidence_spans=(),
+    )
+    timeanchored_run = Mock(return_value=stage_result)
+    commit_timeanchored = Mock()
+    commit_fast_direct = Mock()
+    record = Mock()
+    monkeypatch.setattr(pipeline._alignment_stage_service, "_run_timeanchored_main_chain", timeanchored_run)
+    monkeypatch.setattr(
+        pipeline._alignment_stage_service,
+        "_commit_timeanchored_main_chain_result",
+        commit_timeanchored,
+    )
+    monkeypatch.setattr(
+        pipeline._alignment_stage_service,
+        "_commit_fast_direct_result",
+        commit_fast_direct,
+    )
+    monkeypatch.setattr(pipeline._alignment_stage_service, "_record_hetero_alignment_result", record)
+
+    ctx = _build_ctx(job_id)
+    asyncio.run(pipeline._run_alignment_stage(ctx))
+
+    assert timeanchored_run.call_count == 1
+    assert commit_timeanchored.call_count == 0
+    assert commit_fast_direct.call_count == 1
+    assert commit_fast_direct.call_args.kwargs["reason"] == "default_selection_reject_slow"
+    assert record.call_count == 1
+    remove_streaming_subtitle_manager(job_id)
+
+
+def test_alignment_stage_sensevoice_only_commits_fast_direct_when_timeanchored_rejects_slow(
+    monkeypatch,
+) -> None:
+    job_id = "test_phase7_route_sensevoice_only_selection_reject_slow_fast_direct"
+    pipeline = AsyncDualPipeline(
+        job_id=job_id,
+        draft_engine=DummyEngine(response_text="你好世界", latency_ms=0),
+        patch_engine=None,
+        transcription_profile="sensevoice_only",
+        enable_cross_chunk_merge=False,
+        enable_semantic_buffer=False,
+        punctuation_service=Mock(),
+    )
+    pipeline._alignment_pipeline_mode = "default"
+    _patch_common_alignment_inputs(monkeypatch=monkeypatch, pipeline=pipeline, chosen_source="fast")
+
+    stage_result = SimpleNamespace(
+        alignment_path=None,
+        alignment_report=SimpleNamespace(
+            route="selection_reject_slow",
+            failure_semantic="selection_reject_slow",
+        ),
+        low_confidence_spans=(),
+    )
+    timeanchored_run = Mock(return_value=stage_result)
+    commit_timeanchored = Mock()
+    commit_fast_direct = Mock()
+    record = Mock()
+    monkeypatch.setattr(pipeline._alignment_stage_service, "_run_timeanchored_main_chain", timeanchored_run)
+    monkeypatch.setattr(
+        pipeline._alignment_stage_service,
+        "_commit_timeanchored_main_chain_result",
+        commit_timeanchored,
+    )
+    monkeypatch.setattr(
+        pipeline._alignment_stage_service,
+        "_commit_fast_direct_result",
+        commit_fast_direct,
+    )
+    monkeypatch.setattr(pipeline._alignment_stage_service, "_record_hetero_alignment_result", record)
+
+    ctx = ProcessingContext(
+        job_id=job_id,
+        chunk_index=0,
+        audio_chunk=_build_chunk(),
+        sv_result=_build_sv_result(),
+        whisper_result=None,
+        time_base_chunk=_build_time_base(),
+    )
+    ctx.text_tracks = TextTrackBundle(
+        sv_track=_build_track("你 好 世 界", source="sv"),
+        whisper_track=None,
+    )
+
+    asyncio.run(pipeline._run_alignment_stage(ctx))
+
+    assert timeanchored_run.call_count == 1
+    assert commit_timeanchored.call_count == 0
+    assert commit_fast_direct.call_count == 1
+    assert commit_fast_direct.call_args.kwargs["reason"] == "default_selection_reject_slow"
+    assert record.call_count == 1
+    assert isinstance(ctx.whisper_result, dict)
+    remove_streaming_subtitle_manager(job_id)
+
+
 def test_should_accept_timeanchored_default_rejects_error_route() -> None:
     stage_result = SimpleNamespace(
         alignment_path=None,
