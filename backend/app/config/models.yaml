@@ -111,7 +111,7 @@
   source:
     repo_id: Systran/faster-whisper-large-v3
     files: [model.bin, config.json, tokenizer.json]
-  resources: {vram_mb: 6000}
+  resources: {vram_mb: 3000}
   features: {timestamps: word, languages: multi}
 
 - id: whisper-turbo
