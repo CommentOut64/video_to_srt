@@ -19,6 +19,7 @@ from app.schemas.pipeline_context import ProcessingContext
 from app.services.alignment.types import CharMapping, PunctTrack, TextTrack, TextTrackBundle
 from app.services.language_policy import build_language_policy_snapshot
 from app.services.textflow.alignment_path_adapter import AlignmentPathAdapter
+from app.services.textflow.fast_timed_ingress_adapter import FastTimedIngressAdapter
 from app.services.timeanchored_alignment import AlignmentItem
 from app.services.timeanchored_alignment.contracts import (
     SelectedTextTruth,
@@ -66,6 +67,7 @@ class AlignmentStageService:
         )
         self._alignment_decoder_service = AlignmentDecoderService()
         self._alignment_path_adapter = AlignmentPathAdapter()
+        self._fast_timed_ingress_adapter = FastTimedIngressAdapter()
         self._output_projector = OutputProjector()
         self._selection_service = TextSelectionService(logger=getattr(host, "logger", None))
         self._postprocess_trace_writer = PostprocessTraceWriter(
@@ -1824,103 +1826,53 @@ class AlignmentStageService:
         speaker_id = host._resolve_speaker_id_for_chunk(chunk)
         turn_id = host._resolve_turn_id_for_chunk(chunk)
         sv_words = host._build_sv_word_timestamps(sv_result, chunk)
-        fast_stream = self._build_fast_direct_stream(words=sv_words)
-        tracks = ctx.text_tracks or TextTrackBundle()
-        ctx.text_tracks = tracks
-        normalize_sensevoice_result = getattr(host, "_normalize_sensevoice_result", None)
-        if tracks.sv_track is None and callable(normalize_sensevoice_result):
-            normalize_sensevoice_result(ctx)
-            tracks = ctx.text_tracks or tracks
-        if tracks.sv_track is None:
-            fallback_text = str(
-                sv_result.get("text_clean")
-                or sv_result.get("text_itn_raw")
-                or sv_result.get("text")
-                or sv_result.get("raw_text")
-                or ""
-            ).strip()
-            text_length = len(fallback_text)
-            mapping = list(range(text_length))
-            tracks.sv_track = TextTrack(
-                raw_text=fallback_text,
-                text_itn_raw=fallback_text,
-                text_clean=fallback_text,
-                char_mapping=[
-                    CharMapping(raw_idx=index, clean_idx=index, punct=None)
-                    for index in range(text_length)
-                ],
-                raw_to_clean=list(mapping),
-                clean_to_raw=list(mapping),
-                language=language,
-                source="sensevoice",
-                mapping_coverage=1.0 if text_length > 0 else 0.0,
-            )
-        if tracks.chosen_track is None:
-            clone_text_track = getattr(host, "_clone_text_track", None)
-            if callable(clone_text_track):
-                tracks.chosen_track = clone_text_track(tracks.sv_track, source="chosen")
-            else:
-                tracks.chosen_track = tracks.sv_track
-
+        if not sv_words:
+            raise ValueError("fast timed final 缺少可用 fast_words，拒绝进入统一切分层")
+        tracks = ctx.text_tracks
+        chosen_track = getattr(tracks, "chosen_track", None) if tracks is not None else None
+        sv_track = getattr(tracks, "sv_track", None) if tracks is not None else None
         punct_track = ctx.punct_track
-        punctuation_positions = list(punct_track.positions) if punct_track and punct_track.positions else None
-        punctuation_clean_text = (
+        punctuation_positions = list(punct_track.positions) if punct_track and punct_track.positions else []
+        fallback_clean_text = (
             punct_track.clean_text_ref
             if punct_track and punct_track.clean_text_ref
-            else str(
-                getattr(tracks.chosen_track, "text_clean", "")
-                or sv_result.get("text_clean")
-                or sv_result.get("text_itn_raw")
-                or sv_result.get("text")
-                or ""
-            ).strip()
-        )
-        policy_snapshot = None
-        try:
-            policy_snapshot = build_language_policy_snapshot(language_hint=language)
-        except Exception:
-            host.logger.exception(
-                "Chunk {}: fast_direct 语言策略快照编译失败，回退空快照注入",
-                ctx.chunk_index,
+            else (
+                str(getattr(chosen_track, "text_clean", "") or "")
+                or str(getattr(sv_track, "text_clean", "") or "")
+                or str(
+                    sv_result.get("text_clean")
+                    or sv_result.get("text_itn_raw")
+                    or sv_result.get("text")
+                    or ""
+                ).strip()
             )
-        run_result = host._run_collection_scoring_decision_once(
-            tracks=tracks,
-            sv_result=sv_result,
-            whisper_result=ctx.whisper_result or {},
-            sv_words=sv_words,
+        )
+        adapter_result = self._fast_timed_ingress_adapter.build(
+            chunk=chunk,
+            fast_words=sv_words,
+            language=language,
+            speaker_turns=[],
             punctuation_positions=punctuation_positions,
-            punctuation_clean_text=punctuation_clean_text,
-            variant="legacy",
+            fallback_clean_text=fallback_clean_text,
             speaker_id=speaker_id,
             turn_id=turn_id,
-            policy_snapshot=policy_snapshot,
-            is_fast_only_mode=True,
         )
-        final_sentences = list(run_result.final_sentences)
-
-        fallback_error_code = ""
+        self._inject_timeline_turns_into_decision_input(
+            decision_input=adapter_result.decision_input,
+            time_axis_tokens=sv_words,
+        )
+        decision_output = host._decision_processor.process(
+            adapter_result.decision_input,
+            stream_id=adapter_result.stream_id,
+            chunk_index=adapter_result.chunk_index,
+            is_last_chunk=host._is_last_chunk_index(adapter_result.chunk_index),
+        )
+        final_sentences = list(getattr(decision_output, "sentence_segments", ()) or ())
         if not final_sentences:
-            fallback_text = str(
-                sv_result.get("text_clean")
-                or sv_result.get("text_itn_raw")
-                or sv_result.get("text")
-                or ""
-            ).strip()
-            fallback_confidence = self._resolve_text_fallback_confidence(
-                chosen_source="fast",
-                whisper_result=ctx.whisper_result or {},
-                sv_result=sv_result,
-            )
-            fallback_sentence = self._build_text_fallback_sentence(
-                text=fallback_text,
-                chunk=chunk,
-                confidence=fallback_confidence,
-            )
-            if fallback_sentence is not None:
-                fallback_sentence.speaker_id = speaker_id
-                fallback_sentence.turn_id = turn_id
-                final_sentences = [fallback_sentence]
-                fallback_error_code = "E_FAST_DIRECT_SEGMENT_EMPTY_FALLBACK"
+            raise ValueError("fast timed final 未产出 sentence_segments，拒绝降级为 text-only final")
+        sentence_records = list(getattr(decision_output, "sentence_records", ()) or ())
+        if not sentence_records:
+            raise ValueError("fast timed final 缺少 sentence_records，无法进入统一输出层")
 
         for sentence in final_sentences:
             sentence.source = TextSource.SENSEVOICE
@@ -1940,10 +1892,27 @@ class AlignmentStageService:
         )
         output_traces = host._normalize_output_traces_for_sentences(
             final_sentences=final_sentences,
-            output_traces=list(run_result.output_traces or []),
+            output_traces=list(getattr(decision_output, "output_traces", ()) or ()),
             default_reason="fast_direct",
         )
-        split_stats = dict(run_result.split_stats)
+        injection_stats = {
+            "injection_positions_total": float(len(punctuation_positions)),
+            "injection_unmatched_total": 0.0,
+            "injection_miss_ratio": 0.0,
+            "injection_mapping_coverage": 1.0 if punctuation_positions else 0.0,
+            "injection_blocked": 0.0,
+            "injection_error_code": "",
+        }
+        split_stats = dict(getattr(decision_output, "segmentation_report", {}).get("boundary_score_stats", {}))
+        split_stats.update(
+            dict(getattr(decision_output, "segmentation_report", {}).get("soft_cut_stats", {}))
+        )
+        split_stats["segmentation_ingress_fallback_punct_count"] = int(
+            adapter_result.compat_report.get("fallback_punctuation_position_count", 0) or 0
+        )
+        split_stats["time_mapping_count"] = int(
+            adapter_result.compat_report.get("time_mapping_count", 0) or 0
+        )
         soft_cut_observe_snapshot = host._update_soft_cut_observability(
             split_stats=split_stats,
             chunk_index=ctx.chunk_index,
@@ -1956,15 +1925,13 @@ class AlignmentStageService:
             language=language,
             injection_report={
                 "mapping_coverage": float(
-                    run_result.injection_stats.get("injection_mapping_coverage", 0.0)
+                    injection_stats.get("injection_mapping_coverage", 0.0)
                 ),
                 "mismatch_count": float(
-                    run_result.injection_stats.get("injection_unmatched_total", 0.0)
+                    injection_stats.get("injection_unmatched_total", 0.0)
                 ),
-                "error_code": str(
-                    run_result.injection_stats.get("injection_error_code", "") or fallback_error_code
-                ),
-                "blocked": float(run_result.injection_stats.get("injection_blocked", 0.0)),
+                "error_code": str(injection_stats.get("injection_error_code", "") or ""),
+                "blocked": float(injection_stats.get("injection_blocked", 0.0)),
             },
             segmentation_report={
                 "boundary_score_stats": dict(split_stats),
@@ -1972,15 +1939,19 @@ class AlignmentStageService:
                 "route": "fast_direct",
                 "text_route": "fast_direct",
                 "edge_route": "fast",
-                "error_code": str(split_stats.get("error_code", "") or fallback_error_code),
+                "error_code": str(split_stats.get("error_code", "") or ""),
             },
             output_traces=output_traces,
             default_trace_reason="fast_direct",
-            sentence_records=getattr(run_result, "sentence_records", ()) or (),
-            chunk_sentence_indices=getattr(run_result, "chunk_sentence_indices", ()) or (),
-            subtitle_batch=run_result.subtitle_batch,
+            sentence_records=sentence_records,
+            chunk_sentence_indices=(
+                getattr(decision_output, "chunk_sentence_indices", ()) or ()
+            ),
+            subtitle_batch=getattr(decision_output, "subtitle_batch", None),
         )
 
+        aligned_facts = adapter_result.decision_input.aligned_facts
+        fused_evidence = adapter_result.decision_input.fused_evidence
         ctx.final_sentences = list(final_sentences)
         ctx.hetero_route = "fast"
         ctx.hetero_alignment_result = {
@@ -1991,10 +1962,10 @@ class AlignmentStageService:
         }
         ctx.hetero_alignment_report = dict(ctx.hetero_alignment_result)
         ctx.finalization_metrics = {
-            "coverage": run_result.alignment_result.coverage,
-            "gap_ratio": run_result.alignment_result.gap_ratio,
-            "alignment_score": run_result.alignment_result.alignment_score,
-            "gap_positions": list(run_result.alignment_result.gap_positions),
+            "coverage": 1.0,
+            "gap_ratio": float(getattr(aligned_facts, "gap_ratio", 0.0) or 0.0),
+            "alignment_score": float(getattr(aligned_facts, "alignment_score", 0.0) or 0.0),
+            "gap_positions": list(getattr(aligned_facts, "gap_positions", []) or []),
             "gap_resolution": None,
             "fast_direct_enabled": 1.0,
             "alignment_pipeline_mode": "fast_direct",
@@ -2005,22 +1976,33 @@ class AlignmentStageService:
             "timeanchored_text_route": "fast_direct",
             "timeanchored_edge_route": "fast",
             "timeanchored_final_route": "fast",
-            "timeanchored_item_count": float(len(fast_stream)),
+            "timeanchored_item_count": float(len(sv_words)),
             "timeanchored_sentence_count": float(len(final_sentences)),
             "timeanchored_failed_span_count": 0.0,
             "timeanchored_boundary_candidate_count": float(
                 split_stats.get("boundary_candidate_count", 0.0) or 0.0
             ),
+            "fact_mapping_count": float(len(getattr(aligned_facts, "time_mappings", []) or [])),
+            "evidence_speaker_change_count": float(
+                len(getattr(fused_evidence, "speaker_changes", []) or [])
+            ),
+            "evidence_pause_anchor_count": float(
+                len(getattr(fused_evidence, "pause_anchors", []) or [])
+            ),
+            "evidence_semantic_anchor_count": float(
+                len(getattr(fused_evidence, "semantic_anchors", []) or [])
+            ),
+            "evidence_punctuation_anchor_count": float(
+                len(getattr(fused_evidence, "punctuation_anchors", []) or [])
+            ),
             "l7_error_count": float(len(output_layer_result.output_payload.get("errors", []))),
         }
-        for key, value in run_result.injection_stats.items():
+        for key, value in injection_stats.items():
             ctx.finalization_metrics[key] = value
         for key, value in split_stats.items():
             ctx.finalization_metrics[f"split_{key}"] = value
         for key, value in soft_cut_observe_snapshot.items():
             ctx.finalization_metrics[f"soft_cut_obs_{key}"] = value
-        if fallback_error_code:
-            ctx.finalization_metrics["timeanchored_error_code"] = fallback_error_code
 
         host.logger.debug(
             "Chunk {}: 快流直通定稿完成 sentences={} reason={}",
@@ -2307,6 +2289,8 @@ class AlignmentStageService:
             return False, f"{mode}_{failure_reason}"
         if token_count <= 0:
             return False, f"{mode}_gate_empty_stream"
+        if AlignmentStageService._is_unrecoverable_alignment_low_confidence(stage_result=stage_result):
+            return False, f"{mode}_alignment_low_confidence"
         if mode == "default":
             return True, "default_gate_pass"
         return True, f"{mode}_gate_pass"
@@ -2356,14 +2340,15 @@ class AlignmentStageService:
     ) -> bool:
         if stage_result is None:
             return False
-        if cls._resolve_selected_source(ctx, default="slow") != "fast":
-            return False
         alignment_report = getattr(stage_result, "alignment_report", None)
         route = str(getattr(alignment_report, "route", "") or "").strip()
         failure_semantic = str(
             getattr(alignment_report, "failure_semantic", "") or ""
         ).strip()
-        return route == "selection_reject_slow" or failure_semantic == "selection_reject_slow"
+        selected_source = cls._resolve_selected_source(ctx, default="slow")
+        if route == "selection_reject_slow" or failure_semantic == "selection_reject_slow":
+            return selected_source == "fast"
+        return cls._is_unrecoverable_alignment_low_confidence(stage_result=stage_result)
 
     def _resolve_fast_direct_reason(self, *, ctx: ProcessingContext) -> str:
         host = self._host
@@ -2418,6 +2403,38 @@ class AlignmentStageService:
         stage_result: Optional[Any],
     ) -> int:
         return AlignmentStageService._resolve_timeanchored_token_count(stage_result=stage_result)
+
+    @staticmethod
+    def _is_unrecoverable_alignment_low_confidence(
+        *,
+        stage_result: Optional[Any],
+    ) -> bool:
+        if stage_result is None:
+            return False
+        alignment_report = getattr(stage_result, "alignment_report", None)
+        if str(getattr(alignment_report, "failure_semantic", "") or "").strip() != "alignment_low_confidence":
+            return False
+        metadata = dict(getattr(alignment_report, "metadata", {}) or {})
+        thresholds = dict(metadata.get("thresholds", {}) or {})
+        longest_low_conf_span = AlignmentStageService._safe_int(
+            metadata.get("longest_low_conf_span"),
+            default=0,
+        )
+        max_failure_span = max(
+            1,
+            AlignmentStageService._safe_int(
+                thresholds.get("max_continuous_failure_span"),
+                default=6,
+            ),
+        )
+        return longest_low_conf_span > max_failure_span
+
+    @staticmethod
+    def _safe_int(value: object, *, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return int(default)
 
     @staticmethod
     def _build_fast_direct_stream(*, words: Sequence[Any]) -> tuple[AlignmentItem, ...]:

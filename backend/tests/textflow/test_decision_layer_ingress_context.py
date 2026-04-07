@@ -647,3 +647,16 @@ def test_decision_layer_consumes_token_indexed_punctuation_facts_without_slot_ma
     assert split_idx_by_fact["fact-token-1"] == 1
     assert split_idx_by_fact["fact-token-3"] == 3
     assert split_idx_by_fact["fact-right-token-4"] == 3
+
+
+def test_decision_layer_prioritizes_speaker_change_above_sentence_end_punctuation() -> None:
+    processor = SegmentationProcessor(final_splitter=FinalSplitter())
+
+    assert (
+        processor._INGRESS_SCORING_REASON_PRIORITY["speaker_change"]
+        > processor._INGRESS_SCORING_REASON_PRIORITY["punctuation_sentence_end"]
+    )
+    assert (
+        processor._INGRESS_SCORING_REASON_BONUS["speaker_change"]
+        > processor._INGRESS_SCORING_REASON_BONUS["punctuation_sentence_end"]
+    )

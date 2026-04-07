@@ -166,6 +166,61 @@ class UnifiedSplitter:
             self._strip_sentence_end_punct(sentences)
         return sentences
 
+    def split_draft_chunk(
+        self,
+        chunk: Any,
+    ) -> List[SentenceSegment]:
+        """基于缓冲后的 timed words 重新执行统一草稿切分。"""
+        if chunk is None:
+            return []
+        text_display = str(getattr(chunk, "text", "") or "")
+        audio_range = tuple(getattr(chunk, "audio_range", (0.0, 0.0)) or (0.0, 0.0))
+        chunk_start = float(audio_range[0]) if len(audio_range) >= 1 else 0.0
+        chunk_end = float(audio_range[1]) if len(audio_range) >= 2 else chunk_start
+        words = self._build_words(
+            getattr(chunk, "word_timestamps", None),
+            logger=self.logger,
+        )
+        if not words:
+            return self._build_fallback_sentence(
+                text_display=text_display,
+                chunk_start=chunk_start,
+                chunk_end=chunk_end,
+                confidence=1.0,
+                is_final_output=False,
+            )
+
+        detected_language = str(getattr(chunk, "language", "") or "auto")
+        punctuation_result = getattr(chunk, "punctuation_result", None)
+        punct_positions = list(getattr(punctuation_result, "punctuation_positions", ()) or ())
+        punct_clean_text = (
+            str(getattr(punctuation_result, "text", "") or "").strip()
+            or text_display
+            or None
+        )
+        self._draft_splitter.set_language(detected_language)
+        if self.draft_config.keep_sentence_end_punct:
+            words = self._inject_punctuation_into_words(words, punct_clean_text, punct_positions)
+        sentences = self._draft_splitter.split(
+            words,
+            clean_text=punct_clean_text,
+            punctuation_positions=punct_positions,
+        )
+        sentences = self._merge_short_sentences(sentences, detected_language)
+        self._apply_sentence_flags(
+            sentences,
+            chunk_start=0.0,
+            is_final_output=False,
+        )
+        speaker_id = getattr(chunk, "speaker_id", None)
+        if speaker_id is not None:
+            for sentence in sentences:
+                if getattr(sentence, "speaker_id", None) is None:
+                    sentence.speaker_id = speaker_id
+        if not self.draft_config.keep_sentence_end_punct:
+            self._strip_sentence_end_punct(sentences)
+        return sentences
+
     def _merge_short_sentences(
         self,
         sentences: List[SentenceSegment],
@@ -375,7 +430,7 @@ class UnifiedSplitter:
 
     @staticmethod
     def _build_words(
-        words_data: Optional[Sequence[Dict[str, Any]]],
+        words_data: Optional[Sequence[Any]],
         *,
         logger: Optional[logging.Logger] = None,
     ) -> List[WordTimestamp]:
@@ -400,6 +455,21 @@ class UnifiedSplitter:
 
         words: List[WordTimestamp] = []
         for word in words_data:
+            if isinstance(word, WordTimestamp):
+                words.append(
+                    WordTimestamp(
+                        word=str(word.word or ""),
+                        start=_to_float(word.start, 0.0),
+                        end=_to_float(word.end, 0.0),
+                        confidence=word.confidence,
+                        confidence_raw=word.confidence_raw,
+                        confidence_display_raw=word.confidence_display_raw,
+                        confidence_source=word.confidence_source,
+                        token_type=word.token_type,
+                        is_pseudo=word.is_pseudo,
+                    )
+                )
+                continue
             if not isinstance(word, dict):
                 continue
             words.append(
@@ -410,7 +480,9 @@ class UnifiedSplitter:
                     confidence=_to_float(word.get("confidence", 1.0), 1.0),
                     confidence_raw=word.get("confidence_raw"),
                     confidence_display_raw=word.get("confidence_display_raw"),
+                    confidence_source=word.get("confidence_source"),
                     token_type=word.get("token_type"),
+                    is_pseudo=bool(word.get("is_pseudo", False)),
                 )
             )
         return words

@@ -1953,8 +1953,9 @@ class AsyncDualPipelineKernel:
 
         total_sentences = 0
         chunk_ref_seen: Dict[str, int] = {}
+        all_sentences: List[SentenceSegment] = []
         for chunk in chunks:
-            sentences = chunk.sentences
+            sentences = self._draft_segmenter.unified_splitter.split_draft_chunk(chunk)
             base_chunk_ref = self._resolve_semantic_chunk_ref(
                 chunk=chunk,
                 fallback_chunk_index=ctx.chunk_index,
@@ -1966,12 +1967,13 @@ class AsyncDualPipelineKernel:
             )
             self.subtitle_manager.add_draft_sentences(chunk_ref, sentences)
             total_sentences += len(sentences)
+            all_sentences.extend(sentences)
         self.logger.debug(
             "Chunk {}: SemanticBuffer 草稿推送 ({} 个句子)",
             ctx.chunk_index,
             total_sentences,
         )
-        return [sentence for chunk in chunks for sentence in chunk.sentences]
+        return all_sentences
 
     async def _ingest_bridge_chunks(self, chunks: List[SemanticChunk]) -> None:
         """将语义 Chunk 送入 Bridge 控制器，更新提示词缓存。"""
@@ -2897,7 +2899,7 @@ class AsyncDualPipelineKernel:
         total_sentences = 0
         chunk_ref_seen: Dict[str, int] = {}
         for chunk in chunks:
-            sentences = chunk.sentences
+            sentences = self._draft_segmenter.unified_splitter.split_draft_chunk(chunk)
             base_chunk_ref = self._resolve_semantic_chunk_ref(
                 chunk=chunk,
                 fallback_chunk_index=chunk_index,

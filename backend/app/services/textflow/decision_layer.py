@@ -101,8 +101,8 @@ class SegmentationProcessor:
     _INGRESS_SCORING_MIN_ADJACENT_BOUNDARY_GAP_SEC = 0.22
     _INGRESS_SCORING_MIN_ADJACENT_BOUNDARY_GAP_CJK_SEC = 0.16
     _INGRESS_SCORING_REASON_BONUS = {
+        "speaker_change": 0.24,
         "punctuation_sentence_end": 0.20,
-        "speaker_change": 0.14,
         "gap_pause": 0.10,
         "blank_valley": 0.05,
         "pause_long": 0.05,
@@ -112,8 +112,8 @@ class SegmentationProcessor:
         "anchor_block_close": -0.02,
     }
     _INGRESS_SCORING_REASON_PRIORITY = {
+        "speaker_change": 110,
         "punctuation_sentence_end": 100,
-        "speaker_change": 90,
         "gap_pause": 80,
         "blank_valley": 70,
         "pause_long": 65,

@@ -271,8 +271,9 @@ class FinalSplitter:
                     backtrack_split_blocked_count += 1
                     continue
                 if not is_semantic_boundary and self._should_block_pause_split(words, start_idx, idx):
-                    pause_split_blocked_count += 1
-                    continue
+                    if self._pause_gap_duration(words, idx) < self.config.long_pause:
+                        pause_split_blocked_count += 1
+                        continue
                 segments.append(self._build_sentence(words, start_idx, idx))
                 start_idx = idx + 1
                 last_candidate_idx = None
@@ -636,6 +637,14 @@ class FinalSplitter:
             soft_pause=self.config.soft_pause,
             long_pause=self.config.long_pause,
         )
+
+    def _pause_gap_duration(self, words: List[WordTimestamp], idx: int) -> float:
+        next_idx = self._next_real_word_index(words, idx)
+        if next_idx is None or next_idx >= len(words):
+            return 0.0
+        left_end = float(getattr(words[idx], "end", 0.0) or 0.0)
+        right_start = float(getattr(words[next_idx], "start", left_end) or left_end)
+        return max(0.0, right_start - left_end)
 
     def _is_temporal_backtrack_boundary(self, words: List[WordTimestamp], idx: int) -> bool:
         """时间回退守门：右词起点明显早于左侧边界时，阻断该切点。"""

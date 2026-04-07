@@ -523,6 +523,65 @@ def test_alignment_stage_mode_default_commits_fast_direct_when_selected_fast_rej
     remove_streaming_subtitle_manager(job_id)
 
 
+def test_alignment_stage_mode_default_commits_fast_direct_when_long_low_confidence_span_rejected(
+    monkeypatch,
+) -> None:
+    job_id = "test_phase7_route_default_low_confidence_fast_timed_final"
+    pipeline = _build_pipeline(job_id, mode="default")
+    _patch_common_alignment_inputs(monkeypatch=monkeypatch, pipeline=pipeline)
+
+    monkeypatch.setattr(
+        pipeline,
+        "_run_collection_scoring_decision_once",
+        Mock(side_effect=AssertionError("Chunk 1 只验证路由，不应回落 legacy 四层")),
+    )
+    stage_result = SimpleNamespace(
+        alignment_path=SimpleNamespace(aligned_tokens=(SimpleNamespace(source_chunk_ids=("chunk-0",)),)),
+        alignment_report=SimpleNamespace(
+            route="alignment_path",
+            failure_semantic="alignment_low_confidence",
+            metadata={
+                "longest_low_conf_span": 9,
+                "thresholds": {"max_continuous_failure_span": 6},
+            },
+        ),
+    )
+    timeanchored_run = Mock(return_value=stage_result)
+    commit_timeanchored = Mock()
+    commit_fast_direct = Mock()
+    commit_slow_fallback = Mock()
+    record = Mock()
+    monkeypatch.setattr(pipeline._alignment_stage_service, "_run_timeanchored_main_chain", timeanchored_run)
+    monkeypatch.setattr(
+        pipeline._alignment_stage_service,
+        "_commit_timeanchored_main_chain_result",
+        commit_timeanchored,
+    )
+    monkeypatch.setattr(
+        pipeline._alignment_stage_service,
+        "_commit_fast_direct_result",
+        commit_fast_direct,
+    )
+    monkeypatch.setattr(
+        pipeline._alignment_stage_service,
+        "_commit_slow_text_fallback_result",
+        commit_slow_fallback,
+        raising=False,
+    )
+    monkeypatch.setattr(pipeline._alignment_stage_service, "_record_hetero_alignment_result", record)
+
+    ctx = _build_ctx(job_id)
+    asyncio.run(pipeline._run_alignment_stage(ctx))
+
+    assert timeanchored_run.call_count == 1
+    assert commit_timeanchored.call_count == 0
+    assert commit_fast_direct.call_count == 1
+    assert commit_fast_direct.call_args.kwargs["reason"] == "default_alignment_low_confidence"
+    assert commit_slow_fallback.call_count == 0
+    assert record.call_count == 1
+    remove_streaming_subtitle_manager(job_id)
+
+
 def test_alignment_stage_sensevoice_only_commits_fast_direct_when_timeanchored_rejects_slow(
     monkeypatch,
 ) -> None:
@@ -588,6 +647,108 @@ def test_alignment_stage_sensevoice_only_commits_fast_direct_when_timeanchored_r
     remove_streaming_subtitle_manager(job_id)
 
 
+def test_commit_fast_direct_result_emits_sentence_records_from_decision_output(monkeypatch) -> None:
+    job_id = "test_phase7_fast_direct_emits_sentence_records"
+    pipeline = _build_pipeline(job_id, mode="default")
+    ctx = _build_ctx(job_id)
+    decision_sentence = SentenceSegment(
+        text="Wouldn't it make sense",
+        text_clean="Wouldn't it make sense",
+        start=0.0,
+        end=0.8,
+        words=[],
+    )
+    decision_output = SimpleNamespace(
+        sentence_segments=[decision_sentence],
+        output_traces=[],
+        segmentation_report={"boundary_score_stats": {"force_split_count": 0.0}},
+        sentence_records=[SimpleNamespace(sentence_id="sr-1")],
+        chunk_sentence_indices=[SimpleNamespace(chunk_id="chunk-0")],
+        subtitle_batch=None,
+    )
+    decision_process = Mock(return_value=decision_output)
+    emit_output_layer = Mock(return_value=SimpleNamespace(output_payload={"errors": []}))
+
+    monkeypatch.setattr(
+        pipeline,
+        "_run_collection_scoring_decision_once",
+        Mock(side_effect=AssertionError("fast timed final 不应再回落 legacy 四层")),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_decision_processor",
+        SimpleNamespace(process=decision_process),
+    )
+    monkeypatch.setattr(pipeline, "_is_last_chunk_index", Mock(return_value=False))
+    monkeypatch.setattr(pipeline, "_emit_output_layer", emit_output_layer)
+    monkeypatch.setattr(pipeline, "_update_soft_cut_observability", Mock(return_value={}))
+    monkeypatch.setattr(pipeline, "_resolve_sentence_confidence_source", Mock(return_value="fast"))
+    monkeypatch.setattr(pipeline, "_assign_sentence_identity_by_timeline_overlap", Mock())
+    monkeypatch.setattr(pipeline, "_normalize_output_traces_for_sentences", Mock(return_value=[]))
+
+    pipeline._alignment_stage_service._commit_fast_direct_result(
+        ctx=ctx,
+        sv_result=ctx.sv_result,
+        reason="test_fast_direct",
+    )
+
+    assert decision_process.call_count == 1
+    assert emit_output_layer.call_count == 1
+    assert emit_output_layer.call_args.kwargs["sentence_records"] == decision_output.sentence_records
+    assert ctx.final_sentences
+    remove_streaming_subtitle_manager(job_id)
+
+
+def test_commit_fast_direct_result_rejects_empty_sentence_records(monkeypatch) -> None:
+    job_id = "test_phase7_fast_direct_rejects_empty_sentence_records"
+    pipeline = _build_pipeline(job_id, mode="default")
+    ctx = _build_ctx(job_id)
+    decision_output = SimpleNamespace(
+        sentence_segments=[
+            SentenceSegment(
+                text="Wouldn't it make sense",
+                text_clean="Wouldn't it make sense",
+                start=0.0,
+                end=0.8,
+                words=[],
+            )
+        ],
+        output_traces=[],
+        segmentation_report={"boundary_score_stats": {}},
+        sentence_records=[],
+        chunk_sentence_indices=[],
+        subtitle_batch=None,
+    )
+    emit_output_layer = Mock(return_value=SimpleNamespace(output_payload={"errors": []}))
+
+    monkeypatch.setattr(
+        pipeline,
+        "_run_collection_scoring_decision_once",
+        Mock(side_effect=AssertionError("fast timed final 不应再回落 legacy 四层")),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_decision_processor",
+        SimpleNamespace(process=Mock(return_value=decision_output)),
+    )
+    monkeypatch.setattr(pipeline, "_is_last_chunk_index", Mock(return_value=False))
+    monkeypatch.setattr(pipeline, "_emit_output_layer", emit_output_layer)
+    monkeypatch.setattr(pipeline, "_update_soft_cut_observability", Mock(return_value={}))
+    monkeypatch.setattr(pipeline, "_resolve_sentence_confidence_source", Mock(return_value="fast"))
+    monkeypatch.setattr(pipeline, "_assign_sentence_identity_by_timeline_overlap", Mock())
+    monkeypatch.setattr(pipeline, "_normalize_output_traces_for_sentences", Mock(return_value=[]))
+
+    with pytest.raises(ValueError, match="sentence_records"):
+        pipeline._alignment_stage_service._commit_fast_direct_result(
+            ctx=ctx,
+            sv_result=ctx.sv_result,
+            reason="test_fast_direct_empty_sentence_records",
+        )
+
+    assert emit_output_layer.call_count == 0
+    remove_streaming_subtitle_manager(job_id)
+
+
 def test_should_accept_timeanchored_default_rejects_error_route() -> None:
     stage_result = SimpleNamespace(
         alignment_path=None,
@@ -628,6 +789,27 @@ def test_should_accept_timeanchored_default_accepts_valid_result_without_final_s
 
     assert accepted is True
     assert reason == "default_gate_pass"
+
+
+def test_should_accept_timeanchored_default_rejects_long_low_confidence_span() -> None:
+    stage_result = SimpleNamespace(
+        alignment_path=SimpleNamespace(aligned_tokens=(object(), object())),
+        alignment_report=SimpleNamespace(
+            route="alignment_path",
+            failure_semantic="alignment_low_confidence",
+            metadata={
+                "longest_low_conf_span": 9,
+                "thresholds": {"max_continuous_failure_span": 6},
+            },
+        ),
+    )
+    accepted, reason = AlignmentStageService._should_accept_timeanchored_result(
+        stage_result=stage_result,
+        mode="default",
+    )
+
+    assert accepted is False
+    assert reason == "default_alignment_low_confidence"
 
 
 def test_alignment_stage_emits_punctuation_chain_health_metrics() -> None:
