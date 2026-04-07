@@ -12,7 +12,8 @@ from app.services.timeanchored_alignment.contracts import (
     TimeBaseQuality,
     TimeBaseUnit,
 )
-from app.services.timeanchored_alignment.decoder.contracts import DecoderShadowResult
+from app.services.timeanchored_alignment.decoder.contracts import DecoderPath, DecoderShadowResult, DecoderStep
+from app.services.timeanchored_alignment.decoder.local_repair import LocalRepair
 from app.services.timeanchored_alignment.decoder.service import AlignmentDecoderService
 from app.services.timeanchored_alignment.preparation.assembler import AlignmentPreparationAssembler
 from app.services.timeanchored_alignment.slow_window.contracts import (
@@ -385,6 +386,63 @@ def test_phase3_decoder_keeps_alignment_path_route_when_only_failure_semantic_is
     assert result.alignment_path is not None
     assert result.alignment_report.route == "alignment_path"
     assert result.alignment_report.failure_semantic == "alignment_low_confidence"
+
+
+def test_phase3_local_repair_interpolates_null_span_between_real_anchors() -> None:
+    preparation = _build_preparation_bundle()
+    decode_path = DecoderPath(
+        steps=(
+            DecoderStep(
+                token_index=0,
+                slice_index=0,
+                score=0.9,
+                confidence=0.9,
+                lexical_exact=True,
+                synthetic=False,
+                metadata={"slice_start": 0.0, "slice_end": 0.1, "match_kind": "direct"},
+            ),
+            DecoderStep(
+                token_index=1,
+                slice_index=1,
+                score=0.16,
+                confidence=0.16,
+                lexical_exact=False,
+                synthetic=True,
+                metadata={"slice_start": None, "slice_end": None, "match_kind": "null", "synthetic_reason": "null_align"},
+            ),
+            DecoderStep(
+                token_index=2,
+                slice_index=2,
+                score=0.16,
+                confidence=0.16,
+                lexical_exact=False,
+                synthetic=True,
+                metadata={"slice_start": None, "slice_end": None, "match_kind": "null", "synthetic_reason": "null_align"},
+            ),
+            DecoderStep(
+                token_index=3,
+                slice_index=3,
+                score=0.9,
+                confidence=0.9,
+                lexical_exact=True,
+                synthetic=False,
+                metadata={"slice_start": 1.1, "slice_end": 1.2, "match_kind": "direct"},
+            ),
+        ),
+        total_score=2.12,
+        matched_token_count=2,
+        direct_token_count=2,
+        coverage_ratio=0.5,
+        direct_ratio=0.5,
+    )
+
+    repaired = LocalRepair().repair(preparation=preparation, decode_path=decode_path)
+
+    assert repaired.steps[1].metadata["resolved_start"] == 0.1
+    assert repaired.steps[1].metadata["resolved_end"] == 0.6
+    assert repaired.steps[2].metadata["resolved_start"] == 0.6
+    assert repaired.steps[2].metadata["resolved_end"] == 1.1
+    assert repaired.steps[2].metadata["repair_reason"] == "bounded_span_interpolation"
 
 
 def test_phase3_alignment_stage_writes_decoder_shadow_trace_and_diff(tmp_path: Path) -> None:
