@@ -286,6 +286,7 @@ import AdvancedSettings from '@/components/editor/AdvancedSettings.vue'
 import { useTaskUpload } from '@/composables/task-list/useTaskUpload'
 import { useTaskThumbnail } from '@/composables/task-list/useTaskThumbnail'
 import { navigateToEditor } from '@/utils/editorNavigation'
+import { IS_LITE } from '@/config/flavor'
 
 const DISPLAY_MODE_KEY = 'task-ui-display-mode'
 const SORT_MODE_KEY = 'task-ui-sort-mode'
@@ -608,6 +609,17 @@ function loadTaskUiPreferences() {
   }
 }
 
+async function syncLiteTasksIfNeeded() {
+  if (!IS_LITE) {
+    return
+  }
+  try {
+    await taskStore.syncTasksFromBackend()
+  } catch (error) {
+    console.warn('[TaskListView] Lite 任务列表同步失败:', error)
+  }
+}
+
 watch(displayMode, (value) => {
   localStorage.setItem(DISPLAY_MODE_KEY, value)
 })
@@ -755,8 +767,9 @@ async function loadCustomPresets() {
 
 loadCustomPresets()
 
-onMounted(() => {
+onMounted(async () => {
   loadTaskUiPreferences()
+  await syncLiteTasksIfNeeded()
   if (route.query.action === 'import') {
     showImportDialog.value = true
     const nextQuery = { ...route.query }
@@ -785,8 +798,9 @@ function openAdvancedSettingsDialog() {
 }
 
 // 导入成功后跳转编辑器
-function handleImportSuccess(projectId) {
+async function handleImportSuccess(projectId) {
   showImportDialog.value = false
+  await taskStore.syncTasksFromBackend()
   router.push(`/editor/project/${projectId}`)
 }
 

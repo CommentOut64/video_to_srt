@@ -96,6 +96,20 @@ function startPeriodicSync() {
   }, 60000)
 }
 
+async function syncTaskListOnStartup() {
+  console.log('[App] 步骤 2: 从后端同步任务列表...')
+  try {
+    const syncSuccess = await taskStore.syncTasksFromBackend()
+    if (syncSuccess) {
+      console.log('[App] 任务列表同步成功')
+    } else {
+      console.warn('[App] 任务列表同步失败，将使用本地 localStorage 数据')
+    }
+  } catch (error) {
+    console.error('[App] 任务列表同步异常:', error)
+  }
+}
+
 onMounted(async () => {
   console.log('[App] 应用已挂载，执行初始化')
 
@@ -111,7 +125,8 @@ onMounted(async () => {
   // V3.1.1+dev.20260106.01: 启动时检查更新（每个会话只检查一次，不阻塞其他初始化）
   checkUpdateOnStartup()
 
-  // V3.2.5+dev.20260321.01: Lite 模式无转录能力，跳过全局 SSE / 任务同步 / 兜底定时器
+  // V3.2.5+dev.20260321.01: Lite 模式无转录能力，跳过全局 SSE 与兜底定时器，
+  // 但仍需执行一次 HTTP 同步，把 project-only 卡片恢复到任务页。
   if (!IS_LITE) {
     // 第一步：订阅全局 SSE 事件流（先订阅避免和 HTTP 同步竞态）
     console.log('[App] 步骤 1: 订阅全局 SSE 事件流...')
@@ -294,22 +309,13 @@ onMounted(async () => {
     })
 
     // 第二步：HTTP 同步任务列表（兜底，避免漏事件）
-    console.log('[App] 步骤 2: 从后端同步任务列表...')
-    try {
-      const syncSuccess = await taskStore.syncTasksFromBackend()
-      if (syncSuccess) {
-        console.log('[App] 任务列表同步成功')
-      } else {
-        console.warn('[App] 任务列表同步失败，将使用本地 localStorage 数据')
-      }
-    } catch (error) {
-      console.error('[App] 任务列表同步异常:', error)
-    }
+    await syncTaskListOnStartup()
 
     // 第三步：启动低频兜底同步
     startPeriodicSync()
   } else {
-    console.log('[App] Lite 模式: 跳过全局 SSE 订阅与任务同步')
+    console.log('[App] Lite 模式: 跳过全局 SSE 订阅，保留一次任务同步')
+    await taskStore.syncTasksFromBackend()
   }
 })
 
