@@ -64,18 +64,26 @@
         @mousedown="handleSubtitleMouseDown"
       >
         <!-- 左上角：方向切换按钮 -->
-        <button class="subtitle-control-btn direction-btn" @click.stop="toggleSubtitleDirection" title="切换方向">
-          <svg viewBox="0 0 24 24" fill="currentColor">
-            <path d="M9 4v3h5v12h3V7h5V4H9zm-6 8h3v7h3v-7h3V9H3v3z"/>
-          </svg>
-        </button>
+        <el-popover content="切换方向" placement="top" trigger="hover" popper-class="hint-popover-compact" :show-after="500">
+          <template #reference>
+            <button class="subtitle-control-btn direction-btn" @click.stop="toggleSubtitleDirection">
+              <svg viewBox="0 0 24 24" fill="currentColor">
+                <path d="M9 4v3h5v12h3V7h5V4H9zm-6 8h3v7h3v-7h3V9H3v3z"/>
+              </svg>
+            </button>
+          </template>
+        </el-popover>
 
         <!-- 右上角：重置按钮 -->
-        <button class="subtitle-control-btn reset-btn" @click.stop="resetSubtitlePosition" title="重置位置">
-          <svg viewBox="0 0 24 24" fill="currentColor">
-            <path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/>
-          </svg>
-        </button>
+        <el-popover content="重置位置" placement="top" trigger="hover" popper-class="hint-popover-compact" :show-after="500">
+          <template #reference>
+            <button class="subtitle-control-btn reset-btn" @click.stop="resetSubtitlePosition">
+              <svg viewBox="0 0 24 24" fill="currentColor">
+                <path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/>
+              </svg>
+            </button>
+          </template>
+        </el-popover>
 
         <span class="subtitle-text">{{ currentSubtitleText }}</span>
       </div>
@@ -155,6 +163,7 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, inject } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
 import { usePlaybackStore } from '@/stores/playbackStore'
+import { useEditorProjectionBridge } from '@/stores/editor/editorProjectionBridge'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { ProxyState } from '@/composables/useProxyVideo'
 
@@ -184,6 +193,7 @@ const emit = defineEmits(['loaded', 'error', 'play', 'pause', 'timeupdate', 'end
 // Store
 const projectStore = useProjectStore()
 const playbackStore = usePlaybackStore()
+const editorProjectionBridge = useEditorProjectionBridge()
 
 // 全局播放管理器（单例）
 const playbackManager = usePlaybackManager()
@@ -299,7 +309,9 @@ const canUpgrade = computed(() => {
   return props.currentResolution === '360p' && !props.isUpgrading && !props.autoTrigger720p
 })
 
-const currentSubtitleText = computed(() => projectStore.currentSubtitle?.text || '')
+const currentSubtitleText = computed(() => {
+  return editorProjectionBridge.currentSubtitle?.text || ''
+})
 const isPlaying = computed(() => playbackStore.isPlaying)
 
 // 字幕样式（控制位置）

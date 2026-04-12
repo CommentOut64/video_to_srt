@@ -12,6 +12,7 @@ V3.2.0+dev.20260209.01
 import os
 import sys
 import json
+import hashlib
 import shutil
 import zipfile
 import tempfile
@@ -26,6 +27,27 @@ from datetime import datetime
 logger = logging.getLogger("launcher.updater")
 
 
+def _windows_hidden_subprocess_kwargs() -> Dict[str, Any]:
+    """Windows 下子进程无窗口参数。"""
+    if os.name != "nt":
+        return {}
+
+    kwargs: Dict[str, Any] = {}
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if creationflags:
+        kwargs["creationflags"] = creationflags
+
+    startupinfo_cls = getattr(subprocess, "STARTUPINFO", None)
+    startf_use_showwindow = getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+    sw_hide = getattr(subprocess, "SW_HIDE", 0)
+    if startupinfo_cls and startf_use_showwindow:
+        startupinfo = startupinfo_cls()
+        startupinfo.dwFlags |= startf_use_showwindow
+        startupinfo.wShowWindow = sw_hide
+        kwargs["startupinfo"] = startupinfo
+    return kwargs
+
+
 @dataclass
 class UpdateInfo:
     """更新信息"""
@@ -33,6 +55,11 @@ class UpdateInfo:
     download_url: str
     changelog: str = ""
     size: int = 0
+    profile: str = ""
+    flavor: str = ""
+    channel: str = ""
+    sha256: str = ""
+    manifest_url: str = ""
     is_launcher_update: bool = False
 
 
@@ -61,7 +88,7 @@ class SelfUpdater:
         'tools/python', '.venv', 'node_modules', '.git',
         'backend/models', 'backend/app/assets', 'data'
     }
-    DEFAULT_EXCLUDE_FILES = {'.env', 'uv.lock'}
+    DEFAULT_EXCLUDE_FILES = {'.env'}
 
     def __init__(self, project_root: Path):
         self.project_root = project_root
@@ -83,6 +110,11 @@ class SelfUpdater:
                 download_url=data.get('download_url', ''),
                 changelog=data.get('changelog', ''),
                 size=data.get('size', 0),
+                profile=data.get('profile', ''),
+                flavor=data.get('flavor', ''),
+                channel=data.get('channel', ''),
+                sha256=data.get('sha256', ''),
+                manifest_url=data.get('manifest_url', ''),
                 is_launcher_update=data.get('is_launcher_update', False)
             )
         except Exception as e:
@@ -98,7 +130,7 @@ class SelfUpdater:
             except Exception as e:
                 logger.error(f"清除更新信号失败: {e}")
 
-    def _load_exclude_config(self) -> Tuple[Set[str], Set[str]]:
+    def _load_exclude_config(self, update_info: Optional[UpdateInfo] = None) -> Tuple[Set[str], Set[str]]:
         """加载排除配置"""
         exclude_dirs = self.DEFAULT_EXCLUDE_DIRS.copy()
         exclude_files = self.DEFAULT_EXCLUDE_FILES.copy()
@@ -115,17 +147,76 @@ class SelfUpdater:
             if 'exclude_files' in config:
                 exclude_files = set(config['exclude_files'])
 
-            return exclude_dirs, exclude_files
+            return self._apply_profile_exclude_policy(exclude_dirs, exclude_files, update_info)
         except Exception as e:
             logger.warning(f"加载排除配置失败: {e}")
-            return self.DEFAULT_EXCLUDE_DIRS.copy(), self.DEFAULT_EXCLUDE_FILES.copy()
+            return self._apply_profile_exclude_policy(
+                self.DEFAULT_EXCLUDE_DIRS.copy(),
+                self.DEFAULT_EXCLUDE_FILES.copy(),
+                update_info,
+            )
 
-    def download_update(self, url: str, progress_callback=None) -> Optional[Path]:
+    def _apply_profile_exclude_policy(
+        self,
+        exclude_dirs: Set[str],
+        exclude_files: Set[str],
+        update_info: Optional[UpdateInfo],
+    ) -> Tuple[Set[str], Set[str]]:
+        """
+        根据 profile 调整排除规则。
+
+        设计取舍：
+        - 默认行为保持不变（仍排除 `.venv/tools`），确保旧更新包兼容。
+        - 当信号文件携带 profile/channel 时，按“分发系统重构”策略允许运行时目录更新，
+          解决 Lite 依赖变更无法生效的问题。
+        """
+        if update_info is None:
+            return exclude_dirs, exclude_files
+
+        profile = str(update_info.profile or "").strip().lower()
+        channel = str(update_info.channel or "").strip().lower()
+        if profile == "" and channel == "":
+            return exclude_dirs, exclude_files
+
+        for path in (".venv", "tools", "tools/python"):
+            exclude_dirs.discard(path)
+        logger.info(
+            "按 profile 更新排除策略已启用: profile=%s channel=%s，允许更新 .venv/tools",
+            profile or "<unknown>",
+            channel or "<unknown>",
+        )
+        return exclude_dirs, exclude_files
+
+    def _verify_download_integrity(self, zip_path: Path, update_info: UpdateInfo) -> bool:
+        """按 signal 中的 size/sha256 执行可选完整性校验。"""
+        expected_size = int(update_info.size or 0)
+        expected_sha256 = str(update_info.sha256 or "").strip().lower()
+        actual_size = zip_path.stat().st_size
+        if expected_size > 0 and actual_size != expected_size:
+            logger.error("更新包大小校验失败: expected=%s actual=%s", expected_size, actual_size)
+            return False
+
+        if expected_sha256:
+            hasher = hashlib.sha256()
+            with open(zip_path, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    hasher.update(chunk)
+            actual_sha256 = hasher.hexdigest().lower()
+            if actual_sha256 != expected_sha256:
+                logger.error(
+                    "更新包哈希校验失败: expected=%s actual=%s",
+                    expected_sha256,
+                    actual_sha256,
+                )
+                return False
+        return True
+
+    def download_update(self, update_info: UpdateInfo, progress_callback=None) -> Optional[Path]:
         """
         下载更新包
 
         Args:
-            url: 下载地址
+            update_info: 更新信息（包含下载地址与可选校验信息）
             progress_callback: 进度回调 (message, progress)
 
         Returns:
@@ -146,7 +237,12 @@ class SelfUpdater:
                     total = total_size / 1024 / 1024
                     progress_callback(f"下载中: {downloaded:.1f}/{total:.1f} MB", progress)
 
-            urllib.request.urlretrieve(url, str(zip_path), report_hook)
+            urllib.request.urlretrieve(update_info.download_url, str(zip_path), report_hook)
+
+            if not self._verify_download_integrity(zip_path, update_info):
+                logger.error("更新包完整性校验失败，终止应用更新")
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                return None
 
             if progress_callback:
                 progress_callback("下载完成，正在解压...", 0.6)
@@ -181,7 +277,12 @@ class SelfUpdater:
             logger.error(f"解压更新失败: {e}")
             return None
 
-    def apply_update(self, source_dir: Path, progress_callback=None) -> UpdateResult:
+    def apply_update(
+        self,
+        source_dir: Path,
+        update_info: Optional[UpdateInfo] = None,
+        progress_callback=None,
+    ) -> UpdateResult:
         """
         应用更新
 
@@ -195,7 +296,7 @@ class SelfUpdater:
         if progress_callback:
             progress_callback("正在应用更新...", 0.8)
 
-        exclude_dirs, exclude_files = self._load_exclude_config()
+        exclude_dirs, exclude_files = self._load_exclude_config(update_info)
 
         try:
             copied, skipped = self._copy_with_excludes(
@@ -301,7 +402,8 @@ class SelfUpdater:
             logger.info("启动新版本启动器...")
             subprocess.Popen(
                 [str(current_exe), "--cleanup-old"],
-                cwd=str(current_exe.parent)
+                cwd=str(current_exe.parent),
+                **_windows_hidden_subprocess_kwargs(),
             )
 
             # Step 5: 退出当前进程
@@ -360,7 +462,7 @@ class SelfUpdater:
     def execute_update(self, update_info: UpdateInfo, progress_callback=None) -> UpdateResult:
         """执行完整的更新流程"""
         # 1. 下载
-        zip_path = self.download_update(update_info.download_url, progress_callback)
+        zip_path = self.download_update(update_info, progress_callback)
         if not zip_path:
             return UpdateResult(success=False, message="下载更新失败")
 
@@ -378,7 +480,7 @@ class SelfUpdater:
                     logger.info("启动器更新已暂存，将在下次启动时应用")
 
             # 4. 应用其他更新
-            result = self.apply_update(source_dir, progress_callback)
+            result = self.apply_update(source_dir, update_info, progress_callback)
 
             # 5. 清理
             self.clear_signal()

@@ -6,10 +6,13 @@ from __future__ import annotations
 
 import logging
 import json
+import shutil
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.core.config import FLAVOR
@@ -19,8 +22,12 @@ from app.services.subtitle_doc_service import get_subtitle_doc_service
 from app.services.subtitle_edit_store import (
     add_deletion,
     create_manual_entry,
+    get_edit_store_path,
     load_deleted_indices,
     load_edits,
+    remove_deletion,
+    remove_manual_entry,
+    restore_manual_entry,
     save_edit,
 )
 from app.services.sse_service import get_sse_manager
@@ -29,6 +36,16 @@ from app.utils.text_utils import segments_to_srt
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/projects", tags=["projects"])
+_SUPPRESS_PROJECT_SUBTITLE_EVENTS: ContextVar[bool] = ContextVar(
+    "suppress_project_subtitle_events",
+    default=False,
+)
+
+# V3.2.4+dev.20260304.12: 统一导入媒体格式白名单，保持前后端一致。
+SUPPORTED_IMPORT_MEDIA_EXTENSIONS = frozenset(
+    FileManagementService.VIDEO_EXTENSIONS | FileManagementService.AUDIO_EXTENSIONS
+)
+MEDIA_UPLOAD_CHUNK_SIZE = 1024 * 1024
 
 
 class ProjectTitleUpdateRequest(BaseModel):
@@ -53,6 +70,41 @@ class SubtitleUpdateRequest(BaseModel):
     end: Optional[float] = Field(default=None, ge=0.0)
 
 
+# V3.2.4+dev.20260303.01: undo/redo 批量同步请求模型
+
+
+class BatchSyncUpdateItem(BaseModel):
+    segment_id: str = Field(..., min_length=1)
+    text: Optional[str] = None
+    start: Optional[float] = Field(default=None, ge=0.0)
+    end: Optional[float] = Field(default=None, ge=0.0)
+
+
+class BatchSyncCreateItem(BaseModel):
+    text: str = Field(default="")
+    start: float = Field(..., ge=0.0)
+    end: float = Field(..., ge=0.0)
+    restore_segment_id: Optional[str] = Field(default=None)
+
+
+class BatchSyncDeleteItem(BaseModel):
+    segment_id: str = Field(..., min_length=1)
+
+
+class BatchSyncRequest(BaseModel):
+    updates: list[BatchSyncUpdateItem] = Field(default_factory=list)
+    creates: list[BatchSyncCreateItem] = Field(default_factory=list)
+    deletes: list[BatchSyncDeleteItem] = Field(default_factory=list)
+
+
+class EditorOpsApplyRequest(BaseModel):
+    """批量编辑命令请求。"""
+
+    session_id: str = Field(..., min_length=1)
+    base_revision: Optional[int] = Field(default=None, ge=0)
+    ops: list[dict[str, Any]] = Field(default_factory=list, min_length=1)
+
+
 class ProjectSubtitleTimeOffsetRequest(BaseModel):
     """项目字幕时间偏移请求。"""
 
@@ -65,6 +117,8 @@ class ProjectSubtitleTimeOffsetRequest(BaseModel):
 
 
 def _publish_project_subtitle_event(project_id: str, event_type: str, data: dict) -> None:
+    if _SUPPRESS_PROJECT_SUBTITLE_EVENTS.get():
+        return
     sse_manager = get_sse_manager()
     sse_manager.broadcast_sync(f"project:{project_id}", f"subtitle.{event_type}", data)
 
@@ -109,11 +163,744 @@ def _read_local_file(path: str) -> str:
     return _decode_upload_content(raw_bytes)
 
 
+def _normalize_upload_filename(filename: str) -> str:
+    """规范化上传文件名，避免路径注入和空文件名。"""
+    normalized_name = Path(str(filename or "")).name.strip()
+    if not normalized_name:
+        raise HTTPException(status_code=400, detail="媒体文件名不能为空")
+    return normalized_name
+
+
+def _validate_import_media_extension(filename: str) -> str:
+    """校验导入媒体扩展名是否在白名单内。"""
+    suffix = Path(filename).suffix.lower()
+    if suffix not in SUPPORTED_IMPORT_MEDIA_EXTENSIONS:
+        supported = ", ".join(sorted(SUPPORTED_IMPORT_MEDIA_EXTENSIONS))
+        normalized_suffix = suffix or "<none>"
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的媒体格式: {normalized_suffix}，支持格式: {supported}",
+        )
+    return suffix
+
+
+async def _persist_uploaded_media_file(
+    upload_file: UploadFile,
+    target_path: Path,
+    chunk_size: int = MEDIA_UPLOAD_CHUNK_SIZE,
+) -> int:
+    """
+    分块写入上传媒体，避免一次性读取大文件导致内存峰值和超时放大。
+    """
+    total_written_bytes = 0
+    with target_path.open("wb") as output_fp:
+        while True:
+            chunk = await upload_file.read(chunk_size)
+            if not chunk:
+                break
+            output_fp.write(chunk)
+            total_written_bytes += len(chunk)
+    return total_written_bytes
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
     except (TypeError, ValueError):
         return float(default)
+
+
+EDITOR_OPS_STATE_FILE = ".editor_ops_state.json"
+EDITOR_OPS_STATE_VERSION = 1
+
+
+def _editor_ops_state_path(project_dir: Path) -> Path:
+    return project_dir / EDITOR_OPS_STATE_FILE
+
+
+def _load_editor_ops_state(project_dir: Path) -> dict[str, Any]:
+    state_path = _editor_ops_state_path(project_dir)
+    if not state_path.exists():
+        return {
+            "version": EDITOR_OPS_STATE_VERSION,
+            "server_revision": 0,
+            "sessions": {},
+        }
+
+    try:
+        with state_path.open("r", encoding="utf-8") as file:
+            payload = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        logger.warning("editor-ops 状态文件损坏，已重建: %s", state_path)
+        return {
+            "version": EDITOR_OPS_STATE_VERSION,
+            "server_revision": 0,
+            "sessions": {},
+        }
+
+    server_revision = payload.get("server_revision", 0)
+    sessions = payload.get("sessions", {})
+    return {
+        "version": EDITOR_OPS_STATE_VERSION,
+        "server_revision": int(server_revision) if isinstance(server_revision, int) else 0,
+        "sessions": sessions if isinstance(sessions, dict) else {},
+    }
+
+
+def _save_editor_ops_state(project_dir: Path, state: dict[str, Any]) -> None:
+    state_path = _editor_ops_state_path(project_dir)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    normalized_state = {
+        "version": EDITOR_OPS_STATE_VERSION,
+        "server_revision": int(state.get("server_revision", 0) or 0),
+        "sessions": state.get("sessions", {}),
+    }
+    with state_path.open("w", encoding="utf-8") as file:
+        json.dump(normalized_state, file, ensure_ascii=False, indent=2)
+
+
+def _backup_subtitle_edit_store(project_dir: Path) -> Optional[Path]:
+    edit_store_path = get_edit_store_path(project_dir)
+    if not edit_store_path.exists():
+        return None
+    backup_path = edit_store_path.with_suffix(f"{edit_store_path.suffix}.editor_ops.bak")
+    shutil.copy2(edit_store_path, backup_path)
+    return backup_path
+
+
+def _restore_subtitle_edit_store(project_dir: Path, backup_path: Optional[Path]) -> None:
+    edit_store_path = get_edit_store_path(project_dir)
+    if backup_path is None:
+        if edit_store_path.exists():
+            edit_store_path.unlink()
+        return
+
+    if backup_path.exists():
+        shutil.copy2(backup_path, edit_store_path)
+        backup_path.unlink(missing_ok=True)
+
+
+def _cleanup_subtitle_edit_store_backup(backup_path: Optional[Path]) -> None:
+    if backup_path is not None:
+        backup_path.unlink(missing_ok=True)
+
+
+def _error_code_for_status(status_code: int) -> str:
+    if status_code == 404:
+        return "SEGMENT_NOT_FOUND"
+    if status_code == 409:
+        return "REVISION_CONFLICT"
+    if status_code == 400:
+        return "INVALID_REQUEST"
+    return "INTERNAL_ERROR"
+
+
+def _editor_ops_error(
+    *,
+    status_code: int,
+    message: str,
+    server_revision: Optional[int] = None,
+    failed_op_id: Optional[str] = None,
+    error_code: Optional[str] = None,
+    details: Optional[dict[str, Any]] = None,
+) -> JSONResponse:
+    payload: dict[str, Any] = {
+        "success": False,
+        "error_code": error_code or _error_code_for_status(status_code),
+        "message": message,
+    }
+    if server_revision is not None:
+        payload["server_revision"] = server_revision
+    if failed_op_id:
+        payload["failed_op_id"] = failed_op_id
+    if details:
+        payload["details"] = details
+    return JSONResponse(status_code=status_code, content=payload)
+
+
+def _collect_project_segments(project_dir: Path) -> list[dict]:
+    runtime_segments = _load_runtime_subtitle_segments(project_dir)
+    if runtime_segments:
+        return _compose_runtime_segments_with_user_edits(project_dir, runtime_segments)
+    return get_subtitle_doc_service().load_segments(project_dir)
+
+
+def _sync_homophone_index_for_project_change(
+    *,
+    project_id: str,
+    project_dir: Path,
+    updated_sentence_indices: list[int] | None = None,
+    removed_sentence_indices: list[int] | None = None,
+) -> None:
+    """在 ready 索引存在时按句增量同步；无索引时静默跳过。"""
+    from app.services.homophone.project_sync import sync_project_index_delta
+
+    sync_project_index_delta(
+        project_id=project_id,
+        segments=_collect_project_segments(project_dir),
+        updated_sentence_indices=updated_sentence_indices or [],
+        removed_sentence_indices=removed_sentence_indices or [],
+    )
+
+
+def _normalize_editor_segment_id(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _resolve_editor_segment_id(
+    *,
+    project_dir: Path,
+    op: dict[str, Any],
+    request_bindings: dict[str, str],
+    segment_field: str,
+    client_ref_field: str,
+) -> Optional[str]:
+    current_segments = _collect_project_segments(project_dir)
+    client_ref_id = _normalize_editor_segment_id(op.get(client_ref_field))
+    if client_ref_id and client_ref_id in request_bindings:
+        return request_bindings[client_ref_id]
+
+    explicit_segment_id = _normalize_editor_segment_id(op.get(segment_field))
+    if explicit_segment_id:
+        existing_segment = _find_segment_by_segment_id(
+            current_segments,
+            explicit_segment_id,
+        )
+        if existing_segment is not None:
+            return explicit_segment_id
+
+    if client_ref_id:
+        existing_segment = _find_segment_by_segment_id(
+            current_segments,
+            client_ref_id,
+        )
+        if existing_segment is not None:
+            return client_ref_id
+
+    return None
+
+
+def _require_ms_field(op: dict[str, Any], container_key: str, field_key: str) -> int:
+    container = op.get(container_key)
+    if not isinstance(container, dict) or container.get(field_key) is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{container_key}.{field_key} 不能为空",
+        )
+    try:
+        return int(container[field_key])
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{container_key}.{field_key} 必须是整数毫秒",
+        ) from exc
+
+
+def _require_text_field(op: dict[str, Any], container_key: str, field_key: str = "text") -> str:
+    container = op.get(container_key)
+    if not isinstance(container, dict) or container.get(field_key) is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{container_key}.{field_key} 不能为空",
+        )
+    return str(container.get(field_key, ""))
+
+
+def _ms_to_seconds(ms: int) -> float:
+    return float(ms) / 1000.0
+
+
+def _build_updated_entity(
+    segment: dict[str, Any],
+    *,
+    client_ref_id: Optional[str],
+    revision: Optional[int] = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "client_ref_id": client_ref_id,
+        "segment_id": str(segment.get("segment_id", "") or ""),
+        "text": str(segment.get("text", "") or ""),
+        "start": _safe_float(segment.get("start"), 0.0),
+        "end": _safe_float(segment.get("end"), _safe_float(segment.get("start"), 0.0)),
+    }
+    if revision is not None:
+        payload["revision"] = revision
+    return payload
+
+
+def _build_editor_op_result(
+    *,
+    op_id: str,
+    created_bindings: Optional[list[dict[str, str]]] = None,
+    updated_entities: Optional[list[dict[str, Any]]] = None,
+    events: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    return {
+        "normalized_result": {
+            "op_id": op_id,
+            "applied": True,
+            "warnings": [],
+        },
+        "created_bindings": created_bindings or [],
+        "updated_entities": updated_entities or [],
+        "events": events or [],
+    }
+
+
+def _aggregate_editor_op_result(
+    *,
+    result_entry: dict[str, Any],
+    request_bindings: dict[str, str],
+    created_bindings: list[dict[str, str]],
+    normalized_results: list[dict[str, Any]],
+    updated_entities: list[dict[str, Any]],
+) -> None:
+    for binding in result_entry.get("created_bindings", []):
+        client_ref_id = _normalize_editor_segment_id(binding.get("client_ref_id"))
+        segment_id = _normalize_editor_segment_id(binding.get("segment_id"))
+        if client_ref_id and segment_id:
+            request_bindings[client_ref_id] = segment_id
+            created_bindings.append(
+                {
+                    "client_ref_id": client_ref_id,
+                    "segment_id": segment_id,
+                }
+            )
+    normalized_result = result_entry.get("normalized_result")
+    if isinstance(normalized_result, dict):
+        normalized_results.append(normalized_result)
+    for entity in result_entry.get("updated_entities", []):
+        if isinstance(entity, dict):
+            updated_entities.append(entity)
+
+
+async def _apply_editor_op(
+    *,
+    project_id: str,
+    project_dir: Path,
+    op: dict[str, Any],
+    request_bindings: dict[str, str],
+) -> dict[str, Any]:
+    op_id = _normalize_editor_segment_id(op.get("op_id"))
+    op_type = _normalize_editor_segment_id(op.get("type"))
+    if not op_id:
+        raise HTTPException(status_code=400, detail="op_id 不能为空")
+    if not op_type:
+        raise HTTPException(status_code=400, detail="type 不能为空")
+
+    if op_type == "update_text":
+        segment_id = _resolve_editor_segment_id(
+            project_dir=project_dir,
+            op=op,
+            request_bindings=request_bindings,
+            segment_field="segment_id",
+            client_ref_field="client_ref_id",
+        )
+        if not segment_id:
+            raise HTTPException(status_code=409, detail="update_text 目标字幕缺失，请先对账后重试")
+        updated_text = _require_text_field(op, "after")
+        try:
+            response = await update_project_subtitle(
+                project_id,
+                segment_id,
+                SubtitleUpdateRequest(text=updated_text),
+            )
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                raise HTTPException(status_code=409, detail="update_text 目标字幕缺失，请先对账后重试") from exc
+            raise
+        return _build_editor_op_result(
+            op_id=op_id,
+            updated_entities=[
+                _build_updated_entity(
+                    response["data"],
+                    client_ref_id=_normalize_editor_segment_id(op.get("client_ref_id")) or None,
+                )
+            ],
+            events=[
+                {
+                    "event_type": "edited",
+                    "data": {
+                        "segment_id": segment_id,
+                        "segment": response["data"],
+                        "source": "project_api",
+                        "is_update": True,
+                    },
+                }
+            ],
+        )
+
+    if op_type == "update_timing":
+        segment_id = _resolve_editor_segment_id(
+            project_dir=project_dir,
+            op=op,
+            request_bindings=request_bindings,
+            segment_field="segment_id",
+            client_ref_field="client_ref_id",
+        )
+        if not segment_id:
+            raise HTTPException(status_code=409, detail="update_timing 目标字幕缺失，请先对账后重试")
+        start_ms = _require_ms_field(op, "after", "start_ms")
+        end_ms = _require_ms_field(op, "after", "end_ms")
+        try:
+            response = await update_project_subtitle(
+                project_id,
+                segment_id,
+                SubtitleUpdateRequest(
+                    start=_ms_to_seconds(start_ms),
+                    end=_ms_to_seconds(end_ms),
+                ),
+            )
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                raise HTTPException(status_code=409, detail="update_timing 目标字幕缺失，请先对账后重试") from exc
+            raise
+        return _build_editor_op_result(
+            op_id=op_id,
+            updated_entities=[
+                _build_updated_entity(
+                    response["data"],
+                    client_ref_id=_normalize_editor_segment_id(op.get("client_ref_id")) or None,
+                )
+            ],
+            events=[
+                {
+                    "event_type": "edited",
+                    "data": {
+                        "segment_id": segment_id,
+                        "segment": response["data"],
+                        "source": "project_api",
+                        "is_update": True,
+                    },
+                }
+            ],
+        )
+
+    if op_type == "insert_subtitle":
+        client_ref_id = _normalize_editor_segment_id(op.get("client_ref_id"))
+        if not client_ref_id:
+            raise HTTPException(status_code=400, detail="insert_subtitle.client_ref_id 不能为空")
+        start_ms = _require_ms_field(op, "after", "start_ms")
+        end_ms = _require_ms_field(op, "after", "end_ms")
+        text = _require_text_field(op, "after")
+        response = await create_project_subtitle(
+            project_id,
+            SubtitleCreateRequest(
+                text=text,
+                start=_ms_to_seconds(start_ms),
+                end=_ms_to_seconds(end_ms),
+            ),
+        )
+        segment = response["data"]
+        segment_id = _normalize_editor_segment_id(segment.get("segment_id"))
+        request_bindings[client_ref_id] = segment_id
+        return _build_editor_op_result(
+            op_id=op_id,
+            created_bindings=[
+                {
+                    "client_ref_id": client_ref_id,
+                    "segment_id": segment_id,
+                }
+            ],
+            updated_entities=[
+                _build_updated_entity(segment, client_ref_id=client_ref_id)
+            ],
+            events=[
+                {
+                    "event_type": "added",
+                    "data": {
+                        "segment": segment,
+                        "source": "project_api",
+                        "is_update": True,
+                    },
+                }
+            ],
+        )
+
+    if op_type == "delete_subtitle":
+        explicit_segment_id = _normalize_editor_segment_id(op.get("segment_id"))
+        segment_id = _resolve_editor_segment_id(
+            project_dir=project_dir,
+            op=op,
+            request_bindings=request_bindings,
+            segment_field="segment_id",
+            client_ref_field="client_ref_id",
+        )
+        if not segment_id:
+            if explicit_segment_id:
+                # 幂等删除：segment 已不存在时视为 no-op，避免重放路径被 404 阻断。
+                return _build_editor_op_result(op_id=op_id)
+            raise HTTPException(status_code=404, detail="未找到 delete_subtitle 对应字幕")
+        try:
+            await delete_project_subtitle(project_id, segment_id)
+        except HTTPException as exc:
+            if exc.status_code == 404 and explicit_segment_id:
+                return _build_editor_op_result(op_id=op_id)
+            raise
+        return _build_editor_op_result(
+            op_id=op_id,
+            events=[
+                {
+                    "event_type": "deleted",
+                    "data": {
+                        "segment_id": segment_id,
+                        "source": "project_api",
+                        "is_update": True,
+                    },
+                }
+            ],
+        )
+
+    if op_type == "split_subtitle":
+        source_segment_id = _resolve_editor_segment_id(
+            project_dir=project_dir,
+            op=op,
+            request_bindings=request_bindings,
+            segment_field="segment_id",
+            client_ref_field="client_ref_id",
+        )
+        if not source_segment_id:
+            raise HTTPException(status_code=404, detail="未找到 split_subtitle 对应字幕")
+        created_client_ref_id = _normalize_editor_segment_id(op.get("created_client_ref_id"))
+        if not created_client_ref_id:
+            raise HTTPException(status_code=400, detail="created_client_ref_id 不能为空")
+        kept_start_ms = _require_ms_field(op, "after_kept", "start_ms")
+        kept_end_ms = _require_ms_field(op, "after_kept", "end_ms")
+        created_start_ms = _require_ms_field(op, "after_created", "start_ms")
+        created_end_ms = _require_ms_field(op, "after_created", "end_ms")
+        kept_text = _require_text_field(op, "after_kept")
+        created_text = _require_text_field(op, "after_created")
+
+        kept_response = await update_project_subtitle(
+            project_id,
+            source_segment_id,
+            SubtitleUpdateRequest(
+                text=kept_text,
+                start=_ms_to_seconds(kept_start_ms),
+                end=_ms_to_seconds(kept_end_ms),
+            ),
+        )
+        created_response = await create_project_subtitle(
+            project_id,
+            SubtitleCreateRequest(
+                text=created_text,
+                start=_ms_to_seconds(created_start_ms),
+                end=_ms_to_seconds(created_end_ms),
+            ),
+        )
+        created_segment = created_response["data"]
+        created_segment_id = _normalize_editor_segment_id(created_segment.get("segment_id"))
+        request_bindings[created_client_ref_id] = created_segment_id
+        return _build_editor_op_result(
+            op_id=op_id,
+            created_bindings=[
+                {
+                    "client_ref_id": created_client_ref_id,
+                    "segment_id": created_segment_id,
+                }
+            ],
+            updated_entities=[
+                _build_updated_entity(
+                    kept_response["data"],
+                    client_ref_id=_normalize_editor_segment_id(op.get("client_ref_id")) or None,
+                ),
+                _build_updated_entity(
+                    created_segment,
+                    client_ref_id=created_client_ref_id,
+                ),
+            ],
+            events=[
+                {
+                    "event_type": "edited",
+                    "data": {
+                        "segment_id": source_segment_id,
+                        "segment": kept_response["data"],
+                        "source": "project_api",
+                        "is_update": True,
+                    },
+                },
+                {
+                    "event_type": "added",
+                    "data": {
+                        "segment": created_segment,
+                        "source": "project_api",
+                        "is_update": True,
+                    },
+                },
+            ],
+        )
+
+    if op_type == "merge_subtitle":
+        kept_segment_id = _resolve_editor_segment_id(
+            project_dir=project_dir,
+            op=op,
+            request_bindings=request_bindings,
+            segment_field="kept_segment_id",
+            client_ref_field="kept_client_ref_id",
+        )
+        removed_segment_id = _resolve_editor_segment_id(
+            project_dir=project_dir,
+            op=op,
+            request_bindings=request_bindings,
+            segment_field="removed_segment_id",
+            client_ref_field="removed_client_ref_id",
+        )
+        if not kept_segment_id or not removed_segment_id:
+            raise HTTPException(status_code=404, detail="未找到 merge_subtitle 对应字幕")
+        start_ms = _require_ms_field(op, "after", "start_ms")
+        end_ms = _require_ms_field(op, "after", "end_ms")
+        text = _require_text_field(op, "after")
+        kept_response = await update_project_subtitle(
+            project_id,
+            kept_segment_id,
+            SubtitleUpdateRequest(
+                text=text,
+                start=_ms_to_seconds(start_ms),
+                end=_ms_to_seconds(end_ms),
+            ),
+        )
+        await delete_project_subtitle(project_id, removed_segment_id)
+        return _build_editor_op_result(
+            op_id=op_id,
+            updated_entities=[
+                _build_updated_entity(
+                    kept_response["data"],
+                    client_ref_id=_normalize_editor_segment_id(op.get("kept_client_ref_id")) or None,
+                )
+            ],
+            events=[
+                {
+                    "event_type": "edited",
+                    "data": {
+                        "segment_id": kept_segment_id,
+                        "segment": kept_response["data"],
+                        "source": "project_api",
+                        "is_update": True,
+                    },
+                },
+                {
+                    "event_type": "deleted",
+                    "data": {
+                        "segment_id": removed_segment_id,
+                        "source": "project_api",
+                        "is_update": True,
+                    },
+                },
+            ],
+        )
+
+    if op_type == "move_boundary":
+        upper_segment_id = _resolve_editor_segment_id(
+            project_dir=project_dir,
+            op=op,
+            request_bindings=request_bindings,
+            segment_field="upper_segment_id",
+            client_ref_field="upper_client_ref_id",
+        )
+        lower_segment_id = _resolve_editor_segment_id(
+            project_dir=project_dir,
+            op=op,
+            request_bindings=request_bindings,
+            segment_field="lower_segment_id",
+            client_ref_field="lower_client_ref_id",
+        )
+        if not upper_segment_id or not lower_segment_id:
+            raise HTTPException(status_code=404, detail="未找到 move_boundary 对应字幕")
+        upper_end_ms = _require_ms_field(op, "after", "upper_end_ms")
+        lower_start_ms = _require_ms_field(op, "after", "lower_start_ms")
+        if upper_end_ms != lower_start_ms:
+            raise HTTPException(status_code=400, detail="共享边界必须保持一致")
+        upper_response = await update_project_subtitle(
+            project_id,
+            upper_segment_id,
+            SubtitleUpdateRequest(end=_ms_to_seconds(upper_end_ms)),
+        )
+        lower_response = await update_project_subtitle(
+            project_id,
+            lower_segment_id,
+            SubtitleUpdateRequest(start=_ms_to_seconds(lower_start_ms)),
+        )
+        return _build_editor_op_result(
+            op_id=op_id,
+            updated_entities=[
+                _build_updated_entity(
+                    upper_response["data"],
+                    client_ref_id=_normalize_editor_segment_id(op.get("upper_client_ref_id")) or None,
+                ),
+                _build_updated_entity(
+                    lower_response["data"],
+                    client_ref_id=_normalize_editor_segment_id(op.get("lower_client_ref_id")) or None,
+                ),
+            ],
+            events=[
+                {
+                    "event_type": "edited",
+                    "data": {
+                        "segment_id": upper_segment_id,
+                        "segment": upper_response["data"],
+                        "source": "project_api",
+                        "is_update": True,
+                    },
+                },
+                {
+                    "event_type": "edited",
+                    "data": {
+                        "segment_id": lower_segment_id,
+                        "segment": lower_response["data"],
+                        "source": "project_api",
+                        "is_update": True,
+                    },
+                },
+            ],
+        )
+
+    if op_type == "batch_replace":
+        replacements = op.get("replacements")
+        if not isinstance(replacements, list):
+            raise HTTPException(status_code=400, detail="replacements 必须是数组")
+        entities: list[dict[str, Any]] = []
+        for replacement in replacements:
+            if not isinstance(replacement, dict):
+                raise HTTPException(status_code=400, detail="replacement 项必须是对象")
+            segment_id = _resolve_editor_segment_id(
+                project_dir=project_dir,
+                op=replacement,
+                request_bindings=request_bindings,
+                segment_field="segment_id",
+                client_ref_field="client_ref_id",
+            )
+            if not segment_id:
+                raise HTTPException(status_code=404, detail="batch_replace 存在未绑定字幕")
+            updated_text = _require_text_field(replacement, "after")
+            response = await update_project_subtitle(
+                project_id,
+                segment_id,
+                SubtitleUpdateRequest(text=updated_text),
+            )
+            entities.append(
+                _build_updated_entity(
+                    response["data"],
+                    client_ref_id=_normalize_editor_segment_id(replacement.get("client_ref_id")) or None,
+                )
+            )
+        return _build_editor_op_result(
+            op_id=op_id,
+            updated_entities=entities,
+            events=[
+                {
+                    "event_type": "edited",
+                    "data": {
+                        "segment_id": entity["segment_id"],
+                        "segment": entity,
+                        "source": "project_api",
+                        "is_update": True,
+                    },
+                }
+                for entity in entities
+            ],
+        )
+
+    raise HTTPException(status_code=400, detail=f"未知命令类型: {op_type}")
 
 
 def _get_transcription_service() -> Any:
@@ -300,8 +1087,8 @@ def _compose_runtime_segments_with_user_edits(
         if int(index) in deleted_indices:
             continue
         text = str(edit_entry.get("text", "") or "")
-        if not text.strip():
-            continue
+        # 手动新增字幕允许空文本（仅时间块占位）。
+        # 若这里过滤空文本，会导致“新增后立即导出”丢块，与前端强制保存栅栏语义不一致。
         start = _safe_float(edit_entry.get("start"), 0.0)
         end = _safe_float(edit_entry.get("end"), start)
         if end < start:
@@ -542,9 +1329,29 @@ async def import_project(
         raise HTTPException(status_code=500, detail="项目目录创建失败")
 
     if video_file is not None and video_file.filename:
-        video_bytes = await video_file.read()
-        target_path = project_dir / video_file.filename
-        target_path.write_bytes(video_bytes)
+        media_filename = _normalize_upload_filename(video_file.filename)
+        _validate_import_media_extension(media_filename)
+        target_path = project_dir / media_filename
+        try:
+            written_size = await _persist_uploaded_media_file(video_file, target_path)
+        except HTTPException:
+            target_path.unlink(missing_ok=True)
+            raise
+        except Exception as exc:
+            target_path.unlink(missing_ok=True)
+            logger.exception(
+                "导入项目保存媒体文件失败: project_id=%s, file=%s",
+                project.project_id,
+                media_filename,
+            )
+            raise HTTPException(status_code=500, detail="媒体文件保存失败，请重试") from exc
+        finally:
+            await video_file.close()
+
+        if written_size <= 0:
+            target_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail="媒体文件为空")
+
         project_service.refresh_media_assets(project.project_id)
         project = project_service.get_project(project.project_id) or project
 
@@ -585,6 +1392,7 @@ async def import_project_local(
     # 2. 可选：获取媒体文件路径
     media_path: Optional[str] = None
     if media_filename:
+        _validate_import_media_extension(media_filename)
         media_path = file_service.get_input_file_path(media_filename)
         if not Path(media_path).exists():
             raise HTTPException(status_code=404, detail=f"媒体文件不存在: {media_filename}")
@@ -809,6 +1617,11 @@ async def create_project_subtitle(project_id: str, body: SubtitleCreateRequest):
             "is_modified": True,
             "original_text": entry.get("original_text"),
         }
+        _sync_homophone_index_for_project_change(
+            project_id=project_id,
+            project_dir=project_dir,
+            updated_sentence_indices=[int(legacy_index)],
+        )
         _publish_project_subtitle_event(
             project_id,
             "added",
@@ -821,6 +1634,11 @@ async def create_project_subtitle(project_id: str, body: SubtitleCreateRequest):
         text=body.text,
         start=body.start,
         end=body.end,
+    )
+    _sync_homophone_index_for_project_change(
+        project_id=project_id,
+        project_dir=project_dir,
+        updated_sentence_indices=[int(segment.get("legacy_index", 0))],
     )
     _publish_project_subtitle_event(
         project_id,
@@ -872,6 +1690,11 @@ async def update_project_subtitle(
         segment = _find_segment_by_segment_id(composed_after, segment_id)
         if segment is None:
             raise HTTPException(status_code=404, detail="字幕段不存在")
+        _sync_homophone_index_for_project_change(
+            project_id=project_id,
+            project_dir=project_dir,
+            updated_sentence_indices=[target_index],
+        )
         _publish_project_subtitle_event(
             project_id,
             "edited",
@@ -889,6 +1712,11 @@ async def update_project_subtitle(
         raise HTTPException(status_code=404, detail="字幕段不存在")
 
     segment = subtitle_doc_service.get_segment(project_dir, segment_id)
+    _sync_homophone_index_for_project_change(
+        project_id=project_id,
+        project_dir=project_dir,
+        updated_sentence_indices=[int(segment.get("legacy_index", 0))] if segment else [],
+    )
     _publish_project_subtitle_event(
         project_id,
         "edited",
@@ -919,6 +1747,11 @@ async def delete_project_subtitle(project_id: str, segment_id: str):
             raise HTTPException(status_code=404, detail="字幕段不存在")
         target_index = int(current_segment.get("legacy_index", 0))
         add_deletion(project_dir, target_index)
+        _sync_homophone_index_for_project_change(
+            project_id=project_id,
+            project_dir=project_dir,
+            removed_sentence_indices=[target_index],
+        )
         _publish_project_subtitle_event(
             project_id,
             "deleted",
@@ -926,16 +1759,690 @@ async def delete_project_subtitle(project_id: str, segment_id: str):
         )
         return {"success": True, "data": {"segment_id": segment_id, "is_deleted": True}}
 
+    segment = subtitle_doc_service.get_segment(project_dir, segment_id)
     is_success = subtitle_doc_service.delete_segment(project_dir, segment_id)
     if not is_success:
         raise HTTPException(status_code=404, detail="字幕段不存在")
 
+    _sync_homophone_index_for_project_change(
+        project_id=project_id,
+        project_dir=project_dir,
+        removed_sentence_indices=[int(segment.get("legacy_index", 0))] if segment else [],
+    )
     _publish_project_subtitle_event(
         project_id,
         "deleted",
         {"segment_id": segment_id, "source": "project_api", "is_update": True},
     )
     return {"success": True, "data": {"segment_id": segment_id, "is_deleted": True}}
+
+
+@router.post("/{project_id}/editor-ops:apply")
+async def apply_editor_ops(project_id: str, body: EditorOpsApplyRequest):
+    """统一批量编辑命令入口。"""
+    project_service = get_project_service()
+    project_dir = project_service.get_project_dir(project_id)
+    if project_dir is None:
+        return _editor_ops_error(
+            status_code=404,
+            message="项目不存在",
+            error_code="PROJECT_NOT_FOUND",
+        )
+
+    if not body.ops:
+        return _editor_ops_error(
+            status_code=400,
+            message="ops 不能为空",
+            error_code="INVALID_REQUEST",
+        )
+
+    state = _load_editor_ops_state(project_dir)
+    sessions = state.setdefault("sessions", {})
+    session_ops = sessions.setdefault(body.session_id, {})
+    current_revision = int(state.get("server_revision", 0) or 0)
+
+    request_bindings: dict[str, str] = {}
+    created_bindings: list[dict[str, str]] = []
+    normalized_results: list[dict[str, Any]] = []
+    updated_entities: list[dict[str, Any]] = []
+    new_ops: list[dict[str, Any]] = []
+    seen_op_ids: set[str] = set()
+
+    for op in body.ops:
+        if not isinstance(op, dict):
+            return _editor_ops_error(
+                status_code=400,
+                message="ops 项必须是对象",
+                server_revision=current_revision,
+                error_code="INVALID_REQUEST",
+            )
+        op_id = _normalize_editor_segment_id(op.get("op_id"))
+        if not op_id:
+            return _editor_ops_error(
+                status_code=400,
+                message="存在缺少 op_id 的命令",
+                server_revision=current_revision,
+                error_code="INVALID_REQUEST",
+            )
+        if op_id in seen_op_ids:
+            return _editor_ops_error(
+                status_code=400,
+                message=f"请求内存在重复 op_id: {op_id}",
+                server_revision=current_revision,
+                error_code="INVALID_REQUEST",
+                failed_op_id=op_id,
+            )
+        seen_op_ids.add(op_id)
+        existing_entry = session_ops.get(op_id)
+        if isinstance(existing_entry, dict):
+            _aggregate_editor_op_result(
+                result_entry=existing_entry,
+                request_bindings=request_bindings,
+                created_bindings=created_bindings,
+                normalized_results=normalized_results,
+                updated_entities=updated_entities,
+            )
+        else:
+            new_ops.append(op)
+
+    if new_ops and body.base_revision is not None and body.base_revision != current_revision:
+        return _editor_ops_error(
+            status_code=409,
+            message="客户端基准版本过旧",
+            server_revision=current_revision,
+            error_code="REVISION_CONFLICT",
+            failed_op_id=_normalize_editor_segment_id(new_ops[0].get("op_id")),
+            details={"reason": "base_revision_outdated"},
+        )
+
+    if not new_ops:
+        return {
+            "success": True,
+            "server_revision": current_revision,
+            "created_bindings": created_bindings,
+            "normalized_results": normalized_results,
+            "updated_entities": updated_entities,
+        }
+
+    backup_path = _backup_subtitle_edit_store(project_dir)
+    staged_entries: dict[str, dict[str, Any]] = {}
+    suppress_token = _SUPPRESS_PROJECT_SUBTITLE_EVENTS.set(True)
+
+    try:
+        for op in body.ops:
+            op_id = _normalize_editor_segment_id(op.get("op_id"))
+            if op_id in session_ops:
+                continue
+            result_entry = await _apply_editor_op(
+                project_id=project_id,
+                project_dir=project_dir,
+                op=op,
+                request_bindings=request_bindings,
+            )
+            staged_entries[op_id] = result_entry
+            _aggregate_editor_op_result(
+                result_entry=result_entry,
+                request_bindings=request_bindings,
+                created_bindings=created_bindings,
+                normalized_results=normalized_results,
+                updated_entities=updated_entities,
+            )
+    except HTTPException as exc:
+        _restore_subtitle_edit_store(project_dir, backup_path)
+        detail = exc.detail if isinstance(exc.detail, str) else "editor-ops 执行失败"
+        return _editor_ops_error(
+            status_code=exc.status_code,
+            message=str(detail),
+            server_revision=current_revision,
+            failed_op_id=_normalize_editor_segment_id(op.get("op_id")) if isinstance(op, dict) else None,
+        )
+    except Exception as exc:
+        _restore_subtitle_edit_store(project_dir, backup_path)
+        logger.exception("editor-ops 执行异常: project_id=%s", project_id)
+        return _editor_ops_error(
+            status_code=500,
+            message=f"editor-ops 执行失败: {exc}",
+            server_revision=current_revision,
+            failed_op_id=_normalize_editor_segment_id(op.get("op_id")) if isinstance(op, dict) else None,
+        )
+    finally:
+        _SUPPRESS_PROJECT_SUBTITLE_EVENTS.reset(suppress_token)
+        _cleanup_subtitle_edit_store_backup(backup_path)
+
+    next_revision = current_revision + 1
+    for entry in staged_entries.values():
+        entry["applied_revision"] = next_revision
+        for entity in entry.get("updated_entities", []):
+            if isinstance(entity, dict):
+                entity["revision"] = next_revision
+
+    for entity in updated_entities:
+        entity["revision"] = next_revision
+
+    session_ops.update(staged_entries)
+    state["server_revision"] = next_revision
+    _save_editor_ops_state(project_dir, state)
+
+    for op in body.ops:
+        op_id = _normalize_editor_segment_id(op.get("op_id"))
+        entry = staged_entries.get(op_id)
+        if not isinstance(entry, dict):
+            continue
+        for event in entry.get("events", []):
+            if not isinstance(event, dict):
+                continue
+            event_type = _normalize_editor_segment_id(event.get("event_type"))
+            data = event.get("data")
+            if event_type and isinstance(data, dict):
+                event_payload = dict(data)
+                event_payload["editor_session_id"] = body.session_id
+                _publish_project_subtitle_event(project_id, event_type, event_payload)
+
+    return {
+        "success": True,
+        "server_revision": next_revision,
+        "created_bindings": created_bindings,
+        "normalized_results": normalized_results,
+        "updated_entities": updated_entities,
+    }
+
+
+# V3.2.4+dev.20260303.01: undo/redo 批量同步端点
+
+
+@router.post("/{project_id}/subtitles/batch-sync")
+async def batch_sync_project_subtitles(project_id: str, body: BatchSyncRequest):
+    """undo/redo 后端增量同步（支持 runtime 与 subtitle_doc 双路径）。"""
+    project_service = get_project_service()
+    subtitle_doc_service = get_subtitle_doc_service()
+    project_dir = project_service.get_project_dir(project_id)
+    if project_dir is None:
+        raise HTTPException(status_code=404, detail="项目不存在")
+
+    runtime_segments = _load_runtime_subtitle_segments(project_dir)
+    is_runtime = bool(runtime_segments)
+    results: dict[str, Any] = {
+        "updated": 0,
+        "created": 0,
+        "deleted": 0,
+        "created_segments": [],
+        "errors": [],
+    }
+
+    # 前置校验 end >= start
+    for item in body.updates:
+        if (
+            item.start is not None
+            and item.end is not None
+            and item.end < item.start
+        ):
+            results["errors"].append(
+                f"update: {item.segment_id} end({item.end}) < start({item.start})"
+            )
+    for item in body.creates:
+        if item.end < item.start:
+            results["errors"].append(
+                f"create: end({item.end}) < start({item.start})"
+            )
+    if results["errors"]:
+        return {"success": False, "data": results}
+
+    if is_runtime:
+        _batch_sync_runtime(project_id, project_dir, body, runtime_segments, results)
+    else:
+        _batch_sync_subtitle_doc(
+            project_id, project_dir, body, subtitle_doc_service, results
+        )
+
+    return {
+        "success": len(results["errors"]) == 0,
+        "data": results,
+    }
+
+
+def _batch_sync_runtime(
+    project_id: str,
+    project_dir: Path,
+    body: BatchSyncRequest,
+    runtime_segments: list[dict],
+    results: dict[str, Any],
+) -> None:
+    """Runtime 路径批量同步。"""
+    composed = _compose_runtime_segments_with_user_edits(project_dir, runtime_segments)
+    updated_indices: set[int] = set()
+    removed_indices: set[int] = set()
+
+    # 1. updates
+    for item in body.updates:
+        seg = _find_segment_by_segment_id(composed, item.segment_id)
+        if not seg:
+            results["errors"].append(f"update: {item.segment_id} 不存在")
+            continue
+        payload: dict[str, Any] = {}
+        if item.text is not None:
+            payload["text"] = item.text
+        if item.start is not None:
+            payload["start"] = item.start
+        if item.end is not None:
+            payload["end"] = item.end
+        if payload:
+            save_edit(
+                project_dir,
+                int(seg["legacy_index"]),
+                payload,
+                original_text=str(seg.get("text", "")),
+            )
+            updated_indices.add(int(seg["legacy_index"]))
+            results["updated"] += 1
+            composed_after = _compose_runtime_segments_with_user_edits(
+                project_dir, runtime_segments
+            )
+            updated_segment = _find_segment_by_segment_id(
+                composed_after, item.segment_id
+            )
+            if updated_segment is not None:
+                _publish_project_subtitle_event(
+                    project_id,
+                    "edited",
+                    {
+                        "segment_id": item.segment_id,
+                        "segment": updated_segment,
+                        "source": "project_api",
+                        "is_update": True,
+                    },
+                )
+
+    # 2. deletes
+    for item in body.deletes:
+        seg = _find_segment_by_segment_id(composed, item.segment_id)
+        if not seg:
+            results["errors"].append(f"delete: {item.segment_id} 不存在")
+            continue
+        idx = int(seg["legacy_index"])
+        if idx < 0:
+            remove_manual_entry(project_dir, idx)
+        else:
+            add_deletion(project_dir, idx)
+        removed_indices.add(idx)
+        results["deleted"] += 1
+        _publish_project_subtitle_event(
+            project_id,
+            "deleted",
+            {
+                "segment_id": item.segment_id,
+                "source": "project_api",
+                "is_update": True,
+            },
+        )
+
+    # 3. creates
+    for item in body.creates:
+        if item.restore_segment_id:
+            restored_index = _handle_runtime_restore(
+                project_id, project_dir, item, runtime_segments, results
+            )
+            if restored_index is not None:
+                updated_indices.add(int(restored_index))
+        else:
+            new_index, entry = create_manual_entry(
+                project_dir, item.text or "", float(item.start), float(item.end)
+            )
+            segment_id = _manual_segment_id(new_index)
+            segment = {
+                "segment_id": segment_id,
+                "sentence_uid": None,
+                "chunk_uid": "chunk:manual",
+                "text": str(entry.get("text", item.text or "")),
+                "start": float(entry.get("start", float(item.start))),
+                "end": float(entry.get("end", float(item.end))),
+                "legacy_index": int(new_index),
+                "source_type": "manual",
+                "is_modified": True,
+                "original_text": entry.get("original_text"),
+            }
+            results["created_segments"].append({
+                "segment_id": segment_id,
+                "legacy_index": new_index,
+                "text": segment["text"],
+                "start": segment["start"],
+                "end": segment["end"],
+            })
+            updated_indices.add(int(new_index))
+            results["created"] += 1
+            _publish_project_subtitle_event(
+                project_id,
+                "added",
+                {"segment": segment, "source": "project_api", "is_update": True},
+            )
+
+    _sync_homophone_index_for_project_change(
+        project_id=project_id,
+        project_dir=project_dir,
+        updated_sentence_indices=sorted(updated_indices),
+        removed_sentence_indices=sorted(removed_indices),
+    )
+
+
+def _handle_runtime_restore(
+    project_id: str,
+    project_dir: Path,
+    item: BatchSyncCreateItem,
+    runtime_segments: list[dict],
+    results: dict[str, Any],
+) -> int | None:
+    """Runtime 路径恢复已删除字幕。"""
+    seg_id = item.restore_segment_id
+    if not seg_id:
+        return None
+
+    # 区分正索引（runtime 基线）与负索引（手动新增）
+    if seg_id.startswith("manual-"):
+        try:
+            original_index = -int(seg_id.split("-", 1)[1])
+        except (ValueError, IndexError):
+            results["errors"].append(f"restore: {seg_id} 索引解析失败")
+            return None
+        ok = restore_manual_entry(
+            project_dir, original_index, item.text or "", float(item.start), float(item.end)
+        )
+        if ok:
+            segment = {
+                "segment_id": seg_id,
+                "sentence_uid": None,
+                "chunk_uid": "chunk:manual",
+                "text": str(item.text or ""),
+                "start": float(item.start),
+                "end": float(item.end),
+                "legacy_index": int(original_index),
+                "source_type": "manual",
+                "is_modified": True,
+                "original_text": None,
+            }
+            results["created_segments"].append({
+                "segment_id": seg_id,
+                "legacy_index": original_index,
+                "text": segment["text"],
+                "start": segment["start"],
+                "end": segment["end"],
+            })
+            results["created"] += 1
+            _publish_project_subtitle_event(
+                project_id,
+                "added",
+                {"segment": segment, "source": "project_api", "is_update": True},
+            )
+            return int(original_index)
+        else:
+            results["errors"].append(f"restore: {seg_id} 手动字幕恢复失败")
+            return None
+    else:
+        target = _find_segment_by_segment_id(runtime_segments, seg_id)
+        if not target:
+            results["errors"].append(f"restore: {seg_id} 未找到")
+            return None
+        idx = int(target["legacy_index"])
+        remove_deletion(project_dir, idx)
+        # 如果内容有变，补存编辑
+        delta: dict[str, Any] = {}
+        if item.text and item.text != str(target.get("text", "")):
+            delta["text"] = item.text
+        if item.start is not None and abs(item.start - float(target.get("start", 0))) > 0.001:
+            delta["start"] = item.start
+        if item.end is not None and abs(item.end - float(target.get("end", 0))) > 0.001:
+            delta["end"] = item.end
+        if delta:
+            save_edit(project_dir, idx, delta)
+        composed_after = _compose_runtime_segments_with_user_edits(
+            project_dir, runtime_segments
+        )
+        restored_segment = _find_segment_by_segment_id(composed_after, seg_id)
+        restored_text = (
+            str(restored_segment.get("text", ""))
+            if restored_segment is not None
+            else str(item.text or target.get("text", ""))
+        )
+        restored_start = (
+            float(restored_segment.get("start", 0.0))
+            if restored_segment is not None
+            else float(item.start if item.start is not None else target.get("start", 0.0))
+        )
+        restored_end = (
+            float(restored_segment.get("end", restored_start))
+            if restored_segment is not None
+            else float(item.end if item.end is not None else target.get("end", restored_start))
+        )
+        results["created_segments"].append({
+            "segment_id": seg_id,
+            "legacy_index": idx,
+            "text": restored_text,
+            "start": restored_start,
+            "end": restored_end,
+        })
+        results["created"] += 1
+        _publish_project_subtitle_event(
+            project_id,
+            "added",
+            {
+                "segment": restored_segment
+                if restored_segment is not None
+                else {
+                    "segment_id": seg_id,
+                    "legacy_index": idx,
+                    "text": restored_text,
+                    "start": restored_start,
+                    "end": restored_end,
+                    "source_type": "restored",
+                    "is_modified": True,
+                },
+                "source": "project_api",
+                "is_update": True,
+            },
+        )
+        return idx
+    return None
+
+
+def _batch_sync_subtitle_doc(
+    project_id: str,
+    project_dir: Path,
+    body: BatchSyncRequest,
+    subtitle_doc_service: Any,
+    results: dict[str, Any],
+) -> None:
+    """Subtitle Doc 路径批量同步。"""
+    updated_indices: set[int] = set()
+    removed_indices: set[int] = set()
+    # 1. updates
+    for item in body.updates:
+        payload = {
+            k: v
+            for k, v in {"text": item.text, "start": item.start, "end": item.end}.items()
+            if v is not None
+        }
+        ok = subtitle_doc_service.update_segment(project_dir, item.segment_id, payload)
+        if ok:
+            results["updated"] += 1
+            segment = subtitle_doc_service.get_segment(project_dir, item.segment_id)
+            if segment is not None:
+                updated_indices.add(int(segment.get("legacy_index", 0)))
+                _publish_project_subtitle_event(
+                    project_id,
+                    "edited",
+                    {
+                        "segment_id": item.segment_id,
+                        "segment": segment,
+                        "source": "project_api",
+                        "is_update": True,
+                    },
+                )
+        else:
+            results["errors"].append(f"update: {item.segment_id} 不存在")
+
+    # 2. deletes
+    for item in body.deletes:
+        segment = subtitle_doc_service.get_segment(project_dir, item.segment_id)
+        ok = subtitle_doc_service.delete_segment(project_dir, item.segment_id)
+        if ok:
+            results["deleted"] += 1
+            if segment is not None:
+                removed_indices.add(int(segment.get("legacy_index", 0)))
+            _publish_project_subtitle_event(
+                project_id,
+                "deleted",
+                {
+                    "segment_id": item.segment_id,
+                    "source": "project_api",
+                    "is_update": True,
+                },
+            )
+        else:
+            results["errors"].append(f"delete: {item.segment_id} 不存在")
+
+    # 3. creates
+    for item in body.creates:
+        if item.restore_segment_id:
+            restored_index = _handle_subtitle_doc_restore(
+                project_id, project_dir, item, subtitle_doc_service, results
+            )
+            if restored_index is not None:
+                updated_indices.add(int(restored_index))
+        else:
+            new_seg = subtitle_doc_service.create_segment(
+                project_dir, item.text or "", float(item.start), float(item.end)
+            )
+            results["created_segments"].append({
+                "segment_id": new_seg.get("segment_id"),
+                "legacy_index": new_seg.get("legacy_index"),
+                "text": new_seg.get("text"),
+                "start": new_seg.get("start"),
+                "end": new_seg.get("end"),
+            })
+            updated_indices.add(int(new_seg.get("legacy_index", 0)))
+            results["created"] += 1
+            _publish_project_subtitle_event(
+                project_id,
+                "added",
+                {"segment": new_seg, "source": "project_api", "is_update": True},
+            )
+
+    _sync_homophone_index_for_project_change(
+        project_id=project_id,
+        project_dir=project_dir,
+        updated_sentence_indices=sorted(updated_indices),
+        removed_sentence_indices=sorted(removed_indices),
+    )
+
+
+def _handle_subtitle_doc_restore(
+    project_id: str,
+    project_dir: Path,
+    item: BatchSyncCreateItem,
+    subtitle_doc_service: Any,
+    results: dict[str, Any],
+) -> int | None:
+    """Subtitle Doc 路径恢复已删除字幕（通过 tombstone 映射）。"""
+    seg_id = item.restore_segment_id
+    if not seg_id:
+        return None
+
+    if seg_id.startswith("manual-"):
+        try:
+            original_index = -int(seg_id.split("-", 1)[1])
+        except (ValueError, IndexError):
+            results["errors"].append(f"restore: {seg_id} 索引解析失败")
+            return None
+        ok = restore_manual_entry(
+            project_dir, original_index, item.text or "", float(item.start), float(item.end)
+        )
+        if ok:
+            segment = {
+                "segment_id": seg_id,
+                "legacy_index": int(original_index),
+                "text": str(item.text or ""),
+                "start": float(item.start),
+                "end": float(item.end),
+                "source_type": "manual",
+                "is_modified": True,
+                "is_deleted": False,
+            }
+            results["created_segments"].append({
+                "segment_id": seg_id,
+                "legacy_index": original_index,
+                "text": segment["text"],
+                "start": segment["start"],
+                "end": segment["end"],
+            })
+            results["created"] += 1
+            _publish_project_subtitle_event(
+                project_id,
+                "added",
+                {"segment": segment, "source": "project_api", "is_update": True},
+            )
+            return int(original_index)
+        else:
+            results["errors"].append(f"restore: {seg_id} 手动字幕恢复失败")
+            return None
+    else:
+        # 通过 tombstone 恢复：restore_segment 查询 _deleted_segment_map
+        update: dict[str, Any] = {}
+        if item.text:
+            update["text"] = item.text
+        if item.start is not None:
+            update["start"] = item.start
+        if item.end is not None:
+            update["end"] = item.end
+        restored_index = subtitle_doc_service.restore_segment(
+            project_dir, seg_id, update or None
+        )
+        if restored_index is not None:
+            restored_segment = subtitle_doc_service.get_segment(project_dir, seg_id)
+            restored_text = (
+                str(restored_segment.get("text", ""))
+                if restored_segment is not None
+                else str(item.text or "")
+            )
+            restored_start = (
+                float(restored_segment.get("start", 0.0))
+                if restored_segment is not None
+                else float(item.start if item.start is not None else 0.0)
+            )
+            restored_end = (
+                float(restored_segment.get("end", restored_start))
+                if restored_segment is not None
+                else float(item.end if item.end is not None else restored_start)
+            )
+            results["created_segments"].append({
+                "segment_id": seg_id,
+                "legacy_index": restored_index,
+                "text": restored_text,
+                "start": restored_start,
+                "end": restored_end,
+            })
+            results["created"] += 1
+            _publish_project_subtitle_event(
+                project_id,
+                "added",
+                {
+                    "segment": restored_segment
+                    if restored_segment is not None
+                    else {
+                        "segment_id": seg_id,
+                        "legacy_index": restored_index,
+                        "text": restored_text,
+                        "start": restored_start,
+                        "end": restored_end,
+                        "source_type": "restored",
+                        "is_modified": True,
+                    },
+                    "source": "project_api",
+                    "is_update": True,
+                },
+            )
+            return int(restored_index)
+        else:
+            results["errors"].append(f"restore: {seg_id} tombstone 中未找到")
+            return None
+    return None
 
 
 @router.patch("/{project_id}/subtitles/legacy/{sentence_index}")

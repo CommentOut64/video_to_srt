@@ -88,7 +88,7 @@
       <div class="resizer" @mousedown="startResize" :class="{ active: isResizing }"></div>
 
       <!-- 右侧边栏 -->
-      <aside class="sidebar-column">
+      <aside class="sidebar-column" :class="{ 'is-resizing': isResizing }">
         <!-- 标签页导航 -->
         <div class="tab-nav">
           <button
@@ -115,29 +115,40 @@
           </button>
           <!-- 右侧弹簧 + 视图切换按钮（搜索激活时显示） -->
           <div class="tw-flex-1" />
-          <button
+          <el-popover
             v-if="subtitleListRef?.isSearchActive"
-            class="tab-nav-icon-btn"
-            :title="subtitleListRef?.sortMode === 'grouped' ? '当前：分组模式（点击切换为时间线）' : '当前：时间线模式（点击切换为分组）'"
-            @click="subtitleListRef?.toggleSortMode?.()"
+            :content="subtitleListRef?.sortMode === 'grouped' ? '当前：分组模式（点击切换为时间线）' : '当前：时间线模式（点击切换为分组）'"
+            placement="top"
+            trigger="hover"
+            popper-class="hint-popover-compact"
+            :show-after="500"
           >
-            <svg v-if="subtitleListRef?.sortMode === 'grouped'" viewBox="0 0 24 24" fill="currentColor">
-              <path d="M3 15h4v-2H3v2zm0 4h4v-2H3v2zm0-8h4V9H3v2zm4-6v2h14V5H7zm0 10h14v-2H7v2zm0 4h14v-2H7v2z"/>
-            </svg>
-            <svg v-else viewBox="0 0 24 24" fill="currentColor">
-              <path d="M3 14h4v-4H3v4zm0 5h4v-4H3v4zM3 9h4V5H3v4zm5 5h13v-4H8v4zm0 5h13v-4H8v4zM8 5v4h13V5H8z"/>
-            </svg>
-          </button>
+            <template #reference>
+              <button
+                class="tab-nav-icon-btn"
+                @click="subtitleListRef?.toggleSortMode?.()"
+              >
+                <svg v-if="subtitleListRef?.sortMode === 'grouped'" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M3 15h4v-2H3v2zm0 4h4v-2H3v2zm0-8h4V9H3v2zm4-6v2h14V5H7zm0 10h14v-2H7v2zm0 4h14v-2H7v2z"/>
+                </svg>
+                <svg v-else viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M3 14h4v-4H3v4zm0 5h4v-4H3v4zM3 9h4V5H3v4zm5 5h13v-4H8v4zm0 5h13v-4H8v4zM8 5v4h13V5H8z"/>
+                </svg>
+              </button>
+            </template>
+          </el-popover>
         </div>
 
         <!-- 标签页内容 -->
         <div class="tab-content">
           <div v-show="activeTab === 'subtitles'" class="tab-pane">
-            <SubtitleList
+            <!-- V3.2.5+dev.20260316.04: Phase F-0 运行时硬切换，仅挂载新字幕列表 -->
+            <VirtualSubtitleList
               ref="subtitleListRef"
               :auto-scroll="true"
-              :enable-auto-resume-follow="subtitleFollowAutoResumeEnabled"
-              :editable="true"
+              :enable-auto-resume-follow="true"
+              :auto-resume-delay-seconds="subtitleFollowAutoResumeDelay"
+              :is-resizing="isResizing"
             />
           </div>
 
@@ -189,13 +200,23 @@
           {{ errorCount }} 个问题
         </span>
         <span class="divider">|</span>
-        <button class="settings-btn" @click="showAdvancedSettings = true" title="高级设置">
-          <svg viewBox="0 0 24 24" fill="currentColor">
-            <path
-              d="M19.14,12.94c0.04-0.3,0.06-0.61,0.06-0.94c0-0.32-0.02-0.64-0.07-0.94l2.03-1.58c0.18-0.14,0.23-0.41,0.12-0.61 l-1.92-3.32c-0.12-0.22-0.37-0.29-0.59-0.22l-2.39,0.96c-0.5-0.38-1.03-0.7-1.62-0.94L14.4,2.81c-0.04-0.24-0.24-0.41-0.48-0.41 h-3.84c-0.24,0-0.43,0.17-0.47,0.41L9.25,5.35C8.66,5.59,8.12,5.92,7.63,6.29L5.24,5.33c-0.22-0.08-0.47,0-0.59,0.22L2.74,8.87 C2.62,9.08,2.66,9.34,2.86,9.48l2.03,1.58C4.84,11.36,4.8,11.69,4.8,12s0.02,0.64,0.07,0.94l-2.03,1.58 c-0.18,0.14-0.23,0.41-0.12,0.61l1.92,3.32c0.12,0.22,0.37,0.29,0.59,0.22l2.39-0.96c0.5,0.38,1.03,0.7,1.62,0.94l0.36,2.54 c0.05,0.24,0.24,0.41,0.48,0.41h3.84c0.24,0,0.44-0.17,0.47-0.41l0.36-2.54c0.59-0.24,1.13-0.56,1.62-0.94l2.39,0.96 c0.22,0.08,0.47,0,0.59-0.22l1.92-3.32c0.12-0.22,0.07-0.47-0.12-0.61L19.14,12.94z M12,15.6c-1.98,0-3.6-1.62-3.6-3.6 s1.62-3.6,3.6-3.6s3.6,1.62,3.6,3.6S13.98,15.6,12,15.6z"
-            />
-          </svg>
-        </button>
+        <el-popover
+          content="高级设置"
+          placement="top"
+          trigger="hover"
+          popper-class="hint-popover-compact"
+          :show-after="500"
+        >
+          <template #reference>
+            <button class="settings-btn" @click="showAdvancedSettings = true">
+              <svg viewBox="0 0 24 24" fill="currentColor">
+                <path
+                  d="M19.14,12.94c0.04-0.3,0.06-0.61,0.06-0.94c0-0.32-0.02-0.64-0.07-0.94l2.03-1.58c0.18-0.14,0.23-0.41,0.12-0.61 l-1.92-3.32c-0.12-0.22-0.37-0.29-0.59-0.22l-2.39,0.96c-0.5-0.38-1.03-0.7-1.62-0.94L14.4,2.81c-0.04-0.24-0.24-0.41-0.48-0.41 h-3.84c-0.24,0-0.43,0.17-0.47,0.41L9.25,5.35C8.66,5.59,8.12,5.92,7.63,6.29L5.24,5.33c-0.22-0.08-0.47,0-0.59,0.22L2.74,8.87 C2.62,9.08,2.66,9.34,2.86,9.48l2.03,1.58C4.84,11.36,4.8,11.69,4.8,12s0.02,0.64,0.07,0.94l-2.03,1.58 c-0.18,0.14-0.23,0.41-0.12,0.61l1.92,3.32c0.12,0.22,0.37,0.29,0.59,0.22l2.39-0.96c0.5,0.38,1.03,0.7,1.62,0.94l0.36,2.54 c0.05,0.24,0.24,0.41,0.48,0.41h3.84c0.24,0,0.44-0.17,0.47-0.41l0.36-2.54c0.59-0.24,1.13-0.56,1.62-0.94l2.39,0.96 c0.22,0.08,0.47,0,0.59-0.22l1.92-3.32c0.12-0.22,0.07-0.47-0.12-0.61L19.14,12.94z M12,15.6c-1.98,0-3.6-1.62-3.6-3.6 s1.62-3.6,3.6-3.6s3.6,1.62,3.6,3.6S13.98,15.6,12,15.6z"
+                />
+              </svg>
+            </button>
+          </template>
+        </el-popover>
       </div>
     </footer>
 
@@ -203,12 +224,19 @@
     <el-dialog
       v-model="showAdvancedSettings"
       title="高级设置"
-      width="600px"
+      width="720px"
+      class="advanced-settings-dialog"
+      align-center
+      :lock-scroll="false"
       :close-on-click-modal="false"
       :close-on-press-escape="true"
       @close="handleCloseAdvancedSettings"
     >
-      <AdvancedSettings v-model="advancedConfig" />
+      <AdvancedSettings
+        v-model="advancedConfig"
+        :enable-shortcut-customization="true"
+        @open-about="showAboutDialog = true"
+      />
       <template #footer>
         <span class="dialog-footer">
           <el-button @click="handleCancelAdvancedSettings">取消</el-button>
@@ -216,6 +244,9 @@
         </span>
       </template>
     </el-dialog>
+
+    <!-- V3.2.4+dev.20260303.04: 高级设置内"关于"Tab 触发 -->
+    <AboutDialog v-model="showAboutDialog" />
   </div>
 </template>
 
@@ -234,14 +265,39 @@ import { onBeforeRouteLeave, useRouter } from 'vue-router'
 import { useProjectStore } from '@/stores/projectStore'
 import { usePlaybackStore } from '@/stores/playbackStore'
 import { useTaskRuntimeStore } from '@/stores/taskRuntimeStore'
-import { useEditorSessionStore } from '@/stores/editorSessionStore'
+import { useEditorDocumentStore } from '@/stores/editor/editorDocumentStore'
+import { useEditorCommandBus } from '@/stores/editor/editorCommandBus'
+import { useEditorHistoryStore } from '@/stores/editor/editorHistoryStore'
+import { useEditorSessionStore } from '@/stores/editor/editorSessionStore'
+import { useEditorSyncEngine } from '@/stores/editor/editorSyncEngine'
+import { useEditorProjectionBridge } from '@/stores/editor/editorProjectionBridge'
+import { useEditorEventProjector } from '@/stores/editor/editorEventProjector'
+import {
+  scheduleAuthoritativeReloadForRealtimeEvent,
+  shouldScheduleAuthoritativeReloadForProjectModeEvent,
+} from '@/stores/editor/editorRealtimeSyncPolicy'
+import {
+  applySentencePatch,
+  deleteServerSegment,
+  shouldIgnoreProjectAckEvent,
+  upsertServerSegment,
+} from '@/stores/editor/editorServerProjection'
 import { useSubtitleDocumentStore } from '@/stores/subtitleDocumentStore'
+import { useStructuralSyncStore } from '@/stores/structuralSyncStore'
 import { legacyApi, mediaApi, projectApi, transcriptionApi } from '@/services/api'
 import sseChannelManager from '@/services/sseChannelManager'
 import { useShortcuts } from '@/hooks/useShortcuts'
 import { useProxyVideo } from '@/composables/useProxyVideo'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 import { repairSubtitleOverlaps } from '@/utils/subtitleUtils'
+import {
+  DEFAULT_EDITOR_SHORTCUT_CONFIG,
+  detectBrowserReservedShortcutConflicts,
+  detectEditorShortcutConflicts,
+  getEditorShortcutActionLabel,
+  getEditorShortcutComboLabel,
+  normalizeEditorShortcutConfig,
+} from '@/utils/editorShortcuts'
 import { ElMessage } from 'element-plus'
 import {
   buildDefaultCapabilitySnapshot,
@@ -252,9 +308,12 @@ import {
 import EditorHeader from '@/components/editor/EditorHeader.vue'
 import PlaybackControls from '@/components/editor/PlaybackControls/index.vue'
 import VideoStage from '@/components/editor/VideoStage/index.vue'
-import SubtitleList from '@/components/editor/SubtitleList/index.vue'
+import VirtualSubtitleList from '@/components/editor/VirtualSubtitleList/index.vue'
 import WaveformTimeline from '@/components/editor/WaveformTimeline/index.vue'
 import AdvancedSettings from '@/components/editor/AdvancedSettings.vue'
+import AboutDialog from '@/components/AboutDialog.vue'
+import { isFeatureEnabled } from '@/config/featureFlags'
+import { initEditorCore } from '@/stores/editor/editorCore'
 
 // Props
 const rawProps = defineProps({
@@ -275,9 +334,20 @@ const props = new Proxy(rawProps, {
 const projectStore = useProjectStore()
 const playbackStore = usePlaybackStore()
 const taskStore = useTaskRuntimeStore()
+const editorDocumentStore = useEditorDocumentStore()
+const editorCommandBus = useEditorCommandBus()
+const editorHistoryStore = useEditorHistoryStore()
 const editorSessionStore = useEditorSessionStore()
+const editorSyncEngine = useEditorSyncEngine()
+const editorProjectionBridge = useEditorProjectionBridge()
+const editorEventProjector = useEditorEventProjector()
 const subtitleDocumentStore = useSubtitleDocumentStore()
+const structuralSyncStore = useStructuralSyncStore()
 const router = useRouter()
+
+// V3.2.5+dev.20260315.01: Feature flag 控制新旧内核
+const useEditorV2 = isFeatureEnabled('USE_EDITOR_V2')
+console.log('[EditorView] useEditorV2:', useEditorV2)
 
 // 全局播放管理器
 const playbackManager = usePlaybackManager()
@@ -304,6 +374,8 @@ const lastSaved = ref(null)
 // 布局状态
 const sidebarWidth = ref(350)
 const isResizing = ref(false)
+let sidebarResizeFrameId = 0
+let pendingSidebarWidth = null
 
 // 加载状态
 const isLoading = ref(true)
@@ -311,6 +383,7 @@ const loadError = ref(null)
 
 // 高级设置状态
 const showAdvancedSettings = ref(false)
+const showAboutDialog = ref(false)
 const advancedConfig = ref({
   general: {
     global_time_offset: projectStore.subtitleOffset, // 从 store 初始化
@@ -319,6 +392,10 @@ const advancedConfig = ref({
     preview_font_size: 24,
     enable_shortcuts: true,
     subtitle_follow_auto_resume: true,
+    subtitle_follow_auto_resume_delay: 5,
+    hide_timeline_scale: false,
+    merge_separator: 'space',
+    merge_separator_custom: '',
   },
   preprocessing: {
     demucs_strategy: 'auto',
@@ -345,10 +422,19 @@ const advancedConfig = ref({
     gpu_id: 0,
     temp_file_policy: 'delete_on_complete',
   },
+  shortcuts: { ...DEFAULT_EDITOR_SHORTCUT_CONFIG },
   preset_id: 'default',
 })
 const SUBTITLE_FOLLOW_AUTO_RESUME_PREF_KEY = 'editor-subtitle-follow-auto-resume'
+const SUBTITLE_FOLLOW_AUTO_RESUME_DELAY_PREF_KEY = 'editor-subtitle-follow-auto-resume-delay'
+const HIDE_TIMELINE_SCALE_PREF_KEY = 'editor-hide-timeline-scale'
+const SHORTCUT_ENABLED_PREF_KEY = 'editor-shortcuts-enabled'
+const SHORTCUT_CONFIG_PREF_KEY = 'editor-shortcuts-config'
 const subtitleFollowAutoResumeEnabled = ref(true)
+const subtitleFollowAutoResumeDelay = ref(5)
+const hideTimelineScale = ref(false)
+const shortcutEnabled = ref(true)
+const shortcutConfig = ref({ ...DEFAULT_EDITOR_SHORTCUT_CONFIG })
 
 // 统一进度状态
 const progressStore = taskStore
@@ -379,6 +465,11 @@ let cancelTimeoutTimer = null
 let isRealtimeFinalSyncInFlight = false
 let hasRealtimeFinalSyncPending = false
 let realtimeFinalSyncReason = null
+let editorCoreSessionKey = null
+let isEditorProjectionReloadInFlight = false
+let hasEditorProjectionReloadPending = false
+let editorProjectionReloadReason = null
+let strictSyncInFlightPromise = null
 
 watch(
   () => activeJobId.value,
@@ -404,7 +495,7 @@ const isMediaReady = computed(() => {
     hasVideoSource.value
     || !!projectStore.meta.audioPath
     || proxyVideo.isReady.value
-    || projectStore.subtitles.length > 0
+    || subtitleDocumentStore.subtitles.length > 0
   )
 })
 
@@ -420,6 +511,7 @@ provide('editorContext', {
   // 兼容旧注入名称，避免存量组件行为突变。
   isVideoReady: isMediaReady,
   hasVideoSource,
+  hideTimelineScale,
 })
 
 // 将 projectStore 的估算双流进度同步到统一状态，供 UI 兜底展示
@@ -445,6 +537,7 @@ watch([() => rawProps.projectId, () => rawProps.jobId], async ([newProjectId, ne
 
   // 重置项目状态
   projectStore.resetProject()
+  editorCoreSessionKey = null
 
   // 重新加载项目
   await loadProject()
@@ -533,18 +626,18 @@ const projectName = computed(() => {
 })
 
 // 基础状态
-const isDirty = computed(() => projectStore.isDirty)
-const totalSubtitles = computed(() => projectStore.totalSubtitles)
-const currentSubtitle = computed(() => projectStore.currentSubtitle)
+const isDirty = computed(() => editorSessionStore.isDirty)
+const totalSubtitles = computed(() => editorProjectionBridge.totalSubtitles)
+const currentSubtitle = computed(() => editorProjectionBridge.currentSubtitle)
 const currentSubtitleIndex = computed(() =>
   currentSubtitle.value
-    ? projectStore.subtitles.findIndex((s) => s.id === currentSubtitle.value.id)
+    ? editorProjectionBridge.findSubtitleIndexById(currentSubtitle.value.id)
     : -1
 )
 
 // 撤销/重做
-const canUndo = computed(() => projectStore.canUndo)
-const canRedo = computed(() => projectStore.canRedo)
+const canUndo = computed(() => editorHistoryStore.canUndo)
+const canRedo = computed(() => editorHistoryStore.canRedo)
 
 // 队列进度计算
 const queueCompleted = computed(() => taskStore.tasks.filter((t) => t.status === 'finished').length)
@@ -554,9 +647,7 @@ const activeTasks = computed(
 )
 
 // 问题检查计数（统计有警告的字幕数量）
-const errorCount = computed(
-  () => projectStore.subtitles.filter((s) => s.warning_type && s.warning_type !== 'none').length
-)
+const errorCount = computed(() => editorProjectionBridge.warningCount)
 
 // Grid 布局样式
 const gridStyle = computed(() => ({
@@ -620,6 +711,61 @@ function applyMediaPaths({ project = null, mediaStatus = null } = {}) {
   projectStore.setMediaPaths({
     videoPath: hasVideo ? mediaApi.getVideoUrl(identity) : null,
     audioPath: hasAudio ? mediaApi.getAudioUrl(identity) : null,
+  })
+}
+
+async function reloadEditorProjectionFromBackend(projectId, reason = 'unknown') {
+  void reason
+  if (!useEditorV2 || !projectId) {
+    return 0
+  }
+
+  const nextSessionKey = `${projectId}::${activeJobId.value || ''}`
+  if (editorCoreSessionKey !== nextSessionKey) {
+    initEditorCore(projectId, activeJobId.value)
+    editorCoreSessionKey = nextSessionKey
+  }
+
+  const { loadSubtitlesFromBackend } = await import('@/stores/editor/editorCoreLoader')
+  await loadSubtitlesFromBackend(projectId)
+  return editorProjectionBridge.totalSubtitles
+}
+
+async function scheduleEditorProjectionReload(projectId, reason = 'unknown') {
+  if (!useEditorV2 || !projectId) {
+    return 0
+  }
+
+  editorProjectionReloadReason = reason
+  if (isEditorProjectionReloadInFlight) {
+    hasEditorProjectionReloadPending = true
+    return editorProjectionBridge.totalSubtitles
+  }
+
+  isEditorProjectionReloadInFlight = true
+  try {
+    do {
+      const currentReason = editorProjectionReloadReason || reason
+      hasEditorProjectionReloadPending = false
+      editorProjectionReloadReason = null
+      await reloadEditorProjectionFromBackend(projectId, currentReason)
+    } while (hasEditorProjectionReloadPending)
+  } finally {
+    isEditorProjectionReloadInFlight = false
+  }
+
+  return editorProjectionBridge.totalSubtitles
+}
+
+function scheduleV2RealtimeAuthoritativeReload(reason) {
+  scheduleAuthoritativeReloadForRealtimeEvent({
+    useEditorV2,
+    projectId: props.projectId || projectStore.meta.projectId,
+    reason,
+    activeJobId: activeJobId.value,
+    scheduleReload: (projectId, reloadReason) => {
+      void scheduleEditorProjectionReload(projectId, reloadReason)
+    },
   })
 }
 
@@ -703,18 +849,24 @@ async function resolveIdentity() {
 
 // 加载项目数据
 async function loadProject() {
+  console.log('[loadProject] 开始执行，useEditorV2:', useEditorV2)
   isLoading.value = true
   loadError.value = null
 
   // 先重置项目状态，确保不同任务数据隔离
+  console.log('[loadProject] 重置项目状态')
   projectStore.resetProject()
+  structuralSyncStore.$reset()
 
   try {
+    console.log('[loadProject] 开始 resolveIdentity')
     await resolveIdentity()
+    console.log('[loadProject] resolveIdentity 完成')
     const projectId = props.projectId
     if (!projectId) {
       throw new Error('缺少 project_id，无法进入编辑器（job 转 project 失败）')
     }
+    console.log('[loadProject] projectId:', projectId)
 
     const initialCapabilitySnapshot = resolveCapabilitySnapshot()
     projectStore.setIdentity({
@@ -749,7 +901,9 @@ async function loadProject() {
     applyMediaPaths({ project: projectMeta })
 
     // 纯项目模式（Lite 导入）: 跳过任务状态，改走 project 频道同步
+    console.log('[loadProject] 检查模式，activeJobId:', activeJobId.value, 'projectId:', projectId)
     if (!activeJobId.value && projectId) {
+      console.log('[loadProject] 进入纯项目模式分支')
       try {
         await proxyVideo.refresh()
       } catch (e) {
@@ -769,32 +923,10 @@ async function loadProject() {
         mode: project?.mode || 'normal',
         taskMode: project?.task_mode || 'subtitle_edit',
       })
-      const restored = await projectStore.restoreProject(projectId)
-      // 恢复缓存后再次覆盖媒体路径，防止旧缓存 videoPath 误导为“有视频”。
+      await scheduleEditorProjectionReload(projectId, 'load_project_project_mode')
       applyMediaPaths({ project })
-      if (!restored || projectStore.subtitles.length === 0) {
-        const segments = await projectApi.getSubtitles(projectId)
-        await editorSessionStore.restoreSession({
-          identity: {
-            projectId,
-            jobId: project?.job_id || null,
-            mode: project?.mode || 'normal',
-            taskMode: project?.task_mode || 'subtitle_edit',
-            flavor: project?.flavor || selectFlavor(projectStore.meta.capabilitySnapshot),
-            capabilitySnapshot: projectStore.meta.capabilitySnapshot,
-          },
-          metaPayload: {
-            title: project?.title || '',
-            filename: project?.title || '项目字幕',
-            videoPath: projectStore.meta.videoPath,
-            audioPath: projectStore.meta.audioPath,
-          },
-          segments,
-        })
-        // loadFromProjectData 会更新 meta，确保媒体路径继续以本次判定为准。
-        applyMediaPaths({ project })
-      }
       subscribeSSE()
+
       if (!proxyVideo.isReady.value) {
         startProxyPolling()
       }
@@ -840,39 +972,24 @@ async function loadProject() {
       console.warn('[EditorView] 刷新 Proxy 状态失败（初始阶段，忽略）:', e)
     }
 
-    const restoreKey = projectId
-    const restored = restoreKey ? await projectStore.restoreProject(restoreKey) : false
-    // 恢复缓存后再次覆盖媒体路径，避免历史缓存导致 videoPath 误判。
+    // V2 下不再恢复旧字幕缓存，避免首屏出现旧真源与新真源双装载。
     applyMediaPaths({ project: projectMeta, mediaStatus: jobStatus.media_status })
-    const hasLocalRestore = restored && projectStore.subtitles.length > 0
-    if (hasLocalRestore) {
-      const hasValidFormat = projectStore.subtitles.every((s) => s.sentenceIndex !== undefined)
-      if (!hasValidFormat) {
-        await loadTranscribingSegments()
-      }
-      if (['canceled', 'force_canceled'].includes(jobStatus.status)) {
-        const hasDraft = projectStore.subtitles.some((s) => s.isDraft)
-        if (hasDraft) {
-          await subtitleDocumentStore.finalizeDraftSubtitlesOnTerminal('load_project_terminal')
-        }
-      }
-    }
 
     await loadSubtitleOffset()
 
     if (jobStatus.status === 'finished') {
-      await loadTranscribingSegments()
+      await loadTranscribingSegments('load_project_finished')
       if (!proxyVideo.isReady.value) {
         subscribeSSE()
         startProxyPolling()
       }
     } else if (['processing', 'queued'].includes(jobStatus.status)) {
-      await loadTranscribingSegments()
+      await loadTranscribingSegments(`load_project_${jobStatus.status}`)
       subscribeSSE()
       startProgressPolling()
       startProxyPolling()
     } else if (jobStatus.status === 'paused') {
-      await loadTranscribingSegments()
+      await loadTranscribingSegments('load_project_paused')
       subscribeSSE()
       refreshTaskProgress()
       startProxyPolling()
@@ -884,7 +1001,7 @@ async function loadProject() {
         reason: 'load_project_canceled_terminal',
       })
     } else if (jobStatus.status === 'failed') {
-      await loadTranscribingSegments()
+      await loadTranscribingSegments('load_project_failed')
     }
 
     notifyMissingVideoOnce()
@@ -908,38 +1025,26 @@ async function loadProject() {
 }
 
 // 加载转录中的 segments
-async function loadTranscribingSegments() {
+async function loadTranscribingSegments(reason = 'unknown') {
   const projectId = props.projectId || projectStore.meta.projectId
   if (!projectId) {
     throw new Error('缺少 project_id，无法拉取字幕真源')
   }
-  try {
-    const segments = await projectApi.getSubtitles(projectId)
-    if (Array.isArray(segments) && segments.length > 0) {
-      projectStore.loadFromProjectData(segments, {
-        jobId: activeJobId.value,
-        projectId,
-        filename: projectStore.meta.filename,
-        duration: projectStore.meta.duration,
-        videoPath: projectStore.meta.videoPath,
-        audioPath: projectStore.meta.audioPath,
-      })
-    }
-    return Array.isArray(segments) ? segments.length : 0
-  } catch (error) {
-    console.warn('[EditorView] 拉取 project 字幕真源失败:', error)
-    return 0
-  }
+  return scheduleEditorProjectionReload(projectId, reason)
 }
 
 // V3.2.4+dev.20260222.14: 终态同步必须以后端为唯一数据源
 async function syncSegmentsFromBackendAsSource({ reason = 'unknown' } = {}) {
-  void reason
-  await loadTranscribingSegments()
+  await loadTranscribingSegments(reason)
 }
 
 // V3.2.4+dev.20260222.15: 每次定稿事件都立即触发后端回拉，且高频事件合并为“当前1次+补1次”
 async function scheduleRealtimeFinalSync(reason = 'subtitle_final_event') {
+  if (useEditorV2) {
+    scheduleV2RealtimeAuthoritativeReload(reason)
+    return
+  }
+
   realtimeFinalSyncReason = reason
   if (isRealtimeFinalSyncInFlight) {
     hasRealtimeFinalSyncPending = true
@@ -986,6 +1091,128 @@ function formatSRTTime(seconds) {
   return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')},${ms.toString().padStart(3, '0')}`
 }
 
+function toSafeMs(value) {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) {
+    return 0
+  }
+  return Math.round(numeric)
+}
+
+function toNormalizedSegmentId(value) {
+  const normalized = String(value ?? '').trim()
+  return normalized || null
+}
+
+function assertEditorV2SnapshotConsistency(serverSegments) {
+  if (!useEditorV2) {
+    return
+  }
+
+  const localBySegmentId = new Map()
+  for (const localId of editorDocumentStore.order) {
+    const entity = editorDocumentStore.getEntity(localId)
+    if (!entity || entity.isDeleted) {
+      continue
+    }
+    const segmentId = toNormalizedSegmentId(editorDocumentStore.getCold(localId)?.segmentId)
+    if (!segmentId) {
+      throw new Error(`本地仍存在未绑定字幕（localId=${localId}），请稍后重试导出`)
+    }
+    if (localBySegmentId.has(segmentId)) {
+      throw new Error(`本地存在重复 segment_id=${segmentId}，请刷新后重试`)
+    }
+    localBySegmentId.set(segmentId, {
+      text: String(entity.text ?? ''),
+      startMs: toSafeMs(entity.startMs),
+      endMs: toSafeMs(entity.endMs),
+    })
+  }
+
+  const serverBySegmentId = new Map()
+  for (const segment of (Array.isArray(serverSegments) ? serverSegments : [])) {
+    const segmentId = toNormalizedSegmentId(segment?.segment_id)
+    if (!segmentId) {
+      continue
+    }
+    if (serverBySegmentId.has(segmentId)) {
+      throw new Error(`后端返回重复 segment_id=${segmentId}，请稍后重试`)
+    }
+    serverBySegmentId.set(segmentId, {
+      text: String(segment?.text ?? ''),
+      startMs: toSafeMs(Number(segment?.start ?? 0) * 1000),
+      endMs: toSafeMs(Number(segment?.end ?? segment?.start ?? 0) * 1000),
+    })
+  }
+
+  const mismatches = []
+  if (localBySegmentId.size !== serverBySegmentId.size) {
+    mismatches.push(`数量不一致(local=${localBySegmentId.size}, server=${serverBySegmentId.size})`)
+  }
+
+  for (const [segmentId, localSnapshot] of localBySegmentId.entries()) {
+    const serverSnapshot = serverBySegmentId.get(segmentId)
+    if (!serverSnapshot) {
+      mismatches.push(`后端缺少 segment_id=${segmentId}`)
+      continue
+    }
+    const isTextMismatch = localSnapshot.text !== serverSnapshot.text
+    const isTimingMismatch = (
+      Math.abs(localSnapshot.startMs - serverSnapshot.startMs) > 1
+      || Math.abs(localSnapshot.endMs - serverSnapshot.endMs) > 1
+    )
+    if (isTextMismatch || isTimingMismatch) {
+      mismatches.push(`segment_id=${segmentId} 文本/时间不一致`)
+    }
+  }
+
+  for (const segmentId of serverBySegmentId.keys()) {
+    if (!localBySegmentId.has(segmentId)) {
+      mismatches.push(`本地缺少 segment_id=${segmentId}`)
+    }
+  }
+
+  if (mismatches.length > 0) {
+    const summary = mismatches.slice(0, 3).join('；')
+    throw new Error(`前后端字幕快照不一致：${summary}`)
+  }
+}
+
+async function runEditorSyncStrict() {
+  if (!useEditorV2) {
+    return true
+  }
+
+  if (strictSyncInFlightPromise) {
+    return strictSyncInFlightPromise
+  }
+
+  strictSyncInFlightPromise = (async () => {
+    // 兼容热更新/旧会话：若实例尚未拿到 flushStrict，则降级组合 flush + reconcile + flush。
+    if (typeof editorSyncEngine.flushStrict === 'function') {
+      return editorSyncEngine.flushStrict()
+    }
+    if (typeof editorSyncEngine.flush === 'function') {
+      const firstPass = await editorSyncEngine.flush()
+      if (!firstPass) {
+        return false
+      }
+      if (typeof editorSyncEngine.reconcile === 'function') {
+        await editorSyncEngine.reconcile()
+        return editorSyncEngine.flush()
+      }
+      return firstPass
+    }
+    throw new Error('同步引擎不可用：缺少 flush/flushStrict')
+  })()
+
+  try {
+    return await strictSyncInFlightPromise
+  } finally {
+    strictSyncInFlightPromise = null
+  }
+}
+
 function normalizeProjectSegmentEvent(data) {
   const segment = data?.segment
   const segmentId = data?.segment_id || segment?.segment_id
@@ -1019,87 +1246,60 @@ function normalizeProjectSegmentEvent(data) {
   }
 }
 
-function handleProjectSubtitleUpsert(data) {
-  const normalized = normalizeProjectSegmentEvent(data)
-  if (!normalized) {
-    return
+function handleProjectSubtitleUpsert(data, eventType = 'subtitle.project_upsert') {
+  if (shouldIgnoreProjectAckEvent(data, editorSessionStore.sessionId)) {
+    return true
   }
 
-  const existingIndex = projectStore.subtitles.findIndex(
-    (item) => item.segment_id === normalized.segmentId
-  )
-
-  const payload = {
-    sentenceIndex:
-      normalized.sentenceIndex
-      ?? (existingIndex >= 0 ? projectStore.subtitles[existingIndex].sentenceIndex : undefined),
-    segment_id: normalized.segmentId,
-    text: normalized.text,
-    start: normalized.start,
-    end: normalized.end,
-    isModified: normalized.isModified,
-    originalText: normalized.originalText,
-    words: normalized.words,
-    confidence: normalized.confidence,
-    display_confidence: normalized.displayConfidence,
-    confidence_source: normalized.confidenceSource,
-    warning_type: normalized.warningType,
-    source: normalized.source,
-    isDraft: false,
-    isFinalized: true,
+  const rawSegment = data?.segment
+  if (!rawSegment || typeof rawSegment !== 'object') {
+    throw new Error(`[EditorView] ${eventType} 缺少 segment 载荷`)
   }
 
-  projectStore.pauseHistory()
-  try {
-    if (existingIndex >= 0) {
-      const existingId = projectStore.subtitles[existingIndex].id
-      projectStore.updateSubtitle(existingId, payload)
-      return
-    }
-
-    const insertIndex = projectStore.subtitles.findIndex((item) => item.start > payload.start)
-    const finalIndex = insertIndex === -1 ? projectStore.subtitles.length : insertIndex
-    const nextSubtitle = {
-      id: `subtitle-${normalized.segmentId}`,
-      sentenceIndex: payload.sentenceIndex ?? finalIndex,
-      segment_id: normalized.segmentId,
-      start: payload.start,
-      end: payload.end,
-      text: payload.text,
-      isDirty: false,
-      isModified: payload.isModified,
-      originalText: payload.originalText,
-      chunk_id: null,
-      words: payload.words,
-      confidence: payload.confidence,
-      display_confidence: payload.display_confidence,
-      confidence_source: payload.confidence_source,
-      warning_type: payload.warning_type,
-      source: payload.source,
-      isDraft: false,
-      isFinalized: true,
-    }
-    projectStore.insertSubtitleAt(finalIndex, nextSubtitle)
-  } finally {
-    projectStore.resumeHistory()
+  const applied = upsertServerSegment(editorDocumentStore, {
+    ...rawSegment,
+    segment_id: data?.segment_id || rawSegment.segment_id,
+  })
+  if (!applied) {
+    throw new Error(
+      `[EditorView] ${eventType} 无法投影到 editorDocumentStore（segment_id=${data?.segment_id || rawSegment.segment_id || 'unknown'}）`
+    )
   }
+  if (shouldScheduleAuthoritativeReloadForProjectModeEvent({
+    useEditorV2,
+    activeJobId: activeJobId.value,
+  })) {
+    scheduleV2RealtimeAuthoritativeReload(
+      `${eventType}_${data?.segment_id || rawSegment.segment_id || 'unknown'}`
+    )
+  }
+  return true
 }
 
 function handleProjectSubtitleDelete(data) {
-  const segmentId = data?.segment_id
+  if (shouldIgnoreProjectAckEvent(data, editorSessionStore.sessionId)) {
+    return true
+  }
+
+  const segmentId = data?.segment_id ?? data?.segment?.segment_id
   if (!segmentId) {
-    return
+    throw new Error('[EditorView] subtitle.project_delete 缺少 segment_id')
   }
-  const index = projectStore.subtitles.findIndex((item) => item.segment_id === segmentId)
-  if (index < 0) {
-    return
+
+  const deleted = deleteServerSegment(editorDocumentStore, segmentId)
+  if (!deleted) {
+    if (data?.source === 'project_api' && data?.is_update === true) {
+      return true
+    }
+    throw new Error(`[EditorView] subtitle.project_delete 未命中本地绑定（segment_id=${segmentId}）`)
   }
-  projectStore.pauseHistory()
-  try {
-    projectStore.removeSubtitleAt(index)
-  } finally {
-    projectStore.resumeHistory()
+  if (shouldScheduleAuthoritativeReloadForProjectModeEvent({
+    useEditorV2,
+    activeJobId: activeJobId.value,
+  })) {
+    scheduleV2RealtimeAuthoritativeReload(`subtitle.deleted.project_${segmentId}`)
   }
+  return true
 }
 
 // ========== SSE 实时更新 ==========
@@ -1119,10 +1319,10 @@ function subscribeSSE() {
   if (!jobId && projectId) {
     sseUnsubscribe = sseChannelManager.subscribeProject(projectId, {
       onSubtitleUpdated(data) {
-        handleProjectSubtitleUpsert(data)
+        handleProjectSubtitleUpsert(data, 'subtitle.edited.project')
       },
       onSubtitleAdded(data) {
-        handleProjectSubtitleUpsert(data)
+        handleProjectSubtitleUpsert(data, 'subtitle.added.project')
       },
       onSubtitleDeleted(data) {
         handleProjectSubtitleDelete(data)
@@ -1323,7 +1523,7 @@ function subscribeSSE() {
     },
 
     onSubtitleAdded(data) {
-      handleStreamingSubtitle(data)
+      handleSubtitleAdded(data)
     },
 
     onSubtitleDeleted(data) {
@@ -1454,72 +1654,42 @@ function startCancelTimeoutPolling() {
 function handleStreamingSubtitle(data) {
   if (!data) return
 
-  // 解析字幕数据格式
-  // 兼容两种格式: 直接字段(sv_sentence) 和 嵌套sentence对象(whisper_patch/llm_proof等)
   const sentence = data.sentence || {}
   const sentenceIndex = data.sentence_index ?? data.index ?? sentence.index
-  const text = sentence.text ?? data.text ?? data.content
-  const start = sentence.start ?? data.start_time ?? data.start
-  const end = sentence.end ?? data.end_time ?? data.end
-  const warningType = sentence.warning_type ?? data.warning_type ?? 'none'
-  const source = data.source ?? data.event_type ?? 'unknown'
-  // V3.1.2+dev.20260111.01: 提取 display_confidence 和 confidence_source
-  const confidence = sentence.confidence ?? data.confidence
-  const displayConfidence = sentence.display_confidence ?? data.display_confidence
-  const confidenceSource = sentence.confidence_source ?? data.confidence_source
-
-  if (sentenceIndex === undefined || !text) {
-    console.warn('[EditorView] 无效的字幕数据:', data)
-    return
+  if (sentenceIndex === undefined || sentenceIndex === null) {
+    throw new Error('[EditorView] subtitle.legacy_update 缺少 sentence_index')
   }
 
-  if (projectStore.isSentenceDeleted(sentenceIndex)) {
-    return
+  const applied = applySentencePatch(editorDocumentStore, {
+    ...sentence,
+    index: sentenceIndex,
+    sentence_index: sentenceIndex,
+    text: sentence.text ?? data.text ?? data.content,
+    start: sentence.start ?? data.start_time ?? data.start,
+    end: sentence.end ?? data.end_time ?? data.end,
+    confidence: sentence.confidence ?? data.confidence,
+    display_confidence: sentence.display_confidence ?? data.display_confidence,
+    confidence_source: sentence.confidence_source ?? data.confidence_source,
+    warning_type: sentence.warning_type ?? data.warning_type ?? 'none',
+    source: data.source ?? data.event_type ?? 'unknown',
+    is_modified: sentence.is_modified ?? false,
+    original_text: sentence.original_text ?? null,
+  })
+  if (!applied) {
+    throw new Error(
+      `[EditorView] subtitle.legacy_update 未命中新内核字幕（sentence_index=${sentenceIndex}）`
+    )
   }
-
-  // 暂停历史记录，SSE 推送的内容不应被撤销
-  projectStore.pauseHistory()
-
-  // 更新或添加字幕到 store
-  const existingIndex = projectStore.subtitles.findIndex((s) => s.sentenceIndex === sentenceIndex)
-
-  // V3.1.2+dev.20260112.01: 包含 display_confidence 和 confidence_source
-  const subtitleData = {
-    sentenceIndex,
-    text,
-    start: start ?? 0,
-    end: end ?? 0,
-    confidence,
-    display_confidence: displayConfidence,
-    confidence_source: confidenceSource,
-    warning_type: warningType,
-    source,
-    isModified: sentence.is_modified ?? false,
-    originalText: sentence.original_text ?? null,
-  }
-  const normalized = projectStore.applyOffsetToSentenceData(subtitleData)
-
-  if (existingIndex >= 0) {
-    // V3.1.2+dev.20260112.01: 修复 - 传入正确的 id 而非索引
-    const existingId = projectStore.subtitles[existingIndex].id
-    projectStore.updateSubtitle(existingId, normalized)
-  } else {
-    // 添加新字幕 - 按时间顺序找到插入位置
-    const insertIndex = projectStore.subtitles.findIndex((s) => s.start > (normalized.start ?? 0))
-    const finalIndex = insertIndex === -1 ? projectStore.subtitles.length : insertIndex
-    // V3.1.2: 添加 id 字段给新字幕
-    normalized.id = `sv_${sentenceIndex}`
-    projectStore.addSubtitle(finalIndex, normalized)
-  }
-
-  // 恢复历史记录
-  projectStore.resumeHistory()
-
 }
 
 // Phase 5: 处理草稿字幕（快流/SenseVoice）
 function handleDraftSubtitle(data) {
   if (!data) return
+
+  if (useEditorV2) {
+    editorEventProjector.projectDraft(data)
+    return
+  }
 
   // 后端数据格式: { index, chunk_index, sentence: { text, start, end, confidence, words, ... } }
   const chunkIndex = data.chunk_index
@@ -1556,7 +1726,34 @@ function handleReplaceChunk(data) {
   if (!data) return
 
   const chunkIndex = data.chunk_index
+  if (useEditorV2) {
+    const applied = editorEventProjector.projectReplaceChunk(data)
+    if (!applied) {
+      throw new Error(
+        `[EditorView] subtitle.replace_chunk 未能应用到新内核（chunk_index=${chunkIndex ?? 'unknown'}）`
+      )
+    }
+  }
   void scheduleRealtimeFinalSync(`subtitle_replace_chunk_${chunkIndex ?? 'unknown'}`)
+}
+
+function handleSubtitleAdded(data) {
+  if (!data) return
+
+  if (useEditorV2) {
+    if (data?.segment && typeof data.segment === 'object') {
+      handleProjectSubtitleUpsert(data, 'subtitle.added')
+      return
+    }
+
+    const applied = upsertServerSegment(editorDocumentStore, data)
+    if (!applied) {
+      throw new Error('[EditorView] subtitle.added 无法投影到 editorDocumentStore')
+    }
+    return
+  }
+
+  handleStreamingSubtitle(data)
 }
 
 /**
@@ -1566,100 +1763,54 @@ function handleReplaceChunk(data) {
 function handleRestoredChunk(data) {
   if (!data) return
 
-  const chunkIndex = data.chunk_index
-  const sentences = Array.isArray(data.sentences) ? data.sentences : []
-
-  if (sentences.length === 0) {
-    return
+  const applied = editorEventProjector.projectRestored(data)
+  if (!applied) {
+    throw new Error(
+      `[EditorView] subtitle.restored 未能应用到新内核（chunk_index=${data.chunk_index ?? 'unknown'}）`
+    )
   }
-
-  // V3.1.2+dev.20260111.01: 转换为 projectStore 需要的格式，包含 display_confidence
-  const formattedSentences = sentences.map((sentence, idx) => ({
-    index: sentence.index ?? idx,
-    text: sentence.text || '',
-    start: sentence.start ?? 0,
-    end: sentence.end ?? 0,
-    confidence: sentence.confidence ?? null,
-    display_confidence: sentence.display_confidence, // V3.1.2: 映射后准确率
-    confidence_source: sentence.confidence_source, // V3.1.2: 置信度来源
-    words: sentence.words || [],
-    warning_type: sentence.warning_type || 'none',
-    source: sentence.source || 'restored',
-    is_draft: sentence.is_draft ?? false,
-    is_finalized: sentence.is_finalized ?? true,
-    is_modified: sentence.is_modified ?? false,
-    original_text: sentence.original_text ?? null,
-    speaker_id: sentence.speaker_id ?? null,
-    turn_id: sentence.turn_id ?? null,
-    speaker_label: sentence.speaker_label ?? null,
-    speaker_color_key: sentence.speaker_color_key ?? null,
-    binding_source: sentence.binding_source ?? null,
-  }))
-
-  // 调用 projectStore 的恢复方法
-  projectStore.restoreChunk(chunkIndex, formattedSentences)
-
+  scheduleV2RealtimeAuthoritativeReload(`subtitle_restored_${data.chunk_index ?? 'unknown'}`)
 }
 
 function handleSubtitleDeleted(data) {
   if (!data) return
-  const sentenceIndex = data.index ?? data.sentence_index
-  if (sentenceIndex === undefined || sentenceIndex === null) return
-  projectStore.markSentenceDeleted(sentenceIndex)
-  const target = projectStore.subtitles.find((s) => s.sentenceIndex === sentenceIndex)
-  if (target) {
-    projectStore.removeSubtitle(target.id)
+  const segmentId = data.segment_id ?? data.segment?.segment_id
+  if (!segmentId) {
+    throw new Error('[EditorView] subtitle.deleted 缺少 segment_id')
   }
+  handleProjectSubtitleDelete(data)
 }
 
 function handleSubtitleEdited(data) {
   if (!data) return
 
+  if (data?.segment && typeof data.segment === 'object') {
+    handleProjectSubtitleUpsert(data, 'subtitle.edited')
+    return
+  }
+
   const sentence = data.sentence || {}
   const sentenceIndex = data.index ?? data.sentence_index ?? sentence.index
-  if (sentenceIndex === undefined || sentenceIndex === null) return
-
-  const target = projectStore.subtitles.find((subtitle) => subtitle.sentenceIndex === sentenceIndex)
-  if (!target) {
-    console.warn('[EditorView] 编辑事件未命中本地字幕:', sentenceIndex)
-    return
+  const segmentId = data.segment_id ?? sentence.segment_id
+  if ((sentenceIndex === undefined || sentenceIndex === null) && !segmentId) {
+    throw new Error('[EditorView] subtitle.edited 缺少 sentence_index/segment_id')
   }
 
-  const patch = {}
-
-  if (sentence.text !== undefined) {
-    patch.text = sentence.text
+  const applied = applySentencePatch(editorDocumentStore, {
+    ...sentence,
+    ...(sentenceIndex !== undefined && sentenceIndex !== null
+      ? {
+          index: sentenceIndex,
+          sentence_index: sentenceIndex,
+        }
+      : {}),
+    ...(segmentId ? { segment_id: segmentId } : {}),
+  })
+  if (!applied) {
+    throw new Error(
+      `[EditorView] subtitle.edited 未命中新内核字幕（key=${sentenceIndex ?? segmentId ?? 'unknown'}）`
+    )
   }
-  if (sentence.is_modified !== undefined) {
-    patch.isModified = sentence.is_modified
-  }
-  if (sentence.original_text !== undefined) {
-    patch.originalText = sentence.original_text
-  }
-
-  const hasStart = sentence.start !== undefined && sentence.start !== null
-  const hasEnd = sentence.end !== undefined && sentence.end !== null
-  if (hasStart) {
-    patch.start = projectStore.toDisplayTime(sentence.start)
-  }
-  if (hasEnd) {
-    patch.end = projectStore.toDisplayTime(sentence.end)
-  }
-
-  if (Array.isArray(sentence.words) && sentence.words.length > 0) {
-    const normalized = projectStore.applyOffsetToSentenceData({
-      start: hasStart ? sentence.start : projectStore.toBaseTime(target.start),
-      end: hasEnd ? sentence.end : projectStore.toBaseTime(target.end),
-      words: sentence.words,
-    })
-    patch.words = normalized.words
-  }
-
-  if (Object.keys(patch).length === 0) {
-    return
-  }
-
-  projectStore.updateSubtitle(target.id, patch)
 }
 
 /**
@@ -1671,11 +1822,45 @@ function handleFinalizedSubtitle(data) {
 
   const chunkIndex = data.chunk_index
   const sentenceIndex = data.index
+  if (useEditorV2) {
+    const applied = editorEventProjector.projectFinalized(data)
+    if (!applied) {
+      throw new Error(
+        `[EditorView] subtitle.finalized 未能应用到新内核（key=${chunkIndex ?? sentenceIndex ?? 'unknown'}）`
+      )
+    }
+  }
   void scheduleRealtimeFinalSync(`subtitle_finalized_${chunkIndex ?? sentenceIndex ?? 'unknown'}`)
 }
 
 function handleRevisedSubtitle(data) {
   if (!data) return
+
+  if (useEditorV2) {
+    let applied = false
+
+    if (data.sentence) {
+      applied = applySentencePatch(editorDocumentStore, {
+        ...data.sentence,
+        index: data.index ?? data.sentence.index ?? data.sentence.sentenceIndex,
+      }) || applied
+    }
+
+    if (Array.isArray(data.sentences)) {
+      data.sentences.forEach((item) => {
+        applied = applySentencePatch(editorDocumentStore, {
+          ...item,
+          index: item.index ?? item.sentenceIndex,
+        }) || applied
+      })
+    }
+
+    if (!applied) {
+      throw new Error('[EditorView] subtitle.revised 未能应用到新内核')
+    }
+    scheduleV2RealtimeAuthoritativeReload('subtitle_revised')
+    return
+  }
 
   const revisedPayload = { ...data }
   if (data.sentence) {
@@ -1691,6 +1876,7 @@ function handleRevisedSubtitle(data) {
     }))
   }
   projectStore.applyRevisedSubtitle(revisedPayload)
+
 }
 
 function handleSpeakerProfiles(data) {
@@ -1816,10 +2002,19 @@ async function saveProject() {
   saving.value = true
   try {
     if (mediaIdentityId.value) {
-      const srtContent = projectStore.generateSRT()
+      const srtSegments = useEditorV2
+        ? projectStore.applyOffsetToSegments(await fetchLatestSegments())
+        : null
+      const srtContent = useEditorV2
+        ? segmentsToSRT(srtSegments)
+        : projectStore.generateSRT()
       await mediaApi.saveSRTContent(mediaIdentityId.value, srtContent)
     }
-    await projectStore.saveProject()
+    if (!useEditorV2) {
+      await projectStore.saveProject()
+    } else {
+      await runEditorSyncStrict()
+    }
     lastSaved.value = Date.now()
   } catch (error) {
     console.error('[EditorView] 保存失败:', error)
@@ -1913,10 +2108,12 @@ async function cancelTranscription() {
 // ========== 撤销/重做 ==========
 
 function undo() {
-  if (canUndo.value) projectStore.undo()
+  subtitleListRef.value?.runWithFlip?.(() => editorCommandBus.undo())
+    ?? editorCommandBus.undo()
 }
 function redo() {
-  if (canRedo.value) projectStore.redo()
+  subtitleListRef.value?.runWithFlip?.(() => editorCommandBus.redo())
+    ?? editorCommandBus.redo()
 }
 
 // ========== 导出功能 ==========
@@ -1979,12 +2176,31 @@ async function handleExport(format) {
 }
 
 async function fetchLatestSegments() {
-  await forceSyncNow()
+  let pending = 0
+  let syncErrors = null
+  let syncErrorCount = 0
+  let structuralErrorCount = 0
 
-  const pending = subtitleDocumentStore.pendingCount()
-  const syncErrors = subtitleDocumentStore.syncErrors
-  const syncErrorCount = Number(syncErrors?.size || 0)
-  if (pending > 0 || syncErrorCount > 0) {
+  if (useEditorV2) {
+    await runEditorSyncStrict()
+    pending = Array.isArray(editorSyncEngine.pendingCommands)
+      ? editorSyncEngine.pendingCommands.length
+      : Number(editorSyncEngine.pendingCommands?.value?.length || 0)
+  } else {
+    // 旧链路仍保留给非 V2 模式；Phase F-0 运行时不再使用旧 undo/redo 同步。
+    await forceSyncNow()
+    // 等待结构性操作（删除/插入/切分/合并）飞行中请求落地
+    await structuralSyncStore.waitAll()
+    // 第二轮：结构性操作落地后再次冲洗，覆盖“新增后立刻编辑”的补写场景
+    await forceSyncNow()
+
+    pending = subtitleDocumentStore.pendingCount()
+    syncErrors = subtitleDocumentStore.syncErrors
+    syncErrorCount = Number(syncErrors?.size || 0)
+    structuralErrorCount = structuralSyncStore.errorCount
+  }
+
+  if (pending > 0 || syncErrorCount > 0 || structuralErrorCount > 0) {
     let firstErrorDetail = ''
     if (syncErrorCount > 0 && typeof syncErrors?.entries === 'function') {
       const firstError = syncErrors.entries().next().value
@@ -1992,14 +2208,27 @@ async function fetchLatestSegments() {
         firstErrorDetail = `，首条错误: [${firstError[0]}] ${firstError[1]}`
       }
     }
-    throw new Error(`仍有未同步修改（待同步 ${pending} 条，错误 ${syncErrorCount} 条${firstErrorDetail}）`)
+    if (structuralErrorCount > 0 && !firstErrorDetail) {
+      const firstStructErr = structuralSyncStore.syncErrors.entries().next().value
+      if (firstStructErr) {
+        firstErrorDetail = `，首条结构性错误: [${firstStructErr[1].type}] ${firstStructErr[1].error}`
+      }
+    }
+    throw new Error(`仍有未同步修改（待同步 ${pending} 条，错误 ${syncErrorCount + structuralErrorCount} 条${firstErrorDetail}）`)
   }
 
   const projectId = props.projectId || projectStore.meta.projectId
   if (!projectId) {
     throw new Error('缺少 project_id：无法导出，请从任务列表重新打开并完成任务到项目转换')
   }
+  if (!useEditorV2) {
+    // 旧模式仍保留本地快照保存；V2 已由同步引擎成为唯一持久化入口。
+    await projectStore.saveProject()
+  }
   const segments = await projectApi.getSubtitles(projectId)
+  if (useEditorV2) {
+    assertEditorV2SnapshotConsistency(segments)
+  }
   return Array.isArray(segments)
     ? segments.map((segment, index) => ({
         id: segment.legacy_index ?? index,
@@ -2063,6 +2292,7 @@ function downloadFile(content, filename) {
 // ========== 拖拽调整宽度 ==========
 
 function startResize(e) {
+  e.preventDefault()
   isResizing.value = true
   document.addEventListener('mousemove', onResize)
   document.addEventListener('mouseup', stopResize)
@@ -2070,14 +2300,30 @@ function startResize(e) {
 
 function onResize(e) {
   if (!isResizing.value) return
-  const newWidth = window.innerWidth - e.clientX
-  sidebarWidth.value = Math.max(280, Math.min(600, newWidth))
+  pendingSidebarWidth = Math.max(280, Math.min(600, window.innerWidth - e.clientX))
+  if (sidebarResizeFrameId !== 0) return
+
+  sidebarResizeFrameId = requestAnimationFrame(() => {
+    sidebarResizeFrameId = 0
+    if (pendingSidebarWidth !== null) {
+      sidebarWidth.value = pendingSidebarWidth
+      pendingSidebarWidth = null
+    }
+  })
 }
 
 function stopResize() {
   isResizing.value = false
   document.removeEventListener('mousemove', onResize)
   document.removeEventListener('mouseup', stopResize)
+  if (sidebarResizeFrameId !== 0) {
+    cancelAnimationFrame(sidebarResizeFrameId)
+    sidebarResizeFrameId = 0
+  }
+  if (pendingSidebarWidth !== null) {
+    sidebarWidth.value = pendingSidebarWidth
+    pendingSidebarWidth = null
+  }
   // 保存用户偏好
   localStorage.setItem('editor-sidebar-width', sidebarWidth.value.toString())
 }
@@ -2129,10 +2375,56 @@ function handleResolutionChange(resolution) {
 }
 
 function loadEditorInteractionPreferences() {
+  // 加载快捷键启用开关（仅保存后生效）
+  const savedShortcutEnabled = localStorage.getItem(SHORTCUT_ENABLED_PREF_KEY)
+  const resolvedShortcutEnabled = savedShortcutEnabled === null ? true : savedShortcutEnabled === 'true'
+  shortcutEnabled.value = resolvedShortcutEnabled
+  advancedConfig.value.general.enable_shortcuts = resolvedShortcutEnabled
+
+  // 加载快捷键映射（缺失/异常时回退默认）
+  try {
+    const savedShortcutConfig = localStorage.getItem(SHORTCUT_CONFIG_PREF_KEY)
+    const parsed = savedShortcutConfig ? JSON.parse(savedShortcutConfig) : {}
+    const normalized = normalizeEditorShortcutConfig(parsed)
+    shortcutConfig.value = normalized
+    advancedConfig.value.shortcuts = { ...normalized }
+  } catch {
+    const fallback = normalizeEditorShortcutConfig({})
+    shortcutConfig.value = fallback
+    advancedConfig.value.shortcuts = { ...fallback }
+  }
+
   const savedAutoResume = localStorage.getItem(SUBTITLE_FOLLOW_AUTO_RESUME_PREF_KEY)
   const resolved = savedAutoResume === null ? true : savedAutoResume === 'true'
   subtitleFollowAutoResumeEnabled.value = resolved
   advancedConfig.value.general.subtitle_follow_auto_resume = resolved
+
+  // V3.2.5+dev.20260322.01: 加载字幕跟随自动恢复延迟
+  const savedAutoResumeDelay = localStorage.getItem(SUBTITLE_FOLLOW_AUTO_RESUME_DELAY_PREF_KEY)
+  if (savedAutoResumeDelay !== null) {
+    const parsedDelay = Number(savedAutoResumeDelay)
+    if (Number.isFinite(parsedDelay) && parsedDelay >= 1 && parsedDelay <= 30) {
+      subtitleFollowAutoResumeDelay.value = parsedDelay
+      advancedConfig.value.general.subtitle_follow_auto_resume_delay = parsedDelay
+    }
+  }
+
+  // 加载隐藏波形刻度设置
+  const savedHideScale = localStorage.getItem(HIDE_TIMELINE_SCALE_PREF_KEY)
+  hideTimelineScale.value = savedHideScale === 'true'
+  advancedConfig.value.general.hide_timeline_scale = hideTimelineScale.value
+
+  // V3.2.4+dev.20260302.02: 加载合并分隔符设置
+  try {
+    const savedSeparator = localStorage.getItem('editor-merge-separator')
+    if (savedSeparator) {
+      const config = JSON.parse(savedSeparator)
+      advancedConfig.value.general.merge_separator = config.type || 'space'
+      advancedConfig.value.general.merge_separator_custom = config.custom || ''
+    }
+  } catch {
+    // 解析失败使用默认值
+  }
 }
 
 function resolveCapabilitySnapshot(snapshot = null) {
@@ -2160,13 +2452,58 @@ async function handleSaveAdvancedSettings() {
     }
     offset = Number(offset)
 
+    // 0. 快捷键占用校验：浏览器保留组合直接拦截
+    const browserReservedConflicts = detectBrowserReservedShortcutConflicts(advancedConfig.value.shortcuts)
+    if (browserReservedConflicts.length > 0) {
+      const firstConflict = browserReservedConflicts[0]
+      ElMessage.error(
+        `快捷键被浏览器占用：${getEditorShortcutActionLabel(firstConflict.action)} 不能使用 ${getEditorShortcutComboLabel(firstConflict.combo)}`
+      )
+      return
+    }
+
+    // 0.1 快捷键冲突校验：同一组合不可绑定多个动作
+    const normalizedShortcutConfig = normalizeEditorShortcutConfig(advancedConfig.value.shortcuts)
+    const shortcutConflicts = detectEditorShortcutConflicts(normalizedShortcutConfig)
+    if (shortcutConflicts.length > 0) {
+      const firstConflict = shortcutConflicts[0]
+      ElMessage.error(
+        `快捷键冲突：${getEditorShortcutActionLabel(firstConflict.firstAction)} 与 ${getEditorShortcutActionLabel(firstConflict.secondAction)} 都使用了 ${getEditorShortcutComboLabel(firstConflict.combo)}`
+      )
+      return
+    }
+
     // 1. 应用到前端 projectStore
     projectStore.setSubtitleOffset(offset)
 
-    // 1.1 应用并持久化“字幕手动滚动后自动恢复跟随”偏好
+    // 1.1 应用并持久化快捷键开关与映射（保存后立即生效）
+    const isShortcutOn = advancedConfig.value.general.enable_shortcuts !== false
+    shortcutEnabled.value = isShortcutOn
+    shortcutConfig.value = normalizedShortcutConfig
+    advancedConfig.value.shortcuts = { ...normalizedShortcutConfig }
+    localStorage.setItem(SHORTCUT_ENABLED_PREF_KEY, String(isShortcutOn))
+    localStorage.setItem(SHORTCUT_CONFIG_PREF_KEY, JSON.stringify(normalizedShortcutConfig))
+
+    // 1.2 应用并持久化”字幕手动滚动后自动恢复跟随”偏好
     const followAutoResume = advancedConfig.value.general.subtitle_follow_auto_resume !== false
     subtitleFollowAutoResumeEnabled.value = followAutoResume
     localStorage.setItem(SUBTITLE_FOLLOW_AUTO_RESUME_PREF_KEY, String(followAutoResume))
+
+    // V3.2.5+dev.20260322.01: 持久化自动恢复延迟
+    const followAutoResumeDelay = Number(advancedConfig.value.general.subtitle_follow_auto_resume_delay) || 5
+    subtitleFollowAutoResumeDelay.value = followAutoResumeDelay
+    localStorage.setItem(SUBTITLE_FOLLOW_AUTO_RESUME_DELAY_PREF_KEY, String(followAutoResumeDelay))
+
+    // 1.3 应用并持久化”隐藏波形刻度”偏好
+    hideTimelineScale.value = advancedConfig.value.general.hide_timeline_scale === true
+    localStorage.setItem(HIDE_TIMELINE_SCALE_PREF_KEY, String(hideTimelineScale.value))
+
+    // 1.4 V3.2.4+dev.20260302.02: 持久化合并分隔符设置
+    const separatorConfig = {
+      type: advancedConfig.value.general.merge_separator || 'space',
+      custom: advancedConfig.value.general.merge_separator_custom || ''
+    }
+    localStorage.setItem('editor-merge-separator', JSON.stringify(separatorConfig))
 
     // 2. 保存到后端
     if (projectStore.meta.jobId) {
@@ -2174,7 +2511,7 @@ async function handleSaveAdvancedSettings() {
     }
 
     ElMessage.success('高级设置已保存')
-    showAdvancedSettings.value = false
+    // V3.2.4+dev.20260303.04: 保存后不关闭窗口，允许用户继续修改
   } catch (error) {
     console.error('[EditorView] 保存高级设置失败:', error)
     ElMessage.error('保存高级设置失败: ' + (error.message || '未知错误'))
@@ -2246,6 +2583,9 @@ useShortcuts({
   save: saveProject,
   undo,
   redo,
+}, {
+  isShortcutEnabled: shortcutEnabled,
+  shortcutConfig,
 })
 
 // ========== 生命周期 ==========
@@ -2262,6 +2602,10 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  if (sidebarResizeFrameId !== 0) {
+    cancelAnimationFrame(sidebarResizeFrameId)
+    sidebarResizeFrameId = 0
+  }
   playbackManager.pause()
   if (!activeJobId.value && props.projectId) {
     // 纯 project 模式无后台任务续跑需求，卸载时应主动释放连接，避免悬挂订阅。
@@ -2282,7 +2626,7 @@ onBeforeRouteLeave(async (to, from) => {
   playbackManager.pause()
   if (isDirty.value) {
     try {
-      await projectStore.saveProject()
+      await saveProject()
     } catch (error) {
       console.error('[EditorView] 离开前保存失败:', error)
       const answer = window.confirm('保存失败，确定要离开吗? 未保存的修改可能会丢失。')
@@ -2452,6 +2796,12 @@ onBeforeRouteLeave(async (to, from) => {
   overflow: hidden;
 }
 
+.sidebar-column.is-resizing :deep(.subtitle-row),
+.sidebar-column.is-resizing :deep(.subtitle-row .action-btn),
+.sidebar-column.is-resizing :deep(.subtitle-row .delete-btn) {
+  transition: none;
+}
+
 /* 标签页导航 */
 .tab-nav {
   display: flex;
@@ -2544,7 +2894,7 @@ onBeforeRouteLeave(async (to, from) => {
 
 .tab-pane {
   height: 100%;
-  overflow: auto;
+  overflow: hidden;
 }
 
 /* 占位面板 */

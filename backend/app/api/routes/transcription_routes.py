@@ -30,6 +30,13 @@ from app.services.transcription_recovery_utils import (
     force_finalize_segments_when_finished,
     force_finalize_snapshot_when_finished,
 )
+from app.services.model_task_guard_service import (
+    enforce_required_models_ready,
+    resolve_model_task_guard_mode_from_env,
+    resolve_model_task_guard_poll_sec_from_env,
+    resolve_model_task_guard_timeout_sec_from_env,
+    resolve_required_model_ids_for_job_settings,
+)
 
 
 # ========== v3.5 新版 API 模型 ==========
@@ -169,54 +176,6 @@ class UploadResponse(BaseModel):
     message: str
 
 
-class HomophoneFindRequest(BaseModel):
-    """同音检索请求模型。"""
-
-    mode: Literal["homophone_strict", "homophone_fuzzy"] = Field(
-        default="homophone_strict",
-        description="同音检索模式",
-    )
-    query_text: str = Field(..., min_length=1, description="待检索文本或读音输入")
-    language: Literal["zh", "ja", "en"] = Field(default="zh", description="语言")
-    is_ignore_punctuation: bool = Field(default=False, description="是否忽略标点")
-    limit: int = Field(default=500, ge=1, le=5000, description="最大返回数量")
-
-
-class BatchReplaceRequest(BaseModel):
-    """批量替换请求模型。"""
-
-    mode: Literal["literal", "regex", "homophone_strict", "homophone_fuzzy"] = Field(
-        default="literal",
-        description="替换模式",
-    )
-    query_text: str = Field(..., min_length=1, description="查找文本")
-    replace_text: str = Field(default="", description="替换文本")
-    language: Literal["zh", "ja", "en"] = Field(default="zh", description="语言")
-    is_ignore_punctuation: bool = Field(default=False, description="是否忽略标点")
-    selected_sentence_indices: List[int] = Field(
-        default_factory=list,
-        description="用户勾选的句子索引列表",
-    )
-
-
-class GlobalTermItem(BaseModel):
-    """全局术语配置项。"""
-
-    language: Literal["auto", "zh", "ja", "en"] = Field(default="auto")
-    source_text: str = Field(..., min_length=1)
-    target_text: str = Field(default="")
-    match_mode: Literal["exact", "regex", "homophone_strict", "homophone_fuzzy"] = Field(default="exact")
-    priority: int = Field(default=100, ge=0, le=10000)
-    is_enabled: bool = Field(default=True)
-    note: str = Field(default="")
-
-
-class GlobalTermSyncRequest(BaseModel):
-    """全量同步全局术语请求。"""
-
-    items: List[GlobalTermItem] = Field(default_factory=list)
-
-
 class CreateJobsBatchRequest(BaseModel):
     """批量创建任务请求。"""
 
@@ -236,140 +195,7 @@ def create_transcription_router(
 
     # 获取SSE管理器
     sse_manager = get_sse_manager()
-    from app.services.homophone.db import GlobalTermRule
-    from app.services.homophone.runtime import get_homophone_service
-    from app.services.homophone.service import SentenceRecord
     from app.services.project_id_resolver import get_project_id_resolver
-
-    def _detect_language_from_text(text: str) -> str:
-        if re.search(r"[ぁ-んァ-ン]", text):
-            return "ja"
-        if re.search(r"[\u4e00-\u9fff]", text):
-            return "zh"
-        if re.search(r"[A-Za-z]", text):
-            return "en"
-        return "zh"
-
-    def _ensure_homophone_index_ready(
-        *,
-        job_id: str,
-        requested_language: str,
-    ) -> Optional[Any]:
-        """确保同音索引可查询。"""
-        homophone_service = get_homophone_service()
-        state = homophone_service.get_index_status(job_id)
-        if state is not None:
-            return state
-
-        segments = _collect_segments_from_snapshot(job_id)
-        if not segments:
-            return None
-
-        joined_text = "\n".join(str(item.get("text", "")) for item in segments)
-        language = requested_language or _detect_language_from_text(joined_text)
-        if language not in {"zh", "ja", "en"}:
-            language = _detect_language_from_text(joined_text)
-
-        records = [
-            SentenceRecord(
-                index=int(item.get("id", 0)),
-                text=str(item.get("text", "")),
-            )
-            for item in segments
-        ]
-        homophone_service.index_chunk(
-            job_id=job_id,
-            revision=1,
-            chunk_index=0,
-            language=language,
-            sentences=records,
-        )
-        return homophone_service.get_index_status(job_id)
-
-    def _collect_segments_from_snapshot(job_id: str) -> List[Dict[str, Any]]:
-        from pathlib import Path
-        from app.services.subtitle_edit_store import (
-            apply_deletions_to_segments,
-            apply_edits_to_segments,
-            apply_edits_to_sentences_snapshot,
-            build_manual_segments,
-            load_deleted_indices,
-            load_edits,
-        )
-        from app.services.subtitle_visibility import (
-            filter_hidden_unknown_sentences,
-            is_hidden_unknown_sentence,
-        )
-
-        job = transcription_service.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="任务未找到")
-
-        job_dir = Path(job.dir)
-        checkpoint_path = job_dir / "checkpoint.json"
-        snapshot_path = job_dir / "transcription_text.json"
-
-        data: Optional[Dict[str, Any]] = None
-        transcription_data: Optional[Dict[str, Any]] = None
-
-        if checkpoint_path.exists():
-            with open(checkpoint_path, "r", encoding="utf-8") as file:
-                data = json.load(file)
-                transcription_data = data.get("transcription", {})
-        elif snapshot_path.exists():
-            with open(snapshot_path, "r", encoding="utf-8") as file:
-                transcription_data = json.load(file)
-                data = {"transcription": transcription_data}
-        else:
-            return []
-
-        transcription = transcription_data or {}
-        sentences_snapshot = transcription.get("sentences_snapshot", [])
-        edits = load_edits(job_dir)
-        deleted_indices = load_deleted_indices(job_dir)
-
-        all_segments: List[Dict[str, Any]] = []
-        if sentences_snapshot:
-            if edits:
-                apply_edits_to_sentences_snapshot(sentences_snapshot, edits)
-            for sentence in sentences_snapshot:
-                if is_hidden_unknown_sentence(sentence):
-                    continue
-                all_segments.append(
-                    {
-                        "id": int(sentence.get("_index", sentence.get("index", 0))),
-                        "start": float(sentence.get("start", 0.0)),
-                        "end": float(sentence.get("end", 0.0)),
-                        "text": str(sentence.get("text", "")),
-                        "is_modified": bool(sentence.get("is_modified", False)),
-                    }
-                )
-        else:
-            unaligned_results = (data or {}).get("unaligned_results", [])
-            for result in unaligned_results:
-                all_segments.extend(result.get("segments", []))
-            all_segments.sort(key=lambda item: item.get("start", 0))
-            for index, segment in enumerate(all_segments):
-                segment["id"] = int(segment.get("id", index))
-            if edits:
-                apply_edits_to_segments(all_segments, edits)
-
-        if deleted_indices:
-            all_segments = apply_deletions_to_segments(all_segments, deleted_indices)
-
-        manual_segments = build_manual_segments(edits, deleted_indices)
-        if manual_segments:
-            all_segments.extend(manual_segments)
-        all_segments = filter_hidden_unknown_sentences(all_segments)
-
-        all_segments.sort(
-            key=lambda item: (
-                float(item.get("start", 0.0)),
-                float(item.get("end", 0.0)),
-                int(item.get("id", 0)),
-            )
-        )
-        return all_segments
 
     def _parse_task_config_form(task_config_raw: Optional[str]) -> Dict[str, Any]:
         """解析 Form 中的 task_config JSON。"""
@@ -384,6 +210,51 @@ def create_transcription_router(
         if "task_config" in payload and isinstance(payload["task_config"], dict):
             return dict(payload["task_config"])
         return payload
+
+    async def _guard_models_before_enqueue(job_settings: Optional[JobSettings] = None) -> None:
+        """
+        任务启动前模型守卫：
+        - MODEL_TASK_GUARD_MODE=409: 未就绪直接 409
+        - MODEL_TASK_GUARD_MODE=wait: 等待就绪（带超时）
+        - MODEL_TASK_GUARD_MODE=off: 不拦截
+        """
+        guard_mode = resolve_model_task_guard_mode_from_env()
+        if guard_mode == "off":
+            return
+
+        try:
+            from app.services.model_manager_v2 import get_model_manager_v2
+            from app.services.model_bootstrap_service import get_model_bootstrap_service
+        except Exception:
+            # Lite / Full 依赖缺失时，转录入口本就不可用或会走降级，这里不再额外阻断。
+            return
+
+        model_manager = get_model_manager_v2()
+        bootstrap_service = get_model_bootstrap_service(model_manager=model_manager)
+        timeout_sec = resolve_model_task_guard_timeout_sec_from_env(guard_mode)
+        poll_sec = resolve_model_task_guard_poll_sec_from_env()
+        required_ids = resolve_required_model_ids_for_job_settings(
+            model_manager=model_manager,
+            bootstrap_service=bootstrap_service,
+            job_settings=job_settings,
+        )
+        decision = await enforce_required_models_ready(
+            model_manager=model_manager,
+            bootstrap_service=bootstrap_service,
+            mode=guard_mode,
+            timeout_sec=timeout_sec,
+            poll_sec=poll_sec,
+            required_model_ids=required_ids,
+        )
+        if not bool(decision.get("is_ready")):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "MODEL_NOT_READY",
+                    "message": "必需模型未就绪，请等待模型下载/修复完成后再启动任务",
+                    **decision,
+                },
+            )
 
     def _resolve_project_identity(identifier: Optional[str]):
         normalized_identifier = str(identifier or "").strip()
@@ -490,12 +361,7 @@ def create_transcription_router(
         """根据 task_config 生成 JobSettings。"""
         if not task_config:
             return JobSettings()
-        # 临时策略：任务级 whisper_model 覆盖停用，统一回退 .env。
         normalized_task_config = dict(task_config)
-        transcription_payload = dict(normalized_task_config.get("transcription") or {})
-        if "whisper_model" in transcription_payload:
-            transcription_payload.pop("whisper_model", None)
-            normalized_task_config["transcription"] = transcription_payload
 
         preset_id = str(normalized_task_config.get("preset_id", "balanced") or "balanced")
         has_custom_groups = any(
@@ -719,6 +585,8 @@ def create_transcription_router(
 
             # 🔥 新增: 加入队列（而非直接启动）
             queue_service = get_queue_service(transcription_service)
+            # 模型未就绪时不要把任务推进队列，避免 Runner 直接失败。
+            await _guard_models_before_enqueue(job.settings)
             queue_service.add_job(job)
 
             return {
@@ -807,6 +675,7 @@ def create_transcription_router(
                     project_id = str(getattr(job, "project_id", None) or job.job_id)
 
                     # 加入队列
+                    await _guard_models_before_enqueue(job.settings)
                     queue_service.add_job(job)
 
                     jobs.append({
@@ -885,6 +754,9 @@ def create_transcription_router(
             else:
                 if not isinstance(job.settings, JobSettings):
                     job.settings = JobSettings()
+
+            # 在 settings 最终确定之后再做模型守卫（否则可能误判 whisper 需求）。
+            await _guard_models_before_enqueue(job.settings)
 
             # 🔥 关键改动: 如果任务不在队列中，加入队列
             with queue_service.lock:
@@ -1653,348 +1525,7 @@ def create_transcription_router(
             },
         }
 
-    @router.post("/legacy/tasks/{identifier}/homophone/find")
-    async def homophone_find(identifier: str, payload: HomophoneFindRequest):
-        """同音检索接口（Phase 2）。"""
-        job_id = identifier
-        job = transcription_service.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="任务未找到")
-
-        homophone_service = get_homophone_service()
-        state = _ensure_homophone_index_ready(
-            job_id=job_id,
-            requested_language=payload.language,
-        )
-        if state is None:
-            return {
-                "success": True,
-                "data": {
-                    "matches": [],
-                    "index_status": "missing",
-                    "message": "索引尚未构建完成",
-                },
-            }
-
-        request_language = payload.language if payload.language in {"zh", "ja", "en"} else "zh"
-        indexed_language = request_language
-
-        matches = homophone_service.search_homophone(
-            job_id=job_id,
-            revision=state.revision,
-            language=request_language,
-            query_text=payload.query_text,
-            mode=payload.mode,
-            is_ignore_punctuation=payload.is_ignore_punctuation,
-            limit=payload.limit,
-        )
-
-        if not matches:
-            for fallback_language in ("zh", "ja", "en"):
-                if fallback_language == request_language:
-                    continue
-                fallback_matches = homophone_service.search_homophone(
-                    job_id=job_id,
-                    revision=state.revision,
-                    language=fallback_language,
-                    query_text=payload.query_text,
-                    mode=payload.mode,
-                    is_ignore_punctuation=payload.is_ignore_punctuation,
-                    limit=payload.limit,
-                )
-                if fallback_matches:
-                    matches = fallback_matches
-                    indexed_language = fallback_language
-                    break
-
-        if not matches:
-            segments = _collect_segments_from_snapshot(job_id)
-            if segments:
-                joined_text = "\n".join(str(item.get("text", "")) for item in segments)
-                detected_language = _detect_language_from_text(joined_text)
-                if detected_language in {"zh", "ja", "en"} and detected_language != indexed_language:
-                    records = [
-                        SentenceRecord(
-                            index=int(item.get("id", 0)),
-                            text=str(item.get("text", "")),
-                        )
-                        for item in segments
-                    ]
-                    homophone_service.index_chunk(
-                        job_id=job_id,
-                        revision=state.revision,
-                        chunk_index=0,
-                        language=detected_language,
-                        sentences=records,
-                    )
-                    refreshed_state = homophone_service.get_index_status(job_id)
-                    if refreshed_state is not None:
-                        state = refreshed_state
-
-                    fallback_matches = homophone_service.search_homophone(
-                        job_id=job_id,
-                        revision=state.revision,
-                        language=detected_language,
-                        query_text=payload.query_text,
-                        mode=payload.mode,
-                        is_ignore_punctuation=payload.is_ignore_punctuation,
-                        limit=payload.limit,
-                    )
-                    if fallback_matches:
-                        matches = fallback_matches
-                        indexed_language = detected_language
-        return {
-            "success": True,
-            "data": {
-                "index_status": state.status,
-                "revision": state.revision,
-                "query": payload.query_text,
-                "mode": payload.mode,
-                "language": indexed_language,
-                "is_ignore_punctuation": payload.is_ignore_punctuation,
-                "matches": [
-                    {
-                        "sentence_index": item.sentence_index,
-                        "token_index": item.token_index,
-                        "token_text": item.token_text,
-                        "char_start": item.char_start,
-                        "char_end": item.char_end,
-                        "cluster_id": item.cluster_id,
-                        "reading_label": item.reading_label,
-                    }
-                    for item in matches
-                ],
-            },
-        }
-
-    @router.post("/projects/{project_id}/homophone/find")
-    async def project_homophone_find(project_id: str, payload: HomophoneFindRequest):
-        """Project 语义同音检索接口（兼容壳）。"""
-        runtime_job_id = _resolve_runtime_job_id(project_id)
-        if not runtime_job_id:
-            raise HTTPException(status_code=404, detail="任务未找到")
-        result = await homophone_find(runtime_job_id, payload)
-        result_data = result.get("data")
-        if isinstance(result_data, dict):
-            result_data["project_id"] = project_id
-        return result
-
-    @router.get("/legacy/tasks/{identifier}/homophone/index-status")
-    async def homophone_index_status(identifier: str):
-        """同音索引状态查询接口。"""
-        job_id = identifier
-        job = transcription_service.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="任务未找到")
-
-        homophone_service = get_homophone_service()
-        state = homophone_service.get_index_status(job_id)
-        if state is None:
-            return {
-                "success": True,
-                "data": {
-                    "status": "missing",
-                    "job_id": job_id,
-                },
-            }
-        return {
-            "success": True,
-            "data": {
-                "job_id": state.job_id,
-                "revision": state.revision,
-                "status": state.status,
-                "last_committed_chunk": state.last_committed_chunk,
-                "heartbeat_at": state.heartbeat_at,
-                "updated_at": state.updated_at,
-            },
-        }
-
-    @router.get("/projects/{project_id}/homophone/index-status")
-    async def project_homophone_index_status(project_id: str):
-        """Project 语义同音索引状态接口（兼容壳）。"""
-        runtime_job_id = _resolve_runtime_job_id(project_id)
-        if not runtime_job_id:
-            raise HTTPException(status_code=404, detail="任务未找到")
-        result = await homophone_index_status(runtime_job_id)
-        result_data = result.get("data")
-        if isinstance(result_data, dict):
-            result_data["project_id"] = project_id
-        return result
-
-    @router.get("/settings/homophone/global-terms")
-    async def get_homophone_global_terms():
-        """读取全局专有名词表。"""
-        homophone_service = get_homophone_service()
-        terms = homophone_service.list_global_terms()
-        return {
-            "success": True,
-            "data": {
-                "items": [
-                    {
-                        "language": item.language,
-                        "source_text": item.source_text,
-                        "target_text": item.target_text,
-                        "match_mode": item.match_mode,
-                        "priority": item.priority,
-                        "is_enabled": item.is_enabled,
-                        "note": item.note,
-                    }
-                    for item in terms
-                ]
-            },
-        }
-
-    @router.put("/settings/homophone/global-terms")
-    async def put_homophone_global_terms(payload: GlobalTermSyncRequest):
-        """全量覆盖全局专有名词表。"""
-        homophone_service = get_homophone_service()
-        rules = [
-            GlobalTermRule(
-                language=item.language,
-                source_text=item.source_text,
-                target_text=item.target_text,
-                match_mode=item.match_mode,
-                priority=item.priority,
-                is_enabled=item.is_enabled,
-                note=item.note,
-            )
-            for item in payload.items
-        ]
-        homophone_service.replace_global_terms(rules)
-        return {
-            "success": True,
-            "data": {
-                "count": len(rules),
-            },
-        }
-
-    @router.post("/legacy/tasks/{identifier}/homophone/batch-replace")
-    async def homophone_batch_replace(identifier: str, payload: BatchReplaceRequest):
-        """同音/正则/精确批量替换接口（初版）。"""
-        from pathlib import Path
-        from app.services.sse_service import push_subtitle_event
-        from app.services.streaming_subtitle import get_streaming_subtitle_manager_if_exists
-        from app.services.subtitle_edit_store import save_edit
-
-        job_id = identifier
-        job = transcription_service.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="任务未找到")
-        project_id = str(getattr(job, "project_id", None) or job_id)
-
-        if not payload.selected_sentence_indices:
-            return {
-                "success": True,
-                "data": {
-                    "updated_count": 0,
-                    "updated_indices": [],
-                },
-            }
-
-        selected_indices: Set[int] = {int(item) for item in payload.selected_sentence_indices}
-        all_segments = _collect_segments_from_snapshot(job_id)
-        segment_map: Dict[int, Dict[str, Any]] = {
-            int(segment.get("id", 0)): segment
-            for segment in all_segments
-            if int(segment.get("id", 0)) in selected_indices
-        }
-
-        homophone_service = get_homophone_service()
-        state = homophone_service.get_index_status(job_id)
-        homophone_matches: Dict[int, List[Any]] = {}
-        if payload.mode in {"homophone_strict", "homophone_fuzzy"} and state is not None:
-            query_matches = homophone_service.search_homophone(
-                job_id=job_id,
-                revision=state.revision,
-                language=payload.language,
-                query_text=payload.query_text,
-                mode=payload.mode,
-                is_ignore_punctuation=payload.is_ignore_punctuation,
-                limit=10000,
-            )
-            for match in query_matches:
-                if match.sentence_index in selected_indices:
-                    homophone_matches.setdefault(match.sentence_index, []).append(match)
-
-        subtitle_manager = get_streaming_subtitle_manager_if_exists(job_id)
-        job_dir = Path(job.dir)
-        updated_indices: List[int] = []
-
-        for sentence_index in sorted(selected_indices):
-            source_text = str(segment_map.get(sentence_index, {}).get("text", ""))
-            if not source_text:
-                continue
-
-            replaced_text = source_text
-            if payload.mode == "literal":
-                replaced_text = source_text.replace(payload.query_text, payload.replace_text)
-            elif payload.mode == "regex":
-                try:
-                    replaced_text = re.sub(payload.query_text, payload.replace_text, source_text)
-                except re.error as exc:
-                    raise HTTPException(status_code=400, detail=f"正则表达式无效: {exc}")
-            else:
-                matched_items = homophone_matches.get(sentence_index, [])
-                if not matched_items:
-                    continue
-                chars = list(source_text)
-                for match in sorted(matched_items, key=lambda item: item.char_start, reverse=True):
-                    start = max(0, int(match.char_start))
-                    end = min(len(chars), int(match.char_end))
-                    if start >= end:
-                        continue
-                    chars[start:end] = list(payload.replace_text)
-                replaced_text = "".join(chars)
-
-            if replaced_text == source_text:
-                continue
-
-            save_edit(job_dir, sentence_index, {"text": replaced_text}, original_text=source_text)
-            if subtitle_manager and sentence_index in subtitle_manager.sentences:
-                sentence = subtitle_manager.sentences[sentence_index]
-                if not sentence.is_modified:
-                    sentence.original_text = sentence.text
-                sentence.text = replaced_text
-                sentence.text_clean = replaced_text
-                sentence.is_modified = True
-
-            push_subtitle_event(
-                sse_manager,
-                project_id,
-                "edited",
-                {
-                    "index": sentence_index,
-                    "sentence": {
-                        "index": sentence_index,
-                        "text": replaced_text,
-                        "is_modified": True,
-                        "original_text": source_text,
-                    },
-                    "source": "homophone_batch_replace",
-                    "is_update": True,
-                },
-            )
-            updated_indices.append(sentence_index)
-
-        return {
-            "success": True,
-            "data": {
-                "updated_count": len(updated_indices),
-                "updated_indices": updated_indices,
-            },
-        }
-
-    @router.post("/projects/{project_id}/homophone/batch-replace")
-    async def project_homophone_batch_replace(project_id: str, payload: BatchReplaceRequest):
-        """Project 语义同音批量替换接口（兼容壳）。"""
-        runtime_job_id = _resolve_runtime_job_id(project_id)
-        if not runtime_job_id:
-            raise HTTPException(status_code=404, detail="任务未找到")
-        result = await homophone_batch_replace(runtime_job_id, payload)
-        result_data = result.get("data")
-        if isinstance(result_data, dict):
-            result_data["project_id"] = project_id
-        return result
+    # 同音检索路由已迁移到 `homophone_routes.py`，此处不再保留 legacy/job 旧格式入口。
 
     @router.get("/check-resume/{identifier}")
     async def check_resume(identifier: str):

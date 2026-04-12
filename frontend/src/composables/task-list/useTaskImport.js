@@ -3,6 +3,24 @@ import { ElMessage } from 'element-plus'
 import fileApi from '@/services/api/fileApi'
 import projectApi from '@/services/api/projectApi'
 
+const SUPPORTED_MEDIA_EXTENSIONS = new Set([
+  '.mp4',
+  '.avi',
+  '.mkv',
+  '.mov',
+  '.wmv',
+  '.flv',
+  '.webm',
+  '.m4v',
+  '.mp3',
+  '.wav',
+  '.flac',
+  '.aac',
+  '.ogg',
+  '.m4a',
+  '.wma',
+])
+
 /**
  * 导入字幕对话框逻辑管理
  *
@@ -78,9 +96,25 @@ export function useTaskImport() {
     projectTitle.value = ''
   }
 
+  function isSupportedMediaFile(fileName) {
+    const ext = String(fileName || '')
+      .trim()
+      .toLowerCase()
+      .match(/\.[^.]+$/)?.[0]
+    return !!ext && SUPPORTED_MEDIA_EXTENSIONS.has(ext)
+  }
+
   function handleMediaFileChange(event) {
     const file = event.target.files?.[0]
     if (file) {
+      if (!isSupportedMediaFile(file.name)) {
+        ElMessage.warning(
+          '不支持的媒体格式，支持：mp4/avi/mkv/mov/wmv/flv/webm/m4v/mp3/wav/flac/aac/ogg/m4a/wma'
+        )
+        mediaFile.value = null
+        event.target.value = ''
+        return
+      }
       mediaFile.value = file
     }
     // 重置 input 以允许重复选择同一文件

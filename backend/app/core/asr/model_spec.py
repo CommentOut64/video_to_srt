@@ -24,6 +24,11 @@ class ModelSource:
     files: List[str] = field(default_factory=list)
     hash: Optional[str] = None
     mirrors: List[str] = field(default_factory=list)
+    install_mode: str = "cache"
+    allow_patterns: List[str] = field(default_factory=list)
+    ignore_patterns: List[str] = field(default_factory=list)
+    file_map: Dict[str, str] = field(default_factory=dict)
+    revision: Optional[str] = None
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ModelSource":
@@ -33,6 +38,11 @@ class ModelSource:
             files=data.get("files") or [],
             hash=data.get("hash"),
             mirrors=data.get("mirrors") or [],
+            install_mode=data.get("install_mode") or "cache",
+            allow_patterns=data.get("allow_patterns") or [],
+            ignore_patterns=data.get("ignore_patterns") or [],
+            file_map=data.get("file_map") or {},
+            revision=data.get("revision"),
         )
 
 

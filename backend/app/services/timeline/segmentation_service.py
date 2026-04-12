@@ -2,21 +2,24 @@
 Pyannote segmentation 服务（Phase 2）。
 
 设计模式：Adapter Pattern。
-原因：对业务层隐藏 pyannote 推理细节，统一模型管理与
-推理输入输出，避免在编排层直接耦合第三方 API。
+原因：对业务层隐藏 pyannote 推理细节，统一输出 `SegmentationResult`，
+即使底层边界证据改由 community-1 diarization 投影得到，也不影响上层断点与缓存契约。
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Protocol, Sequence
 
 import numpy as np
 
-from app.services.model_manager_v2 import get_model_manager_v2
-from app.services.pyannote_compat import load_pyannote_model
+from app.services.timeline.diarization_service import (
+    DiarizationResult,
+    DiarizationSegment,
+    PyannoteDiarizationConfig,
+    PyannoteDiarizationService,
+)
 
 
 @dataclass(frozen=True)
@@ -37,12 +40,30 @@ class SegmentationResult:
 
 @dataclass(frozen=True)
 class PyannoteSegmentationConfig:
-    """pyannote segmentation 配置。"""
+    """基于 community-1 边界投影的 segmentation 配置。"""
 
-    model_id: str = "pyannote-segmentation-3-0"
+    model_id: str = "pyannote-speaker-diarization-community-1"
+    local_path: str = ""
+    hf_token: Optional[str] = None
     boundary_threshold: float = 0.55
     min_boundary_interval_sec: float = 0.20
     prefer_device: str = "auto"
+    min_segment_duration_sec: float = 0.15
+    max_speakers: Optional[int] = None
+    min_speakers: Optional[int] = None
+    num_speakers: Optional[int] = None
+
+
+class DiarizationRunnerLike(Protocol):
+    """供 segmentation 适配器复用的 diarization 最小协议。"""
+
+    def run(
+        self,
+        *,
+        audio: np.ndarray,
+        sample_rate: int,
+    ) -> DiarizationResult:
+        ...
 
 
 def map_frame_times_to_word_boundaries(
@@ -119,15 +140,21 @@ def map_frame_times_to_word_boundaries(
 
 
 class PyannoteSegmentationService:
-    """使用 `pyannote.audio` 模型进行说话人变化边界检测。"""
+    """使用 community-1 diarization 结果投影说话人变化边界。"""
 
     def __init__(
         self,
         config: Optional[PyannoteSegmentationConfig] = None,
+        *,
+        diarization_service: Optional[DiarizationRunnerLike] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.config = config or PyannoteSegmentationConfig()
         self.logger = logger or logging.getLogger(__name__)
+        self._diarization_service = diarization_service or PyannoteDiarizationService(
+            config=self._build_diarization_config(),
+            logger=self.logger,
+        )
 
     def run(
         self,
@@ -135,97 +162,114 @@ class PyannoteSegmentationService:
         audio: np.ndarray,
         sample_rate: int,
     ) -> SegmentationResult:
-        """执行 segmentation 并返回边界点。"""
+        """执行 community-1 推理并返回边界点。"""
         if audio.size == 0:
             return SegmentationResult(boundaries=[], frames=[])
 
-        model = self._acquire_model()
-        if model is None:
+        diarization_result = self._diarization_service.run(
+            audio=audio,
+            sample_rate=sample_rate,
+        )
+        audio_duration_sec = float(audio.shape[0]) / float(sample_rate)
+        return self._build_result_from_diarization(
+            diarization_result=diarization_result,
+            audio_duration_sec=audio_duration_sec,
+            boundary_threshold=self.config.boundary_threshold,
+            min_boundary_interval_sec=self.config.min_boundary_interval_sec,
+        )
+
+    def _build_diarization_config(self) -> PyannoteDiarizationConfig:
+        return PyannoteDiarizationConfig(
+            enabled=True,
+            model_id=str(self.config.model_id or "").strip(),
+            local_path=str(self.config.local_path or "").strip(),
+            hf_token=self.config.hf_token,
+            prefer_device=str(self.config.prefer_device or "auto"),
+            min_segment_duration_sec=max(0.0, float(self.config.min_segment_duration_sec)),
+            max_speakers=self.config.max_speakers,
+            min_speakers=self.config.min_speakers,
+            num_speakers=self.config.num_speakers,
+        )
+
+    @staticmethod
+    def _build_result_from_diarization(
+        *,
+        diarization_result: DiarizationResult,
+        audio_duration_sec: float,
+        boundary_threshold: float,
+        min_boundary_interval_sec: float,
+    ) -> SegmentationResult:
+        segments = sorted(
+            diarization_result.segments,
+            key=lambda item: (float(item.start), float(item.end), str(item.speaker_id)),
+        )
+        if not segments:
             return SegmentationResult(boundaries=[], frames=[])
 
-        try:
-            import torch
-            from pyannote.audio import Inference
-        except ImportError as exc:
-            raise RuntimeError("未安装 pyannote.audio，无法执行 segmentation") from exc
-
-        waveform = torch.tensor(audio, dtype=torch.float32).unsqueeze(0)
-
-        # 设计说明（Strategy Pattern）：
-        # segmentation-3.0 属于 permutation-invariant 任务，默认推理会返回
-        # 原始 chunk 级三维张量 (chunk, frame, class)，其 sliding_window 表示
-        # chunk 时间轴而非 frame 时间轴。
-        # 这里先把 class 维度压缩为单分数轨（与说话人身份无关），再让
-        # pyannote 执行重叠聚合，得到稳定的一维 frame 时间轴。
-        inference = Inference(
-            model,
-            pre_aggregation_hook=self._collapse_permutation_invariant_scores,
+        clamped_duration = max(0.0, float(audio_duration_sec))
+        frames = PyannoteSegmentationService._build_frames_from_segments(
+            segments=segments,
+            audio_duration_sec=clamped_duration,
         )
-        sliding_scores = inference({"waveform": waveform, "sample_rate": sample_rate})
-
-        data = np.asarray(sliding_scores.data, dtype=np.float32)
-        if data.ndim == 1:
-            data = data.reshape(-1, 1)
-        if data.ndim != 2:
-            raise RuntimeError(f"segmentation 输出维度不支持: {data.shape}")
-
-        frame_scores = np.max(data, axis=1)
-        frame_step = float(sliding_scores.sliding_window.step)
-        frame_start = float(sliding_scores.sliding_window.start)
-        audio_duration_sec = float(audio.shape[0]) / float(sample_rate)
-
-        boundaries: list[float] = []
-        frames: list[SegmentationFrame] = []
-        last_boundary = -1e9
-        threshold = float(self.config.boundary_threshold)
-
-        for idx, score in enumerate(frame_scores.tolist()):
-            time_sec = frame_start + idx * frame_step
-            if time_sec > audio_duration_sec:
-                time_sec = audio_duration_sec
-            value = float(score)
-            frames.append(SegmentationFrame(time=time_sec, score=value))
-            if value < threshold:
-                continue
-            if time_sec - last_boundary < self.config.min_boundary_interval_sec:
-                continue
-            boundaries.append(time_sec)
-            last_boundary = time_sec
-
+        boundaries = PyannoteSegmentationService._build_boundaries_from_segments(
+            segments=segments,
+            audio_duration_sec=clamped_duration,
+            boundary_threshold=boundary_threshold,
+            min_boundary_interval_sec=min_boundary_interval_sec,
+        )
         return SegmentationResult(boundaries=boundaries, frames=frames)
 
     @staticmethod
-    def _collapse_permutation_invariant_scores(scores: np.ndarray) -> np.ndarray:
-        """将 permutation-invariant 多类输出压缩为单分数轨后再聚合。"""
-        if scores.ndim == 3:
-            return np.max(scores, axis=2, keepdims=True)
-        if scores.ndim == 2:
-            return scores[..., np.newaxis]
-        raise RuntimeError(f"不支持的 segmentation 原始维度: {scores.shape}")
+    def _build_frames_from_segments(
+        *,
+        segments: Sequence[DiarizationSegment],
+        audio_duration_sec: float,
+    ) -> list[SegmentationFrame]:
+        frames: list[SegmentationFrame] = []
+        seen_times: set[float] = set()
+        for segment in segments:
+            confidence = max(0.0, min(1.0, float(segment.confidence)))
+            for raw_time in (segment.start, segment.end):
+                time_sec = max(0.0, min(float(raw_time), audio_duration_sec))
+                rounded_time = round(time_sec, 6)
+                if rounded_time in seen_times:
+                    continue
+                seen_times.add(rounded_time)
+                frames.append(SegmentationFrame(time=time_sec, score=confidence))
+        frames.sort(key=lambda item: item.time)
+        return frames
 
-    def _acquire_model(self):
-        """通过 ModelManagerV2 获取模型目录，并用 pyannote 官方方式加载。"""
-        manager = get_model_manager_v2()
-        spec = manager.registry.get(self.config.model_id)
-        effective_model = manager.runtime_config_service.get_effective_model(spec).get("effective", {})
-        device = str(effective_model.get("device") or self.config.prefer_device)
+    @staticmethod
+    def _build_boundaries_from_segments(
+        *,
+        segments: Sequence[DiarizationSegment],
+        audio_duration_sec: float,
+        boundary_threshold: float,
+        min_boundary_interval_sec: float,
+    ) -> list[float]:
+        threshold = max(0.0, min(1.0, float(boundary_threshold)))
+        min_interval = max(0.0, float(min_boundary_interval_sec))
+        boundaries: list[float] = []
+        last_boundary = -1e9
 
-        local_path = Path(manager.ensure_available(self.config.model_id))
-        if not local_path.exists():
-            raise FileNotFoundError(f"segmentation 模型目录不存在: {local_path}")
+        for prev_item, next_item in zip(segments, segments[1:]):
+            is_speaker_changed = str(prev_item.speaker_id) != str(next_item.speaker_id)
+            if not is_speaker_changed:
+                continue
 
-        model = load_pyannote_model(
-            checkpoint=str(local_path),
-            logger=self.logger,
-        )
+            confidence = (
+                max(0.0, min(1.0, float(prev_item.confidence)))
+                + max(0.0, min(1.0, float(next_item.confidence)))
+            ) / 2.0
+            if confidence < threshold:
+                continue
 
-        try:
-            if device.startswith("cuda"):
-                import torch
+            boundary_time = (float(prev_item.end) + float(next_item.start)) / 2.0
+            boundary_time = max(0.0, min(boundary_time, audio_duration_sec))
+            if boundary_time - last_boundary < min_interval:
+                continue
 
-                if torch.cuda.is_available():
-                    model = model.to(torch.device(device))
-        except Exception as exc:
-            self.logger.warning("segmentation 模型切换设备失败，回退默认设备: %s", exc)
+            boundaries.append(boundary_time)
+            last_boundary = boundary_time
 
-        return model
+        return boundaries

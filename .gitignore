@@ -25,10 +25,17 @@ frontend/.env.development.local
 frontend/.env.test.local
 frontend/.env.production.local
 
+# Electron 依赖和构建产物
+electron/node_modules/
+electron/dist-shell/
+
 # 任务文件和上传内容
 jobs/
 uploads/
 /models/
+
+# 运行时数据（用户预设、锁文件等）
+data/
 
 # 日志文件
 *.log
@@ -88,10 +95,15 @@ tests_output/
 artifacts/
 htmlcov/
 .coverage
+coverage/
+
+# 忽略所有 test.js 后缀测试文件
+*.test.js
 
 # 本地测试文件（不上传，ci_tests/ 除外）
 tests/
 backend/tests/
+frontend/src/**/__tests__/
 
 llmdoc/
 
@@ -101,9 +113,13 @@ tools/python
 build_patch.bat
 patch_tools/apply_patch.py
 
-scripts
+/scripts/*
+!/scripts/packaging/
+!/scripts/packaging/**
+backend/scripts/
 archive
 openspec
 AGENTS.md
 
 uv.lock
+devdoc

@@ -1,23 +1,30 @@
 # -*- coding: utf-8 -*-
 """
 启动器配置模块
-V3.2.0+dev.20260209.01
+V3.2.4+dev.20260303.04
 """
 
 import os
 import sys
+import logging
 from pathlib import Path
-from dataclasses import dataclass, field
-from typing import Optional, Dict, Any
+from dataclasses import dataclass
+from typing import Optional, Dict
 
 
 # ========================================
 # 常量
 # ========================================
-VERSION = "3.2.0+dev.20260209.01"
+VERSION = "3.2.4+dev.20260303.04"
 APP_NAME = "AnchorFlux"
 DEFAULT_BACKEND_PORT = 8000
 DEFAULT_FRONTEND_PORT = 5173
+DEFAULT_UI_MODE = "browser"
+DEFAULT_RUNTIME_POLICY = "offline"
+DEFAULT_FLAVOR = "full"
+VALID_UI_MODES = ("browser", "electron", "none")
+VALID_RUNTIME_POLICIES = ("offline", "hybrid")
+VALID_FLAVORS = ("full", "lite")
 
 # 信号文件
 UPDATE_SIGNAL_FILE = "update_signal.json"
@@ -26,6 +33,7 @@ SHUTDOWN_SIGNAL_FILE = ".shutdown_signal"
 # 日志格式
 LOG_FORMAT_DEV = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 LOG_FORMAT_PROD = "%(asctime)s [%(levelname)s] %(message)s"
+logger = logging.getLogger("launcher.config")
 
 
 def get_project_root() -> Path:
@@ -83,10 +91,19 @@ class LauncherConfig:
     update_url: str = ""
     check_update_on_start: bool = True
 
+    # UI / 运行时策略配置
+    ui_mode: str = DEFAULT_UI_MODE
+    runtime_policy: str = DEFAULT_RUNTIME_POLICY
+    flavor: str = DEFAULT_FLAVOR
+    shell_path: Optional[Path] = None
+
     def __post_init__(self):
         """初始化后处理"""
         if self.tools_dir is None:
             self.tools_dir = self.project_root / "tools"
+        self.ui_mode = normalize_ui_mode(self.ui_mode)
+        self.runtime_policy = normalize_runtime_policy(self.runtime_policy)
+        self.flavor = normalize_flavor(self.flavor)
 
 
 def load_env_config(project_root: Path) -> Dict[str, str]:
@@ -105,10 +122,34 @@ def load_env_config(project_root: Path) -> Dict[str, str]:
                     continue
                 key, value = line.split('=', 1)
                 config[key.strip()] = value.strip()
-    except Exception:
-        pass
+    except OSError as exc:
+        logger.warning("读取 .env 失败: %s", exc)
 
     return config
+
+
+def normalize_ui_mode(raw_value: str) -> str:
+    """归一化 UI 模式值。"""
+    normalized = str(raw_value or "").strip().lower()
+    if normalized in VALID_UI_MODES:
+        return normalized
+    return DEFAULT_UI_MODE
+
+
+def normalize_runtime_policy(raw_value: str) -> str:
+    """归一化运行策略值。"""
+    normalized = str(raw_value or "").strip().lower()
+    if normalized in VALID_RUNTIME_POLICIES:
+        return normalized
+    return DEFAULT_RUNTIME_POLICY
+
+
+def normalize_flavor(raw_value: str) -> str:
+    """归一化 flavor 值。"""
+    normalized = str(raw_value or "").strip().lower()
+    if normalized in VALID_FLAVORS:
+        return normalized
+    return DEFAULT_FLAVOR
 
 
 def detect_dev_mode(project_root: Path) -> bool:

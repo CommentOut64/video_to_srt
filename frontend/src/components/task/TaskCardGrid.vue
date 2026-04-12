@@ -9,7 +9,7 @@
       <h2 class="empty-title">还没有任务</h2>
       <p class="empty-desc">导入字幕或上传视频开始创建任务</p>
       <div class="empty-actions">
-        <el-button size="large" @click="$emit('open-import')">
+        <el-button v-if="canRenderProjectCreateAction" size="large" @click="$emit('open-import')">
           <el-icon><Document /></el-icon>
           导入字幕
         </el-button>
@@ -171,15 +171,24 @@
                     @keyup.enter="$emit('finish-edit-title', task)"
                     @keyup.esc="$emit('cancel-edit-title')"
                   />
-                  <button
+                  <el-popover
                     v-else
-                    class="task-title task-title-link"
-                    :title="getTaskDisplayName(task) + ' (点击查看，双击重命名)'"
-                    @click="$emit('title-click', task)"
-                    @dblclick.prevent="$emit('start-edit-title', task)"
+                    :content="getTaskDisplayName(task) + ' (点击查看，双击重命名)'"
+                    placement="top"
+                    trigger="hover"
+                    popper-class="hint-popover-compact"
+                    :show-after="500"
                   >
-                    {{ getTaskDisplayName(task) }}
-                  </button>
+                    <template #reference>
+                      <button
+                        class="task-title task-title-link"
+                        @click="$emit('title-click', task)"
+                        @dblclick.prevent="$emit('start-edit-title', task)"
+                      >
+                        {{ getTaskDisplayName(task) }}
+                      </button>
+                    </template>
+                  </el-popover>
                 </div>
                 <span class="row-status">{{ getStatusText(task.status) }}</span>
                 <span class="row-time">{{ formatDate(getTaskTime(task)) }}</span>
@@ -320,15 +329,24 @@
                 @keyup.enter="$emit('finish-edit-title', task)"
                 @keyup.esc="$emit('cancel-edit-title')"
               />
-              <button
+              <el-popover
                 v-else
-                class="task-title task-title-link"
-                :title="getTaskDisplayName(task) + ' (点击查看，双击重命名)'"
-                @click="$emit('title-click', task)"
-                @dblclick.prevent="$emit('start-edit-title', task)"
+                :content="getTaskDisplayName(task) + ' (点击查看，双击重命名)'"
+                placement="top"
+                trigger="hover"
+                popper-class="hint-popover-compact"
+                :show-after="500"
               >
-                {{ getTaskDisplayName(task) }}
-              </button>
+                <template #reference>
+                  <button
+                    class="task-title task-title-link"
+                    @click="$emit('title-click', task)"
+                    @dblclick.prevent="$emit('start-edit-title', task)"
+                  >
+                    {{ getTaskDisplayName(task) }}
+                  </button>
+                </template>
+              </el-popover>
             </div>
             <span class="row-status">{{ getStatusText(task.status) }}</span>
             <span class="row-time">{{ formatDate(getTaskTime(task)) }}</span>
@@ -352,9 +370,11 @@
 <script setup>
 import { computed } from "vue";
 import { Upload, Edit, Delete, Clock, Loading, Document, ArrowDown } from "@element-plus/icons-vue";
-import { selectCapabilities } from "@/state/capabilities/capabilitySelector";
+import { selectRouteVisibility } from "@/state/capabilities/capabilitySelector";
 
-const canRenderTranscribeAction = selectCapabilities().canTranscribe;
+const routeVisibility = selectRouteVisibility();
+const canRenderTranscribeAction = routeVisibility.transcribeCreate;
+const canRenderProjectCreateAction = routeVisibility.projectCreate;
 
 const props = defineProps({
   tasks: {

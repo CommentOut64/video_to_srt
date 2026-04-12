@@ -29,6 +29,10 @@ from app.config.lifecycle_config import (
     RUNNER_DETACH_ON_FORCE_CANCEL_ENABLED,
 )
 from app.services.sse_service import get_sse_manager
+from app.services.sse_publisher import (
+    remove_sse_publisher,
+    get_sse_publisher_cache_snapshot,
+)
 from app.core.config import config
 from app.services.checkpoint import RuntimeCheckpointService
 from app.services.project_id_resolver import get_project_id_resolver
@@ -725,6 +729,7 @@ class JobQueueService:
                 self._save_state()
                 self._notify_job_removed(job_id)
                 self._try_process_pending_physical_deletes(limit=1)
+                remove_sse_publisher(job_id)
                 return CancelResult(
                     success=True,
                     status="removed",
@@ -788,7 +793,11 @@ class JobQueueService:
                 logger.info("[Lifecycle] 已触发取消令牌: %s", job_id)
 
             job.canceled = True
-            self._pending_cancel_requests.pop(job_id, None)
+            is_executing = (self._current_executing_job_id == job_id)
+            if (not delete_data) and (is_running or is_executing):
+                self._pending_cancel_requests[job_id] = cancel_request_time
+            else:
+                self._pending_cancel_requests.pop(job_id, None)
 
             if is_running:
                 self.running_job_id = None
@@ -871,6 +880,7 @@ class JobQueueService:
             self._notify_job_removed(job_id)
             self._save_state()
             self._try_process_pending_physical_deletes(limit=1)
+            remove_sse_publisher(job_id)
             return CancelResult(
                 success=True,
                 status="removed",
@@ -904,12 +914,11 @@ class JobQueueService:
 
     def _check_delete_blocked(self, job_id: str) -> tuple[bool, Optional[str]]:
         """删除前占用检测：命中占用时返回阻塞原因，禁止逻辑删除。"""
-        try:
-            from app.services.media_stream_tracker import get_active_streams
-
-            active_streams = int(get_active_streams(job_id) or 0)
-        except Exception:
-            active_streams = 0
+        active_streams = self._wait_active_streams_release(
+            job_id,
+            timeout_seconds=0.8,
+            poll_interval_seconds=0.08,
+        )
 
         if active_streams > 0:
             return True, f"当前有进程占用，请稍后再试 (active_streams={active_streams})"
@@ -943,6 +952,42 @@ class JobQueueService:
                 return True, f"当前有进程占用，请稍后再试 ({stage_name}={status_value})"
 
         return False, None
+
+    def _get_active_stream_count(self, job_id: str) -> int:
+        try:
+            from app.services.media_stream_tracker import get_active_streams
+
+            return max(0, int(get_active_streams(job_id) or 0))
+        except Exception:
+            return 0
+
+    def _wait_active_streams_release(
+        self,
+        job_id: str,
+        *,
+        timeout_seconds: float,
+        poll_interval_seconds: float,
+    ) -> int:
+        active_streams = self._get_active_stream_count(job_id)
+        if active_streams <= 0:
+            return 0
+
+        timeout = max(0.0, float(timeout_seconds or 0.0))
+        poll_interval = max(0.02, float(poll_interval_seconds or 0.0))
+        deadline = time.monotonic() + timeout
+
+        while active_streams > 0 and time.monotonic() < deadline:
+            time.sleep(poll_interval)
+            active_streams = self._get_active_stream_count(job_id)
+
+        if active_streams > 0:
+            logger.warning(
+                "[Lifecycle] 删除前媒体流仍占用: job=%s, active_streams=%s, waited=%.2fs",
+                job_id,
+                active_streams,
+                timeout,
+            )
+        return active_streams
 
     def _worker_loop(self):
         """
@@ -1228,6 +1273,8 @@ class JobQueueService:
         self._remove_cancellation_token(finished_job_id)
         self.heartbeat_service.release(finished_job_id, self._lease_owner)
         self._cleanup_resources()
+        if is_logically_removed or job.status in {"finished", "failed", "canceled", "force_canceled", "removed"}:
+            remove_sse_publisher(finished_job_id)
 
         if is_logically_removed:
             with self.lock:
@@ -1290,12 +1337,11 @@ class JobQueueService:
         job_dir_value = str(payload.get("job_dir") or "")
         job_dir = Path(job_dir_value) if job_dir_value else (Path(config.JOBS_DIR) / job_id)
 
-        try:
-            from app.services.media_stream_tracker import get_active_streams
-
-            active_streams = int(get_active_streams(job_id) or 0)
-        except Exception:
-            active_streams = 0
+        active_streams = self._wait_active_streams_release(
+            job_id,
+            timeout_seconds=0.4,
+            poll_interval_seconds=0.08,
+        )
 
         if active_streams > 0:
             return False, f"当前有进程占用，请稍后再试 (active_streams={active_streams})"
@@ -1370,6 +1416,7 @@ class JobQueueService:
                         logger.info("[Lifecycle] 后台物理删除完成，等待 Runner 收尾: %s", job_id)
                     else:
                         logger.info("[Lifecycle] 后台物理删除完成: %s", job_id)
+                    remove_sse_publisher(job_id)
                     continue
 
                 with self.lock:
@@ -1506,9 +1553,17 @@ class JobQueueService:
                 job.message = f"已取消（超时兜底 {elapsed:.0f}s）"
                 logger.info("[V3.1.0] 历史 canceling 任务已收敛为 canceled: %s", job_id)
 
+            is_orphan_execution = False
             if self.running_job_id == job_id:
                 self.running_job_id = None
                 logger.warning("[V3.1.0] 取消超时兜底清除 running_job_id: %s", job_id)
+                is_orphan_execution = True
+            if self._current_executing_job_id == job_id:
+                self._current_executing_job_id = None
+                logger.warning("[V3.1.0] 取消超时兜底清除 _current_executing_job_id: %s", job_id)
+                is_orphan_execution = True
+
+            if is_orphan_execution:
                 self._orphan_executions[job_id] = time.time()
                 if RUNNER_GATE_ENABLED:
                     self._is_gpu_busy_override = True
@@ -1527,6 +1582,7 @@ class JobQueueService:
         self._notify_queue_change()
         self._notify_job_status(job_id, "canceled")
         self._notify_job_signal(job_id, "job_canceled")
+        remove_sse_publisher(job_id)
 
     async def _run_dual_alignment_pipeline(self, job: 'JobState', preset_id: str):
         """
@@ -2918,6 +2974,54 @@ class JobQueueService:
                 }
             }
 
+    def get_runtime_diagnostics(self) -> dict:
+        """
+        获取队列运行时诊断快照（观测用）。
+
+        说明：
+        - 仅返回内存中的轻量计数字段与ID列表，避免额外副作用；
+        - 不改变调度/状态机语义，可用于长时压测采样。
+        """
+        with self.lock:
+            pending_cancel_job_ids = list(self._pending_cancel_requests.keys())
+            orphan_job_ids = list(self._orphan_executions.keys())
+            pending_physical_delete_ids = list(self._pending_physical_delete.keys())
+            runner_job_ids = list(self._runner_threads.keys())
+            runner_alive_job_ids = [
+                job_id
+                for job_id, thread in self._runner_threads.items()
+                if thread.is_alive()
+            ]
+            logically_removed_job_ids = list(self._logically_removed_jobs)
+
+            snapshot = {
+                "timestamp": time.time(),
+                "queue_length": len(self.queue),
+                "jobs_count": len(self.jobs),
+                "running_job_id": self.running_job_id,
+                "current_executing_job_id": self._current_executing_job_id,
+                "pending_cancel_count": len(pending_cancel_job_ids),
+                "pending_cancel_job_ids": pending_cancel_job_ids,
+                "orphan_execution_count": len(orphan_job_ids),
+                "orphan_execution_job_ids": orphan_job_ids,
+                "runner_thread_count": len(runner_job_ids),
+                "runner_thread_job_ids": runner_job_ids,
+                "runner_alive_count": len(runner_alive_job_ids),
+                "runner_alive_job_ids": runner_alive_job_ids,
+                "pending_physical_delete_count": len(pending_physical_delete_ids),
+                "pending_physical_delete_job_ids": pending_physical_delete_ids,
+                "logically_removed_count": len(logically_removed_job_ids),
+                "logically_removed_job_ids": logically_removed_job_ids,
+                "cancellation_token_count": len(self.cancellation_tokens),
+                "is_gpu_busy_override": bool(self._is_gpu_busy_override),
+                "is_runner_gate_blocking": bool(self._is_runner_gate_blocking_locked()),
+            }
+
+        sse_snapshot = get_sse_publisher_cache_snapshot()
+        snapshot["sse_publisher_cache_count"] = int(sse_snapshot.get("count") or 0)
+        snapshot["sse_publisher_job_ids"] = list(sse_snapshot.get("job_ids") or [])
+        return snapshot
+
     def shutdown(self):
         """
         停止Worker线程并保存所有任务状态
@@ -2961,8 +3065,14 @@ class JobQueueService:
         # V3.2.4+dev.20260222.07: 等待所有 Runner 线程收尾，避免测试进程残留后台线程
         with self.lock:
             runner_threads = list(self._runner_threads.values())
+            known_job_ids = list(self.jobs.keys())
+            self._pending_cancel_requests.clear()
+            self._orphan_executions.clear()
+            self._is_gpu_busy_override = False
         for runner_thread in runner_threads:
             runner_thread.join(timeout=5)
+        for known_job_id in known_job_ids:
+            remove_sse_publisher(known_job_id)
         logger.info("队列服务已停止")
 
 

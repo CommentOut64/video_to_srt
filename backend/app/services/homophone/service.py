@@ -50,7 +50,7 @@ class HomophoneService:
     def index_chunk(
         self,
         *,
-        job_id: str,
+        project_id: str,
         revision: int,
         chunk_index: int,
         language: Language,
@@ -59,7 +59,7 @@ class HomophoneService:
         now = self._now_iso()
         self._db.upsert_index_state(
             IndexState(
-                job_id=job_id,
+                project_id=project_id,
                 revision=revision,
                 status="building",
                 last_committed_chunk=max(-1, chunk_index - 1),
@@ -74,7 +74,7 @@ class HomophoneService:
             for token_index, token in enumerate(token_readings):
                 records.append(
                     PostingRecord(
-                        job_id=job_id,
+                        project_id=project_id,
                         revision=revision,
                         language=language,
                         chunk_index=chunk_index,
@@ -94,7 +94,7 @@ class HomophoneService:
         now_done = self._now_iso()
         self._db.upsert_index_state(
             IndexState(
-                job_id=job_id,
+                project_id=project_id,
                 revision=revision,
                 status="ready",
                 last_committed_chunk=chunk_index,
@@ -103,10 +103,116 @@ class HomophoneService:
             )
         )
 
+    def sync_sentences(
+        self,
+        *,
+        project_id: str,
+        revision: int,
+        language: Language,
+        sentences: Iterable[SentenceRecord],
+    ) -> None:
+        """按句增量同步索引，适用于少量字幕编辑。"""
+        normalized_sentences = list(sentences)
+        if not normalized_sentences:
+            return
+
+        now = self._now_iso()
+        self._db.upsert_index_state(
+            IndexState(
+                project_id=project_id,
+                revision=revision,
+                status="building",
+                last_committed_chunk=0,
+                heartbeat_at=now,
+                updated_at=now,
+            )
+        )
+
+        for sentence in normalized_sentences:
+            records = self._build_posting_records(
+                project_id=project_id,
+                revision=revision,
+                language=language,
+                chunk_index=0,
+                sentence=sentence,
+            )
+            self._db.replace_sentence_postings(
+                project_id=project_id,
+                revision=revision,
+                sentence_index=sentence.index,
+                records=records,
+            )
+
+        now_done = self._now_iso()
+        self._db.upsert_index_state(
+            IndexState(
+                project_id=project_id,
+                revision=revision,
+                status="ready",
+                last_committed_chunk=0,
+                heartbeat_at=now_done,
+                updated_at=now_done,
+            )
+        )
+
+    def remove_sentences(
+        self,
+        *,
+        project_id: str,
+        revision: int,
+        sentence_indices: Iterable[int],
+    ) -> None:
+        """按句删除索引，适用于字幕删除。"""
+        normalized_indices = sorted({int(item) for item in sentence_indices})
+        if not normalized_indices:
+            return
+
+        now = self._now_iso()
+        self._db.upsert_index_state(
+            IndexState(
+                project_id=project_id,
+                revision=revision,
+                status="building",
+                last_committed_chunk=0,
+                heartbeat_at=now,
+                updated_at=now,
+            )
+        )
+        self._db.delete_sentence_postings(
+            project_id=project_id,
+            revision=revision,
+            sentence_indices=normalized_indices,
+        )
+        now_done = self._now_iso()
+        self._db.upsert_index_state(
+            IndexState(
+                project_id=project_id,
+                revision=revision,
+                status="ready",
+                last_committed_chunk=0,
+                heartbeat_at=now_done,
+                updated_at=now_done,
+            )
+        )
+
+    def mark_index_failed(self, *, project_id: str, revision: int) -> None:
+        """显式标记索引失效，促使下次查询走全量重建。"""
+        now = self._now_iso()
+        self._db.upsert_index_state(
+            IndexState(
+                project_id=project_id,
+                revision=revision,
+                status="failed",
+                last_committed_chunk=0,
+                heartbeat_at=now,
+                updated_at=now,
+            )
+        )
+
     def search_homophone(
         self,
         *,
-        job_id: str,
+        project_id: str,
         revision: int,
         language: Language,
         query_text: str,
@@ -125,7 +231,7 @@ class HomophoneService:
             return []
 
         candidate_sentence_indices = self._collect_candidate_sentence_indices(
-            job_id=job_id,
+            project_id=project_id,
             revision=revision,
             language=language,
             query_key_sequence=query_key_sequence,
@@ -137,7 +243,7 @@ class HomophoneService:
             return []
 
         sentence_rows = self._db.list_sentence_postings(
-            job_id=job_id,
+            project_id=project_id,
             revision=revision,
             language=language,
             sentence_indices=sorted(candidate_sentence_indices),
@@ -163,7 +269,7 @@ class HomophoneService:
     def _collect_candidate_sentence_indices(
         self,
         *,
-        job_id: str,
+        project_id: str,
         revision: int,
         language: Language,
         query_key_sequence: List[str],
@@ -177,7 +283,7 @@ class HomophoneService:
         per_seed_limit = max(limit * 8, 1000)
         for seed_key in seed_keys:
             rows = self._db.query_postings(
-                job_id=job_id,
+                project_id=project_id,
                 revision=revision,
                 language=language,
                 key_value=seed_key,
@@ -192,7 +298,7 @@ class HomophoneService:
             prefix_limit = max(limit * 12, 2000)
             for key_prefix in self._build_fuzzy_prefixes(seed_keys):
                 rows = self._db.query_postings_by_prefix(
-                    job_id=job_id,
+                    project_id=project_id,
                     revision=revision,
                     language=language,
                     key_prefix=key_prefix,
@@ -618,8 +724,39 @@ class HomophoneService:
     def list_global_terms(self) -> List[GlobalTermRule]:
         return self._db.list_global_terms()
 
-    def get_index_status(self, job_id: str) -> Optional[IndexState]:
-        return self._db.get_latest_index_state(job_id)
+    def get_index_status(self, project_id: str) -> Optional[IndexState]:
+        return self._db.get_latest_index_state(project_id)
+
+    def _build_posting_records(
+        self,
+        *,
+        project_id: str,
+        revision: int,
+        language: Language,
+        chunk_index: int,
+        sentence: SentenceRecord,
+    ) -> List[PostingRecord]:
+        records: List[PostingRecord] = []
+        token_readings = self._tokenizer.tokenize(sentence.text, language)
+        for token_index, token in enumerate(token_readings):
+            records.append(
+                PostingRecord(
+                    project_id=project_id,
+                    revision=revision,
+                    language=language,
+                    chunk_index=chunk_index,
+                    sentence_index=sentence.index,
+                    token_index=token_index,
+                    token_text=token.token_text,
+                    reading_key=token.reading_key,
+                    reading_key_fuzzy=token.reading_key_fuzzy,
+                    reading_key_no_punct=token.reading_key_no_punct,
+                    reading_key_fuzzy_no_punct=token.reading_key_fuzzy_no_punct,
+                    char_start=token.char_start,
+                    char_end=token.char_end,
+                )
+            )
+        return records
 
     @staticmethod
     def _now_iso() -> str:

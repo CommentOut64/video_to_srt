@@ -19,6 +19,7 @@ import logging
 import threading
 from pathlib import Path
 from typing import Optional, Tuple
+from urllib.parse import urlencode
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
@@ -48,10 +49,28 @@ NEED_TRANSCODE_CODECS = {'hevc', 'h265', 'vp9', 'av1'}
 # 可作为波形数据来源的音频文件扩展名
 AUDIO_SOURCE_EXTS = {'.wav', '.mp3', '.m4a', '.aac', '.flac', '.ogg', '.wma', '.opus'}
 VIDEO_SOURCE_EXTS = {'.mp4', '.avi', '.mkv', '.mov', '.wmv', '.webm', '.flv', '.m4v'}
+NORMALIZED_H264_FILENAME = "normalized_h264.mp4"
 
 # 音频抽取锁（按目录粒度，避免并发请求重复抽取同一文件）
 _audio_extract_lock_guard = threading.Lock()
 _audio_extract_locks: dict[str, threading.Lock] = {}
+_video_request_log_guard = threading.Lock()
+_video_request_log_windows: dict[str, Tuple[float, int]] = {}
+_transcode_cache_guard = threading.Lock()
+_transcode_decision_cache: dict[str, dict] = {}
+_thumbnail_lock_guard = threading.Lock()
+_thumbnail_generation_guard = threading.Lock()
+_thumbnail_locks: dict[str, asyncio.Lock] = {}
+_thumbnail_generation_tasks: dict[str, asyncio.Task] = {}
+_VIDEO_REQUEST_LOG_THROTTLE_SECONDS = 1.0
+_TRANSCODE_CACHE_TTL_SECONDS = 2.0
+TASK_CARD_THUMBNAIL_MAX_WIDTH = 640
+TASK_CARD_THUMBNAIL_FILENAME = "thumbnail.jpg"
+_SHELL_CAPABILITY_QUERY_KEY_MAP = {
+    "shell_hevc_direct_play": "hevcDirectPlay",
+    "shell_h264_direct_play": "h264DirectPlay",
+    "shell_active_gpu_preference": "activeGpuPreference",
+}
 
 # 注意：旧的 _proxy_generation_status 已废弃，改用 MediaPrepService 管理状态
 
@@ -96,6 +115,145 @@ def _get_audio_extract_lock(job_dir: Path) -> threading.Lock:
             lock = threading.Lock()
             _audio_extract_locks[key] = lock
     return lock
+
+
+def _get_thumbnail_lock(job_dir: Path) -> asyncio.Lock:
+    """获取目录级缩略图锁，保证同一项目只会有一个生成流程。"""
+    key = str(job_dir.resolve())
+    with _thumbnail_lock_guard:
+        lock = _thumbnail_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _thumbnail_locks[key] = lock
+    return lock
+
+
+def _resolve_task_card_thumbnail_width(video_width: int) -> int:
+    normalized_width = int(video_width or 0)
+    if normalized_width <= 0:
+        return TASK_CARD_THUMBNAIL_MAX_WIDTH
+    return max(1, min(TASK_CARD_THUMBNAIL_MAX_WIDTH, normalized_width))
+
+
+def _read_cached_thumbnail_bytes(thumbnail_file: Path) -> Optional[bytes]:
+    try:
+        if thumbnail_file.exists():
+            with open(thumbnail_file, "rb") as file:
+                data = file.read()
+            if data:
+                return data
+    except OSError as exc:
+        logger.warning("[media] 读取缩略图缓存失败: file=%s, error=%s", thumbnail_file, exc)
+    return None
+
+
+def _write_cached_thumbnail_atomic(thumbnail_file: Path, thumbnail_bytes: bytes) -> None:
+    tmp_file = thumbnail_file.with_suffix(f"{thumbnail_file.suffix}.tmp")
+    try:
+        with open(tmp_file, "wb") as file:
+            file.write(thumbnail_bytes)
+        os.replace(tmp_file, thumbnail_file)
+    finally:
+        if tmp_file.exists():
+            tmp_file.unlink(missing_ok=True)
+
+
+def _encode_thumbnail_data_url(thumbnail_bytes: bytes) -> str:
+    import base64
+
+    return f"data:image/jpeg;base64,{base64.b64encode(thumbnail_bytes).decode('utf-8')}"
+
+
+async def _generate_task_card_thumbnail_bytes(video_file: Path) -> tuple[Optional[bytes], int]:
+    thumb_width = TASK_CARD_THUMBNAIL_MAX_WIDTH
+    try:
+        width, _ = await _get_video_resolution(video_file)
+        thumb_width = _resolve_task_card_thumbnail_width(width)
+        ffmpeg_cmd = config.get_ffmpeg_command()
+        cmd = [
+            ffmpeg_cmd,
+            "-ss",
+            "1",
+            "-i",
+            str(video_file),
+            "-vframes",
+            "1",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "-vf",
+            f"scale={thumb_width}:-1",
+            "-q:v",
+            "4",
+            "-",
+        ]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            timeout=10,
+        )
+        if result.returncode == 0 and result.stdout:
+            return result.stdout, thumb_width
+        logger.warning(
+            "[media] 生成任务卡片缩略图失败: video=%s, returncode=%s, stderr=%s",
+            video_file,
+            result.returncode,
+            (result.stderr or b"")[:200],
+        )
+    except Exception as exc:
+        logger.warning("[media] 生成任务卡片缩略图异常: video=%s, error=%s", video_file, exc)
+    return None, thumb_width
+
+
+async def _ensure_task_card_thumbnail_cached(
+    *,
+    project_id: str,
+    job_dir: Path,
+    video_file: Path,
+    thumbnail_file: Path,
+) -> tuple[Optional[bytes], int, bool]:
+    thumbnail_lock = _get_thumbnail_lock(job_dir)
+    async with thumbnail_lock:
+        cached_bytes = _read_cached_thumbnail_bytes(thumbnail_file)
+        if cached_bytes is not None:
+            return cached_bytes, 0, True
+
+        generated_bytes, thumb_width = await _generate_task_card_thumbnail_bytes(video_file)
+        if generated_bytes is None:
+            return None, thumb_width, False
+
+        try:
+            _write_cached_thumbnail_atomic(thumbnail_file, generated_bytes)
+            logger.info("[media] 缩略图已缓存: project=%s, width=%spx", project_id, thumb_width)
+        except OSError as exc:
+            logger.warning("[media] 缓存缩略图失败: project=%s, error=%s", project_id, exc)
+        return generated_bytes, thumb_width, False
+
+
+def _schedule_auto_thumbnail_generation(project_id: str, video_file: Path, thumbnail_file: Path) -> bool:
+    task_key = str(thumbnail_file.resolve())
+    with _thumbnail_generation_guard:
+        existing_task = _thumbnail_generation_tasks.get(task_key)
+        if existing_task is not None:
+            done_fn = getattr(existing_task, "done", None)
+            if not callable(done_fn) or not bool(done_fn()):
+                return False
+
+        task = asyncio.create_task(_auto_generate_thumbnail(project_id, video_file, thumbnail_file))
+        _thumbnail_generation_tasks[task_key] = task
+
+        add_done_callback = getattr(task, "add_done_callback", None)
+        if callable(add_done_callback):
+            def _cleanup(finished_task, key=task_key):  # noqa: ANN001
+                with _thumbnail_generation_guard:
+                    current_task = _thumbnail_generation_tasks.get(key)
+                    if current_task is finished_task:
+                        _thumbnail_generation_tasks.pop(key, None)
+
+            add_done_callback(_cleanup)
+    return True
 
 
 def _ensure_waveform_audio(job_dir: Path, identifier: str) -> Path:
@@ -412,7 +570,48 @@ def _get_video_codec(video_path: Path) -> Optional[str]:
     return None
 
 
-def _analyze_transcode_requirement(video_file: Optional[Path]) -> Tuple[bool, str, Optional[str]]:
+def _parse_shell_media_capability(request: Optional[Request]) -> dict:
+    if request is None:
+        return {}
+
+    capability = {}
+    for query_key, field_name in _SHELL_CAPABILITY_QUERY_KEY_MAP.items():
+        raw_value = request.query_params.get(query_key)
+        if raw_value is None:
+            continue
+        normalized_value = str(raw_value).strip().lower()
+        if field_name == "activeGpuPreference":
+            if normalized_value:
+                capability[field_name] = normalized_value
+            continue
+        if normalized_value in {"1", "true", "yes", "on"}:
+            capability[field_name] = True
+        elif normalized_value in {"0", "false", "no", "off"}:
+            capability[field_name] = False
+    return capability
+
+
+def _append_shell_media_capability_to_url(url: Optional[str], shell_capability: Optional[dict]) -> Optional[str]:
+    if not url:
+        return url
+    normalized_capability = shell_capability if isinstance(shell_capability, dict) else {}
+    params = {}
+    for query_key, field_name in _SHELL_CAPABILITY_QUERY_KEY_MAP.items():
+        field_value = normalized_capability.get(field_name)
+        if isinstance(field_value, bool):
+            params[query_key] = "1" if field_value else "0"
+        elif field_name == "activeGpuPreference" and field_value:
+            params[query_key] = str(field_value)
+    if not params:
+        return url
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}{urlencode(params)}"
+
+
+def _analyze_transcode_requirement(
+    video_file: Optional[Path],
+    shell_capability: Optional[dict] = None,
+) -> Tuple[bool, str, Optional[str]]:
     """
     统一分析视频是否需要转码，避免多个接口判断口径不一致。
 
@@ -421,6 +620,24 @@ def _analyze_transcode_requirement(video_file: Optional[Path]) -> Tuple[bool, st
     """
     if video_file is None or not video_file.exists():
         return False, "", None
+    normalized_shell_capability = shell_capability if isinstance(shell_capability, dict) else {}
+    capability_cache_suffix = json.dumps(normalized_shell_capability, sort_keys=True, ensure_ascii=True)
+    cache_key = f"{video_file.resolve()}::{capability_cache_suffix}"
+    file_size = 0
+    file_mtime_ns = 0
+    try:
+        stat = video_file.stat()
+        file_size = int(stat.st_size)
+        file_mtime_ns = int(stat.st_mtime_ns)
+        cached = _get_cached_transcode_decision(
+            cache_key=cache_key,
+            size=file_size,
+            mtime_ns=file_mtime_ns,
+        )
+        if cached is not None:
+            return cached
+    except OSError:
+        cache_key = ""
 
     try:
         from app.services.media_prep_service import get_media_prep_service, TranscodeDecision
@@ -429,27 +646,134 @@ def _analyze_transcode_requirement(video_file: Optional[Path]) -> Tuple[bool, st
         media_prep = get_media_prep_service()
         video_info = media_analyzer.analyze_sync(video_file)
         video_info["container"] = video_file.suffix.lower()
-        decision = media_prep.analyze_transcode_decision(video_info)
+        decision = media_prep.analyze_transcode_decision(
+            video_info,
+            shell_capability=normalized_shell_capability,
+        )
         decision_value = str(getattr(decision, "value", str(decision)))
 
         if decision == TranscodeDecision.DIRECT_PLAY:
-            return False, "", decision_value
+            result = (False, "", decision_value)
+            _set_cached_transcode_decision(cache_key, file_size, file_mtime_ns, result)
+            return result
         if decision == TranscodeDecision.REMUX_ONLY:
-            return True, f"容器不兼容 ({video_file.suffix})", decision_value
+            result = (True, f"容器不兼容 ({video_file.suffix})", decision_value)
+            _set_cached_transcode_decision(cache_key, file_size, file_mtime_ns, result)
+            return result
         if decision == TranscodeDecision.TRANSCODE_AUDIO:
-            return True, "音频编码不兼容", decision_value
-        return True, "视频编码不兼容", decision_value
+            result = (True, "音频编码不兼容", decision_value)
+            _set_cached_transcode_decision(cache_key, file_size, file_mtime_ns, result)
+            return result
+        result = (True, "视频编码不兼容", decision_value)
+        _set_cached_transcode_decision(cache_key, file_size, file_mtime_ns, result)
+        return result
     except Exception as exc:
         logger.warning("[media] 决策分析失败，回退扩展名/编码规则: %s", exc)
 
     suffix = video_file.suffix.lower()
     if suffix in NEED_TRANSCODE_FORMATS:
-        return True, f"格式不兼容 ({video_file.suffix})", "fallback_extension"
+        result = (True, f"格式不兼容 ({video_file.suffix})", "fallback_extension")
+        _set_cached_transcode_decision(cache_key, file_size, file_mtime_ns, result)
+        return result
     if suffix in BROWSER_COMPATIBLE_FORMATS:
+        fallback_need_transcode_codecs = set(NEED_TRANSCODE_CODECS)
+        if (
+            _is_electron_native_profile()
+            and normalized_shell_capability.get("hevcDirectPlay") is True
+        ):
+            fallback_need_transcode_codecs.difference_update({"hevc", "h265"})
         codec = _get_video_codec(video_file)
-        if codec and codec in NEED_TRANSCODE_CODECS:
-            return True, f"编码不兼容 ({codec.upper()})", "fallback_codec"
-    return False, "", "fallback_direct"
+        if codec and codec in fallback_need_transcode_codecs:
+            result = (True, f"编码不兼容 ({codec.upper()})", "fallback_codec")
+            _set_cached_transcode_decision(cache_key, file_size, file_mtime_ns, result)
+            return result
+    result = (False, "", "fallback_direct")
+    _set_cached_transcode_decision(cache_key, file_size, file_mtime_ns, result)
+    return result
+
+
+def _get_cached_transcode_decision(
+    cache_key: str,
+    size: int,
+    mtime_ns: int,
+) -> Optional[Tuple[bool, str, Optional[str]]]:
+    if not cache_key:
+        return None
+    now = time.monotonic()
+    with _transcode_cache_guard:
+        cached = _transcode_decision_cache.get(cache_key)
+        if not cached:
+            return None
+        if now - float(cached.get("cached_at", 0.0)) > _TRANSCODE_CACHE_TTL_SECONDS:
+            _transcode_decision_cache.pop(cache_key, None)
+            return None
+        if int(cached.get("size", -1)) != int(size) or int(cached.get("mtime_ns", -1)) != int(mtime_ns):
+            _transcode_decision_cache.pop(cache_key, None)
+            return None
+        result = cached.get("result")
+        if not isinstance(result, tuple) or len(result) != 3:
+            _transcode_decision_cache.pop(cache_key, None)
+            return None
+        return result  # type: ignore[return-value]
+
+
+def _set_cached_transcode_decision(
+    cache_key: str,
+    size: int,
+    mtime_ns: int,
+    result: Tuple[bool, str, Optional[str]],
+) -> None:
+    if not cache_key:
+        return
+    with _transcode_cache_guard:
+        _transcode_decision_cache[cache_key] = {
+            "cached_at": time.monotonic(),
+            "size": int(size),
+            "mtime_ns": int(mtime_ns),
+            "result": result,
+        }
+
+
+def _log_video_request(project_id: str, identifier: str, job_dir: Path) -> None:
+    """折叠同项目短时间内的重复视频请求日志，避免高频噪声掩盖异常。"""
+    now = time.monotonic()
+    suppressed = 0
+    with _video_request_log_guard:
+        previous = _video_request_log_windows.get(project_id)
+        if previous and now - previous[0] < _VIDEO_REQUEST_LOG_THROTTLE_SECONDS:
+            _video_request_log_windows[project_id] = (previous[0], previous[1] + 1)
+            return
+        if previous and previous[1] > 1:
+            suppressed = previous[1] - 1
+        _video_request_log_windows[project_id] = (now, 1)
+
+    if suppressed > 0:
+        logger.debug(
+            "[media] 收到视频请求: identifier=%s, project_id=%s, dir=%s (1s内重复请求已折叠: %s)",
+            identifier,
+            project_id,
+            job_dir,
+            suppressed,
+        )
+    else:
+        logger.debug(
+            "[media] 收到视频请求: identifier=%s, project_id=%s, dir=%s",
+            identifier,
+            project_id,
+            job_dir,
+        )
+
+
+def _is_browser_compat_profile() -> bool:
+    return config.is_browser_compat_media_profile()
+
+
+def _is_electron_native_profile() -> bool:
+    return config.is_electron_native_media_profile()
+
+
+def _normalized_h264_path(job_dir: Path) -> Path:
+    return job_dir / NORMALIZED_H264_FILENAME
 
 
 def _has_audio_stream(video_path: Path) -> bool:
@@ -866,49 +1190,49 @@ async def get_video(identifier: str, request: Request):
     media_identity = _resolve_media_identity_or_404(job_id)
     project_id = media_identity.project_id
     job_dir = media_identity.project_dir
+    shell_capability = _parse_shell_media_capability(request)
 
-    logger.debug(
-        "[media] 收到视频请求: identifier=%s, project_id=%s, dir=%s",
-        job_id,
-        project_id,
-        job_dir,
-    )
+    _log_video_request(project_id=project_id, identifier=job_id, job_dir=job_dir)
 
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
 
-    # 1. 按优先级查找可用视频
-    # 优先级：720p > remux > 360p > 源视频
+    # 1. 按 profile 查找可用视频
+    # browser_compat: 720p > remux > 360p > 源视频
+    # electron_native: normalized_h264 > remux > 源视频
+    is_browser_profile = _is_browser_compat_profile()
     proxy_720p = job_dir / "proxy_720p.mp4"
     remux_video = job_dir / "remux.mp4"
     preview_360p = job_dir / "preview_360p.mp4"
+    normalized_h264 = _normalized_h264_path(job_dir)
 
-    # V3.1.2+dev.20260114.08: 仅在调度器/状态标记 ready 时返回720p，避免未落盘即切换
-    from app.services.proxy_720_scheduler import get_proxy_scheduler
-    scheduler_state = {}
-    proxy_scheduler = get_proxy_scheduler()
-    scheduler_state = proxy_scheduler.get_state(project_id) or {}
-
-    proxy_status_ready = False
-    try:
-        from app.services.media_prep_service import get_media_prep_service
-
-        media_prep = get_media_prep_service()
-        proxy_status = media_prep.get_proxy_status(project_id)
-        proxy_status_ready = proxy_status and proxy_status.get("status") == "completed"
-    except Exception:
+    if is_browser_profile:
+        # 仅在浏览器兼容 profile 下读取 720 调度状态，避免 electron_native 触发旧链路。
+        from app.services.proxy_720_scheduler import get_proxy_scheduler
+        scheduler_state = get_proxy_scheduler().get_state(project_id) or {}
         proxy_status_ready = False
+        try:
+            from app.services.media_prep_service import get_media_prep_service
+            media_prep = get_media_prep_service()
+            proxy_status = media_prep.get_proxy_status(project_id)
+            proxy_status_ready = proxy_status and proxy_status.get("status") == "completed"
+        except Exception:
+            proxy_status_ready = False
 
-    if proxy_720p.exists() and (scheduler_state.get("state") == "ready" or proxy_status_ready):
-        logger.debug(f"[media] 返回720p高清视频（已就绪）")
-        return _serve_file_with_range(proxy_720p, request, 'video/mp4', job_id=project_id)
+        if proxy_720p.exists() and (scheduler_state.get("state") == "ready" or proxy_status_ready):
+            logger.debug("[media] 返回720p高清视频（已就绪）")
+            return _serve_file_with_range(proxy_720p, request, 'video/mp4', job_id=project_id)
+    else:
+        if normalized_h264.exists():
+            logger.debug("[media] electron_native 返回 normalized_h264")
+            return _serve_file_with_range(normalized_h264, request, 'video/mp4', job_id=project_id)
 
     if remux_video.exists():
-        print(f"[media] 返回重封装视频")
+        logger.debug("[media] 返回重封装视频")
         return _serve_file_with_range(remux_video, request, 'video/mp4', job_id=project_id)
 
-    if preview_360p.exists():
-        print(f"[media] 返回360p预览视频")
+    if is_browser_profile and preview_360p.exists():
+        logger.debug("[media] 返回360p预览视频")
         return _serve_file_with_range(preview_360p, request, 'video/mp4', job_id=project_id)
 
     # 2. 查找源视频
@@ -920,58 +1244,65 @@ async def get_video(identifier: str, request: Request):
     logger.debug(f"找到源视频: {video_file.name}, 扩展名: {video_file.suffix.lower()}")
 
     # 3. 检查是否需要生成Proxy（统一走转码决策，避免误判）
-    needs_transcode, transcode_reason, transcode_decision = _analyze_transcode_requirement(video_file)
+    needs_transcode, transcode_reason, transcode_decision = _analyze_transcode_requirement(
+        video_file,
+        shell_capability=shell_capability,
+    )
 
     if needs_transcode:
-        print(f"[media] 视频需要转码: {transcode_reason}, decision={transcode_decision}")
-        # 使用 MediaPrepService 管理转码任务（渐进式：360p 优先，720p 后续）
+        logger.info(
+            "[media] 视频需要转码: project_id=%s, reason=%s, decision=%s, profile=%s",
+            project_id,
+            transcode_reason,
+            transcode_decision,
+            config.MEDIA_PROFILE,
+        )
+        # 使用 MediaPrepService 管理转码任务
         from app.services.media_prep_service import TranscodeDecision, get_media_prep_service
         media_prep = get_media_prep_service()
-
-        # 360p 预览视频路径
-        preview_360p = job_dir / "preview_360p.mp4"
 
         # 检查 360p 预览状态
         preview_status = media_prep.get_preview_status(project_id)
         preview_in_progress = preview_status and preview_status.get("status") in ["queued", "processing"]
         preview_completed = preview_status and preview_status.get("status") == "completed"
-        print(f"[media] 360p预览状态: {preview_status}, 进行中={preview_in_progress}, 已完成={preview_completed}")
 
         # 检查 720p Proxy 状态
         proxy_status = media_prep.get_proxy_status(project_id)
         proxy_in_progress = proxy_status and proxy_status.get("status") in ["queued", "processing"]
         proxy_completed = proxy_status and proxy_status.get("status") == "completed"
-        print(f"[media] 720p Proxy状态: {proxy_status}, 进行中={proxy_in_progress}, 已完成={proxy_completed}")
+
+        normalize_status = media_prep.get_normalize_status(project_id)
+        normalize_in_progress = normalize_status and normalize_status.get("status") in ["queued", "processing"]
+        normalize_completed = normalize_status and normalize_status.get("status") == "completed"
 
         remux_status = media_prep.get_remux_status(project_id)
         remux_in_progress = remux_status and remux_status.get("status") in ["queued", "processing"]
         remux_completed = remux_status and remux_status.get("status") == "completed"
 
-        # 720p Proxy 视频路径（使用函数开始时定义的变量）
-        # proxy_720p 已在 line 509 定义
-
-        # 优先级1: 如果 720p 已完成，返回 720p 视频
-        if proxy_completed and proxy_720p.exists():
-            print(f"[media] 返回已完成的720p高清视频")
+        # 已完成产物优先返回
+        if not is_browser_profile and normalize_completed and normalized_h264.exists():
+            logger.debug("[media] 返回已完成的 normalize_h264")
+            return _serve_file_with_range(normalized_h264, request, 'video/mp4', job_id=project_id)
+        if is_browser_profile and proxy_completed and proxy_720p.exists():
+            logger.debug("[media] 返回已完成的720p高清视频")
             return _serve_file_with_range(proxy_720p, request, 'video/mp4', job_id=project_id)
-
-        # 优先级2: 如果 360p 已完成，返回 360p 视频（720p可能正在处理或未启动）
-        if preview_completed and preview_360p.exists():
-            print(f"[media] 返回已完成的360p预览视频")
+        if is_browser_profile and preview_completed and preview_360p.exists():
+            logger.debug("[media] 返回已完成的360p预览视频")
             return _serve_file_with_range(preview_360p, request, 'video/mp4', job_id=project_id)
-
-        # 优先级2.5: 如果 remux 已完成，返回 remux
         if remux_completed and remux_video.exists():
-            print(f"[media] 返回已完成的重封装视频")
+            logger.debug("[media] 返回已完成的重封装视频")
             return _serve_file_with_range(remux_video, request, 'video/mp4', job_id=project_id)
 
         # 如果有任务正在处理，返回进度信息
-        if preview_in_progress or proxy_in_progress or remux_in_progress:
-            # 优先显示 360p 进度（因为它更快完成）
-            if preview_in_progress:
+        if preview_in_progress or proxy_in_progress or normalize_in_progress or remux_in_progress:
+            if is_browser_profile and preview_in_progress:
                 current_progress = preview_status.get("progress", 0)
                 current_stage = "360p预览"
                 current_stage_code = "preview_360p"
+            elif normalize_in_progress:
+                current_progress = normalize_status.get("progress", 0)
+                current_stage = "H264兼容转码"
+                current_stage_code = "normalize_h264"
             elif remux_in_progress:
                 current_progress = remux_status.get("progress", 0)
                 current_stage = "容器重封装"
@@ -980,7 +1311,6 @@ async def get_video(identifier: str, request: Request):
                 current_progress = proxy_status.get("progress", 0)
                 current_stage = "720p高清"
                 current_stage_code = "proxy_720p"
-            print(f"[media] 转码进行中: {current_stage}, 进度={current_progress}%")
             raise HTTPException(
                 status_code=202,
                 detail={
@@ -991,10 +1321,9 @@ async def get_video(identifier: str, request: Request):
                 }
             )
 
+        # 仅重封装
         if transcode_decision == TranscodeDecision.REMUX_ONLY.value:
-            print(f"[media] 调用 enqueue_remux() 启动容器重封装: {video_file} -> {remux_video}")
-            success = media_prep.enqueue_remux(project_id, video_file, remux_video, priority=3)
-            print(f"[media] enqueue_remux() 返回: {success}")
+            media_prep.enqueue_remux(project_id, video_file, remux_video, priority=3)
             raise HTTPException(
                 status_code=202,
                 detail={
@@ -1005,7 +1334,7 @@ async def get_video(identifier: str, request: Request):
                 },
             )
 
-        if transcode_decision == TranscodeDecision.TRANSCODE_AUDIO.value:
+        if is_browser_profile and transcode_decision == TranscodeDecision.TRANSCODE_AUDIO.value:
             logger.info(
                 "[media] 仅音频编码不兼容，优先返回源视频避免阻塞主流程: project_id=%s, source=%s",
                 project_id,
@@ -1013,18 +1342,24 @@ async def get_video(identifier: str, request: Request):
             )
             return _serve_file_with_range(video_file, request, 'video/mp4', job_id=project_id)
 
-        # 仅在明确需要完整转码时启动 360p 预览，避免兼容视频被误触发无限转码。
-        print(f"[media] 调用 enqueue_preview() 启动360p转码: {video_file} -> {preview_360p}")
-        success = media_prep.enqueue_preview(project_id, video_file, preview_360p, priority=5)
-        print(f"[media] enqueue_preview() 返回: {success}")
+        if is_browser_profile:
+            # 浏览器兼容 profile：保留旧 360p 渐进链路。
+            media_prep.enqueue_preview(project_id, video_file, preview_360p, priority=5)
+            stage = "preview_360p"
+            stage_text = "预览版本"
+        else:
+            # Electron 原生 profile：直接归一化为 H264/AAC。
+            media_prep.enqueue_normalize_h264(project_id, video_file, normalized_h264, priority=4)
+            stage = "normalize_h264"
+            stage_text = "H264兼容版本"
 
         raise HTTPException(
             status_code=202,
             detail={
-                "message": f"视频{transcode_reason}，正在生成预览版本...",
+                "message": f"视频{transcode_reason}，正在生成{stage_text}...",
                 "format": video_file.suffix,
                 "proxy_generating": True,
-                "stage": "preview_360p"
+                "stage": stage
             }
         )
 
@@ -1152,7 +1487,7 @@ async def get_audio_peaks(identifier: str, samples: int = 0, method: str = "auto
 
 
 @router.get("/{identifier}/proxy-status")
-async def check_proxy_status(identifier: str):
+async def check_proxy_status(identifier: str, request: Request):
     """
     获取 Proxy 视频完整状态（用于前端刷新后恢复）
 
@@ -1175,86 +1510,97 @@ async def check_proxy_status(identifier: str):
     media_identity = _resolve_media_identity_or_404(job_id)
     project_id = media_identity.project_id
     job_dir = media_identity.project_dir
+    shell_capability = _parse_shell_media_capability(request)
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
 
-    # V3.1.2+dev.20260114.06: 获取任务状态（缩进修复）
     from app.services.media_prep_service import get_media_prep_service, TranscodeDecision
-    from app.services.proxy_720_scheduler import get_proxy_scheduler  # 统一720p调度
 
     media_prep = get_media_prep_service()
     task_status = media_prep.get_full_task_status(project_id)
 
-    # 检查文件存在性，构建 URLs
+    is_browser_profile = _is_browser_compat_profile()
     preview_360p = job_dir / "preview_360p.mp4"
-    proxy_720p = job_dir / "proxy_720p.mp4"  # 修复：使用正确的文件名
+    proxy_720p = job_dir / "proxy_720p.mp4"
     remux_video = job_dir / "remux.mp4"
+    normalized_h264 = _normalized_h264_path(job_dir)
     source_video = _find_video_file(job_dir)
 
+    if is_browser_profile:
+        has_720_output = proxy_720p.exists() or remux_video.exists()
+    else:
+        has_720_output = normalized_h264.exists() or remux_video.exists()
+
     urls = {
-        "360p": f"/api/media/{project_id}/video/preview" if preview_360p.exists() else None,
-        "720p": f"/api/media/{project_id}/video" if (proxy_720p.exists() or remux_video.exists()) else None,
-        "source": f"/api/media/{project_id}/video" if source_video else None
+        "360p": _append_shell_media_capability_to_url(
+            f"/api/media/{project_id}/video/preview" if (is_browser_profile and preview_360p.exists()) else None,
+            shell_capability,
+        ),
+        "720p": _append_shell_media_capability_to_url(
+            f"/api/media/{project_id}/video" if has_720_output else None,
+            shell_capability,
+        ),
+        "source": _append_shell_media_capability_to_url(
+            f"/api/media/{project_id}/video" if source_video else None,
+            shell_capability,
+        ),
+        "normalize": _append_shell_media_capability_to_url(
+            f"/api/media/{project_id}/video" if normalized_h264.exists() else None,
+            shell_capability,
+        ),
     }
+    source_codec = _get_video_codec(source_video) if source_video else None
 
-    # V3.1.2+dev.20260114.06: 读取调度器状态（用于版本/状态一致性）
     scheduler_state = {}
-    proxy_scheduler = get_proxy_scheduler()
-    scheduler_state = proxy_scheduler.get_state(project_id) or {}
+    scheduler_version = None
+    if is_browser_profile:
+        from app.services.proxy_720_scheduler import get_proxy_scheduler
 
-    # 如果没有任务状态，根据文件存在性和调度器状态推断
+        proxy_scheduler = get_proxy_scheduler()
+        scheduler_state = proxy_scheduler.get_state(project_id) or {}
+        scheduler_version = scheduler_state.get("version")
+
+    # 无运行态任务时，按文件和决策做兜底推断，并在必要时自动触发任务
     if not task_status:
-        scheduler_state_name = scheduler_state.get("state")
-
-        if proxy_720p.exists() or remux_video.exists():
+        state = "idle"
+        progress = 0
+        if has_720_output:
             state = "ready_720p"
             progress = 100
-        elif preview_360p.exists():
-            # 360p 完成但 720p 未就绪，保持 ready_360p
-            state = scheduler_state_name or "ready_360p"
+        elif is_browser_profile and preview_360p.exists():
+            state = scheduler_state.get("state") or "ready_360p"
             progress = 100
-            # V3.1.2+dev.20260114.06: 确保任务被调度器跟踪，但不在此处触发
             if source_video:
-                get_proxy_scheduler().ensure_tracked(project_id, source_video, trigger_type="editor_check")
+                try:
+                    from app.services.proxy_720_scheduler import get_proxy_scheduler
+                    get_proxy_scheduler().ensure_tracked(project_id, source_video, trigger_type="editor_check")
+                except Exception:
+                    pass
         elif source_video:
             try:
-                needs_transcode, transcode_reason, decision = _analyze_transcode_requirement(source_video)
+                needs_transcode, _, decision = _analyze_transcode_requirement(
+                    source_video,
+                    shell_capability=shell_capability,
+                )
                 if not needs_transcode:
                     state = "direct_play"
                     progress = 100
+                elif decision == TranscodeDecision.REMUX_ONLY.value:
+                    state = "analyzing"
+                    media_prep.enqueue_remux(project_id, source_video, remux_video, priority=3)
+                elif is_browser_profile and decision == TranscodeDecision.TRANSCODE_AUDIO.value:
+                    state = "direct_play"
+                    progress = 100
+                elif is_browser_profile:
+                    state = "analyzing"
+                    media_prep.enqueue_preview(project_id, source_video, preview_360p, priority=5)
                 else:
-                    if decision == TranscodeDecision.REMUX_ONLY.value:
-                        # 仅重封装：自动启动 remux，不触发 360p/720p 全转码。
-                        state = "analyzing"
-                        progress = 0
-                        # 仅重封装
-                        remux_output = job_dir / "remux.mp4"
-                        enqueued = media_prep.enqueue_remux(project_id, source_video, remux_output, priority=3)
-                        print(
-                            f"[media] 自动启动重封装任务: project_id={project_id}, "
-                            f"decision={decision}, reason={transcode_reason}, enqueued={enqueued}"
-                        )
-                    elif decision == TranscodeDecision.TRANSCODE_AUDIO.value:
-                        # 音频兼容性问题先不自动触发转码，避免阻塞主流程与重复排队。
-                        state = "direct_play"
-                        progress = 100
-                    else:
-                        # 仅在完整转码决策下触发 360p 预览。
-                        state = "analyzing"
-                        progress = 0
-                        # 需要完整转码，启动360p预览
-                        enqueued = media_prep.enqueue_preview(project_id, source_video, preview_360p, priority=5)
-                        print(
-                            f"[media] 自动启动360p预览转码: project_id={project_id}, "
-                            f"decision={decision}, reason={transcode_reason}, enqueued={enqueued}"
-                        )
+                    state = "analyzing"
+                    media_prep.enqueue_normalize_h264(project_id, source_video, normalized_h264, priority=4)
             except Exception as e:
-                print(f"[media] 分析视频失败: {e}")
+                logger.warning("[media] proxy-status 自动分析失败: %s", e)
                 state = "idle"
                 progress = 0
-        else:
-            state = scheduler_state_name or "idle"
-            progress = scheduler_state.get("progress", 0) if scheduler_state else 0
 
         return JSONResponse({
             "state": state,
@@ -1265,51 +1611,54 @@ async def check_proxy_status(identifier: str):
             "started_at": None,
             "estimated_remaining": None,
             "auto_trigger_720p": config.PROXY_CONFIG.get('auto_trigger_720p', True),
-            "version": scheduler_state.get("version"),
+            "version": scheduler_version,
             "project_id": project_id,
             "legacy_job_id": None,
+            "media_profile": config.MEDIA_PROFILE,
+            "normalize_h264": media_prep.get_normalize_status(project_id),
+            "source_codec": source_codec,
         })
 
-    # 【新增】检查360p是否需要重试（处理意外关闭的情况）
-    # 如果360p不存在且没有正在进行的360p任务，自动启动360p转码
-    if not preview_360p.exists() and source_video:
-        preview_status = media_prep.get_preview_status(project_id)
-        preview_in_progress = preview_status and preview_status.get("status") in ["queued", "processing"]
-        remux_status = media_prep.get_remux_status(project_id)
-        remux_in_progress = remux_status and remux_status.get("status") in ["queued", "processing"]
-        remux_video = job_dir / "remux.mp4"
+    # 有状态时补偿触发缺失产物，防止意外退出后长期停滞
+    if source_video:
+        try:
+            needs_transcode, _, decision = _analyze_transcode_requirement(
+                source_video,
+                shell_capability=shell_capability,
+            )
+            if needs_transcode:
+                remux_status = media_prep.get_remux_status(project_id)
+                remux_in_progress = remux_status and remux_status.get("status") in ["queued", "processing"]
+                normalize_status = media_prep.get_normalize_status(project_id)
+                normalize_in_progress = normalize_status and normalize_status.get("status") in ["queued", "processing"]
+                preview_status = media_prep.get_preview_status(project_id)
+                preview_in_progress = preview_status and preview_status.get("status") in ["queued", "processing"]
 
-        if not preview_in_progress:
-            try:
-                needs_transcode, _, decision = _analyze_transcode_requirement(source_video)
-                if needs_transcode:
-                    if decision == TranscodeDecision.REMUX_ONLY.value:
-                        if not remux_video.exists() and not remux_in_progress:
-                            remux_enqueued = media_prep.enqueue_remux(project_id, source_video, remux_video, priority=3)
-                            print(
-                                f"[media] 检测到 remux 缺失，按决策触发重封装: "
-                                f"project_id={project_id}, decision={decision}, enqueued={remux_enqueued}"
-                            )
-                    elif decision == TranscodeDecision.TRANSCODE_FULL.value:
-                        # 仅在完整转码决策下补触发 360p，避免可直播视频反复入队。
-                        enqueued = media_prep.enqueue_preview(project_id, source_video, preview_360p, priority=5)
-                        print(
-                            f"[media] 检测到360p缺失，按决策触发360p转码: "
-                            f"project_id={project_id}, decision={decision}, enqueued={enqueued}"
-                        )
-            except Exception as e:
-                print(f"[media] 自动启动360p转码失败: {e}")
+                if decision == TranscodeDecision.REMUX_ONLY.value:
+                    if not remux_video.exists() and not remux_in_progress:
+                        media_prep.enqueue_remux(project_id, source_video, remux_video, priority=3)
+                elif is_browser_profile and decision == TranscodeDecision.TRANSCODE_FULL.value:
+                    if not preview_360p.exists() and not preview_in_progress:
+                        media_prep.enqueue_preview(project_id, source_video, preview_360p, priority=5)
+                elif (not is_browser_profile) and decision in {
+                    TranscodeDecision.TRANSCODE_AUDIO.value,
+                    TranscodeDecision.TRANSCODE_VIDEO.value,
+                    TranscodeDecision.TRANSCODE_FULL.value,
+                }:
+                    if not normalized_h264.exists() and not normalize_in_progress:
+                        media_prep.enqueue_normalize_h264(project_id, source_video, normalized_h264, priority=4)
+        except Exception as e:
+            logger.warning("[media] proxy-status 补偿触发失败: %s", e)
 
-    # 返回完整状态
-    # V3.1.2+dev.20260114.19: 如果 proxy 状态为 waiting_check/paused_for_new_job，静默清理错误
-    proxy_state = task_status.get("proxy_720p") if isinstance(task_status, dict) else None
-    if proxy_state and proxy_state.get("status") in ["waiting_check", "queued"] and proxy_state.get("error") == "paused_for_new_job":
-        proxy_state = dict(proxy_state)
-        proxy_state["error"] = None
-        task_status = dict(task_status)
-        task_status["proxy_720p"] = proxy_state
+    # browser_compat 下保留旧等待态错误清理
+    if is_browser_profile:
+        proxy_state = task_status.get("proxy_720p") if isinstance(task_status, dict) else None
+        if proxy_state and proxy_state.get("status") in ["waiting_check", "queued"] and proxy_state.get("error") == "paused_for_new_job":
+            proxy_state = dict(proxy_state)
+            proxy_state["error"] = None
+            task_status = dict(task_status)
+            task_status["proxy_720p"] = proxy_state
 
-    # V3.1.2+dev.20260114.21: 选择最高可播放的 h264 文件用于兜底加载
     best_h264_path, best_h264_height = _find_best_h264(job_dir)
     best_playable_url = None
     best_playable_resolution = None
@@ -1317,6 +1666,8 @@ async def check_proxy_status(identifier: str):
         best_playable_url = f"/api/media/{project_id}/video"
         if best_h264_path.name == "proxy_720p.mp4":
             best_playable_resolution = "720p"
+        elif best_h264_path.name == NORMALIZED_H264_FILENAME:
+            best_playable_resolution = "normalized_h264"
         elif best_h264_path.name.startswith("preview_"):
             best_playable_resolution = "360p"
         else:
@@ -1338,11 +1689,14 @@ async def check_proxy_status(identifier: str):
         "started_at": task_status.get("started_at"),
         "estimated_remaining": task_status.get("estimated_remaining"),
         "auto_trigger_720p": config.PROXY_CONFIG.get('auto_trigger_720p', True),
-        "version": scheduler_state.get("version"),
+        "version": scheduler_version,
         "best_playable_url": best_playable_url,
         "best_playable_resolution": best_playable_resolution,
         "project_id": project_id,
         "legacy_job_id": None,
+        "media_profile": config.MEDIA_PROFILE,
+        "normalize_h264": task_status.get("normalize_h264"),
+        "source_codec": source_codec,
     })
 
 
@@ -1359,113 +1713,51 @@ async def get_thumbnail(identifier: str):
     """
     job_id = identifier
     try:
-        job_dir = _resolve_media_dir(job_id)
+        media_identity = _resolve_media_identity_or_404(job_id)
     except HTTPException as exc:
         if exc.status_code == 404:
-            return JSONResponse(
-                {
-                    "thumbnail": None,
-                    "message": "任务不存在",
-                }
-            )
+            return JSONResponse({"thumbnail": None, "message": "任务不存在"})
         raise
+
+    project_id = media_identity.project_id
+    job_dir = media_identity.project_dir
     if not job_dir.exists():
+        return JSONResponse({"thumbnail": None, "message": "任务不存在"})
+
+    cached_thumbnail = job_dir / TASK_CARD_THUMBNAIL_FILENAME
+    cached_bytes = _read_cached_thumbnail_bytes(cached_thumbnail)
+    if cached_bytes is not None:
         return JSONResponse(
             {
-                "thumbnail": None,
-                "message": "任务不存在",
+                "thumbnail": _encode_thumbnail_data_url(cached_bytes),
+                "cached": True,
             }
         )
 
-    # 检查缓存的缩略图文件
-    cached_thumbnail = job_dir / "thumbnail.jpg"
-    if cached_thumbnail.exists():
-        try:
-            import base64
-            with open(cached_thumbnail, 'rb') as f:
-                img_base64 = base64.b64encode(f.read()).decode('utf-8')
-            return JSONResponse({
-                "thumbnail": f"data:image/jpeg;base64,{img_base64}",
-                "cached": True
-            })
-        except:
-            pass  # 缓存读取失败，重新生成
-
-    try:
-        import base64
-
-        # 查找视频文件
-        video_file = _find_video_file(job_dir)
-        if not video_file:
-            proxy = job_dir / "proxy_720p.mp4"
-            if proxy.exists():
-                video_file = proxy
-            else:
-                return JSONResponse({
-                    "thumbnail": None,
-                    "message": "视频文件不存在"
-                })
-
-        # 获取视频分辨率（决定缩略图大小）
-        width, height = await _get_video_resolution(video_file)
-
-        # 计算缩略图尺寸：只有4K及以上视频才压缩，其他保持原分辨率（但限制最大1920px）
-        if width > 3840:  # 4K视频
-            thumb_width = 1920
-        elif width > 1920:  # 大于1080p但不到4K
-            thumb_width = width  # 保持原分辨率
-        elif width > 0:
-            thumb_width = width  # 保持原分辨率
+    video_file = _find_video_file(job_dir)
+    if not video_file:
+        proxy = job_dir / "proxy_720p.mp4"
+        if proxy.exists():
+            video_file = proxy
         else:
-            thumb_width = 1280  # 默认值（无法检测分辨率时）
+            return JSONResponse({"thumbnail": None, "message": "视频文件不存在"})
 
-        # 获取第一帧作为缩略图
-        ffmpeg_cmd = config.get_ffmpeg_command()
+    thumbnail_bytes, thumb_width, from_cache = await _ensure_task_card_thumbnail_cached(
+        project_id=project_id,
+        job_dir=job_dir,
+        video_file=video_file,
+        thumbnail_file=cached_thumbnail,
+    )
+    if thumbnail_bytes is None:
+        return JSONResponse({"thumbnail": None, "message": "无法生成缩略图"})
 
-        cmd = [
-            ffmpeg_cmd,
-            '-ss', '1',  # 从1秒开始（避免纯黑帧）
-            '-i', str(video_file),
-            '-vframes', '1',  # 只提取1帧
-            '-f', 'image2pipe',
-            '-vcodec', 'mjpeg',
-            '-vf', f'scale={thumb_width}:-1',  # 根据原视频分辨率设置宽度
-            '-q:v', '2',  # 高质量（2-5之间，数字越小质量越高）
-            '-'
-        ]
-
-        result = subprocess.run(
-            cmd, capture_output=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
-            timeout=10
-        )
-
-        if result.returncode == 0 and result.stdout:
-            # 缓存到文件系统
-            try:
-                with open(cached_thumbnail, 'wb') as f:
-                    f.write(result.stdout)
-                print(f"[media] 缩略图已缓存: {job_id} (宽度: {thumb_width}px)")
-            except Exception as e:
-                print(f"[media] 缓存缩略图失败: {e}")
-
-            img_base64 = base64.b64encode(result.stdout).decode('utf-8')
-            return JSONResponse({
-                "thumbnail": f"data:image/jpeg;base64,{img_base64}",
-                "width": thumb_width,
-                "cached": False
-            })
-        else:
-            return JSONResponse({
-                "thumbnail": None,
-                "message": "无法生成缩略图"
-            })
-
-    except Exception as e:
-        return JSONResponse({
-            "thumbnail": None,
-            "message": str(e)
-        })
+    payload = {
+        "thumbnail": _encode_thumbnail_data_url(thumbnail_bytes),
+        "cached": bool(from_cache),
+    }
+    if not from_cache:
+        payload["width"] = thumb_width
+    return JSONResponse(payload)
 
 
 @router.get("/{identifier}/thumbnails")
@@ -1625,7 +1917,15 @@ async def get_preview_video(identifier: str, request: Request):
     if preview_360p.exists():
         return _serve_file_with_range(preview_360p, request, 'video/mp4', job_id=project_id)
 
-    # 如果没有 360p，尝试返回 720p proxy
+    # 如果没有 360p，按 profile 尝试返回可播放替代
+    normalized_h264 = _normalized_h264_path(job_dir)
+    if normalized_h264.exists():
+        return _serve_file_with_range(normalized_h264, request, 'video/mp4', job_id=project_id)
+
+    remux_video = job_dir / "remux.mp4"
+    if remux_video.exists():
+        return _serve_file_with_range(remux_video, request, 'video/mp4', job_id=project_id)
+
     proxy_video = job_dir / "proxy_720p.mp4"
     if proxy_video.exists():
         return _serve_file_with_range(proxy_video, request, 'video/mp4', job_id=project_id)
@@ -1661,8 +1961,11 @@ async def get_progressive_status(identifier: str):
 
     # 检查各种视频文件
     video_file = _find_video_file(job_dir)
+    is_browser_profile = _is_browser_compat_profile()
     preview_360p = job_dir / "preview_360p.mp4"
     proxy_720p = job_dir / "proxy_720p.mp4"
+    remux_video = job_dir / "remux.mp4"
+    normalized_h264 = _normalized_h264_path(job_dir)
 
     # 判断是否需要转码（统一决策）
     needs_transcode, transcode_reason, transcode_decision = _analyze_transcode_requirement(video_file)
@@ -1670,6 +1973,7 @@ async def get_progressive_status(identifier: str):
     # 获取生成状态
     preview_status = None
     proxy_status = None
+    normalize_status = None
 
     # 从 MediaPrepService 获取转码状态
     from app.services.media_prep_service import get_media_prep_service
@@ -1691,21 +1995,28 @@ async def get_progressive_status(identifier: str):
             "progress": proxy_status_info.get("progress", 0)
         }
 
+    normalize_status_info = media_prep.get_normalize_status(project_id)
+    if normalize_status_info:
+        normalize_status = {
+            "status": normalize_status_info.get("status", "not_started"),
+            "progress": normalize_status_info.get("progress", 0)
+        }
+
     # 关键修复：如果需要转码但没有转码任务，自动触发 360p 预览转码
     if needs_transcode and video_file:
         # 检查是否需要启动转码
         preview_exists = preview_360p.exists()
         preview_in_progress = preview_status_info and preview_status_info.get("status") in ["queued", "processing"]
-        remux_video = job_dir / "remux.mp4"
         remux_status_info = media_prep.get_remux_status(project_id)
         remux_in_progress = remux_status_info and remux_status_info.get("status") in ["queued", "processing"]
+        normalize_in_progress = normalize_status_info and normalize_status_info.get("status") in ["queued", "processing"]
 
         if transcode_decision == "remux_only":
             if not remux_video.exists() and not remux_in_progress:
                 print(f"[media] progressive-status 检测到需重封装，自动触发: {project_id}")
                 remux_success = media_prep.enqueue_remux(project_id, video_file, remux_video, priority=3)
                 print(f"[media] enqueue_remux() 返回: {remux_success}")
-        elif transcode_decision == "transcode_full":
+        elif is_browser_profile and transcode_decision == "transcode_full":
             if not preview_exists and not preview_in_progress:
                 # 仅完整转码决策才补触发 360p 预览
                 print(f"[media] progressive-status 检测到需要转码，自动触发: {project_id}")
@@ -1719,6 +2030,19 @@ async def get_progressive_status(identifier: str):
                         preview_status = {
                             "status": preview_status_info.get("status", "queued"),
                             "progress": preview_status_info.get("progress", 0)
+                        }
+        elif (not is_browser_profile) and transcode_decision in {"transcode_full", "transcode_audio", "transcode_video"}:
+            if not normalized_h264.exists() and not normalize_in_progress:
+                print(f"[media] progressive-status 检测到需要 normalize_h264，自动触发: {project_id}")
+                normalize_success = media_prep.enqueue_normalize_h264(project_id, video_file, normalized_h264, priority=4)
+                print(f"[media] enqueue_normalize_h264() 返回: {normalize_success}")
+
+                if normalize_success:
+                    normalize_status_info = media_prep.get_normalize_status(project_id)
+                    if normalize_status_info:
+                        normalize_status = {
+                            "status": normalize_status_info.get("status", "queued"),
+                            "progress": normalize_status_info.get("progress", 0)
                         }
 
     # 构建响应
@@ -1739,19 +2063,32 @@ async def get_progressive_status(identifier: str):
             "size": proxy_720p.stat().st_size if proxy_720p.exists() else 0,
             "status": proxy_status
         },
+        "normalize_h264": {
+            "exists": normalized_h264.exists(),
+            "url": f"/api/media/{project_id}/video" if normalized_h264.exists() else None,
+            "size": normalized_h264.stat().st_size if normalized_h264.exists() else 0,
+            "status": normalize_status
+        },
         "source": {
             "exists": video_file is not None,
             "filename": video_file.name if video_file else None,
             "compatible": not needs_transcode,
             "url": f"/api/media/{project_id}/video" if video_file and not needs_transcode else None
         },
-        "recommended_url": None  # 推荐使用的视频 URL
+        "recommended_url": None,  # 推荐使用的视频 URL
+        "media_profile": config.MEDIA_PROFILE,
     }
 
     # 确定推荐的视频 URL
-    if proxy_720p.exists():
+    if is_browser_profile and proxy_720p.exists():
         result["recommended_url"] = f"/api/media/{project_id}/video"
         result["current_resolution"] = "720p"
+    elif (not is_browser_profile) and normalized_h264.exists():
+        result["recommended_url"] = f"/api/media/{project_id}/video"
+        result["current_resolution"] = "normalized_h264"
+    elif remux_video.exists():
+        result["recommended_url"] = f"/api/media/{project_id}/video"
+        result["current_resolution"] = "remux"
     elif preview_360p.exists():
         result["recommended_url"] = f"/api/media/{project_id}/video/preview"
         result["current_resolution"] = "360p"
@@ -1876,11 +2213,18 @@ async def post_process_transcription(identifier: str):
                     media_prep.enqueue_remux(project_id, video_file, remux_video, priority=20)
                 )
         else:
-            proxy_video = job_dir / "proxy_720p.mp4"
-            if not proxy_video.exists():
-                results["proxy"] = bool(
-                    media_prep.enqueue_proxy(project_id, video_file, proxy_video, priority=20)
-                )
+            if _is_browser_compat_profile():
+                proxy_video = job_dir / "proxy_720p.mp4"
+                if not proxy_video.exists():
+                    results["proxy"] = bool(
+                        media_prep.enqueue_proxy(project_id, video_file, proxy_video, priority=20)
+                    )
+            else:
+                normalized_h264 = _normalized_h264_path(job_dir)
+                if not normalized_h264.exists():
+                    results["proxy"] = bool(
+                        media_prep.enqueue_normalize_h264(project_id, video_file, normalized_h264, priority=20)
+                    )
 
     return JSONResponse(results)
 
@@ -2159,11 +2503,12 @@ async def get_media_info(identifier: str, retry_missing: bool = True):
     audio_file = job_dir / "audio.wav"
     audio_source_file = _find_audio_source_file(job_dir)
     proxy_video = job_dir / "proxy_720p.mp4"
+    normalized_h264 = _normalized_h264_path(job_dir)
     peaks_cache = job_dir / "peaks_2000.json"
     peaks_caches = list(job_dir.glob("peaks_*_v*.json"))
     sprite_cache = job_dir / "sprite_10.json"
     thumbnails_cache = job_dir / "thumbnails_10.json"
-    thumbnail_single = job_dir / "thumbnail.jpg"
+    thumbnail_single = job_dir / TASK_CARD_THUMBNAIL_FILENAME
 
     srt_file = None
     for file in job_dir.iterdir():
@@ -2178,7 +2523,9 @@ async def get_media_info(identifier: str, retry_missing: bool = True):
     # 获取Proxy生成状态（从 MediaPrepService）
     from app.services.media_prep_service import get_media_prep_service
     media_prep = get_media_prep_service()
+    is_browser_profile = _is_browser_compat_profile()
     proxy_status = media_prep.get_proxy_status(project_id)
+    normalize_status = media_prep.get_normalize_status(project_id)
 
     # 智能重试：如果资源缺失且启用重试，则尝试异步生成
     if retry_missing:
@@ -2193,8 +2540,9 @@ async def get_media_info(identifier: str, retry_missing: bool = True):
         # 2. 如果缩略图缺失但视频文件存在，触发生成
         if not thumbnail_single.exists() and video_file:
             try:
-                print(f"[media] 检测到缩略图缺失，尝试生成: {job_id}")
-                asyncio.create_task(_auto_generate_thumbnail(project_id, video_file, thumbnail_single))
+                started = _schedule_auto_thumbnail_generation(project_id, video_file, thumbnail_single)
+                if started:
+                    print(f"[media] 检测到缩略图缺失，尝试生成: {job_id}")
             except Exception as e:
                 print(f"[media] 缩略图生成失败: {e}")
 
@@ -2217,12 +2565,21 @@ async def get_media_info(identifier: str, retry_missing: bool = True):
                         media_prep.enqueue_remux(project_id, video_file, remux_video, priority=30)
                     except Exception as e:
                         print(f"[media] remux 生成失败: {e}")
-            elif not (proxy_status and proxy_status.get("status") in ["queued", "processing"]):
-                try:
-                    print(f"[media] 检测到Proxy缺失，尝试生成: {project_id}")
-                    media_prep.enqueue_proxy(project_id, video_file, proxy_video, priority=30)
-                except Exception as e:
-                    print(f"[media] Proxy视频生成失败: {e}")
+            elif is_browser_profile:
+                if not (proxy_status and proxy_status.get("status") in ["queued", "processing"]):
+                    try:
+                        print(f"[media] 检测到Proxy缺失，尝试生成: {project_id}")
+                        media_prep.enqueue_proxy(project_id, video_file, proxy_video, priority=30)
+                    except Exception as e:
+                        print(f"[media] Proxy视频生成失败: {e}")
+            else:
+                normalize_in_progress = normalize_status and normalize_status.get("status") in ["queued", "processing"]
+                if not normalized_h264.exists() and not normalize_in_progress:
+                    try:
+                        print(f"[media] 检测到normalize_h264缺失，尝试生成: {project_id}")
+                        media_prep.enqueue_normalize_h264(project_id, video_file, normalized_h264, priority=30)
+                    except Exception as e:
+                        print(f"[media] normalize_h264生成失败: {e}")
 
     video_has_audio_stream = _has_audio_stream(video_file) if video_file else False
     audio_extractable = bool(audio_source_file or video_has_audio_stream)
@@ -2240,10 +2597,21 @@ async def get_media_info(identifier: str, retry_missing: bool = True):
             "format": video_file.suffix if video_file else None,
             "codec": video_codec,  # 视频编码（如 h264, hevc）
             "needs_proxy": needs_proxy,
-            "proxy_exists": proxy_video.exists(),
-            "proxy_generating": proxy_status and proxy_status.get("status") == "processing",
-            "proxy_progress": proxy_status.get("progress", 0) if proxy_status else 0,
-            "url": f"/api/media/{project_id}/video" if video_file or proxy_video.exists() else None
+            "proxy_exists": proxy_video.exists() or normalized_h264.exists(),
+            "proxy_generating": (
+                (proxy_status and proxy_status.get("status") == "processing")
+                or (normalize_status and normalize_status.get("status") == "processing")
+            ),
+            "proxy_progress": (
+                normalize_status.get("progress", 0)
+                if (normalize_status and normalize_status.get("status") in {"queued", "processing"})
+                else (proxy_status.get("progress", 0) if proxy_status else 0)
+            ),
+            "normalize_exists": normalized_h264.exists(),
+            "normalize_generating": normalize_status and normalize_status.get("status") == "processing",
+            "normalize_progress": normalize_status.get("progress", 0) if normalize_status else 0,
+            "media_profile": config.MEDIA_PROFILE,
+            "url": f"/api/media/{project_id}/video" if video_file or proxy_video.exists() or normalized_h264.exists() else None
         },
         "audio": {
             "exists": audio_file.exists(),
@@ -2330,43 +2698,16 @@ async def _auto_generate_peaks(job_id: str, audio_file: Path, peaks_cache: Path)
 async def _auto_generate_thumbnail(job_id: str, video_file: Path, thumbnail_file: Path):
     """自动生成缩略图（后台任务）"""
     try:
-        import base64
+        if thumbnail_file.exists() or not video_file.exists():
+            return
 
-        # 获取视频分辨率
-        width, height = await _get_video_resolution(video_file)
-
-        # 计算缩略图尺寸
-        if width > 3840:  # 4K视频
-            thumb_width = 1920
-        elif width > 1920:
-            thumb_width = width
-        elif width > 0:
-            thumb_width = width
-        else:
-            thumb_width = 1280
-
-        ffmpeg_cmd = config.get_ffmpeg_command()
-        cmd = [
-            ffmpeg_cmd,
-            '-ss', '1',
-            '-i', str(video_file),
-            '-vframes', '1',
-            '-f', 'image2pipe',
-            '-vcodec', 'mjpeg',
-            '-vf', f'scale={thumb_width}:-1',
-            '-q:v', '2',
-            '-'
-        ]
-
-        result = subprocess.run(
-            cmd, capture_output=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
-            timeout=10
+        generated_bytes, thumb_width, from_cache = await _ensure_task_card_thumbnail_cached(
+            project_id=job_id,
+            job_dir=thumbnail_file.parent,
+            video_file=video_file,
+            thumbnail_file=thumbnail_file,
         )
-
-        if result.returncode == 0 and result.stdout:
-            with open(thumbnail_file, 'wb') as f:
-                f.write(result.stdout)
+        if generated_bytes is not None and not from_cache:
             print(f"[media] 缩略图自动生成成功: {job_id} (宽度: {thumb_width}px)")
     except Exception as e:
         print(f"[media] 缩略图自动生成失败 [{job_id}]: {e}")
@@ -2398,6 +2739,17 @@ async def upgrade_to_720p(identifier: str):
         media_identity = _resolve_media_identity_or_404(job_id)
         project_id = media_identity.project_id
         job_dir = media_identity.project_dir
+
+        if _is_electron_native_profile():
+            return JSONResponse(
+                content={
+                    "success": False,
+                    "message": "当前运行 profile 为 electron_native，已禁用720p升级接口",
+                    "reason": "disabled_by_profile",
+                    "media_profile": config.MEDIA_PROFILE,
+                },
+                status_code=400,
+            )
 
         # 自动模式下禁止手动
         auto_enabled = config.PROXY_CONFIG.get('auto_trigger_720p', False)
@@ -2458,6 +2810,7 @@ async def upgrade_to_720p(identifier: str):
         reason = result.get("reason", "unknown")
         message = {
             "auto_disabled": "未开启自动模式，但请求被拒绝",
+            "disabled_by_profile": "当前运行 profile 已禁用720p升级",
             "preview_not_ready": "360p未完成，无法升级720p",
             "already_exists": "720p已存在",
             "already_processing": "720p正在处理中",

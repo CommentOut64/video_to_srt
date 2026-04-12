@@ -28,7 +28,9 @@ export const CAPABILITIES = Object.freeze({
 
 export const ROUTE_VISIBILITY = Object.freeze({
   taskList: true, // Lite 也使用任务列表
-  taskCreate: !IS_LITE,
+  transcribeCreate: !IS_LITE, // 创建转录任务（Full-only）
+  projectCreate: true, // 创建编辑项目（Full/Lite 共用）
+  taskCreate: !IS_LITE, // 兼容旧字段，语义等同 transcribeCreate
   importPage: true,
   editor: true,
 })

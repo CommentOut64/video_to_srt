@@ -4,7 +4,7 @@
  * 职责：智能锚点缩放、滑块/按钮/滚轮逻辑
  * 提取自 WaveformTimeline/index.vue L720-920
  */
-import { ref, computed } from 'vue'
+import { ref } from 'vue'
 
 // ============ 缩放配置常量 ============
 export const ZOOM_MIN = 20 // 最小缩放 20%
@@ -13,6 +13,9 @@ export const ZOOM_STEP = 5 // 滑块精度 5%
 export const ZOOM_BUTTON_STEP = 20 // 按钮步进 20%
 export const ZOOM_WHEEL_STEP = 10 // 滚轮步进 10%
 export const ZOOM_BASE_PX_PER_SEC = 50 // 100%缩放时的基准：每秒50像素
+const WHEEL_PREVIEW_SETTLE_MS = 96
+const BAR_CONFIG_LOW_DETAIL_MAX_PX_PER_SEC = 40
+const BAR_CONFIG_HIGH_DETAIL_MIN_PX_PER_SEC = 250
 
 /**
  * 根据像素密度动态计算柱子配置
@@ -20,22 +23,18 @@ export const ZOOM_BASE_PX_PER_SEC = 50 // 100%缩放时的基准：每秒50像�
  * @returns {object} barConfig - { barWidth, barGap, barRadius }
  */
 export function getAdaptiveBarConfig(minPxPerSec) {
-  if (minPxPerSec >= 400) {
-    // 极度放大（800%+）：较粗柱子
-    return { barWidth: 3, barGap: 1.5, barRadius: 1.5 }
-  } else if (minPxPerSec >= 200) {
-    // 高倍放大（400%+）：中粗柱子
-    return { barWidth: 2.5, barGap: 1, barRadius: 1.5 }
-  } else if (minPxPerSec >= 100) {
-    // 中等放大（200%+）：标准柱子
-    return { barWidth: 2, barGap: 1, barRadius: 1 }
-  } else if (minPxPerSec >= 50) {
-    // 标准缩放（100%+）：较细柱子
-    return { barWidth: 1.5, barGap: 0.5, barRadius: 1 }
-  } else {
-    // 缩小查看全局：细柱子
-    return { barWidth: 1, barGap: 0.3, barRadius: 0.5 }
+  if (minPxPerSec < BAR_CONFIG_LOW_DETAIL_MAX_PX_PER_SEC) {
+    // 低倍总览：略细，避免压缩视图里柱体互相挤压。
+    return { barWidth: 1.25, barGap: 0.35, barRadius: 0.8 }
   }
+
+  if (minPxPerSec > BAR_CONFIG_HIGH_DETAIL_MIN_PX_PER_SEC) {
+    // 极高倍精修：只轻微加粗，避免放大时柱体形态突然跳变。
+    return { barWidth: 1.8, barGap: 0.7, barRadius: 1 }
+  }
+
+  // 主工作区：覆盖绝大多数编辑缩放范围，尽量保持柱体观感稳定。
+  return { barWidth: 1.5, barGap: 0.5, barRadius: 1 }
 }
 
 /**
@@ -78,12 +77,17 @@ export function useWaveformZoom(
 ) {
   // ============ 状态 ============
   const zoomLevel = ref(100)
+  const isZoomPreviewActive = ref(false)
+  const previewZoomLevel = ref(null)
 
   // ============ DOM 缓存 ============
   let cachedWrapper = null
   let cachedScrollContainer = null
   let scrollbarUpdateTimer = null
   let lastSliderZoomTime = 0
+  let previewApplyRafId = null
+  let previewCommitTimer = null
+  let previewAnchorClientX = null
 
   const SLIDER_THROTTLE_MS = 16 // ~60fps
 
@@ -107,6 +111,47 @@ export function useWaveformZoom(
     return Boolean(readPlaybackValue(playbackStore.isPlaying))
   }
 
+  function clampZoom(targetZoom) {
+    return Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, targetZoom))
+  }
+
+  function getPxPerSec(zoom) {
+    return Number((((zoom / 100) * ZOOM_BASE_PX_PER_SEC)).toFixed(4))
+  }
+
+  function areBarConfigsEqual(a, b) {
+    return a.barWidth === b.barWidth && a.barGap === b.barGap && a.barRadius === b.barRadius
+  }
+
+  function maybeScheduleAnimationFrame(callback) {
+    if (typeof requestAnimationFrame === 'function') {
+      return requestAnimationFrame(callback)
+    }
+    return setTimeout(() => callback(Date.now()), 16)
+  }
+
+  function maybeCancelAnimationFrame(handle) {
+    if (!handle) return
+    if (typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(handle)
+      return
+    }
+    clearTimeout(handle)
+  }
+
+  /**
+   * 获取缓存的滚动容器（避免频繁 DOM 查询）
+   */
+  function getWrapperElement() {
+    if (cachedWrapper && cachedWrapper.isConnected) {
+      return cachedWrapper
+    }
+    const ws = wavesurferRef.value
+    if (!ws) return null
+    cachedWrapper = ws.getWrapper()
+    return cachedWrapper
+  }
+
   /**
    * 获取缓存的滚动容器（避免频繁 DOM 查询）
    */
@@ -114,9 +159,7 @@ export function useWaveformZoom(
     if (cachedScrollContainer && cachedScrollContainer.isConnected) {
       return cachedScrollContainer
     }
-    const ws = wavesurferRef.value
-    if (!ws) return null
-    cachedWrapper = ws.getWrapper()
+    cachedWrapper = getWrapperElement()
     if (!cachedWrapper) return null
     cachedScrollContainer = cachedWrapper.parentElement
     return cachedScrollContainer
@@ -129,7 +172,7 @@ export function useWaveformZoom(
     const scrollContainer = getScrollContainer()
     if (!scrollContainer) return false
 
-    const currentPxPerSec = (zoomLevel.value / 100) * ZOOM_BASE_PX_PER_SEC
+    const currentPxPerSec = getPxPerSec(zoomLevel.value)
     const playheadX = getCurrentTimeSec() * currentPxPerSec
     const { scrollLeft, clientWidth } = scrollContainer
 
@@ -143,9 +186,74 @@ export function useWaveformZoom(
     const scrollContainer = getScrollContainer()
     if (!scrollContainer) return 0
 
-    const currentPxPerSec = (zoomLevel.value / 100) * ZOOM_BASE_PX_PER_SEC
+    const currentPxPerSec = getPxPerSec(zoomLevel.value)
     const playheadTotalX = getCurrentTimeSec() * currentPxPerSec
     return playheadTotalX - scrollContainer.scrollLeft
+  }
+
+  /**
+   * 将 clientX 转成相对于视口左侧的锚点像素
+   */
+  function resolveAnchorPx(clientX) {
+    const scrollContainer = getScrollContainer()
+    if (!scrollContainer) return 0
+
+    if (!Number.isFinite(clientX)) {
+      return scrollContainer.clientWidth / 2
+    }
+
+    const rect = scrollContainer.getBoundingClientRect?.()
+    if (!rect) {
+      return scrollContainer.clientWidth / 2
+    }
+
+    return Math.max(0, Math.min(scrollContainer.clientWidth, clientX - rect.left))
+  }
+
+  function clearZoomPreviewStyles() {
+    const wrapper = getWrapperElement()
+    if (!wrapper?.style) return
+
+    wrapper.style.transform = ''
+    wrapper.style.transformOrigin = ''
+    wrapper.style.willChange = ''
+  }
+
+  function resetZoomPreviewState() {
+    if (previewApplyRafId) {
+      maybeCancelAnimationFrame(previewApplyRafId)
+      previewApplyRafId = null
+    }
+    if (previewCommitTimer) {
+      clearTimeout(previewCommitTimer)
+      previewCommitTimer = null
+    }
+    previewAnchorClientX = null
+    isZoomPreviewActive.value = false
+    previewZoomLevel.value = null
+    clearZoomPreviewStyles()
+  }
+
+  function applyZoomPreview() {
+    previewApplyRafId = null
+
+    const wrapper = getWrapperElement()
+    const scrollContainer = getScrollContainer()
+    const targetZoom = previewZoomLevel.value
+    if (!wrapper || !scrollContainer || !Number.isFinite(targetZoom)) {
+      resetZoomPreviewState()
+      return
+    }
+
+    const committedZoom = zoomLevel.value
+    const anchorPx = resolveAnchorPx(previewAnchorClientX)
+    const anchorContentPx = scrollContainer.scrollLeft + anchorPx
+    const scale = targetZoom / committedZoom
+
+    wrapper.style.transform = `scaleX(${scale})`
+    wrapper.style.transformOrigin = `${anchorContentPx}px 0`
+    wrapper.style.willChange = 'transform'
+    isZoomPreviewActive.value = true
   }
 
   /**
@@ -159,48 +267,56 @@ export function useWaveformZoom(
     }, 16)
   }
 
-  /**
-   * 锚点缩放核心算法
-   * @param {number} targetZoom - 目标缩放比例
-   * @param {number} anchorPx - 锚点相对于视口左侧的像素位置
-   */
-  function setZoomWithAnchor(targetZoom, anchorPx) {
+  function commitZoom(targetZoom, anchorPx, options = {}) {
+    const { deferPreviewCleanup = false } = options
     const ws = wavesurferRef.value
     if (!ws || !containerRef.value) return
 
     const scrollContainer = getScrollContainer()
     if (!scrollContainer) return
 
-    // 1. 记录缩放前的状态
-    const oldPxPerSec = (zoomLevel.value / 100) * ZOOM_BASE_PX_PER_SEC
+    const clampedZoom = clampZoom(targetZoom)
+    if (clampedZoom === zoomLevel.value) {
+      if (deferPreviewCleanup) {
+        resetZoomPreviewState()
+      }
+      return
+    }
+
+    const safeAnchorPx = Math.max(0, Math.min(scrollContainer.clientWidth, anchorPx))
+    const oldPxPerSec = getPxPerSec(zoomLevel.value)
     const oldScroll = scrollContainer.scrollLeft
-
-    // 计算锚点对应的"绝对时间点"
-    const anchorTime = (oldScroll + anchorPx) / oldPxPerSec
-
-    // 2. 应用新的缩放
-    const clampedZoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, targetZoom))
-
-    if (clampedZoom === zoomLevel.value) return
+    const anchorTime = (oldScroll + safeAnchorPx) / oldPxPerSec
+    const newPxPerSec = getPxPerSec(clampedZoom)
 
     zoomLevel.value = clampedZoom
-    const newPxPerSec = (clampedZoom / 100) * ZOOM_BASE_PX_PER_SEC
-
     ws.zoom(newPxPerSec)
     projectStore.setZoomLevel(clampedZoom)
 
-    // 动态柱子宽度
+    const oldBarConfig = getAdaptiveBarConfig(oldPxPerSec)
     const newBarConfig = getAdaptiveBarConfig(newPxPerSec)
-    ws.setOptions(newBarConfig)
+    if (!areBarConfigsEqual(oldBarConfig, newBarConfig)) {
+      ws.setOptions(newBarConfig)
+    }
 
-    // 3. 计算新的滚动位置
-    const newScroll = Math.max(0, anchorTime * newPxPerSec - anchorPx)
-
-    // 4. RAF 设置滚动位置
-    requestAnimationFrame(() => {
+    const newScroll = Math.max(0, anchorTime * newPxPerSec - safeAnchorPx)
+    maybeScheduleAnimationFrame(() => {
       scrollContainer.scrollLeft = newScroll
       debouncedUpdateScrollbar()
+      if (deferPreviewCleanup) {
+        resetZoomPreviewState()
+      }
     })
+  }
+
+  /**
+   * 锚点缩放核心算法
+   * @param {number} targetZoom - 目标缩放比例
+   * @param {number} anchorPx - 锚点相对于视口左侧的像素位置
+   */
+  function setZoomWithAnchor(targetZoom, anchorPx) {
+    resetZoomPreviewState()
+    commitZoom(targetZoom, anchorPx)
   }
 
   /**
@@ -224,6 +340,45 @@ export function useWaveformZoom(
     setZoomWithAnchor(targetZoom, anchorPx)
   }
 
+  function queueWheelPreviewZoom(delta, clientX) {
+    const scrollContainer = getScrollContainer()
+    const wrapper = getWrapperElement()
+    if (!scrollContainer || !wrapper) return
+
+    const baseZoom = previewZoomLevel.value ?? zoomLevel.value
+    const targetZoom = clampZoom(baseZoom + delta)
+    if (targetZoom === zoomLevel.value) {
+      if (isZoomPreviewActive.value) {
+        resetZoomPreviewState()
+      }
+      return
+    }
+
+    previewAnchorClientX = clientX
+    previewZoomLevel.value = targetZoom
+    isZoomPreviewActive.value = true
+
+    if (!previewApplyRafId) {
+      previewApplyRafId = maybeScheduleAnimationFrame(() => {
+        applyZoomPreview()
+      })
+    }
+
+    if (previewCommitTimer) {
+      clearTimeout(previewCommitTimer)
+    }
+    previewCommitTimer = setTimeout(() => {
+      previewCommitTimer = null
+      const latestPreviewZoom = previewZoomLevel.value
+      if (!Number.isFinite(latestPreviewZoom)) {
+        resetZoomPreviewState()
+        return
+      }
+      const anchorPx = resolveAnchorPx(previewAnchorClientX)
+      commitZoom(latestPreviewZoom, anchorPx, { deferPreviewCleanup: true })
+    }, WHEEL_PREVIEW_SETTLE_MS)
+  }
+
   /**
    * 滑块输入事件处理（带节流）
    */
@@ -242,11 +397,20 @@ export function useWaveformZoom(
   function setZoom(value) {
     const ws = wavesurferRef.value
     if (!ws) return
-    const clampedValue = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, value))
+    resetZoomPreviewState()
+    const clampedValue = clampZoom(value)
+    if (clampedValue === zoomLevel.value) return
+    const oldPxPerSec = getPxPerSec(zoomLevel.value)
     zoomLevel.value = clampedValue
-    const minPxPerSec = (clampedValue / 100) * ZOOM_BASE_PX_PER_SEC
+    const minPxPerSec = getPxPerSec(clampedValue)
     ws.zoom(minPxPerSec)
     projectStore.setZoomLevel(clampedValue)
+
+    const oldBarConfig = getAdaptiveBarConfig(oldPxPerSec)
+    const newBarConfig = getAdaptiveBarConfig(minPxPerSec)
+    if (!areBarConfigsEqual(oldBarConfig, newBarConfig)) {
+      ws.setOptions(newBarConfig)
+    }
   }
 
   /**
@@ -272,6 +436,7 @@ export function useWaveformZoom(
     const ws = wavesurferRef.value
     if (!ws || !containerRef.value) return
 
+    resetZoomPreviewState()
     const containerWidth = containerRef.value.offsetWidth - 32
     const audioDuration = ws.getDuration()
 
@@ -280,9 +445,6 @@ export function useWaveformZoom(
       const fitZoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, idealZoom))
 
       setZoom(fitZoom)
-
-      const { barConfig } = calculateWaveformConfig(audioDuration, containerWidth)
-      ws.setOptions(barConfig)
     }
   }
 
@@ -290,6 +452,7 @@ export function useWaveformZoom(
    * 清理缓存（组件卸载时调用）
    */
   function cleanup() {
+    resetZoomPreviewState()
     cachedWrapper = null
     cachedScrollContainer = null
     if (scrollbarUpdateTimer) {
@@ -301,6 +464,8 @@ export function useWaveformZoom(
   return {
     // 状态
     zoomLevel,
+    isZoomPreviewActive,
+    previewZoomLevel,
     // 方法
     setZoom,
     zoomIn,
@@ -308,6 +473,7 @@ export function useWaveformZoom(
     fitToScreen,
     handleZoomInput,
     handleZoomWithSmartAnchor,
+    queueWheelPreviewZoom,
     getScrollContainer,
     cleanup,
     // 常量

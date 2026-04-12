@@ -59,8 +59,31 @@ function createPlaybackManager() {
 
   // 定时器
   let seekLockTimer = null;
+  let delayedReleaseTimer = null;
   let timeUpdateTimer = null;
   let lastWaveSurferSyncAt = 0;
+  let pendingDeferredWaveSurferTime = null;
+  let pendingVideoSeekTime = null;
+  let pendingDragCommitTime = null;
+
+  function clearDelayedReleaseTimer() {
+    if (delayedReleaseTimer) {
+      clearTimeout(delayedReleaseTimer);
+      delayedReleaseTimer = null;
+    }
+  }
+
+  function resetSeekLockTimeout() {
+    if (seekLockTimer) {
+      clearTimeout(seekLockTimer);
+    }
+
+    seekLockTimer = setTimeout(() => {
+      if (isSeekingInternal) {
+        forceReleaseLock();
+      }
+    }, CONFIG.SEEK_LOCK_TIMEOUT);
+  }
 
   // Store 引用（延迟获取，避免循环依赖）
   let _store = null;
@@ -173,6 +196,17 @@ function createPlaybackManager() {
         if (!videoElement.paused) {
           videoElement.pause();
         }
+        // Trade-off: 路由切换时仅 pause 可能无法立刻终止浏览器已建立的 Range 拉流，
+        // 主动清空 src 并 load 可触发媒体管线释放，降低后端 active_streams 残留窗口。
+        if (typeof videoElement.removeAttribute === "function") {
+          videoElement.removeAttribute("src");
+        }
+        if ("src" in videoElement) {
+          videoElement.src = "";
+        }
+        if (typeof videoElement.load === "function") {
+          videoElement.load();
+        }
       } catch {
         // 某些浏览器在元素销毁阶段可能抛异常，忽略并继续解绑
       }
@@ -233,20 +267,10 @@ function createPlaybackManager() {
    * 获取 Seek 锁
    */
   function acquireLock(reason = "") {
+    clearDelayedReleaseTimer();
     isSeekingInternal = true;
     getPlaybackStore().setSeeking(true);
-
-    // 清除之前的超时
-    if (seekLockTimer) {
-      clearTimeout(seekLockTimer);
-    }
-
-    // 设置超时保护
-    seekLockTimer = setTimeout(() => {
-      if (isSeekingInternal) {
-        forceReleaseLock();
-      }
-    }, CONFIG.SEEK_LOCK_TIMEOUT);
+    resetSeekLockTimeout();
   }
 
   /**
@@ -255,9 +279,11 @@ function createPlaybackManager() {
    */
   function releaseLock(delay = 0) {
     const doRelease = () => {
+      clearDelayedReleaseTimer();
       isSeekingInternal = false;
       isDraggingInternal = false;
       dragSource = "";
+      pendingDragCommitTime = null;
       getPlaybackStore().setSeeking(false);
 
       if (seekLockTimer) {
@@ -267,7 +293,11 @@ function createPlaybackManager() {
     };
 
     if (delay > 0) {
-      setTimeout(doRelease, delay);
+      clearDelayedReleaseTimer();
+      delayedReleaseTimer = setTimeout(() => {
+        delayedReleaseTimer = null;
+        doRelease();
+      }, delay);
     } else {
       doRelease();
     }
@@ -355,7 +385,12 @@ function createPlaybackManager() {
    * @param {boolean} options.fromDrag - 是否来自拖拽操作
    */
   function seekTo(time, options = {}) {
-    const { fromDrag = false, sessionId = "", force = false } = options;
+    const {
+      fromDrag = false,
+      sessionId = "",
+      force = false,
+      waveSurferSync = "immediate",
+    } = options;
 
     if (!force && !isSessionMatched(sessionId)) {
       const playbackStore = getPlaybackStore();
@@ -381,21 +416,35 @@ function createPlaybackManager() {
     // 1. 更新 Store（单一数据源）
     const playbackStore = getPlaybackStore();
     playbackStore.updateCurrentTimeRaw(clampedTime);
-    playbackStore.commitCurrentTime(clampedTime);
 
     // 2. 直接更新 Video 元素
+    let hasPendingSeekClock = false;
     if (
       videoElement &&
       Math.abs(videoElement.currentTime - clampedTime) > CONFIG.SYNC_THRESHOLD
     ) {
       videoElement.currentTime = clampedTime;
+      hasPendingSeekClock = true;
     }
+    if (videoElement?.seeking) {
+      hasPendingSeekClock = true;
+    }
+    pendingVideoSeekTime = hasPendingSeekClock ? clampedTime : null;
 
     // 3. 更新 WaveSurfer（如果已注册）
-    syncWaveSurfer(clampedTime);
+    if (waveSurferSync === "deferred" && hasPendingSeekClock) {
+      pendingDeferredWaveSurferTime = clampedTime;
+    } else {
+      pendingDeferredWaveSurferTime = null;
+      syncWaveSurfer(clampedTime);
+    }
+
+    if (!fromDrag && !hasPendingSeekClock) {
+      commitStableTime(clampedTime);
+    }
 
     // 如果不是拖拽操作，延迟释放锁
-    if (!fromDrag) {
+    if (!fromDrag && !hasPendingSeekClock) {
       releaseLock(CONFIG.SEEK_PROTECTION_PERIOD);
     }
 
@@ -423,6 +472,10 @@ function createPlaybackManager() {
     }
   }
 
+  function commitStableTime(time) {
+    getPlaybackStore().commitCurrentTime(time);
+  }
+
   /**
    * 开始拖拽
    * @param {string} source - 拖拽来源（'progressBar', 'waveformCursor' 等）
@@ -430,6 +483,7 @@ function createPlaybackManager() {
   function startDragging(source = "unknown") {
     isDraggingInternal = true;
     dragSource = source;
+    pendingDragCommitTime = null;
     acquireLock(`drag:${source}`);
   }
 
@@ -442,7 +496,9 @@ function createPlaybackManager() {
       return;
     }
 
-    seekTo(time, { fromDrag: true });
+    // 拖拽过程中持续续期锁超时，避免长按反向拖动时被 3s 超时强制解锁。
+    resetSeekLockTimeout();
+    pendingDragCommitTime = seekTo(time, { fromDrag: true });
   }
 
   /**
@@ -451,10 +507,23 @@ function createPlaybackManager() {
   function stopDragging() {
     if (!isDraggingInternal) return;
 
+    isDraggingInternal = false;
+
     // 更新保护时间
     lastSeekTime = Date.now();
 
-    // 延迟释放锁，给 Video 一些时间完成 seek
+    // 如果最终拖拽位置仍在等待 video seek 完成，必须继续持锁，
+    // 否则旧时间会在 seeked 前通过 timeupdate 回流，把 UI 拉回旧位置。
+    if (pendingVideoSeekTime !== null || videoElement?.seeking) {
+      resetSeekLockTimeout();
+      return;
+    }
+
+    if (Number.isFinite(pendingDragCommitTime)) {
+      commitStableTime(pendingDragCommitTime);
+    }
+
+    // 纯音频/无待完成 seek 时直接按保护期释放
     releaseLock(CONFIG.SEEK_PROTECTION_PERIOD);
   }
 
@@ -541,7 +610,6 @@ function createPlaybackManager() {
       // 只有差异足够大时才更新
       if (diff > CONFIG.SYNC_THRESHOLD) {
         playbackStore.updateCurrentTimeRaw(latestVideoTime);
-        playbackStore.commitCurrentTime(latestVideoTime);
       }
     }, CONFIG.DEBOUNCE_DELAY);
   }
@@ -582,7 +650,6 @@ function createPlaybackManager() {
     const diff = Math.abs(currentTime - currentStoreTime);
     if (diff > CONFIG.SYNC_THRESHOLD) {
       playbackStore.updateCurrentTimeRaw(currentTime);
-      playbackStore.commitCurrentTime(currentTime);
     }
     resolveDuration(getStore());
   }
@@ -598,7 +665,28 @@ function createPlaybackManager() {
    * 处理 Video 的 seeked 事件
    */
   function handleVideoSeeked() {
-    // 可用于调试
+    if (!videoElement) {
+      return;
+    }
+
+    const currentTime = Number(videoElement.currentTime);
+    if (!Number.isFinite(currentTime)) {
+      return;
+    }
+
+    pendingVideoSeekTime = null;
+    if (isDraggingInternal) {
+      resetSeekLockTimeout();
+      return;
+    }
+    commitStableTime(currentTime);
+
+    if (pendingDeferredWaveSurferTime !== null) {
+      syncWaveSurfer(currentTime);
+      pendingDeferredWaveSurferTime = null;
+    }
+
+    releaseLock(CONFIG.SEEK_PROTECTION_PERIOD);
   }
 
   /**
@@ -632,6 +720,9 @@ function createPlaybackManager() {
    */
   function handleVideoPause() {
     const playbackStore = getPlaybackStore();
+    if (videoElement && Number.isFinite(videoElement.currentTime)) {
+      commitStableTime(videoElement.currentTime);
+    }
     if (Boolean(readStoreValue(playbackStore.isPlaying))) {
       playbackStore.setPlaying(false);
     }
@@ -648,6 +739,10 @@ function createPlaybackManager() {
       return;
     }
     const playbackStore = getPlaybackStore();
+    const currentTime = Number(wavesurferInstance?.getCurrentTime?.());
+    if (Number.isFinite(currentTime)) {
+      commitStableTime(currentTime);
+    }
     if (Boolean(readStoreValue(playbackStore.isPlaying))) {
       playbackStore.setPlaying(false);
     }
@@ -663,6 +758,10 @@ function createPlaybackManager() {
     if (isVirtualTimelineActive) {
       return;
     }
+    const duration = Number(wavesurferInstance?.getDuration?.());
+    if (Number.isFinite(duration)) {
+      commitStableTime(duration);
+    }
     getPlaybackStore().setPlaying(false);
   }
 
@@ -676,6 +775,7 @@ function createPlaybackManager() {
     unregisterWaveSurfer();
     forceReleaseLock();
     isVirtualTimelineActive = false;
+    clearDelayedReleaseTimer();
 
     if (resetPosition) {
       const playbackStore = getPlaybackStore();
@@ -688,6 +788,9 @@ function createPlaybackManager() {
       timeUpdateTimer = null;
     }
     lastWaveSurferSyncAt = 0;
+    pendingDeferredWaveSurferTime = null;
+    pendingVideoSeekTime = null;
+    pendingDragCommitTime = null;
     if (resetSession) {
       activeSessionId = "";
     }

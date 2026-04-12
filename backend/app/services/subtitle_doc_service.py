@@ -25,6 +25,7 @@ from app.services.subtitle_edit_store import (
     get_edit_store_path,
     load_deleted_indices,
     load_edits,
+    remove_deletion,
     save_edit,
 )
 from app.utils.ass_converter import ASSConverter
@@ -69,6 +70,8 @@ class SubtitleDocService:
     """字幕文档服务。"""
 
     SEGMENT_MAP_KEY = "_segment_map"
+    # V3.2.4+dev.20260303.01: tombstone 映射，支持 batch-sync 恢复已删除字幕
+    DELETED_SEGMENT_MAP_KEY = "_deleted_segment_map"
 
     def import_segments(
         self,
@@ -263,6 +266,11 @@ class SubtitleDocService:
         add_deletion(project_dir, sentence_index)
         segment_map.pop(segment_id, None)
         self._save_segment_map(project_dir, segment_map)
+
+        # V3.2.4+dev.20260303.01: 将映射移入 tombstone，支持 batch-sync 恢复
+        tombstone = self._load_deleted_segment_map(project_dir)
+        tombstone[segment_id] = sentence_index
+        self._save_deleted_segment_map(project_dir, tombstone)
         return True
 
     def _load_segment_map(self, project_dir: Path) -> Dict[str, int]:
@@ -283,6 +291,59 @@ class SubtitleDocService:
         payload[self.SEGMENT_MAP_KEY] = {str(k): int(v) for k, v in seg_map.items()}
         payload["updated_at"] = time()
         self._write_payload(project_dir, payload)
+
+    # V3.2.4+dev.20260303.01: tombstone 映射层（已删除字幕的 segment_id → index）
+
+    def _load_deleted_segment_map(self, project_dir: Path) -> Dict[str, int]:
+        payload = self._read_payload(project_dir)
+        raw_map = payload.get(self.DELETED_SEGMENT_MAP_KEY, {})
+        result: Dict[str, int] = {}
+        if not isinstance(raw_map, dict):
+            return result
+        for segment_id, sentence_index in raw_map.items():
+            try:
+                result[str(segment_id)] = int(sentence_index)
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    def _save_deleted_segment_map(self, project_dir: Path, tombstone: Dict[str, int]) -> None:
+        payload = self._read_payload(project_dir)
+        payload[self.DELETED_SEGMENT_MAP_KEY] = {str(k): int(v) for k, v in tombstone.items()}
+        payload["updated_at"] = time()
+        self._write_payload(project_dir, payload)
+
+    def restore_segment(
+        self,
+        project_dir: Path,
+        segment_id: str,
+        update: Optional[dict] = None,
+    ) -> Optional[int]:
+        """从 tombstone 恢复已删除的字幕段。
+
+        将 segment_id 从 _deleted_segment_map 移回 _segment_map，
+        并从 deleted_indices 移除。返回恢复的 sentence_index，失败返回 None。
+        """
+        tombstone = self._load_deleted_segment_map(project_dir)
+        sentence_index = tombstone.get(segment_id)
+        if sentence_index is None:
+            return None
+
+        # 从 deleted_indices 移除
+        remove_deletion(project_dir, sentence_index)
+
+        # 映射从 tombstone 移回 segment_map
+        segment_map = self._load_segment_map(project_dir)
+        segment_map[segment_id] = sentence_index
+        self._save_segment_map(project_dir, segment_map)
+        tombstone.pop(segment_id, None)
+        self._save_deleted_segment_map(project_dir, tombstone)
+
+        # 如果有内容变更，补存编辑
+        if update:
+            save_edit(project_dir, sentence_index, update)
+
+        return sentence_index
 
     def _ensure_segment_ids(self, project_dir: Path, edits: Dict[int, dict]) -> Dict[str, int]:
         """确保每条字幕都有 segment_id 映射。"""

@@ -579,3 +579,92 @@ body.el-popup-parent--hidden {
   align-items: center;
 }
 
+/* 轻提示 Popover（替代 button title） */
+/* 原因：Element Plus 默认宽度 150px，视觉过大，这里统一收口为紧凑提示尺寸 */
+.hint-popover-compact.el-popper {
+  width: auto !important;
+  min-width: 0 !important;
+  max-width: 220px;
+  padding: 6px 8px !important;
+  font-size: 12px;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+/* ==============================================
+   AdvancedSettings 高级设置弹窗专用样式
+   el-dialog teleport 到 body，scoped 无法穿透
+   ============================================== */
+
+/* 原因：重置 dialog 默认 padding，统一高级设置弹窗视觉风格 */
+/* 注意：class="advanced-settings-dialog" 通过 $attrs 合并到 .el-dialog 同一元素上 */
+/* V3.2.4+dev.20260303.04: 固定宽高、居中、body 内滚动且隐藏滚动条 */
+.el-dialog.advanced-settings-dialog {
+  --el-dialog-padding-primary: 0;
+
+  padding: 0;
+  width: 720px;
+  height: 70vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--af-bg-secondary);
+  border: 1px solid var(--af-border-default);
+}
+
+/* 原因：EP 用 padding-bottom/padding-right 单独属性，必须逐个覆盖 */
+.el-dialog.advanced-settings-dialog .el-dialog__header,
+.el-dialog.advanced-settings-dialog .el-dialog__header.show-close {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 18px 24px 16px;
+  border-bottom: 1px solid var(--af-border-default);
+}
+
+.el-dialog.advanced-settings-dialog .el-dialog__title {
+  color: var(--af-text-primary);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+/* 原因：EP headerbtn 默认绝对定位 48x48，需改为 static 与标题对齐 */
+.el-dialog.advanced-settings-dialog .el-dialog__headerbtn {
+  position: static;
+  width: 24px;
+  height: 24px;
+}
+
+/* 原因：Element Plus 不提供 body padding 的 CSS 变量 */
+/* V3.2.4+dev.20260303.04: body 区域弹性填充剩余空间，垂直滚动但隐藏滚动条 */
+.el-dialog.advanced-settings-dialog .el-dialog__body {
+  flex: 1;
+  min-height: 0;
+  padding: 20px 24px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: none; /* Firefox */
+  -ms-overflow-style: none; /* IE/Edge */
+}
+
+.el-dialog.advanced-settings-dialog .el-dialog__body::-webkit-scrollbar {
+  display: none; /* Chrome/Safari */
+}
+
+/* 原因：Element Plus 不提供 footer padding/border 的 CSS 变量 */
+.el-dialog.advanced-settings-dialog .el-dialog__footer {
+  border-top: 1px solid var(--af-border-default);
+  padding: 14px 24px;
+}
+
+/* 原因：重置 EP 默认按钮间距，取消放左侧、保存放右侧 */
+.el-dialog.advanced-settings-dialog .el-dialog__footer .dialog-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.el-dialog.advanced-settings-dialog .el-dialog__footer .dialog-footer .el-button + .el-button {
+  margin-left: 0;
+}
+

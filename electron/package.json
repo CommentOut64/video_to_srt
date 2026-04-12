@@ -1,0 +1,19 @@
+{
+  "name": "anchorflux-electron-shell",
+  "private": true,
+  "version": "3.2.4",
+  "description": "AnchorFlux Electron Shell",
+  "main": "main.js",
+  "scripts": {
+    "dev:shell": "electron .",
+    "build:shell": "electron-builder --win --x64 --dir --config electron-builder.yml",
+    "pack:shell": "electron-builder --win --x64 --config electron-builder.yml",
+    "build:shell:script": "node ./scripts/build-shell.mjs",
+    "test:shell": "node --test *.spec.js"
+  },
+  "devDependencies": {
+    "electron": "^37.2.0",
+    "electron-builder": "^26.0.12",
+    "wait-on": "^9.0.3"
+  }
+}

@@ -19,17 +19,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_global_terms
 ON global_term_replacements(language, source_text, target_text, match_mode);
 
 CREATE TABLE IF NOT EXISTS homophone_index_state (
-  job_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
   revision INTEGER NOT NULL,
   status TEXT NOT NULL,
   last_committed_chunk INTEGER NOT NULL DEFAULT -1,
   heartbeat_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  PRIMARY KEY (job_id, revision)
+  PRIMARY KEY (project_id, revision)
 );
 
 CREATE TABLE IF NOT EXISTS homophone_postings (
-  job_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
   revision INTEGER NOT NULL,
   language TEXT NOT NULL,
   chunk_index INTEGER NOT NULL,
@@ -43,28 +43,28 @@ CREATE TABLE IF NOT EXISTS homophone_postings (
   char_start INTEGER NOT NULL,
   char_end INTEGER NOT NULL,
   PRIMARY KEY (
-    job_id, revision, sentence_index, token_index
+    project_id, revision, sentence_index, token_index
   )
 );
 
 CREATE INDEX IF NOT EXISTS idx_posting_lookup_strict
-ON homophone_postings(job_id, revision, language, reading_key, sentence_index, token_index);
+ON homophone_postings(project_id, revision, language, reading_key, sentence_index, token_index);
 
 CREATE INDEX IF NOT EXISTS idx_posting_lookup_fuzzy
-ON homophone_postings(job_id, revision, language, reading_key_fuzzy, sentence_index, token_index);
+ON homophone_postings(project_id, revision, language, reading_key_fuzzy, sentence_index, token_index);
 
 CREATE INDEX IF NOT EXISTS idx_posting_lookup_strict_no_punct
-ON homophone_postings(job_id, revision, language, reading_key_no_punct, sentence_index, token_index);
+ON homophone_postings(project_id, revision, language, reading_key_no_punct, sentence_index, token_index);
 
 CREATE INDEX IF NOT EXISTS idx_posting_lookup_fuzzy_no_punct
-ON homophone_postings(job_id, revision, language, reading_key_fuzzy_no_punct, sentence_index, token_index);
+ON homophone_postings(project_id, revision, language, reading_key_fuzzy_no_punct, sentence_index, token_index);
 
 CREATE TABLE IF NOT EXISTS sentence_revision (
-  job_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
   sentence_index INTEGER NOT NULL,
   revision INTEGER NOT NULL,
   text_hash TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  PRIMARY KEY (job_id, sentence_index)
+  PRIMARY KEY (project_id, sentence_index)
 );
 

@@ -29,7 +29,7 @@ export class NetworkError extends Error {
 
 // 创建 Axios 实例
 export const apiClient = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000',
+  baseURL: import.meta.env.VITE_API_BASE_URL || window.location.origin,
   timeout: 30000, // 默认 30 秒超时
   headers: {
     'Content-Type': 'application/json'
@@ -59,6 +59,10 @@ apiClient.interceptors.response.use(
     return response.data
   },
   (error) => {
+    if (error?.code === 'ECONNABORTED') {
+      throw new NetworkError('请求超时，请检查媒体文件体积后重试')
+    }
+
     if (error.response) {
       // HTTP 错误响应 (4xx, 5xx)
       const { status, data } = error.response

@@ -478,13 +478,13 @@ class DemucsService:
         
         加载顺序：
         1. 检查 torch 缓存目录是否已有模型
-        2. 如果没有，检查预置模型目录 (backend/models/pretrained/)
+        2. 如果没有，检查预置模型目录 (backend/models/pretrained/demucs-htdemucs/)
         3. 如果有预置模型，复制到 torch 缓存目录
         4. 调用 demucs 加载模型
         
         模型缓存位置：
         - 项目: models/torch/hub/checkpoints/
-        - 预置: backend/models/pretrained/
+        - 预置: backend/models/pretrained/demucs-htdemucs/
         
         【优化】下载前会检查并清理残留的 .partial 文件
         """
@@ -506,7 +506,7 @@ class DemucsService:
         """
         安装预置模型到 torch 缓存目录
         
-        检查 backend/models/pretrained/ 目录下是否有对应的预置模型，
+        检查 backend/models/pretrained/demucs-htdemucs/ 目录下是否有对应的预置模型，
         如果有且 torch 缓存中没有，则复制过去。
         
         Args:
@@ -535,8 +535,8 @@ class DemucsService:
         if not pretrained_file or not cache_file:
             return
         
-        # 获取预置模型目录（backend/models/pretrained/）
-        pretrained_dir = Path(__file__).parent.parent.parent / 'models' / 'pretrained'
+        # 获取预置模型目录（backend/models/pretrained/demucs-htdemucs/）
+        pretrained_dir = Path(__file__).parent.parent.parent / 'models' / 'pretrained' / 'demucs-htdemucs'
         pretrained_path = pretrained_dir / pretrained_file
         
         if not pretrained_path.exists():

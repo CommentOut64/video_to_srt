@@ -14,6 +14,11 @@ from typing import Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
+MEDIA_PROFILE_BROWSER_COMPAT = "browser_compat"
+MEDIA_PROFILE_ELECTRON_NATIVE = "electron_native"
+_MEDIA_PROFILE_VALUES = {MEDIA_PROFILE_BROWSER_COMPAT, MEDIA_PROFILE_ELECTRON_NATIVE}
+
+
 def load_env_file(env_path: Path) -> None:
     """加载.env文件到环境变量 (简化版,无需第三方库)"""
     if not env_path.exists():
@@ -42,6 +47,25 @@ def load_env_file(env_path: Path) -> None:
         logger.info(f"[Config] Loaded environment variables from {env_path}")
     except Exception as e:
         logger.warning(f"[Config] Failed to load .env file: {e}")
+
+
+def _resolve_media_profile_from_env() -> str:
+    """
+    解析媒体预处理 profile。
+
+    优先级：
+    1. ANCHORFLUX_MEDIA_PROFILE=browser_compat|electron_native
+    2. DEV_MODE=true|1|yes -> browser_compat
+    3. 默认 electron_native
+    """
+    raw_profile = str(os.environ.get("ANCHORFLUX_MEDIA_PROFILE", "")).strip().lower()
+    if raw_profile in _MEDIA_PROFILE_VALUES:
+        return raw_profile
+
+    is_dev_mode = str(os.environ.get("DEV_MODE", "")).strip().lower() in ("true", "1", "yes")
+    if is_dev_mode:
+        return MEDIA_PROFILE_BROWSER_COMPAT
+    return MEDIA_PROFILE_ELECTRON_NATIVE
 
 
 class ProjectConfig:
@@ -82,7 +106,7 @@ class ProjectConfig:
         os.environ['HF_HUB_CACHE'] = str(self.HF_CACHE_DIR / "hub")
         
         # HuggingFace 镜像源配置（解决国内访问问题）
-        # 默认启用镜像源，可通过环境变量 USE_HF_MIRROR=false 禁用
+        # 默认启用镜像优先策略，可通过环境变量 USE_HF_MIRROR=false 改为官方优先
         use_mirror = os.getenv('USE_HF_MIRROR', 'true').lower() == 'true'
 
         if use_mirror:
@@ -90,14 +114,14 @@ class ProjectConfig:
             self.HF_ENDPOINT = 'https://hf-mirror.com'
             os.environ['HF_ENDPOINT'] = self.HF_ENDPOINT
             print(f"HuggingFace 镜像源: {self.HF_ENDPOINT}")
-            print("提示：如需使用官方源，请设置环境变量 USE_HF_MIRROR=false")
+            print("提示：下载器默认优先镜像，失败时会自动回退官方源；如需官方优先，请设置 USE_HF_MIRROR=false")
         else:
             # 使用官方源
             self.HF_ENDPOINT = 'https://huggingface.co'
             if 'HF_ENDPOINT' in os.environ:
                 del os.environ['HF_ENDPOINT']
             print(f"使用 HuggingFace 官方源: {self.HF_ENDPOINT}")
-            print("提示：如遇访问问题，可设置环境变量 USE_HF_MIRROR=true 使用镜像源")
+            print("提示：当前为官方优先；如需镜像优先并在失败后自动回退官方，可设置 USE_HF_MIRROR=true")
 
         # 确保目录存在（tools目录不自动创建，需用户手动准备）
         for dir_path in [
@@ -182,10 +206,12 @@ class ProjectConfig:
         # ========== Proxy 视频配置（重构新增）==========
         # 统一管理所有 Proxy 转码相关参数
         # 注意: ffmpeg_cpu_threads 使用延迟计算，避免循环导入
+        self.MEDIA_PROFILE = _resolve_media_profile_from_env()
         self._ffmpeg_cpu_threads_cache = None  # 延迟计算缓存
         self.PROXY_CONFIG = {
             # V3.1.2+dev.20260113.02: 720p自动触发配置（默认启用）
-            "auto_trigger_720p": True,  # 默认自动触发720p转码
+            # browser_compat 启用；electron_native 关闭
+            "auto_trigger_720p": self.MEDIA_PROFILE == MEDIA_PROFILE_BROWSER_COMPAT,
             # FFmpeg CPU 线程配置（避免使用全部核心导致降频）
             # 注意: 实际值通过 get_ffmpeg_cpu_threads() 方法获取（延迟计算）
             "ffmpeg_cpu_threads": None,  # 占位符，实际使用 get_ffmpeg_cpu_threads()
@@ -216,6 +242,14 @@ class ProjectConfig:
                 "enabled": True,                          # 是否启用重封装优化
                 "compatible_codecs": {"h264", "aac", "mp3"},  # 可直接复制的编解码器
                 "target_container": "mp4",                # 目标容器格式
+            },
+            # H264 归一化转码配置（与 proxy 解耦，可独立用于格式兜底）
+            "normalize_h264": {
+                "preset": "veryfast",
+                "crf": 23,
+                "audio_bitrate": "128k",
+                "audio_sample_rate": 44100,
+                "pixel_format": "yuv420p",
             },
             # SSE 推送配置
             "sse": {
@@ -360,6 +394,14 @@ class ProjectConfig:
             self._ffmpeg_cpu_threads_cache = self._calculate_ffmpeg_threads()
         return self._ffmpeg_cpu_threads_cache
 
+    def is_browser_compat_media_profile(self) -> bool:
+        """是否启用浏览器兼容 profile（保留 360p/720p 渐进 proxy）。"""
+        return self.MEDIA_PROFILE == MEDIA_PROFILE_BROWSER_COMPAT
+
+    def is_electron_native_media_profile(self) -> bool:
+        """是否启用 Electron 原生 profile（禁用 360p/720p 渐进 proxy）。"""
+        return self.MEDIA_PROFILE == MEDIA_PROFILE_ELECTRON_NATIVE
+
     def get_ffmpeg_command(self) -> str:
         """
         获取FFmpeg命令
@@ -488,6 +530,7 @@ def _resolve_flavor_from_env() -> Tuple[str, bool]:
 config = ProjectConfig()
 FLAVOR, IS_LITE = _resolve_flavor_from_env()
 logger.info("AnchorFlux flavor: %s (IS_LITE=%s)", FLAVOR, IS_LITE)
+logger.info("AnchorFlux media profile: %s", config.MEDIA_PROFILE)
 
 # 打印配置信息（启动时显示）
 # 注意：避免在模块导入时使用emoji，以防编码问题

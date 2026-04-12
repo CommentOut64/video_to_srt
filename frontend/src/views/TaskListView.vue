@@ -13,26 +13,44 @@
         @mouseenter="isEdgeHovered = true"
         @mouseleave="isEdgeHovered = false"
       >
-        <button
+        <el-popover
           v-if="!isSidebarOpen"
-          class="sidebar-edge-btn"
-          :class="{ visible: isEdgeHovered }"
-          title="展开任务侧栏"
-          @click="isSidebarOpen = true"
+          content="展开任务侧栏"
+          placement="right"
+          trigger="hover"
+          popper-class="hint-popover-compact"
+          :show-after="500"
         >
-          <el-icon><ArrowRightBold /></el-icon>
-        </button>
+          <template #reference>
+            <button
+              class="sidebar-edge-btn"
+              :class="{ visible: isEdgeHovered }"
+              @click="isSidebarOpen = true"
+            >
+              <el-icon><ArrowRightBold /></el-icon>
+            </button>
+          </template>
+        </el-popover>
       </div>
 
       <aside class="task-sidebar" :class="{ open: isSidebarOpen }">
-        <button
+        <el-popover
           v-if="isSidebarOpen"
-          class="sidebar-collapse-btn"
-          title="折叠任务侧栏"
-          @click="isSidebarOpen = false"
+          content="折叠任务侧栏"
+          placement="right"
+          trigger="hover"
+          popper-class="hint-popover-compact"
+          :show-after="500"
         >
-          <el-icon><ArrowLeftBold /></el-icon>
-        </button>
+          <template #reference>
+            <button
+              class="sidebar-collapse-btn"
+              @click="isSidebarOpen = false"
+            >
+              <el-icon><ArrowLeftBold /></el-icon>
+            </button>
+          </template>
+        </el-popover>
 
         <div class="sidebar-inner">
           <section class="sidebar-block">
@@ -149,7 +167,7 @@
           </section>
 
           <section class="sidebar-footer">
-            <el-button class="more-settings-btn" type="primary" plain @click="openAdvancedSettingsDialog">
+            <el-button class="more-settings-btn" @click="openAdvancedSettingsDialog">
               <el-icon><Setting /></el-icon>
               更多设置
             </el-button>
@@ -222,12 +240,15 @@
     <el-dialog
       v-model="showAdvancedSettings"
       title="高级设置"
-      width="600px"
+      width="720px"
+      class="advanced-settings-dialog"
+      align-center
+      :lock-scroll="false"
       :close-on-click-modal="false"
       :close-on-press-escape="true"
       @close="handleCloseAdvancedSettings"
     >
-      <AdvancedSettings v-model="advancedConfig" />
+      <AdvancedSettings v-model="advancedConfig" @open-about="showAboutDialog = true" />
       <template #footer>
         <span class="dialog-footer">
           <el-button @click="handleCancelAdvancedSettings">取消</el-button>
@@ -255,7 +276,6 @@ import {
 } from '@element-plus/icons-vue'
 import { useTaskRuntimeStore } from '@/stores/taskRuntimeStore'
 import { useTranscriptionPresetStore } from '@/stores/transcriptionPresetStore'
-import { selectCapabilities } from '@/state/capabilities/capabilitySelector'
 import { transcriptionApi, projectApi, systemApi, presetsApi } from '@/services/api'
 import AboutDialog from '@/components/AboutDialog.vue'
 import TaskListHeader from '@/components/task/TaskListHeader.vue'
@@ -280,8 +300,6 @@ const route = useRoute()
 const taskStore = useTaskRuntimeStore()
 const transcriptionPresetStore = useTranscriptionPresetStore()
 const { taskConfig } = storeToRefs(transcriptionPresetStore)
-const capabilities = selectCapabilities()
-
 const showAboutDialog = ref(false)
 const showImportDialog = ref(false)
 const showAdvancedSettings = ref(false)
@@ -294,11 +312,11 @@ const taskModeFilter = ref('all')
 const groupCollapseState = ref({
   workspace: false,
   interrupted: false,
-  completed: true,
+  completed: false,
 })
 
 const showCanceledTasks = ref(true)
-const collapseCompletedByDefault = ref(true)
+const collapseCompletedByDefault = ref(false)
 const autoExpandInterrupted = ref(true)
 
 // 内联重命名相关
@@ -314,6 +332,8 @@ const advancedGeneral = ref({
   auto_save_interval: 60,
   preview_font_size: 24,
   enable_shortcuts: true,
+  merge_separator: 'space',
+  merge_separator_custom: '',
 })
 const advancedConfig = ref(buildAdvancedConfig())
 
@@ -570,9 +590,15 @@ function loadTaskUiPreferences() {
     }
   }
   if (savedSidebarSettings && typeof savedSidebarSettings === 'object') {
-    showCanceledTasks.value = savedSidebarSettings.showCanceledTasks !== false
-    collapseCompletedByDefault.value = savedSidebarSettings.collapseCompletedByDefault !== false
-    autoExpandInterrupted.value = savedSidebarSettings.autoExpandInterrupted !== false
+    if (typeof savedSidebarSettings.showCanceledTasks === 'boolean') {
+      showCanceledTasks.value = savedSidebarSettings.showCanceledTasks
+    }
+    if (typeof savedSidebarSettings.collapseCompletedByDefault === 'boolean') {
+      collapseCompletedByDefault.value = savedSidebarSettings.collapseCompletedByDefault
+    }
+    if (typeof savedSidebarSettings.autoExpandInterrupted === 'boolean') {
+      autoExpandInterrupted.value = savedSidebarSettings.autoExpandInterrupted
+    }
   }
   if (savedAdvancedGeneral && typeof savedAdvancedGeneral === 'object') {
     advancedGeneral.value = {
@@ -731,8 +757,11 @@ loadCustomPresets()
 
 onMounted(() => {
   loadTaskUiPreferences()
-  if (!capabilities.canTranscribe || route.query.action === 'import') {
+  if (route.query.action === 'import') {
     showImportDialog.value = true
+    const nextQuery = { ...route.query }
+    delete nextQuery.action
+    router.replace({ query: nextQuery }).catch(() => {})
   }
 })
 
@@ -796,6 +825,7 @@ async function deleteTask(jobId) {
       confirmButtonText: '删除',
       cancelButtonText: '取消',
       type: 'warning',
+      lockScroll: false,
     })
 
     // 调用后端 API 删除任务数据
@@ -997,6 +1027,13 @@ async function handleSaveAdvancedSettings() {
     }
     saveJsonStorage(ADVANCED_GENERAL_KEY, advancedGeneral.value)
 
+    // V3.2.4+dev.20260302.02: 同步合并分隔符到独立 key（projectStore 从此 key 读取）
+    const separatorConfig = {
+      type: advancedConfig.value.general.merge_separator || 'space',
+      custom: advancedConfig.value.general.merge_separator_custom || ''
+    }
+    saveJsonStorage('editor-merge-separator', separatorConfig)
+
     transcriptionPresetStore.applyTaskConfig({
       preset_id: advancedConfig.value.preset_id || taskConfig.value.preset_id,
       preprocessing: { ...advancedConfig.value.preprocessing },
@@ -1006,7 +1043,7 @@ async function handleSaveAdvancedSettings() {
     })
 
     ElMessage.success('高级设置已保存')
-    showAdvancedSettings.value = false
+    // V3.2.4+dev.20260303.04: 保存后不关闭窗口，允许用户继续修改
   } catch (error) {
     console.error('保存高级设置失败:', error)
     ElMessage.error('保存高级设置失败: ' + (error.message || '未知错误'))
@@ -1028,6 +1065,7 @@ async function handleExit() {
       confirmButtonText: '确定退出',
       cancelButtonText: '取消',
       type: 'warning',
+      lockScroll: false,
     })
 
     // 显示关闭进度
@@ -1040,32 +1078,22 @@ async function handleExit() {
     let cleanupReport = null
 
     try {
-      // 调用后端 shutdown API，设置超时
-      const controller = new AbortController()
-      const timeoutId = setTimeout(() => controller.abort(), 10000) // 10秒超时
+      const response = await systemApi.shutdownSystem({
+        cleanup_temp: false, // 不清理临时文件，保留断点数据
+        force: false,
+        timeout_ms: 10000,
+      })
 
-      try {
-        const response = await systemApi.shutdownSystem({
-          cleanup_temp: false, // 不清理临时文件，保留断点数据
-          force: false,
-        })
+      shutdownSuccess = response?.success || false
+      cleanupReport = response?.cleanup_report || null
 
-        clearTimeout(timeoutId)
-        shutdownSuccess = response?.success || false
-        cleanupReport = response?.cleanup_report || null
-
-        if (cleanupReport) {
-          console.log('[Exit] 清理报告:', cleanupReport)
-        }
-      } catch (e) {
-        clearTimeout(timeoutId)
-        // 请求可能因后端关闭而失败，这是预期行为
-        console.log('[Exit] 后端已关闭或请求超时:', e.message || e)
-        shutdownSuccess = true // 如果后端已关闭，认为成功
+      if (cleanupReport) {
+        console.log('[Exit] 清理报告:', cleanupReport)
       }
     } catch (e) {
-      console.log('[Exit] 关闭请求异常:', e)
-      shutdownSuccess = true // 即使异常也认为成功（后端可能已关闭）
+      // 请求可能因后端已关闭/超时被中断，视作进入关闭流程。
+      console.log('[Exit] 后端已关闭或请求超时:', e.message || e)
+      shutdownSuccess = true
     }
 
     loading.close()
@@ -1075,7 +1103,7 @@ async function handleExit() {
       ? '系统已安全关闭，请手动关闭此浏览器标签页。'
       : '系统关闭可能未完全成功，请手动检查后台进程。'
 
-    await ElMessageBox.alert(message, '关闭完成', { type: shutdownSuccess ? 'success' : 'warning' })
+    await ElMessageBox.alert(message, '关闭完成', { type: shutdownSuccess ? 'success' : 'warning', lockScroll: false })
 
     // 尝试关闭当前窗口（部分浏览器可能阻止）
     try {

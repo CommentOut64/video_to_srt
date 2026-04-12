@@ -37,7 +37,6 @@
             <button
               class="toolbar-btn mode-btn tw-flex-shrink-0"
               :class="{ 'is-active': !isLiteralMode }"
-              :title="currentModeLabel"
             >
               <svg viewBox="0 0 24 24" fill="currentColor">
                 <path
@@ -80,30 +79,42 @@
               @keyup.enter="handleSearch"
             />
             <!-- R1C3: 清除按钮（有内容时显示，否则隐藏占位） -->
-            <button
-              class="panel-icon-btn"
-              :style="{ visibility: localSearchText ? 'visible' : 'hidden' }"
-              title="清除搜索"
-              @click="handleClearSearch"
+            <el-popover content="清除搜索" placement="top" trigger="hover" popper-class="hint-popover-compact" :show-after="500">
+              <template #reference>
+                <button
+                  class="panel-icon-btn"
+                  :style="{ visibility: localSearchText ? 'visible' : 'hidden' }"
+                  @click="handleClearSearch"
+                >
+                  <svg viewBox="0 0 24 24" fill="currentColor">
+                    <path
+                      d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+                    />
+                  </svg>
+                </button>
+              </template>
+            </el-popover>
+            <!-- R1C4: 忽略标点（近音模式显示，否则隐藏占位） -->
+            <el-popover
+              :content="isIgnorePunctuation ? '取消忽略标点' : '忽略标点'"
+              placement="top"
+              trigger="hover"
+              popper-class="hint-popover-compact"
+              :show-after="500"
             >
-              <svg viewBox="0 0 24 24" fill="currentColor">
-                <path
-                  d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-                />
-              </svg>
-            </button>
-            <!-- R1C4: 忽略标点（同音模式显示，否则隐藏占位） -->
-            <button
-              class="panel-icon-btn punctuation-btn"
-              :class="{ 'is-active': isIgnorePunctuation }"
-              :style="{ visibility: isHomophoneMode ? 'visible' : 'hidden' }"
-              :title="isIgnorePunctuation ? '取消忽略标点' : '忽略标点'"
-              @click="toggleIgnorePunctuation"
-            >
-              <el-icon :size="14">
-                <Filter />
-              </el-icon>
-            </button>
+              <template #reference>
+                <button
+                  class="panel-icon-btn punctuation-btn"
+                  :class="{ 'is-active': isIgnorePunctuation }"
+                  :style="{ visibility: isHomophoneMode ? 'visible' : 'hidden' }"
+                  @click="toggleIgnorePunctuation"
+                >
+                  <el-icon :size="14">
+                    <Filter />
+                  </el-icon>
+                </button>
+              </template>
+            </el-popover>
           </div>
 
           <!-- 替换行：独立元素，从搜索行下方滑出 -->
@@ -126,31 +137,63 @@
                 title="全选"
                 @change="handleToggleSelectAll"
               />
-              <button
-                class="panel-icon-btn replace-btn"
-                :disabled="selectedCount === 0 || !replaceText"
-                title="批量替换"
-                @click="handleBatchReplace"
-              >
-                <svg viewBox="0 0 24 24" fill="currentColor">
-                  <path
-                    d="M11 6c1.38 0 2.63.56 3.54 1.46L12 10h6V4l-2.05 2.05C14.68 4.78 12.93 4 11 4c-3.53 0-6.43 2.61-6.92 6H6.1c.46-2.28 2.48-4 4.9-4zm5.64 9.14c.66-.9 1.12-1.97 1.28-3.14H15.9c-.46 2.28-2.48 4-4.9 4-1.38 0-2.63-.56-3.54-1.46L10 12H4v6l2.05-2.05C7.32 17.22 9.07 18 11 18c1.55 0 2.98-.51 4.14-1.36L20 21.49 21.49 20l-4.85-4.86z"
-                  />
-                </svg>
-              </button>
+              <el-popover content="批量替换" placement="top" trigger="hover" popper-class="hint-popover-compact" :show-after="500">
+                <template #reference>
+                  <button
+                    class="panel-icon-btn replace-btn"
+                    :disabled="selectedCount === 0 || !replaceText"
+                    @click="handleBatchReplace"
+                  >
+                    <svg viewBox="0 0 24 24" fill="currentColor">
+                      <path
+                        d="M11 6c1.38 0 2.63.56 3.54 1.46L12 10h6V4l-2.05 2.05C14.68 4.78 12.93 4 11 4c-3.53 0-6.43 2.61-6.92 6H6.1c.46-2.28 2.48-4 4.9-4zm5.64 9.14c.66-.9 1.12-1.97 1.28-3.14H15.9c-.46 2.28-2.48 4-4.9 4-1.38 0-2.63-.56-3.54-1.46L10 12H4v6l2.05-2.05C7.32 17.22 9.07 18 11 18c1.55 0 2.98-.51 4.14-1.36L20 21.49 21.49 20l-4.85-4.86z"
+                      />
+                    </svg>
+                  </button>
+                </template>
+              </el-popover>
             </div>
           </Transition>
         </div>
       </div>
     </div>
 
-    <!-- 右侧：添加字幕按钮 -->
+    <!-- 右侧：批量删除 + 添加字幕 -->
     <div class="toolbar-right tw-flex tw-items-center tw-flex-shrink-0">
-      <button class="toolbar-btn" title="添加字幕" @click="handleAddSubtitle">
-        <svg viewBox="0 0 24 24" fill="currentColor">
-          <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z" />
-        </svg>
-      </button>
+      <el-popover
+        v-if="multiSelectedCount > 0"
+        :content="batchDeleteConfirm ? '再次点击确认删除' : `删除 ${multiSelectedCount} 条字幕`"
+        placement="left"
+        trigger="hover"
+        popper-class="hint-popover-compact"
+        :show-after="500"
+      >
+        <template #reference>
+          <button
+            class="toolbar-btn"
+            :style="batchDeleteConfirm ? 'color: var(--af-accent-danger);' : ''"
+            @click="handleBatchDeleteConfirm"
+            @blur="handleBatchDeleteBlur"
+            tabindex="0"
+          >
+            <svg v-if="!batchDeleteConfirm" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
+            </svg>
+            <svg v-else viewBox="0 0 24 24" fill="currentColor" style="color: var(--af-accent-danger);">
+              <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
+            </svg>
+          </button>
+        </template>
+      </el-popover>
+      <el-popover content="添加字幕" placement="top" trigger="hover" popper-class="hint-popover-compact" :show-after="500">
+        <template #reference>
+          <button class="toolbar-btn" @click="handleAddSubtitle">
+            <svg viewBox="0 0 24 24" fill="currentColor">
+              <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z" />
+            </svg>
+          </button>
+        </template>
+      </el-popover>
     </div>
   </div>
 </template>
@@ -166,7 +209,12 @@
 
 import { ref, computed, watch } from 'vue'
 import { Filter } from '@element-plus/icons-vue'
-import { SearchMode, SortMode, IndexStatus } from '@/composables/useHomophoneSearch'
+import {
+  SearchMode,
+  SortMode,
+  IndexStatus,
+  normalizeVisibleSearchMode,
+} from '@/composables/useHomophoneSearch'
 
 const props = defineProps({
   totalSubtitles: { type: Number, default: 0 },
@@ -185,6 +233,7 @@ const props = defineProps({
   selectedCount: { type: Number, default: 0 },
   isAllSelected: { type: Boolean, default: false },
   isIndeterminate: { type: Boolean, default: false },
+  multiSelectedCount: { type: Number, default: 0 },
 })
 
 const emit = defineEmits([
@@ -197,6 +246,7 @@ const emit = defineEmits([
   'search',
   'reset',
   'batch-replace',
+  'batch-delete',
   'toggle-select-all',
   'add-subtitle',
   'quick-search',
@@ -206,6 +256,7 @@ const emit = defineEmits([
 const localSearchText = ref('')
 const isReplaceExpanded = ref(false)
 const modePopoverRef = ref(null)
+const batchDeleteConfirm = ref(false)
 
 // 同步 searchText -> localSearchText
 watch(
@@ -218,8 +269,8 @@ watch(
 
 // 可写计算属性
 const searchMode = computed({
-  get: () => props.searchMode,
-  set: (val) => emit('update:searchMode', val),
+  get: () => normalizeVisibleSearchMode(props.searchMode),
+  set: (val) => emit('update:searchMode', normalizeVisibleSearchMode(val)),
 })
 
 const replaceText = computed({
@@ -236,22 +287,19 @@ const isIgnorePunctuation = computed({
 const isLiteralMode = computed(() => props.searchMode === SearchMode.LITERAL)
 
 const isHomophoneMode = computed(() => {
-  return (
-    props.searchMode === SearchMode.HOMOPHONE_STRICT ||
-    props.searchMode === SearchMode.HOMOPHONE_FUZZY
-  )
+  return normalizeVisibleSearchMode(props.searchMode) === SearchMode.HOMOPHONE_FUZZY
 })
 
 const currentModeLabel = computed(() => {
-  const option = searchModeOptions.find((o) => o.value === props.searchMode)
+  const currentMode = normalizeVisibleSearchMode(props.searchMode)
+  const option = searchModeOptions.find((o) => o.value === currentMode)
   return option ? `搜索模式: ${option.label}` : '搜索模式'
 })
 
 const searchPlaceholder = computed(() => {
-  switch (props.searchMode) {
+  switch (normalizeVisibleSearchMode(props.searchMode)) {
     case SearchMode.REGEX:
       return '正则表达式...'
-    case SearchMode.HOMOPHONE_STRICT:
     case SearchMode.HOMOPHONE_FUZZY:
       return '文字或拼音...'
     default:
@@ -262,13 +310,12 @@ const searchPlaceholder = computed(() => {
 const searchModeOptions = [
   { label: '精确', value: SearchMode.LITERAL },
   { label: '正则', value: SearchMode.REGEX },
-  { label: '同音', value: SearchMode.HOMOPHONE_STRICT },
   { label: '近音', value: SearchMode.HOMOPHONE_FUZZY },
 ]
 
 // 事件处理
 function handleModeChange(mode) {
-  emit('update:searchMode', mode)
+  emit('update:searchMode', normalizeVisibleSearchMode(mode))
   modePopoverRef.value?.hide?.()
 }
 
@@ -278,7 +325,7 @@ function toggleIgnorePunctuation() {
 
 function handleSearch() {
   emit('update:searchText', localSearchText.value)
-  // 统一进入“搜索命中态”，保证精确/正则/同音三类模式都可执行批量替换。
+  // 统一进入“搜索命中态”，保证精确/正则/近音三类模式都可执行批量替换。
   emit('search')
 }
 
@@ -295,12 +342,28 @@ function handleBatchReplace() {
   emit('batch-replace')
 }
 
+function handleBatchDelete() {
+  emit('batch-delete')
+}
+
 function handleToggleSelectAll() {
   emit('toggle-select-all')
 }
 
 function handleAddSubtitle() {
   emit('add-subtitle')
+}
+
+function handleBatchDeleteConfirm() {
+  if (!batchDeleteConfirm.value) {
+    batchDeleteConfirm.value = true
+  } else {
+    batchDeleteConfirm.value = false
+    handleBatchDelete()
+  }
+}
+function handleBatchDeleteBlur() {
+  batchDeleteConfirm.value = false
 }
 </script>
 

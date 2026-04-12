@@ -16,6 +16,12 @@
   padding: 0;
 }
 
+/* V3.2.5+dev.20260321.01: 全局禁用 Chromium 默认焦点框 */
+*:focus,
+*:focus-visible {
+  outline: none;
+}
+
 html {
   font-size: 14px;
   -webkit-font-smoothing: antialiased;
@@ -28,6 +34,7 @@ body {
   color: var(--af-text-normal);
   line-height: 1.5;
   min-height: 100vh;
+  overflow: hidden;
   user-select: none;
   -webkit-user-select: none;
   -moz-user-select: none;

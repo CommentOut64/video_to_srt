@@ -9,6 +9,13 @@
 import { apiClient } from './client'
 import { FLAVOR } from '@/config/flavor'
 
+const DEFAULT_IMPORT_UPLOAD_TIMEOUT_MS = 10 * 60 * 1000
+const ENV_IMPORT_UPLOAD_TIMEOUT_MS = Number(import.meta.env.VITE_IMPORT_UPLOAD_TIMEOUT_MS)
+const IMPORT_UPLOAD_TIMEOUT_MS =
+  Number.isFinite(ENV_IMPORT_UPLOAD_TIMEOUT_MS) && ENV_IMPORT_UPLOAD_TIMEOUT_MS > 0
+    ? ENV_IMPORT_UPLOAD_TIMEOUT_MS
+    : DEFAULT_IMPORT_UPLOAD_TIMEOUT_MS
+
 function unwrapEnvelope(response, fallback = null) {
   if (response && typeof response === 'object' && 'data' in response) {
     return response.data ?? fallback
@@ -31,6 +38,7 @@ class ProjectAPI {
 
     const response = await apiClient.post('/api/projects/import', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: IMPORT_UPLOAD_TIMEOUT_MS,
     })
     return unwrapEnvelope(response, null)
   }
@@ -92,6 +100,16 @@ class ProjectAPI {
   async deleteSubtitle(projectId, segmentId) {
     const response = await apiClient.delete(`/api/projects/${projectId}/subtitles/${segmentId}`)
     return unwrapEnvelope(response, null)
+  }
+
+  // V3.2.4+dev.20260303.01: undo/redo 批量同步
+  // 不走 unwrapEnvelope，保留完整 {success, data} envelope 供调用方判断业务失败
+  async batchSyncSubtitles(projectId, diff) {
+    const response = await apiClient.post(
+      `/api/projects/${projectId}/subtitles/batch-sync`,
+      diff
+    )
+    return response
   }
 
   async exportSubtitles(projectId, format = 'srt') {

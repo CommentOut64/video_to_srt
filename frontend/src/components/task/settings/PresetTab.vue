@@ -34,22 +34,40 @@
         </div>
         <div class="row-actions" @click.stop>
           <!-- 覆盖更新：用当前配置覆写此预设 -->
-          <button
-            class="action-icon"
-            title="用当前配置覆盖此预设"
-            @click="emit('overwrite-preset', preset.id)"
+          <el-popover
+            content="用当前配置覆盖此预设"
+            placement="top"
+            trigger="hover"
+            popper-class="hint-popover-compact"
+            :show-after="500"
           >
-            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 000-1.41l-2.34-2.34a1 1 0 00-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>
-          </button>
+            <template #reference>
+              <button
+                class="action-icon"
+                @click="emit('overwrite-preset', preset.id)"
+              >
+                <svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 000-1.41l-2.34-2.34a1 1 0 00-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>
+              </button>
+            </template>
+          </el-popover>
           <!-- 删除：二次点击确认 -->
-          <button
-            class="action-icon"
-            :class="{ confirming: pendingDeleteId === preset.id }"
-            :title="pendingDeleteId === preset.id ? '再次点击确认删除' : '删除预设'"
-            @click="handleDelete(preset.id)"
+          <el-popover
+            :content="pendingDeleteId === preset.id ? '再次点击确认删除' : '删除预设'"
+            placement="top"
+            trigger="hover"
+            popper-class="hint-popover-compact"
+            :show-after="500"
           >
-            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
-          </button>
+            <template #reference>
+              <button
+                class="action-icon"
+                :class="{ confirming: pendingDeleteId === preset.id }"
+                @click="handleDelete(preset.id)"
+              >
+                <svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+              </button>
+            </template>
+          </el-popover>
         </div>
       </div>
     </div>

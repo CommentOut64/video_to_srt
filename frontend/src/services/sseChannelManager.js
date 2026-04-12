@@ -31,7 +31,7 @@ class SSEChannelManager extends EventEmitter {
     this.UNSUBSCRIBE_DELAY = 2000
 
     // 基础 URL
-    this.baseURL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
+    this.baseURL = import.meta.env.VITE_API_BASE_URL || window.location.origin
 
     console.log('[SSEChannelManager] 频道管理器已初始化')
   }
@@ -297,12 +297,10 @@ class SSEChannelManager extends EventEmitter {
       'subtitle.added': (data) => {
         console.log(`[SSE Job ${jobId}] 新增字幕:`, data)
         handlers.onSubtitleAdded?.(data)
-        handlers.onSubtitleUpdate?.(data)
       },
       'subtitle.deleted': (data) => {
         console.log(`[SSE Job ${jobId}] 删除字幕:`, data)
         handlers.onSubtitleDeleted?.(data)
-        handlers.onSubtitleUpdate?.(data)
       },
       'subtitle.edited': (data) => {
         console.log(`[SSE Job ${jobId}] 用户编辑字幕:`, data)
@@ -386,6 +384,16 @@ class SSEChannelManager extends EventEmitter {
       proxy_complete: (data) => {
         console.log(`[SSE Job ${jobId}] Proxy 完成:`, data)
         handlers.onProxyComplete?.(data)
+      },
+      // H264 归一化进度（Electron 主路径）
+      normalize_progress: (data) => {
+        console.log(`[SSE Job ${jobId}] normalize_h264 进度:`, data.progress)
+        handlers.onNormalizeProgress?.(data)
+      },
+      // H264 归一化完成
+      normalize_complete: (data) => {
+        console.log(`[SSE Job ${jobId}] normalize_h264 完成:`, data)
+        handlers.onNormalizeComplete?.(data)
       },
 
       // === 连接和心跳 ===

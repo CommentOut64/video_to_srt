@@ -1,48 +1,39 @@
-"""同音路由接口单元测试。"""
+"""同音路由接口单元测试（纯 Project 语义）。"""
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any, Dict, List
+from typing import Any, List
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from app.api.routes.transcription_routes import create_transcription_router
+from app.api.routes.homophone_routes import create_homophone_router
 from app.services.homophone.db import GlobalTermRule, IndexState
 
 
-class _DummyFileService:
-    pass
+@dataclass
+class _FakeIdentity:
+    project_id: str
+    project_dir: Path
+    legacy_project_id: str | None = None
 
 
-class _DummyStateRepo:
-    @staticmethod
-    def get_checkpoint_summary(job_id: str) -> Dict[str, Any] | None:
-        return None
+class _FakeProjectIdResolver:
+    def __init__(self, project_dir: Path, project_id: str = "project-1") -> None:
+        self._project_dir = project_dir
+        self._project_id = project_id
 
-
-class _DummyJobLifecycle:
-    def __init__(self) -> None:
-        self.state_repo = _DummyStateRepo()
-
-
-class _DummyTranscriptionService:
-    def __init__(self, job_dir: Path) -> None:
-        self._job = SimpleNamespace(
-            job_id="job-1",
-            dir=str(job_dir),
-            status="running",
+    def resolve_or_fail(self, identifier: str) -> _FakeIdentity:
+        if str(identifier) != self._project_id:
+            raise FileNotFoundError(f"项目不存在: {identifier}")
+        return _FakeIdentity(
+            project_id=self._project_id,
+            project_dir=self._project_dir,
+            legacy_project_id=None,
         )
-        self.job_lifecycle = _DummyJobLifecycle()
-
-    def get_job(self, job_id: str):
-        if job_id != "job-1":
-            return None
-        return self._job
 
 
 @dataclass
@@ -59,7 +50,7 @@ class _FakeMatch:
 class _FakeHomophoneService:
     def __init__(self) -> None:
         self._state = IndexState(
-            job_id="job-1",
+            project_id="project-1",
             revision=1,
             status="ready",
             last_committed_chunk=0,
@@ -78,15 +69,15 @@ class _FakeHomophoneService:
             )
         ]
 
-    def get_index_status(self, job_id: str) -> IndexState | None:
-        if job_id != "job-1":
+    def get_index_status(self, project_id: str) -> IndexState | None:
+        if project_id != "project-1":
             return None
         return self._state
 
     def index_chunk(
         self,
         *,
-        job_id: str,
+        project_id: str,
         revision: int,
         chunk_index: int,
         language: str,
@@ -97,7 +88,7 @@ class _FakeHomophoneService:
     def search_homophone(
         self,
         *,
-        job_id: str,
+        project_id: str,
         revision: int,
         language: str,
         query_text: str,
@@ -127,9 +118,9 @@ class _FakeHomophoneService:
 
 
 def _build_client(tmp_path: Path, monkeypatch) -> tuple[TestClient, _FakeHomophoneService]:
-    job_dir = tmp_path / "job-1"
-    job_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = job_dir / "checkpoint.json"
+    project_dir = tmp_path / "project-1"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = project_dir / "checkpoint.json"
     checkpoint_path.write_text(
         json.dumps(
             {
@@ -151,26 +142,27 @@ def _build_client(tmp_path: Path, monkeypatch) -> tuple[TestClient, _FakeHomopho
     )
 
     fake_homophone_service = _FakeHomophoneService()
+    fake_resolver = _FakeProjectIdResolver(project_dir=project_dir, project_id="project-1")
+
     monkeypatch.setattr(
-        "app.services.homophone.runtime.get_homophone_service",
+        "app.api.routes.homophone_routes.get_homophone_service",
         lambda: fake_homophone_service,
     )
     monkeypatch.setattr(
-        "app.services.sse_service.push_subtitle_event",
+        "app.api.routes.homophone_routes.get_project_id_resolver",
+        lambda: fake_resolver,
+    )
+    monkeypatch.setattr(
+        "app.api.routes.homophone_routes.push_subtitle_event",
         lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
-        "app.services.streaming_subtitle.get_streaming_subtitle_manager_if_exists",
-        lambda job_id: None,
+        "app.api.routes.homophone_routes.get_streaming_subtitle_manager_if_exists",
+        lambda _project_id: None,
     )
 
-    router = create_transcription_router(
-        transcription_service=_DummyTranscriptionService(job_dir=job_dir),
-        file_service=_DummyFileService(),
-        output_dir=str(tmp_path / "out"),
-    )
     app = FastAPI()
-    app.include_router(router)
+    app.include_router(create_homophone_router())
     return TestClient(app), fake_homophone_service
 
 
@@ -178,7 +170,7 @@ def test_homophone_find_and_index_status_api(tmp_path: Path, monkeypatch) -> Non
     client, _ = _build_client(tmp_path, monkeypatch)
 
     find_resp = client.post(
-        "/api/jobs/job-1/homophone/find",
+        "/api/projects/project-1/homophone/find",
         json={
             "mode": "homophone_strict",
             "query_text": "同音",
@@ -190,58 +182,16 @@ def test_homophone_find_and_index_status_api(tmp_path: Path, monkeypatch) -> Non
     assert find_resp.status_code == 200
     payload = find_resp.json()
     assert payload["success"] is True
+    assert payload["data"]["project_id"] == "project-1"
     assert payload["data"]["index_status"] == "ready"
     assert len(payload["data"]["matches"]) == 1
 
-    status_resp = client.get("/api/jobs/job-1/homophone/index-status")
+    status_resp = client.get("/api/projects/project-1/homophone/index-status")
     assert status_resp.status_code == 200
     status_payload = status_resp.json()
     assert status_payload["success"] is True
     assert status_payload["data"]["status"] == "ready"
-
-
-def test_project_homophone_routes_compat_api(tmp_path: Path, monkeypatch) -> None:
-    client, _ = _build_client(tmp_path, monkeypatch)
-
-    find_resp = client.post(
-        "/api/projects/job-1/homophone/find",
-        json={
-            "mode": "homophone_strict",
-            "query_text": "同音",
-            "language": "zh",
-            "is_ignore_punctuation": False,
-            "limit": 10,
-        },
-    )
-    assert find_resp.status_code == 200
-    find_payload = find_resp.json()
-    assert find_payload["success"] is True
-    assert find_payload["data"]["index_status"] == "ready"
-    assert find_payload["data"]["project_id"] == "job-1"
-
-    status_resp = client.get("/api/projects/job-1/homophone/index-status")
-    assert status_resp.status_code == 200
-    status_payload = status_resp.json()
-    assert status_payload["success"] is True
-    assert status_payload["data"]["status"] == "ready"
-    assert status_payload["data"]["project_id"] == "job-1"
-
-    replace_resp = client.post(
-        "/api/projects/job-1/homophone/batch-replace",
-        json={
-            "mode": "literal",
-            "query_text": "foo",
-            "replace_text": "bar",
-            "language": "zh",
-            "is_ignore_punctuation": False,
-            "selected_sentence_indices": [0],
-        },
-    )
-    assert replace_resp.status_code == 200
-    replace_payload = replace_resp.json()
-    assert replace_payload["success"] is True
-    assert replace_payload["data"]["updated_count"] == 1
-    assert replace_payload["data"]["project_id"] == "job-1"
+    assert status_payload["data"]["project_id"] == "project-1"
 
 
 def test_homophone_global_terms_api(tmp_path: Path, monkeypatch) -> None:
@@ -276,7 +226,7 @@ def test_homophone_batch_replace_api(tmp_path: Path, monkeypatch) -> None:
     client, _ = _build_client(tmp_path, monkeypatch)
 
     resp = client.post(
-        "/api/jobs/job-1/homophone/batch-replace",
+        "/api/projects/project-1/homophone/batch-replace",
         json={
             "mode": "literal",
             "query_text": "foo",
@@ -289,5 +239,6 @@ def test_homophone_batch_replace_api(tmp_path: Path, monkeypatch) -> None:
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["success"] is True
+    assert payload["data"]["project_id"] == "project-1"
     assert payload["data"]["updated_count"] == 1
     assert payload["data"]["updated_indices"] == [0]
